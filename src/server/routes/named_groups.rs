@@ -13664,7 +13664,14 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                 let apply_sender = verified_catchup_member_removed_author(&event)
                     .filter(|author| catchup_may_apply_removed_as_author(&event, sender, author))
                     .unwrap_or(*sender);
-                apply_named_group_metadata_event(state, event, apply_sender, true, None).await;
+                // #1623: rule (b) gates a pre-Welcome page link (see
+                // `refuse_unarmed_pre_welcome_page_link`).
+                TREEKEM_CATCHUP_PAGE_APPLY
+                    .scope(
+                        (),
+                        apply_named_group_metadata_event(state, event, apply_sender, true, None),
+                    )
+                    .await;
                 if let Some(ev) = recovery_event {
                     apply_recovered_member_key_package(state, &ev).await;
                 }
@@ -18308,6 +18315,17 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             let Some(commit) = commit else {
                 return ApplyMetadataResult::REJECTED;
             };
+            if refuse_unarmed_pre_welcome_page_link(
+                state,
+                &resolved_group_key,
+                &info,
+                &event_for_log,
+                &local_agent_hex,
+            )
+            .await
+            {
+                return ApplyMetadataResult::REJECTED;
+            }
             let actor_role = info.caller_role(&actor);
             let actor_authorized = actor == sender_hex
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
@@ -18614,6 +18632,17 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             let Some(commit) = commit else {
                 return ApplyMetadataResult::REJECTED;
             };
+            if refuse_unarmed_pre_welcome_page_link(
+                state,
+                &resolved_group_key,
+                &info,
+                &event_for_log,
+                &local_agent_hex,
+            )
+            .await
+            {
+                return ApplyMetadataResult::REJECTED;
+            }
             let actor_role = info.caller_role(&actor);
             let actor_authorized = actor == sender_hex
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
@@ -19180,6 +19209,17 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             let Some(commit) = commit else {
                 return ApplyMetadataResult::REJECTED;
             };
+            if refuse_unarmed_pre_welcome_page_link(
+                state,
+                &resolved_group_key,
+                &info,
+                &event_for_log,
+                &local_agent_hex,
+            )
+            .await
+            {
+                return ApplyMetadataResult::REJECTED;
+            }
             let actor_role = info.caller_role(&actor);
             let actor_authorized = actor == sender_hex
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
@@ -28204,6 +28244,46 @@ async fn drop_local_named_group_state(
 // A responsive rekey must not seal between those events.
 tokio::task_local! {
     static SELF_LEAVE_REKEY_BATCH: ();
+}
+
+// #1623 (ADR 0109 §2 rule (b), D82): the page loop of
+// `handle_treekem_catchup_response` sets this while it applies one page
+// link, so an apply arm knows the link came from a TreeKEM catch-up page.
+tokio::task_local! {
+    static TREEKEM_CATCHUP_PAGE_APPLY: ();
+}
+
+/// #1623 (ADR 0109 §2 rule (b), D82): should a rename, role change or
+/// unban be refused because it is a catch-up page link that a pre-Welcome
+/// node may not apply? Rule (b) scopes the gate to "a catch-up page or the
+/// node's own served chain"; the served chain applies through
+/// `apply_link_state_only`, which has its own checks. So only a page link
+/// is gated here: gossip and direct-message copies keep the ordinary
+/// apply. A node that is Active, or that holds a local TreeKEM group, or a
+/// group on another plane, is not pre-Welcome and is not gated. A gated
+/// link needs [`admit_pre_welcome_state_only_link`]: an armed attested
+/// sequence whose next hash it is, no policy change and no GSS binding
+/// change. Its refusal label goes to `treekem.trace`.
+async fn refuse_unarmed_pre_welcome_page_link(
+    state: &AppState,
+    group_key: &str,
+    info: &x0x::groups::GroupInfo,
+    event: &NamedGroupMetadataEvent,
+    local_agent_hex: &str,
+) -> bool {
+    if TREEKEM_CATCHUP_PAGE_APPLY.try_with(|_| ()).is_err()
+        || info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem
+        || info.has_active_member(local_agent_hex)
+        || state.treekem_groups.read().await.contains_key(group_key)
+    {
+        return false;
+    }
+    // A rename, role change or unban carries no TreeKEM commit, so the
+    // epoch the check keeps is the node's own already.
+    let mut scratch = info.clone();
+    admit_pre_welcome_state_only_link(state, info, &mut scratch, event, local_agent_hex)
+        .await
+        .is_err()
 }
 
 fn self_leave_rekey_batch_held() -> bool {

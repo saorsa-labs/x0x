@@ -1025,8 +1025,7 @@ async fn responder_serves_its_role_change_and_rename_to_a_pre_welcome_joiner() -
     let joiner_hex = hex::encode(joiner.agent.agent_id().as_bytes());
     let owner = responder.agent.identity().agent_keypair();
     let base = base_group(owner, None)?;
-    let key = install_stub(&joiner, base.clone()).await?;
-    install_stub(&responder, base.clone()).await?;
+    let key = install_stub(&responder, base.clone()).await?;
     let owner_ctx = || {
         axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true })
     };
@@ -1041,6 +1040,7 @@ async fn responder_serves_its_role_change_and_rename_to_a_pre_welcome_joiner() -
     .await
     .into_response();
     assert_eq!(response.status(), StatusCode::OK, "the owner promotes");
+    let role_hash = head_of(&responder, &key).await?.state_hash;
     let response = update_named_group(
         State(Arc::clone(&responder)),
         owner_ctx(),
@@ -1054,6 +1054,14 @@ async fn responder_serves_its_role_change_and_rename_to_a_pre_welcome_joiner() -
     .into_response();
     assert_eq!(response.status(), StatusCode::OK, "the owner renames");
     let terminal = head_of(&responder, &key).await?;
+    // Rule (b): the joiner applies page links inside an armed sequence.
+    let mut stub = base.clone();
+    arm(
+        &mut stub,
+        vec![role_hash, terminal.state_hash.clone()],
+        owner,
+    );
+    install_stub(&joiner, stub).await?;
     seat_joiner_on_responder(&responder, &key, &joiner_hex).await;
 
     let served = page_from_responder(&joiner, &responder, &key).await?;
@@ -1458,8 +1466,7 @@ async fn responder_serves_its_unban_to_a_pre_welcome_joiner() -> anyhow::Result<
     seal_link(&mut base, owner, 1_500, |next| {
         next.ban_member(&agent(BANNED), Some(owner_hex.clone()));
     })?;
-    let key = install_stub(&joiner, base.clone()).await?;
-    install_stub(&responder, base).await?;
+    let key = install_stub(&responder, base.clone()).await?;
     let response = unban_group_member(
         State(Arc::clone(&responder)),
         axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
@@ -1469,6 +1476,9 @@ async fn responder_serves_its_unban_to_a_pre_welcome_joiner() -> anyhow::Result<
     .into_response();
     assert_eq!(response.status(), StatusCode::OK, "the owner unbans");
     let terminal = head_of(&responder, &key).await?;
+    let mut stub = base;
+    arm(&mut stub, vec![terminal.state_hash.clone()], owner);
+    install_stub(&joiner, stub).await?;
     seat_joiner_on_responder(&responder, &key, &joiner_hex).await;
 
     let served = page_from_responder(&joiner, &responder, &key).await?;
@@ -1547,5 +1557,185 @@ async fn policy_links_are_not_logged_or_served() -> anyhow::Result<()> {
 
     assert!(served.is_empty(), "no policy link is served: {served:?}");
     assert_eq!(head_of(&joiner, &key).await?.policy, base.policy);
+    Ok(())
+}
+
+/// One state-only link: the record before it, its commit and its event.
+type Link = (
+    GroupInfo,
+    x0x::groups::GroupStateCommit,
+    NamedGroupMetadataEvent,
+);
+
+/// The three state-only links on one owner chain after `base`: role change,
+/// rename and unban (the unbanned seat was banned in `base`).
+fn state_only_links(base: &GroupInfo, owner: &AgentKeypair) -> anyhow::Result<Vec<Link>> {
+    let owner_hex = hex::encode(owner.agent_id().as_bytes());
+    let stable = base.stable_group_id().to_string();
+    let mut ahead = base.clone();
+    let mut links = Vec::new();
+    let before = ahead.clone();
+    let role = seal_link(&mut ahead, owner, 2_000, |next| {
+        next.set_member_role(&agent(PROMOTED), x0x::groups::GroupRole::Admin);
+    })?;
+    let event = NamedGroupMetadataEvent::MemberRoleUpdated {
+        group_id: stable.clone(),
+        revision: role.revision,
+        actor: owner_hex.clone(),
+        agent_id: agent(PROMOTED),
+        role: x0x::groups::GroupRole::Admin,
+        commit: Some(role.clone()),
+    };
+    links.push((before, role, event));
+    let before = ahead.clone();
+    let rename = seal_link(&mut ahead, owner, 3_000, |next| {
+        next.name = "renamed on a page".to_string();
+    })?;
+    let event = NamedGroupMetadataEvent::GroupMetadataUpdated {
+        group_id: stable.clone(),
+        revision: rename.revision,
+        actor: owner_hex.clone(),
+        name: Some("renamed on a page".to_string()),
+        description: None,
+        commit: Some(rename.clone()),
+    };
+    links.push((before, rename, event));
+    let before = ahead.clone();
+    let unban = seal_link(&mut ahead, owner, 4_000, |next| {
+        if let Some(member) = next.members_v2.get_mut(&agent(BANNED)) {
+            member.state = x0x::groups::GroupMemberState::Removed;
+            member.updated_at = 4_000;
+            member.removed_by = None;
+        }
+    })?;
+    let event = NamedGroupMetadataEvent::MemberUnbanned {
+        group_id: stable,
+        revision: unban.revision,
+        actor: owner_hex,
+        agent_id: agent(BANNED),
+        commit: Some(unban.clone()),
+    };
+    links.push((before, unban, event));
+    Ok(links)
+}
+
+/// A TreeKEM base with `BANNED` banned, signed by `owner`.
+fn base_with_ban(owner: &AgentKeypair) -> anyhow::Result<GroupInfo> {
+    let owner_hex = hex::encode(owner.agent_id().as_bytes());
+    let mut base = base_group(owner, None)?;
+    seal_link(&mut base, owner, 1_500, |next| {
+        next.ban_member(&agent(BANNED), Some(owner_hex));
+    })?;
+    Ok(base)
+}
+
+/// `deliver_page`, with the `treekem.trace` text it produced.
+async fn page_trace(
+    state: &Arc<AppState>,
+    key: &str,
+    sender: &AgentKeypair,
+    events: Vec<NamedGroupMetadataEvent>,
+) -> String {
+    #[derive(Clone, Default)]
+    struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("sink").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let sink = Sink::default();
+    let writer = sink.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    deliver_page(state, key, sender, events).await;
+    drop(guard);
+    let bytes = sink.0.lock().expect("sink").clone();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// ADR 0109 rule (b) on a page: an unarmed pre-Welcome joiner refuses a
+/// page-served role change, rename and unban, each with the rule (b)
+/// label. RED before: the ordinary apply took them with no armed sequence.
+#[tokio::test]
+async fn unarmed_pre_welcome_joiner_refuses_page_state_only_links() -> anyhow::Result<()> {
+    let owner = AgentKeypair::generate()?;
+    let base = base_with_ban(&owner)?;
+    for (stub, _, event) in state_only_links(&base, &owner)? {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let key = install_stub(&state, stub.clone()).await?;
+        let kind = named_group_metadata_event_kind(&event);
+        let trace = page_trace(&state, &key, &owner, vec![event]).await;
+        let head = head_of(&state, &key).await?;
+        assert_eq!(head.state_hash, stub.state_hash, "{kind}: nothing applied");
+        assert!(
+            trace.contains("pre_welcome_no_armed_sequence"),
+            "{kind}: the rule (b) label is logged: {trace}"
+        );
+    }
+    Ok(())
+}
+
+/// Control: rule (b) gates page links only. The same rename by gossip or
+/// direct message (the ordinary apply, no page) still applies on an
+/// unarmed pre-Welcome joiner, as before.
+#[tokio::test]
+async fn unarmed_pre_welcome_joiner_still_applies_a_gossip_rename() -> anyhow::Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let owner = AgentKeypair::generate()?;
+    let base = base_with_ban(&owner)?;
+    let (stub, rename, event) = state_only_links(&base, &owner)?.swap_remove(1);
+    let key = install_stub(&state, stub).await?;
+
+    let _ = apply_named_group_metadata_event(&state, event, owner.agent_id(), true, None).await;
+
+    let head = head_of(&state, &key).await?;
+    assert_eq!(
+        head.state_hash, rename.state_hash,
+        "the gossip rename applied"
+    );
+    assert_eq!(head.name, "renamed on a page");
+    let local = hex::encode(state.agent.agent_id().as_bytes());
+    assert!(!head.has_active_member(&local), "still pre-Welcome");
+    Ok(())
+}
+
+/// The dedupe key names the signed state hash: two different state-only
+/// links at one revision (two branches of the chain) are both kept.
+#[tokio::test]
+async fn two_state_only_links_at_one_revision_are_both_kept() -> anyhow::Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let owner = state.agent.identity().agent_keypair();
+    let owner_hex = hex::encode(owner.agent_id().as_bytes());
+    let base = base_group(owner, None)?;
+    let stable = base.stable_group_id().to_string();
+    let mut revisions = Vec::new();
+    for name in ["branch one", "branch two"] {
+        let mut branch = base.clone();
+        let commit = seal_link(&mut branch, owner, 2_000, |next| {
+            next.name = name.to_string()
+        })?;
+        revisions.push(commit.revision);
+        let event = NamedGroupMetadataEvent::GroupMetadataUpdated {
+            group_id: stable.clone(),
+            revision: commit.revision,
+            actor: owner_hex.clone(),
+            name: Some(name.to_string()),
+            description: None,
+            commit: Some(commit),
+        };
+        remember_treekem_membership_event(&state, &event).await;
+    }
+    assert_eq!(revisions[0], revisions[1], "one revision");
+    let logs = state.treekem_event_log.read().await;
+    let log = logs.get(&stable).expect("the log holds the group");
+    assert_eq!(log.len(), 2, "both links are kept");
     Ok(())
 }
