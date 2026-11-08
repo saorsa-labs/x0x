@@ -7300,9 +7300,13 @@ mod tests {
         .await;
         assert_eq!(code, StatusCode::CREATED, "{resp:?}");
         assert_eq!(resp.0["policy"], "encrypted");
+        let (_, expected_topic) = crate::kv::encrypted::group_store_identity(
+            &stable,
+            crate::server::rider_auth::SCRATCH_STORE_NAME,
+        );
         assert_eq!(
             resp.0["topic"].as_str(),
-            Some(format!("x0x/group/{stable}/kv/scratch").as_str()),
+            Some(expected_topic.as_str()),
             "the scratch topic is deterministic from the stable id"
         );
     }

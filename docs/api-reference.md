@@ -676,9 +676,10 @@ authenticates as a distinct principal that may reach exactly:
   decisions 4–5): with `scratch:read`, `GET /stores/:id/keys` and
   `GET /stores/:id/:key`; with `scratch:read_write`, also
   `PUT`/`DELETE /stores/:id/:key` and `POST /groups/:id/stores` with
-  `"name": "scratch"` only. `:id` must be the percent-encoded scratch
-  topic `x0x/group/<gid>/kv/scratch` of a group in the token's grant
-  list, and the open store must be group-bound. No scratch scope means
+  `"name": "scratch"` only. `:id` must be the percent-encoded DERIVED
+  scratch topic of a group in the token's grant list (the `topic` the
+  create route returns — `x0x/group/<gid>/kv/<store digest>`), and the
+  open store must be group-bound. No scratch scope means
   no store access (the `scratch: none` default). A rider never reaches
   any other store, store creation/join, or `GET /stores`.
 
@@ -2925,12 +2926,15 @@ claim, or conclude the task is gone if it stays absent.
 
 Each group's SCRATCH store is the group store named `scratch`
 (`POST /groups/:id/stores` with `{"name":"scratch"}`): an ordinary sealed
-last-writer-wins KV store at the deterministic topic
-`x0x/group/<stable group id>/kv/scratch`, for agents' keyed working
-state. It is the one store a rider token can reach, under the
-`scratch:read` / `scratch:read_write` scopes (see the rider section);
-the `:id` in `/stores/:id/*` is the percent-encoded topic. Owners use
-the ordinary store routes above.
+last-writer-wins KV store at the deterministic derived topic
+`x0x/group/<stable group id>/kv/<store digest>` (the digest is the
+BLAKE3 store identity of the stable group id and the name `scratch`,
+so every member computes the same topic; the create response returns
+it as `topic`), for agents' keyed working state. It is the one store
+a rider token can reach, under the `scratch:read` /
+`scratch:read_write` scopes (see the rider section); the `:id` in
+`/stores/:id/*` is the percent-encoded topic. Owners use the ordinary
+store routes above.
 
 ### Store create request body
 

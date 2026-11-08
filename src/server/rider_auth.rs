@@ -283,11 +283,22 @@ pub(super) fn percent_decode_segment(segment: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-/// The stable group id when `store_id` is a group SCRATCH store topic
-/// (`x0x/group/<gid>/kv/scratch` — ADR 0075 decision 4), else `None`.
-pub(super) fn scratch_topic_group(store_id: &str) -> Option<&str> {
-    let (gid, name) = store_id.strip_prefix("x0x/group/")?.split_once("/kv/")?;
-    (name == SCRATCH_STORE_NAME && !gid.is_empty() && !gid.contains('/')).then_some(gid)
+/// Whether `store_id` is the scratch-store topic of a group on the
+/// token's grant list (ADR 0075 decision 4). Group stores publish under
+/// `x0x/group/<gid>/kv/<store digest hex>` — the digest, not the literal
+/// store name ([`crate::kv::encrypted::group_store_identity`]) — so the
+/// check recomputes the scratch digest from the grant-list gid and
+/// compares the WHOLE topic. A topic that spells `scratch` literally is
+/// not a group store and is refused.
+pub(super) fn is_granted_scratch_topic(store_id: &str, groups: &[String]) -> bool {
+    let Some((gid, _)) = store_id
+        .strip_prefix("x0x/group/")
+        .and_then(|rest| rest.split_once("/kv/"))
+    else {
+        return false;
+    };
+    groups.iter().any(|g| g == gid)
+        && crate::kv::encrypted::group_store_identity(gid, SCRATCH_STORE_NAME).1 == store_id
 }
 
 /// Issue #1094 / ADR 0075 decision 5 — the scratch rows of the rider
@@ -302,8 +313,9 @@ pub(super) fn scratch_topic_group(store_id: &str) -> Option<&str> {
 /// - `PUT /stores/:id/:key` and `DELETE /stores/:id/:key` with
 ///   `scratch:read_write`;
 ///
-/// where `:id` strictly percent-decodes to the scratch topic
-/// `x0x/group/<gid>/kv/scratch` of a group on the token's grant list.
+/// where `:id` strictly percent-decodes to the DERIVED scratch topic
+/// (`group_store_identity(gid, "scratch")`) of a group on the token's
+/// grant list.
 /// The auth middleware ADDITIONALLY requires the open store at that
 /// topic to be group-bound (sealed or group-signed) before admitting a
 /// rider, so a personal store planted at a scratch-shaped topic stays
@@ -341,10 +353,7 @@ pub(super) fn rider_scratch_route_allowed(
     let Some(store_id) = percent_decode_segment(id_enc) else {
         return false;
     };
-    match scratch_topic_group(&store_id) {
-        Some(gid) => groups.iter().any(|g| g == gid),
-        None => false,
-    }
+    is_granted_scratch_topic(&store_id, groups)
 }
 
 /// One persisted rider token. The token SECRET is never stored — only
@@ -813,7 +822,8 @@ mod tests {
     // ── Scratch rows (#1094, ADR 0075 decision 5) ───────────────────────
 
     fn scratch_store_path(gid: &str) -> String {
-        format!("/stores/x0x%2Fgroup%2F{gid}%2Fkv%2Fscratch")
+        let (_, topic) = crate::kv::encrypted::group_store_identity(gid, SCRATCH_STORE_NAME);
+        format!("/stores/{}", topic.replace('/', "%2F"))
     }
 
     #[test]
@@ -940,8 +950,16 @@ mod tests {
             format!("{}/k", scratch_store_path("other")),
             // prefix near-miss on the grant
             format!("{}/k", scratch_store_path("grante")),
-            // a non-scratch store of the granted group
-            "/stores/x0x%2Fgroup%2Fgranted%2Fkv%2Fnotes/k".to_string(),
+            // a non-scratch store of the granted group (real derived topic)
+            format!(
+                "/stores/{}/k",
+                crate::kv::encrypted::group_store_identity("granted", "notes")
+                    .1
+                    .replace('/', "%2F")
+            ),
+            // a LITERAL scratch-named topic — group stores publish under
+            // the derived digest, so a planted literal name is refused
+            "/stores/x0x%2Fgroup%2Fgranted%2Fkv%2Fscratch/k".to_string(),
             // a personal store named scratch
             "/stores/scratch/k".to_string(),
             // nested-key shapes beyond the route's two segments
@@ -977,13 +995,38 @@ mod tests {
     }
 
     #[test]
-    fn scratch_topic_group_parses_exactly() {
-        assert_eq!(scratch_topic_group("x0x/group/g1/kv/scratch"), Some("g1"));
-        assert_eq!(scratch_topic_group("x0x/group/g1/kv/notes"), None);
-        assert_eq!(scratch_topic_group("x0x/group//kv/scratch"), None);
-        assert_eq!(scratch_topic_group("x0x/group/a/b/kv/scratch"), None);
-        assert_eq!(scratch_topic_group("scratch"), None);
-        assert_eq!(scratch_topic_group("x0x/group/g1/kv/"), None);
+    fn scratch_topic_is_derived_and_group_exact() {
+        // WHY: group stores publish under the DERIVED store digest
+        // (group_store_identity), never the literal name — the predicate
+        // must match exactly that topic, for exactly a granted group.
+        let groups = vec!["g1".to_string()];
+        let derived =
+            |gid: &str, name: &str| crate::kv::encrypted::group_store_identity(gid, name).1;
+        assert!(is_granted_scratch_topic(
+            &derived("g1", SCRATCH_STORE_NAME),
+            &groups
+        ));
+        // The literal name is not a group-store topic.
+        assert!(!is_granted_scratch_topic(
+            "x0x/group/g1/kv/scratch",
+            &groups
+        ));
+        // Another store of the same group.
+        assert!(!is_granted_scratch_topic(&derived("g1", "notes"), &groups));
+        // An ungranted group's scratch store.
+        assert!(!is_granted_scratch_topic(
+            &derived("g2", SCRATCH_STORE_NAME),
+            &groups
+        ));
+        // g2's digest planted under g1's prefix (whole-topic equality).
+        let (_, g2_topic) = crate::kv::encrypted::group_store_identity("g2", SCRATCH_STORE_NAME);
+        let digest = g2_topic.rsplit('/').next().unwrap_or_default();
+        assert!(!is_granted_scratch_topic(
+            &format!("x0x/group/g1/kv/{digest}"),
+            &groups
+        ));
+        assert!(!is_granted_scratch_topic("", &groups));
+        assert!(!is_granted_scratch_topic("x0x/group/g1/kv/", &groups));
     }
 
     #[test]

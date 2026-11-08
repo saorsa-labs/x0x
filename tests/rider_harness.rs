@@ -334,7 +334,11 @@ async fn rider_scratch_scope_gates_group_scratch_store() {
     .await;
     assert_eq!(status, reqwest::StatusCode::CREATED, "open scratch: {body}");
     let topic = body["topic"].as_str().expect("topic").to_string();
-    assert_eq!(topic, format!("x0x/group/{home}/kv/scratch"));
+    assert_eq!(
+        topic,
+        x0x::kv::encrypted::group_store_identity(&home, "scratch").1,
+        "the scratch topic is derived from the stable id and store name"
+    );
     assert_eq!(body["policy"], "encrypted", "the scratch store is sealed");
 
     // And a second, non-scratch store riders must never reach.
