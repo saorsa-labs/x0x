@@ -115,7 +115,12 @@ Write-Host "x0x installer (Windows)" -ForegroundColor Blue
 # ── Resolve release ─────────────────────────────────────────────────────────
 
 if ($Version -eq "latest") {
-    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -UseBasicParsing -Headers @{ "User-Agent" = "x0x-install.ps1" }
+    # Authenticated when GITHUB_TOKEN is set: CI runners share egress IPs
+    # and the anonymous GitHub API rate limit refuses them. The token only
+    # goes to api.github.com.
+    $apiHeaders = @{ "User-Agent" = "x0x-install.ps1" }
+    if ($env:GITHUB_TOKEN) { $apiHeaders["Authorization"] = "Bearer $($env:GITHUB_TOKEN)" }
+    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -UseBasicParsing -Headers $apiHeaders
     $Tag = $release.tag_name
     if (-not $Tag) { throw "Could not resolve the latest x0x release." }
 } elseif ($Version.StartsWith("v")) {

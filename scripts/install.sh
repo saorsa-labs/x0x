@@ -154,10 +154,30 @@ else
 fi
 
 fetch() {
+    # GitHub API calls are authenticated when GITHUB_TOKEN is set: CI
+    # runners share egress IPs and the anonymous rate limit refuses them.
+    # The token is only ever sent to api.github.com, never to the asset
+    # hosts a release download redirects to.
+    AUTH=""
+    case "$1" in
+        https://api.github.com/*)
+            if [ -n "${GITHUB_TOKEN:-}" ]; then
+                AUTH="Authorization: Bearer $GITHUB_TOKEN"
+            fi
+            ;;
+    esac
     if [ "$DOWNLOADER" = "curl" ]; then
-        curl -sfL "$1" -o "$2" || { echo "Error: download failed: $1" >&2; exit 1; }
+        if [ -n "$AUTH" ]; then
+            curl -sfL -H "$AUTH" "$1" -o "$2" || { echo "Error: download failed: $1" >&2; exit 1; }
+        else
+            curl -sfL "$1" -o "$2" || { echo "Error: download failed: $1" >&2; exit 1; }
+        fi
     else
-        wget -qO "$2" "$1" || { echo "Error: download failed: $1" >&2; exit 1; }
+        if [ -n "$AUTH" ]; then
+            wget -qO "$2" --header="$AUTH" "$1" || { echo "Error: download failed: $1" >&2; exit 1; }
+        else
+            wget -qO "$2" "$1" || { echo "Error: download failed: $1" >&2; exit 1; }
+        fi
     fi
 }
 

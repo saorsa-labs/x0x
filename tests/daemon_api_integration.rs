@@ -124,9 +124,12 @@ async fn daemon_api_onboard_recipe() {
     assert!(recipe.contains(&format!("x0x direct send {agent_id}")));
     assert!(recipe.contains("install.sh"));
     // Default delivery keeps the ~20 KB link OUT of the recipe text and in
-    // its own field for the caller to hand over.
-    assert!(r["card_link"].as_str().unwrap().starts_with("x0x://agent/"));
-    assert!(!recipe.contains("x0x://agent/"));
+    // its own field for the caller to hand over. The recipe may still NAME
+    // the link scheme (a placeholder in the reply-with-your-card step), so
+    // the check is for the signed link itself, not the scheme prefix.
+    let link = r["card_link"].as_str().unwrap();
+    assert!(link.starts_with("x0x://agent/"));
+    assert!(!recipe.contains(link));
     assert!(!r["steps"].as_array().unwrap().is_empty());
 
     let lookup: Value = ca(&d)
