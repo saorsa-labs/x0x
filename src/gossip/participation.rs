@@ -78,16 +78,38 @@ pub fn leaf_refuses_unsubscribed_passthrough(
     !mode.forwards_passthrough() && !subscribed && is_passthrough_wire_kind(kind)
 }
 
+/// saorsa-gossip-pubsub 0.5.90 `MAX_CACHE_AGE_SECS` (`lib.rs:79`): how long
+/// the sg message cache keeps an entry.
+const SG_MESSAGE_CACHE_AGE: Duration = Duration::from_secs(60);
+
+/// saorsa-gossip-pubsub 0.5.90 key-cache replay delay: `PENDING_TTL` (5 s,
+/// `key_cache.rs:30`) plus the 250 ms pending flusher tick. A v3 "Ref"
+/// EAGER with an unknown signer key is queued, not cached, and a later
+/// hop-local key-cache `Response` replays it through `dispatch_message`
+/// without the C0 gate.
+const SG_KEY_CACHE_REPLAY_DELAY: Duration = Duration::from_millis(5_250);
+
 /// How long a Leaf publish keeps the IWANT exemption for its topic (#731):
 /// the sg message-cache age limit, after which the cache has no copy.
-pub(crate) const PUBLISHER_IWANT_WINDOW: Duration = Duration::from_secs(60);
+pub(crate) const PUBLISHER_IWANT_WINDOW: Duration = SG_MESSAGE_CACHE_AGE;
 
 /// How long the IWANT exemption stays off after a topic stops being
 /// subscribed (#731). While subscribed, the sg cache also holds other peers'
-/// messages, and a subscription drop does not empty it. A frame that passed
-/// the gate first can add an entry for up to the 30 s receive handler
-/// timeout, and an entry lives 60 s. After 90 s only own publishes remain.
-pub(crate) const UNSUBSCRIBE_QUIET: Duration = Duration::from_secs(90);
+/// messages, and a subscription drop does not empty it. After the mark, a
+/// foreign entry can still enter the cache: a queued key-cache frame is
+/// replayed up to [`SG_KEY_CACHE_REPLAY_DELAY`] later, under a fresh receive
+/// handler timeout (`PUBSUB_MESSAGE_HANDLE_TIMEOUT`, 30 s), and the entry then
+/// lives [`SG_MESSAGE_CACHE_AGE`]. That sum is 95.25 s; 120 s adds a margin.
+/// The assertion below keeps the bound when a part changes.
+pub(crate) const UNSUBSCRIBE_QUIET: Duration = Duration::from_secs(120);
+
+const _: () = assert!(
+    UNSUBSCRIBE_QUIET.as_millis()
+        >= SG_KEY_CACHE_REPLAY_DELAY
+            .saturating_add(super::runtime::PUBSUB_MESSAGE_HANDLE_TIMEOUT)
+            .saturating_add(SG_MESSAGE_CACHE_AGE)
+            .as_millis()
+);
 
 /// Maximum number of topics in each [`PublisherTopics`] map (#731).
 pub(crate) const PUBLISHER_TOPICS_CAP: usize = 1024;

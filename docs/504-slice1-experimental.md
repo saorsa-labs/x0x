@@ -118,8 +118,8 @@ This section states current behaviour. It does not change the holds above.
 **`observe_only` never stops a send.** Under the default `byte_policy`, the
 Leaf egress budget is a meter only. `leaf_egress.soft_exceeded` and
 `leaf_egress.hard_exceeded` count samples above a threshold. They do not feed
-eager selection, cooling or admission. `leaf_egress_snapshot.shed_suppressed`
-shows the sends that `shed_normal` would have denied. Under `shed_normal`, sg
+eager selection, cooling or admission.
+`leaf_egress.leaf_egress_snapshot.shed_suppressed` shows the sends that `shed_normal` would have denied. Under `shed_normal`, sg
 still never sheds locally originated publishes or the IWANT replies that serve
 them.
 
@@ -148,18 +148,21 @@ through to PlumTree. The gate still drops EAGER, IHAVE and anti-entropy on
 that topic. It also still drops all four kinds on topics that the node did not
 publish to. A Full node is not changed.
 
-The exemption is off for 90 s after a topic stops being subscribed. While the
+The exemption is off for 120 s after a topic stops being subscribed. While the
 node subscribes, its sg cache also holds messages from other peers. When the
-last local subscription handle drops, x0x does not empty that cache (an
+last local subscription handle drops, x0x does not empty that cache. An
 explicit unsubscribe empties it, but only after the topic leaves the
-subscribed set). A frame that
-passed the gate before the change can add an entry for up to 30 s (the
-receive handler timeout), and each entry lives for 60 s. After 90 s, the cache
-of an unsubscribed topic holds only the node's own publishes, because the gate
-drops every frame that could add a message from a different peer. A node that
-unsubscribes and then publishes again thus does not serve IWANT for that topic
-for the first 90 s. The record of unsubscribed topics also holds at most 1024
-topics. If it is full, the exemption is off for all topics for 90 s.
+subscribed set. A foreign message can also enter the cache after the topic
+stops being subscribed. sg queues a v3 frame whose signer key it does not know
+yet, and a later key-cache response replays it without the gate. The replay
+can come up to 5.25 s later and can run for up to 30 s (the receive handler
+timeout). Each cache entry then lives for 60 s. The sum is 95.25 s, and 120 s
+adds a margin. After 120 s, the cache of an unsubscribed topic holds only the
+node's own publishes, because the gate drops every frame that could add a
+message from a different peer. Thus a node that unsubscribes and then
+publishes again does not serve IWANT for that topic for the first 120 s. The
+record of unsubscribed topics also holds at most 1024 topics. If it is full,
+the exemption is off for all topics for 120 s.
 
 To see this on `GET /diagnostics/gossip`:
 

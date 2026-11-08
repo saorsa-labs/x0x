@@ -3635,7 +3635,8 @@ impl PubSubManager {
             return false;
         }
         // #731: a publisher serves IWANT for its own messages on a topic it
-        // does not subscribe to. `contains` is false for 90 s after the topic
+        // does not subscribe to. `contains` is false for `UNSUBSCRIBE_QUIET`
+        // (120 s, which covers sg key-cache replay) after the topic
         // was last subscribed; after that the cache holds only this node's
         // publishes, because this gate refuses every frame that could add
         // another peer's message. The lock runs only on this refuse path.
