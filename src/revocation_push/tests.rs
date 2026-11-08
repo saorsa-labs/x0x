@@ -287,7 +287,7 @@ fn prefix_and_capability_bit_are_pinned() {
     );
     assert_eq!(
         crate::dm::CapabilityRegistry::GRANT_REVOCATION_PUSH_V1,
-        1 << 14
+        1 << 15
     );
     assert!(crate::dm::CapabilityRegistry::current()
         .supports(crate::dm::CapabilityRegistry::GRANT_REVOCATION_PUSH_V1));

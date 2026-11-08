@@ -130,12 +130,14 @@ impl CapabilityRegistry {
     pub const TREEKEM_CATCHUP_REFUSAL_V1: u64 = 1 << 13;
     /// #1003 (ADR 0080, archived; slot A03): accepts the single-record
     /// grant revocation push (`x0x-grant-revocation-push-v1\0`) and
-    /// ingests it through the shared v3 revocation path. Bit 14, the next
-    /// free bit in acceptance order. The push sender needs POSITIVE
+    /// ingests it through the shared v3 revocation path. Bit 15: bit 14
+    /// was taken first by PR #1826's `share_grant_names_v1` (ADR 0079 v2
+    /// envelope), so this allocation was deconflicted to the next free
+    /// bit on 8 Nov 2026. The push sender needs POSITIVE
     /// evidence: it pushes only to a peer whose current verified advert
     /// HAS this bit (unknown or expired state means "no push"), because an
     /// old receiver would show the payload as an ordinary DM.
-    pub const GRANT_REVOCATION_PUSH_V1: u64 = 1 << 14;
+    pub const GRANT_REVOCATION_PUSH_V1: u64 = 1 << 15;
 
     /// The routes supported by this release's ready receiver.
     pub const fn current() -> Self {
