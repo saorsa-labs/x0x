@@ -1962,6 +1962,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
             RequestField::body_json_doc("expiry", false),
             RequestField::body_json_doc("ttl_secs", false),
             RequestField::body_json_doc("deliver_to", false),
+            RequestField::body_json_doc("include_names", false),
         ]),
     },
     EndpointDef {
