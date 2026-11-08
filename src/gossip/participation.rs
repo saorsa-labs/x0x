@@ -12,12 +12,13 @@
 //! or contradictory Leaf intent. Never silent Leaf on the backbone.
 
 use crate::network::DEFAULT_BOOTSTRAP_PEERS;
-use saorsa_gossip_types::MessageKind;
+use saorsa_gossip_types::{MessageKind, TopicId};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// ADR-0011 dual-listen port. Clients never bind this; `x0xd-443` does.
 const DUAL_LISTEN_PORT: u16 = 443;
@@ -75,6 +76,69 @@ pub fn leaf_refuses_unsubscribed_passthrough(
     kind: MessageKind,
 ) -> bool {
     !mode.forwards_passthrough() && !subscribed && is_passthrough_wire_kind(kind)
+}
+
+/// How long a Leaf publish keeps the IWANT exemption for its topic (#731).
+///
+/// This is the age limit of the saorsa-gossip message cache (60 s). After
+/// it, the cache holds no copy of the publish, so an IWANT has nothing to get.
+pub(crate) const PUBLISHER_IWANT_WINDOW: Duration = Duration::from_secs(60);
+
+/// Maximum number of topics in [`PublisherTopics`] (#731).
+pub(crate) const PUBLISHER_TOPICS_CAP: usize = 1024;
+
+/// Topics that this Leaf node published to recently (#731).
+///
+/// A Leaf that publishes on a topic it does not subscribe to must still
+/// answer IWANT for its own messages. Otherwise its only path to a lazy
+/// subscriber is closed by the #380 C0 refuse gate. Only IWANT is exempt:
+/// EAGER, IHAVE and anti-entropy on such a topic carry or pull other
+/// peers' messages, which is real pass-through. The set is bounded: an
+/// entry expires after [`PUBLISHER_IWANT_WINDOW`], and at
+/// [`PUBLISHER_TOPICS_CAP`] the oldest entry is removed first.
+#[derive(Debug, Default)]
+pub(crate) struct PublisherTopics {
+    last_publish: Mutex<HashMap<TopicId, Instant>>,
+}
+
+impl PublisherTopics {
+    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<TopicId, Instant>> {
+        self.last_publish
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record a local publish on `topic` at `now`.
+    pub(crate) fn record(&self, topic: TopicId, now: Instant) {
+        let mut map = self.map();
+        if !map.contains_key(&topic) && map.len() >= PUBLISHER_TOPICS_CAP {
+            map.retain(|_, at| now.saturating_duration_since(*at) < PUBLISHER_IWANT_WINDOW);
+            if map.len() >= PUBLISHER_TOPICS_CAP {
+                let oldest = map.iter().min_by_key(|(_, at)| **at).map(|(t, _)| *t);
+                if let Some(oldest) = oldest {
+                    map.remove(&oldest);
+                }
+            }
+        }
+        map.insert(topic, now);
+    }
+
+    /// True when this node published on `topic` within the window.
+    #[must_use]
+    pub(crate) fn contains(&self, topic: &TopicId, now: Instant) -> bool {
+        self.map()
+            .get(topic)
+            .is_some_and(|at| now.saturating_duration_since(*at) < PUBLISHER_IWANT_WINDOW)
+    }
+
+    /// Number of entries, including expired ones not yet removed.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.last_publish
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
 }
 
 /// Corrected Leaf/Full outbound split for soak gating.

@@ -1615,6 +1615,9 @@ pub struct PubSubManager {
     unsubscribed_refused_frames: AtomicU64,
     unsubscribed_refused_bytes: AtomicU64,
     unsubscribed_refused_graft_equiv: AtomicU64,
+    /// #731: topics this Leaf published to recently. The C0 gate still
+    /// lets IWANT through on them so the node serves its own messages.
+    publisher_topics: super::participation::PublisherTopics,
     /// Last `fan_out == 0` warn per group, used to rate-limit issue #296.
     zero_fanout_warns: Mutex<HashMap<String, Instant>>,
     /// Test-only: topic ids last passed to `set_topic_peers`.
@@ -2401,6 +2404,7 @@ impl PubSubManager {
             unsubscribed_refused_frames: AtomicU64::new(0),
             unsubscribed_refused_bytes: AtomicU64::new(0),
             unsubscribed_refused_graft_equiv: AtomicU64::new(0),
+            publisher_topics: super::participation::PublisherTopics::default(),
             #[cfg(test)]
             refreshed_topic_ids: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -3270,6 +3274,11 @@ impl PubSubManager {
         let envelope_bytes = Some(Bytes::clone(&encoded));
 
         self.register_dynamic_topic_priority(&topic, topic_id);
+        // #731: record before PlumTree sends the first IHAVE, so a lazy
+        // subscriber's IWANT for this publish cannot meet the C0 gate first.
+        if !self.participation.forwards_passthrough() {
+            self.publisher_topics.record(topic_id, Instant::now());
+        }
         // Classification linearizes here. A roster commit overlapping this
         // publish may affect the next send; a completed writer reconciles
         // every still-known group binding before it returns.
@@ -3613,6 +3622,17 @@ impl PubSubManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(&header.topic);
         if !leaf_refuses_unsubscribed_passthrough(self.participation, subscribed, header.kind) {
+            return false;
+        }
+        // #731: a publisher serves IWANT for its own messages on a topic it
+        // does not subscribe to. The cache of such a topic holds only this
+        // node's publishes, because this gate refuses every frame that could
+        // add another peer's message. The lock runs only on this refuse path.
+        if header.kind == MessageKind::IWant
+            && self
+                .publisher_topics
+                .contains(&header.topic, Instant::now())
+        {
             return false;
         }
         self.unsubscribed_refused_frames
@@ -11154,6 +11174,10 @@ mod closed_input_tests {
         assert_eq!(recv_from_either(&mut first, &mut second).await, Some(47));
     }
 }
+
+#[cfg(test)]
+#[path = "pubsub/issue731_tests.rs"]
+mod issue731_tests;
 
 /// SG76: marker-aware inbound routing gates, proven without sockets.
 ///

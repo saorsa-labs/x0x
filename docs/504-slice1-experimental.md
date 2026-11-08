@@ -110,3 +110,59 @@ Published dependency line: crates.io saorsa-gossip **0.5.76** + ant-quic
 **0.27.50** (CI fence #535 merged to main). Ships via draft release PR #544
 (no tag/publish from docs alone). Daemon restart and public-mesh soak are
 still not part of this checkpoint.
+
+## Leaf publishing, `observe_only` metering and cooling (#731)
+
+This section states current behaviour. It does not change the holds above.
+
+**`observe_only` never stops a send.** Under the default `byte_policy`, the
+Leaf egress budget is a meter only. `leaf_egress.soft_exceeded` and
+`leaf_egress.hard_exceeded` count samples above a threshold. They do not feed
+eager selection, cooling or admission. `leaf_egress_snapshot.shed_suppressed`
+shows the sends that `shed_normal` would have denied. Under `shed_normal`, sg
+still never sheds locally originated publishes or the IWANT replies that serve
+them.
+
+**Eager selection does not follow the budget.** `leaf_max_eager_degree` sets
+the sg eager-degree ceiling for each topic. Budget use does not change it.
+The other connected topic peers are lazy: they get an IHAVE and must send an
+IWANT to get the message. On a quiet topic, a subscriber can depend on that
+IWANT path to the publisher.
+
+**Cooling is local to the node that sends.** A node cools a peer on a topic
+only after its own sends to that peer time out. The `observe_only` budget on
+the publisher sends no signal to the subscriber. Thus a publisher over its
+budget does not cause the subscriber to cool it. Look for cooling on the node
+whose sends failed, in `peer_scores_by_topic` (`suppression_state`,
+`cooldown_ms`, `outbound_send_timeouts`) and `suppressed_peers_by_topic`.
+
+**A Leaf publisher serves IWANT for its own messages.** The #380 C0 gate drops
+EAGER, IHAVE, IWANT and anti-entropy frames on a topic that a Leaf does not
+subscribe to. Before #731, this also dropped the IWANTs for a topic that the
+Leaf published to but did not subscribe to, so a lazy subscriber did not get
+the message. Now a Leaf keeps a bounded record of the topics it published to.
+An entry stays for 60 s, the sg message-cache age limit, and the record holds
+at most 1024 topics. When it is full, the node removes the oldest entry first.
+While a topic is in the record, the gate lets inbound IWANT for that topic
+through to PlumTree. The gate still drops EAGER, IHAVE and anti-entropy on
+that topic. It also still drops all four kinds on topics that the node did not
+publish to. The cache of such a topic holds only the node's own publishes,
+because the gate drops every frame that could add a message from a different
+peer. A Full node is not changed.
+
+To see this on `GET /diagnostics/gossip`:
+
+- `participation.unsubscribed_refused_frames` and
+  `participation.unsubscribed_refused_graft_equiv` do not increase for a
+  served publisher IWANT. They still count real pass-through refusals.
+- `pubsub_stages.message_kinds.iwant` counts the IWANTs that reached PlumTree.
+- `inbound_by_topic` counts the IWANT frame before the gate.
+- `participation.relay_bytes` counts all outbound bytes on topics that the
+  node does not subscribe to. This includes the publisher's own publishes and
+  its IWANT replies on such a topic, not only pass-through.
+- With `RUST_LOG=x0x::gossip=debug`, the log line `Leaf refused unsubscribed
+  PlumTree pass-through frame (#380 C0)` shows each refused frame with its
+  topic and kind.
+
+Still open in #731: a per-topic delivery class and a publish outcome on
+`POST /publish`. Both change the public API and need a decision first.
