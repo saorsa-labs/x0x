@@ -4,6 +4,8 @@
 //! `x0x.group.<16 hex>.meta` metadata form, and the KV `state-sync` form,
 //! next to a second group and a Full pass-through topic.
 
+#![cfg(test)]
+
 use super::*;
 
 async fn manager(reason: &str) -> PubSubManager {
