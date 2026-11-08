@@ -11,91 +11,106 @@
       "id": "A01",
       "revision": 1,
       "path": "A01-r01-purpose-and-product-limits.md",
-      "title": "Purpose and Product Limits"
+      "title": "Purpose and Product Limits",
+      "sha256": "6f6e4ec3fcad0fa3f537811f59e931a2e263c3559766242f4068e7568c05097d"
     },
     {
       "id": "A02",
       "revision": 1,
       "path": "A02-r01-identity-keys-and-device-enrollment.md",
-      "title": "Identity Keys and Device Enrollment"
+      "title": "Identity Keys and Device Enrollment",
+      "sha256": "a9fc1f58c65f093cf902aa2c765feddb65d54c6fcf5490dc050cbc1cee80a334"
     },
     {
       "id": "A03",
       "revision": 1,
       "path": "A03-r01-trust-permissions-sharing-and-revocation.md",
-      "title": "Trust Permissions Sharing and Revocation"
+      "title": "Trust Permissions Sharing and Revocation",
+      "sha256": "5730814ef0deb3a1751bd10c28144bf0af24c528cfb00179fa234feec64706b1"
     },
     {
       "id": "A04",
       "revision": 1,
       "path": "A04-r01-agent-attachment-and-inbound-events.md",
-      "title": "Agent Attachment and Inbound Events"
+      "title": "Agent Attachment and Inbound Events",
+      "sha256": "24be244632121de84e3c3a56af84e7aee540f7b4e1ec88fd8a154a4225cb0914"
     },
     {
       "id": "A05",
       "revision": 1,
       "path": "A05-r01-connectivity-discovery-and-names.md",
-      "title": "Connectivity Discovery and Names"
+      "title": "Connectivity Discovery and Names",
+      "sha256": "ae7078f73fbf893b59a5a7979413867f4a8c3555e44caf83847e9a3530af5bf9"
     },
     {
       "id": "A06",
       "revision": 1,
       "path": "A06-r01-gossip-relay-roles-and-resource-limits.md",
-      "title": "Gossip Relay Roles and Resource Limits"
+      "title": "Gossip Relay Roles and Resource Limits",
+      "sha256": "5e703e9b3cf557d1c26915753f003b856ba0b3e98fcb72f5ebd546e00f2c5d7f"
     },
     {
       "id": "A07",
       "revision": 1,
       "path": "A07-r01-messages-receipts-history-and-retry.md",
-      "title": "Messages Receipts History and Retry"
+      "title": "Messages Receipts History and Retry",
+      "sha256": "43d4d2a4ada26358109fb326be1706ff6fed6204f72a83905232b2dda6080004"
     },
     {
       "id": "A08",
       "revision": 1,
       "path": "A08-r01-groups-home-membership-and-repair.md",
-      "title": "Groups Home Membership and Repair"
+      "title": "Groups Home Membership and Repair",
+      "sha256": "58a96da4d869b867e16c7ff97bc1c2d995968eea4e3d36d03ecb76a8e1b424cf"
     },
     {
       "id": "A09",
       "revision": 1,
       "path": "A09-r01-group-encryption-and-key-changes.md",
-      "title": "Group Encryption and Key Changes"
+      "title": "Group Encryption and Key Changes",
+      "sha256": "64070efb1384afa2fb305362b865b1ef3880f79cf95b849a447e0961517ce4fd"
     },
     {
       "id": "A10",
       "revision": 1,
       "path": "A10-r01-shared-data-files-and-synchronization.md",
-      "title": "Shared Data Files and Synchronization"
+      "title": "Shared Data Files and Synchronization",
+      "sha256": "46a6b1028b75f4a20b9102232fc3d9737fd35d7e57237424e320468bd34aece4"
     },
     {
       "id": "A11",
       "revision": 1,
       "path": "A11-r01-local-api-applications-and-human-interface.md",
-      "title": "Local API Applications and Human Interface"
+      "title": "Local API Applications and Human Interface",
+      "sha256": "e06091ade8fa999608d266ab0bdf3cf606125fb24382ab20f52c711ba65b83d8"
     },
     {
       "id": "A12",
       "revision": 1,
       "path": "A12-r01-agent-teams-delegation-and-task-coordination.md",
-      "title": "Agent Teams Delegation and Task Coordination"
+      "title": "Agent Teams Delegation and Task Coordination",
+      "sha256": "6832f8bc4b1846a8702cdc0255114558680df39cf760d05e6c7d0ea84a76b715"
     },
     {
       "id": "A13",
       "revision": 1,
       "path": "A13-r01-voice-and-video.md",
-      "title": "Voice and Video"
+      "title": "Voice and Video",
+      "sha256": "46aef7990a486609b4afb1986027314b09454576da0e4aa07c2b7a685bfe652d"
     },
     {
       "id": "A14",
       "revision": 1,
       "path": "A14-r01-health-updates-and-recovery.md",
-      "title": "Health Updates and Recovery"
+      "title": "Health Updates and Recovery",
+      "sha256": "bb476e6351af665138a2d15cc194372b99f9c14e89a3edd1ac2a18b7bc843e2d"
     },
     {
       "id": "A15",
       "revision": 1,
       "path": "A15-r01-compatibility-validation-and-decision-rules.md",
-      "title": "Compatibility Validation and Decision Rules"
+      "title": "Compatibility Validation and Decision Rules",
+      "sha256": "0b9293a3dc322ecfc5dfc12a906f4bb19a21ca2a9ed26afd89273d691eb7bf0e"
     }
   ]
 }

@@ -79,7 +79,9 @@ not grant approval. Preserve the existing Accepted text and frozen evidence.
 record paths, required section headings, and a leading Accepted status token
 (David accepted the slots on 7 Nov 2026). It rejects unindexed files, a
 second revision file, and a status or phase change away from the accepted
-state. Status annotations after the leading token are allowed, as in
+state. It also compares each slot file's sha256 against the hash recorded in
+`index.json`, so a rewrite of an accepted decision fails CI unless the same
+PR records the new hash under David's ruling. Status annotations after the leading token are allowed, as in
 `adr-governance.py`.
 
 `python3 scripts/check-adr-count.py` fails when the current count exceeds
