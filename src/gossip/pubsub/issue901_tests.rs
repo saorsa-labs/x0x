@@ -190,13 +190,49 @@ async fn issue901_group_a_change_does_not_reapply_group_b_or_passthrough() {
 }
 
 #[tokio::test]
-async fn issue901_shared_metadata_topic_gives_no_roster_preference() {
-    let manager = manager("issue901_shared_metadata").await;
+async fn issue901_shared_metadata_topic_prefers_the_group_that_derives_it() {
+    let manager = manager("issue901_shared_metadata_derived").await;
     authorize_and_connect(&manager, &[70, 71]).await;
+    // Group A's own ID derives the topic; group B's card only names it.
     let shared = meta("abababababababab");
     let _sub = manager.subscribe(shared.clone()).await;
     // Each install builds a new roster map with a new hash seed, so a
     // first-match lookup would pick group A or group B by chance.
+    for round in 0..32 {
+        manager
+            .replace_group_rosters(vec![
+                ("ab".repeat(32), shared.clone(), vec![AgentId([40; 32])]),
+                ("cd".repeat(32), shared.clone(), vec![AgentId([41; 32])]),
+            ])
+            .await;
+        assert_eq!(
+            preferred(&manager, &shared).await,
+            vec![PeerId::new([70; 32])],
+            "round {round}: the group whose ID derives the topic keeps it"
+        );
+        manager.replace_group_rosters(Vec::new()).await;
+    }
+    // When the collision ends, the remaining claimant is preferred again.
+    manager
+        .replace_group_rosters(vec![(
+            "cd".repeat(32),
+            shared.clone(),
+            vec![AgentId([41; 32])],
+        )])
+        .await;
+    assert_eq!(
+        preferred(&manager, &shared).await,
+        vec![PeerId::new([71; 32])]
+    );
+}
+
+#[tokio::test]
+async fn issue901_shared_metadata_topic_gives_no_roster_preference() {
+    let manager = manager("issue901_shared_metadata").await;
+    authorize_and_connect(&manager, &[70, 71]).await;
+    // Neither group's ID derives the topic, so neither claim is stronger.
+    let shared = meta("efefefefefefefef");
+    let _sub = manager.subscribe(shared.clone()).await;
     for round in 0..32 {
         manager
             .replace_group_rosters(vec![

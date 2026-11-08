@@ -2148,19 +2148,42 @@ impl PubSubManager {
     /// A group card or invite sets the metadata topic, so two local group
     /// records can name the same topic. A first-match lookup then follows
     /// the roster map's random hash order, and the winner changes between
-    /// installs (#901). When more than one roster claims `name`, no roster
-    /// gets a preference. The topic keeps its ordinary eager membership.
+    /// installs (#901). When more than one roster claims `name`, the roster
+    /// whose own group ID derives `name` (`x0x.group.<first 16 hex>.meta`,
+    /// as `NamedGroup::with_policy` sets it) wins, if exactly one does. A
+    /// card for another group cannot take that preference without a group
+    /// ID with the same 64-bit prefix. Otherwise no roster gets a
+    /// preference, and the topic keeps its ordinary eager membership.
     fn sole_metadata_roster(
         rosters: &HashMap<String, GroupEagerRoster>,
         name: &str,
     ) -> Option<Vec<AgentId>> {
-        let mut claims = rosters
-            .values()
-            .filter(|roster| roster.metadata_topic == name);
-        match (claims.next(), claims.next()) {
-            (Some(roster), None) => Some(roster.active_agents.clone()),
-            _ => None,
+        fn exactly_one<'a>(
+            mut claims: impl Iterator<Item = &'a GroupEagerRoster>,
+        ) -> Option<Vec<AgentId>> {
+            match (claims.next(), claims.next()) {
+                (Some(roster), None) => Some(roster.active_agents.clone()),
+                _ => None,
+            }
         }
+        let claims = || {
+            rosters
+                .iter()
+                .filter(|(_, roster)| roster.metadata_topic == name)
+        };
+        exactly_one(claims().map(|(_, roster)| roster)).or_else(|| {
+            exactly_one(
+                claims()
+                    .filter(|(id, _)| {
+                        id.get(..16).is_some_and(|prefix| {
+                            name.strip_prefix("x0x.group.")
+                                .and_then(|rest| rest.strip_suffix(".meta"))
+                                == Some(prefix)
+                        })
+                    })
+                    .map(|(_, roster)| roster),
+            )
+        })
     }
 
     async fn clear_group_topic_preference_locked(&self, topic_id: TopicId) {
