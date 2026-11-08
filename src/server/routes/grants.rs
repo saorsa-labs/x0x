@@ -84,6 +84,16 @@ pub(in crate::server) struct GrantIssueRequest {
     /// known agents and the shared agents' daemons.
     #[serde(default)]
     deliver_to: Vec<String>,
+    /// ADR 0079: carry the owner's name and the shared machines' names to
+    /// capable grantees in the v2 envelope (default). `false` (the CLI's
+    /// `--no-names`) withholds both and sends every recipient the plain v1
+    /// grant.
+    #[serde(default = "default_include_names")]
+    include_names: bool,
+}
+
+fn default_include_names() -> bool {
+    true
 }
 
 /// GET /grants — grants this install's owner issued, with status.
@@ -210,9 +220,39 @@ pub(in crate::server) async fn grants_issue(
     };
     let recipients = state
         .agent
-        .share_grant_recipients(&grant, &deliver_to)
+        .share_grant_recipients_classified(&grant, &deliver_to)
         .await;
-    let delivery = state.agent.deliver_share_grant(&grant, &recipients).await;
+    // ADR 0079: build and sign the names section once; recipients whose
+    // verified advert sets bit 14 (and only grantee-side ones) get the v2
+    // envelope, everyone else the unchanged v1 payload.
+    let envelope = if req.include_names {
+        let (owner_name, own_machine_name) = {
+            let profile = state.profile.read().await;
+            (profile.human_name.clone(), profile.machine_name.clone())
+        };
+        let devices = state.owner_sync.as_ref().map(|s| &**s.store());
+        match state
+            .agent
+            .grant_names_for(devices, owner_name, own_machine_name, &grant)
+            .await
+        {
+            None => None,
+            Some(names) => match state.agent.sign_grant_names(grant.clone(), names) {
+                Ok(envelope) => Some(envelope),
+                Err(err) => {
+                    // Names are a default, not the grant: deliver v1 and say so.
+                    tracing::warn!("grant names not signed; delivering v1 only: {err}");
+                    None
+                }
+            },
+        }
+    } else {
+        None
+    };
+    let delivery = state
+        .agent
+        .deliver_share_grant_with_names(&grant, &recipients, envelope.as_ref())
+        .await;
     (
         StatusCode::OK,
         Json(serde_json::json!({

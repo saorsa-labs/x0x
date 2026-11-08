@@ -3461,11 +3461,27 @@ a typed `403`.
 - `not_before` (optional, Unix seconds): default is now.
 - `deliver_to` (optional, 64-hex agent ids): more agents to deliver the grant
   to.
+- `include_names` (optional, default `true`): ADR 0079 — carry the owner's
+  profile `human_name` and the names of the shared machines (machines with a
+  current owner enrollment, a synced `machine_name`, and a granted agent
+  announced on them; the issuing daemon's own machine takes its name from
+  the local profile and needs no enrollment record) to capable grantees. The daemon signs the names with
+  the owner user key and sends the `x0x-sharegrant-v2\0` envelope ONLY to a
+  grantee-side recipient whose current verified advert sets ADR 0093 bit 14
+  (`share_grant_names_v1`); shared-agent daemons, `deliver_to` recipients
+  and grantees without the bit always get the unchanged v1 payload. `false`
+  withholds both names (the CLI's `--no-names`).
 
 An install with no owner identity (user key) answers `409`.
 
+Each `delivery` entry in the response reports `envelope`: `"v1"` or `"v2"`
+(which payload that recipient was sent, or queued with — a failed v2
+recipient is queued with its signed names, and every outbox retry resends
+the same v2 bytes).
+
 `x0x grant issue` takes one required positional `<GRANT_JSON>` argument: this
-body as a literal, `@path`, a bare path, or `-` for stdin.
+body as a literal, `@path`, a bare path, or `-` for stdin, plus the optional
+`--no-names` flag.
 
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|

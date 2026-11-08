@@ -6,8 +6,14 @@ use anyhow::Result;
 /// `x0x grant issue GRANT_JSON` — GRANT_JSON is the `POST /grants` body
 /// (literal, `@path` or a bare path, or `-` for stdin), e.g.
 /// `{"grantee_user":"<hex>","agents":["<hex>"],"caps":["dm",{"connect":{"ports":[22]}}],"ttl_secs":86400}`.
-pub async fn issue(client: &DaemonClient, grant_json: &str) -> Result<()> {
-    let body = read_json_arg(grant_json)?;
+pub async fn issue(client: &DaemonClient, grant_json: &str, no_names: bool) -> Result<()> {
+    let mut body = read_json_arg(grant_json)?;
+    if no_names {
+        let obj = body
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("--no-names needs a JSON object grant body"))?;
+        obj.insert("include_names".to_string(), serde_json::json!(false));
+    }
     let resp = client.post("/grants", &body).await?;
     print_value(client.format(), &resp);
     Ok(())

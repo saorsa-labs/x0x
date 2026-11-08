@@ -1507,6 +1507,17 @@ pub async fn handle_share_grant_dm_checked(
 /// `Duplicate` and the retry is idempotent.
 pub const GRANT_DELIVERY_RETRIES: u8 = 3;
 
+/// One grant-delivery recipient, classified for ADR 0079: `grantee_side`
+/// recipients may get the names-carrying v2 envelope; shared-agent daemons
+/// (which enforce the grant) and extra recipients always get v1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GrantRecipient {
+    /// The recipient agent.
+    pub agent: AgentId,
+    /// Whether this recipient receives the grant AS the grantee.
+    pub grantee_side: bool,
+}
+
 /// Outcome of delivering a grant to one recipient agent.
 #[derive(Debug, Clone, Serialize)]
 pub struct GrantDelivery {
@@ -1522,6 +1533,9 @@ pub struct GrantDelivery {
     /// outbox write is not confirmed durable).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The envelope sent (or queued) for this recipient: `"v1"` (the plain
+    /// ADR-0070 grant) or `"v2"` (the ADR 0079 names-carrying envelope).
+    pub envelope: &'static str,
 }
 
 /// The exact typed-DM payload and logical request id a grant is delivered
@@ -1566,20 +1580,54 @@ where
     F: Fn(AgentId, Vec<u8>, [u8; 16]) -> Fut,
     Fut: std::future::Future<Output = Result<(), String>>,
 {
-    let (payload, request_id) = match grant_delivery_request(grant) {
-        Ok(request) => request,
-        Err(e) => {
-            return recipients
-                .iter()
-                .map(|a| GrantDelivery {
-                    agent: hex::encode(a.as_bytes()),
-                    delivered: false,
-                    queued: false,
-                    error: Some(e.to_string()),
-                })
-                .collect();
-        }
-    };
+    let classified: Vec<(AgentId, bool)> = recipients.iter().map(|a| (*a, false)).collect();
+    deliver_grant_via_classified(grant, None, &classified, outbox, revocations, now, send).await
+}
+
+/// [`deliver_grant_via`] with the ADR 0079 per-recipient envelope choice:
+/// a recipient flagged `true` is sent the v2 names-carrying payload built
+/// from `envelope` (which must be present and must wrap this `grant`);
+/// every other recipient gets the plain v1 payload. A failed v2 recipient
+/// is queued WITH its names attachment, so the outbox retry resends the
+/// same bytes.
+pub async fn deliver_grant_via_classified<F, Fut>(
+    grant: &ShareGrant,
+    envelope: Option<&names::ShareGrantV2>,
+    recipients: &[(AgentId, bool)],
+    outbox: Option<&outbox::GrantRedeliveryOutbox>,
+    revocations: &RwLock<RevocationSet>,
+    now: impl Fn() -> u64,
+    send: F,
+) -> Vec<GrantDelivery>
+where
+    F: Fn(AgentId, Vec<u8>, [u8; 16]) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    /// One recipient's resolved payload: the typed DM bytes and the logical
+    /// request id, or why they could not be built.
+    type ResolvedRequest = Result<(Vec<u8>, [u8; 16]), String>;
+    let v1 = grant_delivery_request(grant);
+    let v2 = envelope.map(names::grant_delivery_request_v2);
+    let attachment = envelope.map(names::ShareGrantV2::attachment);
+    // Resolve each recipient's payload up front; a recipient whose build
+    // failed (or that was flagged v2 with no envelope) gets an error entry
+    // and no send.
+    let mut resolved: Vec<(AgentId, &'static str, ResolvedRequest)> =
+        Vec::with_capacity(recipients.len());
+    for (recipient, use_v2) in recipients {
+        let (envelope_kind, request) = if *use_v2 {
+            match &v2 {
+                Some(request) => ("v2", request.clone().map_err(|e| e.to_string())),
+                None => (
+                    "v2",
+                    Err("v2 recipient without a names envelope".to_string()),
+                ),
+            }
+        } else {
+            ("v1", v1.clone().map_err(|e| e.to_string()))
+        };
+        resolved.push((*recipient, envelope_kind, request));
+    }
     let permit = match outbox {
         Some(outbox) => Some(outbox.send_permit().await),
         None => None,
@@ -1589,35 +1637,50 @@ where
         .await
         .is_share_grant_revoked(&grant.grant_id, &grant.owner)
     {
-        return recipients
-            .iter()
-            .map(|a| GrantDelivery {
+        return resolved
+            .into_iter()
+            .map(|(a, envelope_kind, _)| GrantDelivery {
                 agent: hex::encode(a.as_bytes()),
                 delivered: false,
                 queued: false,
                 error: Some("grant is revoked; not delivered".to_string()),
+                envelope: envelope_kind,
             })
             .collect();
     }
-    let sends = recipients.iter().map(|recipient| {
-        let fut = send(*recipient, payload.clone(), request_id);
-        async move { (*recipient, outbox::bounded_send(fut).await) }
-    });
+    let sends = resolved
+        .into_iter()
+        .map(|(recipient, envelope_kind, request)| {
+            let fut = request.map(|(payload, request_id)| send(recipient, payload, request_id));
+            async move {
+                let outcome = match fut {
+                    Ok(fut) => outbox::bounded_send(fut).await,
+                    Err(e) => Err(e),
+                };
+                (recipient, envelope_kind, outcome)
+            }
+        });
     let results = futures::future::join_all(sends).await;
     // Release before queueing: `enqueue` takes the gate again, and a
     // revocation queued for it in between must be allowed to run first.
     drop(permit);
     let mut out = Vec::with_capacity(recipients.len());
-    for (recipient, result) in results {
+    for (recipient, envelope_kind, result) in results {
         let mut delivery = GrantDelivery {
             agent: hex::encode(recipient.as_bytes()),
             delivered: result.is_ok(),
             queued: false,
             error: result.err(),
+            envelope: envelope_kind,
         };
         if !delivery.delivered {
             delivery.queued = queue_failed_delivery(
                 grant,
+                if envelope_kind == "v2" {
+                    attachment.as_ref()
+                } else {
+                    None
+                },
                 recipient,
                 outbox,
                 revocations,
@@ -1635,6 +1698,7 @@ where
 /// is appended to `error` so the owner sees why it will not be retried.
 async fn queue_failed_delivery(
     grant: &ShareGrant,
+    names: Option<&names::SignedGrantNames>,
     recipient: AgentId,
     outbox: Option<&outbox::GrantRedeliveryOutbox>,
     revocations: &RwLock<RevocationSet>,
@@ -1645,7 +1709,7 @@ async fn queue_failed_delivery(
         return false;
     };
     match outbox
-        .enqueue_reporting(grant, recipient, now_unix, revocations)
+        .enqueue_reporting(grant, names, recipient, now_unix, revocations)
         .await
     {
         Ok(_) => true,
@@ -1785,10 +1849,25 @@ impl crate::Agent {
         grant: &ShareGrant,
         extra: &[AgentId],
     ) -> Vec<AgentId> {
-        let mut out: BTreeSet<[u8; 32]> = BTreeSet::new();
+        self.share_grant_recipients_classified(grant, extra)
+            .await
+            .into_iter()
+            .map(|r| r.agent)
+            .collect()
+    }
+
+    /// [`Self::share_grant_recipients`], with each recipient classified for
+    /// ADR 0079: `grantee_side` recipients may get the names-carrying v2
+    /// envelope; shared-agent daemons and `extra` recipients always get v1.
+    pub async fn share_grant_recipients_classified(
+        &self,
+        grant: &ShareGrant,
+        extra: &[AgentId],
+    ) -> Vec<GrantRecipient> {
+        let mut grantee_side: BTreeSet<[u8; 32]> = BTreeSet::new();
         match grant.grantee {
             Grantee::Agent(agent) => {
-                out.insert(agent.0);
+                grantee_side.insert(agent.0);
             }
             Grantee::User(user) => {
                 let cache = self.identity_discovery_cache.read().await;
@@ -1799,16 +1878,26 @@ impl crate::Agent {
                         .and_then(|c| c.user_id().ok())
                         .is_some_and(|u| u == user);
                     if names_user {
-                        out.insert(agent.0);
+                        grantee_side.insert(agent.0);
                     }
                 }
             }
         }
+        let mut out: BTreeSet<[u8; 32]> = grantee_side.iter().copied().collect();
         for agent in grant.agents.iter().chain(extra) {
             out.insert(agent.0);
         }
         out.remove(&self.agent_id().0);
-        out.into_iter().map(AgentId).collect()
+        out.into_iter()
+            .map(|id| GrantRecipient {
+                agent: AgentId(id),
+                // ADR 0079 §1: "shared-agent daemons, which enforce the
+                // grant, always get v1" — a shared agent is never
+                // grantee-side, even if a certificate also names it on the
+                // grantee's side.
+                grantee_side: grantee_side.contains(&id) && !grant.agents.iter().any(|a| a.0 == id),
+            })
+            .collect()
     }
 
     /// Deliver a grant to each recipient as a durable typed DM, concurrently.
@@ -1836,6 +1925,46 @@ impl crate::Agent {
         deliver_grant_via(
             grant,
             recipients,
+            outbox.as_deref(),
+            &self.revocation_set,
+            unix_now_secs,
+            |recipient, payload, request_id| {
+                self.send_share_grant_dm(recipient, payload, request_id, GRANT_DELIVERY_RETRIES)
+            },
+        )
+        .await
+    }
+
+    /// [`Self::deliver_share_grant`] with the ADR 0079 names envelope: a
+    /// grantee-side recipient whose current verified advert sets ADR 0093
+    /// bit 14 (`share_grant_names_v1`) is sent the v2 payload built from
+    /// `envelope`; every other recipient — shared-agent daemons, `extra`
+    /// recipients, grantees with no (or a bit-less) verified advert — gets
+    /// the unchanged v1 payload, so old peers never see the new prefix.
+    pub async fn deliver_share_grant_with_names(
+        &self,
+        grant: &ShareGrant,
+        recipients: &[GrantRecipient],
+        envelope: Option<&names::ShareGrantV2>,
+    ) -> Vec<GrantDelivery> {
+        let capability_store = self.capability_store();
+        let classified: Vec<(AgentId, bool)> = recipients
+            .iter()
+            .map(|r| {
+                let use_v2 = r.grantee_side
+                    && envelope.is_some()
+                    && capability_store.verified_registry_supports(
+                        &r.agent,
+                        crate::dm::CapabilityRegistry::SHARE_GRANT_NAMES_V1,
+                    ) == Some(true);
+                (r.agent, use_v2)
+            })
+            .collect();
+        let outbox = self.share_grant_outbox();
+        deliver_grant_via_classified(
+            grant,
+            envelope,
+            &classified,
             outbox.as_deref(),
             &self.revocation_set,
             unix_now_secs,

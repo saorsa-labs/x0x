@@ -522,6 +522,10 @@ enum GrantSub {
         /// "caps":["dm",{"connect":{"ports":[22]}}],"ttl_secs":86400}'.
         #[arg(value_name = "GRANT_JSON")]
         grant: String,
+        /// ADR 0079: withhold the owner and machine names from this grant
+        /// (every recipient then gets the plain v1 payload).
+        #[arg(long)]
+        no_names: bool,
     },
     /// List grants this install's owner issued, with status.
     List,
@@ -3453,7 +3457,9 @@ async fn run(
             }
         },
         Commands::Grant { sub } => match sub {
-            GrantSub::Issue { grant } => commands::grant::issue(&client, &grant).await,
+            GrantSub::Issue { grant, no_names } => {
+                commands::grant::issue(&client, &grant, no_names).await
+            }
             GrantSub::List => commands::grant::list(&client).await,
             GrantSub::Revoke { id } => commands::grant::revoke(&client, &id).await,
             GrantSub::Received => commands::grant::received(&client).await,

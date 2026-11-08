@@ -667,6 +667,7 @@ fn raw_entry(grant: &ShareGrant, to: AgentId, now: u64) -> PendingGrantDelivery 
         deadline: grant.expiry,
         next_attempt_at: now,
         attempts: 0,
+        names: None,
     }
 }
 
@@ -1729,4 +1730,61 @@ async fn revocation_resync_hold_keeps_queued_grant_delivery() {
         .await;
     assert_eq!(resumed.delivered, 1, "{resumed:?}");
     assert!(outbox.is_empty());
+}
+
+/// WHY (ADR 0079): a pre-0079 outbox file — entries with no `names` field —
+/// still loads (migrated in memory, rewritten in the current format on the
+/// next persist), while a tampered names attachment fails the file closed.
+#[tokio::test]
+async fn pre_adr0079_outbox_file_loads_and_a_tampered_names_attachment_fails_closed() {
+    let world = World::new().await;
+    let grant = world.grant(1, 3_600);
+    // Legacy on-disk layout: positional bincode without the trailing
+    // `names` Option (field order of the pre-0079 struct).
+    let legacy = vec![(
+        world.a1,
+        grant.clone(),
+        world.now,
+        world.now + 600,
+        world.now,
+        0u32,
+    )];
+    let mut bytes = b"X0GO".to_vec();
+    bytes.extend_from_slice(&bincode::serialize(&legacy).unwrap());
+    std::fs::write(world.outbox_path(), bytes).unwrap();
+    let outbox = world.outbox(world.now).await;
+    assert!(outbox.load_error().is_none(), "{:?}", outbox.load_error());
+    let pending = outbox.pending();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].recipient, world.a1);
+    assert_eq!(pending[0].names, None, "legacy entries migrate as v1");
+
+    // A names attachment that does not verify against its grant fails the
+    // whole file closed (nothing silently dropped or rewritten).
+    let bogus = super::super::names::SignedGrantNames {
+        names: super::super::names::GrantNames {
+            owner_name: Some("Mallory".to_string()),
+            machines: Vec::new(),
+        },
+        signature: vec![0u8; 4],
+    };
+    let entry = PendingGrantDelivery {
+        recipient: world.a1,
+        grant: grant.clone(),
+        queued_at: world.now,
+        deadline: world.now + 600,
+        next_attempt_at: world.now,
+        attempts: 0,
+        names: Some(bogus),
+    };
+    write_raw_outbox(&world.outbox_path(), &[entry]);
+    let outbox = world.outbox(world.now).await;
+    assert!(
+        outbox
+            .load_error()
+            .is_some_and(|e| e.contains("names attachment")),
+        "{:?}",
+        outbox.load_error()
+    );
+    assert!(outbox.pending().is_empty());
 }
