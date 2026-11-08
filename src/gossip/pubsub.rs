@@ -1648,6 +1648,10 @@ impl PublishFanoutOutcome {
 }
 
 #[cfg(test)]
+#[path = "pubsub/issue901_tests.rs"]
+mod issue901_tests;
+
+#[cfg(test)]
 mod observed_fanout_controls {
     use super::PublishFanoutOutcome;
     use saorsa_gossip_pubsub::FanoutCounts;
@@ -2108,10 +2112,7 @@ impl PubSubManager {
         let rosters = self.group_rosters.read().await;
         let binding = match kv_group_id {
             Some(id) => rosters.get(&id).map(|roster| roster.active_agents.clone()),
-            None => rosters
-                .iter()
-                .find(|(_, roster)| roster.metadata_topic == name)
-                .map(|(_, roster)| roster.active_agents.clone()),
+            None => Self::sole_metadata_roster(&rosters, name),
         };
         #[cfg(test)]
         {
@@ -2140,6 +2141,26 @@ impl PubSubManager {
             self.clear_group_topic_preference_locked(topic_id).await;
         }
         drop(rosters);
+    }
+
+    /// The active roster of the one group whose metadata topic is `name`.
+    ///
+    /// A group card or invite sets the metadata topic, so two local group
+    /// records can name the same topic. A first-match lookup then follows
+    /// the roster map's random hash order, and the winner changes between
+    /// installs (#901). When more than one roster claims `name`, no roster
+    /// gets a preference. The topic keeps its ordinary eager membership.
+    fn sole_metadata_roster(
+        rosters: &HashMap<String, GroupEagerRoster>,
+        name: &str,
+    ) -> Option<Vec<AgentId>> {
+        let mut claims = rosters
+            .values()
+            .filter(|roster| roster.metadata_topic == name);
+        match (claims.next(), claims.next()) {
+            (Some(roster), None) => Some(roster.active_agents.clone()),
+            _ => None,
+        }
     }
 
     async fn clear_group_topic_preference_locked(&self, topic_id: TopicId) {
