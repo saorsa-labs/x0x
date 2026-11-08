@@ -78,39 +78,57 @@ pub fn leaf_refuses_unsubscribed_passthrough(
     !mode.forwards_passthrough() && !subscribed && is_passthrough_wire_kind(kind)
 }
 
-/// How long a Leaf publish keeps the IWANT exemption for its topic (#731).
-///
-/// This is the age limit of the saorsa-gossip message cache (60 s). After
-/// it, the cache holds no copy of the publish, so an IWANT has nothing to get.
+/// How long a Leaf publish keeps the IWANT exemption for its topic (#731):
+/// the sg message-cache age limit, after which the cache has no copy.
 pub(crate) const PUBLISHER_IWANT_WINDOW: Duration = Duration::from_secs(60);
 
-/// Maximum number of topics in [`PublisherTopics`] (#731).
+/// How long the IWANT exemption stays off after a topic stops being
+/// subscribed (#731). While subscribed, the sg cache also holds other peers'
+/// messages, and a subscription drop does not empty it. A frame that passed
+/// the gate first can add an entry for up to the 30 s receive handler
+/// timeout, and an entry lives 60 s. After 90 s only own publishes remain.
+pub(crate) const UNSUBSCRIBE_QUIET: Duration = Duration::from_secs(90);
+
+/// Maximum number of topics in each [`PublisherTopics`] map (#731).
 pub(crate) const PUBLISHER_TOPICS_CAP: usize = 1024;
+
+#[derive(Debug, Default)]
+struct PublisherTopicsInner {
+    /// Last local publish per topic.
+    published: HashMap<TopicId, Instant>,
+    /// Last time each topic stopped being subscribed.
+    unsubscribed: HashMap<TopicId, Instant>,
+    /// Set when `unsubscribed` was full of live marks: no exemption for
+    /// [`UNSUBSCRIBE_QUIET`] after it.
+    blocked_at: Option<Instant>,
+}
 
 /// Topics that this Leaf node published to recently (#731).
 ///
-/// A Leaf that publishes on a topic it does not subscribe to must still
-/// answer IWANT for its own messages. Otherwise its only path to a lazy
-/// subscriber is closed by the #380 C0 refuse gate. Only IWANT is exempt:
-/// EAGER, IHAVE and anti-entropy on such a topic carry or pull other
-/// peers' messages, which is real pass-through. The set is bounded: an
-/// entry expires after [`PUBLISHER_IWANT_WINDOW`], and at
-/// [`PUBLISHER_TOPICS_CAP`] the oldest entry is removed first.
+/// A Leaf that publishes on an unsubscribed topic must still answer IWANT
+/// for its own messages, or the #380 C0 gate closes its only path to a lazy
+/// subscriber. Only IWANT is exempt: EAGER, IHAVE and anti-entropy carry or
+/// pull other peers' messages. The exemption is off for [`UNSUBSCRIBE_QUIET`]
+/// after the topic was last subscribed. Both maps hold at most
+/// [`PUBLISHER_TOPICS_CAP`] topics and fail closed: a full publish map drops
+/// its oldest entry; a full unsubscribe map blocks every topic for
+/// [`UNSUBSCRIBE_QUIET`].
 #[derive(Debug, Default)]
 pub(crate) struct PublisherTopics {
-    last_publish: Mutex<HashMap<TopicId, Instant>>,
+    inner: Mutex<PublisherTopicsInner>,
 }
 
 impl PublisherTopics {
-    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<TopicId, Instant>> {
-        self.last_publish
+    fn lock(&self) -> std::sync::MutexGuard<'_, PublisherTopicsInner> {
+        self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Record a local publish on `topic` at `now`.
     pub(crate) fn record(&self, topic: TopicId, now: Instant) {
-        let mut map = self.map();
+        let mut inner = self.lock();
+        let map = &mut inner.published;
         if !map.contains_key(&topic) && map.len() >= PUBLISHER_TOPICS_CAP {
             map.retain(|_, at| now.saturating_duration_since(*at) < PUBLISHER_IWANT_WINDOW);
             if map.len() >= PUBLISHER_TOPICS_CAP {
@@ -123,21 +141,44 @@ impl PublisherTopics {
         map.insert(topic, now);
     }
 
-    /// True when this node published on `topic` within the window.
+    /// Record that `topic` stops being subscribed at `now`.
+    ///
+    /// Call this before the topic leaves the subscribed set, so the gate
+    /// never sees an unsubscribed topic without this mark.
+    pub(crate) fn note_unsubscribed(&self, topic: TopicId, now: Instant) {
+        let mut inner = self.lock();
+        inner.published.remove(&topic);
+        let map = &mut inner.unsubscribed;
+        if !map.contains_key(&topic) && map.len() >= PUBLISHER_TOPICS_CAP {
+            map.retain(|_, at| now.saturating_duration_since(*at) < UNSUBSCRIBE_QUIET);
+            if map.len() >= PUBLISHER_TOPICS_CAP {
+                inner.blocked_at = Some(now);
+                return;
+            }
+        }
+        map.insert(topic, now);
+    }
+
+    /// True when a Leaf may serve IWANT on unsubscribed `topic` at `now`.
     #[must_use]
     pub(crate) fn contains(&self, topic: &TopicId, now: Instant) -> bool {
-        self.map()
+        let inner = self.lock();
+        let quiet = |at: &Instant| now.saturating_duration_since(*at) < UNSUBSCRIBE_QUIET;
+        if inner.blocked_at.as_ref().is_some_and(quiet)
+            || inner.unsubscribed.get(topic).is_some_and(quiet)
+        {
+            return false;
+        }
+        inner
+            .published
             .get(topic)
             .is_some_and(|at| now.saturating_duration_since(*at) < PUBLISHER_IWANT_WINDOW)
     }
 
-    /// Number of entries, including expired ones not yet removed.
+    /// Number of publish entries, including expired ones not yet removed.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.last_publish
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
+        self.lock().published.len()
     }
 }
 

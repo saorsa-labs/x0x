@@ -1292,6 +1292,8 @@ pub struct Subscription {
     topic_id_by_name: Arc<std::sync::RwLock<HashMap<String, TopicId>>>,
     /// Live subscribed transport ids used by the Leaf C0 refuse gate.
     subscribed_topic_ids: Arc<std::sync::RwLock<HashSet<TopicId>>>,
+    /// #731: marked before the last subscriber leaves the subscribed set.
+    publisher_topics: Arc<super::participation::PublisherTopics>,
     /// Group classification and SG preference cleared with the last subscriber.
     group_topic_by_id: Arc<RwLock<HashMap<TopicId, GroupTopicBinding>>>,
     plumtree: Arc<PlumtreePubSub<PubSubTransport>>,
@@ -1390,6 +1392,7 @@ impl Drop for Subscription {
         let topic_ref_counts = self.topic_ref_counts.clone();
         let topic_id_by_name = self.topic_id_by_name.clone();
         let subscribed_topic_ids = self.subscribed_topic_ids.clone();
+        let publisher_topics = self.publisher_topics.clone();
         let group_topic_by_id = self.group_topic_by_id.clone();
         let plumtree = self.plumtree.clone();
         let group_preference_apply_locks = self.group_preference_apply_locks.clone();
@@ -1422,6 +1425,9 @@ impl Drop for Subscription {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .remove(&topic);
                     if let Some(topic_id) = topic_id {
+                        // #731: this path keeps the sg cache, which still
+                        // holds other peers' messages.
+                        publisher_topics.note_unsubscribed(topic_id, Instant::now());
                         subscribed_topic_ids
                             .write()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1617,7 +1623,7 @@ pub struct PubSubManager {
     unsubscribed_refused_graft_equiv: AtomicU64,
     /// #731: topics this Leaf published to recently. The C0 gate still
     /// lets IWANT through on them so the node serves its own messages.
-    publisher_topics: super::participation::PublisherTopics,
+    publisher_topics: Arc<super::participation::PublisherTopics>,
     /// Last `fan_out == 0` warn per group, used to rate-limit issue #296.
     zero_fanout_warns: Mutex<HashMap<String, Instant>>,
     /// Test-only: topic ids last passed to `set_topic_peers`.
@@ -2404,7 +2410,7 @@ impl PubSubManager {
             unsubscribed_refused_frames: AtomicU64::new(0),
             unsubscribed_refused_bytes: AtomicU64::new(0),
             unsubscribed_refused_graft_equiv: AtomicU64::new(0),
-            publisher_topics: super::participation::PublisherTopics::default(),
+            publisher_topics: Arc::default(),
             #[cfg(test)]
             refreshed_topic_ids: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -2828,6 +2834,7 @@ impl PubSubManager {
                 generation,
                 topic_id_by_name: Arc::clone(&self.topic_id_by_name),
                 subscribed_topic_ids: Arc::clone(&self.subscribed_topic_ids),
+                publisher_topics: Arc::clone(&self.publisher_topics),
                 group_topic_by_id: Arc::clone(&self.group_topic_by_id),
                 plumtree: Arc::clone(&self.plumtree),
                 group_preference_apply_locks: Arc::clone(&self.group_preference_apply_locks),
@@ -2930,6 +2937,7 @@ impl PubSubManager {
                 generation,
                 topic_id_by_name: Arc::clone(&self.topic_id_by_name),
                 subscribed_topic_ids: Arc::clone(&self.subscribed_topic_ids),
+                publisher_topics: Arc::clone(&self.publisher_topics),
                 group_topic_by_id: Arc::clone(&self.group_topic_by_id),
                 plumtree: Arc::clone(&self.plumtree),
                 group_preference_apply_locks: Arc::clone(&self.group_preference_apply_locks),
@@ -2995,6 +3003,7 @@ impl PubSubManager {
                 generation,
                 topic_id_by_name: Arc::clone(&self.topic_id_by_name),
                 subscribed_topic_ids: Arc::clone(&self.subscribed_topic_ids),
+                publisher_topics: Arc::clone(&self.publisher_topics),
                 group_topic_by_id: Arc::clone(&self.group_topic_by_id),
                 plumtree: Arc::clone(&self.plumtree),
                 group_preference_apply_locks: Arc::clone(&self.group_preference_apply_locks),
@@ -3089,6 +3098,7 @@ impl PubSubManager {
             generation,
             topic_id_by_name: Arc::clone(&self.topic_id_by_name),
             subscribed_topic_ids: Arc::clone(&self.subscribed_topic_ids),
+            publisher_topics: Arc::clone(&self.publisher_topics),
             group_topic_by_id: Arc::clone(&self.group_topic_by_id),
             plumtree: Arc::clone(&self.plumtree),
             group_preference_apply_locks: Arc::clone(&self.group_preference_apply_locks),
@@ -3625,9 +3635,10 @@ impl PubSubManager {
             return false;
         }
         // #731: a publisher serves IWANT for its own messages on a topic it
-        // does not subscribe to. The cache of such a topic holds only this
-        // node's publishes, because this gate refuses every frame that could
-        // add another peer's message. The lock runs only on this refuse path.
+        // does not subscribe to. `contains` is false for 90 s after the topic
+        // was last subscribed; after that the cache holds only this node's
+        // publishes, because this gate refuses every frame that could add
+        // another peer's message. The lock runs only on this refuse path.
         if header.kind == MessageKind::IWant
             && self
                 .publisher_topics
@@ -3689,6 +3700,10 @@ impl PubSubManager {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(topic);
+        // #731: mark first, so an IWANT that sees the topic unsubscribed
+        // before `plumtree.unsubscribe` empties the cache is still refused.
+        self.publisher_topics
+            .note_unsubscribed(topic_id, Instant::now());
         self.subscribed_topic_ids
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

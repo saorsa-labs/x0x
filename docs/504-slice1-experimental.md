@@ -146,9 +146,20 @@ at most 1024 topics. When it is full, the node removes the oldest entry first.
 While a topic is in the record, the gate lets inbound IWANT for that topic
 through to PlumTree. The gate still drops EAGER, IHAVE and anti-entropy on
 that topic. It also still drops all four kinds on topics that the node did not
-publish to. The cache of such a topic holds only the node's own publishes,
-because the gate drops every frame that could add a message from a different
-peer. A Full node is not changed.
+publish to. A Full node is not changed.
+
+The exemption is off for 90 s after a topic stops being subscribed. While the
+node subscribes, its sg cache also holds messages from other peers. When the
+last local subscription handle drops, x0x does not empty that cache (an
+explicit unsubscribe empties it, but only after the topic leaves the
+subscribed set). A frame that
+passed the gate before the change can add an entry for up to 30 s (the
+receive handler timeout), and each entry lives for 60 s. After 90 s, the cache
+of an unsubscribed topic holds only the node's own publishes, because the gate
+drops every frame that could add a message from a different peer. A node that
+unsubscribes and then publishes again thus does not serve IWANT for that topic
+for the first 90 s. The record of unsubscribed topics also holds at most 1024
+topics. If it is full, the exemption is off for all topics for 90 s.
 
 To see this on `GET /diagnostics/gossip`:
 
