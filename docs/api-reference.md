@@ -244,7 +244,7 @@ The Home Suite campaign (ADRs 0036–0043, plus the 0044–0058 backfills) added
   `GET /diagnostics/ws`.
 
 Open issues for this release are listed in the README's *Known limitations*
-table (#446–#451). This reference documents **217 endpoints — exactly the set
+table (#446–#451). This reference documents **218 endpoints — exactly the set
 `x0x routes` prints** (two further served paths sit outside the registry:
 `/.well-known/agent-card.json` and the `/gui/` alias). The registry in
 `src/api/mod.rs` is the authoritative list. `x0x routes` prints the copy of
@@ -467,6 +467,7 @@ contains the same sentence as the startup error log. See
 | GET | `/agent/user-id` | `x0x agent user-id` | Current user ID if configured |
 | GET | `/agent/card` | `x0x agent card [DISPLAY_NAME] [--include-groups] [--include-local-addresses]` | Generate a shareable, signed identity card (`--include-local-addresses` adds loopback/RFC1918 addresses for local testnet cards; off by default so shared cards don't leak unroutable addresses) |
 | GET | `/.well-known/agent-card.json` | — | A2A-compatible discovery card (ADR-0017) |
+| GET | `/onboard` | `x0x onboard [--inline-card] [--no-card] [--card-file <PATH>]` | Install-and-join recipe (#894): Markdown + structured steps that teach another agent to install x0x and DM this agent, with the signed card link (`?card=file\|inline\|lookup`, default `file`; `?card_file=` names the handed-over file in the recipe) |
 | POST | `/agent/card/import` | `x0x agent import` | Import a card into contacts (verifies signature; never changes existing trust: floor at existing level, Blocked is sticky) |
 | POST | `/agent/sign` | `x0x agent sign` | Detached ML-DSA-65 signature over caller-supplied bytes |
 | POST | `/agent/verify` | `x0x agent verify` | Verify a detached ML-DSA-65 signature against a caller-supplied public key |

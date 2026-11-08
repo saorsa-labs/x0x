@@ -6,6 +6,7 @@
 #   curl -sfL https://x0x.md | sh -s -- --autostart   # install + start + autostart on boot
 #   bash install.sh --name alice                      # named instance
 #   sh install.sh --verify-only                       # download + verify, install nothing
+#   sh install.sh --no-start                          # install; do not start the daemon
 #
 # What it does:
 #   1. Detects platform (Linux/macOS, x64/arm64)
@@ -19,7 +20,7 @@
 #      mismatch)
 #   4. Stops any running x0xd instance
 #   5. Installs x0xd (daemon) + x0x (CLI) to ~/.local/bin
-#   6. Starts the daemon
+#   6. Starts the daemon (skipped with --no-start)
 #   7. Optionally configures autostart on boot (--autostart)
 #
 # Requirements: curl or wget, tar, gzip (GNU tar execs it for .tar.gz), sh,
@@ -36,6 +37,7 @@ NAME=""
 NAME_SET=false
 AUTOSTART=false
 VERIFY_ONLY=false
+NO_START=false
 # Saorsa Labs release signing key (primary fingerprint of SAORSA_PUBLIC_KEY.asc).
 # Rotate only with a reviewed installer change.
 TRUSTED_FPR="CEB3506E7DCB8A2DD2D679E8EDDA4827D89C0F29"
@@ -50,6 +52,10 @@ while [ $# -gt 0 ]; do
             ;;
         --verify-only)
             VERIFY_ONLY=true
+            shift
+            ;;
+        --no-start)
+            NO_START=true
             shift
             ;;
         --name)
@@ -516,6 +522,17 @@ mkdir -p "$SHARED_DIR"
 # We just ensure the shared directory exists so all instances can find it.
 
 # ── Start daemon ────────────────────────────────────────────────────────────
+
+# --no-start: install only (e.g. CI, or hosts where the daemon must not
+# join the network yet). Everything above — download, verification and the
+# binary install — already ran.
+if [ "$NO_START" = true ]; then
+    echo ""
+    echo "x0x installed (daemon not started: --no-start)"
+    echo "  Binaries: $BIN/x0xd, $BIN/x0x"
+    echo "  Start it later with: x0x start"
+    exit 0
+fi
 
 echo ""
 XOXD="$BIN/x0xd"

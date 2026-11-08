@@ -192,7 +192,7 @@ curl -N -H "Authorization: Bearer $TOKEN" "http://$API/events"     # SSE; fields
 
 Topics starting `local:` are never gossipped — same-daemon IPC only.
 
-To rehearse all of this offline first (two loopback daemons, one DM, the event stream), follow the CI-verified [10-minute recipe](https://github.com/saorsa-labs/x0x/blob/main/docs/quickstart-two-agents.md).
+To rehearse all of this offline first (two loopback daemons, one DM, the event stream), follow the CI-verified [10-minute recipe](https://github.com/saorsa-labs/x0x/blob/main/docs/quickstart-two-agents.md). To bring ANOTHER agent onto x0x, `x0x onboard` (`GET /onboard`) prints a compact install-and-join recipe built around your agent id and signed card.
 
 ---
 

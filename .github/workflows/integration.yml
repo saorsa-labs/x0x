@@ -224,6 +224,43 @@ jobs:
       - name: Run the recipe end-to-end in the loopback-only namespace
         run: python3 scripts/ci/isolated-runtime.py bash scripts/ci/onboarding-recipe.sh
 
+  # Installer smoke (#894): the recipe's install step, run from THIS
+  # checkout's installer scripts on the platforms a fresh agent actually
+  # uses. The installers download and verify the latest RELEASE (checksum +
+  # signed ML-DSA-65 manifest), so this proves the install path, not the
+  # PR's Rust. No daemon is ever started: macOS and Windows runners have no
+  # loopback-only network namespace, and a started daemon would join the
+  # real network (tests/AGENTS.md isolation rule) — install.sh gets
+  # --no-start and install.ps1 simply omits -Start.
+  installer-smoke:
+    name: Installer smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run install.sh --no-start and check the installed binaries
+        if: runner.os == 'macOS'
+        run: |
+          sh scripts/install.sh --no-start
+          test -x "$HOME/.local/bin/x0xd"
+          test -x "$HOME/.local/bin/x0x"
+          "$HOME/.local/bin/x0xd" --version
+          "$HOME/.local/bin/x0x" --version
+      - name: Run install.ps1 (no -Start) and check the installed binaries
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File scripts/install.ps1
+          $bin = Join-Path $env:LOCALAPPDATA "x0x\bin"
+          if (-not (Test-Path (Join-Path $bin "x0xd.exe"))) { throw "x0xd.exe not installed" }
+          if (-not (Test-Path (Join-Path $bin "x0x.exe"))) { throw "x0x.exe not installed" }
+          & (Join-Path $bin "x0xd.exe") --version
+          & (Join-Path $bin "x0x.exe") --version
+
   # Tailnet (ADR-0074 slice 0): the ignored loopback stream/forward suites
   # (7 in tailnet_streams_integration + 1 in forward_v2_attestation_e2e
   # + 2 in forward_half_close_e2e, the #961 FIN/denial proofs,

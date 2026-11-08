@@ -92,6 +92,66 @@ async fn daemon_api_agent() {
     assert!(r["machine_id"].is_string());
 }
 
+/// GET /onboard (#894): the install-and-join recipe must target THIS
+/// daemon's agent id, carry a signed card link in the default (file)
+/// delivery, omit it on `?card=lookup`, and refuse an unknown delivery.
+#[tokio::test]
+#[ignore]
+async fn daemon_api_onboard_recipe() {
+    let d = daemon().await;
+    let agent: Value = ca(&d)
+        .get(d.url("/agent"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let agent_id = agent["agent_id"].as_str().unwrap();
+
+    let r: Value = ca(&d)
+        .get(d.url("/onboard"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["ok"], true);
+    assert_eq!(r["inviter_agent_id"].as_str().unwrap(), agent_id);
+    assert_eq!(r["card_delivery"], "file");
+    let recipe = r["recipe"].as_str().unwrap();
+    assert!(recipe.contains(&format!("x0x direct send {agent_id}")));
+    assert!(recipe.contains("install.sh"));
+    // Default delivery keeps the ~20 KB link OUT of the recipe text and in
+    // its own field for the caller to hand over.
+    assert!(r["card_link"].as_str().unwrap().starts_with("x0x://agent/"));
+    assert!(!recipe.contains("x0x://agent/"));
+    assert!(!r["steps"].as_array().unwrap().is_empty());
+
+    let lookup: Value = ca(&d)
+        .get(d.url("/onboard?card=lookup"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(lookup["ok"], true);
+    assert!(lookup["card_link"].is_null());
+    assert!(lookup["recipe"]
+        .as_str()
+        .unwrap()
+        .contains(&format!("x0x contacts add {agent_id}")));
+
+    let bad = ca(&d)
+        .get(d.url("/onboard?card=bogus"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 #[ignore]
 async fn daemon_api_agent_sign_roundtrip() {
