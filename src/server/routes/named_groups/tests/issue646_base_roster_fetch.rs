@@ -292,7 +292,7 @@ async fn deliver_verifies_content_wakes_waiter_and_parks_replies() -> Result<()>
         .expect("slots")
         .insert(
             format!("{group_id}|{root}"),
-            base_roster_fetch::BaseRosterSlot::Waiter(sender),
+            base_roster_fetch::BaseRosterSlot::Waiter(vec![(0, sender)]),
         );
     base_roster_fetch::deliver_base_roster(&joiner, &group_id, &root, &roster);
     let delivered = receiver.await.expect("waiter woken");
@@ -441,6 +441,204 @@ async fn v5_join_without_roster_source_is_retryable_and_installs_nothing() -> Re
         joiner.named_groups.read().await.is_empty(),
         "a deferred v5 join must install nothing"
     );
+    Ok(())
+}
+
+/// Review r2 fix 1 (#1471): a v5 join whose fetch failed refuses BEFORE
+/// the stale-row clear — a device holding an inert card-import stub gets
+/// the retryable 503 with the stub byte-for-byte unchanged, so group
+/// access keeps answering while the inviter is unreachable.
+#[tokio::test]
+async fn v5_refusal_leaves_inert_card_import_stub_unchanged() -> Result<()> {
+    let (authority, _dir_a) = daemon_state().await?;
+    let group_id = "be".repeat(32);
+    let info = seed_group_with_members(&authority, &group_id, 50).await;
+    let (invite, link) = assemble_signed_v4_invite(&authority, &info, 3_600, None)
+        .map_err(|e| anyhow::anyhow!("v5 mint failed: {e:?}"))?;
+    assert_eq!(invite.version, INVITE_VERSION_V5);
+
+    let (joiner, _dir_b) = daemon_state().await?;
+    let joiner_hex = hex::encode(joiner.agent.agent_id().as_bytes());
+    let stub = super::issue1161_not_member_lineage::card_import_stub(
+        authority.agent.agent_id(),
+        &group_id,
+        &joiner_hex,
+    );
+    let before = serde_json::to_value(&stub)?;
+    joiner
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), stub);
+
+    let response = join_group_via_invite(
+        State(Arc::clone(&joiner)),
+        Json(JoinGroupRequest {
+            invite: link,
+            display_name: None,
+            mode: None,
+            expected_owner_user_id: None,
+        }),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let body = response_json(response).await?.1;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("base_roster_unavailable"),
+        "typed retryable refusal, got {body}"
+    );
+    let after = joiner
+        .named_groups
+        .read()
+        .await
+        .get(&group_id)
+        .cloned()
+        .context("the stub survives the retryable refusal")?;
+    assert_eq!(
+        serde_json::to_value(&after)?,
+        before,
+        "a refused invite leaves the row unchanged (#1471)"
+    );
+    Ok(())
+}
+
+/// Review r2 fix 2: a fetch attempt on a key another join already waits on
+/// SHARES the waiter slot — its own failure (inviter unreachable here)
+/// removes only its own sender, and the reply still wakes the first join.
+#[tokio::test]
+async fn concurrent_fetch_keeps_the_first_joins_waiter() -> Result<()> {
+    let (joiner, _dir) = daemon_state().await?;
+    let group_id = "bf".repeat(32);
+    let roster: base_roster_fetch::BaseRosterProjection = std::iter::once((
+        "11".repeat(32),
+        RosterMemberSnapshot {
+            role: x0x::groups::GroupRole::Member,
+            state: x0x::groups::GroupMemberState::Active,
+            treekem_key_package_hash: None,
+            certificate_digest: None,
+            certificate: None,
+        },
+    ))
+    .collect();
+    let root = roster_root_of_projection(&roster);
+
+    // First join's waiter, already parked on the key.
+    let (sender_a, receiver_a) = tokio::sync::oneshot::channel();
+    joiner
+        .base_roster_fetch_slots
+        .lock()
+        .expect("slots")
+        .insert(
+            format!("{group_id}|{root}"),
+            base_roster_fetch::BaseRosterSlot::Waiter(vec![(u64::MAX, sender_a)]),
+        );
+
+    // A second fetch on the same key: the networkless send fails, so it
+    // errors out — and must take only ITS OWN waiter with it.
+    let err = base_roster_fetch::obtain_base_roster(
+        &joiner,
+        AgentId([3u8; 32]),
+        &group_id,
+        &root,
+        &hex::encode(blake3::hash(&[3u8; 32]).as_bytes()),
+        std::time::Duration::from_millis(200),
+    )
+    .await
+    .expect_err("networkless send cannot reach an inviter");
+    assert_eq!(err, "inviter unreachable");
+
+    // The reply still wakes the first join.
+    base_roster_fetch::deliver_base_roster(&joiner, &group_id, &root, &roster);
+    let delivered = receiver_a
+        .await
+        .expect("the first join's waiter survives a concurrent fetch attempt");
+    assert_eq!(delivered, roster);
+    Ok(())
+}
+
+/// Review r2 fix 3: the parked-reply cache self-cleans — at the cap the
+/// OLDEST parked reply is evicted for the new one, so unsolicited-but-valid
+/// replies for keys no join will ask for cannot pin the cache forever.
+#[tokio::test]
+async fn parked_reply_cache_evicts_oldest_at_cap() -> Result<()> {
+    let (joiner, _dir) = daemon_state().await?;
+    let roster: base_roster_fetch::BaseRosterProjection = std::iter::once((
+        "22".repeat(32),
+        RosterMemberSnapshot {
+            role: x0x::groups::GroupRole::Member,
+            state: x0x::groups::GroupMemberState::Active,
+            treekem_key_package_hash: None,
+            certificate_digest: None,
+            certificate: None,
+        },
+    ))
+    .collect();
+    let root = roster_root_of_projection(&roster);
+
+    // Fill the cache (READY_SLOT_CAP = 16) with distinct group keys; the
+    // first entry is made strictly oldest.
+    let oldest_group = format!("{:064x}", 0u32);
+    base_roster_fetch::deliver_base_roster(&joiner, &oldest_group, &root, &roster);
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    for i in 1..16u32 {
+        base_roster_fetch::deliver_base_roster(&joiner, &format!("{i:064x}"), &root, &roster);
+    }
+    assert_eq!(
+        joiner.base_roster_fetch_slots.lock().expect("slots").len(),
+        16
+    );
+
+    // The 17th parks by evicting the OLDEST, never by being dropped.
+    let newest_group = "ff".repeat(32);
+    base_roster_fetch::deliver_base_roster(&joiner, &newest_group, &root, &roster);
+    let slots = joiner.base_roster_fetch_slots.lock().expect("slots");
+    assert_eq!(slots.len(), 16, "the cache stays at the cap");
+    assert!(
+        !slots.contains_key(&format!("{oldest_group}|{root}")),
+        "the oldest parked reply is evicted"
+    );
+    assert!(
+        slots.contains_key(&format!("{newest_group}|{root}")),
+        "the newest reply is parked"
+    );
+    Ok(())
+}
+
+/// Review r2 item 4: a `BaseRosterFetch` whose sender is not the member it
+/// names is consumed WITHOUT admitting a serve; the matching sender is
+/// admitted (its ticket blocks a duplicate on this current-thread runtime).
+#[tokio::test]
+async fn dispatch_drops_base_roster_fetch_from_mismatched_sender() -> Result<()> {
+    let (inviter, _dir) = daemon_state().await?;
+    let group_id = "ca".repeat(32);
+    let info = seed_group_with_members(&inviter, &group_id, 5).await;
+    let stable = info.stable_group_id().to_string();
+    let member = AgentId([9u8; 32]);
+    let member_hex = hex::encode(member.as_bytes());
+    let fetch = || JoinResultMessage::BaseRosterFetch {
+        group_id: group_id.clone(),
+        member_agent_id: member_hex.clone(),
+        roster_root: "00".repeat(32),
+        secret_hash: "11".repeat(32),
+    };
+
+    // Mismatched sender: consumed, nothing admitted.
+    let outsider = AgentId([8u8; 32]);
+    assert!(dispatch_join_result_message(&inviter, &outsider, true, fetch()).await);
+    assert_eq!(inviter.join_result_fetch_admission.in_flight(), 0);
+
+    // Control: the member itself IS admitted — the spawned serve's ticket
+    // (unpolled on this current-thread runtime) blocks a duplicate.
+    assert!(dispatch_join_result_message(&inviter, &member, true, fetch()).await);
+    assert!(inviter
+        .join_result_fetch_admission
+        .try_admit(&join_result_key(&stable, &member_hex), &stable)
+        .is_err());
     Ok(())
 }
 

@@ -25,7 +25,13 @@ fn lineage_free_row() -> (x0x::groups::GroupInfo, String) {
 }
 
 /// Exact shape [`import_card_into_groups`] inserts for a discoverable card.
-fn card_import_stub(owner: AgentId, group_id: &str, joiner_hex: &str) -> x0x::groups::GroupInfo {
+/// `pub(super)`: the #646 tests reuse it to pin that a v5 retryable refusal
+/// leaves this row unchanged.
+pub(super) fn card_import_stub(
+    owner: AgentId,
+    group_id: &str,
+    joiner_hex: &str,
+) -> x0x::groups::GroupInfo {
     let owner_hex = hex::encode(owner.as_bytes());
     let mut stub = x0x::groups::GroupInfo::with_policy(
         "card stub".into(),

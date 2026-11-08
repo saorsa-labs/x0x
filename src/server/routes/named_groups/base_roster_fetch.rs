@@ -26,18 +26,31 @@ pub(in crate::server) const BASE_ROSTER_FETCH_TIMEOUT: Duration = Duration::from
 /// keeps a burst of unsolicited-but-valid replies from growing the map.
 const READY_SLOT_CAP: usize = 16;
 
+/// How long a parked reply stays before it is dropped. A parked projection
+/// cannot go STALE (it is content-addressed), so the TTL only bounds cache
+/// occupancy: unsolicited-but-valid replies for keys no join will ever ask
+/// for age out instead of pinning [`READY_SLOT_CAP`] slots forever.
+const READY_SLOT_TTL: Duration = Duration::from_secs(60);
+
+/// Distinguishes each parked join's sender inside a shared
+/// [`BaseRosterSlot::Waiter`], so a timed-out join removes only its own.
+static NEXT_WAITER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The digest-only projection map a fetch moves.
 pub(in crate::server) type BaseRosterProjection =
     BTreeMap<String, x0x::groups::state_commit::RosterMemberSnapshot>;
 
-/// One slot per `(stable group, roster root)`: a join waiting for the
+/// One slot per `(stable group, roster root)`: the joins waiting for the
 /// projection, or a verified projection that arrived first.
 pub(in crate::server) enum BaseRosterSlot {
-    /// A join is parked on this key.
-    Waiter(tokio::sync::oneshot::Sender<BaseRosterProjection>),
+    /// Joins parked on this key. Concurrent joins on the same key SHARE
+    /// the slot — each parks its own `(waiter id, sender)` pair, and one
+    /// reply wakes them all.
+    Waiter(Vec<(u64, tokio::sync::oneshot::Sender<BaseRosterProjection>)>),
     /// A verified projection arrived with no waiter (a duplicate reply, a
-    /// reply racing the retry, or a test pre-seeding the exchange).
-    Ready(BaseRosterProjection),
+    /// reply racing the retry, or a test pre-seeding the exchange), with
+    /// the instant it parked for [`READY_SLOT_TTL`] eviction.
+    Ready(BaseRosterProjection, std::time::Instant),
 }
 
 /// The slot key: the stable group id and the content address together.
@@ -86,25 +99,52 @@ pub(in crate::server) fn deliver_base_roster(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     match slots.remove(&key) {
-        Some(BaseRosterSlot::Waiter(waiter)) => {
-            // A dropped receiver (the join timed out) is harmless.
-            let _ = waiter.send(digest_only);
+        Some(BaseRosterSlot::Waiter(waiters)) => {
+            // Every join parked on this key gets the projection. A dropped
+            // receiver (that join timed out) is harmless.
+            for (_, waiter) in waiters {
+                let _ = waiter.send(digest_only.clone());
+            }
         }
-        other => {
-            // Keep an existing Ready copy (identical by content address),
-            // or park this one while the cache has room.
-            let occupied = matches!(other, Some(BaseRosterSlot::Ready(_)));
-            if let Some(existing) = other {
-                slots.insert(key, existing);
-            } else if slots.len() < READY_SLOT_CAP {
-                slots.insert(key, BaseRosterSlot::Ready(digest_only));
+        Some(existing @ BaseRosterSlot::Ready(..)) => {
+            // Keep the existing copy (identical by content address) and
+            // its original parking instant — a resent reply must not keep
+            // refreshing its own slot past the TTL.
+            slots.insert(key, existing);
+        }
+        None => {
+            // Self-cleaning park: expired entries go first, and at cap the
+            // OLDEST parked reply is evicted, so unsolicited-but-valid
+            // replies cannot pin the cache forever.
+            slots.retain(|_, slot| {
+                !matches!(slot, BaseRosterSlot::Ready(_, parked)
+                    if parked.elapsed() >= READY_SLOT_TTL)
+            });
+            let ready_count = slots
+                .values()
+                .filter(|slot| matches!(slot, BaseRosterSlot::Ready(..)))
+                .count();
+            if ready_count >= READY_SLOT_CAP {
+                let oldest = slots
+                    .iter()
+                    .filter_map(|(key, slot)| match slot {
+                        BaseRosterSlot::Ready(_, parked) => Some((key.clone(), *parked)),
+                        BaseRosterSlot::Waiter(_) => None,
+                    })
+                    .min_by_key(|(_, parked)| *parked)
+                    .map(|(key, _)| key);
+                if let Some(oldest) = oldest {
+                    slots.remove(&oldest);
+                }
             }
-            if !occupied {
-                tracing::debug!(
-                    group_id = %LogHexId::group(group_id),
-                    "parked a verified base-roster reply with no waiter"
-                );
-            }
+            slots.insert(
+                key,
+                BaseRosterSlot::Ready(digest_only, std::time::Instant::now()),
+            );
+            tracing::debug!(
+                group_id = %LogHexId::group(group_id),
+                "parked a verified base-roster reply with no waiter"
+            );
         }
     }
 }
@@ -126,29 +166,44 @@ pub(in crate::server) async fn obtain_base_roster(
     timeout: Duration,
 ) -> Result<BaseRosterProjection, &'static str> {
     let key = slot_key(stable_group_id, signed_root);
-    let receiver = {
+    let waiter_id = NEXT_WAITER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    {
         let mut slots = state
             .base_roster_fetch_slots
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match slots.remove(&key) {
-            Some(BaseRosterSlot::Ready(roster)) => return Ok(roster),
-            // A stale waiter from an abandoned join is replaced below.
-            Some(BaseRosterSlot::Waiter(_)) | None => {}
+            // A parked projection cannot go stale (content-addressed), so
+            // any Ready copy answers regardless of its age.
+            Some(BaseRosterSlot::Ready(roster, _)) => return Ok(roster),
+            // A concurrent join (or an abandoned one whose sender is now
+            // closed) already waits on this key: SHARE the slot instead of
+            // replacing its sender, which would fail that join with a 503.
+            Some(BaseRosterSlot::Waiter(mut waiters)) => {
+                waiters.push((waiter_id, sender));
+                slots.insert(key.clone(), BaseRosterSlot::Waiter(waiters));
+            }
+            None => {
+                slots.insert(
+                    key.clone(),
+                    BaseRosterSlot::Waiter(vec![(waiter_id, sender)]),
+                );
+            }
         }
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        slots.insert(key.clone(), BaseRosterSlot::Waiter(sender));
-        receiver
-    };
+    }
     let remove_slot = || {
         let mut slots = state
             .base_roster_fetch_slots
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Only this join's waiter is removed; a Ready parked meanwhile
-        // stays for the retry.
-        if matches!(slots.get(&key), Some(BaseRosterSlot::Waiter(_))) {
-            slots.remove(&key);
+        // Only THIS join's waiter is removed; concurrent joins' waiters
+        // and a Ready parked meanwhile stay for them and for the retry.
+        if let Some(BaseRosterSlot::Waiter(waiters)) = slots.get_mut(&key) {
+            waiters.retain(|(id, _)| *id != waiter_id);
+            if waiters.is_empty() {
+                slots.remove(&key);
+            }
         }
     };
     let request = JoinResultMessage::BaseRosterFetch {

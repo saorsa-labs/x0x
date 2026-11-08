@@ -25568,6 +25568,15 @@ pub(super) async fn join_group_via_invite_inner(
         )
         .await;
     }
+    // #646 (review r2): a v5 join whose fetch failed refuses BEFORE the
+    // stale-row clear — a refused invite leaves the row unchanged (#1471),
+    // so an inert card-import stub survives the retryable 503 and group
+    // access keeps answering while the joiner retries. Everything past
+    // here clears local state or SEEDS a fresh stub from the base
+    // projection, so the typed retryable refusal happens NOW.
+    if v5_roster_missing {
+        return base_roster_unavailable(&state);
+    }
     if stale_not_member_row {
         // Still under the membership guard taken above, so no concurrent
         // join, apply or finalizer can interleave with the clear. A
@@ -25604,13 +25613,6 @@ pub(super) async fn join_group_via_invite_inner(
     }
     // Creator, inviter and group_id bytes were validated above before any
     // not_member stub clear — a refused invite leaves the row unchanged.
-
-    // #646: everything past here SEEDS a fresh stub from the base
-    // projection — a v5 join whose fetch failed refuses NOW, typed and
-    // retryable, before any local state is created.
-    if v5_roster_missing {
-        return base_roster_unavailable(&state);
-    }
 
     // Create the MLS group locally (in a real flow, the inviter would send
     // a Welcome message; for now, we create a local group and the inviter
