@@ -3635,15 +3635,19 @@ impl PubSubManager {
             return false;
         }
         // #731: a publisher serves IWANT for its own messages on a topic it
-        // does not subscribe to. `contains` is false for `UNSUBSCRIBE_QUIET`
-        // (120 s, which covers sg key-cache replay) after the topic
-        // was last subscribed; after that the cache holds only this node's
-        // publishes, because this gate refuses every frame that could add
-        // another peer's message. The lock runs only on this refuse path.
+        // does not subscribe to. `allows_iwant` is false for
+        // `UNSUBSCRIBE_QUIET` (120 s, which covers the bounded sg key-cache
+        // replay) after the topic was last subscribed. After that the cache
+        // normally holds only this node's publishes, because this gate
+        // refuses every frame that could add another peer's message. sg
+        // replays a queued key-cache frame without an age check, so a peer
+        // that stalls the replay can still add one stale entry; that replay
+        // already bypassed C0 before #731. The lock runs only on this refuse
+        // path.
         if header.kind == MessageKind::IWant
             && self
                 .publisher_topics
-                .contains(&header.topic, Instant::now())
+                .allows_iwant(&header.topic, Instant::now())
         {
             return false;
         }

@@ -106,6 +106,12 @@ async fn issue731_leaf_publisher_sends_its_own_cached_message_to_the_requester()
         .await
         .expect("leaf publish on an unsubscribed topic");
     let own_id = sends(&manager, true)[0].1.header.msg_id;
+    // The publish fan-out must not reach the requester, so a later send to
+    // it can only be the IWANT reply.
+    assert!(
+        !served_to(&manager, REQUESTER, own_id, Duration::from_millis(300)).await,
+        "precondition: the publish itself sends nothing to the requester"
+    );
 
     manager
         .handle_incoming(
@@ -235,23 +241,26 @@ fn issue731_publisher_topics_expire_and_unsubscribe_starts_a_quiet_period() {
     let start = Instant::now();
     topics.record(topic, start);
     let last_ms = PUBLISHER_IWANT_WINDOW - Duration::from_millis(1);
-    assert!(topics.contains(&topic, start + last_ms));
+    assert!(topics.allows_iwant(&topic, start + last_ms));
     assert!(
-        !topics.contains(&topic, start + PUBLISHER_IWANT_WINDOW),
+        !topics.allows_iwant(&topic, start + PUBLISHER_IWANT_WINDOW),
         "expired"
     );
-    assert!(!topics.contains(&TopicId::from_entity(b"issue731/other"), start));
+    assert!(!topics.allows_iwant(&TopicId::from_entity(b"issue731/other"), start));
     topics.note_unsubscribed(topic, start);
     assert!(
-        !topics.contains(&topic, start),
+        !topics.allows_iwant(&topic, start),
         "unsubscribe clears the publish"
     );
     let republish = start + Duration::from_secs(1);
     topics.record(topic, republish);
-    assert!(!topics.contains(&topic, republish), "quiet period holds");
+    assert!(
+        !topics.allows_iwant(&topic, republish),
+        "quiet period holds"
+    );
     let after_quiet = start + UNSUBSCRIBE_QUIET;
     topics.record(topic, after_quiet);
-    assert!(topics.contains(&topic, after_quiet));
+    assert!(topics.allows_iwant(&topic, after_quiet));
 
     // A full unsubscribe map fails closed for every topic.
     let full = PublisherTopics::default();
@@ -260,10 +269,13 @@ fn issue731_publisher_topics_expire_and_unsubscribe_starts_a_quiet_period() {
     }
     let other = TopicId::from_entity(b"issue731/other");
     full.record(other, start);
-    assert!(!full.contains(&other, start), "overflow blocks all topics");
+    assert!(
+        !full.allows_iwant(&other, start),
+        "overflow blocks all topics"
+    );
     full.record(other, start + UNSUBSCRIBE_QUIET);
     assert!(
-        full.contains(&other, start + UNSUBSCRIBE_QUIET),
+        full.allows_iwant(&other, start + UNSUBSCRIBE_QUIET),
         "block ends"
     );
 }
@@ -283,15 +295,15 @@ fn issue731_publisher_topics_stay_bounded_and_evict_the_oldest() {
     topics.record(topic(PUBLISHER_TOPICS_CAP), now);
     assert_eq!(topics.len(), PUBLISHER_TOPICS_CAP, "the cap holds");
     assert!(
-        !topics.contains(&topic(0), now),
+        !topics.allows_iwant(&topic(0), now),
         "the oldest entry goes first"
     );
-    assert!(topics.contains(&topic(1), now));
-    assert!(topics.contains(&topic(PUBLISHER_TOPICS_CAP), now));
+    assert!(topics.allows_iwant(&topic(1), now));
+    assert!(topics.allows_iwant(&topic(PUBLISHER_TOPICS_CAP), now));
 
     // At the cap, expired entries are removed before any live one.
     let later = start + PUBLISHER_IWANT_WINDOW + Duration::from_secs(2);
     topics.record(topic(PUBLISHER_TOPICS_CAP + 1), later);
     assert_eq!(topics.len(), 1, "every expired entry was removed");
-    assert!(topics.contains(&topic(PUBLISHER_TOPICS_CAP + 1), later));
+    assert!(topics.allows_iwant(&topic(PUBLISHER_TOPICS_CAP + 1), later));
 }

@@ -100,7 +100,10 @@ pub(crate) const PUBLISHER_IWANT_WINDOW: Duration = SG_MESSAGE_CACHE_AGE;
 /// replayed up to [`SG_KEY_CACHE_REPLAY_DELAY`] later, under a fresh receive
 /// handler timeout (`PUBSUB_MESSAGE_HANDLE_TIMEOUT`, 30 s), and the entry then
 /// lives [`SG_MESSAGE_CACHE_AGE`]. That sum is 95.25 s; 120 s adds a margin.
-/// The assertion below keeps the bound when a part changes.
+/// The assertion below keeps the bound when a part changes. The replay delay
+/// is best effort: sg `take_pending` does not check a queued frame's age, so
+/// a peer that stalls the replay can still add one stale foreign entry. That
+/// replay already bypassed the C0 gate before #731.
 pub(crate) const UNSUBSCRIBE_QUIET: Duration = Duration::from_secs(120);
 
 const _: () = assert!(
@@ -183,7 +186,7 @@ impl PublisherTopics {
 
     /// True when a Leaf may serve IWANT on unsubscribed `topic` at `now`.
     #[must_use]
-    pub(crate) fn contains(&self, topic: &TopicId, now: Instant) -> bool {
+    pub(crate) fn allows_iwant(&self, topic: &TopicId, now: Instant) -> bool {
         let inner = self.lock();
         let quiet = |at: &Instant| now.saturating_duration_since(*at) < UNSUBSCRIBE_QUIET;
         if inner.blocked_at.as_ref().is_some_and(quiet)
