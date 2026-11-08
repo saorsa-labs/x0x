@@ -1739,3 +1739,156 @@ async fn two_state_only_links_at_one_revision_are_both_kept() -> anyhow::Result<
     assert_eq!(log.len(), 2, "both links are kept");
     Ok(())
 }
+
+/// Review round 3, regression guard: a gossip role update parked for a
+/// member who is not seated yet (#876) still applies once a page approval
+/// seats that member. On a pre-Welcome TreeKEM node the page approval is
+/// queued (`treekem_not_ready`) and applied by the TreeKEM replay after
+/// the page loop, so this path passed before the fix too.
+/// `apply_nested_in_a_page_scope_is_not_a_page_link` pins the scoping.
+#[tokio::test]
+async fn parked_gossip_role_update_replayed_by_a_page_link_still_applies() -> anyhow::Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let owner = AgentKeypair::generate()?;
+    let owner_hex = hex::encode(owner.agent_id().as_bytes());
+    let base = base_group(&owner, None)?;
+    let stable = base.stable_group_id().to_string();
+    let mut ahead = base.clone();
+    let revision = base.state_revision + 1;
+    let approval = seal_link(&mut ahead, &owner, 2_000, |next| {
+        set_join_request_approved(
+            next,
+            REQUEST_ID,
+            &owner_hex,
+            &agent(REQUESTER),
+            revision,
+            2_000,
+        );
+        next.set_member_treekem_key_package_hash(&agent(REQUESTER), KEY_PACKAGE_HASH.to_string());
+        take_treekem_epoch(next);
+    })?;
+    let role = seal_link(&mut ahead, &owner, 3_000, |next| {
+        next.set_member_role(&agent(REQUESTER), x0x::groups::GroupRole::Admin);
+    })?;
+    let approval_event = NamedGroupMetadataEvent::JoinRequestApproved {
+        group_id: stable.clone(),
+        request_id: REQUEST_ID.to_string(),
+        revision: approval.revision,
+        actor: owner_hex.clone(),
+        requester_agent_id: agent(REQUESTER),
+        treekem_commit_b64: treekem_commit_b64(),
+        treekem_welcome_b64: Some(BASE64.encode(b"issue1623-welcome-for-requester")),
+        welcome_ref: None,
+        treekem_epoch: Some(TREEKEM_EPOCH),
+        treekem_key_package_hash: Some(KEY_PACKAGE_HASH.to_string()),
+        commit: Some(approval.clone()),
+    };
+    let role_event = NamedGroupMetadataEvent::MemberRoleUpdated {
+        group_id: stable,
+        revision: role.revision,
+        actor: owner_hex,
+        agent_id: agent(REQUESTER),
+        role: x0x::groups::GroupRole::Admin,
+        commit: Some(role.clone()),
+    };
+    // The armed sequence holds the approval only, so rule (b) would refuse
+    // the role update as a page link.
+    let mut stub = base.clone();
+    arm(&mut stub, vec![approval.state_hash.clone()], &owner);
+    let key = install_stub(&state, stub).await?;
+
+    // Gossip first: the requester is not seated, so the update is parked.
+    let _ =
+        apply_named_group_metadata_event(&state, role_event, owner.agent_id(), true, None).await;
+    assert_eq!(
+        head_of(&state, &key).await?.state_hash,
+        base.state_hash,
+        "parked"
+    );
+    // The page approval seats the requester and replays the parked update.
+    deliver_page(&state, &key, &owner, vec![approval_event]).await;
+
+    let head = head_of(&state, &key).await?;
+    assert_eq!(
+        head.state_hash, role.state_hash,
+        "the replayed gossip role update applied after the page approval"
+    );
+    assert_eq!(
+        head.caller_role(&agent(REQUESTER)),
+        Some(x0x::groups::GroupRole::Admin)
+    );
+    let local = hex::encode(state.agent.agent_id().as_bytes());
+    assert!(!head.has_active_member(&local), "still pre-Welcome");
+    Ok(())
+}
+
+/// The rule (b) page gate skips a node that is not pre-Welcome: an Active
+/// node, and a node that holds a local TreeKEM group. Each applies an
+/// unarmed page rename by the ordinary path.
+#[tokio::test]
+async fn page_gate_skips_active_and_tree_holding_nodes() -> anyhow::Result<()> {
+    let owner = AgentKeypair::generate()?;
+    for case in ["active seat", "local tree"] {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let local = hex::encode(state.agent.agent_id().as_bytes());
+        let seat = (case == "active seat").then_some(local.as_str());
+        let base = base_group(&owner, seat)?;
+        let (stub, rename, event) = state_only_links(&base, &owner)?
+            .into_iter()
+            .find(|(_, _, event)| {
+                matches!(event, NamedGroupMetadataEvent::GroupMetadataUpdated { .. })
+            })
+            .ok_or_else(|| anyhow::anyhow!("rename link"))?;
+        let key = install_stub(&state, stub).await?;
+        if case == "local tree" {
+            let group_bytes = hex::decode(&key)?;
+            let seed = agent_treekem_seed(&state.agent, &group_bytes);
+            let tree =
+                x0x::mls::TreeKemMlsGroup::create(group_bytes, state.agent.agent_id(), &seed)?;
+            state
+                .treekem_groups
+                .write()
+                .await
+                .insert(key.clone(), Arc::new(tokio::sync::Mutex::new(tree)));
+        }
+
+        deliver_page(&state, &key, &owner, vec![event]).await;
+
+        let head = head_of(&state, &key).await?;
+        assert_eq!(
+            head.state_hash, rename.state_hash,
+            "{case}: the page rename applied"
+        );
+    }
+    Ok(())
+}
+
+/// Review round 3: the page flag names the one page link. Any other apply
+/// that runs inside that page link's apply (a replay of a parked or held
+/// gossip copy) keeps the ordinary apply. Here an unarmed pre-Welcome
+/// joiner applies a gossip rename inside the page scope of another link,
+/// and the rename applies. With a flag that covers the whole page apply
+/// (the round 2 shape), rule (b) refuses it.
+#[tokio::test]
+async fn apply_nested_in_a_page_scope_is_not_a_page_link() -> anyhow::Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let owner = AgentKeypair::generate()?;
+    let base = base_with_ban(&owner)?;
+    let (stub, rename, event) = state_only_links(&base, &owner)?.swap_remove(1);
+    let key = install_stub(&state, stub).await?;
+    let other_page_link = "a1".repeat(32);
+
+    let _ = TREEKEM_CATCHUP_PAGE_LINK
+        .scope(
+            other_page_link,
+            apply_named_group_metadata_event(&state, event, owner.agent_id(), true, None),
+        )
+        .await;
+
+    let head = head_of(&state, &key).await?;
+    assert_eq!(
+        head.state_hash, rename.state_hash,
+        "the nested gossip rename keeps the ordinary apply"
+    );
+    Ok(())
+}

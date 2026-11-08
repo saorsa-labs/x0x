@@ -9290,12 +9290,13 @@ fn treekem_catchup_link_is_ahead(
     from_revision: u64,
     from_epoch: u64,
 ) -> bool {
-    let cursor_ahead = treekem_catchup_link_cursor(event)
-        .is_some_and(|(revision, epoch)| revision > from_revision || epoch > from_epoch);
-    let commit_ahead = treekem_catchup_link_cursor(event).is_some()
-        && named_group_metadata_event_commit(event)
-            .is_some_and(|commit| commit.revision > from_revision);
-    cursor_ahead || commit_ahead
+    let Some((revision, epoch)) = treekem_catchup_link_cursor(event) else {
+        return false;
+    };
+    revision > from_revision
+        || epoch > from_epoch
+        || named_group_metadata_event_commit(event)
+            .is_some_and(|commit| commit.revision > from_revision)
 }
 
 /// #1623: the order of the links on a catch-up page — the state chain
@@ -13667,9 +13668,12 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                     .unwrap_or(*sender);
                 // #1623: rule (b) gates a pre-Welcome page link (see
                 // `refuse_unarmed_pre_welcome_page_link`).
-                TREEKEM_CATCHUP_PAGE_APPLY
+                let page_link = named_group_metadata_event_commit(&event)
+                    .map(|commit| commit.state_hash.clone())
+                    .unwrap_or_default();
+                TREEKEM_CATCHUP_PAGE_LINK
                     .scope(
-                        (),
+                        page_link,
                         apply_named_group_metadata_event(state, event, apply_sender, true, None),
                     )
                     .await;
@@ -28222,10 +28226,24 @@ tokio::task_local! {
 }
 
 // #1623 (ADR 0109 §2 rule (b), D82): the page loop of
-// `handle_treekem_catchup_response` sets this while it applies one page
-// link, so an apply arm knows the link came from a TreeKEM catch-up page.
+// `handle_treekem_catchup_response` sets this to the commit state hash of
+// the one page link it applies. An apply arm treats a link as a page link
+// only when its own commit hash equals it. The apply of that link also
+// runs replays (parked role updates, held commits, parked GSS removals)
+// inside the same task; those apply other events, with other hashes, so
+// they keep the ordinary apply.
 tokio::task_local! {
-    static TREEKEM_CATCHUP_PAGE_APPLY: ();
+    static TREEKEM_CATCHUP_PAGE_LINK: String;
+}
+
+/// #1623: is `event` the catch-up page link that the page loop applies now?
+fn is_treekem_catchup_page_link(event: &NamedGroupMetadataEvent) -> bool {
+    let Some(commit) = named_group_metadata_event_commit(event) else {
+        return false;
+    };
+    TREEKEM_CATCHUP_PAGE_LINK
+        .try_with(|page_link| *page_link == commit.state_hash)
+        .unwrap_or(false)
 }
 
 /// #1623 (ADR 0109 §2 rule (b), D82): should a rename, role change or
@@ -28246,7 +28264,7 @@ async fn refuse_unarmed_pre_welcome_page_link(
     event: &NamedGroupMetadataEvent,
     local_agent_hex: &str,
 ) -> bool {
-    if TREEKEM_CATCHUP_PAGE_APPLY.try_with(|_| ()).is_err()
+    if !is_treekem_catchup_page_link(event)
         || info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem
         || info.has_active_member(local_agent_hex)
         || state.treekem_groups.read().await.contains_key(group_key)
