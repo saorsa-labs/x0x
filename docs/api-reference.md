@@ -645,7 +645,8 @@ authority evidence), and the response returns the certificate
 (`certificate.storage_b64`) for ACP-attached harness instances.
 
 **Rider tokens** (`{ "sub_agent_id": <hex>, "groups": [gid…], "label"?:
-string, "ttl_secs"?: ≤ 90 days, default 7, "scopes"?: ["gui:show"],
+string, "ttl_secs"?: ≤ 90 days, default 7, "scopes"?: ["gui:show",
+"scratch:read", "scratch:read_write"],
 "delegation": { "payload_b64", "signature" } }`) are stored hashed at
 rest (SHA-256),
 expire, and are revocable per-token or by revoking their sub-agent.
@@ -671,6 +672,16 @@ authenticates as a distinct principal that may reach exactly:
   checks the explicit list only)
 - `GET /history` — `group:` scopes it is granted, limit clamped to 100
 - `POST /gui/show` — only when the token's `scopes` contain `gui:show`
+- the group SCRATCH store of a granted group (issue #1094, ADR 0075
+  decisions 4–5): with `scratch:read`, `GET /stores/:id/keys` and
+  `GET /stores/:id/:key`; with `scratch:read_write`, also
+  `PUT`/`DELETE /stores/:id/:key` and `POST /groups/:id/stores` with
+  `"name": "scratch"` only. `:id` must be the percent-encoded DERIVED
+  scratch topic of a group in the token's grant list (the `topic` the
+  create route returns — `x0x/group/<gid>/kv/<store digest>`), and the
+  open store must be group-bound. No scratch scope means
+  no store access (the `scratch: none` default). A rider never reaches
+  any other store, store creation/join, or `GET /stores`.
 
 Every other route — including `/agent/sign`, `/exec/*`, `/identity/*`,
 `/shutdown`, and the rest of the `/history` family (`/history/search`,
@@ -692,10 +703,11 @@ Home encrypts record the sub-agent id as the history row's author.
 `scopes` on `POST /owner/riders` is optional. It is the rider-token
 permission list. It is not the group list inside the delegation
 capability. Omit the field, or send `[]`, and the rider has no scopes.
-The only allowed value is the exact string `gui:show`. A repeated
-`gui:show` is stored once. Any other string, including a different case
-or added whitespace, is rejected before a certificate lookup or a disk
-write. The mint response is HTTP 400 and nothing is stored:
+The allowed values are the exact strings `gui:show`, `scratch:read`
+and `scratch:read_write`. A repeated scope is stored once. Any other
+string, including a different case or added whitespace, is rejected
+before a certificate lookup or a disk write. The mint response is HTTP
+400 and nothing is stored:
 
 ```json
 {"error":"unknown rider scope: <value>","ok":false,"reason":"unknown_scope"}
@@ -1615,8 +1627,10 @@ recipient, install a group secret, or establish historical-key entitlement.
 ### `POST /groups/:id/stores` — group store
 
 This bearer-authenticated owner route accepts either the durable API token or a
-session token. Rider tokens cannot reach it: the deny-by-default middleware
-returns `403` before the handler, regardless of a rider's group grants. For
+session token. Rider tokens cannot reach it, with one exception (issue #1094,
+ADR 0075 decision 5): a rider whose token carries `scratch:read_write` may open
+the `scratch` store of a group in its grant list — any other name, scope or
+group answers `403` before any store state changes. For
 `MlsEncrypted` groups the daemon's own agent must be an active member. For
 `SignedPublic` groups, public-read policy permits nonmembers to open and read;
 members-only read policy requires an active member. Writes always follow the
@@ -2908,6 +2922,20 @@ claim, or conclude the task is gone if it stays absent.
 | GET | `/stores/:id/:key` | `x0x store get <store_id> <key>` | Get a value |
 | DELETE | `/stores/:id/:key` | `x0x store rm <store_id> <key>` | Remove a value |
 
+### The group scratch store (issue #1094)
+
+Each group's SCRATCH store is the group store named `scratch`
+(`POST /groups/:id/stores` with `{"name":"scratch"}`): an ordinary sealed
+last-writer-wins KV store at the deterministic derived topic
+`x0x/group/<stable group id>/kv/<store digest>` (the digest is the
+BLAKE3 store identity of the stable group id and the name `scratch`,
+so every member computes the same topic; the create response returns
+it as `topic`), for agents' keyed working state. It is the one store
+a rider token can reach, under the `scratch:read` /
+`scratch:read_write` scopes (see the rider section); the `:id` in
+`/stores/:id/*` is the percent-encoded topic. Owners use the ordinary
+store routes above.
+
 ### Store create request body
 
 ```json
@@ -3455,7 +3483,13 @@ a typed `403`.
 - `grantee_user` or `grantee_agent` (64-hex): set exactly one, else `400`.
 - `agents` (required, non-empty): this owner's agents to share.
 - `caps` (required, non-empty): any of `"dm"`, `"exec"`, `"group_invite"`,
-  `"call"`, `{"connect":{"ports":[...]}}`.
+  `"call"`, `{"connect":{"ports":[...]}}`,
+  `{"data":{"group":"<stable group id>","store":"<name>","access":"ro"|"rw"}}`.
+  The `data` capability (issue #1094) names ONE store of ONE group — for
+  example the group's `scratch` store — so data can be shared without
+  sharing the whole group. This release mints, stores, delivers and
+  evaluates it; the remote read/write surface that consumes it is the A4
+  sharing-completeness slice and is not yet wired.
 - `expiry` (Unix seconds) or `ttl_secs` (seconds from `not_before`): set
   exactly one, else `400`. Grants must expire.
 - `not_before` (optional, Unix seconds): default is now.

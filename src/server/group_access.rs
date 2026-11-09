@@ -1184,12 +1184,14 @@ pub(in crate::server) fn is_home_or_owner_certified(info: &x0x::groups::GroupInf
 
 /// `POST /groups/:id/stores`: the rider grant on the binding's STABLE
 /// group id — owner-class bearers pass on class, a rider only with its
-/// token's explicit grant (ADR-0039). Riders cannot reach this route
-/// through the auth middleware (deny-by-default allowlist), so the
-/// grant arm is defence in depth, exactly as the inline check kept it;
-/// the body is byte-identical (`forbidden`). Runs at the inline
-/// check's position: after the plane/binding resolution's lock block,
-/// on the resolved `binding.stable_group_id`.
+/// token's explicit grant (ADR-0039). Since #1094 the auth middleware
+/// admits a rider here when its token carries `scratch:read_write`
+/// (ADR 0075 decision 5); the handler then additionally requires
+/// `name == "scratch"` and that scope, so this grant arm is the
+/// group-level half of that admission (and stays defence in depth for
+/// scopeless riders); the body is byte-identical (`forbidden`). Runs at
+/// the inline check's position: after the plane/binding resolution's
+/// lock block, on the resolved `binding.stable_group_id`.
 pub(in crate::server) fn admit_group_store_route(
     actor: &ActorContext,
     stable_group_id: &str,
