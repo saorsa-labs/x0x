@@ -5,11 +5,15 @@ David accepted A01-A15 at revision r01 on 7 Nov 2026 (course-correction
 directive, ruling 2). The accepted slots are the live decision authority.
 This check keeps the set at exactly 15 Accepted records and rejects a new
 revision file, an unindexed record, or a status change away from Accepted.
+The index records each slot file's sha256; a slot edit whose hash does not
+match is rejected, so a rewrite of an accepted decision cannot pass CI
+without a visible index.json change made under David's ruling.
 It does not replace adr-governance.py. It reads local files only. It never
 starts x0xd or contacts the network.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sys
@@ -70,10 +74,16 @@ def validate(root: Path) -> list[str]:
             errors.append(f"{name}: records must be regular files, not links.")
             continue
         try:
-            text = path.read_text(encoding="utf-8")
+            data = path.read_bytes()
+            text = data.decode("utf-8")
         except (OSError, UnicodeError) as exc:
             errors.append(f"{name}: cannot read record: {exc}")
             continue
+        recorded = slot.get("sha256")
+        if not isinstance(recorded, str) or not re.fullmatch(r"[0-9a-f]{64}", recorded):
+            errors.append(f"{identity}: the index must record the slot file's sha256 (64 lowercase hex).")
+        elif hashlib.sha256(data).hexdigest() != recorded:
+            errors.append(f"{name}: content does not match the sha256 recorded in index.json. A change to an accepted slot needs David's ruling; record it by updating the slot's sha256 in the same PR.")
         title = slot.get("title")
         if not isinstance(title, str) or not text.startswith(f"# {identity} {title}\n"):
             errors.append(f"{name}: title must match the selected slot.")

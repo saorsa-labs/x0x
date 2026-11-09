@@ -626,6 +626,27 @@ esac
                     probe_calls.read_text(encoding="utf-8").splitlines(), ["probe"]
                 )
 
+    def test_pre_channel_manifest_installs_as_stable(self) -> None:
+        # Every release up to and including v0.48.1 was signed before the
+        # channel field existed (#1558): its manifest has NO channel key.
+        # The installer treats that legacy shape as stable (with a printed
+        # note) instead of refusing the only releases that exist; an empty
+        # or non-stable channel VALUE is still refused (REFUSAL_CASES).
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rc, output, probe_calls, bin_dir = self.run_installer(
+                Path(tmpdir),
+                lambda digest: manifest_bytes(digest, channel=None),
+            )
+            self.assertEqual(rc, 0, output)
+            self.assertIn("Manifest predates the channel field", output)
+            self.assertIn("Manifest version 0.48.0 (stable) matches v0.48.0", output)
+            self.assertIn("ML-DSA-65 manifest signature verified", output)
+            self.assertIn("Installed:", output)
+            self.assertTrue((bin_dir / "x0x").exists())
+            self.assertEqual(
+                probe_calls.read_text(encoding="utf-8").splitlines(), ["probe"]
+            )
+
     def test_installer_path_excludes_host_gpg(self) -> None:
         # Greptile P1 on #1753: Linux commonly keeps gpg in /usr/bin, so a
         # PATH holding that directory verbatim finds the host gpg; the GPG
@@ -812,9 +833,12 @@ esac
             False,
             None,
         ),
+        # A channel KEY that is present but empty is refused; a manifest with
+        # no channel key at all is the pre-#1558 legacy stable shape and
+        # installs (test_pre_channel_manifest_installs_as_stable below).
         (
-            "manifest_missing_channel",
-            lambda digest: manifest_bytes(digest, channel=None),
+            "manifest_empty_channel",
+            lambda digest: manifest_bytes(digest, channel=""),
             None,
             (),
             ("missing its version or channel",),

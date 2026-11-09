@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 217,
+  "endpoint_count": 218,
   "endpoints": [
     {
       "category": "status",
@@ -155,6 +155,30 @@
             "cli": "default",
             "in": "query",
             "name": "peer",
+            "required": false
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "identity",
+      "cli_name": "onboard",
+      "description": "Install-and-join recipe that teaches another agent to DM you",
+      "method": "GET",
+      "path": "/onboard",
+      "request": {
+        "fields": [
+          {
+            "cli": "derived",
+            "in": "query",
+            "name": "card",
+            "required": false
+          },
+          {
+            "cli": "derived",
+            "in": "query",
+            "name": "card_file",
             "required": false
           }
         ],
@@ -624,7 +648,7 @@
     {
       "category": "identity",
       "cli_name": "owner riders issue",
-      "description": "Mint a scoped rider token for a registered rider-mode sub-agent (ADR-0039; scopes is a string list, default empty, only gui:show is defined; the required harness-signed delegation is supplied via --delegation-payload-b64/--delegation-signature)",
+      "description": "Mint a scoped rider token for a registered rider-mode sub-agent (ADR-0039; scopes is a string list, default empty; defined scopes: gui:show, scratch:read, scratch:read_write; the required harness-signed delegation is supplied via --delegation-payload-b64/--delegation-signature)",
       "method": "POST",
       "path": "/owner/riders",
       "request": {

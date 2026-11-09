@@ -98,6 +98,30 @@ fn extract_query_token(query: Option<&str>) -> Option<String> {
     None
 }
 
+/// Issue #1094 defence in depth for the rider scratch rows: when an
+/// admitted path addresses a `/stores/:id/*` topic whose store is OPEN,
+/// that store must be group-bound (sealed or group-signed). A personal
+/// store created at a scratch-shaped topic never admits a rider. An
+/// unopened topic passes — the handler answers its ordinary 404. The
+/// non-`/stores` scratch row (`POST /groups/:id/stores`) also passes:
+/// its handler re-runs the admission on the resolved group binding.
+async fn scratch_store_group_bound(state: &AppState, path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/stores/") else {
+        return true;
+    };
+    let Some(id_enc) = rest.split('/').next() else {
+        return false;
+    };
+    let Some(store_id) = super::rider_auth::percent_decode_segment(id_enc) else {
+        return false;
+    };
+    let handle = { state.kv_stores.read().await.get(&store_id).cloned() };
+    match handle {
+        Some(handle) => handle.is_encrypted().await || handle.is_group_signed().await,
+        None => true,
+    }
+}
+
 /// Bearer-token authentication middleware.
 ///
 /// Thin wrapper around [`authorize`]: extracts the header/query tokens into
@@ -196,7 +220,14 @@ pub(super) async fn auth_middleware(
                 )
                     .into_response();
             }
-            if !super::rider_auth::rider_route_allowed(&method, &path, &rider.scopes) {
+            let allowed = super::rider_auth::rider_route_allowed(&method, &path, &rider.scopes)
+                || (super::rider_auth::rider_scratch_route_allowed(
+                    &method,
+                    &path,
+                    &rider.scopes,
+                    &rider.groups,
+                ) && scratch_store_group_bound(&state, &path).await);
+            if !allowed {
                 if method == axum::http::Method::POST && path == "/gui/show" {
                     return (
                         StatusCode::FORBIDDEN,

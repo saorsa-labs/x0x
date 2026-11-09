@@ -1155,6 +1155,7 @@ impl DirectMessaging {
     /// Test seam (#1091): empty the agent↔machine resolution tables —
     /// the post-restart cold state for send-first resolution. Transport
     /// connections are untouched.
+    #[doc(hidden)]
     pub async fn clear_resolution_for_testing(&self) {
         self.machine_to_agent.write().await.clear();
         self.connected_agents.write().await.clear();

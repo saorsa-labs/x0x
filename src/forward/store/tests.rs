@@ -405,6 +405,67 @@ async fn restore_with_a_pin_mismatch_leaves_the_forward_disabled() {
     );
 }
 
+/// WHY (ADR-0074 §2 restart row): right after a daemon restart the pinned
+/// machine is known (owner enrollment, synced name) but the agent it
+/// announces is not rediscovered yet, so the machine name resolves with no
+/// agent. That is not a different key: the forward must stay down as a
+/// *transient* failure and retry until the agent returns. Classifying it as
+/// a permanent `name_changed` left a persisted machine forward down for the
+/// whole daemon run (observed on a two-daemon pair: still down 120 s after
+/// `/health`). A different agent or machine stays permanent.
+#[tokio::test]
+async fn restore_waits_for_an_undiscovered_agent_on_the_pinned_machine() {
+    let names = NameStore::in_memory();
+    let mrec = record(&machine_spec(true));
+    let not_yet = Candidates {
+        agents: Vec::new(),
+        machines: vec![MachineCandidate {
+            machine_id: MachineId([0x11; 32]),
+            label: "box".to_string(),
+            verified: true,
+            agent_id: None,
+        }],
+    };
+    let resolved = resolve_with(
+        &names,
+        &NameRef::parse("machine:box.me").unwrap(),
+        OWNER,
+        &not_yet,
+        NOW,
+    )
+    .await;
+    assert_eq!(resolved.as_ref().unwrap().agent_id, None);
+    let failure = restore_decision_classified(&mrec, Some(resolved)).unwrap_err();
+    assert!(
+        matches!(failure, RestoreFailure::Transient(_)),
+        "an undiscovered agent on the pinned machine must retry: {failure:?}"
+    );
+    let mut retry = RestoreRetry::default();
+    retry.finish(&Err(failure));
+    assert!(
+        retry.next.is_some(),
+        "a transient failure schedules a retry"
+    );
+
+    // No agent, but a different machine: still a changed name.
+    let mut other_machine = resolved_machine([0x44; 32], [0x99; 32]);
+    other_machine.agent_id = None;
+    assert!(matches!(
+        restore_decision_classified(&mrec, Some(Ok(other_machine))),
+        Err(RestoreFailure::Permanent(reason)) if reason.starts_with(NAME_CHANGED)
+    ));
+    // The agent returns as a different key: permanent, never retargeted.
+    assert!(matches!(
+        restore_decision_classified(&mrec, Some(Ok(resolved_machine([0x98; 32], [0x11; 32])))),
+        Err(RestoreFailure::Permanent(reason)) if reason.starts_with(NAME_CHANGED)
+    ));
+    // The agent returns as the pinned key: the forward comes back.
+    assert_eq!(
+        restore_decision(&mrec, Some(Ok(resolved_machine([0x44; 32], [0x11; 32])))).unwrap(),
+        machine_spec(true).pair()
+    );
+}
+
 fn assert_unconfirmed(result: &Result<bool, ForwardStoreError>) {
     assert!(
         matches!(result, Err(e) if e.durability_unconfirmed() && e.to_string().contains("not confirmed")),

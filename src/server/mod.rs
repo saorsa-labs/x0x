@@ -87,11 +87,11 @@ use routes::{
     forward_add, forward_list, forward_remove, get_a2a_agent_card, get_agent_card,
     get_constitution, get_constitution_json, get_group_card, get_group_join_status,
     get_group_public_messages, get_group_state, get_group_state_commits, get_kv_value,
-    get_mls_group, get_named_group, get_named_group_members, get_profile, get_sync_devices,
-    gossip_diagnostics, group_membership_lock, groups_diagnostics, handle_control_blob_message,
-    handle_file_message, health, history_diagnostics, history_list, history_message,
-    history_policy, history_purge, history_retain, history_scopes, history_search, history_stats,
-    identity_revocations, identity_revoke, import_agent_card, import_group_card,
+    get_mls_group, get_named_group, get_named_group_members, get_onboard, get_profile,
+    get_sync_devices, gossip_diagnostics, group_membership_lock, groups_diagnostics,
+    handle_control_blob_message, handle_file_message, health, history_diagnostics, history_list,
+    history_message, history_policy, history_purge, history_retain, history_scopes, history_search,
+    history_stats, identity_revocations, identity_revoke, import_agent_card, import_group_card,
     ingest_public_message, introduction, join_group_via_invite, join_kv_store, leave_group,
     list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys, list_kv_stores,
     list_machines, list_mls_groups, list_named_groups, list_revocations, list_task_lists,
@@ -2976,6 +2976,7 @@ pub async fn serve_with_options(
         .route("/agent", get(agent_info))
         .route("/introduction", get(introduction))
         .route("/agent/card", get(get_agent_card))
+        .route("/onboard", get(get_onboard))
         .route("/sync/devices", get(get_sync_devices))
         .route("/sync/devices/enroll", post(enroll_device))
         .route(
