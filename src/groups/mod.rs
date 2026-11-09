@@ -247,6 +247,12 @@ pub struct IssuedInviteRecord {
     /// mints store None and are never republished.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_link: Option<String>,
+    /// #646 (D95): the roster root a v5 (content-addressed) invite signed
+    /// at mint. The base-roster fetch serves EXACTLY this root to this
+    /// invite's holder and nothing else — a pre-member gets no other kind
+    /// and no other root. `None` on v4 records (nothing is served).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_roster_root: Option<String>,
 }
 
 fn default_invite_max_role() -> GroupRole {
@@ -2660,8 +2666,19 @@ impl GroupInfo {
                 intended_joiner,
                 origin,
                 signed_link,
+                base_roster_root: None,
             },
         );
+    }
+
+    /// #646 (D95): bind the roster root a v5 invite signed to its issued
+    /// record, so the base-roster fetch can serve exactly that root to
+    /// this invite's holder and nothing else. A no-op for an unknown
+    /// secret.
+    pub fn bind_issued_invite_base_roster_root(&mut self, secret: &str, root: Option<String>) {
+        if let Some(record) = self.issued_invites.get_mut(secret) {
+            record.base_roster_root = root;
+        }
     }
 
     /// #469 E3: drop consumed/expired records. Called before the live-cap

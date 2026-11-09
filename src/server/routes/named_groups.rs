@@ -23946,6 +23946,13 @@ pub(in crate::server) async fn mint_invite_transaction(
         origin,
         signed_link,
     );
+    // #646 (D95): a v5 record remembers the ONE root its invite signed —
+    // the base-roster fetch serves exactly that root to this invite's
+    // holder and nothing else. v4 records keep None (nothing is served).
+    next.bind_issued_invite_base_roster_root(
+        &invite.invite_secret,
+        invite.base_roster_root.clone(),
+    );
     // r4 regression fix: persist through `persist_named_group_info`, NOT a
     // plain `persist_named_groups_mutation` insert. The single-record
     // helper is the #457 transaction — for a TreeKEM-plane group it also
@@ -25291,26 +25298,55 @@ pub(super) async fn join_group_via_invite_inner(
     let fetched_base_roster = match view.base_roster_root.as_deref() {
         None => None,
         Some(signed_root) => {
-            let secret_hash_hex = hex::encode(view.secret_hash);
-            match base_roster_fetch::obtain_base_roster(
-                &state,
-                inviter_agent,
-                invite_stable_group_id,
-                signed_root,
-                &secret_hash_hex,
-                base_roster_fetch::BASE_ROSTER_FETCH_TIMEOUT,
-            )
-            .await
-            {
-                Ok(roster) => Some(roster),
-                Err(reason) => {
-                    tracing::debug!(
-                        group_id = %LogHexId::group(&invite.group_id),
-                        inviter = %invite.inviter,
-                        reason,
-                        "content-addressed base roster not fetched; the join refuses where it would seed"
-                    );
-                    None
+            // r4 item 6: a join that cannot SEED — the joiner already
+            // holds an Active seat locally, or its attempt is already
+            // registered as pending — answers idempotently below without
+            // the base, so it skips the fetch window instead of paying it.
+            let joiner_hex = hex::encode(agent_id.as_bytes());
+            let already_active = {
+                let groups = state.named_groups.read().await;
+                groups
+                    .get(&group_id_hex)
+                    .or_else(|| {
+                        groups
+                            .values()
+                            .find(|info| info.mls_group_id == group_id_hex)
+                    })
+                    .is_some_and(|info| info.has_active_member(&joiner_hex))
+            };
+            let already_pending = state
+                .pending_join_attempts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&join_result_key(invite_stable_group_id, &joiner_hex));
+            if already_active || already_pending {
+                tracing::debug!(
+                    group_id = %LogHexId::group(&invite.group_id),
+                    "v5 join is already seated or pending locally; the fetch is skipped"
+                );
+                None
+            } else {
+                let secret_hash_hex = hex::encode(view.secret_hash);
+                match base_roster_fetch::obtain_base_roster(
+                    &state,
+                    inviter_agent,
+                    invite_stable_group_id,
+                    signed_root,
+                    &secret_hash_hex,
+                    base_roster_fetch::BASE_ROSTER_FETCH_TIMEOUT,
+                )
+                .await
+                {
+                    Ok(roster) => Some(roster),
+                    Err(reason) => {
+                        tracing::debug!(
+                            group_id = %LogHexId::group(&invite.group_id),
+                            inviter = %invite.inviter,
+                            reason,
+                            "content-addressed base roster not fetched; the join refuses where it would seed"
+                        );
+                        None
+                    }
                 }
             }
         }
@@ -49476,13 +49512,35 @@ pub(in crate::server) async fn dispatch_join_result_message(
                 );
                 return true;
             }
-            let stable_group = {
-                let roster = state.named_groups.read().await;
-                crate::server::resolve_group_entry_locked(&roster, group_id)
-                    .map(|(_, info)| info.stable_group_id().to_string())
+            // r4 item 5 (and r3 item 6): AUTHORIZE FIRST, under the groups
+            // read lock, with no record clone — an unauthorized request
+            // never takes an admission ticket, so it cannot hold a slot
+            // another member's fetch (or recovery) needs.
+            let now_secs = now_millis_u64() / 1_000;
+            let located = {
+                let groups = state.named_groups.read().await;
+                match crate::server::resolve_group_entry_locked(&groups, group_id) {
+                    None => {
+                        tracing::debug!(group_id = %LogHexId::group(group_id), "base-roster fetch for an unknown group; dropped");
+                        return true;
+                    }
+                    Some((_, info)) => base_roster_fetch::locate_served_base_roster(
+                        info,
+                        &sender_hex,
+                        roster_root,
+                        secret_hash,
+                        now_secs,
+                    )
+                    .map(|roster| (info.stable_group_id().to_string(), roster)),
+                }
             };
-            let Some(stable_group) = stable_group else {
-                tracing::debug!(group_id = %LogHexId::group(group_id), "base-roster fetch for an unknown group; dropped");
+            let Some((stable_group, served_roster)) = located else {
+                tracing::debug!(
+                    group_id = %LogHexId::group(group_id),
+                    requester = %LogHexId::agent(&sender_hex),
+                    "base-roster fetch refused: no live matching invite for this \
+                     requester and root, or over the entry cap"
+                );
                 return true;
             };
             // Review r3 item 5: the coalescing key is PREFIXED so a
@@ -49509,19 +49567,17 @@ pub(in crate::server) async fn dispatch_join_result_message(
             };
             let task_state = Arc::clone(state);
             let requester = *sender;
-            let group_id = group_id.clone();
             let roster_root = roster_root.clone();
-            let secret_hash = secret_hash.clone();
             state.spawn_detached(async move {
                 let _ticket = ticket;
                 let handler = tokio::time::timeout(
                     JOIN_RESULT_FETCH_HANDLER_TIMEOUT,
-                    base_roster_fetch::serve_base_roster_fetch(
+                    base_roster_fetch::send_base_roster_reply(
                         &task_state,
                         &requester,
-                        &group_id,
-                        &roster_root,
-                        &secret_hash,
+                        stable_group,
+                        roster_root,
+                        served_roster,
                     ),
                 );
                 if handler.await.is_err() {
@@ -77958,6 +78014,7 @@ mod cas_rollback_470 {
                             intended_joiner: None,
                             origin: x0x::groups::InviteOrigin::Explicit,
                             signed_link: None,
+                            base_roster_root: None,
                         },
                     );
                 }
@@ -78039,6 +78096,7 @@ mod cas_rollback_470 {
                     intended_joiner: None,
                     origin: x0x::groups::InviteOrigin::Explicit,
                     signed_link: None,
+                    base_roster_root: None,
                 },
             );
             y.home = Some(x0x::groups::HomeMetadata {

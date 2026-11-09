@@ -123,6 +123,25 @@ pub(in crate::server) fn deliver_base_roster(
         );
         return;
     }
+    // r4 item 8: the root encoding joins entries without a length prefix,
+    // so entry keys and states are validated structurally — ids are
+    // strict 64 lowercase hex, and a base projection carries only Active
+    // and Banned seats (what the inline v4 carrier holds).
+    let well_formed = roster.iter().all(|(id, snap)| {
+        id.len() == 64
+            && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            && matches!(
+                snap.state,
+                x0x::groups::GroupMemberState::Active | x0x::groups::GroupMemberState::Banned
+            )
+    });
+    if !well_formed {
+        tracing::debug!(
+            group_id = %LogHexId::group(group_id),
+            "dropped base-roster reply with malformed entry keys or states"
+        );
+        return;
+    }
     let sanitized = sanitize_fetched(roster);
     if x0x::groups::state_commit::roster_root_of_projection(&sanitized) != roster_root {
         tracing::debug!(
@@ -258,72 +277,108 @@ pub(in crate::server) async fn obtain_base_roster(
     let Ok(payload) = serde_json::to_vec(&request) else {
         return Err("request serialization failed");
     };
-    if let Err(e) = state
-        .agent
-        .send_direct_with_config(&inviter, payload, direct_message_send_config())
-        .await
-    {
-        // #1776: a fresh joiner may hold no DM binding for the inviter
-        // yet — ask the mesh for its advert so a retry can ride the
-        // gossip-inbox leg.
-        if !state.agent.holds_gossip_usable_dm_binding(&inviter) {
-            let agent = Arc::clone(&state.agent);
-            tokio::spawn(async move {
-                agent.refresh_dm_capability_binding(inviter).await;
-            });
+    // r4 item 6: ONE timeout bounds the whole exchange — the send's own
+    // internal retries included — so a v5 join never waits past the fetch
+    // window before its typed retryable 503.
+    let exchange = async {
+        if let Err(e) = state
+            .agent
+            .send_direct_with_config(&inviter, payload, direct_message_send_config())
+            .await
+        {
+            // #1776: a fresh joiner may hold no DM binding for the inviter
+            // yet — ask the mesh for its advert so a retry can ride the
+            // gossip-inbox leg.
+            if !state.agent.holds_gossip_usable_dm_binding(&inviter) {
+                let agent = Arc::clone(&state.agent);
+                tokio::spawn(async move {
+                    agent.refresh_dm_capability_binding(inviter).await;
+                });
+            }
+            tracing::debug!("base-roster fetch send failed: {e}");
+            // The reply can have raced the send failure in on another leg
+            // (an earlier attempt's answer); a delivered projection was
+            // already verified against this key's root.
+            return match receiver.try_recv() {
+                Ok(roster)
+                    if x0x::groups::state_commit::roster_root_of_projection(&roster)
+                        == signed_root =>
+                {
+                    Ok(roster)
+                }
+                _ => Err("inviter unreachable"),
+            };
         }
-        tracing::debug!("base-roster fetch send failed: {e}");
-        // The reply can have raced the send failure in on another leg
-        // (an earlier attempt's answer); a delivered projection was
-        // already verified against this key's root.
-        return match receiver.try_recv() {
-            Ok(roster)
-                if x0x::groups::state_commit::roster_root_of_projection(&roster) == signed_root =>
-            {
+        match receiver.await {
+            Ok(roster) => {
+                // Defense in depth: the delivery already verified the
+                // payload against this key's root; re-derive once more
+                // against the SIGNED root before anything seeds from it.
+                if x0x::groups::state_commit::roster_root_of_projection(&roster) != signed_root {
+                    return Err("served roster does not re-derive the signed root");
+                }
                 Ok(roster)
             }
-            _ => Err("inviter unreachable"),
-        };
-    }
-    match tokio::time::timeout(timeout, receiver).await {
-        Ok(Ok(roster)) => {
-            // Defense in depth: the delivery already verified the payload
-            // against this key's root; re-derive once more against the
-            // SIGNED root before anything seeds from it.
-            if x0x::groups::state_commit::roster_root_of_projection(&roster) != signed_root {
-                return Err("served roster does not re-derive the signed root");
-            }
-            Ok(roster)
+            Err(_) => Err("no answer from the inviter within the fetch window"),
         }
-        Ok(Err(_)) | Err(_) => Err("no answer from the inviter within the fetch window"),
+    };
+    match tokio::time::timeout(timeout, exchange).await {
+        Ok(result) => result,
+        Err(_) => Err("no answer from the inviter within the fetch window"),
     }
 }
 
-/// Inviter side, the pure half of the serve: authorize by invite
-/// possession (a LIVE issued-invite record — unconsumed, unexpired —
-/// whose raw 32-byte secret BLAKE3-hashes to `secret_hash`), then locate
-/// the projection the CONTENT ADDRESS names: the live roster when its
-/// root matches, else the retained commit whose signed `roster_root`
-/// matches (so an invite minted a few commits ago is still serveable).
+/// Inviter side, the pure half of the serve. r4 blocker 1 (D95, archived
+/// ADR 0111; A08:71 — "a pre-member gets no other kind and no other
+/// root"):
+/// - the requester must not sit Banned or Removed on the live roster;
+/// - possession of a LIVE issued-invite record (unconsumed, unexpired)
+///   whose raw 32-byte secret BLAKE3-hashes to `secret_hash`, compared in
+///   constant time through [`blake3::Hash`] equality (r4 item 4);
+/// - an ADDRESSED invite is served only to its `intended_joiner`;
+/// - ONLY the root that invite signed at mint
+///   (`IssuedInviteRecord::base_roster_root`) is served — the live roster
+///   when its root still matches, else the retained commit with that
+///   signed root (an invite minted a few commits ago stays serveable); a
+///   v4 record binds no root and serves nothing.
+///
 /// The served projection is certificate-free and anchor-free (see
 /// [`sanitize_fetched`]), and only within the fetch entry cap.
 pub(in crate::server) fn locate_served_base_roster(
     info: &x0x::groups::GroupInfo,
+    requester_hex: &str,
     roster_root: &str,
     secret_hash: &str,
     now_secs: u64,
 ) -> Option<BaseRosterProjection> {
-    let authorized = info.issued_invites.iter().any(|(secret, record)| {
+    if info.members_v2.get(requester_hex).is_some_and(|seat| {
+        matches!(
+            seat.state,
+            x0x::groups::GroupMemberState::Banned | x0x::groups::GroupMemberState::Removed
+        )
+    }) {
+        return None;
+    }
+    let requested: [u8; 32] = hex::decode(secret_hash).ok()?.try_into().ok()?;
+    let requested = blake3::Hash::from(requested);
+    let record = info.issued_invites.iter().find_map(|(secret, record)| {
         if record.consumed_by.is_some()
             || (record.expires_at_secs != 0 && record.expires_at_secs <= now_secs)
         {
-            return false;
+            return None;
         }
-        hex::decode(secret).is_ok_and(|raw| {
-            raw.len() == 32 && hex::encode(blake3::hash(&raw).as_bytes()) == secret_hash
-        })
-    });
-    if !authorized {
+        let raw = hex::decode(secret).ok()?;
+        // blake3::Hash equality is constant-time.
+        (raw.len() == 32 && blake3::hash(&raw) == requested).then_some(record)
+    })?;
+    if record
+        .intended_joiner
+        .as_deref()
+        .is_some_and(|intended| !intended.eq_ignore_ascii_case(requester_hex))
+    {
+        return None;
+    }
+    if record.base_roster_root.as_deref() != Some(roster_root) {
         return None;
     }
     let live = x0x::groups::state_commit::roster_projection_digest_only(&info.members_v2);
@@ -341,39 +396,21 @@ pub(in crate::server) fn locate_served_base_roster(
         .filter(|roster| roster.len() <= x0x::groups::invite::MAX_FETCHED_BASE_ROSTER_ENTRIES)
 }
 
-/// Inviter side: answer one authorized `BaseRosterFetch`. Authorization,
-/// location and sanitization are [`locate_served_base_roster`], run UNDER
-/// the groups read lock (review r3 item 6: no group-record clone before
-/// the invite-secret check — an unauthorized request costs one map walk).
-/// Anything unservable is silently dropped; the joiner retries.
-pub(in crate::server) async fn serve_base_roster_fetch(
+/// Inviter side: send one located, sanitized projection back to the
+/// requester. Authorization and location already ran in the dispatch arm
+/// UNDER the groups read lock and BEFORE the admission ticket (r4 item 5:
+/// an unauthorized request never takes a ticket; r3 item 6: it never
+/// clones the group record either).
+pub(in crate::server) async fn send_base_roster_reply(
     state: &Arc<AppState>,
     requester: &AgentId,
-    group_id: &str,
-    roster_root: &str,
-    secret_hash: &str,
+    stable_group_id: String,
+    roster_root: String,
+    roster: BaseRosterProjection,
 ) {
-    let now_secs = now_millis_u64() / 1_000;
-    let located = {
-        let groups = state.named_groups.read().await;
-        let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group_id) else {
-            tracing::debug!(group_id = %LogHexId::group(group_id), "base-roster fetch for an unknown group; dropped");
-            return;
-        };
-        locate_served_base_roster(info, roster_root, secret_hash, now_secs)
-            .map(|roster| (info.stable_group_id().to_string(), roster))
-    };
-    let Some((stable_group_id, roster)) = located else {
-        tracing::debug!(
-            group_id = %LogHexId::group(group_id),
-            requester = %LogHexId::agent(&hex::encode(requester.as_bytes())),
-            "base-roster fetch refused: no live matching invite, no held root, or over the entry cap"
-        );
-        return;
-    };
     let reply = JoinResultMessage::BaseRoster {
         group_id: stable_group_id,
-        roster_root: roster_root.to_string(),
+        roster_root,
         roster,
     };
     let Ok(payload) = serde_json::to_vec(&reply) else {
@@ -384,9 +421,6 @@ pub(in crate::server) async fn serve_base_roster_fetch(
         .send_direct_with_config(requester, payload, direct_message_send_config())
         .await
     {
-        tracing::debug!(
-            group_id = %LogHexId::group(group_id),
-            "base-roster reply send failed: {e}"
-        );
+        tracing::debug!("base-roster reply send failed: {e}");
     }
 }

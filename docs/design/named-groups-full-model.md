@@ -844,10 +844,13 @@ invite wire **v5**: the link carries the projection's **content address**
 and no inline roster. The joiner, after full invite authentication and
 before any local state, asks the INVITER for the projection over two
 `JoinResultMessage` arms (`BaseRosterFetch` / `BaseRoster`), proving
-invite possession with the BLAKE3 of the raw invite secret. The reply is
-admitted only when it is verified, comes from the join's own inviter,
-answers a waiting join, and re-derives the signed root; nothing is
-cached. Because the roster root does not commit
+invite possession with the BLAKE3 of the raw invite secret (compared in
+constant time). The inviter serves EXACTLY the root that invite signed at
+mint (stored on the issued-invite record), only to the agent an addressed
+invite names, and never to a Banned or Removed requester — a pre-member
+gets no other kind and no other root (D95, A08). The reply is admitted
+only when it is verified, comes from the join's own inviter, answers a
+waiting join, and re-derives the signed root; nothing is cached. Because the roster root does not commit
 `treekem_key_package_hash`, fetched projections are certificate-free AND
 anchor-free — the authority's signed commits carry the real anchors.
 While no source answers, the join refuses with a retryable 503

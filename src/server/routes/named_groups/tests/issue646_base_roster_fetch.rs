@@ -119,6 +119,29 @@ async fn over_cap_mint_is_v5_content_addressed_within_budget() -> Result<()> {
     assert_eq!(small_invite.base_roster_root, None);
     assert_eq!(small_invite.verify_v4_signatures(), Ok(()));
 
+    // The exact boundaries (r4 test gap): 20 members mint v4, 21 mint v5,
+    // 128 (the fetch cap itself) still mints v5.
+    let at_cap_id = "cd".repeat(32);
+    let at_cap = seed_group_with_members(&authority, &at_cap_id, 19).await; // +creator = 20
+    let (at_cap_invite, _) = assemble_signed_v4_invite(&authority, &at_cap, 3_600, None)
+        .map_err(|e| anyhow::anyhow!("at-cap mint failed: {e:?}"))?;
+    assert_eq!(at_cap_invite.version, INVITE_VERSION_V4);
+    let over_cap_id = "ce".repeat(32);
+    let over_cap = seed_group_with_members(&authority, &over_cap_id, 20).await; // +creator = 21
+    let (over_cap_invite, _) = assemble_signed_v4_invite(&authority, &over_cap, 3_600, None)
+        .map_err(|e| anyhow::anyhow!("21-member mint failed: {e:?}"))?;
+    assert_eq!(over_cap_invite.version, INVITE_VERSION_V5);
+    let fetch_cap_id = "cf".repeat(32);
+    let fetch_cap = seed_group_with_members(
+        &authority,
+        &fetch_cap_id,
+        MAX_FETCHED_BASE_ROSTER_ENTRIES - 1,
+    )
+    .await; // +creator = 128
+    let (fetch_cap_invite, _) = assemble_signed_v4_invite(&authority, &fetch_cap, 3_600, None)
+        .map_err(|e| anyhow::anyhow!("128-member mint failed: {e:?}"))?;
+    assert_eq!(fetch_cap_invite.version, INVITE_VERSION_V5);
+
     // Past the FETCH cap the mint refuses with the typed size refusal.
     let huge_id = "cc".repeat(32);
     let huge = seed_group_with_members(&authority, &huge_id, MAX_FETCHED_BASE_ROSTER_ENTRIES).await;
@@ -132,15 +155,17 @@ async fn over_cap_mint_is_v5_content_addressed_within_budget() -> Result<()> {
     Ok(())
 }
 
-/// The serve half: possession of a LIVE invite (hash of the raw secret)
-/// authorizes; the projection is located by CONTENT ADDRESS — the live
-/// roster, or a retained commit whose signed root matches — and anything
-/// else is refused.
+/// The serve half (r4 blocker 1, D95 / A08:71): possession of a LIVE
+/// invite (hash of the raw secret) authorizes EXACTLY the root that
+/// invite signed at mint, for the requester it was addressed to, and a
+/// Banned or Removed requester gets nothing — "a pre-member gets no other
+/// kind and no other root."
 #[tokio::test]
 async fn locate_served_base_roster_authorizes_and_content_addresses() -> Result<()> {
     let (authority, _dir) = daemon_state().await?;
     let group_id = "ad".repeat(32);
     let mut info = seed_group_with_members(&authority, &group_id, 30).await;
+    let requester = "9a".repeat(32);
     let secret = "ab".repeat(32);
     let raw = hex::decode(&secret)?;
     let secret_hash = hex::encode(blake3::hash(&raw).as_bytes());
@@ -149,18 +174,55 @@ async fn locate_served_base_roster_authorizes_and_content_addresses() -> Result<
     let live_projection = roster_projection_digest_only(&info.members_v2);
     let live_root = roster_root_of_projection(&live_projection);
 
-    // Live root + live invite → the live projection.
-    let served =
-        base_roster_fetch::locate_served_base_roster(&info, &live_root, &secret_hash, 2_000)
-            .expect("live root serves");
+    // A v4-shaped record (no bound root) serves NOTHING, not even the
+    // root it names.
+    assert!(base_roster_fetch::locate_served_base_roster(
+        &info,
+        &requester,
+        &live_root,
+        &secret_hash,
+        2_000
+    )
+    .is_none());
+    info.bind_issued_invite_base_roster_root(&secret, Some(live_root.clone()));
+
+    // Live invite + the root IT signed → the live projection.
+    let served = base_roster_fetch::locate_served_base_roster(
+        &info,
+        &requester,
+        &live_root,
+        &secret_hash,
+        2_000,
+    )
+    .expect("the invite's own root serves");
     assert_eq!(served, live_projection);
 
     // Wrong possession proof → nothing.
     let wrong_hash = hex::encode(blake3::hash(b"nope").as_bytes());
-    assert!(
-        base_roster_fetch::locate_served_base_roster(&info, &live_root, &wrong_hash, 2_000)
-            .is_none()
-    );
+    assert!(base_roster_fetch::locate_served_base_roster(
+        &info,
+        &requester,
+        &live_root,
+        &wrong_hash,
+        2_000
+    )
+    .is_none());
+
+    // Expired invite → nothing (r4 test gap).
+    let mut expired = info.clone();
+    expired
+        .issued_invites
+        .get_mut(&secret)
+        .expect("record")
+        .expires_at_secs = 1_500;
+    assert!(base_roster_fetch::locate_served_base_roster(
+        &expired,
+        &requester,
+        &live_root,
+        &secret_hash,
+        2_000
+    )
+    .is_none());
 
     // Consumed invite → nothing.
     let mut consumed = info.clone();
@@ -175,15 +237,70 @@ async fn locate_served_base_roster_authorizes_and_content_addresses() -> Result<
         .expect("consume");
     assert!(base_roster_fetch::locate_served_base_roster(
         &consumed,
+        &requester,
         &live_root,
         &secret_hash,
         2_000
     )
     .is_none());
 
-    // A root the live roster no longer matches is served from the
-    // retained commit log (digest-only), keyed by the commit's SIGNED
-    // roster_root.
+    // An ADDRESSED invite is served only to its intended joiner (D95).
+    let mut addressed = info.clone();
+    let intended = "7b".repeat(32);
+    addressed
+        .issued_invites
+        .get_mut(&secret)
+        .expect("record")
+        .intended_joiner = Some(intended.clone());
+    assert!(
+        base_roster_fetch::locate_served_base_roster(
+            &addressed,
+            &requester,
+            &live_root,
+            &secret_hash,
+            2_000
+        )
+        .is_none(),
+        "a different requester gets nothing from an addressed invite"
+    );
+    assert!(base_roster_fetch::locate_served_base_roster(
+        &addressed,
+        &intended,
+        &live_root,
+        &secret_hash,
+        2_000
+    )
+    .is_some());
+
+    // A Banned (or Removed) requester gets nothing, whatever it holds.
+    let mut with_banned = info.clone();
+    with_banned.add_member(
+        requester.clone(),
+        x0x::groups::GroupRole::Member,
+        None,
+        None,
+    );
+    with_banned
+        .members_v2
+        .get_mut(&requester)
+        .expect("seat")
+        .state = x0x::groups::GroupMemberState::Banned;
+    assert!(
+        base_roster_fetch::locate_served_base_roster(
+            &with_banned,
+            &requester,
+            &live_root,
+            &secret_hash,
+            2_000
+        )
+        .is_none(),
+        "a Banned requester is refused"
+    );
+
+    // The invite's bound root stays serveable from the retained commit
+    // log after the live roster moves on (digest-only) — but a DIFFERENT
+    // root, even one a retained commit holds, is never served to this
+    // invite (D95: no other root).
     let retained_projection = live_projection.clone();
     let retained_root = live_root.clone();
     info.commit_log
@@ -208,19 +325,59 @@ async fn locate_served_base_roster_authorizes_and_content_addresses() -> Result<
         });
     // Advance the live roster so its root moves off the retained one.
     info.add_member("ff".repeat(32), x0x::groups::GroupRole::Member, None, None);
+    let moved_live_root =
+        roster_root_of_projection(&roster_projection_digest_only(&info.members_v2));
     assert_ne!(
-        roster_root_of_projection(&roster_projection_digest_only(&info.members_v2)),
-        retained_root,
+        moved_live_root, retained_root,
         "fixture: the live root must have moved"
     );
-    let served =
-        base_roster_fetch::locate_served_base_roster(&info, &retained_root, &secret_hash, 2_000)
-            .expect("retained root serves from the commit log");
+    // Push the moved live roster into the commit log too, so a non-pinned
+    // serve WOULD have something to give out for it.
+    info.commit_log
+        .push(x0x::groups::state_commit::RetainedCommit {
+            commit: x0x::groups::state_commit::GroupStateCommit {
+                group_id: info.stable_group_id().to_string(),
+                revision: info.state_revision + 1,
+                prev_state_hash: None,
+                roster_root: moved_live_root.clone(),
+                policy_hash: String::new(),
+                public_meta_hash: String::new(),
+                security_binding: None,
+                state_hash: "ef".repeat(32),
+                withdrawn: false,
+                committed_by: "11".repeat(32),
+                committed_at: 2,
+                signer_public_key: String::new(),
+                signature: String::new(),
+            },
+            roster: roster_projection_digest_only(&info.members_v2),
+            meta: Some(info.public_meta()),
+        });
+    let served = base_roster_fetch::locate_served_base_roster(
+        &info,
+        &requester,
+        &retained_root,
+        &secret_hash,
+        2_000,
+    )
+    .expect("the invite's own root serves from the commit log");
     assert_eq!(served, retained_projection);
+    assert!(
+        base_roster_fetch::locate_served_base_roster(
+            &info,
+            &requester,
+            &moved_live_root,
+            &secret_hash,
+            2_000
+        )
+        .is_none(),
+        "the CURRENT roster is a different root: this invite never unlocks it"
+    );
 
     // An unknown root serves nothing.
     assert!(base_roster_fetch::locate_served_base_roster(
         &info,
+        &requester,
         &"d1".repeat(32),
         &secret_hash,
         2_000
@@ -658,6 +815,18 @@ async fn concurrent_fetch_keeps_the_first_joins_waiter() -> Result<()> {
     .await
     .expect_err("networkless send cannot reach an inviter");
     assert_eq!(err, "inviter unreachable");
+    // r4 test gap: the failed fetch's OWN waiter is gone (WaiterGuard on
+    // the error exit); only the first join's waiter stays.
+    assert_eq!(
+        joiner
+            .base_roster_fetch_slots
+            .lock()
+            .expect("slots")
+            .get(&format!("{group_id}|{root}"))
+            .map(Vec::len),
+        Some(1),
+        "exactly the first join's waiter survives"
+    );
 
     // The first join's inviter still wakes the first join.
     base_roster_fetch::deliver_base_roster(&joiner, &inviter_a, &group_id, &root, &roster);
@@ -679,11 +848,22 @@ async fn dispatch_drops_base_roster_fetch_from_mismatched_sender() -> Result<()>
     let stable = info.stable_group_id().to_string();
     let member = AgentId([9u8; 32]);
     let member_hex = hex::encode(member.as_bytes());
+    // r4 item 5: authorization runs BEFORE the admission ticket, so the
+    // control case needs a real live invite bound to the requested root.
+    let live_root = roster_root_of_projection(&roster_projection_digest_only(&info.members_v2));
+    let secret = "ab".repeat(32);
+    let secret_hash = hex::encode(blake3::hash(&hex::decode(&secret)?).as_bytes());
+    {
+        let mut groups = inviter.named_groups.write().await;
+        let info = groups.get_mut(&group_id).context("seeded group")?;
+        info.record_issued_invite(secret.clone(), 1_000, 0, x0x::groups::GroupRole::Member);
+        info.bind_issued_invite_base_roster_root(&secret, Some(live_root.clone()));
+    }
     let fetch = || JoinResultMessage::BaseRosterFetch {
         group_id: group_id.clone(),
         member_agent_id: member_hex.clone(),
-        roster_root: "00".repeat(32),
-        secret_hash: "11".repeat(32),
+        roster_root: live_root.clone(),
+        secret_hash: secret_hash.clone(),
     };
 
     // Mismatched sender: consumed, nothing admitted.
@@ -693,6 +873,18 @@ async fn dispatch_drops_base_roster_fetch_from_mismatched_sender() -> Result<()>
 
     // Review r3 item 5: an UNVERIFIED sender gets no serve either.
     assert!(dispatch_join_result_message(&inviter, &member, false, fetch()).await);
+    assert_eq!(inviter.join_result_fetch_admission.in_flight(), 0);
+
+    // r4 item 5: a verified, matched sender WITHOUT a live invite for the
+    // requested root is refused BEFORE any admission ticket is taken, so
+    // it cannot hold a slot another member's fetch needs.
+    let unauthorized = JoinResultMessage::BaseRosterFetch {
+        group_id: group_id.clone(),
+        member_agent_id: member_hex.clone(),
+        roster_root: "00".repeat(32),
+        secret_hash: "11".repeat(32),
+    };
+    assert!(dispatch_join_result_message(&inviter, &member, true, unauthorized).await);
     assert_eq!(inviter.join_result_fetch_admission.in_flight(), 0);
 
     // Control: the verified member IS admitted — the spawned serve's
