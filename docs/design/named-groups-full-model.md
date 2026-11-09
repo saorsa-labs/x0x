@@ -874,8 +874,8 @@ so past the cap they refuse at mint, as before #646.
 `import_card_into_groups` inserts an inert local row: owner-only authority
 roster, no importer seat, `shared_secret = None`, `secret_epoch = 0`, no
 invite lineage / MLS group. That shape classifies as
-`InertCardImportStub` (not general `JoinFailed`). After full v4 invite
-verification, when the invite's stable group id equals the stub genesis
+`InertCardImportStub` (not general `JoinFailed`). After full v4 or v6
+invite verification, when the invite's stable group id equals the stub genesis
 `group_id`, join clears that metadata under the same write-locked path as
 `UnseatedJoinRemnant`, then runs the ordinary first join. Card
 `owner_agent_id` / genesis `creator_agent_id` are unauthenticated, so a
