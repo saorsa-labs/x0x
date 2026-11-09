@@ -509,6 +509,58 @@ fn pending_slot_bound_is_enforced() {
     );
 }
 
+/// WHY: ADR 0080 §3 retry semantics — ONE successful send publishes
+/// exactly once (never republished), and a local error is retried up to
+/// `1 + GRANT_REVOCATION_PUSH_SEND_RETRIES` attempts in total, stopping
+/// at the first success.
+#[tokio::test]
+async fn push_send_retries_only_on_local_error() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    // One success: exactly one call.
+    let calls = AtomicU32::new(0);
+    let sent: Result<(), String> = super::send_push_with_local_retries(|_| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        async { Ok(()) }
+    })
+    .await;
+    assert!(sent.is_ok());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a successful send publishes exactly once"
+    );
+
+    // Local errors retry; the first success stops the loop.
+    let calls = AtomicU32::new(0);
+    let sent: Result<(), String> = super::send_push_with_local_retries(|attempt| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        async move {
+            if attempt < 2 {
+                Err("local send error".to_string())
+            } else {
+                Ok(())
+            }
+        }
+    })
+    .await;
+    assert!(sent.is_ok());
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+    // Persistent local errors stop at 1 + retries attempts.
+    let calls = AtomicU32::new(0);
+    let sent: Result<(), String> = super::send_push_with_local_retries(|_| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        async { Err("local send error".to_string()) }
+    })
+    .await;
+    assert!(sent.is_err());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1 + u32::from(GRANT_REVOCATION_PUSH_SEND_RETRIES)
+    );
+}
+
 /// WHY: wire pinning — the prefix bytes and the payload-capability mapping
 /// are frozen once released; the capability bit is positive-evidence
 /// gated, so `required_for_payload` must also know the prefix (defence in

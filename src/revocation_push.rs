@@ -57,8 +57,11 @@ pub const GRANT_REVOCATION_PUSH_PREFIX: &[u8] = b"x0x-grant-revocation-push-v1\0
 /// fields, no reason text); the bound leaves room for a bounded reason.
 pub const MAX_GRANT_REVOCATION_PUSH_BYTES: usize = 8 * 1024;
 
-/// Send-layer retries for one push attempt (total attempts = 1 + retries).
-/// The sender retries only on a local send error and waits for no ACK.
+/// Retries after the first send attempt (total attempts = 1 + retries).
+/// ADR 0080 §3: the sender retries ONLY on a local send error and waits
+/// for no ACK — a send that returns success ends the push, so the send
+/// layer itself runs with `max_retries: 0` (it would republish even after
+/// a successful publish) and the retry loop lives in this module.
 pub const GRANT_REVOCATION_PUSH_SEND_RETRIES: u8 = 2;
 
 /// At most this many pushes may be pending in memory at a time; one over
@@ -449,18 +452,34 @@ async fn push_grant_revocation_to(
         }
     }
     let config = crate::dm::DmSendConfig {
-        max_retries: GRANT_REVOCATION_PUSH_SEND_RETRIES,
-        // No ACK of any kind is waited for: a send that returns success
-        // ends this push (ADR 0080 §3).
+        // ADR 0080 §3: no ACK of any kind is waited for, and a send that
+        // returns success ends this push. The send layer's own retry loop
+        // republishes even after a successful publish when no ACK is
+        // required, so it is OFF here; local-error retries run below.
+        max_retries: 0,
         require_gossip_ack: false,
         require_durable_app_ack: false,
         prefer_raw_quic_if_connected: true,
         ..crate::dm::DmSendConfig::default()
     };
-    match agent
-        .send_direct_with_config(&recipient, payload, config)
-        .await
-    {
+    let sent = send_push_with_local_retries(|attempt| {
+        let payload = payload.clone();
+        let config = config.clone();
+        async move {
+            if attempt > 0 {
+                tracing::debug!(
+                    recipient = %hex::encode(recipient.as_bytes()),
+                    attempt,
+                    "grant revocation push retrying after a local send error"
+                );
+            }
+            agent
+                .send_direct_with_config(&recipient, payload, config)
+                .await
+        }
+    })
+    .await;
+    match sent {
         Ok(_) => tracing::info!(
             recipient = %hex::encode(recipient.as_bytes()),
             "grant revocation pushed"
@@ -469,6 +488,25 @@ async fn push_grant_revocation_to(
             recipient = %hex::encode(recipient.as_bytes()),
             "grant revocation push send failed (gossip remains the backstop): {e}"
         ),
+    }
+}
+
+/// Run `send` until it returns `Ok`, retrying ONLY on an error, at most
+/// `1 + GRANT_REVOCATION_PUSH_SEND_RETRIES` attempts in total (ADR 0080
+/// §3: one successful send ends the push — it is never republished).
+/// `send` receives the 0-based attempt number.
+async fn send_push_with_local_retries<F, Fut, T, E>(mut send: F) -> Result<T, E>
+where
+    F: FnMut(u8) -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let mut attempt: u8 = 0;
+    loop {
+        match send(attempt).await {
+            Ok(value) => return Ok(value),
+            Err(e) if attempt >= GRANT_REVOCATION_PUSH_SEND_RETRIES => return Err(e),
+            Err(_) => attempt += 1,
+        }
     }
 }
 
