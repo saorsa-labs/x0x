@@ -1671,6 +1671,26 @@ where
     deliver_grant_via_classified(grant, None, &classified, outbox, revocations, now, send).await
 }
 
+/// ADR 0079 §1 "Who gets v2": `(recipient, use_v2)` for each recipient. A
+/// recipient gets the names-carrying v2 envelope only when an envelope
+/// exists, the recipient is grantee-side (never a shared-agent daemon), and
+/// `names_bit` reports a current verified advert that sets bit 14
+/// (`Some(true)`). No advert (`None`) or an advert without the bit
+/// (`Some(false)`) gets v1, so old peers never see the new prefix.
+pub fn choose_grant_envelopes(
+    recipients: &[GrantRecipient],
+    has_envelope: bool,
+    names_bit: impl Fn(&AgentId) -> Option<bool>,
+) -> Vec<(AgentId, bool)> {
+    recipients
+        .iter()
+        .map(|r| {
+            let use_v2 = has_envelope && r.grantee_side && names_bit(&r.agent) == Some(true);
+            (r.agent, use_v2)
+        })
+        .collect()
+}
+
 /// [`deliver_grant_via`] with the ADR 0079 per-recipient envelope choice:
 /// a recipient flagged `true` is sent the v2 names-carrying payload built
 /// from `envelope` (which must be present and must wrap this `grant`);
@@ -1949,7 +1969,9 @@ impl crate::Agent {
 
     /// [`Self::share_grant_recipients`], with each recipient classified for
     /// ADR 0079: `grantee_side` recipients may get the names-carrying v2
-    /// envelope; shared-agent daemons and `extra` recipients always get v1.
+    /// envelope; shared-agent daemons always get v1. An `extra` recipient
+    /// is grantee-side only when it is itself one of the grantee's agents;
+    /// any other `extra` recipient gets v1.
     pub async fn share_grant_recipients_classified(
         &self,
         grant: &ShareGrant,
@@ -2038,19 +2060,7 @@ impl crate::Agent {
         recipients: &[GrantRecipient],
         envelope: Option<&names::ShareGrantV2>,
     ) -> Vec<GrantDelivery> {
-        let capability_store = self.capability_store();
-        let classified: Vec<(AgentId, bool)> = recipients
-            .iter()
-            .map(|r| {
-                let use_v2 = r.grantee_side
-                    && envelope.is_some()
-                    && capability_store.verified_registry_supports(
-                        &r.agent,
-                        crate::dm::CapabilityRegistry::SHARE_GRANT_NAMES_V1,
-                    ) == Some(true);
-                (r.agent, use_v2)
-            })
-            .collect();
+        let classified = self.grant_envelope_choice(recipients, envelope.is_some());
         let outbox = self.share_grant_outbox();
         deliver_grant_via_classified(
             grant,
@@ -2064,6 +2074,23 @@ impl crate::Agent {
             },
         )
         .await
+    }
+
+    /// The envelope each recipient gets ([`choose_grant_envelopes`]), with
+    /// this daemon's verified capability adverts as the bit-14 evidence.
+    #[must_use]
+    pub fn grant_envelope_choice(
+        &self,
+        recipients: &[GrantRecipient],
+        has_envelope: bool,
+    ) -> Vec<(AgentId, bool)> {
+        let capability_store = self.capability_store();
+        choose_grant_envelopes(recipients, has_envelope, |agent| {
+            capability_store.verified_registry_supports(
+                agent,
+                crate::dm::CapabilityRegistry::SHARE_GRANT_NAMES_V1,
+            )
+        })
     }
 
     /// One durable typed-DM grant send; `Ok` only on the durable v2 ACK.

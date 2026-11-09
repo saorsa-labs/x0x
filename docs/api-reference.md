@@ -3503,9 +3503,13 @@ a typed `403`.
   the local profile and needs no enrollment record) to capable grantees. The daemon signs the names with
   the owner user key and sends the `x0x-sharegrant-v2\0` envelope ONLY to a
   grantee-side recipient whose current verified advert sets ADR 0093 bit 14
-  (`share_grant_names_v1`); shared-agent daemons, `deliver_to` recipients
-  and grantees without the bit always get the unchanged v1 payload. `false`
-  withholds both names (the CLI's `--no-names`).
+  (`share_grant_names_v1`). Shared-agent daemons, `deliver_to` recipients
+  that are not one of the grantee's agents, and grantees without the bit
+  get the unchanged v1 payload. A `deliver_to` agent that is itself one of
+  the grantee's agents is grantee-side, so it gets v2 when it sets bit 14.
+  `false` withholds both names (the CLI's `--no-names`), and every
+  recipient gets v1. The issuing daemon's own machine is always named from
+  the local profile `machine_name`, never from a synced record.
 
 An install with no owner identity (user key) answers `409`.
 

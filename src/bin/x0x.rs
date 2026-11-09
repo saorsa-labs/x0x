@@ -3970,6 +3970,26 @@ mod tests {
         Ok(())
     }
 
+    /// WHY (ADR 0079, #1831 review): `x0x grant issue --no-names` reaches
+    /// the command as `no_names = true`; without the flag it is `false`.
+    #[test]
+    fn grant_issue_no_names_flag_parses() -> anyhow::Result<()> {
+        for (args, expected) in [
+            (vec!["x0x", "grant", "issue", "{}", "--no-names"], true),
+            (vec!["x0x", "grant", "issue", "{}"], false),
+        ] {
+            let cli = Cli::try_parse_from(args)?;
+            let Commands::Grant {
+                sub: GrantSub::Issue { no_names, .. },
+            } = cli.command
+            else {
+                anyhow::bail!("expected grant issue");
+            };
+            assert_eq!(no_names, expected);
+        }
+        Ok(())
+    }
+
     #[test]
     fn bare_ws_alias_parses_without_nested_subcommand() -> anyhow::Result<()> {
         let cli = Cli::try_parse_from(["x0x", "ws"])?;

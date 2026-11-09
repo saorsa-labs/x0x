@@ -888,3 +888,55 @@ fn share_grant_names_v1_is_registry_bit_14() {
         "the v2 envelope has its own bit"
     );
 }
+
+/// WHY (ADR 0079 §1 "Who gets v2", #1831 review): the bit-14 gate the
+/// daemon uses. Only a grantee-side recipient with a verified advert that
+/// sets bit 14 gets v2. A grantee whose advert lacks the bit, a grantee
+/// with no verified advert, and a shared-agent daemon get v1, and with no
+/// envelope everyone gets v1. An inverted or always-true gate fails here.
+#[test]
+fn envelope_choice_gives_v2_only_to_a_bit_14_grantee() {
+    use crate::share_grant::{choose_grant_envelopes, GrantRecipient};
+    let with_bit = AgentId([0x01; 32]);
+    let without_bit = AgentId([0x02; 32]);
+    let no_advert = AgentId([0x03; 32]);
+    let shared = AgentId([0x04; 32]);
+    let recipients = [
+        GrantRecipient {
+            agent: with_bit,
+            grantee_side: true,
+        },
+        GrantRecipient {
+            agent: without_bit,
+            grantee_side: true,
+        },
+        GrantRecipient {
+            agent: no_advert,
+            grantee_side: true,
+        },
+        GrantRecipient {
+            agent: shared,
+            grantee_side: false,
+        },
+    ];
+    let adverts = |agent: &AgentId| match agent.0[0] {
+        0x01 | 0x04 => Some(true),
+        0x02 => Some(false),
+        _ => None,
+    };
+    assert_eq!(
+        choose_grant_envelopes(&recipients, true, adverts),
+        vec![
+            (with_bit, true),
+            (without_bit, false),
+            (no_advert, false),
+            (shared, false),
+        ]
+    );
+    assert!(
+        choose_grant_envelopes(&recipients, false, adverts)
+            .iter()
+            .all(|(_, v2)| !v2),
+        "no envelope: every recipient gets v1"
+    );
+}
