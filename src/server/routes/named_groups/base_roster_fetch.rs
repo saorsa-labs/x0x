@@ -207,12 +207,18 @@ pub(in crate::server) fn deliver_base_roster(
         return;
     }
     // r4 item 8: the root encoding joins entries without a length prefix,
-    // so entry keys and states are validated structurally — ids are
-    // strict 64 lowercase hex, and a base projection carries only Active
-    // and Banned seats (what the inline v4 carrier holds).
+    // so every encoded field is validated structurally to keep the v6
+    // root encoding injective — ids and certificate digests are strict
+    // 64 lowercase hex, the role is a known role (an `Unknown` role
+    // encodes as a sentinel byte that no committed roster carries), and
+    // a base projection carries only Active and Banned seats (what the
+    // inline v4 carrier holds).
+    let is_hex64 =
+        |s: &str| s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
     let well_formed = roster.iter().all(|(id, snap)| {
-        id.len() == 64
-            && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        is_hex64(id)
+            && snap.certificate_digest.as_deref().is_none_or(is_hex64)
+            && snap.role != x0x::groups::GroupRole::Unknown
             && matches!(
                 snap.state,
                 x0x::groups::GroupMemberState::Active | x0x::groups::GroupMemberState::Banned
@@ -221,7 +227,7 @@ pub(in crate::server) fn deliver_base_roster(
     if !well_formed {
         tracing::debug!(
             group_id = %LogHexId::group(group_id),
-            "dropped base-roster reply with malformed entry keys or states"
+            "dropped base-roster reply with malformed entry keys, digests, roles or states"
         );
         return;
     }

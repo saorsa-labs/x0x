@@ -470,6 +470,111 @@ async fn deliver_admits_only_the_expected_inviters_reply_and_caches_nothing() ->
     Ok(())
 }
 
+/// #1828 review: the v6 roster-root encoding joins entries without a
+/// length prefix, so delivery validates the certificate digest (64
+/// lowercase hex) and the role (a known role) as well as ids and states.
+/// A served reply carrying a malformed digest or an unknown role is
+/// refused — the waiting join is NOT woken and nothing is installed —
+/// even though the payload re-derives the very root the join waits on.
+#[tokio::test]
+async fn deliver_refuses_malformed_digest_or_role() -> Result<()> {
+    let (joiner, _dir) = daemon_state().await?;
+    let group_id = "af".repeat(32);
+    let inviter = AgentId([7u8; 32]);
+    let base = |role, digest: Option<String>| -> base_roster_fetch::BaseRosterProjection {
+        (0..3)
+            .map(|i| {
+                (
+                    format!("{i:064x}"),
+                    RosterMemberSnapshot {
+                        role: if i == 1 {
+                            role
+                        } else {
+                            x0x::groups::GroupRole::Member
+                        },
+                        state: x0x::groups::GroupMemberState::Active,
+                        treekem_key_package_hash: None,
+                        certificate_digest: if i == 1 { digest.clone() } else { None },
+                        certificate: None,
+                    },
+                )
+            })
+            .collect()
+    };
+    let cases = [
+        (
+            "short digest with an entry separator",
+            base(x0x::groups::GroupRole::Member, Some("ab|cd".to_string())),
+        ),
+        (
+            "uppercase digest",
+            base(x0x::groups::GroupRole::Member, Some("AB".repeat(32))),
+        ),
+        (
+            "unknown role",
+            base(x0x::groups::GroupRole::Unknown, Some("ab".repeat(32))),
+        ),
+    ];
+    for (label, roster) in cases {
+        // The payload re-derives its own root, so only the structural
+        // check can refuse it.
+        let root = roster_root_of_projection(&roster);
+        let key = format!("{group_id}|{root}");
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        joiner
+            .base_roster_fetch_slots
+            .lock()
+            .expect("slots")
+            .insert(
+                key.clone(),
+                vec![base_roster_fetch::BaseRosterWaiter::for_test(
+                    inviter, sender,
+                )],
+            );
+        base_roster_fetch::deliver_base_roster(&joiner, &inviter, &group_id, &root, &roster);
+        assert!(
+            receiver.try_recv().is_err(),
+            "{label}: a malformed reply must not wake the join"
+        );
+        assert_eq!(
+            joiner
+                .base_roster_fetch_slots
+                .lock()
+                .expect("slots")
+                .get(&key)
+                .map(Vec::len),
+            Some(1),
+            "{label}: the join keeps waiting; nothing is installed"
+        );
+        joiner
+            .base_roster_fetch_slots
+            .lock()
+            .expect("slots")
+            .remove(&key);
+    }
+
+    // Control: the same shape with a well-formed digest and role is served.
+    let roster = base(x0x::groups::GroupRole::Admin, Some("ab".repeat(32)));
+    let root = roster_root_of_projection(&roster);
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    joiner
+        .base_roster_fetch_slots
+        .lock()
+        .expect("slots")
+        .insert(
+            format!("{group_id}|{root}"),
+            vec![base_roster_fetch::BaseRosterWaiter::for_test(
+                inviter, sender,
+            )],
+        );
+    base_roster_fetch::deliver_base_roster(&joiner, &inviter, &group_id, &root, &roster);
+    assert_eq!(
+        receiver.await.expect("a well-formed reply wakes the join"),
+        base_roster_fetch::BaseRosterFetchReply::Served(roster)
+    );
+    Ok(())
+}
+
 /// Review r3 blocker 1: the roster root does NOT commit
 /// `treekem_key_package_hash`, so a served anchor is whatever the sender
 /// chose — a fetched projection reaches the join with every anchor (and

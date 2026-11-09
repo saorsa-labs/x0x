@@ -1966,7 +1966,7 @@ pub(in crate::server) async fn seat_home(
 
     // Mint through the EXISTING invite authority (`POST /groups/:id/invite`)
     // rather than a parallel path: the live-cap, the owner-axis durable
-    // fence, the signed v4 assembly, the recorded secret and the durable
+    // fence, the signed v4/v6 assembly, the recorded secret and the durable
     // persist are one transaction there, and a second mint surface would be
     // a second place for that transaction to drift.
     let mut headers = axum::http::HeaderMap::new();
