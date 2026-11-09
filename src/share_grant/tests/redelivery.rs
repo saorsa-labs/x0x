@@ -844,14 +844,19 @@ impl PausedSend {
 }
 
 /// Shared body of the two race tests: with a send of `grant` paused in
-/// flight, `revoke` (polled exactly once) must NOT be able to complete —
-/// it must wait at the #926 barrier until the pass has finished, so no new
-/// send or enqueue of the grant can follow its return. Deterministic: a
-/// single `now_or_never` poll, no timers. With the barrier removed, that
-/// one poll runs the revoke's insert to completion and an assertion fails.
+/// flight, `revoke` must NOT be able to complete — it must park at the
+/// #926 barrier until the pass has finished, so no new send or enqueue of
+/// the grant can follow its return. The revoke is DRIVEN concurrently for
+/// 250 ms, not poked with one poll: a single `Pending` poll proves nothing
+/// here, because without the barrier the first poll parks in the persist
+/// (the in-process write lock plus fs I/O on the blocking pool) and then
+/// completes. With the barrier it can NEVER finish while the pass holds
+/// the gate, however long it is driven; with the barrier removed (the
+/// case-7 mutation: drop 6b, or the local barrier) it finishes during the
+/// pause and the select panics.
 ///
-/// `in_force_during_wait` pins what that one poll did to the in-memory
-/// set: a LOCAL revoke takes the gate BEFORE it records (ADR 0077), so the
+/// `in_force_during_wait` pins what the drive did to the in-memory set: a
+/// LOCAL revoke takes the gate BEFORE it records (ADR 0077), so the
 /// revocation is NOT in force while it waits; a remote carrier (gossip or
 /// the #1003 push) inserts in memory first and waits in step 6b
 /// (ADR 0080 §4 / D139), so it IS already in force.
@@ -879,10 +884,12 @@ async fn assert_revoke_waits_for_in_flight_send<R>(
     );
 
     tokio::pin!(revoke);
-    assert!(
-        revoke.as_mut().now_or_never().is_none(),
-        "the revoke must wait at the barrier until the in-flight pass ends"
-    );
+    tokio::select! {
+        () = revoke.as_mut() => {
+            panic!("the revoke completed while a send of the grant was in flight")
+        }
+        () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+    }
     assert_eq!(
         world
             .revocations

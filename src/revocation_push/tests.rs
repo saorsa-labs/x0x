@@ -292,6 +292,96 @@ async fn pushed_record_is_a_gossip_duplicate() {
     assert!(!inserted, "a pushed record is a gossip duplicate");
 }
 
+/// WHY: ADR 0080 validation case 7 for the PUSH carrier — a pushed
+/// revocation inserts in memory at once (6a: in force while a redelivery
+/// send of the grant is still in flight) and then parks at the #926 send
+/// gate (6b): the handler cannot return until the in-flight pass has
+/// finished, so no new send or enqueue of the grant can follow it. The
+/// handler is DRIVEN for 250 ms while the send is paused — a single
+/// `Pending` poll would pass without 6b, because the persist alone (the
+/// in-process write lock plus fs I/O) makes the first poll pend and then
+/// completes. With 6b removed, the handler finishes during the pause and
+/// the select panics.
+#[tokio::test]
+async fn pushed_revoke_parks_at_the_outbox_gate_until_the_in_flight_send_ends() {
+    use futures::FutureExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let owner = UserKeypair::generate().expect("owner key");
+    let grantee = AgentId([0xC1; 32]);
+    let shared = AgentId([0xC3; 32]);
+    let grant_id = [0x60; 32];
+    let now = now_unix();
+    let grant = crate::share_grant::ShareGrant::sign(
+        &owner,
+        grant_id,
+        crate::share_grant::Grantee::Agent(grantee),
+        vec![shared],
+        vec![crate::share_grant::ShareCap::Dm],
+        0,
+        now + 3_600,
+    )
+    .expect("sign grant");
+    let receiver = Receiver::new();
+    let outbox = std::sync::Arc::new(
+        crate::share_grant::outbox::GrantRedeliveryOutbox::in_memory(Some(owner.user_id())),
+    );
+    assert!(outbox
+        .enqueue(&grant, grantee, now, &receiver.set)
+        .await
+        .expect("enqueue"));
+    receiver
+        .owner_trust
+        .install_share_grant_outbox(std::sync::Arc::clone(&outbox));
+
+    // A redelivery pass of the grant with its one send paused in flight:
+    // the pass holds the #926 send gate shared until `release` fires.
+    let entered = AtomicBool::new(false);
+    let release = tokio::sync::Notify::new();
+    let due = now + crate::share_grant::outbox::retry_delay_secs(0);
+    let step = outbox.step(due, &receiver.set, |_recipient, _payload, _id| async {
+        entered.store(true, Ordering::SeqCst);
+        release.notified().await;
+        Ok(())
+    });
+    tokio::pin!(step);
+    assert!(step.as_mut().now_or_never().is_none());
+    assert!(
+        entered.load(Ordering::SeqCst),
+        "control: the send is in flight"
+    );
+
+    let record = signed_record(&owner, grant_id, now + 3_600);
+    let payload = encode_grant_revocation_push(&record).expect("encode");
+    let push = receiver.handle(AgentId([0x08; 32]), &payload);
+    tokio::pin!(push);
+    tokio::select! {
+        outcome = push.as_mut() => {
+            panic!("the push handler returned while a send of the grant was in flight: {outcome:?}")
+        }
+        () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+    }
+    // 6a: the pushed revocation is already in force in memory during the
+    // 6b wait.
+    assert!(receiver
+        .set
+        .read()
+        .await
+        .is_share_grant_revoked(&grant_id, &owner.user_id()));
+
+    release.notify_one();
+    let _ = step.await; // the in-flight send returns (its outcome is not the contract)
+    assert_eq!(push.await, PushOutcome::Ingested { inserted: true });
+
+    // From here on nothing of this grant can be queued again.
+    assert_eq!(
+        outbox
+            .enqueue(&grant, AgentId([0xC2; 32]), now, &receiver.set)
+            .await,
+        Err(crate::share_grant::outbox::OutboxError::Revoked),
+        "a revoked grant can no longer be queued"
+    );
+}
+
 /// WHY: ADR 0080 §4 step 5 — at most 16 pushes per minute from one
 /// sender and 256 in total; the excess is dropped, not queued.
 #[test]
