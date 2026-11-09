@@ -51,7 +51,9 @@ ADR. See the [current authoring rule](../transient/README.md).
 
 `python3 scripts/check-adr-count.py` counts the current records; the limit is
 15. `python3 scripts/check-adr-consolidation.py` keeps the set at exactly 15
-Accepted slots. A numbered ADR in the [transfer map](TRANSFER.md) keeps its
+Accepted slots, and each slot's bytes must match the sha256 recorded in
+`index.json`: a change to an accepted slot needs David's ruling and the
+updated hash in the same PR. A numbered ADR in the [transfer map](TRANSFER.md) keeps its
 `docs/adr/` path as a link; its bytes live in `docs/adr-archive/` and stay
 outside the count. Files under `docs/adr/transient/` do not count (D242).
 Another numbered ADR outside that directory, or an A16 record, makes the
