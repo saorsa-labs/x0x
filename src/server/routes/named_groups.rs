@@ -49487,6 +49487,16 @@ pub(in crate::server) const JOIN_RESULT_FETCH_HANDLER_CAP: usize = 32;
 /// runs in registered tasks under the artifact's deadline.
 const JOIN_RESULT_FETCH_HANDLER_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// #646 (review r6): a group's share of base-roster serve handlers. The
+/// pool is SEPARATE from [`JOIN_RESULT_FETCH_PER_GROUP_CAP`] and the
+/// coalescing key is the invite's SECRET HASH, so any number of cheap
+/// agent ids holding one bearer card coalesce to one in-flight serve per
+/// invite and can never starve a group's join-result fetch recovery.
+pub(in crate::server) const BASE_ROSTER_SERVE_PER_GROUP_CAP: usize = 2;
+
+/// #646 (review r6): node-wide bound on concurrent base-roster serves.
+pub(in crate::server) const BASE_ROSTER_SERVE_HANDLER_CAP: usize = 8;
+
 /// The join-result listener's entry point (ADR 0107 r5, G7). A
 /// `FetchRequest` can wait on its group's membership lock (and runs the
 /// owner-certificate retry), so it never runs on the shared listener: it is
@@ -49617,17 +49627,15 @@ pub(in crate::server) async fn dispatch_join_result_message(
                     (stable_group, Some(roster))
                 }
             };
-            // Review r3 item 5: the coalescing key is PREFIXED so a
-            // base-roster fetch never occupies (or is refused as a
-            // Duplicate of) the same slot as a `FetchRequest` for the
-            // same (group, member).
-            let ticket = match state.join_result_fetch_admission.try_admit(
-                &format!(
-                    "base-roster|{}",
-                    join_result_key(&stable_group, member_agent_id)
-                ),
-                &stable_group,
-            ) {
+            // r3 item 5 → r6 major 3: base-roster serves take their OWN
+            // admission pool, never a join-result fetch recovery slot.
+            // The coalescing key is the invite's SECRET HASH, so any
+            // number of agent ids holding one bearer card coalesce to one
+            // in-flight serve per invite.
+            let ticket = match state
+                .base_roster_serve_admission
+                .try_admit(&format!("{stable_group}|{secret_hash}"), &stable_group)
+            {
                 Ok(ticket) => ticket,
                 Err(refusal) => {
                     tracing::debug!(
@@ -53567,6 +53575,10 @@ pub(in crate::server) mod tests {
             join_result_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
                 crate::server::routes::named_groups::JOIN_RESULT_FETCH_PER_GROUP_CAP,
                 crate::server::routes::named_groups::JOIN_RESULT_FETCH_HANDLER_CAP,
+            ),
+            base_roster_serve_admission: crate::server::routes::named_groups::FairAdmission::new(
+                crate::server::routes::named_groups::BASE_ROSTER_SERVE_PER_GROUP_CAP,
+                crate::server::routes::named_groups::BASE_ROSTER_SERVE_HANDLER_CAP,
             ),
             join_result_chunk_admission: crate::server::routes::named_groups::FairAdmission::new(
                 crate::server::routes::named_groups::JOIN_RESULT_CHUNK_PER_GROUP_CAP,

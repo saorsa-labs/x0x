@@ -903,18 +903,36 @@ async fn dispatch_drops_base_roster_fetch_from_mismatched_sender() -> Result<()>
     assert!(dispatch_join_result_message(&inviter, &member, true, unauthorized).await);
     assert_eq!(inviter.join_result_fetch_admission.in_flight(), 0);
 
-    // Control: the verified member IS admitted — the spawned serve's
-    // ticket (unpolled on this current-thread runtime) blocks a duplicate
-    // base-roster fetch, while a `FetchRequest` for the same (group,
-    // member) keeps its OWN coalescing slot (review r3 item 5).
+    // Control (r6 major 3): the verified, authorized member is admitted
+    // on the base-roster pool's OWN slot — join-result fetch recovery is
+    // untouched, so cheap agent ids holding one bearer card can never
+    // starve it. The serve's ticket (unpolled on this current-thread
+    // runtime) coalesces every further request for the SAME invite
+    // (secret hash), whoever sends it.
     assert!(dispatch_join_result_message(&inviter, &member, true, fetch()).await);
-    assert!(inviter
-        .join_result_fetch_admission
-        .try_admit(
-            &format!("base-roster|{}", join_result_key(&stable, &member_hex)),
-            &stable
-        )
-        .is_err());
+    assert_eq!(
+        inviter.join_result_fetch_admission.in_flight(),
+        0,
+        "a base-roster serve must hold NO join-result fetch slot"
+    );
+    assert_eq!(inviter.base_roster_serve_admission.in_flight(), 1);
+    // A second agent id bearing the SAME invite coalesces: nothing more
+    // is admitted while the first serve is in flight.
+    let second = AgentId([10u8; 32]);
+    let second_hex = hex::encode(second.as_bytes());
+    let second_fetch = JoinResultMessage::BaseRosterFetch {
+        group_id: group_id.clone(),
+        member_agent_id: second_hex,
+        roster_root: live_root.clone(),
+        secret_hash: secret_hash.clone(),
+    };
+    assert!(dispatch_join_result_message(&inviter, &second, true, second_fetch).await);
+    assert_eq!(
+        inviter.base_roster_serve_admission.in_flight(),
+        1,
+        "one in-flight serve per invite (coalesced by secret hash)"
+    );
+    // Join-result fetch recovery still has its full share.
     let fetch_request_slot = inviter
         .join_result_fetch_admission
         .try_admit(&join_result_key(&stable, &member_hex), &stable)

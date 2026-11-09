@@ -1320,6 +1320,10 @@ pub async fn serve_with_options(
             crate::server::routes::named_groups::JOIN_RESULT_FETCH_PER_GROUP_CAP,
             crate::server::routes::named_groups::JOIN_RESULT_FETCH_HANDLER_CAP,
         ),
+        base_roster_serve_admission: crate::server::routes::named_groups::FairAdmission::new(
+            crate::server::routes::named_groups::BASE_ROSTER_SERVE_PER_GROUP_CAP,
+            crate::server::routes::named_groups::BASE_ROSTER_SERVE_HANDLER_CAP,
+        ),
         join_result_chunk_admission: crate::server::routes::named_groups::FairAdmission::new(
             crate::server::routes::named_groups::JOIN_RESULT_CHUNK_PER_GROUP_CAP,
             crate::server::routes::named_groups::JOIN_RESULT_CHUNK_TASK_CAP,

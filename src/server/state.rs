@@ -1067,6 +1067,11 @@ pub(super) struct AppState {
     /// listener: one in-flight handler per `(group, member)`, a per-group
     /// share and a global cap.
     pub(super) join_result_fetch_admission: crate::server::routes::named_groups::FairAdmission,
+    /// #646 (review r6): fair, coalescing admission for base-roster serve
+    /// handlers — its OWN pool (never shared with join-result fetch
+    /// recovery), coalesced per invite by the secret hash, with a small
+    /// per-group share and global cap.
+    pub(super) base_roster_serve_admission: crate::server::routes::named_groups::FairAdmission,
     /// ADR 0107 (r5 G8): fair, coalescing admission for join-result chunk
     /// tasks: one in-flight task per chunk, a per-group share and a global
     /// cap. A fetch is validated (staged copy, existing sequence) first.
