@@ -1304,6 +1304,7 @@ pub async fn serve_with_options(
         profile_path,
         mls_groups_path,
         pending_join_results: RwLock::new(HashMap::new()),
+        base_roster_fetch_slots: StdMutex::new(HashMap::new()),
         expected_join_result_inviters: StdMutex::new(HashMap::new()),
         pending_welcomes: RwLock::new(HashMap::new()),
         pending_welcome_receives: RwLock::new(HashMap::new()),
@@ -1322,6 +1323,10 @@ pub async fn serve_with_options(
         join_result_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
             crate::server::routes::named_groups::JOIN_RESULT_FETCH_PER_GROUP_CAP,
             crate::server::routes::named_groups::JOIN_RESULT_FETCH_HANDLER_CAP,
+        ),
+        base_roster_serve_admission: crate::server::routes::named_groups::FairAdmission::new(
+            crate::server::routes::named_groups::BASE_ROSTER_SERVE_PER_GROUP_CAP,
+            crate::server::routes::named_groups::BASE_ROSTER_SERVE_HANDLER_CAP,
         ),
         join_result_chunk_admission: crate::server::routes::named_groups::FairAdmission::new(
             crate::server::routes::named_groups::JOIN_RESULT_CHUNK_PER_GROUP_CAP,
