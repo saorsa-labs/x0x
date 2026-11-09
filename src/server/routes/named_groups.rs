@@ -7,7 +7,7 @@
 //! server decomposition. The router registrations stay in the parent module.
 
 mod base_roster_fetch;
-pub(in crate::server) use base_roster_fetch::BaseRosterSlot;
+pub(in crate::server) use base_roster_fetch::BaseRosterWaiter;
 mod control_blob;
 mod direct_metadata_lanes;
 mod fair_admission;
@@ -23769,7 +23769,9 @@ pub(in crate::server) fn assemble_signed_v4_invite(
         &agent_id,
         expiry_secs,
     );
-    super::identity::populate_invite_base_state_v4(&mut invite, info, intended_joiner);
+    // #646: the ordinary mint is v5-capable — past the inline cap the
+    // invite carries the roster's content address instead of the roster.
+    super::identity::populate_invite_base_state(&mut invite, info, intended_joiner);
 
     let owner_axis = info.policy.admission.owner_certified_user_id().copied();
     let user_kp = owner_axis.and_then(|_| state.agent.identity().user_keypair());
@@ -49437,7 +49439,17 @@ pub(in crate::server) async fn dispatch_join_result_message(
             roster_root,
             roster,
         } => {
-            base_roster_fetch::deliver_base_roster(state, group_id, roster_root, roster);
+            // Review r3 (blocker 1): only a VERIFIED sender can answer a
+            // fetch, and the delivery wakes only joins whose invite names
+            // that sender as the inviter. Nothing is cached.
+            if !verified {
+                tracing::debug!(
+                    group_id = %LogHexId::group(group_id),
+                    "ignoring unverified base-roster reply"
+                );
+                return true;
+            }
+            base_roster_fetch::deliver_base_roster(state, sender, group_id, roster_root, roster);
             return true;
         }
         JoinResultMessage::BaseRosterFetch {
@@ -49446,6 +49458,14 @@ pub(in crate::server) async fn dispatch_join_result_message(
             roster_root,
             secret_hash,
         } => {
+            // Review r3 item 5: an unverified sender gets no serve.
+            if !verified {
+                tracing::debug!(
+                    group_id = %LogHexId::group(group_id),
+                    "ignoring unverified base-roster fetch"
+                );
+                return true;
+            }
             let sender_hex = hex::encode(sender.as_bytes());
             if sender_hex != *member_agent_id {
                 tracing::warn!(
@@ -49465,8 +49485,15 @@ pub(in crate::server) async fn dispatch_join_result_message(
                 tracing::debug!(group_id = %LogHexId::group(group_id), "base-roster fetch for an unknown group; dropped");
                 return true;
             };
+            // Review r3 item 5: the coalescing key is PREFIXED so a
+            // base-roster fetch never occupies (or is refused as a
+            // Duplicate of) the same slot as a `FetchRequest` for the
+            // same (group, member).
             let ticket = match state.join_result_fetch_admission.try_admit(
-                &join_result_key(&stable_group, member_agent_id),
+                &format!(
+                    "base-roster|{}",
+                    join_result_key(&stable_group, member_agent_id)
+                ),
                 &stable_group,
             ) {
                 Ok(ticket) => ticket,

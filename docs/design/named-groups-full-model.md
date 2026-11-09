@@ -835,6 +835,28 @@ Notes:
 - card-import stub creation so non-members can submit join requests
 - note: this phase alone is **not** sufficient for real public discovery; Phase C.2 completes that story
 
+#### Content-addressed invites past 20 members (v5, #646)
+
+An invite's inline base-roster projection is capped at 20 Active+Banned
+members (the link budget). Past the cap, `POST /groups/:id/invite` mints
+invite wire **v5**: the link carries the projection's **content address**
+(`base_roster_root`, the same roster root `base_state_hash` commits to)
+and no inline roster. The joiner, after full invite authentication and
+before any local state, asks the INVITER for the projection over two
+`JoinResultMessage` arms (`BaseRosterFetch` / `BaseRoster`), proving
+invite possession with the BLAKE3 of the raw invite secret. The reply is
+admitted only when it is verified, comes from the join's own inviter,
+answers a waiting join, and re-derives the signed root; nothing is
+cached. Because the roster root does not commit
+`treekem_key_package_hash`, fetched projections are certificate-free AND
+anchor-free — the authority's signed commits carry the real anchors.
+While no source answers, the join refuses with a retryable 503
+`base_roster_unavailable` and installs or clears nothing. The fetched
+carrier caps at 128 entries (one reply fits the DM ceiling); a larger
+roster refuses at mint (`invite_too_large`). Re-seat invites (ADR 0109
+§3a) stay inline-v4: their redeem check reads the signed inline roster,
+so past the cap they refuse at mint, as before #646.
+
 #### Card-import stub and verified invite (#1161)
 
 `import_card_into_groups` inserts an inert local row: owner-only authority

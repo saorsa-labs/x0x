@@ -979,10 +979,10 @@ pub(super) struct AppState {
     /// Authority-signed MemberAdded results staged by an anchor for joiner polling.
     pub(super) pending_join_results: RwLock<HashMap<String, PendingJoinResult>>,
     /// #646: per-(stable group, roster root) slots for the content-addressed
-    /// base-roster fetch of v5 invites — a parked joiner waiting for the
-    /// inviter's reply, or a verified reply that arrived first.
+    /// base-roster fetch of v5 invites — the joins parked on that key, each
+    /// bound to the inviter its invite names. Replies are never cached.
     pub(super) base_roster_fetch_slots:
-        StdMutex<HashMap<String, crate::server::routes::named_groups::BaseRosterSlot>>,
+        StdMutex<HashMap<String, Vec<crate::server::routes::named_groups::BaseRosterWaiter>>>,
     /// Expected inviter for a pending TreeKEM join-result response, keyed by
     /// stable group id + joining member id. Transient process-local state.
     pub(super) expected_join_result_inviters: StdMutex<HashMap<String, ExpectedJoinResultInviter>>,

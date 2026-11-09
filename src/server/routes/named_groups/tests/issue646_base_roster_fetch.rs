@@ -229,13 +229,15 @@ async fn locate_served_base_roster_authorizes_and_content_addresses() -> Result<
     Ok(())
 }
 
-/// Joiner-side delivery is content-verified: a reply that does not
-/// re-derive its own root is dropped; a verified reply wakes the parked
-/// join (or parks for one that has not asked yet).
+/// Joiner-side delivery (review r3, blocker 1): a reply that does not
+/// re-derive its own root is dropped; a reply no join is waiting for is
+/// dropped and NEVER cached; a reply from a peer that is not the waiting
+/// join's inviter does not wake it; the inviter's reply does.
 #[tokio::test]
-async fn deliver_verifies_content_wakes_waiter_and_parks_replies() -> Result<()> {
+async fn deliver_admits_only_the_expected_inviters_reply_and_caches_nothing() -> Result<()> {
     let (joiner, _dir) = daemon_state().await?;
     let group_id = "ae".repeat(32);
+    let inviter = AgentId([4u8; 32]);
     let roster: base_roster_fetch::BaseRosterProjection = (0..30)
         .map(|i| {
             (
@@ -253,38 +255,85 @@ async fn deliver_verifies_content_wakes_waiter_and_parks_replies() -> Result<()>
     let root = roster_root_of_projection(&roster);
 
     // Mismatching payload (claims another root) → dropped, nothing parked.
-    base_roster_fetch::deliver_base_roster(&joiner, &group_id, &"d2".repeat(32), &roster);
+    base_roster_fetch::deliver_base_roster(&joiner, &inviter, &group_id, &"d2".repeat(32), &roster);
     assert!(joiner
         .base_roster_fetch_slots
         .lock()
         .expect("slots")
         .is_empty());
 
-    // Verified payload with no waiter → parked; a later obtain consumes it
-    // without any network.
-    base_roster_fetch::deliver_base_roster(&joiner, &group_id, &root, &roster);
+    // A verified payload NO join asked for is dropped, not cached.
+    base_roster_fetch::deliver_base_roster(&joiner, &inviter, &group_id, &root, &roster);
+    assert!(
+        joiner
+            .base_roster_fetch_slots
+            .lock()
+            .expect("slots")
+            .is_empty(),
+        "an unrequested reply must never be cached"
+    );
+
+    // A waiting join is woken ONLY by its own inviter.
+    let (sender, mut receiver) = tokio::sync::oneshot::channel();
+    joiner
+        .base_roster_fetch_slots
+        .lock()
+        .expect("slots")
+        .insert(
+            format!("{group_id}|{root}"),
+            vec![base_roster_fetch::BaseRosterWaiter::for_test(
+                inviter, sender,
+            )],
+        );
+    let outsider = AgentId([5u8; 32]);
+    base_roster_fetch::deliver_base_roster(&joiner, &outsider, &group_id, &root, &roster);
+    assert!(
+        receiver.try_recv().is_err(),
+        "a reply from a peer that is not the join's inviter must not wake it"
+    );
     assert_eq!(
         joiner.base_roster_fetch_slots.lock().expect("slots").len(),
-        1
+        1,
+        "the join keeps waiting for its inviter"
     );
-    let fetched = base_roster_fetch::obtain_base_roster(
-        &joiner,
-        joiner.agent.agent_id(),
-        &group_id,
-        &root,
-        &hex::encode(blake3::hash(&[0u8; 32]).as_bytes()),
-        std::time::Duration::from_millis(200),
-    )
-    .await
-    .expect("parked reply satisfies the fetch");
-    assert_eq!(fetched, roster);
+    base_roster_fetch::deliver_base_roster(&joiner, &inviter, &group_id, &root, &roster);
+    let delivered = receiver.await.expect("the inviter's reply wakes the join");
+    assert_eq!(delivered, roster);
     assert!(joiner
         .base_roster_fetch_slots
         .lock()
         .expect("slots")
         .is_empty());
+    Ok(())
+}
 
-    // A parked waiter is woken directly.
+/// Review r3 blocker 1: the roster root does NOT commit
+/// `treekem_key_package_hash`, so a served anchor is whatever the sender
+/// chose — a fetched projection reaches the join with every anchor (and
+/// certificate) STRIPPED, while still re-deriving the same root.
+#[tokio::test]
+async fn fetched_roster_key_package_anchors_are_stripped() -> Result<()> {
+    let (joiner, _dir) = daemon_state().await?;
+    let group_id = "cb".repeat(32);
+    let inviter = AgentId([6u8; 32]);
+    // The attacker-shaped payload: correct digests, forged anchors.
+    let forged: base_roster_fetch::BaseRosterProjection = (0..5)
+        .map(|i| {
+            (
+                format!("{i:064x}"),
+                RosterMemberSnapshot {
+                    role: x0x::groups::GroupRole::Member,
+                    state: x0x::groups::GroupMemberState::Active,
+                    treekem_key_package_hash: Some("4d".repeat(32)),
+                    certificate_digest: None,
+                    certificate: None,
+                },
+            )
+        })
+        .collect();
+    // The root ignores the anchors, so the forged payload re-derives the
+    // anchor-free root.
+    let root = roster_root_of_projection(&forged);
     let (sender, receiver) = tokio::sync::oneshot::channel();
     joiner
         .base_roster_fetch_slots
@@ -292,11 +341,59 @@ async fn deliver_verifies_content_wakes_waiter_and_parks_replies() -> Result<()>
         .expect("slots")
         .insert(
             format!("{group_id}|{root}"),
-            base_roster_fetch::BaseRosterSlot::Waiter(vec![(0, sender)]),
+            vec![base_roster_fetch::BaseRosterWaiter::for_test(
+                inviter, sender,
+            )],
         );
-    base_roster_fetch::deliver_base_roster(&joiner, &group_id, &root, &roster);
-    let delivered = receiver.await.expect("waiter woken");
-    assert_eq!(delivered, roster);
+    base_roster_fetch::deliver_base_roster(&joiner, &inviter, &group_id, &root, &forged);
+    let delivered = receiver.await.expect("reply delivered");
+    assert!(
+        delivered
+            .values()
+            .all(|snap| snap.treekem_key_package_hash.is_none() && snap.certificate.is_none()),
+        "a fetched projection must carry no key-package anchors"
+    );
+    assert_eq!(roster_root_of_projection(&delivered), root);
+    Ok(())
+}
+
+/// Review r3 blocker 2: the re-seat mint population stays INLINE-v4 —
+/// `check_reseat_invite` needs the signed inline roster — and past the
+/// inline cap `sign_v4` refuses the oversize roster, so nothing is signed
+/// or stored (pre-#646 behaviour). Only the ordinary mint
+/// (`assemble_signed_v4_invite`, via `populate_invite_base_state`) goes
+/// content-addressed.
+#[tokio::test]
+async fn reseat_mint_population_stays_inline_and_over_cap_sign_refuses() -> Result<()> {
+    let (authority, _dir) = daemon_state().await?;
+    let group_id = "cc".repeat(32);
+    let info = seed_group_with_members(&authority, &group_id, 50).await;
+    let subject = AgentId([7u8; 32]);
+    let mut invite = x0x::groups::invite::SignedInvite::new(
+        info.mls_group_id.clone(),
+        info.name.clone(),
+        &authority.agent.agent_id(),
+        3_600,
+    );
+    crate::server::routes::identity::populate_invite_base_state_v4(
+        &mut invite,
+        &info,
+        Some(subject),
+    );
+    assert_eq!(
+        invite.version, INVITE_VERSION_V4,
+        "the re-seat population must never mint a content-addressed invite"
+    );
+    assert_eq!(invite.base_roster_root, None);
+    assert_eq!(
+        invite.base_roster.as_ref().map(BTreeMap::len),
+        Some(51),
+        "the roster stays inline"
+    );
+    let err = invite
+        .sign_v4(authority.agent.identity().agent_keypair(), None)
+        .expect_err("an over-cap inline roster must refuse at sign");
+    assert!(err.contains("base_roster"), "typed oversize refusal: {err}");
     Ok(())
 }
 
@@ -352,11 +449,17 @@ async fn v5_join_seeds_stub_from_fetched_roster() -> Result<()> {
         .context("v5 content address")?;
 
     let (joiner, _dir_b) = daemon_state().await?;
-    // The projection arrives (out of band) before the join asks: park the
-    // verified copy the inviter would have served.
+    // Stand in for the inviter's serve so the real join route runs
+    // socket-free: the pre-seeded projection still has to re-derive the
+    // SIGNED root inside the fetch, exactly like a served reply (the
+    // delivery/serve halves are pinned by their own tests above).
     let projection = roster_projection_digest_only(&info.members_v2);
     let stable_group_id = invite.stable_group_id.clone().context("stable id")?;
-    base_roster_fetch::deliver_base_roster(&joiner, &stable_group_id, &signed_root, &projection);
+    base_roster_fetch::preseed_fetched_projection_for_test(
+        &stable_group_id,
+        &signed_root,
+        projection.clone(),
+    );
 
     let response = join_group_via_invite(
         State(Arc::clone(&joiner)),
@@ -507,13 +610,15 @@ async fn v5_refusal_leaves_inert_card_import_stub_unchanged() -> Result<()> {
     Ok(())
 }
 
-/// Review r2 fix 2: a fetch attempt on a key another join already waits on
-/// SHARES the waiter slot — its own failure (inviter unreachable here)
-/// removes only its own sender, and the reply still wakes the first join.
+/// Review r2 fix 2 (kept under the r3 model): a fetch attempt on a key
+/// another join already waits on SHARES the waiter list — its own failure
+/// (inviter unreachable here) removes only its own waiter, and the first
+/// join's inviter still wakes the first join.
 #[tokio::test]
 async fn concurrent_fetch_keeps_the_first_joins_waiter() -> Result<()> {
     let (joiner, _dir) = daemon_state().await?;
     let group_id = "bf".repeat(32);
+    let inviter_a = AgentId([1u8; 32]);
     let roster: base_roster_fetch::BaseRosterProjection = std::iter::once((
         "11".repeat(32),
         RosterMemberSnapshot {
@@ -535,7 +640,9 @@ async fn concurrent_fetch_keeps_the_first_joins_waiter() -> Result<()> {
         .expect("slots")
         .insert(
             format!("{group_id}|{root}"),
-            base_roster_fetch::BaseRosterSlot::Waiter(vec![(u64::MAX, sender_a)]),
+            vec![base_roster_fetch::BaseRosterWaiter::for_test(
+                inviter_a, sender_a,
+            )],
         );
 
     // A second fetch on the same key: the networkless send fails, so it
@@ -552,60 +659,12 @@ async fn concurrent_fetch_keeps_the_first_joins_waiter() -> Result<()> {
     .expect_err("networkless send cannot reach an inviter");
     assert_eq!(err, "inviter unreachable");
 
-    // The reply still wakes the first join.
-    base_roster_fetch::deliver_base_roster(&joiner, &group_id, &root, &roster);
+    // The first join's inviter still wakes the first join.
+    base_roster_fetch::deliver_base_roster(&joiner, &inviter_a, &group_id, &root, &roster);
     let delivered = receiver_a
         .await
         .expect("the first join's waiter survives a concurrent fetch attempt");
     assert_eq!(delivered, roster);
-    Ok(())
-}
-
-/// Review r2 fix 3: the parked-reply cache self-cleans — at the cap the
-/// OLDEST parked reply is evicted for the new one, so unsolicited-but-valid
-/// replies for keys no join will ask for cannot pin the cache forever.
-#[tokio::test]
-async fn parked_reply_cache_evicts_oldest_at_cap() -> Result<()> {
-    let (joiner, _dir) = daemon_state().await?;
-    let roster: base_roster_fetch::BaseRosterProjection = std::iter::once((
-        "22".repeat(32),
-        RosterMemberSnapshot {
-            role: x0x::groups::GroupRole::Member,
-            state: x0x::groups::GroupMemberState::Active,
-            treekem_key_package_hash: None,
-            certificate_digest: None,
-            certificate: None,
-        },
-    ))
-    .collect();
-    let root = roster_root_of_projection(&roster);
-
-    // Fill the cache (READY_SLOT_CAP = 16) with distinct group keys; the
-    // first entry is made strictly oldest.
-    let oldest_group = format!("{:064x}", 0u32);
-    base_roster_fetch::deliver_base_roster(&joiner, &oldest_group, &root, &roster);
-    std::thread::sleep(std::time::Duration::from_millis(5));
-    for i in 1..16u32 {
-        base_roster_fetch::deliver_base_roster(&joiner, &format!("{i:064x}"), &root, &roster);
-    }
-    assert_eq!(
-        joiner.base_roster_fetch_slots.lock().expect("slots").len(),
-        16
-    );
-
-    // The 17th parks by evicting the OLDEST, never by being dropped.
-    let newest_group = "ff".repeat(32);
-    base_roster_fetch::deliver_base_roster(&joiner, &newest_group, &root, &roster);
-    let slots = joiner.base_roster_fetch_slots.lock().expect("slots");
-    assert_eq!(slots.len(), 16, "the cache stays at the cap");
-    assert!(
-        !slots.contains_key(&format!("{oldest_group}|{root}")),
-        "the oldest parked reply is evicted"
-    );
-    assert!(
-        slots.contains_key(&format!("{newest_group}|{root}")),
-        "the newest reply is parked"
-    );
     Ok(())
 }
 
@@ -632,13 +691,75 @@ async fn dispatch_drops_base_roster_fetch_from_mismatched_sender() -> Result<()>
     assert!(dispatch_join_result_message(&inviter, &outsider, true, fetch()).await);
     assert_eq!(inviter.join_result_fetch_admission.in_flight(), 0);
 
-    // Control: the member itself IS admitted — the spawned serve's ticket
-    // (unpolled on this current-thread runtime) blocks a duplicate.
+    // Review r3 item 5: an UNVERIFIED sender gets no serve either.
+    assert!(dispatch_join_result_message(&inviter, &member, false, fetch()).await);
+    assert_eq!(inviter.join_result_fetch_admission.in_flight(), 0);
+
+    // Control: the verified member IS admitted — the spawned serve's
+    // ticket (unpolled on this current-thread runtime) blocks a duplicate
+    // base-roster fetch, while a `FetchRequest` for the same (group,
+    // member) keeps its OWN coalescing slot (review r3 item 5).
     assert!(dispatch_join_result_message(&inviter, &member, true, fetch()).await);
     assert!(inviter
         .join_result_fetch_admission
-        .try_admit(&join_result_key(&stable, &member_hex), &stable)
+        .try_admit(
+            &format!("base-roster|{}", join_result_key(&stable, &member_hex)),
+            &stable
+        )
         .is_err());
+    let fetch_request_slot = inviter
+        .join_result_fetch_admission
+        .try_admit(&join_result_key(&stable, &member_hex), &stable)
+        .expect("a FetchRequest for the same (group, member) is not displaced");
+    drop(fetch_request_slot);
+    Ok(())
+}
+
+/// Review r3 blocker 1: an UNVERIFIED `BaseRoster` reply never reaches the
+/// waiting join, even from the right sender with the right root.
+#[tokio::test]
+async fn dispatch_drops_unverified_base_roster_reply() -> Result<()> {
+    let (joiner, _dir) = daemon_state().await?;
+    let group_id = "ce".repeat(32);
+    let inviter = AgentId([2u8; 32]);
+    let roster: base_roster_fetch::BaseRosterProjection = std::iter::once((
+        "33".repeat(32),
+        RosterMemberSnapshot {
+            role: x0x::groups::GroupRole::Member,
+            state: x0x::groups::GroupMemberState::Active,
+            treekem_key_package_hash: None,
+            certificate_digest: None,
+            certificate: None,
+        },
+    ))
+    .collect();
+    let root = roster_root_of_projection(&roster);
+    let (sender, mut receiver) = tokio::sync::oneshot::channel();
+    joiner
+        .base_roster_fetch_slots
+        .lock()
+        .expect("slots")
+        .insert(
+            format!("{group_id}|{root}"),
+            vec![base_roster_fetch::BaseRosterWaiter::for_test(
+                inviter, sender,
+            )],
+        );
+    let reply = JoinResultMessage::BaseRoster {
+        group_id: group_id.clone(),
+        roster_root: root.clone(),
+        roster: roster.clone(),
+    };
+    assert!(dispatch_join_result_message(&joiner, &inviter, false, reply).await);
+    assert!(
+        receiver.try_recv().is_err(),
+        "an unverified reply must not wake the join"
+    );
+    assert_eq!(
+        joiner.base_roster_fetch_slots.lock().expect("slots").len(),
+        1,
+        "the join keeps waiting"
+    );
     Ok(())
 }
 
