@@ -150,6 +150,16 @@ impl RequestField {
         }
     }
 
+    /// Query field the CLI synthesizes from other arguments.
+    pub const fn query_derived(name: &'static str, required: bool) -> Self {
+        Self {
+            name,
+            location: FieldLocation::Query,
+            required,
+            cli: CliExpose::Derived,
+        }
+    }
+
     /// Body field the request struct carries but the handler ignores or
     /// rejects (e.g. a tombstoned pre-migration knob).
     pub const fn body_ignored(name: &'static str) -> Self {
@@ -321,6 +331,19 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         description: "Introduction card with trust-scoped disclosure",
         category: "identity",
         request: RequestSpec::Fields(&[RequestField::query("peer", false)]),
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/onboard",
+        cli_name: "onboard",
+        description: "Install-and-join recipe that teaches another agent to DM you",
+        category: "identity",
+        // `card` (file|inline|lookup) and `card_file` are synthesized by the
+        // CLI from `--inline-card` / `--no-card` / `--card-file`.
+        request: RequestSpec::Fields(&[
+            RequestField::query_derived("card", false),
+            RequestField::query_derived("card_file", false),
+        ]),
     },
     EndpointDef {
         method: Method::Post,
