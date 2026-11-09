@@ -941,27 +941,61 @@ fn treekem_catchup_cursor_epoch_maps_the_head_binding() {
 // to the membership links. Before it kept only the membership links, so a
 // pre-Welcome joiner was never served a rename or a role change in its gap.
 
-/// Pages `joiner` from the real `responder` until a page is empty, as
-/// `pre_welcome_joiner_pages_two_links_from_a_real_responder` does, with
-/// the responder as the page sender. Returns the kinds served, in order.
+/// The cursor the joiner's last page ask to `peer` left from, as the
+/// production page loop recorded it at ask initiation.
+fn recorded_page_ask_cursor(key: &str, peer: &str) -> Option<(u64, u64, String)> {
+    let guard = TREEKEM_PAGE_ASK_CURSORS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .get(key)
+        .and_then(|peers| peers.get(peer))
+        .map(|(revision, epoch, hash, _)| (*revision, *epoch, hash.clone()))
+}
+
+/// Pages `joiner` from the real `responder` through the joiner's own
+/// page loop, with the responder as the page sender. The helper sends
+/// only the first ask. Each page goes to the joiner unchanged, so a
+/// truncated page must make the joiner ask for the next page itself,
+/// from its moved cursor; the helper then forwards that ask (with the
+/// cursor the joiner recorded) to the responder. The last page is not
+/// truncated and the joiner asks no more. Returns the kinds served, in
+/// order.
 async fn page_from_responder(
     joiner: &Arc<AppState>,
     responder: &Arc<AppState>,
     key: &str,
 ) -> anyhow::Result<Vec<&'static str>> {
     let joiner_hex = hex::encode(joiner.agent.agent_id().as_bytes());
+    let responder_hex = hex::encode(responder.agent.agent_id().as_bytes());
+    let joiner_recorders = &joiner.named_group_test_recorders;
+    // The joiner's page ask counts as sent and is recorded, not put on
+    // the wire (the test agent has no gossip runtime).
+    joiner_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    joiner_recorders
+        .catchup_responses
+        .lock()
+        .expect("asks")
+        .clear();
+    let head = head_of(joiner, key).await?;
+    let first_epoch = treekem_catchup_cursor_epoch(
+        joiner,
+        &[key.to_string()],
+        (head.secret_epoch, head.security_binding.clone()),
+    )
+    .await;
+    let mut cursor = (head.state_revision, first_epoch, head.state_hash);
     let mut served = Vec::new();
     for _ in 0..8 {
-        let head = head_of(joiner, key).await?;
-        let cursor = (head.secret_epoch, head.security_binding.clone());
         let request = TreeKemCatchupRequest {
             message_type: "treekem_catchup_request".to_string(),
             group_id: key.to_string(),
             requester_agent_id: joiner_hex.clone(),
-            from_revision: head.state_revision,
-            from_treekem_epoch: treekem_catchup_cursor_epoch(joiner, &[key.to_string()], cursor)
-                .await,
-            current_state_hash: head.state_hash.clone(),
+            from_revision: cursor.0,
+            from_treekem_epoch: cursor.1,
+            current_state_hash: cursor.2.clone(),
             missing_prev_state_hash: None,
             target_member_id: None,
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
@@ -982,23 +1016,44 @@ async fn page_from_responder(
             .pop()
             .expect("responder sent a catch-up response");
         let page: TreeKemCatchupResponse = serde_json::from_slice(&payload)?;
-        if page.events.is_empty() {
-            break;
-        }
+        let truncated = page.truncated;
         served.extend(page.events.iter().map(named_group_metadata_event_kind));
         handle_treekem_catchup_response(
             joiner,
             &responder.agent.agent_id(),
             &x0x::identity::MachineId([0x26; 32]),
             true,
-            TreeKemCatchupResponse {
-                truncated: false,
-                ..page
-            },
+            page,
         )
         .await;
+        let asks = std::mem::take(&mut *joiner_recorders.catchup_responses.lock().expect("asks"));
+        if !truncated {
+            assert!(asks.is_empty(), "the last page asks for no next page");
+            return Ok(served);
+        }
+        assert_eq!(
+            asks,
+            vec![key.as_bytes().to_vec()],
+            "a truncated page makes the joiner ask for the next page"
+        );
+        let stops = joiner_recorders
+            .catchup_page_stops
+            .lock()
+            .expect("stops")
+            .clone();
+        assert!(stops.is_empty(), "the page loop did not stop: {stops:?}");
+        let head = head_of(joiner, key).await?;
+        let asked = recorded_page_ask_cursor(key, &responder_hex)
+            .expect("the joiner recorded its next-page ask cursor");
+        assert_eq!(
+            (asked.0, &asked.2),
+            (head.state_revision, &head.state_hash),
+            "the next page is asked from the joiner's moved head"
+        );
+        assert_ne!(asked, cursor, "the ask cursor moved");
+        cursor = asked;
     }
-    Ok(served)
+    anyhow::bail!("the page loop did not reach a last page: {served:?}")
 }
 
 /// The responder seats the joiner (the terminal add, not on any page), so
