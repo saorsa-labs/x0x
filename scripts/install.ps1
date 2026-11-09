@@ -46,7 +46,20 @@ $Asset = "x0x-windows-x64.zip"
 $TrustedFingerprint = "CEB3506E7DCB8A2DD2D679E8EDDA4827D89C0F29"
 
 function Get-Download([string]$Url, [string]$OutFile) {
-    Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing
+    # Bounded retry with backoff: GitHub's release downloads return
+    # transient 504s under load, and one such answer should not fail an
+    # install. Verification happens after the download, so a retried
+    # fetch changes nothing security-wise.
+    for ($attempt = 1; $attempt -le 4; $attempt++) {
+        try {
+            Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing
+            return
+        } catch {
+            if ($attempt -eq 4) { throw }
+            Write-Host "  download failed (attempt $attempt of 4), retrying: $Url"
+            Start-Sleep -Seconds (2 * $attempt)
+        }
+    }
 }
 
 function Find-Gpg {
@@ -143,7 +156,17 @@ if ($Version -eq "latest") {
     # goes to api.github.com.
     $apiHeaders = @{ "User-Agent" = "x0x-install.ps1" }
     if ($env:GITHUB_TOKEN) { $apiHeaders["Authorization"] = "Bearer $($env:GITHUB_TOKEN)" }
-    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -UseBasicParsing -Headers $apiHeaders
+    # Same bounded retry as Get-Download: the API answers transient 504s too.
+    for ($attempt = 1; $attempt -le 4; $attempt++) {
+        try {
+            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -UseBasicParsing -Headers $apiHeaders
+            break
+        } catch {
+            if ($attempt -eq 4) { throw }
+            Write-Host "  release lookup failed (attempt $attempt of 4), retrying"
+            Start-Sleep -Seconds (2 * $attempt)
+        }
+    }
     $Tag = $release.tag_name
     if (-not $Tag) { throw "Could not resolve the latest x0x release." }
 } elseif ($Version.StartsWith("v")) {

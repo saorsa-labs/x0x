@@ -166,19 +166,33 @@ fetch() {
             fi
             ;;
     esac
-    if [ "$DOWNLOADER" = "curl" ]; then
-        if [ -n "$AUTH" ]; then
-            curl -sfL -H "$AUTH" "$1" -o "$2" || { echo "Error: download failed: $1" >&2; exit 1; }
+    # Bounded retry with backoff: GitHub's release downloads return
+    # transient 504s under load, and one such answer should not fail an
+    # install. Four attempts, 2/4/6 s apart; verification happens after
+    # the download, so a retried fetch changes nothing security-wise.
+    FETCH_ATTEMPT=1
+    while :; do
+        if [ "$DOWNLOADER" = "curl" ]; then
+            if [ -n "$AUTH" ]; then
+                curl -sfL -H "$AUTH" "$1" -o "$2" && return 0
+            else
+                curl -sfL "$1" -o "$2" && return 0
+            fi
         else
-            curl -sfL "$1" -o "$2" || { echo "Error: download failed: $1" >&2; exit 1; }
+            if [ -n "$AUTH" ]; then
+                wget -qO "$2" --header="$AUTH" "$1" && return 0
+            else
+                wget -qO "$2" "$1" && return 0
+            fi
         fi
-    else
-        if [ -n "$AUTH" ]; then
-            wget -qO "$2" --header="$AUTH" "$1" || { echo "Error: download failed: $1" >&2; exit 1; }
-        else
-            wget -qO "$2" "$1" || { echo "Error: download failed: $1" >&2; exit 1; }
+        if [ "$FETCH_ATTEMPT" -ge 4 ]; then
+            echo "Error: download failed: $1" >&2
+            exit 1
         fi
-    fi
+        echo "  download failed (attempt $FETCH_ATTEMPT of 4), retrying: $1" >&2
+        sleep $((FETCH_ATTEMPT * 2))
+        FETCH_ATTEMPT=$((FETCH_ATTEMPT + 1))
+    done
 }
 
 verify_failed() {
