@@ -136,10 +136,17 @@ impl CapabilityRegistry {
     /// bit on 8 Nov 2026. The push sender needs POSITIVE
     /// evidence: it pushes only to a peer whose current verified advert
     /// HAS this bit (unknown or expired state means "no push"), because an
-    /// old receiver would show the payload as an ordinary DM.
+    /// old receiver would show the payload as an ordinary DM. The bit is
+    /// ROUTE-GATED (ADR 0080 §1): [`Self::current`] leaves it out, and a
+    /// receiver advertises it only when its typed route for the push
+    /// prefix is registered and ready ([`Self::advertised`]).
     pub const GRANT_REVOCATION_PUSH_V1: u64 = 1 << 15;
 
-    /// The routes supported by this release's ready receiver.
+    /// The routes supported by every receiver of this release.
+    /// Route-gated bits (`grant_revocation_push_v1`) are NOT here: they are
+    /// added per daemon by [`Self::advertised`] from the typed routes the
+    /// DM inbox actually registered, so a library embedder that never wires
+    /// the route never advertises the bit.
     pub const fn current() -> Self {
         Self {
             version: 1,
@@ -156,9 +163,25 @@ impl CapabilityRegistry {
                 | Self::GUI_SHOW_V1
                 | Self::JOIN_PENDING_NOTICE_V1
                 | Self::KEY_REPUBLISH_V1
-                | Self::TREEKEM_CATCHUP_REFUSAL_V1
-                | Self::GRANT_REVOCATION_PUSH_V1,
+                | Self::TREEKEM_CATCHUP_REFUSAL_V1,
         }
+    }
+
+    /// The registry a READY receiver advertises, given the prefixes of the
+    /// typed routes its DM inbox registered. ADR 0080 §1:
+    /// `grant_revocation_push_v1` is route-gated — the bit is advertised
+    /// only when the push route is registered and ready; everything in
+    /// [`Self::current`] is unconditional.
+    #[must_use]
+    pub fn advertised<P: AsRef<[u8]>>(route_prefixes: impl IntoIterator<Item = P>) -> Self {
+        let mut registry = Self::current();
+        if route_prefixes
+            .into_iter()
+            .any(|p| p.as_ref() == crate::revocation_push::GRANT_REVOCATION_PUSH_PREFIX)
+        {
+            registry.bits |= Self::GRANT_REVOCATION_PUSH_V1;
+        }
+        registry
     }
 
     /// Require the bit for a typed product payload. Ordinary DMs are unchanged.

@@ -31,10 +31,19 @@
 //!
 //! Prefix ownership is unconditional: the payload never reaches DM
 //! history or DM subscribers, verified or not, before and after the inbox
-//! is ready. The registered typed route covers a running inbox; in the
-//! startup window (no routes yet) a verified push is dropped and logged
-//! `not_ready` in `dispatch_raw_direct_after_gates`, and an unverified one
-//! by the static production-prefix table. The handler stops at the first
+//! is ready, on the raw direct path AND the gossip DM path. The registered
+//! typed route covers a running x0xd inbox. On the raw path a verified
+//! push with no route is dropped and logged `not_ready` in
+//! `dispatch_raw_direct_after_gates`, an unverified one by the static
+//! production-prefix table. On the gossip v1 and v2-durable paths a
+//! production typed prefix with no registered route is dropped before the
+//! dedupe claim / withheld before dispatch, so a daemon that never wires
+//! the route (a library embedder) leaks nothing either. The bit itself is
+//! ROUTE-GATED (`CapabilityRegistry::advertised`): such a daemon never
+//! advertises `grant_revocation_push_v1`, so a conforming sender never
+//! pushes to it and gossip stays its only carrier.
+//!
+//! The handler stops at the first
 //! failure — decode, subject, stale, known-record (no verify), rate
 //! limit — then hands the one record to the SAME ingest as the v3 gossip
 //! carrier (`crate::ingest_share_grant_revocation_records`): one verify

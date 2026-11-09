@@ -575,8 +575,24 @@ fn prefix_and_capability_bit_are_pinned() {
         crate::dm::CapabilityRegistry::GRANT_REVOCATION_PUSH_V1,
         1 << 15
     );
-    assert!(crate::dm::CapabilityRegistry::current()
+    // ADR 0080 §1: the bit is ROUTE-GATED. No route means no bit; a
+    // registered push route means the bit.
+    assert!(!crate::dm::CapabilityRegistry::current()
         .supports(crate::dm::CapabilityRegistry::GRANT_REVOCATION_PUSH_V1));
+    let no_routes: [&[u8]; 0] = [];
+    assert!(!crate::dm::CapabilityRegistry::advertised(no_routes)
+        .supports(crate::dm::CapabilityRegistry::GRANT_REVOCATION_PUSH_V1));
+    assert!(
+        !crate::dm::CapabilityRegistry::advertised([b"x0x-exec-v1\0".as_slice()])
+            .supports(crate::dm::CapabilityRegistry::GRANT_REVOCATION_PUSH_V1)
+    );
+    let with_route = crate::dm::CapabilityRegistry::advertised([GRANT_REVOCATION_PUSH_PREFIX]);
+    assert!(with_route.supports(crate::dm::CapabilityRegistry::GRANT_REVOCATION_PUSH_V1));
+    assert_eq!(
+        with_route.bits & !crate::dm::CapabilityRegistry::GRANT_REVOCATION_PUSH_V1,
+        crate::dm::CapabilityRegistry::current().bits,
+        "the route gate adds exactly the one bit"
+    );
     let mut payload = GRANT_REVOCATION_PUSH_PREFIX.to_vec();
     payload.push(1);
     assert_eq!(

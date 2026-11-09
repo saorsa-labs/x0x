@@ -16837,6 +16837,16 @@ impl Agent {
                 "cannot start DM inbox: no gossip runtime configured",
             ))
         })?;
+        // ADR 0080 §1: `grant_revocation_push_v1` is route-gated. Compute
+        // the advertised registry from the routes THIS inbox registers,
+        // before `config` moves into the service: the bit goes out only
+        // when the push route is registered and ready.
+        let advertised_registry = dm::CapabilityRegistry::advertised(
+            config
+                .typed_payload_routes
+                .iter()
+                .map(|route| route.prefix.as_slice()),
+        );
         let signing = std::sync::Arc::new(gossip::SigningContext::from_keypair(
             self.identity.agent_keypair(),
         ));
@@ -16916,11 +16926,12 @@ impl Agent {
         // handle there is nothing to commit to, so the honest advert is v1:
         // a strict sender then gets a typed 409 rather than clearing its gate
         // and hanging on a waiter this daemon can never satisfy.
-        let upgraded = if self.history_handle.is_some() {
+        let mut upgraded = if self.history_handle.is_some() {
             dm::DmCapabilities::v2_durable_gossip_ready(kem_keypair.public_bytes.clone())
         } else {
             dm::DmCapabilities::v1_gossip_ready(kem_keypair.public_bytes.clone())
         };
+        upgraded.application_registry = advertised_registry;
         // send_replace stores the value even when no receiver is subscribed
         // yet; a plain send() drops the upgrade if this runs before the
         // capability advert service subscribes, leaving peers cached on

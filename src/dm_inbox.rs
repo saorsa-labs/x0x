@@ -4025,13 +4025,31 @@ impl InboxPipeline {
             return;
         }
 
+        let (typed_route, typed_route_outcome) =
+            Self::matching_typed_route(&self.typed_payload_routes, &plaintext.payload);
+        // N12 / ADR 0080 §4: a payload claiming a PRODUCTION typed protocol
+        // that no route here CONSUMES — none registered (the startup window,
+        // or a library embedder that never wires the route), or a registered
+        // route's validator refused the bytes — is a protocol frame, not a
+        // user DM: it must reach neither DM history nor the generic
+        // subscribers, on the gossip path exactly as on the raw path.
+        // Dropped BEFORE the dedupe claim and with the ACK withheld, so a
+        // sender retry still lands once the route exists.
+        if typed_route.is_none() && recognized_production_typed_prefix(&plaintext.payload) {
+            tracing::debug!(
+                target: "dm.trace",
+                stage = "inbound_production_prefix_unrouted",
+                request_id = %hex::encode(envelope.request_id),
+                sender = %crate::logging::LogAgentId::from(&sender_agent_id),
+                "gossip DM claims a production typed protocol no route consumes; dropped"
+            );
+            return;
+        }
         // Reserve bounded typed-route capacity before claiming dedupe. A full
         // predecessor channel cannot justify an Accepted ACK: the sender's
         // obligation must remain pending so it can retry. The permit makes
         // capacity admission atomic with the claim across the primary inbox
         // and legacy-bus subscription loops.
-        let (typed_route, typed_route_outcome) =
-            Self::matching_typed_route(&self.typed_payload_routes, &plaintext.payload);
         let typed_permit = if let Some(route) = typed_route {
             match route.sender.try_reserve() {
                 Ok(permit) => Some(permit),
@@ -4214,6 +4232,25 @@ impl InboxPipeline {
             return DurableAckDecision::Withheld("typed_route_not_durable");
         }
         let is_durable_typed_route = typed_route_durable == Some(true);
+
+        // N12 / ADR 0080 §4: same production-prefix ownership as the v1
+        // path — a production typed protocol frame that no route here
+        // consumes (none registered, or the route's validator refused the
+        // bytes) reaches neither DM history nor the generic subscribers.
+        // The v2 ACK is withheld like any other refusal, so the sender
+        // keeps its bounded retry (a #1003 push sender never waits for an
+        // ACK at all).
+        if typed_route_durable.is_none() && recognized_production_typed_prefix(&application_payload)
+        {
+            tracing::debug!(
+                target: "dm.trace",
+                stage = "inbound_durable_production_prefix_unrouted",
+                request_id = %hex::encode(request_id),
+                sender = %hex::encode(sender_agent_id.as_bytes()),
+                "durable gossip DM claims a production typed protocol no route consumes; dropped"
+            );
+            return DurableAckDecision::Withheld("production_prefix_unrouted");
+        }
 
         // 1. Per-logical-request lock. Serializes the primary inbox and the
         //    legacy-bus copy of the same envelope so neither can observe a
@@ -5634,6 +5671,136 @@ mod tests {
             .await;
 
         assert_eq!(decision, DurableAckDecision::Withheld("commit_failed"));
+    }
+
+    /// ADR 0080 §4 on the GOSSIP v1 path: a payload claiming a PRODUCTION
+    /// typed protocol (here the #1003 grant-revocation push) on a daemon
+    /// with the DEFAULT inbox config — no typed routes, as in a library
+    /// embedder or the startup window — must reach neither the generic
+    /// subscribers nor the dedupe/ACK path. RED without the gossip-path
+    /// production-prefix drop: the payload is broadcast as an ordinary DM.
+    #[tokio::test]
+    async fn gossip_v1_production_prefix_without_route_is_dropped() {
+        let sender = test_keypair();
+        let machine = MachineId([0xE1; 32]);
+        let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
+        assert!(
+            harness.pipeline.typed_payload_routes.is_empty(),
+            "default config: no routes"
+        );
+
+        let mut payload = crate::revocation_push::GRANT_REVOCATION_PUSH_PREFIX.to_vec();
+        payload.extend_from_slice(b"push-record-bytes");
+        let mut envelope = craft_unsigned_payload_envelope_versioned(
+            &harness,
+            &sender,
+            machine,
+            0x81,
+            DM_PROTOCOL_V1,
+            payload.clone(),
+        );
+        sign_envelope_with_agent(&mut envelope, &sender);
+        let key = envelope.dedupe_key();
+        let body = match envelope.body.clone() {
+            DmBody::Payload(p) => p,
+            _ => panic!("payload body"),
+        };
+        harness
+            .pipeline
+            .handle_payload(
+                envelope,
+                body,
+                machine,
+                PayloadOrigin::Retained,
+                sender.public_key().as_bytes().to_vec(),
+                false,
+            )
+            .await;
+        assert_no_delivery(&mut harness.receiver).await;
+        assert!(
+            harness.pipeline.cache.lookup(&key).is_none(),
+            "dropped before the dedupe claim: a retry still lands once the route exists"
+        );
+
+        // Control: an ordinary payload through the same inbox IS delivered.
+        let ordinary = b"ordinary gossip DM".to_vec();
+        let mut envelope = craft_unsigned_payload_envelope_versioned(
+            &harness,
+            &sender,
+            machine,
+            0x82,
+            DM_PROTOCOL_V1,
+            ordinary.clone(),
+        );
+        sign_envelope_with_agent(&mut envelope, &sender);
+        let body = match envelope.body.clone() {
+            DmBody::Payload(p) => p,
+            _ => panic!("payload body"),
+        };
+        harness
+            .pipeline
+            .handle_payload(
+                envelope,
+                body,
+                machine,
+                PayloadOrigin::Retained,
+                sender.public_key().as_bytes().to_vec(),
+                false,
+            )
+            .await;
+        let shown = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("delivery wait")
+            .expect("ordinary DM delivered");
+        assert_eq!(shown.payload, ordinary);
+    }
+
+    /// ADR 0080 §4 on the GOSSIP v2-durable path: the same ownership — with
+    /// no registered route the push payload is withheld before DM history
+    /// and the generic subscribers, like any other refusal (the sender
+    /// keeps its bounded retry). RED without the durable-path drop: a
+    /// committed DM-history row and a generic broadcast.
+    #[tokio::test]
+    async fn gossip_v2_production_prefix_without_route_is_withheld() {
+        let sender = test_keypair();
+        let machine = MachineId([0xE2; 32]);
+        let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
+        let _service = attach_history(&mut harness);
+        let history = harness.pipeline.history.clone().expect("history handle");
+        assert!(harness.pipeline.typed_payload_routes.is_empty());
+
+        let mut payload = crate::revocation_push::GRANT_REVOCATION_PUSH_PREFIX.to_vec();
+        payload.extend_from_slice(b"push-record-bytes");
+        let mut envelope = craft_unsigned_payload_envelope_versioned(
+            &harness,
+            &sender,
+            machine,
+            0x83,
+            DM_PROTOCOL_DURABLE_ACK,
+            payload.clone(),
+        );
+        sign_envelope_with_agent(&mut envelope, &sender);
+        let decision = harness
+            .pipeline
+            .handle_payload_durable(
+                envelope,
+                payload,
+                TrustDecision::Accept,
+                machine,
+                true,
+                sender.public_key().as_bytes().to_vec(),
+                false,
+            )
+            .await;
+        assert_eq!(
+            decision,
+            DurableAckDecision::Withheld("production_prefix_unrouted")
+        );
+        assert_no_delivery(&mut harness.receiver).await;
+        assert!(
+            committed_rows(&history, &sender, 0x83).is_empty(),
+            "no DM-history row for an unrouted production typed frame"
+        );
     }
 
     /// Happy path: commit lands first, then a v2-stamped ACK, and the schema
