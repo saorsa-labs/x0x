@@ -8095,6 +8095,7 @@ async fn two_admin_real_invite_stub(
         &joiner_hex,
         None,
         None,
+        None,
     );
     // The real join caller attaches the #468 A5 lineage at stub creation.
     stub.invite_lineage = Some(x0x::groups::InviteLineage {
