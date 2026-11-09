@@ -574,3 +574,27 @@ async fn machine_default_without_hosting_evidence_is_only_suggested() {
         .expect("accept");
     assert_eq!(applied.machine_pins, ["machine:studio-mac.bob-smith"]);
 }
+
+/// WHY (ADR 0093: one regression test per bit): `share_grant_names_v1` is
+/// registry bit 14, this release advertises it, and it is the bit a v2
+/// grant payload requires.
+#[test]
+fn share_grant_names_v1_is_registry_bit_14() {
+    use crate::dm::CapabilityRegistry;
+    assert_eq!(CapabilityRegistry::SHARE_GRANT_NAMES_V1, 1 << 14);
+    assert!(
+        CapabilityRegistry::current().supports(CapabilityRegistry::SHARE_GRANT_NAMES_V1),
+        "this release advertises the names bit"
+    );
+    let mut payload = SHARE_GRANT_V2_DM_PREFIX.to_vec();
+    payload.extend_from_slice(b"body");
+    assert_eq!(
+        CapabilityRegistry::required_for_payload(&payload),
+        Some((1 << 14, "share_grant_names_v1"))
+    );
+    assert_ne!(
+        CapabilityRegistry::SHARE_GRANT_NAMES_V1,
+        CapabilityRegistry::SHARE_GRANT_V1,
+        "the v2 envelope has its own bit"
+    );
+}

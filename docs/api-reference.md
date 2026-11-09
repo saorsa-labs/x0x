@@ -4323,6 +4323,10 @@ they travel only inside the end-to-end encrypted grant DM. The daemon
 advertises ADR 0093 application bit 14, `share_grant_names_v1`, for this
 route; a sender uses the v2 envelope only toward a grantee whose current
 verified advert sets bit 14, and sends the unchanged v1 payload otherwise.
+An encoded v2 envelope after the prefix is at most 48 KiB (the v1 grant
+limit is 32 KiB). The names section carries at most 64 machines, and each
+name is at most 128 bytes (the ADR-0036 profile rule). A larger or
+non-canonical envelope is refused whole.
 
 The receiver verifies the grant by the v1 rules and the names signature
 under the grant's owner key; a failure of either refuses the whole envelope
@@ -4346,6 +4350,9 @@ The names become ADR-0074 §1 defaults in the local name store:
 - A **stranger's** grant yields only a pending suggestion (`suggestions` in
   `GET /names`). `POST /names/accept {"label": …}` applies it (and removes
   it); `DELETE /names/suggestions/:label` drops it.
+- When a label is bound to an owner (by a grant default or
+  `POST /names/owners`), a pending suggestion that another owner left under
+  that label is dropped: it can no longer be accepted.
 - One owner holds at most one pending suggestion; a later one from the same
   owner replaces it. One owner holds at most 16 `default_conflict` reports;
   a further report drops that owner's oldest. The tables hold at most 256

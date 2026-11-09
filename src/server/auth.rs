@@ -497,18 +497,21 @@ fn is_grants_path(path: &str) -> bool {
 }
 
 /// `true` for the ADR-0074 §1 name routes: `/names`, `/names/resolve`,
-/// `/names/owners`, `/names/machines`, and `/names/{owners,pins}/<segment>`.
+/// `/names/owners`, `/names/machines`, `/names/accept`, and
+/// `/names/{owners,pins,suggestions}/<segment>`.
 fn is_names_path(path: &str) -> bool {
     if matches!(
         path,
-        "/names" | "/names/resolve" | "/names/owners" | "/names/machines"
+        "/names" | "/names/resolve" | "/names/owners" | "/names/machines" | "/names/accept"
     ) {
         return true;
     }
-    ["/names/owners/", "/names/pins/"].iter().any(|base| {
-        path.strip_prefix(base)
-            .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
-    })
+    ["/names/owners/", "/names/pins/", "/names/suggestions/"]
+        .iter()
+        .any(|base| {
+            path.strip_prefix(base)
+                .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
+        })
 }
 
 /// `true` for exactly `/groups/<nonempty-id>/quarantine/clear`.
@@ -1594,6 +1597,8 @@ mod tests {
                 "/names/machines",
                 "/names/owners/bob",
                 "/names/pins/agent:studio.bob",
+                "/names/accept",
+                "/names/suggestions/bob-smith",
             ] {
                 assert!(
                     requires_durable_owner(&method, path),
@@ -1607,6 +1612,9 @@ mod tests {
             "/namesx",
             "/names/owners/",
             "/names/pins/a/b",
+            "/names/accept/x",
+            "/names/suggestions/",
+            "/names/suggestions/a/b",
         ] {
             assert!(!is_names_path(path), "{path} must not be classified");
         }
