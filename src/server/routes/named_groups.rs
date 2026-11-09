@@ -6,6 +6,8 @@
 //! Extracted verbatim from `src/server/mod.rs` as part of the #125 / WS1.4
 //! server decomposition. The router registrations stay in the parent module.
 
+mod base_roster_fetch;
+pub(in crate::server) use base_roster_fetch::BaseRosterWaiter;
 mod control_blob;
 mod direct_metadata_lanes;
 mod event_steps;
@@ -1476,6 +1478,40 @@ pub(in crate::server) enum JoinResultMessage {
     /// and whose advert sets `join_pending_notice_v1` — a legacy joiner
     /// never sees this arm.
     Pending { notice: Box<JoinPendingNotice> },
+    /// #646: a joiner holding a v6 (content-addressed) invite asks the
+    /// INVITER for the base roster projection the invite's signed
+    /// `base_roster_root` names. Proof of invite possession rides as the
+    /// BLAKE3 of the raw 32-byte invite secret (never the secret itself):
+    /// the inviter serves only while a live issued-invite record hashes to
+    /// it. A pre-#646 peer fails to decode this arm and drops it — such a
+    /// peer also never minted a v6 invite, so no joiner asks it.
+    BaseRosterFetch {
+        group_id: String,
+        member_agent_id: String,
+        roster_root: String,
+        secret_hash: String,
+    },
+    /// #646: the inviter's answer — the digest-only projection whose
+    /// `roster_root_of_projection` equals `roster_root`. The reply carries
+    /// no authority of its own: the joiner admits it ONLY when it
+    /// re-derives the invite's SIGNED root (content addressing makes the
+    /// payload self-certifying), so neither the sender nor the bytes need
+    /// any further trust.
+    BaseRoster {
+        group_id: String,
+        roster_root: String,
+        roster: BTreeMap<String, x0x::groups::state_commit::RosterMemberSnapshot>,
+    },
+    /// #646 (r5 item 6): the inviter's TERMINAL answer — the requester's
+    /// invite is live and authorized, but the root it signed is in
+    /// neither the live roster nor the retained commit log any more
+    /// (pruned), so no retry can ever serve it. The joiner maps it to a
+    /// terminal typed refusal instead of the retryable 503. Additive like
+    /// the two arms above; a pre-#646 peer drops it.
+    BaseRosterUnavailable {
+        group_id: String,
+        roster_root: String,
+    },
 }
 
 /// #477 W2 — the terminal refusal reasons. Exactly the DEFINITIVE
@@ -23902,7 +23938,9 @@ pub(in crate::server) fn assemble_signed_v4_invite(
         &agent_id,
         expiry_secs,
     );
-    super::identity::populate_invite_base_state_v4(&mut invite, info, intended_joiner);
+    // #646: the ordinary mint is v6-capable — past the inline cap the
+    // invite carries the roster's content address instead of the roster.
+    super::identity::populate_invite_base_state(&mut invite, info, intended_joiner);
 
     let owner_axis = info.policy.admission.owner_certified_user_id().copied();
     let user_kp = owner_axis.and_then(|_| state.agent.identity().user_keypair());
@@ -23922,6 +23960,20 @@ pub(in crate::server) fn assemble_signed_v4_invite(
     // (v7 F4) follows; all before the caller records anything.
     if let Some((field, size)) = invite.v4_field_caps_violation() {
         return Err(MintInviteError::TooLarge { field, size });
+    }
+    // #646: a v6 (content-addressed) invite stands for a roster the joiner
+    // fetches in ONE direct-message reply — refuse at mint what that reply
+    // could not carry, with the same typed refusal shape as the old inline
+    // cap.
+    if invite.version == x0x::groups::invite::INVITE_VERSION_V6 {
+        let entries =
+            x0x::groups::state_commit::roster_projection_digest_only(&info.members_v2).len();
+        if entries > x0x::groups::invite::MAX_FETCHED_BASE_ROSTER_ENTRIES {
+            return Err(MintInviteError::TooLarge {
+                field: "base_roster",
+                size: entries,
+            });
+        }
     }
     invite
         .sign_v4(state.agent.identity().agent_keypair(), user_kp)
@@ -24062,6 +24114,13 @@ pub(in crate::server) async fn mint_invite_transaction(
         intended_joiner.map(|agent| hex::encode(agent.as_bytes())),
         origin,
         signed_link,
+    );
+    // #646 (D95): a v6 record remembers the ONE root its invite signed —
+    // the base-roster fetch serves exactly that root to this invite's
+    // holder and nothing else. v4 records keep None (nothing is served).
+    next.bind_issued_invite_base_roster_root(
+        &invite.invite_secret,
+        invite.base_roster_root.clone(),
     );
     // r4 regression fix: persist through `persist_named_group_info`, NOT a
     // plain `persist_named_groups_mutation` insert. The single-record
@@ -24238,6 +24297,7 @@ pub(in crate::server) async fn create_group_invite(
         .into_response()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn invite_join_group_info(
     invite: &x0x::groups::invite::SignedInvite,
     creator: AgentId,
@@ -24246,6 +24306,10 @@ fn invite_join_group_info(
     joiner_hex: &str,
     display_name: Option<String>,
     treekem_key_package_b64: Option<String>,
+    // #646: the out-of-band-fetched projection of a v6 invite, already
+    // verified against the invite's signed roster root by the caller.
+    // `None` for v4 invites (whose projection rides inline).
+    fetched_base_roster: Option<&BTreeMap<String, x0x::groups::state_commit::RosterMemberSnapshot>>,
 ) -> x0x::groups::GroupInfo {
     let invite_is_treekem = invite.secure_plane == Some(x0x::mls::SecureGroupPlane::TreeKem);
     let has_authority_base_state = invite.base_state_hash.is_some();
@@ -24306,7 +24370,11 @@ fn invite_join_group_info(
     // digest-only member hash identically to its byte-bearing form, and
     // the announce/discovery hydration bridge fills the bytes later
     // (digest-matched, mismatch ignored+logged).
-    if let Some(base_roster) = invite.base_roster.clone() {
+    if let Some(base_roster) = invite
+        .base_roster
+        .clone()
+        .or_else(|| fetched_base_roster.cloned())
+    {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -25147,13 +25215,16 @@ pub(super) async fn join_group_via_invite_inner(
         api_error(StatusCode::CONFLICT, reason)
     };
 
-    // version (A2 step 2, hoisted r6 Codex 1b): a non-v4 blob refuses
-    // before ANY structural work — `invite_unsigned` covers version < 4
-    // (including the legacy sentinel 0). The structural rules that used
-    // to share this gate (projection presence, fat-roster refusal,
-    // absent `policy`/`secure_plane`) stay in the view construction
-    // below.
-    if invite.version != x0x::groups::invite::INVITE_VERSION_V4 {
+    // version (A2 step 2, hoisted r6 Codex 1b): an unknown-version blob
+    // refuses before ANY structural work — `invite_unsigned` covers
+    // version < 4 (including the legacy sentinel 0) and any future
+    // version. v6 (#646) carries the roster's content address instead of
+    // the inline projection. The structural rules that used to share
+    // this gate (projection presence, fat-roster refusal, absent
+    // `policy`/`secure_plane`) stay in the view construction below.
+    if invite.version != x0x::groups::invite::INVITE_VERSION_V4
+        && invite.version != x0x::groups::invite::INVITE_VERSION_V6
+    {
         return refuse_invite(&state, &invite, "invite_unsigned");
     }
     // legacy-sig (A2 step 3, hoisted r6 Codex 1b): the vestigial legacy
@@ -25258,7 +25329,9 @@ pub(super) async fn join_group_via_invite_inner(
         let Some(view_policy) = view.policy.as_ref() else {
             return refuse_invite(&state, &invite, "invite_unsigned");
         };
-        let roster_root = x0x::groups::state_commit::roster_root_of_projection(&view.base_roster);
+        // #646: on a v6 view the root is the carried content address; on
+        // v4 it re-derives from the inline projection as before.
+        let roster_root = view.signed_roster_root();
         let policy_hash = x0x::groups::state_commit::compute_policy_hash(view_policy);
         let meta_hash = x0x::groups::state_commit::compute_public_meta_hash(&view.public_meta);
         let recomputed = x0x::groups::state_commit::compute_state_hash(
@@ -25381,6 +25454,115 @@ pub(super) async fn join_group_via_invite_inner(
     let agent_id = state.agent.agent_id();
     let group_id_hex = invite.group_id.clone();
     let invite_stable_group_id = invite.stable_group_id.as_deref().unwrap_or(&group_id_hex);
+    // ── #646: content-addressed base roster (v6) ──
+    // The signed view carries only the roster's content address. Fetch
+    // the projection from the inviter NOW — after the full A2
+    // authentication, before any lock or local state — and admit it only
+    // when it re-derives the signed root. The network wait runs outside
+    // the membership lock. A v4 invite skips this entirely. A FAILED
+    // fetch is not fatal yet: duplicate joins of an already-seated or
+    // already-pending group answer without the roster, so the typed
+    // retryable refusal fires only at the points that actually SEED from
+    // the base (the remnant discriminator and the fresh stub install).
+    let fetched_base_roster = match view.base_roster_root.as_deref() {
+        None => (None, false),
+        Some(signed_root) => {
+            // r4 item 6: a join that cannot SEED — the joiner already
+            // holds an Active seat locally, or its attempt is already
+            // registered as pending — answers idempotently below without
+            // the base, so it skips the fetch window instead of paying it.
+            // r5 item 4: the pending check reads the SAME source the
+            // idempotent answer reads (`local_join_membership_state`'s
+            // `pending_authority_commit` clause: the expected-inviter
+            // registry, outside an open re-seat staging), so the skip can
+            // never fire for a join the answer path would not classify as
+            // pending.
+            let joiner_hex = hex::encode(agent_id.as_bytes());
+            let already_active = {
+                let groups = state.named_groups.read().await;
+                groups
+                    .get(&group_id_hex)
+                    .or_else(|| {
+                        groups
+                            .values()
+                            .find(|info| info.mls_group_id == group_id_hex)
+                    })
+                    .is_some_and(|info| info.has_active_member(&joiner_hex))
+            };
+            let staged_join = !crate::server::reseat_scope::in_any_reseat_scope()
+                && (state
+                    .reseat_stagings
+                    .scope_for(invite_stable_group_id)
+                    .is_some()
+                    || state.reseat_stagings.scope_for(&group_id_hex).is_some());
+            let already_pending = !staged_join
+                && expected_join_result_inviter(
+                    &state,
+                    &join_result_key(invite_stable_group_id, &joiner_hex),
+                )
+                .is_some();
+            if already_active || already_pending {
+                tracing::debug!(
+                    group_id = %LogHexId::group(&invite.group_id),
+                    "v6 join is already seated or pending locally; the fetch is skipped"
+                );
+                (None, false)
+            } else {
+                let secret_hash_hex = hex::encode(view.secret_hash);
+                match base_roster_fetch::obtain_base_roster(
+                    &state,
+                    inviter_agent,
+                    invite_stable_group_id,
+                    signed_root,
+                    &secret_hash_hex,
+                    base_roster_fetch::BASE_ROSTER_FETCH_TIMEOUT,
+                )
+                .await
+                {
+                    Ok(roster) => (Some(roster), false),
+                    Err(error) => {
+                        tracing::debug!(
+                            group_id = %LogHexId::group(&invite.group_id),
+                            inviter = %invite.inviter,
+                            ?error,
+                            "content-addressed base roster not fetched; the join refuses where it would seed"
+                        );
+                        (
+                            None,
+                            error == base_roster_fetch::ObtainBaseRosterError::Pruned,
+                        )
+                    }
+                }
+            }
+        }
+    };
+    let (fetched_base_roster, base_roster_pruned) = fetched_base_roster;
+    // v6 with no fetched roster: the typed answer for every path below
+    // that needs the base projection — retryable 503 while the inviter
+    // may still serve, TERMINAL 409 once the inviter answered that the
+    // invite's root is pruned (r5 item 6: no retry can ever serve it).
+    let base_roster_unavailable = |state: &AppState| {
+        if base_roster_pruned {
+            state
+                .groups_diagnostics
+                .record_invite_refusal(&invite.group_id, "base_roster_pruned");
+            return api_error(
+                StatusCode::CONFLICT,
+                "base_roster_pruned: the inviter no longer holds the roster this \
+                 invite signed; request a fresh invite",
+            );
+        }
+        state
+            .groups_diagnostics
+            .record_invite_refusal(&invite.group_id, "base_roster_unavailable");
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "base_roster_unavailable: the inviter did not serve the invite's \
+             content-addressed base roster; retry while the inviter is reachable",
+        )
+    };
+    let v6_roster_missing = view.base_roster_root.is_some() && fetched_base_roster.is_none();
+    let effective_base_roster = fetched_base_roster.as_ref().unwrap_or(&view.base_roster);
     let membership_lock = group_membership_lock(&state, &group_id_hex).await;
     let membership_guard = membership_lock.lock().await;
     // #477: the AUTHORITATIVE 409 recheck — serialized against the stub
@@ -25485,8 +25667,12 @@ pub(super) async fn join_group_via_invite_inner(
                     // is re-armed (neither the #1148 clear nor the
                     // base-seat shortcut runs). Otherwise #1148's clear
                     // stands.
-                    let base_seats_device = view
-                        .base_roster
+                    // #646: the discriminator reads the base projection —
+                    // never guess it from an unfetched v6 base.
+                    if v6_roster_missing {
+                        return base_roster_unavailable(&state);
+                    }
+                    let base_seats_device = effective_base_roster
                         .get(&joiner_hex)
                         .is_some_and(|seat| seat.state == x0x::groups::GroupMemberState::Active);
                     #[cfg(test)]
@@ -25618,6 +25804,15 @@ pub(super) async fn join_group_via_invite_inner(
         )
         .await;
     }
+    // #646 (review r2): a v6 join whose fetch failed refuses BEFORE the
+    // stale-row clear — a refused invite leaves the row unchanged (#1471),
+    // so an inert card-import stub survives the retryable 503 and group
+    // access keeps answering while the joiner retries. Everything past
+    // here clears local state or SEEDS a fresh stub from the base
+    // projection, so the typed retryable refusal happens NOW.
+    if v6_roster_missing {
+        return base_roster_unavailable(&state);
+    }
     if stale_not_member_row {
         // Still under the membership guard taken above, so no concurrent
         // join, apply or finalizer can interleave with the clear. A
@@ -25693,6 +25888,7 @@ pub(super) async fn join_group_via_invite_inner(
                 &joiner_hex,
                 req.display_name.clone(),
                 treekem_key_package_b64.clone(),
+                fetched_base_roster.as_ref(),
             );
             // #468 A5: PENDING lineage marker at stub creation — the base
             // the authenticated invite committed to, before any seat.
@@ -25701,9 +25897,9 @@ pub(super) async fn join_group_via_invite_inner(
             info.invite_lineage = Some(x0x::groups::InviteLineage {
                 base_revision: view.base_state_revision,
                 base_hash: view.base_state_hash.clone(),
-                base_roster_root: x0x::groups::state_commit::roster_root_of_projection(
-                    &view.base_roster,
-                ),
+                // #646: the signed root — carried on v6, re-derived from
+                // the inline projection on v4 (same value either way).
+                base_roster_root: view.signed_roster_root(),
                 seated_at_revision: None,
                 corroborated: false,
                 fork_evidence: None,
@@ -49510,6 +49706,16 @@ pub(in crate::server) const JOIN_RESULT_FETCH_HANDLER_CAP: usize = 32;
 /// runs in registered tasks under the artifact's deadline.
 const JOIN_RESULT_FETCH_HANDLER_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// #646 (review r6): a group's share of base-roster serve handlers. The
+/// pool is SEPARATE from [`JOIN_RESULT_FETCH_PER_GROUP_CAP`] and the
+/// coalescing key is the invite's SECRET HASH, so any number of cheap
+/// agent ids holding one bearer card coalesce to one in-flight serve per
+/// invite and can never starve a group's join-result fetch recovery.
+pub(in crate::server) const BASE_ROSTER_SERVE_PER_GROUP_CAP: usize = 2;
+
+/// #646 (review r6): node-wide bound on concurrent base-roster serves.
+pub(in crate::server) const BASE_ROSTER_SERVE_HANDLER_CAP: usize = 8;
+
 /// The join-result listener's entry point (ADR 0107 r5, G7). A
 /// `FetchRequest` can wait on its group's membership lock (and runs the
 /// owner-certificate retry), so it never runs on the shared listener: it is
@@ -49525,6 +49731,178 @@ pub(in crate::server) async fn dispatch_join_result_message(
     verified: bool,
     msg: JoinResultMessage,
 ) -> bool {
+    // #646: the content-addressed base-roster exchange is handled here in
+    // full — neither arm is a durable apply. The reply hand-off is local
+    // memory only (the waiting joiner verifies it against the invite's
+    // SIGNED root before using it); the serve runs as a bounded detached
+    // task under the same per-(group, member) fetch admission as a
+    // join-result fetch.
+    match &msg {
+        JoinResultMessage::BaseRoster {
+            group_id,
+            roster_root,
+            roster,
+        } => {
+            // Review r3 (blocker 1): only a VERIFIED sender can answer a
+            // fetch, and the delivery wakes only joins whose invite names
+            // that sender as the inviter. Nothing is cached.
+            if !verified {
+                tracing::debug!(
+                    group_id = %LogHexId::group(group_id),
+                    "ignoring unverified base-roster reply"
+                );
+                return true;
+            }
+            base_roster_fetch::deliver_base_roster(state, sender, group_id, roster_root, roster);
+            return true;
+        }
+        JoinResultMessage::BaseRosterUnavailable {
+            group_id,
+            roster_root,
+        } => {
+            // r5 item 6: the terminal answer rides the same trust rules as
+            // a served reply — verified sender, honoured only for a join
+            // waiting on that sender as its inviter, never cached.
+            if !verified {
+                tracing::debug!(
+                    group_id = %LogHexId::group(group_id),
+                    "ignoring unverified base-roster-unavailable answer"
+                );
+                return true;
+            }
+            base_roster_fetch::deliver_base_roster_unavailable(
+                state,
+                sender,
+                group_id,
+                roster_root,
+            );
+            return true;
+        }
+        JoinResultMessage::BaseRosterFetch {
+            group_id,
+            member_agent_id,
+            roster_root,
+            secret_hash,
+        } => {
+            // Review r3 item 5: an unverified sender gets no serve.
+            if !verified {
+                tracing::debug!(
+                    group_id = %LogHexId::group(group_id),
+                    "ignoring unverified base-roster fetch"
+                );
+                return true;
+            }
+            let sender_hex = hex::encode(sender.as_bytes());
+            if sender_hex != *member_agent_id {
+                tracing::warn!(
+                    group_id = %LogHexId::group(group_id),
+                    sender = %LogHexId::agent(&sender_hex),
+                    member = %LogHexId::agent(member_agent_id),
+                    "ignoring unauthorized base-roster fetch"
+                );
+                return true;
+            }
+            // r4 item 5 (and r3 item 6): AUTHORIZE FIRST, under the groups
+            // read lock, with no record clone — an unauthorized request
+            // never takes an admission ticket, so it cannot hold a slot
+            // another member's fetch (or recovery) needs.
+            let now_secs = now_millis_u64() / 1_000;
+            let located = {
+                let groups = state.named_groups.read().await;
+                crate::server::resolve_group_entry_locked(&groups, group_id).map(|(_, info)| {
+                    (
+                        info.stable_group_id().to_string(),
+                        base_roster_fetch::locate_served_base_roster(
+                            info,
+                            &sender_hex,
+                            roster_root,
+                            secret_hash,
+                            now_secs,
+                        ),
+                    )
+                })
+            };
+            let (stable_group, served_roster) = match located {
+                None => {
+                    tracing::debug!(group_id = %LogHexId::group(group_id), "base-roster fetch for an unknown group; dropped");
+                    return true;
+                }
+                Some((_, base_roster_fetch::BaseRosterServeDecision::Refuse)) => {
+                    tracing::debug!(
+                        group_id = %LogHexId::group(group_id),
+                        requester = %LogHexId::agent(&sender_hex),
+                        "base-roster fetch refused: no live matching invite for this \
+                         requester and root"
+                    );
+                    return true;
+                }
+                // r5 item 6: authorized, but the bound root is unserveable
+                // — answer terminally (under the same admission as a
+                // serve) so the joiner stops retrying.
+                Some((stable_group, base_roster_fetch::BaseRosterServeDecision::Unavailable)) => {
+                    (stable_group, None)
+                }
+                Some((stable_group, base_roster_fetch::BaseRosterServeDecision::Serve(roster))) => {
+                    (stable_group, Some(roster))
+                }
+            };
+            // r3 item 5 → r6 major 3: base-roster serves take their OWN
+            // admission pool, never a join-result fetch recovery slot.
+            // The coalescing key is the invite's SECRET HASH, so any
+            // number of agent ids holding one bearer card coalesce to one
+            // in-flight serve per invite.
+            let ticket = match state
+                .base_roster_serve_admission
+                .try_admit(&format!("{stable_group}|{secret_hash}"), &stable_group)
+            {
+                Ok(ticket) => ticket,
+                Err(refusal) => {
+                    tracing::debug!(
+                        group_id = %LogHexId::group(group_id),
+                        member = %LogHexId::agent(member_agent_id),
+                        ?refusal,
+                        "base-roster fetch not admitted; the joiner retries"
+                    );
+                    return true;
+                }
+            };
+            let task_state = Arc::clone(state);
+            let requester = *sender;
+            let roster_root = roster_root.clone();
+            state.spawn_detached(async move {
+                let _ticket = ticket;
+                let send = async {
+                    match served_roster {
+                        Some(roster) => {
+                            base_roster_fetch::send_base_roster_reply(
+                                &task_state,
+                                &requester,
+                                stable_group,
+                                roster_root,
+                                roster,
+                            )
+                            .await;
+                        }
+                        None => {
+                            base_roster_fetch::send_base_roster_unavailable(
+                                &task_state,
+                                &requester,
+                                stable_group,
+                                roster_root,
+                            )
+                            .await;
+                        }
+                    }
+                };
+                let handler = tokio::time::timeout(JOIN_RESULT_FETCH_HANDLER_TIMEOUT, send);
+                if handler.await.is_err() {
+                    tracing::warn!("base-roster fetch handler timed out; the joiner retries");
+                }
+            });
+            return true;
+        }
+        _ => {}
+    }
     let JoinResultMessage::FetchRequest {
         group_id,
         member_agent_id,
@@ -49544,7 +49922,11 @@ pub(in crate::server) async fn dispatch_join_result_message(
             }
             JoinResultMessage::Refused { receipt } => receipt.group_id.clone(),
             JoinResultMessage::Pending { notice } => notice.group_id.clone(),
-            JoinResultMessage::FetchRequest { group_id, .. } => group_id.clone(),
+            JoinResultMessage::FetchRequest { group_id, .. }
+            // #646: both arms returned above; named for exhaustiveness.
+            | JoinResultMessage::BaseRosterFetch { group_id, .. }
+            | JoinResultMessage::BaseRoster { group_id, .. }
+            | JoinResultMessage::BaseRosterUnavailable { group_id, .. } => group_id.clone(),
         };
         let apply_state = Arc::clone(state);
         let sender = *sender;
@@ -50676,6 +51058,12 @@ async fn handle_join_result_message_bound(
         JoinResultMessage::Pending { notice } => {
             verify_and_hold_join_pending_notice(state, verified, &notice).await;
         }
+        // #646: the base-roster arms are consumed by
+        // `dispatch_join_result_message` before this handler; a direct
+        // call with one is a no-op.
+        JoinResultMessage::BaseRosterFetch { .. }
+        | JoinResultMessage::BaseRoster { .. }
+        | JoinResultMessage::BaseRosterUnavailable { .. } => {}
     }
 }
 
@@ -52602,6 +52990,7 @@ pub(in crate::server) mod tests {
     mod issue1809_secret_file_mode;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
+    mod issue646_base_roster_fetch;
     mod issue821_read_auth;
     mod issue877_error_body_session;
     mod join_pending_notice_1575;
@@ -53374,6 +53763,7 @@ pub(in crate::server) mod tests {
             mls_groups: crate::server::reseat_scope::ScopedGroupMap::default(),
             mls_groups_path: data_dir.join("mls_groups.bin"),
             pending_join_results: RwLock::new(HashMap::new()),
+            base_roster_fetch_slots: StdMutex::new(HashMap::new()),
             pending_join_refusals: StdMutex::new(HashMap::new()),
             pending_join_notices: StdMutex::new(HashMap::new()),
             join_pending_notice_sign_limiter: StdMutex::new(JoinRefusalSignLimiter::default()),
@@ -53404,6 +53794,10 @@ pub(in crate::server) mod tests {
             join_result_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
                 crate::server::routes::named_groups::JOIN_RESULT_FETCH_PER_GROUP_CAP,
                 crate::server::routes::named_groups::JOIN_RESULT_FETCH_HANDLER_CAP,
+            ),
+            base_roster_serve_admission: crate::server::routes::named_groups::FairAdmission::new(
+                crate::server::routes::named_groups::BASE_ROSTER_SERVE_PER_GROUP_CAP,
+                crate::server::routes::named_groups::BASE_ROSTER_SERVE_HANDLER_CAP,
             ),
             join_result_chunk_admission: crate::server::routes::named_groups::FairAdmission::new(
                 crate::server::routes::named_groups::JOIN_RESULT_CHUNK_PER_GROUP_CAP,
@@ -67221,6 +67615,7 @@ pub(in crate::server) mod tests {
             &joiner_hex,
             display_name.clone(),
             None,
+            None,
         );
         assert_eq!(joiner_pre_commit.members_v2, base.members_v2);
         assert_eq!(joiner_pre_commit.state_hash, base.state_hash);
@@ -67354,6 +67749,7 @@ pub(in crate::server) mod tests {
             &group_id,
             &joiner_hex,
             Some("new display".to_string()),
+            None,
             None,
         );
 
@@ -72355,6 +72751,7 @@ pub(in crate::server) mod tests {
                 &inviter_hex,
                 &"ee".repeat(32),
                 &joiner_hex,
+                None,
                 None,
                 None,
             );
@@ -77939,6 +78336,7 @@ mod cas_rollback_470 {
                             intended_joiner: None,
                             origin: x0x::groups::InviteOrigin::Explicit,
                             signed_link: None,
+                            base_roster_root: None,
                         },
                     );
                 }
@@ -78020,6 +78418,7 @@ mod cas_rollback_470 {
                     intended_joiner: None,
                     origin: x0x::groups::InviteOrigin::Explicit,
                     signed_link: None,
+                    base_roster_root: None,
                 },
             );
             y.home = Some(x0x::groups::HomeMetadata {

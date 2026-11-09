@@ -2863,6 +2863,7 @@ mod tests {
                     intended_joiner: (n % 3 == 0).then(|| format!("joiner-{n}")),
                     origin: crate::groups::InviteOrigin::Explicit,
                     signed_link: None,
+                    base_roster_root: None,
                 },
             );
             original

@@ -541,9 +541,17 @@ pub(in crate::server) fn populate_invite_base_state_v4(
     // #1023: the digest-only projection — the invite link is DM-budgeted
     // and is not a certificate carrier; the bytes travel with the
     // retained-commit chain instead.
-    invite.base_roster = Some(x0x::groups::state_commit::roster_projection_digest_only(
-        &info.members_v2,
-    ));
+    // #646 r3 (blocker 2): this helper ALWAYS carries the projection
+    // inline (v4) — past the cap, `sign_v4` refuses `base_roster` as
+    // oversize exactly as before #646, so a caller like
+    // `mint_reseat_invite` never signs or stores an invite its redeem
+    // side (`check_reseat_invite`, which requires the inline roster)
+    // cannot use. The ordinary mint path opts into the v6
+    // content-addressed carrier through
+    // [`populate_invite_base_state`].
+    let projection = x0x::groups::state_commit::roster_projection_digest_only(&info.members_v2);
+    invite.base_roster = Some(projection);
+    invite.base_roster_root = None;
     invite.base_members_v2 = None;
     // #469 D1: exact public-meta snapshot — the precise input of
     // `compute_public_meta_hash`, so the joiner recomputes the base state
@@ -563,6 +571,34 @@ pub(in crate::server) fn populate_invite_base_state_v4(
     invite.secure_plane = Some(info.secure_plane);
     invite.base_secret_epoch = Some(info.secret_epoch);
     invite.base_security_binding = info.security_binding.clone();
+}
+
+/// #646 (D13): the v6-capable mint population for the ORDINARY invite
+/// path (`assemble_signed_v4_invite`). A projection past the inline cap
+/// no longer rides the link: the invite becomes v6 and carries the
+/// projection's CONTENT ADDRESS (its roster root); the joiner fetches the
+/// projection from the inviter and admits it only when it re-derives this
+/// signed root. At or under the cap the invite stays v4, byte-identical
+/// to pre-#646 links. The re-seat path keeps
+/// [`populate_invite_base_state_v4`]: its redeem side needs the inline
+/// roster (r3 blocker 2).
+pub(in crate::server) fn populate_invite_base_state(
+    invite: &mut x0x::groups::invite::SignedInvite,
+    info: &x0x::groups::GroupInfo,
+    intended_joiner: Option<x0x::identity::AgentId>,
+) {
+    populate_invite_base_state_v4(invite, info, intended_joiner);
+    let over_cap = invite
+        .base_roster
+        .as_ref()
+        .is_some_and(|roster| roster.len() > x0x::groups::invite::MAX_INVITE_ROSTER_ENTRIES);
+    if over_cap {
+        let projection = invite.base_roster.take().unwrap_or_default();
+        invite.version = x0x::groups::invite::INVITE_VERSION_V6;
+        invite.base_roster_root = Some(x0x::groups::state_commit::roster_root_of_projection(
+            &projection,
+        ));
+    }
 }
 
 /// GET /agent/card — generate a shareable identity card.
