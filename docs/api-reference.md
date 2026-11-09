@@ -244,7 +244,7 @@ The Home Suite campaign (ADRs 0036–0043, plus the 0044–0058 backfills) added
   `GET /diagnostics/ws`.
 
 Open issues for this release are listed in the README's *Known limitations*
-table (#446–#451). This reference documents **217 endpoints — exactly the set
+table (#446–#451). This reference documents **218 endpoints — exactly the set
 `x0x routes` prints** (two further served paths sit outside the registry:
 `/.well-known/agent-card.json` and the `/gui/` alias). The registry in
 `src/api/mod.rs` is the authoritative list. `x0x routes` prints the copy of
@@ -467,6 +467,7 @@ contains the same sentence as the startup error log. See
 | GET | `/agent/user-id` | `x0x agent user-id` | Current user ID if configured |
 | GET | `/agent/card` | `x0x agent card [DISPLAY_NAME] [--include-groups] [--include-local-addresses]` | Generate a shareable, signed identity card (`--include-local-addresses` adds loopback/RFC1918 addresses for local testnet cards; off by default so shared cards don't leak unroutable addresses) |
 | GET | `/.well-known/agent-card.json` | — | A2A-compatible discovery card (ADR-0017) |
+| GET | `/onboard` | `x0x onboard [--inline-card] [--no-card] [--card-file <PATH>]` | Install-and-join recipe (#894): Markdown + structured steps that teach another agent to install x0x and DM this agent, with the signed card link (`?card=file\|inline\|lookup`, default `file`; `?card_file=` names the handed-over file in the recipe) |
 | POST | `/agent/card/import` | `x0x agent import` | Import a card into contacts (verifies signature; never changes existing trust: floor at existing level, Blocked is sticky) |
 | POST | `/agent/sign` | `x0x agent sign` | Detached ML-DSA-65 signature over caller-supplied bytes |
 | POST | `/agent/verify` | `x0x agent verify` | Verify a detached ML-DSA-65 signature against a caller-supplied public key |
@@ -645,7 +646,8 @@ authority evidence), and the response returns the certificate
 (`certificate.storage_b64`) for ACP-attached harness instances.
 
 **Rider tokens** (`{ "sub_agent_id": <hex>, "groups": [gid…], "label"?:
-string, "ttl_secs"?: ≤ 90 days, default 7, "scopes"?: ["gui:show"],
+string, "ttl_secs"?: ≤ 90 days, default 7, "scopes"?: ["gui:show",
+"scratch:read", "scratch:read_write"],
 "delegation": { "payload_b64", "signature" } }`) are stored hashed at
 rest (SHA-256),
 expire, and are revocable per-token or by revoking their sub-agent.
@@ -671,6 +673,16 @@ authenticates as a distinct principal that may reach exactly:
   checks the explicit list only)
 - `GET /history` — `group:` scopes it is granted, limit clamped to 100
 - `POST /gui/show` — only when the token's `scopes` contain `gui:show`
+- the group SCRATCH store of a granted group (issue #1094, ADR 0075
+  decisions 4–5): with `scratch:read`, `GET /stores/:id/keys` and
+  `GET /stores/:id/:key`; with `scratch:read_write`, also
+  `PUT`/`DELETE /stores/:id/:key` and `POST /groups/:id/stores` with
+  `"name": "scratch"` only. `:id` must be the percent-encoded DERIVED
+  scratch topic of a group in the token's grant list (the `topic` the
+  create route returns — `x0x/group/<gid>/kv/<store digest>`), and the
+  open store must be group-bound. No scratch scope means
+  no store access (the `scratch: none` default). A rider never reaches
+  any other store, store creation/join, or `GET /stores`.
 
 Every other route — including `/agent/sign`, `/exec/*`, `/identity/*`,
 `/shutdown`, and the rest of the `/history` family (`/history/search`,
@@ -692,10 +704,11 @@ Home encrypts record the sub-agent id as the history row's author.
 `scopes` on `POST /owner/riders` is optional. It is the rider-token
 permission list. It is not the group list inside the delegation
 capability. Omit the field, or send `[]`, and the rider has no scopes.
-The only allowed value is the exact string `gui:show`. A repeated
-`gui:show` is stored once. Any other string, including a different case
-or added whitespace, is rejected before a certificate lookup or a disk
-write. The mint response is HTTP 400 and nothing is stored:
+The allowed values are the exact strings `gui:show`, `scratch:read`
+and `scratch:read_write`. A repeated scope is stored once. Any other
+string, including a different case or added whitespace, is rejected
+before a certificate lookup or a disk write. The mint response is HTTP
+400 and nothing is stored:
 
 ```json
 {"error":"unknown rider scope: <value>","ok":false,"reason":"unknown_scope"}
@@ -1615,8 +1628,10 @@ recipient, install a group secret, or establish historical-key entitlement.
 ### `POST /groups/:id/stores` — group store
 
 This bearer-authenticated owner route accepts either the durable API token or a
-session token. Rider tokens cannot reach it: the deny-by-default middleware
-returns `403` before the handler, regardless of a rider's group grants. For
+session token. Rider tokens cannot reach it, with one exception (issue #1094,
+ADR 0075 decision 5): a rider whose token carries `scratch:read_write` may open
+the `scratch` store of a group in its grant list — any other name, scope or
+group answers `403` before any store state changes. For
 `MlsEncrypted` groups the daemon's own agent must be an active member. For
 `SignedPublic` groups, public-read policy permits nonmembers to open and read;
 members-only read policy requires an active member. Writes always follow the
@@ -2908,6 +2923,20 @@ claim, or conclude the task is gone if it stays absent.
 | GET | `/stores/:id/:key` | `x0x store get <store_id> <key>` | Get a value |
 | DELETE | `/stores/:id/:key` | `x0x store rm <store_id> <key>` | Remove a value |
 
+### The group scratch store (issue #1094)
+
+Each group's SCRATCH store is the group store named `scratch`
+(`POST /groups/:id/stores` with `{"name":"scratch"}`): an ordinary sealed
+last-writer-wins KV store at the deterministic derived topic
+`x0x/group/<stable group id>/kv/<store digest>` (the digest is the
+BLAKE3 store identity of the stable group id and the name `scratch`,
+so every member computes the same topic; the create response returns
+it as `topic`), for agents' keyed working state. It is the one store
+a rider token can reach, under the `scratch:read` /
+`scratch:read_write` scopes (see the rider section); the `:id` in
+`/stores/:id/*` is the percent-encoded topic. Owners use the ordinary
+store routes above.
+
 ### Store create request body
 
 ```json
@@ -3455,7 +3484,13 @@ a typed `403`.
 - `grantee_user` or `grantee_agent` (64-hex): set exactly one, else `400`.
 - `agents` (required, non-empty): this owner's agents to share.
 - `caps` (required, non-empty): any of `"dm"`, `"exec"`, `"group_invite"`,
-  `"call"`, `{"connect":{"ports":[...]}}`.
+  `"call"`, `{"connect":{"ports":[...]}}`,
+  `{"data":{"group":"<stable group id>","store":"<name>","access":"ro"|"rw"}}`.
+  The `data` capability (issue #1094) names ONE store of ONE group — for
+  example the group's `scratch` store — so data can be shared without
+  sharing the whole group. This release mints, stores, delivers and
+  evaluates it; the remote read/write surface that consumes it is the A4
+  sharing-completeness slice and is not yet wired.
 - `expiry` (Unix seconds) or `ttl_secs` (seconds from `not_before`): set
   exactly one, else `400`. Grants must expire.
 - `not_before` (optional, Unix seconds): default is now.
@@ -4236,7 +4271,7 @@ At daemon start each persisted forward is re-bound. A named forward is first re-
 Restore failures are either permanent or transient:
 
 - A permanent failure (`name_changed`, invalid or reserved names, ambiguous kind, or an unsupported target kind) is never retried during this daemon run. Check the reported reason, correct the target or name if needed, then delete and re-add the forward to accept its ids and restore it. A later name change back to the saved ids does not clear this failure.
-- A transient failure (an unknown name, an unverified owner, ambiguous name candidates, a name-store failure, or `bind_failed`) gets five retries after the initial attempt. The delays are 10, 20, 40, 80 and 160 seconds. After the fifth retry, the daemon retries every 10 minutes indefinitely, until the forward listens, the owner deletes it, or a retry finds a permanent failure. A peer discovered much later can therefore recover without owner action. Every attempt still checks the saved ids; a retry never retargets the forward.
+- A transient failure (an unknown name, an unverified owner, ambiguous name candidates, a name-store failure, or `bind_failed`) gets five retries after the initial attempt. A machine name that reaches its pinned machine while that machine's agent is not rediscovered yet (usual right after a restart) is an unknown name, so it retries; only a different agent or machine id is `name_changed`. The delays are 10, 20, 40, 80 and 160 seconds. After the fifth retry, the daemon retries every 10 minutes indefinitely, until the forward listens, the owner deletes it, or a retry finds a permanent failure. A peer discovered much later can therefore recover without owner action. Every attempt still checks the saved ids; a retry never retargets the forward.
 
 The retry schedule is per forward and held only in memory. A committed owner add or delete resets it. A daemon restart starts a new schedule. The background restore task stays active while any transient forward is down, and stops when no retry remains (or the daemon shuts down).
 
@@ -4304,6 +4339,10 @@ they travel only inside the end-to-end encrypted grant DM. The daemon
 advertises ADR 0093 application bit 14, `share_grant_names_v1`, for this
 route; a sender uses the v2 envelope only toward a grantee whose current
 verified advert sets bit 14, and sends the unchanged v1 payload otherwise.
+An encoded v2 envelope after the prefix is at most 48 KiB (the v1 grant
+limit is 32 KiB). The names section carries at most 64 machines, and each
+name is at most 128 bytes (the ADR-0036 profile rule). A larger or
+non-canonical envelope is refused whole.
 
 The receiver verifies the grant by the v1 rules and the names signature
 under the grant's owner key; a failure of either refuses the whole envelope
@@ -4327,6 +4366,9 @@ The names become ADR-0074 §1 defaults in the local name store:
 - A **stranger's** grant yields only a pending suggestion (`suggestions` in
   `GET /names`). `POST /names/accept {"label": …}` applies it (and removes
   it); `DELETE /names/suggestions/:label` drops it.
+- When a label is bound to an owner (by a grant default or
+  `POST /names/owners`), a pending suggestion that another owner left under
+  that label is dropped: it can no longer be accepted.
 - One owner holds at most one pending suggestion; a later one from the same
   owner replaces it. One owner holds at most 16 `default_conflict` reports;
   a further report drops that owner's oldest. The tables hold at most 256

@@ -68,6 +68,7 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Post, "/announce", daemon_api_announce),
     covered!(Get, "/agent/user-id", "GET /agent/user-id"),
     covered!(Get, "/agent/card", "GET /agent/card"),
+    covered!(Get, "/onboard", daemon_api_onboard_recipe),
     covered!(Get, "/introduction", "GET /introduction"),
     covered!(
         Post,

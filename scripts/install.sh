@@ -6,6 +6,7 @@
 #   curl -sfL https://x0x.md | sh -s -- --autostart   # install + start + autostart on boot
 #   bash install.sh --name alice                      # named instance
 #   sh install.sh --verify-only                       # download + verify, install nothing
+#   sh install.sh --no-start                          # install; do not start the daemon
 #
 # What it does:
 #   1. Detects platform (Linux/macOS, x64/arm64)
@@ -19,7 +20,7 @@
 #      mismatch)
 #   4. Stops any running x0xd instance
 #   5. Installs x0xd (daemon) + x0x (CLI) to ~/.local/bin
-#   6. Starts the daemon
+#   6. Starts the daemon (skipped with --no-start)
 #   7. Optionally configures autostart on boot (--autostart)
 #
 # Requirements: curl or wget, tar, gzip (GNU tar execs it for .tar.gz), sh,
@@ -36,6 +37,7 @@ NAME=""
 NAME_SET=false
 AUTOSTART=false
 VERIFY_ONLY=false
+NO_START=false
 # Saorsa Labs release signing key (primary fingerprint of SAORSA_PUBLIC_KEY.asc).
 # Rotate only with a reviewed installer change.
 TRUSTED_FPR="CEB3506E7DCB8A2DD2D679E8EDDA4827D89C0F29"
@@ -50,6 +52,10 @@ while [ $# -gt 0 ]; do
             ;;
         --verify-only)
             VERIFY_ONLY=true
+            shift
+            ;;
+        --no-start)
+            NO_START=true
             shift
             ;;
         --name)
@@ -148,11 +154,45 @@ else
 fi
 
 fetch() {
-    if [ "$DOWNLOADER" = "curl" ]; then
-        curl -sfL "$1" -o "$2" || { echo "Error: download failed: $1" >&2; exit 1; }
-    else
-        wget -qO "$2" "$1" || { echo "Error: download failed: $1" >&2; exit 1; }
-    fi
+    # GitHub API calls are authenticated when GITHUB_TOKEN is set: CI
+    # runners share egress IPs and the anonymous rate limit refuses them.
+    # The token is only ever sent to api.github.com, never to the asset
+    # hosts a release download redirects to.
+    AUTH=""
+    case "$1" in
+        https://api.github.com/*)
+            if [ -n "${GITHUB_TOKEN:-}" ]; then
+                AUTH="Authorization: Bearer $GITHUB_TOKEN"
+            fi
+            ;;
+    esac
+    # Bounded retry with backoff: GitHub's release downloads return
+    # transient 504s under load, and one such answer should not fail an
+    # install. Four attempts, 2/4/6 s apart; verification happens after
+    # the download, so a retried fetch changes nothing security-wise.
+    FETCH_ATTEMPT=1
+    while :; do
+        if [ "$DOWNLOADER" = "curl" ]; then
+            if [ -n "$AUTH" ]; then
+                curl -sfL -H "$AUTH" "$1" -o "$2" && return 0
+            else
+                curl -sfL "$1" -o "$2" && return 0
+            fi
+        else
+            if [ -n "$AUTH" ]; then
+                wget -qO "$2" --header="$AUTH" "$1" && return 0
+            else
+                wget -qO "$2" "$1" && return 0
+            fi
+        fi
+        if [ "$FETCH_ATTEMPT" -ge 4 ]; then
+            echo "Error: download failed: $1" >&2
+            exit 1
+        fi
+        echo "  download failed (attempt $FETCH_ATTEMPT of 4), retrying: $1" >&2
+        sleep $((FETCH_ATTEMPT * 2))
+        FETCH_ATTEMPT=$((FETCH_ATTEMPT + 1))
+    done
 }
 
 verify_failed() {
@@ -311,6 +351,15 @@ MANIFEST_CHANNEL=$(tr -d '\n\r' < "$TMP/release-manifest.json" | awk '{
         exit
     }
 }')
+# Signed manifests published before the channel field existed (#1558,
+# post-v0.48.1) have NO "channel" key: there was only one channel, stable.
+# A manifest whose signature verifies and that has no channel key at all is
+# that legacy stable shape. A present-but-empty channel is still refused.
+if [ -z "$MANIFEST_CHANNEL" ] \
+    && ! tr -d '\n\r' < "$TMP/release-manifest.json" | grep -q '"channel"'; then
+    MANIFEST_CHANNEL="stable"
+    echo "  Manifest predates the channel field; treating it as stable"
+fi
 if [ -z "$MANIFEST_VERSION" ] || [ -z "$MANIFEST_CHANNEL" ]; then
     verify_failed "manifest is missing its version or channel field"
 fi
@@ -516,6 +565,17 @@ mkdir -p "$SHARED_DIR"
 # We just ensure the shared directory exists so all instances can find it.
 
 # ── Start daemon ────────────────────────────────────────────────────────────
+
+# --no-start: install only (e.g. CI, or hosts where the daemon must not
+# join the network yet). Everything above — download, verification and the
+# binary install — already ran.
+if [ "$NO_START" = true ]; then
+    echo ""
+    echo "x0x installed (daemon not started: --no-start)"
+    echo "  Binaries: $BIN/x0xd, $BIN/x0x"
+    echo "  Start it later with: x0x start"
+    exit 0
+fi
 
 echo ""
 XOXD="$BIN/x0xd"

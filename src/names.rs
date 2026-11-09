@@ -1535,7 +1535,8 @@ impl NameStore {
         self.commit(move |state| {
             if let Some(held) = state.owners.get(&label) {
                 return if held.user_id == user {
-                    Ok((BindOutcome::Unchanged, false))
+                    let evicted = evict_foreign_suggestion(state, &label, user);
+                    Ok((BindOutcome::Unchanged, evicted))
                 } else {
                     Err(NameError::PinMismatch {
                         name: label,
@@ -1547,6 +1548,7 @@ impl NameStore {
             if state.owners.len() >= MAX_OWNER_LABELS {
                 return Err(NameError::Store("owner label table is full".into()));
             }
+            evict_foreign_suggestion(state, &label, user);
             state.owners.insert(
                 label,
                 OwnerBinding {
@@ -1955,6 +1957,7 @@ fn apply_defaults_trusted(
                 } else if state.owners.len() >= MAX_OWNER_LABELS {
                     None
                 } else {
+                    evict_foreign_suggestion(state, &derived, user);
                     state.owners.insert(
                         derived.clone(),
                         OwnerBinding {
@@ -2031,6 +2034,7 @@ fn apply_defaults_trusted(
         changed = true;
     }
     if !deferred.is_empty() {
+        changed |= evict_foreign_suggestion(state, &owner_label, user);
         let mut machines = state
             .suggestions
             .get(&owner_label)
@@ -2126,6 +2130,21 @@ fn suggest_defaults(
     applied.owner_label = Some(label);
     applied.suggested = true;
     (applied, changed)
+}
+
+/// Drop a pending suggestion under `label` that another owner left. Once
+/// `label` is bound to `user`, that suggestion can never be accepted (the
+/// label is taken), and keeping it would block `user`'s own suggestion
+/// under the label. Returns whether one was removed.
+fn evict_foreign_suggestion(state: &mut NamesState, label: &str, user: UserId) -> bool {
+    let foreign = state
+        .suggestions
+        .get(label)
+        .is_some_and(|held| held.user_id != user);
+    if foreign {
+        state.suggestions.remove(label);
+    }
+    foreign
 }
 
 /// Hold `next` as the pending suggestion under `label`. One owner holds at

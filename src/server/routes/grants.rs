@@ -69,7 +69,8 @@ pub(in crate::server) struct GrantIssueRequest {
     /// This owner's agents to share (hex, non-empty).
     agents: Vec<String>,
     /// Capabilities: `"dm"`, `"exec"`, `"group_invite"`, `"call"`,
-    /// `{"connect":{"ports":[22]}}`.
+    /// `{"connect":{"ports":[22]}}`,
+    /// `{"data":{"group":"<stable id>","store":"scratch","access":"ro"|"rw"}}`.
     caps: Vec<ShareCap>,
     /// Unix seconds the grant starts (default: now).
     #[serde(default)]

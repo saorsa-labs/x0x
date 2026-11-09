@@ -310,7 +310,7 @@ curl -H "Authorization: Bearer $TOKEN" "http://$API/contacts"
 
 - **[SKILL.md](./SKILL.md)** — core agent skill (first direct message, group join, scratch KV write). Longer contracts are the topic pages in `docs/skill/`.
 - **[docs/quickstart-two-agents.md](./docs/quickstart-two-agents.md)** — the 10-minute recipe: two local daemons, a direct message exchanged over REST, received on the event stream. CI runs it end-to-end on every PR.
-- **[docs/api-reference.md](./docs/api-reference.md)** — the complete REST + WebSocket + SSE reference (all 217 endpoints, auth classes, request/response shapes, WS/SSE event tables).
+- **[docs/api-reference.md](./docs/api-reference.md)** — the complete REST + WebSocket + SSE reference (all 218 endpoints, auth classes, request/response shapes, WS/SSE event tables).
 - **[docs/local-apps.md](./docs/local-apps.md)** — integrating non-Rust applications with the daemon.
 - **[docs/adr/README.md](./docs/adr/README.md)** — the ADR index: every design decision, 0001–0058, with errata.
 - `x0x routes` — print every endpoint served by your running daemon.

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Offline checks for real ways to bypass the 15-slot transition rule."""
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -25,6 +26,12 @@ class ConsolidationTests(unittest.TestCase):
 
     def save_index(self):
         self.index_path.write_text(json.dumps(self.index))
+
+    def record_hash(self, slot_index=0):
+        """Re-record a mutated slot file's sha256, as a ruled supersession PR would."""
+        slot = self.index["slots"][slot_index]
+        slot["sha256"] = hashlib.sha256((self.directory / slot["path"]).read_bytes()).hexdigest()
+        self.save_index()
 
     def assert_rejected(self, phrase):
         errors = CHECK.validate(self.root)
@@ -70,10 +77,12 @@ class ConsolidationTests(unittest.TestCase):
         for status in ("Accepted (record)", "**Accepted** review recorded", "Accepted; folded 7 Nov 2026"):
             with self.subTest(status=status):
                 path.write_text(original.replace(self.STATUS_LINE, f"- **Status:** {status}"))
+                self.record_hash()
                 self.assertEqual(CHECK.validate(self.root), [])
         for status in ("Proposed", "Proposed (Accepted draft)", "AcceptedElsewhere"):
             with self.subTest(status=status):
                 path.write_text(original.replace(self.STATUS_LINE, f"- **Status:** {status}"))
+                self.record_hash()
                 self.assert_rejected("slot status must remain Accepted")
 
     def test_missing_or_duplicate_status_cannot_bypass_the_lock(self):
@@ -125,6 +134,27 @@ class ConsolidationTests(unittest.TestCase):
         self.index["slots"][0]["path"] = "../0001-bootstrap-peers-are-seed-hints-only.md"
         self.save_index()
         self.assert_rejected("use its own Axx-rNN-title.md file")
+
+    def test_accepted_decision_rewrite_is_rejected_without_an_index_update(self):
+        path = self.directory / self.index["slots"][0]["path"]
+        path.write_text(path.read_text().replace("## Decision", "## Decision\n\nRewritten.", 1))
+        self.assert_rejected("does not match the sha256 recorded in index.json")
+
+    def test_ruled_supersession_records_the_new_hash_and_passes(self):
+        path = self.directory / self.index["slots"][0]["path"]
+        path.write_text(path.read_text().replace("## Decision", "## Decision\n\nRuled change.", 1))
+        self.record_hash()
+        self.assertEqual(CHECK.validate(self.root), [])
+
+    def test_missing_or_malformed_slot_hash_is_rejected(self):
+        for bad in (None, "abc", "G" * 64, hashlib.sha256(b"x").hexdigest().upper()):
+            with self.subTest(sha256=bad):
+                if bad is None:
+                    self.index["slots"][0].pop("sha256", None)
+                else:
+                    self.index["slots"][0]["sha256"] = bad
+                self.save_index()
+                self.assert_rejected("must record the slot file's sha256")
 
     def test_malformed_index_fails_closed_with_a_clear_result(self):
         self.index_path.write_text("{")

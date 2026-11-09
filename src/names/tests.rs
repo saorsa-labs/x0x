@@ -2008,3 +2008,46 @@ async fn trusted_machine_default_needs_hosting_evidence() {
         Some([0x04; 32])
     );
 }
+
+/// WHY (#1826 review r3, item 3): a stranger's stale suggestion under a
+/// label must not swallow the machines of the trusted owner who later binds
+/// that label. Binding the label evicts the other owner's suggestion, so
+/// the bound owner's unverified machines are kept as its own suggestion.
+#[tokio::test]
+async fn binding_a_label_evicts_another_owners_stale_suggestion() {
+    let store = NameStore::in_memory();
+    let mallory = UserId([0x77; 32]);
+    let bob = UserId([0xbb; 32]);
+    let applied = store
+        .apply_grant_names(&defaults(mallory, "Bob", &[]), false, NOW)
+        .await
+        .unwrap();
+    assert!(applied.suggested);
+    let mut offered = defaults(bob, "Bob", &[(0x05, "Studio")]);
+    offered.verified_hosts = BTreeSet::new();
+    let applied = store
+        .apply_grant_names(&offered, true, NOW + 1)
+        .await
+        .unwrap();
+    assert!(applied.owner_bound, "{applied:?}");
+    assert!(applied.suggested, "{applied:?}");
+    let (suggestions, _) = store.pending().await.unwrap();
+    let held = suggestions.get("bob").expect("bob's suggestion");
+    assert_eq!(held.user_id, bob, "the stranger's stale suggestion is gone");
+    assert_eq!(
+        held.machines,
+        vec![(MachineId([0x05; 32]), "Studio".to_string())]
+    );
+
+    // A manual bind evicts another owner's suggestion under that label too.
+    store
+        .apply_grant_names(&defaults(mallory, "Carol", &[]), false, NOW + 2)
+        .await
+        .unwrap();
+    assert!(store.pending().await.unwrap().0.contains_key("carol"));
+    store
+        .bind_owner("carol", UserId([0xcc; 32]), BindSource::Manual, NOW + 3)
+        .await
+        .unwrap();
+    assert!(!store.pending().await.unwrap().0.contains_key("carol"));
+}
