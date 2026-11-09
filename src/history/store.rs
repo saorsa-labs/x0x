@@ -6202,14 +6202,18 @@ mod tests {
         // current state survived the escape hatch intact.
         let (rows_after, replaceable_after): (u64, u64) = {
             let guard = lock_conn(&store.conn).unwrap();
-            guard
+            let (rows, replaceable): (i64, i64) = guard
                 .query_row(
                     "SELECT COUNT(*), COUNT(*) FILTER (WHERE replace_key IS NOT NULL) \
                      FROM history",
                     [],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
-                .unwrap()
+                .unwrap();
+            (
+                u64::try_from(rows).unwrap(),
+                u64::try_from(replaceable).unwrap(),
+            )
         };
         assert_eq!(
             replaceable_after, REPLACEABLE as u64,
