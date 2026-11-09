@@ -63,55 +63,56 @@ function Find-Gpg {
     return $null
 }
 
-function ConvertTo-GpgPath([string]$Path) {
-    # Git for Windows ships an MSYS gpg that treats a backslashed Windows
-    # path as a relative POSIX path (it prepends the cwd and fails to read
-    # the file). Both MSYS and native Windows gpg accept drive-letter paths
-    # with forward slashes, so every path handed to gpg goes through here.
-    return ($Path -replace "\\", "/")
-}
-
 function Test-ReleaseSignature([string]$Gpg, [string]$Artifact, [string]$Signature, [string]$KeyFile, [string]$WorkDir) {
     # gpg writes progress to stderr; under "Stop", Windows PowerShell 5.1 turns
     # redirected native stderr into a terminating error. Exit codes and the
     # status-fd lines are checked explicitly instead.
     $ErrorActionPreference = "Continue"
-    $gpgKeyFile = ConvertTo-GpgPath $KeyFile
-    $gpgArtifact = ConvertTo-GpgPath $Artifact
-    $gpgSignature = ConvertTo-GpgPath $Signature
-    # Check the downloaded key is the pinned one before trusting anything it signs.
-    $keyInfo = & $Gpg --batch --with-colons --show-keys --fingerprint $gpgKeyFile 2>$null
-    $keyFprs = @($keyInfo | Where-Object { $_ -like "fpr:*" } | ForEach-Object { ($_ -split ":")[9].ToUpperInvariant() })
-    if ($keyFprs -notcontains $TrustedFingerprint) {
-        throw "Downloaded SAORSA_PUBLIC_KEY.asc is not the pinned release key ($TrustedFingerprint)."
-    }
-
-    # Isolated keyring so the user's own GnuPG state is untouched.
-    $gnupgHome = Join-Path $WorkDir "gnupg"
-    New-Item -ItemType Directory -Force -Path $gnupgHome | Out-Null
-    # An empty common.conf pins the classic keybox files: modern gpg4win
-    # otherwise initializes a fresh homedir with use-keyboxd and the import
-    # fails when the keyboxd daemon cannot start (seen on CI runners).
-    Set-Content -LiteralPath (Join-Path $gnupgHome "common.conf") -Value ""
-    $gpgHomeDir = ConvertTo-GpgPath $gnupgHome
-    $importOut = & $Gpg --homedir $gpgHomeDir --batch --no-tty --import $gpgKeyFile 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        $detail = ($importOut | ForEach-Object { "$_" }) -join " | "
-        throw "gpg failed to import the release key: $detail"
-    }
-
-    $status = & $Gpg --homedir $gpgHomeDir --batch --no-tty --status-fd 1 --verify $gpgSignature $gpgArtifact 2>$null
-    $verifyExit = $LASTEXITCODE
-    $signers = @()
-    foreach ($line in $status) {
-        $parts = $line -split "\s+"
-        if ($parts.Length -ge 3 -and $parts[0] -eq "[GNUPG:]" -and $parts[1] -eq "VALIDSIG") {
-            $signers += $parts[2].ToUpperInvariant()
-            if ($parts.Length -ge 12) { $signers += $parts[11].ToUpperInvariant() }
+    # Every file this function hands to gpg lives in $WorkDir, and gpg runs
+    # FROM $WorkDir with bare relative names. Git for Windows ships a
+    # Cygwin-style gpg that mangles an absolute Windows path in --homedir
+    # (it prepends its POSIX cwd: keyblock resource '/d/a/.../C:/Users/...'
+    # on the CI runners); a cwd-relative name means the same file to that
+    # gpg and to native Windows gpg, with no cygpath dependency.
+    $keyName = Split-Path -Leaf $KeyFile
+    $artifactName = Split-Path -Leaf $Artifact
+    $signatureName = Split-Path -Leaf $Signature
+    Push-Location -LiteralPath $WorkDir
+    try {
+        # Check the downloaded key is the pinned one before trusting anything it signs.
+        $keyInfo = & $Gpg --batch --no-tty --with-colons --show-keys --fingerprint $keyName 2>$null
+        $keyFprs = @($keyInfo | Where-Object { $_ -like "fpr:*" } | ForEach-Object { ($_ -split ":")[9].ToUpperInvariant() })
+        if ($keyFprs -notcontains $TrustedFingerprint) {
+            throw "Downloaded SAORSA_PUBLIC_KEY.asc is not the pinned release key ($TrustedFingerprint)."
         }
-    }
-    if ($verifyExit -ne 0 -or ($signers -notcontains $TrustedFingerprint)) {
-        throw "GPG signature verification FAILED for $Asset. The download may have been tampered with."
+
+        # Isolated keyring so the user's own GnuPG state is untouched.
+        New-Item -ItemType Directory -Force -Path (Join-Path $WorkDir "gnupg") | Out-Null
+        # An empty common.conf pins the classic keybox files: modern gpg4win
+        # otherwise initializes a fresh homedir with use-keyboxd and the import
+        # fails when the keyboxd daemon cannot start (seen on CI runners).
+        Set-Content -LiteralPath (Join-Path $WorkDir "gnupg\common.conf") -Value ""
+        $importOut = & $Gpg --homedir gnupg --batch --no-tty --import $keyName 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            $detail = ($importOut | ForEach-Object { "$_" }) -join " | "
+            throw "gpg failed to import the release key: $detail"
+        }
+
+        $status = & $Gpg --homedir gnupg --batch --no-tty --status-fd 1 --verify $signatureName $artifactName 2>$null
+        $verifyExit = $LASTEXITCODE
+        $signers = @()
+        foreach ($line in $status) {
+            $parts = $line -split "\s+"
+            if ($parts.Length -ge 3 -and $parts[0] -eq "[GNUPG:]" -and $parts[1] -eq "VALIDSIG") {
+                $signers += $parts[2].ToUpperInvariant()
+                if ($parts.Length -ge 12) { $signers += $parts[11].ToUpperInvariant() }
+            }
+        }
+        if ($verifyExit -ne 0 -or ($signers -notcontains $TrustedFingerprint)) {
+            throw "GPG signature verification FAILED for $Asset. The download may have been tampered with."
+        }
+    } finally {
+        Pop-Location
     }
 }
 
