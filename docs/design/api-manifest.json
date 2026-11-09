@@ -3586,7 +3586,7 @@
     {
       "category": "grants",
       "cli_name": "grant revoke",
-      "description": "Revoke a share grant (owner key; gossiped on x0x.revocation.v3)",
+      "description": "Revoke a share grant (owner key; gossiped on x0x.revocation.v3 and pushed directly to capable recipients)",
       "method": "DELETE",
       "path": "/grants/:id",
       "request": {

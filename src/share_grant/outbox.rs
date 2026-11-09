@@ -51,16 +51,18 @@
 //! 1. **Owner side (enforced here):** once a revocation has been recorded,
 //!    this install makes NO new send and NO new enqueue of that grant.
 //! 2. **In-flight sends (enforced by the receiver):** the revocation reaches
-//!    the recipient on the `x0x.revocation.v3` gossip carrier (there is no
-//!    separate direct push). A receiver that already knows the revocation
+//!    the recipient on the `x0x.revocation.v3` gossip carrier, and — since
+//!    #1003 ([`crate::revocation_push`]) — as a best-effort direct push to
+//!    each capable recipient. A receiver that already knows the revocation
 //!    refuses to store the grant ([`super::handle_share_grant_dm_checked`]);
 //!    one that stored it first stops honouring it the moment the revocation
 //!    arrives — every access decision filters grants through the local
 //!    revocation set ([`super::evaluate_grant_access`]).
 //!
-//!    **Window:** until that gossip arrives, a receiver that stored an
-//!    in-flight grant still honours it. Closing the window needs a direct
-//!    revocation push, a wire change tracked in #1003.
+//!    **Window:** until a carrier arrives, a receiver that stored an
+//!    in-flight grant still honours it. The push shrinks the window to one
+//!    DM at capable hosts; at hosts without the capability bit, gossip
+//!    alone closes it.
 //!
 //! # Revocation is serialized with sending
 //!
