@@ -49,9 +49,13 @@
 //! metadata topic. Without it, a resend or a cache pull of A's renames can
 //! move J's stub past r while its large join result is in flight, and the
 //! join carry then starts from that later head. S3's messages and the join
-//! result go on other paths, so the hold does not touch them. With the
-//! hold, only the join result moves J, and A sends it after the seal, so
-//! J is still at r when the case reads it after the seal.
+//! result go on other paths, so the hold does not touch them. #1623: A's
+//! in-memory TreeKEM catch-up log also holds A's own renames, and A serves
+//! them to J page by page (a direct message, not on the metadata topic).
+//! So the case also empties A's catch-up log for the group after the
+//! renames, as an A restart does. With the hold and the empty log, only
+//! the join result moves J, and A sends it after the seal, so J is still
+//! at r when the case reads it after the seal.
 //!
 //! **Observations.** J's head and `recovery` state at each poll, and A's
 //! answers to J from J's direct message stream (decoded with
@@ -176,6 +180,32 @@ pub(super) async fn hold_meta_from_j(sim: &Sim, group: &str) -> Result<()> {
     Ok(())
 }
 
+/// #1623: A's in-memory TreeKEM catch-up log holds its own renames and
+/// serves them to J page by page while the join result is in flight, a
+/// path the metadata hold does not cover. Empty A's log for the group, as
+/// an A restart does (the log is in memory), so only the join result moves
+/// J. This is main's catch-up answer for a gap of renames only.
+async fn empty_catchup_log_on_a(sim: &Sim, group: &str) -> Result<()> {
+    let state = sim.state("A")?;
+    let keys = {
+        let groups = state.named_groups.read().await;
+        let (key, info) = crate::server::resolve_group_entry_locked(&groups, group)
+            .with_context(|| format!("A has no record of {group}"))?;
+        [
+            key.to_string(),
+            info.stable_group_id().to_string(),
+            info.mls_group_id.clone(),
+        ]
+    };
+    let mut logs = state.treekem_event_log.write().await;
+    for key in &keys {
+        logs.remove(key);
+    }
+    sim.fabric()
+        .mark("fault: A's TreeKEM catch-up log emptied".to_string());
+    Ok(())
+}
+
 /// One run: A renames `renames` times after the mint, then seals J.
 async fn gap_run(sim: &Sim, renames: usize) -> Result<Run> {
     let (group, _) = s0(sim, LABELS, true, &[]).await?;
@@ -189,6 +219,7 @@ async fn gap_run(sim: &Sim, renames: usize) -> Result<Run> {
     }
     settled(sim, &["M1", "M2"], &group, "M1 and M2 hold the renames").await?;
     hold_meta_from_j(sim, &group).await?;
+    empty_catchup_log_on_a(sim, &group).await?;
     let mut rx = sim.state("J")?.agent.subscribe_direct();
     let a_id = sim.ids("A")?.0;
     let since = sim
