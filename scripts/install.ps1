@@ -78,10 +78,17 @@ function Test-ReleaseSignature([string]$Gpg, [string]$Artifact, [string]$Signatu
     # Isolated keyring so the user's own GnuPG state is untouched.
     $gnupgHome = Join-Path $WorkDir "gnupg"
     New-Item -ItemType Directory -Force -Path $gnupgHome | Out-Null
-    & $Gpg --homedir $gnupgHome --batch --import $KeyFile 2>$null | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "gpg failed to import the release key." }
+    # An empty common.conf pins the classic keybox files: modern gpg4win
+    # otherwise initializes a fresh homedir with use-keyboxd and the import
+    # fails when the keyboxd daemon cannot start (seen on CI runners).
+    Set-Content -LiteralPath (Join-Path $gnupgHome "common.conf") -Value ""
+    $importOut = & $Gpg --homedir $gnupgHome --batch --no-tty --import $KeyFile 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        $detail = ($importOut | ForEach-Object { "$_" }) -join " | "
+        throw "gpg failed to import the release key: $detail"
+    }
 
-    $status = & $Gpg --homedir $gnupgHome --batch --status-fd 1 --verify $Signature $Artifact 2>$null
+    $status = & $Gpg --homedir $gnupgHome --batch --no-tty --status-fd 1 --verify $Signature $Artifact 2>$null
     $verifyExit = $LASTEXITCODE
     $signers = @()
     foreach ($line in $status) {
@@ -223,6 +230,14 @@ try {
     $releaseManifest = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
     $manifestVersion = [string]$releaseManifest.version
     $manifestChannel = [string]$releaseManifest.channel
+    # Signed manifests published before the channel field existed (#1558,
+    # post-v0.48.1) have NO channel property: there was only one channel,
+    # stable. A present-but-empty channel is still refused.
+    if (-not $manifestChannel -and
+        -not ($releaseManifest.PSObject.Properties.Name -contains "channel")) {
+        $manifestChannel = "stable"
+        Write-Host "  Manifest predates the channel field; treating it as stable"
+    }
     if (-not $manifestVersion -or -not $manifestChannel) {
         throw "The signed manifest is missing its version or channel."
     }

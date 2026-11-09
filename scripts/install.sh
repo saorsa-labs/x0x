@@ -337,6 +337,15 @@ MANIFEST_CHANNEL=$(tr -d '\n\r' < "$TMP/release-manifest.json" | awk '{
         exit
     }
 }')
+# Signed manifests published before the channel field existed (#1558,
+# post-v0.48.1) have NO "channel" key: there was only one channel, stable.
+# A manifest whose signature verifies and that has no channel key at all is
+# that legacy stable shape. A present-but-empty channel is still refused.
+if [ -z "$MANIFEST_CHANNEL" ] \
+    && ! tr -d '\n\r' < "$TMP/release-manifest.json" | grep -q '"channel"'; then
+    MANIFEST_CHANNEL="stable"
+    echo "  Manifest predates the channel field; treating it as stable"
+fi
 if [ -z "$MANIFEST_VERSION" ] || [ -z "$MANIFEST_CHANNEL" ]; then
     verify_failed "manifest is missing its version or channel field"
 fi
