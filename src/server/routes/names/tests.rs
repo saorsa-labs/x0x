@@ -1091,3 +1091,159 @@ async fn share_grant_dispatch_routes_v2_and_v1_payloads() -> anyhow::Result<()> 
     assert_eq!(outcome, Ok(DmTypedPayloadCompletion::Duplicate), "v1 route");
     Ok(())
 }
+
+/// WHY (#1826 ZCode review, test gap 3; ADR 0079 §2): the positive path of
+/// the hosting gate through the daemon's share-grant route. A granted
+/// agent in the discovery cache, whose certificate chains to the grant
+/// owner and whose machine binding is recorded, makes its machine a
+/// verified host, so the route pins that machine's default. A second
+/// granted agent that is only in the discovery cache (no machine binding)
+/// gives no host: its machine's default in the same grant is only
+/// suggested.
+#[tokio::test]
+async fn share_grant_dispatch_pins_a_machine_default_with_real_hosting_evidence(
+) -> anyhow::Result<()> {
+    use x0x::dm_inbox::{DmTypedPayload, DmTypedPayloadCompletion};
+    use x0x::share_grant::names::{GrantMachineName, GrantNames, ShareGrantV2};
+    use x0x::share_grant::{Grantee, ShareCap, ShareGrant};
+    let (state, _dir) =
+        crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+    let bob = crate::identity::UserKeypair::generate()?;
+    let bob_agent = crate::identity::AgentKeypair::generate()?;
+    // `seed_agent_cert` announces Bob's certified agent on machine 0xee and
+    // records its machine binding.
+    let host = crate::identity::MachineId([0xee; 32]);
+    seed_agent_cert(
+        &state,
+        &bob_agent,
+        crate::identity::AgentCertificate::issue(&bob, &bob_agent)?,
+    )
+    .await;
+    // A second certified agent of Bob: a discovery entry on machine 0x77
+    // with no machine binding in any authority store.
+    let unbound_agent = crate::identity::AgentKeypair::generate()?;
+    let unbound = crate::identity::MachineId([0x77; 32]);
+    let now = unix_now_secs();
+    let unbound_cert = crate::identity::AgentCertificate::issue(&bob, &unbound_agent)?;
+    state.agent.identity_discovery_cache.write().await.insert(
+        unbound_agent.agent_id(),
+        crate::DiscoveredAgent {
+            self_name: None,
+            agent_id: unbound_agent.agent_id(),
+            machine_id: unbound,
+            user_id: Some(bob.user_id()),
+            addresses: Vec::new(),
+            announced_at: now,
+            last_seen: now,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: unbound_cert.not_after(),
+            agent_certificate: Some(unbound_cert),
+            agent_public_key: unbound_agent.public_key().as_bytes().to_vec(),
+            cert_digest: None,
+        },
+    );
+    add_contact(
+        &state,
+        bob_agent.agent_id(),
+        x0x::contacts::TrustLevel::Known,
+    )
+    .await;
+    state
+        .agent
+        .install_share_grant_store(Arc::new(x0x::share_grant::ShareGrantStore::in_memory(
+            state.agent.agent_id(),
+            state.agent.user_id(),
+        )));
+    let granted = vec![bob_agent.agent_id(), unbound_agent.agent_id()];
+    let grant = ShareGrant::sign(
+        &bob,
+        [0x5b; 32],
+        Grantee::Agent(state.agent.agent_id()),
+        granted.clone(),
+        vec![ShareCap::Dm],
+        0,
+        now + 3600,
+    )?;
+    assert_eq!(
+        state.agent.verified_grant_hosts(&grant).await,
+        std::collections::BTreeSet::from([host.0]),
+        "only the bound machine of a certified granted agent is a host"
+    );
+
+    // A grant from another owner listing the same agents gets no host: the
+    // agents' certificates do not chain to that owner.
+    let carol = crate::identity::UserKeypair::generate()?;
+    let foreign = ShareGrant::sign(
+        &carol,
+        [0x5c; 32],
+        Grantee::Agent(state.agent.agent_id()),
+        granted,
+        vec![ShareCap::Dm],
+        0,
+        now + 3600,
+    )?;
+    assert!(state.agent.verified_grant_hosts(&foreign).await.is_empty());
+
+    let mut machines = vec![
+        GrantMachineName {
+            machine_id: host,
+            machine_name: "Studio Mac".to_string(),
+        },
+        GrantMachineName {
+            machine_id: unbound,
+            machine_name: "Far Box".to_string(),
+        },
+    ];
+    machines.sort_by_key(|m| m.machine_id.0);
+    let envelope = ShareGrantV2::sign(
+        &bob,
+        grant,
+        GrantNames {
+            owner_name: Some("Bob Smith".to_string()),
+            machines,
+        },
+    )?;
+    let outcome = crate::server::dispatch_share_grant_typed(
+        &state,
+        DmTypedPayload {
+            sender: bob_agent.agent_id(),
+            machine_id: host,
+            payload: envelope.to_dm_payload()?,
+            verified: true,
+            trust_decision: None,
+            received_at_unix_ms: 0,
+            request_id: [0x02; 16],
+            completion: None,
+        },
+    )
+    .await;
+    assert_eq!(outcome, Ok(DmTypedPayloadCompletion::Inserted));
+    let pin = state
+        .names
+        .get_pin("machine:studio-mac.bob-smith")
+        .await?
+        .expect("the hosted machine's default is pinned");
+    assert_eq!(pin.id, host.0);
+    assert_eq!(pin.owner, bob.user_id());
+    assert!(
+        state
+            .names
+            .get_pin("machine:far-box.bob-smith")
+            .await?
+            .is_none(),
+        "a machine without hosting evidence is not pinned"
+    );
+    let (suggestions, _) = state.names.pending().await?;
+    assert_eq!(
+        suggestions.get("bob-smith").map(|s| s.machines.clone()),
+        Some(vec![(unbound, "Far Box".to_string())]),
+        "it is held for the local owner"
+    );
+    Ok(())
+}

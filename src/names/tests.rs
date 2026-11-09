@@ -2287,3 +2287,82 @@ async fn verified_grant_hosts_returns_the_authenticated_machine_and_it_pins() {
     assert!(store.get_pin("machine:laptop.bob").await.unwrap().is_none());
     local.shutdown().await;
 }
+
+/// A `names.json` body with `suggestions` pending suggestions and
+/// `conflicts` conflict reports, each from a distinct owner.
+fn names_file_json(suggestions: usize, conflicts: usize) -> serde_json::Value {
+    let suggestions: serde_json::Map<String, serde_json::Value> = (0..suggestions)
+        .map(|i| {
+            (
+                format!("s-{i}"),
+                serde_json::json!({
+                    "user_id": hex::encode(stranger(i).as_bytes()),
+                    "owner_name": format!("S {i}"),
+                    "machines": [],
+                    "suggested_at": NOW,
+                }),
+            )
+        })
+        .collect();
+    let conflicts: Vec<serde_json::Value> = (0..conflicts)
+        .map(|i| {
+            serde_json::json!({
+                "kind": "owner",
+                "case": "label_taken",
+                "label": "bob",
+                "held": "bb".repeat(32),
+                "offered": hex::encode(stranger(i).as_bytes()),
+                "offered_name": "Bob",
+                "reported_at": NOW,
+                "from": hex::encode(stranger(i).as_bytes()),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "version": 1,
+        "owners": {},
+        "pins": {},
+        "suggestions": suggestions,
+        "conflicts": conflicts,
+    })
+}
+
+/// WHY (#1826 ZCode review, test gap 1): `names.json` is refused at load
+/// when it holds more than `MAX_SUGGESTIONS` suggestions or more than
+/// `MAX_CONFLICTS` conflict reports. A file at exactly both bounds loads.
+#[tokio::test]
+async fn load_refuses_suggestions_or_conflicts_over_their_bounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = NameStore::path_in(dir.path());
+    let write = |body: serde_json::Value| {
+        let path = path.clone();
+        async move {
+            tokio::fs::write(&path, serde_json::to_vec(&body).unwrap())
+                .await
+                .unwrap();
+        }
+    };
+
+    write(names_file_json(MAX_SUGGESTIONS, MAX_CONFLICTS)).await;
+    let store = NameStore::load(path.clone()).await;
+    assert!(store.load_error().is_none(), "{:?}", store.load_error());
+    let (suggestions, conflicts) = store.pending().await.unwrap();
+    assert_eq!(suggestions.len(), MAX_SUGGESTIONS);
+    assert_eq!(conflicts.len(), MAX_CONFLICTS);
+
+    for (suggestions, conflicts) in [(MAX_SUGGESTIONS + 1, 0), (0, MAX_CONFLICTS + 1)] {
+        write(names_file_json(suggestions, conflicts)).await;
+        let store = NameStore::load(path.clone()).await;
+        let error = store.load_error().map(str::to_string);
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|e| e.contains("exceeds its size bounds")),
+            "{suggestions} suggestions, {conflicts} conflicts: {error:?}"
+        );
+        assert!(
+            store.pending().await.is_err(),
+            "an over-bound store is not usable"
+        );
+    }
+}
