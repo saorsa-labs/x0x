@@ -618,45 +618,7 @@ pub(in crate::server) async fn get_agent_card(
     axum::extract::Query(query): axum::extract::Query<CardQuery>,
 ) -> impl IntoResponse {
     let agent_id = state.agent.agent_id();
-    let machine_id = hex::encode(state.agent.machine_id().as_bytes());
-    // ADR-0036: the stored profile's display_name is the source of truth.
-    // `?display_name=` is DEPRECATED — still accepted as a fallback for
-    // callers that never set a profile, but a stored name always wins, so
-    // cards can no longer disagree with what the daemon announces.
-    let profile = state.profile.read().await;
-    let display_name = profile
-        .display_name
-        .clone()
-        .or(query.display_name)
-        .unwrap_or_default();
-
-    let mut card = x0x::groups::card::AgentCard::new(display_name, &agent_id, &machine_id);
-    card.owner_name = profile.human_name.clone();
-    // ADR 0030 §3: the card must carry the same protocol version the mesh
-    // advert claims. Hardcoding v1 here made an imported card contradict the
-    // live advert, and a lower-version card import would then have to be
-    // ignored by the capability store.
-    card.dm_capabilities = Some(
-        state
-            .agent
-            .current_dm_capabilities()
-            .with_kem_public_key(state.agent_kem_keypair.public_bytes.clone()),
-    );
-
-    // Add user ID if available
-    card.user_id = state.agent.user_id().map(|u| hex::encode(u.as_bytes()));
-
-    // Observed addresses and interface hints remain public-only by default.
-    if let Some(network) = state.agent.network() {
-        if let Some(ns) = network.node_status().await {
-            card.addresses = card_addresses(
-                ns.local_addr,
-                &ns.external_addrs,
-                x0x::collect_local_interface_addrs(ns.local_addr.port()),
-                query.include_local_addresses,
-            );
-        }
-    }
+    let mut card = build_base_card(&state, query.display_name, query.include_local_addresses).await;
 
     // Optionally include group invite links (#469 E3 transaction):
     // reuse-or-mint under the group's membership lock, durably persisted
@@ -841,7 +803,69 @@ pub(in crate::server) async fn get_agent_card(
         }
     }
 
-    // Include stores
+    let link = finish_signed_card(&state, &mut card).await;
+
+    Json(serde_json::json!({
+        "ok": true,
+        "card": card,
+        "link": link,
+    }))
+}
+
+/// Build the base identity card every card surface shares: identity ids,
+/// display name (the stored profile wins, ADR-0036), DM capabilities (ADR
+/// 0030 §3: the card carries the same protocol version the mesh advert
+/// claims) and public-only reachability hints. Group invites and stores
+/// are each caller's own concern.
+pub(in crate::server) async fn build_base_card(
+    state: &Arc<AppState>,
+    display_name_fallback: Option<String>,
+    include_local_addresses: bool,
+) -> x0x::groups::card::AgentCard {
+    let agent_id = state.agent.agent_id();
+    let machine_id = hex::encode(state.agent.machine_id().as_bytes());
+    let profile = state.profile.read().await;
+    let display_name = profile
+        .display_name
+        .clone()
+        .or(display_name_fallback)
+        .unwrap_or_default();
+
+    let mut card = x0x::groups::card::AgentCard::new(display_name, &agent_id, &machine_id);
+    card.owner_name = profile.human_name.clone();
+    drop(profile);
+    card.dm_capabilities = Some(
+        state
+            .agent
+            .current_dm_capabilities()
+            .with_kem_public_key(state.agent_kem_keypair.public_bytes.clone()),
+    );
+
+    card.user_id = state.agent.user_id().map(|u| hex::encode(u.as_bytes()));
+
+    // Observed addresses and interface hints remain public-only by default.
+    if let Some(network) = state.agent.network() {
+        if let Some(ns) = network.node_status().await {
+            card.addresses = card_addresses(
+                ns.local_addr,
+                &ns.external_addrs,
+                x0x::collect_local_interface_addrs(ns.local_addr.port()),
+                include_local_addresses,
+            );
+        }
+    }
+    card
+}
+
+/// Attach the replicated-store listing, sign the card (ADR-0017) so its
+/// reachability hints and capability advertisements are tamper-evident in
+/// transit, and return the link encoding. Signing should not fail for a
+/// valid keypair; degrade to an unsigned card with a warning rather than
+/// failing the request.
+pub(in crate::server) async fn finish_signed_card(
+    state: &Arc<AppState>,
+    card: &mut x0x::groups::card::AgentCard,
+) -> String {
     let stores = state.kv_stores.read().await;
     for topic in stores.keys() {
         card.stores.push(x0x::groups::card::CardStore {
@@ -849,22 +873,13 @@ pub(in crate::server) async fn get_agent_card(
             topic: topic.clone(),
         });
     }
+    drop(stores);
 
-    // Sign the card (ADR-0017) so its reachability hints and capability
-    // advertisements are tamper-evident in transit. Signing should not fail
-    // for a valid keypair; degrade to an unsigned card with a warning rather
-    // than failing the request.
     if let Err(e) = card.sign(state.agent.identity().agent_keypair()) {
         tracing::warn!("failed to sign agent card: {e}");
     }
 
-    let link = card.to_link();
-
-    Json(serde_json::json!({
-        "ok": true,
-        "card": card,
-        "link": link,
-    }))
+    card.to_link()
 }
 
 /// GET /.well-known/agent-card.json — A2A-compatible discovery card (ADR-0017).

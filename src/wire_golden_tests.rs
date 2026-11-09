@@ -268,7 +268,7 @@ fn grant_delegation_and_move_enums_match_main() {
     check::<crate::share_grant::ShareCap>(
         "ShareCap",
         BINCODE,
-        &["Dm", "Exec", "Connect", "GroupInvite", "Call"],
+        &["Dm", "Exec", "Connect", "GroupInvite", "Call", "Data"],
     );
     check::<crate::delegation::AuthorityScope>("AuthorityScope", JSON, &["TaskExecute", "SendAs"]);
     check::<crate::delegation::DelegationVerb>(

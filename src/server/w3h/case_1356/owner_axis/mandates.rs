@@ -1,8 +1,8 @@
 //! ADR 0109 §10 row H-S3-rm2 (receiver rule, D156, #1572). H-S3-c runs up
 //! to A's re-seat call, with member M (here M1, seated before invite I) on
-//! the candidate. Every write that A or J originates is held from M1 from
-//! the removal of J (r+3) on, so A's real re-seat seal (r+4) does not
-//! reach M1. A then publishes to M1, one at a time as gossip, a copy of
+//! the candidate. Every write that A or J originates (except transport
+//! control) is held from M1 from the removal of J (r+3) on, so A's real
+//! re-seat seal (r+4) does not reach M1. A then publishes to M1, one at a time as gossip, a copy of
 //! its re-seat `MemberAdded` whose `reseat_mandate` the harness changes in
 //! one way and re-signs with A's agent key (except (1)). M1 must refuse
 //! each with `reseat_mandate_invalid` and the typed cause, and keep its
@@ -77,6 +77,10 @@ struct Answer {
     elsewhere: usize,
     causes: Vec<String>,
     unchanged: bool,
+    /// M1's role on A's topic mesh when A publishes, and the pulls to A
+    /// that passed in the window.
+    role: String,
+    pulls: u64,
 }
 
 /// The fault for this row, after the prefix's own: while `held`, every
@@ -85,10 +89,24 @@ struct Answer {
 /// dropped at every other node, always. A forgery reaches M1 only in its
 /// own window (`window`): a later resend of it is dropped at M1 too, so no
 /// refusal of an earlier forgery falls into the window of the next one.
+///
+/// A write to A with a forgery's message ID passes. It is a pull (IWANT),
+/// not the forgery: an IWANT header carries the requested message ID
+/// (saorsa-gossip-pubsub `requested[0]`), so the origin map reads it as
+/// A's. When M1 is lazy on A's topic mesh, A sends M1 an IHAVE only, and
+/// M1 gets the forgery only by its IWANT. A write to A takes no forgery
+/// bytes to any other node, and A's answer to a pull is held by the rules
+/// above. `pulls` counts the writes that pass by this rule.
+///
+/// Transport control (membership and plane hellos) always passes: it
+/// carries no group state. When it was held, A's SWIM detector marked M1
+/// dead during the hold, and a dead peer makes A defer its eager push
+/// (cooling) and send M1 an IHAVE only, so M1 needs the pull above.
 struct M1Hold {
     held: Arc<AtomicBool>,
     injecting: Arc<AtomicBool>,
     window: Arc<AtomicU64>,
+    pulls: Arc<AtomicU64>,
 }
 
 fn hold_m1(sim: &Sim) -> Result<M1Hold> {
@@ -96,48 +114,95 @@ fn hold_m1(sim: &Sim) -> Result<M1Hold> {
     let held = Arc::new(AtomicBool::new(true));
     let injecting = Arc::new(AtomicBool::new(false));
     let window = Arc::new(AtomicU64::new(0));
+    let pulls = Arc::new(AtomicU64::new(0));
     let seen: Arc<Mutex<HashSet<[u8; 32]>>> = Arc::default();
     let forged: Arc<Mutex<HashMap<[u8; 32], u64>>> = Arc::default();
-    let hold = install_hold(sim);
-    let (h, inj, win) = (
+    let (h, inj, win, pulled) = (
         Arc::clone(&held),
         Arc::clone(&injecting),
         Arc::clone(&window),
+        Arc::clone(&pulls),
     );
-    set_hold(
-        sim,
-        &hold,
-        "A's and J's writes to M1 held; A's forgeries reach M1 only",
-        move |origin, dst, msg| {
-            let mut forged_in = None;
-            if let (Some(id), true) = (msg, origin == a) {
-                let (Ok(mut seen), Ok(mut forged)) = (seen.lock(), forged.lock()) else {
-                    return true;
-                };
-                let open = inj.load(Ordering::SeqCst);
-                if let Some(at) = forged.get(&id) {
-                    forged_in = Some(*at);
-                } else if !seen.contains(&id) && open {
-                    let at = win.load(Ordering::SeqCst);
-                    forged.insert(id, at);
-                    forged_in = Some(at);
-                } else {
-                    seen.insert(id);
-                }
+    let origins: Mutex<HashMap<[u8; 32], [u8; 32]>> = Mutex::default();
+    let policy = move |origin: [u8; 32], dst: [u8; 32], msg: Option<[u8; 32]>| {
+        let mut forged_in = None;
+        if let (Some(id), true) = (msg, origin == a) {
+            let (Ok(mut seen), Ok(mut forged)) = (seen.lock(), forged.lock()) else {
+                return true;
+            };
+            let open = inj.load(Ordering::SeqCst);
+            if let Some(at) = forged.get(&id) {
+                forged_in = Some(*at);
+            } else if !seen.contains(&id) && open {
+                let at = win.load(Ordering::SeqCst);
+                forged.insert(id, at);
+                forged_in = Some(at);
+            } else {
+                seen.insert(id);
             }
-            if let Some(at) = forged_in {
-                let live = inj.load(Ordering::SeqCst) && at == win.load(Ordering::SeqCst);
-                return !(live && dst == m1);
+        }
+        if let Some(at) = forged_in {
+            if dst == a {
+                pulled.fetch_add(1, Ordering::SeqCst);
+                return false;
             }
-            h.load(Ordering::SeqCst) && dst == m1 && (origin == a || origin == j)
-        },
-    );
-    sim.fabric().mark("fault: A's and J's writes to M1 held");
+            let live = inj.load(Ordering::SeqCst) && at == win.load(Ordering::SeqCst);
+            return !(live && dst == m1);
+        }
+        h.load(Ordering::SeqCst) && dst == m1 && (origin == a || origin == j)
+    };
+    // As `install_hold`, but transport control passes (see [`M1Hold`]).
+    sim.fabric().add_rule(move |write| {
+        use crate::network::sim::{Fault, LaneClass};
+        if matches!(
+            write.lane.class,
+            LaneClass::Membership | LaneClass::PlaneHello
+        ) {
+            return Fault::Pass;
+        }
+        let msg = (write.lane.class == LaneClass::PubSub)
+            .then(|| pubsub_header(&write.bytes))
+            .flatten()
+            .map(|(_, id)| id);
+        let origin = match (msg, origins.lock()) {
+            (Some(id), Ok(mut map)) => *map.entry(id).or_insert(write.lane.src),
+            (Some(_), Err(_)) => return Fault::Drop,
+            (None, _) => write.lane.src,
+        };
+        match policy(origin, write.lane.dst, msg) {
+            true => Fault::Drop,
+            false => Fault::Pass,
+        }
+    });
+    sim.fabric()
+        .mark("fault: A's and J's writes to M1 held; A's forgeries reach M1 only");
     Ok(M1Hold {
         held,
         injecting,
         window,
+        pulls,
     })
+}
+
+/// M1 as A sees it when A publishes on `topic`: its PlumTree role on A's
+/// mesh (`eager`, `lazy`, ... or `absent`) and its SWIM health at A.
+async fn m1_at_a(sim: &Sim, topic: &str) -> Result<String> {
+    use saorsa_gossip_types::PeerHealthOracle;
+    let state = sim.state("A")?;
+    let Some(rt) = state.agent.gossip_runtime.as_ref() else {
+        return Ok("absent (no gossip runtime)".to_string());
+    };
+    let m1 = saorsa_gossip_types::PeerId::new(sim.peer("M1")?.0);
+    let topic = saorsa_gossip_types::TopicId::from_entity(topic.as_bytes()).to_string();
+    let role = rt
+        .pubsub()
+        .stage_stats()
+        .peer_scores_by_topic
+        .get(&topic)
+        .and_then(|by_peer| by_peer.get(&m1.to_string()))
+        .map_or_else(|| "absent".to_string(), |row| row.role.clone());
+    let health = rt.membership().swim_arc().health_of(&m1).await;
+    Ok(format!("{role}, SWIM {health:?}"))
 }
 
 /// Delivered pubsub writes after `cut` that carry `needle`: to M1, and to
@@ -275,6 +340,8 @@ async fn inject(
         .fabric()
         .mark_indexed(format!("case: A publishes {}", forgery.what));
     let from = sim.fabric().now();
+    let role = m1_at_a(sim, topic).await?;
+    let pulls_from = hold.pulls.load(Ordering::SeqCst);
     hold.window.fetch_add(1, Ordering::SeqCst);
     hold.injecting.store(true, Ordering::SeqCst);
     let published = sim
@@ -309,6 +376,8 @@ async fn inject(
         elsewhere,
         causes: refusal_causes(sim, from),
         unchanged: same_record(Some(&now), Some(base)) && now.state_revision == base.state_revision,
+        role,
+        pulls: hold.pulls.load(Ordering::SeqCst) - pulls_from,
     })
 }
 
@@ -505,13 +574,16 @@ async fn mandate_refusals(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         let refused = !answer.causes.is_empty() && answer.causes.iter().all(|c| c == forgery.cause);
         red |= answer.to_m1 > 0 && !(refused && answer.unchanged);
         receipt.note(format!(
-            "{}: frames to M1 {}, to other nodes {}; causes {:?} (want {}); M1 unchanged {}",
+            "{}: frames to M1 {}, to other nodes {}; causes {:?} (want {}); M1 unchanged {}; \
+             M1 {} at A, pulls to A {}",
             forgery.what,
             answer.to_m1,
             answer.elsewhere,
             answer.causes,
             forgery.cause,
-            answer.unchanged
+            answer.unchanged,
+            answer.role,
+            answer.pulls
         ));
         // Each forgery has a distinct cause, so it names its sub-checks.
         let cause = forgery.cause;

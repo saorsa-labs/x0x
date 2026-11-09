@@ -222,13 +222,13 @@ signed bytes, and receivers verify the full owner-cert → sub-agent-key
 
 ## Available Endpoints
 
-x0xd exposes 217 REST endpoints (the registry in `src/api/mod.rs` is
+x0xd exposes 218 REST endpoints (the registry in `src/api/mod.rs` is
 authoritative). `x0x routes` prints the registry that is compiled into the
 CLI. It does not send a request to a daemon. Key categories:
 
 | Category | Endpoints | What you can do |
 |----------|-----------|-----------------|
-| Identity | `/agent`, `/agent/card` | Read agent/machine/user IDs, export identity card |
+| Identity | `/agent`, `/agent/card`, `/onboard` | Read agent/machine/user IDs, export identity card, emit an install-and-join recipe for another agent (#894) |
 | Owner | `/owner/agents`, `/owner/riders` | Certify harness sub-agents; rider-token lifecycle (ADR-0039) |
 | Messaging | `/publish`, `/subscribe`, `/events` | Gossip pub/sub, SSE event stream |
 | Direct | `/direct/send`, `/direct/events` | Point-to-point encrypted messages |

@@ -92,6 +92,8 @@ Test a cold start, saved-peer start, NAT changes, packet loss, a relay path and 
 
 Restart a persistent forward and verify the same target identity. Change the name binding and confirm that the forward refuses the new target.
 
+User-identity consent stays in memory only. After a restart, the opener presents its owner certificate again only after a consented `POST /announce`. For the `tailnet-r4-e2e` restart row, restart the opener, give consent again with that announce, and require the forward to be back within 30 s after `/health` answers. An unattended restart keeps owner-principal forwards denied until consent is given again. This is expected behavior, not a failure (David's ruling (b), 8 Nov 2026; it amends the restart row of archived ADR 0074).
+
 ## Matters to settle
 
 Set the supported network matrix and connection-time budgets. Decide any new relay or blocked-UDP fallback through the transport design, not a workaround in each application.

@@ -25,6 +25,7 @@ mod messaging;
 pub(crate) mod named_groups;
 pub(in crate::server) mod names;
 mod network;
+mod onboard;
 mod owner;
 mod presence;
 mod profile;
@@ -136,6 +137,7 @@ pub(super) use network::{
     probe_peer_handler, relay_diagnostics, state_sync_diagnostics, transport_diagnostics,
     upgrade_diagnostics,
 };
+pub(super) use onboard::get_onboard;
 pub(super) use owner::{
     owner_agents_issue, owner_agents_revoke, owner_group_recovery_mandate, owner_machines,
     owner_riders_issue, owner_riders_list, owner_riders_revoke,

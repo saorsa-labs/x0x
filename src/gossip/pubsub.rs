@@ -1292,6 +1292,8 @@ pub struct Subscription {
     topic_id_by_name: Arc<std::sync::RwLock<HashMap<String, TopicId>>>,
     /// Live subscribed transport ids used by the Leaf C0 refuse gate.
     subscribed_topic_ids: Arc<std::sync::RwLock<HashSet<TopicId>>>,
+    /// #731: marked before the last subscriber leaves the subscribed set.
+    publisher_topics: Arc<super::participation::PublisherTopics>,
     /// Group classification and SG preference cleared with the last subscriber.
     group_topic_by_id: Arc<RwLock<HashMap<TopicId, GroupTopicBinding>>>,
     plumtree: Arc<PlumtreePubSub<PubSubTransport>>,
@@ -1390,6 +1392,7 @@ impl Drop for Subscription {
         let topic_ref_counts = self.topic_ref_counts.clone();
         let topic_id_by_name = self.topic_id_by_name.clone();
         let subscribed_topic_ids = self.subscribed_topic_ids.clone();
+        let publisher_topics = self.publisher_topics.clone();
         let group_topic_by_id = self.group_topic_by_id.clone();
         let plumtree = self.plumtree.clone();
         let group_preference_apply_locks = self.group_preference_apply_locks.clone();
@@ -1422,6 +1425,9 @@ impl Drop for Subscription {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .remove(&topic);
                     if let Some(topic_id) = topic_id {
+                        // #731: this path keeps the sg cache, which still
+                        // holds other peers' messages.
+                        publisher_topics.note_unsubscribed(topic_id, Instant::now());
                         subscribed_topic_ids
                             .write()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1615,6 +1621,9 @@ pub struct PubSubManager {
     unsubscribed_refused_frames: AtomicU64,
     unsubscribed_refused_bytes: AtomicU64,
     unsubscribed_refused_graft_equiv: AtomicU64,
+    /// #731: topics this Leaf published to recently. The C0 gate still
+    /// lets IWANT through on them so the node serves its own messages.
+    publisher_topics: Arc<super::participation::PublisherTopics>,
     /// Last `fan_out == 0` warn per group, used to rate-limit issue #296.
     zero_fanout_warns: Mutex<HashMap<String, Instant>>,
     /// Test-only: topic ids last passed to `set_topic_peers`.
@@ -1646,6 +1655,10 @@ impl PublishFanoutOutcome {
         (self.fan_out, self.observed_counts)
     }
 }
+
+#[cfg(test)]
+#[path = "pubsub/issue901_tests.rs"]
+mod issue901_tests;
 
 #[cfg(test)]
 mod observed_fanout_controls {
@@ -2108,10 +2121,7 @@ impl PubSubManager {
         let rosters = self.group_rosters.read().await;
         let binding = match kv_group_id {
             Some(id) => rosters.get(&id).map(|roster| roster.active_agents.clone()),
-            None => rosters
-                .iter()
-                .find(|(_, roster)| roster.metadata_topic == name)
-                .map(|(_, roster)| roster.active_agents.clone()),
+            None => Self::sole_metadata_roster(&rosters, name),
         };
         #[cfg(test)]
         {
@@ -2140,6 +2150,26 @@ impl PubSubManager {
             self.clear_group_topic_preference_locked(topic_id).await;
         }
         drop(rosters);
+    }
+
+    /// The active roster of the one group whose metadata topic is `name`.
+    ///
+    /// A group card or invite sets the metadata topic, so two local group
+    /// records can name the same topic. A first-match lookup then follows
+    /// the roster map's random hash order, and the winner changes between
+    /// installs (#901). When more than one roster claims `name`, no roster
+    /// gets a preference. The topic keeps its ordinary eager membership.
+    fn sole_metadata_roster(
+        rosters: &HashMap<String, GroupEagerRoster>,
+        name: &str,
+    ) -> Option<Vec<AgentId>> {
+        let mut claims = rosters
+            .values()
+            .filter(|roster| roster.metadata_topic == name);
+        match (claims.next(), claims.next()) {
+            (Some(roster), None) => Some(roster.active_agents.clone()),
+            _ => None,
+        }
     }
 
     async fn clear_group_topic_preference_locked(&self, topic_id: TopicId) {
@@ -2401,6 +2431,7 @@ impl PubSubManager {
             unsubscribed_refused_frames: AtomicU64::new(0),
             unsubscribed_refused_bytes: AtomicU64::new(0),
             unsubscribed_refused_graft_equiv: AtomicU64::new(0),
+            publisher_topics: Arc::default(),
             #[cfg(test)]
             refreshed_topic_ids: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -2824,6 +2855,7 @@ impl PubSubManager {
                 generation,
                 topic_id_by_name: Arc::clone(&self.topic_id_by_name),
                 subscribed_topic_ids: Arc::clone(&self.subscribed_topic_ids),
+                publisher_topics: Arc::clone(&self.publisher_topics),
                 group_topic_by_id: Arc::clone(&self.group_topic_by_id),
                 plumtree: Arc::clone(&self.plumtree),
                 group_preference_apply_locks: Arc::clone(&self.group_preference_apply_locks),
@@ -2926,6 +2958,7 @@ impl PubSubManager {
                 generation,
                 topic_id_by_name: Arc::clone(&self.topic_id_by_name),
                 subscribed_topic_ids: Arc::clone(&self.subscribed_topic_ids),
+                publisher_topics: Arc::clone(&self.publisher_topics),
                 group_topic_by_id: Arc::clone(&self.group_topic_by_id),
                 plumtree: Arc::clone(&self.plumtree),
                 group_preference_apply_locks: Arc::clone(&self.group_preference_apply_locks),
@@ -2991,6 +3024,7 @@ impl PubSubManager {
                 generation,
                 topic_id_by_name: Arc::clone(&self.topic_id_by_name),
                 subscribed_topic_ids: Arc::clone(&self.subscribed_topic_ids),
+                publisher_topics: Arc::clone(&self.publisher_topics),
                 group_topic_by_id: Arc::clone(&self.group_topic_by_id),
                 plumtree: Arc::clone(&self.plumtree),
                 group_preference_apply_locks: Arc::clone(&self.group_preference_apply_locks),
@@ -3085,6 +3119,7 @@ impl PubSubManager {
             generation,
             topic_id_by_name: Arc::clone(&self.topic_id_by_name),
             subscribed_topic_ids: Arc::clone(&self.subscribed_topic_ids),
+            publisher_topics: Arc::clone(&self.publisher_topics),
             group_topic_by_id: Arc::clone(&self.group_topic_by_id),
             plumtree: Arc::clone(&self.plumtree),
             group_preference_apply_locks: Arc::clone(&self.group_preference_apply_locks),
@@ -3270,6 +3305,11 @@ impl PubSubManager {
         let envelope_bytes = Some(Bytes::clone(&encoded));
 
         self.register_dynamic_topic_priority(&topic, topic_id);
+        // #731: record before PlumTree sends the first IHAVE, so a lazy
+        // subscriber's IWANT for this publish cannot meet the C0 gate first.
+        if !self.participation.forwards_passthrough() {
+            self.publisher_topics.record(topic_id, Instant::now());
+        }
         // Classification linearizes here. A roster commit overlapping this
         // publish may affect the next send; a completed writer reconciles
         // every still-known group binding before it returns.
@@ -3615,6 +3655,23 @@ impl PubSubManager {
         if !leaf_refuses_unsubscribed_passthrough(self.participation, subscribed, header.kind) {
             return false;
         }
+        // #731: a publisher serves IWANT for its own messages on a topic it
+        // does not subscribe to. `allows_iwant` is false for
+        // `UNSUBSCRIBE_QUIET` (120 s, which covers the bounded sg key-cache
+        // replay) after the topic was last subscribed. After that the cache
+        // normally holds only this node's publishes, because this gate
+        // refuses every frame that could add another peer's message. sg
+        // replays a queued key-cache frame without an age check, so a peer
+        // that stalls the replay can still add one stale entry; that replay
+        // already bypassed C0 before #731. The lock runs only on this refuse
+        // path.
+        if header.kind == MessageKind::IWant
+            && self
+                .publisher_topics
+                .allows_iwant(&header.topic, Instant::now())
+        {
+            return false;
+        }
         self.unsubscribed_refused_frames
             .fetch_add(1, Ordering::Relaxed);
         self.unsubscribed_refused_bytes
@@ -3669,6 +3726,10 @@ impl PubSubManager {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(topic);
+        // #731: mark first, so an IWANT that sees the topic unsubscribed
+        // before `plumtree.unsubscribe` empties the cache is still refused.
+        self.publisher_topics
+            .note_unsubscribed(topic_id, Instant::now());
         self.subscribed_topic_ids
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -11154,6 +11215,10 @@ mod closed_input_tests {
         assert_eq!(recv_from_either(&mut first, &mut second).await, Some(47));
     }
 }
+
+#[cfg(test)]
+#[path = "pubsub/issue731_tests.rs"]
+mod issue731_tests;
 
 /// SG76: marker-aware inbound routing gates, proven without sockets.
 ///

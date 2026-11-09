@@ -6,6 +6,10 @@
 # numbers, config, connect wait and send retry below match the document's
 # commands. The recipe is only "CI-verified" while this runs them.
 #
+# The final leg proves the #894 `GET /onboard` output: a THIRD fresh daemon
+# (carol) imports the inviter's signed card from the onboard response and
+# DMs the inviter, asserted on the inviter's own subscription.
+#
 # Isolation: 127.0.0.1 binds, mdns_enabled = false, --no-hard-coded-bootstrap,
 # loopback bootstrap_peers, a private plane (network_id = "x0x.quickstart",
 # never x0x.prod), and --skip-update-check plus [update] enabled = false so
@@ -41,7 +45,7 @@ cleanup() {
     sleep 1
     for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill -9 "$p" 2>/dev/null || true; done
     if [ "$rc" -ne 0 ]; then
-        for n in alice bob; do
+        for n in alice bob carol; do
             echo "--- $n daemon log (tail) ---"; tail -40 "$WORK/$n.log" 2>/dev/null || true
             echo "--- $n ws frames ---"; cat "$WORK/$n.ws.ndjson" 2>/dev/null || true
             echo "--- $n ws stderr ---"; cat "$WORK/$n.ws.err" 2>/dev/null || true
@@ -203,5 +207,68 @@ echo "PASS: alice -> bob DM delivered on bob's /ws/direct stream, sender verifie
 send_dm "$BA" "$BT" "$AID" "$MSG_BA"
 assert_dm alice "$MSG_BA" "$BID"
 echo "PASS: bob -> alice reply delivered on alice's /ws/direct stream, sender verified"
+
+# ── #894 leg: GET /onboard output joins a NEW agent to the inviter ───────
+# Alice is the inviter. Carol is the fresh agent: a third daemon that knows
+# only alice's transport address (the loopback stand-in for "shares a
+# network with the inviter"). Carol follows the onboard output — import the
+# inviter's signed card, DM the inviter — and the DM must land on ALICE's
+# own /ws/direct subscription with carol as the attributed sender.
+mkdir -p "$WORK/carol"
+cat > "$WORK/carol/config.toml" <<TOML
+instance_name = "qs-carol"
+network_id = "x0x.quickstart"
+data_dir = "$WORK/carol"
+identity_dir = "$WORK/carol/identity"
+bind_address = "127.0.0.1:19803"
+api_address = "127.0.0.1:19903"
+mdns_enabled = false
+bootstrap_peers = ["127.0.0.1:19801"]
+log_level = "warn"
+
+[update]
+enabled = false
+TOML
+"$X0XD" --config "$WORK/carol/config.toml" --no-hard-coded-bootstrap --skip-update-check \
+    > "$WORK/carol.log" 2>&1 &
+PIDS+=("$!")
+disown
+wait_for 60 "carol /health" curl -sf -m 2 "http://127.0.0.1:19903/health"
+wait_for 30 "carol api-token" test -s "$WORK/carol/api-token"
+CA="http://127.0.0.1:19903"
+CT=$(cat "$WORK/carol/api-token")
+CID=$(curl -s -H "Authorization: Bearer $CT" "$CA/agent" | json "['agent_id']")
+[ -n "$CID" ] || { echo "FAIL: could not read carol's agent id" >&2; exit 1; }
+
+# The inviter asks its own daemon for the recipe (default: file delivery).
+ONBOARD=$(curl -s -H "Authorization: Bearer $AT" "$AA/onboard")
+[ "$(printf '%s' "$ONBOARD" | json "['ok']")" = True ] \
+    || { echo "FAIL: GET /onboard refused: $ONBOARD" >&2; exit 1; }
+printf '%s' "$ONBOARD" | json "['recipe']" > "$WORK/onboard-recipe.md"
+grep -qF "install.sh" "$WORK/onboard-recipe.md" \
+    || { echo "FAIL: onboard recipe has no install step" >&2; exit 1; }
+grep -qF "x0x direct send $AID" "$WORK/onboard-recipe.md" \
+    || { echo "FAIL: onboard recipe does not target the inviter's agent id" >&2; exit 1; }
+INVITER_ID=$(printf '%s' "$ONBOARD" | json "['inviter_agent_id']")
+[ "$INVITER_ID" = "$AID" ] \
+    || { echo "FAIL: onboard inviter_agent_id '$INVITER_ID' != alice '$AID'" >&2; exit 1; }
+CARD_LINK=$(printf '%s' "$ONBOARD" | json "['card_link']")
+case "$CARD_LINK" in x0x://agent/*) ;; *)
+    echo "FAIL: onboard card_link is not an x0x://agent/ link: ${CARD_LINK:0:40}" >&2; exit 1 ;;
+esac
+echo "PASS: GET /onboard serves the recipe, inviter id and signed card link"
+
+# Carol follows the recipe's import + DM steps (REST spellings of
+# `x0x agent import` and `x0x direct send`).
+IMPORT=$(curl -s -m 10 -X POST -H "Authorization: Bearer $CT" -H "Content-Type: application/json" \
+    -d "{\"card\":\"$CARD_LINK\",\"trust_level\":\"known\"}" "$CA/agent/card/import")
+[ "$(printf '%s' "$IMPORT" | json "['ok']")" = True ] \
+    || { echo "FAIL: carol could not import the inviter card: $IMPORT" >&2; exit 1; }
+echo "PASS: carol imported the inviter's card from the onboard output"
+
+MSG_CA="hello inviter — onboarded $$"
+send_dm "$CA" "$CT" "$AID" "$MSG_CA"
+assert_dm alice "$MSG_CA" "$CID"
+echo "PASS: carol -> alice DM delivered on the inviter's /ws/direct stream, sender verified"
 
 echo "onboarding recipe: ALL PASS"
