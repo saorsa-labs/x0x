@@ -63,13 +63,24 @@ function Find-Gpg {
     return $null
 }
 
+function ConvertTo-GpgPath([string]$Path) {
+    # Git for Windows ships an MSYS gpg that treats a backslashed Windows
+    # path as a relative POSIX path (it prepends the cwd and fails to read
+    # the file). Both MSYS and native Windows gpg accept drive-letter paths
+    # with forward slashes, so every path handed to gpg goes through here.
+    return ($Path -replace "\\", "/")
+}
+
 function Test-ReleaseSignature([string]$Gpg, [string]$Artifact, [string]$Signature, [string]$KeyFile, [string]$WorkDir) {
     # gpg writes progress to stderr; under "Stop", Windows PowerShell 5.1 turns
     # redirected native stderr into a terminating error. Exit codes and the
     # status-fd lines are checked explicitly instead.
     $ErrorActionPreference = "Continue"
+    $gpgKeyFile = ConvertTo-GpgPath $KeyFile
+    $gpgArtifact = ConvertTo-GpgPath $Artifact
+    $gpgSignature = ConvertTo-GpgPath $Signature
     # Check the downloaded key is the pinned one before trusting anything it signs.
-    $keyInfo = & $Gpg --batch --with-colons --show-keys --fingerprint $KeyFile 2>$null
+    $keyInfo = & $Gpg --batch --with-colons --show-keys --fingerprint $gpgKeyFile 2>$null
     $keyFprs = @($keyInfo | Where-Object { $_ -like "fpr:*" } | ForEach-Object { ($_ -split ":")[9].ToUpperInvariant() })
     if ($keyFprs -notcontains $TrustedFingerprint) {
         throw "Downloaded SAORSA_PUBLIC_KEY.asc is not the pinned release key ($TrustedFingerprint)."
@@ -82,13 +93,14 @@ function Test-ReleaseSignature([string]$Gpg, [string]$Artifact, [string]$Signatu
     # otherwise initializes a fresh homedir with use-keyboxd and the import
     # fails when the keyboxd daemon cannot start (seen on CI runners).
     Set-Content -LiteralPath (Join-Path $gnupgHome "common.conf") -Value ""
-    $importOut = & $Gpg --homedir $gnupgHome --batch --no-tty --import $KeyFile 2>&1
+    $gpgHomeDir = ConvertTo-GpgPath $gnupgHome
+    $importOut = & $Gpg --homedir $gpgHomeDir --batch --no-tty --import $gpgKeyFile 2>&1
     if ($LASTEXITCODE -ne 0) {
         $detail = ($importOut | ForEach-Object { "$_" }) -join " | "
         throw "gpg failed to import the release key: $detail"
     }
 
-    $status = & $Gpg --homedir $gnupgHome --batch --no-tty --status-fd 1 --verify $Signature $Artifact 2>$null
+    $status = & $Gpg --homedir $gpgHomeDir --batch --no-tty --status-fd 1 --verify $gpgSignature $gpgArtifact 2>$null
     $verifyExit = $LASTEXITCODE
     $signers = @()
     foreach ($line in $status) {
