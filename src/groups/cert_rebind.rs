@@ -922,13 +922,24 @@ pub fn is_self_rebind_link(
     link: &BTreeMap<String, RosterMemberSnapshot>,
     committer: &str,
 ) -> bool {
+    // #646 r5 blocker 2: a joiner seeded from a FETCHED (v5) base roster
+    // holds no `treekem_key_package_hash` anchors — the roster root does
+    // not cover them, so the fetch strips them. A local anchor of `None`
+    // therefore says "unknown", not "no package": the hash is compared
+    // only when the LOCAL (predecessor) side holds one, or a valid D129
+    // self-rebind from an anchored committer would be misread as an
+    // admin action and refused on every v5 joiner.
+    let anchor_matches = |before: &RosterMemberSnapshot, after: &RosterMemberSnapshot| {
+        before.treekem_key_package_hash.is_none()
+            || before.treekem_key_package_hash == after.treekem_key_package_hash
+    };
     let (Some(before), Some(after)) = (predecessor.get(committer), link.get(committer)) else {
         return false;
     };
     if before.state != GroupMemberState::Active
         || after.state != GroupMemberState::Active
         || before.role != after.role
-        || before.treekem_key_package_hash != after.treekem_key_package_hash
+        || !anchor_matches(before, after)
         || after.certificate_digest.is_none()
         || before.certificate_digest == after.certificate_digest
     {
@@ -937,9 +948,15 @@ pub fn is_self_rebind_link(
     if predecessor.len() != link.len() {
         return false;
     }
-    predecessor
-        .iter()
-        .all(|(id, snapshot)| id == committer || link.get(id) == Some(snapshot))
+    predecessor.iter().all(|(id, snapshot)| {
+        id == committer
+            || link.get(id).is_some_and(|linked| {
+                snapshot.role == linked.role
+                    && snapshot.state == linked.state
+                    && snapshot.certificate_digest == linked.certificate_digest
+                    && anchor_matches(snapshot, linked)
+            })
+    })
 }
 
 #[cfg(test)]

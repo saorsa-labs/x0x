@@ -845,10 +845,15 @@ and no inline roster. The joiner, after full invite authentication and
 before any local state, asks the INVITER for the projection over two
 `JoinResultMessage` arms (`BaseRosterFetch` / `BaseRoster`), proving
 invite possession with the BLAKE3 of the raw invite secret (compared in
-constant time). The inviter serves EXACTLY the root that invite signed at
-mint (stored on the issued-invite record), only to the agent an addressed
-invite names, and never to a Banned or Removed requester — a pre-member
-gets no other kind and no other root (D95, A08). The reply is admitted
+constant time). The secret hash stands in for archived ADR 0111's
+(Proposed) carry-the-invite rule: the request proves possession without
+resending the signed link. The inviter serves EXACTLY the root that
+invite signed at mint (stored on the issued-invite record), only to the
+agent an addressed invite names, and never to a Banned or Removed
+requester — archived 0111's serve rule: a pre-member gets no other kind
+and no other root. An authorized request whose root is pruned from the
+commit log gets a terminal `BaseRosterUnavailable` answer, which the
+join maps to a terminal 409 `base_roster_pruned`. The reply is admitted
 only when it is verified, comes from the join's own inviter, answers a
 waiting join, and re-derives the signed root; nothing is cached. Because the roster root does not commit
 `treekem_key_package_hash`, fetched projections are certificate-free AND

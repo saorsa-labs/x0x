@@ -1498,6 +1498,16 @@ pub(in crate::server) enum JoinResultMessage {
         roster_root: String,
         roster: BTreeMap<String, x0x::groups::state_commit::RosterMemberSnapshot>,
     },
+    /// #646 (r5 item 6): the inviter's TERMINAL answer — the requester's
+    /// invite is live and authorized, but the root it signed is in
+    /// neither the live roster nor the retained commit log any more
+    /// (pruned), so no retry can ever serve it. The joiner maps it to a
+    /// terminal typed refusal instead of the retryable 503. Additive like
+    /// the two arms above; a pre-#646 peer drops it.
+    BaseRosterUnavailable {
+        group_id: String,
+        roster_root: String,
+    },
 }
 
 /// #477 W2 — the terminal refusal reasons. Exactly the DEFINITIVE
@@ -25296,12 +25306,18 @@ pub(super) async fn join_group_via_invite_inner(
     // retryable refusal fires only at the points that actually SEED from
     // the base (the remnant discriminator and the fresh stub install).
     let fetched_base_roster = match view.base_roster_root.as_deref() {
-        None => None,
+        None => (None, false),
         Some(signed_root) => {
             // r4 item 6: a join that cannot SEED — the joiner already
             // holds an Active seat locally, or its attempt is already
             // registered as pending — answers idempotently below without
             // the base, so it skips the fetch window instead of paying it.
+            // r5 item 4: the pending check reads the SAME source the
+            // idempotent answer reads (`local_join_membership_state`'s
+            // `pending_authority_commit` clause: the expected-inviter
+            // registry, outside an open re-seat staging), so the skip can
+            // never fire for a join the answer path would not classify as
+            // pending.
             let joiner_hex = hex::encode(agent_id.as_bytes());
             let already_active = {
                 let groups = state.named_groups.read().await;
@@ -25314,17 +25330,24 @@ pub(super) async fn join_group_via_invite_inner(
                     })
                     .is_some_and(|info| info.has_active_member(&joiner_hex))
             };
-            let already_pending = state
-                .pending_join_attempts
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .contains_key(&join_result_key(invite_stable_group_id, &joiner_hex));
+            let staged_join = !crate::server::reseat_scope::in_any_reseat_scope()
+                && (state
+                    .reseat_stagings
+                    .scope_for(invite_stable_group_id)
+                    .is_some()
+                    || state.reseat_stagings.scope_for(&group_id_hex).is_some());
+            let already_pending = !staged_join
+                && expected_join_result_inviter(
+                    &state,
+                    &join_result_key(invite_stable_group_id, &joiner_hex),
+                )
+                .is_some();
             if already_active || already_pending {
                 tracing::debug!(
                     group_id = %LogHexId::group(&invite.group_id),
                     "v5 join is already seated or pending locally; the fetch is skipped"
                 );
-                None
+                (None, false)
             } else {
                 let secret_hash_hex = hex::encode(view.secret_hash);
                 match base_roster_fetch::obtain_base_roster(
@@ -25337,23 +25360,39 @@ pub(super) async fn join_group_via_invite_inner(
                 )
                 .await
                 {
-                    Ok(roster) => Some(roster),
-                    Err(reason) => {
+                    Ok(roster) => (Some(roster), false),
+                    Err(error) => {
                         tracing::debug!(
                             group_id = %LogHexId::group(&invite.group_id),
                             inviter = %invite.inviter,
-                            reason,
+                            ?error,
                             "content-addressed base roster not fetched; the join refuses where it would seed"
                         );
-                        None
+                        (
+                            None,
+                            error == base_roster_fetch::ObtainBaseRosterError::Pruned,
+                        )
                     }
                 }
             }
         }
     };
-    // v5 with no fetched roster: the typed retryable answer for every
-    // path below that needs the base projection.
+    let (fetched_base_roster, base_roster_pruned) = fetched_base_roster;
+    // v5 with no fetched roster: the typed answer for every path below
+    // that needs the base projection — retryable 503 while the inviter
+    // may still serve, TERMINAL 409 once the inviter answered that the
+    // invite's root is pruned (r5 item 6: no retry can ever serve it).
     let base_roster_unavailable = |state: &AppState| {
+        if base_roster_pruned {
+            state
+                .groups_diagnostics
+                .record_invite_refusal(&invite.group_id, "base_roster_pruned");
+            return api_error(
+                StatusCode::CONFLICT,
+                "base_roster_pruned: the inviter no longer holds the roster this \
+                 invite signed; request a fresh invite",
+            );
+        }
         state
             .groups_diagnostics
             .record_invite_refusal(&invite.group_id, "base_roster_unavailable");
@@ -49488,6 +49527,28 @@ pub(in crate::server) async fn dispatch_join_result_message(
             base_roster_fetch::deliver_base_roster(state, sender, group_id, roster_root, roster);
             return true;
         }
+        JoinResultMessage::BaseRosterUnavailable {
+            group_id,
+            roster_root,
+        } => {
+            // r5 item 6: the terminal answer rides the same trust rules as
+            // a served reply — verified sender, honoured only for a join
+            // waiting on that sender as its inviter, never cached.
+            if !verified {
+                tracing::debug!(
+                    group_id = %LogHexId::group(group_id),
+                    "ignoring unverified base-roster-unavailable answer"
+                );
+                return true;
+            }
+            base_roster_fetch::deliver_base_roster_unavailable(
+                state,
+                sender,
+                group_id,
+                roster_root,
+            );
+            return true;
+        }
         JoinResultMessage::BaseRosterFetch {
             group_id,
             member_agent_id,
@@ -49519,29 +49580,42 @@ pub(in crate::server) async fn dispatch_join_result_message(
             let now_secs = now_millis_u64() / 1_000;
             let located = {
                 let groups = state.named_groups.read().await;
-                match crate::server::resolve_group_entry_locked(&groups, group_id) {
-                    None => {
-                        tracing::debug!(group_id = %LogHexId::group(group_id), "base-roster fetch for an unknown group; dropped");
-                        return true;
-                    }
-                    Some((_, info)) => base_roster_fetch::locate_served_base_roster(
-                        info,
-                        &sender_hex,
-                        roster_root,
-                        secret_hash,
-                        now_secs,
+                crate::server::resolve_group_entry_locked(&groups, group_id).map(|(_, info)| {
+                    (
+                        info.stable_group_id().to_string(),
+                        base_roster_fetch::locate_served_base_roster(
+                            info,
+                            &sender_hex,
+                            roster_root,
+                            secret_hash,
+                            now_secs,
+                        ),
                     )
-                    .map(|roster| (info.stable_group_id().to_string(), roster)),
-                }
+                })
             };
-            let Some((stable_group, served_roster)) = located else {
-                tracing::debug!(
-                    group_id = %LogHexId::group(group_id),
-                    requester = %LogHexId::agent(&sender_hex),
-                    "base-roster fetch refused: no live matching invite for this \
-                     requester and root, or over the entry cap"
-                );
-                return true;
+            let (stable_group, served_roster) = match located {
+                None => {
+                    tracing::debug!(group_id = %LogHexId::group(group_id), "base-roster fetch for an unknown group; dropped");
+                    return true;
+                }
+                Some((_, base_roster_fetch::BaseRosterServeDecision::Refuse)) => {
+                    tracing::debug!(
+                        group_id = %LogHexId::group(group_id),
+                        requester = %LogHexId::agent(&sender_hex),
+                        "base-roster fetch refused: no live matching invite for this \
+                         requester and root"
+                    );
+                    return true;
+                }
+                // r5 item 6: authorized, but the bound root is unserveable
+                // — answer terminally (under the same admission as a
+                // serve) so the joiner stops retrying.
+                Some((stable_group, base_roster_fetch::BaseRosterServeDecision::Unavailable)) => {
+                    (stable_group, None)
+                }
+                Some((stable_group, base_roster_fetch::BaseRosterServeDecision::Serve(roster))) => {
+                    (stable_group, Some(roster))
+                }
             };
             // Review r3 item 5: the coalescing key is PREFIXED so a
             // base-roster fetch never occupies (or is refused as a
@@ -49570,16 +49644,30 @@ pub(in crate::server) async fn dispatch_join_result_message(
             let roster_root = roster_root.clone();
             state.spawn_detached(async move {
                 let _ticket = ticket;
-                let handler = tokio::time::timeout(
-                    JOIN_RESULT_FETCH_HANDLER_TIMEOUT,
-                    base_roster_fetch::send_base_roster_reply(
-                        &task_state,
-                        &requester,
-                        stable_group,
-                        roster_root,
-                        served_roster,
-                    ),
-                );
+                let send = async {
+                    match served_roster {
+                        Some(roster) => {
+                            base_roster_fetch::send_base_roster_reply(
+                                &task_state,
+                                &requester,
+                                stable_group,
+                                roster_root,
+                                roster,
+                            )
+                            .await;
+                        }
+                        None => {
+                            base_roster_fetch::send_base_roster_unavailable(
+                                &task_state,
+                                &requester,
+                                stable_group,
+                                roster_root,
+                            )
+                            .await;
+                        }
+                    }
+                };
+                let handler = tokio::time::timeout(JOIN_RESULT_FETCH_HANDLER_TIMEOUT, send);
                 if handler.await.is_err() {
                     tracing::warn!("base-roster fetch handler timed out; the joiner retries");
                 }
@@ -49610,7 +49698,8 @@ pub(in crate::server) async fn dispatch_join_result_message(
             JoinResultMessage::FetchRequest { group_id, .. }
             // #646: both arms returned above; named for exhaustiveness.
             | JoinResultMessage::BaseRosterFetch { group_id, .. }
-            | JoinResultMessage::BaseRoster { group_id, .. } => group_id.clone(),
+            | JoinResultMessage::BaseRoster { group_id, .. }
+            | JoinResultMessage::BaseRosterUnavailable { group_id, .. } => group_id.clone(),
         };
         let apply_state = Arc::clone(state);
         let sender = *sender;
@@ -50742,10 +50831,12 @@ async fn handle_join_result_message_bound(
         JoinResultMessage::Pending { notice } => {
             verify_and_hold_join_pending_notice(state, verified, &notice).await;
         }
-        // #646: both base-roster arms are consumed by
+        // #646: the base-roster arms are consumed by
         // `dispatch_join_result_message` before this handler; a direct
         // call with one is a no-op.
-        JoinResultMessage::BaseRosterFetch { .. } | JoinResultMessage::BaseRoster { .. } => {}
+        JoinResultMessage::BaseRosterFetch { .. }
+        | JoinResultMessage::BaseRoster { .. }
+        | JoinResultMessage::BaseRosterUnavailable { .. } => {}
     }
 }
 

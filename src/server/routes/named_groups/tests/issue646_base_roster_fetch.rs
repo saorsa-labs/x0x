@@ -183,7 +183,7 @@ async fn locate_served_base_roster_authorizes_and_content_addresses() -> Result<
         &secret_hash,
         2_000
     )
-    .is_none());
+    .is_refused());
     info.bind_issued_invite_base_roster_root(&secret, Some(live_root.clone()));
 
     // Live invite + the root IT signed → the live projection.
@@ -194,6 +194,7 @@ async fn locate_served_base_roster_authorizes_and_content_addresses() -> Result<
         &secret_hash,
         2_000,
     )
+    .served()
     .expect("the invite's own root serves");
     assert_eq!(served, live_projection);
 
@@ -206,7 +207,7 @@ async fn locate_served_base_roster_authorizes_and_content_addresses() -> Result<
         &wrong_hash,
         2_000
     )
-    .is_none());
+    .is_refused());
 
     // Expired invite → nothing (r4 test gap).
     let mut expired = info.clone();
@@ -222,7 +223,7 @@ async fn locate_served_base_roster_authorizes_and_content_addresses() -> Result<
         &secret_hash,
         2_000
     )
-    .is_none());
+    .is_refused());
 
     // Consumed invite → nothing.
     let mut consumed = info.clone();
@@ -242,7 +243,7 @@ async fn locate_served_base_roster_authorizes_and_content_addresses() -> Result<
         &secret_hash,
         2_000
     )
-    .is_none());
+    .is_refused());
 
     // An ADDRESSED invite is served only to its intended joiner (D95).
     let mut addressed = info.clone();
@@ -260,7 +261,7 @@ async fn locate_served_base_roster_authorizes_and_content_addresses() -> Result<
             &secret_hash,
             2_000
         )
-        .is_none(),
+        .is_refused(),
         "a different requester gets nothing from an addressed invite"
     );
     assert!(base_roster_fetch::locate_served_base_roster(
@@ -270,6 +271,7 @@ async fn locate_served_base_roster_authorizes_and_content_addresses() -> Result<
         &secret_hash,
         2_000
     )
+    .served()
     .is_some());
 
     // A Banned (or Removed) requester gets nothing, whatever it holds.
@@ -293,7 +295,7 @@ async fn locate_served_base_roster_authorizes_and_content_addresses() -> Result<
             &secret_hash,
             2_000
         )
-        .is_none(),
+        .is_refused(),
         "a Banned requester is refused"
     );
 
@@ -360,6 +362,7 @@ async fn locate_served_base_roster_authorizes_and_content_addresses() -> Result<
         &secret_hash,
         2_000,
     )
+    .served()
     .expect("the invite's own root serves from the commit log");
     assert_eq!(served, retained_projection);
     assert!(
@@ -370,7 +373,7 @@ async fn locate_served_base_roster_authorizes_and_content_addresses() -> Result<
             &secret_hash,
             2_000
         )
-        .is_none(),
+        .is_refused(),
         "the CURRENT roster is a different root: this invite never unlocks it"
     );
 
@@ -382,7 +385,7 @@ async fn locate_served_base_roster_authorizes_and_content_addresses() -> Result<
         &secret_hash,
         2_000
     )
-    .is_none());
+    .is_refused());
     Ok(())
 }
 
@@ -455,7 +458,10 @@ async fn deliver_admits_only_the_expected_inviters_reply_and_caches_nothing() ->
     );
     base_roster_fetch::deliver_base_roster(&joiner, &inviter, &group_id, &root, &roster);
     let delivered = receiver.await.expect("the inviter's reply wakes the join");
-    assert_eq!(delivered, roster);
+    assert_eq!(
+        delivered,
+        base_roster_fetch::BaseRosterFetchReply::Served(roster.clone())
+    );
     assert!(joiner
         .base_roster_fetch_slots
         .lock()
@@ -503,7 +509,11 @@ async fn fetched_roster_key_package_anchors_are_stripped() -> Result<()> {
             )],
         );
     base_roster_fetch::deliver_base_roster(&joiner, &inviter, &group_id, &root, &forged);
-    let delivered = receiver.await.expect("reply delivered");
+    let base_roster_fetch::BaseRosterFetchReply::Served(delivered) =
+        receiver.await.expect("reply delivered")
+    else {
+        panic!("served reply expected");
+    };
     assert!(
         delivered
             .values()
@@ -814,7 +824,10 @@ async fn concurrent_fetch_keeps_the_first_joins_waiter() -> Result<()> {
     )
     .await
     .expect_err("networkless send cannot reach an inviter");
-    assert_eq!(err, "inviter unreachable");
+    assert_eq!(
+        err,
+        base_roster_fetch::ObtainBaseRosterError::Retryable("inviter unreachable")
+    );
     // r4 test gap: the failed fetch's OWN waiter is gone (WaiterGuard on
     // the error exit); only the first join's waiter stays.
     assert_eq!(
@@ -833,7 +846,10 @@ async fn concurrent_fetch_keeps_the_first_joins_waiter() -> Result<()> {
     let delivered = receiver_a
         .await
         .expect("the first join's waiter survives a concurrent fetch attempt");
-    assert_eq!(delivered, roster);
+    assert_eq!(
+        delivered,
+        base_roster_fetch::BaseRosterFetchReply::Served(roster.clone())
+    );
     Ok(())
 }
 
@@ -997,4 +1013,168 @@ async fn legacy_v4_link_without_new_field_still_joins_inline() -> Result<()> {
     // 6 base members from the inline projection + the joiner's own seat.
     assert_eq!(stub.members_v2.len(), 7, "inline projection seated");
     Ok(())
+}
+
+/// r5 item 6: an AUTHORIZED request whose bound root is in neither the
+/// live roster nor the retained commit log is `Unavailable` (terminal),
+/// never the silent refusal; and a Removed requester is refused outright
+/// (r5 test gaps).
+#[tokio::test]
+async fn pruned_root_is_unavailable_and_removed_requester_is_refused() -> Result<()> {
+    let (authority, _dir) = daemon_state().await?;
+    let group_id = "da".repeat(32);
+    let mut info = seed_group_with_members(&authority, &group_id, 5).await;
+    let requester = "9b".repeat(32);
+    let secret = "cd".repeat(32);
+    let secret_hash = hex::encode(blake3::hash(&hex::decode(&secret)?).as_bytes());
+    info.record_issued_invite(secret.clone(), 1_000, 0, x0x::groups::GroupRole::Member);
+    // Bind a root that nothing holds: the mint-time roster was pruned.
+    let pruned_root = "ab".repeat(32);
+    info.bind_issued_invite_base_roster_root(&secret, Some(pruned_root.clone()));
+    assert!(
+        base_roster_fetch::locate_served_base_roster(
+            &info,
+            &requester,
+            &pruned_root,
+            &secret_hash,
+            2_000
+        )
+        .is_unavailable(),
+        "an authorized request for a pruned root is TERMINAL, not silent"
+    );
+    // The same request with a Removed seat for the requester: refused.
+    info.add_member(
+        requester.clone(),
+        x0x::groups::GroupRole::Member,
+        None,
+        None,
+    );
+    info.members_v2.get_mut(&requester).expect("seat").state =
+        x0x::groups::GroupMemberState::Removed;
+    assert!(
+        base_roster_fetch::locate_served_base_roster(
+            &info,
+            &requester,
+            &pruned_root,
+            &secret_hash,
+            2_000
+        )
+        .is_refused(),
+        "a Removed requester is refused before anything else"
+    );
+    Ok(())
+}
+
+/// r5 item 6, joiner side: a verified `BaseRosterUnavailable` from the
+/// join's own inviter wakes it terminally; from anyone else it is dropped.
+#[tokio::test]
+async fn unavailable_answer_wakes_only_the_inviters_waiter() -> Result<()> {
+    let (joiner, _dir) = daemon_state().await?;
+    let group_id = "db".repeat(32);
+    let root = "ac".repeat(32);
+    let inviter = AgentId([11u8; 32]);
+    let (sender, mut receiver) = tokio::sync::oneshot::channel();
+    joiner
+        .base_roster_fetch_slots
+        .lock()
+        .expect("slots")
+        .insert(
+            format!("{group_id}|{root}"),
+            vec![base_roster_fetch::BaseRosterWaiter::for_test(
+                inviter, sender,
+            )],
+        );
+    let outsider = AgentId([12u8; 32]);
+    base_roster_fetch::deliver_base_roster_unavailable(&joiner, &outsider, &group_id, &root);
+    assert!(
+        receiver.try_recv().is_err(),
+        "an outsider's terminal answer must not wake the join"
+    );
+    base_roster_fetch::deliver_base_roster_unavailable(&joiner, &inviter, &group_id, &root);
+    assert_eq!(
+        receiver.await.expect("the inviter's answer wakes the join"),
+        base_roster_fetch::BaseRosterFetchReply::Unavailable
+    );
+    assert!(joiner
+        .base_roster_fetch_slots
+        .lock()
+        .expect("slots")
+        .is_empty());
+    Ok(())
+}
+
+/// r5 blocker 2 (D129): a v5 joiner's stub holds NO key-package anchors
+/// (the fetch strips them, since the roster root does not cover them), so
+/// the self-rebind classification must treat an absent LOCAL anchor as
+/// "unknown", not as "no package" — or every non-admin certificate
+/// self-rebind in an anchored TreeKEM group is misread as an admin action
+/// and refused on v5 joiners.
+#[test]
+fn v5_stub_accepts_anchored_self_rebind_link() {
+    use x0x::groups::cert_rebind::is_self_rebind_link;
+    let committer = format!("{:064x}", 1u32);
+    // The group's REAL roster: >20 members, every seat anchored.
+    let mut anchored: BTreeMap<String, RosterMemberSnapshot> = (0..25u32)
+        .map(|i| {
+            (
+                format!("{i:064x}"),
+                RosterMemberSnapshot {
+                    role: x0x::groups::GroupRole::Member,
+                    state: x0x::groups::GroupMemberState::Active,
+                    treekem_key_package_hash: Some("3c".repeat(32)),
+                    certificate_digest: Some("1a".repeat(32)),
+                    certificate: None,
+                },
+            )
+        })
+        .collect();
+    anchored
+        .get_mut(&format!("{:064x}", 0u32))
+        .expect("admin seat")
+        .role = x0x::groups::GroupRole::Admin;
+    // The v5 joiner's local predecessor: the SAME committed seats,
+    // anchor-free (exactly what the fetch seeds).
+    let stub: BTreeMap<String, RosterMemberSnapshot> = anchored
+        .iter()
+        .map(|(id, snap)| {
+            let mut snap = snap.clone();
+            snap.treekem_key_package_hash = None;
+            (id.clone(), snap)
+        })
+        .collect();
+    // A non-admin member renews its certificate: the link carries the
+    // real anchors and the new digest.
+    let mut link = anchored.clone();
+    link.get_mut(&committer)
+        .expect("committer")
+        .certificate_digest = Some("2b".repeat(32));
+    assert!(
+        is_self_rebind_link(&stub, &link, &committer),
+        "a v5 joiner must accept a valid D129 self-rebind link"
+    );
+    // Anything beyond the committer's own certificate still refuses.
+    let mut tampered = link.clone();
+    tampered
+        .get_mut(&format!("{:064x}", 2u32))
+        .expect("member")
+        .role = x0x::groups::GroupRole::Admin;
+    assert!(!is_self_rebind_link(&stub, &tampered, &committer));
+    // An anchored LOCAL side still pins the committer's anchor.
+    let mut anchor_moved = link.clone();
+    anchor_moved
+        .get_mut(&committer)
+        .expect("committer")
+        .treekem_key_package_hash = Some("4d".repeat(32));
+    assert!(!is_self_rebind_link(&anchored, &anchor_moved, &committer));
+    // And an anchored local side still pins every OTHER member's anchor.
+    let mut other_anchor_moved = link.clone();
+    other_anchor_moved
+        .get_mut(&format!("{:064x}", 3u32))
+        .expect("member")
+        .treekem_key_package_hash = Some("4d".repeat(32));
+    assert!(!is_self_rebind_link(
+        &anchored,
+        &other_anchor_moved,
+        &committer
+    ));
 }

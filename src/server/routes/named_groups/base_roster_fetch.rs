@@ -35,13 +35,35 @@ static NEXT_WAITER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 pub(in crate::server) type BaseRosterProjection =
     BTreeMap<String, x0x::groups::state_commit::RosterMemberSnapshot>;
 
+/// What a waiting join is woken with.
+#[derive(Debug, Clone, PartialEq)]
+pub(in crate::server) enum BaseRosterFetchReply {
+    /// The inviter served a verified projection.
+    Served(BaseRosterProjection),
+    /// r5 item 6: the inviter answered that this invite's signed root is
+    /// in neither its live roster nor its retained commit log any more —
+    /// TERMINAL, no retry can serve it.
+    Unavailable,
+}
+
+/// How [`obtain_base_roster`] fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::server) enum ObtainBaseRosterError {
+    /// The inviter could not be asked or did not answer in time; the join
+    /// route maps it to the retryable typed 503.
+    Retryable(&'static str),
+    /// r5 item 6: the inviter answered that the invite's signed root is
+    /// pruned — the join route maps it to a TERMINAL typed refusal.
+    Pruned,
+}
+
 /// One join parked on a `(stable group, roster root)` key, bound to the
 /// inviter its invite names: a reply wakes it only when that inviter sent
 /// it. Concurrent joins on one key each park their own waiter.
 pub(in crate::server) struct BaseRosterWaiter {
     id: u64,
     inviter: AgentId,
-    sender: tokio::sync::oneshot::Sender<BaseRosterProjection>,
+    sender: tokio::sync::oneshot::Sender<BaseRosterFetchReply>,
 }
 
 impl BaseRosterWaiter {
@@ -49,7 +71,7 @@ impl BaseRosterWaiter {
     #[cfg(test)]
     pub(in crate::server) fn for_test(
         inviter: AgentId,
-        sender: tokio::sync::oneshot::Sender<BaseRosterProjection>,
+        sender: tokio::sync::oneshot::Sender<BaseRosterFetchReply>,
     ) -> Self {
         Self {
             id: NEXT_WAITER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -57,6 +79,38 @@ impl BaseRosterWaiter {
             sender,
         }
     }
+}
+
+/// Wake every waiter on `key` whose expected inviter is `sender` with
+/// `reply`; the others keep waiting. Returns whether any join was woken.
+fn wake_matching_waiters(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    key: &str,
+    reply: &BaseRosterFetchReply,
+) -> bool {
+    let mut slots = state
+        .base_roster_fetch_slots
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(waiters) = slots.remove(key) else {
+        return false;
+    };
+    let mut woken = false;
+    let mut kept = Vec::with_capacity(waiters.len());
+    for waiter in waiters {
+        if waiter.inviter == *sender {
+            woken = true;
+            // A dropped receiver (that join timed out) is harmless.
+            let _ = waiter.sender.send(reply.clone());
+        } else {
+            kept.push(waiter);
+        }
+    }
+    if !kept.is_empty() {
+        slots.insert(key.to_string(), kept);
+    }
+    woken
 }
 
 /// The slot key: the stable group id and the content address together.
@@ -150,38 +204,37 @@ pub(in crate::server) fn deliver_base_roster(
         );
         return;
     }
-    let key = slot_key(group_id, roster_root);
-    let mut slots = state
-        .base_roster_fetch_slots
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some(waiters) = slots.remove(&key) else {
-        tracing::debug!(
-            group_id = %LogHexId::group(group_id),
-            "dropped base-roster reply no join is waiting for"
-        );
-        return;
-    };
     // Wake ONLY the joins whose invite names this sender as the inviter;
-    // a join waiting on another inviter keeps waiting. A dropped receiver
-    // (that join timed out) is harmless.
-    let mut woken = false;
-    let mut kept = Vec::with_capacity(waiters.len());
-    for waiter in waiters {
-        if waiter.inviter == *sender {
-            woken = true;
-            let _ = waiter.sender.send(sanitized.clone());
-        } else {
-            kept.push(waiter);
-        }
-    }
-    if !kept.is_empty() {
-        slots.insert(key, kept);
-    }
-    if !woken {
+    // a join waiting on another inviter keeps waiting.
+    let key = slot_key(group_id, roster_root);
+    if !wake_matching_waiters(
+        state,
+        sender,
+        &key,
+        &BaseRosterFetchReply::Served(sanitized),
+    ) {
         tracing::debug!(
             group_id = %LogHexId::group(group_id),
-            "dropped base-roster reply from a peer no waiting join named as its inviter"
+            "dropped base-roster reply no waiting join asked this sender for"
+        );
+    }
+}
+
+/// Joiner side: admit one `BaseRosterUnavailable` answer from `sender` —
+/// terminal for every join waiting on this key with `sender` as its
+/// expected inviter (r5 item 6). Like a served reply, it is honoured only
+/// for a waiting join and never cached.
+pub(in crate::server) fn deliver_base_roster_unavailable(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    group_id: &str,
+    roster_root: &str,
+) {
+    let key = slot_key(group_id, roster_root);
+    if !wake_matching_waiters(state, sender, &key, &BaseRosterFetchReply::Unavailable) {
+        tracing::debug!(
+            group_id = %LogHexId::group(group_id),
+            "dropped base-roster-unavailable answer no waiting join asked this sender for"
         );
     }
 }
@@ -219,8 +272,10 @@ impl Drop for WaiterGuard<'_> {
 ///
 /// # Errors
 ///
-/// A static reason when the inviter could not be asked or did not answer
-/// in time; the join route maps it to a retryable typed 503.
+/// [`ObtainBaseRosterError::Retryable`] when the inviter could not be
+/// asked or did not answer in time (the join route maps it to the
+/// retryable typed 503); [`ObtainBaseRosterError::Pruned`] when the
+/// inviter answered that the root is gone (terminal).
 pub(in crate::server) async fn obtain_base_roster(
     state: &Arc<AppState>,
     inviter: AgentId,
@@ -228,7 +283,8 @@ pub(in crate::server) async fn obtain_base_roster(
     signed_root: &str,
     secret_hash_hex: &str,
     timeout: Duration,
-) -> Result<BaseRosterProjection, &'static str> {
+) -> Result<BaseRosterProjection, ObtainBaseRosterError> {
+    use ObtainBaseRosterError::Retryable;
     let key = slot_key(stable_group_id, signed_root);
     #[cfg(test)]
     {
@@ -241,7 +297,9 @@ pub(in crate::server) async fn obtain_base_roster(
             if x0x::groups::state_commit::roster_root_of_projection(&sanitized) == signed_root {
                 return Ok(sanitized);
             }
-            return Err("served roster does not re-derive the signed root");
+            return Err(Retryable(
+                "served roster does not re-derive the signed root",
+            ));
         }
     }
     let waiter_id = NEXT_WAITER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -275,7 +333,21 @@ pub(in crate::server) async fn obtain_base_roster(
         secret_hash: secret_hash_hex.to_string(),
     };
     let Ok(payload) = serde_json::to_vec(&request) else {
-        return Err("request serialization failed");
+        return Err(Retryable("request serialization failed"));
+    };
+    // Defense in depth: the delivery already verified a served payload
+    // against this key's root; re-derive once more against the SIGNED
+    // root before anything seeds from it.
+    let admit = |reply: BaseRosterFetchReply| match reply {
+        BaseRosterFetchReply::Served(roster) => {
+            if x0x::groups::state_commit::roster_root_of_projection(&roster) != signed_root {
+                return Err(Retryable(
+                    "served roster does not re-derive the signed root",
+                ));
+            }
+            Ok(roster)
+        }
+        BaseRosterFetchReply::Unavailable => Err(ObtainBaseRosterError::Pruned),
     };
     // r4 item 6: ONE timeout bounds the whole exchange — the send's own
     // internal retries included — so a v5 join never waits past the fetch
@@ -297,34 +369,24 @@ pub(in crate::server) async fn obtain_base_roster(
             }
             tracing::debug!("base-roster fetch send failed: {e}");
             // The reply can have raced the send failure in on another leg
-            // (an earlier attempt's answer); a delivered projection was
-            // already verified against this key's root.
+            // (an earlier attempt's answer).
             return match receiver.try_recv() {
-                Ok(roster)
-                    if x0x::groups::state_commit::roster_root_of_projection(&roster)
-                        == signed_root =>
-                {
-                    Ok(roster)
-                }
-                _ => Err("inviter unreachable"),
+                Ok(reply) => admit(reply),
+                Err(_) => Err(Retryable("inviter unreachable")),
             };
         }
         match receiver.await {
-            Ok(roster) => {
-                // Defense in depth: the delivery already verified the
-                // payload against this key's root; re-derive once more
-                // against the SIGNED root before anything seeds from it.
-                if x0x::groups::state_commit::roster_root_of_projection(&roster) != signed_root {
-                    return Err("served roster does not re-derive the signed root");
-                }
-                Ok(roster)
-            }
-            Err(_) => Err("no answer from the inviter within the fetch window"),
+            Ok(reply) => admit(reply),
+            Err(_) => Err(Retryable(
+                "no answer from the inviter within the fetch window",
+            )),
         }
     };
     match tokio::time::timeout(timeout, exchange).await {
         Ok(result) => result,
-        Err(_) => Err("no answer from the inviter within the fetch window"),
+        Err(_) => Err(Retryable(
+            "no answer from the inviter within the fetch window",
+        )),
     }
 }
 
@@ -344,22 +406,67 @@ pub(in crate::server) async fn obtain_base_roster(
 ///
 /// The served projection is certificate-free and anchor-free (see
 /// [`sanitize_fetched`]), and only within the fetch entry cap.
+///
+/// The decision distinguishes the SILENT refusal (nothing proves the
+/// requester may ask) from the TERMINAL answer (the invite is live and
+/// authorized, but its root is unserveable — pruned from the commit log,
+/// or over the fetch entry cap — so no retry can succeed; r5 item 6).
+pub(in crate::server) enum BaseRosterServeDecision {
+    /// No live matching invite, wrong addressee, or a Banned/Removed
+    /// requester: dropped silently, the joiner just retries blind.
+    Refuse,
+    /// Authorized, but the bound root cannot be served any more: answer
+    /// `BaseRosterUnavailable`, which the joiner maps to a terminal
+    /// refusal.
+    Unavailable,
+    /// Authorized and located: serve this projection.
+    Serve(BaseRosterProjection),
+}
+
+#[cfg(test)]
+impl BaseRosterServeDecision {
+    /// Test helper: the silent refusal.
+    pub(in crate::server) fn is_refused(&self) -> bool {
+        matches!(self, BaseRosterServeDecision::Refuse)
+    }
+
+    /// Test helper: the terminal answer.
+    pub(in crate::server) fn is_unavailable(&self) -> bool {
+        matches!(self, BaseRosterServeDecision::Unavailable)
+    }
+
+    /// Test helper: the served projection, when one was located.
+    pub(in crate::server) fn served(self) -> Option<BaseRosterProjection> {
+        match self {
+            BaseRosterServeDecision::Serve(roster) => Some(roster),
+            BaseRosterServeDecision::Refuse | BaseRosterServeDecision::Unavailable => None,
+        }
+    }
+}
+
 pub(in crate::server) fn locate_served_base_roster(
     info: &x0x::groups::GroupInfo,
     requester_hex: &str,
     roster_root: &str,
     secret_hash: &str,
     now_secs: u64,
-) -> Option<BaseRosterProjection> {
+) -> BaseRosterServeDecision {
+    use BaseRosterServeDecision::{Refuse, Serve, Unavailable};
     if info.members_v2.get(requester_hex).is_some_and(|seat| {
         matches!(
             seat.state,
             x0x::groups::GroupMemberState::Banned | x0x::groups::GroupMemberState::Removed
         )
     }) {
-        return None;
+        return Refuse;
     }
-    let requested: [u8; 32] = hex::decode(secret_hash).ok()?.try_into().ok()?;
+    let requested: [u8; 32] = match hex::decode(secret_hash)
+        .ok()
+        .and_then(|raw| raw.try_into().ok())
+    {
+        Some(bytes) => bytes,
+        None => return Refuse,
+    };
     let requested = blake3::Hash::from(requested);
     let record = info.issued_invites.iter().find_map(|(secret, record)| {
         if record.consumed_by.is_some()
@@ -370,16 +477,19 @@ pub(in crate::server) fn locate_served_base_roster(
         let raw = hex::decode(secret).ok()?;
         // blake3::Hash equality is constant-time.
         (raw.len() == 32 && blake3::hash(&raw) == requested).then_some(record)
-    })?;
+    });
+    let Some(record) = record else {
+        return Refuse;
+    };
     if record
         .intended_joiner
         .as_deref()
         .is_some_and(|intended| !intended.eq_ignore_ascii_case(requester_hex))
     {
-        return None;
+        return Refuse;
     }
     if record.base_roster_root.as_deref() != Some(roster_root) {
-        return None;
+        return Refuse;
     }
     let live = x0x::groups::state_commit::roster_projection_digest_only(&info.members_v2);
     let roster = if x0x::groups::state_commit::roster_root_of_projection(&live) == roster_root {
@@ -391,9 +501,17 @@ pub(in crate::server) fn locate_served_base_roster(
             .find(|entry| entry.commit.roster_root == roster_root && entry.roster_root_consistent())
             .map(|entry| entry.roster.clone())
     };
-    roster
-        .map(|roster| sanitize_fetched(&roster))
-        .filter(|roster| roster.len() <= x0x::groups::invite::MAX_FETCHED_BASE_ROSTER_ENTRIES)
+    match roster {
+        Some(roster) => {
+            let sanitized = sanitize_fetched(&roster);
+            if sanitized.len() <= x0x::groups::invite::MAX_FETCHED_BASE_ROSTER_ENTRIES {
+                Serve(sanitized)
+            } else {
+                Unavailable
+            }
+        }
+        None => Unavailable,
+    }
 }
 
 /// Inviter side: send one located, sanitized projection back to the
@@ -422,5 +540,30 @@ pub(in crate::server) async fn send_base_roster_reply(
         .await
     {
         tracing::debug!("base-roster reply send failed: {e}");
+    }
+}
+
+/// Inviter side (r5 item 6): tell an AUTHORIZED requester its invite's
+/// root is unserveable, so its join can refuse terminally instead of
+/// retrying forever.
+pub(in crate::server) async fn send_base_roster_unavailable(
+    state: &Arc<AppState>,
+    requester: &AgentId,
+    stable_group_id: String,
+    roster_root: String,
+) {
+    let reply = JoinResultMessage::BaseRosterUnavailable {
+        group_id: stable_group_id,
+        roster_root,
+    };
+    let Ok(payload) = serde_json::to_vec(&reply) else {
+        return;
+    };
+    if let Err(e) = state
+        .agent
+        .send_direct_with_config(requester, payload, direct_message_send_config())
+        .await
+    {
+        tracing::debug!("base-roster-unavailable send failed: {e}");
     }
 }
