@@ -225,6 +225,7 @@ async fn grant_names_routes_wired() -> anyhow::Result<()> {
         owner: bob,
         owner_name: Some("Bob Smith".to_string()),
         machines: vec![(machine, "Studio Mac".to_string())],
+        verified_hosts: std::collections::BTreeSet::new(),
     };
 
     // A stranger's grant yields a suggestion, never a binding.
@@ -274,6 +275,7 @@ async fn grant_names_routes_wired() -> anyhow::Result<()> {
         owner: UserId([0xcc; 32]),
         owner_name: Some("Bob Smith".to_string()),
         machines: Vec::new(),
+        verified_hosts: std::collections::BTreeSet::new(),
     };
     let applied = state.names.apply_grant_names(&other, true, 2).await?;
     assert_eq!(applied.conflicts, 1, "{applied:?}");
@@ -287,6 +289,7 @@ async fn grant_names_routes_wired() -> anyhow::Result<()> {
         owner: UserId([0xee; 32]),
         owner_name: Some("Carol".to_string()),
         machines: Vec::new(),
+        verified_hosts: std::collections::BTreeSet::new(),
     };
     state.names.apply_grant_names(&carol, false, 3).await?;
     let (status, body) = send(
@@ -919,5 +922,172 @@ async fn forward_delete_refuses_session_and_rider_and_accepts_durable_owner() ->
     assert!(state.forwards.records().await?.is_empty());
     assert!(forwarder.forward_at(addr).is_none());
     forwarder.shutdown();
+    Ok(())
+}
+
+async fn add_contact(
+    state: &AppState,
+    agent: x0x::identity::AgentId,
+    level: x0x::contacts::TrustLevel,
+) {
+    state
+        .agent
+        .contacts()
+        .write()
+        .await
+        .add(x0x::contacts::Contact {
+            agent_id: agent,
+            trust_level: level,
+            label: None,
+            added_at: 0,
+            last_seen: None,
+            identity_type: Default::default(),
+            machines: Vec::new(),
+            dm_capabilities: None,
+        });
+}
+
+/// WHY (#1826 review, LOW; ADR 0079 §2 contact gate): an owner is a
+/// contact only through a Known or Trusted contact agent whose cached
+/// certificate chains to that owner. No contact, a Blocked contact, a
+/// contact certified by another user and a revoked contact agent all say
+/// no.
+#[tokio::test]
+async fn owner_contact_gate_needs_a_live_known_or_trusted_certified_agent() -> anyhow::Result<()> {
+    use x0x::contacts::TrustLevel;
+    let (state, _dir) =
+        crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+    let bob = crate::identity::UserKeypair::generate()?;
+    let carol = crate::identity::UserKeypair::generate()?;
+    let bob_agent = crate::identity::AgentKeypair::generate()?;
+    seed_agent_cert(
+        &state,
+        &bob_agent,
+        crate::identity::AgentCertificate::issue(&bob, &bob_agent)?,
+    )
+    .await;
+
+    assert!(
+        !owner_is_known_or_trusted_contact(&state, bob.user_id()).await,
+        "no contact"
+    );
+    add_contact(&state, bob_agent.agent_id(), TrustLevel::Blocked).await;
+    assert!(
+        !owner_is_known_or_trusted_contact(&state, bob.user_id()).await,
+        "a Blocked contact is not a contact"
+    );
+    add_contact(&state, bob_agent.agent_id(), TrustLevel::Known).await;
+    assert!(
+        owner_is_known_or_trusted_contact(&state, bob.user_id()).await,
+        "a Known certified contact"
+    );
+    assert!(
+        !owner_is_known_or_trusted_contact(&state, carol.user_id()).await,
+        "the contact's certificate chains to Bob, not Carol"
+    );
+    add_contact(&state, bob_agent.agent_id(), TrustLevel::Trusted).await;
+    assert!(owner_is_known_or_trusted_contact(&state, bob.user_id()).await);
+
+    let record = x0x::revocation::RevocationRecord::sign(
+        x0x::revocation::RevokedSubject::Agent(bob_agent.agent_id()),
+        bob_agent.public_key(),
+        bob_agent.secret_key(),
+        unix_now_secs(),
+        None,
+    )?;
+    state
+        .agent
+        .revocation_set()
+        .write()
+        .await
+        .verify_and_insert(record, None)?;
+    assert!(
+        !owner_is_known_or_trusted_contact(&state, bob.user_id()).await,
+        "a revoked contact agent is not evidence"
+    );
+    Ok(())
+}
+
+/// WHY (#1826 review, LOW): the daemon's share-grant route sends a
+/// `x0x-sharegrant-v2\0` payload to the v2 handler (the names apply) and a
+/// v1 payload to the v1 handler (the same grant is a Duplicate).
+#[tokio::test]
+async fn share_grant_dispatch_routes_v2_and_v1_payloads() -> anyhow::Result<()> {
+    use x0x::dm_inbox::{DmTypedPayload, DmTypedPayloadCompletion};
+    use x0x::share_grant::names::{GrantMachineName, GrantNames, ShareGrantV2};
+    use x0x::share_grant::{Grantee, ShareCap, ShareGrant};
+    let (state, _dir) =
+        crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+    let bob = crate::identity::UserKeypair::generate()?;
+    let bob_agent = crate::identity::AgentKeypair::generate()?;
+    seed_agent_cert(
+        &state,
+        &bob_agent,
+        crate::identity::AgentCertificate::issue(&bob, &bob_agent)?,
+    )
+    .await;
+    add_contact(
+        &state,
+        bob_agent.agent_id(),
+        x0x::contacts::TrustLevel::Known,
+    )
+    .await;
+    state
+        .agent
+        .install_share_grant_store(Arc::new(x0x::share_grant::ShareGrantStore::in_memory(
+            state.agent.agent_id(),
+            state.agent.user_id(),
+        )));
+    let now = unix_now_secs();
+    let grant = ShareGrant::sign(
+        &bob,
+        [0x5a; 32],
+        Grantee::Agent(state.agent.agent_id()),
+        vec![bob_agent.agent_id()],
+        vec![ShareCap::Dm],
+        0,
+        now + 3600,
+    )?;
+    let envelope = ShareGrantV2::sign(
+        &bob,
+        grant.clone(),
+        GrantNames {
+            owner_name: Some("Bob Smith".to_string()),
+            machines: vec![GrantMachineName {
+                machine_id: crate::identity::MachineId([0x99; 32]),
+                machine_name: "Far Box".to_string(),
+            }],
+        },
+    )?;
+    let typed = |payload: Vec<u8>| DmTypedPayload {
+        sender: bob_agent.agent_id(),
+        machine_id: crate::identity::MachineId([0xee; 32]),
+        payload,
+        verified: true,
+        trust_decision: None,
+        received_at_unix_ms: 0,
+        request_id: [0x01; 16],
+        completion: None,
+    };
+
+    let outcome =
+        crate::server::dispatch_share_grant_typed(&state, typed(envelope.to_dm_payload()?)).await;
+    assert_eq!(outcome, Ok(DmTypedPayloadCompletion::Inserted));
+    assert_eq!(
+        state.names.owner("bob-smith").await?.map(|b| b.user_id),
+        Some(bob.user_id()),
+        "v2 applied the owner name"
+    );
+    // Machine 0x99 hosts no discovered agent of the grant: held, not pinned.
+    assert!(state
+        .names
+        .get_pin("machine:far-box.bob-smith")
+        .await?
+        .is_none());
+    assert!(state.names.pending().await?.0.contains_key("bob-smith"));
+
+    let outcome =
+        crate::server::dispatch_share_grant_typed(&state, typed(grant.to_dm_payload()?)).await;
+    assert_eq!(outcome, Ok(DmTypedPayloadCompletion::Duplicate), "v1 route");
     Ok(())
 }

@@ -1648,6 +1648,9 @@ fn defaults(owner: UserId, owner_name: &str, machines: &[(u8, &str)]) -> GrantNa
             .iter()
             .map(|(b, n)| (MachineId([*b; 32]), (*n).to_string()))
             .collect(),
+        // These tests exercise the label rules, so every machine counts as
+        // hosting a granted agent; the hosting gate has its own tests.
+        verified_hosts: machines.iter().map(|(b, _)| [*b; 32]).collect(),
     }
 }
 
@@ -1865,4 +1868,143 @@ async fn suggestions_are_inert_until_accepted_and_can_be_dismissed() {
     assert!(!store.dismiss_suggestion("bob").await.unwrap());
     let (suggestions, _) = store.pending().await.unwrap();
     assert!(suggestions.is_empty());
+}
+
+/// WHY (#1826 review, LOW): one stranger owner holds at most one pending
+/// suggestion. A later grant with another owner name replaces the earlier
+/// suggestion, so one owner cannot fill the table with labels.
+#[tokio::test]
+async fn one_owner_holds_at_most_one_suggestion() {
+    let store = NameStore::in_memory();
+    let mallory = UserId([0x77; 32]);
+    for i in 0..40u64 {
+        let applied = store
+            .apply_grant_names(
+                &defaults(mallory, &format!("Mallory {i}"), &[]),
+                false,
+                NOW + i,
+            )
+            .await
+            .unwrap();
+        assert!(applied.suggested, "{applied:?}");
+    }
+    let (suggestions, _) = store.pending().await.unwrap();
+    assert_eq!(suggestions.len(), 1, "{:?}", suggestions.keys());
+    assert!(
+        suggestions.contains_key("mallory-39"),
+        "the latest one is kept"
+    );
+
+    // Another owner still gets its own suggestion.
+    store
+        .apply_grant_names(&defaults(UserId([0x66; 32]), "Carol", &[]), false, NOW + 50)
+        .await
+        .unwrap();
+    assert_eq!(store.pending().await.unwrap().0.len(), 2);
+}
+
+/// WHY (#1826 review, LOW): one owner holds at most
+/// `MAX_CONFLICTS_PER_OWNER` conflict reports. Its further reports drop its
+/// own oldest, and another owner's report stays. The owner of each report
+/// survives a reload.
+#[tokio::test]
+async fn conflicts_are_capped_per_owner_and_keep_their_owner_across_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = NameStore::path_in(dir.path());
+    let bob = UserId([0xbb; 32]);
+    let carol = UserId([0xcc; 32]);
+    let dave = UserId([0xdd; 32]);
+    {
+        let store = NameStore::load(path.clone()).await;
+        // Carol's one report: her default label is held by Bob.
+        store
+            .bind_owner("bob", bob, BindSource::Manual, NOW)
+            .await
+            .unwrap();
+        let applied = store
+            .apply_grant_names(&defaults(carol, "Bob", &[]), true, NOW)
+            .await
+            .unwrap();
+        assert_eq!(applied.conflicts, 1);
+        // Dave pins machine 1 as "studio", then offers 20 more machines
+        // under the same label: 20 label_taken reports from Dave.
+        store
+            .apply_grant_names(&defaults(dave, "Dave", &[(1, "Studio")]), true, NOW)
+            .await
+            .unwrap();
+        for b in 2..=21u8 {
+            let applied = store
+                .apply_grant_names(
+                    &defaults(dave, "Dave", &[(b, "Studio")]),
+                    true,
+                    NOW + u64::from(b),
+                )
+                .await
+                .unwrap();
+            assert_eq!(applied.conflicts, 1, "machine {b}: {applied:?}");
+        }
+        let (_, conflicts) = store.pending().await.unwrap();
+        let from_dave = conflicts.iter().filter(|c| c.from == Some(dave)).count();
+        assert_eq!(from_dave, MAX_CONFLICTS_PER_OWNER);
+        assert!(
+            conflicts.iter().any(|c| c.from == Some(carol)),
+            "another owner's report is not pushed out"
+        );
+        let newest = conflicts.iter().rfind(|c| c.from == Some(dave));
+        assert_eq!(
+            newest.map(|c| c.offered.clone()),
+            Some(hex::encode([21u8; 32]))
+        );
+    }
+    let store = NameStore::load(path).await;
+    assert!(store.load_error().is_none(), "{:?}", store.load_error());
+    let (_, conflicts) = store.pending().await.unwrap();
+    assert_eq!(
+        conflicts.iter().filter(|c| c.from == Some(dave)).count(),
+        MAX_CONFLICTS_PER_OWNER
+    );
+    assert!(conflicts.iter().any(|c| c.from == Some(carol)));
+}
+
+/// WHY (#1826 review, MEDIUM 2): a trusted owner's machine default without
+/// verified hosting evidence is held as a suggestion, never pinned, so it
+/// cannot squat a label. Hosted machines in the same grant still pin.
+#[tokio::test]
+async fn trusted_machine_default_needs_hosting_evidence() {
+    let store = NameStore::in_memory();
+    let bob = UserId([0xbb; 32]);
+    let mut offered = defaults(bob, "Bob", &[(0x01, "Studio"), (0x02, "Laptop")]);
+    offered.verified_hosts = BTreeSet::from([[0x01; 32]]);
+    let applied = store.apply_grant_names(&offered, true, NOW).await.unwrap();
+    assert!(applied.owner_bound);
+    assert_eq!(applied.machine_pins, ["machine:studio.bob"]);
+    assert!(applied.suggested, "{applied:?}");
+    assert!(store.get_pin("machine:laptop.bob").await.unwrap().is_none());
+    let (suggestions, _) = store.pending().await.unwrap();
+    assert_eq!(
+        suggestions.get("bob").map(|s| s.machines.clone()),
+        Some(vec![(MachineId([0x02; 32]), "Laptop".to_string())])
+    );
+
+    // Without evidence an unrelated machine cannot take a label first: the
+    // later hosted machine named the same gets it.
+    let mut squat = defaults(bob, "Bob", &[(0x03, "Desk")]);
+    squat.verified_hosts = BTreeSet::new();
+    store
+        .apply_grant_names(&squat, true, NOW + 1)
+        .await
+        .unwrap();
+    let applied = store
+        .apply_grant_names(&defaults(bob, "Bob", &[(0x04, "Desk")]), true, NOW + 2)
+        .await
+        .unwrap();
+    assert_eq!(applied.machine_pins, ["machine:desk.bob"]);
+    assert_eq!(
+        store
+            .get_pin("machine:desk.bob")
+            .await
+            .unwrap()
+            .map(|p| p.id),
+        Some([0x04; 32])
+    );
 }

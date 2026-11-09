@@ -248,10 +248,17 @@ impl ShareGrantV2 {
     }
 
     /// The grant-names defaults this envelope carries, for
-    /// [`crate::names::NameStore::apply_grant_names`].
+    /// [`crate::names::NameStore::apply_grant_names`]. `verified_hosts` is
+    /// the caller's local hosting evidence
+    /// ([`crate::Agent::verified_grant_hosts`]); it is never taken from the
+    /// envelope.
     #[must_use]
-    pub fn name_defaults(&self) -> crate::names::GrantNameDefaults {
+    pub fn name_defaults(
+        &self,
+        verified_hosts: std::collections::BTreeSet<[u8; 32]>,
+    ) -> crate::names::GrantNameDefaults {
         crate::names::GrantNameDefaults {
+            verified_hosts,
             owner: self.grant.owner,
             owner_name: self.names.owner_name.clone(),
             machines: self
@@ -273,24 +280,33 @@ impl ShareGrantV2 {
 /// local owner's own grants are skipped (the local owner is always `me`).
 /// `owner_trusted` says whether the grant's owner is a Known or Trusted
 /// contact (ADR 0079 §2 contact gate); a stranger's names are kept as a
-/// suggestion, never applied.
+/// suggestion, never applied. `verified_hosts` gives the machines with
+/// local hosting evidence for the grant
+/// ([`crate::Agent::verified_grant_hosts`]); a machine default for any other
+/// machine is kept as a suggestion, never pinned.
 ///
 /// The completion resolves `Inserted`/`Duplicate` only once the grant is
 /// stored AND the name store holds the outcome durably; a name-store write
 /// failure withholds the ACK so the sender's outbox retries the same bytes
-/// (a replay is idempotent on both stores). Name conflicts and suggestions
-/// are normal outcomes, not failures.
-pub async fn handle_share_grant_v2_dm<F, Fut>(
+/// (a replay is idempotent on both stores). A name store that failed to
+/// load (`names.json` unreadable or corrupt) cannot recover by a retry, so
+/// the grant is ACKed and its names are skipped; otherwise the sender would
+/// retry forever. Name conflicts and suggestions are normal outcomes, not
+/// failures.
+pub async fn handle_share_grant_v2_dm<F, Fut, H, HFut>(
     store: Option<&super::ShareGrantStore>,
     revocations: Option<&tokio::sync::RwLock<crate::revocation::RevocationSet>>,
     name_store: &crate::names::NameStore,
     local_user: Option<UserId>,
     owner_trusted: F,
+    verified_hosts: H,
     typed: crate::dm_inbox::DmTypedPayload,
 ) -> crate::dm_inbox::DmTypedPayloadCompletionResult
 where
     F: FnOnce(UserId) -> Fut,
     Fut: std::future::Future<Output = bool>,
+    H: FnOnce(ShareGrant) -> HFut,
+    HFut: std::future::Future<Output = std::collections::BTreeSet<[u8; 32]>>,
 {
     let crate::dm_inbox::DmTypedPayload {
         sender,
@@ -304,6 +320,7 @@ where
         name_store,
         local_user,
         owner_trusted,
+        verified_hosts,
         &payload,
     )
     .await;
@@ -325,17 +342,20 @@ where
     result
 }
 
-async fn handle_v2_bytes<F, Fut>(
+async fn handle_v2_bytes<F, Fut, H, HFut>(
     store: Option<&super::ShareGrantStore>,
     revocations: Option<&tokio::sync::RwLock<crate::revocation::RevocationSet>>,
     name_store: &crate::names::NameStore,
     local_user: Option<UserId>,
     owner_trusted: F,
+    verified_hosts: H,
     payload: &[u8],
 ) -> crate::dm_inbox::DmTypedPayloadCompletionResult
 where
     F: FnOnce(UserId) -> Fut,
     Fut: std::future::Future<Output = bool>,
+    H: FnOnce(ShareGrant) -> HFut,
+    HFut: std::future::Future<Output = std::collections::BTreeSet<[u8; 32]>>,
 {
     let Some(store) = store else {
         return Err("share grants are not enabled on this daemon".to_string());
@@ -361,8 +381,20 @@ where
     if local_user == Some(owner) {
         return Ok(outcome);
     }
+    // An unloadable name store fails every write until the operator repairs
+    // names.json, so withholding the ACK would only make the sender retry
+    // forever. ACK the stored grant and skip its names.
+    if let Some(load_error) = name_store.load_error() {
+        tracing::warn!(
+            owner = %hex::encode(owner.as_bytes()),
+            load_error,
+            "grant stored; name defaults skipped because the name store did not load"
+        );
+        return Ok(outcome);
+    }
     let trusted = owner_trusted(owner).await;
-    let defaults = envelope.name_defaults();
+    let hosts = verified_hosts(envelope.grant.clone()).await;
+    let defaults = envelope.name_defaults(hosts);
     match name_store
         .apply_grant_names(&defaults, trusted, super::unix_now_secs())
         .await

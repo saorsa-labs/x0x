@@ -4296,8 +4296,13 @@ delivery, so v1 and v2 copies of one grant are an idempotent duplicate.
 The names become ADR-0074 §1 defaults in the local name store:
 
 - When the grant's owner is a **Known or Trusted** contact, an unbound
-  owner gets the petname derived from `owner_name` (source `grant`), and
-  each listed machine with no label under that owner gets a machine pin.
+  owner gets the petname derived from `owner_name` (source `grant`). A
+  listed machine with no label under that owner gets a machine pin only
+  when this daemon has verified hosting evidence for it: a discovered agent
+  of the grant whose certificate chains to the owner and whose
+  authenticated machine is that machine, with nothing revoked. This is the
+  evidence a manual shared-machine label needs. A machine without that
+  evidence is kept in the owner's pending suggestion and is not pinned.
   Defaults never rebind: a label already bound to another key, or a later
   grant carrying a different name, is reported as a `default_conflict`
   (`conflicts` in `GET /names`: `kind`, `case` `label_taken` or
@@ -4306,6 +4311,14 @@ The names become ADR-0074 §1 defaults in the local name store:
 - A **stranger's** grant yields only a pending suggestion (`suggestions` in
   `GET /names`). `POST /names/accept {"label": …}` applies it (and removes
   it); `DELETE /names/suggestions/:label` drops it.
+- One owner holds at most one pending suggestion; a later one from the same
+  owner replaces it. One owner holds at most 16 `default_conflict` reports;
+  a further report drops that owner's oldest. The tables hold at most 256
+  entries each.
+- If `names.json` failed to load, the grant is still stored and ACKed, and
+  its names are skipped (a retry cannot succeed until the file is repaired).
+  A failed name-store write withholds the ACK, and the sender's retry
+  applies the names.
 
 A machine label recorded from a grant resolves only while the ADR-0074
 shared-machine rule holds: the machine must currently host a certified
