@@ -2737,6 +2737,51 @@ mod tests {
         );
     }
 
+    /// Pinned BLAKE3-256 (hex) over the canonical bytes of the fixed-field
+    /// v6 view below — the v6 counterpart of
+    /// [`PINNED_VIEW_CANONICAL_BLAKE3`]: any field reorder, insertion or
+    /// representation change in the v6 signed layout, or a change to the
+    /// v6 domain strings, moves this digest and fails the pin.
+    const PINNED_V6_VIEW_CANONICAL_BLAKE3: &str =
+        "e97bcbcd6564e1ad4cc300df7ef58db71a922f9f320c6fe61712e71cf5a0c9bd";
+
+    /// The fixed-field v6 view: the v4 pinned view re-carried as content
+    /// address (no inline roster, a fixed root), version 6.
+    fn pinned_v6_view() -> InviteSignedViewV4 {
+        let mut view = pinned_view();
+        view.version = INVITE_VERSION_V6;
+        view.base_roster = BTreeMap::new();
+        view.base_roster_root = Some("de".repeat(32));
+        view
+    }
+
+    #[test]
+    fn canonical_bytes_pinned_vector_v6() {
+        assert_eq!(INVITE_V6_CANONICAL_DOMAIN, b"x0x.invite.v6\0".as_slice());
+        assert_eq!(
+            INVITE_V6_INVITER_DOMAIN,
+            b"x0x.invite.v6.inviter\0".as_slice()
+        );
+        assert_eq!(INVITE_V6_OWNER_DOMAIN, b"x0x.invite.v6.owner\0".as_slice());
+        let view = pinned_v6_view();
+        let canonical = view.canonical_bytes().expect("canonical bytes");
+        assert!(
+            canonical.starts_with(INVITE_V6_CANONICAL_DOMAIN),
+            "v6 canonical bytes must open with the v6 signing domain"
+        );
+        assert_eq!(
+            canonical,
+            pinned_v6_view()
+                .canonical_bytes()
+                .expect("canonical bytes (rebuild)")
+        );
+        assert_eq!(
+            hex::encode(blake3::hash(&canonical).as_bytes()),
+            PINNED_V6_VIEW_CANONICAL_BLAKE3,
+            "the v6 canonical layout or domain moved"
+        );
+    }
+
     // ─── r3 (Fable 5): v0.40.4 cross-version fixtures ────────────────────
 
     /// Byte-faithful replica of the v0.40.4 wire types a v0.40.4 node

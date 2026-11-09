@@ -140,6 +140,35 @@ static TEST_PRESEEDED_PROJECTIONS: std::sync::LazyLock<
     StdMutex<HashMap<String, BaseRosterProjection>>,
 > = std::sync::LazyLock::new(|| StdMutex::new(HashMap::new()));
 
+#[cfg(test)]
+static TEST_PRESEEDED_PRUNED: std::sync::LazyLock<StdMutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| StdMutex::new(std::collections::HashSet::new()));
+
+/// Test seam (consumed on use): make one `obtain_base_roster` call answer
+/// [`ObtainBaseRosterError::Pruned`], standing in for the inviter's
+/// `BaseRosterUnavailable` answer.
+#[cfg(test)]
+pub(in crate::server) fn preseed_pruned_answer_for_test(stable_group_id: &str, roster_root: &str) {
+    TEST_PRESEEDED_PRUNED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(slot_key(stable_group_id, roster_root));
+}
+
+/// Test tripwire: true while a preseeded projection for this key is still
+/// UNCONSUMED — a join that fetched would have eaten it, so this proves a
+/// fetch-skip path never asked.
+#[cfg(test)]
+pub(in crate::server) fn preseeded_projection_untouched_for_test(
+    stable_group_id: &str,
+    roster_root: &str,
+) -> bool {
+    TEST_PRESEEDED_PROJECTIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains_key(&slot_key(stable_group_id, roster_root))
+}
+
 /// Test seam (consumed on use): satisfy one `obtain_base_roster` call
 /// without any network, standing in for the inviter's serve so the real
 /// join route runs socket-free. The projection still has to re-derive the
@@ -288,6 +317,13 @@ pub(in crate::server) async fn obtain_base_roster(
     let key = slot_key(stable_group_id, signed_root);
     #[cfg(test)]
     {
+        if TEST_PRESEEDED_PRUNED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&key)
+        {
+            return Err(ObtainBaseRosterError::Pruned);
+        }
         let preseeded = TEST_PRESEEDED_PROJECTIONS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

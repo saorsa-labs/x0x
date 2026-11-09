@@ -1196,3 +1196,236 @@ fn v6_stub_accepts_anchored_self_rebind_link() {
         &committer
     ));
 }
+
+/// ZCode r7 item 1: the TERMINAL 409 `base_roster_pruned` through the
+/// real join route — the inviter answered that the invite's root is gone,
+/// so the join refuses with the typed terminal code, records the typed
+/// refusal, and installs nothing.
+#[tokio::test]
+async fn v6_join_refuses_terminally_when_the_inviter_pruned_the_root() -> Result<()> {
+    let (authority, _dir_a) = daemon_state().await?;
+    let group_id = "dc".repeat(32);
+    let info = seed_group_with_members(&authority, &group_id, 50).await;
+    let (invite, link) = assemble_signed_v4_invite(&authority, &info, 3_600, None)
+        .map_err(|e| anyhow::anyhow!("v6 mint failed: {e:?}"))?;
+    let signed_root = invite.base_roster_root.clone().context("content address")?;
+    let stable_group_id = invite.stable_group_id.clone().context("stable id")?;
+
+    let (joiner, _dir_b) = daemon_state().await?;
+    base_roster_fetch::preseed_pruned_answer_for_test(&stable_group_id, &signed_root);
+    let response = join_group_via_invite(
+        State(Arc::clone(&joiner)),
+        Json(JoinGroupRequest {
+            invite: link,
+            display_name: None,
+            mode: None,
+            expected_owner_user_id: None,
+        }),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let body = response_json(response).await?.1;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("base_roster_pruned"),
+        "typed TERMINAL refusal, got {body}"
+    );
+    assert!(
+        joiner.named_groups.read().await.is_empty(),
+        "a pruned v6 join must install nothing"
+    );
+    let snapshot = joiner.groups_diagnostics.snapshot(
+        &HashMap::new(),
+        &std::collections::HashSet::new(),
+        &std::collections::HashSet::new(),
+        &HashMap::new(),
+        0,
+    );
+    let row = snapshot
+        .groups
+        .iter()
+        .find(|row| row.group_id == group_id)
+        .context("refusal row recorded")?;
+    assert_eq!(
+        row.counters
+            .invites_refused_reasons
+            .get("base_roster_pruned"),
+        Some(&1),
+        "the typed refusal is recorded once"
+    );
+    Ok(())
+}
+
+/// ZCode r7 item 2: the REAL mint transaction (`mint_invite_transaction`)
+/// on a >20-member group writes the v6 invite, binds the signed root onto
+/// the issued record it persists, and the serve half answers that exact
+/// record end to end — no hand-binding anywhere.
+#[tokio::test]
+async fn minted_v6_record_serves_its_signed_root_end_to_end() -> Result<()> {
+    let (authority, _dir) = daemon_state().await?;
+    let group_id = "dd".repeat(32);
+    seed_group_with_members(&authority, &group_id, 30).await;
+    let (invite, _link) = mint_invite_transaction(
+        &authority,
+        &group_id,
+        3_600,
+        None,
+        x0x::groups::InviteOrigin::Explicit,
+        false,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("real mint failed: {e:?}"))?;
+    assert_eq!(invite.version, INVITE_VERSION_V6);
+    let signed_root = invite.base_roster_root.clone().context("content address")?;
+
+    let stored = authority
+        .named_groups
+        .read()
+        .await
+        .get(&group_id)
+        .cloned()
+        .context("group record")?;
+    assert_eq!(
+        stored
+            .issued_invites
+            .get(&invite.invite_secret)
+            .context("issued record")?
+            .base_roster_root
+            .as_deref(),
+        Some(signed_root.as_str()),
+        "the mint binds the signed root onto the persisted record"
+    );
+
+    let requester = "9c".repeat(32);
+    let secret_hash = hex::encode(blake3::hash(&hex::decode(&invite.invite_secret)?).as_bytes());
+    let served = base_roster_fetch::locate_served_base_roster(
+        &stored,
+        &requester,
+        &signed_root,
+        &secret_hash,
+        now_millis_u64() / 1_000,
+    )
+    .served()
+    .context("the minted record serves its own root")?;
+    assert_eq!(roster_root_of_projection(&served), signed_root);
+    Ok(())
+}
+
+/// ZCode r7 item 3a: an already-ACTIVE joiner's v6 re-join answers
+/// idempotently WITHOUT a fetch — the preseeded projection tripwire stays
+/// unconsumed.
+#[tokio::test]
+async fn already_active_v6_rejoin_answers_without_a_fetch() -> Result<()> {
+    let (authority, _dir_a) = daemon_state().await?;
+    let group_id = "de".repeat(32);
+    let info = seed_group_with_members(&authority, &group_id, 50).await;
+    let (invite, link) = assemble_signed_v4_invite(&authority, &info, 3_600, None)
+        .map_err(|e| anyhow::anyhow!("v6 mint failed: {e:?}"))?;
+    let signed_root = invite.base_roster_root.clone().context("content address")?;
+    let stable_group_id = invite.stable_group_id.clone().context("stable id")?;
+
+    let (joiner, _dir_b) = daemon_state().await?;
+    let joiner_hex = hex::encode(joiner.agent.agent_id().as_bytes());
+    let mut local = info.clone();
+    local.add_member(
+        joiner_hex.clone(),
+        x0x::groups::GroupRole::Member,
+        None,
+        None,
+    );
+    joiner
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), local);
+    // Tripwire: a fetch would consume this.
+    base_roster_fetch::preseed_fetched_projection_for_test(
+        &stable_group_id,
+        &signed_root,
+        roster_projection_digest_only(&info.members_v2),
+    );
+
+    let response = join_group_via_invite(
+        State(Arc::clone(&joiner)),
+        Json(JoinGroupRequest {
+            invite: link,
+            display_name: None,
+            mode: None,
+            expected_owner_user_id: None,
+        }),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let body = response_json(response).await?.1;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["already_joined"], json!(true), "{body}");
+    assert!(
+        base_roster_fetch::preseeded_projection_untouched_for_test(&stable_group_id, &signed_root),
+        "an already-active re-join must not fetch"
+    );
+    Ok(())
+}
+
+/// ZCode r7 item 3b: a v6 re-join whose attempt is already PENDING (the
+/// expected-inviter registry, the same source the idempotent answer
+/// reads) answers idempotently WITHOUT a fetch.
+#[tokio::test]
+async fn already_pending_v6_rejoin_answers_without_a_fetch() -> Result<()> {
+    let (authority, _dir_a) = daemon_state().await?;
+    let group_id = "df".repeat(32);
+    let info = seed_group_with_members(&authority, &group_id, 50).await;
+    let (invite, link) = assemble_signed_v4_invite(&authority, &info, 3_600, None)
+        .map_err(|e| anyhow::anyhow!("v6 mint failed: {e:?}"))?;
+    let signed_root = invite.base_roster_root.clone().context("content address")?;
+    let stable_group_id = invite.stable_group_id.clone().context("stable id")?;
+
+    let (joiner, _dir_b) = daemon_state().await?;
+    let joiner_hex = hex::encode(joiner.agent.agent_id().as_bytes());
+    // Local record WITHOUT the joiner's seat + a registered pending
+    // attempt: the answer path classifies pending_authority_commit.
+    joiner
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), info.clone());
+    record_expected_join_result_inviter(
+        &joiner,
+        join_result_key(&stable_group_id, &joiner_hex),
+        invite.inviter.clone(),
+    );
+    base_roster_fetch::preseed_fetched_projection_for_test(
+        &stable_group_id,
+        &signed_root,
+        roster_projection_digest_only(&info.members_v2),
+    );
+
+    let response = join_group_via_invite(
+        State(Arc::clone(&joiner)),
+        Json(JoinGroupRequest {
+            invite: link,
+            display_name: None,
+            mode: None,
+            expected_owner_user_id: None,
+        }),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let body = response_json(response).await?.1;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["join_state"],
+        json!("pending_authority_commit"),
+        "{body}"
+    );
+    assert!(
+        base_roster_fetch::preseeded_projection_untouched_for_test(&stable_group_id, &signed_root),
+        "an already-pending re-join must not fetch"
+    );
+    Ok(())
+}
