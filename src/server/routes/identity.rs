@@ -546,7 +546,7 @@ pub(in crate::server) fn populate_invite_base_state_v4(
     // oversize exactly as before #646, so a caller like
     // `mint_reseat_invite` never signs or stores an invite its redeem
     // side (`check_reseat_invite`, which requires the inline roster)
-    // cannot use. The ordinary mint path opts into the v5
+    // cannot use. The ordinary mint path opts into the v6
     // content-addressed carrier through
     // [`populate_invite_base_state`].
     let projection = x0x::groups::state_commit::roster_projection_digest_only(&info.members_v2);
@@ -573,9 +573,9 @@ pub(in crate::server) fn populate_invite_base_state_v4(
     invite.base_security_binding = info.security_binding.clone();
 }
 
-/// #646 (D13): the v5-capable mint population for the ORDINARY invite
+/// #646 (D13): the v6-capable mint population for the ORDINARY invite
 /// path (`assemble_signed_v4_invite`). A projection past the inline cap
-/// no longer rides the link: the invite becomes v5 and carries the
+/// no longer rides the link: the invite becomes v6 and carries the
 /// projection's CONTENT ADDRESS (its roster root); the joiner fetches the
 /// projection from the inviter and admits it only when it re-derives this
 /// signed root. At or under the cap the invite stays v4, byte-identical
@@ -594,7 +594,7 @@ pub(in crate::server) fn populate_invite_base_state(
         .is_some_and(|roster| roster.len() > x0x::groups::invite::MAX_INVITE_ROSTER_ENTRIES);
     if over_cap {
         let projection = invite.base_roster.take().unwrap_or_default();
-        invite.version = x0x::groups::invite::INVITE_VERSION_V5;
+        invite.version = x0x::groups::invite::INVITE_VERSION_V6;
         invite.base_roster_root = Some(x0x::groups::state_commit::roster_root_of_projection(
             &projection,
         ));

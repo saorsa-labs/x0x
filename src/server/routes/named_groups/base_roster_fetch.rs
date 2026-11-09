@@ -1,6 +1,6 @@
-//! #646 (D13/W4): content-addressed base-roster fetch for v5 invites.
+//! #646 (D13/W4): content-addressed base-roster fetch for v6 invites.
 //!
-//! A v5 invite names its base roster by CONTENT ADDRESS (the roster root)
+//! A v6 invite names its base roster by CONTENT ADDRESS (the roster root)
 //! instead of carrying the projection inline. Before installing any local
 //! state, the joiner asks the INVITER for the projection
 //! ([`super::JoinResultMessage::BaseRosterFetch`]) and admits the answer
@@ -350,7 +350,7 @@ pub(in crate::server) async fn obtain_base_roster(
         BaseRosterFetchReply::Unavailable => Err(ObtainBaseRosterError::Pruned),
     };
     // r4 item 6: ONE timeout bounds the whole exchange — the send's own
-    // internal retries included — so a v5 join never waits past the fetch
+    // internal retries included — so a v6 join never waits past the fetch
     // window before its typed retryable 503.
     let exchange = async {
         if let Err(e) = state

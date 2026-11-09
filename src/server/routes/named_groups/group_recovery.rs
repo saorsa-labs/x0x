@@ -6486,7 +6486,7 @@ async fn mint_reseat_invite(
     );
     // #646 r3 (blocker 2): the re-seat invite stays INLINE-v4 —
     // `check_reseat_invite` reads the signed base roster from the link,
-    // so a v5 content-addressed carrier could never be redeemed. Past
+    // so a v6 content-addressed carrier could never be redeemed. Past
     // the inline cap `sign_v4` refuses `base_roster` as oversize, so
     // nothing is signed or stored, exactly as before #646.
     crate::server::routes::identity::populate_invite_base_state_v4(

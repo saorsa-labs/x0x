@@ -1474,13 +1474,13 @@ pub(in crate::server) enum JoinResultMessage {
     /// and whose advert sets `join_pending_notice_v1` — a legacy joiner
     /// never sees this arm.
     Pending { notice: Box<JoinPendingNotice> },
-    /// #646: a joiner holding a v5 (content-addressed) invite asks the
+    /// #646: a joiner holding a v6 (content-addressed) invite asks the
     /// INVITER for the base roster projection the invite's signed
     /// `base_roster_root` names. Proof of invite possession rides as the
     /// BLAKE3 of the raw 32-byte invite secret (never the secret itself):
     /// the inviter serves only while a live issued-invite record hashes to
     /// it. A pre-#646 peer fails to decode this arm and drops it — such a
-    /// peer also never minted a v5 invite, so no joiner asks it.
+    /// peer also never minted a v6 invite, so no joiner asks it.
     BaseRosterFetch {
         group_id: String,
         member_agent_id: String,
@@ -23779,7 +23779,7 @@ pub(in crate::server) fn assemble_signed_v4_invite(
         &agent_id,
         expiry_secs,
     );
-    // #646: the ordinary mint is v5-capable — past the inline cap the
+    // #646: the ordinary mint is v6-capable — past the inline cap the
     // invite carries the roster's content address instead of the roster.
     super::identity::populate_invite_base_state(&mut invite, info, intended_joiner);
 
@@ -23802,11 +23802,11 @@ pub(in crate::server) fn assemble_signed_v4_invite(
     if let Some((field, size)) = invite.v4_field_caps_violation() {
         return Err(MintInviteError::TooLarge { field, size });
     }
-    // #646: a v5 (content-addressed) invite stands for a roster the joiner
+    // #646: a v6 (content-addressed) invite stands for a roster the joiner
     // fetches in ONE direct-message reply — refuse at mint what that reply
     // could not carry, with the same typed refusal shape as the old inline
     // cap.
-    if invite.version == x0x::groups::invite::INVITE_VERSION_V5 {
+    if invite.version == x0x::groups::invite::INVITE_VERSION_V6 {
         let entries =
             x0x::groups::state_commit::roster_projection_digest_only(&info.members_v2).len();
         if entries > x0x::groups::invite::MAX_FETCHED_BASE_ROSTER_ENTRIES {
@@ -23956,7 +23956,7 @@ pub(in crate::server) async fn mint_invite_transaction(
         origin,
         signed_link,
     );
-    // #646 (D95): a v5 record remembers the ONE root its invite signed —
+    // #646 (D95): a v6 record remembers the ONE root its invite signed —
     // the base-roster fetch serves exactly that root to this invite's
     // holder and nothing else. v4 records keep None (nothing is served).
     next.bind_issued_invite_base_roster_root(
@@ -24147,7 +24147,7 @@ fn invite_join_group_info(
     joiner_hex: &str,
     display_name: Option<String>,
     treekem_key_package_b64: Option<String>,
-    // #646: the out-of-band-fetched projection of a v5 invite, already
+    // #646: the out-of-band-fetched projection of a v6 invite, already
     // verified against the invite's signed roster root by the caller.
     // `None` for v4 invites (whose projection rides inline).
     fetched_base_roster: Option<&BTreeMap<String, x0x::groups::state_commit::RosterMemberSnapshot>>,
@@ -25059,12 +25059,12 @@ pub(super) async fn join_group_via_invite_inner(
     // version (A2 step 2, hoisted r6 Codex 1b): an unknown-version blob
     // refuses before ANY structural work — `invite_unsigned` covers
     // version < 4 (including the legacy sentinel 0) and any future
-    // version. v5 (#646) carries the roster's content address instead of
+    // version. v6 (#646) carries the roster's content address instead of
     // the inline projection. The structural rules that used to share
     // this gate (projection presence, fat-roster refusal, absent
     // `policy`/`secure_plane`) stay in the view construction below.
     if invite.version != x0x::groups::invite::INVITE_VERSION_V4
-        && invite.version != x0x::groups::invite::INVITE_VERSION_V5
+        && invite.version != x0x::groups::invite::INVITE_VERSION_V6
     {
         return refuse_invite(&state, &invite, "invite_unsigned");
     }
@@ -25170,7 +25170,7 @@ pub(super) async fn join_group_via_invite_inner(
         let Some(view_policy) = view.policy.as_ref() else {
             return refuse_invite(&state, &invite, "invite_unsigned");
         };
-        // #646: on a v5 view the root is the carried content address; on
+        // #646: on a v6 view the root is the carried content address; on
         // v4 it re-derives from the inline projection as before.
         let roster_root = view.signed_roster_root();
         let policy_hash = x0x::groups::state_commit::compute_policy_hash(view_policy);
@@ -25295,7 +25295,7 @@ pub(super) async fn join_group_via_invite_inner(
     let agent_id = state.agent.agent_id();
     let group_id_hex = invite.group_id.clone();
     let invite_stable_group_id = invite.stable_group_id.as_deref().unwrap_or(&group_id_hex);
-    // ── #646: content-addressed base roster (v5) ──
+    // ── #646: content-addressed base roster (v6) ──
     // The signed view carries only the roster's content address. Fetch
     // the projection from the inviter NOW — after the full A2
     // authentication, before any lock or local state — and admit it only
@@ -25345,7 +25345,7 @@ pub(super) async fn join_group_via_invite_inner(
             if already_active || already_pending {
                 tracing::debug!(
                     group_id = %LogHexId::group(&invite.group_id),
-                    "v5 join is already seated or pending locally; the fetch is skipped"
+                    "v6 join is already seated or pending locally; the fetch is skipped"
                 );
                 (None, false)
             } else {
@@ -25378,7 +25378,7 @@ pub(super) async fn join_group_via_invite_inner(
         }
     };
     let (fetched_base_roster, base_roster_pruned) = fetched_base_roster;
-    // v5 with no fetched roster: the typed answer for every path below
+    // v6 with no fetched roster: the typed answer for every path below
     // that needs the base projection — retryable 503 while the inviter
     // may still serve, TERMINAL 409 once the inviter answered that the
     // invite's root is pruned (r5 item 6: no retry can ever serve it).
@@ -25402,7 +25402,7 @@ pub(super) async fn join_group_via_invite_inner(
              content-addressed base roster; retry while the inviter is reachable",
         )
     };
-    let v5_roster_missing = view.base_roster_root.is_some() && fetched_base_roster.is_none();
+    let v6_roster_missing = view.base_roster_root.is_some() && fetched_base_roster.is_none();
     let effective_base_roster = fetched_base_roster.as_ref().unwrap_or(&view.base_roster);
     let membership_lock = group_membership_lock(&state, &group_id_hex).await;
     let membership_guard = membership_lock.lock().await;
@@ -25509,8 +25509,8 @@ pub(super) async fn join_group_via_invite_inner(
                     // base-seat shortcut runs). Otherwise #1148's clear
                     // stands.
                     // #646: the discriminator reads the base projection —
-                    // never guess it from an unfetched v5 base.
-                    if v5_roster_missing {
+                    // never guess it from an unfetched v6 base.
+                    if v6_roster_missing {
                         return base_roster_unavailable(&state);
                     }
                     let base_seats_device = effective_base_roster
@@ -25645,13 +25645,13 @@ pub(super) async fn join_group_via_invite_inner(
         )
         .await;
     }
-    // #646 (review r2): a v5 join whose fetch failed refuses BEFORE the
+    // #646 (review r2): a v6 join whose fetch failed refuses BEFORE the
     // stale-row clear — a refused invite leaves the row unchanged (#1471),
     // so an inert card-import stub survives the retryable 503 and group
     // access keeps answering while the joiner retries. Everything past
     // here clears local state or SEEDS a fresh stub from the base
     // projection, so the typed retryable refusal happens NOW.
-    if v5_roster_missing {
+    if v6_roster_missing {
         return base_roster_unavailable(&state);
     }
     if stale_not_member_row {
@@ -25738,7 +25738,7 @@ pub(super) async fn join_group_via_invite_inner(
             info.invite_lineage = Some(x0x::groups::InviteLineage {
                 base_revision: view.base_state_revision,
                 base_hash: view.base_state_hash.clone(),
-                // #646: the signed root — carried on v5, re-derived from
+                // #646: the signed root — carried on v6, re-derived from
                 // the inline projection on v4 (same value either way).
                 base_roster_root: view.signed_roster_root(),
                 seated_at_revision: None,

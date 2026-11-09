@@ -2,7 +2,7 @@
 //! Active+Banned roster members.
 //!
 //! A roster projection over [`x0x::groups::invite::MAX_INVITE_ROSTER_ENTRIES`]
-//! no longer rides the link: the mint emits a v5 invite carrying the
+//! no longer rides the link: the mint emits a v6 invite carrying the
 //! projection's CONTENT ADDRESS (its roster root), and the joiner fetches
 //! the projection from the inviter out of band, admitting it only when it
 //! re-derives the signed root. These tests pin the mint shape, the serve
@@ -14,7 +14,7 @@
 use super::*;
 
 use crate::groups::invite::{
-    INVITE_VERSION_V4, INVITE_VERSION_V5, MAX_FETCHED_BASE_ROSTER_ENTRIES,
+    INVITE_VERSION_V4, INVITE_VERSION_V6, MAX_FETCHED_BASE_ROSTER_ENTRIES,
 };
 use crate::groups::state_commit::{
     roster_projection_digest_only, roster_root_of_projection, RosterMemberSnapshot,
@@ -78,34 +78,34 @@ async fn seed_group_with_members(
     info
 }
 
-/// Over the inline cap, the mint emits a v5 invite: no inline projection,
+/// Over the inline cap, the mint emits a v6 invite: no inline projection,
 /// the projection's root as its content address, a verifying signature,
 /// and a link whose size no longer grows with the roster. At or under the
 /// cap the mint stays v4 — inline projection, no content address.
 #[tokio::test]
-async fn over_cap_mint_is_v5_content_addressed_within_budget() -> Result<()> {
+async fn over_cap_mint_is_v6_content_addressed_within_budget() -> Result<()> {
     let (authority, _dir) = daemon_state().await?;
 
     // 50 Active members + the creator: past the inline cap of 20.
     let group_id = "aa".repeat(32);
     let info = seed_group_with_members(&authority, &group_id, 50).await;
     let (invite, link) = assemble_signed_v4_invite(&authority, &info, 3_600, None)
-        .map_err(|e| anyhow::anyhow!("v5 mint failed: {e:?}"))?;
-    assert_eq!(invite.version, INVITE_VERSION_V5);
-    assert_eq!(invite.base_roster, None, "v5 carries no inline projection");
+        .map_err(|e| anyhow::anyhow!("v6 mint failed: {e:?}"))?;
+    assert_eq!(invite.version, INVITE_VERSION_V6);
+    assert_eq!(invite.base_roster, None, "v6 carries no inline projection");
     let expected_root = roster_root_of_projection(&roster_projection_digest_only(&info.members_v2));
     assert_eq!(
         invite.base_roster_root.as_deref(),
         Some(expected_root.as_str())
     );
     assert_eq!(invite.verify_v4_signatures(), Ok(()));
-    // A v5 link carries the fixed-size signing material (two inline
+    // A v6 link carries the fixed-size signing material (two inline
     // ML-DSA-65 keys + signatures ≈ 9.4 KiB of base64) but NO roster:
     // its size is roster-independent, far under the 40,960 B budget a
     // 21-member v4 link would overflow once wrapped.
     assert!(
         link.len() < 16 * 1024,
-        "a v5 link is roster-size independent (got {} B)",
+        "a v6 link is roster-size independent (got {} B)",
         link.len()
     );
 
@@ -119,8 +119,8 @@ async fn over_cap_mint_is_v5_content_addressed_within_budget() -> Result<()> {
     assert_eq!(small_invite.base_roster_root, None);
     assert_eq!(small_invite.verify_v4_signatures(), Ok(()));
 
-    // The exact boundaries (r4 test gap): 20 members mint v4, 21 mint v5,
-    // 128 (the fetch cap itself) still mints v5.
+    // The exact boundaries (r4 test gap): 20 members mint v4, 21 mint v6,
+    // 128 (the fetch cap itself) still mints v6.
     let at_cap_id = "cd".repeat(32);
     let at_cap = seed_group_with_members(&authority, &at_cap_id, 19).await; // +creator = 20
     let (at_cap_invite, _) = assemble_signed_v4_invite(&authority, &at_cap, 3_600, None)
@@ -130,7 +130,7 @@ async fn over_cap_mint_is_v5_content_addressed_within_budget() -> Result<()> {
     let over_cap = seed_group_with_members(&authority, &over_cap_id, 20).await; // +creator = 21
     let (over_cap_invite, _) = assemble_signed_v4_invite(&authority, &over_cap, 3_600, None)
         .map_err(|e| anyhow::anyhow!("21-member mint failed: {e:?}"))?;
-    assert_eq!(over_cap_invite.version, INVITE_VERSION_V5);
+    assert_eq!(over_cap_invite.version, INVITE_VERSION_V6);
     let fetch_cap_id = "cf".repeat(32);
     let fetch_cap = seed_group_with_members(
         &authority,
@@ -140,7 +140,7 @@ async fn over_cap_mint_is_v5_content_addressed_within_budget() -> Result<()> {
     .await; // +creator = 128
     let (fetch_cap_invite, _) = assemble_signed_v4_invite(&authority, &fetch_cap, 3_600, None)
         .map_err(|e| anyhow::anyhow!("128-member mint failed: {e:?}"))?;
-    assert_eq!(fetch_cap_invite.version, INVITE_VERSION_V5);
+    assert_eq!(fetch_cap_invite.version, INVITE_VERSION_V6);
 
     // Past the FETCH cap the mint refuses with the typed size refusal.
     let huge_id = "cc".repeat(32);
@@ -597,23 +597,23 @@ fn base_roster_reply_fits_dm_budget() {
     );
 }
 
-/// End to end on the joiner: a v5 invite into a 50-member group seeds the
+/// End to end on the joiner: a v6 invite into a 50-member group seeds the
 /// stub from the FETCHED projection — every base member seated, the
 /// lineage anchored at the SIGNED root — through the real join route.
 /// (The fetch is satisfied from a parked verified reply so the test stays
 /// socket-free; the delivery/serve halves are pinned above.)
 #[tokio::test]
-async fn v5_join_seeds_stub_from_fetched_roster() -> Result<()> {
+async fn v6_join_seeds_stub_from_fetched_roster() -> Result<()> {
     let (authority, _dir_a) = daemon_state().await?;
     let group_id = "af".repeat(32);
     let info = seed_group_with_members(&authority, &group_id, 50).await;
     let (invite, link) = assemble_signed_v4_invite(&authority, &info, 3_600, None)
-        .map_err(|e| anyhow::anyhow!("v5 mint failed: {e:?}"))?;
-    assert_eq!(invite.version, INVITE_VERSION_V5);
+        .map_err(|e| anyhow::anyhow!("v6 mint failed: {e:?}"))?;
+    assert_eq!(invite.version, INVITE_VERSION_V6);
     let signed_root = invite
         .base_roster_root
         .clone()
-        .context("v5 content address")?;
+        .context("v6 content address")?;
 
     let (joiner, _dir_b) = daemon_state().await?;
     // Stand in for the inviter's serve so the real join route runs
@@ -675,15 +675,15 @@ async fn v5_join_seeds_stub_from_fetched_roster() -> Result<()> {
 }
 
 /// Without any source for the projection (inviter unreachable, nothing
-/// parked), a v5 join refuses with a typed RETRYABLE 503 and installs
+/// parked), a v6 join refuses with a typed RETRYABLE 503 and installs
 /// nothing.
 #[tokio::test]
-async fn v5_join_without_roster_source_is_retryable_and_installs_nothing() -> Result<()> {
+async fn v6_join_without_roster_source_is_retryable_and_installs_nothing() -> Result<()> {
     let (authority, _dir_a) = daemon_state().await?;
     let group_id = "ba".repeat(32);
     let info = seed_group_with_members(&authority, &group_id, 50).await;
     let (_invite, link) = assemble_signed_v4_invite(&authority, &info, 3_600, None)
-        .map_err(|e| anyhow::anyhow!("v5 mint failed: {e:?}"))?;
+        .map_err(|e| anyhow::anyhow!("v6 mint failed: {e:?}"))?;
 
     let (joiner, _dir_b) = daemon_state().await?;
     let response = join_group_via_invite(
@@ -709,23 +709,23 @@ async fn v5_join_without_roster_source_is_retryable_and_installs_nothing() -> Re
     );
     assert!(
         joiner.named_groups.read().await.is_empty(),
-        "a deferred v5 join must install nothing"
+        "a deferred v6 join must install nothing"
     );
     Ok(())
 }
 
-/// Review r2 fix 1 (#1471): a v5 join whose fetch failed refuses BEFORE
+/// Review r2 fix 1 (#1471): a v6 join whose fetch failed refuses BEFORE
 /// the stale-row clear — a device holding an inert card-import stub gets
 /// the retryable 503 with the stub byte-for-byte unchanged, so group
 /// access keeps answering while the inviter is unreachable.
 #[tokio::test]
-async fn v5_refusal_leaves_inert_card_import_stub_unchanged() -> Result<()> {
+async fn v6_refusal_leaves_inert_card_import_stub_unchanged() -> Result<()> {
     let (authority, _dir_a) = daemon_state().await?;
     let group_id = "be".repeat(32);
     let info = seed_group_with_members(&authority, &group_id, 50).await;
     let (invite, link) = assemble_signed_v4_invite(&authority, &info, 3_600, None)
-        .map_err(|e| anyhow::anyhow!("v5 mint failed: {e:?}"))?;
-    assert_eq!(invite.version, INVITE_VERSION_V5);
+        .map_err(|e| anyhow::anyhow!("v6 mint failed: {e:?}"))?;
+    assert_eq!(invite.version, INVITE_VERSION_V6);
 
     let (joiner, _dir_b) = daemon_state().await?;
     let joiner_hex = hex::encode(joiner.agent.agent_id().as_bytes());
@@ -1103,14 +1103,14 @@ async fn unavailable_answer_wakes_only_the_inviters_waiter() -> Result<()> {
     Ok(())
 }
 
-/// r5 blocker 2 (D129): a v5 joiner's stub holds NO key-package anchors
+/// r5 blocker 2 (D129): a v6 joiner's stub holds NO key-package anchors
 /// (the fetch strips them, since the roster root does not cover them), so
 /// the self-rebind classification must treat an absent LOCAL anchor as
 /// "unknown", not as "no package" — or every non-admin certificate
 /// self-rebind in an anchored TreeKEM group is misread as an admin action
-/// and refused on v5 joiners.
+/// and refused on v6 joiners.
 #[test]
-fn v5_stub_accepts_anchored_self_rebind_link() {
+fn v6_stub_accepts_anchored_self_rebind_link() {
     use x0x::groups::cert_rebind::is_self_rebind_link;
     let committer = format!("{:064x}", 1u32);
     // The group's REAL roster: >20 members, every seat anchored.
@@ -1132,7 +1132,7 @@ fn v5_stub_accepts_anchored_self_rebind_link() {
         .get_mut(&format!("{:064x}", 0u32))
         .expect("admin seat")
         .role = x0x::groups::GroupRole::Admin;
-    // The v5 joiner's local predecessor: the SAME committed seats,
+    // The v6 joiner's local predecessor: the SAME committed seats,
     // anchor-free (exactly what the fetch seeds).
     let stub: BTreeMap<String, RosterMemberSnapshot> = anchored
         .iter()
@@ -1150,7 +1150,7 @@ fn v5_stub_accepts_anchored_self_rebind_link() {
         .certificate_digest = Some("2b".repeat(32));
     assert!(
         is_self_rebind_link(&stub, &link, &committer),
-        "a v5 joiner must accept a valid D129 self-rebind link"
+        "a v6 joiner must accept a valid D129 self-rebind link"
     );
     // Anything beyond the committer's own certificate still refuses.
     let mut tampered = link.clone();

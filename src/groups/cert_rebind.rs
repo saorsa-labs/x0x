@@ -922,13 +922,13 @@ pub fn is_self_rebind_link(
     link: &BTreeMap<String, RosterMemberSnapshot>,
     committer: &str,
 ) -> bool {
-    // #646 r5 blocker 2: a joiner seeded from a FETCHED (v5) base roster
+    // #646 r5 blocker 2: a joiner seeded from a FETCHED (v6) base roster
     // holds no `treekem_key_package_hash` anchors — the roster root does
     // not cover them, so the fetch strips them. A local anchor of `None`
     // therefore says "unknown", not "no package": the hash is compared
     // only when the LOCAL (predecessor) side holds one, or a valid D129
     // self-rebind from an anchored committer would be misread as an
-    // admin action and refused on every v5 joiner.
+    // admin action and refused on every v6 joiner.
     let anchor_matches = |before: &RosterMemberSnapshot, after: &RosterMemberSnapshot| {
         before.treekem_key_package_hash.is_none()
             || before.treekem_key_package_hash == after.treekem_key_package_hash

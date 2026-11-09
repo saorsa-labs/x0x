@@ -247,7 +247,7 @@ pub struct IssuedInviteRecord {
     /// mints store None and are never republished.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_link: Option<String>,
-    /// #646 (D95): the roster root a v5 (content-addressed) invite signed
+    /// #646 (D95): the roster root a v6 (content-addressed) invite signed
     /// at mint. The base-roster fetch serves EXACTLY this root to this
     /// invite's holder and nothing else — a pre-member gets no other kind
     /// and no other root. `None` on v4 records (nothing is served).
@@ -2671,7 +2671,7 @@ impl GroupInfo {
         );
     }
 
-    /// #646 (D95): bind the roster root a v5 invite signed to its issued
+    /// #646 (D95): bind the roster root a v6 invite signed to its issued
     /// record, so the base-roster fetch can serve exactly that root to
     /// this invite's holder and nothing else. A no-op for an unknown
     /// secret.

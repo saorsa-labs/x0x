@@ -835,11 +835,15 @@ Notes:
 - card-import stub creation so non-members can submit join requests
 - note: this phase alone is **not** sufficient for real public discovery; Phase C.2 completes that story
 
-#### Content-addressed invites past 20 members (v5, #646)
+#### Content-addressed invites past 20 members (v6, #646)
 
 An invite's inline base-roster projection is capped at 20 Active+Banned
 members (the link budget). Past the cap, `POST /groups/:id/invite` mints
-invite wire **v5**: the link carries the projection's **content address**
+invite wire **v6**: the link carries the projection's **content address**.
+Version 5 and the `x0x.invite.v5*` domains stay reserved for archived
+ADR 0112's addressed, expiring design (David's 9 Nov 2026 renumber
+ruling); a version-5 link is refused as unsupported. The v6 link
+carries the root
 (`base_roster_root`, the same roster root `base_state_hash` commits to)
 and no inline roster. The joiner, after full invite authentication and
 before any local state, asks the INVITER for the projection over two

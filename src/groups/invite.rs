@@ -130,7 +130,7 @@ pub struct SignedInvite {
     pub base_roster: Option<BTreeMap<String, crate::groups::state_commit::RosterMemberSnapshot>>,
     /// #646 (D13/W4): the CONTENT ADDRESS of the base roster projection —
     /// the roster root (`roster_root_of_projection`), hex BLAKE3. Present
-    /// exactly on v5 invites, whose Active+Banned roster exceeds
+    /// exactly on v6 invites, whose Active+Banned roster exceeds
     /// [`MAX_INVITE_ROSTER_ENTRIES`] and therefore no longer rides the
     /// link: the joiner fetches the projection out of band from the
     /// inviter and admits it only when it re-derives this signed root.
@@ -182,10 +182,15 @@ pub const INVITE_VERSION_V4: u8 = 4;
 /// (`base_roster_root`) instead of inline. Minted exactly when the
 /// Active+Banned projection exceeds [`MAX_INVITE_ROSTER_ENTRIES`]; smaller
 /// rosters keep minting v4, byte-identical to pre-#646 links. A pre-#646
-/// joiner refuses a v5 link with the existing typed `invite_unsigned`
+/// joiner refuses a v6 link with the existing typed `invite_unsigned`
 /// (such joiners could never receive an over-cap invite before — minting
 /// one was refused).
-pub const INVITE_VERSION_V5: u8 = 5;
+///
+/// Version 5 is RESERVED, never minted and refused as unsupported: David
+/// ruled on 9 Nov 2026 ("Yes, renumber") that it stays with archived ADR
+/// 0112's addressed, expiring invite design (D99/D104), together with the
+/// `x0x.invite.v5*` domain strings.
+pub const INVITE_VERSION_V6: u8 = 6;
 
 /// Domain prefix for the v4 canonical signed bytes.
 pub const INVITE_V4_CANONICAL_DOMAIN: &[u8] = b"x0x.invite.v4\0";
@@ -195,14 +200,14 @@ pub const INVITE_V4_INVITER_DOMAIN: &[u8] = b"x0x.invite.v4.inviter\0";
 /// Domain prefix for the owner user-key countersignature over the
 /// canonical bytes.
 pub const INVITE_V4_OWNER_DOMAIN: &[u8] = b"x0x.invite.v4.owner\0";
-/// #646: domain prefix for the v5 canonical signed bytes (the layout
+/// #646: domain prefix for the v6 canonical signed bytes (the layout
 /// appends `base_roster_root` to the frozen v4 field order).
-pub const INVITE_V5_CANONICAL_DOMAIN: &[u8] = b"x0x.invite.v5\0";
-/// #646: domain prefix for the inviter signature over v5 canonical bytes.
-pub const INVITE_V5_INVITER_DOMAIN: &[u8] = b"x0x.invite.v5.inviter\0";
-/// #646: domain prefix for the owner countersignature over v5 canonical
+pub const INVITE_V6_CANONICAL_DOMAIN: &[u8] = b"x0x.invite.v6\0";
+/// #646: domain prefix for the inviter signature over v6 canonical bytes.
+pub const INVITE_V6_INVITER_DOMAIN: &[u8] = b"x0x.invite.v6.inviter\0";
+/// #646: domain prefix for the owner countersignature over v6 canonical
 /// bytes.
-pub const INVITE_V5_OWNER_DOMAIN: &[u8] = b"x0x.invite.v5.owner\0";
+pub const INVITE_V6_OWNER_DOMAIN: &[u8] = b"x0x.invite.v6.owner\0";
 
 // ─── D5: per-field caps ──────────────────────────────────────────────────
 //
@@ -245,7 +250,7 @@ pub const INVITE_MAX_HOME_PRIMARY_AGENT_BYTES: usize = 64;
 pub const MAX_INVITE_ROSTER_ENTRIES: usize = 20;
 
 /// #646: maximum Active+Banned projection entries a CONTENT-ADDRESSED
-/// (v5) invite may stand for. The projection no longer rides the link —
+/// (v6) invite may stand for. The projection no longer rides the link —
 /// the bound is the out-of-band fetch answer: one `base_roster` reply
 /// (group id, roster root and the digest-only projection as JSON) must
 /// fit the 49 152-byte gossip DM ceiling ([`crate::dm::MAX_PAYLOAD_BYTES`]).
@@ -384,8 +389,8 @@ pub struct InviteSignedViewV4 {
     pub expires_at: u64,
     /// Intended joiner agent id (hex), when addressed.
     pub intended_joiner: Option<String>,
-    /// #646 (v5): the signed CONTENT ADDRESS of the base roster — its
-    /// roster root. `Some` exactly on v5 views, whose inline `base_roster`
+    /// #646 (v6): the signed CONTENT ADDRESS of the base roster — its
+    /// roster root. `Some` exactly on v6 views, whose inline `base_roster`
     /// above is EMPTY; `None` on every v4 view and EXCLUDED from v4
     /// canonical bytes (the frozen pre-#646 layout serialized by the
     /// private `InviteSignedViewV4Frozen` shadow), so v4 signatures stay
@@ -517,7 +522,7 @@ impl InviteSignedViewV4 {
             owner_countersignature_b64: _owner_countersignature,
         } = invite;
 
-        if *version != INVITE_VERSION_V4 && *version != INVITE_VERSION_V5 {
+        if *version != INVITE_VERSION_V4 && *version != INVITE_VERSION_V6 {
             return Err(InviteRefusal::Unsigned);
         }
         // v4 carries the projection; a fat legacy roster alongside is a
@@ -535,10 +540,10 @@ impl InviteSignedViewV4 {
         let base_state_hash = base_state_hash.clone().ok_or(InviteRefusal::Unsigned)?;
         // #646: the roster carrier is version-exact. v4 carries the inline
         // projection and MUST NOT carry a content address (it would ride
-        // outside the frozen v4 signed bytes); v5 carries the content
+        // outside the frozen v4 signed bytes); v6 carries the content
         // address (strict 64 lowercase hex) and MUST NOT carry an inline
         // projection.
-        let (base_roster, base_roster_root) = if *version == INVITE_VERSION_V5 {
+        let (base_roster, base_roster_root) = if *version == INVITE_VERSION_V6 {
             if base_roster.is_some() {
                 return Err(InviteRefusal::Malformed);
             }
@@ -636,8 +641,8 @@ impl InviteSignedViewV4 {
 
     /// Canonical signed bytes. v4: `INVITE_V4_CANONICAL_DOMAIN ‖
     /// postcard(frozen pre-#646 layout)` — byte-identical to every v4
-    /// signature ever minted, pinned by a byte-vector test. v5 (#646):
-    /// `INVITE_V5_CANONICAL_DOMAIN ‖ postcard(view)` — the same field
+    /// signature ever minted, pinned by a byte-vector test. v6 (#646):
+    /// `INVITE_V6_CANONICAL_DOMAIN ‖ postcard(view)` — the same field
     /// order with `base_roster_root` appended (and an empty inline
     /// roster).
     ///
@@ -645,8 +650,8 @@ impl InviteSignedViewV4 {
     ///
     /// Returns the postcard error on serialization failure.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, postcard::Error> {
-        let (domain, payload) = if self.version >= INVITE_VERSION_V5 {
-            (INVITE_V5_CANONICAL_DOMAIN, postcard::to_stdvec(self)?)
+        let (domain, payload) = if self.version >= INVITE_VERSION_V6 {
+            (INVITE_V6_CANONICAL_DOMAIN, postcard::to_stdvec(self)?)
         } else {
             (
                 INVITE_V4_CANONICAL_DOMAIN,
@@ -660,7 +665,7 @@ impl InviteSignedViewV4 {
     }
 
     /// #646: the SIGNED roster root this view commits to — the carried
-    /// content address on a v5 view, and the root re-derived from the
+    /// content address on a v6 view, and the root re-derived from the
     /// inline projection on a v4 view. This is the value the base state
     /// hash must commit to on both versions.
     #[must_use]
@@ -673,8 +678,8 @@ impl InviteSignedViewV4 {
 
 /// #646: the inviter-signature domain for an invite wire version.
 fn inviter_domain(version: u8) -> &'static [u8] {
-    if version >= INVITE_VERSION_V5 {
-        INVITE_V5_INVITER_DOMAIN
+    if version >= INVITE_VERSION_V6 {
+        INVITE_V6_INVITER_DOMAIN
     } else {
         INVITE_V4_INVITER_DOMAIN
     }
@@ -682,8 +687,8 @@ fn inviter_domain(version: u8) -> &'static [u8] {
 
 /// #646: the owner-countersignature domain for an invite wire version.
 fn owner_domain(version: u8) -> &'static [u8] {
-    if version >= INVITE_VERSION_V5 {
-        INVITE_V5_OWNER_DOMAIN
+    if version >= INVITE_VERSION_V6 {
+        INVITE_V6_OWNER_DOMAIN
     } else {
         INVITE_V4_OWNER_DOMAIN
     }
@@ -2537,7 +2542,7 @@ mod tests {
         assert!(err.actual > INVITE_LINK_MAX_BYTES);
     }
 
-    // ─── #646: v5 content-addressed base roster ──────────────────────────
+    // ─── #646: v6 content-addressed base roster ──────────────────────────
 
     /// A digest-only projection with `n` Active members — over the inline
     /// cap when `n > MAX_INVITE_ROSTER_ENTRIES`.
@@ -2558,16 +2563,16 @@ mod tests {
             .collect()
     }
 
-    /// Deterministic v5 fixture: the v4 fixture retargeted at a 50-member
+    /// Deterministic v6 fixture: the v4 fixture retargeted at a 50-member
     /// roster carried by CONTENT ADDRESS. Returns the invite and the
     /// out-of-band projection it stands for.
-    fn v5_fixture(
+    fn v6_fixture(
         inviter_kp: &AgentKeypair,
         owner_kp: Option<&UserKeypair>,
     ) -> (SignedInvite, BTreeMap<String, RosterMemberSnapshot>) {
         let roster = projection_of(50);
         let mut invite = v4_fixture(inviter_kp, owner_kp);
-        invite.version = INVITE_VERSION_V5;
+        invite.version = INVITE_VERSION_V6;
         invite.base_roster = None;
         invite.base_roster_root = Some(crate::groups::state_commit::roster_root_of_projection(
             &roster,
@@ -2576,17 +2581,17 @@ mod tests {
     }
 
     #[test]
-    fn v5_content_addressed_invite_signs_verifies_and_round_trips() {
+    fn v6_content_addressed_invite_signs_verifies_and_round_trips() {
         let inviter_kp = AgentKeypair::generate().expect("agent keypair");
-        let (mut invite, roster) = v5_fixture(&inviter_kp, None);
-        invite.sign_v4(&inviter_kp, None).expect("sign v5");
+        let (mut invite, roster) = v6_fixture(&inviter_kp, None);
+        invite.sign_v4(&inviter_kp, None).expect("sign v6");
         assert_eq!(invite.verify_v4_signatures(), Ok(()));
 
-        let view = InviteSignedViewV4::from_invite(&invite).expect("v5 view");
-        assert_eq!(view.version, INVITE_VERSION_V5);
+        let view = InviteSignedViewV4::from_invite(&invite).expect("v6 view");
+        assert_eq!(view.version, INVITE_VERSION_V6);
         assert!(
             view.base_roster.is_empty(),
-            "v5 views carry no inline roster"
+            "v6 views carry no inline roster"
         );
         assert_eq!(
             view.signed_roster_root(),
@@ -2595,14 +2600,14 @@ mod tests {
         );
         let canonical = view.canonical_bytes().expect("canonical bytes");
         assert!(
-            canonical.starts_with(INVITE_V5_CANONICAL_DOMAIN),
-            "v5 canonical bytes open with the v5 domain"
+            canonical.starts_with(INVITE_V6_CANONICAL_DOMAIN),
+            "v6 canonical bytes open with the v6 domain"
         );
 
         // The link is roster-size independent and far under the budget.
-        let link = invite.encode_link().expect("v5 link fits");
-        let restored = SignedInvite::from_link(&link).expect("parse v5 link");
-        assert_eq!(restored.version, INVITE_VERSION_V5);
+        let link = invite.encode_link().expect("v6 link fits");
+        let restored = SignedInvite::from_link(&link).expect("parse v6 link");
+        assert_eq!(restored.version, INVITE_VERSION_V6);
         assert_eq!(restored.base_roster, None);
         assert_eq!(restored.base_roster_root, invite.base_roster_root);
         assert_eq!(restored.verify_v4_signatures(), Ok(()));
@@ -2618,13 +2623,13 @@ mod tests {
     }
 
     #[test]
-    fn v5_owner_axis_countersignature_rides_the_v5_domain() {
+    fn v6_owner_axis_countersignature_rides_the_v6_domain() {
         let inviter_kp = AgentKeypair::generate().expect("agent keypair");
         let owner_kp = UserKeypair::generate().expect("user keypair");
-        let (mut invite, _) = v5_fixture(&inviter_kp, Some(&owner_kp));
+        let (mut invite, _) = v6_fixture(&inviter_kp, Some(&owner_kp));
         invite
             .sign_v4(&inviter_kp, Some(&owner_kp))
-            .expect("sign owner-axis v5");
+            .expect("sign owner-axis v6");
         assert_eq!(invite.verify_v4_signatures(), Ok(()));
         let mut stripped = invite.clone();
         stripped.owner_countersignature_b64 = None;
@@ -2635,18 +2640,18 @@ mod tests {
     }
 
     #[test]
-    fn v5_structural_rules_fail_closed() {
+    fn v6_structural_rules_fail_closed() {
         let inviter_kp = AgentKeypair::generate().expect("agent keypair");
-        let (invite, roster) = v5_fixture(&inviter_kp, None);
+        let (invite, roster) = v6_fixture(&inviter_kp, None);
 
-        // v5 must NOT carry an inline projection next to the address.
+        // v6 must NOT carry an inline projection next to the address.
         let mut t = invite.clone();
         t.base_roster = Some(roster.clone());
         assert_eq!(
             InviteSignedViewV4::from_invite(&t),
             Err(InviteRefusal::Malformed)
         );
-        // v5 without the content address is unsigned.
+        // v6 without the content address is unsigned.
         let mut t = invite.clone();
         t.base_roster_root = None;
         assert_eq!(
@@ -2673,36 +2678,62 @@ mod tests {
         );
         // Future versions stay refused.
         let mut t = invite.clone();
-        t.version = 6;
+        t.version = 7;
         assert_eq!(
             InviteSignedViewV4::from_invite(&t),
             Err(InviteRefusal::Unsigned)
         );
     }
 
-    /// #646: a pre-#646 node parses a v5 link (every new field defaults /
+    /// #646: a pre-#646 node parses a v6 link (every new field defaults /
     /// is ignored) and refuses it with the TYPED version gate — exactly
     /// how it treats any future version, never a parse error. Pinned by
-    /// deserializing v5 JSON into the frozen v0.40.4 replica.
+    /// deserializing v6 JSON into the frozen v0.40.4 replica.
     #[test]
-    fn v5_link_fails_closed_on_old_nodes() {
+    fn v6_link_fails_closed_on_old_nodes() {
         let inviter_kp = AgentKeypair::generate().expect("agent keypair");
-        let (mut invite, _) = v5_fixture(&inviter_kp, None);
-        invite.sign_v4(&inviter_kp, None).expect("sign v5");
-        let json = serde_json::to_string(&invite).expect("serialize v5 invite");
+        let (mut invite, _) = v6_fixture(&inviter_kp, None);
+        invite.sign_v4(&inviter_kp, None).expect("sign v6");
+        let json = serde_json::to_string(&invite).expect("serialize v6 invite");
         let old: replica_v0_40_4::SignedInvite =
-            serde_json::from_str(&json).expect("v5 invite JSON parses on the v0.40.4 replica");
+            serde_json::from_str(&json).expect("v6 invite JSON parses on the v0.40.4 replica");
         assert_eq!(old.group_name, "fixture group");
         // A v0.41+ node (v4-only verifier) refuses on the version gate.
         // Simulate its view constructor: version != 4 → Unsigned.
         let mut as_seen_by_v4_only = invite.clone();
         as_seen_by_v4_only.version = INVITE_VERSION_V4;
         // A v4-only node never reaches the signature (its gate fires on
-        // the raw version field first); this pins that a v5 blob cannot
+        // the raw version field first); this pins that a v6 blob cannot
         // masquerade as v4 either.
         assert_eq!(
             InviteSignedViewV4::from_invite(&as_seen_by_v4_only),
             Err(InviteRefusal::Malformed)
+        );
+    }
+
+    /// David's 9 Nov 2026 ruling ("Yes, renumber"): invite version 5 and
+    /// the `x0x.invite.v5*` domains stay RESERVED for archived ADR 0112's
+    /// addressed, expiring design (D99/D104). A version-5 link — whatever
+    /// carrier shape it claims — is refused as unsupported at the typed
+    /// version gate and never reaches a signature check.
+    #[test]
+    fn version_5_is_reserved_and_refused() {
+        let inviter_kp = AgentKeypair::generate().expect("agent keypair");
+        // Content-addressed shape relabelled 5.
+        let (mut invite, roster) = v6_fixture(&inviter_kp, None);
+        invite.sign_v4(&inviter_kp, None).expect("sign v6");
+        invite.version = 5;
+        assert_eq!(
+            InviteSignedViewV4::from_invite(&invite),
+            Err(InviteRefusal::Unsigned)
+        );
+        // Inline (v4) shape relabelled 5 is equally unsupported.
+        let mut inline = invite.clone();
+        inline.base_roster = Some(roster);
+        inline.base_roster_root = None;
+        assert_eq!(
+            InviteSignedViewV4::from_invite(&inline),
+            Err(InviteRefusal::Unsigned)
         );
     }
 
