@@ -36,9 +36,11 @@
 //! push with no route is dropped and logged `not_ready` in
 //! `dispatch_raw_direct_after_gates`, an unverified one by the static
 //! production-prefix table. On the gossip v1 and v2-durable paths a
-//! production typed prefix with no registered route is dropped before the
+//! push-prefixed payload that no route claims is dropped before the
 //! dedupe claim / withheld before dispatch, so a daemon that never wires
-//! the route (a library embedder) leaks nothing either. The bit itself is
+//! the route (a library embedder) leaks nothing either; every other
+//! prefix, and any frame a route's validator refused, keeps its
+//! documented generic path. The bit itself is
 //! ROUTE-GATED (`CapabilityRegistry::advertised`): such a daemon never
 //! advertises `grant_revocation_push_v1`, so a conforming sender never
 //! pushes to it and gossip stays its only carrier.

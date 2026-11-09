@@ -4027,21 +4027,29 @@ impl InboxPipeline {
 
         let (typed_route, typed_route_outcome) =
             Self::matching_typed_route(&self.typed_payload_routes, &plaintext.payload);
-        // N12 / ADR 0080 §4: a payload claiming a PRODUCTION typed protocol
-        // that no route here CONSUMES — none registered (the startup window,
-        // or a library embedder that never wires the route), or a registered
-        // route's validator refused the bytes — is a protocol frame, not a
-        // user DM: it must reach neither DM history nor the generic
-        // subscribers, on the gossip path exactly as on the raw path.
-        // Dropped BEFORE the dedupe claim and with the ACK withheld, so a
-        // sender retry still lands once the route exists.
-        if typed_route.is_none() && recognized_production_typed_prefix(&plaintext.payload) {
+        // ADR 0080 §4: the grant-revocation push prefix — and ONLY that
+        // prefix — is owned unconditionally on every DM ingress path. With
+        // no route claiming it (the startup window, or a library embedder
+        // that never wires the route) the payload reaches neither DM
+        // history nor the generic subscribers, on the gossip path exactly
+        // as on the raw path. Dropped BEFORE the dedupe claim and with the
+        // ACK withheld, so a sender retry still lands once the route
+        // exists. Every other prefix, and any frame a registered route's
+        // validator refused, keeps the documented generic path (a
+        // validator returning false leaves the bytes on the generic DM
+        // path; the refusal is marked in the history row).
+        if typed_route.is_none()
+            && plaintext
+                .payload
+                .starts_with(crate::revocation_push::GRANT_REVOCATION_PUSH_PREFIX)
+        {
             tracing::debug!(
                 target: "dm.trace",
-                stage = "inbound_production_prefix_unrouted",
+                stage = "inbound_push_prefix_unrouted",
+                reason = "not_ready",
                 request_id = %hex::encode(envelope.request_id),
                 sender = %crate::logging::LogAgentId::from(&sender_agent_id),
-                "gossip DM claims a production typed protocol no route consumes; dropped"
+                "gossip DM carries a grant-revocation push no route claims; dropped"
             );
             return;
         }
@@ -4233,23 +4241,25 @@ impl InboxPipeline {
         }
         let is_durable_typed_route = typed_route_durable == Some(true);
 
-        // N12 / ADR 0080 §4: same production-prefix ownership as the v1
-        // path — a production typed protocol frame that no route here
-        // consumes (none registered, or the route's validator refused the
-        // bytes) reaches neither DM history nor the generic subscribers.
-        // The v2 ACK is withheld like any other refusal, so the sender
-        // keeps its bounded retry (a #1003 push sender never waits for an
-        // ACK at all).
-        if typed_route_durable.is_none() && recognized_production_typed_prefix(&application_payload)
+        // ADR 0080 §4: same push-prefix ownership as the v1 path — with no
+        // route claiming the grant-revocation push prefix, the payload
+        // reaches neither DM history nor the generic subscribers. The v2
+        // ACK is withheld like any other refusal (a #1003 push sender never
+        // waits for an ACK at all). ONLY this prefix: every other payload,
+        // including one a registered route's validator refused, keeps the
+        // generic durable path.
+        if typed_route_durable.is_none()
+            && application_payload.starts_with(crate::revocation_push::GRANT_REVOCATION_PUSH_PREFIX)
         {
             tracing::debug!(
                 target: "dm.trace",
-                stage = "inbound_durable_production_prefix_unrouted",
+                stage = "inbound_durable_push_prefix_unrouted",
+                reason = "not_ready",
                 request_id = %hex::encode(request_id),
                 sender = %hex::encode(sender_agent_id.as_bytes()),
-                "durable gossip DM claims a production typed protocol no route consumes; dropped"
+                "durable gossip DM carries a grant-revocation push no route claims; dropped"
             );
-            return DurableAckDecision::Withheld("production_prefix_unrouted");
+            return DurableAckDecision::Withheld("push_prefix_unrouted");
         }
 
         // 1. Per-logical-request lock. Serializes the primary inbox and the
@@ -5673,12 +5683,12 @@ mod tests {
         assert_eq!(decision, DurableAckDecision::Withheld("commit_failed"));
     }
 
-    /// ADR 0080 §4 on the GOSSIP v1 path: a payload claiming a PRODUCTION
-    /// typed protocol (here the #1003 grant-revocation push) on a daemon
-    /// with the DEFAULT inbox config — no typed routes, as in a library
-    /// embedder or the startup window — must reach neither the generic
-    /// subscribers nor the dedupe/ACK path. RED without the gossip-path
-    /// production-prefix drop: the payload is broadcast as an ordinary DM.
+    /// ADR 0080 §4 on the GOSSIP v1 path: a #1003 grant-revocation push on
+    /// a daemon with the DEFAULT inbox config — no typed routes, as in a
+    /// library embedder or the startup window — must reach neither the
+    /// generic subscribers nor the dedupe/ACK path. RED without the
+    /// gossip-path push-prefix drop: the payload is broadcast as an
+    /// ordinary DM.
     #[tokio::test]
     async fn gossip_v1_production_prefix_without_route_is_dropped() {
         let sender = test_keypair();
@@ -5759,7 +5769,8 @@ mod tests {
     /// no registered route the push payload is withheld before DM history
     /// and the generic subscribers, like any other refusal (the sender
     /// keeps its bounded retry). RED without the durable-path drop: a
-    /// committed DM-history row and a generic broadcast.
+    /// committed DM-history row and a generic broadcast. ONLY the push
+    /// prefix is owned this way; see the validator-refused tests below.
     #[tokio::test]
     async fn gossip_v2_production_prefix_without_route_is_withheld() {
         let sender = test_keypair();
@@ -5794,13 +5805,125 @@ mod tests {
             .await;
         assert_eq!(
             decision,
-            DurableAckDecision::Withheld("production_prefix_unrouted")
+            DurableAckDecision::Withheld("push_prefix_unrouted")
         );
         assert_no_delivery(&mut harness.receiver).await;
         assert!(
             committed_rows(&history, &sender, 0x83).is_empty(),
             "no DM-history row for an unrouted production typed frame"
         );
+    }
+
+    /// Round 6 (David: "Fold into #1829"): the gossip drop owns ONLY the
+    /// push prefix. A frame that a registered VALIDATED route refused —
+    /// here a production prefix whose validator returns false, e.g. a
+    /// signed non-predecessor event — keeps the documented generic path on
+    /// gossip v1: delivered to subscribers (the history row marks the
+    /// refused prefix). RED against the round-5 drop, which swallowed every
+    /// production prefix and silently dropped such user DMs.
+    #[tokio::test]
+    async fn gossip_v1_validator_refused_production_frame_still_delivered() {
+        let sender = test_keypair();
+        let machine = MachineId([0xE3; 32]);
+        let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
+        let (tx, mut typed_rx) = mpsc::channel::<DmTypedPayload>(4);
+        harness.pipeline.typed_payload_routes = vec![DmTypedPayloadRoute {
+            prefix: b"X0X-GROUP-PREDECESSOR-RELAY-V1\n".to_vec(),
+            sender: tx,
+            durable_completion: false,
+            validator: Some(|_| false),
+        }];
+
+        let payload = b"X0X-GROUP-PREDECESSOR-RELAY-V1\nnot-a-predecessor-event".to_vec();
+        let mut envelope = craft_unsigned_payload_envelope_versioned(
+            &harness,
+            &sender,
+            machine,
+            0x84,
+            DM_PROTOCOL_V1,
+            payload.clone(),
+        );
+        sign_envelope_with_agent(&mut envelope, &sender);
+        let body = match envelope.body.clone() {
+            DmBody::Payload(p) => p,
+            _ => panic!("payload body"),
+        };
+        harness
+            .pipeline
+            .handle_payload(
+                envelope,
+                body,
+                machine,
+                PayloadOrigin::Retained,
+                sender.public_key().as_bytes().to_vec(),
+                false,
+            )
+            .await;
+        assert!(
+            typed_rx.try_recv().is_err(),
+            "the validator refused it: never on the typed route"
+        );
+        let shown = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("delivery wait")
+            .expect("validator-refused frame stays on the generic DM path");
+        assert_eq!(shown.payload, payload);
+    }
+
+    /// Round 6: the v2-durable twin — a validator-refused production-prefix
+    /// frame keeps the generic durable path (dispatched to subscribers,
+    /// committed, Acked), instead of being withheld until the sender's
+    /// retries expire. RED against the round-5 drop.
+    #[tokio::test]
+    async fn gossip_v2_validator_refused_production_frame_still_delivered() {
+        let sender = test_keypair();
+        let machine = MachineId([0xE4; 32]);
+        let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
+        let _service = attach_history(&mut harness);
+        let (tx, mut typed_rx) = mpsc::channel::<DmTypedPayload>(4);
+        harness.pipeline.typed_payload_routes = vec![DmTypedPayloadRoute {
+            prefix: b"X0X-GROUP-PREDECESSOR-RELAY-V1\n".to_vec(),
+            sender: tx,
+            durable_completion: false,
+            validator: Some(|_| false),
+        }];
+
+        let payload = b"X0X-GROUP-PREDECESSOR-RELAY-V1\nnot-a-predecessor-event".to_vec();
+        let mut envelope = craft_unsigned_payload_envelope_versioned(
+            &harness,
+            &sender,
+            machine,
+            0x85,
+            DM_PROTOCOL_DURABLE_ACK,
+            payload.clone(),
+        );
+        sign_envelope_with_agent(&mut envelope, &sender);
+        let decision = harness
+            .pipeline
+            .handle_payload_durable(
+                envelope,
+                payload.clone(),
+                TrustDecision::Accept,
+                machine,
+                true,
+                sender.public_key().as_bytes().to_vec(),
+                false,
+            )
+            .await;
+        assert_eq!(
+            decision,
+            DurableAckDecision::Acked {
+                protocol_version: DM_PROTOCOL_DURABLE_ACK,
+                accepted: true,
+            },
+            "a validator-refused frame keeps the generic durable path"
+        );
+        assert!(typed_rx.try_recv().is_err());
+        let shown = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("delivery wait")
+            .expect("validator-refused frame delivered to subscribers");
+        assert_eq!(shown.payload, payload);
     }
 
     /// Happy path: commit lands first, then a v2-stamped ACK, and the schema
