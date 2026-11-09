@@ -92,13 +92,16 @@ function Test-ReleaseSignature([string]$Gpg, [string]$Artifact, [string]$Signatu
         # otherwise initializes a fresh homedir with use-keyboxd and the import
         # fails when the keyboxd daemon cannot start (seen on CI runners).
         Set-Content -LiteralPath (Join-Path $WorkDir "gnupg\common.conf") -Value ""
-        $importOut = & $Gpg --homedir gnupg --batch --no-tty --import $keyName 2>&1
+        # --no-autostart: importing a public key and verifying a detached
+        # signature need no agent, and Git for Windows' gpg otherwise exits
+        # nonzero failing to start a gpg-agent it does not ship.
+        $importOut = & $Gpg --homedir gnupg --batch --no-tty --no-autostart --import $keyName 2>&1
         if ($LASTEXITCODE -ne 0) {
             $detail = ($importOut | ForEach-Object { "$_" }) -join " | "
             throw "gpg failed to import the release key: $detail"
         }
 
-        $status = & $Gpg --homedir gnupg --batch --no-tty --status-fd 1 --verify $signatureName $artifactName 2>$null
+        $status = & $Gpg --homedir gnupg --batch --no-tty --no-autostart --status-fd 1 --verify $signatureName $artifactName 2>$null
         $verifyExit = $LASTEXITCODE
         $signers = @()
         foreach ($line in $status) {
