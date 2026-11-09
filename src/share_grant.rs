@@ -2244,6 +2244,43 @@ impl crate::Agent {
     }
 }
 
+/// [`crate::Agent::revoke_share_grant`], then schedule the best-effort
+/// direct revocation push (#1003, ADR 0080 archived, slot A03) to the
+/// grant's recipients whose current verified advert sets
+/// `grant_revocation_push_v1`. The push runs in the background and is
+/// never waited for; the `x0x.revocation.v3` gossip carrier (published by
+/// the revoke) stays the backstop. No push is scheduled when the
+/// revocation was not durable (the caller's retry pushes) or when this
+/// install does not hold the issued grant (then no recipient set is
+/// computable, and gossip alone revokes it).
+///
+/// # Errors
+/// As [`crate::Agent::revoke_share_grant`].
+pub async fn revoke_share_grant_pushing(
+    agent: &std::sync::Arc<crate::Agent>,
+    grant_id: [u8; 32],
+    reason: Option<String>,
+) -> Result<
+    (
+        crate::revocation::RevocationRecord,
+        crate::revocation_push::GrantRevocationPushReport,
+    ),
+    ShareGrantError,
+> {
+    let grant = agent
+        .share_grant_store()
+        .and_then(|store| store.issued(&grant_id));
+    let record = agent.revoke_share_grant(grant_id, reason).await?;
+    let report = match &grant {
+        Some(grant) => {
+            crate::revocation_push::schedule_share_grant_revocation_push(agent, &record, grant)
+                .await
+        }
+        None => crate::revocation_push::GrantRevocationPushReport::default(),
+    };
+    Ok((record, report))
+}
+
 /// Record a LOCAL share-grant revocation (#926): under the outbox's
 /// revocation barrier, insert `record`, write `revocations-v3.bin` durably,
 /// and durably drop the grant's queued deliveries.

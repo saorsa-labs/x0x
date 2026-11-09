@@ -1992,7 +1992,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Delete,
         path: "/grants/:id",
         cli_name: "grant revoke",
-        description: "Revoke a share grant (owner key; gossiped on x0x.revocation.v3)",
+        description: "Revoke a share grant (owner key; gossiped on x0x.revocation.v3 and pushed directly to capable recipients)",
         category: "grants",
         request: RequestSpec::None,
     },

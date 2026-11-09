@@ -3526,8 +3526,22 @@ body as a literal, `@path`, a bare path, or `-` for stdin, plus the optional
 |---|---|---|---|
 | GET | `/grants` | `x0x grant list` | List share grants this install's owner issued, with status |
 | POST | `/grants` | `x0x grant issue <GRANT_JSON>` | Sign a share grant with the owner key, store it, and deliver it by durable DM |
-| DELETE | `/grants/:id` | `x0x grant revoke <id>` | Revoke a share grant (owner key; revocation gossiped on `x0x.revocation.v3`) |
+| DELETE | `/grants/:id` | `x0x grant revoke <id>` | Revoke a share grant (owner key; revocation gossiped on `x0x.revocation.v3` and pushed directly to capable recipients) |
 | GET | `/grants/received` | `x0x grant received` | List share grants that name this install as grantee |
+
+**Direct revocation push (#1003).** A successful `DELETE /grants/:id` also
+pushes the one signed revocation record, as a typed DM
+(`x0x-grant-revocation-push-v1`), to each recipient of the revoked grant
+whose current verified capability advert sets `grant_revocation_push_v1`.
+The push is best-effort and has no ACK; gossip stays the backstop. The
+response carries a `push` object with `recipients`, `scheduled`,
+`skipped_not_capable` and `skipped_bound` — what was scheduled at revoke
+time, not what arrived. A recipient of UNKNOWN capability also counts as
+`scheduled`: the push waits for one targeted advert refresh and is skipped
+later if no advert with the bit arrives. When this install does not hold
+the issued grant, the DELETE still revokes by id (gossip-only) and `push`
+is all zeros — the recipients are unknown here. A `503` DELETE schedules
+no push; the retry does.
 
 ## Upgrade
 

@@ -845,17 +845,29 @@ impl PausedSend {
 }
 
 /// Shared body of the two race tests: with a send of `grant` paused in
-/// flight, `revoke` (polled exactly once) must NOT be able to make the
-/// revocation effective — it must wait at the barrier until the pass has
-/// finished. Deterministic: a single `now_or_never` poll, no timers. With
-/// the barrier removed, that one poll inserts the revocation synchronously
-/// (before any I/O await) and the assertion fails.
+/// flight, `revoke` must NOT be able to complete — it must park at the
+/// #926 barrier until the pass has finished, so no new send or enqueue of
+/// the grant can follow its return. The revoke is DRIVEN concurrently for
+/// 250 ms, not poked with one poll: a single `Pending` poll proves nothing
+/// here, because without the barrier the first poll parks in the persist
+/// (the in-process write lock plus fs I/O on the blocking pool) and then
+/// completes. With the barrier it can NEVER finish while the pass holds
+/// the gate, however long it is driven; with the barrier removed (the
+/// case-7 mutation: drop 6b, or the local barrier) it finishes during the
+/// pause and the select panics.
+///
+/// `in_force_during_wait` pins what the drive did to the in-memory set: a
+/// LOCAL revoke takes the gate BEFORE it records (ADR 0077), so the
+/// revocation is NOT in force while it waits; a remote carrier (gossip or
+/// the #1003 push) inserts in memory first and waits in step 6b
+/// (ADR 0080 §4 / D139), so it IS already in force.
 async fn assert_revoke_waits_for_in_flight_send<R>(
     world: &World,
     outbox: &GrantRedeliveryOutbox,
     receiver: &Receiver,
     grant: &ShareGrant,
     revoke: R,
+    in_force_during_wait: bool,
 ) where
     R: std::future::Future<Output = ()>,
 {
@@ -873,14 +885,21 @@ async fn assert_revoke_waits_for_in_flight_send<R>(
     );
 
     tokio::pin!(revoke);
-    assert!(revoke.as_mut().now_or_never().is_none());
-    assert!(
-        !world
+    tokio::select! {
+        () = revoke.as_mut() => {
+            panic!("the revoke completed while a send of the grant was in flight")
+        }
+        () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+    }
+    assert_eq!(
+        world
             .revocations
             .read()
             .await
             .is_share_grant_revoked(&grant.grant_id, &grant.owner),
-        "a revocation took effect while a send of the grant was in flight"
+        in_force_during_wait,
+        "local: gate before record (ADR 0077); remote: in force in memory \
+         during the 6b wait (ADR 0080 §4 / D139)"
     );
 
     paused.release.notify_one();
@@ -931,13 +950,16 @@ async fn local_revoke_is_ordered_after_an_in_flight_send() {
     let revoke = async {
         world.revoke(&grant, &identity_dir, &outbox).await.unwrap();
     };
-    assert_revoke_waits_for_in_flight_send(&world, &outbox, &receiver, &grant, revoke).await;
+    assert_revoke_waits_for_in_flight_send(&world, &outbox, &receiver, &grant, revoke, false).await;
 }
 
-/// WHY (review r2 P1): a revocation delivered by GOSSIP (the
-/// `x0x.revocation.v3` carrier) must be ordered against redelivery exactly
-/// like a local one — it takes the same barrier through `OwnerTrust`, so a
-/// queued send cannot slip out after it took effect.
+/// WHY (review r2 P1; re-pinned to D139 by #1003 review round 1): a
+/// revocation delivered by GOSSIP (the `x0x.revocation.v3` carrier) runs
+/// ADR 0080 §4 step 6's split — 6a inserts in memory at once (the
+/// revocation is in force while the send is still in flight), then 6b
+/// waits at the same `OwnerTrust` barrier, so the ingest cannot RETURN
+/// until the in-flight pass has finished and no new send or enqueue of the
+/// grant can follow it.
 #[tokio::test]
 async fn gossiped_revoke_is_ordered_after_an_in_flight_send() {
     let world = World::new().await;
@@ -969,7 +991,7 @@ async fn gossiped_revoke_is_ordered_after_an_in_flight_send() {
             .await
         );
     };
-    assert_revoke_waits_for_in_flight_send(&world, &outbox, &receiver, &grant, revoke).await;
+    assert_revoke_waits_for_in_flight_send(&world, &outbox, &receiver, &grant, revoke, true).await;
     // The gossiped revocation is durable too.
     let bytes = std::fs::read(identity_dir.join(crate::SHARE_GRANT_REVOCATIONS_FILE)).unwrap();
     assert!(RevocationSet::from_bytes_v3(&bytes)
