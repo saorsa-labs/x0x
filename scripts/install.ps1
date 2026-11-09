@@ -46,7 +46,20 @@ $Asset = "x0x-windows-x64.zip"
 $TrustedFingerprint = "CEB3506E7DCB8A2DD2D679E8EDDA4827D89C0F29"
 
 function Get-Download([string]$Url, [string]$OutFile) {
-    Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing
+    # Bounded retry with backoff: GitHub's release downloads return
+    # transient 504s under load, and one such answer should not fail an
+    # install. Verification happens after the download, so a retried
+    # fetch changes nothing security-wise.
+    for ($attempt = 1; $attempt -le 4; $attempt++) {
+        try {
+            Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing
+            return
+        } catch {
+            if ($attempt -eq 4) { throw }
+            Write-Host "  download failed (attempt $attempt of 4), retrying: $Url"
+            Start-Sleep -Seconds (2 * $attempt)
+        }
+    }
 }
 
 function Find-Gpg {
@@ -68,31 +81,54 @@ function Test-ReleaseSignature([string]$Gpg, [string]$Artifact, [string]$Signatu
     # redirected native stderr into a terminating error. Exit codes and the
     # status-fd lines are checked explicitly instead.
     $ErrorActionPreference = "Continue"
-    # Check the downloaded key is the pinned one before trusting anything it signs.
-    $keyInfo = & $Gpg --batch --with-colons --show-keys --fingerprint $KeyFile 2>$null
-    $keyFprs = @($keyInfo | Where-Object { $_ -like "fpr:*" } | ForEach-Object { ($_ -split ":")[9].ToUpperInvariant() })
-    if ($keyFprs -notcontains $TrustedFingerprint) {
-        throw "Downloaded SAORSA_PUBLIC_KEY.asc is not the pinned release key ($TrustedFingerprint)."
-    }
-
-    # Isolated keyring so the user's own GnuPG state is untouched.
-    $gnupgHome = Join-Path $WorkDir "gnupg"
-    New-Item -ItemType Directory -Force -Path $gnupgHome | Out-Null
-    & $Gpg --homedir $gnupgHome --batch --import $KeyFile 2>$null | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "gpg failed to import the release key." }
-
-    $status = & $Gpg --homedir $gnupgHome --batch --status-fd 1 --verify $Signature $Artifact 2>$null
-    $verifyExit = $LASTEXITCODE
-    $signers = @()
-    foreach ($line in $status) {
-        $parts = $line -split "\s+"
-        if ($parts.Length -ge 3 -and $parts[0] -eq "[GNUPG:]" -and $parts[1] -eq "VALIDSIG") {
-            $signers += $parts[2].ToUpperInvariant()
-            if ($parts.Length -ge 12) { $signers += $parts[11].ToUpperInvariant() }
+    # Every file this function hands to gpg lives in $WorkDir, and gpg runs
+    # FROM $WorkDir with bare relative names. Git for Windows ships a
+    # Cygwin-style gpg that mangles an absolute Windows path in --homedir
+    # (it prepends its POSIX cwd: keyblock resource '/d/a/.../C:/Users/...'
+    # on the CI runners); a cwd-relative name means the same file to that
+    # gpg and to native Windows gpg, with no cygpath dependency.
+    $keyName = Split-Path -Leaf $KeyFile
+    $artifactName = Split-Path -Leaf $Artifact
+    $signatureName = Split-Path -Leaf $Signature
+    Push-Location -LiteralPath $WorkDir
+    try {
+        # Check the downloaded key is the pinned one before trusting anything it signs.
+        $keyInfo = & $Gpg --batch --no-tty --with-colons --show-keys --fingerprint $keyName 2>$null
+        $keyFprs = @($keyInfo | Where-Object { $_ -like "fpr:*" } | ForEach-Object { ($_ -split ":")[9].ToUpperInvariant() })
+        if ($keyFprs -notcontains $TrustedFingerprint) {
+            throw "Downloaded SAORSA_PUBLIC_KEY.asc is not the pinned release key ($TrustedFingerprint)."
         }
-    }
-    if ($verifyExit -ne 0 -or ($signers -notcontains $TrustedFingerprint)) {
-        throw "GPG signature verification FAILED for $Asset. The download may have been tampered with."
+
+        # Isolated keyring so the user's own GnuPG state is untouched.
+        New-Item -ItemType Directory -Force -Path (Join-Path $WorkDir "gnupg") | Out-Null
+        # An empty common.conf pins the classic keybox files: modern gpg4win
+        # otherwise initializes a fresh homedir with use-keyboxd and the import
+        # fails when the keyboxd daemon cannot start (seen on CI runners).
+        Set-Content -LiteralPath (Join-Path $WorkDir "gnupg\common.conf") -Value ""
+        # --no-autostart: importing a public key and verifying a detached
+        # signature need no agent, and Git for Windows' gpg otherwise exits
+        # nonzero failing to start a gpg-agent it does not ship.
+        $importOut = & $Gpg --homedir gnupg --batch --no-tty --no-autostart --import $keyName 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            $detail = ($importOut | ForEach-Object { "$_" }) -join " | "
+            throw "gpg failed to import the release key: $detail"
+        }
+
+        $status = & $Gpg --homedir gnupg --batch --no-tty --no-autostart --status-fd 1 --verify $signatureName $artifactName 2>$null
+        $verifyExit = $LASTEXITCODE
+        $signers = @()
+        foreach ($line in $status) {
+            $parts = $line -split "\s+"
+            if ($parts.Length -ge 3 -and $parts[0] -eq "[GNUPG:]" -and $parts[1] -eq "VALIDSIG") {
+                $signers += $parts[2].ToUpperInvariant()
+                if ($parts.Length -ge 12) { $signers += $parts[11].ToUpperInvariant() }
+            }
+        }
+        if ($verifyExit -ne 0 -or ($signers -notcontains $TrustedFingerprint)) {
+            throw "GPG signature verification FAILED for $Asset. The download may have been tampered with."
+        }
+    } finally {
+        Pop-Location
     }
 }
 
@@ -115,7 +151,22 @@ Write-Host "x0x installer (Windows)" -ForegroundColor Blue
 # ── Resolve release ─────────────────────────────────────────────────────────
 
 if ($Version -eq "latest") {
-    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -UseBasicParsing -Headers @{ "User-Agent" = "x0x-install.ps1" }
+    # Authenticated when GITHUB_TOKEN is set: CI runners share egress IPs
+    # and the anonymous GitHub API rate limit refuses them. The token only
+    # goes to api.github.com.
+    $apiHeaders = @{ "User-Agent" = "x0x-install.ps1" }
+    if ($env:GITHUB_TOKEN) { $apiHeaders["Authorization"] = "Bearer $($env:GITHUB_TOKEN)" }
+    # Same bounded retry as Get-Download: the API answers transient 504s too.
+    for ($attempt = 1; $attempt -le 4; $attempt++) {
+        try {
+            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -UseBasicParsing -Headers $apiHeaders
+            break
+        } catch {
+            if ($attempt -eq 4) { throw }
+            Write-Host "  release lookup failed (attempt $attempt of 4), retrying"
+            Start-Sleep -Seconds (2 * $attempt)
+        }
+    }
     $Tag = $release.tag_name
     if (-not $Tag) { throw "Could not resolve the latest x0x release." }
 } elseif ($Version.StartsWith("v")) {
@@ -218,6 +269,14 @@ try {
     $releaseManifest = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
     $manifestVersion = [string]$releaseManifest.version
     $manifestChannel = [string]$releaseManifest.channel
+    # Signed manifests published before the channel field existed (#1558,
+    # post-v0.48.1) have NO channel property: there was only one channel,
+    # stable. A present-but-empty channel is still refused.
+    if (-not $manifestChannel -and
+        -not ($releaseManifest.PSObject.Properties.Name -contains "channel")) {
+        $manifestChannel = "stable"
+        Write-Host "  Manifest predates the channel field; treating it as stable"
+    }
     if (-not $manifestVersion -or -not $manifestChannel) {
         throw "The signed manifest is missing its version or channel."
     }

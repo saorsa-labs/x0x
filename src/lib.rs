@@ -145,7 +145,11 @@ pub mod mls;
 
 /// A2A (Agent2Agent) interoperability — Agent Card adapter (ADR-0017).
 pub mod a2a;
+
 pub mod delegation;
+/// Install-and-join onboarding recipe shared by `GET /onboard` and
+/// `x0x onboard` (#894, R11).
+pub mod onboard;
 
 /// Direct agent-to-agent messaging.
 ///

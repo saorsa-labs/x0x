@@ -86,6 +86,9 @@ pub const MAX_GRANT_PORTS: usize = 64;
 /// still-full store refuses new grants.
 pub const MAX_STORED_GRANTS: usize = 1024;
 
+/// Maximum byte length of a `Data` capability's `group` or `store` field.
+pub const MAX_GRANT_DATA_FIELD_BYTES: usize = 128;
+
 /// Who a grant is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -118,6 +121,29 @@ pub enum ShareCap {
     /// ADR-0073 calling: the holder may ring the granted agents (inbound
     /// call gate only, `Agent::call_gate_inbound`; opens no stream).
     Call,
+    /// Issue #1094: access to ONE named store of ONE group without group
+    /// membership — "share the data, not the group". `group` is the
+    /// STABLE group id, `store` the store name (`"scratch"` for the
+    /// scratch store). Minted and evaluated here; the remote read/write
+    /// surface that consumes it is the A4 sharing-completeness slice.
+    Data {
+        /// Stable group id the store belongs to.
+        group: String,
+        /// Store name within the group (e.g. `"scratch"`).
+        store: String,
+        /// Conferred access level.
+        access: DataAccess,
+    },
+}
+
+/// Access level a [`ShareCap::Data`] capability confers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DataAccess {
+    /// Read-only.
+    Ro,
+    /// Read and write.
+    Rw,
 }
 
 impl ShareCap {
@@ -128,6 +154,7 @@ impl ShareCap {
             Self::Connect { .. } => 3,
             Self::GroupInvite => 4,
             Self::Call => 5,
+            Self::Data { .. } => 6,
         }
     }
 }
@@ -271,11 +298,31 @@ impl ShareGrant {
         out.extend_from_slice(&(self.caps.len() as u32).to_le_bytes());
         for cap in &self.caps {
             out.push(cap.tag());
-            if let ShareCap::Connect { ports } = cap {
-                out.extend_from_slice(&(ports.len() as u32).to_le_bytes());
-                for port in ports {
-                    out.extend_from_slice(&port.to_le_bytes());
+            match cap {
+                ShareCap::Connect { ports } => {
+                    out.extend_from_slice(&(ports.len() as u32).to_le_bytes());
+                    for port in ports {
+                        out.extend_from_slice(&port.to_le_bytes());
+                    }
                 }
+                ShareCap::Data {
+                    group,
+                    store,
+                    access,
+                } => {
+                    out.extend_from_slice(&(group.len() as u32).to_le_bytes());
+                    out.extend_from_slice(group.as_bytes());
+                    out.extend_from_slice(&(store.len() as u32).to_le_bytes());
+                    out.extend_from_slice(store.as_bytes());
+                    out.push(match access {
+                        DataAccess::Ro => 1,
+                        DataAccess::Rw => 2,
+                    });
+                }
+                // Payload-free caps: the tag byte above is their whole
+                // encoding. A new variant with a payload must get its own
+                // arm, or its fields would be left out of the signed bytes.
+                ShareCap::Dm | ShareCap::Exec | ShareCap::GroupInvite | ShareCap::Call => {}
             }
         }
         out.extend_from_slice(&self.not_before.to_le_bytes());
@@ -313,6 +360,19 @@ impl ShareGrant {
                 }
                 if ports.contains(&0) || ports.windows(2).any(|w| w[0] >= w[1]) {
                     return invalid("connect ports must be sorted, unique and non-zero");
+                }
+            }
+            if let ShareCap::Data { group, store, .. } = cap {
+                if group.is_empty() || store.is_empty() {
+                    return invalid("data group and store must not be empty");
+                }
+                if group.len() > MAX_GRANT_DATA_FIELD_BYTES
+                    || store.len() > MAX_GRANT_DATA_FIELD_BYTES
+                {
+                    return invalid("data group and store must be bounded");
+                }
+                if group.contains('/') || store.contains('/') {
+                    return invalid("data group and store must not contain '/'");
                 }
             }
         }
@@ -1109,6 +1169,9 @@ pub struct GrantAccess {
     pub group_invite: bool,
     /// `Call` (ADR-0073): the inbound call gate admits the caller (#980).
     pub call: bool,
+    /// `Data` (#1094): per `(group, store)` access conferred by the grants.
+    /// `Rw` wins where grants overlap.
+    pub data: BTreeMap<(String, String), DataAccess>,
 }
 
 /// Crate-private evaluation result: public access bits plus the Connect
@@ -1139,6 +1202,19 @@ impl GrantAccess {
         self.connect_ports.contains(&port)
     }
 
+    /// Whether a `Data` capability covers reading `store` in `group`.
+    #[must_use]
+    pub fn allows_data_read(&self, group: &str, store: &str) -> bool {
+        self.data
+            .contains_key(&(group.to_string(), store.to_string()))
+    }
+
+    /// Whether a `Data` capability covers writing `store` in `group`.
+    #[must_use]
+    pub fn allows_data_write(&self, group: &str, store: &str) -> bool {
+        self.data.get(&(group.to_string(), store.to_string())) == Some(&DataAccess::Rw)
+    }
+
     fn absorb(&mut self, caps: &BTreeSet<ShareCap>) {
         for cap in caps {
             match cap {
@@ -1147,6 +1223,17 @@ impl GrantAccess {
                 ShareCap::Connect { ports } => self.connect_ports.extend(ports.iter().copied()),
                 ShareCap::GroupInvite => self.group_invite = true,
                 ShareCap::Call => self.call = true,
+                ShareCap::Data {
+                    group,
+                    store,
+                    access,
+                } => {
+                    let entry = self
+                        .data
+                        .entry((group.clone(), store.clone()))
+                        .or_insert(*access);
+                    *entry = (*entry).max(*access);
+                }
             }
         }
     }
