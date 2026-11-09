@@ -432,4 +432,106 @@ mod tests {
         }
         Ok(())
     }
+
+    /// WHY: #1003 — a successful DELETE reports its best-effort push
+    /// scheduling: a held grant's recipients are counted and scheduled
+    /// (an unknown-capability recipient counts as scheduled: it waits
+    /// behind one targeted advert refresh), and a revocation for a grant
+    /// this install does not hold schedules NO push (`push` all zeros) —
+    /// its recipients are unknown here, and gossip is the only carrier.
+    #[tokio::test]
+    async fn grant_revoke_reports_push_scheduling() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let user = x0x::identity::UserKeypair::from_seed(&[0x51; 32])
+            .map_err(|e| anyhow::anyhow!("user key: {e}"))?;
+        let user_id = user.user_id();
+        let grant_id = [0x52u8; 32];
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let grant = x0x::share_grant::ShareGrant::sign(
+            &user,
+            grant_id,
+            x0x::share_grant::Grantee::Agent(x0x::identity::AgentId([0xBB; 32])),
+            vec![x0x::identity::AgentId([0xBC; 32])],
+            vec![x0x::share_grant::ShareCap::Dm],
+            0,
+            now + 3600,
+        )
+        .map_err(|e| anyhow::anyhow!("sign grant: {e}"))?;
+        let agent = Arc::new(
+            x0x::Agent::builder()
+                .with_identity_dir(dir.path().join("identity"))
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key(
+                    x0x::identity::AgentKeypair::generate()
+                        .map_err(|e| anyhow::anyhow!("agent key: {e}"))?,
+                )
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_user_key(user)
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .build()
+                .await
+                .map_err(|e| anyhow::anyhow!("agent: {e}"))?,
+        );
+        let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+            dir.path(),
+            Arc::clone(&agent),
+        )
+        .await?;
+        let store = Arc::new(x0x::share_grant::ShareGrantStore::in_memory(
+            agent.agent_id(),
+            Some(user_id),
+        ));
+        store
+            .accept(grant, now)
+            .await
+            .map_err(|e| anyhow::anyhow!("accept grant: {e}"))?;
+        agent.install_share_grant_store(store);
+        let app = grants_router(Arc::clone(&state), false);
+
+        // A held grant: two recipients (the grantee agent and the shared
+        // agent), capability unknown for both, so each is scheduled behind
+        // the refresh-and-wait gate.
+        let (status, body) = send(
+            &app,
+            owner_req("DELETE", &format!("/grants/{}", hex::encode(grant_id)), "")?,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["revoked"], serde_json::json!(true), "{body}");
+        assert_eq!(body["known"], serde_json::json!(true), "{body}");
+        assert_eq!(body["push"]["recipients"], serde_json::json!(2), "{body}");
+        assert_eq!(body["push"]["scheduled"], serde_json::json!(2), "{body}");
+        assert_eq!(
+            body["push"]["skipped_not_capable"],
+            serde_json::json!(0),
+            "{body}"
+        );
+        assert_eq!(
+            body["push"]["skipped_bound"],
+            serde_json::json!(0),
+            "{body}"
+        );
+
+        // A grant this install does not hold: revoked (by id, gossip-only,
+        // `grant_expiry` unknown) and NO push is scheduled.
+        let (status, body) = send(
+            &app,
+            owner_req("DELETE", &format!("/grants/{}", "dd".repeat(32)), "")?,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["known"], serde_json::json!(false), "{body}");
+        for field in [
+            "recipients",
+            "scheduled",
+            "skipped_not_capable",
+            "skipped_bound",
+        ] {
+            assert_eq!(body["push"][field], serde_json::json!(0), "{field}: {body}");
+        }
+        Ok(())
+    }
 }

@@ -29,8 +29,12 @@
 //!
 //! # Receiver
 //!
-//! The typed route owns the prefix unconditionally: the payload never
-//! reaches DM history or DM subscribers. The handler stops at the first
+//! Prefix ownership is unconditional: the payload never reaches DM
+//! history or DM subscribers, verified or not, before and after the inbox
+//! is ready. The registered typed route covers a running inbox; in the
+//! startup window (no routes yet) a verified push is dropped and logged
+//! `not_ready` in `dispatch_raw_direct_after_gates`, and an unverified one
+//! by the static production-prefix table. The handler stops at the first
 //! failure — decode, subject, stale, known-record (no verify), rate
 //! limit — then hands the one record to the SAME ingest as the v3 gossip
 //! carrier (`crate::ingest_share_grant_revocation_records`): one verify

@@ -7208,12 +7208,12 @@ pub(crate) async fn ingest_share_grant_revocation_records(
     identity_dir: Option<&std::path::Path>,
     records: Vec<revocation::RevocationRecord>,
 ) -> bool {
+    // 6a (ADR 0080 §4 / D139): verify and insert in memory FIRST. The only
+    // signature verify runs here, before any outbox ordering, so a forged or
+    // duplicate record never holds or waits on the #926 send gate, and a new
+    // record is in force the moment the insert returns.
     let mut inserted = false;
     {
-        // #926: ordered against in-flight grant redeliveries.
-        let _barrier = owner_trust
-            .share_grant_revocation_barrier(&records, revocation_set)
-            .await;
         let mut set = revocation_set.write().await;
         for record in records {
             if !matches!(record.subject, revocation::RevokedSubject::ShareGrant(_))
@@ -7231,6 +7231,15 @@ pub(crate) async fn ingest_share_grant_revocation_records(
         }
     }
     if inserted {
+        // 6b (D139): order the outbox. Take the #926 send gate exclusively
+        // and release it, so a redelivery pass that was in flight when the
+        // record landed finishes before this ingest counts as done — this
+        // install then never sends a grant after its revocation took effect
+        // (the local revoke keeps ADR 0077's gate-before-record order). The
+        // revocation set is NOT held here, so the lock order has no cycle.
+        if let Some(outbox) = owner_trust.share_grant_outbox() {
+            drop(outbox.revocation_barrier().await);
+        }
         persist_share_grant_revocations(revocation_set, identity_dir).await;
     }
     inserted
@@ -7538,6 +7547,28 @@ async fn dispatch_raw_direct_after_gates(
         if route_outcome == dm_inbox::TypedRouteOutcome::Recognized {
             return route_outcome;
         }
+    }
+
+    // ADR 0080 §4: ownership of the grant-revocation push prefix is
+    // UNCONDITIONAL — verified or not, before and after the inbox is ready,
+    // the payload never reaches DM history or DM subscribers. This is the
+    // catch-all for every verified push no typed route consumed: chiefly
+    // the startup window, where the raw listener dispatches with NO
+    // registered routes while a sender can hold a pre-restart capability
+    // advert for up to 900 s, but also a trust-rejected sender or a frame
+    // the route's validator refused. Drop it, logged `not_ready`: gossip
+    // still carries the record, and the next copy that reaches the shared
+    // ingest starts the live-session bound.
+    if verified && data.starts_with(revocation_push::GRANT_REVOCATION_PUSH_PREFIX) {
+        tracing::debug!(
+            target: "x0x::direct",
+            stage = "recv_push_dropped",
+            reason = "not_ready",
+            sender = %network::hex_prefix(&sender.0, 4),
+            payload_bytes = data.len(),
+            "verified grant-revocation push not consumed by a typed route; dropped"
+        );
+        return dm_inbox::TypedRouteOutcome::RejectedPrefix;
     }
 
     // N12: an UNVERIFIED frame whose bytes claim a typed protocol route is
@@ -29048,6 +29079,76 @@ mod tests {
             generic
                 .try_recv()
                 .expect("ordinary DMs still delivered")
+                .payload,
+            ordinary
+        );
+    }
+
+    /// ADR 0080 §4 (prefix ownership is unconditional): a VERIFIED
+    /// grant-revocation push that arrives in the startup window — the raw
+    /// listener runs before the inbox registers any typed route, and a
+    /// sender can hold a pre-restart capability advert for up to 900 s —
+    /// must be dropped (`not_ready`), never recorded in history or shown
+    /// on the generic bus as an ordinary DM. The static production table
+    /// covers only UNVERIFIED frames, so without the dedicated drop in
+    /// `dispatch_raw_direct_after_gates` this frame falls through (RED
+    /// without the fix: the generic bus shows the push bytes as a DM).
+    #[tokio::test]
+    async fn raw_path_verified_push_is_dropped_before_inbox_starts() {
+        let dm = direct::DirectMessaging::new();
+        let mut generic = dm.subscribe();
+        let sender = identity::AgentId([0x97; 32]);
+        let machine_id = identity::MachineId([0x98; 32]);
+        // The startup-window shape: no registered routes at all.
+        let no_routes: Vec<dm_inbox::DmTypedPayloadRoute> = Vec::new();
+        let mut payload = crate::revocation_push::GRANT_REVOCATION_PUSH_PREFIX.to_vec();
+        payload.extend_from_slice(b"verified-startup-window-push");
+        let outcome = dispatch_raw_direct_after_gates(
+            &dm,
+            None,
+            &no_routes,
+            RawDirectDelivery {
+                sender,
+                machine_id,
+                data: payload.clone(),
+                verified: true,
+                trust_decision: Some(trust::TrustDecision::Accept),
+                observed_origin: None,
+                digest: direct::dm_payload_digest_hex(&payload),
+            },
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            dm_inbox::TypedRouteOutcome::RejectedPrefix,
+            "a verified push with no registered route is dropped, not routed"
+        );
+        assert!(
+            generic.try_recv().is_none(),
+            "a verified push must never reach the generic bus, inbox or not"
+        );
+        // Control: a verified ORDINARY frame in the same window IS
+        // delivered — the drop is prefix ownership, not a startup blackout.
+        let ordinary = b"verified ordinary startup-window DM".to_vec();
+        dispatch_raw_direct_after_gates(
+            &dm,
+            None,
+            &no_routes,
+            RawDirectDelivery {
+                sender,
+                machine_id,
+                data: ordinary.clone(),
+                verified: true,
+                trust_decision: Some(trust::TrustDecision::Accept),
+                observed_origin: None,
+                digest: direct::dm_payload_digest_hex(&ordinary),
+            },
+        )
+        .await;
+        assert_eq!(
+            generic
+                .try_recv()
+                .expect("verified ordinary DMs still delivered")
                 .payload,
             ordinary
         );

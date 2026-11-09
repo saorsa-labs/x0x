@@ -3481,7 +3481,12 @@ whose current verified capability advert sets `grant_revocation_push_v1`.
 The push is best-effort and has no ACK; gossip stays the backstop. The
 response carries a `push` object with `recipients`, `scheduled`,
 `skipped_not_capable` and `skipped_bound` — what was scheduled at revoke
-time, not what arrived. A `503` DELETE schedules no push; the retry does.
+time, not what arrived. A recipient of UNKNOWN capability also counts as
+`scheduled`: the push waits for one targeted advert refresh and is skipped
+later if no advert with the bit arrives. When this install does not hold
+the issued grant, the DELETE still revokes by id (gossip-only) and `push`
+is all zeros — the recipients are unknown here. A `503` DELETE schedules
+no push; the retry does.
 
 ## Upgrade
 

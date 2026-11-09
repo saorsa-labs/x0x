@@ -3962,8 +3962,12 @@ async fn start_dm_inbox_when_gossip_ready(
                 gui_show_route_tx.clone(),
             )
             // #1003: plain (non-durable) — the push sender waits for no
-            // ACK, and the route owning the prefix keeps the payload out
-            // of DM history and generic subscribers on every path.
+            // ACK. This route owns the prefix once the inbox runs; before
+            // that, the raw dispatcher drops a verified push (logged
+            // `not_ready`)
+            // and the static production-prefix table an unverified one, so
+            // the payload reaches DM history and generic subscribers on NO
+            // path (ADR 0080 §4).
             .with_typed_payload_route(
                 x0x::revocation_push::GRANT_REVOCATION_PUSH_PREFIX,
                 revocation_push_route_tx.clone(),

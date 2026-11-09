@@ -192,9 +192,31 @@ async fn malformed_and_wrong_subject_pushes_are_dropped() {
         PushOutcome::Dropped(PushDrop::Malformed)
     );
 
-    // An oversize payload is refused before decode.
+    // An oversize payload is refused by the SIZE bound, not by decode: the
+    // record is well-formed (it round-trips through plain bincode) and only
+    // its unbounded reason pushes it over MAX_GRANT_REVOCATION_PUSH_BYTES.
+    let oversize_record = RevocationRecord::sign(
+        RevokedSubject::ShareGrant(ShareGrantRevocation {
+            grant_id: [0x4a; 32],
+            owner: owner.user_id(),
+            grant_expiry: now_unix() + 86_400,
+        }),
+        owner.public_key(),
+        owner.secret_key(),
+        now_unix(),
+        Some("r".repeat(2 * MAX_GRANT_REVOCATION_PUSH_BYTES)),
+    )
+    .expect("sign oversize record");
+    let body = bincode::serialize(&oversize_record).expect("encode");
+    let round_trip: RevocationRecord = bincode::deserialize(&body).expect("well-formed record");
+    assert_eq!(round_trip.record_hash(), oversize_record.record_hash());
+    assert!(
+        encode_grant_revocation_push(&oversize_record).is_err(),
+        "the sender refuses an over-bound record"
+    );
     let mut oversize = GRANT_REVOCATION_PUSH_PREFIX.to_vec();
-    oversize.resize(MAX_GRANT_REVOCATION_PUSH_BYTES + 1, 0xaa);
+    oversize.extend_from_slice(&body);
+    assert!(oversize.len() > MAX_GRANT_REVOCATION_PUSH_BYTES);
     assert_eq!(
         receiver.handle(sender, &oversize).await,
         PushOutcome::Dropped(PushDrop::Malformed)
@@ -219,20 +241,52 @@ async fn malformed_and_wrong_subject_pushes_are_dropped() {
 #[tokio::test]
 async fn pushed_record_is_a_gossip_duplicate() {
     let owner = UserKeypair::generate().expect("owner key");
-    let record = signed_record(&owner, [0x49; 32], now_unix() + 86_400);
+    let grant_id = [0x49; 32];
+    let record = signed_record(&owner, grant_id, now_unix() + 86_400);
     let receiver = Receiver::new();
     let payload = encode_grant_revocation_push(&record).expect("encode");
     assert_eq!(
         receiver.handle(AgentId([0x06; 32]), &payload).await,
         PushOutcome::Ingested { inserted: true }
     );
-    // The same record through the shared records ingest (the gossip path
-    // after batch decode) inserts nothing new.
-    let inserted = crate::ingest_share_grant_revocation_records(
+    // A real v3 gossip batch (the full gossip path, batch decode included)
+    // holding the pushed record plus a DISTINCT later record for the same
+    // grant (a retried DELETE: a new `revoked_at`, so a new record hash):
+    // the pushed record is a duplicate, the later record still inserts.
+    let later = RevocationRecord::sign(
+        RevokedSubject::ShareGrant(ShareGrantRevocation {
+            grant_id,
+            owner: owner.user_id(),
+            grant_expiry: now_unix() + 86_400,
+        }),
+        owner.public_key(),
+        owner.secret_key(),
+        now_unix() + 7,
+        None,
+    )
+    .expect("sign later record");
+    assert_ne!(later.record_hash(), record.record_hash());
+    let batch = crate::revocation::encode_revocation_batch(&[record.clone(), later.clone()])
+        .expect("encode batch");
+    let inserted = crate::ingest_share_grant_revocations(
         &receiver.owner_trust,
         &receiver.set,
-        Some(receiver.dir.path()),
-        vec![record],
+        Some(receiver.dir.path().to_path_buf()),
+        &batch,
+    )
+    .await;
+    assert!(inserted, "the distinct later record inserts through gossip");
+    let set = receiver.set.read().await;
+    assert!(set.contains_hash(&later.record_hash()));
+    assert!(set.contains_hash(&record.record_hash()));
+    drop(set);
+    // The pushed record alone, re-sent as a batch, is a pure duplicate.
+    let dup = crate::revocation::encode_revocation_batch(&[record]).expect("encode batch");
+    let inserted = crate::ingest_share_grant_revocations(
+        &receiver.owner_trust,
+        &receiver.set,
+        Some(receiver.dir.path().to_path_buf()),
+        &dup,
     )
     .await;
     assert!(!inserted, "a pushed record is a gossip duplicate");
@@ -273,6 +327,96 @@ fn rate_limiter_bounds_per_sender_and_total() {
     // The window resets after a minute.
     let later = now + std::time::Duration::from_secs(61);
     assert!(limiter.admit(&sender, later));
+}
+
+/// WHY: ADR 0080 §3 (D113, positive evidence) — the sender pushes only on a
+/// current verified advert that HAS the bit: a capable recipient is
+/// scheduled, an advert WITHOUT the bit is `skipped_not_capable` (never
+/// sent: an old receiver would show the payload as an ordinary DM), and an
+/// unknown recipient is scheduled behind the one-refresh-and-wait gate.
+#[tokio::test]
+async fn schedule_counts_capable_not_capable_and_unknown() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let owner = UserKeypair::generate().expect("owner key");
+    let agent = std::sync::Arc::new(
+        crate::Agent::builder()
+            .with_identity_dir(dir.path())
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .build()
+            .await
+            .expect("offline agent"),
+    );
+    let capable = AgentId([0xA1; 32]);
+    let not_capable = AgentId([0xA2; 32]);
+    let unknown = AgentId([0xA3; 32]);
+    let bit = crate::dm::CapabilityRegistry::GRANT_REVOCATION_PUSH_V1;
+    let now_ms = crate::dm_capability::now_unix_ms();
+    let mut with_bit = crate::dm::DmCapabilities::pending();
+    with_bit.application_registry = crate::dm::CapabilityRegistry {
+        version: 1,
+        bits: crate::dm::CapabilityRegistry::current().bits | bit,
+    };
+    let mut without_bit = crate::dm::DmCapabilities::pending();
+    without_bit.application_registry = crate::dm::CapabilityRegistry {
+        version: 1,
+        bits: crate::dm::CapabilityRegistry::current().bits & !bit,
+    };
+    assert!(agent.capability_store().insert(
+        capable,
+        crate::identity::MachineId([0xB1; 32]),
+        with_bit,
+        now_ms
+    ));
+    assert!(agent.capability_store().insert(
+        not_capable,
+        crate::identity::MachineId([0xB2; 32]),
+        without_bit,
+        now_ms
+    ));
+    let grant = crate::share_grant::ShareGrant::sign(
+        &owner,
+        [0x50; 32],
+        crate::share_grant::Grantee::Agent(capable),
+        vec![not_capable, unknown],
+        vec![crate::share_grant::ShareCap::Dm],
+        0,
+        now_unix() + 86_400,
+    )
+    .expect("sign grant");
+    let record = signed_record(&owner, [0x50; 32], now_unix() + 86_400);
+    let report = schedule_share_grant_revocation_push(&agent, &record, &grant).await;
+    assert_eq!(report.recipients, 3);
+    assert_eq!(
+        report.skipped_not_capable, 1,
+        "a current verified advert WITHOUT the bit is never pushed to"
+    );
+    assert_eq!(
+        report.scheduled, 2,
+        "the capable recipient and the unknown one (behind the refresh gate)"
+    );
+    assert_eq!(report.skipped_bound, 0);
+}
+
+/// WHY: ADR 0080 §3 — at most `MAX_PENDING_PUSHES` pushes pending in
+/// memory; one over the bound is skipped (RAII slots return on drop).
+/// Runs under nextest's process-per-test model, so the global counter is
+/// this test's alone.
+#[test]
+fn pending_slot_bound_is_enforced() {
+    let slots: Vec<PendingSlot> = (0..MAX_PENDING_PUSHES)
+        .map(|_| PendingSlot::try_take().expect("slot within the bound"))
+        .collect();
+    assert!(
+        PendingSlot::try_take().is_none(),
+        "one push over the bound is refused"
+    );
+    drop(slots);
+    assert!(
+        PendingSlot::try_take().is_some(),
+        "a released slot is reusable"
+    );
 }
 
 /// WHY: wire pinning — the prefix bytes and the payload-capability mapping
