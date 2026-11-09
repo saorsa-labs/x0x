@@ -145,7 +145,11 @@ pub mod mls;
 
 /// A2A (Agent2Agent) interoperability — Agent Card adapter (ADR-0017).
 pub mod a2a;
+
 pub mod delegation;
+/// Install-and-join onboarding recipe shared by `GET /onboard` and
+/// `x0x onboard` (#894, R11).
+pub mod onboard;
 
 /// Direct agent-to-agent messaging.
 ///
@@ -13896,10 +13900,14 @@ impl Agent {
     ///
     /// # Security Note
     ///
-    /// This method does **not** apply trust filtering from `ContactStore`.
-    /// Messages from blocked agents will still be delivered. Use
-    /// [`recv_direct_annotated()`](Self::recv_direct_annotated) if you need
-    /// trust-based filtering.
+    /// The receive path drops a message before delivery when its trust
+    /// decision is [`TrustDecision::RejectBlocked`](trust::TrustDecision::RejectBlocked)
+    /// or [`TrustDecision::RejectMachineMismatch`](trust::TrustDecision::RejectMachineMismatch).
+    /// This method applies no other trust filter. Every other message,
+    /// including one from an unknown sender, is delivered. This method and
+    /// [`recv_direct_annotated()`](Self::recv_direct_annotated) return the
+    /// same messages. Inspect `msg.trust_decision` and `msg.verified` to
+    /// decide how to handle each message.
     ///
     /// # Returns
     ///
@@ -13918,31 +13926,6 @@ impl Agent {
         self.recv_direct_inner().await
     }
 
-    /// Receive the next direct message, filtering by trust level.
-    ///
-    /// All messages now carry pre-computed `verified` and `trust_decision`
-    /// fields from the identity discovery cache and contact store. This
-    /// method passes through all messages — applications should inspect
-    /// `msg.trust_decision` and `msg.verified` to decide how to handle
-    /// each message.
-    ///
-    /// # Returns
-    ///
-    /// The received [`DirectMessage`], or `None` if the channel closes.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// loop {
-    ///     if let Some(msg) = agent.recv_direct_annotated().await {
-    ///         match msg.trust_decision {
-    ///             Some(TrustDecision::RejectBlocked) => continue, // skip
-    ///             Some(TrustDecision::Accept) if msg.verified => { /* trusted */ }
-    ///             _ => { /* handle accordingly */ }
-    ///         }
-    ///     }
-    /// }
-    /// ```
     /// The authenticated agent→machine binding store (ADR 0115).
     pub(crate) fn authenticated_machine_bindings(&self) -> dm_inbox::AuthenticatedMachineBindings {
         std::sync::Arc::clone(&self.authenticated_machine_bindings)
@@ -13953,9 +13936,10 @@ impl Agent {
         std::sync::Arc::clone(&self.announced_machine_bindings)
     }
 
-    /// Test seam for #1088's frame-level listener tests (unit and the
-    /// connectivity integration file): the authenticated machine-binding
-    /// registry the raw delivery path consults.
+    /// Test seam for the #1088 frame-level listener unit tests: the
+    /// authenticated machine-binding registry that the raw delivery path
+    /// reads.
+    #[doc(hidden)]
     pub fn authenticated_machine_bindings_for_testing(
         &self,
     ) -> dm_inbox::AuthenticatedMachineBindings {
@@ -13974,6 +13958,7 @@ impl Agent {
     /// Test seam for #1088: record an authenticated machine binding the
     /// way the inbox records one after a verified fresh machine-key
     /// attestation.
+    #[doc(hidden)]
     pub async fn record_authenticated_binding_for_testing(
         &self,
         agent: identity::AgentId,
@@ -14009,6 +13994,7 @@ impl Agent {
     }
 
     /// Test seam: read one discovery-cache entry.
+    #[doc(hidden)]
     pub async fn discovered_agent_for_testing(
         &self,
         agent: &identity::AgentId,
@@ -14020,6 +14006,36 @@ impl Agent {
             .cloned()
     }
 
+    /// Receive the next direct message with its trust annotations.
+    ///
+    /// Each message carries `verified` and `trust_decision` fields. The
+    /// receive path sets them from the identity discovery cache and the
+    /// contact store.
+    ///
+    /// Before delivery, the receive path drops a message whose trust
+    /// decision is [`TrustDecision::RejectBlocked`](trust::TrustDecision::RejectBlocked)
+    /// or [`TrustDecision::RejectMachineMismatch`](trust::TrustDecision::RejectMachineMismatch).
+    /// This method does not filter further. It reads the same queue as
+    /// [`recv_direct()`](Self::recv_direct) and returns the same messages.
+    /// Inspect `msg.trust_decision` and `msg.verified` to decide how to
+    /// handle each message.
+    ///
+    /// # Returns
+    ///
+    /// The received [`DirectMessage`], or `None` if the channel closes.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// loop {
+    ///     if let Some(msg) = agent.recv_direct_annotated().await {
+    ///         match msg.trust_decision {
+    ///             Some(TrustDecision::Accept) if msg.verified => { /* trusted */ }
+    ///             _ => { /* handle accordingly */ }
+    ///         }
+    ///     }
+    /// }
+    /// ```
     pub async fn recv_direct_annotated(&self) -> Option<direct::DirectMessage> {
         self.recv_direct_inner().await
     }

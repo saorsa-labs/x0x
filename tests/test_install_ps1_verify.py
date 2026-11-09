@@ -396,6 +396,38 @@ class InstallPs1VerifyTests(unittest.TestCase):
             )
             self.assert_refused(rc, output, bindir, probe_calls, "but release v0.48.0 was requested")
 
+    def test_pre_channel_manifest_installs_as_stable(self) -> None:
+        # Mirrors the shell suite: a signed manifest with NO channel key is
+        # the pre-#1558 legacy stable shape (every release up to v0.48.1)
+        # and installs with a printed note; an empty or non-stable channel
+        # VALUE is still refused (the two tests below).
+        with scratch_directory() as tmp:
+            rc, output, bindir, probe_calls = self.run_installer(
+                tmp,
+                lambda digest: manifest_bytes(
+                    digest, target=WINDOWS_TARGET, version="0.48.0", channel=None
+                ),
+            )
+            self.assertEqual(rc, 0, output)
+            self.assertIn("Manifest predates the channel field", self.flat(output))
+            self.assertIn("Manifest version 0.48.0 (stable) matches v0.48.0", self.flat(output))
+            self.assertIn("Installed:", output)
+            self.assertTrue((bindir / "x0x.exe").exists())
+
+    def test_manifest_empty_channel_is_refused(self) -> None:
+        # The channel KEY present with an empty value is not the legacy
+        # shape; it stays a refusal.
+        with scratch_directory() as tmp:
+            rc, output, bindir, probe_calls = self.run_installer(
+                tmp,
+                lambda digest: manifest_bytes(
+                    digest, target=WINDOWS_TARGET, version="0.48.0", channel=""
+                ),
+            )
+            self.assert_refused(
+                rc, output, bindir, probe_calls, "missing its version or channel"
+            )
+
     def test_manifest_channel_not_stable(self) -> None:
         with scratch_directory() as tmp:
             rc, output, bindir, probe_calls = self.run_installer(

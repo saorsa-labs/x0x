@@ -150,6 +150,16 @@ impl RequestField {
         }
     }
 
+    /// Query field the CLI synthesizes from other arguments.
+    pub const fn query_derived(name: &'static str, required: bool) -> Self {
+        Self {
+            name,
+            location: FieldLocation::Query,
+            required,
+            cli: CliExpose::Derived,
+        }
+    }
+
     /// Body field the request struct carries but the handler ignores or
     /// rejects (e.g. a tombstoned pre-migration knob).
     pub const fn body_ignored(name: &'static str) -> Self {
@@ -321,6 +331,19 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         description: "Introduction card with trust-scoped disclosure",
         category: "identity",
         request: RequestSpec::Fields(&[RequestField::query("peer", false)]),
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/onboard",
+        cli_name: "onboard",
+        description: "Install-and-join recipe that teaches another agent to DM you",
+        category: "identity",
+        // `card` (file|inline|lookup) and `card_file` are synthesized by the
+        // CLI from `--inline-card` / `--no-card` / `--card-file`.
+        request: RequestSpec::Fields(&[
+            RequestField::query_derived("card", false),
+            RequestField::query_derived("card_file", false),
+        ]),
     },
     EndpointDef {
         method: Method::Post,
@@ -511,7 +534,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Post,
         path: "/owner/riders",
         cli_name: "owner riders issue",
-        description: "Mint a scoped rider token for a registered rider-mode sub-agent (ADR-0039; scopes is a string list, default empty, only gui:show is defined; the required harness-signed delegation is supplied via --delegation-payload-b64/--delegation-signature)",
+        description: "Mint a scoped rider token for a registered rider-mode sub-agent (ADR-0039; scopes is a string list, default empty; defined scopes: gui:show, scratch:read, scratch:read_write; the required harness-signed delegation is supplied via --delegation-payload-b64/--delegation-signature)",
         category: "identity",
         request: RequestSpec::Fields(&[RequestField::body_as("sub_agent_id", true, "AGENT_ID"), RequestField::body_as("groups", false, "--group"), RequestField::body_as("scopes", false, "--scope"), RequestField::body("label", false), RequestField::body("ttl_secs", false), RequestField::body_as("delegation", true, "--delegation-payload-b64")]),
     },

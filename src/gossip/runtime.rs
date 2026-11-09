@@ -81,7 +81,7 @@ const PRESENCE_MESSAGE_HANDLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// timeouts did not lose messages, only marked them late. Raising the cap to
 /// 30 s converts those false-positive watchdog fires into successful
 /// completions; a real wedged handler still gets cancelled, just later.
-const PUBSUB_MESSAGE_HANDLE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const PUBSUB_MESSAGE_HANDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum time to spend handling one inbound membership message.
 const MEMBERSHIP_MESSAGE_HANDLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Fixed worker count for the HyParView/SWIM membership control stream.

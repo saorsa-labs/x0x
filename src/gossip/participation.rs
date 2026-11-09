@@ -12,12 +12,13 @@
 //! or contradictory Leaf intent. Never silent Leaf on the backbone.
 
 use crate::network::DEFAULT_BOOTSTRAP_PEERS;
-use saorsa_gossip_types::MessageKind;
+use saorsa_gossip_types::{MessageKind, TopicId};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// ADR-0011 dual-listen port. Clients never bind this; `x0xd-443` does.
 const DUAL_LISTEN_PORT: u16 = 443;
@@ -75,6 +76,135 @@ pub fn leaf_refuses_unsubscribed_passthrough(
     kind: MessageKind,
 ) -> bool {
     !mode.forwards_passthrough() && !subscribed && is_passthrough_wire_kind(kind)
+}
+
+/// saorsa-gossip-pubsub 0.5.90 `MAX_CACHE_AGE_SECS` (`lib.rs:79`): how long
+/// the sg message cache keeps an entry.
+const SG_MESSAGE_CACHE_AGE: Duration = Duration::from_secs(60);
+
+/// saorsa-gossip-pubsub 0.5.90 key-cache replay delay: `PENDING_TTL` (5 s,
+/// `key_cache.rs:30`) plus the 250 ms pending flusher tick. A v3 "Ref"
+/// EAGER with an unknown signer key is queued, not cached, and a later
+/// hop-local key-cache `Response` replays it through `dispatch_message`
+/// without the C0 gate.
+const SG_KEY_CACHE_REPLAY_DELAY: Duration = Duration::from_millis(5_250);
+
+/// How long a Leaf publish keeps the IWANT exemption for its topic (#731):
+/// the sg message-cache age limit, after which the cache has no copy.
+pub(crate) const PUBLISHER_IWANT_WINDOW: Duration = SG_MESSAGE_CACHE_AGE;
+
+/// How long the IWANT exemption stays off after a topic stops being
+/// subscribed (#731). While subscribed, the sg cache also holds other peers'
+/// messages, and a subscription drop does not empty it. After the mark, a
+/// foreign entry can still enter the cache: a queued key-cache frame is
+/// replayed up to [`SG_KEY_CACHE_REPLAY_DELAY`] later, under a fresh receive
+/// handler timeout (`PUBSUB_MESSAGE_HANDLE_TIMEOUT`, 30 s), and the entry then
+/// lives [`SG_MESSAGE_CACHE_AGE`]. That sum is 95.25 s; 120 s adds a margin.
+/// The assertion below keeps the bound when a part changes. The replay delay
+/// is best effort: sg `take_pending` does not check a queued frame's age, so
+/// a peer that stalls the replay can still add one stale foreign entry. That
+/// replay already bypassed the C0 gate before #731.
+pub(crate) const UNSUBSCRIBE_QUIET: Duration = Duration::from_secs(120);
+
+const _: () = assert!(
+    UNSUBSCRIBE_QUIET.as_millis()
+        >= SG_KEY_CACHE_REPLAY_DELAY
+            .saturating_add(super::runtime::PUBSUB_MESSAGE_HANDLE_TIMEOUT)
+            .saturating_add(SG_MESSAGE_CACHE_AGE)
+            .as_millis()
+);
+
+/// Maximum number of topics in each [`PublisherTopics`] map (#731).
+pub(crate) const PUBLISHER_TOPICS_CAP: usize = 1024;
+
+#[derive(Debug, Default)]
+struct PublisherTopicsInner {
+    /// Last local publish per topic.
+    published: HashMap<TopicId, Instant>,
+    /// Last time each topic stopped being subscribed.
+    unsubscribed: HashMap<TopicId, Instant>,
+    /// Set when `unsubscribed` was full of live marks: no exemption for
+    /// [`UNSUBSCRIBE_QUIET`] after it.
+    blocked_at: Option<Instant>,
+}
+
+/// Topics that this Leaf node published to recently (#731).
+///
+/// A Leaf that publishes on an unsubscribed topic must still answer IWANT
+/// for its own messages, or the #380 C0 gate closes its only path to a lazy
+/// subscriber. Only IWANT is exempt: EAGER, IHAVE and anti-entropy carry or
+/// pull other peers' messages. The exemption is off for [`UNSUBSCRIBE_QUIET`]
+/// after the topic was last subscribed. Both maps hold at most
+/// [`PUBLISHER_TOPICS_CAP`] topics and fail closed: a full publish map drops
+/// its oldest entry; a full unsubscribe map blocks every topic for
+/// [`UNSUBSCRIBE_QUIET`].
+#[derive(Debug, Default)]
+pub(crate) struct PublisherTopics {
+    inner: Mutex<PublisherTopicsInner>,
+}
+
+impl PublisherTopics {
+    fn lock(&self) -> std::sync::MutexGuard<'_, PublisherTopicsInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record a local publish on `topic` at `now`.
+    pub(crate) fn record(&self, topic: TopicId, now: Instant) {
+        let mut inner = self.lock();
+        let map = &mut inner.published;
+        if !map.contains_key(&topic) && map.len() >= PUBLISHER_TOPICS_CAP {
+            map.retain(|_, at| now.saturating_duration_since(*at) < PUBLISHER_IWANT_WINDOW);
+            if map.len() >= PUBLISHER_TOPICS_CAP {
+                let oldest = map.iter().min_by_key(|(_, at)| **at).map(|(t, _)| *t);
+                if let Some(oldest) = oldest {
+                    map.remove(&oldest);
+                }
+            }
+        }
+        map.insert(topic, now);
+    }
+
+    /// Record that `topic` stops being subscribed at `now`.
+    ///
+    /// Call this before the topic leaves the subscribed set, so the gate
+    /// never sees an unsubscribed topic without this mark.
+    pub(crate) fn note_unsubscribed(&self, topic: TopicId, now: Instant) {
+        let mut inner = self.lock();
+        inner.published.remove(&topic);
+        let map = &mut inner.unsubscribed;
+        if !map.contains_key(&topic) && map.len() >= PUBLISHER_TOPICS_CAP {
+            map.retain(|_, at| now.saturating_duration_since(*at) < UNSUBSCRIBE_QUIET);
+            if map.len() >= PUBLISHER_TOPICS_CAP {
+                inner.blocked_at = Some(now);
+                return;
+            }
+        }
+        map.insert(topic, now);
+    }
+
+    /// True when a Leaf may serve IWANT on unsubscribed `topic` at `now`.
+    #[must_use]
+    pub(crate) fn allows_iwant(&self, topic: &TopicId, now: Instant) -> bool {
+        let inner = self.lock();
+        let quiet = |at: &Instant| now.saturating_duration_since(*at) < UNSUBSCRIBE_QUIET;
+        if inner.blocked_at.as_ref().is_some_and(quiet)
+            || inner.unsubscribed.get(topic).is_some_and(quiet)
+        {
+            return false;
+        }
+        inner
+            .published
+            .get(topic)
+            .is_some_and(|at| now.saturating_duration_since(*at) < PUBLISHER_IWANT_WINDOW)
+    }
+
+    /// Number of publish entries, including expired ones not yet removed.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.lock().published.len()
+    }
 }
 
 /// Corrected Leaf/Full outbound split for soak gating.
