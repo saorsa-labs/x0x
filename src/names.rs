@@ -1691,8 +1691,11 @@ impl NameStore {
     /// defaults are kept as a pending suggestion for `accept_suggestion`.
     /// A trusted owner's machine default is pinned only for a machine in
     /// `defaults.verified_hosts`; any other machine is kept in that owner's
-    /// pending suggestion instead. One durable commit covers everything
-    /// this call changes.
+    /// pending suggestion instead. Machine names need an owner label: when
+    /// the owner has no bound label and the grant's owner name gives none
+    /// (absent, or not a valid label), a machines-only names section is
+    /// dropped and nothing is pinned, suggested or reported. One durable
+    /// commit covers everything this call changes.
     ///
     /// # Errors
     /// [`NameError::Store`].
