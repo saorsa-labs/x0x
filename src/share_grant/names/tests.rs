@@ -776,3 +776,91 @@ async fn machine_default_without_hosting_evidence_is_only_suggested() {
         .expect("accept");
     assert_eq!(applied.machine_pins, ["machine:studio-mac.bob-smith"]);
 }
+
+/// WHY (#1831 review, LOW 2): a v2 recipient whose payload could not be
+/// built is reported and NOT queued. A queued row without its envelope
+/// would resend as v1 while the response said v2.
+#[tokio::test]
+async fn an_unbuilt_v2_payload_is_never_queued() {
+    let owner = UserKeypair::generate().expect("owner key");
+    let grantee = AgentId([0x44; 32]);
+    let grant = grant_for(&owner, grantee);
+    let revocations = tokio::sync::RwLock::new(crate::revocation::RevocationSet::new());
+    let outbox =
+        crate::share_grant::outbox::GrantRedeliveryOutbox::in_memory(Some(owner.user_id()));
+    let now = now();
+    let deliveries = crate::share_grant::deliver_grant_via_classified(
+        &grant,
+        None,
+        &[(grantee, true)],
+        Some(&outbox),
+        &revocations,
+        || now,
+        |_recipient, _payload, _id| async { Err("must not be called".to_string()) },
+    )
+    .await;
+    assert_eq!(deliveries.len(), 1);
+    assert!(!deliveries[0].delivered);
+    assert!(!deliveries[0].queued, "{:?}", deliveries[0]);
+    assert_eq!(deliveries[0].envelope, "v2");
+    assert!(outbox.is_empty(), "nothing queued for an unbuilt payload");
+}
+
+/// WHY (#1831 review, LOW 1): this machine's name comes from the profile,
+/// not from a synced MachineNames record that may be stale. With no profile
+/// name, this machine is not named even when a synced record names it.
+#[test]
+fn own_machine_name_comes_from_the_profile_not_a_synced_record() {
+    let owner = UserKeypair::generate().expect("owner key");
+    let now_ms = 1_900_000_000_000u64;
+    let own = MachineId([7; 32]);
+    let other = MachineId([8; 32]);
+    let enrollments = vec![
+        crate::owner_sync::OwnerEnrollment::sign(own, &owner, now_ms - 10, None).expect("enroll"),
+        crate::owner_sync::OwnerEnrollment::sign(other, &owner, now_ms - 10, None).expect("enroll"),
+    ];
+    let synced = vec![
+        (own, "Old Studio".to_string()),
+        (other, "Laptop".to_string()),
+    ];
+    let hosts = vec![(AgentId([0x22; 32]), own), (AgentId([0x23; 32]), other)];
+    let machines = assemble_grant_machine_names(
+        &owner.user_id(),
+        &enrollments,
+        &synced,
+        &hosts,
+        own,
+        Some("New Studio".to_string()),
+        now_ms,
+    );
+    assert_eq!(
+        machines,
+        vec![
+            GrantMachineName {
+                machine_id: own,
+                machine_name: "New Studio".to_string(),
+            },
+            GrantMachineName {
+                machine_id: other,
+                machine_name: "Laptop".to_string(),
+            },
+        ]
+    );
+    let machines = assemble_grant_machine_names(
+        &owner.user_id(),
+        &enrollments,
+        &synced,
+        &hosts,
+        own,
+        None,
+        now_ms,
+    );
+    assert_eq!(
+        machines,
+        vec![GrantMachineName {
+            machine_id: other,
+            machine_name: "Laptop".to_string(),
+        }],
+        "a stale synced name is never used for this machine"
+    );
+}

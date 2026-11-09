@@ -1651,13 +1651,14 @@ where
     let sends = resolved
         .into_iter()
         .map(|(recipient, envelope_kind, request)| {
+            let built = request.is_ok();
             let fut = request.map(|(payload, request_id)| send(recipient, payload, request_id));
             async move {
                 let outcome = match fut {
                     Ok(fut) => outbox::bounded_send(fut).await,
                     Err(e) => Err(e),
                 };
-                (recipient, envelope_kind, outcome)
+                (recipient, envelope_kind, built, outcome)
             }
         });
     let results = futures::future::join_all(sends).await;
@@ -1665,7 +1666,7 @@ where
     // revocation queued for it in between must be allowed to run first.
     drop(permit);
     let mut out = Vec::with_capacity(recipients.len());
-    for (recipient, envelope_kind, result) in results {
+    for (recipient, envelope_kind, built, result) in results {
         let mut delivery = GrantDelivery {
             agent: hex::encode(recipient.as_bytes()),
             delivered: result.is_ok(),
@@ -1673,7 +1674,10 @@ where
             error: result.err(),
             envelope: envelope_kind,
         };
-        if !delivery.delivered {
+        // A payload that failed to build was never sent and cannot be
+        // retried as recorded: a queued v2 row without its envelope would
+        // resend as v1. Report the error and queue nothing.
+        if !delivery.delivered && built {
             delivery.queued = queue_failed_delivery(
                 grant,
                 if envelope_kind == "v2" {

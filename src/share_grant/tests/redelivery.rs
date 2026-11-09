@@ -1788,3 +1788,89 @@ async fn pre_adr0079_outbox_file_loads_and_a_tampered_names_attachment_fails_clo
     );
     assert!(outbox.pending().is_empty());
 }
+
+/// WHY (#1831 review nit): a pre-0079 outbox file with several entries
+/// loads every entry in order, each migrated as v1.
+#[tokio::test]
+async fn pre_adr0079_outbox_file_with_several_entries_migrates_all() {
+    let world = World::new().await;
+    let first = world.grant(1, 3_600);
+    let second = world.grant(2, 3_600);
+    let other = recipient(9);
+    let legacy = vec![
+        (
+            world.a1,
+            first.clone(),
+            world.now,
+            world.now + 600,
+            world.now,
+            0u32,
+        ),
+        (
+            other,
+            second.clone(),
+            world.now,
+            world.now + 600,
+            world.now,
+            2u32,
+        ),
+    ];
+    let mut bytes = b"X0GO".to_vec();
+    bytes.extend_from_slice(&bincode::serialize(&legacy).unwrap());
+    std::fs::write(world.outbox_path(), bytes).unwrap();
+    let outbox = world.outbox(world.now).await;
+    assert!(outbox.load_error().is_none(), "{:?}", outbox.load_error());
+    let pending = outbox.pending();
+    assert_eq!(pending.len(), 2);
+    let find = |grant: &ShareGrant| {
+        pending
+            .iter()
+            .find(|p| p.grant == *grant)
+            .cloned()
+            .expect("entry migrated")
+    };
+    let a = find(&first);
+    assert_eq!(
+        (a.recipient, a.attempts, a.names.clone()),
+        (world.a1, 0, None)
+    );
+    let b = find(&second);
+    assert_eq!((b.recipient, b.attempts, b.names.clone()), (other, 2, None));
+}
+
+/// WHY (#1831 review nit): a valid v2 entry reloaded from disk retries with
+/// the exact v2 bytes and request id the first send used.
+#[tokio::test]
+async fn reloaded_v2_entry_retries_with_the_exact_v2_bytes() {
+    let world = World::new().await;
+    let grant = world.grant(3, 3_600);
+    let envelope = super::super::names::ShareGrantV2::sign(
+        &world.owner,
+        grant.clone(),
+        super::super::names::GrantNames {
+            owner_name: Some("Bob Smith".to_string()),
+            machines: Vec::new(),
+        },
+    )
+    .unwrap();
+    let (expected_payload, expected_id) =
+        super::super::names::grant_delivery_request_v2(&envelope).unwrap();
+    let mut entry = raw_entry(&grant, world.a1, world.now);
+    entry.names = Some(envelope.attachment());
+    write_raw_outbox(&world.outbox_path(), &[entry]);
+
+    let outbox = world.outbox(world.now).await;
+    assert!(outbox.load_error().is_none(), "{:?}", outbox.load_error());
+    assert_eq!(outbox.pending().len(), 1);
+    let sent: std::sync::Mutex<Vec<(Vec<u8>, [u8; 16])>> = std::sync::Mutex::new(Vec::new());
+    let report = outbox
+        .step(world.now, &world.revocations, |_to, payload, id| {
+            sent.lock().unwrap().push((payload, id));
+            async { Ok(()) }
+        })
+        .await;
+    assert_eq!(report.delivered, 1, "{report:?}");
+    let sent = sent.into_inner().unwrap();
+    assert_eq!(sent, vec![(expected_payload, expected_id)]);
+    assert!(outbox.is_empty());
+}

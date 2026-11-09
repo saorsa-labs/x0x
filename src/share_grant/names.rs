@@ -506,6 +506,45 @@ pub fn grant_machine_names(
         .collect()
 }
 
+/// The machines section of a grant this install issues (ADR 0079 §1):
+/// [`grant_machine_names`] over the other owner machines, plus this
+/// machine (`own_machine`) under its profile `machine_name` when it hosts a
+/// granted agent. This machine's name always comes from the profile; a
+/// synced record for it is ignored, because that record can be older than
+/// the profile. With no valid profile name, this machine is not named.
+#[must_use]
+pub fn assemble_grant_machine_names(
+    owner: &UserId,
+    enrollments: &[crate::owner_sync::OwnerEnrollment],
+    synced: &[(MachineId, String)],
+    hosts: &[(crate::identity::AgentId, MachineId)],
+    own_machine: MachineId,
+    own_machine_name: Option<String>,
+    now_ms: u64,
+) -> Vec<GrantMachineName> {
+    let others: Vec<(MachineId, String)> = synced
+        .iter()
+        .filter(|(machine, _)| *machine != own_machine)
+        .cloned()
+        .collect();
+    let mut machines = grant_machine_names(owner, enrollments, &others, hosts, now_ms);
+    let own_machine_name = own_machine_name
+        .map(|name| name.trim().to_string())
+        .filter(|name| validate_display_name("machine_name", name).is_ok());
+    if let Some(name) = own_machine_name {
+        if hosts.iter().any(|(_, machine)| *machine == own_machine)
+            && machines.len() < MAX_GRANT_AGENTS
+        {
+            machines.push(GrantMachineName {
+                machine_id: own_machine,
+                machine_name: name,
+            });
+            machines.sort_by_key(|m| m.machine_id.0);
+        }
+    }
+    machines
+}
+
 impl crate::Agent {
     /// The authority machine currently hosting each of the grant's agents:
     /// this install's own machine for its own agent, and the authorized
@@ -542,7 +581,9 @@ impl crate::Agent {
     /// in `devices`, and the current announcements hosting the granted
     /// agents. This daemon's own machine needs no enrollment record: the
     /// issuing install signs the section with the owner key, which vouches
-    /// for its own profile name directly.
+    /// for its own profile name directly. Its name is always the profile
+    /// `machine_name`; a synced record for it is ignored, because that
+    /// record can be older than the profile.
     pub async fn grant_names_for(
         &self,
         devices: Option<&crate::owner_sync::OwnerSyncStore>,
@@ -557,10 +598,9 @@ impl crate::Agent {
             .map(|name| name.trim().to_string())
             .filter(|name| validate_display_name("owner_name", name).is_ok());
         let hosts = self.granted_agent_hosts(grant).await;
-        let mut machines = match devices {
-            None => Vec::new(),
+        let (enrollments, synced) = match devices {
+            None => (Vec::new(), Vec::new()),
             Some(devices) => {
-                let owner = grant.owner;
                 let mut named = Vec::new();
                 for record in devices.records_snapshot().await {
                     if let crate::owner_sync::SyncValue::MachineNames {
@@ -574,36 +614,23 @@ impl crate::Agent {
                         let Ok(bytes) = <[u8; 32]>::try_from(bytes.as_slice()) else {
                             continue;
                         };
-                        if record.verify_owner(&owner).is_ok() {
+                        if record.verify_owner(&grant.owner).is_ok() {
                             named.push((MachineId(bytes), machine_name.clone()));
                         }
                     }
                 }
-                grant_machine_names(
-                    &owner,
-                    &devices.enrolled_devices().await,
-                    &named,
-                    &hosts,
-                    super::unix_now_secs().saturating_mul(1000),
-                )
+                (devices.enrolled_devices().await, named)
             }
         };
-        let own_machine = self.machine_id();
-        let own_machine_name = own_machine_name
-            .map(|name| name.trim().to_string())
-            .filter(|name| validate_display_name("machine_name", name).is_ok());
-        if let Some(name) = own_machine_name {
-            if hosts.iter().any(|(_, machine)| *machine == own_machine)
-                && !machines.iter().any(|m| m.machine_id == own_machine)
-                && machines.len() < MAX_GRANT_AGENTS
-            {
-                machines.push(GrantMachineName {
-                    machine_id: own_machine,
-                    machine_name: name,
-                });
-                machines.sort_by_key(|m| m.machine_id.0);
-            }
-        }
+        let machines = assemble_grant_machine_names(
+            &grant.owner,
+            &enrollments,
+            &synced,
+            &hosts,
+            self.machine_id(),
+            own_machine_name,
+            super::unix_now_secs().saturating_mul(1000),
+        );
         if owner_name.is_none() && machines.is_empty() {
             return None;
         }
