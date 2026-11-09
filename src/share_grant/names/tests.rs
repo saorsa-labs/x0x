@@ -40,6 +40,11 @@ fn names_section() -> GrantNames {
     }
 }
 
+/// The local hosting evidence for the test grant's machine.
+fn hosts() -> std::collections::BTreeSet<[u8; 32]> {
+    std::collections::BTreeSet::from([[0x33; 32]])
+}
+
 fn typed(payload: Vec<u8>) -> DmTypedPayload {
     DmTypedPayload {
         sender: AgentId([0x44; 32]),
@@ -198,6 +203,7 @@ async fn v2_delivery_stores_grant_and_applies_defaults_for_a_trusted_owner() {
         &names,
         None,
         |_| async { true },
+        |_| async { hosts() },
         typed(payload.clone()),
     )
     .await
@@ -225,6 +231,7 @@ async fn v2_delivery_stores_grant_and_applies_defaults_for_a_trusted_owner() {
         &names,
         None,
         |_| async { true },
+        |_| async { hosts() },
         typed(payload),
     )
     .await
@@ -258,6 +265,7 @@ async fn v2_delivery_from_a_stranger_only_suggests() {
         &names,
         None,
         |_| async { false },
+        |_| async { hosts() },
         typed(payload),
     )
     .await
@@ -303,6 +311,7 @@ async fn own_grants_skip_names_and_a_bad_signature_refuses_the_envelope() {
         &names,
         Some(owner.user_id()),
         |_| async { true },
+        |_| async { hosts() },
         typed(envelope.to_dm_payload().expect("encode")),
     )
     .await
@@ -328,6 +337,7 @@ async fn own_grants_skip_names_and_a_bad_signature_refuses_the_envelope() {
         &names,
         None,
         |_| async { true },
+        |_| async { hosts() },
         typed(tampered.to_dm_payload().expect("encode")),
     )
     .await
@@ -541,4 +551,228 @@ async fn a_v2_flag_without_an_envelope_fails_only_that_recipient() {
         .find(|d| d.agent == hex::encode(shared.as_bytes()))
         .expect("shared row");
     assert!(shared_delivery.delivered);
+}
+
+/// WHY (#1826 review, MEDIUM 1): a name store that failed to load fails
+/// every write until names.json is repaired. If that withheld the ACK, the
+/// sender would retry forever. The grant is stored and ACKed; the names are
+/// skipped.
+#[tokio::test]
+async fn unloadable_name_store_acks_the_grant_and_skips_names() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("names.json");
+    std::fs::write(&path, b"{ not json").expect("write corrupt names.json");
+    let names = NameStore::load(path).await;
+    assert!(
+        names.load_error().is_some(),
+        "control: the store must not load"
+    );
+
+    let owner = UserKeypair::generate().expect("owner key");
+    let grantee = AgentId([0x44; 32]);
+    let store = ShareGrantStore::in_memory(grantee, None);
+    let envelope =
+        ShareGrantV2::sign(&owner, grant_for(&owner, grantee), names_section()).expect("sign");
+    let outcome = handle_share_grant_v2_dm(
+        Some(&store),
+        None,
+        &names,
+        None,
+        |_| async { true },
+        |_| async { hosts() },
+        typed(envelope.to_dm_payload().expect("encode")),
+    )
+    .await
+    .expect("grant ACKed although the name store is unusable");
+    assert_eq!(outcome, DmTypedPayloadCompletion::Inserted);
+    assert_eq!(
+        store.grants(crate::share_grant::GrantRole::Received).len(),
+        1,
+        "the grant is stored"
+    );
+}
+
+/// WHY (#1826 review, LOW): a name-store WRITE failure withholds the ACK,
+/// and the sender's replay of the same bytes is a grant `Duplicate` that
+/// applies the names once the store can write again.
+#[tokio::test]
+async fn name_store_write_failure_then_replay_is_duplicate_with_names_applied() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Load while the parent directory is missing (an empty store), then
+    // put a regular file where the parent should be: the write fails for
+    // any user, root included.
+    let blocker = dir.path().join("blocker");
+    let names = NameStore::load(blocker.join("names.json")).await;
+    assert!(names.load_error().is_none(), "a missing file loads empty");
+    std::fs::write(&blocker, b"not a directory").expect("write blocker");
+
+    let owner = UserKeypair::generate().expect("owner key");
+    let grantee = AgentId([0x44; 32]);
+    let store = ShareGrantStore::in_memory(grantee, None);
+    let envelope =
+        ShareGrantV2::sign(&owner, grant_for(&owner, grantee), names_section()).expect("sign");
+    let payload = envelope.to_dm_payload().expect("encode");
+
+    let err = handle_share_grant_v2_dm(
+        Some(&store),
+        None,
+        &names,
+        None,
+        |_| async { true },
+        |_| async { hosts() },
+        typed(payload.clone()),
+    )
+    .await
+    .expect_err("a name-store write failure withholds the ACK");
+    assert!(err.contains("not durable"), "{err}");
+    assert_eq!(
+        store.grants(crate::share_grant::GrantRole::Received).len(),
+        1,
+        "the grant itself is stored before the names"
+    );
+
+    std::fs::remove_file(&blocker).expect("remove blocker");
+    std::fs::create_dir(&blocker).expect("create the store directory");
+    let outcome = handle_share_grant_v2_dm(
+        Some(&store),
+        None,
+        &names,
+        None,
+        |_| async { true },
+        |_| async { hosts() },
+        typed(payload),
+    )
+    .await
+    .expect("replay ACKed");
+    assert_eq!(outcome, DmTypedPayloadCompletion::Duplicate);
+    assert!(
+        names
+            .owner("bob-smith")
+            .await
+            .expect("store usable")
+            .is_some(),
+        "the replay applies the owner name"
+    );
+    assert!(
+        names
+            .get_pin("machine:studio-mac.bob-smith")
+            .await
+            .expect("store usable")
+            .is_some(),
+        "the replay applies the machine name"
+    );
+}
+
+/// WHY (#1826 review, LOW): a revoked grant on the v2 path is refused and
+/// not stored, and no names are applied.
+#[tokio::test]
+async fn revoked_grant_on_the_v2_path_is_refused() {
+    use crate::revocation::{
+        RevocationRecord, RevocationSet, RevokedSubject, ShareGrantRevocation,
+    };
+    let owner = UserKeypair::generate().expect("owner key");
+    let grantee = AgentId([0x44; 32]);
+    let store = ShareGrantStore::in_memory(grantee, None);
+    let names = NameStore::in_memory();
+    let grant = grant_for(&owner, grantee);
+    let record = RevocationRecord::sign(
+        RevokedSubject::ShareGrant(ShareGrantRevocation {
+            grant_id: grant.grant_id,
+            owner: owner.user_id(),
+            grant_expiry: grant.expiry,
+        }),
+        owner.public_key(),
+        owner.secret_key(),
+        now(),
+        None,
+    )
+    .expect("sign revocation");
+    let mut set = RevocationSet::new();
+    set.verify_and_insert(record, None)
+        .expect("insert revocation");
+    let revocations = tokio::sync::RwLock::new(set);
+    let envelope = ShareGrantV2::sign(&owner, grant, names_section()).expect("sign");
+
+    let err = handle_share_grant_v2_dm(
+        Some(&store),
+        Some(&revocations),
+        &names,
+        None,
+        |_| async { true },
+        |_| async { hosts() },
+        typed(envelope.to_dm_payload().expect("encode")),
+    )
+    .await
+    .expect_err("a revoked grant is refused");
+    assert!(err.contains("revoked"), "{err}");
+    assert!(store
+        .grants(crate::share_grant::GrantRole::Received)
+        .is_empty());
+    let (suggestions, _) = names.pending().await.expect("store usable");
+    assert!(
+        names
+            .owner("bob-smith")
+            .await
+            .expect("store usable")
+            .is_none()
+            && suggestions.is_empty(),
+        "a revoked grant applies no names"
+    );
+}
+
+/// WHY (#1826 review, MEDIUM 2): a signed machine-name default is only a
+/// claim. Without local hosting evidence for a granted agent, a trusted
+/// owner's machine default is held as a suggestion, not pinned, so it can
+/// never squat a label on an unrelated machine.
+#[tokio::test]
+async fn machine_default_without_hosting_evidence_is_only_suggested() {
+    let owner = UserKeypair::generate().expect("owner key");
+    let grantee = AgentId([0x44; 32]);
+    let store = ShareGrantStore::in_memory(grantee, None);
+    let names = NameStore::in_memory();
+    let envelope =
+        ShareGrantV2::sign(&owner, grant_for(&owner, grantee), names_section()).expect("sign");
+
+    handle_share_grant_v2_dm(
+        Some(&store),
+        None,
+        &names,
+        None,
+        |_| async { true },
+        |_| async { std::collections::BTreeSet::new() },
+        typed(envelope.to_dm_payload().expect("encode")),
+    )
+    .await
+    .expect("v2 accepted");
+    assert!(
+        names
+            .owner("bob-smith")
+            .await
+            .expect("store usable")
+            .is_some(),
+        "the owner name still applies"
+    );
+    assert!(
+        names
+            .get_pin("machine:studio-mac.bob-smith")
+            .await
+            .expect("store usable")
+            .is_none(),
+        "no pin without hosting evidence"
+    );
+    let (suggestions, _) = names.pending().await.expect("store usable");
+    let held = suggestions
+        .get("bob-smith")
+        .expect("machine held as a suggestion");
+    assert_eq!(
+        held.machines,
+        vec![(MachineId([0x33; 32]), "Studio Mac".to_string())]
+    );
+
+    // The local owner can still confirm it.
+    let applied = names
+        .accept_suggestion("bob-smith", now())
+        .await
+        .expect("accept");
+    assert_eq!(applied.machine_pins, ["machine:studio-mac.bob-smith"]);
 }

@@ -2861,28 +2861,10 @@ pub async fn serve_with_options(
     // the owner-signed names into the name store as ADR-0074 §1 defaults,
     // gated on the owner being a Known or Trusted contact.
     {
-        let grant_agent = Arc::clone(&agent);
         let grant_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
             while let Some(typed) = share_grant_dm_rx.recv().await {
-                if typed
-                    .payload
-                    .starts_with(x0x::share_grant::names::SHARE_GRANT_V2_DM_PREFIX)
-                {
-                    let store = grant_agent.share_grant_store();
-                    let revocations = grant_agent.revocation_set();
-                    let _ = x0x::share_grant::names::handle_share_grant_v2_dm(
-                        store.as_deref(),
-                        Some(&revocations),
-                        &grant_state.names,
-                        grant_agent.user_id(),
-                        |owner| routes::owner_is_known_or_trusted_contact(&grant_state, owner),
-                        typed,
-                    )
-                    .await;
-                } else {
-                    let _ = grant_agent.handle_share_grant_delivery(typed).await;
-                }
+                let _ = dispatch_share_grant_typed(&grant_state, typed).await;
             }
         }));
     }
@@ -3887,6 +3869,38 @@ pub(crate) fn valid_predecessor_relay_typed_dm(payload: &[u8]) -> bool {
         && routes::named_groups::decode_and_verify_v2(bytes).is_ok_and(|(event, _, _)| {
             matches!(event, NamedGroupMetadataEvent::JoinRequestCreated { .. })
         })
+}
+
+/// Route one share-grant typed DM (ADR-0070 §2). A payload with the ADR
+/// 0079 `x0x-sharegrant-v2\0` prefix goes to the names-carrying v2 handler:
+/// the owner-signed names go into the name store as ADR-0074 §1 defaults,
+/// gated on the owner being a Known or Trusted contact and on local hosting
+/// evidence for each machine. Every other payload is a v1 delivery.
+pub(in crate::server) async fn dispatch_share_grant_typed(
+    state: &Arc<AppState>,
+    typed: x0x::dm_inbox::DmTypedPayload,
+) -> x0x::dm_inbox::DmTypedPayloadCompletionResult {
+    if !typed
+        .payload
+        .starts_with(x0x::share_grant::names::SHARE_GRANT_V2_DM_PREFIX)
+    {
+        return state.agent.handle_share_grant_delivery(typed).await;
+    }
+    let store = state.agent.share_grant_store();
+    let revocations = state.agent.revocation_set();
+    x0x::share_grant::names::handle_share_grant_v2_dm(
+        store.as_deref(),
+        Some(&revocations),
+        &state.names,
+        state.agent.user_id(),
+        |owner| routes::owner_is_known_or_trusted_contact(state, owner),
+        |grant| {
+            let agent = Arc::clone(&state.agent);
+            async move { agent.verified_grant_hosts(&grant).await }
+        },
+        typed,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
