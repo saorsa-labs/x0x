@@ -2061,6 +2061,22 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         category: "names",
         request: RequestSpec::None,
     },
+    EndpointDef {
+        method: Method::Post,
+        path: "/names/accept",
+        cli_name: "names accept",
+        description: "Apply a pending grant-names suggestion (ADR 0079)",
+        category: "names",
+        request: RequestSpec::Fields(&[RequestField::body_as("label", true, "LABEL")]),
+    },
+    EndpointDef {
+        method: Method::Delete,
+        path: "/names/suggestions/:label",
+        cli_name: "names dismiss",
+        description: "Drop a pending grant-names suggestion",
+        category: "names",
+        request: RequestSpec::None,
+    },
 ];
 
 /// Find an endpoint by its CLI name.

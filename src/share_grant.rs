@@ -2183,6 +2183,7 @@ pub async fn record_local_share_grant_revocation(
     }
 }
 
+pub mod names;
 pub mod outbox;
 
 #[cfg(test)]

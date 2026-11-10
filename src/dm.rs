@@ -142,6 +142,15 @@ impl CapabilityRegistry {
     /// prefix is registered and ready ([`Self::advertised`]).
     pub const GRANT_REVOCATION_PUSH_V1: u64 = 1 << 15;
 
+    /// ADR 0079: understands the `x0x-sharegrant-v2\0` typed route (the v1
+    /// grant plus an owner-signed names section). Bit 14, the next free bit
+    /// after #1657's `treekem_catchup_refusal_v1` (bit 13). Senders send
+    /// the v2 envelope only to a grantee whose verified advert carries this
+    /// bit; every other grantee gets the unchanged v1 payload, so old peers
+    /// never see the new prefix (their generic inbox would record it as a
+    /// junk DM and release a durable ACK).
+    pub const SHARE_GRANT_NAMES_V1: u64 = 1 << 14;
+
     /// The routes supported by every receiver of this release.
     /// Route-gated bits (`grant_revocation_push_v1`) are NOT here: they are
     /// added per daemon by [`Self::advertised`] from the typed routes the
@@ -163,7 +172,8 @@ impl CapabilityRegistry {
                 | Self::GUI_SHOW_V1
                 | Self::JOIN_PENDING_NOTICE_V1
                 | Self::KEY_REPUBLISH_V1
-                | Self::TREEKEM_CATCHUP_REFUSAL_V1,
+                | Self::TREEKEM_CATCHUP_REFUSAL_V1
+                | Self::SHARE_GRANT_NAMES_V1,
         }
     }
 
@@ -197,6 +207,8 @@ impl CapabilityRegistry {
     pub(crate) fn required_for_payload(payload: &[u8]) -> Option<(u64, &'static str)> {
         if payload.starts_with(crate::share_grant::SHARE_GRANT_DM_PREFIX) {
             Some((Self::SHARE_GRANT_V1, "share_grant_v1"))
+        } else if payload.starts_with(crate::share_grant::names::SHARE_GRANT_V2_DM_PREFIX) {
+            Some((Self::SHARE_GRANT_NAMES_V1, "share_grant_names_v1"))
         } else if payload.starts_with(b"X0X-GROUP-PREDECESSOR-RELAY-V1\n") {
             Some((Self::PREDECESSOR_OFFER_V1, "predecessor_offer_v1"))
         } else if payload.starts_with(crate::groups::eviction::EVICTION_HANDOFF_PREFIX) {

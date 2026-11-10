@@ -2867,12 +2867,15 @@ pub async fn serve_with_options(
 
     // ADR-0070 §2: share-grant deliveries. The handler verifies and stores
     // the grant before completing, so the v2 ACK means "stored"; every
-    // refusal withholds it.
+    // refusal withholds it. An ADR 0079 names-carrying envelope (the
+    // `x0x-sharegrant-v2\0` prefix on the same channel) additionally puts
+    // the owner-signed names into the name store as ADR-0074 §1 defaults,
+    // gated on the owner being a Known or Trusted contact.
     {
-        let grant_agent = Arc::clone(&agent);
+        let grant_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
             while let Some(typed) = share_grant_dm_rx.recv().await {
-                let _ = grant_agent.handle_share_grant_delivery(typed).await;
+                let _ = dispatch_share_grant_typed(&grant_state, typed).await;
             }
         }));
     }
@@ -3282,6 +3285,8 @@ pub async fn serve_with_options(
         .route("/names/owners/:label", delete(routes::names_owner_unbind))
         .route("/names/machines", post(routes::names_machine_label))
         .route("/names/pins/:name", delete(routes::names_unpin))
+        .route("/names/accept", post(routes::names_accept))
+        .route("/names/suggestions/:label", delete(routes::names_dismiss))
         // Peer observability (ant-quic 0.27.1/0.27.2 surface)
         .route("/peers/:peer_id/probe", post(probe_peer_handler))
         .route("/peers/:peer_id/health", get(peer_health_handler))
@@ -3893,6 +3898,38 @@ pub(crate) fn valid_predecessor_relay_typed_dm(payload: &[u8]) -> bool {
         })
 }
 
+/// Route one share-grant typed DM (ADR-0070 §2). A payload with the ADR
+/// 0079 `x0x-sharegrant-v2\0` prefix goes to the names-carrying v2 handler:
+/// the owner-signed names go into the name store as ADR-0074 §1 defaults,
+/// gated on the owner being a Known or Trusted contact and on local hosting
+/// evidence for each machine. Every other payload is a v1 delivery.
+pub(in crate::server) async fn dispatch_share_grant_typed(
+    state: &Arc<AppState>,
+    typed: x0x::dm_inbox::DmTypedPayload,
+) -> x0x::dm_inbox::DmTypedPayloadCompletionResult {
+    if !typed
+        .payload
+        .starts_with(x0x::share_grant::names::SHARE_GRANT_V2_DM_PREFIX)
+    {
+        return state.agent.handle_share_grant_delivery(typed).await;
+    }
+    let store = state.agent.share_grant_store();
+    let revocations = state.agent.revocation_set();
+    x0x::share_grant::names::handle_share_grant_v2_dm(
+        store.as_deref(),
+        Some(&revocations),
+        &state.names,
+        state.agent.user_id(),
+        |owner| routes::owner_is_known_or_trusted_contact(state, owner),
+        |grant| {
+            let agent = Arc::clone(&state.agent);
+            async move { agent.verified_grant_hosts(&grant).await }
+        },
+        typed,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn start_dm_inbox_when_gossip_ready(
     agent: Arc<x0x::Agent>,
@@ -3951,6 +3988,14 @@ async fn start_dm_inbox_when_gossip_ready(
         let dm_inbox_config = dm_inbox_config
             .with_durable_typed_payload_route(
                 x0x::share_grant::SHARE_GRANT_DM_PREFIX,
+                share_grant_route_tx.clone(),
+            )
+            // ADR 0079 §1: the names-carrying v2 envelope shares the v1
+            // route channel (one consumer, two prefixes); the handler
+            // branches on the prefix. Durable for the same reason as v1:
+            // the v2 ACK must mean "grant stored and names durable".
+            .with_durable_typed_payload_route(
+                x0x::share_grant::names::SHARE_GRANT_V2_DM_PREFIX,
                 share_grant_route_tx.clone(),
             )
             // ADR 0083 slice 3: durable, not validated. A validator would

@@ -463,6 +463,18 @@ enum NamesSub {
         #[arg(value_name = "NAME")]
         name: String,
     },
+    /// Apply a pending grant-names suggestion (ADR 0079).
+    Accept {
+        /// The suggested owner label (see `x0x names list`).
+        #[arg(value_name = "LABEL")]
+        label: String,
+    },
+    /// Drop a pending grant-names suggestion.
+    Dismiss {
+        /// The suggested owner label.
+        #[arg(value_name = "LABEL")]
+        label: String,
+    },
 }
 
 /// `x0x names owner` sub-actions.
@@ -3461,6 +3473,8 @@ async fn run(
                 }
             },
             NamesSub::Unpin { name } => commands::names::unpin(&client, &name).await,
+            NamesSub::Accept { label } => commands::names::accept(&client, &label).await,
+            NamesSub::Dismiss { label } => commands::names::dismiss(&client, &label).await,
         },
         Commands::Onboard {
             json,

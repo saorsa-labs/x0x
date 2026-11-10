@@ -128,8 +128,8 @@ pub(super) use named_groups::{
     GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE,
 };
 pub(super) use names::{
-    names_list, names_machine_label, names_owner_bind, names_owner_unbind, names_resolve,
-    names_unpin,
+    names_accept, names_dismiss, names_list, names_machine_label, names_owner_bind,
+    names_owner_unbind, names_resolve, names_unpin, owner_is_known_or_trusted_contact,
 };
 pub(super) use network::{
     ack_diagnostics, bootstrap_cache_stats, connectivity_diagnostics, dm_diagnostics,
