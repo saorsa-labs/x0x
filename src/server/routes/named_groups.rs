@@ -45,6 +45,7 @@ pub(in crate::server) use seat_cert_fetch::{
 
 #[cfg(test)]
 mod issue1229_stored_delivery;
+pub(in crate::server) mod join_sequence;
 mod requester_offer;
 pub(in crate::server) use requester_offer::{
     insert_requester_offer_obligation, load_requester_offer_outbox, requester_offer_step,
@@ -53207,6 +53208,7 @@ pub(in crate::server) mod tests {
     mod issue1685_catchup_page_no_progress;
     #[cfg(unix)]
     mod issue1809_secret_file_mode;
+    mod issue1840_sequence;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue646_base_roster_fetch;
@@ -53957,6 +53959,7 @@ pub(in crate::server) mod tests {
             cert_unresolvable_since: StdMutex::new(HashMap::new()),
             pending_b8_compensation: Mutex::new(None),
             pending_listener_admission: Mutex::new(None),
+            join_sequencer: Mutex::new(Default::default()),
             group_metadata_tasks: RwLock::new(HashMap::new()),
             group_card_cache: RwLock::new(HashMap::new()),
             directory_cache: RwLock::new(x0x::groups::DirectoryShardCache::default()),
