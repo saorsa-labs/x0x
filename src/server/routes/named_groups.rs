@@ -9590,11 +9590,11 @@ async fn should_queue_treekem_membership_event(
 /// (`AppState::treekem_event_log`), which `handle_treekem_catchup_request`
 /// serves. It keeps the membership links and (#1623, ADR 0109 §7 (b)) the
 /// state-only links of [`treekem_state_only_link`]. A state-only link is
-/// kept only when this node signed it: the receiver applies a rename, a
-/// role change, an unban or a rejection only from its signer (`actor ==
-/// sender`), so a
-/// relayed copy would be refused, and a released receiver with no #1685
-/// stop would ask for the same page again. Each class has its own
+/// kept only when this node signed it. The receiver applies a rename, a
+/// role change, an unban or a rejection only when the page sender is the
+/// event's `actor` and an Active admin. So a copy relayed by another node
+/// would be refused, and a released receiver with no #1685 stop would ask
+/// for the same page again. Each class has its own
 /// [`TREEKEM_EVENT_LOG_PER_GROUP_CAP`], oldest out first, so state-only
 /// links never evict a membership link that key catch-up needs.
 async fn remember_treekem_membership_event(state: &AppState, event: &NamedGroupMetadataEvent) {
@@ -13603,9 +13603,9 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         .and(response.responder_state_revision);
     let mut events = response.events;
     events.sort_by_key(treekem_catchup_link_sort_key);
-    // #1623: a state-only link (rename, role change, unban) that
-    // could not apply counts too, or a truncated page that serves only
-    // that link would be asked for again for ever.
+    // #1623: a state-only link (rename, role change, unban, join-request
+    // rejection) that could not apply counts too, or a truncated page that
+    // serves only that link would be asked for again for ever.
     let page_served_ahead = events
         .iter()
         .any(|event| treekem_catchup_link_is_ahead(event, cursor_before.0, cursor_before.1));
@@ -19116,35 +19116,40 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             let Some(commit) = commit else {
                 return ApplyMetadataResult::REJECTED;
             };
-            if refuse_unarmed_pre_welcome_page_link(
+            // #1623 (ADR 0109 §2 rule (b)): read once, so the gate and
+            // the no-record branch below decide on the same answer.
+            let pre_welcome_page_link = is_pre_welcome_page_link(
                 state,
                 &resolved_group_key,
                 &info,
                 &event_for_log,
                 &local_agent_hex,
             )
-            .await
-            {
-                return ApplyMetadataResult::REJECTED;
-            }
-            // #1623 (ADR 0109 §2 rule (b)): a pre-Welcome record comes
-            // from an invite, which carries no join request records, and
-            // the state hash does not cover them. So a pre-Welcome node
-            // cannot check "the request is pending" for a page link that
-            // the gate above admitted (the next hash of an armed attested
-            // sequence). It applies that link state-only: the admin
-            // signer check stays, and no request record is made from the
-            // event. A request record that the node does hold keeps the
-            // ordinary step.
-            let no_request_record = !info.join_requests.contains_key(&request_id)
-                && is_pre_welcome_page_link(
+            .await;
+            if pre_welcome_page_link
+                && refuse_unadmitted_pre_welcome_link(
                     state,
-                    &resolved_group_key,
                     &info,
                     &event_for_log,
                     &local_agent_hex,
                 )
-                .await;
+                .await
+            {
+                return ApplyMetadataResult::REJECTED;
+            }
+            // A pre-Welcome record comes from an invite, which carries no
+            // join request records, and the state hash does not cover
+            // them. So a pre-Welcome node cannot check "the request is
+            // pending" for a page link that the gate above admitted (the
+            // next hash of an armed attested sequence). It applies that
+            // link state-only. The page sender must be the event's
+            // `actor` and an Active admin; the commit does not cover
+            // `actor` or `request_id`, and the commit's own signer and
+            // hashes are checked by the apply below. No request record is
+            // made from the event. A request record that the node does
+            // hold keeps the ordinary step.
+            let no_request_record =
+                pre_welcome_page_link && !info.join_requests.contains_key(&request_id);
             let action;
             let mutate: Box<dyn FnOnce(&mut x0x::groups::GroupInfo) + Send + '_> =
                 if no_request_record {
@@ -28520,9 +28525,10 @@ async fn is_pre_welcome_page_link(
 /// catch-up page or the node's own served chain"; the served chain applies
 /// through `apply_link_state_only`, which has its own checks. So only a
 /// page link is gated here ([`is_pre_welcome_page_link`]): gossip and
-/// direct-message copies keep the ordinary apply. A gated link needs [`admit_pre_welcome_state_only_link`]: an armed attested
-/// sequence whose next hash it is, no policy change and no GSS binding
-/// change. Its refusal label goes to `treekem.trace`.
+/// direct-message copies keep the ordinary apply. A gated link needs
+/// [`admit_pre_welcome_state_only_link`]: an armed attested sequence whose
+/// next hash it is, no policy change and no GSS binding change. Its
+/// refusal label goes to `treekem.trace`.
 async fn refuse_unarmed_pre_welcome_page_link(
     state: &AppState,
     group_key: &str,
@@ -28530,9 +28536,18 @@ async fn refuse_unarmed_pre_welcome_page_link(
     event: &NamedGroupMetadataEvent,
     local_agent_hex: &str,
 ) -> bool {
-    if !is_pre_welcome_page_link(state, group_key, info, event, local_agent_hex).await {
-        return false;
-    }
+    is_pre_welcome_page_link(state, group_key, info, event, local_agent_hex).await
+        && refuse_unadmitted_pre_welcome_link(state, info, event, local_agent_hex).await
+}
+
+/// #1623: the admission half of [`refuse_unarmed_pre_welcome_page_link`],
+/// for a caller that already knows `event` is a pre-Welcome page link.
+async fn refuse_unadmitted_pre_welcome_link(
+    state: &AppState,
+    info: &x0x::groups::GroupInfo,
+    event: &NamedGroupMetadataEvent,
+    local_agent_hex: &str,
+) -> bool {
     // These links carry no TreeKEM commit, so the epoch the check keeps is
     // the node's own already.
     let mut scratch = info.clone();

@@ -937,8 +937,8 @@ fn treekem_catchup_cursor_epoch_maps_the_head_binding() {
 }
 
 // #1623 responder slice: the catch-up log keeps and serves the state-only
-// links (rename, role change, unban) that this node signed, next
-// to the membership links. Before it kept only the membership links, so a
+// links (rename, role change, unban, join-request rejection) that this
+// node signed, next to the membership links. Before it kept only the membership links, so a
 // pre-Welcome joiner was never served a rename or a role change in its gap.
 
 /// The cursor the joiner's last page ask to `peer` left from, as the
@@ -1248,8 +1248,9 @@ async fn page_role_removal_rename(log_order: &[usize]) -> anyhow::Result<()> {
 
 /// The log keeps state-only links under their own cap, so they never evict
 /// a membership link. It keeps only the state-only links this node signed
-/// (the receiver applies a rename, a role change or an unban only from its
-/// signer), and a repeat of one link once.
+/// (the receiver applies a rename, a role change, an unban or a rejection
+/// only when the page sender is the event's `actor` and an Active admin),
+/// and a repeat of one link once.
 #[tokio::test]
 async fn state_only_links_keep_their_own_log_cap() -> anyhow::Result<()> {
     let (state, _dir) = secure_endpoint_test_state().await?;
@@ -2125,9 +2126,11 @@ async fn pre_welcome_page_reject_link_obeys_rule_b() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The reject with no request record applies only as a page link from its
-/// signer on a pre-Welcome node. A copy from another admin, a gossip copy
-/// and a copy on a seated node are refused, as before.
+/// The reject with no request record applies only as a page link on a
+/// pre-Welcome node, and only when the page sender is the event's `actor`
+/// and an Active admin. A copy from another admin, a copy that a Member
+/// sends under its own name, a gossip copy and a copy on a seated node are
+/// refused.
 #[tokio::test]
 async fn reject_without_a_request_record_needs_the_signer_and_a_page() -> anyhow::Result<()> {
     let owner = AgentKeypair::generate()?;
@@ -2154,6 +2157,19 @@ async fn reject_without_a_request_record_needs_the_signer_and_a_page() -> anyhow
         head_of(&state, &key).await?.state_hash,
         base.state_hash,
         "a relayed reject is refused"
+    );
+    // A Member is the page sender and the event's `actor`. The commit is
+    // the owner's and does not cover `actor`, so only the role check
+    // refuses this copy.
+    let mut by_member = event.clone();
+    if let NamedGroupMetadataEvent::JoinRequestRejected { actor, .. } = &mut by_member {
+        *actor = agent(PROMOTED);
+    }
+    page(Arc::clone(&state), by_member, AgentId([0x52; 32])).await;
+    assert_eq!(
+        head_of(&state, &key).await?.state_hash,
+        base.state_hash,
+        "a reject that a Member sends under its own name is refused"
     );
     // A gossip or direct-message copy from the signer (no page).
     let _ = apply_named_group_metadata_event(&state, event, owner.agent_id(), true, None).await;
