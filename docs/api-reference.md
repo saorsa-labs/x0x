@@ -951,13 +951,17 @@ body extraction, with a matching handler-side check. The request is:
 
 The target must not be this daemon's own agent. The daemon must be owned and
 must hold the elected canonical Home locally; a losing or remote Home cannot
-mint seats into its duplicate. A successful `200` response has this shape:
+mint seats into its duplicate. The seat mints through the ordinary invite
+authority (`POST /groups/:id/invite`), so a Home with more than 20
+Active+Banned members gets a content-addressed v6 link (#646); the
+20-placement cap still applies. A successful
+`200` response has this shape:
 
 ```json
 {
   "ok": true,
   "group_id": "<canonical Home group id>",
-  "invite": "<signed addressed v4 invite link>",
+  "invite": "<signed addressed v4 or v6 invite link>",
   "intended_joiner": "<requested agent id>",
   "owner_user_id": "<Home OwnerCertified user id>",
   "join_hint": "x0x group join <invite> --home --owner <owner_user_id>",
