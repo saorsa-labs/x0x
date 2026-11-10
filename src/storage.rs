@@ -1087,7 +1087,7 @@ fn expire_merged_v3(store: RevocationStore, merged: &mut RevocationSet) {
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0);
     if now != 0 {
-        merged.expire_records_older_than(crate::SHARE_GRANT_REVOCATIONS_TTL_SECS, now);
+        merged.collect_dead_records(now);
     }
 }
 

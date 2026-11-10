@@ -514,6 +514,11 @@ Before [#1108](https://github.com/saorsa-labs/x0x/issues/1108) the listing
 showed `agent` and `machine` rows only. A client that reads the listing must
 ignore a `subject_kind` it does not know.
 
+A record does not leave the listing because of its age. Agent, machine and
+binding records stay for good. A share-grant record goes when the grant is
+past `grant_expiry` plus the clock allowance. A daemon older than this rule
+removed agent and machine records 90 days after `revoked_at`.
+
 The listing shows signed records only. A binding that a key-move activation
 bundle retired has no record of its own; `GET /agent/moves` counts it in
 `derived.retired_bindings`.

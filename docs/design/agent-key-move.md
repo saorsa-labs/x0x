@@ -420,8 +420,9 @@ tombstone.
 
 ### 7.3 Permanence
 
-`expire_records_older_than` (`src/revocation.rs:398-423`, driven at
-`src/lib.rs:2761`) skips binding records. Permanent, grow-only —
+The heartbeat sweep (`collect_dead_records` in `src/revocation.rs`) never
+removes a binding record. Since #1108 it also keeps agent and machine
+records. Permanent, grow-only —
 ADR-0018's original rule, restored for the subject class where
 resurrection is a security hole. In the derived view this is literal:
 `ActivationBundle` records are never garbage-collected from
