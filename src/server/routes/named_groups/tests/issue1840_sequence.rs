@@ -93,15 +93,20 @@ async fn requester_asks(
     .expect("response");
     assert_eq!(status, StatusCode::CREATED, "request: {body}");
     let request_id = body["request_id"].as_str().expect("request id").to_string();
-    let envelope = offered_envelope(&requester, &request_id).await;
+    let envelope = offered_envelope(&requester, &request_id, None).await;
     (requester, dir, request_id, envelope)
 }
 
 /// The exact `JoinRequestCreated` envelope the requester would offer. The
 /// test agent has no gossip runtime, so the publish in the handler returns no
 /// bytes; the envelope is rebuilt here from the requester's stored request
-/// and the commit it sealed, and signed with the requester's key.
-async fn offered_envelope(requester: &AppState, request_id: &str) -> Vec<u8> {
+/// and the commit it sealed (or `resealed`), and signed with the requester's
+/// key.
+async fn offered_envelope(
+    requester: &AppState,
+    request_id: &str,
+    resealed: Option<x0x::groups::GroupStateCommit>,
+) -> Vec<u8> {
     use base64::Engine as _;
     let groups = requester.named_groups.read().await;
     let stub = groups
@@ -109,12 +114,13 @@ async fn offered_envelope(requester: &AppState, request_id: &str) -> Vec<u8> {
         .find(|info| info.join_requests.contains_key(request_id))
         .expect("the requester stored its request");
     let request = &stub.join_requests[request_id];
-    let commit = stub
-        .commit_log
-        .last()
-        .expect("sealed commit")
-        .commit
-        .clone();
+    let commit = resealed.unwrap_or_else(|| {
+        stub.commit_log
+            .last()
+            .expect("sealed commit")
+            .commit
+            .clone()
+    });
     let event = NamedGroupMetadataEvent::JoinRequestCreated {
         group_id: stub.stable_group_id().to_string(),
         request_id: request.request_id.clone(),
@@ -183,16 +189,42 @@ async fn approve(owner: &Arc<AppState>, key: &str, request_id: &str) -> StatusCo
 
 type Asked = (Arc<AppState>, tempfile::TempDir, String, Vec<u8>);
 
+/// TEST-ONLY seal of a join request over the authority's current head, read
+/// straight from the authority's record. It stands in for slice 2: there the
+/// turn holder is told the head and a production seal, with its own checks,
+/// signs. A pending request is not in the state hash, so the link repeats
+/// the head's hash inputs at the next revision.
+fn seal_request_over_authority_head(
+    head: &x0x::groups::GroupInfo,
+    requester: &AppState,
+) -> x0x::groups::GroupStateCommit {
+    x0x::groups::GroupStateCommit::sign(
+        head.stable_group_id().to_string(),
+        head.state_revision + 1,
+        Some(head.state_hash.clone()),
+        x0x::groups::state_commit::compute_roster_root(&head.members_v2),
+        x0x::groups::state_commit::compute_policy_hash(&head.policy),
+        x0x::groups::state_commit::compute_public_meta_hash(&head.public_meta()),
+        head.security_binding.clone(),
+        false,
+        now_millis_u64(),
+        requester.agent.identity().agent_keypair(),
+    )
+    .expect("sign the request link")
+}
+
 /// The only code in this file that uses the #1840 sequencer. For the RED
-/// run on origin/main these three bodies are empty (main has no sequencer).
+/// run on origin/main these bodies are empty (main has no sequencer).
 mod sequencer {
     use super::*;
-    use crate::server::routes::named_groups::join_sequence::{next_turn, JOIN_SEQUENCE_TURN_MS};
+    use crate::server::routes::named_groups::join_sequence::{
+        note_refused_request, turn_on, JOIN_SEQUENCE_TURN_MS,
+    };
 
-    /// Do what the turn DM will do: while a requester holds the turn, give
-    /// it the head, let it seal the SAME request again and offer it. A
-    /// holder that is not in `online` does nothing; its turn runs out.
-    /// Returns the turn holders in order and the clock at the end.
+    /// Do what the turn DM will do: while a requester holds the turn, let
+    /// it seal the SAME request again over the authority's head and offer
+    /// it. A holder that is not in `online` does nothing; its turn runs
+    /// out. Returns the turn holders in order and the clock at the end.
     pub(super) async fn drive_turns(
         owner: &Arc<AppState>,
         key: &str,
@@ -201,8 +233,15 @@ mod sequencer {
     ) -> (Vec<String>, u64) {
         let mut holders = Vec::new();
         for _ in 0..32 {
-            let Some(turn) = next_turn(owner, key, now_ms).await else {
-                break;
+            let (turn, head) = {
+                let groups = owner.named_groups.read().await;
+                let info = groups.get(key).expect("group");
+                let mut queue = owner.join_sequencer.lock().await;
+                let Some(turn) = turn_on(&mut queue, info, key, now_ms) else {
+                    break;
+                };
+                assert_eq!(turn.head_revision, info.state_revision);
+                (turn, info.clone())
             };
             let holder = turn.request.requester_agent_id.clone();
             if holders.last() != Some(&holder) {
@@ -218,19 +257,15 @@ mod sequencer {
                 &turn.request.request_id, request_id,
                 "the turn names the request"
             );
-            requester
-                .named_groups
-                .write()
-                .await
-                .get_mut(key)
-                .expect("stub")
-                .seal_join_request_over_head(
-                    &turn.head,
-                    requester.agent.identity().agent_keypair(),
-                    now_millis_u64(),
-                )
-                .expect("seal over the told head");
-            let envelope = offered_envelope(requester, request_id).await;
+            let commit = seal_request_over_authority_head(&head, requester);
+            {
+                let mut groups = requester.named_groups.write().await;
+                let stub = groups.get_mut(key).expect("stub");
+                stub.state_revision = commit.revision;
+                stub.prev_state_hash = commit.prev_state_hash.clone();
+                stub.state_hash = commit.state_hash.clone();
+            }
+            let envelope = offered_envelope(requester, request_id, Some(commit)).await;
             offer(owner, requester, &envelope).await;
         }
         (holders, now_ms)
@@ -243,6 +278,17 @@ mod sequencer {
     /// A daemon restart: the in-memory queue is gone.
     pub(super) async fn forget_queue(owner: &AppState) {
         *owner.join_sequencer.lock().await = Default::default();
+    }
+
+    /// What the listener calls after a refusal with no roster write.
+    /// Returns the number of waiting entries afterwards.
+    pub(super) async fn refused(
+        owner: &AppState,
+        key: &str,
+        event: &NamedGroupMetadataEvent,
+    ) -> usize {
+        note_refused_request(owner, key, event, now_millis_u64()).await;
+        waiting(owner).await
     }
 }
 
@@ -342,13 +388,11 @@ async fn issue1840_missed_turn_does_not_block_and_leaves_nothing_durable() {
         asked.push(requester_asks(&card).await);
     }
     // Only the silent requester first: the queue alone must write nothing.
-    offer(&owner, &asked[1].0, &asked[1].3).await;
+    // The baseline is read BEFORE the first refused offer.
     let roster_before = tokio::fs::read(&owner.named_groups_path)
         .await
         .expect("roster");
-    let sidecar_before = tokio::fs::read(&owner.predecessor_relay_outbox_path)
-        .await
-        .ok();
+    offer(&owner, &asked[1].0, &asked[1].3).await;
     offer(&owner, &asked[1].0, &asked[1].3).await;
     assert_eq!(
         sequencer::waiting(&owner).await,
@@ -363,7 +407,7 @@ async fn issue1840_missed_turn_does_not_block_and_leaves_nothing_durable() {
         "a waiting entry writes no roster state"
     );
     assert!(listener_journal_is_free(&owner).await);
-    restart_relay_is_clean(&owner, sidecar_before).await;
+    restart_relay_is_clean(&owner, &[&asked[1].2, &agent_hex(&asked[1].0)]).await;
 
     offer(&owner, &asked[0].0, &asked[0].3).await;
     offer(&owner, &asked[2].0, &asked[2].3).await;
@@ -390,15 +434,20 @@ async fn issue1840_missed_turn_does_not_block_and_leaves_nothing_durable() {
         .contains(&asked[1].2));
 }
 
-/// The relay sidecar holds no trace of a waiting entry, and startup is clean.
-async fn restart_relay_is_clean(owner: &Arc<AppState>, sidecar_before: Option<Vec<u8>>) {
-    assert_eq!(
-        tokio::fs::read(&owner.predecessor_relay_outbox_path)
-            .await
-            .ok(),
-        sidecar_before,
-        "a waiting entry writes no sidecar state"
-    );
+/// The relay sidecar holds no trace of a waiting entry, and startup is
+/// clean. (The #1842 refusal itself writes the sidecar, to release the
+/// journal marker, so the file is searched and not compared byte for byte.)
+async fn restart_relay_is_clean(owner: &Arc<AppState>, absent: &[&str]) {
+    let sidecar = tokio::fs::read(&owner.predecessor_relay_outbox_path)
+        .await
+        .unwrap_or_default();
+    let sidecar = String::from_utf8_lossy(&sidecar);
+    for needle in absent {
+        assert!(
+            !sidecar.contains(needle),
+            "a waiting entry writes no sidecar state"
+        );
+    }
     load_predecessor_relay_outbox(owner)
         .await
         .expect("startup with a waiting requester is clean");
@@ -504,5 +553,101 @@ async fn issue1840_r1_approved_requester_with_partial_stub_cannot_apply_the_appr
                 "a partial stub refuses the approval with a state hash mismatch"
             );
         }
+    }
+}
+
+/// Only a request that is still admissible, and whose commit the validator
+/// refuses for the head it was sealed over, is queued. Every terminal
+/// refusal, every other validator refusal and an over-long request id are
+/// not queued.
+#[tokio::test]
+async fn issue1840_only_head_refusals_are_queued() {
+    let (owner, _o) = secure_endpoint_test_state().await.expect("owner state");
+    let key = install_authority_group(&owner, b"1840-seq-class", 1).await;
+    let asked = requester_asks(&authority_card(&owner, &key).await).await;
+    let requester_hex = agent_hex(&asked.0);
+    let (request, commit) = {
+        let groups = asked.0.named_groups.read().await;
+        let stub = groups.get(&key).expect("stub");
+        (
+            stub.join_requests[&asked.2].clone(),
+            stub.commit_log.last().expect("commit").commit.clone(),
+        )
+    };
+    let event_with = |request_id: &str, commit: Option<x0x::groups::GroupStateCommit>| {
+        NamedGroupMetadataEvent::JoinRequestCreated {
+            group_id: key.clone(),
+            request_id: request_id.to_string(),
+            requester_agent_id: requester_hex.clone(),
+            message: None,
+            ts: request.created_at,
+            requester_kem_public_key_b64: None,
+            treekem_key_package_b64: None,
+            commit,
+        }
+    };
+    let base = owner
+        .named_groups
+        .read()
+        .await
+        .get(&key)
+        .expect("group")
+        .clone();
+    let owner_hex = agent_hex(&owner);
+
+    // Control: the stub-sealed commit is refused for its head and is queued.
+    let good = event_with(&asked.2, Some(commit.clone()));
+    assert_eq!(sequencer::refused(&owner, &key, &good).await, 1);
+    sequencer::forget_queue(&owner).await;
+
+    let mut member = base.clone();
+    member.add_member(
+        requester_hex.clone(),
+        x0x::groups::GroupRole::Member,
+        Some(owner_hex.clone()),
+        None,
+    );
+    let mut banned = base.clone();
+    banned.ban_member(&requester_hex, Some(owner_hex.clone()));
+    let mut pending = base.clone();
+    let mut other = request.clone();
+    other.request_id = "another-pending-request".to_string();
+    pending
+        .join_requests
+        .insert(other.request_id.clone(), other);
+    let mut used = base.clone();
+    let mut rejected = request.clone();
+    rejected.status = x0x::groups::JoinRequestStatus::Rejected;
+    used.join_requests
+        .insert(rejected.request_id.clone(), rejected);
+    let mut invite_only = base.clone();
+    invite_only.policy = x0x::groups::GroupPolicyPreset::PrivateSecure.to_policy();
+    for (case, info) in [
+        ("member", member),
+        ("banned", banned),
+        ("pending request", pending),
+        ("used request id", used),
+        ("not request-access", invite_only),
+    ] {
+        owner.named_groups.write().await.insert(key.clone(), info);
+        assert_eq!(sequencer::refused(&owner, &key, &good).await, 0, "{case}");
+    }
+    owner.named_groups.write().await.insert(key.clone(), base);
+
+    let mut wrong_group = commit.clone();
+    wrong_group.group_id = "ff".repeat(32);
+    let mut bad_signature = commit.clone();
+    bad_signature.committed_at += 1;
+    let long_id = "r".repeat(129);
+    for (case, event) in [
+        ("no commit", event_with(&asked.2, None)),
+        ("group id mismatch", event_with(&asked.2, Some(wrong_group))),
+        ("bad signature", event_with(&asked.2, Some(bad_signature))),
+        (
+            "request id over the cap",
+            event_with(&long_id, Some(commit.clone())),
+        ),
+    ] {
+        assert_eq!(sequencer::refused(&owner, &key, &event).await, 0, "{case}");
     }
 }

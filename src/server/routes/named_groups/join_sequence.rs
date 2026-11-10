@@ -10,8 +10,10 @@
 //! This module fixes the ORDER of those requesters. The authority (the group
 //! creator, the only node that admits request offers) keeps a bounded queue.
 //! Order is the order of arrival of the first refused offer. One requester
-//! per group holds the turn; it is the one to be told the head
-//! ([`ChainHead`]) so that it can seal again.
+//! per group holds the turn; it is the one to be told the head so that it
+//! can seal again. This slice does not tell it: the daemon only records and
+//! logs the order. There is no timer; the queue moves when a refused offer
+//! arrives.
 //!
 //! The queue is a hint and never authority. It applies nothing, signs
 //! nothing and writes nothing durable. The ADR 0028 single-slot admission
@@ -20,8 +22,10 @@
 //! requester's durable offer obligation offers the request again and the
 //! queue is rebuilt in the order of those re-offers.
 
-use super::{AppState, NamedGroupMetadataEvent, CAUSAL_APPROVAL_RETENTION_MS};
-use crate::groups::state_commit::ChainHead;
+use super::{
+    apply_stateful_event_to_group, AppState, NamedGroupMetadataEvent, CAUSAL_APPROVAL_RETENTION_MS,
+};
+use crate::groups::state_commit::{ActionKind, ApplyError, GroupStateCommit};
 
 /// Waiting requesters per group. A full queue takes no new entry.
 pub(in crate::server) const JOIN_SEQUENCE_PER_GROUP_CAP: usize = 16;
@@ -33,6 +37,8 @@ pub(in crate::server) const JOIN_SEQUENCE_ENTRY_TTL_MS: u64 = CAUSAL_APPROVAL_RE
 pub(in crate::server) const JOIN_SEQUENCE_TURN_MS: u64 = 30_000;
 /// A requester that misses more turns than this is dropped.
 pub(in crate::server) const JOIN_SEQUENCE_MAX_MISSED_TURNS: u8 = 2;
+/// A request with a longer id is not queued (the id is stored per entry).
+pub(in crate::server) const JOIN_SEQUENCE_REQUEST_ID_MAX_BYTES: usize = 128;
 
 /// One requester that waits for its turn on one group.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,10 +78,29 @@ impl JoinSequencer {
         seq
     }
 
+    /// Drop the entries of `group_id` that are expired or `resolved` (the
+    /// request applied, or it can no longer be admitted). An expired entry
+    /// of another group goes on the next [`Self::enqueue`].
+    fn prune(
+        &mut self,
+        group_id: &str,
+        now_ms: u64,
+        mut resolved: impl FnMut(&WaitingRequest) -> bool,
+    ) {
+        self.waiting.retain(|w| {
+            w.group_id != group_id
+                || (now_ms < w.first_seen_ms.saturating_add(JOIN_SEQUENCE_ENTRY_TTL_MS)
+                    && !resolved(w))
+        });
+    }
+
     /// Record a refused request. One entry per (group, requester): a later
-    /// request id from the same requester takes over the entry and keeps
-    /// its position, so a requester can not get a second slot or a better
-    /// place by asking again.
+    /// request id from the same requester takes over the entry. It keeps
+    /// the position (`seq`) and the first-arrival time, so asking again
+    /// gives no second slot, no better place and no longer stay. The turn
+    /// state starts again, because the new request was never offered a
+    /// turn. The caller prunes resolved entries first, so an entry whose
+    /// request was applied is never taken over.
     pub(in crate::server) fn enqueue(
         &mut self,
         group_id: &str,
@@ -90,7 +115,11 @@ impl JoinSequencer {
             .iter_mut()
             .find(|w| w.group_id == group_id && w.requester_agent_id == requester_agent_id)
         {
-            entry.request_id = request_id.to_string();
+            if entry.request_id != request_id {
+                entry.request_id = request_id.to_string();
+                entry.turn_started_ms = None;
+                entry.missed_turns = 0;
+            }
             return Enqueued::AlreadyQueued;
         }
         let in_group = self
@@ -117,23 +146,18 @@ impl JoinSequencer {
     }
 
     /// The requester whose turn it is on `group_id`: the entry with the
-    /// lowest `seq`. Entries that are expired, or for which `resolved` is
-    /// true (the request applied, or it can no longer be admitted), are
-    /// dropped first. A holder that kept the turn for
+    /// lowest `seq`, after [`Self::prune`]. A holder that kept the turn for
     /// [`JOIN_SEQUENCE_TURN_MS`] without being resolved goes to the back,
     /// and is dropped after [`JOIN_SEQUENCE_MAX_MISSED_TURNS`] misses, so
-    /// one requester can not hold the head of the line.
+    /// one requester can not hold the head of the line. Time passes only
+    /// when this is called; there is no timer.
     pub(in crate::server) fn turn(
         &mut self,
         group_id: &str,
         now_ms: u64,
-        mut resolved: impl FnMut(&WaitingRequest) -> bool,
+        resolved: impl FnMut(&WaitingRequest) -> bool,
     ) -> Option<WaitingRequest> {
-        self.waiting.retain(|w| {
-            w.group_id != group_id
-                || (now_ms < w.first_seen_ms.saturating_add(JOIN_SEQUENCE_ENTRY_TTL_MS)
-                    && !resolved(w))
-        });
+        self.prune(group_id, now_ms, resolved);
         loop {
             let index = self
                 .waiting
@@ -189,11 +213,10 @@ impl JoinSequencer {
     }
 }
 
-/// Whether a refused request from `requester_agent_id` can still be admitted
-/// once it is sealed over the right head. False for every terminal refusal
-/// (policy, member, banned, a pending request, a used request id): those do
-/// not wait for a turn.
-fn request_waits_for_a_turn(
+/// Whether `requester_agent_id` can still be admitted on `info` with a
+/// request `request_id`. False for every terminal state (policy, member,
+/// banned, a pending request, a used request id).
+fn request_is_admissible(
     info: &crate::groups::GroupInfo,
     requester_agent_id: &str,
     request_id: &str,
@@ -209,80 +232,94 @@ fn request_waits_for_a_turn(
             .any(|r| r.requester_agent_id == requester_agent_id && r.is_pending())
 }
 
-/// The requester whose turn it is, with the head it must seal over.
+/// Whether the validator refuses `commit` on `info` ONLY because of the
+/// head it was sealed over: a used revision, an old previous hash, or hash
+/// inputs that are not the authority's. This runs the same read-only
+/// validation as the apply (a pending request is not in the state hash, so
+/// no mutation is needed). A bad signature, a wrong group id, an
+/// unauthorized signer and every other refusal are not this class.
+fn refused_for_its_head(info: &crate::groups::GroupInfo, commit: &GroupStateCommit) -> bool {
+    matches!(
+        apply_stateful_event_to_group(info, commit, ActionKind::NonMemberRequest, |_| {}),
+        Err(ApplyError::StaleRevision { .. }
+            | ApplyError::PrevHashMismatch { .. }
+            | ApplyError::StateHashMismatch { .. })
+    )
+}
+
+/// The requester whose turn it is, with the revision of the head it must
+/// seal over.
 #[derive(Debug, Clone)]
 pub(in crate::server) struct JoinTurn {
     pub(in crate::server) request: WaitingRequest,
-    pub(in crate::server) head: ChainHead,
+    pub(in crate::server) head_revision: u64,
 }
 
-/// The current turn on `group_key`, or `None` when nobody waits.
-pub(in crate::server) async fn next_turn(
-    state: &AppState,
+/// The current turn on `group_key`, read under the caller's locks.
+pub(in crate::server) fn turn_on(
+    sequencer: &mut JoinSequencer,
+    info: &crate::groups::GroupInfo,
     group_key: &str,
     now_ms: u64,
 ) -> Option<JoinTurn> {
-    let groups = state.named_groups.read().await;
-    let info = groups.get(group_key)?;
-    let mut sequencer = state.join_sequencer.lock().await;
     let request = sequencer.turn(group_key, now_ms, |w| {
-        !request_waits_for_a_turn(info, &w.requester_agent_id, &w.request_id)
+        !request_is_admissible(info, &w.requester_agent_id, &w.request_id)
     })?;
     Some(JoinTurn {
         request,
-        head: info.chain_head(),
+        head_revision: info.state_revision,
     })
 }
 
 /// The authority's listener refused `event` by validation, with no roster
-/// write (#1842). If the only thing wrong is the head the requester sealed
-/// over, the requester joins the queue. Nothing durable changes here.
+/// write (#1842). The requester joins the queue only when the request is
+/// still admissible and the commit was refused for its head
+/// ([`refused_for_its_head`]). Nothing durable changes here. Returns the
+/// current turn on the group, if any.
 pub(in crate::server) async fn note_refused_request(
     state: &AppState,
     group_key: &str,
     event: &NamedGroupMetadataEvent,
     now_ms: u64,
-) {
+) -> Option<JoinTurn> {
     let NamedGroupMetadataEvent::JoinRequestCreated {
         request_id,
         requester_agent_id,
-        commit: Some(_),
+        commit: Some(commit),
         ..
     } = event
     else {
-        return;
+        return None;
     };
-    let waits = state
-        .named_groups
-        .read()
-        .await
-        .get(group_key)
-        .is_some_and(|info| request_waits_for_a_turn(info, requester_agent_id, request_id));
-    if !waits {
-        return;
+    let groups = state.named_groups.read().await;
+    let info = groups.get(group_key)?;
+    let mut sequencer = state.join_sequencer.lock().await;
+    // Resolved entries go first, so an applied request's entry is dropped
+    // and never taken over by a later request of the same requester.
+    sequencer.prune(group_key, now_ms, |w| {
+        !request_is_admissible(info, &w.requester_agent_id, &w.request_id)
+    });
+    let waits = request_id.len() <= JOIN_SEQUENCE_REQUEST_ID_MAX_BYTES
+        && request_is_admissible(info, requester_agent_id, request_id)
+        && refused_for_its_head(info, commit);
+    let enqueued =
+        waits.then(|| sequencer.enqueue(group_key, request_id, requester_agent_id, now_ms));
+    let position = sequencer.position(group_key, requester_agent_id);
+    let turn = turn_on(&mut sequencer, info, group_key, now_ms);
+    if enqueued.is_some() {
+        tracing::info!(
+            group_id = %group_key,
+            requester = %requester_agent_id,
+            outcome = "waiting",
+            ?enqueued,
+            ?position,
+            waiting = sequencer.len(),
+            turn_holder = turn.as_ref().map(|t| t.request.requester_agent_id.as_str()),
+            head_revision = turn.as_ref().map(|t| t.head_revision),
+            "issue 1840: join request refused for the head it was sealed over; requester waits for its turn"
+        );
     }
-    let (enqueued, position, waiting) = {
-        let mut sequencer = state.join_sequencer.lock().await;
-        let enqueued = sequencer.enqueue(group_key, request_id, requester_agent_id, now_ms);
-        (
-            enqueued,
-            sequencer.position(group_key, requester_agent_id),
-            sequencer.len(),
-        )
-    };
-    let turn = next_turn(state, group_key, now_ms).await;
-    tracing::info!(
-        group_id = %group_key,
-        request_id = %request_id,
-        requester = %requester_agent_id,
-        outcome = "waiting",
-        ?enqueued,
-        ?position,
-        waiting,
-        turn_holder = turn.as_ref().map(|t| t.request.requester_agent_id.as_str()),
-        head_revision = turn.as_ref().map(|t| t.head.revision),
-        "issue 1840: join request sealed over a partial or used head; requester waits for its turn"
-    );
+    turn
 }
 
 #[cfg(test)]
@@ -318,6 +355,53 @@ mod tests {
         }
         assert_eq!(order, ["c", "a", "b"]);
         assert_eq!(s.len(), 0);
+    }
+
+    #[test]
+    fn issue1840_new_request_id_keeps_place_and_restarts_the_turn() {
+        let mut s = JoinSequencer::default();
+        for who in ["a", "b"] {
+            enqueue(&mut s, "g", who, 0);
+        }
+        assert_eq!(holder(&mut s, "g", 0).as_deref(), Some("a"));
+        // "a" asks again just before its turn runs out. It keeps the place,
+        // and the new request gets a full turn with no miss counted.
+        let late = JOIN_SEQUENCE_TURN_MS - 1;
+        assert_eq!(
+            s.enqueue("g", "req-a-2", "a", late),
+            Enqueued::AlreadyQueued
+        );
+        assert_eq!(s.position("g", "a"), Some(1));
+        let turn = s.turn("g", JOIN_SEQUENCE_TURN_MS + 1, |_| false);
+        assert_eq!(
+            turn.as_ref().map(|w| w.request_id.as_str()),
+            Some("req-a-2")
+        );
+        assert_eq!(turn.map(|w| w.missed_turns), Some(0));
+        // The same request id again changes nothing.
+        assert_eq!(
+            s.enqueue("g", "req-a-2", "a", late),
+            Enqueued::AlreadyQueued
+        );
+        assert_eq!(
+            holder(&mut s, "g", 2 * JOIN_SEQUENCE_TURN_MS + 1).as_deref(),
+            Some("b"),
+            "the turn of the new request also runs out"
+        );
+    }
+
+    #[test]
+    fn issue1840_resolved_entry_is_dropped_and_not_reused() {
+        let mut s = JoinSequencer::default();
+        for who in ["a", "b"] {
+            enqueue(&mut s, "g", who, 0);
+        }
+        s.prune("g", 1, |w| w.requester_agent_id == "a");
+        assert_eq!(s.position("g", "a"), None);
+        // "a" asks again later: a new entry at the back, with a new clock.
+        assert_eq!(s.enqueue("g", "req-a-2", "a", 5), Enqueued::Queued);
+        assert_eq!(s.position("g", "b"), Some(1));
+        assert_eq!(s.position("g", "a"), Some(2));
     }
 
     #[test]

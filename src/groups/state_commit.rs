@@ -467,48 +467,6 @@ pub fn compute_state_hash(
     blake3_hex(&buf)
 }
 
-/// One chain head as its hash inputs (issue #1840).
-///
-/// A join requester is not a member. It does not hold the roster, so it can
-/// not compute `roster_root` or know `security_binding`. The sequencing
-/// authority gives the requester whose turn it is this value, and the
-/// requester seals its `JoinRequestCreated` commit over it
-/// ([`GroupInfo::seal_join_request_over_head`](super::GroupInfo::seal_join_request_over_head)).
-/// It holds hashes only: no member id and no role. Every signed commit
-/// already carries the same inputs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ChainHead {
-    pub revision: u64,
-    pub state_hash: String,
-    #[serde(default)]
-    pub prev_state_hash: Option<String>,
-    pub roster_root: String,
-    pub policy_hash: String,
-    pub public_meta_hash: String,
-    #[serde(default)]
-    pub security_binding: Option<String>,
-}
-
-impl ChainHead {
-    /// Whether the inputs hash to `state_hash` for a live (not withdrawn)
-    /// group. A head that fails this check must not be sealed over.
-    #[must_use]
-    pub fn is_consistent(&self, group_id: &str) -> bool {
-        !self.state_hash.is_empty()
-            && self.state_hash
-                == compute_state_hash(
-                    group_id,
-                    self.revision,
-                    self.prev_state_hash.as_deref(),
-                    &self.roster_root,
-                    &self.policy_hash,
-                    &self.public_meta_hash,
-                    self.security_binding.as_deref(),
-                    false,
-                )
-    }
-}
-
 fn push_len_prefixed(buf: &mut Vec<u8>, bytes: &[u8]) {
     buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
     buf.extend_from_slice(bytes);

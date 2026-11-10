@@ -4962,6 +4962,8 @@ async fn handle_predecessor_relay_typed_payload_inner(
                     );
                     // Issue #1840: a requester that sealed over a partial
                     // or used head waits for its turn, in arrival order.
+                    // The queue needs no journal lock.
+                    drop(_journal_guard);
                     crate::server::routes::named_groups::join_sequence::note_refused_request(
                         relay_state,
                         &group_id_str,
