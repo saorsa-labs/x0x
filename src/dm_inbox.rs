@@ -492,6 +492,19 @@ pub struct AuthenticatedMachineBindingCache {
     clock: u64,
     /// ADR-0074 §4: wake open-stream reauth after a retained-machine change.
     change_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// #901: roster members that had no retained binding at a roster
+    /// resolve. Counts resolve-time misses, not distinct agents. Internal;
+    /// the debug line in [`Self::note_roster_misses`] reports it.
+    roster_members_without_binding: u64,
+    /// #901: the part of [`Self::roster_members_without_binding`] where
+    /// this cache still attributes a machine to the agent, so the capacity
+    /// bound dropped the retained binding.
+    roster_members_evicted: u64,
+    /// Last roster-miss debug line, monotonic milliseconds.
+    roster_miss_log_ms: u64,
+    /// Test seam (#901): binding-resolve write-lock acquisitions.
+    #[cfg(test)]
+    resolve_lock_takes: u64,
 }
 
 impl Default for AuthenticatedMachineBindingCache {
@@ -540,6 +553,11 @@ impl Default for AuthenticatedMachineBindingCache {
             capacity: AUTHENTICATED_MACHINE_BINDING_CAPACITY,
             clock: 0,
             change_notify: None,
+            roster_members_without_binding: 0,
+            roster_members_evicted: 0,
+            roster_miss_log_ms: 0,
+            #[cfg(test)]
+            resolve_lock_takes: 0,
         }
     }
 }
@@ -555,7 +573,7 @@ impl AuthenticatedMachineBindingCache {
     }
 
     #[cfg(test)]
-    fn with_capacity(capacity: usize) -> Self {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             entries: std::collections::HashMap::new(),
             by_machine: Default::default(),
@@ -600,6 +618,11 @@ impl AuthenticatedMachineBindingCache {
             capacity: capacity.max(1),
             clock: 0,
             change_notify: None,
+            roster_members_without_binding: 0,
+            roster_members_evicted: 0,
+            roster_miss_log_ms: 0,
+            #[cfg(test)]
+            resolve_lock_takes: 0,
         }
     }
 
@@ -2061,6 +2084,86 @@ impl AuthenticatedMachineBindingCache {
         self.recency.insert((tick.0, tick.1, agent_id.0));
         Some(binding)
     }
+
+    /// Resolve every member of one group roster, in roster order (#901).
+    ///
+    /// Each member with a retained binding is touched in the LRU order, as
+    /// one [`Self::resolve`] per member does. A member without a retained
+    /// binding yields `None`: missing evidence gives no machine.
+    ///
+    /// The misses are counted. `local` is this daemon's own agent and is
+    /// not counted, because its machine is never a roster peer.
+    fn resolve_roster(&mut self, agents: &[AgentId], local: &AgentId) -> Vec<Option<MachineId>> {
+        let mut machines = Vec::with_capacity(agents.len());
+        let mut without_binding = 0u64;
+        let mut evicted = 0u64;
+        let mut evicted_sample = None;
+        for agent in agents {
+            let machine = self.resolve(agent);
+            if machine.is_none() && agent != local {
+                without_binding += 1;
+                // Attribution outlives LRU eviction of the retained binding
+                // (#1659), so it shows that a binding was held and dropped.
+                // It is bounded too: when it is gone, the miss is counted
+                // only in `without_binding`.
+                if self.accepted_machines.contains_key(agent) {
+                    evicted += 1;
+                    evicted_sample.get_or_insert(*agent);
+                }
+            }
+            machines.push(machine);
+        }
+        self.note_roster_misses(without_binding, evicted, evicted_sample);
+        machines
+    }
+
+    /// Count roster members without a retained binding. At most one debug
+    /// line per warning interval reports an evicted member.
+    fn note_roster_misses(&mut self, without_binding: u64, evicted: u64, sample: Option<AgentId>) {
+        self.roster_members_without_binding = self
+            .roster_members_without_binding
+            .saturating_add(without_binding);
+        self.roster_members_evicted = self.roster_members_evicted.saturating_add(evicted);
+        let Some(agent) = sample else {
+            return;
+        };
+        let now = monotonic_ms();
+        if !warn_interval_open(self.roster_miss_log_ms, now) {
+            return;
+        }
+        self.roster_miss_log_ms = now.max(1);
+        tracing::debug!(
+            agent = %hex::encode(agent.as_bytes()),
+            evicted_in_roster = evicted,
+            evicted_total = self.roster_members_evicted,
+            without_binding_total = self.roster_members_without_binding,
+            capacity = self.capacity,
+            "#901: roster member's authenticated binding was evicted; no eager preference until it announces again"
+        );
+    }
+
+    /// `(without binding, of which evicted)` roster-resolve misses (#901).
+    #[cfg(test)]
+    pub(crate) fn roster_binding_misses(&self) -> (u64, u64) {
+        (
+            self.roster_members_without_binding,
+            self.roster_members_evicted,
+        )
+    }
+
+    /// Test seam (#901): binding-resolve write-lock acquisitions.
+    #[cfg(test)]
+    pub(crate) fn resolve_lock_takes(&self) -> u64 {
+        self.resolve_lock_takes
+    }
+
+    #[cfg(test)]
+    fn count_resolve_lock_take(&mut self) {
+        self.resolve_lock_takes += 1;
+    }
+
+    #[cfg(not(test))]
+    fn count_resolve_lock_take(&mut self) {}
 }
 
 /// Shared retained cache of authenticated agent→machine bindings.
@@ -2246,14 +2349,34 @@ pub(crate) async fn authenticated_machine_binding_evidence(
     bindings: &AuthenticatedMachineBindings,
     agent_id: &AgentId,
 ) -> Option<AuthenticatedMachineBinding> {
-    bindings.write().await.resolve_evidence(agent_id)
+    let mut cache = bindings.write().await;
+    cache.count_resolve_lock_take();
+    cache.resolve_evidence(agent_id)
 }
 
 pub(crate) async fn authenticated_machine_binding(
     bindings: &AuthenticatedMachineBindings,
     agent_id: &AgentId,
 ) -> Option<MachineId> {
-    bindings.write().await.resolve(agent_id)
+    let mut cache = bindings.write().await;
+    cache.count_resolve_lock_take();
+    cache.resolve(agent_id)
+}
+
+/// The retained machine of every member of one group roster, in roster
+/// order, under one write-lock acquisition (#901).
+///
+/// A `None` entry has no authenticated binding and must get no preference.
+/// `local` is this daemon's own agent; see
+/// `AuthenticatedMachineBindingCache::resolve_roster`.
+pub(crate) async fn authenticated_roster_machine_bindings(
+    bindings: &AuthenticatedMachineBindings,
+    agents: &[AgentId],
+    local: &AgentId,
+) -> Vec<Option<MachineId>> {
+    let mut cache = bindings.write().await;
+    cache.count_resolve_lock_take();
+    cache.resolve_roster(agents, local)
 }
 
 #[cfg(test)]

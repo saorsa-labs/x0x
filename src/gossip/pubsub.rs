@@ -2200,10 +2200,15 @@ impl PubSubManager {
         let local = self.transport.local_peer_id();
         let mut ranked = Vec::new();
         let mut seen = HashSet::new();
-        for agent in agents {
-            if let Some(machine) =
-                crate::dm_inbox::authenticated_machine_binding(&identity.bindings, &agent).await
-            {
+        // #901: one cache write lock for the whole roster, not one per member.
+        let machines = crate::dm_inbox::authenticated_roster_machine_bindings(
+            &identity.bindings,
+            &agents,
+            &self.signing.agent_id,
+        )
+        .await;
+        for (agent, machine) in agents.into_iter().zip(machines) {
+            if let Some(machine) = machine {
                 // Raw Direct frames carry an untrusted AgentId prefix and can
                 // overwrite the reachability map. Only an independently
                 // authenticated binding may authorize a roster preference.
