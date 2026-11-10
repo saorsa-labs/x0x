@@ -937,8 +937,8 @@ fn treekem_catchup_cursor_epoch_maps_the_head_binding() {
 }
 
 // #1623 responder slice: the catch-up log keeps and serves the state-only
-// links (rename, role change, unban) that this node signed, next
-// to the membership links. Before it kept only the membership links, so a
+// links (rename, role change, unban, join-request rejection) that this
+// node signed, next to the membership links. Before it kept only the membership links, so a
 // pre-Welcome joiner was never served a rename or a role change in its gap.
 
 /// The cursor the joiner's last page ask to `peer` left from, as the
@@ -1248,8 +1248,9 @@ async fn page_role_removal_rename(log_order: &[usize]) -> anyhow::Result<()> {
 
 /// The log keeps state-only links under their own cap, so they never evict
 /// a membership link. It keeps only the state-only links this node signed
-/// (the receiver applies a rename, a role change or an unban only from its
-/// signer), and a repeat of one link once.
+/// (the receiver applies a rename, a role change, an unban or a rejection
+/// only when the page sender is the event's `actor` and an Active admin),
+/// and a repeat of one link once.
 #[tokio::test]
 async fn state_only_links_keep_their_own_log_cap() -> anyhow::Result<()> {
     let (state, _dir) = secure_endpoint_test_state().await?;
@@ -1944,6 +1945,252 @@ async fn apply_nested_in_a_page_scope_is_not_a_page_link() -> anyhow::Result<()>
     assert_eq!(
         head.state_hash, rename.state_hash,
         "the nested gossip rename keeps the ordinary apply"
+    );
+    Ok(())
+}
+
+// ─── #1623: the `JoinRequestRejected` link ─────────────────────────────────
+// A reject is an admin-signed chain link (`reject_join_request` seals a
+// commit). The state hash does not cover join requests, and an invite stub
+// holds none, so a pre-Welcome joiner cannot check "the request is pending".
+
+/// The joiner's record as an invite builds it: no join request records.
+fn invite_stub(base: &GroupInfo) -> GroupInfo {
+    let mut stub = base.clone();
+    stub.join_requests.clear();
+    stub
+}
+
+/// The owner's reject of `REQUEST_ID` after `base`: its commit and event.
+fn reject_link(
+    base: &GroupInfo,
+    owner: &AgentKeypair,
+) -> anyhow::Result<(x0x::groups::GroupStateCommit, NamedGroupMetadataEvent)> {
+    let owner_hex = hex::encode(owner.agent_id().as_bytes());
+    let mut ahead = base.clone();
+    let commit = seal_link(&mut ahead, owner, 2_000, |next| {
+        set_join_request_rejected(next, REQUEST_ID, &owner_hex, 2_000);
+    })?;
+    let event = NamedGroupMetadataEvent::JoinRequestRejected {
+        group_id: base.stable_group_id().to_string(),
+        request_id: REQUEST_ID.to_string(),
+        actor: owner_hex,
+        requester_agent_id: agent(REQUESTER),
+        commit: Some(commit.clone()),
+    };
+    Ok((commit, event))
+}
+
+/// RED on main: the responder's REST reject was never logged, so the page
+/// served only the rename after it, which does not link to the joiner's
+/// base. The joiner's stub holds no join request, as an invite stub does.
+#[tokio::test]
+async fn responder_serves_its_join_request_reject_to_a_pre_welcome_joiner() -> anyhow::Result<()> {
+    let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+    let (responder, _responder_dir) = secure_endpoint_test_state().await?;
+    let joiner_hex = hex::encode(joiner.agent.agent_id().as_bytes());
+    let owner = responder.agent.identity().agent_keypair();
+    let base = base_group(owner, None)?;
+    let key = install_stub(&responder, base.clone()).await?;
+    let owner_ctx = || {
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true })
+    };
+    let response = reject_join_request(
+        State(Arc::clone(&responder)),
+        owner_ctx(),
+        Path((key.clone(), REQUEST_ID.to_string())),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK, "the owner rejects");
+    let reject_hash = head_of(&responder, &key).await?.state_hash;
+    let response = update_named_group(
+        State(Arc::clone(&responder)),
+        owner_ctx(),
+        Path(key.clone()),
+        Json(UpdateGroupRequest {
+            name: Some("renamed after the reject".to_string()),
+            description: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK, "the owner renames");
+    let terminal = head_of(&responder, &key).await?;
+    // The log keeps one copy of the reject.
+    let logged_rejects = || async {
+        let logs = responder.treekem_event_log.read().await;
+        let rejects: Vec<NamedGroupMetadataEvent> = logs
+            .get(base.stable_group_id())
+            .into_iter()
+            .flatten()
+            .filter(|event| named_group_metadata_event_kind(event) == "join_request_rejected")
+            .cloned()
+            .collect();
+        rejects
+    };
+    let rejects = logged_rejects().await;
+    assert_eq!(rejects.len(), 1, "the signer logs its reject");
+    remember_treekem_membership_event(&responder, &rejects[0]).await;
+    assert_eq!(logged_rejects().await.len(), 1, "a second copy is not kept");
+    let mut stub = invite_stub(&base);
+    arm(
+        &mut stub,
+        vec![reject_hash, terminal.state_hash.clone()],
+        owner,
+    );
+    install_stub(&joiner, stub).await?;
+    seat_joiner_on_responder(&responder, &key, &joiner_hex).await;
+
+    let served = page_from_responder(&joiner, &responder, &key).await?;
+
+    assert_eq!(
+        served,
+        ["join_request_rejected", "group_metadata_updated"],
+        "the reject and the rename are served, in chain order"
+    );
+    let head = head_of(&joiner, &key).await?;
+    assert_eq!(
+        head.state_hash, terminal.state_hash,
+        "the joiner is at the head"
+    );
+    assert_eq!(head.name, "renamed after the reject");
+    assert!(
+        head.join_requests.is_empty(),
+        "no request record is taken from the event"
+    );
+    assert!(!head.has_active_member(&joiner_hex), "still pre-Welcome");
+    assert_eq!(
+        head.secret_epoch, base.secret_epoch,
+        "no epoch from the chain"
+    );
+    assert_no_tree(&joiner, &key).await;
+    Ok(())
+}
+
+/// A page-served reject on a pre-Welcome joiner obeys ADR 0109 rule (b).
+/// Inside an armed sequence it applies, with or without the request record.
+/// With no armed sequence it is refused with the rule (b) label (RED
+/// before: the ordinary apply took it). A request that is known and not
+/// pending is refused, as on a member.
+#[tokio::test]
+async fn pre_welcome_page_reject_link_obeys_rule_b() -> anyhow::Result<()> {
+    let owner = AgentKeypair::generate()?;
+    let base = base_group(&owner, None)?;
+    let (commit, event) = reject_link(&base, &owner)?;
+    let armed = |mut stub: GroupInfo| {
+        arm(&mut stub, vec![commit.state_hash.clone()], &owner);
+        stub
+    };
+    let mut resolved = base.clone();
+    set_join_request_cancelled(&mut resolved, REQUEST_ID, &agent(REQUESTER));
+    // (case, stub, applies)
+    let cases = [
+        ("armed, no request record", armed(invite_stub(&base)), true),
+        ("armed, pending request", armed(base.clone()), true),
+        ("armed, request not pending", armed(resolved), false),
+        ("unarmed, pending request", base.clone(), false),
+        ("unarmed, no request record", invite_stub(&base), false),
+    ];
+    for (case, stub, applies) in cases {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let was_armed = stub.invite_lineage.is_some();
+        let held_request = stub.join_requests.contains_key(REQUEST_ID);
+        let key = install_stub(&state, stub).await?;
+        let trace = page_trace(&state, &key, &owner, vec![event.clone()]).await;
+        let head = head_of(&state, &key).await?;
+        if !applies {
+            assert_eq!(head.state_hash, base.state_hash, "{case}: nothing applied");
+            assert_eq!(
+                trace.contains("pre_welcome_no_armed_sequence"),
+                !was_armed,
+                "{case}: the rule (b) label: {trace}"
+            );
+            continue;
+        }
+        assert_eq!(
+            head.state_hash, commit.state_hash,
+            "{case}: the link applied"
+        );
+        assert_eq!(
+            head.join_requests
+                .get(REQUEST_ID)
+                .map(|request| request.status),
+            held_request.then_some(x0x::groups::JoinRequestStatus::Rejected),
+            "{case}: a held request is resolved; none is created"
+        );
+        let local = hex::encode(state.agent.agent_id().as_bytes());
+        assert!(!head.has_active_member(&local), "{case}: still pre-Welcome");
+        assert_no_tree(&state, &key).await;
+    }
+    Ok(())
+}
+
+/// The reject with no request record applies only as a page link on a
+/// pre-Welcome node, and only when the page sender is the event's `actor`
+/// and an Active admin. A copy from another admin, a copy that a Member
+/// sends under its own name, a gossip copy and a copy on a seated node are
+/// refused.
+#[tokio::test]
+async fn reject_without_a_request_record_needs_the_signer_and_a_page() -> anyhow::Result<()> {
+    let owner = AgentKeypair::generate()?;
+    let page = |state: Arc<AppState>, event: NamedGroupMetadataEvent, sender: AgentId| async move {
+        let page_link = named_group_metadata_event_commit(&event)
+            .map(|commit| commit.state_hash.clone())
+            .unwrap_or_default();
+        let _ = TREEKEM_CATCHUP_PAGE_LINK
+            .scope(
+                page_link,
+                apply_named_group_metadata_event(&state, event, sender, true, None),
+            )
+            .await;
+    };
+    // A page link from another Active admin, not the signer.
+    let base = base_group(&owner, None)?;
+    let (commit, event) = reject_link(&base, &owner)?;
+    let mut stub = invite_stub(&base);
+    arm(&mut stub, vec![commit.state_hash.clone()], &owner);
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let key = install_stub(&state, stub.clone()).await?;
+    page(Arc::clone(&state), event.clone(), AgentId([0x51; 32])).await;
+    assert_eq!(
+        head_of(&state, &key).await?.state_hash,
+        base.state_hash,
+        "a relayed reject is refused"
+    );
+    // A Member is the page sender and the event's `actor`. The commit is
+    // the owner's and does not cover `actor`, so only the role check
+    // refuses this copy.
+    let mut by_member = event.clone();
+    if let NamedGroupMetadataEvent::JoinRequestRejected { actor, .. } = &mut by_member {
+        *actor = agent(PROMOTED);
+    }
+    page(Arc::clone(&state), by_member, AgentId([0x52; 32])).await;
+    assert_eq!(
+        head_of(&state, &key).await?.state_hash,
+        base.state_hash,
+        "a reject that a Member sends under its own name is refused"
+    );
+    // A gossip or direct-message copy from the signer (no page).
+    let _ = apply_named_group_metadata_event(&state, event, owner.agent_id(), true, None).await;
+    assert_eq!(
+        head_of(&state, &key).await?.state_hash,
+        base.state_hash,
+        "a gossip reject with no request record is refused"
+    );
+    // A page link on a node that holds an Active seat.
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let local = hex::encode(state.agent.agent_id().as_bytes());
+    let seated = base_group(&owner, Some(&local))?;
+    let (commit, event) = reject_link(&seated, &owner)?;
+    let mut stub = invite_stub(&seated);
+    arm(&mut stub, vec![commit.state_hash.clone()], &owner);
+    let key = install_stub(&state, stub).await?;
+    page(Arc::clone(&state), event, owner.agent_id()).await;
+    assert_eq!(
+        head_of(&state, &key).await?.state_hash,
+        seated.state_hash,
+        "a seated node keeps the request check"
     );
     Ok(())
 }

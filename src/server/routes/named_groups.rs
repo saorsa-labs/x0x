@@ -9236,6 +9236,9 @@ fn treekem_membership_event_key(event: &NamedGroupMetadataEvent) -> Option<Strin
             NamedGroupMetadataEvent::MemberUnbanned { agent_id, .. } => {
                 ("unban", agent_id.as_str())
             }
+            NamedGroupMetadataEvent::JoinRequestRejected { request_id, .. } => {
+                ("reject", request_id.as_str())
+            }
             _ => return None,
         };
         return Some(format!(
@@ -9264,10 +9267,12 @@ fn treekem_membership_event_key(event: &NamedGroupMetadataEvent) -> Option<Strin
 
 /// #1623 (ADR 0109 §7 (b)): a commit-bearing link with no TreeKEM commit
 /// that the TreeKEM catch-up log keeps and serves next to the membership
-/// links: a rename, a role change or an unban. Returns the signed commit
-/// and the event's actor. Every one of them is a link of the same state
-/// chain, so a joiner whose gap holds one cannot link the membership links
-/// after it until it is served. A policy update is not one of them: ADR
+/// links: a rename, a role change, an unban or the rejection of a join
+/// request. Returns the signed commit and the event's actor. Every one of
+/// them is a link of the same state chain, so a joiner whose gap holds one
+/// cannot link the membership links after it until it is served. A join
+/// request and its cancellation are signed by the requester, not by a
+/// member, so they are not kept. A policy update is not one of them: ADR
 /// 0109 §2 rule (b) refuses a link that changes the policy hash on a
 /// pre-Welcome node, and the `PolicyUpdated` apply has no pre-Welcome
 /// check, so serving it would let the joiner adopt it.
@@ -9286,6 +9291,11 @@ fn treekem_state_only_link(
             ..
         }
         | NamedGroupMetadataEvent::MemberUnbanned {
+            actor,
+            commit: Some(commit),
+            ..
+        }
+        | NamedGroupMetadataEvent::JoinRequestRejected {
             actor,
             commit: Some(commit),
             ..
@@ -9580,10 +9590,11 @@ async fn should_queue_treekem_membership_event(
 /// (`AppState::treekem_event_log`), which `handle_treekem_catchup_request`
 /// serves. It keeps the membership links and (#1623, ADR 0109 §7 (b)) the
 /// state-only links of [`treekem_state_only_link`]. A state-only link is
-/// kept only when this node signed it: the receiver applies a rename, a
-/// role change or an unban only from its signer (`actor == sender`), so a
-/// relayed copy would be refused, and a released receiver with no #1685
-/// stop would ask for the same page again. Each class has its own
+/// kept only when this node signed it. The receiver applies a rename, a
+/// role change, an unban or a rejection only when the page sender is the
+/// event's `actor` and an Active admin. So a copy relayed by another node
+/// would be refused, and a released receiver with no #1685 stop would ask
+/// for the same page again. Each class has its own
 /// [`TREEKEM_EVENT_LOG_PER_GROUP_CAP`], oldest out first, so state-only
 /// links never evict a membership link that key catch-up needs.
 async fn remember_treekem_membership_event(state: &AppState, event: &NamedGroupMetadataEvent) {
@@ -13592,9 +13603,9 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         .and(response.responder_state_revision);
     let mut events = response.events;
     events.sort_by_key(treekem_catchup_link_sort_key);
-    // #1623: a state-only link (rename, role change, unban) that
-    // could not apply counts too, or a truncated page that serves only
-    // that link would be asked for again for ever.
+    // #1623: a state-only link (rename, role change, unban, join-request
+    // rejection) that could not apply counts too, or a truncated page that
+    // serves only that link would be asked for again for ever.
     let page_served_ahead = events
         .iter()
         .any(|event| treekem_catchup_link_is_ahead(event, cursor_before.0, cursor_before.1));
@@ -19105,15 +19116,65 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             let Some(commit) = commit else {
                 return ApplyMetadataResult::REJECTED;
             };
-            let Ok((action, mutate)) = event_steps::join_request_rejected(
+            // #1623 (ADR 0109 §2 rule (b)): read once, so the gate and
+            // the no-record branch below decide on the same answer.
+            let pre_welcome_page_link = is_pre_welcome_page_link(
+                state,
+                &resolved_group_key,
                 &info,
-                &sender_hex,
-                &request_id,
-                &actor,
-                commit.committed_at,
-            ) else {
+                &event_for_log,
+                &local_agent_hex,
+            )
+            .await;
+            if pre_welcome_page_link
+                && refuse_unadmitted_pre_welcome_link(
+                    state,
+                    &info,
+                    &event_for_log,
+                    &local_agent_hex,
+                )
+                .await
+            {
                 return ApplyMetadataResult::REJECTED;
-            };
+            }
+            // A pre-Welcome record comes from an invite, which carries no
+            // join request records, and the state hash does not cover
+            // them. So a pre-Welcome node cannot check "the request is
+            // pending" for a page link that the gate above admitted (the
+            // next hash of an armed attested sequence). It applies that
+            // link state-only. The page sender must be the event's
+            // `actor` and an Active admin; the commit does not cover
+            // `actor` or `request_id`, and the commit's own signer and
+            // hashes are checked by the apply below. No request record is
+            // made from the event. A request record that the node does
+            // hold keeps the ordinary step.
+            let no_request_record =
+                pre_welcome_page_link && !info.join_requests.contains_key(&request_id);
+            let action;
+            let mutate: Box<dyn FnOnce(&mut x0x::groups::GroupInfo) + Send + '_> =
+                if no_request_record {
+                    let admin_signed = actor == sender_hex
+                        && info
+                            .caller_role(&actor)
+                            .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin));
+                    if !admin_signed {
+                        return ApplyMetadataResult::REJECTED;
+                    }
+                    action = x0x::groups::ActionKind::AdminOrHigher;
+                    Box::new(|_| {})
+                } else {
+                    let Ok((step_action, step_mutate)) = event_steps::join_request_rejected(
+                        &info,
+                        &sender_hex,
+                        &request_id,
+                        &actor,
+                        commit.committed_at,
+                    ) else {
+                        return ApplyMetadataResult::REJECTED;
+                    };
+                    action = step_action;
+                    Box::new(step_mutate)
+                };
             let current = info.clone();
             let Ok(next) = apply_stateful_event_with_evidence(
                 state,
@@ -28442,17 +28503,32 @@ fn is_treekem_catchup_page_link(event: &NamedGroupMetadataEvent) -> bool {
         .unwrap_or(false)
 }
 
-/// #1623 (ADR 0109 §2 rule (b), D82): should a rename, role change or
-/// unban be refused because it is a catch-up page link that a pre-Welcome
-/// node may not apply? Rule (b) scopes the gate to "a catch-up page or the
-/// node's own served chain"; the served chain applies through
-/// `apply_link_state_only`, which has its own checks. So only a page link
-/// is gated here: gossip and direct-message copies keep the ordinary
-/// apply. A node that is Active, or that holds a local TreeKEM group, or a
-/// group on another plane, is not pre-Welcome and is not gated. A gated
-/// link needs [`admit_pre_welcome_state_only_link`]: an armed attested
-/// sequence whose next hash it is, no policy change and no GSS binding
-/// change. Its refusal label goes to `treekem.trace`.
+/// #1623: is `event` a catch-up page link on a pre-Welcome TreeKEM node?
+/// A node that is Active, or that holds a local TreeKEM group, or a group
+/// on another plane, is not pre-Welcome.
+async fn is_pre_welcome_page_link(
+    state: &AppState,
+    group_key: &str,
+    info: &x0x::groups::GroupInfo,
+    event: &NamedGroupMetadataEvent,
+    local_agent_hex: &str,
+) -> bool {
+    is_treekem_catchup_page_link(event)
+        && info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+        && !info.has_active_member(local_agent_hex)
+        && !state.treekem_groups.read().await.contains_key(group_key)
+}
+
+/// #1623 (ADR 0109 §2 rule (b), D82): should a rename, role change, unban
+/// or join-request rejection be refused because it is a catch-up page link
+/// that a pre-Welcome node may not apply? Rule (b) scopes the gate to "a
+/// catch-up page or the node's own served chain"; the served chain applies
+/// through `apply_link_state_only`, which has its own checks. So only a
+/// page link is gated here ([`is_pre_welcome_page_link`]): gossip and
+/// direct-message copies keep the ordinary apply. A gated link needs
+/// [`admit_pre_welcome_state_only_link`]: an armed attested sequence whose
+/// next hash it is, no policy change and no GSS binding change. Its
+/// refusal label goes to `treekem.trace`.
 async fn refuse_unarmed_pre_welcome_page_link(
     state: &AppState,
     group_key: &str,
@@ -28460,15 +28536,20 @@ async fn refuse_unarmed_pre_welcome_page_link(
     event: &NamedGroupMetadataEvent,
     local_agent_hex: &str,
 ) -> bool {
-    if !is_treekem_catchup_page_link(event)
-        || info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem
-        || info.has_active_member(local_agent_hex)
-        || state.treekem_groups.read().await.contains_key(group_key)
-    {
-        return false;
-    }
-    // A rename, role change or unban carries no TreeKEM commit, so the
-    // epoch the check keeps is the node's own already.
+    is_pre_welcome_page_link(state, group_key, info, event, local_agent_hex).await
+        && refuse_unadmitted_pre_welcome_link(state, info, event, local_agent_hex).await
+}
+
+/// #1623: the admission half of [`refuse_unarmed_pre_welcome_page_link`],
+/// for a caller that already knows `event` is a pre-Welcome page link.
+async fn refuse_unadmitted_pre_welcome_link(
+    state: &AppState,
+    info: &x0x::groups::GroupInfo,
+    event: &NamedGroupMetadataEvent,
+    local_agent_hex: &str,
+) -> bool {
+    // These links carry no TreeKEM commit, so the epoch the check keeps is
+    // the node's own already.
     let mut scratch = info.clone();
     admit_pre_welcome_state_only_link(state, info, &mut scratch, event, local_agent_hex)
         .await
@@ -36429,6 +36510,8 @@ pub(in crate::server) async fn reject_join_request(
         requester_agent_id: requester_hex.clone(),
         commit: Some(commit),
     };
+    // #1623: the signer serves this chain link on TreeKEM catch-up pages.
+    remember_treekem_membership_event(&state, &event).await;
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     spawn_named_group_event_delivery(&state, &requester_hex, &event);
     maybe_publish_group_card_after_state_change(&state, &id).await;
