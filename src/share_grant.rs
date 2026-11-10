@@ -2230,14 +2230,16 @@ impl crate::Agent {
         // still gets the error (a 5xx), and a retry rewrites both files.
         if let Some(rt) = &self.gossip_runtime {
             let records = self.revocation_set.read().await.share_grant_records();
-            if let Ok(bytes) = crate::revocation::encode_revocation_batch(&records) {
-                let _ = rt
-                    .pubsub()
-                    .publish(
-                        crate::REVOCATION_V3_TOPIC.to_string(),
-                        bytes::Bytes::from(bytes),
-                    )
-                    .await;
+            if let Ok(batches) = crate::revocation::encode_revocation_batches(&records) {
+                for bytes in batches {
+                    let _ = rt
+                        .pubsub()
+                        .publish(
+                            crate::REVOCATION_V3_TOPIC.to_string(),
+                            bytes::Bytes::from(bytes),
+                        )
+                        .await;
+                }
             }
         }
         durable.map(|()| record)

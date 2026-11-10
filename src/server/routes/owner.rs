@@ -286,6 +286,18 @@ pub(in crate::server) async fn owner_agents_revoke(
     }
 
     let reason = body.and_then(|Json(req)| req.reason);
+    if reason
+        .as_ref()
+        .is_some_and(|reason| reason.len() > crate::revocation::MAX_REVOCATION_REASON_BYTES)
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "reason is longer than {} bytes",
+                crate::revocation::MAX_REVOCATION_REASON_BYTES
+            ),
+        );
+    }
     let durability_error = match state.agent.revoke_as_owner(&cert, reason).await {
         Ok(_) => None,
         Err(e @ crate::error::IdentityError::Storage(_)) => Some(e),

@@ -263,6 +263,11 @@ impl RevocationRecord {
         revoked_at: u64,
         reason: Option<String>,
     ) -> Result<Self, IdentityError> {
+        if !reason_within_limit(&reason) {
+            return Err(IdentityError::Revocation(format!(
+                "reason is longer than {MAX_REVOCATION_REASON_BYTES} bytes"
+            )));
+        }
         let issuer_pub_bytes = issuer_public_key.as_bytes().to_vec();
         let message = Self::canonical_message(&subject, &issuer_pub_bytes, revoked_at, &reason);
         let signature = sign_with_ml_dsa(issuer_secret_key, &message).map_err(|e| {
@@ -445,6 +450,32 @@ impl RevocationRecord {
         hasher.finalize().into()
     }
 
+    /// The `(subject, issuer)` pair of this record, as one key (#1857).
+    ///
+    /// `None` for a share-grant subject: those records are collected when
+    /// the grant ends, and the set keeps every one of them.
+    fn pair_key(&self) -> Option<[u8; 32]> {
+        if matches!(self.subject, RevokedSubject::ShareGrant(_)) {
+            return None;
+        }
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"x0x-revocation-pair-v1");
+        hasher.update(&[self.subject.tag()]);
+        match self.subject.binding_subject_bytes() {
+            Some(bytes) => hasher.update(&bytes),
+            None => hasher.update(self.subject.id_bytes()),
+        };
+        hasher.update(&self.issuer_public_key);
+        Some(*hasher.finalize().as_bytes())
+    }
+
+    /// The order between two records of one pair (#1857): the earlier
+    /// `revoked_at` is kept, and for equal times the lower record hash.
+    /// Every node computes the same order from the signed bytes.
+    fn rank(&self) -> (u64, [u8; 32]) {
+        (self.revoked_at, self.record_hash())
+    }
+
     /// BLAKE3 hash of the canonical (signed) message, used for de-duplication.
     ///
     /// Two records for the same `(subject, issuer, revoked_at, reason)` hash
@@ -476,6 +507,36 @@ struct PersistedRevocation {
     subject_cert: Option<AgentCertificate>,
 }
 
+/// The batches of one publish round arrive within seconds. A batch that
+/// arrives later than this after the sender's last one starts a new round.
+const RESYNC_ROUND_GAP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The order key of a record inside its pair: `(revoked_at, record hash)`.
+type RecordRank = (u64, [u8; 32]);
+
+/// One trusted sender's carrier snapshot while a carrier waits for a
+/// resync (#1116): the union of the batches of its latest round (#1857).
+#[derive(Debug, Clone, Default)]
+struct SnapshotCandidate {
+    last_batch: Option<std::time::Instant>,
+    /// Pair key (record hash for a share grant) → `(revoked_at, hash)` of
+    /// the record this set would keep.
+    kept: HashMap<[u8; 32], RecordRank>,
+}
+
+impl SnapshotCandidate {
+    fn hashes(&self) -> HashSet<[u8; 32]> {
+        self.kept.values().map(|(_, hash)| *hash).collect()
+    }
+}
+
+/// Whether `reason` is inside [`MAX_REVOCATION_REASON_BYTES`].
+fn reason_within_limit(reason: &Option<String>) -> bool {
+    reason
+        .as_ref()
+        .is_none_or(|reason| reason.len() <= MAX_REVOCATION_REASON_BYTES)
+}
+
 /// In-memory grow-only set of verified revocations.
 ///
 /// Maintains `HashSet`s of revoked agent/machine ids for O(1) gate checks plus
@@ -493,6 +554,10 @@ pub struct RevocationSet {
     revoked_agents: HashSet<AgentId>,
     revoked_machines: HashSet<MachineId>,
     records_by_hash: HashMap<[u8; 32], PersistedRevocation>,
+    /// The one record held for each `(subject, issuer)` pair of an agent,
+    /// machine or binding subject (#1857): pair key → record hash. Kept in
+    /// step with `records_by_hash`.
+    pair_index: HashMap<[u8; 32], [u8; 32]>,
     /// ADR-0043 tombstone epochs from ad-hoc binding `RevocationRecord`s
     /// (`x0x.revocation.v2` carrier). Grow-only; never swept.
     binding_epochs: HashMap<(AgentId, MachineId), u64>,
@@ -530,7 +595,7 @@ pub struct RevocationSet {
     /// Remote snapshots offered for a waiting carrier. Index 0 is v1, 1 is
     /// v2, 2 is v3. The key is the sending agent. Ordinary ingestion does
     /// not write this map and does not open the carrier.
-    resync_candidates: [HashMap<AgentId, HashSet<[u8; 32]>>; 3],
+    resync_candidates: [HashMap<AgentId, SnapshotCandidate>; 3],
     /// Carriers whose verified resync has not been written to the live path.
     rebuild_pending: u8,
     /// Set when the quarantine rename failed. Status then says the live
@@ -710,6 +775,62 @@ pub(crate) fn decode_revocation_batch(
         }
     }
     Ok(records)
+}
+
+/// The most bytes one received revocation batch may have. A larger payload
+/// is ignored whole. Released daemons use the same number.
+pub(crate) const MAX_REVOCATION_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
+
+/// The size a published batch aims for (#1857): a quarter of
+/// [`MAX_REVOCATION_PAYLOAD_BYTES`], about 95 records.
+pub(crate) const REVOCATION_BATCH_TARGET_BYTES: usize = 512 * 1024;
+
+/// The longest `reason` a new record may carry (#1857). The reason is
+/// inside the signed bytes, so a long one cannot be cut: the record is
+/// refused when it is signed here or when it arrives from a peer. A record
+/// already in the store is kept.
+pub const MAX_REVOCATION_REASON_BYTES: usize = 1024;
+
+/// Encode `records` for one carrier as one or more batches (#1857).
+///
+/// Each batch is a complete [`encode_revocation_batch`] payload, so a
+/// released daemon reads it as it reads a single batch today. A batch stays
+/// near [`REVOCATION_BATCH_TARGET_BYTES`]; one record that is larger than
+/// that goes in a batch of its own. The records are put in record-hash
+/// order, so the same set gives the same batches on every node.
+///
+/// # Errors
+/// The bincode encode error.
+pub(crate) fn encode_revocation_batches(
+    records: &[RevocationRecord],
+) -> Result<Vec<Vec<u8>>, bincode::Error> {
+    let mut ordered: Vec<(&RevocationRecord, [u8; 32])> = records
+        .iter()
+        .map(|record| (record, record.record_hash()))
+        .collect();
+    ordered.sort_by_key(|(_, hash)| *hash);
+
+    let mut batches = Vec::new();
+    let mut current: Vec<RevocationRecord> = Vec::new();
+    let mut current_bytes = 0usize;
+    for (record, _) in ordered {
+        // The framed encoding adds a length prefix per record.
+        let size = usize::try_from(bincode::serialized_size(record)?)
+            .unwrap_or(usize::MAX)
+            .saturating_add(16);
+        if !current.is_empty() && current_bytes.saturating_add(size) > REVOCATION_BATCH_TARGET_BYTES
+        {
+            batches.push(encode_revocation_batch(&current)?);
+            current.clear();
+            current_bytes = 0;
+        }
+        current_bytes = current_bytes.saturating_add(size);
+        current.push(record.clone());
+    }
+    if !current.is_empty() {
+        batches.push(encode_revocation_batch(&current)?);
+    }
+    Ok(batches)
 }
 
 /// Record one remote carrier snapshot (#1116).
@@ -910,12 +1031,44 @@ impl RevocationSet {
         {
             return;
         }
-        let hashes: HashSet<[u8; 32]> = records.iter().map(RevocationRecord::record_hash).collect();
-        let known = self.known_carrier_hashes(carrier);
-        if !hashes.is_superset(&known) {
-            return;
+        // #1857: a sender publishes one carrier as several batches, so
+        // its snapshot is the union of the batches of one round. This set
+        // holds one record per (subject, issuer) pair; a sender that holds
+        // more (a released daemon) is compared by the records this set
+        // would keep. A record this node refuses for its long reason is
+        // left out, unless this node already holds it from its own store.
+        let offered: Vec<([u8; 32], RecordRank)> = records
+            .iter()
+            .filter_map(|record| {
+                let hash = record.record_hash();
+                if !reason_within_limit(&record.reason) && !self.records_by_hash.contains_key(&hash)
+                {
+                    return None;
+                }
+                Some((record.pair_key().unwrap_or(hash), (record.revoked_at, hash)))
+            })
+            .collect();
+        let now = std::time::Instant::now();
+        let candidate = self.resync_candidates[index].entry(*sender).or_default();
+        if candidate
+            .last_batch
+            .is_some_and(|last| now.duration_since(last) > RESYNC_ROUND_GAP)
+        {
+            // A new round replaces the last one, so a record the sender
+            // no longer holds does not stay in its snapshot.
+            candidate.kept.clear();
         }
-        self.resync_candidates[index].insert(*sender, hashes);
+        candidate.last_batch = Some(now);
+        for (key, rank) in offered {
+            match candidate.kept.get(&key) {
+                Some(held) if *held <= rank => {}
+                _ => {
+                    candidate.kept.insert(key, rank);
+                }
+            }
+        }
+        // `try_complete_carrier` accepts a snapshot only when it equals
+        // the held records, so one that omits a held record stays refused.
         self.try_complete_carrier(carrier);
     }
 
@@ -999,7 +1152,7 @@ impl RevocationSet {
         }
         let agreed = self.resync_candidates[index]
             .values()
-            .any(|hashes| hashes == &known);
+            .any(|candidate| candidate.hashes() == known);
         if !agreed {
             return;
         }
@@ -1205,6 +1358,48 @@ impl RevocationSet {
         self.records_by_hash.contains_key(hash)
     }
 
+    /// Whether the set already gives everything `record` would give
+    /// (#1857): it holds this record, or it holds the record that is kept
+    /// for the same `(subject, issuer)` pair. A caller can skip a covered
+    /// record with no signature check. The subject of a covered record is
+    /// revoked in this set.
+    #[must_use]
+    pub fn covers(&self, record: &RevocationRecord) -> bool {
+        let hash = record.record_hash();
+        if self.records_by_hash.contains_key(&hash) {
+            return true;
+        }
+        record
+            .pair_key()
+            .and_then(|pair| self.pair_index.get(&pair))
+            .and_then(|held| self.records_by_hash.get(held))
+            .is_some_and(|held| held.record.rank() <= (record.revoked_at, hash))
+    }
+
+    /// Put a verified record in the record map under the one-record-per-pair
+    /// rule (#1857). Returns `false` when the set already covers it. The
+    /// subject indices are not touched: both records of a pair name the
+    /// same subject, so a replacement cannot un-revoke anything.
+    fn admit(&mut self, persisted: PersistedRevocation) -> bool {
+        let hash = persisted.record.record_hash();
+        if self.records_by_hash.contains_key(&hash) {
+            return false;
+        }
+        if let Some(pair) = persisted.record.pair_key() {
+            if let Some(held_hash) = self.pair_index.get(&pair).copied() {
+                if let Some(held) = self.records_by_hash.get(&held_hash) {
+                    if held.record.rank() <= (persisted.record.revoked_at, hash) {
+                        return false;
+                    }
+                    self.records_by_hash.remove(&held_hash);
+                }
+            }
+            self.pair_index.insert(pair, hash);
+        }
+        self.records_by_hash.insert(hash, persisted);
+        true
+    }
+
     /// Verify a record's authority, then insert it. Returns `true` if it was
     /// newly added, `false` if already present (idempotent).
     ///
@@ -1260,6 +1455,11 @@ impl RevocationSet {
             return Err(IdentityError::Revocation(format!(
                 "revoked_at {} is more than {REVOCATION_MAX_FUTURE_SKEW_SECS} s ahead of local time {now_unix}",
                 record.revoked_at
+            )));
+        }
+        if !reason_within_limit(&record.reason) {
+            return Err(IdentityError::Revocation(format!(
+                "reason is longer than {MAX_REVOCATION_REASON_BYTES} bytes"
             )));
         }
         self.verify_and_insert(record, subject_cert)
@@ -1323,6 +1523,7 @@ impl RevocationSet {
         self.binding_epochs.clear();
         self.binding_machines_by_agent.clear();
         self.revoked_share_grants.clear();
+        self.pair_index.clear();
         let remaining: Vec<PersistedRevocation> = self
             .records_by_hash
             .drain()
@@ -1415,8 +1616,7 @@ impl RevocationSet {
     /// records that were already in the set while it rebuilds the indices.
     /// Returns `true` if new.
     fn insert_verified(&mut self, persisted: PersistedRevocation) -> bool {
-        let hash = persisted.record.record_hash();
-        if self.records_by_hash.contains_key(&hash) {
+        if self.covers(&persisted.record) {
             return false;
         }
         match &persisted.record.subject {
@@ -1449,7 +1649,7 @@ impl RevocationSet {
                 *entry = (*entry).max(grant.grant_expiry);
             }
         }
-        self.records_by_hash.insert(hash, persisted);
+        self.admit(persisted);
         self.change_generation = self.change_generation.saturating_add(1);
         self.notify_change();
         true
@@ -1682,11 +1882,8 @@ impl RevocationSet {
                 changed = true;
             }
         }
-        for (hash, persisted) in other.records_by_hash {
-            if let std::collections::hash_map::Entry::Vacant(slot) =
-                self.records_by_hash.entry(hash)
-            {
-                slot.insert(persisted);
+        for persisted in other.records_by_hash.into_values() {
+            if self.admit(persisted) {
                 changed = true;
             }
         }
@@ -1715,8 +1912,8 @@ impl RevocationSet {
                 }
             }
         }
-        for (hash, persisted) in other.records_by_hash {
-            self.records_by_hash.entry(hash).or_insert(persisted);
+        for persisted in other.records_by_hash.into_values() {
+            self.admit(persisted);
         }
     }
 
@@ -3444,7 +3641,11 @@ mod tests {
             loaded
                 .verify_and_insert(self_revocation(&other, u64::MAX), None)
                 .expect("legacy far-future record");
-            assert_eq!(loaded.drop_future_records(now), 2);
+            // #1857: the current record for `kp` took the place of its
+            // far-future record (the earlier `revoked_at` is kept), so one
+            // far-future record is left to drop.
+            assert_eq!(loaded.len(), 2);
+            assert_eq!(loaded.drop_future_records(now), 1);
             assert_eq!(loaded.len(), 1);
             assert!(
                 loaded.is_agent_revoked(&kp.agent_id()),
@@ -4126,6 +4327,323 @@ mod tests {
 
     /// ADR-0070 slice 3: share-grant revocations and the old-decoder
     /// guarantees of the v1/v2 carriers.
+    /// #1857: the set is not swept by age (#1108), so its size and its
+    /// gossip must stay inside limits by other rules.
+    mod batches_and_pairs {
+        use super::super::*;
+        use crate::identity::{AgentKeypair, UserKeypair};
+
+        fn self_revocation(kp: &AgentKeypair, revoked_at: u64, reason: &str) -> RevocationRecord {
+            RevocationRecord::sign(
+                RevokedSubject::Agent(kp.agent_id()),
+                kp.public_key(),
+                kp.secret_key(),
+                revoked_at,
+                Some(reason.to_string()),
+            )
+            .expect("sign")
+        }
+
+        /// A record with the byte sizes of a real one and no valid
+        /// signature (for codec tests, which do not verify).
+        fn sized_fake(tag: u32) -> RevocationRecord {
+            let mut id = [0u8; 32];
+            id[..4].copy_from_slice(&tag.to_le_bytes());
+            RevocationRecord {
+                subject: RevokedSubject::Agent(AgentId(id)),
+                issuer_public_key: vec![7; 1952],
+                revoked_at: 1_800_000_000,
+                reason: Some("r".to_string()),
+                signature: vec![9; 3309],
+            }
+        }
+
+        /// WHY: one key can sign any number of records for one subject
+        /// (a new time or a new reason each). With no age sweep, each one
+        /// stayed for good and was sent again every two hours. The set
+        /// must hold one record for each subject and issuer.
+        #[test]
+        fn more_records_for_one_subject_and_issuer_do_not_grow_the_set() {
+            let kp = AgentKeypair::generate().expect("keypair");
+            let mut set = RevocationSet::new();
+            let first = self_revocation(&kp, 1_000, "first");
+            assert!(set
+                .verify_and_insert(first.clone(), None)
+                .expect("verifies"));
+
+            for n in 0..20u64 {
+                let later = self_revocation(&kp, 1_001 + n, &format!("again {n}"));
+                assert!(
+                    !set.verify_and_insert(later.clone(), None)
+                        .expect("verifies"),
+                    "a later record for the same pair adds nothing"
+                );
+                assert!(set.covers(&later), "and the set covers it");
+                assert!(!set.contains_hash(&later.record_hash()));
+            }
+            assert_eq!(set.len(), 1);
+            assert_eq!(set.all_records(), vec![first]);
+            assert!(set.is_agent_revoked(&kp.agent_id()));
+
+            // The file a restart reads holds one record too.
+            let loaded =
+                RevocationSet::from_bytes(&set.to_bytes().expect("encode")).expect("decode");
+            assert_eq!(loaded.len(), 1);
+        }
+
+        /// WHY: every node must keep the SAME record, or two nodes never
+        /// agree on the set (the #1116 resync compares record hashes). The
+        /// rule is the earlier `revoked_at`, then the lower hash. A
+        /// replacement must never leave the subject not revoked.
+        #[test]
+        fn every_arrival_order_keeps_the_same_record_and_the_subject_stays_revoked() {
+            let kp = AgentKeypair::generate().expect("keypair");
+            let early = self_revocation(&kp, 1_000, "early");
+            let late = self_revocation(&kp, 2_000, "late");
+            let same_time = self_revocation(&kp, 1_000, "same time, other reason");
+            let winner_of_tie = if early.record_hash() < same_time.record_hash() {
+                early.clone()
+            } else {
+                same_time.clone()
+            };
+
+            for order in [
+                [&early, &late, &same_time],
+                [&late, &same_time, &early],
+                [&same_time, &early, &late],
+            ] {
+                let mut set = RevocationSet::new();
+                for record in order {
+                    set.verify_and_insert(record.clone(), None)
+                        .expect("verifies");
+                    assert!(
+                        set.is_agent_revoked(&kp.agent_id()),
+                        "the subject is revoked after every step"
+                    );
+                }
+                assert_eq!(set.all_records(), vec![winner_of_tie.clone()]);
+            }
+        }
+
+        /// WHY: another issuer is another pair. An owner's record for an
+        /// agent and the agent's own record are both kept: each one has
+        /// its own authority.
+        #[test]
+        fn two_issuers_for_one_subject_are_both_kept() {
+            let owner = UserKeypair::generate().expect("owner");
+            let agent = AgentKeypair::generate().expect("agent");
+            let cert = AgentCertificate::issue(&owner, &agent).expect("cert");
+            let by_owner = RevocationRecord::sign(
+                RevokedSubject::Agent(agent.agent_id()),
+                owner.public_key(),
+                owner.secret_key(),
+                1_000,
+                None,
+            )
+            .expect("sign");
+            let mut set = RevocationSet::new();
+            assert!(set
+                .verify_and_insert(by_owner, Some(&cert))
+                .expect("verifies"));
+            assert!(set
+                .verify_and_insert(self_revocation(&agent, 2_000, "self"), None)
+                .expect("verifies"));
+            assert_eq!(set.len(), 2);
+        }
+
+        /// WHY: a receiver ignores a whole batch above 2 MiB, about 380
+        /// records. One batch for a larger set meant that NO revocation
+        /// from that daemon reached any peer. Several batches, each one
+        /// well under the limit, carry every record.
+        #[test]
+        fn a_large_set_is_sent_as_batches_under_the_receive_limit() {
+            let records: Vec<RevocationRecord> = (0..1_000).map(sized_fake).collect();
+            assert!(
+                encode_revocation_batch(&records).expect("encode").len()
+                    > MAX_REVOCATION_PAYLOAD_BYTES,
+                "one batch of this set is over the limit a receiver accepts"
+            );
+
+            let batches = encode_revocation_batches(&records).expect("encode");
+            assert!(batches.len() > 1);
+            let mut seen = HashSet::new();
+            for batch in &batches {
+                assert!(batch.len() <= REVOCATION_BATCH_TARGET_BYTES + 8 * 1024);
+                assert!(batch.len() < MAX_REVOCATION_PAYLOAD_BYTES / 2);
+                for record in decode_revocation_batch(batch).expect("a released decoder reads it") {
+                    seen.insert(record.record_hash());
+                }
+            }
+            assert_eq!(seen.len(), 1_000, "every record is in some batch");
+
+            // The same set gives the same batches in any input order.
+            let mut reversed = records.clone();
+            reversed.reverse();
+            assert_eq!(
+                encode_revocation_batches(&reversed).expect("encode"),
+                batches
+            );
+            // A small set is still one batch, with the bytes of today.
+            assert_eq!(
+                encode_revocation_batches(&records[..2])
+                    .expect("encode")
+                    .len(),
+                1
+            );
+            assert!(encode_revocation_batches(&[]).expect("encode").is_empty());
+        }
+
+        /// WHY: a store written before this change can hold more records
+        /// than one batch carries. After a restart the daemon must still
+        /// hold every subject as revoked and must send them all.
+        #[test]
+        fn an_over_limit_store_still_loads_and_goes_out_in_batches() {
+            let keys: Vec<AgentKeypair> = (0..420)
+                .map(|_| AgentKeypair::generate().expect("keypair"))
+                .collect();
+            let mut set = RevocationSet::new();
+            for kp in &keys {
+                set.verify_and_insert(self_revocation(kp, 1_000, "r"), None)
+                    .expect("verifies");
+            }
+            let bytes = set.to_bytes().expect("encode");
+            assert!(bytes.len() > MAX_REVOCATION_PAYLOAD_BYTES, "over one batch");
+
+            let loaded = RevocationSet::from_bytes(&bytes).expect("decode");
+            assert!(keys
+                .iter()
+                .all(|kp| loaded.is_agent_revoked(&kp.agent_id())));
+            let batches = encode_revocation_batches(&loaded.all_records()).expect("encode");
+            assert!(batches.len() > 1);
+            let mut sent = 0;
+            for batch in &batches {
+                assert!(batch.len() < MAX_REVOCATION_PAYLOAD_BYTES / 2);
+                sent += decode_revocation_batch(batch).expect("decode").len();
+            }
+            assert_eq!(sent, 420);
+        }
+
+        /// WHY: the reason is inside the signed bytes and had no limit, so
+        /// one signature could put megabytes in every node's store. A new
+        /// record with a long reason is refused where it is signed and
+        /// where it arrives. A record that is already in a store is kept:
+        /// refusing it at load would un-revoke its subject.
+        #[test]
+        fn a_long_reason_is_refused_for_new_records_and_kept_for_stored_ones() {
+            let kp = AgentKeypair::generate().expect("keypair");
+            let at_limit = "x".repeat(MAX_REVOCATION_REASON_BYTES);
+            let over = "x".repeat(MAX_REVOCATION_REASON_BYTES + 1);
+            assert!(RevocationRecord::sign(
+                RevokedSubject::Agent(kp.agent_id()),
+                kp.public_key(),
+                kp.secret_key(),
+                1_000,
+                Some(over.clone()),
+            )
+            .is_err());
+
+            // A record as a released daemon could have signed it.
+            let subject = RevokedSubject::Agent(kp.agent_id());
+            let issuer = kp.public_key().as_bytes().to_vec();
+            let reason = Some(over);
+            let message = RevocationRecord::canonical_message(&subject, &issuer, 1_000, &reason);
+            let signature = sign_with_ml_dsa(kp.secret_key(), &message).expect("sign");
+            let long = RevocationRecord {
+                subject,
+                issuer_public_key: issuer,
+                revoked_at: 1_000,
+                reason,
+                signature: signature.as_bytes().to_vec(),
+            };
+
+            let mut fresh = RevocationSet::new();
+            assert!(
+                fresh
+                    .verify_and_insert_at(long.clone(), None, 1_000)
+                    .is_err(),
+                "refused when it arrives from a peer"
+            );
+            assert!(!fresh.is_agent_revoked(&kp.agent_id()));
+            let other = AgentKeypair::generate().expect("keypair");
+            assert!(fresh
+                .verify_and_insert_at(self_revocation(&other, 1_000, &at_limit), None, 1_000)
+                .expect("a reason at the limit is accepted"));
+
+            // Already stored (the load path has no bound): kept.
+            let mut stored = RevocationSet::new();
+            assert!(stored.verify_and_insert(long, None).expect("verifies"));
+            let loaded =
+                RevocationSet::from_bytes(&stored.to_bytes().expect("encode")).expect("decode");
+            assert!(loaded.is_agent_revoked(&kp.agent_id()));
+        }
+
+        /// WHY (#1116 with #1857): a sender now publishes a carrier as
+        /// several batches. A waiting node must read the batches of one
+        /// round as ONE snapshot, or a set that needs two batches could
+        /// never open the carrier. A snapshot that omits a held record
+        /// must still be refused.
+        #[test]
+        fn a_resync_snapshot_in_two_batches_opens_the_carrier() {
+            let a = AgentKeypair::generate().expect("keypair");
+            let b = AgentKeypair::generate().expect("keypair");
+            let record_a = self_revocation(&a, 1_000, "a");
+            let record_b = self_revocation(&b, 1_000, "b");
+            let sender = AgentId([0xA1; 32]);
+
+            let mut held = RevocationSet::quarantined_carrier(REVOCATION_CARRIER_V1);
+            held.apply_group_revocation_resync(vec![record_a.clone(), record_b.clone()], 3_000);
+            held.observe_remote_carrier_snapshot(
+                REVOCATION_CARRIER_V1,
+                &sender,
+                std::slice::from_ref(&record_a),
+                true,
+            );
+            assert!(
+                held.carrier_resync_pending(REVOCATION_CARRIER_V1),
+                "one batch that omits a held record does not open the carrier"
+            );
+            held.observe_remote_carrier_snapshot(
+                REVOCATION_CARRIER_V1,
+                &sender,
+                std::slice::from_ref(&record_b),
+                true,
+            );
+            assert!(
+                !held.carrier_resync_pending(REVOCATION_CARRIER_V1),
+                "the two batches of one round are one snapshot"
+            );
+        }
+
+        /// WHY (#1116): a node that waits for a resync opens a carrier when
+        /// a trusted snapshot matches its own records. A released daemon
+        /// can hold two records for one pair; this node keeps one. The
+        /// snapshot must be compared by the records this node would keep,
+        /// or the carrier never opens against such a daemon.
+        #[test]
+        fn a_resync_snapshot_with_two_records_for_one_pair_still_opens_the_carrier() {
+            let kp = AgentKeypair::generate().expect("keypair");
+            let kept = self_revocation(&kp, 1_000, "kept");
+            let extra = self_revocation(&kp, 2_000, "extra");
+            let mut held = RevocationSet::quarantined_carrier(REVOCATION_CARRIER_V1);
+            held.apply_group_revocation_resync(vec![kept.clone()], 3_000);
+            assert!(
+                held.carrier_resync_pending(REVOCATION_CARRIER_V1),
+                "one insert is not a snapshot"
+            );
+
+            held.observe_remote_carrier_snapshot(
+                REVOCATION_CARRIER_V1,
+                &AgentId([0xA1; 32]),
+                &[kept, extra],
+                true,
+            );
+            assert!(
+                !held.carrier_resync_pending(REVOCATION_CARRIER_V1),
+                "the trusted snapshot is accepted"
+            );
+        }
+    }
+
     mod share_grant_v3 {
         use super::super::*;
         use crate::identity::UserKeypair;
@@ -4366,8 +4884,8 @@ mod tests {
         }
 
         /// WHY: a revoked grant must stay revoked across restart (v3 file)
-        /// and past the 90-day TTL while the grant could still be honoured —
-        /// a grant may be valid for longer than the TTL, and an early
+        /// for as long as the grant could still be honoured — a grant may be
+        /// valid for a long time, and an early
         /// collection would resurrect it. Once the grant itself is dead
         /// (expiry + slack) the record is collected, so the set stays
         /// bounded; every node computes that point from the SIGNED expiry.
@@ -4397,7 +4915,7 @@ mod tests {
             restored.merge_v3(RevocationSet::from_bytes_v3(&bytes).unwrap());
             assert!(restored.is_share_grant_revoked(&grant_id, &owner.user_id()));
 
-            // Far past the 90-day TTL, but before expiry + slack: kept.
+            // Long after the revocation, but before expiry + slack: kept.
             let just_before = grant_expiry + SHARE_GRANT_REVOCATION_GC_SLACK_SECS - 1;
             assert_eq!(restored.collect_dead_records(just_before), 0);
             assert!(restored.is_share_grant_revoked(&grant_id, &owner.user_id()));

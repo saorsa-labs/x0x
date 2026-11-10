@@ -3923,7 +3923,7 @@ async fn apply_legacy_revocation_records(
             .await;
         let mut set = revocation_set.write().await;
         for record in records {
-            if set.contains_hash(&record.record_hash()) {
+            if set.covers(&record) {
                 continue;
             }
             let subject_cert = match &record.subject {
@@ -4028,7 +4028,7 @@ async fn apply_v2_revocation_records(
             .await;
         let mut set = revocation_set.write().await;
         for record in records {
-            if set.contains_hash(&record.record_hash()) {
+            if set.covers(&record) {
                 continue;
             }
             let subject_cert = match &record.subject {
@@ -6836,38 +6836,51 @@ impl HeartbeatContext {
             // gating as the v1 arm.
             let binding_records = self.revocation_set.read().await.binding_records();
             if !binding_records.is_empty() {
-                if let Ok(bytes) = revocation::encode_revocation_batch(&binding_records) {
-                    let _ = self
-                        .runtime
-                        .pubsub()
-                        .publish(REVOCATION_V2_TOPIC.to_string(), bytes::Bytes::from(bytes))
-                        .await;
+                if let Ok(batches) = revocation::encode_revocation_batches(&binding_records) {
+                    for bytes in batches {
+                        let _ = self
+                            .runtime
+                            .pubsub()
+                            .publish(REVOCATION_V2_TOPIC.to_string(), bytes::Bytes::from(bytes))
+                            .await;
+                    }
                 }
             }
             // ADR-0070: share-grant revocations ride v3 only, same gating.
             let share_grant_records = self.revocation_set.read().await.share_grant_records();
             if !share_grant_records.is_empty() {
-                if let Ok(bytes) = revocation::encode_revocation_batch(&share_grant_records) {
-                    let _ = self
-                        .runtime
-                        .pubsub()
-                        .publish(REVOCATION_V3_TOPIC.to_string(), bytes::Bytes::from(bytes))
-                        .await;
+                if let Ok(batches) = revocation::encode_revocation_batches(&share_grant_records) {
+                    for bytes in batches {
+                        let _ = self
+                            .runtime
+                            .pubsub()
+                            .publish(REVOCATION_V3_TOPIC.to_string(), bytes::Bytes::from(bytes))
+                            .await;
+                    }
                 }
             }
 
             let records = self.revocation_set.read().await.all_records();
             if !records.is_empty() {
-                match revocation::encode_revocation_batch(&records) {
-                    Ok(bytes) => {
-                        if let Err(e) = self
-                            .runtime
-                            .pubsub()
-                            .publish(REVOCATION_TOPIC.to_string(), bytes::Bytes::from(bytes))
-                            .await
-                        {
-                            tracing::debug!("heartbeat: revocation re-broadcast failed: {e}");
-                        } else {
+                // #1857: several batches, each far under the 2 MiB that a
+                // receiver accepts. One oversized batch was ignored whole.
+                match revocation::encode_revocation_batches(&records) {
+                    Ok(batches) => {
+                        let mut all_sent = true;
+                        for bytes in batches {
+                            if let Err(e) = self
+                                .runtime
+                                .pubsub()
+                                .publish(REVOCATION_TOPIC.to_string(), bytes::Bytes::from(bytes))
+                                .await
+                            {
+                                all_sent = false;
+                                tracing::debug!("heartbeat: revocation re-broadcast failed: {e}");
+                            }
+                        }
+                        // A failed batch leaves the generation behind, so
+                        // the next heartbeat publishes the set again.
+                        if all_sent {
                             self.last_revocation_generation
                                 .store(current_gen, std::sync::atomic::Ordering::Relaxed);
                         }
@@ -6877,7 +6890,8 @@ impl HeartbeatContext {
                     }
                 }
             } else if changed {
-                // Set became empty (all records expired) — advance the
+                // The set became empty (its last record was collected or
+                // taken) — advance the
                 // generation tracker so we don't re-enter on every tick.
                 self.last_revocation_generation
                     .store(current_gen, std::sync::atomic::Ordering::Relaxed);
@@ -7210,8 +7224,7 @@ async fn ingest_share_grant_revocations_for_s4(
     identity_dir: Option<std::path::PathBuf>,
     payload: &[u8],
 ) -> bool {
-    const MAX_V3_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
-    if payload.len() > MAX_V3_PAYLOAD_BYTES {
+    if payload.len() > revocation::MAX_REVOCATION_PAYLOAD_BYTES {
         return false;
     }
     let Ok(records) = revocation::decode_revocation_batch(payload) else {
@@ -15332,8 +15345,7 @@ impl Agent {
                         // Size-limit: max 2 MiB for a revocation batch (records
                         // are ~5.3 KB each; 2 MiB ≈ 380 records, far beyond
                         // any realistic fleet size in v1).
-                        const MAX_REVOCATION_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
-                        if msg.payload.len() > MAX_REVOCATION_PAYLOAD_BYTES {
+                        if msg.payload.len() > revocation::MAX_REVOCATION_PAYLOAD_BYTES {
                             tracing::debug!(
                                 "ignoring oversized revocation payload ({} bytes)",
                                 msg.payload.len()
@@ -15460,8 +15472,7 @@ impl Agent {
                     // the subject cert resolved from the discovery cache
                     // (fail-closed without it, exactly the v1 rule).
                     DiscoveryMessage::RevocationV2(msg) => {
-                        const MAX_V2_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
-                        if msg.payload.len() > MAX_V2_PAYLOAD_BYTES {
+                        if msg.payload.len() > revocation::MAX_REVOCATION_PAYLOAD_BYTES {
                             continue;
                         }
                         let Ok(records) = revocation::decode_revocation_batch(&msg.payload) else {
@@ -17741,10 +17752,13 @@ impl Agent {
         record: revocation::RevocationRecord,
         roster_cert: Option<&identity::AgentCertificate>,
     ) -> error::Result<bool> {
-        let hash = record.record_hash();
-        if self.revocation_set.read().await.contains_hash(&hash) {
+        // #1857: a record that the set covers (it holds the record kept
+        // for the same subject and issuer) is in force here, so the
+        // handoff's evidence is held.
+        if self.revocation_set.read().await.covers(&record) {
             return Ok(true);
         }
+        let covered_probe = record.clone();
         let certs = match record.needs_certificate_authority() {
             Some(subject) => {
                 let journal = load_journal_certs(self.cert_journal_path.as_deref()).await;
@@ -17777,7 +17791,7 @@ impl Agent {
         let subject_cert = pick_subject_cert(Some(&certs), &record).cloned();
         self.apply_and_publish_revocation(record, subject_cert.as_ref())
             .await?;
-        Ok(self.revocation_set.read().await.contains_hash(&hash))
+        Ok(self.revocation_set.read().await.covers(&covered_probe))
     }
 
     /// ADR 0110 §4 (ADR 0093): unknown or expired support for an
@@ -18087,14 +18101,13 @@ impl Agent {
                     _ => (REVOCATION_TOPIC, set.all_records()),
                 }
             };
-            match revocation::encode_revocation_batch(&records) {
-                Ok(bytes) if !bytes.is_empty() => {
+            if let Ok(batches) = revocation::encode_revocation_batches(&records) {
+                for bytes in batches {
                     let _ = rt
                         .pubsub()
                         .publish(topic.to_string(), bytes::Bytes::from(bytes))
                         .await;
                 }
-                _ => {}
             }
         }
 

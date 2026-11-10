@@ -1599,6 +1599,18 @@ pub(in crate::server) async fn identity_revoke(
     Json(body): Json<RevokeRequest>,
 ) -> impl IntoResponse {
     use x0x::revocation::RevokedSubject;
+    // #1857: the reason is inside the signed record and is stored by every
+    // peer, so it has a size limit.
+    if body
+        .reason
+        .as_ref()
+        .is_some_and(|reason| reason.len() > x0x::revocation::MAX_REVOCATION_REASON_BYTES)
+    {
+        return bad_request(format!(
+            "reason is longer than {} bytes",
+            x0x::revocation::MAX_REVOCATION_REASON_BYTES
+        ));
+    }
     // ADR-0043 both-fields form: owner-key issued binding tombstone.
     if let (Some(agent_hex), Some(machine_hex)) =
         (body.agent_id.as_deref(), body.machine_id.as_deref())

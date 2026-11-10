@@ -76,7 +76,7 @@ A network-wide reputation score cannot replace an owner's explicit grant or a gr
 
 ## Current implementation
 
-Many trust, grant and ACL surfaces exist. Unified authority and complete revocation coverage remain incomplete. The corrupt-store quarantine rule above entered the tree with PR #1336. The heartbeat sweep removes only the records of dead share grants; agent, machine and binding records stay (#1108). A daemon older than this change still removes agent and machine records 90 days after `revoked_at`. The number of held records has no upper limit, and one v1 gossip batch holds about 380 records (2 MiB). The corruption requirements above are not fully implemented.
+Many trust, grant and ACL surfaces exist. Unified authority and complete revocation coverage remain incomplete. The corrupt-store quarantine rule above entered the tree with PR #1336. The heartbeat sweep removes only the records of dead share grants; agent, machine and binding records stay (#1108). A daemon older than this change still removes agent and machine records 90 days after `revoked_at`. The set holds one record for each subject and issuer of an agent, machine or binding revocation (the earlier `revoked_at`, then the lower record hash), and a new record's `reason` is at most 1024 bytes (#1857). A daemon sends each revocation carrier as several batches of about 512 KiB; a receiver ignores a batch above 2 MiB. The number of different subjects has no upper limit: any key can revoke itself. The corruption requirements above are not fully implemented.
 
 ## Validation
 
