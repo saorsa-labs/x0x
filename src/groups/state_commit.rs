@@ -737,6 +737,88 @@ impl GroupStateCommit {
     }
 }
 
+// ─────────────────── Join request reject binding (#1623) ─────────────────
+
+/// Domain separator of the signature that binds a `JoinRequestRejected`
+/// link to the join request that it rejects (#1623).
+pub const JOIN_REQUEST_REJECT_DOMAIN: &[u8] = b"x0x.group.join-request-reject.v1";
+
+/// #1623: the bytes that the signer of a reject commit signs to name the
+/// rejected request. A commit covers no join request: the state hash and
+/// the roster root do not change with a request's status. So this second
+/// signature, by the same key, binds the commit (`group_id`, `revision`,
+/// `state_hash`) to one `request_id` and its requester.
+///
+/// The commit's signed bytes are not changed, so a peer that does not know
+/// this binding still verifies the commit.
+#[must_use]
+pub fn join_request_reject_signable_bytes(
+    commit: &GroupStateCommit,
+    request_id: &str,
+    requester_agent_id: &str,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(256);
+    buf.extend_from_slice(JOIN_REQUEST_REJECT_DOMAIN);
+    push_len_prefixed(&mut buf, commit.group_id.as_bytes());
+    buf.extend_from_slice(&commit.revision.to_le_bytes());
+    push_len_prefixed(&mut buf, commit.state_hash.as_bytes());
+    push_len_prefixed(&mut buf, request_id.as_bytes());
+    push_len_prefixed(&mut buf, requester_agent_id.as_bytes());
+    buf
+}
+
+/// #1623: sign [`join_request_reject_signable_bytes`] with the key that
+/// signed `commit`. Returns the hex ML-DSA-65 signature.
+///
+/// # Errors
+///
+/// `keypair` is not the commit's signer, or the signature fails.
+pub fn sign_join_request_reject(
+    commit: &GroupStateCommit,
+    request_id: &str,
+    requester_agent_id: &str,
+    keypair: &AgentKeypair,
+) -> Result<String, ApplyError> {
+    if hex::encode(keypair.public_key().as_bytes()) != commit.signer_public_key {
+        return Err(ApplyError::InvalidSignature(
+            "the reject binding signer is not the commit signer".to_string(),
+        ));
+    }
+    let bytes = join_request_reject_signable_bytes(commit, request_id, requester_agent_id);
+    let sig = sign_with_ml_dsa(keypair.secret_key(), &bytes)
+        .map_err(|e| ApplyError::InvalidSignature(format!("{e:?}")))?;
+    Ok(hex::encode(sig.as_bytes()))
+}
+
+/// #1623: verify that `binding` is the signature of the commit's signer
+/// over [`join_request_reject_signable_bytes`] for this request. The key is
+/// `commit.signer_public_key`; [`GroupStateCommit::verify_structure`] binds
+/// that key to `committed_by` and to the commit, and the caller's apply
+/// runs it.
+///
+/// # Errors
+///
+/// The binding does not decode, or does not verify for this commit,
+/// `request_id` and `requester_agent_id`.
+pub fn verify_join_request_reject(
+    commit: &GroupStateCommit,
+    request_id: &str,
+    requester_agent_id: &str,
+    binding: &str,
+) -> Result<(), ApplyError> {
+    let pubkey_bytes = hex::decode(&commit.signer_public_key)
+        .map_err(|e| ApplyError::InvalidSignature(format!("bad pubkey hex: {e}")))?;
+    let pubkey = MlDsaPublicKey::from_bytes(&pubkey_bytes)
+        .map_err(|e| ApplyError::InvalidSignature(format!("bad pubkey: {e:?}")))?;
+    let sig_bytes = hex::decode(binding)
+        .map_err(|e| ApplyError::InvalidSignature(format!("bad binding hex: {e}")))?;
+    let sig = MlDsaSignature::from_bytes(&sig_bytes)
+        .map_err(|e| ApplyError::InvalidSignature(format!("bad binding: {e:?}")))?;
+    let bytes = join_request_reject_signable_bytes(commit, request_id, requester_agent_id);
+    verify_with_ml_dsa(&pubkey, &bytes, &sig)
+        .map_err(|e| ApplyError::InvalidSignature(format!("binding verify failed: {e:?}")))
+}
+
 // ─────────────────────────── Apply errors ───────────────────────────────
 
 /// Errors produced during apply-side validation.
@@ -2953,5 +3035,109 @@ mod tests {
         )
         .expect_err("post-withdrawal link refused");
         assert_eq!(err, "link follows a withdrawn (terminal) link in the chain");
+    }
+
+    // ── #1623: the reject binding ───────────────────────────────────────
+
+    fn reject_commit(keypair: &AgentKeypair) -> GroupStateCommit {
+        GroupStateCommit::sign(
+            "g1623".to_string(),
+            7,
+            Some("aa".repeat(32)),
+            "bb".repeat(32),
+            "cc".repeat(32),
+            "dd".repeat(32),
+            None,
+            false,
+            9_000,
+            keypair,
+        )
+        .expect("commit")
+    }
+
+    /// Pinned vector: the signed bytes of the reject binding. A change to
+    /// this layout changes signed content; old bindings stop verifying.
+    #[test]
+    fn join_request_reject_signable_bytes_are_pinned() {
+        let commit = GroupStateCommit {
+            group_id: "g1".to_string(),
+            revision: 0x0102,
+            prev_state_hash: None,
+            roster_root: "unsigned-here".to_string(),
+            policy_hash: "unsigned-here".to_string(),
+            public_meta_hash: "unsigned-here".to_string(),
+            security_binding: None,
+            state_hash: "5a5a".to_string(),
+            withdrawn: false,
+            committed_by: "unsigned-here".to_string(),
+            committed_at: 99,
+            signer_public_key: String::new(),
+            signature: String::new(),
+        };
+        let bytes = join_request_reject_signable_bytes(&commit, "req-1", "ab");
+        let mut want = b"x0x.group.join-request-reject.v1".to_vec();
+        want.extend_from_slice(&[2, 0, 0, 0]);
+        want.extend_from_slice(b"g1");
+        want.extend_from_slice(&[2, 1, 0, 0, 0, 0, 0, 0]);
+        want.extend_from_slice(&[4, 0, 0, 0]);
+        want.extend_from_slice(b"5a5a");
+        want.extend_from_slice(&[5, 0, 0, 0]);
+        want.extend_from_slice(b"req-1");
+        want.extend_from_slice(&[2, 0, 0, 0]);
+        want.extend_from_slice(b"ab");
+        assert_eq!(bytes, want);
+        assert_eq!(
+            hex::encode(&bytes),
+            concat!(
+                "7830782e67726f75702e6a6f696e2d726571756573742d72656a6563742e7631",
+                "0200000067310201000000000000",
+                "0400000035613561",
+                "050000007265712d31",
+                "020000006162",
+            )
+        );
+    }
+
+    /// The binding verifies only for the commit, the request and the
+    /// requester that the commit signer named.
+    #[test]
+    fn join_request_reject_binding_names_one_request() {
+        let signer = AgentKeypair::generate().expect("signer");
+        let other = AgentKeypair::generate().expect("other");
+        let commit = reject_commit(&signer);
+        let binding = sign_join_request_reject(&commit, "req-1", "requester", &signer)
+            .expect("the commit signer signs");
+        assert_eq!(
+            verify_join_request_reject(&commit, "req-1", "requester", &binding),
+            Ok(())
+        );
+        let refused = |commit: &GroupStateCommit, request: &str, requester: &str, sig: &str| {
+            matches!(
+                verify_join_request_reject(commit, request, requester, sig),
+                Err(ApplyError::InvalidSignature(_))
+            )
+        };
+        assert!(refused(&commit, "req-2", "requester", &binding));
+        assert!(refused(&commit, "req-1", "another", &binding));
+        assert!(refused(&commit, "req-1", "requester", "not hex"));
+        assert!(refused(&commit, "req-1", "requester", ""));
+        // The same request under another link of the same signer.
+        let mut later = commit.clone();
+        later.revision += 1;
+        assert!(refused(&later, "req-1", "requester", &binding));
+        let mut other_head = commit.clone();
+        other_head.state_hash = "ee".repeat(32);
+        assert!(refused(&other_head, "req-1", "requester", &binding));
+        let mut other_group = commit.clone();
+        other_group.group_id = "g2".to_string();
+        assert!(refused(&other_group, "req-1", "requester", &binding));
+        // Another key: it cannot sign for this commit, and its signature
+        // over the same bytes does not verify under the commit's key.
+        assert!(sign_join_request_reject(&commit, "req-1", "requester", &other).is_err());
+        let mut as_other = commit.clone();
+        as_other.signer_public_key = hex::encode(other.public_key().as_bytes());
+        let forged = sign_join_request_reject(&as_other, "req-1", "requester", &other)
+            .expect("the other key signs its own claim");
+        assert!(refused(&commit, "req-1", "requester", &forged));
     }
 }

@@ -146,22 +146,83 @@ pub(in crate::server) fn unban<'a>(
     }))
 }
 
-/// `JoinRequestRejected`: an admin rejects a pending request.
+/// #1623: a `JoinRequestRejected` event names the request that its commit
+/// signer rejected. The commit covers no join request, so two rules tie
+/// the event to its signer:
+///
+/// - `actor` is `commit.committed_by`. Every caller also needs the
+///   authenticated sender to be `actor`, so only the commit signer can
+///   present its reject. Another admin cannot reuse the commit under its
+///   own name.
+/// - `request_binding`, when present, is the signer's signature over the
+///   commit, `request_id` and `requester_agent_id`
+///   (`state_commit::verify_join_request_reject`). A copy with another
+///   request or requester is refused.
+///
+/// A reject with no binding is the form of a signer older than #1623. It
+/// is accepted under the first rule alone, so a chain that holds such a
+/// link still applies. A third party cannot remove the binding to
+/// re-label a reject: without the signer's transport identity the first
+/// rule refuses its copy.
+pub(in crate::server) fn reject_names_its_request(
+    commit: &x0x::groups::GroupStateCommit,
+    actor: &str,
+    request_id: &str,
+    requester_agent_id: &str,
+    request_binding: Option<&str>,
+) -> bool {
+    commit.committed_by == actor
+        && request_binding.is_none_or(|binding| {
+            x0x::groups::state_commit::verify_join_request_reject(
+                commit,
+                request_id,
+                requester_agent_id,
+                binding,
+            )
+            .is_ok()
+        })
+}
+
+/// The fields of a `JoinRequestRejected` event that its step reads.
+#[derive(Clone, Copy)]
+pub(in crate::server) struct RejectedRequest<'a> {
+    pub request_id: &'a str,
+    pub actor: &'a str,
+    pub requester_agent_id: &'a str,
+    pub request_binding: Option<&'a str>,
+}
+
+/// `JoinRequestRejected`: an admin rejects a pending request. The event
+/// must name the request that the commit signer rejected
+/// ([`reject_names_its_request`], #1623).
 pub(in crate::server) fn join_request_rejected<'a>(
     cursor: &GroupInfo,
     sender_hex: &str,
-    request_id: &'a str,
-    actor: &'a str,
-    committed_at: u64,
+    reject: RejectedRequest<'a>,
+    commit: &x0x::groups::GroupStateCommit,
 ) -> Step<impl FnOnce(&mut GroupInfo) + 'a> {
+    let RejectedRequest {
+        request_id,
+        actor,
+        requester_agent_id,
+        request_binding,
+    } = reject;
     if !admin_signed(cursor, actor, sender_hex)
         || !cursor
             .join_requests
             .get(request_id)
             .is_some_and(|request| request.is_pending())
+        || !reject_names_its_request(
+            commit,
+            actor,
+            request_id,
+            requester_agent_id,
+            request_binding,
+        )
     {
         return Err(StepRefusal::Refused);
     }
+    let committed_at = commit.committed_at;
     Ok((ActionKind::AdminOrHigher, move |next: &mut GroupInfo| {
         super::set_join_request_rejected(next, request_id, actor, committed_at)
     }))
@@ -230,12 +291,34 @@ mod tests {
             join_request_cancelled(&cursor, &admin_hex, "r", &requester).err(),
             Some(StepRefusal::Refused)
         );
-        assert!(join_request_rejected(&cursor, &admin_hex, "r", &admin_hex, 0).is_ok());
+        // The step reads the commit's signer; the apply verifies the commit.
+        let commit = x0x::groups::GroupStateCommit {
+            group_id: "g".into(),
+            revision: 1,
+            prev_state_hash: None,
+            roster_root: String::new(),
+            policy_hash: String::new(),
+            public_meta_hash: String::new(),
+            security_binding: None,
+            state_hash: String::new(),
+            withdrawn: false,
+            committed_by: admin_hex.clone(),
+            committed_at: 0,
+            signer_public_key: String::new(),
+            signature: String::new(),
+        };
+        let reject = RejectedRequest {
+            request_id: "r",
+            actor: &admin_hex,
+            requester_agent_id: &requester,
+            request_binding: None,
+        };
+        assert!(join_request_rejected(&cursor, &admin_hex, reject, &commit).is_ok());
         // A resolved request: no admin may reject it.
         request.status = x0x::groups::JoinRequestStatus::Rejected;
         cursor.join_requests.insert("r".into(), request);
         assert_eq!(
-            join_request_rejected(&cursor, &admin_hex, "r", &admin_hex, 0).err(),
+            join_request_rejected(&cursor, &admin_hex, reject, &commit).err(),
             Some(StepRefusal::Refused)
         );
     }

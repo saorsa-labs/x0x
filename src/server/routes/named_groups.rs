@@ -2503,6 +2503,13 @@ pub(in crate::server) enum NamedGroupMetadataEvent {
         requester_agent_id: String,
         #[serde(default)]
         commit: Option<x0x::groups::GroupStateCommit>,
+        /// #1623: the hex ML-DSA-65 signature of the commit signer that
+        /// names the rejected request
+        /// (`state_commit::join_request_reject_signable_bytes`). `None` is
+        /// the form of a signer older than #1623; the field is then not
+        /// on the wire. Receivers: `event_steps::reject_names_its_request`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_binding: Option<String>,
     },
     JoinRequestCancelled {
         group_id: String,
@@ -19168,11 +19175,19 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
         NamedGroupMetadataEvent::JoinRequestRejected {
             request_id,
             actor,
+            requester_agent_id,
             commit,
+            request_binding,
             ..
         } => {
             let Some(commit) = commit else {
                 return ApplyMetadataResult::REJECTED;
+            };
+            let reject = event_steps::RejectedRequest {
+                request_id: &request_id,
+                actor: &actor,
+                requester_agent_id: &requester_agent_id,
+                request_binding: request_binding.as_deref(),
             };
             // #1623 (ADR 0109 §2 rule (b)): read once, so the gate and
             // the no-record branch below decide on the same answer.
@@ -19201,8 +19216,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // pending" for a page link that the gate above admitted (the
             // next hash of an armed attested sequence). It applies that
             // link state-only. The page sender must be the event's
-            // `actor` and an Active admin; the commit does not cover
-            // `actor` or `request_id`, and the commit's own signer and
+            // `actor` and an Active admin. The commit does not cover
+            // `actor` or `request_id`, so the event must also name the
+            // request that the commit signer rejected (#1623,
+            // `reject_names_its_request`). The commit's own signer and
             // hashes are checked by the apply below. No request record is
             // made from the event. A request record that the node does
             // hold keeps the ordinary step.
@@ -19215,19 +19232,23 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         && info
                             .caller_role(&actor)
                             .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin));
-                    if !admin_signed {
+                    if !admin_signed
+                        || !event_steps::reject_names_its_request(
+                            &commit,
+                            reject.actor,
+                            reject.request_id,
+                            reject.requester_agent_id,
+                            reject.request_binding,
+                        )
+                    {
                         return ApplyMetadataResult::REJECTED;
                     }
                     action = x0x::groups::ActionKind::AdminOrHigher;
                     Box::new(|_| {})
                 } else {
-                    let Ok((step_action, step_mutate)) = event_steps::join_request_rejected(
-                        &info,
-                        &sender_hex,
-                        &request_id,
-                        &actor,
-                        commit.committed_at,
-                    ) else {
+                    let Ok((step_action, step_mutate)) =
+                        event_steps::join_request_rejected(&info, &sender_hex, reject, &commit)
+                    else {
                         return ApplyMetadataResult::REJECTED;
                     };
                     action = step_action;
@@ -36561,12 +36582,30 @@ pub(in crate::server) async fn reject_join_request(
     }
     drop(membership_guard);
 
+    // #1623: the commit covers no join request, so its signer names the
+    // rejected request in a second signature. Hot file: this is the one
+    // place that signs a reject.
+    let request_binding = match x0x::groups::state_commit::sign_join_request_reject(
+        &commit,
+        &request_id,
+        &requester_hex,
+        signing_kp,
+    ) {
+        Ok(binding) => binding,
+        Err(e) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("reject binding failed: {e}"),
+            );
+        }
+    };
     let event = NamedGroupMetadataEvent::JoinRequestRejected {
         group_id: event_group_id,
         request_id,
         actor: caller_hex,
         requester_agent_id: requester_hex.clone(),
         commit: Some(commit),
+        request_binding: Some(request_binding),
     };
     // #1623: the signer serves this chain link on TreeKEM catch-up pages.
     remember_treekem_membership_event(&state, &event).await;

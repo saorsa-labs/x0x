@@ -1977,6 +1977,7 @@ fn reject_link(
         actor: owner_hex,
         requester_agent_id: agent(REQUESTER),
         commit: Some(commit.clone()),
+        request_binding: None,
     };
     Ok((commit, event))
 }
@@ -2191,6 +2192,340 @@ async fn reject_without_a_request_record_needs_the_signer_and_a_page() -> anyhow
         head_of(&state, &key).await?.state_hash,
         seated.state_hash,
         "a seated node keeps the request check"
+    );
+    Ok(())
+}
+
+// ─── #1623: the signed reject names the request that it rejects ────────────
+// RED on main: the commit of a reject covers no request, so a copy with
+// another `request_id` passed every check.
+
+const OTHER_REQUESTER: &str = "56";
+const OTHER_REQUEST_ID: &str = "issue1623-other-request";
+
+/// `base` with a second pending request. Join requests are in no signed
+/// root, so the sealed head is unchanged.
+fn with_second_request(mut base: GroupInfo) -> GroupInfo {
+    let mut request = x0x::groups::JoinRequest::new(
+        base.stable_group_id().to_string(),
+        agent(OTHER_REQUESTER),
+        None,
+        600,
+    );
+    request.request_id = OTHER_REQUEST_ID.to_string();
+    set_join_request_created(&mut base, request, None);
+    base
+}
+
+/// The reject of `REQUEST_ID` that the real REST route signs on
+/// `responder`, read from its catch-up log.
+async fn route_reject(
+    responder: &Arc<AppState>,
+    base: &GroupInfo,
+) -> anyhow::Result<NamedGroupMetadataEvent> {
+    let key = install_stub(responder, base.clone()).await?;
+    let response = reject_join_request(
+        State(Arc::clone(responder)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path((key, REQUEST_ID.to_string())),
+    )
+    .await
+    .into_response();
+    anyhow::ensure!(response.status() == StatusCode::OK, "the owner rejects");
+    let logs = responder.treekem_event_log.read().await;
+    logs.get(base.stable_group_id())
+        .into_iter()
+        .flatten()
+        .find(|event| named_group_metadata_event_kind(event) == "join_request_rejected")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("the signer logs its reject"))
+}
+
+/// A wire copy of `event` with JSON fields set (`Some`) or removed (`None`).
+fn rewritten(
+    event: &NamedGroupMetadataEvent,
+    edits: &[(&str, Option<&str>)],
+) -> anyhow::Result<NamedGroupMetadataEvent> {
+    let mut value = serde_json::to_value(event)?;
+    let fields = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("an event is a JSON object"))?;
+    for (field, text) in edits {
+        match text {
+            Some(text) => fields.insert((*field).to_string(), serde_json::json!(text)),
+            None => fields.remove(*field),
+        };
+    }
+    Ok(serde_json::from_value(value)?)
+}
+
+fn request_status(head: &GroupInfo, request_id: &str) -> Option<x0x::groups::JoinRequestStatus> {
+    head.join_requests
+        .get(request_id)
+        .map(|request| request.status)
+}
+
+/// A seated member holds two pending requests. Only the reject as its
+/// signer made it applies. A copy that names the other request, or another
+/// requester, is refused, from the signer and from another admin, with the
+/// binding or with the binding removed.
+#[tokio::test]
+async fn relabelled_reject_is_refused_on_a_seated_member() -> anyhow::Result<()> {
+    use x0x::groups::JoinRequestStatus::{Pending, Rejected};
+    let other_admin = agent(ADMIN);
+    let other_requester = agent(OTHER_REQUESTER);
+    // (case, edits, sent by the signer, applies)
+    type Edits<'a> = Vec<(&'a str, Option<&'a str>)>;
+    let cases: [(&str, Edits, bool, bool); 7] = [
+        ("the signer's own copy", vec![], true, true),
+        (
+            "the signer's copy with no binding (a signer older than #1623)",
+            vec![("request_binding", None)],
+            true,
+            true,
+        ),
+        (
+            "the request_id is changed",
+            vec![("request_id", Some(OTHER_REQUEST_ID))],
+            true,
+            false,
+        ),
+        (
+            "the requester is changed",
+            vec![("requester_agent_id", Some(&other_requester))],
+            true,
+            false,
+        ),
+        (
+            "another admin names another request",
+            vec![
+                ("request_id", Some(OTHER_REQUEST_ID)),
+                ("actor", Some(&other_admin)),
+            ],
+            false,
+            false,
+        ),
+        (
+            "another admin removes the binding and names another request",
+            vec![
+                ("request_binding", None),
+                ("request_id", Some(OTHER_REQUEST_ID)),
+                ("actor", Some(&other_admin)),
+            ],
+            false,
+            false,
+        ),
+        (
+            "another admin removes the binding and keeps the request",
+            vec![("request_binding", None), ("actor", Some(&other_admin))],
+            false,
+            false,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (case, edits, from_signer, applies) in cases {
+        let (responder, _responder_dir) = secure_endpoint_test_state().await?;
+        let (member, _member_dir) = secure_endpoint_test_state().await?;
+        let owner = responder.agent.identity().agent_keypair();
+        let member_hex = hex::encode(member.agent.agent_id().as_bytes());
+        let base = with_second_request(base_group(owner, Some(&member_hex))?);
+        let honest = route_reject(&responder, &base).await?;
+        let rejected = head_of(&responder, &base.mls_group_id).await?;
+        let key = install_stub(&member, base.clone()).await?;
+        let sender = if from_signer {
+            owner.agent_id()
+        } else {
+            AgentId([0x51; 32])
+        };
+
+        let _ = apply_named_group_metadata_event(
+            &member,
+            rewritten(&honest, &edits)?,
+            sender,
+            true,
+            None,
+        )
+        .await;
+
+        let head = head_of(&member, &key).await?;
+        let expected = if applies { &rejected } else { &base };
+        let got = (
+            head.state_hash == rejected.state_hash,
+            request_status(&head, REQUEST_ID),
+            request_status(&head, OTHER_REQUEST_ID),
+        );
+        let want = (
+            expected.state_hash == rejected.state_hash,
+            Some(if applies { Rejected } else { Pending }),
+            Some(Pending),
+        );
+        if got != want {
+            wrong.push(format!(
+                "{case}: (applied, request, other request) is {got:?}, not {want:?}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    Ok(())
+}
+
+/// The #1844 page path: a pre-Welcome joiner holds no request record. It
+/// applies the signer's page reject, and refuses a copy that names another
+/// request.
+#[tokio::test]
+async fn relabelled_page_reject_is_refused_on_a_pre_welcome_joiner() -> anyhow::Result<()> {
+    let (responder, _responder_dir) = secure_endpoint_test_state().await?;
+    let owner = responder.agent.identity().agent_keypair();
+    let base = with_second_request(base_group(owner, None)?);
+    let honest = route_reject(&responder, &base).await?;
+    let rejected = head_of(&responder, &base.mls_group_id).await?;
+    let relabelled = rewritten(&honest, &[("request_id", Some(OTHER_REQUEST_ID))])?;
+    for (case, event, applies) in [
+        ("the request_id is changed", relabelled, false),
+        ("the signer's own copy", honest, true),
+    ] {
+        let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+        let mut stub = invite_stub(&base);
+        arm(&mut stub, vec![rejected.state_hash.clone()], owner);
+        let key = install_stub(&joiner, stub).await?;
+
+        deliver_page(&joiner, &key, owner, vec![event]).await;
+
+        let head = head_of(&joiner, &key).await?;
+        let expected = if applies { &rejected } else { &base };
+        assert_eq!(
+            head.state_hash, expected.state_hash,
+            "{case}: the head (applies: {applies})"
+        );
+        assert!(head.join_requests.is_empty(), "{case}: no request record");
+    }
+    Ok(())
+}
+
+/// Mixed versions, wire shape. The binding is one more JSON field, written
+/// last and only when it is set. A v0.48.1 decoder (no such field, no
+/// `deny_unknown_fields`) reads the new event and gets the same commit. A
+/// reject from v0.48.1 decodes here with no binding.
+#[test]
+fn reject_binding_is_an_additive_wire_field() -> anyhow::Result<()> {
+    /// The `JoinRequestRejected` variant as v0.48.1 declares it.
+    #[derive(Debug, Deserialize)]
+    #[serde(tag = "event", rename_all = "snake_case")]
+    enum ReleasedEvent {
+        JoinRequestRejected {
+            group_id: String,
+            request_id: String,
+            actor: String,
+            requester_agent_id: String,
+            #[serde(default)]
+            commit: Option<x0x::groups::GroupStateCommit>,
+        },
+    }
+    let owner = AgentKeypair::generate()?;
+    let base = base_group(&owner, None)?;
+    let (commit, legacy) = reject_link(&base, &owner)?;
+    let binding = x0x::groups::state_commit::sign_join_request_reject(
+        &commit,
+        REQUEST_ID,
+        &agent(REQUESTER),
+        &owner,
+    )?;
+    let mut bound = legacy.clone();
+    if let NamedGroupMetadataEvent::JoinRequestRejected {
+        request_binding, ..
+    } = &mut bound
+    {
+        *request_binding = Some(binding.clone());
+    }
+
+    let legacy_wire = serde_json::to_string(&legacy)?;
+    let bound_wire = serde_json::to_string(&bound)?;
+    assert!(
+        !legacy_wire.contains("request_binding"),
+        "no binding: the v0.48.1 bytes"
+    );
+    assert_eq!(
+        bound_wire,
+        format!(
+            "{},\"request_binding\":\"{binding}\"}}",
+            legacy_wire.strip_suffix('}').unwrap_or_default()
+        ),
+        "the binding is the last field"
+    );
+    let ReleasedEvent::JoinRequestRejected {
+        group_id,
+        request_id,
+        actor,
+        requester_agent_id,
+        commit: released_commit,
+    } = serde_json::from_str(&bound_wire)?;
+    assert_eq!(
+        (group_id.as_str(), request_id.as_str()),
+        (base.stable_group_id(), REQUEST_ID)
+    );
+    assert_eq!(actor, hex::encode(owner.agent_id().as_bytes()));
+    assert_eq!(requester_agent_id, agent(REQUESTER));
+    assert_eq!(released_commit.as_ref(), Some(&commit));
+    assert_eq!(
+        released_commit.map(|commit| commit.verify_structure()),
+        Some(Ok(())),
+        "the commit's signed bytes are unchanged"
+    );
+    assert_eq!(
+        serde_json::from_str::<NamedGroupMetadataEvent>(&legacy_wire)?,
+        legacy,
+        "a v0.48.1 reject decodes with no binding"
+    );
+    Ok(())
+}
+
+/// The step that the ordinary apply and the GSS held-chain walk share
+/// (#1606) refuses a reject that does not name the signer's request.
+#[test]
+fn reject_step_refuses_a_request_that_the_signer_did_not_name() -> anyhow::Result<()> {
+    let owner = AgentKeypair::generate()?;
+    let owner_hex = hex::encode(owner.agent_id().as_bytes());
+    let base = with_second_request(base_group(&owner, None)?);
+    let (commit, _) = reject_link(&base, &owner)?;
+    let requester = agent(REQUESTER);
+    let binding = x0x::groups::state_commit::sign_join_request_reject(
+        &commit, REQUEST_ID, &requester, &owner,
+    )?;
+    let step = |request_id: &str, actor: &str, sender: &str, binding: Option<&str>| {
+        event_steps::join_request_rejected(
+            &base,
+            sender,
+            event_steps::RejectedRequest {
+                request_id,
+                actor,
+                requester_agent_id: &requester,
+                request_binding: binding,
+            },
+            &commit,
+        )
+        .is_ok()
+    };
+    let admin = agent(ADMIN);
+    assert!(step(REQUEST_ID, &owner_hex, &owner_hex, Some(&binding)));
+    assert!(
+        step(REQUEST_ID, &owner_hex, &owner_hex, None),
+        "a reject of a signer older than #1623"
+    );
+    assert!(
+        !step(OTHER_REQUEST_ID, &owner_hex, &owner_hex, Some(&binding)),
+        "the binding names another request"
+    );
+    assert!(
+        !step(REQUEST_ID, &owner_hex, &owner_hex, Some("00")),
+        "a binding that is not a signature"
+    );
+    assert!(
+        !step(OTHER_REQUEST_ID, &admin, &admin, None),
+        "another admin cannot present the signer's commit with no binding"
+    );
+    assert!(
+        !step(REQUEST_ID, &admin, &admin, Some(&binding)),
+        "another admin cannot present the signer's commit with its binding"
     );
     Ok(())
 }

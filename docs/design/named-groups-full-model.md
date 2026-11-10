@@ -744,6 +744,29 @@ Possible event families:
 - `card_republished`
 - `state_withdrawn` / hidden supersession tombstone
 
+### The reject link names its request (#1623)
+
+A `join_request_rejected` event carries a signed `GroupStateCommit`. That
+commit moves the revision and the hash chain, but it covers no join
+request: the state hash and the roster root do not change with the status
+of a request. So the event has a second signature, `request_binding`.
+
+- The commit signer signs `"x0x.group.join-request-reject.v1"`, then the
+  commit's `group_id`, `revision` and `state_hash`, then `request_id` and
+  `requester_agent_id` (ML-DSA-65, hex; each string has a 4-byte
+  little-endian length before it; `revision` is 8 bytes little-endian).
+- A receiver refuses a reject when `actor` is not `commit.committed_by`,
+  or when the binding does not verify for the event's `request_id` and
+  `requester_agent_id`.
+- A reject with no binding comes from a signer older than #1623. A
+  receiver accepts it only from its commit signer (the authenticated
+  sender is `actor`, and `actor` is `commit.committed_by`).
+- The commit's signed bytes are unchanged. A peer older than #1623
+  ignores the field and applies the link as before.
+- Limit: the signer itself can still sign two bindings for one commit.
+  The state hash does not cover join requests, so the chain cannot show
+  that.
+
 ### Important note
 For v1, prefer a **single canonical state-commit chain** even if multiple admins exist socially. Admins may authorize or propose actions, but accepted public state must linearize into one revision stream. This is simpler and safer than multi-writer conflict resolution for security-sensitive state.
 

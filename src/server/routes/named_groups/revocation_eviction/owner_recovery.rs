@@ -2853,14 +2853,22 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
             )
         }
         Event::JoinRequestRejected {
-            request_id, actor, ..
+            request_id,
+            actor,
+            requester_agent_id,
+            request_binding,
+            ..
         } => {
             let (action, mutate) = steps::join_request_rejected(
                 cursor,
                 &author,
-                request_id,
-                actor,
-                commit.committed_at,
+                steps::RejectedRequest {
+                    request_id,
+                    actor,
+                    requester_agent_id,
+                    request_binding: request_binding.as_deref(),
+                },
+                commit,
             )
             .ok()?;
             super::super::apply_stateful_event_to_group(cursor, commit, action, mutate)
