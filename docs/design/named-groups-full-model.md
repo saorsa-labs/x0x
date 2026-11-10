@@ -85,6 +85,42 @@ metadata-plane state changes:
 - Deterministic pair-harness proof lives in `tests/named_group_d4_apply.rs`;
   report in `tests/proof-reports/PHASE_D4_REPORT.md`.
 
+### The reject link names its request (#1623)
+
+A `join_request_rejected` event carries a signed `GroupStateCommit`. That
+commit moves the revision and the hash chain, but it covers no join
+request: the state hash and the roster root do not change with the status
+of a request. So the event has a second signature, `request_binding`.
+
+- The commit signer signs `"x0x.group.join-request-reject.v1"`, then the
+  commit's `group_id`, `revision` and `state_hash`, then `request_id` and
+  `requester_agent_id` (ML-DSA-65, hex; each string has a 4-byte
+  little-endian length before it; `revision` is 8 bytes little-endian).
+- A receiver refuses a reject when `actor` is not `commit.committed_by`,
+  or when a binding is present and does not verify for the event's
+  `request_id` and `requester_agent_id`.
+- A reject with no binding comes from a signer older than #1623. On
+  gossip, on a direct message and on a catch-up page, a receiver accepts
+  it only when the authenticated sender is `actor` and `actor` is
+  `commit.committed_by`. A GSS node that holds a commit that does not
+  chain yet applies it later as its commit signer. So it holds an unbound
+  reject only when the commit signer itself delivered it; a bound reject
+  can be held from any verified peer.
+- Result of a refusal: the event is dropped. The head does not move and
+  no request changes. The node stays one link behind until it gets the
+  signer's own copy (gossip, direct message or catch-up page), as for
+  any other refused link. A refused copy does not stop a later correct
+  copy of the same link.
+- Result for a peer that is not the commit signer: it cannot change the
+  request that a reject names, with the binding or with the binding
+  removed.
+- The commit's signed bytes are unchanged. A peer older than #1623
+  ignores the field and applies the link as before. It does not check
+  the binding.
+- Limit: the commit signer itself can send an unbound copy, or sign two
+  bindings, for one commit. The state hash does not cover join requests,
+  so the chain cannot show that.
+
 **Phase F status at current working-tree HEAD:** the dedicated live suites are
 clean, and the named-groups shell runner now has repeatable clean archived runs.
 The remaining work is procedural rather than architectural: merge/commit-state
@@ -743,29 +779,6 @@ Possible event families:
 - `group_deleted`
 - `card_republished`
 - `state_withdrawn` / hidden supersession tombstone
-
-### The reject link names its request (#1623)
-
-A `join_request_rejected` event carries a signed `GroupStateCommit`. That
-commit moves the revision and the hash chain, but it covers no join
-request: the state hash and the roster root do not change with the status
-of a request. So the event has a second signature, `request_binding`.
-
-- The commit signer signs `"x0x.group.join-request-reject.v1"`, then the
-  commit's `group_id`, `revision` and `state_hash`, then `request_id` and
-  `requester_agent_id` (ML-DSA-65, hex; each string has a 4-byte
-  little-endian length before it; `revision` is 8 bytes little-endian).
-- A receiver refuses a reject when `actor` is not `commit.committed_by`,
-  or when the binding does not verify for the event's `request_id` and
-  `requester_agent_id`.
-- A reject with no binding comes from a signer older than #1623. A
-  receiver accepts it only from its commit signer (the authenticated
-  sender is `actor`, and `actor` is `commit.committed_by`).
-- The commit's signed bytes are unchanged. A peer older than #1623
-  ignores the field and applies the link as before.
-- Limit: the signer itself can still sign two bindings for one commit.
-  The state hash does not cover join requests, so the chain cannot show
-  that.
 
 ### Important note
 For v1, prefer a **single canonical state-commit chain** even if multiple admins exist socially. Admins may authorize or propose actions, but accepted public state must linearize into one revision stream. This is simpler and safer than multi-writer conflict resolution for security-sensitive state.

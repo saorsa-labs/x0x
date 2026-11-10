@@ -2370,8 +2370,10 @@ async fn relabelled_reject_is_refused_on_a_seated_member() -> anyhow::Result<()>
 }
 
 /// The #1844 page path: a pre-Welcome joiner holds no request record. It
-/// applies the signer's page reject, and refuses a copy that names another
-/// request.
+/// applies the signer's page reject, with the binding or (older signer)
+/// with none. It refuses a copy that names another request or requester,
+/// a binding that is not the signer's signature, and every copy that
+/// another admin presents under its own name.
 #[tokio::test]
 async fn relabelled_page_reject_is_refused_on_a_pre_welcome_joiner() -> anyhow::Result<()> {
     let (responder, _responder_dir) = secure_endpoint_test_state().await?;
@@ -2379,26 +2381,92 @@ async fn relabelled_page_reject_is_refused_on_a_pre_welcome_joiner() -> anyhow::
     let base = with_second_request(base_group(owner, None)?);
     let honest = route_reject(&responder, &base).await?;
     let rejected = head_of(&responder, &base.mls_group_id).await?;
-    let relabelled = rewritten(&honest, &[("request_id", Some(OTHER_REQUEST_ID))])?;
-    for (case, event, applies) in [
-        ("the request_id is changed", relabelled, false),
-        ("the signer's own copy", honest, true),
-    ] {
+    let other_admin = agent(ADMIN);
+    let other_requester = agent(OTHER_REQUESTER);
+    type Edits<'a> = Vec<(&'a str, Option<&'a str>)>;
+    // (case, edits, the page sender is the signer, applies)
+    let cases: [(&str, Edits, bool, bool); 8] = [
+        ("the signer's own copy", vec![], true, true),
+        (
+            "the signer's copy with no binding (a signer older than #1623)",
+            vec![("request_binding", None)],
+            true,
+            true,
+        ),
+        (
+            "the request_id is changed",
+            vec![("request_id", Some(OTHER_REQUEST_ID))],
+            true,
+            false,
+        ),
+        (
+            "the requester is changed",
+            vec![("requester_agent_id", Some(&other_requester))],
+            true,
+            false,
+        ),
+        (
+            "the binding is not a signature",
+            vec![("request_binding", Some("00"))],
+            true,
+            false,
+        ),
+        (
+            "another admin presents the signer's bound reject",
+            vec![("actor", Some(&other_admin))],
+            false,
+            false,
+        ),
+        (
+            "another admin presents the signer's commit with no binding",
+            vec![("request_binding", None), ("actor", Some(&other_admin))],
+            false,
+            false,
+        ),
+        (
+            "another admin removes the binding and names another request",
+            vec![
+                ("request_binding", None),
+                ("request_id", Some(OTHER_REQUEST_ID)),
+                ("actor", Some(&other_admin)),
+            ],
+            false,
+            false,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (case, edits, from_signer, applies) in cases {
         let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
         let mut stub = invite_stub(&base);
         arm(&mut stub, vec![rejected.state_hash.clone()], owner);
         let key = install_stub(&joiner, stub).await?;
+        let sender = if from_signer {
+            owner.agent_id()
+        } else {
+            AgentId([0x51; 32])
+        };
 
-        deliver_page(&joiner, &key, owner, vec![event]).await;
+        let _ = TREEKEM_CATCHUP_PAGE_LINK
+            .scope(
+                rejected.state_hash.clone(),
+                apply_named_group_metadata_event(
+                    &joiner,
+                    rewritten(&honest, &edits)?,
+                    sender,
+                    true,
+                    None,
+                ),
+            )
+            .await;
 
         let head = head_of(&joiner, &key).await?;
-        let expected = if applies { &rejected } else { &base };
-        assert_eq!(
-            head.state_hash, expected.state_hash,
-            "{case}: the head (applies: {applies})"
-        );
+        let applied = head.state_hash == rejected.state_hash;
+        if applied != applies || (!applied && head.state_hash != base.state_hash) {
+            wrong.push(format!("{case}: applied is {applied}, not {applies}"));
+        }
         assert!(head.join_requests.is_empty(), "{case}: no request record");
     }
+    assert!(wrong.is_empty(), "{wrong:#?}");
     Ok(())
 }
 

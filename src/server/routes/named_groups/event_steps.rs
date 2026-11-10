@@ -161,9 +161,14 @@ pub(in crate::server) fn unban<'a>(
 ///
 /// A reject with no binding is the form of a signer older than #1623. It
 /// is accepted under the first rule alone, so a chain that holds such a
-/// link still applies. A third party cannot remove the binding to
-/// re-label a reject: without the signer's transport identity the first
-/// rule refuses its copy.
+/// link still applies. That rule protects it only where the caller's
+/// sender is the peer that delivered the event: gossip, a direct message
+/// and a catch-up page. The GSS held-event replay and walk pass the commit
+/// signer as the sender, so `owner_recovery::hold_unchained_event` holds
+/// an unbound reject only when its transport sender is the commit signer.
+/// With both rules, a peer that is not the commit signer cannot remove
+/// the binding to re-label a reject. The commit signer itself can still
+/// send an unbound copy, or sign two bindings, for one commit.
 pub(in crate::server) fn reject_names_its_request(
     commit: &x0x::groups::GroupStateCommit,
     reject: RejectedRequest<'_>,

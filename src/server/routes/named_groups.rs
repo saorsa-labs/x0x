@@ -15707,8 +15707,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event(
 ) -> ApplyMetadataResult {
     // ADR 0110 S4 (#1508 rc12): a commit that chains on a GSS owner
     // recovery not yet installed here waits for it.
-    let newly_held =
-        verified && revocation_eviction::owner_recovery::hold_unchained_event(state, &event).await;
+    let newly_held = verified
+        && revocation_eviction::owner_recovery::hold_unchained_event(state, &event, &sender).await;
     let held_group = newly_held.then(|| named_group_metadata_event_group_id(&event).to_string());
     let applied = apply_named_group_metadata_event_with_binding(
         state,
@@ -36563,19 +36563,9 @@ pub(in crate::server) async fn reject_join_request(
         (metadata_topic, event_group_id, requester_hex, commit, next)
     };
 
-    if !matches!(
-        persist_named_group_info(&state, &id, next).await,
-        Ok(AtomicWriteOutcome::Durable)
-    ) {
-        return api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "named-group state is not directory-durable",
-        );
-    }
-    drop(membership_guard);
-
     // #1623: the commit covers no join request, so its signer names the
-    // rejected request in a second signature.
+    // rejected request in a second signature. It signs before the persist,
+    // so a failure leaves the head where it was.
     let request_binding = match x0x::groups::state_commit::sign_join_request_reject(
         &commit,
         &request_id,
@@ -36590,6 +36580,17 @@ pub(in crate::server) async fn reject_join_request(
             );
         }
     };
+    if !matches!(
+        persist_named_group_info(&state, &id, next).await,
+        Ok(AtomicWriteOutcome::Durable)
+    ) {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "named-group state is not directory-durable",
+        );
+    }
+    drop(membership_guard);
+
     let event = NamedGroupMetadataEvent::JoinRequestRejected {
         group_id: event_group_id,
         request_id,
