@@ -690,6 +690,8 @@ pub struct Agent {
     /// cleared — carrying an explicit no-name — so peers ERASE the cached
     /// name instead of displaying it forever (see the upsert clear rule).
     self_name_ever_set: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Orders this agent's own identity announces (see [`OwnAnnounceOrder`]).
+    own_announce_order: OwnAnnounceOrder,
     /// ADR-0036 owner certificate journal (sibling of `agent.cert`);
     /// `None` when no user identity is configured. Written at cert-issue
     /// time; read by `GET /owner/agents` as the authoritative base roster.
@@ -5588,6 +5590,9 @@ pub(crate) mod announced_record_barrier {
 
     pub(crate) const INGEST_BETWEEN_WRITES: &str = "ingest_between_writes";
     pub(crate) const HYDRATION_PUBLISH: &str = "hydration_publish";
+    /// A heartbeat-style beat, after it read `announced_at` and the
+    /// self-name and before its first publish.
+    pub(crate) const HEARTBEAT_AFTER_NAME_READ: &str = "heartbeat_after_name_read";
 
     pub(crate) struct Gate {
         /// One permit each time a task parks here.
@@ -6239,6 +6244,19 @@ pub struct AgentBuilder {
     history_config: Option<history::HistoryConfig>,
 }
 
+/// Orders the builders of this agent's own identity announce: the explicit
+/// announce (`Agent::publish_identity_announcement`) and every heartbeat-style
+/// beat (`HeartbeatContext::announce`). One builder holds the lock from its
+/// `announced_at` read to its discovery self-write.
+///
+/// `upsert_discovered_agent` accepts an equal `announced_at`, so of two own
+/// announces in one clock second the later arrival wins. Without this order a
+/// beat that read the self-name before a rename could publish and self-write
+/// after the announce of that rename. The old name then stayed, locally and
+/// on peers, until the next heartbeat. With it, the announce that starts last
+/// reads the newest name and is also published and written last.
+type OwnAnnounceOrder = std::sync::Arc<tokio::sync::Mutex<()>>;
+
 struct HeartbeatContext {
     /// ADR-0043: this machine's enrolled ML-KEM public bytes (publishes
     /// on the V3 machine announce); `None` disables V3 publication.
@@ -6279,6 +6297,8 @@ struct HeartbeatContext {
     self_name: std::sync::Arc<std::sync::RwLock<Option<String>>>,
     /// Shared ever-named latch (see `Agent::self_name_ever_set`).
     self_name_ever_set: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Shared with `Agent::own_announce_order` (see [`OwnAnnounceOrder`]).
+    own_announce_order: OwnAnnounceOrder,
     /// E2d: shared verified-certificate event ring (the self-announce
     /// record carries no certificate, but the upsert signature is shared).
     verified_cert_tx: std::sync::Arc<tokio::sync::broadcast::Sender<VerifiedCertificate>>,
@@ -6294,6 +6314,7 @@ impl HeartbeatContext {
     }
 
     async fn announce(&self) -> error::Result<()> {
+        let own_announce_guard = self.own_announce_order.lock().await;
         let machine_public_key = self
             .identity
             .machine_keypair()
@@ -6465,6 +6486,12 @@ impl HeartbeatContext {
             relay_candidates: relay_candidates.clone(),
             agent_public_key,
         };
+        #[cfg(test)]
+        announced_record_barrier::park(
+            &announcement.agent_id,
+            announced_record_barrier::HEARTBEAT_AFTER_NAME_READ,
+        )
+        .await;
         tracing::debug!(
             target: "x0x::discovery",
             announcement_kind = "heartbeat",
@@ -6658,6 +6685,7 @@ impl HeartbeatContext {
         };
         upsert_discovered_machine_from_agent(&self.machine_cache, &discovered_agent).await;
         upsert_discovered_agent(&self.cache, &self.verified_cert_tx, discovered_agent).await;
+        drop(own_announce_guard);
 
         // ADR-0043 §2.1: publish the V3 machine announcement (enrollment
         // KEM key + placement digests + capability advert) on its own
@@ -14274,6 +14302,9 @@ impl Agent {
         })?;
 
         self.start_identity_listener().await?;
+        // Held to the end of this function: the `announced_at` and self-name
+        // reads, every publish and the discovery self-write.
+        let _own_announce_guard = self.own_announce_order.lock().await;
 
         let network_status = if let Some(network) = self.network.as_ref() {
             network.node_status().await
@@ -16687,6 +16718,7 @@ impl Agent {
                 legacy_announce: self.legacy_announce,
                 self_name: std::sync::Arc::clone(&self.self_name),
                 self_name_ever_set: std::sync::Arc::clone(&self.self_name_ever_set),
+                own_announce_order: std::sync::Arc::clone(&self.own_announce_order),
             };
             // Routed through spawn_tracked (issue #116) so a shutdown racing
             // bootstrap refuses to start it once the registry is closed; it is
@@ -20908,6 +20940,7 @@ impl Agent {
             legacy_announce: self.legacy_announce,
             self_name: std::sync::Arc::clone(&self.self_name),
             self_name_ever_set: std::sync::Arc::clone(&self.self_name_ever_set),
+            own_announce_order: std::sync::Arc::clone(&self.own_announce_order),
         };
         ctx.announce().await
     }
@@ -22181,6 +22214,7 @@ impl Agent {
             move_state: std::sync::Arc::clone(&self.move_state),
             self_name: std::sync::Arc::clone(&self.self_name),
             self_name_ever_set: std::sync::Arc::clone(&self.self_name_ever_set),
+            own_announce_order: std::sync::Arc::clone(&self.own_announce_order),
             verified_cert_tx: std::sync::Arc::clone(&self.verified_cert_tx),
         };
         let handle = tokio::task::spawn(async move {
@@ -24510,6 +24544,7 @@ impl AgentBuilder {
             history_handle,
             self_name: std::sync::Arc::new(std::sync::RwLock::new(None)),
             self_name_ever_set: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            own_announce_order: OwnAnnounceOrder::default(),
             cert_journal_path,
             agent_cert_path,
             cert_adoption_lock: tokio::sync::Mutex::new(()),
@@ -44888,6 +44923,9 @@ mod issue1239_tests;
 
 #[cfg(test)]
 mod issue1239_send_deadline_tests;
+
+#[cfg(test)]
+mod announce_rename_order_tests;
 
 #[cfg(test)]
 mod wire_golden_tests;
