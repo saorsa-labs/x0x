@@ -85,6 +85,16 @@ pub(in crate::server) struct GrantIssueRequest {
     /// known agents and the shared agents' daemons.
     #[serde(default)]
     deliver_to: Vec<String>,
+    /// ADR 0079: carry the owner's name and the shared machines' names to
+    /// capable grantees in the v2 envelope (default). `false` (the CLI's
+    /// `--no-names`) withholds both and sends every recipient the plain v1
+    /// grant.
+    #[serde(default = "default_include_names")]
+    include_names: bool,
+}
+
+fn default_include_names() -> bool {
+    true
 }
 
 /// GET /grants — grants this install's owner issued, with status.
@@ -211,9 +221,39 @@ pub(in crate::server) async fn grants_issue(
     };
     let recipients = state
         .agent
-        .share_grant_recipients(&grant, &deliver_to)
+        .share_grant_recipients_classified(&grant, &deliver_to)
         .await;
-    let delivery = state.agent.deliver_share_grant(&grant, &recipients).await;
+    // ADR 0079: build and sign the names section once; recipients whose
+    // verified advert sets bit 14 (and only grantee-side ones) get the v2
+    // envelope, everyone else the unchanged v1 payload.
+    let envelope = if req.include_names {
+        let (owner_name, own_machine_name) = {
+            let profile = state.profile.read().await;
+            (profile.human_name.clone(), profile.machine_name.clone())
+        };
+        let devices = state.owner_sync.as_ref().map(|s| &**s.store());
+        match state
+            .agent
+            .grant_names_for(devices, owner_name, own_machine_name, &grant)
+            .await
+        {
+            None => None,
+            Some(names) => match state.agent.sign_grant_names(grant.clone(), names) {
+                Ok(envelope) => Some(envelope),
+                Err(err) => {
+                    // Names are a default, not the grant: deliver v1 and say so.
+                    tracing::warn!("grant names not signed; delivering v1 only: {err}");
+                    None
+                }
+            },
+        }
+    } else {
+        None
+    };
+    let delivery = state
+        .agent
+        .deliver_share_grant_with_names(&grant, &recipients, envelope.as_ref())
+        .await;
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -431,6 +471,141 @@ mod tests {
                 "durable {method} {path} must clear the gate: {json}"
             );
         }
+        Ok(())
+    }
+
+    /// Advertise `bits` for `agent` as a verified capability advert, as the
+    /// gossip advert service would ingest it.
+    fn advertise(state: &AppState, agent: &x0x::identity::AgentId, bits: u64) {
+        let mut caps = x0x::dm::DmCapabilities::v1_gossip_ready(vec![42; 1184]);
+        caps.application_registry = x0x::dm::CapabilityRegistry { version: 1, bits };
+        assert!(
+            state.agent.capability_store.insert(
+                *agent,
+                x0x::identity::MachineId([0x5e; 32]),
+                caps,
+                x0x::dm_capability::now_unix_ms(),
+            ),
+            "the verified advert inserts"
+        );
+    }
+
+    /// WHY (ADR 0079 §1, #1831 review): on an install WITH an owner, the
+    /// default `POST /grants` (no `include_names`) signs the names and the
+    /// delivery report says `v2` for a grantee whose verified advert sets
+    /// bit 14, through the daemon's real capability gate. `include_names:
+    /// false` sends v1. A grantee with no verified advert, and a
+    /// `deliver_to` agent that is not the grantee, get v1.
+    #[tokio::test]
+    async fn grant_issue_sends_v2_only_to_a_bit_14_grantee_unless_names_are_withheld(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let agent = Arc::new(
+            crate::Agent::builder()
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_user_key(crate::identity::UserKeypair::from_seed(&[0x31; 32])?)
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .build()
+                .await?,
+        );
+        let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+            dir.path(),
+            agent,
+        )
+        .await?;
+        state.agent.install_share_grant_store(Arc::new(
+            x0x::share_grant::ShareGrantStore::in_memory(
+                state.agent.agent_id(),
+                state.agent.user_id(),
+            ),
+        ));
+        state.profile.write().await.human_name = Some("Bob Smith".to_string());
+        let capable = x0x::identity::AgentId([0xc1; 32]);
+        let old = x0x::identity::AgentId([0xc2; 32]);
+        advertise(
+            &state,
+            &capable,
+            x0x::dm::CapabilityRegistry::current().bits,
+        );
+        let app = grants_router(Arc::clone(&state), false);
+        let own = hex::encode(state.agent.agent_id().as_bytes());
+        let issue = |grantee: &x0x::identity::AgentId, extra: serde_json::Value| {
+            let mut body = serde_json::json!({
+                "grantee_agent": hex::encode(grantee.as_bytes()),
+                "agents": [own.clone()],
+                "caps": ["dm"],
+                "ttl_secs": 3600,
+            });
+            if let (Some(obj), Some(more)) = (body.as_object_mut(), extra.as_object()) {
+                for (k, v) in more {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            body.to_string()
+        };
+        let envelope_for = |body: &serde_json::Value, agent: &x0x::identity::AgentId| {
+            body["delivery"]
+                .as_array()
+                .and_then(|rows| {
+                    rows.iter()
+                        .find(|r| r["agent"] == hex::encode(agent.as_bytes()))
+                })
+                .map(|r| r["envelope"].clone())
+        };
+
+        let (status, body) = send(
+            &app,
+            owner_req("POST", "/grants", &issue(&capable, serde_json::json!({})))?,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            envelope_for(&body, &capable),
+            Some(serde_json::json!("v2")),
+            "default include_names: {body}"
+        );
+
+        let (status, body) = send(
+            &app,
+            owner_req(
+                "POST",
+                "/grants",
+                &issue(&capable, serde_json::json!({"include_names": false})),
+            )?,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            envelope_for(&body, &capable),
+            Some(serde_json::json!("v1")),
+            "include_names=false: {body}"
+        );
+
+        let (status, body) = send(
+            &app,
+            owner_req(
+                "POST",
+                "/grants",
+                &issue(
+                    &old,
+                    serde_json::json!({"deliver_to": [hex::encode(capable.as_bytes())]}),
+                ),
+            )?,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            envelope_for(&body, &old),
+            Some(serde_json::json!("v1")),
+            "no verified advert: {body}"
+        );
+        assert_eq!(
+            envelope_for(&body, &capable),
+            Some(serde_json::json!("v1")),
+            "a deliver_to agent that is not the grantee: {body}"
+        );
         Ok(())
     }
 

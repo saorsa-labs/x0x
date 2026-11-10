@@ -522,6 +522,10 @@ enum GrantSub {
         /// "caps":["dm",{"connect":{"ports":[22]}}],"ttl_secs":86400}'.
         #[arg(value_name = "GRANT_JSON")]
         grant: String,
+        /// ADR 0079: withhold the owner and machine names from this grant
+        /// (every recipient then gets the plain v1 payload).
+        #[arg(long)]
+        no_names: bool,
     },
     /// List grants this install's owner issued, with status.
     List,
@@ -3453,7 +3457,9 @@ async fn run(
             }
         },
         Commands::Grant { sub } => match sub {
-            GrantSub::Issue { grant } => commands::grant::issue(&client, &grant).await,
+            GrantSub::Issue { grant, no_names } => {
+                commands::grant::issue(&client, &grant, no_names).await
+            }
             GrantSub::List => commands::grant::list(&client).await,
             GrantSub::Revoke { id } => commands::grant::revoke(&client, &id).await,
             GrantSub::Received => commands::grant::received(&client).await,
@@ -3960,6 +3966,26 @@ mod tests {
                 gui_view_fragment(Some(bad)).is_err(),
                 "{bad} must be rejected"
             );
+        }
+        Ok(())
+    }
+
+    /// WHY (ADR 0079, #1831 review): `x0x grant issue --no-names` reaches
+    /// the command as `no_names = true`; without the flag it is `false`.
+    #[test]
+    fn grant_issue_no_names_flag_parses() -> anyhow::Result<()> {
+        for (args, expected) in [
+            (vec!["x0x", "grant", "issue", "{}", "--no-names"], true),
+            (vec!["x0x", "grant", "issue", "{}"], false),
+        ] {
+            let cli = Cli::try_parse_from(args)?;
+            let Commands::Grant {
+                sub: GrantSub::Issue { no_names, .. },
+            } = cli.command
+            else {
+                anyhow::bail!("expected grant issue");
+            };
+            assert_eq!(no_names, expected);
         }
         Ok(())
     }

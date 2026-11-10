@@ -418,5 +418,244 @@ where
     }
 }
 
+// ─── Sender side (ADR 0079 §1 "Who gets v2") ────────────────────────────────
+
+/// The owner-signed names attachment, as the sender and the redelivery
+/// outbox persist it. Rebuilding the envelope from the same grant and
+/// attachment reproduces the exact v2 bytes (bincode is deterministic), so
+/// every retry resends the same bytes (ADR 0079 §1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedGrantNames {
+    /// The names section.
+    pub names: GrantNames,
+    /// ML-DSA-65 signature by the owner user key over
+    /// [`names_signed_bytes`].
+    pub signature: Vec<u8>,
+}
+
+impl ShareGrantV2 {
+    /// Rebuild the envelope a persisted attachment was taken from.
+    #[must_use]
+    pub fn from_parts(grant: ShareGrant, attachment: SignedGrantNames) -> Self {
+        Self {
+            grant,
+            names: attachment.names,
+            names_signature: attachment.signature,
+        }
+    }
+
+    /// The attachment the redelivery outbox persists.
+    #[must_use]
+    pub fn attachment(&self) -> SignedGrantNames {
+        SignedGrantNames {
+            names: self.names.clone(),
+            signature: self.names_signature.clone(),
+        }
+    }
+}
+
+/// The v2 counterpart of [`super::grant_delivery_request`]: the typed DM
+/// payload and its logical request id (the BLAKE3 of the payload, so every
+/// resend of the same bytes is the same idempotent logical request).
+///
+/// # Errors
+/// [`ShareGrantError::Malformed`] on encode failure.
+pub fn grant_delivery_request_v2(
+    envelope: &ShareGrantV2,
+) -> Result<(Vec<u8>, [u8; 16]), ShareGrantError> {
+    let payload = envelope.to_dm_payload()?;
+    let mut request_id = [0u8; 16];
+    request_id.copy_from_slice(&blake3::hash(&payload).as_bytes()[..16]);
+    Ok((payload, request_id))
+}
+
+/// The machines a grant names (ADR 0079 §1): machines with a current,
+/// owner-verified ADR-0041 enrollment AND a synced, valid `machine_name`
+/// AND (per `hosts`, the current announcements) at least one of the granted
+/// agents. Sorted by id, unique, bounded by [`MAX_GRANT_AGENTS`].
+#[must_use]
+pub fn grant_machine_names(
+    owner: &UserId,
+    enrollments: &[crate::owner_sync::OwnerEnrollment],
+    named: &[(MachineId, String)],
+    hosts: &[(crate::identity::AgentId, MachineId)],
+    now_ms: u64,
+) -> Vec<GrantMachineName> {
+    let enrolled: std::collections::BTreeSet<[u8; 32]> = enrollments
+        .iter()
+        .filter(|e| e.verify_owner(owner).is_ok() && e.is_current_at(now_ms))
+        .map(|e| e.machine_id)
+        .collect();
+    let hosting: std::collections::BTreeSet<[u8; 32]> = hosts.iter().map(|(_, m)| m.0).collect();
+    let mut out: std::collections::BTreeMap<[u8; 32], String> = std::collections::BTreeMap::new();
+    for (machine, name) in named {
+        if !enrolled.contains(&machine.0) || !hosting.contains(&machine.0) {
+            continue;
+        }
+        if validate_display_name("machine_name", name).is_err() {
+            continue;
+        }
+        out.entry(machine.0).or_insert_with(|| name.clone());
+    }
+    out.into_iter()
+        .take(MAX_GRANT_AGENTS)
+        .map(|(machine_id, machine_name)| GrantMachineName {
+            machine_id: MachineId(machine_id),
+            machine_name,
+        })
+        .collect()
+}
+
+/// The machines section of a grant this install issues (ADR 0079 §1):
+/// [`grant_machine_names`] over the other owner machines, plus this
+/// machine (`own_machine`) under its profile `machine_name` when it hosts a
+/// granted agent. This machine's name always comes from the profile; a
+/// synced record for it is ignored, because that record can be older than
+/// the profile. With no valid profile name, this machine is not named.
+#[must_use]
+pub fn assemble_grant_machine_names(
+    owner: &UserId,
+    enrollments: &[crate::owner_sync::OwnerEnrollment],
+    synced: &[(MachineId, String)],
+    hosts: &[(crate::identity::AgentId, MachineId)],
+    own_machine: MachineId,
+    own_machine_name: Option<String>,
+    now_ms: u64,
+) -> Vec<GrantMachineName> {
+    let others: Vec<(MachineId, String)> = synced
+        .iter()
+        .filter(|(machine, _)| *machine != own_machine)
+        .cloned()
+        .collect();
+    let mut machines = grant_machine_names(owner, enrollments, &others, hosts, now_ms);
+    let own_machine_name = own_machine_name
+        .map(|name| name.trim().to_string())
+        .filter(|name| validate_display_name("machine_name", name).is_ok());
+    if let Some(name) = own_machine_name {
+        if hosts.iter().any(|(_, machine)| *machine == own_machine)
+            && machines.len() < MAX_GRANT_AGENTS
+        {
+            machines.push(GrantMachineName {
+                machine_id: own_machine,
+                machine_name: name,
+            });
+            machines.sort_by_key(|m| m.machine_id.0);
+        }
+    }
+    machines
+}
+
+impl crate::Agent {
+    /// The authority machine currently hosting each of the grant's agents:
+    /// this install's own machine for its own agent, and the authorized
+    /// routing machine of each announced agent otherwise.
+    pub async fn granted_agent_hosts(
+        &self,
+        grant: &ShareGrant,
+    ) -> Vec<(crate::identity::AgentId, MachineId)> {
+        let mut out = Vec::with_capacity(grant.agents.len());
+        for agent in &grant.agents {
+            let machine = if *agent == self.agent_id() {
+                Some(self.machine_id())
+            } else {
+                let hinted = self
+                    .identity_discovery_cache
+                    .read()
+                    .await
+                    .get(agent)
+                    .map(|entry| entry.machine_id);
+                self.authorized_routing_machine(agent, hinted).await
+            };
+            if let Some(machine) = machine {
+                out.push((*agent, machine));
+            }
+        }
+        out
+    }
+
+    /// The names section for a grant this install's owner is issuing
+    /// (ADR 0079 §1), or `None` when there is nothing valid to carry (the
+    /// grant is then sent as v1). `owner_name` and `own_machine_name` are
+    /// the ADR-0036 profile `human_name` and `machine_name`; other machines
+    /// come from the owner's current enrollments, the synced machine names
+    /// in `devices`, and the current announcements hosting the granted
+    /// agents. This daemon's own machine needs no enrollment record: the
+    /// issuing install signs the section with the owner key, which vouches
+    /// for its own profile name directly. Its name is always the profile
+    /// `machine_name`; a synced record for it is ignored, because that
+    /// record can be older than the profile.
+    pub async fn grant_names_for(
+        &self,
+        devices: Option<&crate::owner_sync::OwnerSyncStore>,
+        owner_name: Option<String>,
+        own_machine_name: Option<String>,
+        grant: &ShareGrant,
+    ) -> Option<GrantNames> {
+        if self.user_id() != Some(grant.owner) {
+            return None;
+        }
+        let owner_name = owner_name
+            .map(|name| name.trim().to_string())
+            .filter(|name| validate_display_name("owner_name", name).is_ok());
+        let hosts = self.granted_agent_hosts(grant).await;
+        let (enrollments, synced) = match devices {
+            None => (Vec::new(), Vec::new()),
+            Some(devices) => {
+                let mut named = Vec::new();
+                for record in devices.records_snapshot().await {
+                    if let crate::owner_sync::SyncValue::MachineNames {
+                        machine_name: Some(machine_name),
+                        ..
+                    } = &record.value
+                    {
+                        let Ok(bytes) = hex::decode(&record.key) else {
+                            continue;
+                        };
+                        let Ok(bytes) = <[u8; 32]>::try_from(bytes.as_slice()) else {
+                            continue;
+                        };
+                        if record.verify_owner(&grant.owner).is_ok() {
+                            named.push((MachineId(bytes), machine_name.clone()));
+                        }
+                    }
+                }
+                (devices.enrolled_devices().await, named)
+            }
+        };
+        let machines = assemble_grant_machine_names(
+            &grant.owner,
+            &enrollments,
+            &synced,
+            &hosts,
+            self.machine_id(),
+            own_machine_name,
+            super::unix_now_secs().saturating_mul(1000),
+        );
+        if owner_name.is_none() && machines.is_empty() {
+            return None;
+        }
+        Some(GrantNames {
+            owner_name,
+            machines,
+        })
+    }
+
+    /// Sign `names` onto `grant` with this install's owner key (ADR 0079 §1).
+    ///
+    /// # Errors
+    /// [`ShareGrantError::Invalid`] without an owner key or on invalid
+    /// names; [`ShareGrantError::BadSignature`] when signing fails.
+    pub fn sign_grant_names(
+        &self,
+        grant: ShareGrant,
+        names: GrantNames,
+    ) -> Result<ShareGrantV2, ShareGrantError> {
+        let key = self.identity().user_keypair().ok_or_else(|| {
+            ShareGrantError::Invalid("signing grant names needs the owner key".into())
+        })?;
+        ShareGrantV2::sign(key, grant, names)
+    }
+}
+
 #[cfg(test)]
 mod tests;

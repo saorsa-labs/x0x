@@ -182,11 +182,54 @@ pub struct PendingGrantDelivery {
     /// Outbox attempts made so far (the initial `POST /grants` delivery is
     /// not counted).
     pub attempts: u32,
+    /// ADR 0079: the owner-signed names attachment of a failed v2
+    /// delivery, recorded so every retry resends the SAME v2 bytes. `None`
+    /// means the entry is (and resends) a plain v1 delivery.
+    pub names: Option<super::names::SignedGrantNames>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct OutboxFile {
     entries: Vec<PendingGrantDelivery>,
+}
+
+/// The pre-ADR-0079 on-disk entry (no `names` field). The store is strict
+/// positional bincode, so an upgraded daemon migrates an old file by
+/// decoding this shape when the current one does not fit; the first
+/// successful persist rewrites it in the current format.
+#[derive(Debug, Deserialize)]
+struct PendingGrantDeliveryLegacyV1 {
+    recipient: AgentId,
+    grant: ShareGrant,
+    queued_at: u64,
+    deadline: u64,
+    next_attempt_at: u64,
+    attempts: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct OutboxFileLegacyV1 {
+    entries: Vec<PendingGrantDeliveryLegacyV1>,
+}
+
+impl From<OutboxFileLegacyV1> for OutboxFile {
+    fn from(legacy: OutboxFileLegacyV1) -> Self {
+        Self {
+            entries: legacy
+                .entries
+                .into_iter()
+                .map(|e| PendingGrantDelivery {
+                    recipient: e.recipient,
+                    grant: e.grant,
+                    queued_at: e.queued_at,
+                    deadline: e.deadline,
+                    next_attempt_at: e.next_attempt_at,
+                    attempts: e.attempts,
+                    names: None,
+                })
+                .collect(),
+        }
+    }
 }
 
 type EntryKey = ([u8; 32], [u8; 32]);
@@ -293,7 +336,15 @@ impl GrantRedeliveryOutbox {
         let file =
             if bytes.len() >= OUTBOX_MAGIC.len() && &bytes[..OUTBOX_MAGIC.len()] == OUTBOX_MAGIC {
                 let body = &bytes[OUTBOX_MAGIC.len()..];
+                // Current format first; a pre-ADR-0079 file (entries with
+                // no `names` field) is migrated in memory and rewritten in
+                // the current format on the first successful persist.
                 super::strict_decode::<OutboxFile>(body, body.len() as u64)
+                    .or_else(|current_err| {
+                        super::strict_decode::<OutboxFileLegacyV1>(body, body.len() as u64)
+                            .map(OutboxFile::from)
+                            .map_err(|_| current_err)
+                    })
                     .map_err(|e| format!("decode {}: {e}", path.display()))
             } else {
                 Err(format!("{} missing X0GO magic", path.display()))
@@ -345,6 +396,14 @@ impl GrantRedeliveryOutbox {
         for entry in file.entries {
             if let Err(e) = self.queueable(&entry.grant) {
                 return Err(format!("{}: {e}", path.display()));
+            }
+            if let Some(names) = &entry.names {
+                if let Err(e) =
+                    super::names::ShareGrantV2::from_parts(entry.grant.clone(), names.clone())
+                        .verify()
+                {
+                    return Err(format!("{}: names attachment: {e}", path.display()));
+                }
             }
             if entry.deadline > entry.grant.expiry {
                 return Err(format!(
@@ -478,22 +537,29 @@ impl GrantRedeliveryOutbox {
         now_unix: u64,
         revocations: &RwLock<RevocationSet>,
     ) -> Result<bool, OutboxError> {
-        self.enqueue_reporting(grant, recipient, now_unix, revocations)
+        self.enqueue_reporting(grant, None, recipient, now_unix, revocations)
             .await
             .map_err(|refusal| refusal.error)
     }
 
     /// [`Self::enqueue`], and on refusal also whether the entry is still
     /// queued in memory (#1322 review P3), so the caller never describes a
-    /// queued entry as absent.
+    /// queued entry as absent. `names` is the ADR 0079 attachment of a
+    /// failed v2 delivery; the retry then resends the same v2 bytes.
     pub(crate) async fn enqueue_reporting(
         &self,
         grant: &ShareGrant,
+        names: Option<&super::names::SignedGrantNames>,
         recipient: AgentId,
         now_unix: u64,
         revocations: &RwLock<RevocationSet>,
     ) -> Result<bool, WriteRefusal<OutboxError>> {
         self.queueable(grant)?;
+        if let Some(names) = names {
+            super::names::ShareGrantV2::from_parts(grant.clone(), names.clone())
+                .verify()
+                .map_err(|e| OutboxError::NotQueueable(format!("names attachment: {e}")))?;
+        }
         let deadline = grant
             .expiry
             .min(now_unix.saturating_add(OUTBOX_ENTRY_TTL_SECS));
@@ -540,6 +606,7 @@ impl GrantRedeliveryOutbox {
                         deadline,
                         next_attempt_at: now_unix.saturating_add(retry_delay_secs(0)),
                         attempts: 0,
+                        names: names.cloned(),
                     },
                 );
                 false
@@ -733,7 +800,13 @@ impl GrantRedeliveryOutbox {
             return report;
         }
         let sends = due.into_iter().map(|entry| {
-            let request = super::grant_delivery_request(&entry.grant);
+            // ADR 0079: a queued v2 delivery resends the SAME v2 bytes.
+            let request = match &entry.names {
+                Some(names) => super::names::grant_delivery_request_v2(
+                    &super::names::ShareGrantV2::from_parts(entry.grant.clone(), names.clone()),
+                ),
+                None => super::grant_delivery_request(&entry.grant),
+            };
             let fut =
                 request.map(|(payload, request_id)| send(entry.recipient, payload, request_id));
             async move {

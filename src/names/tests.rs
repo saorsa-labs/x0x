@@ -1741,31 +1741,118 @@ async fn taken_labels_are_reported_not_rebound() {
     );
 }
 
-/// WHY (ADR 0079 §2): a machine already labelled under that owner gets no
-/// second label from a grant default.
+/// WHY (ADR 0079 §2, #1831 ZCode review): a machine already labelled under
+/// that owner gets no second label from a grant default. A later grant that
+/// carries a different name for it is reported as a `name_changed`
+/// `default_conflict` and is not applied; the first label stands. The same
+/// name again, or the same report again, records nothing.
 #[tokio::test]
-async fn an_already_labelled_machine_gets_no_second_default() {
+async fn a_later_grant_renaming_a_machine_is_reported_not_applied() {
     let store = NameStore::in_memory();
     let bob = UserId([0xbb; 32]);
-    store
+    let first = store
         .apply_grant_names(&defaults(bob, "Bob", &[(0x01, "Studio")]), true, NOW)
+        .await
+        .unwrap();
+    assert_eq!(first.machine_pins, ["machine:studio.bob"]);
+
+    // The same name again is not a conflict.
+    let same = store
+        .apply_grant_names(&defaults(bob, "Bob", &[(0x01, "Studio")]), true, NOW + 1)
+        .await
+        .unwrap();
+    assert!(same.machine_pins.is_empty(), "{same:?}");
+    assert_eq!(same.conflicts, 0, "{same:?}");
+    assert!(store.pending().await.unwrap().1.is_empty());
+
+    // A later grant carries a different name for the same machine.
+    let renamed = defaults(bob, "Bob", &[(0x01, "Renamed Studio")]);
+    let applied = store
+        .apply_grant_names(&renamed, true, NOW + 2)
+        .await
+        .unwrap();
+    assert!(applied.machine_pins.is_empty(), "{applied:?}");
+    assert_eq!(applied.conflicts, 1, "the rename is reported: {applied:?}");
+    assert!(
+        store
+            .get_pin("machine:renamed-studio.bob")
+            .await
+            .unwrap()
+            .is_none(),
+        "the new name is not applied"
+    );
+    assert_eq!(
+        store
+            .get_pin("machine:studio.bob")
+            .await
+            .unwrap()
+            .map(|p| p.id),
+        Some([0x01; 32]),
+        "the first label stands"
+    );
+    let (suggestions, conflicts) = store.pending().await.unwrap();
+    assert!(suggestions.is_empty(), "{suggestions:?}");
+    assert_eq!(
+        conflicts,
+        vec![NameConflict {
+            kind: ConflictKind::Machine,
+            case: ConflictCase::NameChanged,
+            label: "studio".to_string(),
+            held: "studio".to_string(),
+            offered: "renamed-studio".to_string(),
+            offered_name: "Renamed Studio".to_string(),
+            reported_at: NOW + 2,
+            from: Some(bob),
+        }]
+    );
+
+    // The identical report is deduplicated.
+    let again = store
+        .apply_grant_names(&renamed, true, NOW + 3)
+        .await
+        .unwrap();
+    assert_eq!(again.conflicts, 0, "{again:?}");
+    assert_eq!(store.pending().await.unwrap().1.len(), 1);
+
+    // The report needs no hosting evidence: the machine is already pinned
+    // under this owner, and nothing is suggested for it.
+    let mut unverified = defaults(bob, "Bob", &[(0x01, "Third Name")]);
+    unverified.verified_hosts = BTreeSet::new();
+    let applied = store
+        .apply_grant_names(&unverified, true, NOW + 4)
+        .await
+        .unwrap();
+    assert_eq!(applied.conflicts, 1, "{applied:?}");
+    assert!(!applied.suggested, "{applied:?}");
+
+    // Another machine of the same owner still gets its own default.
+    let applied = store
+        .apply_grant_names(&defaults(bob, "Bob", &[(0x02, "Laptop")]), true, NOW + 5)
+        .await
+        .unwrap();
+    assert_eq!(applied.machine_pins, ["machine:laptop.bob"]);
+    assert_eq!(applied.conflicts, 0, "{applied:?}");
+
+    // Machine labels are unique only under one owner: another owner's
+    // identical rename is its own report, not a duplicate of Bob's.
+    let carol = UserId([0xcc; 32]);
+    store
+        .apply_grant_names(
+            &defaults(carol, "Carol", &[(0x03, "Studio")]),
+            true,
+            NOW + 6,
+        )
         .await
         .unwrap();
     let applied = store
         .apply_grant_names(
-            &defaults(bob, "Bob", &[(0x01, "Renamed Studio")]),
+            &defaults(carol, "Carol", &[(0x03, "Renamed Studio")]),
             true,
-            NOW + 1,
+            NOW + 7,
         )
         .await
         .unwrap();
-    assert!(applied.machine_pins.is_empty(), "{applied:?}");
-    assert_eq!(applied.conflicts, 0, "a skip is not a conflict");
-    assert!(store
-        .get_pin("machine:renamed-studio.bob")
-        .await
-        .unwrap()
-        .is_none());
+    assert_eq!(applied.conflicts, 1, "{applied:?}");
 }
 
 /// WHY (ADR 0079 §2): suggestions and conflicts persist across restart,

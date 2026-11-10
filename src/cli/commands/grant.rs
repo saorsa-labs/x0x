@@ -6,8 +6,8 @@ use anyhow::Result;
 /// `x0x grant issue GRANT_JSON` — GRANT_JSON is the `POST /grants` body
 /// (literal, `@path` or a bare path, or `-` for stdin), e.g.
 /// `{"grantee_user":"<hex>","agents":["<hex>"],"caps":["dm",{"connect":{"ports":[22]}}],"ttl_secs":86400}`.
-pub async fn issue(client: &DaemonClient, grant_json: &str) -> Result<()> {
-    let body = read_json_arg(grant_json)?;
+pub async fn issue(client: &DaemonClient, grant_json: &str, no_names: bool) -> Result<()> {
+    let body = issue_body(grant_json, no_names)?;
     let resp = client.post("/grants", &body).await?;
     print_value(client.format(), &resp);
     Ok(())
@@ -32,6 +32,19 @@ pub async fn received(client: &DaemonClient) -> Result<()> {
     let resp = client.get("/grants/received").await?;
     print_value(client.format(), &resp);
     Ok(())
+}
+
+/// The `POST /grants` body for `x0x grant issue`: GRANT_JSON as given, with
+/// `include_names: false` added for `--no-names` (ADR 0079).
+fn issue_body(grant_json: &str, no_names: bool) -> Result<serde_json::Value> {
+    let mut body = read_json_arg(grant_json)?;
+    if no_names {
+        let obj = body
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("--no-names needs a JSON object grant body"))?;
+        obj.insert("include_names".to_string(), serde_json::json!(false));
+    }
+    Ok(body)
 }
 
 fn read_json_arg(spec: &str) -> Result<serde_json::Value> {
@@ -62,6 +75,26 @@ mod tests {
             .expect("literal parses");
         assert_eq!(v["caps"][0], "dm");
         assert!(read_json_arg("{not json").is_err());
+    }
+
+    /// WHY (ADR 0079, #1831 review): `--no-names` sets
+    /// `include_names: false` in the body and overrides a `true` in
+    /// GRANT_JSON; without the flag the body is sent as given, so the
+    /// daemon's default (`true`) applies. A non-object body is refused.
+    #[test]
+    fn no_names_sets_include_names_false_in_the_body() {
+        let grant = r#"{"agents":["aa"],"caps":["dm"],"ttl_secs":60}"#;
+        let body = issue_body(grant, true).expect("body");
+        assert_eq!(body["include_names"], serde_json::json!(false));
+        assert_eq!(body["caps"][0], "dm");
+        let body = issue_body(grant, false).expect("body");
+        assert!(body.get("include_names").is_none(), "{body}");
+        let explicit = r#"{"agents":["aa"],"caps":["dm"],"ttl_secs":60,"include_names":true}"#;
+        assert_eq!(
+            issue_body(explicit, true).expect("body")["include_names"],
+            serde_json::json!(false)
+        );
+        assert!(issue_body("[1,2]", true).is_err());
     }
 
     #[test]
