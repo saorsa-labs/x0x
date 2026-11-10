@@ -2382,6 +2382,100 @@ mod owner_act_tests {
         Ok(())
     }
 
+    /// The next identity announce frame on the announce topic. The v3
+    /// `payload_version` is `0` for an anonymous announce.
+    async fn next_announce_frame(
+        wire: &mut crate::gossip::pubsub::Subscription,
+    ) -> crate::announce_v3::IdentityAnnouncementV3 {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let msg = tokio::time::timeout_at(deadline, wire.recv())
+                .await
+                .expect("an identity announcement was published")
+                .expect("the wire subscription stays open");
+            if crate::announce_v3::is_v3_payload(&msg.payload) {
+                return crate::announce_v3::deserialize_v3(&msg.payload)
+                    .expect("the identity announce wire frame decodes");
+            }
+        }
+    }
+
+    /// #1107: the durable owner token withdraws the consent through
+    /// `POST /announce`. The answer is 200 with `consent_withdrawn`, the
+    /// record file is gone, and the announce published by the withdrawal
+    /// and the next ordinary announce are both anonymous on the wire.
+    #[tokio::test]
+    async fn withdraw_consent_removes_the_record_and_announces_anonymously() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let user = crate::identity::UserKeypair::from_seed(&[0x42; 32])?;
+        let config = crate::network::NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse()?),
+            bootstrap_nodes: Vec::new(),
+            network_id: Some(format!("withdraw-consent-{}", rand::random::<u32>())),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..crate::network::NetworkConfig::default()
+        };
+        let agent = Arc::new(
+            crate::Agent::builder()
+                .with_identity_dir(dir.path())
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_user_key(user)
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .with_network_config(config)
+                .build()
+                .await?,
+        );
+        let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+            dir.path(),
+            Arc::clone(&agent),
+        )
+        .await?;
+        let app = matrix_router(Arc::clone(&state));
+        let mut wire = agent.subscribe(crate::IDENTITY_ANNOUNCE_TOPIC).await?;
+        let record = dir.path().join("user-consent.bin");
+
+        let consent = serde_json::json!({ "include_user_identity": true, "human_consent": true });
+        let (status, json) = call(&app, "POST", "/announce", DURABLE, consent).await;
+        assert_eq!(status, StatusCode::OK, "consented announce: {json}");
+        assert!(record.exists(), "the consented announce writes the record");
+        assert_ne!(
+            next_announce_frame(&mut wire).await.payload_version,
+            0,
+            "the consented announce is an identity announce"
+        );
+        assert!(agent.user_identity_consented());
+
+        let withdraw = serde_json::json!({ "withdraw_consent": true });
+        let (status, json) = call(&app, "POST", "/announce", DURABLE, withdraw).await;
+        assert_eq!(status, StatusCode::OK, "withdrawal: {json}");
+        assert_eq!(json["consent_withdrawn"], true, "withdrawal: {json}");
+        assert!(!record.exists(), "the withdrawal removes the record");
+        assert!(!agent.user_identity_consented());
+        assert_eq!(
+            next_announce_frame(&mut wire).await.payload_version,
+            0,
+            "the announce published by the withdrawal is anonymous"
+        );
+
+        // The next ordinary announce, in a later second, is anonymous too.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let (status, json) = call(&app, "POST", "/announce", DURABLE, serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::OK, "plain announce: {json}");
+        assert!(json.get("consent_withdrawn").is_none(), "{json}");
+        assert_eq!(
+            next_announce_frame(&mut wire).await.payload_version,
+            0,
+            "the next announce after the withdrawal is anonymous"
+        );
+        assert!(!record.exists(), "an anonymous announce writes no record");
+        agent.shutdown().await;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn owner_act_matrix_home_rename() -> anyhow::Result<()> {
         let (state, _dir) = matrix_state().await?;

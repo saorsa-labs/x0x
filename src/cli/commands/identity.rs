@@ -881,6 +881,35 @@ mod tests {
         assert!(result.is_ok(), "announce should succeed: {:?}", result);
     }
 
+    /// #1107: `x0x announce --withdraw-consent` sends `withdraw_consent`,
+    /// and an ordinary announce does not send the field at all.
+    #[tokio::test]
+    async fn announce_withdraw_consent_request_body() {
+        use crate::cli::commands::test_support::start_capturing_mock_server;
+        let (url, _shutdown, captured) =
+            start_capturing_mock_server(serde_json::json!({"ok": true})).await;
+        let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
+
+        announce(&client, false, false, true).await.unwrap();
+        let (path, body) = captured.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(path, "/announce");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "include_user_identity": false,
+                "human_consent": false,
+                "withdraw_consent": true,
+            })
+        );
+
+        announce(&client, true, true, false).await.unwrap();
+        let (_, body) = captured.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({ "include_user_identity": true, "human_consent": true })
+        );
+    }
+
     #[tokio::test]
     async fn card_handles_shareable_link_response() {
         let mock_resp = serde_json::json!({"link": "x0x-card:abc", "ok": true});
