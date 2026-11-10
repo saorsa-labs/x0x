@@ -2855,3 +2855,67 @@ async fn issue1840_transient_roster_write_failure_keeps_journal() {
         "a transient durability failure must keep the admission journal"
     );
 }
+
+/// Review r1 (#1842) control. A live marker whose envelope is not a
+/// `JoinRequestCreated` is never written by the live path, so the sidecar
+/// is suspect: startup still fails closed and the sidecar bytes stay.
+#[tokio::test]
+async fn issue1840_restart_non_request_marker_is_still_fatal() {
+    let (state, _dir) = s_state().await;
+    let gk = format!("{:032x}", 0x1840_000eu32);
+    install_group_with_policy(
+        &state,
+        &gk,
+        2,
+        x0x::groups::GroupPolicyPreset::PublicRequestSecure,
+    )
+    .await;
+    let requester_kp = fresh_kp();
+    let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
+    let topic = group_topic(&state, &gk).await;
+    let event = NamedGroupMetadataEvent::JoinRequestCancelled {
+        group_id: gk.clone(),
+        request_id: "req-1840-not-a-request".to_string(),
+        requester_agent_id: requester_hex.clone(),
+        commit: None,
+    };
+    let envelope = sign_v2_envelope(&requester_kp, &topic, &event);
+    let entry = RelayEntry {
+        digest: blake3::hash(&envelope).into(),
+        byte_size: envelope.len(),
+        envelope,
+        request_id: "req-1840-not-a-request".to_string(),
+    };
+    *state.pending_listener_admission.lock().await = Some(marker_admission(
+        &gk,
+        &requester_hex,
+        &entry,
+        unix_ms() - 1000,
+    ));
+    assert_eq!(
+        save_roster(&state).await.expect("roster save"),
+        AtomicWriteOutcome::Durable
+    );
+    assert_eq!(
+        save_relay(&state).await.expect("relay save"),
+        AtomicWriteOutcome::Durable
+    );
+    let held_bytes = relay_sidecar_bytes(&state).await;
+
+    let result = restart_relay(&state).await;
+    assert!(
+        result.is_err(),
+        "a non-request marker must stay fatal at startup: {result:?}"
+    );
+    assert_eq!(
+        relay_sidecar_bytes(&state).await,
+        held_bytes,
+        "the rejected sidecar is preserved byte-for-byte"
+    );
+    assert!(
+        !tokio::fs::try_exists(refused_listener_admission_evidence_path(&state))
+            .await
+            .expect("stat evidence path"),
+        "a fatal rejection is not a refusal: no refused-admission copy"
+    );
+}

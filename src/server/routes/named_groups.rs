@@ -1274,7 +1274,9 @@ pub(in crate::server) struct ApplyMetadataResult {
     /// `JoinRequestCreated` before any roster write for it. Memory and disk
     /// hold no part of the request, so the listener-admission journal has
     /// nothing to recover and must not keep its marker. A failed or
-    /// indeterminate durable write is never reported here.
+    /// indeterminate write of the REQUEST is never reported here. A fork
+    /// evidence record for the refused commit is separate state; its
+    /// install can fail without changing this flag.
     pub(in crate::server) refused_without_mutation: bool,
 }
 
@@ -43589,19 +43591,22 @@ fn validate_relay_obligation_for_restart(
 /// restart call site can route the rejection through the SAME
 /// fork-evidence evaluation as the live apply path — a
 /// PrevHashMismatch/StaleRevision on a group carrying lineage is
-/// evidence, not just a startup failure.
+/// evidence, not just a refused journal entry.
 #[derive(Debug)]
 enum ListenerRestartAdmissionError {
     /// The marker is not a requester `JoinRequestCreated` at all — the
     /// live path never journals such a marker, so the sidecar is suspect.
     Inadmissible(String),
     /// Issue #1840: the request fails an admissibility check against the
-    /// durable roster (no commit, policy, already a member, banned, a
-    /// pending request exists). The live path refuses the same request
-    /// without mutation, so recovery refuses the entry and carries on.
+    /// durable roster (no commit, signer is not the requester, policy,
+    /// already a member, banned, a pending request exists, request id
+    /// present). The live path refuses the same request without
+    /// mutation, so recovery refuses the entry and carries on.
     Refused(String),
     /// The signed state commit failed to apply. The caller evaluates
-    /// fork evidence from the carried pair before failing the restart.
+    /// fork evidence from the carried pair, then refuses the entry and
+    /// carries on (issue #1840). Startup still fails when evidence was
+    /// found but could not be installed durably.
     CommitInvalid(Box<CommitInvalidError>),
 }
 
@@ -44601,6 +44606,30 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
                                                     );
                                             }
                                             _ => {}
+                                        }
+                                    } else {
+                                        // Review r1 (#1842): evidence was
+                                        // found but the install did not
+                                        // report durable. Dropping the
+                                        // marker now would lose the only
+                                        // record of the conflict, so
+                                        // startup fails closed as before
+                                        // #1840 and the next start retries
+                                        // the install. A group that
+                                        // already carries containment
+                                        // (first-complete-wins no-op) has
+                                        // lost nothing and is refused
+                                        // like any other entry.
+                                        let already_contained = state
+                                            .named_groups
+                                            .read()
+                                            .await
+                                            .get(&admission.group_id)
+                                            .is_some_and(fork_evidence_already_recorded);
+                                        if !already_contained {
+                                            return Err(format!(
+                                                "listener admission journal commit is invalid: {error} (fork evidence was not installed durably)"
+                                            ));
                                         }
                                     }
                                 }
