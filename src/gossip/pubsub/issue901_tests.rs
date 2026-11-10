@@ -242,3 +242,213 @@ async fn issue901_shared_metadata_topic_gives_no_roster_preference() {
         manager.replace_group_rosters(Vec::new()).await;
     }
 }
+
+type Bindings = crate::dm_inbox::AuthenticatedMachineBindings;
+
+/// Install `cache` as the group identity context and connect `machines`.
+fn install_bindings(
+    manager: &PubSubManager,
+    cache: crate::dm_inbox::AuthenticatedMachineBindingCache,
+    machines: &[u8],
+) -> Bindings {
+    let bindings = Arc::new(RwLock::new(cache));
+    manager.set_group_identity_context(
+        Arc::clone(&bindings),
+        Arc::new(RwLock::new(crate::revocation::RevocationSet::new())),
+        Arc::new(RwLock::new(crate::key_move::MoveState::default())),
+    );
+    manager
+        .transport
+        .recorder
+        .lock()
+        .expect("recorder")
+        .as_mut()
+        .expect("recorder installed")
+        .peers = machines.iter().map(|n| PeerId::new([*n; 32])).collect();
+    bindings
+}
+
+/// Bind agent `[n - 30; 32]` to machine `[n; 32]`.
+async fn bind(bindings: &Bindings, n: u8) {
+    crate::dm_inbox::record_authenticated_machine_binding(
+        bindings,
+        AgentId([n - 30; 32]),
+        MachineId([n; 32]),
+        1,
+    )
+    .await;
+}
+
+/// Subscribe to one KV topic of a new group whose roster is `agents`.
+async fn roster_topic(manager: &PubSubManager, agents: Vec<AgentId>) -> String {
+    let group = "ab".repeat(32);
+    let topic = state_sync(&group, &"01".repeat(32));
+    std::mem::forget(manager.subscribe(topic.clone()).await);
+    manager
+        .replace_group_rosters(vec![(group, String::new(), agents)])
+        .await;
+    topic
+}
+
+/// #901 item 4: one roster resolve takes the binding-cache write lock once,
+/// not once per member.
+#[tokio::test]
+async fn issue901_roster_resolve_takes_the_binding_lock_once() {
+    let manager = manager("issue901_one_lock").await;
+    let machines: Vec<u8> = (70..82).collect();
+    let bindings = install_bindings(&manager, Default::default(), &machines);
+    for n in &machines {
+        bind(&bindings, *n).await;
+    }
+    let agents: Vec<AgentId> = machines.iter().map(|n| AgentId([n - 30; 32])).collect();
+    let topic = roster_topic(&manager, agents).await;
+
+    let before = bindings.read().await.resolve_lock_takes();
+    let chosen = preferred(&manager, &topic).await;
+    let takes = bindings.read().await.resolve_lock_takes() - before;
+    println!("issue901: binding write-lock takes for a 12-member roster = {takes}");
+    assert_eq!(chosen.len(), 8, "all 12 members resolve; 8 slots");
+    assert_eq!(takes, 1, "one write lock per roster resolve");
+}
+
+/// #901 item 4: the batch touches every resolved member in the LRU order.
+/// The next insert at capacity evicts the member that is not in the roster.
+#[tokio::test]
+async fn issue901_roster_resolve_touches_each_member_in_the_lru() {
+    let manager = manager("issue901_lru_touch").await;
+    let cache = crate::dm_inbox::AuthenticatedMachineBindingCache::with_capacity(3);
+    let bindings = install_bindings(&manager, cache, &[70, 71, 72, 73]);
+    for n in [70, 71, 72] {
+        bind(&bindings, n).await;
+    }
+    // Machine 72's agent is the newest entry and is not in the roster.
+    let topic = roster_topic(&manager, vec![AgentId([40; 32]), AgentId([41; 32])]).await;
+    assert_eq!(preferred(&manager, &topic).await.len(), 2);
+    bind(&bindings, 73).await;
+    let cache = bindings.read().await;
+    assert!(cache.peek(&AgentId([40; 32])).is_some());
+    assert!(cache.peek(&AgentId([41; 32])).is_some());
+    assert!(
+        cache.peek(&AgentId([42; 32])).is_none(),
+        "the roster resolve made both members newer than the outsider"
+    );
+}
+
+/// #901 item 5: a member whose binding the cache bound evicted gets no
+/// preference, and the miss is counted as evicted. A member that never
+/// announced is counted as without binding only. The local agent is not
+/// counted.
+#[tokio::test]
+async fn issue901_evicted_member_gets_no_preference_and_is_counted() {
+    let manager = manager("issue901_evicted").await;
+    let cache = crate::dm_inbox::AuthenticatedMachineBindingCache::with_capacity(2);
+    // Machine 70 stays connected after its binding is evicted, and machine
+    // 73 is connected without any binding: reachability gives no preference.
+    let bindings = install_bindings(&manager, cache, &[70, 71, 72, 73]);
+    for n in [70, 71, 72] {
+        bind(&bindings, n).await;
+    }
+    assert!(bindings.read().await.peek(&AgentId([40; 32])).is_none());
+    let topic = roster_topic(
+        &manager,
+        vec![
+            AgentId([40; 32]),
+            AgentId([41; 32]),
+            AgentId([42; 32]),
+            AgentId([43; 32]),
+            manager.signing.agent_id,
+        ],
+    )
+    .await;
+
+    let before = bindings.read().await.roster_binding_misses();
+    let mut chosen = preferred(&manager, &topic).await;
+    let after = bindings.read().await.roster_binding_misses();
+    chosen.sort_unstable_by_key(|peer| *peer.as_bytes());
+    assert_eq!(
+        chosen,
+        vec![PeerId::new([71; 32]), PeerId::new([72; 32])],
+        "no binding, no preference"
+    );
+    assert_eq!(
+        (after.0 - before.0, after.1 - before.1),
+        (2, 1),
+        "(without binding, of which evicted)"
+    );
+
+    // A new announcement restores the preference. At capacity it evicts
+    // the least recently used member (machine 71), which is counted next.
+    bind(&bindings, 70).await;
+    let before = bindings.read().await.roster_binding_misses();
+    let mut chosen = preferred(&manager, &topic).await;
+    let after = bindings.read().await.roster_binding_misses();
+    chosen.sort_unstable_by_key(|peer| *peer.as_bytes());
+    assert_eq!(chosen, vec![PeerId::new([70; 32]), PeerId::new([72; 32])]);
+    assert_eq!((after.0 - before.0, after.1 - before.1), (2, 1));
+}
+
+/// #901 item 4 measurement. Not a gate: run with `--run-ignored only`.
+/// One task resolves a 256-member roster 2,000 times. A second task
+/// resolves one sender's binding in a loop, as DM ingress does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "measurement only"]
+async fn issue901_measure_roster_resolve_against_dm_ingress() {
+    const MEMBERS: u16 = 256;
+    const RESOLVES: u32 = 2_000;
+    let agent = |n: u16| {
+        let mut id = [7u8; 32];
+        id[..2].copy_from_slice(&n.to_be_bytes());
+        AgentId(id)
+    };
+    let local = AgentId([0xEE; 32]);
+    let agents: Vec<AgentId> = (0..MEMBERS).map(agent).collect();
+    for batch in [false, true] {
+        let bindings: Bindings = Arc::new(RwLock::new(Default::default()));
+        for member in &agents {
+            crate::dm_inbox::record_authenticated_machine_binding(
+                &bindings,
+                *member,
+                MachineId(member.0),
+                1,
+            )
+            .await;
+        }
+        let before = bindings.read().await.resolve_lock_takes();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ingress = tokio::spawn({
+            let (bindings, stop, sender) = (Arc::clone(&bindings), Arc::clone(&stop), agents[0]);
+            async move {
+                let mut worst = std::time::Duration::ZERO;
+                let mut count = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let start = std::time::Instant::now();
+                    crate::dm_inbox::authenticated_machine_binding_evidence(&bindings, &sender)
+                        .await;
+                    worst = worst.max(start.elapsed());
+                    count += 1;
+                    tokio::task::yield_now().await;
+                }
+                (count, worst)
+            }
+        });
+        let start = std::time::Instant::now();
+        for _ in 0..RESOLVES {
+            if batch {
+                crate::dm_inbox::authenticated_roster_machine_bindings(&bindings, &agents, &local)
+                    .await;
+            } else {
+                for member in &agents {
+                    crate::dm_inbox::authenticated_machine_binding(&bindings, member).await;
+                }
+            }
+        }
+        let elapsed = start.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (ingress_count, ingress_worst) = ingress.await.expect("ingress task");
+        let takes = bindings.read().await.resolve_lock_takes() - before - ingress_count;
+        println!(
+            "issue901 measure: batch={batch} roster_lock_takes={takes} roster_wall={elapsed:?} \
+             ingress_resolves={ingress_count} ingress_worst_wait={ingress_worst:?}"
+        );
+    }
+}
