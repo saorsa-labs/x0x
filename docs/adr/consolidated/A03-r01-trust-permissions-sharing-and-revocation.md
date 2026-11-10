@@ -33,6 +33,8 @@ Evidence loading is bounded at startup (accepted 19 Oct 2026; archived as [T-008
 
 A ShareGrant gives selected agents limited access. It must state the recipient, actions, targets and expiry. It does not expose Home or grant control of the owner's other agents. Re-sharing is denied unless an accepted design explicitly permits it.
 
+A grant that carries names (archived ADR 0079) names each machine that hosts a granted agent. The issuing daemon names its own machine from its live local profile `machine_name`. Its own machine needs no enrollment record and no synced name record, and the daemon ignores a synced name record for it. The owner key that signs the names section vouches for this name directly. Each other machine must have a current, owner-verified ADR 0041 enrollment and an owner-signed synced `machine_name`. The daemon omits a machine whose name is not valid and keeps the other machines. This amends the `machines` rule of archived ADR 0079 §1, which required a synced `machine_name` and an enrollment for every listed machine (David's ruling, 10 Nov 2026, which accepts PR #1831 as built). It does not change behavior.
+
 ## Service and token permissions
 
 Remote command execution remains off unless the local ACL enables it. The allowed command, arguments and target must pass that ACL. A message that asks for execution is not an execution grant.
