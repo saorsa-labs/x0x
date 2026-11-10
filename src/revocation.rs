@@ -494,12 +494,12 @@ pub struct RevocationSet {
     revoked_machines: HashSet<MachineId>,
     records_by_hash: HashMap<[u8; 32], PersistedRevocation>,
     /// ADR-0043 tombstone epochs from ad-hoc binding `RevocationRecord`s
-    /// (`x0x.revocation.v2` carrier). Grow-only; never TTL-swept.
+    /// (`x0x.revocation.v2` carrier). Grow-only; never swept.
     binding_epochs: HashMap<(AgentId, MachineId), u64>,
     /// ADR-0043 tombstone epochs unioned from VERIFIED
     /// `ActivationBundle.retired_bindings` sets (owner-covered by the
     /// bundle signature — not standalone records). Grow-only, order-
-    /// independent; never TTL-swept. Both maps feed
+    /// independent; never swept. Both maps feed
     /// [`Self::is_binding_revoked`].
     bundle_retired_epochs: HashMap<(AgentId, MachineId), u64>,
     /// Ad-hoc binding tombstones indexed by agent (#1659). Kept in step
@@ -512,7 +512,7 @@ pub struct RevocationSet {
     /// by the latest signed `grant_expiry`. Collected once the grant itself is dead
     /// (`grant_expiry + SHARE_GRANT_REVOCATION_GC_SLACK_SECS`).
     revoked_share_grants: HashMap<([u8; 32], UserId), u64>,
-    /// Monotonic change counter — incremented on every insert or expiry.
+    /// Monotonic change counter — incremented on every insert or collection.
     /// Publishers compare this to decide whether the set changed since
     /// their last full broadcast (the on-change piggyback gate), avoiding
     /// a full `all_records` comparison per heartbeat.
@@ -1336,7 +1336,7 @@ impl RevocationSet {
         taken
     }
 
-    /// Monotonic generation counter — changes on every insert or expiry.
+    /// Monotonic generation counter — changes on every insert or collection.
     /// The heartbeat piggyback compares generations: unchanged set ⇒ skip
     /// the publish (except the periodic fallback).
     #[must_use]
