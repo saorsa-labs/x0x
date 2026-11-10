@@ -19232,15 +19232,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         && info
                             .caller_role(&actor)
                             .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin));
-                    if !admin_signed
-                        || !event_steps::reject_names_its_request(
-                            &commit,
-                            reject.actor,
-                            reject.request_id,
-                            reject.requester_agent_id,
-                            reject.request_binding,
-                        )
-                    {
+                    if !admin_signed || !event_steps::reject_names_its_request(&commit, reject) {
                         return ApplyMetadataResult::REJECTED;
                     }
                     action = x0x::groups::ActionKind::AdminOrHigher;
@@ -36583,8 +36575,7 @@ pub(in crate::server) async fn reject_join_request(
     drop(membership_guard);
 
     // #1623: the commit covers no join request, so its signer names the
-    // rejected request in a second signature. Hot file: this is the one
-    // place that signs a reject.
+    // rejected request in a second signature.
     let request_binding = match x0x::groups::state_commit::sign_join_request_reject(
         &commit,
         &request_id,

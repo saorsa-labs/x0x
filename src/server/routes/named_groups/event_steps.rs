@@ -166,17 +166,14 @@ pub(in crate::server) fn unban<'a>(
 /// rule refuses its copy.
 pub(in crate::server) fn reject_names_its_request(
     commit: &x0x::groups::GroupStateCommit,
-    actor: &str,
-    request_id: &str,
-    requester_agent_id: &str,
-    request_binding: Option<&str>,
+    reject: RejectedRequest<'_>,
 ) -> bool {
-    commit.committed_by == actor
-        && request_binding.is_none_or(|binding| {
+    commit.committed_by == reject.actor
+        && reject.request_binding.is_none_or(|binding| {
             x0x::groups::state_commit::verify_join_request_reject(
                 commit,
-                request_id,
-                requester_agent_id,
+                reject.request_id,
+                reject.requester_agent_id,
                 binding,
             )
             .is_ok()
@@ -202,23 +199,14 @@ pub(in crate::server) fn join_request_rejected<'a>(
     commit: &x0x::groups::GroupStateCommit,
 ) -> Step<impl FnOnce(&mut GroupInfo) + 'a> {
     let RejectedRequest {
-        request_id,
-        actor,
-        requester_agent_id,
-        request_binding,
+        request_id, actor, ..
     } = reject;
     if !admin_signed(cursor, actor, sender_hex)
         || !cursor
             .join_requests
             .get(request_id)
             .is_some_and(|request| request.is_pending())
-        || !reject_names_its_request(
-            commit,
-            actor,
-            request_id,
-            requester_agent_id,
-            request_binding,
-        )
+        || !reject_names_its_request(commit, reject)
     {
         return Err(StepRefusal::Refused);
     }
