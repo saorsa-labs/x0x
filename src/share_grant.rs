@@ -2170,6 +2170,13 @@ impl crate::Agent {
         !agents.is_empty() && outbox.nudge(&agents, unix_now_secs())
     }
 
+    /// #1158: `agent`'s verified capability advert arrived. Make every
+    /// queued grant delivery to it due now.
+    pub fn nudge_share_grant_outbox_for_agent(&self, agent: &AgentId) -> bool {
+        self.share_grant_outbox()
+            .is_some_and(|outbox| outbox.nudge(&[*agent], unix_now_secs()))
+    }
+
     /// Revoke an issued grant (owner key only): sign a
     /// [`crate::revocation::RevokedSubject::ShareGrant`] record, apply it
     /// locally (effective at the next evaluation, no restart), durably

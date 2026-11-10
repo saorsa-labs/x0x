@@ -514,6 +514,15 @@ pub(in crate::server) async fn direct_send(
                 x0x::dm::DmError::RecipientUpgradeRequired { .. } => {
                     (StatusCode::CONFLICT, "recipient_upgrade_required")
                 }
+                // #1158: an obligation-carrying typed payload and no
+                // current verified capability advert. Nothing was sent;
+                // retry after the recipient's advert arrives.
+                x0x::dm::DmError::RecipientCapabilityPending { .. } => {
+                    (StatusCode::CONFLICT, "recipient_capability_pending")
+                }
+                x0x::dm::DmError::RecipientCapabilityUnavailable { .. } => {
+                    (StatusCode::CONFLICT, "recipient_capability_unavailable")
+                }
                 x0x::dm::DmError::AckSemanticsUnavailable(_) => {
                     (StatusCode::CONFLICT, "recipient_ack_semantics_unavailable")
                 }
