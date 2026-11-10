@@ -128,8 +128,17 @@ fn issue1099_card_keeps_supported_bits_but_cannot_transfer_them_between_machines
         store.lookup(&recipient).unwrap().application_registry,
         CapabilityRegistry::default()
     );
+    // #1158: a card from another machine is not a current verified advert,
+    // so the capability is unknown and the grant is held, not sent.
+    assert!(matches!(
+        store.require_payload_capability(&recipient, share_grant::SHARE_GRANT_DM_PREFIX),
+        Err(DmError::RecipientCapabilityPending {
+            capability: "share_grant_v1"
+        })
+    ));
+    // An ordinary DM is not held.
     store
-        .require_payload_capability(&recipient, share_grant::SHARE_GRANT_DM_PREFIX)
+        .require_payload_capability(&recipient, b"hello")
         .unwrap();
 }
 
