@@ -456,8 +456,8 @@ impl CapabilityStore {
     /// - A current verified advert decides: the payload's bit is set
     ///   (`Ok`) or not (`RecipientUpgradeRequired`).
     /// - No current verified advert (unknown, expired or card-only state):
-    ///   an obligation-carrying payload
-    ///   ([`crate::dm::CapabilityRegistry::obligation_for_payload`]) is held with
+    ///   an obligation-carrying payload (a share grant, predecessor relay
+    ///   or requester offer) is held with
     ///   `RecipientCapabilityPending`, and with
     ///   `RecipientCapabilityUnavailable` once
     ///   [`OBLIGATION_CAPABILITY_WAIT_SECS`] have passed since the first
