@@ -21,6 +21,38 @@ Each agent maintains a `ContactStore` of known peers with:
 
 The identity listener applies trust evaluation to every incoming announcement. Blocked and machine-mismatched announcements are silently dropped.
 
+## User-identity consent across restarts (#1107)
+
+An agent includes its user ID and agent certificate in announcements only
+after the user consents: `POST /announce` with `include_user_identity: true`
+and `human_consent: true`. A peer that receives a later announcement without
+the certificate drops the certificate from its cache. Owner trust then fails
+on a peer that holds no ADR 0089 evidence record for that agent.
+
+Before #1107 the consent was in memory only. After each restart the daemon
+announced without the identity until someone repeated the consented
+announce. The consent is now durable:
+
+- A successful consented announce writes `user-consent.bin` in the identity
+  directory (mode `0600` on Unix). The file holds the 4-byte magic `X0UC`
+  and a bincode body: format version `1`, the user ID, the agent ID and the
+  time of consent. It is 77 bytes.
+- At build, before the first announce, the agent loads the record. The
+  startup announce and every heartbeat then carry the user ID and the
+  certificate.
+- The record applies only to the identity it names. The agent must have a
+  certificate, disclose the same user ID, and have the same agent ID. If
+  not, the agent announces without the user identity. A device that holds
+  only a certificate from its owner (no user key) keeps its consent, because
+  it discloses the same user.
+- A missing, unreadable or damaged record means "not consented". The daemon
+  starts.
+- `POST /announce` with `withdraw_consent: true` removes the record and
+  stops the disclosure. See the API reference.
+
+The certificate is still not sent in-band on forward and `SyncV1` opens.
+That part of #1107 is not done.
+
 ## Owner-sync admission for enrolled machines (#1040)
 
 The inbound stream gate resolves a transport-authenticated machine to the

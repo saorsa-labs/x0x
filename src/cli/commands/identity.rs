@@ -92,12 +92,22 @@ pub async fn owner_machines(client: &DaemonClient) -> Result<()> {
 }
 
 /// `x0x announce` — POST /announce
-pub async fn announce(client: &DaemonClient, include_user: bool, consent: bool) -> Result<()> {
+pub async fn announce(
+    client: &DaemonClient,
+    include_user: bool,
+    consent: bool,
+    withdraw_consent: bool,
+) -> Result<()> {
     client.ensure_running().await?;
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "include_user_identity": include_user,
         "human_consent": consent,
     });
+    // #1107: sent only when asked, so the body an older daemon sees is
+    // unchanged for an ordinary announce.
+    if withdraw_consent {
+        body["withdraw_consent"] = serde_json::Value::Bool(true);
+    }
     let resp = client.post("/announce", &body).await?;
     print_value(client.format(), &resp);
     Ok(())
@@ -867,7 +877,7 @@ mod tests {
         let mock_resp = serde_json::json!({"announced": true});
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
-        let result = announce(&client, true, true).await;
+        let result = announce(&client, true, true, false).await;
         assert!(result.is_ok(), "announce should succeed: {:?}", result);
     }
 

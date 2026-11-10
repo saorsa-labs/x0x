@@ -75,6 +75,10 @@ pub(in crate::server) struct AnnounceIdentityRequest {
     include_user_identity: bool,
     #[serde(default)]
     human_consent: bool,
+    /// #1107: withdraw the recorded consent to user-identity disclosure
+    /// before this (anonymous) announce.
+    #[serde(default)]
+    withdraw_consent: bool,
 }
 
 /// GET /agent
@@ -299,16 +303,53 @@ pub(in crate::server) async fn announce_identity(
         )
         .into_response();
     }
+    // #1107: withdrawing the consent is the owner's decision, like giving
+    // it. The durable record and the in-memory flag are cleared before the
+    // anonymous announce, so a failed publish cannot leave consent on.
+    if req.withdraw_consent {
+        if req.include_user_identity {
+            return bad_request(
+                "withdraw_consent cannot be combined with include_user_identity: true",
+            )
+            .into_response();
+        }
+        if !actor.is_durable_owner() {
+            return api_error(
+                StatusCode::FORBIDDEN,
+                "withdrawing the user-identity consent requires the durable API token (owner act)",
+            )
+            .into_response();
+        }
+        if let Err(e) = state.agent.withdraw_user_identity_consent().await {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not remove the user-identity consent record: {e}"),
+            )
+            .into_response();
+        }
+    }
     match state
         .agent
         .announce_identity(req.include_user_identity, req.human_consent)
         .await
     {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
+        Ok(()) => {
+            let mut body = serde_json::json!({
                 "ok": true,
                 "include_user_identity": req.include_user_identity,
+            });
+            if req.withdraw_consent {
+                body["consent_withdrawn"] = serde_json::Value::Bool(true);
+            }
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        // The withdrawal is already done when the announce fails; say so.
+        Err(e) if req.withdraw_consent => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("{e}"),
+                "consent_withdrawn": true,
             })),
         )
             .into_response(),
@@ -2278,6 +2319,65 @@ mod owner_act_tests {
             status,
             StatusCode::BAD_REQUEST,
             "plain announce stays session-allowed (400 = gossip runtime absent, NOT 403)"
+        );
+        Ok(())
+    }
+
+    /// #1107: withdrawing the consent is an owner act, and it cannot be
+    /// combined with a disclosure.
+    #[tokio::test]
+    async fn owner_act_matrix_withdraw_consent() -> anyhow::Result<()> {
+        let (state, _dir) = matrix_state().await?;
+        let app = matrix_router(Arc::clone(&state));
+        let withdraw = serde_json::json!({ "withdraw_consent": true });
+
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/announce",
+            &session_token(&state).await,
+            withdraw.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "session bearer: {json}");
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/announce",
+            &rider_token(&state).await,
+            withdraw.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "rider token: {json}");
+
+        // Durable clears the gate and the withdrawal runs; the fixture
+        // agent has no gossip runtime, so the anonymous announce after it
+        // answers 400 with the handler's own error.
+        let (status, json) = call(&app, "POST", "/announce", DURABLE, withdraw).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "durable: {json}");
+        assert!(
+            json["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("gossip runtime")),
+            "the withdrawal passed and the announce failed: {json}"
+        );
+        assert_eq!(
+            json["consent_withdrawn"], true,
+            "a failed announce still reports the withdrawal: {json}"
+        );
+
+        let both = serde_json::json!({
+            "include_user_identity": true,
+            "human_consent": true,
+            "withdraw_consent": true,
+        });
+        let (status, json) = call(&app, "POST", "/announce", DURABLE, both).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "combined: {json}");
+        assert!(
+            json["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("withdraw_consent cannot be combined")),
+            "combined request is refused before any change: {json}"
         );
         Ok(())
     }

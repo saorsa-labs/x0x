@@ -1084,7 +1084,7 @@ const PINNED_MANUAL_BODY_ENDPOINTS: &[(&str, &str, &[&str])] = &[
     (
         "POST",
         "/announce",
-        &["human_consent", "include_user_identity"],
+        &["human_consent", "include_user_identity", "withdraw_consent"],
     ),
     // parse_optional_json over raw Bytes (create_group_invite)
     ("POST", "/groups/:id/invite", &["expiry_secs"]),
