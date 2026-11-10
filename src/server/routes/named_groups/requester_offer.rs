@@ -85,6 +85,23 @@ pub(in crate::server) struct RequesterOfferObligation {
     pub(in crate::server) next_retry_at_ms: u64,
     /// Offer attempts completed so far.
     pub(in crate::server) retry_count: u32,
+    /// Issue #1840: set when the authority refused this exact envelope
+    /// (see `join_request_outcome`). A refused obligation is never offered
+    /// again; it stays until the local request stops being pending, so the
+    /// API can show the refusal. Absent from the sidecar bytes when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::server) refusal: Option<RequesterOfferRefusal>,
+}
+
+/// Issue #1840: the authority's typed refusal of one offered envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(in crate::server) struct RequesterOfferRefusal {
+    /// `JoinRequestRefusalReason::as_str` of the received reason.
+    pub(in crate::server) reason: String,
+    /// `true` when a new envelope sealed over a fresh head can succeed.
+    pub(in crate::server) retryable: bool,
+    /// Unix-epoch millis when this daemon recorded the refusal.
+    pub(in crate::server) refused_at_ms: u64,
 }
 
 /// Sidecar shape: version + obligations grouped by group id.
@@ -193,6 +210,52 @@ pub(in crate::server) async fn insert_requester_offer_obligation(
     }
 }
 
+/// Issue #1840: record `refusal` on the stored obligation of
+/// `(group, request_id)`, durably, when `accept` admits the stored one.
+/// `Ok(false)` when there is no such obligation or `accept` refuses it.
+pub(in crate::server) async fn mark_requester_offer_refused(
+    state: &AppState,
+    group_id: &str,
+    request_id: &str,
+    refusal: RequesterOfferRefusal,
+    accept: impl Fn(&RequesterOfferObligation) -> bool,
+) -> Result<bool, String> {
+    let Some(mut refused) = find_requester_offer(state, group_id, request_id).await else {
+        return Ok(false);
+    };
+    if !accept(&refused) {
+        return Ok(false);
+    }
+    refused.refusal = Some(refusal);
+    // `accept` runs again on the entry stored under the persistence lock.
+    match outbox(state)
+        .replace_if(refused, |stored| accept(stored))
+        .await
+    {
+        Ok(replaced) => Ok(replaced),
+        // After the rename the disk and memory hold the refusal (#1101), so
+        // it is in effect; only the directory fsync is unconfirmed.
+        Err(e) if e.crossed_rename() => Ok(true),
+        Err(e) => Err(format!("failed to write requester offer outbox: {e}")),
+    }
+}
+
+/// The stored obligation of `(group, request_id)`, if any.
+pub(in crate::server) async fn find_requester_offer(
+    state: &AppState,
+    group_id: &str,
+    request_id: &str,
+) -> Option<RequesterOfferObligation> {
+    state
+        .requester_offer_outbox
+        .read()
+        .await
+        .get(group_id)?
+        .iter()
+        .find(|o| o.request_id == request_id)
+        .cloned()
+}
+
 /// Load the outbox at boot. Missing ⇒ empty. Malformed, wrong version, or
 /// over the daemon caps ⇒ empty + an error, and the file is moved aside
 /// (#942 M2) so the operator keeps the evidence and the next insert
@@ -204,7 +267,10 @@ pub(in crate::server) async fn load_requester_offer_outbox(state: &AppState) -> 
 /// Is the obligation's join still live — pending, in a live group? When
 /// this is false the offer can never matter again (an authority may only
 /// act on a pending request), so the worker drops it.
-async fn offer_still_live(state: &AppState, obligation: &RequesterOfferObligation) -> bool {
+pub(in crate::server) async fn offer_still_live(
+    state: &AppState,
+    obligation: &RequesterOfferObligation,
+) -> bool {
     let groups = state.named_groups.read().await;
     let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, &obligation.group_id)
     else {
@@ -234,11 +300,16 @@ pub(in crate::server) async fn requester_offer_step(state: &std::sync::Arc<AppSt
     let mut resolved: Vec<RequesterOfferObligation> = Vec::new();
     let mut to_send: Vec<RequesterOfferObligation> = Vec::new();
     for obligation in due {
-        if offer_still_live(state, &obligation).await {
-            to_send.push(obligation);
-        } else {
+        if !offer_still_live(state, &obligation).await {
             resolved.push(obligation);
+        } else if obligation.refusal.is_none() {
+            to_send.push(obligation);
         }
+        // Issue #1840: a refused envelope of a still-pending request is
+        // kept and never offered again.
+    }
+    if resolved.is_empty() && to_send.is_empty() {
+        return;
     }
     // #942 r4 (bounded pass): a per-pass SEND budget — a hundred slow
     // strict sends can no longer starve a brand-new obligation behind
@@ -352,6 +423,7 @@ mod tests {
             first_seen_ms,
             next_retry_at_ms: 0,
             retry_count: 0,
+            refusal: None,
         }
     }
 

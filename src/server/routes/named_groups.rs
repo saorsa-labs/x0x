@@ -45,6 +45,10 @@ pub(in crate::server) use seat_cert_fetch::{
 
 #[cfg(test)]
 mod issue1229_stored_delivery;
+mod join_request_outcome;
+pub(in crate::server) use join_request_outcome::{
+    handle_join_request_outcome_typed_payload, send_join_request_refusal,
+};
 mod requester_offer;
 pub(in crate::server) use requester_offer::{
     insert_requester_offer_obligation, load_requester_offer_outbox, requester_offer_step,
@@ -1278,6 +1282,11 @@ pub(in crate::server) struct ApplyMetadataResult {
     /// neither is a refusal whose fork evidence was found but not
     /// installed durably.
     pub(in crate::server) refused_without_mutation: bool,
+    /// Issue #1840 (ask 4): why validation refused the request. `Some` only
+    /// together with `refused_without_mutation`. The listener sends it to
+    /// the requester as a typed outcome (`join_request_outcome`).
+    pub(in crate::server) refusal_reason:
+        Option<x0x::groups::join_outcome::JoinRequestRefusalReason>,
 }
 
 impl ApplyMetadataResult {
@@ -1287,6 +1296,7 @@ impl ApplyMetadataResult {
         should_exit: false,
         pre_mutation_group: None,
         refused_without_mutation: false,
+        refusal_reason: None,
     };
 
     /// Issue #1840: a `JoinRequestCreated` refused by validation, with no
@@ -1296,7 +1306,16 @@ impl ApplyMetadataResult {
         should_exit: false,
         pre_mutation_group: None,
         refused_without_mutation: true,
+        refusal_reason: None,
     };
+
+    /// Issue #1840: [`Self::REFUSED_WITHOUT_MUTATION`] with its reason.
+    fn refused(reason: x0x::groups::join_outcome::JoinRequestRefusalReason) -> Self {
+        Self {
+            refusal_reason: Some(reason),
+            ..Self::REFUSED_WITHOUT_MUTATION
+        }
+    }
 
     /// Event accepted and persisted; re-check whether the subscriber
     /// should exit. Roster changes do not rotate the metadata topic.
@@ -1305,6 +1324,7 @@ impl ApplyMetadataResult {
         should_exit: true,
         pre_mutation_group: None,
         refused_without_mutation: false,
+        refusal_reason: None,
     };
 
     /// Event accepted and persisted; subscriber should continue
@@ -1314,6 +1334,7 @@ impl ApplyMetadataResult {
         should_exit: false,
         pre_mutation_group: None,
         refused_without_mutation: false,
+        refusal_reason: None,
     };
 }
 
@@ -18771,30 +18792,31 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // to release its marker. Two cases stay plain REJECTED and keep
             // the marker: fork evidence that was found but not installed
             // durably, and the persist failures below.
+            use x0x::groups::join_outcome::JoinRequestRefusalReason as Reason;
             let Some(commit) = commit else {
-                return ApplyMetadataResult::REFUSED_WITHOUT_MUTATION;
+                return ApplyMetadataResult::refused(Reason::Invalid);
             };
             if sender_hex != requester_agent_id {
-                return ApplyMetadataResult::REFUSED_WITHOUT_MUTATION;
+                return ApplyMetadataResult::refused(Reason::Invalid);
             }
             if info.policy.admission != x0x::groups::GroupAdmission::RequestAccess {
-                return ApplyMetadataResult::REFUSED_WITHOUT_MUTATION;
+                return ApplyMetadataResult::refused(Reason::NotRequestAccess);
             }
             if info.has_active_member(&requester_agent_id) {
-                return ApplyMetadataResult::REFUSED_WITHOUT_MUTATION;
+                return ApplyMetadataResult::refused(Reason::AlreadyMember);
             }
             if info.is_banned(&requester_agent_id) {
-                return ApplyMetadataResult::REFUSED_WITHOUT_MUTATION;
+                return ApplyMetadataResult::refused(Reason::Banned);
             }
             if info
                 .join_requests
                 .values()
                 .any(|r| r.requester_agent_id == requester_agent_id && r.is_pending())
             {
-                return ApplyMetadataResult::REFUSED_WITHOUT_MUTATION;
+                return ApplyMetadataResult::refused(Reason::PendingExists);
             }
             if info.join_requests.contains_key(&request_id) {
-                return ApplyMetadataResult::REFUSED_WITHOUT_MUTATION;
+                return ApplyMetadataResult::refused(Reason::Invalid);
             }
             let current = info.clone();
             // The central hook ([`apply_stateful_event_with_evidence`]),
@@ -18845,7 +18867,14 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     return if evidence_not_durable {
                         ApplyMetadataResult::REJECTED
                     } else {
-                        ApplyMetadataResult::REFUSED_WITHOUT_MUTATION
+                        ApplyMetadataResult::refused(match error {
+                            x0x::groups::ApplyError::StaleRevision { .. } => Reason::StaleHead,
+                            x0x::groups::ApplyError::PrevHashMismatch { .. }
+                            | x0x::groups::ApplyError::StateHashMismatch { .. } => {
+                                Reason::StateMismatch
+                            }
+                            _ => Reason::Invalid,
+                        })
                     };
                 }
             };
@@ -18889,6 +18918,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 should_exit: false,
                 pre_mutation_group: Some(current),
                 refused_without_mutation: false,
+                refusal_reason: None,
             }
         }
         NamedGroupMetadataEvent::JoinRequestApproved {
@@ -21423,6 +21453,7 @@ pub(in crate::server) async fn get_named_group(
     // ADR 0109 §8: the additive `recovery` object (absent when S3 holds no
     // state for the group).
     let s3_recovery = group_recovery::recovery_json(&state, &info).await;
+    let own_join_request = join_request_outcome::own_join_request_json(&state, &info).await;
 
     (
         StatusCode::OK,
@@ -21445,6 +21476,9 @@ pub(in crate::server) async fn get_named_group(
             // PR #370 review item 2: clients must be able to distinguish a
             // retained withdrawn tombstone from a live group.
             "withdrawn": info.withdrawn,
+            // #1840: this daemon's own pending join request and, when the
+            // authority refused it, the typed reason. `null` otherwise.
+            "own_join_request": own_join_request,
             "metadata_topic": info.metadata_topic,
             "policy": info.policy,
             "policy_revision": info.policy_revision,
@@ -35411,6 +35445,7 @@ pub(in crate::server) async fn create_join_request(
                 first_seen_ms: now_ms,
                 next_retry_at_ms: now_ms,
                 retry_count: 0,
+                refusal: None,
             };
             if let Err(error) = insert_requester_offer_obligation(&state, obligation).await {
                 // Fail-visible fallback: the pre-#908 one-shot shape, so
@@ -53176,6 +53211,7 @@ pub(in crate::server) mod tests {
     mod issue1685_catchup_page_no_progress;
     #[cfg(unix)]
     mod issue1809_secret_file_mode;
+    mod issue1840_join_request_outcome;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue646_base_roster_fetch;
@@ -54020,6 +54056,7 @@ pub(in crate::server) mod tests {
             )),
             treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
             treekem_catchup_refusals: StdMutex::new(HashMap::new()),
+            join_request_outcome_sends: StdMutex::new(HashMap::new()),
             group_membership_locks: RwLock::new(HashMap::new()),
             reseat_stagings: Default::default(),
             treekem_groups: crate::server::reseat_scope::ScopedGroupMap::default(),

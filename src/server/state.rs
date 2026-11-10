@@ -1307,6 +1307,11 @@ pub(super) struct AppState {
     /// refusal for a group this node does not hold records nothing
     /// (review finding 2), so the map is bounded by the local groups.
     pub(super) treekem_catchup_refusals: StdMutex<HashMap<String, TreeKemCatchupRefusalNote>>,
+    /// Issue #1840: when this authority last sent a join-request outcome
+    /// for a refused envelope digest (Unix millis). It limits the outcome
+    /// to one per digest per interval; `join_request_outcome` prunes and
+    /// caps it.
+    pub(super) join_request_outcome_sends: StdMutex<HashMap<[u8; 32], u64>>,
     /// Per-group serialization for authoritative membership mutations. The
     /// owner-side `MemberJoined`→`MemberAdded` add (and every other membership
     /// apply) is a read-modify-write that loads `info`, mutates a clone, mutates

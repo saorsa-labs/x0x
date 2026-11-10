@@ -223,6 +223,31 @@ impl<'a, T: OutboxRecord> Outbox<'a, T> {
         self.persist_then_commit(next).await
     }
 
+    /// Replace the stored entry that has `entry`'s partition and id, and
+    /// persist. Nothing changes, and `Ok(false)` is returned, when no such
+    /// entry is stored or `accept` refuses the stored one. The check and
+    /// the write run under the persistence lock, so a concurrent `settle`
+    /// cannot remove the entry between them (#1840).
+    pub(crate) async fn replace_if(
+        &self,
+        entry: T,
+        accept: impl FnOnce(&T) -> bool,
+    ) -> Result<bool, DurableWriteError> {
+        let _guard = self.persist_lock.lock().await;
+        let mut next = self.entries.read().await.clone();
+        let Some(stored) = next
+            .get_mut(entry.partition())
+            .and_then(|list| list.iter_mut().find(|o| o.id() == entry.id()))
+        else {
+            return Ok(false);
+        };
+        if !accept(stored) {
+            return Ok(false);
+        }
+        *stored = entry;
+        self.persist_then_commit(next).await.map(|()| true)
+    }
+
     /// Apply one worker pass: drop `resolved`, remove delivered entries,
     /// and reschedule failed ones from `schedule_secs`. Then persist.
     pub(crate) async fn settle(
