@@ -1265,6 +1265,16 @@ pub(super) struct AppState {
     /// Watson item 5: in-memory pending listener admission journal.
     /// Mirrors the durable sidecar field. Cleared after both request apply
     /// and obligation save complete.
+    ///
+    /// Single-writer invariant: after startup, only the predecessor-relay
+    /// typed-DM receiver task writes this slot
+    /// (`handle_predecessor_relay_typed_payload`), and that task awaits each
+    /// payload to completion in arrival order. The startup loader
+    /// (`load_predecessor_relay_outbox`) writes it before that task runs.
+    /// The #1840 release therefore takes the slot without an identity
+    /// re-check: the marker it finds is the one the same call wrote or
+    /// matched. A second writer, or a concurrent receiver, must add that
+    /// re-check first.
     pub(super) pending_listener_admission:
         Mutex<Option<crate::server::routes::named_groups::PendingListenerAdmission>>,
     /// Bounded per-group log of locally authored/applied TreeKEM membership

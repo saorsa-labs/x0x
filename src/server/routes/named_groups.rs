@@ -44685,10 +44685,11 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
                 "ADR 0028 startup: {reason}; refusing this journal entry and continuing"
             );
             preserve_refused_listener_admission_evidence(state).await;
-            // Fork evidence for the refused commit was installed in the
-            // live map. Carry it into the detached candidate so a later
-            // candidate install cannot drop it. Recovery itself never
-            // edits these two fields.
+            // The `CommitInvalid` arm may have installed fork evidence for
+            // the refused commit in the live map (the `Refused` arm
+            // installs none). Carry the live containment into the
+            // detached candidate so a later candidate install cannot drop
+            // it. Recovery itself never edits these two fields.
             let live = state.named_groups.read().await;
             for (key, candidate) in groups_view.iter_mut() {
                 if let Some(live_info) = live.get(key) {

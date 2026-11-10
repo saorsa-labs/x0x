@@ -3103,6 +3103,160 @@ async fn issue1840_restart_keeps_marker_until_fork_evidence_is_durable() {
     assert!(refused_evidence_exists(&state).await);
 }
 
+/// #1842 review r3 (Greptile P1 "Failed quarantine saves are forgotten").
+/// Each roster-save outcome that is not `Durable` keeps startup fatal when
+/// the refused commit is fork evidence: the sidecar keeps the marker
+/// byte-for-byte, no refused-admission copy is written, and the group is
+/// not served. The next start, with a working save, installs the
+/// quarantine and only then drops the marker.
+///
+/// RED with the `evidence_not_durable` stop removed from the startup
+/// `CommitInvalid` arm: startup returns `Ok`, the marker is cleared and the
+/// group is served without a quarantine.
+#[tokio::test]
+async fn issue1842_restart_stays_fatal_for_each_non_durable_fork_evidence_save() {
+    for (index, fault) in [
+        SaveFault::Error,
+        SaveFault::NotReplaced,
+        SaveFault::ReplacedNotDurable,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (state, _dir) = s_state().await;
+        let gk = format!("{:032x}", 0x1842_0100u32 + index as u32);
+        let requester_kp = fresh_kp();
+        let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
+        let entry =
+            removed_admin_fork_request(&state, &gk, "req-1842-fork-save", &requester_kp).await;
+        *state.pending_listener_admission.lock().await = Some(marker_admission(
+            &gk,
+            &requester_hex,
+            &entry,
+            unix_ms() - 1000,
+        ));
+        assert_eq!(
+            save_roster(&state).await.expect("roster save"),
+            AtomicWriteOutcome::Durable
+        );
+        assert_eq!(
+            save_relay(&state).await.expect("relay save"),
+            AtomicWriteOutcome::Durable
+        );
+        let held_bytes = relay_sidecar_bytes(&state).await;
+
+        {
+            let _fault = set_save_fault(&state, fault);
+            let error = restart_relay(&state)
+                .await
+                .expect_err("fork evidence that is not durable must stop startup");
+            assert!(
+                error.contains("fork evidence was not installed durably"),
+                "index {index}: unexpected startup error: {error}"
+            );
+        }
+        assert_eq!(
+            relay_sidecar_bytes(&state).await,
+            held_bytes,
+            "index {index}: the sidecar must keep the marker"
+        );
+        assert!(
+            !refused_evidence_exists(&state).await,
+            "index {index}: a fatal stop is not a refusal"
+        );
+        assert!(
+            !group_is_quarantined(&state, &gk).await,
+            "index {index}: a save that is not durable leaves no live quarantine"
+        );
+
+        assert_eq!(
+            restart_relay(&state).await,
+            Ok(()),
+            "index {index}: the next start installs the evidence"
+        );
+        assert!(group_is_quarantined(&state, &gk).await, "index {index}");
+        assert!(listener_admission_is_none(&state).await, "index {index}");
+        assert!(!request_is_stored(&state, &gk, &entry.request_id).await);
+    }
+}
+
+/// #1842 review r3 (Greptile P1 "Groups without lineage miss quarantine").
+/// A request-access group formed without an invite has no `invite_lineage`.
+/// Startup must use the live gate (`fork_evidence_path_open`), so a refused
+/// commit signed by a former admin still sets the quarantine before the
+/// marker is dropped.
+///
+/// RED with the gate narrowed to `invite_lineage.is_some()`: startup
+/// returns `Ok` and clears the marker, but the group is not quarantined.
+#[tokio::test]
+async fn issue1842_restart_quarantines_group_without_invite_lineage() {
+    let (state, _dir) = s_state().await;
+    let gk = format!("{:032x}", 0x1842_0200u32);
+    let requester_kp = fresh_kp();
+    let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
+    let entry = removed_admin_fork_request(&state, &gk, "req-1842-no-lineage", &requester_kp).await;
+    {
+        let groups = state.named_groups.read().await;
+        let info = groups.get(&gk).expect("group");
+        assert!(
+            info.invite_lineage.is_none(),
+            "fixture: the group must have no invite lineage"
+        );
+        assert!(
+            info.policy.admission.owner_certified_user_id().is_none(),
+            "fixture: an ordinary request-access group"
+        );
+        assert!(info.fork_quarantine.is_none());
+    }
+    *state.pending_listener_admission.lock().await = Some(marker_admission(
+        &gk,
+        &requester_hex,
+        &entry,
+        unix_ms() - 1000,
+    ));
+    assert_eq!(
+        save_roster(&state).await.expect("roster save"),
+        AtomicWriteOutcome::Durable
+    );
+    assert_eq!(
+        save_relay(&state).await.expect("relay save"),
+        AtomicWriteOutcome::Durable
+    );
+
+    assert_eq!(restart_relay(&state).await, Ok(()));
+    {
+        let groups = state.named_groups.read().await;
+        let info = groups.get(&gk).expect("group");
+        let marker = info
+            .fork_quarantine
+            .as_ref()
+            .expect("startup must quarantine a group without lineage");
+        assert!(marker.committed_by.eq_ignore_ascii_case(&requester_hex));
+        assert!(info.invite_lineage.is_none());
+    }
+    // The quarantine is in the roster file, not only in memory.
+    let roster = tokio::fs::read_to_string(&state.named_groups_path)
+        .await
+        .expect("roster file");
+    let roster: serde_json::Value = serde_json::from_str(&roster).expect("roster json");
+    fn has_quarantine(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Object(map) => map
+                .iter()
+                .any(|(key, v)| (key == "fork_quarantine" && !v.is_null()) || has_quarantine(v)),
+            serde_json::Value::Array(items) => items.iter().any(has_quarantine),
+            _ => false,
+        }
+    }
+    assert!(
+        has_quarantine(&roster),
+        "the quarantine must be in the durable roster"
+    );
+    assert!(listener_admission_is_none(&state).await);
+    assert!(!request_is_stored(&state, &gk, &entry.request_id).await);
+    assert!(refused_evidence_exists(&state).await);
+}
+
 /// #1842 review r2, live path — the same rule. Evidence found but not
 /// installed durably keeps the journal marker; once the install is
 /// durable, the re-offer of the same envelope is a clean refusal and the
