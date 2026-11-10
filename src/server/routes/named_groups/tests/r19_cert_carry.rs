@@ -499,21 +499,26 @@ async fn home_seal_before_the_listener_binds_the_announce_is_pending() -> Result
         "{err}"
     );
 
-    // Hold the listener for a further 100 ms, then let every beat through.
-    let releaser = tokio::spawn({
-        let gate = Arc::clone(&gate);
-        async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            gate.release.add_permits(64);
-        }
-    });
-    anonymous_announce_ingested(&state.agent, &marker).await?;
+    // The gate is still closed, so the wait must stay pending. A wait that
+    // returns on the discovery entry alone completes here and fails the test;
+    // no scheduling pause can hide it, because only this task opens the gate.
+    let wait = anonymous_announce_ingested(&state.agent, &marker);
+    tokio::pin!(wait);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), &mut wait)
+            .await
+            .is_err(),
+        "the wait must stay pending while the listener is parked before the binding"
+    );
+    assert_eq!(bound_machine(&state, local).await, None);
+    // Let every beat through, then the same wait completes.
+    gate.release.add_permits(64);
+    wait.await?;
     assert_eq!(
         bound_machine(&state, local).await,
         Some(state.agent.machine_id()),
         "the wait returns only after the listener recorded the binding"
     );
-    releaser.await?;
     barrier::disarm(&local, barrier::INGEST_BEFORE_BINDING);
     seal_commit_owner_certified(
         &state,
