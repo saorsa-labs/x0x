@@ -823,7 +823,8 @@ pub struct NameConflict {
     pub label: String,
     /// What the label is bound to now (hex id), or the label in force.
     pub held: String,
-    /// What the grant offered (hex id).
+    /// What the grant offered: the hex id for `LabelTaken`, the label
+    /// derived from the offered name for `NameChanged`.
     pub offered: String,
     /// The display name the grant carried.
     pub offered_name: String,
@@ -1856,7 +1857,8 @@ fn install_pin(
 }
 
 /// Record a `default_conflict` (ADR 0079 §2), deduplicated on
-/// `(kind, case, label, offered, offered_name)`. An owner at
+/// `(kind, case, label, offered, offered_name, from)`: machine labels are
+/// unique only under one owner, so two owners' reports stay apart. An owner at
 /// [`MAX_CONFLICTS_PER_OWNER`] loses its own oldest report; otherwise the
 /// oldest report is dropped when the table is full. Returns whether it was
 /// inserted.
@@ -1867,6 +1869,7 @@ fn record_conflict(state: &mut NamesState, conflict: NameConflict) -> bool {
             && held.label == conflict.label
             && held.offered == conflict.offered
             && held.offered_name == conflict.offered_name
+            && held.from == conflict.from
     });
     if duplicate {
         return false;
@@ -1889,6 +1892,15 @@ fn record_conflict(state: &mut NamesState, conflict: NameConflict) -> bool {
     true
 }
 
+/// The machine label of pin key `machine:<label>.<owner>`; `None` for an
+/// agent pin.
+fn machine_pin_label(key: &str) -> Option<String> {
+    match parse_pin_key(key) {
+        Ok((NameKind::Machine, name)) => Some(name.label),
+        _ => None,
+    }
+}
+
 /// The label bound to `user`, if any (sync, inside a commit).
 fn label_of(state: &NamesState, user: &UserId) -> Option<String> {
     state
@@ -1901,8 +1913,10 @@ fn label_of(state: &NamesState, user: &UserId) -> Option<String> {
 /// Apply grant-carried defaults for a Known or Trusted owner (ADR 0079 §2).
 ///
 /// Nothing silently rebinds: an owner that already has a petname keeps it
-/// (a differing grant name is reported as `name_changed`), a label bound to
-/// another key reports `label_taken`, and machine pins follow the TOFU rule.
+/// (a differing grant name is reported as `name_changed`), a machine that
+/// already has a label under the owner keeps it (a differing grant name is
+/// reported as `name_changed` too), a label bound to another key or machine
+/// reports `label_taken`, and machine pins follow the TOFU rule.
 /// A full table skips the default (hex ids keep working) rather than fail.
 fn apply_defaults_trusted(
     state: &mut NamesState,
@@ -1983,15 +1997,39 @@ fn apply_defaults_trusted(
     };
     let mut deferred: Vec<(MachineId, String)> = Vec::new();
     for (machine, display) in &defaults.machines {
-        let already_labelled = state.pins.iter().any(|(key, pin)| {
-            pin.owner == user && pin.id == machine.0 && key.starts_with("machine:")
-        });
-        if already_labelled {
-            continue;
-        }
         let Some(label) = label_from_display(display) else {
             continue;
         };
+        // A machine that already has a label under this owner keeps it. A
+        // later grant that names it differently is a `name_changed` report
+        // (ADR 0079 §2), never a second label.
+        let held_labels: Vec<String> = state
+            .pins
+            .iter()
+            .filter(|(_, pin)| pin.owner == user && pin.id == machine.0)
+            .filter_map(|(key, _)| machine_pin_label(key))
+            .collect();
+        if let Some(held_label) = held_labels.first() {
+            if !held_labels.contains(&label)
+                && record_conflict(
+                    state,
+                    NameConflict {
+                        kind: ConflictKind::Machine,
+                        case: ConflictCase::NameChanged,
+                        label: held_label.clone(),
+                        held: held_label.clone(),
+                        offered: label,
+                        offered_name: display.clone(),
+                        reported_at: now_unix,
+                        from: Some(user),
+                    },
+                )
+            {
+                applied.conflicts += 1;
+                changed = true;
+            }
+            continue;
+        }
         // A signed default is only a claim that the machine hosts a granted
         // agent. Pin it only with the same verified hosting evidence a
         // manual label needs; otherwise hold it for the local owner.

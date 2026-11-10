@@ -4376,11 +4376,15 @@ The names become ADR-0074 §1 defaults in the local name store:
   authenticated machine is that machine, with nothing revoked. This is the
   evidence a manual shared-machine label needs. A machine without that
   evidence is kept in the owner's pending suggestion and is not pinned.
-  Defaults never rebind: a label already bound to another key, or a later
-  grant carrying a different name, is reported as a `default_conflict`
-  (`conflicts` in `GET /names`: `kind`, `case` `label_taken` or
-  `name_changed`, `label`, `held`, `offered`, `offered_name`) and not
-  applied. Only the local owner rebinds, by removing the label first.
+  Defaults never rebind: a label already bound to another key or machine,
+  or a later grant carrying a different name for the owner or for a
+  machine that already has a label under that owner, is reported as a
+  `default_conflict` (`conflicts` in `GET /names`: `kind` `owner` or
+  `machine`, `case` `label_taken` or `name_changed`, `label`, `held`,
+  `offered`, `offered_name`) and not applied. For `name_changed`, `label`
+  and `held` are the label in force and `offered` is the label derived
+  from the new name. Only the local owner rebinds, by removing the label
+  first.
 - A **stranger's** grant yields only a pending suggestion (`suggestions` in
   `GET /names`). `POST /names/accept {"label": …}` applies it (and removes
   it); `DELETE /names/suggestions/:label` drops it.

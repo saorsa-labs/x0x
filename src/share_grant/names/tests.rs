@@ -137,6 +137,76 @@ fn names_signature_binds_the_grant_and_the_names() {
     ));
 }
 
+/// WHY (ADR 0079 validation, #1831 ZCode review): the names signature covers
+/// every machine entry. A changed machine name, a changed machine id, a
+/// removed entry and an added entry each fail verification, and a v2
+/// delivery with a tampered machine name is refused whole: the grant is not
+/// stored and no name is written.
+#[tokio::test]
+async fn a_tampered_machine_name_is_refused() {
+    let owner = UserKeypair::generate().expect("owner key");
+    let grantee = AgentId([0x44; 32]);
+    let envelope =
+        ShareGrantV2::sign(&owner, grant_for(&owner, grantee), names_section()).expect("sign");
+    envelope.verify().expect("the untouched envelope verifies");
+    assert_eq!(envelope.names.owner_name.as_deref(), Some("Bob Smith"));
+
+    // Same length as "Studio Mac": only the name bytes differ.
+    let mut renamed = envelope.clone();
+    renamed.names.machines[0].machine_name = "Studio Mad".to_string();
+    let mut moved = envelope.clone();
+    moved.names.machines[0].machine_id = MachineId([0x34; 32]);
+    let mut removed = envelope.clone();
+    removed.names.machines.clear();
+    let mut added = envelope.clone();
+    added.names.machines.push(GrantMachineName {
+        machine_id: MachineId([0x35; 32]),
+        machine_name: "Extra".to_string(),
+    });
+    for (what, tampered) in [
+        ("machine name", &renamed),
+        ("machine id", &moved),
+        ("removed machine", &removed),
+        ("added machine", &added),
+    ] {
+        assert_eq!(
+            tampered.names.owner_name, envelope.names.owner_name,
+            "{what}: the owner name is untouched"
+        );
+        assert!(
+            matches!(tampered.verify(), Err(ShareGrantError::BadSignature(_))),
+            "{what}: {:?}",
+            tampered.verify()
+        );
+    }
+
+    let store = ShareGrantStore::in_memory(grantee, None);
+    let names = NameStore::in_memory();
+    handle_share_grant_v2_dm(
+        Some(&store),
+        None,
+        &names,
+        None,
+        |_| async { true },
+        |_| async { hosts() },
+        typed(renamed.to_dm_payload().expect("encode")),
+    )
+    .await
+    .expect_err("an envelope with a tampered machine name is refused");
+    assert!(
+        store
+            .grants(crate::share_grant::GrantRole::Received)
+            .is_empty(),
+        "the grant is not stored"
+    );
+    let (owners, pins) = names.snapshot().await.expect("store usable");
+    let (suggestions, conflicts) = names.pending().await.expect("store usable");
+    assert!(
+        owners.is_empty() && pins.is_empty() && suggestions.is_empty() && conflicts.is_empty(),
+        "no name is written"
+    );
+}
+
 /// WHY (ADR 0079 validation): the structural bounds hold — an empty
 /// section, an oversized name, too many machines, and unsorted machine ids
 /// are all invalid.
