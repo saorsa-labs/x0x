@@ -710,6 +710,23 @@ enum OwnerSub {
     },
     /// M1 machine census over owner-sync (#1383): devices + local version digest.
     Machines,
+    /// Lost-device action: stop this owner's agents on a lost machine (#1108).
+    ///
+    /// Signs a binding tombstone for each of your agents on that machine,
+    /// revokes each agent pinned to it and removes it from your device
+    /// set. Run it on another of your devices. It does not revoke the
+    /// machine key, and it does not cover an agent you certify later.
+    LoseDevice {
+        /// Hex machine id of the lost device (see `x0x owner machines`).
+        #[arg(value_name = "MACHINE_ID")]
+        machine_id: String,
+        /// Optional reason stored in each revocation record.
+        #[arg(long, value_name = "REASON")]
+        reason: Option<String>,
+        /// Act on a machine that this owner has no record of.
+        #[arg(long)]
+        force: bool,
+    },
     /// Derived placement ledger (ADR-0043 Pinned/Roaming + mint status).
     Placement,
     /// Owner actions on named groups (ADR 0110 §4b(1) recovery).
@@ -1110,13 +1127,17 @@ enum AuthSub {
 /// Key lifecycle sub-actions (`x0x identity revoke`, `x0x identity revocations`).
 #[derive(Subcommand)]
 enum IdentitySub {
-    /// Revoke this daemon's agent or an owner-authorized agent–machine binding.
+    /// Revoke this daemon's agent or machine, or an owner-authorized
+    /// agent–machine binding.
     ///
-    /// With one id, only this daemon's own agent is supported. The daemon
-    /// signs with its agent key; it cannot revoke its machine or another
-    /// agent through this form. For a registered sub-agent, use
-    /// `x0x owner agents revoke <AGENT_ID>`. Both ids plus --move-epoch select
-    /// an owner-signed binding revocation and require the durable API token.
+    /// With one id, only this daemon's own agent or own machine is
+    /// supported. The daemon signs with that key; it cannot revoke another
+    /// agent or machine through this form. Revoking the own machine needs
+    /// the durable API token and cannot be undone. For a registered
+    /// sub-agent, use `x0x owner agents revoke <AGENT_ID>`. For a lost
+    /// device, use `x0x owner lose-device <MACHINE_ID>`. Both ids plus
+    /// --move-epoch select an owner-signed binding revocation and require
+    /// the durable API token.
     Revoke {
         /// Agent ID to revoke (hex, 64 chars).
         #[arg(long)]
@@ -2532,6 +2553,19 @@ async fn run(
             }) => commands::identity::owner_riders_revoke(&client, token_id).await,
             Some(OwnerSub::Placement) => commands::identity::owner_placement(&client).await,
             Some(OwnerSub::Machines) => commands::identity::owner_machines(&client).await,
+            Some(OwnerSub::LoseDevice {
+                machine_id,
+                reason,
+                force,
+            }) => {
+                commands::identity::owner_lose_device(
+                    &client,
+                    &machine_id,
+                    reason.as_deref(),
+                    force,
+                )
+                .await
+            }
         },
         Commands::Move { sub } => match sub {
             MoveSub::Authorize {

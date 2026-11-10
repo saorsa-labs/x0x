@@ -228,7 +228,7 @@ kill $(echo $PIDS) 2>/dev/null; wait 2>/dev/null; rm -rf "$WORK"
   card — hand it to any agent and it can install x0x and DM you back.
 - [docs/local-apps.md](local-apps.md) — the same discovery/auth flow from
   Python, Node, and Rust.
-- [docs/api-reference.md](api-reference.md) — all 218 endpoints.
+- [docs/api-reference.md](api-reference.md) — all 219 endpoints.
 
 ## Troubleshooting
 

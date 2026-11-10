@@ -20,6 +20,24 @@
     }
   },
   {
+    "method": "GET",
+    "path": "/groups/:id/stores/:app/legacy-imports/:source_id",
+    "cli_name": "group store legacy download",
+    "description": "Download the exact reviewed legacy Wiki/Web snapshot without changing it",
+    "category": "stores",
+    "request": {
+      "fields": [
+        {
+          "cli": "default",
+          "in": "query",
+          "name": "idempotency_key",
+          "required": false
+        }
+      ],
+      "kind": "fields"
+    }
+  },
+  {
     "method": "POST",
     "path": "/shutdown",
     "cli_name": "stop",
@@ -34,6 +52,16 @@
     "path": "/auth/session",
     "cli_name": "auth session",
     "description": "Exchange the durable API token for a short-lived browser session token",
+    "category": "status",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/auth/session/refresh",
+    "cli_name": "auth refresh",
+    "description": "Swap a live session token for a fresh one (12h cap from the original mint)",
     "category": "status",
     "request": {
       "kind": "none"
@@ -125,6 +153,30 @@
           "cli": "default",
           "in": "query",
           "name": "peer",
+          "required": false
+        }
+      ],
+      "kind": "fields"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/onboard",
+    "cli_name": "onboard",
+    "description": "Install-and-join recipe that teaches another agent to DM you",
+    "category": "identity",
+    "request": {
+      "fields": [
+        {
+          "cli": "derived",
+          "in": "query",
+          "name": "card",
+          "required": false
+        },
+        {
+          "cli": "derived",
+          "in": "query",
+          "name": "card_file",
           "required": false
         }
       ],
@@ -225,7 +277,7 @@
     "method": "POST",
     "path": "/identity/revoke",
     "cli_name": "identity revoke",
-    "description": "Issue a signed revocation for an agent-id or machine-id keypair",
+    "description": "Revoke the daemon's own agent or machine, or an owner-authorized agent-machine binding",
     "category": "identity",
     "request": {
       "fields": [
@@ -528,6 +580,40 @@
     }
   },
   {
+    "method": "GET",
+    "path": "/owner/machines",
+    "cli_name": "owner machines",
+    "description": "M1 machine census over owner-sync: enrolled devices + last-sync status + local version/policy digest (#1383)",
+    "category": "identity",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/owner/devices/:machine_id/lose",
+    "cli_name": "owner lose-device",
+    "description": "Lost-device action: binding tombstones for the owner's agents on that machine, revocation of agents pinned to it, removal from the device set (#1108)",
+    "category": "identity",
+    "request": {
+      "fields": [
+        {
+          "cli": "default",
+          "in": "body",
+          "name": "reason",
+          "required": false
+        },
+        {
+          "cli": "default",
+          "in": "body",
+          "name": "force",
+          "required": false
+        }
+      ],
+      "kind": "fields"
+    }
+  },
+  {
     "method": "POST",
     "path": "/owner/agents/issue",
     "cli_name": "owner agents issue",
@@ -585,7 +671,7 @@
     "method": "POST",
     "path": "/owner/riders",
     "cli_name": "owner riders issue",
-    "description": "Mint a scoped rider token for a registered rider-mode sub-agent (ADR-0039; the required harness-signed delegation is supplied via --delegation-payload-b64/--delegation-signature)",
+    "description": "Mint a scoped rider token for a registered rider-mode sub-agent (ADR-0039; scopes is a string list, default empty; defined scopes: gui:show, scratch:read, scratch:read_write; the required harness-signed delegation is supplied via --delegation-payload-b64/--delegation-signature)",
     "category": "identity",
     "request": {
       "fields": [
@@ -599,6 +685,12 @@
           "cli": "--group",
           "in": "body",
           "name": "groups",
+          "required": false
+        },
+        {
+          "cli": "--scope",
+          "in": "body",
+          "name": "scopes",
           "required": false
         },
         {
@@ -641,6 +733,24 @@
     "category": "identity",
     "request": {
       "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/owner/groups/:id/recovery-mandate",
+    "cli_name": "owner groups recovery-mandate",
+    "description": "ADR 0110 §4b(1): owner-sign an OwnerRecoveryMandateV1 promoting one certified member when every admin of an OwnerCertified group is revoked",
+    "category": "identity",
+    "request": {
+      "fields": [
+        {
+          "cli": "--promoted",
+          "in": "body",
+          "name": "promoted_agent_id",
+          "required": true
+        }
+      ],
+      "kind": "fields"
     }
   },
   {
@@ -847,6 +957,16 @@
   },
   {
     "method": "GET",
+    "path": "/diagnostics/upgrade",
+    "cli_name": "diagnostics upgrade",
+    "description": "Local version + update-policy digest for the M1 census (#1383; local only, no wire change)",
+    "category": "network",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "GET",
     "path": "/diagnostics/relay",
     "cli_name": "diagnostics relay",
     "description": "ADR-0035 relay-decentralization metering: advert census + inbound-dialer evidence",
@@ -862,7 +982,15 @@
     "description": "Direct-message send/receive counters and per-peer health",
     "category": "network",
     "request": {
-      "kind": "none"
+      "fields": [
+        {
+          "cli": "default",
+          "in": "query",
+          "name": "agent",
+          "required": false
+        }
+      ],
+      "kind": "fields"
     }
   },
   {
@@ -1044,6 +1172,40 @@
     }
   },
   {
+    "method": "GET",
+    "path": "/history/policy",
+    "cli_name": "history policy",
+    "description": "Local history policy in force (ADR 0116): rules, defaults, pins and counters (owner-only)",
+    "category": "history",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/history/retain",
+    "cli_name": "history retain",
+    "description": "Trim local history now under its startup policy, within a row and time budget (ADR 0116, owner-only)",
+    "category": "history",
+    "request": {
+      "fields": [
+        {
+          "cli": "default",
+          "in": "body",
+          "name": "max_rows",
+          "required": false
+        },
+        {
+          "cli": "default",
+          "in": "body",
+          "name": "budget_ms",
+          "required": false
+        }
+      ],
+      "kind": "fields"
+    }
+  },
+  {
     "method": "DELETE",
     "path": "/history",
     "cli_name": "history purge",
@@ -1086,6 +1248,16 @@
     "path": "/diagnostics/ws",
     "cli_name": "diagnostics ws",
     "description": "WebSocket outbound-queue health: capacity and drop/slow-consumer-close counters",
+    "category": "network",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/diagnostics/sidecar-quarantine",
+    "cli_name": "diagnostics sidecar-quarantine",
+    "description": "Read-only list of each quarantined sidecar copy (ADR 0108 §5a) with its size (D148)",
     "category": "network",
     "request": {
       "kind": "none"
@@ -1747,6 +1919,80 @@
   },
   {
     "method": "POST",
+    "path": "/calls",
+    "cli_name": "call",
+    "description": "Ring an agent (audio, optionally video); callee must pass trust and connect-ACL gates",
+    "category": "calls",
+    "request": {
+      "fields": [
+        {
+          "cli": "AGENT_ID",
+          "in": "body",
+          "name": "agent_id",
+          "required": true
+        },
+        {
+          "cli": "default",
+          "in": "body",
+          "name": "video",
+          "required": false
+        }
+      ],
+      "kind": "fields"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/calls",
+    "cli_name": "call list",
+    "description": "List calls with gate and lifecycle counters",
+    "category": "calls",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/calls/:id",
+    "cli_name": "call show",
+    "description": "Show one call's lifecycle state",
+    "category": "calls",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/calls/:id/accept",
+    "cli_name": "call accept",
+    "description": "Answer a ringing incoming call",
+    "category": "calls",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/calls/:id/reject",
+    "cli_name": "call reject",
+    "description": "Decline a ringing incoming call",
+    "category": "calls",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/calls/:id/hangup",
+    "cli_name": "call hangup",
+    "description": "End or cancel a call",
+    "category": "calls",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
     "path": "/mls/groups",
     "cli_name": "groups create",
     "description": "Create encrypted group",
@@ -2127,6 +2373,30 @@
   },
   {
     "method": "POST",
+    "path": "/groups/:id/quarantine/clear",
+    "cli_name": "groups quarantine clear",
+    "description": "Manually clear the local fork-quarantine marker (owner-key node clear or --force with --reason)",
+    "category": "named-groups",
+    "request": {
+      "fields": [
+        {
+          "cli": "default",
+          "in": "body",
+          "name": "force",
+          "required": false
+        },
+        {
+          "cli": "--reason",
+          "in": "body",
+          "name": "reason",
+          "required": false
+        }
+      ],
+      "kind": "fields"
+    }
+  },
+  {
+    "method": "POST",
     "path": "/groups/join",
     "cli_name": "group join",
     "description": "Join group via invite (mode=home with --home --owner pins the expected Home owner, #468/#469)",
@@ -2338,6 +2608,58 @@
           "in": "body",
           "name": "role",
           "required": true
+        }
+      ],
+      "kind": "fields"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/groups/:id/members/:agent_id/reseat",
+    "cli_name": "group reseat",
+    "description": "Re-seat a forked or removed node by hand under a signed authorisation (admin+, ADR 0109 §3)",
+    "category": "named-groups",
+    "request": {
+      "fields": [
+        {
+          "cli": "--reason",
+          "in": "body",
+          "name": "reason",
+          "required": true
+        },
+        {
+          "cli": "--basis",
+          "in": "body",
+          "name": "basis",
+          "required": true
+        }
+      ],
+      "kind": "fields"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/groups/:id/recovery",
+    "cli_name": "group recovery",
+    "description": "Show this node's ADR 0109 recovery state, and on an admin the pending requesters and issued re-seats",
+    "category": "named-groups",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/groups/:id/members/:agent_id/certificate/rebind",
+    "cli_name": "group rebind-certificate",
+    "description": "Self-rebind this agent's renewed certificate into its seat before the cutoff (ADR 0110 §4a)",
+    "category": "named-groups",
+    "request": {
+      "fields": [
+        {
+          "cli": "default",
+          "in": "body",
+          "name": "certificate",
+          "required": false
         }
       ],
       "kind": "fields"
@@ -2791,7 +3113,7 @@
     "method": "POST",
     "path": "/groups/:id/stores",
     "cli_name": "group store create",
-    "description": "Open a group-scoped encrypted store bound to a named secure group (#341); member-gated, group must be MlsEncrypted on the GSS plane",
+    "description": "Open a creator-anchored group store: signed plaintext for SignedPublic, encrypted for MlsEncrypted GSS; current group policy gates writes",
     "category": "stores",
     "request": {
       "fields": [
@@ -2799,6 +3121,40 @@
           "cli": "NAME",
           "in": "body",
           "name": "name",
+          "required": true
+        }
+      ],
+      "kind": "fields"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/groups/:id/stores/:app/legacy-imports",
+    "cli_name": "group store legacy imports",
+    "description": "List local legacy Wiki/Web snapshots with durable import and local sync-publication status",
+    "category": "stores",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/groups/:id/stores/:app/legacy-imports/:source_id",
+    "cli_name": "group store legacy import",
+    "description": "Import a reviewed local legacy Wiki/Web snapshot and offer its retained history for shared-space sync",
+    "category": "stores",
+    "request": {
+      "fields": [
+        {
+          "cli": "default",
+          "in": "body",
+          "name": "source_digest",
+          "required": true
+        },
+        {
+          "cli": "default",
+          "in": "body",
+          "name": "idempotency_key",
           "required": true
         }
       ],
@@ -2954,7 +3310,15 @@
     "description": "Daemon applies the latest verified release manifest with transactional restart (CLI x0x upgrade --apply delegates to this authenticated route)",
     "category": "upgrade",
     "request": {
-      "kind": "none"
+      "fields": [
+        {
+          "cli": "default",
+          "in": "query",
+          "name": "now",
+          "required": false
+        }
+      ],
+      "kind": "fields"
     }
   },
   {
@@ -3007,6 +3371,30 @@
   },
   {
     "method": "POST",
+    "path": "/gui/show",
+    "cli_name": "show",
+    "description": "Show a GUI view on this machine or, with --on, on an owner machine",
+    "category": "gui",
+    "request": {
+      "fields": [
+        {
+          "cli": "VIEW",
+          "in": "body",
+          "name": "view",
+          "required": true
+        },
+        {
+          "cli": "--on",
+          "in": "body",
+          "name": "target_machine",
+          "required": false
+        }
+      ],
+      "kind": "fields"
+    }
+  },
+  {
+    "method": "POST",
     "path": "/forwards",
     "cli_name": "forward add",
     "description": "Add a local port forward to a peer's loopback service",
@@ -3036,6 +3424,12 @@
           "in": "body",
           "name": "target_port",
           "required": true
+        },
+        {
+          "cli": "--ephemeral",
+          "in": "body",
+          "name": "ephemeral",
+          "required": false
         }
       ],
       "kind": "fields"
@@ -3067,6 +3461,296 @@
     "cli_name": "streams",
     "description": "Active forward-stream count + connect-ACL counters",
     "category": "connect",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/acl/connect",
+    "cli_name": "acl connect list",
+    "description": "List connect ACL entries (TOML floor + API-managed) and reload status",
+    "category": "acl",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/acl/connect",
+    "cli_name": "acl connect add",
+    "description": "Add an API-managed connect ACL entry (TOML entry schema as JSON)",
+    "category": "acl",
+    "request": {
+      "kind": "passthrough"
+    }
+  },
+  {
+    "method": "DELETE",
+    "path": "/acl/connect/:id",
+    "cli_name": "acl connect rm",
+    "description": "Remove an API-managed connect ACL entry (floor entries: 409)",
+    "category": "acl",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/acl/exec",
+    "cli_name": "acl exec list",
+    "description": "List exec ACL entries (TOML floor + API-managed) and reload status",
+    "category": "acl",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/acl/exec",
+    "cli_name": "acl exec add",
+    "description": "Add an API-managed exec ACL entry (TOML entry schema as JSON)",
+    "category": "acl",
+    "request": {
+      "kind": "passthrough"
+    }
+  },
+  {
+    "method": "DELETE",
+    "path": "/acl/exec/:id",
+    "cli_name": "acl exec rm",
+    "description": "Remove an API-managed exec ACL entry (floor entries: 409)",
+    "category": "acl",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/acl/reload",
+    "cli_name": "acl reload",
+    "description": "Re-read the connect/exec ACL floors and overlays; rejects keep the last good ACL",
+    "category": "acl",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/grants",
+    "cli_name": "grant list",
+    "description": "List share grants this install's owner issued, with status",
+    "category": "grants",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/grants",
+    "cli_name": "grant issue",
+    "description": "Sign a share grant with the owner key, store it, and deliver it by durable DM",
+    "category": "grants",
+    "request": {
+      "fields": [
+        {
+          "cli": "json-doc",
+          "in": "body",
+          "name": "grantee_user",
+          "required": false
+        },
+        {
+          "cli": "json-doc",
+          "in": "body",
+          "name": "grantee_agent",
+          "required": false
+        },
+        {
+          "cli": "json-doc",
+          "in": "body",
+          "name": "agents",
+          "required": true
+        },
+        {
+          "cli": "json-doc",
+          "in": "body",
+          "name": "caps",
+          "required": true
+        },
+        {
+          "cli": "json-doc",
+          "in": "body",
+          "name": "not_before",
+          "required": false
+        },
+        {
+          "cli": "json-doc",
+          "in": "body",
+          "name": "expiry",
+          "required": false
+        },
+        {
+          "cli": "json-doc",
+          "in": "body",
+          "name": "ttl_secs",
+          "required": false
+        },
+        {
+          "cli": "json-doc",
+          "in": "body",
+          "name": "deliver_to",
+          "required": false
+        },
+        {
+          "cli": "json-doc",
+          "in": "body",
+          "name": "include_names",
+          "required": false
+        }
+      ],
+      "kind": "fields"
+    }
+  },
+  {
+    "method": "DELETE",
+    "path": "/grants/:id",
+    "cli_name": "grant revoke",
+    "description": "Revoke a share grant (owner key; gossiped on x0x.revocation.v3 and pushed directly to capable recipients)",
+    "category": "grants",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/grants/received",
+    "cli_name": "grant received",
+    "description": "List share grants that name this install as grantee",
+    "category": "grants",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/names",
+    "cli_name": "names list",
+    "description": "List owner petnames and pinned names",
+    "category": "names",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/names/resolve",
+    "cli_name": "names resolve",
+    "description": "Resolve [agent:|machine:]<label>.<owner> locally; pins the name at first use",
+    "category": "names",
+    "request": {
+      "fields": [
+        {
+          "cli": "NAME",
+          "in": "body",
+          "name": "name",
+          "required": true
+        }
+      ],
+      "kind": "fields"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/names/owners",
+    "cli_name": "names owner add",
+    "description": "Bind a local owner petname to a user id (frozen at first bind)",
+    "category": "names",
+    "request": {
+      "fields": [
+        {
+          "cli": "LABEL",
+          "in": "body",
+          "name": "label",
+          "required": true
+        },
+        {
+          "cli": "USER_ID",
+          "in": "body",
+          "name": "user_id",
+          "required": true
+        }
+      ],
+      "kind": "fields"
+    }
+  },
+  {
+    "method": "DELETE",
+    "path": "/names/owners/:label",
+    "cli_name": "names owner rm",
+    "description": "Remove a local owner petname and every pin under it",
+    "category": "names",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/names/machines",
+    "cli_name": "names machine label",
+    "description": "Label a shared machine (machine:<label>.<owner> -> machine id)",
+    "category": "names",
+    "request": {
+      "fields": [
+        {
+          "cli": "NAME",
+          "in": "body",
+          "name": "name",
+          "required": true
+        },
+        {
+          "cli": "MACHINE_ID",
+          "in": "body",
+          "name": "machine_id",
+          "required": true
+        }
+      ],
+      "kind": "fields"
+    }
+  },
+  {
+    "method": "DELETE",
+    "path": "/names/pins/:name",
+    "cli_name": "names unpin",
+    "description": "Drop a TOFU pin so the name re-pins at next use",
+    "category": "names",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/names/accept",
+    "cli_name": "names accept",
+    "description": "Apply a pending grant-names suggestion (ADR 0079)",
+    "category": "names",
+    "request": {
+      "fields": [
+        {
+          "cli": "LABEL",
+          "in": "body",
+          "name": "label",
+          "required": true
+        }
+      ],
+      "kind": "fields"
+    }
+  },
+  {
+    "method": "DELETE",
+    "path": "/names/suggestions/:label",
+    "cli_name": "names dismiss",
+    "description": "Drop a pending grant-names suggestion",
+    "category": "names",
     "request": {
       "kind": "none"
     }

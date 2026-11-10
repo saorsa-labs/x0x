@@ -174,6 +174,7 @@ Detached ML-DSA-65 signatures with a mandatory domain-separation `context` (`[a-
 x0x agent sign --context my-app-v1 --file -      # POST /agent/sign {"context","payload_b64"} -> signature_b64
 x0x agent verify ...                             # POST /agent/verify (stateless; 200 {valid:false} on bad sig)
 x0x identity revoke --agent-id <64-hex>          # POST /identity/revoke — this daemon's own agent only
+x0x identity revoke --machine-id <64-hex>        # this daemon's own machine only; durable token; cannot be undone
 x0x identity revoke --agent-id <64-hex> --machine-id <64-hex> --move-epoch <N>   # ADR-0043 binding form: permanent (agent,machine) tombstone (all three required together)
 ```
 

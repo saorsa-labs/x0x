@@ -373,7 +373,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Post,
         path: "/identity/revoke",
         cli_name: "identity revoke",
-        description: "Revoke the daemon's own agent or an owner-authorized agent-machine binding",
+        description: "Revoke the daemon's own agent or machine, or an owner-authorized agent-machine binding",
         category: "identity",
         request: RequestSpec::Fields(&[RequestField::body("agent_id", false), RequestField::body("machine_id", false), RequestField::body("move_epoch", false), RequestField::body("reason", false)]),
     },
@@ -513,6 +513,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         description: "M1 machine census over owner-sync: enrolled devices + last-sync status + local version/policy digest (#1383)",
         category: "identity",
         request: RequestSpec::None,
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/owner/devices/:machine_id/lose",
+        cli_name: "owner lose-device",
+        description: "Lost-device action: binding tombstones for the owner's agents on that machine, revocation of agents pinned to it, removal from the device set (#1108)",
+        category: "identity",
+        request: RequestSpec::Fields(&[RequestField::body("reason", false), RequestField::body("force", false)]),
     },
     EndpointDef {
         method: Method::Post,

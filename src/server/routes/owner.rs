@@ -756,6 +756,266 @@ pub(in crate::server) async fn owner_riders_revoke(
     }
 }
 
+/// Request body for `POST /owner/devices/:machine_id/lose`.
+#[derive(Debug, Default, Deserialize)]
+pub(in crate::server) struct LoseDeviceRequest {
+    /// Reason stored in each new revocation record.
+    #[serde(default)]
+    reason: Option<String>,
+    /// Act on a machine that this owner has no record of.
+    #[serde(default)]
+    force: bool,
+}
+
+/// The `note` field of a lose-device answer.
+const LOSE_DEVICE_NOTE: &str = "Each listed agent can no longer act from this machine. An agent pinned to this machine is revoked. A roaming agent keeps its identity: if its key was on this machine, revoke it with DELETE /owner/agents/:id. The machine key is not revoked. An agent that you certify later is not covered: run this action again after you certify it. An agent in agents_without_placement has no placement record on this daemon and is not covered: if it ran on this machine, revoke it with DELETE /owner/agents/:id.";
+
+/// The answer text for one lose-device revocation step. A step that failed
+/// or is not durable clears `complete`.
+fn revocation_outcome(
+    result: crate::error::Result<crate::revocation::RevocationRecord>,
+    complete: &mut bool,
+) -> String {
+    match result {
+        Ok(_) => "revoked".to_string(),
+        Err(e @ crate::error::IdentityError::Storage(_)) => {
+            *complete = false;
+            format!("revoked, not durable: {e}")
+        }
+        Err(e) => {
+            *complete = false;
+            format!("failed: {e}")
+        }
+    }
+}
+
+/// POST /owner/devices/:machine_id/lose — the lost-device action (#1108,
+/// #891).
+///
+/// It uses only record kinds that released daemons enforce:
+///
+/// 1. for each agent on this owner's placement ledger, an owner-signed
+///    binding tombstone `(agent, machine)` at the agent's placement epoch;
+/// 2. for each agent pinned to the machine, an owner-signed agent
+///    revocation, and a sweep of that agent's rider tokens;
+/// 3. removal of the machine from the owner device set.
+///
+/// A certified agent with no placement record on this daemon (an ACP agent
+/// whose machine was never confirmed) gets no tombstone; the answer lists
+/// it in `agents_without_placement`.
+///
+/// A repeat call makes no new record. The machine key is not revoked: no
+/// evidence that other peers can check ties a machine to its owner (see
+/// `docs/design/owner-machine-revocation.md`).
+///
+/// `403` without the durable token. `409` with no owner key, or when the
+/// machine is the one this daemon runs on. `404` when the owner has no
+/// record of the machine and `force` is not set. `500` with the same body
+/// when a step failed or a record is not durable.
+pub(in crate::server) async fn owner_device_lose(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
+    Path(machine_hex): Path<String>,
+    body: Option<Json<LoseDeviceRequest>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !actor.is_durable_owner() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "owner-admin endpoints require the durable API token (not a session token)",
+        );
+    }
+    if state.agent.identity().user_keypair().is_none() {
+        return owner_missing();
+    }
+    let machine = hex::decode(&machine_hex)
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+        .map(crate::identity::MachineId);
+    let Some(machine) = machine else {
+        return api_error(StatusCode::BAD_REQUEST, "machine id must be 64 hex chars");
+    };
+    if machine == state.agent.machine_id() {
+        return api_error(
+            StatusCode::CONFLICT,
+            "this is the machine this daemon runs on: run lose-device on another of your devices, or revoke this machine with POST /identity/revoke",
+        );
+    }
+    let request = body.map(|Json(request)| request).unwrap_or_default();
+
+    // Bring the placement ledger up to date. A refused mint must not stop
+    // a lost-device action: go on with the ledger as it is, and report it.
+    let placement_mint_error = match state.agent.move_mint_placements().await {
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!("lose-device: placement mint refused, using the held ledger: {e}");
+            Some(e.to_string())
+        }
+    };
+    // (agent, placement epoch, pinned machine), in a stable order.
+    let mut agents: Vec<(
+        crate::identity::AgentId,
+        u64,
+        Option<crate::identity::MachineId>,
+    )> = {
+        let move_state = state.agent.move_state();
+        let view = move_state.read().await;
+        view.placement_view()
+            .values()
+            .map(|record| {
+                (
+                    record.agent_id,
+                    record.placement_epoch,
+                    record.placement.pinned_machine(),
+                )
+            })
+            .collect()
+    };
+    agents.sort_by_key(|(agent, _, _)| agent.0);
+    // Certified agents that have no placement record here. A binding
+    // tombstone needs a placement epoch, so this action cannot cover
+    // them; the answer names them for the operator.
+    let mut agents_without_placement: Vec<String> = state
+        .agent
+        .owner_issued_certificates()
+        .await
+        .into_iter()
+        .map(|cert| cert.agent_id)
+        .filter(|agent_hex| {
+            !agents
+                .iter()
+                .any(|(agent, _, _)| hex::encode(agent.as_bytes()) == *agent_hex)
+        })
+        .collect();
+    agents_without_placement.sort();
+    agents_without_placement.dedup();
+
+    let enrolled = match state.owner_sync.as_ref() {
+        Some(sync) => sync
+            .store()
+            .enrolled_devices()
+            .await
+            .iter()
+            .any(|enrollment| enrollment.machine_id == machine.0),
+        None => false,
+    };
+    // What the set held before this call: (binding tombstone, agent revoked).
+    let before: Vec<(bool, bool)> = {
+        let set = state.agent.revocation_set();
+        let set = set.read().await;
+        agents
+            .iter()
+            .map(|(agent, _, _)| {
+                (
+                    set.is_binding_revoked(agent, &machine),
+                    set.is_agent_revoked(agent),
+                )
+            })
+            .collect()
+    };
+    let known = enrolled
+        || agents.iter().any(|(_, _, pinned)| *pinned == Some(machine))
+        || before.iter().any(|(binding, _)| *binding);
+    if !known && !request.force {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "this owner has no record of that machine (not enrolled, no agent pinned to it); send {\"force\": true} to act anyway",
+        );
+    }
+
+    let mut complete = true;
+    let mut rows = Vec::with_capacity(agents.len());
+    for ((agent, epoch, pinned), (binding_before, agent_before)) in agents.iter().zip(before) {
+        let agent_hex = hex::encode(agent.as_bytes());
+        let binding = if binding_before {
+            "already_revoked".to_string()
+        } else {
+            revocation_outcome(
+                state
+                    .agent
+                    .revoke_binding(agent, &machine, *epoch, request.reason.clone())
+                    .await,
+                &mut complete,
+            )
+        };
+        let pinned_here = *pinned == Some(machine);
+        let mut rider_tokens_revoked = 0usize;
+        let agent_state = if !pinned_here {
+            "kept".to_string()
+        } else {
+            let outcome = if agent_before {
+                "already_revoked".to_string()
+            } else {
+                revocation_outcome(
+                    state
+                        .agent
+                        .revoke_agent_as_owner(agent, request.reason.clone())
+                        .await,
+                    &mut complete,
+                )
+            };
+            match state
+                .rider_tokens
+                .lock()
+                .await
+                .revoke_for_agent(&agent_hex, crate::server::rider_auth::unix_now_secs())
+                .await
+            {
+                Ok(count) => rider_tokens_revoked = count,
+                Err(e) => {
+                    complete = false;
+                    tracing::warn!("lose-device: rider-token sweep did not persist: {e}");
+                }
+            }
+            outcome
+        };
+        rows.push(serde_json::json!({
+            "agent_id": agent_hex,
+            "placement": if pinned.is_some() { "pinned" } else { "roaming" },
+            "pinned_to_this_machine": pinned_here,
+            "binding": binding,
+            "agent": agent_state,
+            "rider_tokens_revoked": rider_tokens_revoked,
+        }));
+    }
+
+    let device_enrollment = match state.owner_sync.as_ref() {
+        None => "no_device_set".to_string(),
+        Some(sync) => match sync.store().unenroll(&machine).await {
+            Ok(true) => {
+                sync.kick();
+                "removed".to_string()
+            }
+            Ok(false) => "not_enrolled".to_string(),
+            Err(e) => {
+                complete = false;
+                format!("failed: {e}")
+            }
+        },
+    };
+
+    let status = if complete {
+        StatusCode::OK
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "ok": complete,
+            "machine_id": hex::encode(machine.as_bytes()),
+            "agents": rows,
+            "agents_without_placement": agents_without_placement,
+            "placement_mint_error": placement_mint_error,
+            "device_enrollment": device_enrollment,
+            "machine_key_revoked": false,
+            "covers_agents_certified_later": false,
+            "note": LOSE_DEVICE_NOTE,
+        })),
+    )
+}
+
 /// One machine row in the `GET /owner/machines` census (#1383).
 #[derive(Debug, serde::Serialize)]
 pub(in crate::server) struct OwnerMachineEntry {
@@ -1307,5 +1567,283 @@ mod rider_scope_mint_tests {
         );
         assert!(state.rider_tokens.lock().await.list().is_empty());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lose_device_tests {
+    //! #1108 / #891: the lost-device action, through the real handler.
+    use super::*;
+    use crate::identity::{AgentCertificate, AgentId, AgentKeypair, MachineId, UserKeypair};
+    use crate::key_move::{Placement, PlacementAuthority, PlacementRecord};
+    use crate::revocation::RevocationSet;
+    use crate::server::rider_auth::ActorContext;
+
+    const LOST: MachineId = MachineId([0x51; 32]);
+
+    async fn owned_state(dir: &std::path::Path) -> Arc<AppState> {
+        super::super::identity::revocation_persistence_tests::state_at(dir).await
+    }
+
+    /// Certify a new sub-agent through the real issue route.
+    async fn issue(state: &Arc<AppState>, mode: &str) -> AgentKeypair {
+        let agent = AgentKeypair::generate().unwrap();
+        let (status, _) = owner_agents_issue(
+            State(Arc::clone(state)),
+            axum::extract::Extension(ActorContext::Owner { durable: true }),
+            Json(IssueAgentRequest {
+                agent_public_key: hex::encode(agent.public_key().as_bytes()),
+                mode: Some(mode.to_string()),
+                label: None,
+                not_after: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "issue {mode} agent");
+        agent
+    }
+
+    /// Record an owner-signed placement that pins `agent` to `machine`.
+    async fn pin(state: &Arc<AppState>, agent: &AgentKeypair, machine: MachineId) {
+        let owner = state.agent.identity().user_keypair().unwrap();
+        let cert = AgentCertificate::issue(owner, agent).unwrap();
+        let record = PlacementRecord::sign(
+            agent.agent_id(),
+            owner.public_key().as_bytes(),
+            Placement::Pinned(machine),
+            0,
+            1_800_000_000,
+            owner.secret_key(),
+        )
+        .unwrap();
+        let move_state = state.agent.move_state();
+        let cached = move_state
+            .write()
+            .await
+            .cache_placement(record, PlacementAuthority::cert_issuer(&cert).unwrap())
+            .unwrap();
+        assert!(cached, "placement cached");
+    }
+
+    async fn enroll(state: &Arc<AppState>, machine: MachineId) {
+        let owner = state.agent.identity().user_keypair().unwrap();
+        state
+            .owner_sync
+            .as_ref()
+            .expect("owned state has a device set")
+            .store()
+            .enroll(crate::owner_sync::OwnerEnrollment::sign(machine, owner, 1_000, None).unwrap())
+            .await
+            .unwrap();
+    }
+
+    async fn lose(
+        state: &Arc<AppState>,
+        durable: bool,
+        machine_hex: &str,
+        force: bool,
+    ) -> (StatusCode, serde_json::Value) {
+        let (status, Json(body)) = owner_device_lose(
+            State(Arc::clone(state)),
+            axum::extract::Extension(ActorContext::Owner { durable }),
+            Path(machine_hex.to_string()),
+            Some(Json(LoseDeviceRequest {
+                reason: Some("lost laptop".to_string()),
+                force,
+            })),
+        )
+        .await;
+        (status, body)
+    }
+
+    /// What another peer holds after it receives this daemon's records:
+    /// each record must verify again from the record and its certificate.
+    async fn peer_view(state: &Arc<AppState>) -> RevocationSet {
+        let set = state.agent.revocation_set();
+        let set = set.read().await;
+        let mut peer = RevocationSet::new();
+        for (record, cert) in set.records_with_certs() {
+            peer.verify_and_insert(record.clone(), cert)
+                .expect("a peer verifies every record");
+        }
+        peer
+    }
+
+    fn row<'a>(body: &'a serde_json::Value, agent: &AgentId) -> &'a serde_json::Value {
+        let hex = hex::encode(agent.as_bytes());
+        body["agents"]
+            .as_array()
+            .expect("agents array")
+            .iter()
+            .find(|row| row["agent_id"] == hex)
+            .unwrap_or_else(|| panic!("no row for {hex} in {body}"))
+    }
+
+    /// WHY: when a device is lost, every agent this owner certified must
+    /// stop working from that device, on every peer. An agent pinned to
+    /// the device has its key there, so that agent is revoked. A roaming
+    /// agent keeps its identity for the owner's other devices. Another
+    /// owner's agent on the same machine is not this owner's to stop.
+    #[tokio::test]
+    async fn lose_device_stops_owner_agents_on_that_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = owned_state(dir.path()).await;
+        let local = state.agent.agent_id();
+        let rider = issue(&state, "rider").await;
+        let pinned = issue(&state, "acp").await;
+        pin(&state, &pinned, LOST).await;
+        // An ACP agent whose machine this daemon never confirmed.
+        let unplaced = issue(&state, "acp").await;
+        enroll(&state, LOST).await;
+
+        // Another owner's agent that also runs on the lost machine.
+        let other_owner = UserKeypair::generate().unwrap();
+        let foreign = AgentKeypair::generate().unwrap();
+        let _foreign_cert = AgentCertificate::issue(&other_owner, &foreign).unwrap();
+
+        let (status, body) = lose(&state, true, &hex::encode(LOST.0), false).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["machine_id"], hex::encode(LOST.0));
+        assert_eq!(body["device_enrollment"], "removed");
+        assert_eq!(body["machine_key_revoked"], false);
+        assert_eq!(body["covers_agents_certified_later"], false);
+        assert_eq!(body["agents"].as_array().unwrap().len(), 3, "{body}");
+        // The action cannot cover an agent with no placement record, so
+        // it must name that agent and not report silent success for it.
+        assert_eq!(
+            body["agents_without_placement"],
+            serde_json::json!([hex::encode(unplaced.agent_id().as_bytes())]),
+            "{body}"
+        );
+
+        let local_row = row(&body, &local);
+        assert_eq!(local_row["placement"], "roaming");
+        assert_eq!(local_row["binding"], "revoked");
+        assert_eq!(local_row["agent"], "kept");
+        let rider_row = row(&body, &rider.agent_id());
+        assert_eq!(rider_row["binding"], "revoked");
+        assert_eq!(rider_row["agent"], "kept");
+        let pinned_row = row(&body, &pinned.agent_id());
+        assert_eq!(pinned_row["pinned_to_this_machine"], true);
+        assert_eq!(pinned_row["binding"], "revoked");
+        assert_eq!(pinned_row["agent"], "revoked");
+
+        let peer = peer_view(&state).await;
+        // Every owner agent is refused on the lost machine.
+        assert!(peer.is_binding_revoked(&local, &LOST));
+        assert!(peer.is_binding_revoked(&rider.agent_id(), &LOST));
+        assert!(peer.is_binding_revoked(&pinned.agent_id(), &LOST));
+        // The agent whose key was on the device is dead everywhere.
+        assert!(peer.is_agent_revoked(&pinned.agent_id()));
+        // The roaming agent still works from the owner's other machines.
+        assert!(!peer.is_agent_revoked(&local));
+        assert!(!peer.is_binding_revoked(&local, &state.agent.machine_id()));
+        assert!(!peer.is_agent_revoked(&rider.agent_id()));
+        // Another owner's agent on that machine is not touched.
+        assert!(!peer.is_agent_revoked(&foreign.agent_id()));
+        assert!(!peer.is_binding_revoked(&foreign.agent_id(), &LOST));
+        // The machine key itself is not revoked (design note, option A).
+        assert!(!peer.is_machine_revoked(&LOST));
+
+        let devices = state
+            .owner_sync
+            .as_ref()
+            .unwrap()
+            .store()
+            .enrolled_devices()
+            .await;
+        assert!(devices.iter().all(|device| device.machine_id != LOST.0));
+    }
+
+    /// WHY: an operator in a hurry runs the action twice. A repeat must
+    /// succeed and must not sign new records, because the revocation set
+    /// has no size limit (#1857).
+    #[tokio::test]
+    async fn lose_device_twice_makes_no_new_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = owned_state(dir.path()).await;
+        let pinned = issue(&state, "acp").await;
+        pin(&state, &pinned, LOST).await;
+        enroll(&state, LOST).await;
+
+        let (status, _) = lose(&state, true, &hex::encode(LOST.0), false).await;
+        assert_eq!(status, StatusCode::OK);
+        let held = state.agent.all_revocation_records().await.len();
+
+        let (status, body) = lose(&state, true, &hex::encode(LOST.0), false).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["device_enrollment"], "not_enrolled");
+        for row in body["agents"].as_array().unwrap() {
+            assert_eq!(row["binding"], "already_revoked", "{row}");
+        }
+        assert_eq!(row(&body, &pinned.agent_id())["agent"], "already_revoked");
+        assert_eq!(state.agent.all_revocation_records().await.len(), held);
+    }
+
+    /// WHY: the action covers the agents that exist when it runs. The
+    /// answer says so, and a second run covers an agent certified later.
+    #[tokio::test]
+    async fn an_agent_certified_later_needs_a_second_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = owned_state(dir.path()).await;
+        enroll(&state, LOST).await;
+        let (status, body) = lose(&state, true, &hex::encode(LOST.0), false).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["covers_agents_certified_later"], false);
+        assert!(body["note"].as_str().unwrap().contains("certify later"));
+
+        let later = issue(&state, "rider").await;
+        assert!(
+            !peer_view(&state)
+                .await
+                .is_binding_revoked(&later.agent_id(), &LOST),
+            "the first run cannot cover an agent that did not exist"
+        );
+
+        let (status, body) = lose(&state, true, &hex::encode(LOST.0), false).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(row(&body, &later.agent_id())["binding"], "revoked");
+        assert_eq!(
+            row(&body, &state.agent.agent_id())["binding"],
+            "already_revoked"
+        );
+        assert!(peer_view(&state)
+            .await
+            .is_binding_revoked(&later.agent_id(), &LOST));
+    }
+
+    /// WHY: this is an owner-key signing act, so a 10-minute session token
+    /// must not do it. A wrong id must not sign tombstones by accident,
+    /// and the machine the daemon runs on has its own route.
+    #[tokio::test]
+    async fn lose_device_refuses_wrong_callers_and_wrong_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = owned_state(dir.path()).await;
+        enroll(&state, LOST).await;
+        let lost_hex = hex::encode(LOST.0);
+
+        let (status, _) = lose(&state, false, &lost_hex, false).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "session token");
+
+        let (status, _) = lose(&state, true, "zz", false).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "bad machine id");
+
+        let own_hex = hex::encode(state.agent.machine_id().0);
+        let (status, _) = lose(&state, true, &own_hex, true).await;
+        assert_eq!(status, StatusCode::CONFLICT, "the daemon's own machine");
+
+        let unknown_hex = hex::encode([0x77u8; 32]);
+        let (status, _) = lose(&state, true, &unknown_hex, false).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "unknown machine");
+        assert!(
+            state.agent.all_revocation_records().await.is_empty(),
+            "no refused call signed a record"
+        );
+
+        let (status, body) = lose(&state, true, &unknown_hex, true).await;
+        assert_eq!(status, StatusCode::OK, "force: {body}");
+        assert_eq!(body["device_enrollment"], "not_enrolled");
     }
 }

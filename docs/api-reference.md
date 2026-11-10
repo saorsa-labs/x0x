@@ -244,7 +244,7 @@ The Home Suite campaign (ADRs 0036–0043, plus the 0044–0058 backfills) added
   `GET /diagnostics/ws`.
 
 Open issues for this release are listed in the README's *Known limitations*
-table (#446–#451). This reference documents **218 endpoints — exactly the set
+table (#446–#451). This reference documents **219 endpoints — exactly the set
 `x0x routes` prints** (two further served paths sit outside the registry:
 `/.well-known/agent-card.json` and the `/gui/` alias). The registry in
 `src/api/mod.rs` is the authoritative list. `x0x routes` prints the copy of
@@ -472,7 +472,7 @@ contains the same sentence as the startup error log. See
 | POST | `/agent/sign` | `x0x agent sign` | Detached ML-DSA-65 signature over caller-supplied bytes |
 | POST | `/agent/verify` | `x0x agent verify` | Verify a detached ML-DSA-65 signature against a caller-supplied public key |
 | GET | `/introduction` | `x0x agent introduction` | Trust-gated introduction card (`?peer=<64-hex>` scopes it to that peer's trust) |
-| POST | `/identity/revoke` | `x0x identity revoke [--agent-id <hex>] [--machine-id <hex>] [--move-epoch <n>] [--reason <text>]` | Revoke the daemon's own agent, or an owner-authorized agent–machine binding; see [Key revocation](#key-revocation) for the supported forms |
+| POST | `/identity/revoke` | `x0x identity revoke [--agent-id <hex>] [--machine-id <hex>] [--move-epoch <n>] [--reason <text>]` | Revoke the daemon's own agent or machine, or an owner-authorized agent–machine binding; see [Key revocation](#key-revocation) for the supported forms |
 | GET | `/identity/revocations` | `x0x identity revocations` | List every signed revocation record this daemon holds: agent, machine, binding and share-grant subjects |
 
 ### Agent identity response
@@ -520,13 +520,20 @@ bundle retired has no record of its own; `GET /agent/moves` counts it in
 
 ### Key revocation
 
-The one-id form of `POST /identity/revoke` signs with the daemon's agent key
-and supplies no subject certificate. It supports `agent_id` set to this
-daemon's own agent. It cannot issue machine-signed or user-authority
-revocations: revoking this daemon's machine or another agent through this
-form returns `403`. Loading an owner key or an agent certificate does not
-change the signer used by this form. This limitation is tracked in
-[#1108](https://github.com/saorsa-labs/x0x/issues/1108).
+The one-id form of `POST /identity/revoke` revokes an identity whose key this
+daemon holds:
+
+- `agent_id` set to this daemon's own agent: the daemon signs with its agent
+  key.
+- `machine_id` set to this daemon's own machine: the daemon signs with its
+  machine key. This needs the durable API token (`403` for a session token).
+  The answer has a `warning` field. The revocation cannot be undone: peers
+  refuse this machine and every agent on it for good. To use the computer
+  again, stop `x0xd`, delete `machine.key` and start `x0xd`.
+
+Any other agent or machine id returns `403`: the daemon has no authority
+over it. Loading an owner key or an agent certificate does not change the
+signer used by this form.
 
 To revoke a registered sub-agent, use `DELETE /owner/agents/:id` (CLI:
 `x0x owner agents revoke <AGENT_ID>`). That separate route requires the
@@ -539,6 +546,71 @@ certificate. It revokes that agent–machine binding, not the machine key.
 After the selected form's token check, neither id, malformed ids, or both ids
 without `move_epoch` return `400`. The binding form rejects a session token
 with `403` before these field checks.
+
+### Lost device
+
+`POST /owner/devices/:machine_id/lose` (CLI: `x0x owner lose-device
+<MACHINE_ID> [--reason <text>] [--force]`) stops this owner's agents on a
+lost machine. Run it on another of your devices. It needs the durable API
+token and the loaded owner key. Body (all optional): `{"reason": "<text>",
+"force": false}`.
+
+The daemon does three things, with records that every released daemon
+enforces:
+
+1. For each agent on the owner's placement ledger, it signs a binding
+   revocation `(agent, machine)`. That agent can no longer act from the lost
+   machine.
+2. For each agent **pinned** to the lost machine, it also revokes the agent
+   and its rider tokens. The key of a pinned agent was on that machine.
+3. It removes the machine from the owner device set.
+
+Response:
+
+```json
+{
+  "ok": true,
+  "machine_id": "<64-hex>",
+  "agents": [
+    {"agent_id": "<64-hex>", "placement": "roaming", "pinned_to_this_machine": false,
+     "binding": "revoked", "agent": "kept", "rider_tokens_revoked": 0}
+  ],
+  "agents_without_placement": [],
+  "placement_mint_error": null,
+  "device_enrollment": "removed",
+  "machine_key_revoked": false,
+  "covers_agents_certified_later": false,
+  "note": "<text>"
+}
+```
+
+- `binding` is `revoked` or `already_revoked`. `agent` is `kept`, `revoked`
+  or `already_revoked`. `device_enrollment` is `removed`, `not_enrolled` or
+  `no_device_set`. A failed step puts `failed: <cause>` or `revoked, not
+  durable: <cause>` in that field, and the answer is `500` with `ok: false`
+  and the same body.
+- `placement_mint_error` is `null`, or the cause when the daemon could not
+  bring the placement ledger up to date. The action then used the ledger
+  it held.
+- A repeat call signs no new record.
+- **A roaming agent keeps its identity.** If its key was on the lost
+  machine, also revoke that agent with `DELETE /owner/agents/:id`.
+- **The machine key is not revoked.** No evidence that other peers can check
+  ties a machine to its owner; see
+  [`docs/design/owner-machine-revocation.md`](design/owner-machine-revocation.md).
+  A new agent with no certificate on that machine is a stranger to every
+  peer.
+- **An agent that you certify later is not covered.** Run the action again
+  after you certify it.
+- **`agents_without_placement`** lists certified agents that have no
+  placement record on this daemon (an ACP agent whose machine was never
+  confirmed). The action cannot cover them. If one ran on the lost machine,
+  revoke it with `DELETE /owner/agents/:id`.
+
+Errors: `403` without the durable token; `409` with no owner key, or when
+the machine is the one this daemon runs on (use `POST /identity/revoke`);
+`400` for a bad id; `404` when the owner has no record of the machine (not
+enrolled, no agent pinned to it) and `force` is not `true`.
 
 ### Announce request body
 
@@ -1071,6 +1143,7 @@ own `MemberAdded`, mint a fresh invite rather than replaying the link.
 | POST | `/sync/devices/enroll` | `x0x sync enroll` | durable-owner (#446) | Owner-key-sign a DeviceEnrollment for a machine |
 | DELETE | `/sync/devices/:machine_id` | `x0x sync revoke <MACHINE_ID>` | durable-owner (#446) | Remove a machine from the device set |
 | GET | `/owner/machines` | `x0x owner machines` | owner (riders denied) | M1 machine census: enrolled devices + last-sync status + this machine's version/policy digest (#1383) |
+| POST | `/owner/devices/:machine_id/lose` | `x0x owner lose-device <MACHINE_ID>` | durable-owner | Lost-device action; see [Lost device](#lost-device) |
 
 All three answer `409` when no owner identity is configured. Sync replicates
 owner state **owner-to-owner only** — Tier 1: profile/names, the Home

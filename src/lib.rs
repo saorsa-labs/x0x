@@ -17988,6 +17988,57 @@ impl Agent {
         Ok(record)
     }
 
+    /// Revoke an agent that this daemon's owner certified, by agent id
+    /// (#1108 lost-device response).
+    ///
+    /// The certificate comes from the same sources as
+    /// [`Self::revoke_binding`]: the local agent certificate, the discovery
+    /// cache, then the owner's issuance journal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`error::IdentityError::Revocation`] when no certificate is
+    /// known for the agent, and the errors of [`Self::revoke_as_owner`].
+    pub async fn revoke_agent_as_owner(
+        &self,
+        agent: &identity::AgentId,
+        reason: Option<String>,
+    ) -> error::Result<revocation::RevocationRecord> {
+        let cert = self.agent_certificate_for(agent).await.ok_or_else(|| {
+            error::IdentityError::Revocation(
+                "no certificate known for the agent — owner revocation requires it".to_string(),
+            )
+        })?;
+        self.revoke_as_owner(&cert, reason).await
+    }
+
+    /// Revoke the machine this daemon runs on, signed with the machine key
+    /// (#1108).
+    ///
+    /// This is a self-revocation: the issuer key hashes to the machine id,
+    /// so every peer accepts it with no other evidence. After it, peers
+    /// refuse this machine for good.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::revoke`].
+    pub async fn revoke_own_machine(
+        &self,
+        reason: Option<String>,
+    ) -> error::Result<revocation::RevocationRecord> {
+        let machine_kp = self.identity.machine_keypair();
+        let record = revocation::RevocationRecord::sign(
+            revocation::RevokedSubject::Machine(self.machine_id()),
+            machine_kp.public_key(),
+            machine_kp.secret_key(),
+            Self::unix_timestamp_secs(),
+            reason,
+        )?;
+        self.apply_and_publish_revocation(record.clone(), None)
+            .await?;
+        Ok(record)
+    }
+
     /// Apply a revocation record to the local set, persist, publish, and evict.
     ///
     /// Used both by [`revoke`](Agent::revoke) (self-issued) and the gossip

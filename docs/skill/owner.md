@@ -125,6 +125,14 @@ Rider sends are signed by the daemon's key but carry a provenance envelope **ins
 
 **Lifecycle:** revoke a token (`DELETE /owner/riders/:id`) → it fails on the next request, no restart. Revoke the sub-agent (`DELETE /owner/agents/:id`, ADR-0018 issuer revocation) → its tokens die too and the roster shows `revoked: true`.
 
+**Lost device:** on another of your devices, find the machine id with `x0x owner machines`, then:
+
+```bash
+x0x owner lose-device <MACHINE_ID>   # POST /owner/devices/:machine_id/lose (durable token)
+```
+
+Each of your agents stops working from that machine; an agent pinned to it is revoked; the machine leaves your device set. A roaming agent keeps its identity: if its key was on the lost device, also run `x0x owner agents revoke <AGENT_ID>`. The machine key is not revoked, and an agent you certify later is not covered (run it again).
+
 ### 3.4 Durable token vs session token — and issue #446
 
 - **Durable API token** (`<data_dir>/api-token`) — full control plane including owner acts. Keep it secret; never in a URL.
