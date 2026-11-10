@@ -1281,6 +1281,7 @@ pub async fn serve_with_options(
         cert_unresolvable_since: StdMutex::new(std::collections::HashMap::new()),
         pending_b8_compensation: Mutex::new(None),
         pending_listener_admission: Mutex::new(None),
+        join_sequencer: Mutex::new(Default::default()),
         group_metadata_tasks: RwLock::new(HashMap::new()),
         group_card_cache: RwLock::new(HashMap::new()),
         directory_cache: RwLock::new(x0x::groups::DirectoryShardCache::default()),
@@ -4959,6 +4960,15 @@ async fn handle_predecessor_relay_typed_payload_inner(
                         outcome = "refused",
                         "ADR 0028: request refused by validation without mutation; admission journal released"
                     );
+                    // Issue #1840: a requester that sealed over a partial
+                    // or used head waits for its turn, in arrival order.
+                    crate::server::routes::named_groups::join_sequence::note_refused_request(
+                        relay_state,
+                        &group_id_str,
+                        &event,
+                        now_ms,
+                    )
+                    .await;
                 } else {
                     *relay_state.pending_listener_admission.lock().await = marker;
                     tracing::error!(

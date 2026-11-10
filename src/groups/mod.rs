@@ -1452,6 +1452,70 @@ impl GroupInfo {
     ) -> Result<state_commit::GroupStateCommit, state_commit::ApplyError> {
         self.seal_commit_inner(keypair, now_ms)
     }
+    /// Issue #1840: this record's current head as hash inputs. Meaningful on
+    /// a node that holds the full roster (the sequencing authority).
+    #[must_use]
+    pub fn chain_head(&self) -> state_commit::ChainHead {
+        state_commit::ChainHead {
+            revision: self.state_revision,
+            state_hash: self.state_hash.clone(),
+            prev_state_hash: self.prev_state_hash.clone(),
+            roster_root: state_commit::compute_roster_root(&self.members_v2),
+            policy_hash: state_commit::compute_policy_hash(&self.policy),
+            public_meta_hash: state_commit::compute_public_meta_hash(&self.public_meta()),
+            security_binding: self.security_binding.clone(),
+        }
+    }
+
+    /// Issue #1840: seal a `JoinRequestCreated` commit over the authority's
+    /// head, not over this node's own roster.
+    ///
+    /// A pending request is not in the roster root, so a request link
+    /// repeats the head's hash inputs at the next revision. A requester
+    /// holds a partial roster (an imported card gives an owner-only stub)
+    /// or an old one; a commit sealed over that copy does not apply on the
+    /// authority. The signed content is the ordinary [`GroupStateCommit`].
+    ///
+    /// Refuses a head whose inputs do not hash to its `state_hash`. On
+    /// success this record's chain fields move to the new link, as in every
+    /// other seal.
+    ///
+    /// [`GroupStateCommit`]: state_commit::GroupStateCommit
+    pub fn seal_join_request_over_head(
+        &mut self,
+        head: &state_commit::ChainHead,
+        keypair: &AgentKeypair,
+        now_ms: u64,
+    ) -> Result<state_commit::GroupStateCommit, state_commit::ApplyError> {
+        self.refuse_unknown_variants()?;
+        if self.withdrawn {
+            return Err(state_commit::ApplyError::Withdrawn);
+        }
+        if !head.is_consistent(self.stable_group_id()) {
+            return Err(state_commit::ApplyError::Invariant(
+                "join request head inputs do not hash to its state hash".to_string(),
+            ));
+        }
+        let commit = state_commit::GroupStateCommit::sign(
+            self.stable_group_id().to_string(),
+            head.revision.saturating_add(1),
+            Some(head.state_hash.clone()),
+            head.roster_root.clone(),
+            head.policy_hash.clone(),
+            head.public_meta_hash.clone(),
+            head.security_binding.clone(),
+            false,
+            now_ms,
+            keypair,
+        )?;
+        self.state_revision = commit.revision;
+        self.prev_state_hash = commit.prev_state_hash.clone();
+        self.state_hash = commit.state_hash.clone();
+        self.updated_at = now_ms;
+        self.retain_commit(&commit);
+        Ok(commit)
+    }
+
     /// Shared sealing core: chain advance + signature. No admission logic —
     /// the public entry points own that.
     fn seal_commit_inner(

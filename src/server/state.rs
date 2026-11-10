@@ -1277,6 +1277,11 @@ pub(super) struct AppState {
     /// re-check first.
     pub(super) pending_listener_admission:
         Mutex<Option<crate::server::routes::named_groups::PendingListenerAdmission>>,
+    /// Issue #1840: join requests the authority refused only because the
+    /// requester sealed over a head that is partial or used, in arrival
+    /// order. Memory only; rebuilt from the requesters' re-offers.
+    pub(super) join_sequencer:
+        Mutex<crate::server::routes::named_groups::join_sequence::JoinSequencer>,
     /// Bounded per-group log of locally authored/applied TreeKEM membership
     /// events used to satisfy explicit catch-up requests.
     pub(super) treekem_event_log: RwLock<HashMap<String, VecDeque<NamedGroupMetadataEvent>>>,
