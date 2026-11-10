@@ -2575,3 +2575,283 @@ async fn pr291_metadata_first_repair_re_offers_after_real_apply() {
         "Repair arm must permit B8 approval with 200 (metadata-first apply)"
     );
 }
+
+// ===========================================================================
+// Issue #1840 — a request the authority refuses by validation must not hold
+// the single-slot admission journal, live or across a restart.
+// ===========================================================================
+
+/// How the requester's signed commit goes stale against the authority.
+#[derive(Clone, Copy, Debug)]
+enum StaleCommit {
+    /// Issue #1840 route 2: the requester sealed over an owner-only stub
+    /// while the authority's roster has more members.
+    StubRoster,
+    /// Issue #1840 route 3: the authority's revision moved on (a PATCH)
+    /// after the requester sealed.
+    AuthorityMovedOn,
+}
+
+/// Build a requester-signed `JoinRequestCreated` relay entry whose commit
+/// cannot apply to the authority's current state of `gk`.
+async fn stale_request_entry(
+    state: &AppState,
+    gk: &str,
+    request_id: &str,
+    requester_kp: &AgentKeypair,
+    kind: StaleCommit,
+) -> RelayEntry {
+    let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
+    let topic = group_topic(state, gk).await;
+    let lh = local_hex(state);
+    let commit = {
+        let mut groups = state.named_groups.write().await;
+        let group = groups.get_mut(gk).expect("group exists");
+        match kind {
+            StaleCommit::StubRoster => {
+                // The stub keeps the authority's chain head (hash and
+                // revision, as an imported card gives them) but holds an
+                // owner-only roster, so the sealed roster root is wrong.
+                let mut stub = group.clone();
+                stub.members_v2.retain(|id, _| *id == lh);
+                assert_ne!(stub.members_v2.len(), group.members_v2.len());
+                signed_request_join_commit(&stub, requester_kp)
+            }
+            StaleCommit::AuthorityMovedOn => {
+                let commit = signed_request_join_commit(group, requester_kp);
+                group.description = "edited after the request was sealed".to_string();
+                group.state_revision += 1;
+                group.recompute_state_hash();
+                commit
+            }
+        }
+    };
+    build_relay_entry_with_commit(
+        requester_kp,
+        &topic,
+        gk,
+        request_id,
+        &requester_hex,
+        0,
+        commit,
+    )
+}
+
+async fn request_is_stored(state: &AppState, gk: &str, request_id: &str) -> bool {
+    state
+        .named_groups
+        .read()
+        .await
+        .get(gk)
+        .is_some_and(|info| info.join_requests.contains_key(request_id))
+}
+
+/// Live path, routes 2 and 3. The authority journals the request, the
+/// validator refuses the stale commit, and nothing durable holds the
+/// request. The journal slot must then be free, durably, so that a valid
+/// request on ANOTHER group of the same authority is admitted and approved.
+///
+/// RED on main: the marker stays held ("keeping admission journal and
+/// stopping") and the second group's request is refused ("unresolved
+/// listener-admission journal blocks new admission").
+#[tokio::test]
+async fn issue1840_live_validation_refusal_frees_journal_for_other_groups() {
+    for kind in [StaleCommit::StubRoster, StaleCommit::AuthorityMovedOn] {
+        let (state, _dir) = s_state().await;
+        let lh = local_hex(&state);
+        let gk_a = format!("{:032x}", 0x1840_000au32);
+        let gk_b = format!("{:032x}", 0x1840_000bu32);
+        for gk in [&gk_a, &gk_b] {
+            install_group_with_policy(
+                &state,
+                gk,
+                2,
+                x0x::groups::GroupPolicyPreset::PublicRequestSecure,
+            )
+            .await;
+        }
+        assert_eq!(
+            save_roster(&state).await.expect("roster save"),
+            AtomicWriteOutcome::Durable
+        );
+
+        let stale_kp = fresh_kp();
+        let stale = stale_request_entry(&state, &gk_a, "req-1840-stale", &stale_kp, kind).await;
+        offer_via_handler(&state, &lh, &stale, &stale_kp, unix_ms()).await;
+
+        assert!(
+            !request_is_stored(&state, &gk_a, &stale.request_id).await,
+            "{kind:?}: the refused request must not be stored"
+        );
+        assert_eq!(
+            relay_outbox_total(&state).await,
+            0,
+            "{kind:?}: a refused request creates no relay obligation"
+        );
+        assert!(
+            listener_admission_is_none(&state).await,
+            "{kind:?}: a validation refusal must not hold the admission journal"
+        );
+        // The clear is durable: a restart finds no marker and succeeds.
+        restart_relay(&state)
+            .await
+            .unwrap_or_else(|e| panic!("{kind:?}: restart after a refusal must succeed: {e}"));
+        assert!(listener_admission_is_none(&state).await);
+
+        // A valid request on an unrelated group of the same authority.
+        let good_kp = fresh_kp();
+        let good_hex = hex::encode(good_kp.agent_id().as_bytes());
+        let topic_b = group_topic(&state, &gk_b).await;
+        let commit = {
+            let groups = state.named_groups.read().await;
+            signed_request_join_commit(groups.get(&gk_b).expect("group b"), &good_kp)
+        };
+        let good = build_relay_entry_with_commit(
+            &good_kp,
+            &topic_b,
+            &gk_b,
+            "req-1840-good",
+            &good_hex,
+            0,
+            commit,
+        );
+        offer_via_handler(&state, &lh, &good, &good_kp, unix_ms()).await;
+        assert!(
+            request_is_stored(&state, &gk_b, &good.request_id).await,
+            "{kind:?}: another group's request must be admitted"
+        );
+        assert_eq!(
+            approve_status(&state, &gk_b, &good.request_id).await,
+            StatusCode::OK,
+            "{kind:?}: approval on another group must not be blocked"
+        );
+    }
+}
+
+/// Restart path, routes 2 and 3. A live marker (inside the retention
+/// window) whose request cannot be rebuilt against the durable roster must
+/// not stop startup. The entry is refused: no request, no obligation, the
+/// marker is cleared durably, and the sidecar bytes that held it are kept
+/// as evidence.
+///
+/// RED on main: `listener admission journal commit is invalid: state hash
+/// mismatch` / `stale revision`, which ends daemon startup.
+#[tokio::test]
+async fn issue1840_restart_refuses_unbuildable_live_marker_and_continues() {
+    for kind in [StaleCommit::StubRoster, StaleCommit::AuthorityMovedOn] {
+        let (state, _dir) = s_state().await;
+        let gk = format!("{:032x}", 0x1840_000cu32);
+        install_group_with_policy(
+            &state,
+            &gk,
+            2,
+            x0x::groups::GroupPolicyPreset::PublicRequestSecure,
+        )
+        .await;
+        let requester_kp = fresh_kp();
+        let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
+        let entry = stale_request_entry(&state, &gk, "req-1840-restart", &requester_kp, kind).await;
+        let marker_time = unix_ms() - 1000; // live
+
+        *state.pending_listener_admission.lock().await =
+            Some(marker_admission(&gk, &requester_hex, &entry, marker_time));
+        assert_eq!(
+            save_roster(&state).await.expect("roster save"),
+            AtomicWriteOutcome::Durable
+        );
+        assert_eq!(
+            save_relay(&state).await.expect("relay save"),
+            AtomicWriteOutcome::Durable
+        );
+        let held_bytes = relay_sidecar_bytes(&state).await;
+
+        let result = restart_relay(&state).await;
+        assert!(
+            result.is_ok(),
+            "{kind:?}: an unbuildable journal entry must not stop startup: {result:?}"
+        );
+        assert!(
+            listener_admission_is_none(&state).await,
+            "{kind:?}: the refused entry must not stay in the journal"
+        );
+        assert!(
+            !request_is_stored(&state, &gk, &entry.request_id).await,
+            "{kind:?}: the refused request must not be applied"
+        );
+        assert_eq!(relay_outbox_total(&state).await, 0);
+
+        // Evidence: the sidecar bytes that carried the marker are kept.
+        let evidence_path = refused_listener_admission_evidence_path(&state);
+        let evidence = tokio::fs::read(&evidence_path)
+            .await
+            .expect("refused-admission evidence copy");
+        assert_eq!(evidence, held_bytes, "{kind:?}: evidence is byte-exact");
+
+        // The clear is durable: the next start is clean too.
+        restart_relay(&state)
+            .await
+            .unwrap_or_else(|e| panic!("{kind:?}: second restart must succeed: {e}"));
+        assert!(listener_admission_is_none(&state).await);
+    }
+}
+
+/// Control for the transient side. When the request is valid but the roster
+/// write fails, the outcome is NOT a validation refusal: the journal marker
+/// stays held, exactly as before #1840.
+#[tokio::test]
+async fn issue1840_transient_roster_write_failure_keeps_journal() {
+    let (state, _dir) = s_state().await;
+    let lh = local_hex(&state);
+    let gk = format!("{:032x}", 0x1840_000du32);
+    install_group_with_policy(
+        &state,
+        &gk,
+        2,
+        x0x::groups::GroupPolicyPreset::PublicRequestSecure,
+    )
+    .await;
+    assert_eq!(
+        save_roster(&state).await.expect("roster save"),
+        AtomicWriteOutcome::Durable
+    );
+    let requester_kp = fresh_kp();
+    let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
+    let topic = group_topic(&state, &gk).await;
+    let commit = {
+        let groups = state.named_groups.read().await;
+        signed_request_join_commit(groups.get(&gk).expect("group"), &requester_kp)
+    };
+    let entry = build_relay_entry_with_commit(
+        &requester_kp,
+        &topic,
+        &gk,
+        "req-1840-transient",
+        &requester_hex,
+        0,
+        commit,
+    );
+
+    // Make the roster replacement fail: a non-empty directory sits at the
+    // roster path, so the atomic rename cannot replace it.
+    tokio::fs::remove_file(&state.named_groups_path)
+        .await
+        .expect("remove roster file");
+    tokio::fs::create_dir(&state.named_groups_path)
+        .await
+        .expect("block roster path");
+    tokio::fs::write(state.named_groups_path.join("blocker"), b"x")
+        .await
+        .expect("blocker file");
+
+    offer_via_handler(&state, &lh, &entry, &requester_kp, unix_ms()).await;
+
+    assert!(
+        !request_is_stored(&state, &gk, &entry.request_id).await,
+        "the request did not become durable, so memory must not keep it"
+    );
+    let marker = state.pending_listener_admission.lock().await.clone();
+    assert!(
+        marker.is_some_and(|m| m.request_id == entry.request_id && m.digest == entry.digest),
+        "a transient durability failure must keep the admission journal"
+    );
+}

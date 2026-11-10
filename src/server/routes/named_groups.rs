@@ -1270,6 +1270,12 @@ pub(in crate::server) struct ApplyMetadataResult {
     /// state (without the request) if obligation admission fails. `None`
     /// for all other event types and for rejected applies.
     pub(in crate::server) pre_mutation_group: Option<x0x::groups::GroupInfo>,
+    /// Issue #1840: `true` only when a validation check refused a
+    /// `JoinRequestCreated` before any roster write for it. Memory and disk
+    /// hold no part of the request, so the listener-admission journal has
+    /// nothing to recover and must not keep its marker. A failed or
+    /// indeterminate durable write is never reported here.
+    pub(in crate::server) refused_without_mutation: bool,
 }
 
 impl ApplyMetadataResult {
@@ -1278,6 +1284,16 @@ impl ApplyMetadataResult {
         accepted: false,
         should_exit: false,
         pre_mutation_group: None,
+        refused_without_mutation: false,
+    };
+
+    /// Issue #1840: a `JoinRequestCreated` refused by validation, with no
+    /// roster write attempted for it. See `refused_without_mutation`.
+    pub const REFUSED_WITHOUT_MUTATION: Self = Self {
+        accepted: false,
+        should_exit: false,
+        pre_mutation_group: None,
+        refused_without_mutation: true,
     };
 
     /// Event accepted and persisted; re-check whether the subscriber
@@ -1286,6 +1302,7 @@ impl ApplyMetadataResult {
         accepted: true,
         should_exit: true,
         pre_mutation_group: None,
+        refused_without_mutation: false,
     };
 
     /// Event accepted and persisted; subscriber should continue
@@ -1294,6 +1311,7 @@ impl ApplyMetadataResult {
         accepted: true,
         should_exit: false,
         pre_mutation_group: None,
+        refused_without_mutation: false,
     };
 }
 
@@ -18723,30 +18741,35 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             commit,
             ..
         } => {
+            // Issue #1840: every refusal from here to the persist below is a
+            // validation outcome, decided before any roster write for this
+            // request (a fork-evidence record is separate state). The
+            // listener-admission journal uses the typed result to release
+            // its marker; the persist failures below stay plain REJECTED.
             let Some(commit) = commit else {
-                return ApplyMetadataResult::REJECTED;
+                return ApplyMetadataResult::REFUSED_WITHOUT_MUTATION;
             };
             if sender_hex != requester_agent_id {
-                return ApplyMetadataResult::REJECTED;
+                return ApplyMetadataResult::REFUSED_WITHOUT_MUTATION;
             }
             if info.policy.admission != x0x::groups::GroupAdmission::RequestAccess {
-                return ApplyMetadataResult::REJECTED;
+                return ApplyMetadataResult::REFUSED_WITHOUT_MUTATION;
             }
             if info.has_active_member(&requester_agent_id) {
-                return ApplyMetadataResult::REJECTED;
+                return ApplyMetadataResult::REFUSED_WITHOUT_MUTATION;
             }
             if info.is_banned(&requester_agent_id) {
-                return ApplyMetadataResult::REJECTED;
+                return ApplyMetadataResult::REFUSED_WITHOUT_MUTATION;
             }
             if info
                 .join_requests
                 .values()
                 .any(|r| r.requester_agent_id == requester_agent_id && r.is_pending())
             {
-                return ApplyMetadataResult::REJECTED;
+                return ApplyMetadataResult::REFUSED_WITHOUT_MUTATION;
             }
             if info.join_requests.contains_key(&request_id) {
-                return ApplyMetadataResult::REJECTED;
+                return ApplyMetadataResult::REFUSED_WITHOUT_MUTATION;
             }
             let current = info.clone();
             let Ok(next) = apply_stateful_event_with_evidence(
@@ -18779,7 +18802,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             )
             .await
             else {
-                return ApplyMetadataResult::REJECTED;
+                return ApplyMetadataResult::REFUSED_WITHOUT_MUTATION;
             };
             // Finding A: `accepted: true` must mean durably persisted. Use the
             // shared roster transaction so the persistence mutex spans the
@@ -18820,6 +18843,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 accepted: true,
                 should_exit: false,
                 pre_mutation_group: Some(current),
+                refused_without_mutation: false,
             }
         }
         NamedGroupMetadataEvent::JoinRequestApproved {
@@ -43568,9 +43592,14 @@ fn validate_relay_obligation_for_restart(
 /// evidence, not just a startup failure.
 #[derive(Debug)]
 enum ListenerRestartAdmissionError {
-    /// An admissibility precondition failed — the marker cannot be
-    /// applied at all.
+    /// The marker is not a requester `JoinRequestCreated` at all — the
+    /// live path never journals such a marker, so the sidecar is suspect.
     Inadmissible(String),
+    /// Issue #1840: the request fails an admissibility check against the
+    /// durable roster (no commit, policy, already a member, banned, a
+    /// pending request exists). The live path refuses the same request
+    /// without mutation, so recovery refuses the entry and carries on.
+    Refused(String),
     /// The signed state commit failed to apply. The caller evaluates
     /// fork evidence from the carried pair before failing the restart.
     CommitInvalid(Box<CommitInvalidError>),
@@ -43582,6 +43611,34 @@ enum ListenerRestartAdmissionError {
 struct CommitInvalidError {
     error: x0x::groups::state_commit::ApplyError,
     commit: x0x::groups::state_commit::GroupStateCommit,
+}
+
+/// Issue #1840: where startup keeps the relay sidecar bytes that carried a
+/// listener-admission marker it refused. One slot beside the sidecar; a
+/// later refusal replaces it, so the evidence stays bounded.
+pub(in crate::server) fn refused_listener_admission_evidence_path(state: &AppState) -> PathBuf {
+    let mut name = state
+        .predecessor_relay_outbox_path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(".refused-admission");
+    state.predecessor_relay_outbox_path.with_file_name(name)
+}
+
+/// Issue #1840: best-effort copy of the as-loaded relay sidecar (which
+/// still holds the refused marker) to the evidence slot, before recovery
+/// re-saves the sidecar without that marker. A failed copy is logged and
+/// does not stop startup: the refusal itself is logged with its identity.
+async fn preserve_refused_listener_admission_evidence(state: &AppState) {
+    let evidence_path = refused_listener_admission_evidence_path(state);
+    if let Err(error) = tokio::fs::copy(&state.predecessor_relay_outbox_path, &evidence_path).await
+    {
+        tracing::warn!(
+            path = %evidence_path.display(),
+            "ADR 0028 startup: could not keep refused listener-admission evidence: {error}"
+        );
+    }
 }
 
 /// Build the roster half of a pending listener admission without mutating
@@ -43610,7 +43667,7 @@ fn build_listener_request_candidate_for_restart(
         ));
     };
     let commit = commit.as_ref().ok_or_else(|| {
-        ListenerRestartAdmissionError::Inadmissible(
+        ListenerRestartAdmissionError::Refused(
             "listener admission journal has no state commit".to_string(),
         )
     })?;
@@ -43623,7 +43680,7 @@ fn build_listener_request_candidate_for_restart(
         })
         || current.join_requests.contains_key(request_id)
     {
-        return Err(ListenerRestartAdmissionError::Inadmissible(
+        return Err(ListenerRestartAdmissionError::Refused(
             "listener admission journal request is not admissible".to_string(),
         ));
     }
@@ -44466,6 +44523,10 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
         // or obligation, but still falls through to clear the marker after
         // any exact clock migration/durability confirmation in the common
         // tail.
+        // Issue #1840: set when the live marker's request cannot be rebuilt
+        // against the durable roster. The entry is refused (no request, no
+        // obligation, marker cleared below) and startup carries on.
+        let mut refused_reason: Option<String> = None;
         if let Some(validated_obligation) = validated_obligation {
             let recovered_group = if !request_id_is_occupied {
                 let (decoded_event, signer, _) = decode_and_verify_v2(&admission.envelope_bytes)
@@ -44481,19 +44542,23 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
                     Err(ListenerRestartAdmissionError::Inadmissible(reason)) => {
                         return Err(reason);
                     }
+                    Err(ListenerRestartAdmissionError::Refused(reason)) => {
+                        refused_reason = Some(reason);
+                        None
+                    }
                     Err(ListenerRestartAdmissionError::CommitInvalid(payload)) => {
                         let CommitInvalidError { error, commit } = *payload;
                         // r3 (#468 A5 / Codex 9): route the typed
                         // rejection through the SAME fork-evidence
                         // evaluation as the live apply path, and persist
                         // the record DURABLY through the standard
-                        // mutation helper BEFORE the restart fails — the
-                        // recovery path returns without installing
-                        // `groups_view`, so merging into the candidate
-                        // map would discard it. The live map still holds
-                        // the as-loaded records here (the swap happens
-                        // only on success, under the persistence lock we
-                        // do NOT hold yet).
+                        // mutation helper against the live map, which
+                        // still holds the as-loaded records here (the
+                        // swap happens only later, under the persistence
+                        // lock we do NOT hold yet). Issue #1840: the
+                        // entry is then refused and recovery carries on,
+                        // so the refusal tail below copies the installed
+                        // containment into the detached `groups_view`.
                         if info.invite_lineage.is_some() {
                             match evaluate_fork_evidence_candidate(
                                 state,
@@ -44545,9 +44610,10 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
                                 ForkEvidenceOutcome::NotEvidence => {}
                             }
                         }
-                        return Err(format!(
+                        refused_reason = Some(format!(
                             "listener admission journal commit is invalid: {error}"
                         ));
+                        None
                     }
                 }
             } else {
@@ -44592,6 +44658,35 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
             }
             outbox = candidate_outbox;
             tombstones = candidate_tombstones;
+        }
+        if let Some(reason) = refused_reason {
+            // Issue #1840: one entry that cannot be rebuilt must not stop
+            // the daemon. Nothing of the request is durable, so dropping
+            // the marker leaves the consistent "neither" state — the same
+            // outcome as the live validation refusal. Keep the sidecar
+            // bytes as evidence before the re-save below removes the
+            // marker from the sidecar.
+            tracing::error!(
+                group_id = %admission.group_id,
+                request_id = %admission.request_id,
+                requester = %admission.requester_agent_id,
+                digest = %hex::encode(admission.digest),
+                first_seen_ms = admission.first_seen_ms,
+                outcome = "refused",
+                "ADR 0028 startup: {reason}; refusing this journal entry and continuing"
+            );
+            preserve_refused_listener_admission_evidence(state).await;
+            // Fork evidence for the refused commit was installed in the
+            // live map. Carry it into the detached candidate so a later
+            // candidate install cannot drop it. Recovery itself never
+            // edits these two fields.
+            let live = state.named_groups.read().await;
+            for (key, candidate) in groups_view.iter_mut() {
+                if let Some(live_info) = live.get(key) {
+                    candidate.fork_quarantine = live_info.fork_quarantine.clone();
+                    candidate.invite_lineage = live_info.invite_lineage.clone();
+                }
+            }
         }
         pending_listener_admission = None;
     }
