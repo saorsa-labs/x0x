@@ -268,7 +268,8 @@ pub async fn revoke(
 
 /// `x0x identity revocations` — GET /identity/revocations
 ///
-/// Lists all revocation records held by this daemon.
+/// Lists every revocation record held by this daemon: agent, machine,
+/// binding and share-grant subjects. Each row has a `subject_kind`.
 pub async fn revocations(client: &DaemonClient) -> Result<()> {
     client.run_get("/identity/revocations").await
 }

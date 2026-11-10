@@ -17893,6 +17893,16 @@ impl Agent {
         self.revocation_set.read().await.all_records()
     }
 
+    /// Return a snapshot of every revocation record this agent holds:
+    /// agent, machine, binding and share-grant subjects (#1108).
+    ///
+    /// [`Self::revocation_records`] returns the agent and machine records
+    /// only. Use this method for display. Do not publish its result on the
+    /// v1 revocation topic.
+    pub async fn all_revocation_records(&self) -> Vec<revocation::RevocationRecord> {
+        self.revocation_set.read().await.all_subject_records()
+    }
+
     /// Sign and publish a revocation for the given subject, then persist it
     /// locally and apply it immediately.
     ///
