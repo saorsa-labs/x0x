@@ -435,8 +435,8 @@ impl RevocationRecord {
     }
 
     /// SHA-256 of the issuer public key bytes, for compact display in REST
-    /// responses.  This is deterministic given the issuer keypair and matches
-    /// the AgentId/MachineId derivation when the issuer is self-revoking.
+    /// responses. This is a plain SHA-256 with no domain separator, so it is
+    /// NOT equal to the issuer's AgentId, MachineId or UserId.
     #[must_use]
     pub fn issuer_public_key_hash(&self) -> [u8; 32] {
         use sha2::{Digest, Sha256};
@@ -1483,6 +1483,22 @@ impl RevocationSet {
         self.records_by_hash
             .values()
             .filter(|p| is_v1_subject(&p.record.subject))
+            .map(|p| p.record.clone())
+            .collect()
+    }
+
+    /// All held records of every subject kind (order unspecified), for
+    /// local display such as `GET /identity/revocations` (#1108).
+    ///
+    /// This is NOT a wire or storage view. The v1 carrier and
+    /// `revocations.bin` use [`Self::all_records`], because an old daemon
+    /// cannot decode a binding or share-grant subject. Tombstones that came
+    /// from a move bundle are not records and are not included; see
+    /// [`Self::is_binding_revoked`].
+    #[must_use]
+    pub fn all_subject_records(&self) -> Vec<RevocationRecord> {
+        self.records_by_hash
+            .values()
             .map(|p| p.record.clone())
             .collect()
     }
@@ -4264,6 +4280,9 @@ mod tests {
             let v1 = set.all_records();
             let v2 = set.binding_records();
             let v3 = set.share_grant_records();
+            // #1108: the display view holds every record; the v1 view
+            // above must stay legacy-only.
+            assert_eq!(set.all_subject_records().len(), 4);
             assert_eq!(v1.len(), 2);
             assert_eq!(v2.len(), 1);
             assert_eq!(v3.len(), 1);

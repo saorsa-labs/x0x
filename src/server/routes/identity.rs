@@ -89,6 +89,14 @@ pub(in crate::server) async fn agent_info(
             agent_id: hex::encode(state.agent.agent_id().as_bytes()),
             machine_id: hex::encode(state.agent.machine_id().as_bytes()),
             user_id: state.agent.user_id().map(|u| hex::encode(u.as_bytes())),
+            agent_public_key: hex::encode(
+                state
+                    .agent
+                    .identity()
+                    .agent_keypair()
+                    .public_key()
+                    .as_bytes(),
+            ),
             kem_public_key_b64: BASE64.encode(&state.agent_kem_keypair.public_bytes),
             human_name: profile.human_name.clone(),
             display_name: profile.display_name.clone(),
@@ -1510,6 +1518,10 @@ pub(in crate::server) struct AgentData {
     agent_id: String,
     machine_id: String,
     user_id: Option<String>,
+    /// Hex of the agent's ML-DSA-65 public key (#1108). `agent_id` is the
+    /// identity hash of this key. It is the value that
+    /// `POST /owner/agents/issue` takes as `agent_public_key`.
+    agent_public_key: String,
     /// Base64 of the agent's ML-KEM-768 public key. Used by other daemons to
     /// seal group-shared-secret envelopes to this agent.
     kem_public_key_b64: String,
@@ -1701,28 +1713,60 @@ pub(in crate::server) async fn identity_revoke(
     }
 }
 
-/// GET /identity/revocations — list all revocation records held by this daemon.
+/// One row of `GET /identity/revocations`.
+///
+/// `subject`, `subject_kind`, `issuer`, `revoked_at` and `reason` are in
+/// every row. The other fields name the parts of the subject and depend on
+/// `subject_kind` (#1108).
+fn revocation_row(record: &x0x::revocation::RevocationRecord) -> serde_json::Value {
+    use x0x::revocation::RevokedSubject;
+
+    let mut row = serde_json::json!({
+        "subject": record.subject_hex(),
+        "subject_kind": record.subject_kind(),
+        "issuer": hex::encode(record.issuer_public_key_hash()),
+        "revoked_at": record.revoked_at,
+        "reason": record.reason,
+    });
+    match &record.subject {
+        RevokedSubject::Agent(agent) => {
+            row["agent_id"] = serde_json::json!(hex::encode(agent.as_bytes()));
+        }
+        RevokedSubject::Machine(machine) => {
+            row["machine_id"] = serde_json::json!(hex::encode(machine.as_bytes()));
+        }
+        RevokedSubject::AgentMachineBinding(binding) => {
+            row["agent_id"] = serde_json::json!(hex::encode(binding.agent.as_bytes()));
+            row["machine_id"] = serde_json::json!(hex::encode(binding.machine.as_bytes()));
+            row["move_epoch"] = serde_json::json!(binding.move_epoch);
+        }
+        RevokedSubject::ShareGrant(grant) => {
+            row["grant_id"] = serde_json::json!(hex::encode(grant.grant_id));
+            row["owner"] = serde_json::json!(hex::encode(grant.owner.as_bytes()));
+            row["grant_expiry"] = serde_json::json!(grant.grant_expiry);
+        }
+    }
+    row
+}
+
+/// GET /identity/revocations — list every revocation record held by this
+/// daemon: agent, machine, binding and share-grant subjects (#1108).
 pub(in crate::server) async fn identity_revocations(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let records = state.agent.revocation_records().await;
-    let items: Vec<serde_json::Value> = records
-        .iter()
-        .map(|r| {
-            serde_json::json!({
-                "subject": r.subject_hex(),
-                "subject_kind": r.subject_kind(),
-                "issuer": hex::encode(r.issuer_public_key_hash()),
-                "revoked_at": r.revoked_at,
-                "reason": r.reason,
-            })
-        })
-        .collect();
+    let mut records = state.agent.all_revocation_records().await;
+    // Oldest first; the record hash makes the order of equal times stable.
+    records.sort_by_cached_key(|r| (r.revoked_at, r.record_hash()));
+    let items: Vec<serde_json::Value> = records.iter().map(revocation_row).collect();
     (
         StatusCode::OK,
         Json(serde_json::json!({ "revocations": items })),
     )
 }
+
+#[cfg(test)]
+#[path = "identity_listing_tests.rs"]
+mod listing_tests;
 
 #[cfg(test)]
 mod owner_act_tests {

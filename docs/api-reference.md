@@ -462,7 +462,7 @@ contains the same sentence as the startup error log. See
 
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
-| GET | `/agent` | `x0x agent` | Local agent identity |
+| GET | `/agent` | `x0x agent` | Local agent identity, with the agent public key (`agent_public_key`) |
 | POST | `/announce` | `x0x announce` | Re-announce identity to the network |
 | GET | `/agent/user-id` | `x0x agent user-id` | Current user ID if configured |
 | GET | `/agent/card` | `x0x agent card [DISPLAY_NAME] [--include-groups] [--include-local-addresses]` | Generate a shareable, signed identity card (`--include-local-addresses` adds loopback/RFC1918 addresses for local testnet cards; off by default so shared cards don't leak unroutable addresses) |
@@ -473,7 +473,50 @@ contains the same sentence as the startup error log. See
 | POST | `/agent/verify` | `x0x agent verify` | Verify a detached ML-DSA-65 signature against a caller-supplied public key |
 | GET | `/introduction` | `x0x agent introduction` | Trust-gated introduction card (`?peer=<64-hex>` scopes it to that peer's trust) |
 | POST | `/identity/revoke` | `x0x identity revoke [--agent-id <hex>] [--machine-id <hex>] [--move-epoch <n>] [--reason <text>]` | Revoke the daemon's own agent, or an owner-authorized agent–machine binding; see [Key revocation](#key-revocation) for the supported forms |
-| GET | `/identity/revocations` | `x0x identity revocations` | List signed identity revocations known to this daemon |
+| GET | `/identity/revocations` | `x0x identity revocations` | List every signed revocation record this daemon holds: agent, machine, binding and share-grant subjects |
+
+### Agent identity response
+
+`GET /agent` returns `agent_id`, `machine_id`, `user_id` (or `null`),
+`agent_public_key`, `kem_public_key_b64` and, when they are set, the profile
+names `human_name`, `display_name` and `machine_name`.
+
+- `agent_public_key` — the agent's ML-DSA-65 public key in hex (1952 bytes,
+  3904 hex characters). `agent_id` is the SHA-256 of the domain separator
+  `AUTONOMI_PEER_ID_V2:` followed by these key bytes. This is the value that
+  `POST /owner/agents/issue` takes as `agent_public_key`.
+- `kem_public_key_b64` — the agent's ML-KEM-768 public key in base64.
+
+### Revocation listing
+
+`GET /identity/revocations` returns `{"revocations": [...]}` with one row for
+each signed revocation record that this daemon holds. The rows are in
+`revoked_at` order, oldest first. Each row has these fields:
+
+- `subject_kind` — `agent`, `machine`, `binding` or `share_grant`.
+- `subject` — one hex id for the subject: the agent id (`agent` and
+  `binding`), the machine id (`machine`) or the grant id (`share_grant`).
+- `issuer` — hex SHA-256 of the issuer's public key bytes. This value has no
+  domain separator, so it is not an agent, machine or user id.
+- `revoked_at` — Unix seconds.
+- `reason` — text, or `null`.
+
+The other fields name each part of the subject:
+
+| `subject_kind` | More fields |
+|---|---|
+| `agent` | `agent_id` |
+| `machine` | `machine_id` |
+| `binding` | `agent_id`, `machine_id`, `move_epoch` |
+| `share_grant` | `grant_id`, `owner` (the grantor's user id), `grant_expiry` (Unix seconds) |
+
+Before [#1108](https://github.com/saorsa-labs/x0x/issues/1108) the listing
+showed `agent` and `machine` rows only. A client that reads the listing must
+ignore a `subject_kind` it does not know.
+
+The listing shows signed records only. A binding that a key-move activation
+bundle retired has no record of its own; `GET /agent/moves` counts it in
+`derived.retired_bindings`.
 
 ### Key revocation
 
