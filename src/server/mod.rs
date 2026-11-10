@@ -4936,6 +4936,39 @@ async fn handle_predecessor_relay_typed_payload_inner(
             ))
             .await;
             replay_after = replay_group_id;
+            if !apply_result.accepted && apply_result.refused_without_mutation {
+                // Issue #1840: validation refused the request before any
+                // roster write, so durable state holds "neither" half and
+                // the journal has nothing to recover. Release the marker,
+                // durably, so this refusal cannot block other admissions
+                // or the next startup. The ACK stays `Err`: the refusal
+                // is judged against the current frontier only.
+                let _journal_guard = relay_state
+                    .predecessor_relay_outbox_persistence_lock
+                    .lock()
+                    .await;
+                let marker = relay_state.pending_listener_admission.lock().await.take();
+                if matches!(
+                    save_predecessor_relay_outbox_unlocked(relay_state).await,
+                    Ok(AtomicWriteOutcome::Durable)
+                ) {
+                    tracing::warn!(
+                        group_id = %group_id_str,
+                        request_id = %request_id,
+                        requester = %requester_agent_id,
+                        outcome = "refused",
+                        "ADR 0028: request refused by validation without mutation; admission journal released"
+                    );
+                } else {
+                    *relay_state.pending_listener_admission.lock().await = marker;
+                    tracing::error!(
+                        group_id = %group_id_str,
+                        request_id = %request_id,
+                        "ADR 0028: refused request's journal release is not durable; keeping admission journal"
+                    );
+                }
+                break 'admission true;
+            }
             if !apply_result.accepted {
                 tracing::error!(
                     group_id = %group_id_str,
