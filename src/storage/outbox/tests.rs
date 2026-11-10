@@ -117,6 +117,40 @@ fn retry_offsets_clamp_at_the_last_entry() {
     assert_eq!(retry_delay_secs(&[], 3), 0, "no table, no panic");
 }
 
+/// #1840: `replace_if` replaces only a stored entry that `accept` admits,
+/// never adds one, and the replacement is durable.
+#[tokio::test]
+async fn replace_if_replaces_only_an_accepted_stored_entry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cells = Cells::new(dir.path());
+    let a = note("g1", "a", 10);
+    cells.outbox().insert(a.clone()).await.expect("insert a");
+    let mut a2 = a.clone();
+    a2.size = 11;
+
+    // No stored entry with that id, or that partition: nothing is added.
+    for absent in [note("g1", "zz", 10), note("g9", "a", 10)] {
+        let replaced = cells.outbox().replace_if(absent, |_| true).await;
+        assert!(matches!(replaced, Ok(false)));
+    }
+    // `accept` sees the STORED entry and can refuse it.
+    let refused = cells
+        .outbox()
+        .replace_if(a2.clone(), |stored| stored.size != 10)
+        .await;
+    assert!(matches!(refused, Ok(false)));
+    assert_eq!(cells.outbox().snapshot().await, vec![a.clone()]);
+    assert_eq!(cells.restarted().await.outbox().snapshot().await, vec![a]);
+
+    let replaced = cells
+        .outbox()
+        .replace_if(a2.clone(), |stored| stored.size == 10)
+        .await;
+    assert!(matches!(replaced, Ok(true)));
+    assert_eq!(cells.outbox().snapshot().await, vec![a2.clone()]);
+    assert_eq!(cells.restarted().await.outbox().snapshot().await, vec![a2]);
+}
+
 #[tokio::test]
 async fn insert_is_durable_and_survives_restart() {
     let dir = tempfile::tempdir().expect("tempdir");

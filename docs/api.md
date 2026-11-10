@@ -200,7 +200,7 @@ still emits withdrawn cards so stale public listings are superseded.
 | POST | `/groups/:id/ban/:agent_id` | `x0x group ban` | Ban a member (admin+) |
 | DELETE | `/groups/:id/ban/:agent_id` | `x0x group unban` | Unban a member (admin+) |
 | GET | `/groups/:id/requests` | `x0x group requests` | List join requests (admin+) |
-| POST | `/groups/:id/requests` | `x0x group request-access` | Submit a join request |
+| POST | `/groups/:id/requests` | `x0x group request-access` | Submit a join request. `201` means stored and offered, not accepted; `own_join_request` on `GET /groups/:id` shows a later refusal by the authority |
 | POST | `/groups/:id/requests/:request_id/approve` | `x0x group approve-request` | Approve join request (admin+) |
 | POST | `/groups/:id/requests/:request_id/reject` | `x0x group reject-request` | Reject join request (admin+) |
 | DELETE | `/groups/:id/requests/:request_id` | `x0x group cancel-request` | Cancel own pending request |

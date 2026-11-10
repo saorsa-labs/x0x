@@ -10,9 +10,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::pr291_restart_marker_matrix::{
-    bound_join_request, build_relay_entry_with_commit, group_topic, install_group_with_policy,
-    listener_admission_is_none, local_hex, offer_via_handler, s_state, save_roster,
-    signed_request_join_commit, stale_request_entry, unix_ms, RelayEntry, StaleCommit,
+    bound_join_request, build_relay_entry, build_relay_entry_with_commit, group_topic,
+    install_group_with_policy, listener_admission_is_none, local_hex, offer_via_handler, s_state,
+    save_roster, signed_request_join_commit, stale_request_entry, unix_ms, RelayEntry, StaleCommit,
 };
 use super::*;
 use crate::dm::CapabilityRegistry;
@@ -21,6 +21,9 @@ use crate::groups::join_outcome::{JoinRequestOutcome, JoinRequestRefusalReason};
 use crate::identity::{AgentId, MachineId};
 use crate::server::handle_predecessor_relay_typed_payload;
 use crate::server::routes::named_groups::join_request_outcome::test_seam::sent_by;
+use crate::server::routes::named_groups::join_request_outcome::{
+    OUTCOME_RESEND_MIN_MS, OUTCOME_SEND_MEMORY_CAP, OUTCOME_SEND_PER_REQUESTER_CAP,
+};
 use crate::server::routes::named_groups::requester_offer::{
     find_requester_offer, RequesterOfferRefusal,
 };
@@ -86,6 +89,8 @@ async fn requester_holds_offer(pair: &Pair, entry: &RelayEntry) {
         .expect("owner group")
         .clone();
     assert_eq!(stub.stable_group_id(), pair.gk, "fixture: one group id");
+    // A requester's own daemon holds at most its own request.
+    stub.join_requests.clear();
     stub.join_requests.insert(
         entry.request_id.clone(),
         bound_join_request(entry, &pair.gk, &r_hex, unix_ms()),
@@ -162,22 +167,64 @@ async fn own_join_request(pair: &Pair) -> serde_json::Value {
     body["own_join_request"].clone()
 }
 
-/// A refused offer and the one outcome payload `O` sent for it.
-async fn refused_offer(pair: &Pair, kind: StaleCommit) -> (RelayEntry, Vec<u8>) {
+/// `R` holds the offer of `entry` and offers it; `O` refuses it. Returns
+/// the one outcome payload `O` sent for it.
+async fn refused_entry(pair: &Pair, entry: &RelayEntry, row: &str) -> Vec<u8> {
     advertise_requester(pair, CapabilityRegistry::JOIN_REQUEST_OUTCOME_V1);
-    let kp = pair.requester.agent.identity().agent_keypair();
-    let entry = stale_request_entry(&pair.owner, &pair.gk, REQUEST_ID, kp, kind).await;
-    requester_holds_offer(pair, &entry).await;
-    offer(pair, &entry).await;
-    assert!(listener_admission_is_none(&pair.owner).await);
+    let before = sent_by(&pair.owner).len();
+    requester_holds_offer(pair, entry).await;
+    offer(pair, entry).await;
+    assert!(listener_admission_is_none(&pair.owner).await, "{row}");
+    assert!(
+        !pair.owner.named_groups.read().await[&pair.gk]
+            .join_requests
+            .values()
+            .any(|r| r.predecessor_envelope_digest == Some(entry.digest)),
+        "{row}: fixture: the authority must refuse this envelope"
+    );
     let sent = sent_by(&pair.owner);
     assert_eq!(
         sent.len(),
-        1,
-        "{kind:?}: the authority must send one outcome for the refused envelope"
+        before + 1,
+        "{row}: the authority must send one outcome for the refused envelope"
     );
-    assert_eq!(sent[0].0, pair.requester.agent.agent_id());
-    (entry, sent[0].1.clone())
+    assert_eq!(sent[before].0, pair.requester.agent.agent_id());
+    sent[before].1.clone()
+}
+
+/// A refused stale offer and the one outcome payload `O` sent for it.
+async fn refused_offer(pair: &Pair, kind: StaleCommit) -> (RelayEntry, Vec<u8>) {
+    let kp = pair.requester.agent.identity().agent_keypair();
+    let entry = stale_request_entry(&pair.owner, &pair.gk, REQUEST_ID, kp, kind).await;
+    let payload = refused_entry(pair, &entry, &format!("{kind:?}")).await;
+    (entry, payload)
+}
+
+/// An offer of `R` with a commit that is valid over `O`'s current state.
+async fn current_head_entry(pair: &Pair, request_id: &str) -> RelayEntry {
+    let kp = pair.requester.agent.identity().agent_keypair();
+    let topic = group_topic(&pair.owner, &pair.gk).await;
+    let commit = {
+        let groups = pair.owner.named_groups.read().await;
+        signed_request_join_commit(groups.get(&pair.gk).expect("group"), kp)
+    };
+    build_relay_entry_with_commit(
+        kp,
+        &topic,
+        &pair.gk,
+        request_id,
+        &local_hex(&pair.requester),
+        0,
+        commit,
+    )
+}
+
+/// Change `O`'s group in place and re-hash it.
+async fn edit_owner_group(pair: &Pair, edit: impl FnOnce(&mut crate::groups::GroupInfo)) {
+    let mut groups = pair.owner.named_groups.write().await;
+    let group = groups.get_mut(&pair.gk).expect("group");
+    edit(group);
+    group.recompute_state_hash();
 }
 
 /// The main row. RED before the fix: the authority sends nothing, so the
@@ -189,12 +236,12 @@ async fn issue1840_refused_offer_reaches_requester_as_typed_outcome() {
         (
             0x1840_0401u32,
             StaleCommit::StubRoster,
-            JoinRequestRefusalReason::StateMismatch,
+            JoinRequestRefusalReason::Stale,
         ),
         (
             0x1840_0402u32,
             StaleCommit::AuthorityMovedOn,
-            JoinRequestRefusalReason::StaleHead,
+            JoinRequestRefusalReason::Stale,
         ),
     ] {
         let pair = pair(tag).await;
@@ -356,7 +403,7 @@ async fn issue1840_forged_outcome_is_ignored() {
     deliver_to_requester(&pair, owner_id, payload, true).await;
     assert_eq!(
         recorded_refusal(&pair).await.map(|r| r.reason),
-        Some("state_mismatch".to_string()),
+        Some("stale".to_string()),
         "the genuine outcome is accepted"
     );
 }
@@ -424,6 +471,20 @@ async fn issue1840_no_outcome_without_the_capability_bit() {
         offer(&pair, &entry).await;
         assert!(listener_admission_is_none(&pair.owner).await, "{advert:?}");
         assert!(sent_by(&pair.owner).is_empty(), "{advert:?}");
+        // Not vacuous: the same kind of offer on the same path does get an
+        // outcome when the requester's advert has the bit.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let second = stale_request_entry(
+            &pair.owner,
+            &pair.gk,
+            "req-1840-second",
+            kp,
+            StaleCommit::StubRoster,
+        )
+        .await;
+        advertise_requester(&pair, CapabilityRegistry::JOIN_REQUEST_OUTCOME_V1);
+        offer(&pair, &second).await;
+        assert_eq!(sent_by(&pair.owner).len(), 1, "{advert:?}: control");
     }
     // The bit is route-gated: advertised only with the typed route.
     let bit = CapabilityRegistry::JOIN_REQUEST_OUTCOME_V1;
@@ -432,4 +493,326 @@ async fn issue1840_no_outcome_without_the_capability_bit() {
         crate::groups::join_outcome::JOIN_REQUEST_OUTCOME_DM_PREFIX
     ])
     .supports(bit));
+}
+
+/// Every wire reason, end to end: the authority's refusal, the outcome,
+/// and the state the requester shows. Only `stale` is retryable.
+#[tokio::test]
+async fn issue1840_each_wire_reason_reaches_the_requester() {
+    use JoinRequestRefusalReason as Reason;
+    for (tag, row, reason) in [
+        (
+            0x1840_0410u32,
+            "policy is not request access",
+            Reason::Stale,
+        ),
+        (0x1840_0411u32, "already a member", Reason::AlreadyMember),
+        (0x1840_0412u32, "banned", Reason::Banned),
+        (
+            0x1840_0413u32,
+            "pending request exists",
+            Reason::PendingExists,
+        ),
+        (0x1840_0414u32, "envelope without a commit", Reason::Invalid),
+    ] {
+        let pair = pair(tag).await;
+        let r_hex = local_hex(&pair.requester);
+        let o_hex = local_hex(&pair.owner);
+        match reason {
+            Reason::Stale => {
+                edit_owner_group(&pair, |g| {
+                    g.policy = crate::groups::GroupPolicyPreset::PrivateSecure.to_policy();
+                })
+                .await;
+            }
+            Reason::AlreadyMember => {
+                edit_owner_group(&pair, |g| {
+                    g.add_member(
+                        r_hex.clone(),
+                        crate::groups::GroupRole::Member,
+                        Some(o_hex),
+                        None,
+                    );
+                })
+                .await;
+            }
+            Reason::Banned => {
+                edit_owner_group(&pair, |g| g.ban_member(&r_hex, Some(o_hex))).await;
+            }
+            Reason::PendingExists => {
+                let earlier = current_head_entry(&pair, "req-1840-earlier").await;
+                let request = bound_join_request(&earlier, &pair.gk, &r_hex, unix_ms());
+                edit_owner_group(&pair, |g| {
+                    g.join_requests.insert(request.request_id.clone(), request);
+                })
+                .await;
+            }
+            _ => {}
+        }
+        let entry = if reason == Reason::Invalid {
+            let kp = pair.requester.agent.identity().agent_keypair();
+            let topic = group_topic(&pair.owner, &pair.gk).await;
+            build_relay_entry(kp, &topic, &pair.gk, REQUEST_ID, &r_hex, 0)
+        } else {
+            current_head_entry(&pair, REQUEST_ID).await
+        };
+        let payload = refused_entry(&pair, &entry, row).await;
+        let outcome = JoinRequestOutcome::decode(&payload).expect("outcome payload");
+        assert_eq!(outcome.reason, reason, "{row}");
+        assert_eq!(outcome.envelope_digest, hex::encode(entry.digest), "{row}");
+
+        deliver_to_requester(&pair, pair.owner.agent.agent_id(), payload, true).await;
+        let refusal = recorded_refusal(&pair).await.expect("refusal recorded");
+        assert_eq!(refusal.reason, reason.as_str(), "{row}");
+        assert_eq!(refusal.retryable, reason == Reason::Stale, "{row}");
+        let shown = own_join_request(&pair).await;
+        assert_eq!(shown["status"], "refused", "{row}: {shown}");
+        assert_eq!(shown["refusal"]["reason"], reason.as_str(), "{row}");
+        assert_eq!(shown["refusal"]["retryable"], reason == Reason::Stale);
+    }
+}
+
+/// Disclosure invariant (PR #1850 review r1). An agent that knows only the
+/// group id can sign any commit. Its outcomes must not show the
+/// authority's revision, chain head, roster or admission policy: every
+/// probe below gets the same bytes apart from the request id and digest.
+#[tokio::test]
+async fn issue1840_owner_state_probes_get_the_same_outcome() {
+    let pair = pair(0x1840_0420).await;
+    advertise_requester(&pair, CapabilityRegistry::JOIN_REQUEST_OUTCOME_V1);
+    edit_owner_group(&pair, |g| g.state_revision = 5).await;
+    let kp = pair.requester.agent.identity().agent_keypair();
+    let r_hex = local_hex(&pair.requester);
+    let topic = group_topic(&pair.owner, &pair.gk).await;
+    let head = pair.owner.named_groups.read().await[&pair.gk].clone();
+    let wrong_prev = "5a".repeat(32);
+    let probe = |revision: u64, prev: &str| {
+        crate::groups::GroupStateCommit::sign(
+            head.stable_group_id().to_string(),
+            revision,
+            Some(prev.to_string()),
+            crate::groups::state_commit::compute_roster_root(&head.members_v2),
+            crate::groups::state_commit::compute_policy_hash(&head.policy),
+            crate::groups::state_commit::compute_public_meta_hash(&head.public_meta()),
+            head.security_binding.clone(),
+            false,
+            revision,
+            kp,
+        )
+        .expect("sign probe commit")
+    };
+    let mut probes = vec![
+        ("behind the revision, wrong chain", probe(2, &wrong_prev)),
+        ("at the revision, right hash", probe(5, &head.state_hash)),
+        ("next revision, wrong chain", probe(6, &wrong_prev)),
+        ("far ahead, wrong chain", probe(900, &wrong_prev)),
+        ("next revision, right chain, stub roster", {
+            let mut stub = head.clone();
+            let o_hex = local_hex(&pair.owner);
+            stub.members_v2.retain(|id, _| *id == o_hex);
+            signed_request_join_commit(&stub, kp)
+        }),
+    ];
+    // The same probe after the group stopped admitting by request.
+    let policy_probe = probe(6, &wrong_prev);
+    let mut normalised = Vec::new();
+    let offer_probe = |name: &'static str, commit, index: usize| {
+        let entry = build_relay_entry_with_commit(
+            kp,
+            &topic,
+            &pair.gk,
+            &format!("req-1840-probe-{index}"),
+            &r_hex,
+            0,
+            commit,
+        );
+        (name, entry)
+    };
+    let entries: Vec<_> = probes
+        .drain(..)
+        .enumerate()
+        .map(|(i, (name, commit))| offer_probe(name, commit, i))
+        .collect();
+    for (name, entry) in &entries {
+        offer(&pair, entry).await;
+        assert!(listener_admission_is_none(&pair.owner).await, "{name}");
+    }
+    edit_owner_group(&pair, |g| {
+        g.policy = crate::groups::GroupPolicyPreset::PrivateSecure.to_policy();
+    })
+    .await;
+    let (policy_name, policy_entry) = offer_probe("policy is not request access", policy_probe, 99);
+    offer(&pair, &policy_entry).await;
+
+    let sent = sent_by(&pair.owner);
+    assert_eq!(sent.len(), entries.len() + 1, "one outcome per probe");
+    let names = entries.iter().map(|(name, _)| *name).chain([policy_name]);
+    for ((_, payload), name) in sent.iter().zip(names) {
+        let mut outcome = JoinRequestOutcome::decode(payload).expect("outcome");
+        assert_eq!(outcome.reason, JoinRequestRefusalReason::Stale, "{name}");
+        outcome.request_id = String::new();
+        outcome.envelope_digest = String::new();
+        normalised.push((name, outcome.encode().expect("encode")));
+    }
+    for (name, bytes) in &normalised {
+        assert_eq!(
+            bytes, &normalised[0].1,
+            "{name}: same bytes as every other probe"
+        );
+    }
+
+    // The requester's own facts win over the policy check, so the policy
+    // is not shown to a banned requester either.
+    for policy in [
+        crate::groups::GroupPolicyPreset::PrivateSecure,
+        crate::groups::GroupPolicyPreset::PublicRequestSecure,
+    ] {
+        let o_hex = local_hex(&pair.owner);
+        edit_owner_group(&pair, |g| {
+            g.policy = policy.to_policy();
+            g.ban_member(&r_hex, Some(o_hex));
+        })
+        .await;
+        let before = sent_by(&pair.owner).len();
+        let (_, entry) = offer_probe("banned", probe(6, &wrong_prev), 200 + before);
+        offer(&pair, &entry).await;
+        let sent = sent_by(&pair.owner);
+        assert_eq!(sent.len(), before + 1);
+        let outcome = JoinRequestOutcome::decode(&sent[before].1).expect("outcome");
+        assert_eq!(outcome.reason, JoinRequestRefusalReason::Banned);
+    }
+}
+
+/// The send limits: one outcome per digest per interval, a cap per
+/// requester, a total cap, and expiry of the memory after the interval.
+#[tokio::test]
+async fn issue1840_outcome_send_limits() {
+    let pair = pair(0x1840_0430).await;
+    advertise_requester(&pair, CapabilityRegistry::JOIN_REQUEST_OUTCOME_V1);
+    let requester = pair.requester.agent.agent_id();
+    let send = |to: AgentId, digest: [u8; 32]| {
+        send_join_request_refusal(
+            &pair.owner,
+            &pair.gk,
+            REQUEST_ID,
+            to,
+            digest,
+            JoinRequestRefusalReason::Stale,
+        );
+        sent_by(&pair.owner).len()
+    };
+    assert_eq!(send(requester, [1; 32]), 1);
+    assert_eq!(send(requester, [1; 32]), 1, "one per digest per interval");
+    for i in 2..=OUTCOME_SEND_PER_REQUESTER_CAP {
+        assert_eq!(send(requester, [i as u8; 32]), i);
+    }
+    assert_eq!(
+        send(requester, [0xee; 32]),
+        OUTCOME_SEND_PER_REQUESTER_CAP,
+        "the per-requester cap stops one agent"
+    );
+
+    // Another requester is not affected by the first one's cap.
+    let other = AgentId([0x42; 32]);
+    let mut caps = crate::dm::DmCapabilities::v2_durable_gossip_ready(
+        pair.requester.agent_kem_keypair.public_bytes.clone(),
+    );
+    caps.application_registry = CapabilityRegistry {
+        version: 1,
+        bits: CapabilityRegistry::JOIN_REQUEST_OUTCOME_V1,
+    };
+    assert!(pair.owner.agent.capability_store().insert(
+        other,
+        MachineId([0x43; 32]),
+        caps,
+        crate::dm_capability::now_unix_ms(),
+    ));
+    let count = OUTCOME_SEND_PER_REQUESTER_CAP + 1;
+    assert_eq!(send(other, [0xa0; 32]), count);
+
+    // Total cap: with the memory full, no outcome is sent.
+    let now_ms = unix_ms();
+    {
+        let mut sent = pair.owner.join_request_outcome_sends.lock().unwrap();
+        for i in 0..OUTCOME_SEND_MEMORY_CAP as u32 {
+            let mut key = [0xf0u8; 32];
+            key[..4].copy_from_slice(&i.to_be_bytes());
+            let mut agent = [0xf1u8; 32];
+            agent[..4].copy_from_slice(&i.to_be_bytes());
+            sent.insert(key, (now_ms, AgentId(agent)));
+        }
+    }
+    assert_eq!(send(other, [0xa1; 32]), count, "memory full: no send");
+
+    // After the interval the memory is pruned and the same digest is sent
+    // again (a lost outcome is repeated on a later offer).
+    {
+        let mut sent = pair.owner.join_request_outcome_sends.lock().unwrap();
+        for (at, _) in sent.values_mut() {
+            *at = now_ms.saturating_sub(OUTCOME_RESEND_MIN_MS + 1);
+        }
+    }
+    assert_eq!(
+        send(requester, [1; 32]),
+        count + 1,
+        "resend after the interval"
+    );
+    assert_eq!(
+        pair.owner.join_request_outcome_sends.lock().unwrap().len(),
+        1
+    );
+}
+
+/// After a refusal the client cancels the request and files a new one.
+/// The refused obligation is dropped and the new request starts clean.
+#[tokio::test]
+async fn issue1840_cancel_then_new_request_after_refusal() {
+    let pair = pair(0x1840_0440).await;
+    let (_entry, payload) = refused_offer(&pair, StaleCommit::StubRoster).await;
+    deliver_to_requester(&pair, pair.owner.agent.agent_id(), payload, true).await;
+    assert_eq!(own_join_request(&pair).await["status"], "refused");
+
+    let owner_actor = crate::server::rider_auth::ActorContext::Owner { durable: true };
+    let cancelled = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        cancel_join_request(
+            State(Arc::clone(&pair.requester)),
+            Extension(owner_actor),
+            Path((pair.gk.clone(), REQUEST_ID.to_string())),
+        ),
+    )
+    .await
+    .expect("cancel ends")
+    .into_response();
+    assert_eq!(cancelled.status(), StatusCode::OK);
+    assert_eq!(own_join_request(&pair).await, serde_json::Value::Null);
+
+    // The worker drops the refused obligation of the cancelled request.
+    {
+        let mut outbox = pair.requester.requester_offer_outbox.write().await;
+        outbox.get_mut(&pair.gk).expect("group")[0].next_retry_at_ms = 0;
+    }
+    requester_offer_step(&pair.requester).await;
+    assert!(find_requester_offer(&pair.requester, &pair.gk, REQUEST_ID)
+        .await
+        .is_none());
+
+    let created = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        create_join_request(
+            State(Arc::clone(&pair.requester)),
+            Path(pair.gk.clone()),
+            None,
+        ),
+    )
+    .await
+    .expect("create ends")
+    .into_response();
+    let (status, body) = response_json(created).await.expect("response");
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let new_id = body["request_id"].as_str().expect("request id").to_string();
+    assert_ne!(new_id, REQUEST_ID);
+    let shown = own_join_request(&pair).await;
+    assert_eq!(shown["request_id"], new_id.as_str());
+    assert_eq!(shown["status"], "pending", "{shown}");
 }

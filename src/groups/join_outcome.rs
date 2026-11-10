@@ -26,26 +26,32 @@ pub const JOIN_REQUEST_OUTCOME_DM_PREFIX: &[u8] = b"x0x-group-join-outcome-v1\0"
 /// about 250 bytes.
 pub const MAX_JOIN_REQUEST_OUTCOME_BYTES: usize = 1024;
 
-/// Why the authority refused the request. A closed set: it names facts
-/// about the requester or its envelope only, never another member.
+/// Why the authority refused the request. A closed set.
+///
+/// Disclosure rule: the requester can be any agent that knows the group
+/// id, so a reason names only (a) a fact about the requester itself
+/// (`AlreadyMember`, `Banned`, `PendingExists`), (b) `Stale`, or (c)
+/// `Invalid`. `Stale` is ONE reason for every refusal that depends on the
+/// authority's group state (revision, chain head, roster, admission
+/// policy), so it does not show which of those checks refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum JoinRequestRefusalReason {
-    /// The signed commit is at or behind the authority's revision.
-    StaleHead,
-    /// The signed commit does not chain to, or does not hash to, the
-    /// authority's current state (for example a stub roster).
-    StateMismatch,
-    /// The group does not admit by request.
-    NotRequestAccess,
+    /// The requester's copy of the group is not the authority's current
+    /// state: the signed commit is behind the head, does not chain to it,
+    /// seals another roster, the group does not admit by request, or the
+    /// request id is already in the authority's roster.
+    Stale,
     /// The requester already holds an active seat.
     AlreadyMember,
     /// The requester is banned from the group.
     Banned,
     /// The authority already holds a pending request from this requester.
     PendingExists,
-    /// Any other validation refusal of the envelope.
+    /// The envelope is not acceptable (terminal): a check of the envelope
+    /// alone refused it, or a check that runs after its commit matched the
+    /// authority's revision and chain head.
     Invalid,
     /// A reason this release does not know, from a newer authority. Never
     /// encoded.
@@ -58,9 +64,7 @@ impl JoinRequestRefusalReason {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::StaleHead => "stale_head",
-            Self::StateMismatch => "state_mismatch",
-            Self::NotRequestAccess => "not_request_access",
+            Self::Stale => "stale",
             Self::AlreadyMember => "already_member",
             Self::Banned => "banned",
             Self::PendingExists => "pending_exists",
@@ -69,11 +73,11 @@ impl JoinRequestRefusalReason {
         }
     }
 
-    /// `true` when a NEW envelope, sealed over the authority's current
-    /// head, can succeed. The same envelope is never worth another offer.
+    /// `true` when a NEW envelope, made from a current copy of the group,
+    /// can succeed. The same envelope is never worth another offer.
     #[must_use]
     pub fn is_retryable(self) -> bool {
-        matches!(self, Self::StaleHead | Self::StateMismatch)
+        matches!(self, Self::Stale)
     }
 }
 
@@ -133,7 +137,7 @@ mod tests {
             group_id: "g".to_string(),
             request_id: "r".to_string(),
             envelope_digest: "ab".repeat(32),
-            reason: JoinRequestRefusalReason::StaleHead,
+            reason: JoinRequestRefusalReason::Stale,
         };
         let payload = outcome.encode().expect("encode");
         assert_eq!(JoinRequestOutcome::decode(&payload), Some(outcome));

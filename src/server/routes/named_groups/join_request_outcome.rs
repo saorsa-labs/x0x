@@ -13,8 +13,13 @@
 //!   `join_request_outcome_v1` (an older requester would show the payload
 //!   as an ordinary DM);
 //! - at most once per envelope digest in [`OUTCOME_RESEND_MIN_MS`], with a
-//!   capped memory of recent digests. When the memory is full, no outcome
-//!   is sent and the requester keeps its old behaviour.
+//!   memory of recent digests that is capped per requester and in total.
+//!   At a cap, no outcome is sent and the requester keeps its old
+//!   behaviour (it offers again on its schedule).
+//!
+//! The outcome goes out as a plain (v1) DM with no application ACK. If the
+//! requester cannot store it, the authority is not told; the requester's
+//! next offer of that envelope gets a new outcome after the interval.
 //!
 //! Requester side ([`handle_join_request_outcome_typed_payload`]): the
 //! outcome is accepted only when all of these hold, else it is ignored:
@@ -46,9 +51,13 @@ use crate::server::state::AppState;
 /// One outcome per refused envelope digest in this interval. The
 /// requester's offer schedule starts at 0, 1, 2, 4 … seconds, so this stops
 /// an outcome per early re-offer and still repeats a lost one.
-const OUTCOME_RESEND_MIN_MS: u64 = 30_000;
-/// Cap on remembered digests (64 bytes each, at most about 16 KiB).
-const OUTCOME_SEND_MEMORY_CAP: usize = 256;
+pub(in crate::server) const OUTCOME_RESEND_MIN_MS: u64 = 30_000;
+/// Cap on remembered digests, in total.
+pub(in crate::server) const OUTCOME_SEND_MEMORY_CAP: usize = 256;
+/// Cap on remembered digests per requester: one agent with many
+/// self-signed envelopes gets this many outcomes per interval and cannot
+/// fill the total memory for other requesters.
+pub(in crate::server) const OUTCOME_SEND_PER_REQUESTER_CAP: usize = 8;
 
 /// Authority side: send the refusal of one offered envelope to its
 /// requester, subject to the capability gate and the per-digest limit.
@@ -85,11 +94,15 @@ pub(in crate::server) fn send_join_request_refusal(
             .join_request_outcome_sends
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        sent.retain(|_, at| now_ms.saturating_sub(*at) < OUTCOME_RESEND_MIN_MS);
-        if sent.contains_key(&envelope_digest) || sent.len() >= OUTCOME_SEND_MEMORY_CAP {
+        sent.retain(|_, (at, _)| now_ms.saturating_sub(*at) < OUTCOME_RESEND_MIN_MS);
+        if sent.contains_key(&envelope_digest)
+            || sent.len() >= OUTCOME_SEND_MEMORY_CAP
+            || sent.values().filter(|(_, to)| *to == requester).count()
+                >= OUTCOME_SEND_PER_REQUESTER_CAP
+        {
             return;
         }
-        sent.insert(envelope_digest, now_ms);
+        sent.insert(envelope_digest, (now_ms, requester));
     }
     #[cfg(test)]
     test_seam::record(state, requester, payload.clone());

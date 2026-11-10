@@ -18799,9 +18799,17 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             if sender_hex != requester_agent_id {
                 return ApplyMetadataResult::refused(Reason::Invalid);
             }
-            if info.policy.admission != x0x::groups::GroupAdmission::RequestAccess {
-                return ApplyMetadataResult::refused(Reason::NotRequestAccess);
-            }
+            // #1840 disclosure rule (PR #1850 review r1). The reason goes to
+            // the requester, who can be any agent that knows the group id.
+            // It may name only (a) a fact about the requester itself, or
+            // (b) `Stale`: "your copy of this group is not current". It
+            // must not show WHICH owner-state check refused. So the facts
+            // about the requester are read first, and the admission policy
+            // and a request id that the roster already holds answer
+            // `Stale`, the same as a commit over a wrong head. `Invalid`
+            // is only for what the envelope alone decides (above, and the
+            // structural checks of the validator), or for validator checks
+            // that run after the revision and the chain matched.
             if info.has_active_member(&requester_agent_id) {
                 return ApplyMetadataResult::refused(Reason::AlreadyMember);
             }
@@ -18815,8 +18823,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             {
                 return ApplyMetadataResult::refused(Reason::PendingExists);
             }
-            if info.join_requests.contains_key(&request_id) {
-                return ApplyMetadataResult::refused(Reason::Invalid);
+            if info.policy.admission != x0x::groups::GroupAdmission::RequestAccess
+                || info.join_requests.contains_key(&request_id)
+            {
+                return ApplyMetadataResult::refused(Reason::Stale);
             }
             let current = info.clone();
             // The central hook ([`apply_stateful_event_with_evidence`]),
@@ -18867,12 +18877,14 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     return if evidence_not_durable {
                         ApplyMetadataResult::REJECTED
                     } else {
+                        // One reason for a commit behind the head, off the
+                        // chain, or over another roster: the validator
+                        // checks the revision before the chain, so two
+                        // reasons would let a prober read the revision.
                         ApplyMetadataResult::refused(match error {
-                            x0x::groups::ApplyError::StaleRevision { .. } => Reason::StaleHead,
-                            x0x::groups::ApplyError::PrevHashMismatch { .. }
-                            | x0x::groups::ApplyError::StateHashMismatch { .. } => {
-                                Reason::StateMismatch
-                            }
+                            x0x::groups::ApplyError::StaleRevision { .. }
+                            | x0x::groups::ApplyError::PrevHashMismatch { .. }
+                            | x0x::groups::ApplyError::StateHashMismatch { .. } => Reason::Stale,
                             _ => Reason::Invalid,
                         })
                     };

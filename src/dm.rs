@@ -163,7 +163,8 @@ impl CapabilityRegistry {
     pub const JOIN_REQUEST_OUTCOME_V1: u64 = 1 << 16;
 
     /// The routes supported by every receiver of this release.
-    /// Route-gated bits (`grant_revocation_push_v1`) are NOT here: they are
+    /// Route-gated bits (`grant_revocation_push_v1`,
+    /// `join_request_outcome_v1`) are NOT here: they are
     /// added per daemon by [`Self::advertised`] from the typed routes the
     /// DM inbox actually registered, so a library embedder that never wires
     /// the route never advertises the bit.
@@ -191,8 +192,9 @@ impl CapabilityRegistry {
     /// The registry a READY receiver advertises, given the prefixes of the
     /// typed routes its DM inbox registered. ADR 0080 §1:
     /// `grant_revocation_push_v1` is route-gated — the bit is advertised
-    /// only when the push route is registered and ready; everything in
-    /// [`Self::current`] is unconditional.
+    /// only when the push route is registered and ready. #1840:
+    /// `join_request_outcome_v1` is route-gated in the same way. Everything
+    /// in [`Self::current`] is unconditional.
     #[must_use]
     pub fn advertised<P: AsRef<[u8]>>(route_prefixes: impl IntoIterator<Item = P>) -> Self {
         let mut registry = Self::current();

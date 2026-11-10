@@ -142,7 +142,7 @@ pub(super) struct RelayEntry {
     pub(super) byte_size: usize,
 }
 
-fn build_relay_entry(
+pub(super) fn build_relay_entry(
     requester_kp: &AgentKeypair,
     topic: &str,
     group_key: &str,
