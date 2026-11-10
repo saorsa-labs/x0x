@@ -42,13 +42,17 @@ announce. The consent is now durable:
   certificate.
 - The record applies only to the identity it names. The agent must have a
   certificate, disclose the same user ID, and have the same agent ID. If
-  not, the agent announces without the user identity. A device that holds
-  only a certificate from its owner (no user key) keeps its consent, because
-  it discloses the same user.
+  not, the agent announces without the user identity. A release build loads
+  `agent.cert` only beside the user key, so durable consent applies to
+  devices that hold the user key. A device with a certificate and no user
+  key is not a production configuration today.
 - A missing, unreadable or damaged record means "not consented". The daemon
   starts.
 - `POST /announce` with `withdraw_consent: true` removes the record and
   stops the disclosure. See the API reference.
+- An identity announce that is already in flight can reach a peer after
+  the anonymous announce of the withdrawal. That peer drops the cached
+  certificate at the next anonymous heartbeat (default 600 s).
 
 The certificate is still not sent in-band on forward and `SyncV1` opens.
 That part of #1107 is not done.

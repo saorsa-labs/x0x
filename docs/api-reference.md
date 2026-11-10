@@ -532,7 +532,12 @@ publishes an announce without it. The response has
 `"consent_withdrawn": true`. `withdraw_consent` together with
 `include_user_identity: true` returns `400`. The record is removed before
 the announce: if the announce fails, the request returns `400` with
-`"consent_withdrawn": true`, and the consent stays withdrawn. Withdrawal does not make peers forget an
+`"consent_withdrawn": true`, and the consent stays withdrawn. If the daemon
+can neither remove nor empty the record (a storage error), the request
+returns `500` and no announce is sent. This run then announces without the
+identity, but the record is still on disk and the consent returns at the
+next start: correct the storage fault and send the withdrawal again.
+Withdrawal does not make peers forget an
 identity that they already saw. A peer drops the cached certificate when
 it receives a later announce without the identity.
 

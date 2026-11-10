@@ -333,7 +333,10 @@ async fn withdrawal_wins_over_an_announce_in_flight() {
         let agent = std::sync::Arc::clone(&agent);
         async move { agent.reannounce_identity_if_consented().await }
     });
-    reached_rx.await.expect("the announce published");
+    tokio::time::timeout(Duration::from_secs(30), reached_rx)
+        .await
+        .expect("the announce reaches the gate after its publish within 30 s")
+        .expect("the announce published");
 
     agent
         .withdraw_user_identity_consent()
@@ -342,8 +345,9 @@ async fn withdrawal_wins_over_an_announce_in_flight() {
     assert!(!record_path.exists(), "the withdrawal removed the record");
 
     resume_tx.send(()).expect("the announce is waiting");
-    in_flight
+    tokio::time::timeout(Duration::from_secs(30), in_flight)
         .await
+        .expect("the announce finishes within 30 s after the gate opens")
         .expect("announce task")
         .expect("the announce itself succeeded");
     assert!(

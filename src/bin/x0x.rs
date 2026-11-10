@@ -3945,6 +3945,26 @@ mod tests {
     upgrade_now_cli_regression_tests!();
     use super::*;
 
+    // #1107: `--withdraw-consent` cannot be combined with `--include-user`.
+    #[test]
+    fn announce_withdraw_consent_conflicts_with_include_user() -> anyhow::Result<()> {
+        let refused =
+            Cli::try_parse_from(["x0x", "announce", "--withdraw-consent", "--include-user"]);
+        match refused {
+            Err(e) => assert_eq!(e.kind(), clap::error::ErrorKind::ArgumentConflict),
+            Ok(_) => anyhow::bail!("the two flags must conflict"),
+        }
+        let cli = Cli::try_parse_from(["x0x", "announce", "--withdraw-consent"])?;
+        match cli.command {
+            Commands::Announce {
+                include_user: false,
+                consent: false,
+                withdraw_consent: true,
+            } => Ok(()),
+            _ => anyhow::bail!("expected announce with only withdraw_consent set"),
+        }
+    }
+
     #[test]
     fn bare_presence_alias_parses_without_nested_subcommand() -> anyhow::Result<()> {
         let cli = Cli::try_parse_from(["x0x", "presence"])?;
