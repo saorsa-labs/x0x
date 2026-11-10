@@ -767,6 +767,11 @@ pub(in crate::server) struct LoseDeviceRequest {
     force: bool,
 }
 
+/// The `owner_key_warning` field of a lose-device answer. The daemon holds
+/// no record of which machines hold the owner key, so the answer always
+/// carries it.
+const LOSE_DEVICE_OWNER_KEY_WARNING: &str = "This action does not protect your owner key (user.key). If the lost machine held it, whoever has the machine can act as you: certify new agents, sign grants and enroll devices. x0x cannot replace an owner key today. Treat the owner identity as compromised, create a new one and tell your contacts.";
+
 /// The `note` field of a lose-device answer.
 const LOSE_DEVICE_NOTE: &str = "Each listed agent can no longer act from this machine. An agent pinned to this machine is revoked. A roaming agent keeps its identity: if its key was on this machine, revoke it with DELETE /owner/agents/:id. The machine key is not revoked. An agent that you certify later is not covered: run this action again after you certify it. An agent in agents_without_placement has no placement record on this daemon and is not covered: if it ran on this machine, revoke it with DELETE /owner/agents/:id.";
 
@@ -1010,6 +1015,10 @@ pub(in crate::server) async fn owner_device_lose(
             "placement_mint_error": placement_mint_error,
             "device_enrollment": device_enrollment,
             "machine_key_revoked": false,
+            // No record says which machines hold `user.key`. A machine in
+            // the owner device set normally does.
+            "owner_key_on_device": if enrolled { "likely" } else { "unknown" },
+            "owner_key_warning": LOSE_DEVICE_OWNER_KEY_WARNING,
             "covers_agents_certified_later": false,
             "note": LOSE_DEVICE_NOTE,
         })),
@@ -1708,6 +1717,12 @@ mod lose_device_tests {
         assert_eq!(body["device_enrollment"], "removed");
         assert_eq!(body["machine_key_revoked"], false);
         assert_eq!(body["covers_agents_certified_later"], false);
+        // The owner key is the limit that matters most: the answer must
+        // say it, and must not claim to know where the key is.
+        assert_eq!(body["owner_key_on_device"], "likely", "enrolled device");
+        assert!(body["owner_key_warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("user.key")));
         assert_eq!(body["agents"].as_array().unwrap().len(), 3, "{body}");
         // The action cannot cover an agent with no placement record, so
         // it must name that agent and not report silent success for it.
@@ -1845,5 +1860,6 @@ mod lose_device_tests {
         let (status, body) = lose(&state, true, &unknown_hex, true).await;
         assert_eq!(status, StatusCode::OK, "force: {body}");
         assert_eq!(body["device_enrollment"], "not_enrolled");
+        assert_eq!(body["owner_key_on_device"], "unknown", "never enrolled");
     }
 }

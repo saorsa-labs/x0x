@@ -70,7 +70,7 @@ pub(in crate::server) struct AgentVerifyRequest {
 
 /// The `warning` field of a `POST /identity/revoke` answer that revoked this
 /// daemon's own machine (#1108).
-const OWN_MACHINE_REVOKED_WARNING: &str = "This machine is now revoked for good. Other peers refuse it and every agent on it. To use this computer on the network again, stop x0xd, delete machine.key and start x0xd to get a new machine identity.";
+const OWN_MACHINE_REVOKED_WARNING: &str = "This machine is now revoked for good. Other peers refuse it and every agent on it. x0xd does not stop itself: it keeps running and peers refuse it. To use this computer on the network again, stop x0xd, delete machine.key and start x0xd to get a new machine identity.";
 
 /// POST /announce request body.
 #[derive(Debug, Default, Deserialize)]
@@ -1690,6 +1690,26 @@ pub(in crate::server) async fn identity_revoke(
         return api_error(
             StatusCode::FORBIDDEN,
             "revoking this daemon's machine requires the durable API token (not a session token)",
+        );
+    }
+    // A repeat must not sign another record: the set has no size limit.
+    if own_machine
+        && state
+            .agent
+            .revocation_set()
+            .read()
+            .await
+            .is_machine_revoked(&state.agent.machine_id())
+    {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "subject": hex::encode(state.agent.machine_id().as_bytes()),
+                "subject_kind": "machine",
+                "already_revoked": true,
+                "warning": OWN_MACHINE_REVOKED_WARNING,
+            })),
         );
     }
     let outcome = if own_machine {

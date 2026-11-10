@@ -528,8 +528,10 @@ daemon holds:
 - `machine_id` set to this daemon's own machine: the daemon signs with its
   machine key. This needs the durable API token (`403` for a session token).
   The answer has a `warning` field. The revocation cannot be undone: peers
-  refuse this machine and every agent on it for good. To use the computer
-  again, stop `x0xd`, delete `machine.key` and start `x0xd`.
+  refuse this machine and every agent on it for good. `x0xd` does not stop
+  itself; it keeps running and peers refuse it. A repeat call signs no new
+  record and answers `"already_revoked": true`. To use the computer again,
+  stop `x0xd`, delete `machine.key` and start `x0xd`.
 
 Any other agent or machine id returns `403`: the daemon has no authority
 over it. Loading an owner key or an agent certificate does not change the
@@ -579,6 +581,8 @@ Response:
   "placement_mint_error": null,
   "device_enrollment": "removed",
   "machine_key_revoked": false,
+  "owner_key_on_device": "likely",
+  "owner_key_warning": "<text>",
   "covers_agents_certified_later": false,
   "note": "<text>"
 }
@@ -593,6 +597,13 @@ Response:
   bring the placement ledger up to date. The action then used the ledger
   it held.
 - A repeat call signs no new record.
+- **Your owner key is not protected.** If the lost machine held `user.key`,
+  whoever has the machine can act as you: certify agents, sign grants and
+  enroll devices. This action does not help with that, and x0x cannot
+  replace an owner key today. Treat the owner identity as compromised,
+  create a new one and tell your contacts. `owner_key_on_device` is `likely`
+  when the machine was in the owner device set, and `unknown` in all other
+  cases: the daemon holds no record of which machines hold the key.
 - **A roaming agent keeps its identity.** If its key was on the lost
   machine, also revoke that agent with `DELETE /owner/agents/:id`.
 - **The machine key is not revoked.** No evidence that other peers can check

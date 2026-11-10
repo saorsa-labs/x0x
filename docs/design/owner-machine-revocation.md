@@ -136,6 +136,21 @@ Questions for the decision:
   path", or is Option B required as well?
 - May a machine have more than one owner? Option B assumes one.
 
+## 5a. Limits of what is built
+
+- **The owner key.** A device that can certify agents holds the owner's
+  `user.key`. If the lost device held it, the thief holds the owner
+  identity itself, and can certify agents, sign grants and enroll devices.
+  The lost-device action does not help with that. x0x has no owner-key
+  rotation today. The daemon holds no record of which machines hold the
+  key, so the answer says `likely` for a machine in the owner device set
+  and `unknown` in all other cases.
+- **The machine key** is not revoked (Option B, #1858).
+- **A roaming agent** whose key was on the device needs a separate agent
+  revocation.
+- **An agent with no placement record** gets no tombstone; the answer
+  names it.
+
 ## 6. Tests each option would need (RED first)
 
 - A: after `lose-device`, a peer that holds the records refuses each owner

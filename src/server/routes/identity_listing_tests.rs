@@ -228,6 +228,8 @@ async fn own_machine_revoke_signs_with_the_machine_key() {
     let (state, _dir) = test_state().await;
     let machine = state.agent.machine_id();
 
+    let announce_before = state.agent.announce_identity(false, false).await.is_ok();
+
     let (status, body) = revoke_machine(&state, true, &machine).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["subject_kind"], "machine");
@@ -245,6 +247,20 @@ async fn own_machine_revoke_signs_with_the_machine_key() {
     let mut peer = crate::revocation::RevocationSet::new();
     assert!(peer.verify_and_insert(records[0].clone(), None).unwrap());
     assert!(peer.is_machine_revoked(&machine));
+
+    // The daemon does not stop itself: its own announce call gives the
+    // same result as before the revocation (peers are the ones that
+    // refuse it).
+    assert_eq!(
+        state.agent.announce_identity(false, false).await.is_ok(),
+        announce_before
+    );
+
+    // A repeat signs no second record.
+    let (status, body) = revoke_machine(&state, true, &machine).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["already_revoked"], true);
+    assert_eq!(state.agent.all_revocation_records().await.len(), 1);
 }
 
 /// WHY: a machine revocation cannot be undone, so a session token must
