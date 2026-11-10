@@ -3213,7 +3213,11 @@ fn designated_send_outcome(
         {
             Outcome::PolicyRefused
         }
+        // #1158: these two hold only share-grant and predecessor-offer
+        // payloads, never this hand-off; unknown support is unresolved.
         DmError::EnvelopeConstruction(_)
+        | DmError::RecipientCapabilityPending { .. }
+        | DmError::RecipientCapabilityUnavailable { .. }
         | DmError::RecipientUndiscovered(_)
         | DmError::RecipientKeyUnavailable(_)
         | DmError::RecipientKeyInvalid(_)

@@ -201,6 +201,19 @@ pub(in crate::server) async fn load_requester_offer_outbox(state: &AppState) -> 
     outbox(state).load(now_millis_u64()).await
 }
 
+/// #1158: `authority`'s capability advert arrived while an offer to it
+/// was held. Make its queued offers due now, so the next worker pass
+/// sends them.
+pub(in crate::server) async fn nudge_requester_offers_for(
+    state: &AppState,
+    authority: &crate::identity::AgentId,
+) -> bool {
+    let authority_hex = hex::encode(authority.as_bytes());
+    outbox(state)
+        .nudge(now_millis_u64(), |o| o.authority_agent_id == authority_hex)
+        .await
+}
+
 /// Is the obligation's join still live — pending, in a live group? When
 /// this is false the offer can never matter again (an authority may only
 /// act on a pending request), so the worker drops it.

@@ -11476,8 +11476,9 @@ impl Agent {
         //
         // The refresh runs only for a real requirement (durable ACK or the
         // payload's application bit). `require_payload_capability` fails
-        // only when `required_for_payload` names a bit, so the last
-        // conjunct is defensive: it keeps this gate from starting an
+        // only when `required_for_payload` names a bit: a current advert
+        // lacks it, or (#1158) an obligation-carrying payload has no
+        // current verified advert at all. The last conjunct is defensive: it keeps this gate from starting an
         // addressability flight (#1776) if those two ever diverge.
         let required_application =
             dm::CapabilityRegistry::required_for_payload(&payload).map(|(bit, _)| bit);
@@ -11498,8 +11499,13 @@ impl Agent {
             .await;
             advert_binding = self.capability_store.lookup_binding(to);
         }
-        // ADR 0093: only positive, current advert evidence of missing support
-        // holds product payloads. Unknown capabilities keep existing behaviour.
+        // ADR 0093: positive, current advert evidence of missing support
+        // holds product payloads. #1158 (ruling A, 20 Oct 2026): a share
+        // grant, predecessor relay or requester offer is also held while
+        // the recipient has NO current verified advert, even when a peer
+        // evidence view could address it. The refresh above has asked the
+        // recipient for its advert; the obligation's outbox retries. Every
+        // other payload with unknown capability is sent as before.
         if let Err(error) = self
             .capability_store
             .require_payload_capability(to, &payload)
