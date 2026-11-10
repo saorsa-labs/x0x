@@ -10,33 +10,67 @@
 
 use super::*;
 
-/// Drive the real local pubsub listener through the formerly racy ordering.
-/// A unique V3.1 name defeats payload dedup even within the same clock second;
-/// waiting for that name AND digest proves ingest, not just publish completion.
+/// Drive the real local pubsub listener through the formerly racy ordering:
+/// publish an anonymous announce and wait until the listener ingested it
+/// ([`anonymous_announce_ingested`]).
 async fn anonymous_announce_lands(agent: &Agent) -> Result<()> {
+    let marker = publish_anonymous_announce(agent).await?;
+    anonymous_announce_ingested(agent, &marker).await
+}
+
+/// Publish this agent's anonymous announce under a fresh name; returns the
+/// name. A unique V3.1 name defeats payload dedup even within the same
+/// clock second.
+async fn publish_anonymous_announce(agent: &Agent) -> Result<String> {
     let marker = format!("r1132-{}", rand::random::<u64>());
     agent.set_self_name(Some(marker.clone()));
     agent.announce_identity(false, false).await?;
-    let anonymous = x0x::announce_v3::cert_digest(&None, &None);
+    Ok(marker)
+}
+
+/// Discovery shows the `marker` announce: that name, the anonymous digest
+/// and no certificate. This does NOT prove listener ingest. Since #1818
+/// `announce_identity` writes exactly this entry itself, before it returns.
+async fn anonymous_entry_shows(agent: &Agent, marker: &str) -> Result<bool> {
+    let anonymous = x0x::announce_v3::anonymous_cert_digest();
+    Ok(agent
+        .discovered_agent(agent.agent_id())
+        .await?
+        .is_some_and(|entry| {
+            entry.self_name.as_deref() == Some(marker)
+                && entry.cert_digest == Some(anonymous)
+                && entry.agent_certificate.is_none()
+        }))
+}
+
+/// Wait until the listener ingested the `marker` announce: discovery shows
+/// it AND the agent is bound to its own machine. Only the listener records
+/// that authenticated binding, and it records it before its discovery write.
+/// The Home rule (ADR 0108 §4) reads the binding, so a seal that runs on the
+/// discovery entry alone can refuse (#1845). The caller's announce must be
+/// the agent's first: a binding from an earlier announce proves nothing.
+async fn anonymous_announce_ingested(agent: &Agent, marker: &str) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if agent
-                .discovered_agent(agent.agent_id())
-                .await?
-                .is_some_and(|entry| {
-                    entry.self_name.as_deref() == Some(marker.as_str())
-                        && entry.cert_digest == Some(anonymous)
-                        && entry.agent_certificate.is_none()
-                })
-            {
+            if anonymous_entry_shows(agent, marker).await? && own_machine_is_bound(agent).await {
                 return Ok::<_, anyhow::Error>(());
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .context("anonymous V3 must invalidate the discovered certificate")??;
+    .context("the listener must ingest the anonymous V3 announce")??;
     Ok(())
+}
+
+/// The agent's authenticated machine binding names its own machine.
+async fn own_machine_is_bound(agent: &Agent) -> bool {
+    x0x::dm_inbox::authenticated_machine_binding_for_testing(
+        &agent.authenticated_machine_bindings_for_testing(),
+        &agent.agent_id(),
+    )
+    .await
+        == Some(agent.machine_id())
 }
 
 /// Mechanism control: the ordinary announcement listener, with no peer or
@@ -412,6 +446,83 @@ async fn anonymous_announce_keeps_hand_installed_cert_in_a_committed_home() -> R
     );
     assert!(info.is_home_scope(), "the new head still covers the Home");
     assert!(state.agent.peers().await?.is_empty());
+    state.agent.shutdown().await;
+    Ok(())
+}
+
+/// #1845, the forced order. The listener is parked before it records the
+/// authenticated machine binding. `announce_identity` has returned, so its
+/// self-write shows the anonymous entry, but the agent has no bound machine:
+/// the Home rule does not apply and the seal is `OwnerCertMemberPending`.
+/// After the listener continues, [`anonymous_announce_ingested`] returns
+/// only with the binding recorded, and the same seal commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn home_seal_before_the_listener_binds_the_announce_is_pending() -> Result<()> {
+    use x0x::announced_record_barrier as barrier;
+    let plane = format!("r19-home-gap-{}", rand::random::<u32>());
+    let dir = tempfile::tempdir()?;
+    let state = announce_writer_state(dir.path(), &plane).await?;
+    let owner = x0x::identity::UserKeypair::generate()?;
+    let local = state.agent.agent_id();
+    let cert =
+        x0x::identity::AgentCertificate::issue(&owner, state.agent.identity().agent_keypair())?;
+    let local_hex = hex::encode(local.as_bytes());
+    install_discovery_cert(&state, &state.agent, &cert).await;
+    let (_, mut info) =
+        committed_home_group(&state, &owner, &plane, &[(local_hex.clone(), &cert, true)]).await?;
+
+    let gate = barrier::arm(local, barrier::INGEST_BEFORE_BINDING);
+    let marker = publish_anonymous_announce(&state.agent).await?;
+    tokio::time::timeout(Duration::from_secs(10), gate.reached.acquire())
+        .await
+        .context("the listener must reach the binding step")??
+        .forget();
+    assert!(
+        anonymous_entry_shows(&state.agent, &marker).await?,
+        "the self-write alone shows the anonymous entry"
+    );
+    assert_eq!(bound_machine(&state, local).await, None);
+    let err = seal_commit_owner_certified(
+        &state,
+        &mut info.clone(),
+        state.agent.identity().agent_keypair(),
+        now_millis_u64(),
+    )
+    .await
+    .expect_err("no bound machine: the Home rule does not apply yet");
+    assert!(
+        matches!(
+            &err,
+            x0x::groups::state_commit::ApplyError::OwnerCertMemberPending { members, .. }
+                if members == &vec![local_hex.clone()]
+        ),
+        "{err}"
+    );
+
+    // Hold the listener for a further 100 ms, then let every beat through.
+    let releaser = tokio::spawn({
+        let gate = Arc::clone(&gate);
+        async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            gate.release.add_permits(64);
+        }
+    });
+    anonymous_announce_ingested(&state.agent, &marker).await?;
+    assert_eq!(
+        bound_machine(&state, local).await,
+        Some(state.agent.machine_id()),
+        "the wait returns only after the listener recorded the binding"
+    );
+    releaser.await?;
+    barrier::disarm(&local, barrier::INGEST_BEFORE_BINDING);
+    seal_commit_owner_certified(
+        &state,
+        &mut info,
+        state.agent.identity().agent_keypair(),
+        now_millis_u64(),
+    )
+    .await
+    .expect("in a committed Home the anonymous digest is no disclosure");
     state.agent.shutdown().await;
     Ok(())
 }

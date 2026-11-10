@@ -5586,6 +5586,9 @@ pub(crate) mod announced_record_barrier {
     use std::collections::HashMap;
     use std::sync::{Arc, LazyLock, Mutex};
 
+    /// The identity listener, before it records the authenticated machine
+    /// binding of an accepted announcement (#1845).
+    pub(crate) const INGEST_BEFORE_BINDING: &str = "ingest_before_binding";
     pub(crate) const INGEST_BETWEEN_WRITES: &str = "ingest_between_writes";
     pub(crate) const HYDRATION_PUBLISH: &str = "hydration_publish";
 
@@ -15988,6 +15991,12 @@ impl Agent {
                         announcement.announced_at.saturating_mul(1000), now.saturating_mul(1000),
                     );
                 }
+                #[cfg(test)]
+                announced_record_barrier::park(
+                    &announcement.agent_id,
+                    announced_record_barrier::INGEST_BEFORE_BINDING,
+                )
+                .await;
                 // Probe before the bindings write lock. The contact bit is
                 // re-read if a concurrent resolve wins the epoch. The
                 // contacts lock is not held while groups and grants are scanned.
