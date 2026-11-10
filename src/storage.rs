@@ -2090,6 +2090,12 @@ pub(crate) async fn clear_user_disclosure_consent(path: &Path) -> Result<()> {
 /// [`IdentityError::Storage`] when the write or the sync fails.
 pub(crate) async fn void_user_disclosure_consent(path: &Path) -> Result<()> {
     fs::write(path, b"").await.map_err(IdentityError::from)?;
+    // The record is 0600 already; this covers a file that some other
+    // process created with a wider mode.
+    #[cfg(unix)]
+    fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .await
+        .map_err(IdentityError::from)?;
     let file = fs::File::open(path).await.map_err(IdentityError::from)?;
     file.sync_all().await.map_err(IdentityError::from)
 }

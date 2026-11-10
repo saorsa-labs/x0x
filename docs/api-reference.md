@@ -530,7 +530,13 @@ record means "not consented". It never stops the daemon.
 daemon removes the record, stops including the user identity, and then
 publishes an announce without it. The response has
 `"consent_withdrawn": true`. `withdraw_consent` together with
-`include_user_identity: true` returns `400`. The record is removed before
+`include_user_identity: true` returns `400` for the durable token; a
+session or rider token gets `403` first. A daemon older than this option
+ignores the field: it announces and returns `200` with no
+`consent_withdrawn`, and its consent stays on. Always check for
+`"consent_withdrawn": true`. The CLI does this and exits non-zero with a
+message when the field is absent; upgrade that daemon, or restart it to
+drop its in-memory consent. The record is removed before
 the announce: if the announce fails, the request returns `400` with
 `"consent_withdrawn": true`, and the consent stays withdrawn. If the daemon
 can neither remove nor empty the record (a storage error), the request
