@@ -2637,6 +2637,12 @@ async fn stale_request_entry(
     )
 }
 
+async fn refused_evidence_exists(state: &AppState) -> bool {
+    tokio::fs::try_exists(refused_listener_admission_evidence_path(state))
+        .await
+        .expect("stat refused-admission evidence path")
+}
+
 async fn request_is_stored(state: &AppState, gk: &str, request_id: &str) -> bool {
     state
         .named_groups
@@ -2697,6 +2703,13 @@ async fn issue1840_live_validation_refusal_frees_journal_for_other_groups() {
             .await
             .unwrap_or_else(|e| panic!("{kind:?}: restart after a refusal must succeed: {e}"));
         assert!(listener_admission_is_none(&state).await);
+        // Startup found no marker ON DISK: had the live release been
+        // memory-only, the loader would have refused the on-disk marker
+        // here and written the refused-admission copy.
+        assert!(
+            !refused_evidence_exists(&state).await,
+            "{kind:?}: the live release must be durable"
+        );
 
         // A valid request on an unrelated group of the same authority.
         let good_kp = fresh_kp();
@@ -2786,6 +2799,14 @@ async fn issue1840_restart_refuses_unbuildable_live_marker_and_continues() {
             .await
             .expect("refused-admission evidence copy");
         assert_eq!(evidence, held_bytes, "{kind:?}: evidence is byte-exact");
+        // The release is durable: the re-saved sidecar no longer holds
+        // the marker.
+        let resaved = relay_sidecar_bytes(&state).await;
+        assert_ne!(resaved, held_bytes, "{kind:?}: sidecar was re-saved");
+        assert!(
+            !String::from_utf8_lossy(&resaved).contains(&entry.request_id),
+            "{kind:?}: the on-disk sidecar must not hold the refused marker"
+        );
 
         // The clear is durable: the next start is clean too.
         restart_relay(&state)
@@ -2903,9 +2924,10 @@ async fn issue1840_restart_non_request_marker_is_still_fatal() {
     let held_bytes = relay_sidecar_bytes(&state).await;
 
     let result = restart_relay(&state).await;
-    assert!(
-        result.is_err(),
-        "a non-request marker must stay fatal at startup: {result:?}"
+    assert_eq!(
+        result,
+        Err("relay envelope is not JoinRequestCreated".to_string()),
+        "a non-request marker must stay fatal at startup"
     );
     assert_eq!(
         relay_sidecar_bytes(&state).await,
@@ -2913,9 +2935,206 @@ async fn issue1840_restart_non_request_marker_is_still_fatal() {
         "the rejected sidecar is preserved byte-for-byte"
     );
     assert!(
-        !tokio::fs::try_exists(refused_listener_admission_evidence_path(&state))
-            .await
-            .expect("stat evidence path"),
+        !refused_evidence_exists(&state).await,
         "a fatal rejection is not a refusal: no refused-admission copy"
     );
+}
+
+/// #1842 review r2. Startup `Refused` arm: a live marker whose request has
+/// no state commit is not admissible, and nothing of it is durable. The
+/// entry is refused, the marker is dropped durably and startup continues.
+#[tokio::test]
+async fn issue1840_restart_refuses_marker_without_commit_and_continues() {
+    let (state, _dir) = s_state().await;
+    let gk = format!("{:032x}", 0x1840_000fu32);
+    install_group_with_policy(
+        &state,
+        &gk,
+        2,
+        x0x::groups::GroupPolicyPreset::PublicRequestSecure,
+    )
+    .await;
+    let requester_kp = fresh_kp();
+    let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
+    let topic = group_topic(&state, &gk).await;
+    let marker_time = unix_ms() - 1000;
+    let entry = build_relay_entry(
+        &requester_kp,
+        &topic,
+        &gk,
+        "req-1840-no-commit",
+        &requester_hex,
+        marker_time,
+    );
+    *state.pending_listener_admission.lock().await =
+        Some(marker_admission(&gk, &requester_hex, &entry, marker_time));
+    assert_eq!(
+        save_roster(&state).await.expect("roster save"),
+        AtomicWriteOutcome::Durable
+    );
+    assert_eq!(
+        save_relay(&state).await.expect("relay save"),
+        AtomicWriteOutcome::Durable
+    );
+    let held_bytes = relay_sidecar_bytes(&state).await;
+
+    let result = restart_relay(&state).await;
+    assert_eq!(result, Ok(()), "a refused entry must not stop startup");
+    assert!(listener_admission_is_none(&state).await);
+    assert!(!request_is_stored(&state, &gk, &entry.request_id).await);
+    assert_eq!(relay_outbox_total(&state).await, 0);
+    assert!(refused_evidence_exists(&state).await);
+    assert!(
+        !String::from_utf8_lossy(&relay_sidecar_bytes(&state).await).contains(&entry.request_id),
+        "the on-disk sidecar must not hold the refused marker"
+    );
+    assert_ne!(relay_sidecar_bytes(&state).await, held_bytes);
+    assert_eq!(restart_relay(&state).await, Ok(()), "second start is clean");
+}
+
+/// Fixture for the fork-evidence rows: a request-access group whose
+/// retained log shows `requester` as an Active Admin at revision 1 and
+/// removed at revision 2 (the head). The returned entry carries the
+/// requester's commit sealed over revision 1, so the authority refuses it
+/// as `stale revision` AND classifies it as authenticated fork evidence.
+async fn removed_admin_fork_request(
+    state: &AppState,
+    gk: &str,
+    request_id: &str,
+    requester_kp: &AgentKeypair,
+) -> RelayEntry {
+    let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
+    let owner_kp = state.agent.identity().agent_keypair();
+    install_group_with_policy(
+        state,
+        gk,
+        0,
+        x0x::groups::GroupPolicyPreset::PublicRequestSecure,
+    )
+    .await;
+    let at_revision_1 = {
+        let mut groups = state.named_groups.write().await;
+        let info = groups.get_mut(gk).expect("group");
+        info.add_member(
+            requester_hex.clone(),
+            x0x::groups::GroupRole::Admin,
+            Some(local_hex(state)),
+            None,
+        );
+        info.seal_commit(owner_kp, unix_ms()).expect("seal rev 1");
+        let at_revision_1 = info.clone();
+        info.remove_member(&requester_hex, Some(local_hex(state)));
+        info.seal_commit(owner_kp, unix_ms()).expect("seal rev 2");
+        at_revision_1
+    };
+    let commit = signed_request_join_commit(&at_revision_1, requester_kp);
+    let topic = group_topic(state, gk).await;
+    build_relay_entry_with_commit(
+        requester_kp,
+        &topic,
+        gk,
+        request_id,
+        &requester_hex,
+        0,
+        commit,
+    )
+}
+
+async fn group_is_quarantined(state: &AppState, gk: &str) -> bool {
+    state
+        .named_groups
+        .read()
+        .await
+        .get(gk)
+        .is_some_and(|info| info.fork_quarantine.is_some())
+}
+
+/// #1842 review r1/r2, startup. Fork evidence is found for the refused
+/// commit but its install fails: startup stays fatal and keeps the sidecar
+/// (the marker is the only copy of the conflict). When the install can
+/// succeed, the next start records the evidence, refuses the entry and
+/// continues.
+#[tokio::test]
+async fn issue1840_restart_keeps_marker_until_fork_evidence_is_durable() {
+    let (state, _dir) = s_state().await;
+    let gk = format!("{:032x}", 0x1840_0010u32);
+    let requester_kp = fresh_kp();
+    let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
+    let entry =
+        removed_admin_fork_request(&state, &gk, "req-1840-fork-restart", &requester_kp).await;
+    *state.pending_listener_admission.lock().await = Some(marker_admission(
+        &gk,
+        &requester_hex,
+        &entry,
+        unix_ms() - 1000,
+    ));
+    assert_eq!(
+        save_roster(&state).await.expect("roster save"),
+        AtomicWriteOutcome::Durable
+    );
+    assert_eq!(
+        save_relay(&state).await.expect("relay save"),
+        AtomicWriteOutcome::Durable
+    );
+    let held_bytes = relay_sidecar_bytes(&state).await;
+
+    {
+        let _fault = set_save_fault(&state, SaveFault::Error);
+        let result = restart_relay(&state).await;
+        let error = result.expect_err("evidence not durable must stay fatal");
+        assert!(
+            error.contains("stale revision")
+                && error.contains("fork evidence was not installed durably"),
+            "unexpected startup error: {error}"
+        );
+    }
+    assert_eq!(relay_sidecar_bytes(&state).await, held_bytes);
+    assert!(!refused_evidence_exists(&state).await);
+    assert!(!group_is_quarantined(&state, &gk).await);
+
+    assert_eq!(
+        restart_relay(&state).await,
+        Ok(()),
+        "retry installs evidence"
+    );
+    assert!(group_is_quarantined(&state, &gk).await);
+    assert!(listener_admission_is_none(&state).await);
+    assert!(!request_is_stored(&state, &gk, &entry.request_id).await);
+    assert!(refused_evidence_exists(&state).await);
+}
+
+/// #1842 review r2, live path — the same rule. Evidence found but not
+/// installed durably keeps the journal marker; once the install is
+/// durable, the re-offer of the same envelope is a clean refusal and the
+/// marker is released.
+#[tokio::test]
+async fn issue1840_live_keeps_marker_until_fork_evidence_is_durable() {
+    let (state, _dir) = s_state().await;
+    let lh = local_hex(&state);
+    let gk = format!("{:032x}", 0x1840_0011u32);
+    let requester_kp = fresh_kp();
+    let entry = removed_admin_fork_request(&state, &gk, "req-1840-fork-live", &requester_kp).await;
+    assert_eq!(
+        save_roster(&state).await.expect("roster save"),
+        AtomicWriteOutcome::Durable
+    );
+
+    {
+        let _fault = set_save_fault(&state, SaveFault::Error);
+        offer_via_handler(&state, &lh, &entry, &requester_kp, unix_ms()).await;
+    }
+    let marker = state.pending_listener_admission.lock().await.clone();
+    assert!(
+        marker.is_some_and(|m| m.digest == entry.digest),
+        "evidence found but not durable must keep the admission journal"
+    );
+    assert!(!group_is_quarantined(&state, &gk).await);
+
+    offer_via_handler(&state, &lh, &entry, &requester_kp, unix_ms()).await;
+    assert!(group_is_quarantined(&state, &gk).await);
+    assert!(
+        listener_admission_is_none(&state).await,
+        "with the evidence durable the refusal releases the journal"
+    );
+    assert!(!request_is_stored(&state, &gk, &entry.request_id).await);
 }
