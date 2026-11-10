@@ -308,6 +308,162 @@ async fn withdrawal_clears_the_record_across_a_restart() {
     assert_eq!(seen.discovered_user, Some(user_id));
 }
 
+/// A withdrawal that completes while a consented announce is in flight
+/// wins: the announce, which published before the withdrawal, must not
+/// write the record again or turn the flag back on. The gate stops the
+/// announce between its publish and its consent record, so the order is
+/// fixed without a sleep.
+#[tokio::test]
+async fn withdrawal_wins_over_an_announce_in_flight() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    write_user_key(dir.path()).await;
+    let record_path = dir.path().join(CONSENT_FILE);
+    let agent = std::sync::Arc::new(agent_on(dir.path()).await);
+    agent
+        .announce_identity(true, true)
+        .await
+        .expect("the consented disclosure publishes");
+    assert!(record_path.exists());
+
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+    *agent.consented_publish_test_gate.lock().expect("gate lock") = Some((reached_tx, resume_rx));
+    // The cert-renewal path: it sees the consent and announces with it.
+    let in_flight = tokio::spawn({
+        let agent = std::sync::Arc::clone(&agent);
+        async move { agent.reannounce_identity_if_consented().await }
+    });
+    reached_rx.await.expect("the announce published");
+
+    agent
+        .withdraw_user_identity_consent()
+        .await
+        .expect("withdrawal");
+    assert!(!record_path.exists(), "the withdrawal removed the record");
+
+    resume_tx.send(()).expect("the announce is waiting");
+    in_flight
+        .await
+        .expect("announce task")
+        .expect("the announce itself succeeded");
+    assert!(
+        !agent.user_identity_consented(),
+        "the older announce must not turn the consent back on"
+    );
+    assert!(
+        !record_path.exists(),
+        "the older announce must not write the record again"
+    );
+    agent.shutdown().await;
+
+    let seen = restart_and_observe(dir.path()).await;
+    assert_anonymous(
+        &seen,
+        "the withdrawal completed after the announce published",
+    );
+}
+
+/// A directory with one file in it at the record path: the record can be
+/// neither written, removed nor emptied.
+fn block_record_path(record_path: &Path) {
+    std::fs::create_dir(record_path).expect("directory at the record path");
+    std::fs::write(record_path.join("blocker"), b"x").expect("blocker file");
+}
+
+/// The record write fails once. The consent still holds for this run, and
+/// the next consented announce writes the record.
+#[tokio::test]
+async fn failed_record_write_is_retried_by_the_next_consented_announce() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let user_id = write_user_key(dir.path()).await;
+    let record_path = dir.path().join(CONSENT_FILE);
+    block_record_path(&record_path);
+
+    let agent = agent_on(dir.path()).await;
+    assert!(!agent.user_identity_consented());
+    agent
+        .announce_identity(true, true)
+        .await
+        .expect("the announce succeeds when the record write fails");
+    assert!(agent.user_identity_consented());
+    assert!(record_path.is_dir(), "the record was not written");
+
+    std::fs::remove_dir_all(&record_path).expect("clear the record path");
+    agent
+        .announce_identity(true, true)
+        .await
+        .expect("the second consented announce publishes");
+    let record = storage::load_user_disclosure_consent(&record_path)
+        .await
+        .expect("the consent record decodes")
+        .expect("the second consented announce writes the record");
+    assert_eq!(record.user_id, user_id);
+    agent.shutdown().await;
+
+    let seen = restart_and_observe(dir.path()).await;
+    assert!(seen.consented && seen.startup_is_identity);
+}
+
+/// The record can be neither removed nor emptied: the withdrawal reports
+/// the error, and this run is still anonymous.
+#[tokio::test]
+async fn withdrawal_reports_a_record_it_cannot_remove() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    write_user_key(dir.path()).await;
+    block_record_path(&dir.path().join(CONSENT_FILE));
+
+    let agent = agent_on(dir.path()).await;
+    agent
+        .announce_identity(true, true)
+        .await
+        .expect("the consented disclosure publishes");
+    assert!(agent.user_identity_consented());
+    assert!(
+        agent.withdraw_user_identity_consent().await.is_err(),
+        "the failed removal is an error"
+    );
+    assert!(!agent.user_identity_consented());
+    agent.shutdown().await;
+}
+
+/// A read-only identity directory: the record cannot be removed, so the
+/// withdrawal empties it. The next start does not bring the consent back.
+#[cfg(unix)]
+#[tokio::test]
+async fn withdrawal_empties_a_record_it_cannot_remove() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tmpdir");
+    write_user_key(dir.path()).await;
+    let record_path = dir.path().join(CONSENT_FILE);
+    let agent = agent_on(dir.path()).await;
+    agent
+        .announce_identity(true, true)
+        .await
+        .expect("the consented disclosure publishes");
+    assert!(record_path.exists());
+
+    let set_mode = |mode: u32| {
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode))
+            .expect("set the directory mode");
+    };
+    set_mode(0o500);
+    let withdrawn = agent.withdraw_user_identity_consent().await;
+    set_mode(0o700);
+    withdrawn.expect("the withdrawal empties the record");
+    assert!(!agent.user_identity_consented());
+    // A privileged test user can still remove the file; both results mean
+    // "not consented".
+    let left = std::fs::metadata(&record_path).map(|meta| meta.len()).ok();
+    assert!(
+        matches!(left, None | Some(0)),
+        "record bytes left: {left:?}"
+    );
+    agent.shutdown().await;
+
+    let seen = restart_and_observe(dir.path()).await;
+    assert_anonymous(&seen, "the record was emptied by the withdrawal");
+}
+
 /// The record format: `X0UC` + bincode(version, user, agent, time), 77
 /// bytes. Wrong magic, an unknown version, short and long inputs fail.
 #[test]

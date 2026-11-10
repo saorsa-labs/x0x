@@ -30,7 +30,8 @@ All notable changes to this project will be documented in this file.
   identity directory. At the next start the daemon loads it before the first
   announce, so the startup announce and the heartbeats carry the user ID and
   the agent certificate with no manual step. The record applies only to the
-  same user, agent and certificate; a missing or unreadable record means no
+  same user and agent, with a certificate present (a renewed certificate
+  keeps the consent); a missing or unreadable record means no
   consent, and the daemon still starts. New: `POST /announce` with
   `withdraw_consent: true` (CLI `x0x announce --withdraw-consent`, durable
   owner token only) removes the record and announces anonymously; the

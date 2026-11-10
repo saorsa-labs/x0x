@@ -2082,6 +2082,18 @@ pub(crate) async fn clear_user_disclosure_consent(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Make the consent record empty and fsync it. An empty file is not a
+/// valid record, so a load reads it as "not consented". Used when the
+/// record cannot be removed.
+///
+/// # Errors
+/// [`IdentityError::Storage`] when the write or the sync fails.
+pub(crate) async fn void_user_disclosure_consent(path: &Path) -> Result<()> {
+    fs::write(path, b"").await.map_err(IdentityError::from)?;
+    let file = fs::File::open(path).await.map_err(IdentityError::from)?;
+    file.sync_all().await.map_err(IdentityError::from)
+}
+
 /// Default path for the revocation set file.
 ///
 /// When `identity_dir` is provided (multi-instance daemons), the file is
