@@ -52,9 +52,10 @@ existing rule stays: those registries are never seeded from evidence.
 No new message. On every new connection to a related peer the opener
 already sends its EvidenceV1 Hello (announce and capability advert). The
 receiver reports whether it holds the certificate; on a miss the opener
-sends it in a CERTIFICATE continuation. The Hello runs at most once a
-minute per peer. A failure there never blocks the open: the forward is then
-decided as before this change.
+sends it in a CERTIFICATE continuation. The Hello runs at most once per
+peer per 60 s (`HELLO_INTERVAL`), not once per certificate. A failure
+there never blocks the open: the forward is then decided as before this
+change.
 
 ## SyncV1
 
@@ -71,9 +72,12 @@ receiver when the receiver holds its evidence.
 ## Tests
 
 `src/peer_evidence_forward_opener_tests.rs`: admitted from evidence with an
-empty cache (registries stay empty); denied when the header is not signed
-by the agent key, when the record names another machine, when the agent is
-revoked, when the certificate is expired, and when it is from another
-owner. `src/owner_trust/tests.rs`: `ForwardV2` from an enrolled machine
+empty cache (registries stay empty); denied, with the reason asserted, when
+the header is not signed by the agent key, when the transport machine is
+another enrolled machine, when a discovery entry names another machine
+(not overridden), when the agent, the machine or the binding is revoked,
+when the certificate expires after ingest, and when it is from another
+owner. `src/forward.rs`: an enrolled machine with no known agent that is
+revoked before the header read is dropped without a panic. `src/owner_trust/tests.rs`: `ForwardV2` from an enrolled machine
 with no known agent reaches the forward acceptor; a machine that is not
 enrolled gets nothing.

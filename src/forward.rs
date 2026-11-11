@@ -1256,7 +1256,12 @@ pub(crate) async fn handle_inbound(mut stream: PeerStream, ctx: &InboundCtx) {
             ctx.fwd_diag.record_revoked_mid_flight();
             tracing::info!(
                 target: "x0x::forward",
-                agent = %hex::encode(agents[0].as_bytes()),
+                // #1107: an enrolled machine with no known agent arrives
+                // with an empty list.
+                agent = %agents
+                    .first()
+                    .map(|a| hex::encode(a.as_bytes()))
+                    .unwrap_or_default(),
                 agent_count = agents.len(),
                 machine = %hex::encode(peer.as_bytes()),
                 outcome = "drop_revoked_mid_flight",
@@ -6215,6 +6220,58 @@ mod tests {
             machine_id: Some(machine),
             newly_pinned: false,
         }
+    }
+
+    /// #1107: an enrolled owner machine with no known agent reaches the
+    /// forward acceptor with an EMPTY agent list. If the machine is revoked
+    /// before the header read, the acceptor drops the stream cleanly; it
+    /// must not index the empty list.
+    #[tokio::test]
+    async fn revoked_machine_with_no_known_agent_drops_before_header_without_panic() {
+        let machine_kp = crate::identity::MachineKeypair::generate().expect("machine");
+        let machine = machine_kp.machine_id();
+        let mut revocations = crate::revocation::RevocationSet::new();
+        let record = crate::revocation::RevocationRecord::sign(
+            crate::revocation::RevokedSubject::Machine(machine),
+            machine_kp.public_key(),
+            machine_kp.secret_key(),
+            1,
+            None,
+        )
+        .expect("machine revocation");
+        revocations
+            .verify_and_insert(record, None)
+            .expect("insert machine revocation");
+        assert!(revocations.is_machine_revoked(&machine));
+
+        let policy = Arc::new(ConnectPolicy::default());
+        let fwd_diag = Arc::new(ForwardDiagnostics::default());
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let ctx = InboundCtx {
+            connect_diag: Arc::new(ConnectDiagnostics::new(policy.summary())),
+            policy,
+            fwd_diag: Arc::clone(&fwd_diag),
+            revocation_set: Arc::new(tokio::sync::RwLock::new(revocations)),
+            move_state: Arc::new(tokio::sync::RwLock::new(crate::key_move::MoveState::new())),
+            discovery_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            contact_store: Arc::new(tokio::sync::RwLock::new(ContactStore::new(
+                dir.path().join("contacts.json"),
+            ))),
+            own_machine_id: MachineId([0x77; 32]),
+            require_attestation: true,
+            owner_trust: crate::owner_trust::OwnerTrust::default(),
+            live: Arc::new(teardown::LiveStreams::new(Arc::clone(&fwd_diag))),
+            reauth: Arc::new(tokio::sync::Notify::new()),
+        };
+        let ((send, recv), (_peer_send, _peer_recv)) =
+            crate::network::sim::connected_bi_halves().await;
+        let stream = PeerStream::new(Vec::new(), machine, StreamProtocol::ForwardV2, send, recv);
+        handle_inbound(stream, &ctx).await;
+        assert_eq!(
+            fwd_diag.revoked_mid_flight(),
+            1,
+            "the revoked machine is dropped before the header read"
+        );
     }
 
     fn peer_stream(

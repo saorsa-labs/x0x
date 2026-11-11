@@ -22,11 +22,18 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 const TARGET: &str = "127.0.0.1:22";
+/// The denial for an opener the gate cannot accept from evidence. The
+/// store's point-of-use check (`usable`) refuses a revoked or expired
+/// record, so the gate finds no opener; a foreign certificate passes that
+/// check but gives no owner trust. Both deny as for an unknown agent.
+const NO_USABLE_EVIDENCE: ConnectDenialReason = ConnectDenialReason::AttestationFailed;
 
 struct Fixture {
     _dir: tempfile::TempDir,
     peer: Peer,
     local_machine: MachineId,
+    /// Another machine the same owner enrolled; it holds no record.
+    other_enrolled: MachineId,
     owner_trust: crate::owner_trust::OwnerTrust,
     revocations: Arc<tokio::sync::RwLock<RevocationSet>>,
     bindings: Arc<tokio::sync::RwLock<crate::dm_inbox::AuthenticatedMachineBindingCache>>,
@@ -50,9 +57,9 @@ async fn fixture(
     record.certificate = cert(&peer).map(|c| c.to_storage_bytes().expect("cert bytes"));
     let fixture_store =
         PeerEvidenceStore::open(dir.path(), EvidenceConfig::default(), policy, now).expect("store");
-    // An expired certificate may be refused here already; the gate must
-    // deny either way, so the result is not asserted.
-    let _ = fixture_store.ingest(record, IngestSource::Hello, now);
+    fixture_store
+        .ingest(record, IngestSource::Hello, now)
+        .expect("the record is valid at ingest");
     fixture_store.flush(now, true).expect("flush");
     drop(fixture_store);
 
@@ -72,6 +79,14 @@ async fn fixture(
         )
         .await
         .expect("enroll");
+    let other_enrolled = Peer::new().m();
+    devices
+        .enroll(
+            crate::owner_sync::OwnerEnrollment::sign(other_enrolled, owner, now - 1000, None)
+                .expect("enrollment"),
+        )
+        .await
+        .expect("enroll the other machine");
     owner_trust.install_device_store(devices);
     let revocations = Arc::new(tokio::sync::RwLock::new(RevocationSet::new()));
     let runtime = Arc::new(EvidenceRuntime::default());
@@ -91,6 +106,7 @@ async fn fixture(
         _dir: dir,
         peer,
         local_machine: local.m(),
+        other_enrolled,
         owner_trust,
         revocations,
         bindings,
@@ -154,12 +170,37 @@ async fn assert_registries_empty(f: &Fixture) {
     );
 }
 
+fn issued(owner: &UserKeypair) -> impl FnOnce(&Peer) -> Option<AgentCertificate> + '_ {
+    move |p: &Peer| AgentCertificate::issue(owner, &p.agent).ok()
+}
+
+async fn assert_no_usable_evidence(f: &Fixture) {
+    let now = crate::dm_capability::now_unix_ms();
+    assert!(
+        f._runtime.usable(f.peer.a(), f.peer.m(), now).is_none(),
+        "the evidence store refuses the record at point of use"
+    );
+}
+
+async fn revoke(f: &Fixture, record: RevocationRecord, cert: Option<&AgentCertificate>) {
+    f.revocations
+        .write()
+        .await
+        .verify_and_insert(record, cert)
+        .expect("insert revocation");
+}
+
+fn now_secs() -> u64 {
+    crate::dm_capability::now_unix_ms() / 1000
+}
+
 /// The receiver knows the opener only from evidence: the owner-principal
-/// forward is admitted. RED before #1107: `agent_not_in_discovery_cache`.
+/// forward is admitted. RED before #1107: `AttestationFailed` from
+/// `agent_not_in_discovery_cache`.
 #[tokio::test]
 async fn forward_opener_known_only_from_evidence_is_admitted() {
     let owner = UserKeypair::generate().expect("owner");
-    let f = fixture(&owner, |p| AgentCertificate::issue(&owner, &p.agent).ok()).await;
+    let f = fixture(&owner, issued(&owner)).await;
     let h = header(&f.peer.agent, &f.peer.agent, f.local_machine);
     assert_eq!(
         decide(&f, &h, f.peer.m()).await,
@@ -168,13 +209,23 @@ async fn forward_opener_known_only_from_evidence_is_admitted() {
     assert_registries_empty(&f).await;
 }
 
+/// The fixture really stores a usable record, so the denial tests below
+/// fail for their own reason, not for an empty store.
+#[tokio::test]
+async fn fixture_record_is_usable() {
+    let owner = UserKeypair::generate().expect("owner");
+    let f = fixture(&owner, issued(&owner)).await;
+    let now = crate::dm_capability::now_unix_ms();
+    assert!(f._runtime.usable(f.peer.a(), f.peer.m(), now).is_some());
+}
+
 /// A machine that names the agent and carries its public key, but cannot
 /// sign as that agent, is denied. The machine-signed record alone is never
 /// enough.
 #[tokio::test]
 async fn forward_opener_that_cannot_sign_as_the_agent_is_denied() {
     let owner = UserKeypair::generate().expect("owner");
-    let f = fixture(&owner, |p| AgentCertificate::issue(&owner, &p.agent).ok()).await;
+    let f = fixture(&owner, issued(&owner)).await;
     let forger = AgentKeypair::generate().expect("forger");
     let h = header(&f.peer.agent, &forger, f.local_machine);
     assert_eq!(
@@ -184,63 +235,149 @@ async fn forward_opener_that_cannot_sign_as_the_agent_is_denied() {
     assert_registries_empty(&f).await;
 }
 
-/// The record names another machine than the transport peer: denied.
+/// The transport machine is another machine of the same owner, enrolled
+/// too, but the record names the agent's own machine: no evidence for this
+/// pair, so the opener is unknown.
 #[tokio::test]
-async fn forward_opener_on_another_machine_than_the_record_is_denied() {
+async fn forward_opener_on_another_enrolled_machine_is_denied() {
     let owner = UserKeypair::generate().expect("owner");
-    let f = fixture(&owner, |p| AgentCertificate::issue(&owner, &p.agent).ok()).await;
+    let f = fixture(&owner, issued(&owner)).await;
     let h = header(&f.peer.agent, &f.peer.agent, f.local_machine);
-    let other = MachineId([0x5a; 32]);
-    assert!(decide(&f, &h, other).await.is_err());
+    assert_eq!(
+        decide(&f, &h, f.other_enrolled).await,
+        Err(ConnectDenialReason::AttestationFailed)
+    );
     assert_registries_empty(&f).await;
 }
 
-/// The fixture really stores a usable record, so the denial tests below
-/// fail for their own reason, not for an empty store.
+/// A discovery entry that names a different machine is not overridden by
+/// evidence: the cache answers, and the machine does not match.
 #[tokio::test]
-async fn fixture_record_is_usable() {
+async fn discovery_entry_on_another_machine_is_not_overridden_by_evidence() {
     let owner = UserKeypair::generate().expect("owner");
-    let f = fixture(&owner, |p| AgentCertificate::issue(&owner, &p.agent).ok()).await;
-    let now = crate::dm_capability::now_unix_ms();
-    assert!(f._runtime.usable(f.peer.a(), f.peer.m(), now).is_some());
+    let f = fixture(&owner, issued(&owner)).await;
+    let elsewhere = MachineId([0x5a; 32]);
+    let entry = crate::DiscoveredAgent {
+        self_name: None,
+        agent_id: f.peer.a(),
+        machine_id: elsewhere,
+        user_id: None,
+        addresses: Vec::new(),
+        announced_at: 0,
+        last_seen: 0,
+        machine_public_key: Vec::new(),
+        nat_type: None,
+        can_receive_direct: None,
+        is_relay: None,
+        is_coordinator: None,
+        reachable_via: Vec::new(),
+        relay_candidates: Vec::new(),
+        cert_not_after: None,
+        agent_certificate: None,
+        agent_public_key: f.peer.agent.public_key().as_bytes().to_vec(),
+        cert_digest: None,
+    };
+    f.discovery.write().await.insert(f.peer.a(), entry);
+    let h = header(&f.peer.agent, &f.peer.agent, f.local_machine);
+    assert_eq!(
+        decide(&f, &h, f.peer.m()).await,
+        Err(ConnectDenialReason::AgentNotOnMachine)
+    );
+    let cache = f.discovery.read().await;
+    assert_eq!(cache.len(), 1);
+    assert_eq!(
+        cache.get(&f.peer.a()).map(|e| e.machine_id),
+        Some(elsewhere),
+        "the discovery entry is not rewritten from evidence"
+    );
 }
 
 /// A self-revoked agent is denied, though its record is still on disk.
 #[tokio::test]
 async fn forward_opener_with_a_revoked_agent_is_denied() {
     let owner = UserKeypair::generate().expect("owner");
-    let f = fixture(&owner, |p| AgentCertificate::issue(&owner, &p.agent).ok()).await;
+    let f = fixture(&owner, issued(&owner)).await;
     let record = RevocationRecord::sign(
         RevokedSubject::Agent(f.peer.a()),
         f.peer.agent.public_key(),
         f.peer.agent.secret_key(),
-        crate::dm_capability::now_unix_ms() / 1000,
+        now_secs(),
         None,
     )
     .expect("revocation");
-    f.revocations
-        .write()
-        .await
-        .verify_and_insert(record, None)
-        .expect("insert revocation");
+    revoke(&f, record, None).await;
     let h = header(&f.peer.agent, &f.peer.agent, f.local_machine);
-    assert!(decide(&f, &h, f.peer.m()).await.is_err());
+    assert_eq!(decide(&f, &h, f.peer.m()).await, Err(NO_USABLE_EVIDENCE));
+    assert_no_usable_evidence(&f).await;
     assert_registries_empty(&f).await;
 }
 
-/// An expired certificate gives no owner trust: denied.
+/// A self-revoked machine is denied on the evidence path.
 #[tokio::test]
-async fn forward_opener_with_an_expired_certificate_is_denied() {
+async fn forward_opener_on_a_revoked_machine_is_denied() {
     let owner = UserKeypair::generate().expect("owner");
-    // Past the expiry clock-skew allowance, so the certificate is expired.
-    let past =
-        crate::dm_capability::now_unix_ms() / 1000 - crate::identity::EXPIRY_CLOCK_SKEW_SECS - 60;
+    let f = fixture(&owner, issued(&owner)).await;
+    let record = RevocationRecord::sign(
+        RevokedSubject::Machine(f.peer.m()),
+        f.peer.machine.public_key(),
+        f.peer.machine.secret_key(),
+        now_secs(),
+        None,
+    )
+    .expect("revocation");
+    revoke(&f, record, None).await;
+    let h = header(&f.peer.agent, &f.peer.agent, f.local_machine);
+    assert_eq!(decide(&f, &h, f.peer.m()).await, Err(NO_USABLE_EVIDENCE));
+    assert_no_usable_evidence(&f).await;
+    assert_registries_empty(&f).await;
+}
+
+/// The owner retired the agent's binding to this machine: denied on the
+/// evidence path.
+#[tokio::test]
+async fn forward_opener_with_a_revoked_binding_is_denied() {
+    let owner = UserKeypair::generate().expect("owner");
+    let f = fixture(&owner, issued(&owner)).await;
+    let cert = AgentCertificate::issue(&owner, &f.peer.agent).expect("cert");
+    let record = RevocationRecord::sign(
+        RevokedSubject::AgentMachineBinding(crate::revocation::AgentMachineBinding {
+            agent: f.peer.a(),
+            machine: f.peer.m(),
+            move_epoch: 1,
+        }),
+        owner.public_key(),
+        owner.secret_key(),
+        now_secs(),
+        None,
+    )
+    .expect("revocation");
+    revoke(&f, record, Some(&cert)).await;
+    let h = header(&f.peer.agent, &f.peer.agent, f.local_machine);
+    assert_eq!(decide(&f, &h, f.peer.m()).await, Err(NO_USABLE_EVIDENCE));
+    assert_no_usable_evidence(&f).await;
+    assert_registries_empty(&f).await;
+}
+
+/// The certificate is valid when the record is stored and expires before
+/// the forward: the gate denies (the ingest succeeded; see the fixture).
+#[tokio::test]
+async fn forward_opener_whose_certificate_expired_after_ingest_is_denied() {
+    let owner = UserKeypair::generate().expect("owner");
+    // Expired, with the skew allowance, two seconds from now.
+    let not_after = now_secs() + 2 - crate::identity::EXPIRY_CLOCK_SKEW_SECS;
     let f = fixture(&owner, |p| {
-        AgentCertificate::issue_with_expiry(&owner, &p.agent, Some(past)).ok()
+        AgentCertificate::issue_with_expiry(&owner, &p.agent, Some(not_after)).ok()
     })
     .await;
+    let now = crate::dm_capability::now_unix_ms();
+    assert!(
+        f._runtime.usable(f.peer.a(), f.peer.m(), now).is_some(),
+        "the certificate is still current at ingest"
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
     let h = header(&f.peer.agent, &f.peer.agent, f.local_machine);
-    assert!(decide(&f, &h, f.peer.m()).await.is_err());
+    assert_eq!(decide(&f, &h, f.peer.m()).await, Err(NO_USABLE_EVIDENCE));
+    assert_no_usable_evidence(&f).await;
     assert_registries_empty(&f).await;
 }
 
@@ -249,11 +386,12 @@ async fn forward_opener_with_an_expired_certificate_is_denied() {
 async fn forward_opener_with_a_foreign_certificate_is_denied() {
     let owner = UserKeypair::generate().expect("owner");
     let stranger = UserKeypair::generate().expect("stranger");
-    let f = fixture(&owner, |p| {
-        AgentCertificate::issue(&stranger, &p.agent).ok()
-    })
-    .await;
+    let f = fixture(&owner, issued(&stranger)).await;
     let h = header(&f.peer.agent, &f.peer.agent, f.local_machine);
-    assert!(decide(&f, &h, f.peer.m()).await.is_err());
+    assert_eq!(decide(&f, &h, f.peer.m()).await, Err(NO_USABLE_EVIDENCE));
+    // Here the record itself is usable; owner trust refuses the foreign
+    // certificate, and an evidence opener is admitted for owner trust only.
+    let now = crate::dm_capability::now_unix_ms();
+    assert!(f._runtime.usable(f.peer.a(), f.peer.m(), now).is_some());
     assert_registries_empty(&f).await;
 }
