@@ -519,6 +519,11 @@ or binding revocation: the one with the earlier `revoked_at`, and for equal
 times the lower record hash (#1857). A later record for the same pair adds
 nothing, and the subject stays revoked.
 
+A daemon sends its revocation set to peers as one gossip batch when the set
+fits, and as a round of marked batches when it does not; see
+[`docs/design/revocation-batches.md`](design/revocation-batches.md). The
+marker records of a round are never in this listing.
+
 A new record's `reason` is at most 1024 bytes. `POST /identity/revoke` and
 `DELETE /owner/agents/:id` answer `400` above that, and a daemon refuses
 such a record from a peer. The reason is inside the signed record and every
