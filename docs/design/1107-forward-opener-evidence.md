@@ -30,10 +30,12 @@ hold:
 4. The record came through EvidenceV1 admission (a related peer or the
    bounded pool), and the store's point-of-use check (`usable`) passes.
 
-An opener found this way is admitted for owner trust only. Contact rules
-and share grants still need the discovery path. The ShareGrant path is
-denied for evidence-source openers at the `authorize_attested_opener` gate
-(`src/forward.rs`).
+An opener found this way is admitted for owner trust only. Only a
+`principal = "owner"` connect ACL entry that lists the target admits it.
+An exact-pair entry or a `principal = "grant"` entry does not, at admission
+or at the re-check of a live stream. Contact rules and share grants still
+need the discovery path. `authorize_attested_opener` (`src/forward.rs`)
+applies this rule; admission and the re-check both call it.
 
 The gate writes nothing to the discovery cache, the authenticated binding
 registry or the capability registry. It does not cache the result. The
@@ -89,12 +91,16 @@ the header is not signed by the agent key, when the transport machine is
 another enrolled machine, when a discovery entry names another machine
 (not overridden), when the agent, the machine or the binding is revoked,
 when the certificate expires after ingest, and when it is from another
-owner. `src/forward.rs`: an enrolled machine with no known agent that is
+owner, and when the ACL has only an exact-pair entry or only a grant entry. `src/forward.rs`: an enrolled machine with no known agent that is
 revoked before the header read is dropped without a panic; and
 `forward_from_evidence_only_opener_survives_registration_reauth` drives the
 real path (enrollment routing, acceptor, `handle_inbound`, registration and
 its reauth pass) with an empty discovery cache, checks bytes still flow
 after the reauth, and checks that revoking the opener tears the stream
-down. Without the `reevaluate` change that test fails. `src/owner_trust/tests.rs`: `ForwardV2` from an enrolled machine
+down. Without the `reevaluate` change that test fails.
+`forward_from_evidence_only_opener_is_not_admitted_by_an_exact_pair_entry`
+uses the same real path: when the owner entry is replaced by an exact-pair
+entry for the opener, the re-check tears the stream down and a new stream
+is refused. `src/owner_trust/tests.rs`: `ForwardV2` from an enrolled machine
 with no known agent reaches the forward acceptor; a machine that is not
 enrolled gets nothing.

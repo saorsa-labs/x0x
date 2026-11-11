@@ -1033,6 +1033,26 @@ pub(crate) async fn authorize_attested_opener(
     ) {
         return LocalAuthorityOutcome::Deny(AuthzDenial::Gate(reason));
     }
+    // #1107 (A03, A05, docs/connect-acl.md): an opener known only from
+    // evidence is admitted by a `principal = "owner"` entry that lists this
+    // target, and by nothing else. An exact-pair entry does not match it.
+    // (Grant entries cannot match: grant access is empty for this source.)
+    // The reauth re-check calls this function, so the same rule applies to a
+    // live stream.
+    if agent.source == OpenerSource::Evidence {
+        let ConnectPolicy::Enabled(acl) = policy else {
+            return LocalAuthorityOutcome::Deny(AuthzDenial::Gate(
+                ConnectDenialReason::ConnectDisabled,
+            ));
+        };
+        if !acl.owner_entry_allows(target) {
+            return LocalAuthorityOutcome::Deny(AuthzDenial::Gate(if acl.has_owner_entries() {
+                ConnectDenialReason::TargetNotAllowed
+            } else {
+                ConnectDenialReason::AgentMachineNotInAcl
+            }));
+        }
+    }
 
     // The machine-level gate may have excluded a moved-away co-resident
     // while accepting a live agent on the same machine. Authenticate the
@@ -1065,6 +1085,10 @@ pub(crate) async fn authorize_attested_opener(
         return LocalAuthorityOutcome::Deny(AuthzDenial::PairingRetired);
     }
 
+    if agent.source == OpenerSource::Evidence {
+        // Only an owner entry can have admitted it (checked above).
+        return LocalAuthorityOutcome::Allow(teardown::StreamAuthority::OwnerTrust);
+    }
     LocalAuthorityOutcome::Allow(teardown::StreamAuthority::classify(
         policy,
         opener,
@@ -6726,16 +6750,66 @@ mod tests {
         counted
     }
 
-    /// #1107 real accept path. Bob's discovery cache never holds Alice. Bob's
-    /// owner enrolled Alice's machine, and Bob's evidence store holds Alice's
-    /// record with a certificate from that owner. Alice opens a `ForwardV2`
-    /// forward: Bob routes the agentless stream to the forward acceptor,
-    /// `handle_inbound` admits it from evidence, registration runs a reauth
-    /// pass, and bytes still flow after it. Nothing is written to Bob's
-    /// discovery cache.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn forward_from_evidence_only_opener_survives_registration_reauth() {
-        use tokio::io::AsyncWriteExt;
+    /// The #1107 real-path rig. Bob's discovery cache never holds Alice.
+    /// Bob's owner enrolled Alice's machine, and Bob's evidence store holds
+    /// Alice's record with a certificate from that owner. Bob's connect ACL
+    /// has one `principal = "owner"` entry for the target. Alice has a live
+    /// `ForwardV2` forward to Bob at `local`.
+    struct EvidenceForwardRig {
+        _dir: tempfile::TempDir,
+        alice: Arc<crate::Agent>,
+        bob: Arc<crate::Agent>,
+        alice_fwd: Arc<ForwardService>,
+        bob_fwd: Arc<ForwardService>,
+        local: SocketAddr,
+        target: SocketAddr,
+        target_bytes: Arc<std::sync::atomic::AtomicU64>,
+        target_cancel: CancellationToken,
+        now_ms: u64,
+    }
+
+    impl EvidenceForwardRig {
+        async fn shutdown(self) {
+            self.target_cancel.cancel();
+            self.alice_fwd.shutdown();
+            self.bob_fwd.shutdown();
+            self.alice.shutdown().await;
+            self.bob.shutdown().await;
+        }
+
+        /// Wait until the target has counted `n` bytes in all.
+        async fn target_reaches(&self, n: u64, secs: u64) -> bool {
+            tokio::time::timeout(std::time::Duration::from_secs(secs), async {
+                while self.target_bytes.load(std::sync::atomic::Ordering::SeqCst) < n {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .is_ok()
+        }
+
+        /// Wait until Bob has torn down `n` streams on reauth.
+        async fn torn_down(&self, n: u64, secs: u64) -> bool {
+            tokio::time::timeout(std::time::Duration::from_secs(secs), async {
+                while self.bob_fwd.diagnostics().torn_down_reauth() < n {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .is_ok()
+        }
+    }
+
+    async fn alice_known_to_bob(alice: &crate::Agent, bob: &crate::Agent) -> bool {
+        let alice_machine = alice.machine_id();
+        bob.identity_discovery_cache
+            .read()
+            .await
+            .values()
+            .any(|a| a.machine_id == alice_machine)
+    }
+
+    async fn evidence_forward_rig() -> Option<EvidenceForwardRig> {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let owner = crate::identity::UserKeypair::generate().expect("owner");
         let bob_home = dir.path().join("bob");
@@ -6743,12 +6817,10 @@ mod tests {
         crate::storage::save_user_keypair_to(&owner, bob_home.join("user.key"))
             .await
             .expect("bob owner key");
-        let Some(alice) = build_loopback_agent(dir.path(), "alice").await else {
-            return;
-        };
+        let alice = build_loopback_agent(dir.path(), "alice").await?;
         let Some(bob) = build_loopback_agent(dir.path(), "bob").await else {
             alice.shutdown().await;
-            return;
+            return None;
         };
         let alice = Arc::new(alice);
         let bob = Arc::new(bob);
@@ -6815,16 +6887,8 @@ mod tests {
         alice
             .record_authenticated_machine_binding_for_testing(bob.agent_id(), bob.machine_id())
             .await;
-        let alice_machine = alice.machine_id();
-        let alice_known_to_bob = |bob: Arc<crate::Agent>| async move {
-            bob.identity_discovery_cache
-                .read()
-                .await
-                .values()
-                .any(|a| a.machine_id == alice_machine)
-        };
         assert!(
-            !alice_known_to_bob(Arc::clone(&bob)).await,
+            !alice_known_to_bob(&alice, &bob).await,
             "bob has no agent for alice"
         );
 
@@ -6859,63 +6923,70 @@ mod tests {
             .await
             .expect("alice forward");
 
-        let mut client = TcpStream::connect(local).await.expect("client");
-        client.write_all(b"first").await.expect("first write");
-        let first = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            while target_bytes.load(std::sync::atomic::Ordering::SeqCst) < 5 {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
+        Some(EvidenceForwardRig {
+            _dir: dir,
+            alice,
+            bob,
+            alice_fwd,
+            bob_fwd,
+            local,
+            target: SocketAddr::from(([127, 0, 0, 1], target_port)),
+            target_bytes,
+            target_cancel,
+            now_ms,
         })
-        .await;
+    }
+
+    /// #1107 real accept path, owner entry. Alice opens a `ForwardV2`
+    /// forward: Bob routes the agentless stream to the forward acceptor,
+    /// `handle_inbound` admits it from evidence, registration runs a reauth
+    /// pass, and bytes still flow after it. Nothing is written to Bob's
+    /// discovery cache. Revoking Alice's agent then tears the stream down.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn forward_from_evidence_only_opener_survives_registration_reauth() {
+        use tokio::io::AsyncWriteExt;
+        let Some(rig) = evidence_forward_rig().await else {
+            return;
+        };
+        let mut client = TcpStream::connect(rig.local).await.expect("client");
+        client.write_all(b"first").await.expect("first write");
+        let first = rig.target_reaches(5, 15).await;
         // Registration starts a reauth pass. That pass gives its verdict
         // or tears the stream down no later than `REAUTH_PASS_BUDGET` (5 s)
         // after it starts. Wait past that budget, so a teardown from that
         // pass has occurred before the second write.
         tokio::time::sleep(teardown::REAUTH_PASS_BUDGET + std::time::Duration::from_secs(1)).await;
         client.write_all(b"second").await.expect("second write");
-        let second = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while target_bytes.load(std::sync::atomic::Ordering::SeqCst) < 11 {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await;
-        let torn = bob_fwd.diagnostics().torn_down_reauth();
-        let reasons = bob_fwd.diagnostics().torn_down_reasons();
-        let still_unknown = !alice_known_to_bob(Arc::clone(&bob)).await;
+        let second = rig.target_reaches(11, 10).await;
+        let torn = rig.bob_fwd.diagnostics().torn_down_reauth();
+        let reasons = rig.bob_fwd.diagnostics().torn_down_reasons();
+        let still_unknown = !alice_known_to_bob(&rig.alice, &rig.bob).await;
 
         // The same evidence lookup tears the stream down once Alice's agent
         // is revoked.
         let revocation = crate::revocation::RevocationRecord::sign(
-            crate::revocation::RevokedSubject::Agent(alice.agent_id()),
-            alice.identity().agent_keypair().public_key(),
-            alice.identity().agent_keypair().secret_key(),
-            now_ms / 1000,
+            crate::revocation::RevokedSubject::Agent(rig.alice.agent_id()),
+            rig.alice.identity().agent_keypair().public_key(),
+            rig.alice.identity().agent_keypair().secret_key(),
+            rig.now_ms / 1000,
             None,
         )
         .expect("revocation");
-        bob.revocation_set
+        rig.bob
+            .revocation_set
             .write()
             .await
             .verify_and_insert(revocation, None)
             .expect("insert revocation");
-        bob.stream_reauth_signal().notify_one();
-        let revoked_torn = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while bob_fwd.diagnostics().torn_down_reauth() < 1 {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await;
+        rig.bob.stream_reauth_signal().notify_one();
+        let revoked_torn = rig.torn_down(1, 10).await;
 
         drop(client);
-        target_cancel.cancel();
-        alice_fwd.shutdown();
-        bob_fwd.shutdown();
-        alice.shutdown().await;
-        bob.shutdown().await;
+        rig.shutdown().await;
 
-        assert!(first.is_ok(), "the forward from evidence carries bytes");
+        assert!(first, "the forward from evidence carries bytes");
         assert!(
-            second.is_ok(),
+            second,
             "the stream is alive after the registration reauth (torn={torn}, reasons={reasons:?})"
         );
         assert_eq!(torn, 0, "no reauth teardown: {reasons:?}");
@@ -6924,9 +6995,63 @@ mod tests {
             "bob's discovery cache still has no agent for alice"
         );
         assert!(
-            revoked_torn.is_ok(),
+            revoked_torn,
             "revoking the opener tears the evidence-admitted stream down"
         );
+    }
+
+    /// #1107 real accept path, exact-pair entry (Greptile P1 on #1869). An
+    /// opener known only from evidence is admitted by a `principal =
+    /// "owner"` entry and by nothing else (A03, A05). Bob replaces his
+    /// owner entry with an exact-pair entry for Alice's agent and machine
+    /// on the same target. The reauth pass tears the live stream down, and
+    /// a new stream is refused at admission.
+    /// RED without the owner-entry check in `authorize_attested_opener`:
+    /// the exact-pair entry matches, the stream stays up and the new one
+    /// carries bytes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn forward_from_evidence_only_opener_is_not_admitted_by_an_exact_pair_entry() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let Some(rig) = evidence_forward_rig().await else {
+            return;
+        };
+        let mut client = TcpStream::connect(rig.local).await.expect("client");
+        client.write_all(b"first").await.expect("first write");
+        let first = rig.target_reaches(5, 15).await;
+
+        // Reauth: the exact-pair entry does not keep the stream.
+        rig.bob
+            .set_connect_policy(allow_exact(&rig.alice, rig.target));
+        let reauth_torn = rig.torn_down(1, 10).await;
+        let reasons = rig.bob_fwd.diagnostics().torn_down_reasons();
+
+        // Admission: a new stream under the exact-pair entry is refused.
+        let mut second = TcpStream::connect(rig.local).await.expect("second client");
+        let _ = second.write_all(b"second").await;
+        let mut buf = [0u8; 16];
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                match second.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await
+        .is_ok();
+        let carried = rig.target_reaches(11, 2).await;
+
+        drop(client);
+        drop(second);
+        rig.shutdown().await;
+
+        assert!(first, "the owner entry admits the forward from evidence");
+        assert!(
+            reauth_torn,
+            "the reauth pass tears the stream down under an exact-pair entry: {reasons:?}"
+        );
+        assert!(closed, "the new stream is closed at admission");
+        assert!(!carried, "the new stream carries no bytes to the target");
     }
 
     /// WHY (Codex P2 / #1505): a successful SOCKS proxy must show up in the

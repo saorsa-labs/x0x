@@ -452,3 +452,30 @@ async fn forward_opener_with_a_foreign_certificate_is_denied() {
     assert!(f._runtime.usable(f.peer.a(), f.peer.m(), now).is_some());
     assert_registries_empty(&f).await;
 }
+
+/// The receiver knows the opener only from evidence, and the ACL has only
+/// an exact-pair entry for the opener's agent and machine on the target.
+/// Only a `principal = "owner"` entry admits such an opener (A03, A05), so
+/// the forward is denied. RED without the owner-entry check in
+/// `authorize_attested_opener` (Greptile P1 on #1869): the exact-pair entry
+/// matches and the forward is admitted.
+#[tokio::test]
+async fn forward_opener_known_only_from_evidence_is_not_admitted_by_an_exact_pair_entry() {
+    let owner = UserKeypair::generate().expect("owner");
+    let f = fixture(&owner, issued(&owner)).await;
+    let text = format!(
+        "[connect]\nenabled = true\n[[connect.allow]]\nagent_id = \"{}\"\nmachine_id = \"{}\"\ntargets = [\"{TARGET}\"]\n",
+        hex::encode(f.peer.a().0),
+        hex::encode(f.peer.m().0),
+    );
+    let pair_policy =
+        crate::connect::parse_connect_policy(std::path::Path::new("/tmp/x"), 0, &text)
+            .expect("pair policy");
+
+    let h = header(&f.peer.agent, &f.peer.agent, f.local_machine);
+    assert_eq!(
+        decide_with_policy(&f, &h, f.peer.m(), &pair_policy).await,
+        Err(ConnectDenialReason::AgentMachineNotInAcl)
+    );
+    assert_registries_empty(&f).await;
+}
