@@ -146,14 +146,22 @@ hours. Decision (Claude, under David's delegation of 10 Nov 2026):
   record once when it is first sent. A daemon that was offline then does
   not learn it from the 2-hour publish.
 - A subject is **seen**, and its self-revocation is published, when it is:
-  this daemon's own agent or machine; a contact that is not blocked; an
-  agent or machine in the discovery cache; an agent in this owner's
-  issued-certificate journal; or a member of a named group in any state.
-- Receiving a revocation removes its subject from the discovery cache and
-  blocks it as a contact. So a daemon checks these places **when the record
-  arrives**, before that removal, and keeps the result in memory. The
-  heartbeat checks the other places every 10 minutes. A record whose
-  subject becomes seen is published at the next heartbeat.
+  this daemon's own agent or machine; a contact that is not blocked; a
+  machine listed on a contact that is not blocked; an agent or machine in
+  the discovery cache, or the machine of a discovered agent; an agent in
+  this owner's issued-certificate journal; or a member of a named group in
+  any state. The gossip ingest, the local apply path and the heartbeat use
+  this one rule.
+- **A blocked contact never counts.** Applying a revocation blocks its
+  subject as a contact, and that creates a contact entry for a stranger.
+  If a blocked entry counted, a second self-revocation of the same
+  stranger (a better record of the pair) would find the entry that the
+  first one made, and would be published. Nothing that a revocation
+  creates makes its subject seen.
+- Applying a revocation also removes its subject from the discovery cache.
+  So a daemon checks the rule **before** that removal, and keeps the
+  result in memory. The heartbeat checks again every 10 minutes. A record
+  whose subject becomes seen is published at the next heartbeat.
 - A mark changes the set's generation, so the next heartbeat publishes.
 - A self-revocation that this daemon applies itself (an operator revokes
   this agent or machine) is marked at once and is in the immediate publish.
@@ -182,6 +190,14 @@ sender is behind.
 **Known gap.** A waiting daemon that lost a self-revocation for a subject
 that only it knows does not get the record back from senders to whom the
 subject is a stranger. It opens without that record. Follow-up:
+[#1867](https://github.com/saorsa-labs/x0x/issues/1867).
+
+**Known stall: an empty published set.** A sender whose held v1 records
+are all self-revocations of strangers publishes an empty set, and an
+empty batch never opens a waiting carrier. If every trusted sender is in
+that state, a waiting daemon stays closed (fail closed) until a sender
+has a record that it publishes. Whether a signed empty statement from an
+authority should open a waiter is open in
 [#1867](https://github.com/saorsa-labs/x0x/issues/1867).
 
 **Mixed versions.** A released daemon (v0.48.1 and earlier) that waits for

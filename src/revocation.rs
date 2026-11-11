@@ -1398,7 +1398,9 @@ impl RevocationSet {
     ///
     /// This does not insert records. An untrusted sender, an empty
     /// snapshot, a record from another carrier, or a snapshot that omits
-    /// a revocation already in the set is ignored. The carrier opens only
+    /// a revocation already in the set is ignored. One exception (#1863):
+    /// a held self-revocation for which the snapshot has no record of its
+    /// pair does not count as omitted. The carrier opens only
     /// when a trusted authority has offered a snapshot whose records have
     /// all verified and match the records already in the set.
     pub(crate) fn observe_remote_carrier_snapshot(
@@ -2241,8 +2243,10 @@ impl RevocationSet {
         true
     }
 
-    /// All held records for the V1 wire (`Agent`/`Machine` subjects only,
-    /// order unspecified), for rebroadcast/anti-entropy.
+    /// All held records with an `Agent`/`Machine` subject (order
+    /// unspecified), for the `revocations.bin` store. The v1 publish uses
+    /// [`Self::published_records`], which leaves out the self-revocations
+    /// of strangers (#1863).
     ///
     /// ADR-0043 §7.4: the v1 batch is one whole `Vec<RevocationRecord>`
     /// that legacy peers deserialize in full — an unknown variant would
@@ -2332,9 +2336,10 @@ impl RevocationSet {
     /// All held records of every subject kind (order unspecified), for
     /// local display such as `GET /identity/revocations` (#1108).
     ///
-    /// This is NOT a wire or storage view. The v1 carrier and
-    /// `revocations.bin` use [`Self::all_records`], because an old daemon
-    /// cannot decode a binding or share-grant subject. Tombstones that came
+    /// This is NOT a wire or storage view. `revocations.bin` uses
+    /// [`Self::all_records`] and the v1 carrier uses
+    /// [`Self::published_records`], because an old daemon cannot decode a
+    /// binding or share-grant subject. Tombstones that came
     /// from a move bundle are not records and are not included; see
     /// [`Self::is_binding_revoked`].
     #[must_use]
@@ -3113,11 +3118,15 @@ mod tests {
     /// A snapshot that omits a known revocation cannot open it either.
     #[tokio::test]
     async fn partial_snapshot_omitting_known_revocation_keeps_the_hold_1116() {
+        // An owner revocation: #1863 lets a waiter ignore an omitted
+        // self-revocation, so the known record here is not one.
         let revoked = crate::identity::AgentKeypair::generate().unwrap();
+        let owner = crate::identity::UserKeypair::generate().unwrap();
+        let cert = AgentCertificate::issue(&owner, &revoked).unwrap();
         let record = RevocationRecord::sign(
             RevokedSubject::Agent(revoked.agent_id()),
-            revoked.public_key(),
-            revoked.secret_key(),
+            owner.public_key(),
+            owner.secret_key(),
             1_000,
             None,
         )
@@ -3166,7 +3175,7 @@ mod tests {
         assert!(set
             .write()
             .await
-            .verify_and_insert(record.clone(), None)
+            .verify_and_insert(record.clone(), Some(&cert))
             .unwrap());
         arm_incoming_revocation_snapshot(
             &set,
@@ -3223,7 +3232,9 @@ mod tests {
         )
         .await;
         assert!(
-            set.read().await.revocation_resync_required(),
+            set.read()
+                .await
+                .carrier_resync_pending(REVOCATION_CARRIER_V1),
             "a trusted snapshot that omits a known revocation stays closed"
         );
         let admin = AgentId([0xE5; 32]);
