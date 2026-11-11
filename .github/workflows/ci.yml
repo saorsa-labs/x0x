@@ -44,6 +44,11 @@ jobs:
           # nextest controls (X0X_MESH_GROUP_LIVE=1) where binaries exist.
           python3 -B scripts/ci/test_nextest_mesh_serialization.py -v
 
+      # #1871: the apt retry paths, with fake dpkg-query, apt-get and sleep
+      # commands. It changes no runner packages and does not wait.
+      - name: Test the apt-install.sh retry paths
+        run: bash scripts/ci/test_apt_install.sh
+
       - name: Install Rust 1.95.0
         uses: dtolnay/rust-toolchain@master
         with:
