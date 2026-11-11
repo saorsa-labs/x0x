@@ -1412,9 +1412,11 @@ pub const MAX_QUEUED_INTAKE: usize = 4096;
 struct IntakeInner {
     queue: VecDeque<VerifiedAgentRevocation>,
     reconcile_all: bool,
-    /// Record hashes from a live route whose revocation-store write has
-    /// not succeeded yet (#1765). A startup-loaded record is never here.
-    not_durable: BTreeSet<[u8; 32]>,
+    /// Records from a live route whose revocation-store write has not
+    /// succeeded yet (#1765): record hash → the key of the record's
+    /// `(subject, issuer)` pair (#1864). A startup-loaded record is never
+    /// here.
+    not_durable: BTreeMap<[u8; 32], [u8; 32]>,
     /// A task retries a failed revocation-store write for S4 (#1765).
     persist_retrying: bool,
 }
@@ -1471,7 +1473,12 @@ impl RevocationIntake {
         {
             let mut inner = self.lock();
             if !from_startup_load {
-                inner.not_durable.insert(record_hash);
+                // An Agent subject always has a pair key; the record hash
+                // stands in when it has none, and then only the record
+                // itself makes it durable.
+                inner
+                    .not_durable
+                    .insert(record_hash, record.pair_key().unwrap_or(record_hash));
             }
             if inner.queue.len() >= MAX_QUEUED_INTAKE {
                 inner.queue.pop_front();
@@ -1497,8 +1504,18 @@ impl RevocationIntake {
     /// The live-route record hashes whose revocation-store write has not
     /// succeeded yet. Take this before the store snapshot is encoded:
     /// every hash in it is then in the snapshot (#1765).
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn not_durable_hashes(&self) -> BTreeSet<[u8; 32]> {
+        self.lock().not_durable.keys().copied().collect()
+    }
+
+    /// [`Self::not_durable_hashes`] with the pair key of each record
+    /// (#1864). The revocation set keeps one record per pair, so a
+    /// waiting record can be replaced before its store write. Its
+    /// evidence is then on disk when the kept record of its pair is.
+    #[must_use]
+    pub(crate) fn not_durable_pairs(&self) -> BTreeMap<[u8; 32], [u8; 32]> {
         self.lock().not_durable.clone()
     }
 
@@ -1510,7 +1527,7 @@ impl RevocationIntake {
         }
         self.lock()
             .not_durable
-            .retain(|hash| !hashes.contains(hash));
+            .retain(|hash, _| !hashes.contains(hash));
         self.notify.notify_one();
     }
 
@@ -1519,7 +1536,10 @@ impl RevocationIntake {
     /// verified stays not durable until its store write succeeds.
     #[must_use]
     pub(crate) fn all_durable(&self, hashes: &BTreeSet<[u8; 32]>) -> bool {
-        self.lock().not_durable.is_disjoint(hashes)
+        let inner = self.lock();
+        !hashes
+            .iter()
+            .any(|hash| inner.not_durable.contains_key(hash))
     }
 
     /// Become the one task that retries a failed revocation-store write.

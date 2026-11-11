@@ -106,13 +106,27 @@ A03). It opens a carrier only from a sender that is a trusted authority:
   One exception: a part of the round that the daemon already holds
   complete (the same `set`) changes nothing, because the sender publishes
   the same set again every 2 hours.
+- A batch from a trusted sender that the daemon cannot use (a bad marker,
+  a count or index out of range, a record of another carrier, an empty
+  batch) also removes what that sender offered before (#1864). The batch
+  shows that the sender's set has changed, so the earlier offer is stale.
+  The carrier stays closed for that sender until it sends a set that the
+  daemon can read.
+- **A held record that the sender has replaced (#1864).** The #1116 rule
+  refuses a snapshot that omits a revocation the daemon holds. A held
+  record is not omitted when the snapshot has a record for the same
+  subject and issuer that the daemon keeps in its place (the order rule
+  of #1857). The offer then stays, the ingest admits that record, and the
+  carrier opens when the daemon's held records equal the snapshot's kept
+  records, each one verified. A snapshot whose record for the pair is
+  worse than the held one is still refused.
 
 Bounds on what a waiting daemon holds for one sender and carrier:
 
 | Bound | Value |
 |---|---|
 | Open rounds | 1 |
-| Batches in a round (`n`) | at most 512. This is the real limit for an honest sender: about 190,000 records. A sender with a larger set cannot resync a waiting peer; it logs that at WARN. |
+| Batches in a round (`n`) | at most 512. This is the real limit for an honest sender: about 190,000 records. A sender with a larger set cannot resync a waiting peer; it logs that at WARN. Its markers are bad markers for the receiver, so they also remove what that sender offered before. |
 | Records in an open round | at most 262,144 (512 batches of 512 records, about 30 MB of hashes and order keys); over that the round is dropped. A full batch of real records holds about 370, so a round inside the batch limit is always inside this one. A part that arrives again at the same index is counted once. |
 | Time with no new part | 10 minutes; a part that arrives later starts the round again |
 
@@ -126,7 +140,9 @@ A new record's `reason` is at most 1024 bytes. A store from a released
 daemon can hold a record with a longer reason. That record stays in force
 on the daemon that holds it, and it is sent to peers.
 
-- A daemon that waits for a resync admits it from a trusted authority.
+- A daemon that waits for a resync admits it from a trusted authority,
+  also when it takes the place of a long-reason record that the daemon
+  already holds for the same subject and issuer.
 - **A daemon that is not waiting refuses it from gossip.** A new or freshly
   installed daemon therefore does not learn that a subject is revoked when
   the ONLY record for it has a long reason.

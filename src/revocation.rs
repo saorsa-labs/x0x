@@ -454,7 +454,7 @@ impl RevocationRecord {
     ///
     /// `None` for a share-grant subject: those records are collected when
     /// the grant ends, and the set keeps every one of them.
-    fn pair_key(&self) -> Option<[u8; 32]> {
+    pub(crate) fn pair_key(&self) -> Option<[u8; 32]> {
         if matches!(self.subject, RevokedSubject::ShareGrant(_)) {
             return None;
         }
@@ -525,9 +525,6 @@ struct PersistedRevocation {
     record: RevocationRecord,
     subject_cert: Option<AgentCertificate>,
 }
-
-/// The most replaced-record hashes the set remembers for S4.
-const MAX_REPLACED_RECORDS: usize = 4096;
 
 /// The order key of a record inside its pair: `(revoked_at not credible,
 /// reason over the limit, revoked_at, record hash)`. The lower key is kept.
@@ -639,9 +636,6 @@ pub struct RevocationSet {
     /// machine or binding subject (#1857): pair key → record hash. Kept in
     /// step with `records_by_hash`.
     pair_index: HashMap<[u8; 32], [u8; 32]>,
-    /// Records that were held and then replaced by the kept record of
-    /// their pair: replaced record hash → pair key. Not serialized.
-    replaced: HashMap<[u8; 32], [u8; 32]>,
     /// Makes "read the set, encode it, publish every batch" one step for
     /// the agent that owns this set (#1857). A set that needs several
     /// batches is a round, named by the digest of the set. Two publishers
@@ -650,8 +644,6 @@ pub struct RevocationSet {
     /// would drop each round when a part of the other arrives. Not
     /// serialized.
     publish_lock: Arc<tokio::sync::Mutex<()>>,
-    /// The keys of `replaced`, oldest first, for its size bound.
-    replaced_order: std::collections::VecDeque<[u8; 32]>,
     /// ADR-0043 tombstone epochs from ad-hoc binding `RevocationRecord`s
     /// (`x0x.revocation.v2` carrier). Grow-only; never swept.
     binding_epochs: HashMap<(AgentId, MachineId), u64>,
@@ -1305,9 +1297,43 @@ impl RevocationSet {
             BatchRound::Part(marker) => {
                 self.observe_remote_round_part(carrier, sender, records, marker, trusted_authority);
             }
-            // A batch with a bad marker is never a snapshot.
-            BatchRound::Invalid => {}
+            // A batch with a bad marker is never a snapshot. From a
+            // trusted sender it still says that the sender's set is a
+            // newer round now, so what the sender offered before is
+            // stale (#1864).
+            BatchRound::Invalid => {
+                if trusted_authority {
+                    self.drop_sender_candidate(carrier, sender);
+                }
+            }
         }
+    }
+
+    /// Forget what `sender` offered for a waiting carrier (#1864): a
+    /// whole set and an open round. The carrier then cannot open on that
+    /// offer. A trusted sender's batch that this node cannot use as a
+    /// snapshot calls this, because the batch still shows that the
+    /// sender's set has changed.
+    fn drop_sender_candidate(&mut self, carrier: u8, sender: &AgentId) {
+        if let Some(index) = carrier_index(carrier) {
+            self.resync_candidates[index].remove(sender);
+        }
+    }
+
+    /// Whether a snapshot whose kept records are `kept` covers every
+    /// record this set holds for `carrier` (#1857, #1864): the snapshot
+    /// has the held record, or it has a record of the same pair that this
+    /// set would keep in its place. A covered record's subject is revoked
+    /// in the sender's set also.
+    fn snapshot_covers_held(&self, carrier: u8, kept: &HashMap<[u8; 32], RecordRank>) -> bool {
+        self.records_by_hash
+            .iter()
+            .filter(|(_, persisted)| subject_carrier(&persisted.record.subject) == Some(carrier))
+            .all(|(hash, persisted)| {
+                let key = persisted.record.pair_key().unwrap_or(*hash);
+                kept.get(&key)
+                    .is_some_and(|rank| rank.3 == *hash || *rank <= persisted.record.rank())
+            })
     }
 
     /// Remember one remote sender's whole-set snapshot (#1116): one batch
@@ -1325,15 +1351,21 @@ impl RevocationSet {
         records: &[RevocationRecord],
         trusted_authority: bool,
     ) {
-        if !trusted_authority || self.resync_carriers & carrier == 0 || records.is_empty() {
+        if !trusted_authority || self.resync_carriers & carrier == 0 {
             return;
         }
         let Some(index) = carrier_index(carrier) else {
             return;
         };
-        if records.iter().any(|record| {
-            is_round_marker(record) || subject_carrier(&record.subject) != Some(carrier)
-        }) {
+        // This batch is the sender's set now. Whatever the sender offered
+        // before (a whole set or an open round) is stale, also when this
+        // batch is refused below.
+        self.drop_sender_candidate(carrier, sender);
+        if records.is_empty()
+            || records.iter().any(|record| {
+                is_round_marker(record) || subject_carrier(&record.subject) != Some(carrier)
+            })
+        {
             return;
         }
         // #1857: this set holds one record per (subject, issuer) pair. A
@@ -1345,18 +1377,19 @@ impl RevocationSet {
             let rank = record.rank();
             (record.pair_key().unwrap_or(rank.3), rank)
         }));
-        let known = self.known_carrier_hashes(carrier);
-        let candidate = self.resync_candidates[index].entry(*sender).or_default();
-        // This batch is the sender's set now. Whatever the sender offered
-        // before (a whole set or an open round) is stale, also when this
-        // batch is refused below.
-        candidate.whole = None;
-        candidate.whole_set = None;
-        candidate.round = None;
-        if !kept_hashes(&kept).is_superset(&known) {
+        // #1864: a held record is covered when the snapshot has it or has
+        // the record that takes its place here. The offer must stay for
+        // the second case: the ingest admits a long-reason record only
+        // while a trusted snapshot offers it. The carrier still opens
+        // only when the held records equal the snapshot's kept records
+        // (`try_complete_carrier`), after each one has verified.
+        if !self.snapshot_covers_held(carrier, &kept) {
             return;
         }
-        candidate.whole = Some(kept);
+        self.resync_candidates[index]
+            .entry(*sender)
+            .or_default()
+            .whole = Some(kept);
         self.try_complete_carrier(carrier);
     }
 
@@ -1386,12 +1419,14 @@ impl RevocationSet {
         if marker.batches == 0
             || marker.batches > MAX_ROUND_BATCHES
             || marker.index >= marker.batches
+            || records.iter().any(|record| {
+                is_round_marker(record) || subject_carrier(&record.subject) != Some(carrier)
+            })
         {
-            return;
-        }
-        if records.iter().any(|record| {
-            is_round_marker(record) || subject_carrier(&record.subject) != Some(carrier)
-        }) {
+            // Not a part this node can use. It still shows that the
+            // sender's set has changed, so the earlier offer is stale
+            // (#1864).
+            self.drop_sender_candidate(carrier, sender);
             return;
         }
         let mut hashes: Vec<[u8; 32]> = records.iter().map(RevocationRecord::record_hash).collect();
@@ -1403,7 +1438,6 @@ impl RevocationSet {
                 (record.pair_key().unwrap_or(rank.3), rank)
             })
             .collect();
-        let known = self.known_carrier_hashes(carrier);
         let candidate = self.resync_candidates[index].entry(*sender).or_default();
         // One open round per carrier per sender: a part of another round
         // (the sender's set changed) replaces the open one. Parts of two
@@ -1468,6 +1502,7 @@ impl RevocationSet {
             .parts
             .insert(marker.index, RoundPart { hashes, offered });
         let parts_held = round.parts.len();
+        let mut complete = None;
         if u32::try_from(parts_held).ok() == Some(round.batches) {
             let mut all: Vec<[u8; 32]> = round
                 .parts
@@ -1483,11 +1518,16 @@ impl RevocationSet {
                         .values()
                         .flat_map(|part| part.offered.iter().copied()),
                 );
-                if kept_hashes(&kept).is_superset(&known) {
-                    candidate.whole = Some(kept);
-                    candidate.whole_set = Some(round.set);
-                    candidate.round = None;
-                }
+                complete = Some((kept, round.set));
+            }
+        }
+        if let Some((kept, set)) = complete {
+            // The whole-set rule (see `observe_remote_carrier_snapshot`).
+            if self.snapshot_covers_held(carrier, &kept) {
+                let candidate = self.resync_candidates[index].entry(*sender).or_default();
+                candidate.whole = Some(kept);
+                candidate.whole_set = Some(set);
+                candidate.round = None;
             }
         }
         self.try_complete_carrier(carrier);
@@ -1499,7 +1539,7 @@ impl RevocationSet {
                 sender = %hex::encode(sender.as_bytes()),
                 parts_held,
                 parts_in_round = marker.batches,
-                held_records = known.len(),
+                held_records = self.known_carrier_hashes(carrier).len(),
                 "revocation resync: the carrier stays closed. It opens when every batch of one round from a trusted sender has arrived and matches the held records. If a batch was lost, the next chance is the sender's next full publish (up to 2 hours)"
             );
         }
@@ -1834,14 +1874,15 @@ impl RevocationSet {
             .any(|carrier| carrier.values().any(|candidate| candidate.offers(hash)))
     }
 
-    /// Whether the set holds the record that took the place of the record
-    /// with this hash (#1857). The S4 store write uses it: evidence for a
-    /// replaced record is on disk when the kept record of its pair is.
+    /// Whether the set holds a record for the `(subject, issuer)` pair
+    /// with this key (#1857, #1864). The S4 store write uses it: evidence
+    /// for a record that was replaced is on disk when the kept record of
+    /// its pair is. S4 keeps the pair key of each record it waits for, so
+    /// this set keeps no memory of replaced records and has no bound to
+    /// run over.
     #[must_use]
-    pub(crate) fn holds_replacement_for(&self, hash: &[u8; 32]) -> bool {
-        self.replaced
-            .get(hash)
-            .is_some_and(|pair| self.pair_index.contains_key(pair))
+    pub(crate) fn holds_pair(&self, pair: &[u8; 32]) -> bool {
+        self.pair_index.contains_key(pair)
     }
 
     /// Put a verified record in the record map under the one-record-per-pair
@@ -1864,17 +1905,6 @@ impl RevocationSet {
                         return false;
                     }
                     self.records_by_hash.remove(&held_hash);
-                    // Bounded, oldest first: S4 asks about a replaced
-                    // record soon after the replacement (the next store
-                    // write), so the newest entries are the ones it needs.
-                    while self.replaced_order.len() >= MAX_REPLACED_RECORDS {
-                        if let Some(oldest) = self.replaced_order.pop_front() {
-                            self.replaced.remove(&oldest);
-                        }
-                    }
-                    if self.replaced.insert(held_hash, pair).is_none() {
-                        self.replaced_order.push_back(held_hash);
-                    }
                 }
             }
             self.pair_index.insert(pair, hash);
@@ -5185,48 +5215,6 @@ mod tests {
             assert_eq!(set.all_records(), vec![credible_long]);
         }
 
-        /// WHY: S4 asks whether a replaced record's evidence is on disk
-        /// soon after the replacement. The memory of replaced records has
-        /// a size bound; when it is full, the OLDEST entry must go, not
-        /// all of them, or a record that S4 still waits for is forgotten.
-        #[test]
-        fn the_replaced_record_memory_drops_the_oldest_entry_first() {
-            let mut set = RevocationSet::new();
-            let fake = |revoked_at: u64| RevocationRecord {
-                subject: RevokedSubject::Agent(AgentId([0x33; 32])),
-                issuer_public_key: vec![7; 4],
-                revoked_at,
-                reason: None,
-                signature: vec![9; 4],
-            };
-            // Each record is earlier than the one before, so each one
-            // takes the place of the one before.
-            let total = MAX_REPLACED_RECORDS as u64 + 10;
-            let first = fake(total + 1);
-            assert!(set.insert_verified(PersistedRevocation {
-                record: first.clone(),
-                subject_cert: None
-            }));
-            let mut last_replaced = first.record_hash();
-            for step in 0..total {
-                let record = fake(total - step);
-                let hash = record.record_hash();
-                assert!(set.insert_verified(PersistedRevocation {
-                    record,
-                    subject_cert: None
-                }));
-                assert!(set.holds_replacement_for(&last_replaced), "step {step}");
-                last_replaced = hash;
-            }
-            assert_eq!(set.len(), 1);
-            assert_eq!(set.replaced.len(), MAX_REPLACED_RECORDS);
-            assert_eq!(set.replaced_order.len(), MAX_REPLACED_RECORDS);
-            assert!(
-                !set.holds_replacement_for(&first.record_hash()),
-                "the oldest entry was dropped"
-            );
-        }
-
         /// WHY: a set of one batch must have the bytes it had before
         /// #1857, so that a released daemon reads it as before. These are
         /// fixed bytes: plain bincode of the record list, no marker.
@@ -6071,6 +6059,294 @@ mod tests {
             let mut waiter = waiting();
             receive(&mut waiter, &one[0], true);
             assert!(!pending(&waiter));
+        }
+    }
+
+    /// #1864: three review findings on the batch and round code of #1857.
+    mod recovery_1864 {
+        use super::super::*;
+        use crate::identity::AgentKeypair;
+
+        const SENDER: AgentId = AgentId([0xA1; 32]);
+        const SMALL_TARGET: usize = 12 * 1024;
+
+        fn waiting() -> RevocationSet {
+            RevocationSet::quarantined_carrier(REVOCATION_CARRIER_V1)
+        }
+
+        fn pending(waiter: &RevocationSet) -> bool {
+            waiter.carrier_resync_pending(REVOCATION_CARRIER_V1)
+        }
+
+        /// A signed record with a reason over the limit, as a released
+        /// daemon could have made it (`sign` refuses it now).
+        fn long_reason_record(kp: &AgentKeypair, revoked_at: u64) -> RevocationRecord {
+            let subject = RevokedSubject::Agent(kp.agent_id());
+            let issuer = kp.public_key().as_bytes().to_vec();
+            let reason = Some("x".repeat(MAX_REVOCATION_REASON_BYTES + 1));
+            let message =
+                RevocationRecord::canonical_message(&subject, &issuer, revoked_at, &reason);
+            let signature = sign_with_ml_dsa(kp.secret_key(), &message).expect("sign");
+            RevocationRecord {
+                subject,
+                issuer_public_key: issuer,
+                revoked_at,
+                reason,
+                signature: signature.as_bytes().to_vec(),
+            }
+        }
+
+        fn short_record(revoked_at: u64) -> RevocationRecord {
+            let kp = AgentKeypair::generate().expect("keypair");
+            RevocationRecord::sign(
+                RevokedSubject::Agent(kp.agent_id()),
+                kp.public_key(),
+                kp.secret_key(),
+                revoked_at,
+                None,
+            )
+            .expect("sign")
+        }
+
+        /// What a waiting node does with one gossip batch: record the
+        /// sender's offer, then ingest the records.
+        fn receive(waiter: &mut RevocationSet, batch: &[u8], trusted: bool) {
+            let (records, round) = decode_revocation_batch_with_round(batch).expect("decode");
+            waiter.observe_remote_carrier_batch(
+                REVOCATION_CARRIER_V1,
+                &SENDER,
+                &records,
+                round,
+                trusted,
+            );
+            for record in records {
+                let _ = waiter.verify_and_insert_at(record, None, 2_000);
+            }
+        }
+
+        /// A marked batch whose marker the decoder refuses (a count over
+        /// the round limit, as the encoder sends above 512 batches).
+        fn batch_with_invalid_marker(records: &[RevocationRecord]) -> Vec<u8> {
+            let mut marker = round_marker_record(&RoundMarker {
+                batches: 2,
+                index: 0,
+                set: [1u8; 32],
+            });
+            marker.reason = Some(format!(
+                "x0x-revocation-round-v1 n={} i=0 set={}",
+                MAX_ROUND_BATCHES + 1,
+                hex::encode([1u8; 32])
+            ));
+            let mut group = records.to_vec();
+            group.push(marker);
+            let batch = encode_revocation_batch(&group).expect("encode");
+            let (_, round) = decode_revocation_batch_with_round(&batch).expect("decode");
+            assert_eq!(round, BatchRound::Invalid);
+            batch
+        }
+
+        /// WHY (finding 1): the waiting node holds a legacy record (reason
+        /// over the limit). The trusted sender holds a better record of
+        /// the same pair, also with a long reason. The snapshot does not
+        /// list the held record's hash, but it covers the held record:
+        /// this node keeps the sender's record in its place. The offer
+        /// must stay, or the long-reason replacement is refused and every
+        /// repeat fails in the same way.
+        #[test]
+        fn a_better_legacy_record_of_a_held_pair_completes_recovery() {
+            let kp = AgentKeypair::generate().expect("keypair");
+            let held = long_reason_record(&kp, 1_500);
+            let better = long_reason_record(&kp, 1_000);
+            let mut waiter = waiting();
+            assert!(waiter
+                .verify_and_insert(held.clone(), None)
+                .expect("insert"));
+            assert!(pending(&waiter));
+
+            let batch = encode_revocation_batch(std::slice::from_ref(&better)).expect("encode");
+            receive(&mut waiter, &batch, true);
+            assert!(
+                waiter.contains_hash(&better.record_hash()),
+                "the trusted sender's long-reason record is admitted"
+            );
+            assert!(!waiter.contains_hash(&held.record_hash()));
+            assert!(waiter.is_agent_revoked(&kp.agent_id()));
+            assert!(!pending(&waiter), "recovery completes");
+        }
+
+        /// The same case when the sender's set is a marked round.
+        #[test]
+        fn a_better_legacy_record_of_a_held_pair_completes_a_round() {
+            let keys: Vec<AgentKeypair> = (0..6)
+                .map(|_| AgentKeypair::generate().expect("keypair"))
+                .collect();
+            let held = long_reason_record(&keys[0], 1_500);
+            let set: Vec<RevocationRecord> = keys
+                .iter()
+                .map(|kp| long_reason_record(kp, 1_000))
+                .collect();
+            let batches =
+                encode_revocation_batches_with_target(&set, SMALL_TARGET).expect("encode");
+            assert!(batches.len() >= 2, "the test needs a round");
+            // The batch with the better record of the held pair arrives
+            // last, so the round completes while the old record is held.
+            let better = set[0].record_hash();
+            let (last, first): (Vec<&Vec<u8>>, Vec<&Vec<u8>>) = batches.iter().partition(|batch| {
+                decode_revocation_batch(batch)
+                    .expect("decode")
+                    .iter()
+                    .any(|record| record.record_hash() == better)
+            });
+            assert_eq!(last.len(), 1);
+            let mut waiter = waiting();
+            assert!(waiter.verify_and_insert(held, None).expect("insert"));
+            for batch in first.into_iter().chain(last) {
+                receive(&mut waiter, batch, true);
+            }
+            assert_eq!(waiter.len(), set.len());
+            assert!(!pending(&waiter), "recovery completes on this round");
+        }
+
+        /// The snapshot stays refused when it does not cover a held
+        /// record: the sender's record of the pair is worse, so this node
+        /// would keep its own record and the two sets differ.
+        #[test]
+        fn a_worse_record_of_a_held_pair_does_not_complete_recovery() {
+            let kp = AgentKeypair::generate().expect("keypair");
+            let held = long_reason_record(&kp, 1_000);
+            let worse = long_reason_record(&kp, 1_500);
+            let mut waiter = waiting();
+            assert!(waiter
+                .verify_and_insert(held.clone(), None)
+                .expect("insert"));
+            let batch = encode_revocation_batch(std::slice::from_ref(&worse)).expect("encode");
+            receive(&mut waiter, &batch, true);
+            assert!(waiter.contains_hash(&held.record_hash()));
+            assert!(pending(&waiter));
+        }
+
+        /// A snapshot that covers a held record by a better record opens
+        /// nothing until that better record has verified here.
+        #[test]
+        fn a_covering_snapshot_does_not_open_before_its_record_verifies() {
+            let kp = AgentKeypair::generate().expect("keypair");
+            let held = long_reason_record(&kp, 1_500);
+            let mut forged = long_reason_record(&kp, 1_000);
+            forged.signature = vec![0u8; forged.signature.len()];
+            let mut waiter = waiting();
+            assert!(waiter
+                .verify_and_insert(held.clone(), None)
+                .expect("insert"));
+            let batch = encode_revocation_batch(std::slice::from_ref(&forged)).expect("encode");
+            receive(&mut waiter, &batch, true);
+            assert!(waiter.contains_hash(&held.record_hash()));
+            assert!(pending(&waiter));
+        }
+
+        /// WHY (finding 2): a trusted sender offered a complete snapshot
+        /// that still waits (one record is not verified yet). Then a
+        /// marked batch with a marker this node cannot read arrives from
+        /// the same sender: its set is a newer round now. The earlier
+        /// snapshot is stale. If it stays, the late record completes it
+        /// and the carrier opens with the newer batches missing.
+        #[test]
+        fn an_invalid_marker_drops_the_senders_earlier_snapshot() {
+            let old_set = vec![short_record(1_000), short_record(1_000)];
+            let mut waiter = waiting();
+            waiter.observe_remote_carrier_batch(
+                REVOCATION_CARRIER_V1,
+                &SENDER,
+                &old_set,
+                BatchRound::Whole,
+                true,
+            );
+            assert!(pending(&waiter));
+
+            let batch = batch_with_invalid_marker(&old_set[..1]);
+            receive(&mut waiter, &batch, true);
+            assert!(waiter.contains_hash(&old_set[0].record_hash()));
+
+            // The late record of the earlier snapshot verifies now.
+            assert!(waiter
+                .verify_and_insert_at(old_set[1].clone(), None, 2_000)
+                .expect("insert"));
+            assert!(
+                pending(&waiter),
+                "a stale snapshot must not open the carrier"
+            );
+        }
+
+        /// An invalid marker from a sender that is not a trusted authority
+        /// changes nothing.
+        #[test]
+        fn an_invalid_marker_from_an_untrusted_sender_is_ignored() {
+            let set = vec![short_record(1_000), short_record(1_000)];
+            let mut waiter = waiting();
+            waiter.observe_remote_carrier_batch(
+                REVOCATION_CARRIER_V1,
+                &SENDER,
+                &set,
+                BatchRound::Whole,
+                true,
+            );
+            let (records, round) =
+                decode_revocation_batch_with_round(&batch_with_invalid_marker(&set[..1]))
+                    .expect("decode");
+            waiter.observe_remote_carrier_batch(
+                REVOCATION_CARRIER_V1,
+                &SENDER,
+                &records,
+                round,
+                false,
+            );
+            for record in set {
+                let _ = waiter.verify_and_insert_at(record, None, 2_000);
+            }
+            assert!(!pending(&waiter), "the trusted snapshot still stands");
+        }
+
+        /// A round part with a count or index out of range is the same
+        /// case on the direct path.
+        #[test]
+        fn an_out_of_range_round_part_drops_the_senders_earlier_snapshot() {
+            for marker in [
+                RoundMarker {
+                    batches: MAX_ROUND_BATCHES + 1,
+                    index: 0,
+                    set: [1u8; 32],
+                },
+                RoundMarker {
+                    batches: 2,
+                    index: 2,
+                    set: [1u8; 32],
+                },
+                RoundMarker {
+                    batches: 0,
+                    index: 0,
+                    set: [1u8; 32],
+                },
+            ] {
+                let old_set = vec![short_record(1_000), short_record(1_000)];
+                let mut waiter = waiting();
+                waiter.observe_remote_carrier_batch(
+                    REVOCATION_CARRIER_V1,
+                    &SENDER,
+                    &old_set,
+                    BatchRound::Whole,
+                    true,
+                );
+                waiter.observe_remote_carrier_batch(
+                    REVOCATION_CARRIER_V1,
+                    &SENDER,
+                    &old_set[..1],
+                    BatchRound::Part(marker),
+                    true,
+                );
+                for record in old_set {
+                    let _ = waiter.verify_and_insert_at(record, None, 2_000);
+                }
+                assert!(pending(&waiter), "{marker:?}");
+            }
         }
     }
 
