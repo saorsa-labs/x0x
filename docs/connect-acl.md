@@ -83,7 +83,7 @@ It matches a requester that holds a **current ShareGrant** for this daemon's age
 - **Both must allow the target.** The entry lists the exact loopback target, and the grant lists its port. A grant for port 22 does not open `127.0.0.1:80`, even when a grant entry lists it; a grant entry without a matching grant opens nothing.
 - **A grant never opens connect by itself.** With no `principal = "grant"` entry a grantee is denied. If the connect plane is disabled, a peer admitted only by a grant is refused at the stream gate, because that gate would otherwise be the only boundary.
 - A grant counts only when it is signed by this install's owner, lists this daemon's agent, and is inside its `[not_before, expiry)` window. The requester's machine must be the agent's **authenticated** binding (the transport peer), as for owner trust. A revoked grant (`x0x grant revoke`, gossiped on `x0x.revocation.v3`), a revoked agent/machine/binding, and a `Blocked` contact all get nothing. Revocation takes effect at the next connection, without a restart.
-- Grant entries apply to the inbound stream gate and to attested `ForwardV2` forwards, like owner entries. `ForwardV1` matches exact pairs only.
+- Grant entries apply to the inbound stream gate and to attested `ForwardV2` forwards, like owner entries. `ForwardV1` matches exact pairs only. A `principal = "grant"` entry does not match an opener known only from evidence (#1107).
 - A grant entry must not set `agent_id` or `machine_id`. Adding one through the API returns `409` on an install with no owner key.
 
 ## Managing the ACL at runtime (ADR-0070 §3)
@@ -141,9 +141,9 @@ ForwardV2 carries the opener's `agent_id` plus an ML-DSA-65 signature over the h
 
 1. Confirms the header names this machine as the recipient (`recipient_machine_id` binding — prevents replay to a different machine).
 2. Checks the freshness window: `issued_at_ms` must be within `[now − 60s, now + 5s skew]` (prevents replay after the TTL).
-3. Looks up the opener's `agent_id` in the discovery cache and retrieves the cached agent public key.
+3. Looks up the opener's `agent_id`: first in the discovery cache, then — on a miss — in the ADR 0089 evidence store; evidence-sourced admission requires all conditions in the [#1107 design note](../design/1107-forward-opener-evidence.md) and is for **owner trust only**.
 4. Confirms the agent is on the transport-authenticated machine (`machine_id` match).
-5. Verifies the ML-DSA-65 signature against the cached key, checking that the key hashes to the claimed `agent_id` (binding).
+5. Verifies the ML-DSA-65 signature against the looked-up key, checking that the key hashes to the claimed `agent_id` (binding).
 6. Evaluates the attested agent's **real trust** via the contact store — a Blocked agent is denied (attestation complements, not replaces, the trust + ACL layers).
 7. ACL-checks **that specific authenticated agent** — not every agent on the machine.
 

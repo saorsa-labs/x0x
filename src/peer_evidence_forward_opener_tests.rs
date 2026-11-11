@@ -143,6 +143,15 @@ async fn decide(
     header: &ForwardV2Header,
     peer_machine: MachineId,
 ) -> std::result::Result<SocketAddr, ConnectDenialReason> {
+    decide_with_policy(f, header, peer_machine, &owner_policy()).await
+}
+
+async fn decide_with_policy(
+    f: &Fixture,
+    header: &ForwardV2Header,
+    peer_machine: MachineId,
+    policy: &crate::connect::ConnectPolicy,
+) -> std::result::Result<SocketAddr, ConnectDenialReason> {
     let contacts = Arc::new(tokio::sync::RwLock::new(
         crate::contacts::ContactStore::new(f._dir.path().join("contacts.json")),
     ));
@@ -154,7 +163,7 @@ async fn decide(
         f.owner_trust.clone(),
         false,
     );
-    decide_inbound_attested(header, &owner_policy(), &peer_machine, &ctx).await
+    decide_inbound_attested(header, policy, &peer_machine, &ctx).await
 }
 
 async fn assert_registries_empty(f: &Fixture) {
@@ -205,6 +214,54 @@ async fn forward_opener_known_only_from_evidence_is_admitted() {
     assert_eq!(
         decide(&f, &h, f.peer.m()).await,
         Ok(TARGET.parse().expect("target"))
+    );
+    assert_registries_empty(&f).await;
+}
+
+/// The receiver knows the opener only from evidence and the owner gave the
+/// opener a current ShareGrant with a Connect port for the target. The ACL
+/// has only a `principal = "grant"` entry. The evidence path gives owner
+/// trust only, so the grant entry must not match: the forward is denied.
+/// RED without the #1107 grant gate in `authorize_attested_opener`: the
+/// grant is confirmed from the evidence record and the forward is admitted.
+#[tokio::test]
+async fn forward_opener_known_only_from_evidence_is_not_admitted_by_a_grant_entry() {
+    use crate::share_grant::{Grantee, ShareCap, ShareGrant, ShareGrantStore};
+
+    let owner = UserKeypair::generate().expect("owner");
+    let f = fixture(&owner, issued(&owner)).await;
+    let target: SocketAddr = TARGET.parse().expect("target");
+    let local_agent = AgentKeypair::generate().expect("local agent").agent_id();
+    let grants = Arc::new(ShareGrantStore::in_memory(
+        local_agent,
+        Some(owner.user_id()),
+    ));
+    let now = now_secs();
+    let grant = ShareGrant::sign(
+        &owner,
+        [0xB7; 32],
+        Grantee::Agent(f.peer.a()),
+        vec![local_agent],
+        vec![ShareCap::Connect {
+            ports: vec![target.port()],
+        }],
+        now - 60,
+        now + 3600,
+    )
+    .expect("sign grant");
+    grants.accept(grant, now).await.expect("accept grant");
+    f.owner_trust.install_share_grant_store(grants);
+    let text = format!(
+        "[connect]\nenabled = true\n[[connect.allow]]\nprincipal = \"grant\"\ntargets = [\"{TARGET}\"]\n"
+    );
+    let grant_policy =
+        crate::connect::parse_connect_policy(std::path::Path::new("/tmp/x"), 0, &text)
+            .expect("grant policy");
+
+    let h = header(&f.peer.agent, &f.peer.agent, f.local_machine);
+    assert_eq!(
+        decide_with_policy(&f, &h, f.peer.m(), &grant_policy).await,
+        Err(ConnectDenialReason::AgentMachineNotInAcl)
     );
     assert_registries_empty(&f).await;
 }

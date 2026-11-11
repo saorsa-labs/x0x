@@ -980,7 +980,12 @@ pub(crate) async fn authorize_attested_opener(
     // target lets a `principal = "grant"` entry match, and raises the trust
     // decision for this target only. Blocked/pin mismatch get no grant.
     // Grant expiry uses OwnerTrust's construction-injected clock (no now arg).
-    let access = if ctx.local_authority_only {
+    // #1107 (A03): the ShareGrant path needs the discovery path. An opener
+    // known only from evidence gets no grant access, so a
+    // `principal = "grant"` entry cannot admit it.
+    let access = if agent.source != OpenerSource::Discovery {
+        crate::share_grant::GrantAccessEval::default()
+    } else if ctx.local_authority_only {
         match ctx
             .owner_trust
             .grant_access_nonblocking(
@@ -6862,8 +6867,11 @@ mod tests {
             }
         })
         .await;
-        // The registration reauth pass has run; wait past a reauth interval.
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        // Registration starts a reauth pass. That pass gives its verdict
+        // or tears the stream down no later than `REAUTH_PASS_BUDGET` (5 s)
+        // after it starts. Wait past that budget, so a teardown from that
+        // pass has occurred before the second write.
+        tokio::time::sleep(teardown::REAUTH_PASS_BUDGET + std::time::Duration::from_secs(1)).await;
         client.write_all(b"second").await.expect("second write");
         let second = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while target_bytes.load(std::sync::atomic::Ordering::SeqCst) < 11 {

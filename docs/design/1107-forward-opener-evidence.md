@@ -31,7 +31,9 @@ hold:
    bounded pool), and the store's point-of-use check (`usable`) passes.
 
 An opener found this way is admitted for owner trust only. Contact rules
-and share grants still need the discovery path.
+and share grants still need the discovery path. The ShareGrant path is
+denied for evidence-source openers at the `authorize_attested_opener` gate
+(`src/forward.rs`).
 
 The gate writes nothing to the discovery cache, the authenticated binding
 registry or the capability registry. It does not cache the result. The

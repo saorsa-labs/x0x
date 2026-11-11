@@ -79,8 +79,10 @@ Owner sync now rests on the owner-signed enrollment alone:
   agent that became known during the prefix read sends the stream through the
   normal agent-level gate, including trust, revocation and the connect ACL. A
   `SyncV1` stream is otherwise handed to the registered owner-sync acceptor,
-  and never to the default channel. Any other protocol
-  is denied `deny_not_verified`, as it was before. The owner-sync session then
+  and never to the default channel. A `ForwardV2` stream is handed to the
+  forward acceptor, whose gate requires a signed header and a usable evidence
+  record (#1107). Any other protocol is denied `deny_not_verified`, as it was
+  before. The owner-sync session then
   still requires the owner-key possession proof. Nothing else is widened: a
   machine with any known agent goes through the normal agent-level gate, and
   the shared gate used by the datagram lane and forwards is unchanged. The
