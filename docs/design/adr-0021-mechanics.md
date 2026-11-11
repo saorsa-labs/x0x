@@ -198,8 +198,8 @@ The inbox attributes these machines to the sender:
 
 An older pre-#213 peer of that sender is refused the same way. A valid
 origin attestation is still accepted. EP3 still drops an attested DM whose
-resolved machine is revoked. A machine-revocation record still expires
-under the existing revocation TTL, and this refusal ends with that record.
+resolved machine is revoked. A machine-revocation record does not expire
+(#1108), so this refusal does not end with time.
 
 A contact or protected non-contact with none of those machines revoked
 keeps the absent-attestation path above. A stranger keeps that path when

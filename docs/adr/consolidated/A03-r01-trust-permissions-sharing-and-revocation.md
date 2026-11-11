@@ -49,6 +49,8 @@ Long-lived subscriptions must apply current permission rules. A revoked credenti
 
 A verified revocation must survive restart. A corrupt existing revocation store must not be treated as evidence that no revocations exist. First-run absence and damaged persisted state are different cases.
 
+A revocation record stays in force until the revoked credential can no longer be used (David's ruling A on [#1108](https://github.com/saorsa-labs/x0x/issues/1108), 20 Oct 2026). The age of a record is never a reason to remove it. An agent or machine record names a key, and a key has no expiry, so x0xd keeps these records for good. A binding tombstone is permanent. A share-grant record goes when the grant is past its signed expiry plus the clock allowance. An expired certificate does not end an agent revocation: the same key can hold a later certificate or announce with no certificate.
+
 When a revocation file is present and x0xd cannot decode it, x0xd does four things (accepted by David 13 Oct 2026; archived as [T-revocation-store-corrupt](../../adr-archive/transient/T-revocation-store-corrupt.md)):
 
 1. It moves the bad bytes to a quarantine file (`<file>.quarantined-<unix-ms>`, `-<seq>` on a taken name). The live path does not hold the payload, and the next start does not read it. A readable file placed on the live path is a rebuild.
@@ -74,7 +76,7 @@ A network-wide reputation score cannot replace an owner's explicit grant or a gr
 
 ## Current implementation
 
-Many trust, grant and ACL surfaces exist. Unified authority and complete revocation coverage remain incomplete. The corrupt-store quarantine rule above entered the tree with PR #1336. The heartbeat removes agent and machine revocation records after 90 days, without checking credential expiry. Binding tombstones are permanent; grant revocations follow the grant expiry. The corruption and lifetime requirements above are not fully implemented.
+Many trust, grant and ACL surfaces exist. Unified authority and complete revocation coverage remain incomplete. The corrupt-store quarantine rule above entered the tree with PR #1336. The heartbeat sweep removes only the records of dead share grants; agent, machine and binding records stay (#1108). A daemon older than this change still removes agent and machine records 90 days after `revoked_at`. The number of held records has no upper limit, and one v1 gossip batch holds about 380 records (2 MiB). The corruption requirements above are not fully implemented.
 
 ## Validation
 
