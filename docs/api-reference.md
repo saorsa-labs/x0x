@@ -524,10 +524,13 @@ are too large for any peer to accept (only a record from an old store can
 be). While it is not 0, a peer that waits for a resync cannot open from this
 daemon; revoke that subject again with a short reason.
 
-A daemon sends its revocation set to peers as one gossip batch when the set
-fits, and as a round of marked batches when it does not; see
+A daemon sends its published revocation set to peers as one gossip batch when
+the set fits, and as a round of marked batches when it does not; see
 [`docs/design/revocation-batches.md`](design/revocation-batches.md). The
-marker records of a round are never in this listing.
+marker records of a round are never in this listing. The published set is the
+held set without the self-revocation of a key that this daemon has no
+relationship with (#1863). The daemon still holds and enforces such a record,
+and this listing still shows it.
 
 A new record's `reason` is at most 1024 bytes. `POST /identity/revoke` and
 `DELETE /owner/agents/:id` answer `400` above that, and a daemon refuses

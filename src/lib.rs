@@ -39683,8 +39683,9 @@ mod tests {
 
     /// #1863: the group rule. Only an active member of the group is a
     /// relationship, and only in a group that this node is an active
-    /// member of and that needs approval to join. A removed member counts
-    /// (the revocation path removes a revoked member).
+    /// member of and that needs approval to join. A pending, removed or
+    /// banned row does not count. The revocation path removes a revoked
+    /// member, so that subject is then a stranger again.
     #[test]
     fn the_group_relationship_rule() {
         let local = identity::AgentId([0x11; 32]);
