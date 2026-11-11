@@ -519,6 +519,8 @@ type RecordRank = (u64, [u8; 32]);
 #[derive(Debug, Clone, Default)]
 struct SnapshotCandidate {
     last_batch: Option<std::time::Instant>,
+    /// Batches seen in the current round (for the operator log).
+    batches: u32,
     /// Pair key (record hash for a share grant) → `(revoked_at, hash)` of
     /// the record this set would keep.
     kept: HashMap<[u8; 32], RecordRank>,
@@ -781,9 +783,11 @@ pub(crate) fn decode_revocation_batch(
 /// is ignored whole. Released daemons use the same number.
 pub(crate) const MAX_REVOCATION_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
 
-/// The size a published batch aims for (#1857): a quarter of
-/// [`MAX_REVOCATION_PAYLOAD_BYTES`], about 95 records.
-pub(crate) const REVOCATION_BATCH_TARGET_BYTES: usize = 512 * 1024;
+/// The size a published batch aims for (#1857): three quarters of
+/// [`MAX_REVOCATION_PAYLOAD_BYTES`], about 285 records. It stays near
+/// the old single-batch size on purpose: a released daemon that waits for
+/// a #1116 resync reads one batch as a whole snapshot.
+pub(crate) const REVOCATION_BATCH_TARGET_BYTES: usize = 1536 * 1024;
 
 /// The longest `reason` a new record may carry (#1857). The reason is
 /// inside the signed bytes, so a long one cannot be cut: the record is
@@ -1057,8 +1061,10 @@ impl RevocationSet {
             // A new round replaces the last one, so a record the sender
             // no longer holds does not stay in its snapshot.
             candidate.kept.clear();
+            candidate.batches = 0;
         }
         candidate.last_batch = Some(now);
+        candidate.batches = candidate.batches.saturating_add(1);
         for (key, rank) in offered {
             match candidate.kept.get(&key) {
                 Some(held) if *held <= rank => {}
@@ -1067,9 +1073,22 @@ impl RevocationSet {
                 }
             }
         }
+        let (batches, offered_records) = (candidate.batches, candidate.kept.len());
         // `try_complete_carrier` accepts a snapshot only when it equals
         // the held records, so one that omits a held record stays refused.
         self.try_complete_carrier(carrier);
+        if self.resync_carriers & carrier != 0 {
+            // An operator must be able to tell a round that is not yet
+            // complete, or lost a batch, from a hang.
+            tracing::warn!(
+                carrier,
+                sender = %hex::encode(sender.as_bytes()),
+                batches,
+                offered_records,
+                held_records = self.known_carrier_hashes(carrier).len(),
+                "revocation resync: the snapshot round from this sender does not yet match the held records; the carrier stays closed. If no further batch of this round arrives within 60 s, a batch was lost or the sets differ, and the next chance is the sender's next full publish (up to 2 hours)"
+            );
+        }
     }
 
     /// Insert a fully verified snapshot without treating it as group proof.
@@ -4347,14 +4366,27 @@ mod tests {
         /// A record with the byte sizes of a real one and no valid
         /// signature (for codec tests, which do not verify).
         fn sized_fake(tag: u32) -> RevocationRecord {
+            sized_fake_with_reason(tag, "r".to_string())
+        }
+
+        fn sized_fake_with_reason(tag: u32, reason: String) -> RevocationRecord {
             let mut id = [0u8; 32];
             id[..4].copy_from_slice(&tag.to_le_bytes());
             RevocationRecord {
                 subject: RevokedSubject::Agent(AgentId(id)),
                 issuer_public_key: vec![7; 1952],
                 revoked_at: 1_800_000_000,
-                reason: Some("r".to_string()),
+                reason: Some(reason),
                 signature: vec![9; 3309],
+            }
+        }
+
+        /// Every batch is at most the target plus one record, and under
+        /// the size a receiver accepts.
+        fn assert_batches_fit(batches: &[Vec<u8>], one_record: usize) {
+            for batch in batches {
+                assert!(batch.len() <= REVOCATION_BATCH_TARGET_BYTES + one_record);
+                assert!(batch.len() < MAX_REVOCATION_PAYLOAD_BYTES);
             }
         }
 
@@ -4467,9 +4499,17 @@ mod tests {
             let batches = encode_revocation_batches(&records).expect("encode");
             assert!(batches.len() > 1);
             let mut seen = HashSet::new();
+            let one_record = bincode::serialize(&records[0]).expect("encode").len() + 16;
+            assert_batches_fit(&batches, one_record);
+            // The target keeps a single batch near the old size: a set
+            // that fits in 1.5 MiB is still one batch.
+            assert_eq!(
+                encode_revocation_batches(&records[..280])
+                    .expect("encode")
+                    .len(),
+                1
+            );
             for batch in &batches {
-                assert!(batch.len() <= REVOCATION_BATCH_TARGET_BYTES + 8 * 1024);
-                assert!(batch.len() < MAX_REVOCATION_PAYLOAD_BYTES / 2);
                 for record in decode_revocation_batch(batch).expect("a released decoder reads it") {
                     seen.insert(record.record_hash());
                 }
@@ -4491,6 +4531,19 @@ mod tests {
                 1
             );
             assert!(encode_revocation_batches(&[]).expect("encode").is_empty());
+
+            // The longest reason a record may carry, on every record.
+            let long: Vec<RevocationRecord> = (0..1_000)
+                .map(|tag| sized_fake_with_reason(tag, "x".repeat(MAX_REVOCATION_REASON_BYTES)))
+                .collect();
+            let long_batches = encode_revocation_batches(&long).expect("encode");
+            let one_long = bincode::serialize(&long[0]).expect("encode").len() + 16;
+            assert_batches_fit(&long_batches, one_long);
+            let carried: usize = long_batches
+                .iter()
+                .map(|batch| decode_revocation_batch(batch).expect("decode").len())
+                .sum();
+            assert_eq!(carried, 1_000);
         }
 
         /// WHY: a store written before this change can hold more records
@@ -4516,8 +4569,8 @@ mod tests {
             let batches = encode_revocation_batches(&loaded.all_records()).expect("encode");
             assert!(batches.len() > 1);
             let mut sent = 0;
+            assert_batches_fit(&batches, 8 * 1024);
             for batch in &batches {
-                assert!(batch.len() < MAX_REVOCATION_PAYLOAD_BYTES / 2);
                 sent += decode_revocation_batch(batch).expect("decode").len();
             }
             assert_eq!(sent, 420);
