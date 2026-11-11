@@ -17,6 +17,7 @@ on:
       - 'src/dm*.rs'
       - 'Cargo.lock'
       - 'scripts/ci/isolated-runtime.py'
+      - 'scripts/ci/apt-install.sh'
   pull_request:
     paths:
       - 'examples/python-client/**'
@@ -28,6 +29,7 @@ on:
       - 'src/dm*.rs'
       - 'Cargo.lock'
       - 'scripts/ci/isolated-runtime.py'
+      - 'scripts/ci/apt-install.sh'
 
 permissions:
   contents: read
@@ -88,8 +90,7 @@ jobs:
       # does not build its bundled copy with CMake (#1816).
       - name: Install Opus (libopus-dev, pkg-config)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libopus-dev pkg-config
+          scripts/ci/apt-install.sh --no-install-recommends libopus-dev pkg-config
           pkg-config --modversion opus
       - name: Build x0xd
         run: cargo build --locked --bin x0xd
