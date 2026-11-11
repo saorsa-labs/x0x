@@ -647,6 +647,18 @@ impl OwnerTrust {
         devices.is_enrolled(machine_id, &owner).await
     }
 
+    /// Whether `machine_id` is in this owner's verified, current device
+    /// roster (#1863). Unlike [`Self::is_enrolled_owner_machine`] it does
+    /// not look at the revocation set: the revocation path asks it about a
+    /// machine that is revoked. A machine that is not enrolled costs a map
+    /// lookup.
+    pub(crate) async fn machine_in_owner_roster(&self, machine_id: &MachineId) -> bool {
+        let (Some(owner), Some(devices)) = (self.local_owner, self.device_store()) else {
+            return false;
+        };
+        devices.is_enrolled(machine_id, &owner).await
+    }
+
     /// Whether an explicit revocation record bars `sender` from reopening a
     /// corrupt carrier (#1116).
     ///

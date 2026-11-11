@@ -90,7 +90,8 @@ single-record path is refused with a WARN log line.
 A03). It opens a carrier only from a sender that is a trusted authority:
 
 - A batch with **no marker** is the sender's whole set. The rule of #1116
-  applies as before.
+  applies as before, with one exception for self-revocations (see
+  "Self-revocations of strangers" below).
 - A batch with a **marker** is one part of a round. The daemon keeps one
   open round for each sender and carrier. A part of another round (another
   `set` or `n`) replaces the open round; parts of two rounds are never
@@ -119,7 +120,9 @@ A03). It opens a carrier only from a sender that is a trusted authority:
   of #1857). The offer then stays, the ingest admits that record, and the
   carrier opens when the daemon's held records equal the snapshot's kept
   records, each one verified. A snapshot whose record for the pair is
-  worse than the held one is still refused.
+  worse than the held one is still refused. A held self-revocation that
+  the snapshot has no record of its pair for does not count as omitted
+  (#1863, see below).
 
 Bounds on what a waiting daemon holds for one sender and carrier:
 
@@ -133,6 +136,107 @@ Bounds on what a waiting daemon holds for one sender and carrier:
 The records of a part are not verified when the part is recorded; they are
 verified when they are ingested. Only a trusted authority can fill this
 state.
+
+## Self-revocations of strangers (#1863)
+
+Any key can revoke itself, and each new key is a new (subject, issuer)
+pair. Without a limit, one new key and one signature put about 5.3 KB in
+every daemon's store for good, and every daemon sent it again every 2
+hours. Decision (Claude, under David's delegation of 10 Nov 2026):
+
+- A daemon keeps the self-revocation of a **stranger** in force and in its
+  store, but leaves it out of the set that it publishes. Pubsub spreads the
+  record once when it is first sent. A daemon that was offline then does
+  not learn it from the 2-hour publish.
+- A subject is **seen**, and its self-revocation is published, when this
+  daemon has a **relationship** with it that a peer cannot create alone
+  for a fresh key (decided 11 Nov 2026, #1868 review round 2). The gossip
+  ingest, the local apply path and the heartbeat use this one rule, and
+  each reads every source below through one constructor
+  (`SeenEvidence::gather`), so no path can leave a source out (#1868
+  review round 4). The heartbeat checks again every 10 minutes.
+
+  | Subject | Seen when | Can a peer with no relationship make it for a fresh key? |
+  |---|---|---|
+  | agent | it is this daemon's own agent | no |
+  | agent | a contact with trust Known or Trusted | no: only the local user sets this (REST, CLI, GUI) |
+  | agent | in this owner's issued-certificate journal | no: only this owner writes it |
+  | agent | an active member of a named group that this node is an active member of and that admits only with approval (`InviteOnly`, `RequestAccess`, `OwnerCertified`; an unknown variant does not count) | no; but an admin of such a group can add members (see below) |
+  | machine | it is this daemon's own machine | no |
+  | machine | in this owner's verified device roster | no: needs this owner's signed enrollment |
+  | machine | listed on a Known or Trusted contact | no; but that contact can list a new machine (see below) |
+
+  **Not seen:** the discovery caches, an Unknown or Blocked contact, a
+  pending, removed or banned row in a group, any member of an `OpenJoin`
+  group. A verified announce from a fresh key fills the
+  discovery caches and makes an Unknown contact entry with its machine;
+  applying a revocation blocks its subject as a contact. None of these is
+  a relationship.
+
+  A removed row does not count. A requester makes a pending row alone (a
+  join request), and cancelling the request, or an admin's rejection,
+  turns it into a removed row. A removed former member is also no longer
+  a relationship.
+
+  **Remaining trust in related peers (accepted risk).** An admin of an
+  approval-only group that this node joined can seat many fresh keys as
+  Active members, and each one is then seen: its self-revocation is
+  published. A Known or Trusted contact can announce fresh machines in
+  the same way. This is accepted because joining the group, or raising
+  the contact, needs a local user action. A bound per group is a possible
+  later step (#1867).
+- Applying a revocation blocks its subject as a contact, so a Known
+  contact is no longer a relationship after that. A daemon checks the
+  rule **before** that change, and keeps the result in memory. The
+  heartbeat checks again every 10 minutes. A record whose subject gets a
+  relationship later (for example the user raises a contact to Known) is
+  published at the next heartbeat.
+- A mark changes the set's generation, so the next heartbeat publishes.
+- Every publish path reads its records from one function
+  (`revocation_publish_records`), and a test decodes what it sends.
+- A self-revocation that this daemon applies itself (an operator revokes
+  this agent or machine) is marked at once and is in the immediate publish.
+- The mark is in memory only. After a restart, a subject whose only
+  relationship was a Known or Trusted contact is a stranger again (the
+  revocation blocked the contact), and its record is no longer published
+  by this daemon. An agent of this owner and an owner machine stay seen.
+  A group member stays seen only while it is active; the revocation path
+  removes a revoked member, so after a restart it is a stranger again.
+- Owner revocations, binding tombstones and share-grant records are always
+  published.
+- No disk bound: removing a record would make its subject valid again.
+  `GET /diagnostics/gossip` shows the number of held stranger records as
+  `identity_authority.revocation_stranger_self_held`.
+
+**The resync rule changes for self-revocations only.** A daemon that waits
+for a resync compares the sender's set with its held records. The sender
+now leaves out strangers, so a waiting daemon that holds a stranger's
+record (from the one pubsub spread) would never open. So a held
+self-revocation for which the sender's set has **no record of the same
+subject and issuer** does not block opening, in both checks (the cover
+check and the equality check). Every other held record keeps the exact
+rules. Opening never removes a held record, so an ignored record stays in
+force. The cost: an omitted self-revocation is no longer a sign that the
+sender is behind.
+
+**Known gap.** A waiting daemon that lost a self-revocation for a subject
+that only it knows does not get the record back from senders to whom the
+subject is a stranger. It opens without that record. Follow-up:
+[#1867](https://github.com/saorsa-labs/x0x/issues/1867).
+
+**Known stall: an empty published set.** A sender whose held v1 records
+are all self-revocations of strangers publishes an empty set, and an
+empty batch never opens a waiting carrier. If every trusted sender is in
+that state, a waiting daemon stays closed (fail closed) until a sender
+has a record that it publishes. Whether a signed empty statement from an
+authority should open a waiter is open in
+[#1867](https://github.com/saorsa-labs/x0x/issues/1867).
+
+**Mixed versions.** A released daemon (v0.48.1 and earlier) that waits for
+a resync compares exact record sets. If it holds a stranger's
+self-revocation, it cannot open from a new sender, only from a released
+sender that still publishes the record. It stays closed (fail closed)
+until a released sender publishes, or it is upgraded. This is accepted.
 
 ## A legacy record with a long reason
 

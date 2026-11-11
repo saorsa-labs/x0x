@@ -482,6 +482,24 @@ pub fn record_startup_diagnostic(event: &str) {
 
 /// Install the check that reopens a corrupt revocation carrier (#1116).
 ///
+/// #1863: the group check of "seen" that `x0xd` installs on its agent. The
+/// rule is [`x0x::revocation_group_relationship`] over the named-group
+/// roster. A locked roster reads as "not seen": the next heartbeat asks
+/// again. The check holds a `Weak`, so the agent does not keep `AppState`
+/// alive.
+fn revocation_group_seen_check(state: &Arc<AppState>) -> x0x::RevocationGroupSeen {
+    let roster_state = Arc::downgrade(state);
+    Arc::new(move |agent_id| {
+        let Some(state) = roster_state.upgrade() else {
+            return false;
+        };
+        let Ok(groups) = state.named_groups.try_read() else {
+            return false;
+        };
+        x0x::revocation_group_relationship(groups.values(), &state.agent.agent_id(), agent_id)
+    })
+}
+
 /// A trusted sender is a machine enrolled to the local owner, or an Active
 /// owner or admin in a local group this node belongs to. An explicit
 /// revocation of that agent, machine, or binding does not qualify. The
@@ -1646,6 +1664,10 @@ pub async fn serve_with_options(
             health_verdict::run_delivery_probe(probe_agent, probe_snapshot, shutdown_rx).await;
         }));
     }
+
+    // #1863: a self-revocation of a group member is published again; one
+    // of a stranger is not.
+    agent.set_revocation_group_seen(revocation_group_seen_check(&state));
 
     // ADR 0089: relationship sources are installed before load verification.
     let context_state = Arc::downgrade(&state);
@@ -6504,3 +6526,90 @@ targets = [\"127.0.0.1:22\"]
 // (Accepted), identity discovery authority. Test builds only.
 #[cfg(test)]
 mod identity_ingest_authority_tests;
+
+/// #1868 review round 4: the group case of #1863 through the check that
+/// `x0xd` installs and the heartbeat step, with the agent's own sources.
+#[cfg(test)]
+mod revocation_group_seen_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::revocation_group_seen_check;
+    use crate as x0x;
+    use crate::server::routes::named_groups::tests::secure_endpoint_test_state;
+
+    fn self_revocation(kp: &x0x::identity::AgentKeypair) -> x0x::revocation::RevocationRecord {
+        x0x::revocation::RevocationRecord::sign(
+            x0x::revocation::RevokedSubject::Agent(kp.agent_id()),
+            kp.public_key(),
+            kp.secret_key(),
+            1_000,
+            None,
+        )
+        .expect("sign")
+    }
+
+    #[tokio::test]
+    async fn the_roster_check_publishes_an_active_member_and_not_a_removed_one() {
+        let (state, _dir) = secure_endpoint_test_state().await.expect("state");
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let active = x0x::identity::AgentKeypair::generate().expect("keypair");
+        let removed = x0x::identity::AgentKeypair::generate().expect("keypair");
+        let removed_hex = hex::encode(removed.agent_id().as_bytes());
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "g".to_string(),
+            String::new(),
+            x0x::identity::AgentId([0x33; 32]),
+            "00112233445566778899aabbccddeeff".to_string(),
+            x0x::groups::policy::GroupPolicy {
+                admission: x0x::groups::policy::GroupAdmission::InviteOnly,
+                ..x0x::groups::policy::GroupPolicy::default()
+            },
+        );
+        for hex_id in [
+            local_hex,
+            hex::encode(active.agent_id().as_bytes()),
+            removed_hex.clone(),
+        ] {
+            info.add_member(hex_id, x0x::groups::GroupRole::Member, None, None);
+        }
+        info.remove_member(&removed_hex, Some(hex::encode([0x33u8; 32])));
+        state
+            .named_groups
+            .write()
+            .await
+            .insert("g".to_string(), info);
+        state
+            .agent
+            .set_revocation_group_seen(revocation_group_seen_check(&state));
+
+        let set = state.agent.revocation_set();
+        let active_record = self_revocation(&active);
+        {
+            let mut guard = set.write().await;
+            assert!(guard
+                .verify_and_insert(active_record.clone(), None)
+                .expect("insert"));
+            assert!(guard
+                .verify_and_insert(self_revocation(&removed), None)
+                .expect("insert"));
+            assert!(guard.published_records().is_empty());
+        }
+        assert!(
+            x0x::mark_seen_revocation_subjects(&set, &state.agent.revocation_seen_sources()).await
+        );
+        let guard = set.read().await;
+        assert_eq!(
+            guard
+                .published_records()
+                .iter()
+                .map(x0x::revocation::RevocationRecord::record_hash)
+                .collect::<Vec<_>>(),
+            vec![active_record.record_hash()],
+            "an active member is published; a removed one is not"
+        );
+        assert!(
+            guard.is_agent_revoked(&removed.agent_id()),
+            "held, unpublished"
+        );
+    }
+}
