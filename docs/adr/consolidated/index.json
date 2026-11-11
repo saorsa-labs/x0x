@@ -26,7 +26,7 @@
       "revision": 1,
       "path": "A03-r01-trust-permissions-sharing-and-revocation.md",
       "title": "Trust Permissions Sharing and Revocation",
-      "sha256": "00e965ffd2db6f61f1dbcb7e64280ee133ea0b8cbb7d15cf073daa34a17ceffd"
+      "sha256": "ec94f635d6405e4f2aced65312767bee111c56f06f627ef27700d4953b46a1b7"
     },
     {
       "id": "A04",
@@ -40,7 +40,7 @@
       "revision": 1,
       "path": "A05-r01-connectivity-discovery-and-names.md",
       "title": "Connectivity Discovery and Names",
-      "sha256": "84278ffbf8a21c96bd57f5c8dbf742b62e4f7448d751d0816ca2f73b098a8587"
+      "sha256": "51ea94aab2056164f5b6a6ed66607b00a9dca64de8d3f97885964944cb85e166"
     },
     {
       "id": "A06",

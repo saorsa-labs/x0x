@@ -489,6 +489,33 @@ pub(crate) struct AttestationVerifyCtx {
     local_authority_only: bool,
 }
 
+#[cfg(test)]
+impl AttestationVerifyCtx {
+    /// A verify context for tests outside this module, with the system
+    /// clock and an empty move state.
+    pub(crate) fn for_test(
+        discovery_cache: std::sync::Arc<
+            tokio::sync::RwLock<std::collections::HashMap<AgentId, crate::DiscoveredAgent>>,
+        >,
+        contact_store: std::sync::Arc<tokio::sync::RwLock<crate::contacts::ContactStore>>,
+        own_machine_id: MachineId,
+        revocation_set: Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>,
+        owner_trust: crate::owner_trust::OwnerTrust,
+        local_authority_only: bool,
+    ) -> Self {
+        Self {
+            discovery_cache,
+            contact_store,
+            own_machine_id,
+            clock: teardown::system_clock(),
+            revocation_set,
+            move_state: Arc::new(tokio::sync::RwLock::new(crate::key_move::MoveState::new())),
+            owner_trust,
+            local_authority_only,
+        }
+    }
+}
+
 /// Inbound gate decision for a `ForwardV2` attested stream (#204).
 ///
 /// The opener has cryptographically proven its identity (the ML-DSA-65
@@ -585,9 +612,11 @@ async fn decide_inbound_attested_with_authority(
     // is used for EXISTENCE + machine binding only — the public key travels
     // in the header (bound via hash → agent_id), so the verifier never depends
     // on announce-propagation timing (#204 soak NO-GO fix).
-    let cached = {
-        let cache = ctx.discovery_cache.read().await;
-        cache.get(&header.opener_agent_id).cloned()
+    // #1107: on a cache miss, a usable evidence record for this agent on
+    // the transport machine stands in; nothing is written to the cache.
+    let cached = match opener_view(&header.opener_agent_id, peer_machine, ctx).await {
+        LocalAuthorityOutcome::Allow(view) => view,
+        LocalAuthorityOutcome::Deny(_) | LocalAuthorityOutcome::Busy => None,
     };
     let agent = cached.ok_or_else(|| {
         tracing::warn!(
@@ -635,7 +664,7 @@ async fn decide_inbound_attested_with_authority(
 
     // Opportunistically upgrade the cache entry with the header's key so
     // subsequent forwards (and other subsystems) benefit.
-    if agent.agent_public_key.is_empty() && !header.opener_agent_public_key.is_empty() {
+    if agent.cached_key_missing && !header.opener_agent_public_key.is_empty() {
         let mut cache = ctx.discovery_cache.write().await;
         if let Some(entry) = cache.get_mut(&header.opener_agent_id) {
             entry.agent_public_key = header.opener_agent_public_key.clone();
@@ -665,7 +694,7 @@ async fn decide_inbound_attested_with_authority(
 /// [`decide_inbound_attested_with_authority`] without the authority (the
 /// gate-matrix tests compare the admitted target only).
 #[cfg(test)]
-async fn decide_inbound_attested(
+pub(crate) async fn decide_inbound_attested(
     header: &ForwardV2Header,
     policy: &ConnectPolicy,
     peer_machine: &MachineId,
@@ -808,6 +837,77 @@ impl AuthzDenial {
     }
 }
 
+/// Where the forward gate found the opener (#1107).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenerSource {
+    /// The discovery cache, filled by the opener's identity announce.
+    Discovery,
+    /// A usable ADR 0089 evidence record for this agent on this machine.
+    /// Used only on a discovery-cache miss, and only for owner trust.
+    Evidence,
+}
+
+/// What the forward gate needs about the opener: its machine and the
+/// expiry of its certificate.
+#[derive(Debug, Clone, Copy)]
+struct OpenerView {
+    machine_id: MachineId,
+    cert_not_after: Option<u64>,
+    source: OpenerSource,
+    /// The discovery entry has no agent public key yet.
+    cached_key_missing: bool,
+}
+
+/// Find the opener in the discovery cache, else in the evidence store.
+///
+/// #1107: on a discovery-cache miss the gate may read a usable evidence
+/// record for `opener` on `peer_machine` (the transport-authenticated
+/// machine). The record must carry a certificate. Callers must still prove
+/// the agent key with the signed header and must admit an evidence opener
+/// only with owner trust. Nothing is written to the discovery cache or to
+/// any registry, and the result is not cached.
+async fn opener_view(
+    opener: &AgentId,
+    peer_machine: &MachineId,
+    ctx: &AttestationVerifyCtx,
+) -> LocalAuthorityOutcome<Option<OpenerView>, AuthzDenial> {
+    let cached = {
+        let cache = ctx.discovery_cache.read().await;
+        cache.get(opener).map(|agent| OpenerView {
+            machine_id: agent.machine_id,
+            cert_not_after: agent.cert_not_after,
+            source: OpenerSource::Discovery,
+            cached_key_missing: agent.agent_public_key.is_empty(),
+        })
+    };
+    if cached.is_some() {
+        return LocalAuthorityOutcome::Allow(cached);
+    }
+    let Some(runtime) = ctx.owner_trust.evidence() else {
+        return LocalAuthorityOutcome::Allow(None);
+    };
+    let now_ms = (ctx.clock)();
+    let view = if ctx.local_authority_only {
+        match runtime.try_usable(*opener, *peer_machine, now_ms) {
+            Ok(view) => view,
+            Err(()) => return LocalAuthorityOutcome::Busy,
+        }
+    } else {
+        runtime.usable(*opener, *peer_machine, now_ms)
+    };
+    let found = view.and_then(|view| {
+        let cert = view.certificate.as_ref()?;
+        (view.announcement.agent_id == *opener && view.announcement.machine_id == *peer_machine)
+            .then(|| OpenerView {
+                machine_id: view.announcement.machine_id,
+                cert_not_after: cert.not_after(),
+                source: OpenerSource::Evidence,
+                cached_key_missing: false,
+            })
+    });
+    LocalAuthorityOutcome::Allow(found)
+}
+
 /// Authorization half of the attested (`ForwardV2`) inbound gate: every
 /// check that depends on current authority rather than on the header bytes.
 /// Admission runs it after the attestation checks; the ADR-0074 §4 re-check
@@ -828,12 +928,13 @@ pub(crate) async fn authorize_attested_opener(
 ) -> LocalAuthorityOutcome<teardown::StreamAuthority, AuthzDenial> {
     use crate::owner_trust::NonblockingEval;
 
-    let agent = {
-        let cache = ctx.discovery_cache.read().await;
-        cache.get(opener).cloned()
-    };
-    let Some(agent) = agent else {
-        return LocalAuthorityOutcome::Deny(AuthzDenial::AgentUnknown);
+    let agent = match opener_view(opener, peer_machine, ctx).await {
+        LocalAuthorityOutcome::Allow(Some(agent)) => agent,
+        LocalAuthorityOutcome::Allow(None) => {
+            return LocalAuthorityOutcome::Deny(AuthzDenial::AgentUnknown)
+        }
+        LocalAuthorityOutcome::Deny(denial) => return LocalAuthorityOutcome::Deny(denial),
+        LocalAuthorityOutcome::Busy => return LocalAuthorityOutcome::Busy,
     };
     if agent.machine_id != *peer_machine {
         return LocalAuthorityOutcome::Deny(AuthzDenial::AgentNotOnMachine);
@@ -905,6 +1006,11 @@ pub(crate) async fn authorize_attested_opener(
             )
             .await
     };
+    // #1107: an opener known only from evidence is admitted for owner
+    // trust alone; contact rules and grants still need the discovery path.
+    if agent.source == OpenerSource::Evidence && !pair.owner_trusted {
+        return LocalAuthorityOutcome::Deny(AuthzDenial::AgentUnknown);
+    }
     let grant_port_allowed = access.allows_connect_port(target.port());
     let decision = pair.decision.with_owner_trust(grant_port_allowed);
 

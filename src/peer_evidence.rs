@@ -9,6 +9,9 @@ use crate::{
     dm_capability::CapabilityAdvert,
     identity::{AgentCertificate, AgentId, MachineId, UserId},
 };
+#[cfg(test)]
+#[path = "peer_evidence_forward_opener_tests.rs"]
+mod forward_opener_tests;
 mod runtime;
 #[cfg(test)]
 pub(crate) use runtime::set_w3h_inline_lookups;
@@ -1653,7 +1656,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     const NOW: u64 = 2_000_000_000_000;
     #[derive(Default)]
-    struct Policy {
+    pub(super) struct Policy {
         peers: Mutex<HashMap<AgentId, u8>>,
         revoked: AtomicBool,
         unavailable: AtomicBool,
@@ -1677,24 +1680,24 @@ mod tests {
             self.peers.lock().unwrap().contains_key(&a)
         }
     }
-    struct Peer {
-        agent: AgentKeypair,
-        machine: MachineKeypair,
+    pub(super) struct Peer {
+        pub(super) agent: AgentKeypair,
+        pub(super) machine: MachineKeypair,
     }
     impl Peer {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             Self {
                 agent: AgentKeypair::generate().unwrap(),
                 machine: MachineKeypair::generate().unwrap(),
             }
         }
-        fn a(&self) -> AgentId {
+        pub(super) fn a(&self) -> AgentId {
             self.agent.agent_id()
         }
-        fn m(&self) -> MachineId {
+        pub(super) fn m(&self) -> MachineId {
             self.machine.machine_id()
         }
-        fn record(&self, ann_time: u64, advert_time: u64) -> EvidenceRecordV1 {
+        pub(super) fn record(&self, ann_time: u64, advert_time: u64) -> EvidenceRecordV1 {
             let v2 = crate::IdentityAnnouncement {
                 self_name: Some("wire name".into()),
                 agent_id: self.a(),
@@ -1756,7 +1759,7 @@ mod tests {
             }
         }
     }
-    fn setup(peer: &Peer) -> (tempfile::TempDir, Arc<Policy>, PeerEvidenceStore) {
+    pub(super) fn setup(peer: &Peer) -> (tempfile::TempDir, Arc<Policy>, PeerEvidenceStore) {
         let dir = tempfile::tempdir().unwrap();
         let p = Arc::new(Policy::default());
         p.peers.lock().unwrap().insert(peer.a(), GROUP);
