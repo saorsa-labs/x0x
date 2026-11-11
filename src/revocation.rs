@@ -868,6 +868,10 @@ const ROUND_MARKER_REASON_PREFIX: &str = "x0x-revocation-round-v1";
 /// The most batches one round may have.
 pub(crate) const MAX_ROUND_BATCHES: u32 = 4096;
 
+/// The most records a waiting node holds for one open round of one sender
+/// (about 700 full batches of real records).
+const MAX_ROUND_RECORDS: usize = 262_144;
+
 /// What a round-marker record says: this batch is batch `index` of
 /// `batches`, and `set` is the BLAKE3 digest of the sorted record hashes of
 /// the sender's whole set for the carrier.
@@ -1350,6 +1354,10 @@ impl RevocationSet {
             .as_ref()
             .is_some_and(|round| round.set == marker.set && round.batches == marker.batches);
         if !same_round {
+            // The sender's set is this round now. A whole-set snapshot
+            // that it offered earlier is stale and must not open the
+            // carrier any more.
+            candidate.whole = None;
             candidate.round = Some(OpenRound {
                 set: marker.set,
                 batches: marker.batches,
@@ -1365,6 +1373,19 @@ impl RevocationSet {
             .is_some_and(|held| held.hashes != hashes)
         {
             // The same index with other content: refuse the new part.
+            return;
+        }
+        // The records of a part are not verified here, so bound what one
+        // sender can make this node hold. Over the bound, the round is
+        // dropped and the carrier stays closed.
+        let round_records: usize = round.parts.values().map(|part| part.hashes.len()).sum();
+        if round_records.saturating_add(hashes.len()) > MAX_ROUND_RECORDS {
+            tracing::warn!(
+                carrier,
+                sender = %hex::encode(sender.as_bytes()),
+                "revocation resync: a round offers more records than this node holds for one sender; the round is dropped"
+            );
+            candidate.round = None;
             return;
         }
         round
@@ -5361,6 +5382,39 @@ mod tests {
             }
             assert!(!pending(&waiter), "the complete round B opens");
             assert_eq!(waiter.len(), 7);
+        }
+
+        /// WHY: a sender offers its whole set as one batch, and later its
+        /// set grows into a round. The old one-batch snapshot is stale. If
+        /// the waiter kept it, it could open on that old set while it
+        /// holds only part of the sender's set of now.
+        #[test]
+        fn an_earlier_whole_snapshot_does_not_open_after_a_round_starts() {
+            let old = records(2);
+            let mut grown = old.clone();
+            grown.extend(records(4));
+            let mut waiter = waiting();
+            // The old snapshot is offered while the waiter holds nothing
+            // of it yet.
+            waiter.observe_remote_carrier_snapshot(REVOCATION_CARRIER_V1, &SENDER, &old, true);
+            // A part of the new round arrives (not ingested: lost records).
+            let batches = round(&grown);
+            let (part, marker) = decode_revocation_batch_with_round(&batches[0]).expect("decode");
+            waiter.observe_remote_carrier_batch(
+                REVOCATION_CARRIER_V1,
+                &SENDER,
+                &part,
+                marker,
+                true,
+            );
+            // The waiter now comes to hold exactly the OLD set.
+            for record in old {
+                let _ = waiter.verify_and_insert_at(record, None, 2_000);
+            }
+            assert!(
+                pending(&waiter),
+                "the stale one-batch snapshot must not open the carrier"
+            );
         }
 
         /// WHY: only a trusted authority can offer a snapshot. A marker
