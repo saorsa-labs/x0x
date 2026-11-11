@@ -4510,6 +4510,46 @@ async fn durable_send_1455(
     count
 }
 
+/// Total outbound PubSub frames sent by `agent` plus the sends its budget
+/// refused. Either one moving means the plane is not idle yet.
+fn outbound_activity(agent: &Agent) -> u64 {
+    let stats = pubsub(agent).stage_stats();
+    stats
+        .outbound_by_kind
+        .values()
+        .map(|kind| kind.msgs)
+        .sum::<u64>()
+        .saturating_add(stats.outbound_budget_exhausted)
+}
+
+/// #1862: wait until the pair has sent nothing for `QUIET_WINDOW`. The
+/// first durable send runs with no retry (`max_retries: 0`), so a DM EAGER
+/// frame shed by a per-peer in-flight permit or the byte budget while the
+/// capability-advert burst of a fresh plane is still draining never
+/// arrives and the ACK wait ends at `DELIVERY`. A fixed sleep covered that
+/// burst on an idle machine only. This waits on the cause (no outbound
+/// frames), not on elapsed time, bounded by `SETUP`. It does not retry the
+/// send or raise `DELIVERY`, so a real non-arrival (#613) still fails.
+async fn wait_pair_quiet(alice: &Agent, bob: &Agent) {
+    const QUIET_WINDOW: Duration = Duration::from_secs(1);
+    const SAMPLE: Duration = Duration::from_millis(100);
+    bounded("1455 pair outbound traffic quiet", SETUP, async {
+        let mut last = (outbound_activity(alice), outbound_activity(bob));
+        let mut quiet_since = tokio::time::Instant::now();
+        loop {
+            tokio::time::sleep(SAMPLE).await;
+            let now = (outbound_activity(alice), outbound_activity(bob));
+            if now != last {
+                last = now;
+                quiet_since = tokio::time::Instant::now();
+            } else if quiet_since.elapsed() >= QUIET_WINDOW {
+                break;
+            }
+        }
+    })
+    .await;
+}
+
 /// WHY (#1455): six bystander daemons on the sender's loopback plane take
 /// the Leaf's bounded EAGER fan-out for the recipient's inbox topic —
 /// membership carries no subscription signal, so the single inbox EAGER
@@ -4555,8 +4595,9 @@ async fn dm_1455_bystander_plane_durable_send_stays_on_inbox_eager() {
         // measured sends: a fresh 8-daemon plane runs a burst of capability
         // adverts whose per-peer in-flight data permits can otherwise shed
         // the DM EAGER frame (sg local saturation), which is unrelated to
-        // the eager-target selection under test.
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // the eager-target selection under test. Wait for the burst to end
+        // (#1862), not for a fixed time.
+        wait_pair_quiet(alice, bob).await;
         for label in ["send-1", "send-2", "send-3"] {
             let id = dm_send::fresh_request_id();
             let payload = marked(label);
@@ -4629,7 +4670,7 @@ async fn dm_1455_bystander_plane_durable_send_stays_on_inbox_eager() {
             );
             // Drain per-peer in-flight permits so one send's frames cannot
             // shed the next send's EAGER (see the settle note above).
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            wait_pair_quiet(alice, bob).await;
         }
     })
     .catch_unwind()
