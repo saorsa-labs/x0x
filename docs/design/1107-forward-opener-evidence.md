@@ -9,7 +9,8 @@ A receiver admits an attested forward (`ForwardV2`) only when its
 discovery cache holds the opener's agent. After the receiver restarts, or
 before the opener's identity announce reaches it, the cache is empty. The
 stream was then refused at dispatch (`deny_not_verified`), and the forward
-gate refused with `agent_not_in_discovery_cache`. This held even when the
+gate refused with `agent_not_in_discovery_cache` (now
+`agent_not_in_discovery_cache_or_evidence`). This held even when the
 receiver's evidence store already had a verified record and certificate for
 that agent, and owner trust already reads that store.
 
@@ -46,6 +47,15 @@ existing rule stays: those registries are never seeded from evidence.
   no known agent may now open `ForwardV2` as well as `SyncV1`. The stream
   goes only to the forward acceptor, whose gate applies the rule above.
   Other stream kinds stay denied.
+- `src/forward.rs` `spawn_stream_handler`: that stream carries no agent; its
+  admission slot is keyed by the machine. Any other agentless stream is
+  still reset.
+- `src/forward/teardown.rs` `reevaluate`: for an attested inbound stream
+  from a machine with no agent in the discovery cache, the machine-level
+  gate is skipped (it has nothing to check and would deny). The forwarder's
+  gate re-reads the evidence record and re-checks owner trust and every
+  revocation, so the stream is torn down when the record stops being usable
+  or a revocation applies.
 
 ## Opener side
 
@@ -78,6 +88,11 @@ another enrolled machine, when a discovery entry names another machine
 (not overridden), when the agent, the machine or the binding is revoked,
 when the certificate expires after ingest, and when it is from another
 owner. `src/forward.rs`: an enrolled machine with no known agent that is
-revoked before the header read is dropped without a panic. `src/owner_trust/tests.rs`: `ForwardV2` from an enrolled machine
+revoked before the header read is dropped without a panic; and
+`forward_from_evidence_only_opener_survives_registration_reauth` drives the
+real path (enrollment routing, acceptor, `handle_inbound`, registration and
+its reauth pass) with an empty discovery cache, checks bytes still flow
+after the reauth, and checks that revoking the opener tears the stream
+down. Without the `reevaluate` change that test fails. `src/owner_trust/tests.rs`: `ForwardV2` from an enrolled machine
 with no known agent reaches the forward acceptor; a machine that is not
 enrolled gets nothing.

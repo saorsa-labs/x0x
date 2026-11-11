@@ -621,7 +621,8 @@ async fn decide_inbound_attested_with_authority(
     let agent = cached.ok_or_else(|| {
         tracing::warn!(
             target: "x0x::forward",
-            reason = "agent_not_in_discovery_cache",
+            // #1107: the evidence store had no usable record either.
+            reason = "agent_not_in_discovery_cache_or_evidence",
             agent = %hex::encode(header.opener_agent_id.as_bytes()),
             "forward v2 attestation denied: opener absent from discovery cache"
         );
@@ -2171,17 +2172,24 @@ impl ForwardService {
     /// its `handle_inbound` task. Over-cap streams are reset (dropped) +
     /// counted rather than spawning unbounded.
     fn spawn_stream_handler(self: &Arc<Self>, stream: PeerStream) {
-        // Forward streams reach this acceptor only after the agent identity
-        // gate, so they always carry an agent. An agentless stream (only the
-        // #1040 enrollment-only SyncV1 path creates one) fails closed: it is
-        // dropped, which resets it, before admission or any handler runs.
-        let Some(peer_agent) = stream.agent() else {
-            tracing::warn!(
-                target: "x0x::forward",
-                peer = %hex::encode(stream.peer().0),
-                "inbound forward refused: stream carries no agent identity — resetting"
-            );
-            return;
+        // Forward streams normally reach this acceptor after the agent
+        // identity gate, so they carry an agent. #1107: an enrolled owner
+        // machine with no known agent may open `ForwardV2` (see
+        // `Agent::route_enrolled_owner_sync`); that stream carries no agent,
+        // and its gate decides from the signed header and the evidence store.
+        // Its admission slot is keyed by the machine. Any other agentless
+        // stream fails closed: it is dropped, which resets it.
+        let peer_agent = match stream.agent() {
+            Some(agent) => agent,
+            None if stream.protocol() == StreamProtocol::ForwardV2 => AgentId(stream.peer().0),
+            None => {
+                tracing::warn!(
+                    target: "x0x::forward",
+                    peer = %hex::encode(stream.peer().0),
+                    "inbound forward refused: stream carries no agent identity — resetting"
+                );
+                return;
+            }
         };
         let admission = match self.admit(peer_agent, true) {
             Some(a) => a,
@@ -6711,6 +6719,206 @@ mod tests {
         let (handler, counted) = tokio::join!(handler, client_side);
         handler.expect("socks session");
         counted
+    }
+
+    /// #1107 real accept path. Bob's discovery cache never holds Alice. Bob's
+    /// owner enrolled Alice's machine, and Bob's evidence store holds Alice's
+    /// record with a certificate from that owner. Alice opens a `ForwardV2`
+    /// forward: Bob routes the agentless stream to the forward acceptor,
+    /// `handle_inbound` admits it from evidence, registration runs a reauth
+    /// pass, and bytes still flow after it. Nothing is written to Bob's
+    /// discovery cache.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn forward_from_evidence_only_opener_survives_registration_reauth() {
+        use tokio::io::AsyncWriteExt;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let owner = crate::identity::UserKeypair::generate().expect("owner");
+        let bob_home = dir.path().join("bob");
+        std::fs::create_dir_all(&bob_home).expect("bob home");
+        crate::storage::save_user_keypair_to(&owner, bob_home.join("user.key"))
+            .await
+            .expect("bob owner key");
+        let Some(alice) = build_loopback_agent(dir.path(), "alice").await else {
+            return;
+        };
+        let Some(bob) = build_loopback_agent(dir.path(), "bob").await else {
+            alice.shutdown().await;
+            return;
+        };
+        let alice = Arc::new(alice);
+        let bob = Arc::new(bob);
+        let now_ms = crate::dm_capability::now_unix_ms();
+
+        // Bob's owner enrolls Alice's machine.
+        let devices = Arc::new(
+            crate::owner_sync::OwnerSyncStore::load(&bob_home)
+                .await
+                .expect("device store"),
+        );
+        devices
+            .enroll(
+                crate::owner_sync::OwnerEnrollment::sign(
+                    alice.machine_id(),
+                    &owner,
+                    now_ms - 1000,
+                    None,
+                )
+                .expect("enrollment"),
+            )
+            .await
+            .expect("enroll");
+        bob.owner_trust.install_device_store(devices);
+        bob.start_peer_evidence(
+            bob_home.join("evidence"),
+            crate::peer_evidence::EvidenceConfig::default(),
+            Arc::new(|_| Some(false)),
+        )
+        .expect("bob evidence");
+        assert!(bob.peer_evidence().wait(0).await, "bob evidence loads");
+        let mut record = crate::peer_evidence::record_for_test(
+            alice.identity().agent_keypair(),
+            alice.identity().machine_keypair(),
+            now_ms,
+            now_ms,
+        );
+        record.certificate = Some(
+            crate::identity::AgentCertificate::issue(&owner, alice.identity().agent_keypair())
+                .expect("cert")
+                .to_storage_bytes()
+                .expect("cert bytes"),
+        );
+        bob.peer_evidence()
+            .store()
+            .expect("bob store")
+            .ingest(record, crate::peer_evidence::IngestSource::Hello, now_ms)
+            .expect("ingest alice's record");
+
+        // Link the pair. Only Bob joins (his stream accept loop starts
+        // there); Alice never announces, so Bob never learns her agent.
+        bob.join_network().await.expect("bob join");
+        let alice_net = alice.network().expect("alice network").clone();
+        let bob_net = bob.network().expect("bob network").clone();
+        let bob_addr = normalize_loopback(bob_net.bound_addr().await.expect("bob addr"));
+        alice_net
+            .connect_addr(bob_addr)
+            .await
+            .expect("alice dials bob");
+        let mut card = peer_card(bob.agent_id(), bob.machine_id(), now_ms / 1000);
+        card.addresses = vec![bob_addr];
+        alice.insert_discovered_agent_for_testing(card).await;
+        alice.set_contact_trusted_for_testing(bob.agent_id()).await;
+        alice
+            .record_authenticated_machine_binding_for_testing(bob.agent_id(), bob.machine_id())
+            .await;
+        let alice_machine = alice.machine_id();
+        let alice_known_to_bob = |bob: Arc<crate::Agent>| async move {
+            bob.identity_discovery_cache
+                .read()
+                .await
+                .values()
+                .any(|a| a.machine_id == alice_machine)
+        };
+        assert!(
+            !alice_known_to_bob(Arc::clone(&bob)).await,
+            "bob has no agent for alice"
+        );
+
+        let (target_port, target_bytes, target_cancel) = spawn_counting_target().await;
+        let text = format!(
+            "[connect]\nenabled = true\n[[connect.allow]]\nprincipal = \"owner\"\ntargets = [\"127.0.0.1:{target_port}\"]\n"
+        );
+        let bob_policy = Arc::new(
+            crate::connect::parse_connect_policy(std::path::Path::new("/tmp/x"), 0, &text)
+                .expect("owner policy"),
+        );
+        bob.set_connect_policy(Arc::clone(&bob_policy));
+        let bob_diag = Arc::new(ConnectDiagnostics::new(bob_policy.summary()));
+        let bob_fwd = Arc::new(
+            ForwardService::new(Arc::clone(&bob), bob_policy, bob_diag, true)
+                .expect("bob forwarder"),
+        );
+        bob_fwd.spawn_inbound();
+        let alice_policy = Arc::new(ConnectPolicy::default());
+        let alice_diag = Arc::new(ConnectDiagnostics::new(alice_policy.summary()));
+        let alice_fwd = Arc::new(
+            ForwardService::new(Arc::clone(&alice), alice_policy, alice_diag, true)
+                .expect("alice forwarder"),
+        );
+        let local = alice_fwd
+            .add_forward(ForwardSpec {
+                local_addr: "127.0.0.1:0".parse().expect("loopback"),
+                peer_agent: bob.agent_id(),
+                target_host: "127.0.0.1".to_string(),
+                target_port,
+            })
+            .await
+            .expect("alice forward");
+
+        let mut client = TcpStream::connect(local).await.expect("client");
+        client.write_all(b"first").await.expect("first write");
+        let first = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while target_bytes.load(std::sync::atomic::Ordering::SeqCst) < 5 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        // The registration reauth pass has run; wait past a reauth interval.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        client.write_all(b"second").await.expect("second write");
+        let second = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while target_bytes.load(std::sync::atomic::Ordering::SeqCst) < 11 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        let torn = bob_fwd.diagnostics().torn_down_reauth();
+        let reasons = bob_fwd.diagnostics().torn_down_reasons();
+        let still_unknown = !alice_known_to_bob(Arc::clone(&bob)).await;
+
+        // The same evidence lookup tears the stream down once Alice's agent
+        // is revoked.
+        let revocation = crate::revocation::RevocationRecord::sign(
+            crate::revocation::RevokedSubject::Agent(alice.agent_id()),
+            alice.identity().agent_keypair().public_key(),
+            alice.identity().agent_keypair().secret_key(),
+            now_ms / 1000,
+            None,
+        )
+        .expect("revocation");
+        bob.revocation_set
+            .write()
+            .await
+            .verify_and_insert(revocation, None)
+            .expect("insert revocation");
+        bob.stream_reauth_signal().notify_one();
+        let revoked_torn = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while bob_fwd.diagnostics().torn_down_reauth() < 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+
+        drop(client);
+        target_cancel.cancel();
+        alice_fwd.shutdown();
+        bob_fwd.shutdown();
+        alice.shutdown().await;
+        bob.shutdown().await;
+
+        assert!(first.is_ok(), "the forward from evidence carries bytes");
+        assert!(
+            second.is_ok(),
+            "the stream is alive after the registration reauth (torn={torn}, reasons={reasons:?})"
+        );
+        assert_eq!(torn, 0, "no reauth teardown: {reasons:?}");
+        assert!(
+            still_unknown,
+            "bob's discovery cache still has no agent for alice"
+        );
+        assert!(
+            revoked_torn.is_ok(),
+            "revoking the opener tears the evidence-admitted stream down"
+        );
     }
 
     /// WHY (Codex P2 / #1505): a successful SOCKS proxy must show up in the
