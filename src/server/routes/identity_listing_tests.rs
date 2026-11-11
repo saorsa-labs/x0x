@@ -266,6 +266,11 @@ async fn own_machine_revoke_signs_with_the_machine_key() {
     assert_eq!(body["reason"], "retired");
     assert!(body["issuer"].is_string() && body["warning"].is_string());
     assert_eq!(state.agent.all_revocation_records().await.len(), 1);
+    // The library method has the same guard: a caller that does not go
+    // through the route also gets the held record and signs nothing.
+    let again = state.agent.revoke_own_machine(None).await.unwrap();
+    assert_eq!(again.record_hash(), records[0].record_hash());
+    assert_eq!(state.agent.all_revocation_records().await.len(), 1);
     state.agent.shutdown().await;
 }
 

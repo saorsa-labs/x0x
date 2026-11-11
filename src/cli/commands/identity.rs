@@ -454,6 +454,10 @@ pub async fn owner_lose_device(
     reason: Option<&str>,
     force: bool,
 ) -> Result<()> {
+    // The id goes into the URL path: refuse anything that is not an id.
+    if machine_id.len() != 64 || !machine_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("MACHINE_ID must be 64 hex characters (see `x0x owner machines`)");
+    }
     client.ensure_running().await?;
     let mut body = serde_json::json!({ "force": force });
     if let Some(reason) = reason {
@@ -730,6 +734,25 @@ mod tests {
         let (path, body) = captured.lock().unwrap().last().cloned().unwrap();
         assert_eq!(path, format!("/owner/agents/{}", "cd".repeat(32)));
         assert_eq!(body["reason"], "superseded");
+    }
+
+    /// WHY: the machine id goes into the URL path. A value that is not an
+    /// id must not reach the daemon as a path.
+    #[tokio::test]
+    async fn owner_lose_device_refuses_a_value_that_is_not_a_machine_id() {
+        let (client, captured, _shutdown) = capture_client().await;
+        for bad in ["zz", "../agents/issue", &"ab".repeat(31), &"zz".repeat(32)] {
+            assert!(owner_lose_device(&client, bad, None, false).await.is_err());
+        }
+        assert!(captured.lock().unwrap().is_empty(), "no request was sent");
+
+        owner_lose_device(&client, &"cd".repeat(32), Some("lost"), true)
+            .await
+            .unwrap();
+        let (path, body) = captured.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(path, format!("/owner/devices/{}/lose", "cd".repeat(32)));
+        assert_eq!(body["reason"], "lost");
+        assert_eq!(body["force"], true);
     }
 
     /// WHY (review r2, finding 2): the ADR-0043 binding form must serialize.

@@ -1704,14 +1704,7 @@ pub(in crate::server) async fn identity_revoke(
         None
     };
     if own_machine {
-        let own = RevokedSubject::Machine(state.agent.machine_id());
-        let held = state
-            .agent
-            .all_revocation_records()
-            .await
-            .into_iter()
-            .filter(|record| record.subject == own)
-            .min_by_key(|record| (record.revoked_at, record.record_hash()));
+        let held = state.agent.own_machine_revocation().await;
         if let Some(record) = held {
             // The same fields as the first answer, and the flag.
             return (

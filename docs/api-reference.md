@@ -577,6 +577,7 @@ Response:
 ```json
 {
   "ok": true,
+  "store_write_error": null,
   "machine_id": "<64-hex>",
   "agents": [
     {"agent_id": "<64-hex>", "placement": "roaming", "pinned_to_this_machine": false,
@@ -602,7 +603,15 @@ Response:
 - `placement_mint_error` is `null`, or the cause when the daemon could not
   bring the placement ledger up to date. The action then used the ledger
   it held.
-- A repeat call signs no new record.
+- A repeat call signs no new record. Every call writes the agent/machine
+  store and the binding store again from the held records, so a repeat
+  makes a record durable that an earlier call left `revoked, not durable`
+  after a write failure. `store_write_error` is `null`, or the cause when
+  that write failed; the answer is then `500`. One cause does not go away
+  with a repeat: a store that x0xd found unreadable is quarantined and is
+  not written until it is rebuilt (`x0x identity rebuild-revocation-store`)
+  or resynced; see [troubleshooting](troubleshooting.md). The record is in
+  force in memory and is published in both cases.
 - **Your owner key is not protected.** If the lost machine held `user.key`,
   whoever has the machine can act as you: certify agents, sign grants and
   enroll devices. This action does not help with that, and x0x cannot
@@ -1171,7 +1180,7 @@ own `MemberAdded`, mint a fresh invite rather than replaying the link.
 | GET | `/owner/machines` | `x0x owner machines` | owner (riders denied) | M1 machine census: enrolled devices + last-sync status + this machine's version/policy digest (#1383) |
 | POST | `/owner/devices/:machine_id/lose` | `x0x owner lose-device <MACHINE_ID>` | durable-owner | Lost-device action; see [Lost device](#lost-device) |
 
-All three answer `409` when no owner identity is configured. Sync replicates
+All five answer `409` when no owner identity is configured. Sync replicates
 owner state **owner-to-owner only** — Tier 1: profile/names, the Home
 history, DMs, and exec data
 never replicate, and no third party receives the state. Inbound SyncV1 streams

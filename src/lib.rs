@@ -18022,6 +18022,45 @@ impl Agent {
         self.revoke_as_owner(&cert, reason).await
     }
 
+    /// The held revocation record of the machine this daemon runs on, when
+    /// the machine is revoked (#1108). With several records, the one with
+    /// the earliest `revoked_at`, then the lowest record hash.
+    pub async fn own_machine_revocation(&self) -> Option<revocation::RevocationRecord> {
+        let own = revocation::RevokedSubject::Machine(self.machine_id());
+        self.revocation_set
+            .read()
+            .await
+            .all_subject_records()
+            .into_iter()
+            .filter(|record| record.subject == own)
+            .min_by_key(|record| (record.revoked_at, record.record_hash()))
+    }
+
+    /// Write the agent/machine store and the binding store again from the
+    /// records held in memory (#1108).
+    ///
+    /// A revocation can be in force but not durable when its store write
+    /// failed. A caller that repeats the action uses this to make the held
+    /// records durable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`error::IdentityError::Storage`] when a store write fails,
+    /// and [`error::IdentityError::Serialization`] on an encode failure.
+    pub async fn persist_identity_revocation_stores(&self) -> error::Result<()> {
+        persist_s4_revocations(
+            &self.revocation_set,
+            &self.s4_revocation_intake,
+            self.identity_dir.as_deref(),
+        )
+        .await?;
+        let bindings = self.revocation_set.read().await.to_bytes_v2()?;
+        if let Some(path) = self.move_file_path("revocations-v2.bin") {
+            storage::save_private_bytes_to(&path, bindings).await?;
+        }
+        Ok(())
+    }
+
     /// Revoke the machine this daemon runs on, signed with the machine key
     /// (#1108).
     ///
@@ -18036,6 +18075,14 @@ impl Agent {
         &self,
         reason: Option<String>,
     ) -> error::Result<revocation::RevocationRecord> {
+        // One call at a time in this process, so that the repeat check
+        // and the signing are one step. A repeat returns the held record
+        // and signs nothing: the set has no size limit.
+        static OWN_MACHINE_REVOKE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _one_call = OWN_MACHINE_REVOKE.lock().await;
+        if let Some(held) = self.own_machine_revocation().await {
+            return Ok(held);
+        }
         let machine_kp = self.identity.machine_keypair();
         let record = revocation::RevocationRecord::sign(
             revocation::RevokedSubject::Machine(self.machine_id()),
@@ -19371,11 +19418,26 @@ impl Agent {
                 return Some(cert);
             }
         }
-        if let Ok(Some(entry)) = self.discovered_agent(*agent).await {
-            if let Some(cert) = entry.agent_certificate {
-                return Some(cert);
-            }
+        // This owner's issuance journal comes before the discovery cache
+        // (#1108): the cache can hold a certificate that ANOTHER owner
+        // issued for the same agent key, and that one gives this owner no
+        // authority. `DELETE /owner/agents/:id` reads the journal too.
+        if let Some(cert) = self.owner_journal_certificate_for(agent).await {
+            return Some(cert);
         }
+        self.discovered_agent(*agent)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|entry| entry.agent_certificate)
+    }
+
+    /// The newest certificate that the loaded owner key issued for `agent`,
+    /// from this install's issuance journal.
+    async fn owner_journal_certificate_for(
+        &self,
+        agent: &identity::AgentId,
+    ) -> Option<identity::AgentCertificate> {
         let journal_path = self.cert_journal_path()?;
         let target_hex = hex::encode(agent.as_bytes());
         let user_hex = self

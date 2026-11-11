@@ -41,9 +41,12 @@ network-wide.
 `x0x owner lose-device <machine>` / `POST /owner/devices/:machine_id/lose`
 does, with the owner key, on any of the owner's devices:
 
-1. For each of the owner's agents known on that machine: an owner-signed
-   **binding tombstone** `(agent, machine, epoch)` on the v2 carrier
-   (`Agent::revoke_binding`, exists).
+1. For each agent that the owner certified and that has an owner-signed
+   placement record on this daemon: an owner-signed **binding tombstone**
+   `(agent, machine, epoch)` on the v2 carrier (`Agent::revoke_binding`,
+   exists). As built, this is every such agent, not only the ones known
+   to be on that machine: a tombstone for a pairing that never existed
+   does no harm, and the daemon cannot always know where an agent ran.
 2. For each agent **pinned** to that machine: an owner-signed **agent**
    revocation (`revoke_as_owner`, exists). A roaming agent keeps its
    identity and loses only this machine.

@@ -1040,6 +1040,19 @@ pub(in crate::server) async fn owner_device_lose(
         },
     };
 
+    // A repeat must be able to make a record durable that an earlier
+    // call left "revoked, not durable": that row is `already_revoked`
+    // now and signs nothing, so the store write is done here, every time.
+    // A store that was quarantined as unreadable stays blocked until it
+    // is rebuilt or resynced (#1116); the answer then names that cause.
+    let store_write_error = match state.agent.persist_identity_revocation_stores().await {
+        Ok(()) => None,
+        Err(e) => {
+            complete = false;
+            Some(e.to_string())
+        }
+    };
+
     let status = if complete {
         StatusCode::OK
     } else {
@@ -1049,6 +1062,7 @@ pub(in crate::server) async fn owner_device_lose(
         status,
         Json(serde_json::json!({
             "ok": complete,
+            "store_write_error": store_write_error,
             "machine_id": hex::encode(machine.as_bytes()),
             "agents": rows,
             "agents_without_placement": agents_without_placement,
@@ -1993,6 +2007,178 @@ mod lose_device_tests {
             .await
             .is_binding_revoked(&state.agent.agent_id(), &LOST));
         assert_eq!(body["device_enrollment"], "removed");
+
+        // The operator repeats the call. The tombstone is held, so the row
+        // signs nothing. The daemon tries the store write again, and the
+        // answer says exactly why it still fails: an unreadable store is
+        // quarantined and is not written until it is rebuilt or resynced
+        // (A03, #1116). The answer must not claim success.
+        let (status, body) = lose(&state, true, &hex::encode(LOST.0), false).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(body["ok"], false);
+        assert_eq!(
+            row(&body, &state.agent.agent_id())["binding"],
+            "already_revoked"
+        );
+        assert!(
+            body["store_write_error"]
+                .as_str()
+                .is_some_and(|cause| cause.contains("quarantined")),
+            "{body}"
+        );
+        assert!(state
+            .agent
+            .revocation_set()
+            .read()
+            .await
+            .is_binding_revoked(&state.agent.agent_id(), &LOST));
+        state.agent.shutdown().await;
+    }
+
+    /// WHY: an agent pinned to the lost machine had its key there, and a
+    /// rider token for that agent may have been there too. The action
+    /// revokes the agent, so its rider tokens must stop working as well.
+    #[tokio::test]
+    async fn lose_device_revokes_the_rider_tokens_of_a_pinned_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = owned_state(dir.path()).await;
+        let pinned = issue(&state, "acp").await;
+        pin(&state, &pinned, LOST).await;
+        enroll(&state, LOST).await;
+        let pinned_hex = hex::encode(pinned.agent_id().as_bytes());
+        let now = crate::server::rider_auth::unix_now_secs();
+        let (_, token) = state
+            .rider_tokens
+            .lock()
+            .await
+            .issue(
+                pinned_hex.clone(),
+                vec![],
+                None,
+                600,
+                "digest".to_string(),
+                None,
+                None,
+                now,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let live = |records: Vec<crate::server::rider_auth::RiderTokenRecord>| {
+            records
+                .iter()
+                .any(|record| record.token_id == token.token_id && record.revoked_at.is_none())
+        };
+        assert!(live(state.rider_tokens.lock().await.list()), "live before");
+
+        let (status, body) = lose(&state, true, &hex::encode(LOST.0), false).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let pinned_row = row(&body, &pinned.agent_id());
+        assert_eq!(pinned_row["agent"], "revoked");
+        assert_eq!(pinned_row["rider_tokens_revoked"], 1, "{body}");
+        assert_eq!(
+            pinned_row["rider_token_sweep_error"],
+            serde_json::Value::Null
+        );
+        assert!(
+            !live(state.rider_tokens.lock().await.list()),
+            "the token is revoked in the store that checks it"
+        );
+        let reloaded = crate::server::rider_auth::RiderTokenStore::load(
+            dir.path()
+                .join(crate::server::rider_auth::RIDER_TOKENS_FILE),
+        )
+        .await;
+        assert!(!live(reloaded.list()), "and on disk");
+        state.agent.shutdown().await;
+    }
+
+    /// A discovery-cache entry for `agent` that carries `cert`.
+    async fn discover_with_cert(state: &Arc<AppState>, agent: AgentId, cert: AgentCertificate) {
+        let now = crate::server::rider_auth::unix_now_secs();
+        state
+            .agent
+            .insert_discovered_agent_for_testing(crate::DiscoveredAgent {
+                agent_id: agent,
+                machine_id: LOST,
+                user_id: None,
+                addresses: Vec::new(),
+                announced_at: now,
+                last_seen: now,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: None,
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                cert_not_after: None,
+                agent_certificate: Some(cert),
+                cert_digest: None,
+                agent_public_key: Vec::new(),
+                self_name: None,
+            })
+            .await;
+    }
+
+    /// WHY: one agent key can hold certificates from two owners. The
+    /// discovery cache can hold the OTHER owner's certificate. The action
+    /// must use the certificate this owner issued (its journal), as
+    /// `DELETE /owner/agents/:id` does, or it fails where that route works.
+    #[tokio::test]
+    async fn an_agent_that_another_owner_also_certified_is_still_revoked() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = owned_state(dir.path()).await;
+        let pinned = issue(&state, "acp").await;
+        pin(&state, &pinned, LOST).await;
+        enroll(&state, LOST).await;
+        let other_owner = UserKeypair::generate().unwrap();
+        let foreign_cert = AgentCertificate::issue(&other_owner, &pinned).unwrap();
+        discover_with_cert(&state, pinned.agent_id(), foreign_cert).await;
+
+        let (status, body) = lose(&state, true, &hex::encode(LOST.0), false).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let pinned_row = row(&body, &pinned.agent_id());
+        assert_eq!(pinned_row["binding"], "revoked", "{body}");
+        assert_eq!(pinned_row["agent"], "revoked", "{body}");
+        assert!(peer_view(&state).await.is_agent_revoked(&pinned.agent_id()));
+        state.agent.shutdown().await;
+    }
+
+    /// WHY: the owner has authority over an agent only through a
+    /// certificate that this owner issued. With no certificate, or with
+    /// one from another owner, the call must fail with a clear cause and
+    /// must sign nothing.
+    #[tokio::test]
+    async fn owner_revocation_by_id_needs_this_owners_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = owned_state(dir.path()).await;
+
+        let unknown = AgentKeypair::generate().unwrap();
+        let error = state
+            .agent
+            .revoke_agent_as_owner(&unknown.agent_id(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("no certificate known"),
+            "{error}"
+        );
+
+        let other_owner = UserKeypair::generate().unwrap();
+        let foreign = AgentKeypair::generate().unwrap();
+        let foreign_cert = AgentCertificate::issue(&other_owner, &foreign).unwrap();
+        discover_with_cert(&state, foreign.agent_id(), foreign_cert).await;
+        let error = state
+            .agent
+            .revoke_agent_as_owner(&foreign.agent_id(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("not issued by this owner"),
+            "{error}"
+        );
+        assert!(state.agent.all_revocation_records().await.is_empty());
         state.agent.shutdown().await;
     }
 }

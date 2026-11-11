@@ -178,7 +178,7 @@ x0x identity revoke --machine-id <64-hex>        # this daemon's own machine onl
 x0x identity revoke --agent-id <64-hex> --machine-id <64-hex> --move-epoch <N>   # ADR-0043 binding form: permanent (agent,machine) tombstone (all three required together)
 ```
 
-`/agent/sign` is owner-plane (never reachable by riders). The one-id revoke form signs with the daemon's agent key; it cannot revoke its machine or another agent. Use `x0x owner agents revoke <AGENT_ID>` for a registered sub-agent (durable API token, loaded owner key and retained certificate required). The both-id binding form also requires the durable API token and owner authority. `x0x identity revocations` (`GET /identity/revocations`) lists the revocation events this daemon has seen.
+`/agent/sign` is owner-plane (never reachable by riders). The one-id revoke form revokes this daemon's own agent (agent key) or own machine (machine key); it cannot revoke another agent or machine. Use `x0x owner agents revoke <AGENT_ID>` for a registered sub-agent (durable API token, loaded owner key and retained certificate required). The both-id binding form also requires the durable API token and owner authority. `x0x identity revocations` (`GET /identity/revocations`) lists the revocation events this daemon has seen.
 
 ### 4.10 Durable history (local, ADR-0023)
 
