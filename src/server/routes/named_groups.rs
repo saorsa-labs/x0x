@@ -48,8 +48,8 @@ mod issue1229_stored_delivery;
 pub(in crate::server) mod join_sequence;
 mod requester_offer;
 pub(in crate::server) use requester_offer::{
-    insert_requester_offer_obligation, load_requester_offer_outbox, requester_offer_step,
-    RequesterOfferObligation,
+    insert_requester_offer_obligation, load_requester_offer_outbox, nudge_requester_offers_for,
+    requester_offer_step, RequesterOfferObligation,
 };
 
 use super::super::state::{AppState, TreeKemCatchupRefusalNote};

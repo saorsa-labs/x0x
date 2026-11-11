@@ -324,3 +324,34 @@ async fn write_failures_keep_memory_aligned_with_disk() {
         vec![note("g", "b", 2)]
     );
 }
+
+/// #1158: a nudge makes matching entries due now, in memory, and leaves
+/// the retry count and every other entry alone.
+#[tokio::test]
+async fn nudge_makes_matching_entries_due_without_charging_a_retry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cells = Cells::new(dir.path());
+    for (id, group) in [("a", "g1"), ("b", "g2")] {
+        cells
+            .outbox()
+            .insert(note(group, id, 100))
+            .await
+            .expect("insert");
+    }
+    // One failed attempt each at 5 000: retry 2 is scheduled 1 s later.
+    for _ in 0..2 {
+        let due = cells.outbox().due(5_000).await;
+        let attempts: Vec<_> = due.into_iter().map(|n| (n, false)).collect();
+        cells.outbox().settle(5_000, &[], &attempts, SCHEDULE).await;
+    }
+    assert!(cells.outbox().due(5_500).await.is_empty());
+    assert!(!cells.outbox().nudge(5_500, |n| n.id == "zz").await);
+    assert!(cells.outbox().nudge(5_500, |n| n.id == "a").await);
+    let due = cells.outbox().due(5_500).await;
+    assert_eq!(due.len(), 1);
+    assert_eq!((due[0].id.as_str(), due[0].retry_count), ("a", 2));
+    assert_eq!(due[0].next_retry_at_ms, 5_500);
+    // An entry that is already due keeps its earlier schedule.
+    assert!(cells.outbox().nudge(9_000, |n| n.id == "a").await);
+    assert_eq!(cells.outbox().due(5_500).await.len(), 1);
+}

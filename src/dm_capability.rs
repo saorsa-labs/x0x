@@ -80,6 +80,18 @@ pub const ADVERT_PUBLISH_INTERVAL_SECS: u64 = 600;
 /// publish window doesn't evict the cache entry.
 pub const ADVERT_CACHE_TTL_SECS: u64 = 900;
 
+/// #1158 (David's ruling A, 20 Oct 2026): how long an obligation-carrying
+/// typed send waits for a current verified advert before its hold is
+/// reported as `recipient_capability_unavailable`. One advert period.
+pub const OBLIGATION_CAPABILITY_WAIT_SECS: u64 = ADVERT_PUBLISH_INTERVAL_SECS;
+
+/// Bound on recipients with a running obligation wait (memory only).
+const MAX_OBLIGATION_WAITS: usize = 1024;
+
+/// Buffered advert-arrival signals for obligation workers. A worker that
+/// lags only loses a prompt retry; its normal backoff still retries.
+const OBLIGATION_ADVERT_SIGNAL_CAPACITY: usize = 256;
+
 /// Maximum tolerated sender clock lead for signed capability state. An advert
 /// dated further ahead than this is rejected rather than cached, so a skewed
 /// or hostile clock cannot mint an entry that outlives the local TTL.
@@ -327,10 +339,25 @@ pub struct CapabilityStore {
     /// new (#674). Diagnostics-only; see
     /// [`Self::would_accept_advert`].
     prefiltered_stale_adverts: AtomicU64,
+    /// #1158: a verified advert arrived for a recipient with a running
+    /// obligation wait. Outbox workers subscribe and retry at once.
+    obligation_adverts: tokio::sync::broadcast::Sender<AgentId>,
+}
+
+/// One recipient's obligation wait (#1158). Memory only.
+struct ObligationWait {
+    /// When the first held send for this recipient was seen.
+    since: Instant,
+    /// The newest held send. A gap longer than the wait means no live
+    /// obligation kept asking, so the next hold starts a new wait.
+    last_checked: Instant,
 }
 
 #[derive(Default)]
 struct CapabilityStoreInner {
+    /// #1158: recipients with a held obligation and no current verified
+    /// advert. A verified advert removes the entry.
+    obligation_waits: HashMap<[u8; 32], ObligationWait>,
     adverts: HashMap<[u8; 32], CachedAdvert>,
     /// Signed digest extensions (#448), kept separately so the bit merges
     /// orthogonally to the base advert's ordering (a base advert and its
@@ -397,6 +424,8 @@ impl CapabilityStore {
             inner: Mutex::new(CapabilityStoreInner::default()),
             ttl: Duration::from_secs(ADVERT_CACHE_TTL_SECS),
             prefiltered_stale_adverts: AtomicU64::new(0),
+            obligation_adverts: tokio::sync::broadcast::channel(OBLIGATION_ADVERT_SIGNAL_CAPACITY)
+                .0,
             evidence_wire: Default::default(),
             evidence: Default::default(),
         }
@@ -409,6 +438,8 @@ impl CapabilityStore {
             inner: Mutex::new(CapabilityStoreInner::default()),
             ttl,
             prefiltered_stale_adverts: AtomicU64::new(0),
+            obligation_adverts: tokio::sync::broadcast::channel(OBLIGATION_ADVERT_SIGNAL_CAPACITY)
+                .0,
             evidence_wire: Default::default(),
             evidence: Default::default(),
         }
@@ -420,28 +451,88 @@ impl CapabilityStore {
             .map(|binding| binding.capabilities)
     }
 
-    /// Hold typed payloads only when a current verified advert lacks support.
-    /// Unknown, expired and card-only state preserves existing send behaviour.
+    /// The compatibility gate for typed payloads (ADR 0093, #1158).
+    ///
+    /// - A current verified advert decides: the payload's bit is set
+    ///   (`Ok`) or not (`RecipientUpgradeRequired`).
+    /// - No current verified advert (unknown, expired or card-only state):
+    ///   an obligation-carrying payload (a share grant, predecessor relay
+    ///   or requester offer) is held with
+    ///   `RecipientCapabilityPending`, and with
+    ///   `RecipientCapabilityUnavailable` once
+    ///   [`OBLIGATION_CAPABILITY_WAIT_SECS`] have passed since the first
+    ///   hold. Every other payload, ordinary DMs included, is sent as
+    ///   before.
+    ///
+    /// A hold starts (or continues) this recipient's wait; a verified
+    /// advert ends it and signals [`Self::subscribe_obligation_adverts`].
     pub fn require_payload_capability(
         &self,
         recipient: &AgentId,
         payload: &[u8],
     ) -> Result<(), crate::dm::DmError> {
-        let Ok(inner) = self.inner.lock() else {
+        self.require_payload_capability_at(recipient, payload, Instant::now())
+    }
+
+    /// [`Self::require_payload_capability`] at an explicit instant.
+    pub(crate) fn require_payload_capability_at(
+        &self,
+        recipient: &AgentId,
+        payload: &[u8],
+        now: Instant,
+    ) -> Result<(), crate::dm::DmError> {
+        let Ok(mut inner) = self.inner.lock() else {
             return Ok(());
         };
         if let Some(entry) = inner.adverts.get(recipient.as_bytes()) {
-            if entry.verified_advert
-                && entry.machine_id != [0; 32]
-                && Instant::now() <= entry.expires_at
-            {
+            if entry.verified_advert && entry.machine_id != [0; 32] && now <= entry.expires_at {
                 return entry
                     .capabilities
                     .application_registry
                     .require_payload(payload);
             }
         }
-        Ok(())
+        let Some((_, capability)) = crate::dm::CapabilityRegistry::obligation_for_payload(payload)
+        else {
+            return Ok(());
+        };
+        let window = Duration::from_secs(OBLIGATION_CAPABILITY_WAIT_SECS);
+        let key = *recipient.as_bytes();
+        let waits = &mut inner.obligation_waits;
+        if !waits.contains_key(&key) && waits.len() >= MAX_OBLIGATION_WAITS {
+            waits.retain(|_, wait| now.saturating_duration_since(wait.last_checked) <= window);
+            if waits.len() >= MAX_OBLIGATION_WAITS {
+                let oldest = waits
+                    .iter()
+                    .min_by_key(|(_, wait)| wait.last_checked)
+                    .map(|(agent, _)| *agent);
+                if let Some(oldest) = oldest {
+                    waits.remove(&oldest);
+                }
+            }
+        }
+        let wait = waits.entry(key).or_insert(ObligationWait {
+            since: now,
+            last_checked: now,
+        });
+        if now.saturating_duration_since(wait.last_checked) > window {
+            wait.since = now;
+        }
+        wait.last_checked = now;
+        if now.saturating_duration_since(wait.since) >= window {
+            Err(crate::dm::DmError::RecipientCapabilityUnavailable { capability })
+        } else {
+            Err(crate::dm::DmError::RecipientCapabilityPending { capability })
+        }
+    }
+
+    /// #1158: agents whose verified advert arrived while an obligation
+    /// send to them was held. A worker that owns such obligations retries
+    /// them when it receives the agent here. A lagged receiver loses only
+    /// the prompt retry.
+    #[must_use]
+    pub fn subscribe_obligation_adverts(&self) -> tokio::sync::broadcast::Receiver<AgentId> {
+        self.obligation_adverts.subscribe()
     }
 
     /// `Some(true)` only when this agent's current verified advert sets
@@ -657,6 +748,13 @@ impl CapabilityStore {
                 created_at_unix_ms,
             },
         );
+        // #1158: the capability is now known (bit set or not). End the
+        // obligation wait and let the outbox workers retry at once.
+        if machine_id.as_bytes() != &[0; 32]
+            && inner.obligation_waits.remove(agent_id.as_bytes()).is_some()
+        {
+            let _ = self.obligation_adverts.send(agent_id);
+        }
         true
     }
 
