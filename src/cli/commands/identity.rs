@@ -254,11 +254,13 @@ pub async fn verify(
 
 /// `x0x identity revoke` — POST /identity/revoke
 ///
-/// The one-id form supports revoking the daemon's own agent. The daemon signs
-/// with its agent key and supplies no subject certificate, so this form cannot
-/// issue machine-signed or user-authority revocations. Use `x0x owner agents
-/// revoke` for a registered sub-agent. Both ids plus `move_epoch` select the
-/// separate owner-signed binding form, which requires the durable API token.
+/// The one-id form supports revoking the daemon's own agent (signed with the
+/// agent key) or its own machine (signed with the machine key, durable API
+/// token). It supplies no subject certificate, so it cannot issue
+/// user-authority revocations. Use `x0x owner agents revoke` for a registered
+/// sub-agent and `x0x owner lose-device` for a lost device. Both ids plus
+/// `move_epoch` select the separate owner-signed binding form, which requires
+/// the durable API token.
 pub async fn revoke(
     client: &DaemonClient,
     agent_id: Option<&str>,
@@ -459,6 +461,29 @@ pub async fn owner_agents_revoke(
     let body = serde_json::json!({ "reason": reason });
     let resp = client
         .delete_with_body(&format!("/owner/agents/{agent_id}"), &body)
+        .await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x owner lose-device` — POST /owner/devices/:machine_id/lose (#1108).
+pub async fn owner_lose_device(
+    client: &DaemonClient,
+    machine_id: &str,
+    reason: Option<&str>,
+    force: bool,
+) -> Result<()> {
+    // The id goes into the URL path: refuse anything that is not an id.
+    if machine_id.len() != 64 || !machine_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("MACHINE_ID must be 64 hex characters (see `x0x owner machines`)");
+    }
+    client.ensure_running().await?;
+    let mut body = serde_json::json!({ "force": force });
+    if let Some(reason) = reason {
+        body["reason"] = serde_json::json!(reason);
+    }
+    let resp = client
+        .post(&format!("/owner/devices/{machine_id}/lose"), &body)
         .await?;
     print_value(client.format(), &resp);
     Ok(())
@@ -728,6 +753,25 @@ mod tests {
         let (path, body) = captured.lock().unwrap().last().cloned().unwrap();
         assert_eq!(path, format!("/owner/agents/{}", "cd".repeat(32)));
         assert_eq!(body["reason"], "superseded");
+    }
+
+    /// WHY: the machine id goes into the URL path. A value that is not an
+    /// id must not reach the daemon as a path.
+    #[tokio::test]
+    async fn owner_lose_device_refuses_a_value_that_is_not_a_machine_id() {
+        let (client, captured, _shutdown) = capture_client().await;
+        for bad in ["zz", "../agents/issue", &"ab".repeat(31), &"zz".repeat(32)] {
+            assert!(owner_lose_device(&client, bad, None, false).await.is_err());
+        }
+        assert!(captured.lock().unwrap().is_empty(), "no request was sent");
+
+        owner_lose_device(&client, &"cd".repeat(32), Some("lost"), true)
+            .await
+            .unwrap();
+        let (path, body) = captured.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(path, format!("/owner/devices/{}/lose", "cd".repeat(32)));
+        assert_eq!(body["reason"], "lost");
+        assert_eq!(body["force"], true);
     }
 
     /// WHY (review r2, finding 2): the ADR-0043 binding form must serialize.

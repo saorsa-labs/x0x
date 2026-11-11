@@ -68,6 +68,13 @@ pub(in crate::server) struct AgentVerifyRequest {
     algorithm: Option<serde_json::Value>,
 }
 
+/// The `warning` field of a `POST /identity/revoke` answer that revoked this
+/// daemon's own machine (#1108).
+const OWN_MACHINE_REVOKED_WARNING: &str = "This machine is now revoked for good. Other peers refuse it and every agent on it. x0xd does not stop itself: it keeps running and peers refuse it. To use this computer on the network again, stop x0xd, delete machine.key and start x0xd to get a new machine identity.";
+
+/// Serializes own-machine revocations in this process (#1108).
+static OWN_MACHINE_REVOKE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// POST /announce request body.
 #[derive(Debug, Default, Deserialize)]
 pub(in crate::server) struct AnnounceIdentityRequest {
@@ -1716,14 +1723,58 @@ pub(in crate::server) async fn identity_revoke(
         (None, None) => return bad_request("supply exactly one of agent_id or machine_id"),
     };
 
-    let issuer_keypair = state.agent.identity().agent_keypair();
-    match state
-        .agent
-        .revoke(issuer_keypair, subject, body.reason, None)
-        .await
-    {
+    // #1108: this daemon's own machine. Only the machine key can revoke a
+    // machine, and this daemon holds that key. Any other machine id falls
+    // through to the agent-key signer and is refused with 403.
+    let own_machine = matches!(
+        &subject,
+        RevokedSubject::Machine(machine) if *machine == state.agent.machine_id()
+    );
+    if own_machine && !actor.is_durable_owner() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "revoking this daemon's machine requires the durable API token (not a session token)",
+        );
+    }
+    // A repeat must not sign another record: the set has no size limit.
+    // The lock makes the check and the signing one step, so two calls at
+    // once sign one record.
+    let _own_machine_guard = if own_machine {
+        Some(OWN_MACHINE_REVOKE_LOCK.lock().await)
+    } else {
+        None
+    };
+    if own_machine {
+        let held = state.agent.own_machine_revocation().await;
+        if let Some(record) = held {
+            // The same fields as the first answer, and the flag.
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "subject": record.subject_hex(),
+                    "subject_kind": record.subject_kind(),
+                    "issuer": hex::encode(record.issuer_public_key_hash()),
+                    "revoked_at": record.revoked_at,
+                    "reason": record.reason,
+                    "already_revoked": true,
+                    "warning": OWN_MACHINE_REVOKED_WARNING,
+                })),
+            );
+        }
+    }
+    let outcome = if own_machine {
+        state.agent.revoke_own_machine(body.reason).await
+    } else {
+        let issuer_keypair = state.agent.identity().agent_keypair();
+        state
+            .agent
+            .revoke(issuer_keypair, subject, body.reason, None)
+            .await
+    };
+    match outcome {
         Ok(record) => {
-            let resp = serde_json::json!({
+            let mut resp = serde_json::json!({
                 "ok": true,
                 "subject": record.subject_hex(),
                 "subject_kind": record.subject_kind(),
@@ -1731,6 +1782,9 @@ pub(in crate::server) async fn identity_revoke(
                 "revoked_at": record.revoked_at,
                 "reason": record.reason,
             });
+            if own_machine {
+                resp["warning"] = serde_json::json!(OWN_MACHINE_REVOKED_WARNING);
+            }
             (StatusCode::OK, Json(resp))
         }
         Err(e @ x0x::error::IdentityError::Storage(_)) => api_error(

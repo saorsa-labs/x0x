@@ -18182,6 +18182,117 @@ impl Agent {
         Ok(record)
     }
 
+    /// Revoke an agent that this daemon's owner certified, by agent id
+    /// (#1108 lost-device response).
+    ///
+    /// The certificate comes from the same sources as
+    /// [`Self::revoke_binding`]: the local agent certificate, the discovery
+    /// cache, then the owner's issuance journal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`error::IdentityError::Revocation`] when no certificate is
+    /// known for the agent, and the errors of [`Self::revoke_as_owner`].
+    pub async fn revoke_agent_as_owner(
+        &self,
+        agent: &identity::AgentId,
+        reason: Option<String>,
+    ) -> error::Result<revocation::RevocationRecord> {
+        let cert = self.agent_certificate_for(agent).await.ok_or_else(|| {
+            error::IdentityError::Revocation(
+                "no certificate known for the agent — owner revocation requires it".to_string(),
+            )
+        })?;
+        // The same check as `DELETE /owner/agents/:id`: refuse early, with a
+        // clear cause, a certificate that this owner did not issue for
+        // this agent.
+        let issued_here = cert.verify().is_ok()
+            && cert.agent_id().is_ok_and(|certified| certified == *agent)
+            && self
+                .user_id()
+                .is_some_and(|owner| cert.user_id().is_ok_and(|issuer| issuer == owner));
+        if !issued_here {
+            return Err(error::IdentityError::Revocation(
+                "the certificate held for the agent was not issued by this owner".to_string(),
+            ));
+        }
+        self.revoke_as_owner(&cert, reason).await
+    }
+
+    /// The held revocation record of the machine this daemon runs on, when
+    /// the machine is revoked (#1108). With several records, the one with
+    /// the earliest `revoked_at`, then the lowest record hash.
+    pub async fn own_machine_revocation(&self) -> Option<revocation::RevocationRecord> {
+        let own = revocation::RevokedSubject::Machine(self.machine_id());
+        self.revocation_set
+            .read()
+            .await
+            .all_subject_records()
+            .into_iter()
+            .filter(|record| record.subject == own)
+            .min_by_key(|record| (record.revoked_at, record.record_hash()))
+    }
+
+    /// Write the agent/machine store and the binding store again from the
+    /// records held in memory (#1108).
+    ///
+    /// A revocation can be in force but not durable when its store write
+    /// failed. A caller that repeats the action uses this to make the held
+    /// records durable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`error::IdentityError::Storage`] when a store write fails,
+    /// and [`error::IdentityError::Serialization`] on an encode failure.
+    pub async fn persist_identity_revocation_stores(&self) -> error::Result<()> {
+        persist_s4_revocations(
+            &self.revocation_set,
+            &self.s4_revocation_intake,
+            self.identity_dir.as_deref(),
+        )
+        .await?;
+        let bindings = self.revocation_set.read().await.to_bytes_v2()?;
+        if let Some(path) = self.move_file_path("revocations-v2.bin") {
+            storage::save_private_bytes_to(&path, bindings).await?;
+        }
+        Ok(())
+    }
+
+    /// Revoke the machine this daemon runs on, signed with the machine key
+    /// (#1108).
+    ///
+    /// This is a self-revocation: the issuer key hashes to the machine id,
+    /// so every peer accepts it with no other evidence. After it, peers
+    /// refuse this machine for good.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::revoke`].
+    pub async fn revoke_own_machine(
+        &self,
+        reason: Option<String>,
+    ) -> error::Result<revocation::RevocationRecord> {
+        // One call at a time in this process, so that the repeat check
+        // and the signing are one step. A repeat returns the held record
+        // and signs nothing: the set has no size limit.
+        static OWN_MACHINE_REVOKE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _one_call = OWN_MACHINE_REVOKE.lock().await;
+        if let Some(held) = self.own_machine_revocation().await {
+            return Ok(held);
+        }
+        let machine_kp = self.identity.machine_keypair();
+        let record = revocation::RevocationRecord::sign(
+            revocation::RevokedSubject::Machine(self.machine_id()),
+            machine_kp.public_key(),
+            machine_kp.secret_key(),
+            Self::unix_timestamp_secs(),
+            reason,
+        )?;
+        self.apply_and_publish_revocation(record.clone(), None)
+            .await?;
+        Ok(record)
+    }
+
     /// Apply a revocation record to the local set, persist, publish, and evict.
     ///
     /// Used both by [`revoke`](Agent::revoke) (self-issued) and the gossip
@@ -19504,11 +19615,26 @@ impl Agent {
                 return Some(cert);
             }
         }
-        if let Ok(Some(entry)) = self.discovered_agent(*agent).await {
-            if let Some(cert) = entry.agent_certificate {
-                return Some(cert);
-            }
+        // This owner's issuance journal comes before the discovery cache
+        // (#1108): the cache can hold a certificate that ANOTHER owner
+        // issued for the same agent key, and that one gives this owner no
+        // authority. `DELETE /owner/agents/:id` reads the journal too.
+        if let Some(cert) = self.owner_journal_certificate_for(agent).await {
+            return Some(cert);
         }
+        self.discovered_agent(*agent)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|entry| entry.agent_certificate)
+    }
+
+    /// The newest certificate that the loaded owner key issued for `agent`,
+    /// from this install's issuance journal.
+    async fn owner_journal_certificate_for(
+        &self,
+        agent: &identity::AgentId,
+    ) -> Option<identity::AgentCertificate> {
         let journal_path = self.cert_journal_path()?;
         let target_hex = hex::encode(agent.as_bytes());
         let user_hex = self

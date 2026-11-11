@@ -418,12 +418,17 @@ fn registry_requiredness_matches_clap() {
 
 /// Dummy CLI value for a flag/positional: BOOL placeholders need a real
 /// boolean, PATH/JSON placeholders point at a valid-JSON temp file (some
-/// commands read AND parse the file client-side), AGENT needs a complete
-/// hexadecimal identity, and other placeholders retain the scalar exemplar "1".
+/// commands read AND parse the file client-side), AGENT and MACHINE_ID need
+/// a complete hexadecimal identity (`x0x owner lose-device` refuses any
+/// other value before it builds the URL, #1108), and other placeholders
+/// retain the scalar exemplar "1".
 fn dummy_value(placeholder: &str) -> String {
     let up = placeholder.to_ascii_uppercase();
-    if normalize_positional(placeholder) == "agent" {
+    let normalized = normalize_positional(placeholder);
+    if normalized == "agent" {
         "ab".repeat(32)
+    } else if normalized == "machine_id" {
+        "cd".repeat(32)
     } else if up.contains("BOOL") {
         "true".to_string()
     } else if up.contains("FILE") {
@@ -463,6 +468,11 @@ fn agent_dummy_value_passes_exact_diagnostics_validation() {
         );
     }
     assert!(x0x::dm_digest_diagnostics::parse_agent_filter("1").is_err());
+    // #1108: a machine id is a path segment of a signing route; the CLI
+    // checks its shape, so the exemplar is a complete id.
+    for placeholder in ["MACHINE_ID", "<MACHINE_ID>", "[MACHINE_ID]"] {
+        assert_eq!(dummy_value(placeholder), "cd".repeat(32));
+    }
     assert_eq!(dummy_value("LIMIT"), "1");
     assert_eq!(dummy_value("BOOL"), "true");
 }

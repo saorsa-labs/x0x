@@ -194,3 +194,104 @@ async fn revocation_listing_shows_every_subject_kind() {
     assert_eq!(v1.len(), 1);
     assert!(matches!(v1[0].subject, RevokedSubject::Agent(_)));
 }
+
+async fn revoke_machine(
+    state: &Arc<AppState>,
+    durable: bool,
+    machine: &MachineId,
+) -> (StatusCode, serde_json::Value) {
+    let response = identity_revoke(
+        State(Arc::clone(state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable }),
+        Json(RevokeRequest {
+            agent_id: None,
+            machine_id: Some(hex::encode(machine.as_bytes())),
+            move_epoch: None,
+            reason: Some("retired".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+/// WHY (#1108 item 1): the docs said a daemon can revoke its own machine,
+/// but the route signed with the agent key, so the answer was always 403.
+/// The daemon holds the machine key; a record signed with it is one that
+/// every peer accepts with no other evidence.
+#[tokio::test]
+async fn own_machine_revoke_signs_with_the_machine_key() {
+    let (state, _dir) = test_state().await;
+    let machine = state.agent.machine_id();
+
+    let announce_before = state.agent.announce_identity(false, false).await.is_ok();
+
+    let (status, body) = revoke_machine(&state, true, &machine).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["subject_kind"], "machine");
+    assert_eq!(body["subject"], hex::encode(machine.as_bytes()));
+    assert!(
+        body["warning"]
+            .as_str()
+            .is_some_and(|w| w.contains("revoked for good")),
+        "the answer warns that the machine identity is dead: {body}"
+    );
+
+    // Another daemon accepts the record from the record alone.
+    let records = state.agent.all_revocation_records().await;
+    assert_eq!(records.len(), 1);
+    let mut peer = crate::revocation::RevocationSet::new();
+    assert!(peer.verify_and_insert(records[0].clone(), None).unwrap());
+    assert!(peer.is_machine_revoked(&machine));
+
+    // The daemon does not stop itself: its own announce call gives the
+    // same result as before the revocation (peers are the ones that
+    // refuse it).
+    assert_eq!(
+        state.agent.announce_identity(false, false).await.is_ok(),
+        announce_before
+    );
+
+    // A repeat signs no second record.
+    let (status, body) = revoke_machine(&state, true, &machine).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["already_revoked"], true);
+    // The repeat answer has the fields of the first answer.
+    assert_eq!(body["subject_kind"], "machine");
+    assert_eq!(body["revoked_at"], records[0].revoked_at);
+    assert_eq!(body["reason"], "retired");
+    assert!(body["issuer"].is_string() && body["warning"].is_string());
+    assert_eq!(state.agent.all_revocation_records().await.len(), 1);
+    // The library method has the same guard: a caller that does not go
+    // through the route also gets the held record and signs nothing.
+    let again = state.agent.revoke_own_machine(None).await.unwrap();
+    assert_eq!(again.record_hash(), records[0].record_hash());
+    assert_eq!(state.agent.all_revocation_records().await.len(), 1);
+    state.agent.shutdown().await;
+}
+
+/// WHY: a machine revocation cannot be undone, so a session token must
+/// not do it. A daemon has no authority over any other machine, so that
+/// request keeps its 403 and signs nothing that a peer would accept.
+#[tokio::test]
+async fn machine_revoke_refuses_a_session_token_and_another_machine() {
+    let (state, _dir) = test_state().await;
+
+    let (status, _) = revoke_machine(&state, false, &state.agent.machine_id()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "session token");
+
+    let other = MachineId([0x4E; 32]);
+    let (status, _) = revoke_machine(&state, true, &other).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "another machine");
+
+    let set = state.agent.revocation_set();
+    let set = set.read().await;
+    assert!(!set.is_machine_revoked(&state.agent.machine_id()));
+    assert!(!set.is_machine_revoked(&other));
+    drop(set);
+    state.agent.shutdown().await;
+}

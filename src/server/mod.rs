@@ -100,16 +100,16 @@ use routes::{
     machine_for_agent_handler, machines_by_user_handler,
     migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
     named_group_metadata_event_group_id, network_status, now_millis_u64, owner_agents,
-    owner_agents_issue, owner_agents_revoke, owner_group_recovery_mandate, owner_machines,
-    owner_riders_issue, owner_riders_list, owner_riders_revoke, peer_health_handler, peers,
-    pin_machine, presence, presence_find, presence_foaf, presence_online, presence_status,
-    probe_peer_handler, publish, publish_group_card_to_discovery, put_kv_value, quick_trust,
-    rebind_member_certificate, recover_home_suite_sidecar_journals, recover_treekem_named_journals,
-    reject_join_request, reject_unverified_direct_public_message, relay_diagnostics,
-    remove_mls_member, remove_named_group_member, replay_pending_causal_approvals,
-    requester_offer_step, restore_treekem_groups, revoke_contact, run_direct_metadata_listener,
-    run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
-    save_named_groups_checked, save_named_groups_checked_unlocked,
+    owner_agents_issue, owner_agents_revoke, owner_device_lose, owner_group_recovery_mandate,
+    owner_machines, owner_riders_issue, owner_riders_list, owner_riders_revoke,
+    peer_health_handler, peers, pin_machine, presence, presence_find, presence_foaf,
+    presence_online, presence_status, probe_peer_handler, publish, publish_group_card_to_discovery,
+    put_kv_value, quick_trust, rebind_member_certificate, recover_home_suite_sidecar_journals,
+    recover_treekem_named_journals, reject_join_request, reject_unverified_direct_public_message,
+    relay_diagnostics, remove_mls_member, remove_named_group_member,
+    replay_pending_causal_approvals, requester_offer_step, restore_treekem_groups, revoke_contact,
+    run_direct_metadata_listener, run_fallback_github_poll, run_gossip_update_listener,
+    run_startup_update_check, save_named_groups_checked, save_named_groups_checked_unlocked,
     save_predecessor_relay_outbox_unlocked, seal_group_state, secure_group_decrypt,
     secure_group_encrypt, secure_group_reseal, secure_open_envelope_adversarial,
     send_group_public_message, set_group_display_name, shutdown_handler,
@@ -3042,6 +3042,7 @@ pub async fn serve_with_options(
         .route("/owner/machines", get(owner_machines))
         .route("/owner/agents/issue", post(owner_agents_issue))
         .route("/owner/agents/:id", delete(owner_agents_revoke))
+        .route("/owner/devices/:machine_id/lose", post(owner_device_lose))
         .route(
             "/owner/riders",
             post(owner_riders_issue).get(owner_riders_list),
