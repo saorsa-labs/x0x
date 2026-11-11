@@ -519,6 +519,11 @@ or binding revocation: the one with the earlier `revoked_at`, and for equal
 times the lower record hash (#1857). A later record for the same pair adds
 nothing, and the subject stays revoked.
 
+The answer also has `unsendable_records`: the number of held records that
+are too large for any peer to accept (only a record from an old store can
+be). While it is not 0, a peer that waits for a resync cannot open from this
+daemon; revoke that subject again with a short reason.
+
 A daemon sends its revocation set to peers as one gossip batch when the set
 fits, and as a round of marked batches when it does not; see
 [`docs/design/revocation-batches.md`](design/revocation-batches.md). The

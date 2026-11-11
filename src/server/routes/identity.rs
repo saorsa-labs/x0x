@@ -1770,9 +1770,17 @@ pub(in crate::server) async fn identity_revocations(
     // Oldest first; the record hash makes the order of equal times stable.
     records.sort_by_cached_key(|r| (r.revoked_at, r.record_hash()));
     let items: Vec<serde_json::Value> = records.iter().map(revocation_row).collect();
+    // #1857: records that are too large to send. While this is not 0, no
+    // peer that waits for a resync can open from this daemon.
+    let unsendable = state
+        .agent
+        .revocation_set()
+        .read()
+        .await
+        .unsendable_record_count();
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "revocations": items })),
+        Json(serde_json::json!({ "revocations": items, "unsendable_records": unsendable })),
     )
 }
 

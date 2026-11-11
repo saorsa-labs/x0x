@@ -20,16 +20,30 @@ ignored, and no revocation from that daemon reached any peer.
 | Larger | A **round**: several batches. Each batch holds records in record-hash order and ends with one **round-marker record**. |
 
 One record that is larger than the batch size goes in a batch of its own,
-with its marker. A record that is over the receive limit by itself (only a
-record from an old store can be) is **not sent**: no receiver accepts a
-batch that holds it. It is left out of the round and out of the round's
-`set`, and the sender logs its hash at WARN. A batch that held it with no
-marker would look like a whole set, so that is never done.
+with its marker.
+
+**A record that cannot be sent.** A record that is over the receive limit
+by itself (only a record from an old store can be) is not sent: no receiver
+accepts a batch that holds it. Its hash **stays in the round's `set`**, and
+every batch of that publish carries a marker, also when only one batch is
+left. The offered records then never match `set`. So:
+
+- peers still get every other record by ordinary gossip;
+- **no daemon that waits for a resync can open from this sender**, new or
+  released. That is correct: it would otherwise open with that subject not
+  revoked;
+- the sender logs the record hash at WARN on every publish, and
+  `GET /identity/revocations` shows the count as `unsendable_records`.
+
+What an operator does: revoke the subject again with a short reason. The
+set prefers a record with a reason inside the limit for the same subject
+and issuer, so the new record takes the place of the large one, and the
+sender can resync a waiting peer again.
 
 A daemon publishes a set as one step: it reads the set, encodes it and
-sends every batch while it holds one lock for the process. The heartbeat,
-a new revocation and a share-grant revocation use the same lock, so parts
-of two rounds are not sent mixed together.
+sends every batch while it holds one lock for that agent's set. The
+heartbeat, a new revocation and a share-grant revocation use the same
+lock, so parts of two rounds are not sent mixed together.
 
 ## The round-marker record
 
@@ -50,7 +64,7 @@ The `reason` text is one line of four words, with one space between them:
 x0x-revocation-round-v1 n=<batches> i=<index> set=<digest>
 ```
 
-- `n` — the number of batches in the round, decimal, 1 to 4096, no leading
+- `n` — the number of batches in the round, decimal, 1 to 512, no leading
   zero.
 - `i` — the index of this batch, decimal, 0 to `n` − 1, no leading zero.
 - `set` — 64 lower-case hex characters: BLAKE3 over the bytes
@@ -89,14 +103,17 @@ A03). It opens a carrier only from a sender that is a trusted authority:
 - A marker from a sender that is not a trusted authority is ignored.
 - A newer batch from a sender, marked or not, replaces what that sender
   offered before. An older whole set never opens the carrier after it.
+  One exception: a part of the round that the daemon already holds
+  complete (the same `set`) changes nothing, because the sender publishes
+  the same set again every 2 hours.
 
 Bounds on what a waiting daemon holds for one sender and carrier:
 
 | Bound | Value |
 |---|---|
 | Open rounds | 1 |
-| Batches in a round (`n`) | at most 4096 |
-| Records in an open round | at most 262,144 (about 30 MB of hashes and order keys); over that the round is dropped |
+| Batches in a round (`n`) | at most 512. This is the real limit for an honest sender: about 190,000 records. A sender with a larger set cannot resync a waiting peer; it logs that at WARN. |
+| Records in an open round | at most 262,144 (512 batches of 512 records, about 30 MB of hashes and order keys); over that the round is dropped. A full batch of real records holds about 370, so a round inside the batch limit is always inside this one. A part that arrives again at the same index is counted once. |
 | Time with no new part | 10 minutes; a part that arrives later starts the round again |
 
 The records of a part are not verified when the part is recorded; they are
@@ -120,6 +137,19 @@ reason by itself (the text comes from an operator). What an operator does:
 revoke the subject again with a short reason. The set prefers a record
 with a reason inside the limit for the same subject and issuer, so the new
 record takes the place of the long one and reaches every peer.
+
+## Known limit: a bad clock at load
+
+The order between two records of one subject and issuer puts a record
+with a credible time before a record with a far-future time, by the local
+clock. A daemon whose clock is far behind at load can see a normal record
+as far in the future. If the store also holds a legacy long-reason record
+for the same subject and issuer, both are then "not credible", the short
+one wins the pair, and the far-future sweep at load drops it. The subject
+is then not revoked on that daemon until gossip brings the record again.
+This needs a legacy long reason and a clock that is wrong by more than the
+record's age. A daemon before #1857 also drops far-future records at load
+by design; it would have kept the other record of the pair.
 
 ## Released daemons
 

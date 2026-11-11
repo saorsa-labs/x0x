@@ -549,6 +549,9 @@ struct SnapshotCandidate {
     /// marked round with a matching set digest (#1857). Pair key (record
     /// hash for a share grant) → rank of the record this set would keep.
     whole: Option<HashMap<[u8; 32], RecordRank>>,
+    /// The `set` of the round that gave `whole`; `None` when `whole` came
+    /// from an unmarked batch. A repeat of the same round keeps `whole`.
+    whole_set: Option<[u8; 32]>,
     /// The one open round of this sender for this carrier.
     round: Option<OpenRound>,
 }
@@ -639,6 +642,14 @@ pub struct RevocationSet {
     /// Records that were held and then replaced by the kept record of
     /// their pair: replaced record hash → pair key. Not serialized.
     replaced: HashMap<[u8; 32], [u8; 32]>,
+    /// Makes "read the set, encode it, publish every batch" one step for
+    /// the agent that owns this set (#1857). A set that needs several
+    /// batches is a round, named by the digest of the set. Two publishers
+    /// at once (the heartbeat and a new revocation) would send parts of
+    /// two rounds mixed together, and a peer that waits for a resync
+    /// would drop each round when a part of the other arrives. Not
+    /// serialized.
+    publish_lock: Arc<tokio::sync::Mutex<()>>,
     /// The keys of `replaced`, oldest first, for its size bound.
     replaced_order: std::collections::VecDeque<[u8; 32]>,
     /// ADR-0043 tombstone epochs from ad-hoc binding `RevocationRecord`s
@@ -894,14 +905,17 @@ pub(crate) const ROUND_MARKER_ISSUER: &[u8] = b"x0x-revocation-round-marker-v1";
 const ROUND_MARKER_REASON_PREFIX: &str = "x0x-revocation-round-v1";
 
 /// The most batches one round may have.
-pub(crate) const MAX_ROUND_BATCHES: u32 = 4096;
+pub(crate) const MAX_ROUND_BATCHES: u32 = 512;
 
 /// More than the bytes of any round-marker record (about 210).
 const ROUND_MARKER_MAX_BYTES: usize = 512;
 
-/// The most records a waiting node holds for one open round of one sender
-/// (about 700 full batches of real records).
-const MAX_ROUND_RECORDS: usize = 262_144;
+/// The most records a waiting node holds for one open round of one sender:
+/// [`MAX_ROUND_BATCHES`] batches of 512 records. A full batch of real
+/// records holds about 370, so a round inside the batch bound is always
+/// inside this bound; the batch bound is the real limit for an honest
+/// sender (about 190,000 records).
+const MAX_ROUND_RECORDS: usize = MAX_ROUND_BATCHES as usize * 512;
 
 /// What a round-marker record says: this batch is batch `index` of
 /// `batches`, and `set` is the BLAKE3 digest of the sorted record hashes of
@@ -1040,8 +1054,10 @@ fn encode_revocation_batches_with_target(
     let mut groups: Vec<Vec<RevocationRecord>> = Vec::new();
     let mut current: Vec<RevocationRecord> = Vec::new();
     let mut current_bytes = 0usize;
-    // The record hashes that are sent, in order: the round's `set`.
-    let mut sendable: Vec<[u8; 32]> = ordered.iter().map(|(_, hash)| *hash).collect();
+    // The round's `set` is every record hash of the carrier set, in order,
+    // also the hash of a record that cannot be sent.
+    let set_hashes: Vec<[u8; 32]> = ordered.iter().map(|(_, hash)| *hash).collect();
+    let mut unsendable = 0usize;
     for (record, hash) in &ordered {
         // The framed encoding adds a length prefix per record.
         let size = usize::try_from(bincode::serialized_size(record)?)
@@ -1049,15 +1065,17 @@ fn encode_revocation_batches_with_target(
             .saturating_add(16);
         if size.saturating_add(ROUND_MARKER_MAX_BYTES) > MAX_REVOCATION_PAYLOAD_BYTES {
             // Only a stored legacy record can be this large. No receiver
-            // accepts a batch that holds it, so it is not sent, and it is
-            // not part of the round or of the round's `set`. (A batch with
-            // this record and no marker would look like a whole set.)
+            // accepts a batch that holds it, so it is not sent. Its hash
+            // STAYS in the round's `set`, and every batch of this publish
+            // carries a marker: the offered records then never match the
+            // set, so no waiting node opens from this sender with this
+            // subject not revoked.
             tracing::warn!(
                 record = %hex::encode(hash),
                 bytes = size,
-                "revocation record is over the size a receiver accepts; it is not sent to peers"
+                "revocation record is over the size a receiver accepts; it is not sent to peers, and no peer that waits for a resync can open from this daemon until a record with a short reason takes its place"
             );
-            sendable.retain(|held| held != hash);
+            unsendable = unsendable.saturating_add(1);
             continue;
         }
         if !current.is_empty() && current_bytes.saturating_add(size) > target_bytes {
@@ -1070,7 +1088,7 @@ fn encode_revocation_batches_with_target(
     if !current.is_empty() {
         groups.push(current);
     }
-    if groups.len() <= 1 {
+    if groups.len() <= 1 && unsendable == 0 {
         // One batch: no marker, the bytes of before #1857.
         return groups
             .iter()
@@ -1084,7 +1102,7 @@ fn encode_revocation_batches_with_target(
             "revocation set needs more batches than one round may have; a peer that waits for a resync cannot open from this daemon"
         );
     }
-    let set = round_set_digest(&sendable);
+    let set = round_set_digest(&set_hashes);
     let mut out = Vec::with_capacity(groups.len());
     for (index, mut group) in groups.into_iter().enumerate() {
         group.push(round_marker_record(&RoundMarker {
@@ -1333,6 +1351,7 @@ impl RevocationSet {
         // before (a whole set or an open round) is stale, also when this
         // batch is refused below.
         candidate.whole = None;
+        candidate.whole_set = None;
         candidate.round = None;
         if !kept_hashes(&kept).is_superset(&known) {
             return;
@@ -1389,6 +1408,12 @@ impl RevocationSet {
         // One open round per carrier per sender: a part of another round
         // (the sender's set changed) replaces the open one. Parts of two
         // rounds are never mixed.
+        if candidate.whole.is_some() && candidate.whole_set == Some(marker.set) {
+            // A repeat publish of the round that this node already holds
+            // complete: the snapshot is still the sender's set.
+            self.try_complete_carrier(carrier);
+            return;
+        }
         let now = std::time::Instant::now();
         let same_round = candidate.round.as_ref().is_some_and(|round| {
             round.set == marker.set
@@ -1400,6 +1425,7 @@ impl RevocationSet {
             // that it offered earlier is stale and must not open the
             // carrier any more.
             candidate.whole = None;
+            candidate.whole_set = None;
             candidate.round = Some(OpenRound {
                 set: marker.set,
                 batches: marker.batches,
@@ -1422,7 +1448,13 @@ impl RevocationSet {
         // The records of a part are not verified here, so bound what one
         // sender can make this node hold. Over the bound, the round is
         // dropped and the carrier stays closed.
-        let round_records: usize = round.parts.values().map(|part| part.hashes.len()).sum();
+        // A repeat of a part at the same index is not counted twice.
+        let round_records: usize = round
+            .parts
+            .iter()
+            .filter(|(index, _)| **index != marker.index)
+            .map(|(_, part)| part.hashes.len())
+            .sum();
         if round_records.saturating_add(hashes.len()) > MAX_ROUND_RECORDS {
             tracing::warn!(
                 carrier,
@@ -1453,6 +1485,7 @@ impl RevocationSet {
                 );
                 if kept_hashes(&kept).is_superset(&known) {
                     candidate.whole = Some(kept);
+                    candidate.whole_set = Some(round.set);
                     candidate.round = None;
                 }
             }
@@ -1765,6 +1798,13 @@ impl RevocationSet {
     #[must_use]
     pub fn contains_hash(&self, hash: &[u8; 32]) -> bool {
         self.records_by_hash.contains_key(hash)
+    }
+
+    /// The lock a publisher holds while it reads this set, encodes it and
+    /// sends every batch (#1857).
+    #[must_use]
+    pub(crate) fn publish_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(&self.publish_lock)
     }
 
     /// Whether the set already gives everything `record` would give
@@ -2145,6 +2185,24 @@ impl RevocationSet {
             .values()
             .map(|p| p.record.clone())
             .collect()
+    }
+
+    /// How many held records are over the size a receiver accepts and so
+    /// are never sent to peers (#1857). While this is not 0, no peer that
+    /// waits for a resync can open from this daemon.
+    #[must_use]
+    pub fn unsendable_record_count(&self) -> usize {
+        self.records_by_hash
+            .values()
+            .filter(|persisted| {
+                bincode::serialized_size(&persisted.record).is_ok_and(|size| {
+                    usize::try_from(size)
+                        .unwrap_or(usize::MAX)
+                        .saturating_add(16 + ROUND_MARKER_MAX_BYTES)
+                        > MAX_REVOCATION_PAYLOAD_BYTES
+                })
+            })
+            .count()
     }
 
     /// All held share-grant records for the `x0x.revocation.v3` carrier and
@@ -5202,11 +5260,11 @@ mod tests {
         }
 
         /// WHY: a record that no receiver accepts (it is over the receive
-        /// limit by itself) must not be in a round. A batch that held it
-        /// with no marker would look like a whole set to a waiting node.
-        /// It is left out of the batches and out of the round's digest.
+        /// limit by itself) cannot be sent. Its hash stays in the round's
+        /// digest and every batch keeps a marker, so the batches never
+        /// look like the sender's whole set.
         #[test]
-        fn a_record_over_the_receive_limit_is_left_out_of_the_round() {
+        fn a_record_over_the_receive_limit_is_not_sent_but_stays_in_the_digest() {
             let mut records: Vec<RevocationRecord> = (0..800).map(sized_fake).collect();
             let giant = sized_fake_with_reason(9_999, "x".repeat(MAX_REVOCATION_PAYLOAD_BYTES));
             records.push(giant.clone());
@@ -5226,7 +5284,19 @@ mod tests {
             assert!(!sent.contains(&giant.record_hash()));
             assert_eq!(sent.len(), 800);
             sent.sort_unstable();
-            assert_eq!(sets, HashSet::from([round_set_digest(&sent)]));
+            let mut all = sent.clone();
+            all.push(giant.record_hash());
+            all.sort_unstable();
+            assert_eq!(sets, HashSet::from([round_set_digest(&all)]));
+            assert_ne!(sets, HashSet::from([round_set_digest(&sent)]));
+
+            // When the rest fits one batch, that batch still has a marker.
+            let few = vec![sized_fake(1), sized_fake(2), giant];
+            let batches = encode_revocation_batches(&few).expect("encode");
+            assert_eq!(batches.len(), 1);
+            let (part, round) = decode_revocation_batch_with_round(&batches[0]).expect("decode");
+            assert_eq!(part.len(), 2);
+            assert!(matches!(round, BatchRound::Part(marker) if marker.batches == 1));
         }
 
         /// WHY: a trusted resync snapshot can hold a legacy record with a
@@ -5656,6 +5726,97 @@ mod tests {
             );
         }
 
+        /// A signed self-revocation that is over the receive limit by
+        /// itself, as only an old store can hold.
+        fn unsendable_record() -> RevocationRecord {
+            let kp = AgentKeypair::generate().expect("keypair");
+            let subject = RevokedSubject::Agent(kp.agent_id());
+            let issuer = kp.public_key().as_bytes().to_vec();
+            let reason = Some("x".repeat(MAX_REVOCATION_PAYLOAD_BYTES));
+            let message = RevocationRecord::canonical_message(&subject, &issuer, 1_000, &reason);
+            let signature = sign_with_ml_dsa(kp.secret_key(), &message).expect("sign");
+            RevocationRecord {
+                subject,
+                issuer_public_key: issuer,
+                revoked_at: 1_000,
+                reason,
+                signature: signature.as_bytes().to_vec(),
+            }
+        }
+
+        /// WHY (review MAJOR): a sender holds a record that cannot be sent.
+        /// A waiting node that opened from that sender would hold the set
+        /// MINUS that record, with its subject not revoked. The node must
+        /// stay closed, whether the rest needs a round or fits one batch.
+        /// A released waiter must stay closed too.
+        #[test]
+        fn a_waiter_never_opens_from_a_sender_that_holds_an_unsendable_record() {
+            // (a) The rest needs a round.
+            let mut set = records(6);
+            set.push(unsendable_record());
+            let mut waiter = waiting();
+            for batch in &round(&set) {
+                receive(&mut waiter, batch, true);
+            }
+            assert_eq!(waiter.len(), 6);
+            assert!(pending(&waiter), "the round can never match its digest");
+
+            // (b) The rest fits one batch.
+            let mut set = records(2);
+            set.push(unsendable_record());
+            let batches =
+                encode_revocation_batches_with_target(&set, SMALL_TARGET).expect("encode");
+            assert_eq!(batches.len(), 1);
+            let mut waiter = waiting();
+            receive(&mut waiter, &batches[0], true);
+            assert_eq!(waiter.len(), 2);
+            assert!(
+                pending(&waiter),
+                "one batch from this sender is not its whole set"
+            );
+
+            let mut released = ReleasedWaiter::new();
+            assert_eq!(released.receive(&batches[0]), 2);
+            assert!(!released.open, "a released waiter stays closed too");
+        }
+
+        /// WHY: the sender publishes the same set again every two hours.
+        /// A waiting node that holds the complete round must keep it when
+        /// a part of the SAME round arrives again, or it could never open
+        /// while its own ingest is still behind.
+        #[test]
+        fn a_repeat_of_the_same_round_keeps_the_complete_snapshot() {
+            let set = records(6);
+            let batches = round(&set);
+            let mut waiter = waiting();
+            // Every part is offered; nothing is ingested yet.
+            for batch in &batches {
+                let (part, marker) = decode_revocation_batch_with_round(batch).expect("decode");
+                waiter.observe_remote_carrier_batch(
+                    REVOCATION_CARRIER_V1,
+                    &SENDER,
+                    &part,
+                    marker,
+                    true,
+                );
+            }
+            assert!(pending(&waiter));
+            // The sender publishes again: part 0 of the same round.
+            let (part, marker) = decode_revocation_batch_with_round(&batches[0]).expect("decode");
+            waiter.observe_remote_carrier_batch(
+                REVOCATION_CARRIER_V1,
+                &SENDER,
+                &part,
+                marker,
+                true,
+            );
+            // The ingest catches up.
+            for record in set {
+                let _ = waiter.verify_and_insert_at(record, None, 2_000);
+            }
+            assert!(!pending(&waiter), "the complete round still stands");
+        }
+
         /// WHY: only a trusted authority can offer a snapshot. A marker
         /// from any other sender must not start, extend or close a round.
         #[test]
@@ -5721,7 +5882,7 @@ mod tests {
                     hex::encode([1u8; 32])
                 ),
                 format!(
-                    "x0x-revocation-round-v1 n=4097 i=0 set={}",
+                    "x0x-revocation-round-v1 n=513 i=0 set={}",
                     hex::encode([1u8; 32])
                 ),
                 format!(

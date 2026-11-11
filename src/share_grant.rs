@@ -2236,7 +2236,8 @@ impl crate::Agent {
         // here and the owner's other installs should learn it. The caller
         // still gets the error (a 5xx), and a retry rewrites both files.
         if let Some(rt) = &self.gossip_runtime {
-            let _one_round = crate::revocation_publish_lock().await;
+            let publish_lock = self.revocation_set.read().await.publish_lock();
+            let _one_round = publish_lock.lock().await;
             let records = self.revocation_set.read().await.share_grant_records();
             if let Ok(batches) = crate::revocation::encode_revocation_batches(&records) {
                 for bytes in batches {
