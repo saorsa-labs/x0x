@@ -6834,65 +6834,54 @@ impl HeartbeatContext {
             // topic (binding records only — the v1 batch stays
             // byte-identical for old peers). Same on-change + fallback
             // gating as the v1 arm.
-            let binding_records = self.revocation_set.read().await.binding_records();
-            if !binding_records.is_empty() {
-                if let Ok(batches) = revocation::encode_revocation_batches(&binding_records) {
-                    for bytes in batches {
-                        let _ = self
-                            .runtime
-                            .pubsub()
-                            .publish(REVOCATION_V2_TOPIC.to_string(), bytes::Bytes::from(bytes))
-                            .await;
-                    }
-                }
-            }
-            // ADR-0070: share-grant revocations ride v3 only, same gating.
-            let share_grant_records = self.revocation_set.read().await.share_grant_records();
-            if !share_grant_records.is_empty() {
-                if let Ok(batches) = revocation::encode_revocation_batches(&share_grant_records) {
-                    for bytes in batches {
-                        let _ = self
-                            .runtime
-                            .pubsub()
-                            .publish(REVOCATION_V3_TOPIC.to_string(), bytes::Bytes::from(bytes))
-                            .await;
-                    }
-                }
-            }
-
-            let records = self.revocation_set.read().await.all_records();
-            if !records.is_empty() {
-                // #1857: several batches, each far under the 2 MiB that a
-                // receiver accepts. One oversized batch was ignored whole.
-                match revocation::encode_revocation_batches(&records) {
+            // #1857: every carrier goes out as one or more batches under
+            // the size a receiver accepts (one oversized batch was ignored
+            // whole). The v1 batch stays byte-identical for old peers.
+            let (binding_records, share_grant_records, records) = {
+                let set = self.revocation_set.read().await;
+                (
+                    set.binding_records(),
+                    set.share_grant_records(),
+                    set.all_records(),
+                )
+            };
+            let mut all_sent = true;
+            for (topic, carrier_records) in [
+                (REVOCATION_V2_TOPIC, binding_records),
+                (REVOCATION_V3_TOPIC, share_grant_records),
+                (REVOCATION_TOPIC, records),
+            ] {
+                match revocation::encode_revocation_batches(&carrier_records) {
                     Ok(batches) => {
-                        let mut all_sent = true;
                         for bytes in batches {
                             if let Err(e) = self
                                 .runtime
                                 .pubsub()
-                                .publish(REVOCATION_TOPIC.to_string(), bytes::Bytes::from(bytes))
+                                .publish(topic.to_string(), bytes::Bytes::from(bytes))
                                 .await
                             {
                                 all_sent = false;
-                                tracing::debug!("heartbeat: revocation re-broadcast failed: {e}");
+                                tracing::debug!(
+                                    topic,
+                                    "heartbeat: revocation re-broadcast failed: {e}"
+                                );
                             }
-                        }
-                        // A failed batch leaves the generation behind, so
-                        // the next heartbeat publishes the set again.
-                        if all_sent {
-                            self.last_revocation_generation
-                                .store(current_gen, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
                     Err(e) => {
-                        tracing::debug!("heartbeat: failed to serialize revocation set: {e}");
+                        all_sent = false;
+                        tracing::debug!(
+                            topic,
+                            "heartbeat: failed to serialize revocation set: {e}"
+                        );
                     }
                 }
-            } else if changed {
-                // The set became empty (its last record was collected or
-                // taken) — advance the
-                // generation tracker so we don't re-enter on every tick.
+            }
+            // A failed batch on ANY carrier leaves the generation behind,
+            // so the next heartbeat publishes the set again. An empty set
+            // also advances the tracker, so an emptied set does not
+            // re-enter on every tick.
+            if all_sent {
                 self.last_revocation_generation
                     .store(current_gen, std::sync::atomic::Ordering::Relaxed);
             }
@@ -6971,7 +6960,10 @@ fn s4_pending_in_set(
     s4_intake: &groups::eviction::RevocationIntake,
 ) -> std::collections::BTreeSet<[u8; 32]> {
     let mut pending = s4_intake.not_durable_hashes();
-    pending.retain(|hash| set.contains_hash(hash));
+    // #1857: a record that the kept record of its pair replaced counts as
+    // held. The store write holds that kept record, which is the same
+    // evidence (same subject, same issuer).
+    pending.retain(|hash| set.contains_hash(hash) || set.holds_replacement_for(hash));
     pending
 }
 
@@ -38765,6 +38757,54 @@ mod tests {
     /// #1765 review finding 1: a live record that leaves the set before
     /// any write held it is not in the bytes of a later write. It stays
     /// not durable, and no retry waits for it.
+    /// #1857: a later record L and then the earlier record E for one
+    /// subject and issuer arrive before any store write. E takes the place
+    /// of L in the set. An eviction row that waits for L must not wait for
+    /// ever: the store write that holds E makes L's evidence durable.
+    #[tokio::test]
+    async fn a_replaced_revocation_is_durable_when_its_kept_record_is_written() {
+        let dir = tempfile::tempdir().expect("dir");
+        let set = tokio::sync::RwLock::new(revocation::RevocationSet::new());
+        let intake = groups::eviction::RevocationIntake::new();
+        let kp = identity::AgentKeypair::generate().expect("keypair");
+        let sign = |revoked_at: u64| {
+            revocation::RevocationRecord::sign(
+                revocation::RevokedSubject::Agent(kp.agent_id()),
+                kp.public_key(),
+                kp.secret_key(),
+                revoked_at,
+                None,
+            )
+            .expect("sign")
+        };
+        let later = sign(2_000);
+        let earlier = sign(1_000);
+        {
+            let mut guard = set.write().await;
+            assert!(guard
+                .verify_and_insert(later.clone(), None)
+                .expect("insert"));
+            intake.note_verified(&later);
+            assert!(guard
+                .verify_and_insert(earlier.clone(), None)
+                .expect("insert"));
+            intake.note_verified(&earlier);
+            assert!(!guard.contains_hash(&later.record_hash()));
+        }
+        persist_s4_revocations(&set, &intake, Some(dir.path()))
+            .await
+            .expect("store write");
+        let hashes = std::collections::BTreeSet::from([later.record_hash(), earlier.record_hash()]);
+        assert!(
+            intake.all_durable(&hashes),
+            "the replaced record's evidence is on disk as the kept record"
+        );
+        let written = std::fs::read(dir.path().join("revocations.bin")).expect("store");
+        let on_disk = revocation::RevocationSet::from_bytes(&written).expect("decode");
+        assert!(on_disk.contains_hash(&earlier.record_hash()));
+        assert!(on_disk.is_agent_revoked(&kp.agent_id()));
+    }
+
     #[tokio::test]
     async fn a_taken_revocation_is_not_durable_after_a_later_store_write() {
         let dir = tempfile::tempdir().expect("dir");

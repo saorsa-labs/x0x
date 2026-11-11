@@ -469,11 +469,18 @@ impl RevocationRecord {
         Some(*hasher.finalize().as_bytes())
     }
 
-    /// The order between two records of one pair (#1857): the earlier
-    /// `revoked_at` is kept, and for equal times the lower record hash.
-    /// Every node computes the same order from the signed bytes.
-    fn rank(&self) -> (u64, [u8; 32]) {
-        (self.revoked_at, self.record_hash())
+    /// The order between two records of one pair (#1857). A record whose
+    /// reason is inside the limit comes before one whose reason is over
+    /// it (a legacy record), so that a node keeps, and sends again, a
+    /// record that every peer accepts. Then the earlier `revoked_at` is
+    /// kept, and for equal times the lower record hash. Every node
+    /// computes the same order from the signed bytes.
+    fn rank(&self) -> RecordRank {
+        (
+            !reason_within_limit(&self.reason),
+            self.revoked_at,
+            self.record_hash(),
+        )
     }
 
     /// BLAKE3 hash of the canonical (signed) message, used for de-duplication.
@@ -507,12 +514,16 @@ struct PersistedRevocation {
     subject_cert: Option<AgentCertificate>,
 }
 
+/// The most replaced-record hashes the set remembers for S4.
+const MAX_REPLACED_RECORDS: usize = 4096;
+
 /// The batches of one publish round arrive within seconds. A batch that
 /// arrives later than this after the sender's last one starts a new round.
 const RESYNC_ROUND_GAP: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// The order key of a record inside its pair: `(revoked_at, record hash)`.
-type RecordRank = (u64, [u8; 32]);
+/// The order key of a record inside its pair: `(reason over the limit,
+/// revoked_at, record hash)`. The lower key is kept.
+type RecordRank = (bool, u64, [u8; 32]);
 
 /// One trusted sender's carrier snapshot while a carrier waits for a
 /// resync (#1116): the union of the batches of its latest round (#1857).
@@ -528,7 +539,7 @@ struct SnapshotCandidate {
 
 impl SnapshotCandidate {
     fn hashes(&self) -> HashSet<[u8; 32]> {
-        self.kept.values().map(|(_, hash)| *hash).collect()
+        self.kept.values().map(|(_, _, hash)| *hash).collect()
     }
 }
 
@@ -560,6 +571,9 @@ pub struct RevocationSet {
     /// machine or binding subject (#1857): pair key → record hash. Kept in
     /// step with `records_by_hash`.
     pair_index: HashMap<[u8; 32], [u8; 32]>,
+    /// Records that were held and then replaced by the kept record of
+    /// their pair: replaced record hash → pair key. Not serialized.
+    replaced: HashMap<[u8; 32], [u8; 32]>,
     /// ADR-0043 tombstone epochs from ad-hoc binding `RevocationRecord`s
     /// (`x0x.revocation.v2` carrier). Grow-only; never swept.
     binding_epochs: HashMap<(AgentId, MachineId), u64>,
@@ -822,6 +836,15 @@ pub(crate) fn encode_revocation_batches(
         let size = usize::try_from(bincode::serialized_size(record)?)
             .unwrap_or(usize::MAX)
             .saturating_add(16);
+        if size > MAX_REVOCATION_PAYLOAD_BYTES {
+            // Only a stored legacy record can be this large. It goes out
+            // alone, and every receiver ignores that batch.
+            tracing::warn!(
+                record = %hex::encode(record.record_hash()),
+                bytes = size,
+                "revocation record is over the size a receiver accepts; peers will not take it from gossip"
+            );
+        }
         if !current.is_empty() && current_bytes.saturating_add(size) > REVOCATION_BATCH_TARGET_BYTES
         {
             batches.push(encode_revocation_batch(&current)?);
@@ -1039,17 +1062,15 @@ impl RevocationSet {
         // its snapshot is the union of the batches of one round. This set
         // holds one record per (subject, issuer) pair; a sender that holds
         // more (a released daemon) is compared by the records this set
-        // would keep. A record this node refuses for its long reason is
-        // left out, unless this node already holds it from its own store.
+        // would keep. A record with a long reason stays in the snapshot:
+        // the sender is a trusted authority, so the ingest admits it (see
+        // `verify_and_insert_at`), and the carrier must not open while its
+        // subject is not revoked here.
         let offered: Vec<([u8; 32], RecordRank)> = records
             .iter()
-            .filter_map(|record| {
-                let hash = record.record_hash();
-                if !reason_within_limit(&record.reason) && !self.records_by_hash.contains_key(&hash)
-                {
-                    return None;
-                }
-                Some((record.pair_key().unwrap_or(hash), (record.revoked_at, hash)))
+            .map(|record| {
+                let rank = record.rank();
+                (record.pair_key().unwrap_or(rank.2), rank)
             })
             .collect();
         let now = std::time::Instant::now();
@@ -1143,7 +1164,13 @@ impl RevocationSet {
             let cert = record
                 .needs_certificate_authority()
                 .and_then(|agent| certs.get(&agent));
-            let _ = self.verify_and_insert_at(record, cert, now_unix);
+            // The pre-check above verified every record. This path is an
+            // authenticated group resync, so the reason limit of open
+            // gossip does not apply: dropping a record here would open
+            // the carrier with its subject not revoked.
+            if self.verify_and_insert(record, cert).is_err() {
+                return false;
+            }
         }
         // The snapshot is accepted when its resync bit clears. Admission
         // stays closed until the rebuild releases the reconcile hold.
@@ -1392,7 +1419,28 @@ impl RevocationSet {
             .pair_key()
             .and_then(|pair| self.pair_index.get(&pair))
             .and_then(|held| self.records_by_hash.get(held))
-            .is_some_and(|held| held.record.rank() <= (record.revoked_at, hash))
+            .is_some_and(|held| held.record.rank() <= record.rank())
+    }
+
+    /// Whether a trusted authority offered this record in a resync
+    /// snapshot for a carrier that still waits (#1116). Only a trusted
+    /// sender's batch reaches the candidate store.
+    fn offered_by_trusted_snapshot(&self, hash: &[u8; 32]) -> bool {
+        self.resync_candidates.iter().any(|carrier| {
+            carrier
+                .values()
+                .any(|candidate| candidate.kept.values().any(|(_, _, held)| held == hash))
+        })
+    }
+
+    /// Whether the set holds the record that took the place of the record
+    /// with this hash (#1857). The S4 store write uses it: evidence for a
+    /// replaced record is on disk when the kept record of its pair is.
+    #[must_use]
+    pub(crate) fn holds_replacement_for(&self, hash: &[u8; 32]) -> bool {
+        self.replaced
+            .get(hash)
+            .is_some_and(|pair| self.pair_index.contains_key(pair))
     }
 
     /// Put a verified record in the record map under the one-record-per-pair
@@ -1407,10 +1455,16 @@ impl RevocationSet {
         if let Some(pair) = persisted.record.pair_key() {
             if let Some(held_hash) = self.pair_index.get(&pair).copied() {
                 if let Some(held) = self.records_by_hash.get(&held_hash) {
-                    if held.record.rank() <= (persisted.record.revoked_at, hash) {
+                    if held.record.rank() <= persisted.record.rank() {
                         return false;
                     }
                     self.records_by_hash.remove(&held_hash);
+                    // Bounded: a full map is cleared, and S4 then treats
+                    // an old replaced hash as it did before #1857.
+                    if self.replaced.len() >= MAX_REPLACED_RECORDS {
+                        self.replaced.clear();
+                    }
+                    self.replaced.insert(held_hash, pair);
                 }
             }
             self.pair_index.insert(pair, hash);
@@ -1476,7 +1530,9 @@ impl RevocationSet {
                 record.revoked_at
             )));
         }
-        if !reason_within_limit(&record.reason) {
+        if !reason_within_limit(&record.reason)
+            && !self.offered_by_trusted_snapshot(&record.record_hash())
+        {
             return Err(IdentityError::Revocation(format!(
                 "reason is longer than {MAX_REVOCATION_REASON_BYTES} bytes"
             )));
@@ -4383,10 +4439,30 @@ mod tests {
 
         /// Every batch is at most the target plus one record, and under
         /// the size a receiver accepts.
-        fn assert_batches_fit(batches: &[Vec<u8>], one_record: usize) {
+        fn assert_batches_fit(batches: &[Vec<u8>]) {
             for batch in batches {
-                assert!(batch.len() <= REVOCATION_BATCH_TARGET_BYTES + one_record);
+                // The encoder closes a batch before its estimate passes
+                // the target; the batch header is the only extra.
+                assert!(batch.len() <= REVOCATION_BATCH_TARGET_BYTES + 32);
                 assert!(batch.len() < MAX_REVOCATION_PAYLOAD_BYTES);
+            }
+        }
+
+        /// A signed record with a reason over the limit, as a released
+        /// daemon could have made it (`sign` refuses it now).
+        fn long_reason_record(kp: &AgentKeypair, revoked_at: u64) -> RevocationRecord {
+            let subject = RevokedSubject::Agent(kp.agent_id());
+            let issuer = kp.public_key().as_bytes().to_vec();
+            let reason = Some("x".repeat(MAX_REVOCATION_REASON_BYTES + 1));
+            let message =
+                RevocationRecord::canonical_message(&subject, &issuer, revoked_at, &reason);
+            let signature = sign_with_ml_dsa(kp.secret_key(), &message).expect("sign");
+            RevocationRecord {
+                subject,
+                issuer_public_key: issuer,
+                revoked_at,
+                reason,
+                signature: signature.as_bytes().to_vec(),
             }
         }
 
@@ -4439,10 +4515,14 @@ mod tests {
                 same_time.clone()
             };
 
+            let mut stores = Vec::new();
             for order in [
                 [&early, &late, &same_time],
+                [&early, &same_time, &late],
+                [&late, &early, &same_time],
                 [&late, &same_time, &early],
                 [&same_time, &early, &late],
+                [&same_time, &late, &early],
             ] {
                 let mut set = RevocationSet::new();
                 for record in order {
@@ -4454,7 +4534,192 @@ mod tests {
                     );
                 }
                 assert_eq!(set.all_records(), vec![winner_of_tie.clone()]);
+                // A restart reads the same record back.
+                let bytes = set.to_bytes().expect("encode");
+                let loaded = RevocationSet::from_bytes(&bytes).expect("decode");
+                assert_eq!(loaded.all_records(), vec![winner_of_tie.clone()]);
+                assert!(loaded.is_agent_revoked(&kp.agent_id()));
+                stores.push(bytes);
             }
+            assert!(
+                stores.windows(2).all(|pair| pair[0] == pair[1]),
+                "every arrival order writes the same store bytes"
+            );
+        }
+
+        /// WHY: the move epoch is part of a binding subject. Tombstones for
+        /// two epochs are two subjects, and both must stay: the highest
+        /// epoch orders placement records. Two records for ONE epoch are
+        /// one pair.
+        #[test]
+        fn binding_tombstones_with_different_epochs_are_separate_pairs() {
+            let owner = UserKeypair::generate().expect("owner");
+            let agent = AgentKeypair::generate().expect("agent");
+            let cert = AgentCertificate::issue(&owner, &agent).expect("cert");
+            let machine = MachineId([0x4D; 32]);
+            let tombstone = |epoch: u64, revoked_at: u64| {
+                RevocationRecord::sign(
+                    RevokedSubject::AgentMachineBinding(AgentMachineBinding {
+                        agent: agent.agent_id(),
+                        machine,
+                        move_epoch: epoch,
+                    }),
+                    owner.public_key(),
+                    owner.secret_key(),
+                    revoked_at,
+                    None,
+                )
+                .expect("sign")
+            };
+            let mut set = RevocationSet::new();
+            assert!(set
+                .verify_and_insert(tombstone(1, 1_000), Some(&cert))
+                .expect("ok"));
+            assert!(set
+                .verify_and_insert(tombstone(3, 1_000), Some(&cert))
+                .expect("ok"));
+            assert!(
+                !set.verify_and_insert(tombstone(3, 2_000), Some(&cert))
+                    .expect("ok"),
+                "a second record for epoch 3 is the same pair"
+            );
+            assert_eq!(set.binding_records().len(), 2);
+            assert_eq!(set.max_revoked_binding_epoch(&agent.agent_id()), Some(3));
+            assert!(set.is_binding_revoked(&agent.agent_id(), &machine));
+        }
+
+        /// WHY: the store merges (`merge_v2`, `merge_v3`) also put records
+        /// in the set. They must follow the pair rule for bindings, and
+        /// must keep every share-grant record (those are exempt).
+        #[test]
+        fn store_merges_follow_the_pair_rule() {
+            let owner = UserKeypair::generate().expect("owner");
+            let agent = AgentKeypair::generate().expect("agent");
+            let cert = AgentCertificate::issue(&owner, &agent).expect("cert");
+            let machine = MachineId([0x4D; 32]);
+            let tombstone = |revoked_at: u64| {
+                RevocationRecord::sign(
+                    RevokedSubject::AgentMachineBinding(AgentMachineBinding {
+                        agent: agent.agent_id(),
+                        machine,
+                        move_epoch: 2,
+                    }),
+                    owner.public_key(),
+                    owner.secret_key(),
+                    revoked_at,
+                    None,
+                )
+                .expect("sign")
+            };
+            let early = tombstone(1_000);
+            let mut live = RevocationSet::new();
+            live.verify_and_insert(tombstone(2_000), Some(&cert))
+                .expect("ok");
+            let mut disk = RevocationSet::new();
+            disk.verify_and_insert(early.clone(), Some(&cert))
+                .expect("ok");
+            live.merge_v2(disk);
+            assert_eq!(live.binding_records(), vec![early]);
+            assert!(live.is_binding_revoked(&agent.agent_id(), &machine));
+
+            let grant = |revoked_at: u64| {
+                RevocationRecord::sign(
+                    RevokedSubject::ShareGrant(ShareGrantRevocation {
+                        grant_id: [0x61; 32],
+                        owner: owner.user_id(),
+                        grant_expiry: 5_000,
+                    }),
+                    owner.public_key(),
+                    owner.secret_key(),
+                    revoked_at,
+                    None,
+                )
+                .expect("sign")
+            };
+            let mut live = RevocationSet::new();
+            live.verify_and_insert(grant(1_000), None).expect("ok");
+            let mut disk = RevocationSet::new();
+            disk.verify_and_insert(grant(2_000), None).expect("ok");
+            live.merge_v3(disk);
+            assert_eq!(
+                live.share_grant_records().len(),
+                2,
+                "share-grant records are exempt from the pair rule"
+            );
+        }
+
+        /// WHY: a store from an earlier build can hold a record with a
+        /// long reason. Peers refuse that record from gossip, so a node
+        /// that kept sending it would not spread the revocation. A record
+        /// for the same pair with a reason inside the limit is preferred,
+        /// whatever its time. The subject stays revoked through the change.
+        #[test]
+        fn a_record_inside_the_limit_takes_the_place_of_a_stored_long_one() {
+            let kp = AgentKeypair::generate().expect("keypair");
+            let long = long_reason_record(&kp, 1_000);
+            let short = self_revocation(&kp, 2_000, "short");
+
+            let mut set = RevocationSet::new();
+            assert!(set.verify_and_insert(long.clone(), None).expect("stored"));
+            assert!(set
+                .verify_and_insert_at(short.clone(), None, 3_000)
+                .expect("accepted"));
+            assert!(set.is_agent_revoked(&kp.agent_id()));
+            assert_eq!(set.all_records(), vec![short.clone()]);
+            let batches = encode_revocation_batches(&set.all_records()).expect("encode");
+            assert_eq!(
+                decode_revocation_batch(&batches[0]).expect("decode"),
+                vec![short.clone()]
+            );
+
+            // The other order: the long record adds nothing.
+            let mut set = RevocationSet::new();
+            assert!(set.verify_and_insert(short.clone(), None).expect("ok"));
+            assert!(!set.verify_and_insert(long, None).expect("verifies"));
+            assert_eq!(set.all_records(), vec![short]);
+        }
+
+        /// WHY: a trusted resync snapshot can hold a legacy record with a
+        /// long reason. If the waiting node dropped it and then opened the
+        /// carrier, the subject would not be revoked there. The record is
+        /// admitted when a trusted authority offered it, and only then.
+        #[test]
+        fn a_long_reason_record_in_a_trusted_resync_is_admitted_and_revokes() {
+            let kp = AgentKeypair::generate().expect("keypair");
+            let long = long_reason_record(&kp, 1_000);
+
+            let mut open_gossip = RevocationSet::quarantined_carrier(REVOCATION_CARRIER_V1);
+            open_gossip.observe_remote_carrier_snapshot(
+                REVOCATION_CARRIER_V1,
+                &AgentId([0xB2; 32]),
+                std::slice::from_ref(&long),
+                false,
+            );
+            assert!(
+                open_gossip
+                    .verify_and_insert_at(long.clone(), None, 3_000)
+                    .is_err(),
+                "a sender that is not a trusted authority does not lift the limit"
+            );
+
+            let mut held = RevocationSet::quarantined_carrier(REVOCATION_CARRIER_V1);
+            held.observe_remote_carrier_snapshot(
+                REVOCATION_CARRIER_V1,
+                &AgentId([0xA1; 32]),
+                std::slice::from_ref(&long),
+                true,
+            );
+            assert!(held.carrier_resync_pending(REVOCATION_CARRIER_V1));
+            assert!(held
+                .verify_and_insert_at(long.clone(), None, 3_000)
+                .expect("admitted from the trusted snapshot"));
+            assert!(held.is_agent_revoked(&kp.agent_id()));
+            assert!(!held.carrier_resync_pending(REVOCATION_CARRIER_V1));
+
+            // The authenticated group resync path admits it too.
+            let mut group = RevocationSet::quarantined_carrier(REVOCATION_CARRIER_V1);
+            group.apply_group_revocation_resync(vec![long], 3_000);
+            assert!(group.is_agent_revoked(&kp.agent_id()));
         }
 
         /// WHY: another issuer is another pair. An owner's record for an
@@ -4499,8 +4764,7 @@ mod tests {
             let batches = encode_revocation_batches(&records).expect("encode");
             assert!(batches.len() > 1);
             let mut seen = HashSet::new();
-            let one_record = bincode::serialize(&records[0]).expect("encode").len() + 16;
-            assert_batches_fit(&batches, one_record);
+            assert_batches_fit(&batches);
             // The target keeps a single batch near the old size: a set
             // that fits in 1.5 MiB is still one batch.
             assert_eq!(
@@ -4537,8 +4801,7 @@ mod tests {
                 .map(|tag| sized_fake_with_reason(tag, "x".repeat(MAX_REVOCATION_REASON_BYTES)))
                 .collect();
             let long_batches = encode_revocation_batches(&long).expect("encode");
-            let one_long = bincode::serialize(&long[0]).expect("encode").len() + 16;
-            assert_batches_fit(&long_batches, one_long);
+            assert_batches_fit(&long_batches);
             let carried: usize = long_batches
                 .iter()
                 .map(|batch| decode_revocation_batch(batch).expect("decode").len())
@@ -4569,7 +4832,7 @@ mod tests {
             let batches = encode_revocation_batches(&loaded.all_records()).expect("encode");
             assert!(batches.len() > 1);
             let mut sent = 0;
-            assert_batches_fit(&batches, 8 * 1024);
+            assert_batches_fit(&batches);
             for batch in &batches {
                 sent += decode_revocation_batch(batch).expect("decode").len();
             }
@@ -4591,23 +4854,12 @@ mod tests {
                 kp.public_key(),
                 kp.secret_key(),
                 1_000,
-                Some(over.clone()),
+                Some(over),
             )
             .is_err());
 
             // A record as a released daemon could have signed it.
-            let subject = RevokedSubject::Agent(kp.agent_id());
-            let issuer = kp.public_key().as_bytes().to_vec();
-            let reason = Some(over);
-            let message = RevocationRecord::canonical_message(&subject, &issuer, 1_000, &reason);
-            let signature = sign_with_ml_dsa(kp.secret_key(), &message).expect("sign");
-            let long = RevocationRecord {
-                subject,
-                issuer_public_key: issuer,
-                revoked_at: 1_000,
-                reason,
-                signature: signature.as_bytes().to_vec(),
-            };
+            let long = long_reason_record(&kp, 1_000);
 
             let mut fresh = RevocationSet::new();
             assert!(
