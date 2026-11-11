@@ -75,6 +75,10 @@ pub(in crate::server) struct AnnounceIdentityRequest {
     include_user_identity: bool,
     #[serde(default)]
     human_consent: bool,
+    /// #1107: withdraw the recorded consent to user-identity disclosure
+    /// before this (anonymous) announce.
+    #[serde(default)]
+    withdraw_consent: bool,
 }
 
 /// GET /agent
@@ -307,16 +311,53 @@ pub(in crate::server) async fn announce_identity(
         )
         .into_response();
     }
+    // #1107: withdrawing the consent is the owner's decision, like giving
+    // it. The durable record and the in-memory flag are cleared before the
+    // anonymous announce, so a failed publish cannot leave consent on.
+    if req.withdraw_consent {
+        if req.include_user_identity {
+            return bad_request(
+                "withdraw_consent cannot be combined with include_user_identity: true",
+            )
+            .into_response();
+        }
+        if !actor.is_durable_owner() {
+            return api_error(
+                StatusCode::FORBIDDEN,
+                "withdrawing the user-identity consent requires the durable API token (owner act)",
+            )
+            .into_response();
+        }
+        if let Err(e) = state.agent.withdraw_user_identity_consent().await {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not remove the user-identity consent record: {e}"),
+            )
+            .into_response();
+        }
+    }
     match state
         .agent
         .announce_identity(req.include_user_identity, req.human_consent)
         .await
     {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
+        Ok(()) => {
+            let mut body = serde_json::json!({
                 "ok": true,
                 "include_user_identity": req.include_user_identity,
+            });
+            if req.withdraw_consent {
+                body["consent_withdrawn"] = serde_json::Value::Bool(true);
+            }
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        // The withdrawal is already done when the announce fails; say so.
+        Err(e) if req.withdraw_consent => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("{e}"),
+                "consent_withdrawn": true,
             })),
         )
             .into_response(),
@@ -2323,6 +2364,194 @@ mod owner_act_tests {
             StatusCode::BAD_REQUEST,
             "plain announce stays session-allowed (400 = gossip runtime absent, NOT 403)"
         );
+        Ok(())
+    }
+
+    /// #1107: withdrawing the consent is an owner act, and it cannot be
+    /// combined with a disclosure.
+    #[tokio::test]
+    async fn owner_act_matrix_withdraw_consent() -> anyhow::Result<()> {
+        let (state, _dir) = matrix_state().await?;
+        let app = matrix_router(Arc::clone(&state));
+        let withdraw = serde_json::json!({ "withdraw_consent": true });
+
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/announce",
+            &session_token(&state).await,
+            withdraw.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "session bearer: {json}");
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/announce",
+            &rider_token(&state).await,
+            withdraw.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "rider token: {json}");
+
+        // Durable clears the gate and the withdrawal runs; the fixture
+        // agent has no gossip runtime, so the anonymous announce after it
+        // answers 400 with the handler's own error.
+        let (status, json) = call(&app, "POST", "/announce", DURABLE, withdraw).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "durable: {json}");
+        assert!(
+            json["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("gossip runtime")),
+            "the withdrawal passed and the announce failed: {json}"
+        );
+        assert_eq!(
+            json["consent_withdrawn"], true,
+            "a failed announce still reports the withdrawal: {json}"
+        );
+
+        let both = serde_json::json!({
+            "include_user_identity": true,
+            "human_consent": true,
+            "withdraw_consent": true,
+        });
+        let (status, json) = call(&app, "POST", "/announce", DURABLE, both).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "combined: {json}");
+        assert!(
+            json["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("withdraw_consent cannot be combined")),
+            "combined request is refused before any change: {json}"
+        );
+        Ok(())
+    }
+
+    /// The next identity announce frame on the announce topic. The v3
+    /// `payload_version` is `0` for an anonymous announce.
+    async fn next_announce_frame(
+        wire: &mut crate::gossip::pubsub::Subscription,
+    ) -> crate::announce_v3::IdentityAnnouncementV3 {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let msg = tokio::time::timeout_at(deadline, wire.recv())
+                .await
+                .expect("an identity announcement was published")
+                .expect("the wire subscription stays open");
+            if crate::announce_v3::is_v3_payload(&msg.payload) {
+                return crate::announce_v3::deserialize_v3(&msg.payload)
+                    .expect("the identity announce wire frame decodes");
+            }
+        }
+    }
+
+    /// A real loopback agent with its identity directory at `dir`, so the
+    /// consent record path is `dir/user-consent.bin`.
+    async fn consent_state(dir: &std::path::Path) -> anyhow::Result<Arc<AppState>> {
+        let user = crate::identity::UserKeypair::from_seed(&[0x42; 32])?;
+        let config = crate::network::NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse()?),
+            bootstrap_nodes: Vec::new(),
+            network_id: Some(format!("withdraw-consent-{}", rand::random::<u32>())),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..crate::network::NetworkConfig::default()
+        };
+        let agent = Arc::new(
+            crate::Agent::builder()
+                .with_identity_dir(dir)
+                .with_machine_key(dir.join("machine.key"))
+                .with_agent_key_path(dir.join("agent.key"))
+                .with_agent_cert_path(dir.join("agent.cert"))
+                .with_user_key(user)
+                .with_contact_store_path(dir.join("contacts.json"))
+                .with_peer_cache_disabled()
+                .with_network_config(config)
+                .build()
+                .await?,
+        );
+        crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(dir, agent).await
+    }
+
+    /// #1107: the durable owner token withdraws the consent through
+    /// `POST /announce`. The answer is 200 with `consent_withdrawn`, the
+    /// record file is gone, and the announce published by the withdrawal
+    /// and the next ordinary announce are both anonymous on the wire.
+    #[tokio::test]
+    async fn withdraw_consent_removes_the_record_and_announces_anonymously() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = consent_state(dir.path()).await?;
+        let agent = Arc::clone(&state.agent);
+        let app = matrix_router(Arc::clone(&state));
+        let mut wire = agent.subscribe(crate::IDENTITY_ANNOUNCE_TOPIC).await?;
+        let record = dir.path().join("user-consent.bin");
+
+        let consent = serde_json::json!({ "include_user_identity": true, "human_consent": true });
+        let (status, json) = call(&app, "POST", "/announce", DURABLE, consent).await;
+        assert_eq!(status, StatusCode::OK, "consented announce: {json}");
+        assert!(record.exists(), "the consented announce writes the record");
+        assert_ne!(
+            next_announce_frame(&mut wire).await.payload_version,
+            0,
+            "the consented announce is an identity announce"
+        );
+        assert!(agent.user_identity_consented());
+
+        let withdraw = serde_json::json!({ "withdraw_consent": true });
+        let (status, json) = call(&app, "POST", "/announce", DURABLE, withdraw).await;
+        assert_eq!(status, StatusCode::OK, "withdrawal: {json}");
+        assert_eq!(json["consent_withdrawn"], true, "withdrawal: {json}");
+        assert!(!record.exists(), "the withdrawal removes the record");
+        assert!(!agent.user_identity_consented());
+        assert_eq!(
+            next_announce_frame(&mut wire).await.payload_version,
+            0,
+            "the announce published by the withdrawal is anonymous"
+        );
+
+        // The next ordinary announce, in a later second, is anonymous too.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let (status, json) = call(&app, "POST", "/announce", DURABLE, serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::OK, "plain announce: {json}");
+        assert!(json.get("consent_withdrawn").is_none(), "{json}");
+        assert_eq!(
+            next_announce_frame(&mut wire).await.payload_version,
+            0,
+            "the next announce after the withdrawal is anonymous"
+        );
+        assert!(!record.exists(), "an anonymous announce writes no record");
+        agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1107: the record can be neither removed nor emptied (a directory
+    /// is at its path). The withdrawal answers 500 and the daemon stops the
+    /// disclosure for this run.
+    #[tokio::test]
+    async fn withdraw_consent_storage_failure_answers_500() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let record = dir.path().join("user-consent.bin");
+        std::fs::create_dir(&record)?;
+        std::fs::write(record.join("blocker"), b"x")?;
+        let state = consent_state(dir.path()).await?;
+        let app = matrix_router(Arc::clone(&state));
+
+        let consent = serde_json::json!({ "include_user_identity": true, "human_consent": true });
+        let (status, json) = call(&app, "POST", "/announce", DURABLE, consent).await;
+        assert_eq!(status, StatusCode::OK, "consented announce: {json}");
+        assert!(state.agent.user_identity_consented());
+
+        let withdraw = serde_json::json!({ "withdraw_consent": true });
+        let (status, json) = call(&app, "POST", "/announce", DURABLE, withdraw).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{json}");
+        assert!(
+            json["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("could not remove the user-identity consent record")),
+            "{json}"
+        );
+        assert!(json.get("consent_withdrawn").is_none(), "{json}");
+        assert!(!state.agent.user_identity_consented());
+        state.agent.shutdown().await;
         Ok(())
     }
 

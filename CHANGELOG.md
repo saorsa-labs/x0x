@@ -24,6 +24,20 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **The consent to disclose the user identity now survives a restart (#1107).**
+  A successful `POST /announce` with `include_user_identity: true` and
+  `human_consent: true` writes `user-consent.bin` (mode `0600`) in the
+  identity directory. At the next start the daemon loads it before the first
+  announce, so the startup announce and the heartbeats carry the user ID and
+  the agent certificate with no manual step. The record applies only to the
+  same user and agent, with a certificate present (a renewed certificate
+  keeps the consent); a missing or unreadable record means no
+  consent, and the daemon still starts. New: `POST /announce` with
+  `withdraw_consent: true` (CLI `x0x announce --withdraw-consent`, durable
+  owner token only) removes the record and announces anonymously; the
+  answer has `consent_withdrawn: true`. This replaces the memory-only
+  behaviour of ruling (b), 8 Nov 2026; see the 10 Nov 2026 amendment in
+  consolidated slot A05. No wire format or signed content changes.
 - **`x0xd --check-updates` now only reports update availability (#1370).**
   It no longer installs updates. Operators whose scripts used this flag to
   apply updates must switch to `x0x upgrade --apply` or authenticated

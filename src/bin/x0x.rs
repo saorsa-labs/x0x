@@ -135,6 +135,10 @@ enum Commands {
         /// Consent to share human identity.
         #[arg(long)]
         consent: bool,
+        /// Withdraw the recorded consent to share human identity, then
+        /// announce without it. Cannot be combined with --include-user.
+        #[arg(long, conflicts_with = "include_user")]
+        withdraw_consent: bool,
     },
     /// List connected gossip peers.
     Peers,
@@ -2629,7 +2633,8 @@ async fn run(
         Commands::Announce {
             include_user,
             consent,
-        } => commands::identity::announce(&client, include_user, consent).await,
+            withdraw_consent,
+        } => commands::identity::announce(&client, include_user, consent, withdraw_consent).await,
         Commands::Peers => commands::network::peers(&client).await,
         Commands::Presence { sub } => match sub {
             None => commands::network::presence(&client).await,
@@ -3939,6 +3944,26 @@ mod tests {
     ));
     upgrade_now_cli_regression_tests!();
     use super::*;
+
+    // #1107: `--withdraw-consent` cannot be combined with `--include-user`.
+    #[test]
+    fn announce_withdraw_consent_conflicts_with_include_user() -> anyhow::Result<()> {
+        let refused =
+            Cli::try_parse_from(["x0x", "announce", "--withdraw-consent", "--include-user"]);
+        match refused {
+            Err(e) => assert_eq!(e.kind(), clap::error::ErrorKind::ArgumentConflict),
+            Ok(_) => anyhow::bail!("the two flags must conflict"),
+        }
+        let cli = Cli::try_parse_from(["x0x", "announce", "--withdraw-consent"])?;
+        match cli.command {
+            Commands::Announce {
+                include_user: false,
+                consent: false,
+                withdraw_consent: true,
+            } => Ok(()),
+            _ => anyhow::bail!("expected announce with only withdraw_consent set"),
+        }
+    }
 
     #[test]
     fn bare_presence_alias_parses_without_nested_subcommand() -> anyhow::Result<()> {

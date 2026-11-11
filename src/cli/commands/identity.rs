@@ -92,14 +92,33 @@ pub async fn owner_machines(client: &DaemonClient) -> Result<()> {
 }
 
 /// `x0x announce` — POST /announce
-pub async fn announce(client: &DaemonClient, include_user: bool, consent: bool) -> Result<()> {
+pub async fn announce(
+    client: &DaemonClient,
+    include_user: bool,
+    consent: bool,
+    withdraw_consent: bool,
+) -> Result<()> {
     client.ensure_running().await?;
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "include_user_identity": include_user,
         "human_consent": consent,
     });
+    // #1107: sent only when asked, so the body an older daemon sees is
+    // unchanged for an ordinary announce.
+    if withdraw_consent {
+        body["withdraw_consent"] = serde_json::Value::Bool(true);
+    }
     let resp = client.post("/announce", &body).await?;
     print_value(client.format(), &resp);
+    // #1107: a daemon older than `withdraw_consent` ignores the unknown
+    // field, announces, and answers 200. Without this check the operator
+    // would believe the consent is withdrawn while that daemon still
+    // discloses the identity.
+    if withdraw_consent && resp.get("consent_withdrawn") != Some(&serde_json::Value::Bool(true)) {
+        bail!(
+            "this daemon did not withdraw the consent; it is older than the withdraw_consent option — upgrade it, or restart it to drop the in-memory consent"
+        );
+    }
     Ok(())
 }
 
@@ -868,8 +887,64 @@ mod tests {
         let mock_resp = serde_json::json!({"announced": true});
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
-        let result = announce(&client, true, true).await;
+        let result = announce(&client, true, true, false).await;
         assert!(result.is_ok(), "announce should succeed: {:?}", result);
+    }
+
+    /// #1107: `x0x announce --withdraw-consent` sends `withdraw_consent`,
+    /// and an ordinary announce does not send the field at all.
+    #[tokio::test]
+    async fn announce_withdraw_consent_request_body() {
+        use crate::cli::commands::test_support::start_capturing_mock_server;
+        let (url, _shutdown, captured) =
+            start_capturing_mock_server(serde_json::json!({"ok": true, "consent_withdrawn": true}))
+                .await;
+        let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
+
+        announce(&client, false, false, true).await.unwrap();
+        let (path, body) = captured.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(path, "/announce");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "include_user_identity": false,
+                "human_consent": false,
+                "withdraw_consent": true,
+            })
+        );
+
+        announce(&client, true, true, false).await.unwrap();
+        let (_, body) = captured.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({ "include_user_identity": true, "human_consent": true })
+        );
+    }
+
+    /// #1107: a daemon older than `withdraw_consent` answers 200 with no
+    /// `consent_withdrawn`. The CLI must fail, not report success. An
+    /// ordinary announce to the same daemon still succeeds.
+    #[tokio::test]
+    async fn announce_withdraw_consent_fails_when_the_daemon_did_not_withdraw() {
+        for old_daemon_answer in [
+            serde_json::json!({"ok": true, "include_user_identity": false}),
+            serde_json::json!({"ok": true, "consent_withdrawn": false}),
+        ] {
+            let (url, _shutdown) = start_mock_server(old_daemon_answer).await;
+            let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
+            let error = announce(&client, false, false, true)
+                .await
+                .expect_err("no consent_withdrawn: true in the answer");
+            assert!(
+                error
+                    .to_string()
+                    .contains("this daemon did not withdraw the consent"),
+                "{error}"
+            );
+            announce(&client, false, false, false)
+                .await
+                .expect("an ordinary announce does not need the field");
+        }
     }
 
     #[tokio::test]

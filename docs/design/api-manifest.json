@@ -98,6 +98,12 @@
             "in": "body",
             "name": "human_consent",
             "required": false
+          },
+          {
+            "cli": "--withdraw-consent",
+            "in": "body",
+            "name": "withdraw_consent",
+            "required": false
           }
         ],
         "kind": "fields"

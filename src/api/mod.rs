@@ -306,7 +306,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "announce",
         description: "Announce identity to network",
         category: "identity",
-        request: RequestSpec::Fields(&[RequestField::body_as("include_user_identity", false, "--include-user"), RequestField::body_as("human_consent", false, "--consent")]),
+        request: RequestSpec::Fields(&[RequestField::body_as("include_user_identity", false, "--include-user"), RequestField::body_as("human_consent", false, "--consent"), RequestField::body_as("withdraw_consent", false, "--withdraw-consent")]),
     },
     EndpointDef {
         method: Method::Get,

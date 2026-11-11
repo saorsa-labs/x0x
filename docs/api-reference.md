@@ -100,7 +100,7 @@ Auth-class labels used throughout this reference:
   (#1347)** below.
   Payload-conditional durable gates (body or prefix inspected, enforced
   in the handler): `POST /announce` **with
-  `include_user_identity: true`**, and `POST /direct/send` / WS
+  `include_user_identity: true` or `withdraw_consent: true`**, and `POST /direct/send` / WS
   `send_direct` carrying a reserved `x0x-exec-v1\0` exec frame.
   The same two generic send paths refuse `x0x-gui-show-v1\0`,
   `x0x-gui-show-result-v1\0`, and `x0x-gui-activity-v1\0` for every
@@ -110,7 +110,7 @@ Auth-class labels used throughout this reference:
   Rider tokens authenticate in the `Authorization` header only.
 
 **#446 resolution notes:** `POST /announce` without
-`include_user_identity` and `PATCH /groups/:id` on ordinary
+`include_user_identity` and without `withdraw_consent`, and `PATCH /groups/:id` on ordinary
  (non-Home) groups stay bearer — no credential or capability is
 involved. `DELETE /groups/:id` requires **active membership** for any
 group (self-leave is its purpose; a non-member cannot delete the local
@@ -550,13 +550,50 @@ with `403` before these field checks.
 ```json
 {
   "include_user_identity": false,
-  "human_consent": false
+  "human_consent": false,
+  "withdraw_consent": false
 }
 ```
 
 Notes:
 - Set `include_user_identity: true` only when the daemon has a configured user key.
 - Set `human_consent: true` when intentionally sharing human identity.
+
+**Consent is durable (#1107).** A successful announce with both
+`include_user_identity: true` and `human_consent: true` records the
+consent in `user-consent.bin` in the identity directory, next to the keys
+(mode `0600` on Unix). The daemon loads the record at each start, before
+the first announce. The startup announce and every heartbeat then carry
+the user ID and the agent certificate. You do not need to repeat the
+announce after a restart.
+
+The record names the user and the agent that consented. It applies only
+when the daemon starts with the same agent key and a certificate from the
+same user. With another user key, another agent key, or no certificate,
+the daemon announces without the user identity. A missing or damaged
+record means "not consented". It never stops the daemon.
+
+**Withdraw the consent.** Send `{"withdraw_consent": true}` (CLI:
+`x0x announce --withdraw-consent`). This needs the durable API token. The
+daemon removes the record, stops including the user identity, and then
+publishes an announce without it. The response has
+`"consent_withdrawn": true`. `withdraw_consent` together with
+`include_user_identity: true` returns `400` for the durable token; a
+session or rider token gets `403` first. A daemon older than this option
+ignores the field: it announces and returns `200` with no
+`consent_withdrawn`, and its consent stays on. Always check for
+`"consent_withdrawn": true`. The CLI does this and exits non-zero with a
+message when the field is absent; upgrade that daemon, or restart it to
+drop its in-memory consent. The record is removed before
+the announce: if the announce fails, the request returns `400` with
+`"consent_withdrawn": true`, and the consent stays withdrawn. If the daemon
+can neither remove nor empty the record (a storage error), the request
+returns `500` and no announce is sent. This run then announces without the
+identity, but the record is still on disk and the consent returns at the
+next start: correct the storage fault and send the withdrawal again.
+Withdrawal does not make peers forget an
+identity that they already saw. A peer drops the cached certificate when
+it receives a later announce without the identity.
 
 ### Agent card query params
 
@@ -1060,7 +1097,9 @@ No multi-device convergence or roster-merge claim is made.
 **Second owner device joining (#447).** A single explicit
 `POST /announce` with body `{"include_user_identity":true,"human_consent":true}`
 on the joining device is sufficient — a bodyless announce publishes the
-anonymous certificate digest, which the owner can never resolve. A join that
+anonymous certificate digest, which the owner can never resolve. The consent
+is durable (#1107): after a restart the device announces with the certificate
+again, with no second announce. A join that
 arrives before the certificate is visible is retained in a typed `pending`
 state (`retain_pending_owner_cert_join`) and retried when the evidence lands
 (`retry_pending_owner_cert_joins`), rather than wedging. There is no

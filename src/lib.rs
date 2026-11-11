@@ -791,8 +791,36 @@ pub struct Agent {
     /// Whether the user has consented to disclosing their identity in
     /// announcements.  Set by a successful `announce_identity(true, true)`
     /// and respected by the heartbeat so it doesn't erase a consented
-    /// disclosure.
+    /// disclosure. Loaded at build from the durable record
+    /// (`user_consent_path`) when that record names this identity (#1107).
     user_identity_consented: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Where the durable consent record lives (#1107):
+    /// `<identity dir>/user-consent.bin`. `None` when there is no identity
+    /// directory and no home directory; consent is then in-memory only.
+    user_consent_path: Option<std::path::PathBuf>,
+    /// Serialises changes to the consent flag and its durable record, so a
+    /// consented announce and a withdrawal cannot leave the two in
+    /// disagreement.
+    user_consent_record_lock: tokio::sync::Mutex<()>,
+    /// Counts withdrawals. A consented announce reads it before it
+    /// publishes; if it has changed when the announce comes to record
+    /// consent, a withdrawal completed in between and the announce records
+    /// nothing. Changed only under `user_consent_record_lock`.
+    user_consent_generation: std::sync::atomic::AtomicU64,
+    /// Whether the durable record is on disk for the current consent. Off
+    /// after a failed write, so the next consented announce tries again.
+    /// Changed only under `user_consent_record_lock`.
+    user_consent_record_saved: std::sync::atomic::AtomicBool,
+    /// Test hook: a consented announce stops here after its publish and
+    /// before it records consent. It sends on the first channel, then
+    /// waits for the second.
+    #[cfg(test)]
+    consented_publish_test_gate: std::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     /// Capability store populated by the advert service and consulted by
     /// `send_direct` to choose between gossip and raw-QUIC paths.
     capability_store: std::sync::Arc<dm_capability::CapabilityStore>,
@@ -7275,6 +7303,42 @@ pub(crate) async fn ingest_share_grant_revocation_records(
         persist_share_grant_revocations(revocation_set, identity_dir).await;
     }
     inserted
+}
+
+/// #1107: whether the consent record at `path` applies to `identity`.
+///
+/// A missing, unreadable or corrupt record is "not consented"; it never
+/// stops the build. A record for another user or agent, or an identity
+/// with no certificate, is also "not consented".
+async fn load_applicable_user_consent(
+    path: Option<&std::path::Path>,
+    identity: &identity::Identity,
+) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    match storage::load_user_disclosure_consent(path).await {
+        Ok(Some(record)) => {
+            let applies = identity.agent_certificate().is_some()
+                && identity.disclosed_user_id() == Some(record.user_id)
+                && identity.agent_id() == record.agent_id;
+            if !applies {
+                tracing::info!(
+                    path = %path.display(),
+                    "the user-identity consent record names another identity; announcing without the user identity"
+                );
+            }
+            applies
+        }
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                "the user-identity consent record is unreadable; announcing without the user identity: {e}"
+            );
+            false
+        }
+    }
 }
 
 /// Best-effort write of `revocations-v3.bin` (see
@@ -14268,6 +14332,11 @@ impl Agent {
         include_user_identity: bool,
         human_consent: bool,
     ) -> error::Result<()> {
+        // Read before the publish: a withdrawal that completes after this
+        // point must win over this announce (#1107).
+        let consent_generation = self
+            .user_consent_generation
+            .load(std::sync::atomic::Ordering::Acquire);
         let result = self
             .publish_identity_announcement(include_user_identity, human_consent)
             .await;
@@ -14279,12 +14348,135 @@ impl Agent {
         // never escalate to identity beats on their own. There is nothing
         // to restore on failure, so concurrent disclosures need no lock:
         // the only write is this monotone `true`, and a failed call never
-        // touches the flag.
+        // touches the flag. #1107 adds one other writer, the explicit
+        // withdrawal; `user_consent_record_lock` orders the two, and the
+        // generation read above lets a completed withdrawal win over an
+        // announce that was already in flight.
         if result.is_ok() && include_user_identity && human_consent {
-            self.user_identity_consented
-                .store(true, std::sync::atomic::Ordering::Release);
+            #[cfg(test)]
+            {
+                let gate = self
+                    .consented_publish_test_gate
+                    .lock()
+                    .ok()
+                    .and_then(|mut gate| gate.take());
+                if let Some((reached, resume)) = gate {
+                    let _ = reached.send(());
+                    let _ = resume.await;
+                }
+            }
+            self.record_user_identity_consent(consent_generation).await;
         }
         result
+    }
+
+    /// Record consent after a consented disclosure published: write the
+    /// durable record (#1107), then turn the in-memory flag on.
+    ///
+    /// `generation_at_start` is the withdrawal count that the announce read
+    /// before it published. If a withdrawal completed since then, this
+    /// records nothing: the later withdrawal wins over the older grant, so
+    /// an announce that was in flight cannot bring the record back.
+    ///
+    /// The record is written when it is not on disk for the current
+    /// consent: on the change to "consented", and again after a failed
+    /// write. A write failure is logged and does not fail the announce,
+    /// which has already published: consent then lasts until the daemon
+    /// stops, and the next consented announce tries the write again.
+    async fn record_user_identity_consent(&self, generation_at_start: u64) {
+        use std::sync::atomic::Ordering;
+        let _guard = self.user_consent_record_lock.lock().await;
+        if self.user_consent_generation.load(Ordering::Acquire) != generation_at_start {
+            tracing::info!(
+                "consent was withdrawn while a consented announce was in flight; consent is not recorded"
+            );
+            return;
+        }
+        if !self.user_consent_record_saved.load(Ordering::Acquire) {
+            if let (Some(path), Some(user_id)) =
+                (&self.user_consent_path, self.identity.disclosed_user_id())
+            {
+                let record = storage::UserDisclosureConsent {
+                    user_id,
+                    agent_id: self.identity.agent_id(),
+                    consented_at: Self::unix_timestamp_secs(),
+                };
+                match storage::save_user_disclosure_consent(path, &record).await {
+                    Ok(()) => self
+                        .user_consent_record_saved
+                        .store(true, Ordering::Release),
+                    Err(e) => tracing::warn!(
+                        path = %path.display(),
+                        "could not save the user-identity consent record; consent will not survive a restart until a later consented announce saves it: {e}"
+                    ),
+                }
+            }
+        }
+        self.user_identity_consented.store(true, Ordering::Release);
+    }
+
+    /// Whether the user has consented to user-identity disclosure, so the
+    /// heartbeat and the startup announce carry the user ID and the agent
+    /// certificate.
+    #[must_use]
+    pub(crate) fn user_identity_consented(&self) -> bool {
+        self.user_identity_consented
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Withdraw the consent to user-identity disclosure (#1107).
+    ///
+    /// Removes the durable record and turns the in-memory flag off. The
+    /// announcements that follow (heartbeats, the next startup announce)
+    /// are anonymous until a new `announce_identity(true, true)`.
+    ///
+    /// This does not publish anything. Call
+    /// `announce_identity(false, false)` afterwards to send a fresh
+    /// anonymous announcement. Peers that already saw the identity are not
+    /// made to forget it; they drop the cached certificate when a fresher
+    /// anonymous announcement reaches them.
+    ///
+    /// A consented announce that is in flight when this returns does not
+    /// record consent again.
+    ///
+    /// # Errors
+    /// [`error::IdentityError::Storage`] when the record can be neither
+    /// removed nor emptied. The in-memory flag is off in that case too, so
+    /// this run announces anonymously, but the record is still on disk and
+    /// the consent comes back at the next start. A warning is logged.
+    /// Repeat the withdrawal when the cause is fixed.
+    pub async fn withdraw_user_identity_consent(&self) -> error::Result<()> {
+        use std::sync::atomic::Ordering;
+        let _guard = self.user_consent_record_lock.lock().await;
+        self.user_consent_generation.fetch_add(1, Ordering::AcqRel);
+        self.user_consent_record_saved
+            .store(false, Ordering::Release);
+        self.user_identity_consented.store(false, Ordering::Release);
+        let Some(path) = &self.user_consent_path else {
+            return Ok(());
+        };
+        let Err(remove_error) = storage::clear_user_disclosure_consent(path).await else {
+            return Ok(());
+        };
+        // The removal failed (for example, a read-only directory). An empty
+        // file is not a valid record, so the next start reads it as "not
+        // consented".
+        match storage::void_user_disclosure_consent(path).await {
+            Ok(()) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "could not remove the user-identity consent record ({remove_error}); it is now empty, which means not consented"
+                );
+                Ok(())
+            }
+            Err(void_error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "could not remove ({remove_error}) or empty ({void_error}) the user-identity consent record; the consent will come back at the next start unless the withdrawal is repeated"
+                );
+                Err(remove_error)
+            }
+        }
     }
 
     /// Build and publish the identity announcement on behalf of
@@ -16689,7 +16881,12 @@ impl Agent {
             }
         }
 
-        if let Err(e) = self.announce_identity(false, false).await {
+        // #1107: a consent loaded from the durable record makes the
+        // startup announce an identity announce, so a restart does not
+        // publish a fresher anonymous digest that drops the certificate on
+        // every peer.
+        let consented = self.user_identity_consented();
+        if let Err(e) = self.announce_identity(consented, consented).await {
             tracing::warn!("Initial identity announcement failed: {}", e);
         }
         if let Err(e) = self.start_identity_heartbeat().await {
@@ -24548,6 +24745,11 @@ impl AgentBuilder {
         // struct — the blob responder serves this pair to fetchers.
         let own_pair_user = identity.disclosed_user_id();
         let own_pair_cert = identity.agent_certificate().cloned();
+        // #1107: load the durable consent record before the first
+        // announce. It applies only to the identity it was given for.
+        let user_consent_path = storage::user_consent_path(self.identity_dir.as_deref());
+        let user_consent_loaded =
+            load_applicable_user_consent(user_consent_path.as_deref(), &identity).await;
         Ok(Agent {
             move_state,
             move_state_load_failed,
@@ -24597,7 +24799,15 @@ impl AgentBuilder {
             direct_listener_started: std::sync::atomic::AtomicBool::new(false),
             observed_prefix_enabled,
             presence,
-            user_identity_consented: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            user_identity_consented: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                user_consent_loaded,
+            )),
+            user_consent_path,
+            user_consent_record_lock: tokio::sync::Mutex::new(()),
+            user_consent_generation: std::sync::atomic::AtomicU64::new(0),
+            user_consent_record_saved: std::sync::atomic::AtomicBool::new(user_consent_loaded),
+            #[cfg(test)]
+            consented_publish_test_gate: std::sync::Mutex::new(None),
             capability_store: std::sync::Arc::new(dm_capability::CapabilityStore::new()),
             capability_refreshes: std::sync::Arc::new(CapabilityRefreshRegistry::default()),
             #[cfg(test)]
@@ -44943,6 +45153,9 @@ mod issue1239_send_deadline_tests;
 
 #[cfg(test)]
 mod announce_rename_order_tests;
+#[cfg(test)]
+#[path = "identity_user_consent_persist_tests.rs"]
+mod identity_user_consent_persist_tests;
 
 #[cfg(test)]
 mod wire_golden_tests;
