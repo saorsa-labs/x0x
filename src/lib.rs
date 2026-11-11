@@ -3938,8 +3938,7 @@ async fn apply_legacy_revocation_records(
     revocation_set: &std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
     s4_intake: &groups::eviction::RevocationIntake,
     identity_dir: Option<std::path::PathBuf>,
-    owner_trust: &owner_trust::OwnerTrust,
-    contact_store: &std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
+    seen: &RevocationSeenSources,
     discovery_cache: &std::sync::Arc<
         tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
     >,
@@ -3947,6 +3946,8 @@ async fn apply_legacy_revocation_records(
         tokio::sync::RwLock<std::collections::HashMap<identity::MachineId, DiscoveredMachine>>,
     >,
 ) {
+    let owner_trust = &seen.owner_trust;
+    let contact_store = &seen.contact_store;
     let mut newly_inserted = Vec::new();
     {
         let _share_grant_barrier = owner_trust
@@ -3992,15 +3993,11 @@ async fn apply_legacy_revocation_records(
             s4_intake.clone(),
             identity_dir.clone(),
         );
-        // #1863: the eviction below blocks the subject as a contact, so a
-        // Known or Trusted contact stops being a relationship. Mark the
-        // subjects first, by the same rule as the heartbeat
-        // (`SeenEvidence`).
-        SeenEvidence::gather(contact_store)
-            .await
-            .with_owner_trust(owner_trust)
-            .mark(revocation_set)
-            .await;
+        // #1863: the eviction below blocks the subject as a contact, and a
+        // group admin's eviction removes its member row, so the evidence
+        // goes away. Mark the subjects first, from every source, by the
+        // same rule as the heartbeat (`SeenEvidence`).
+        SeenEvidence::gather(seen).await.mark(revocation_set).await;
         for record in newly_inserted {
             match &record.subject {
                 revocation::RevokedSubject::Agent(agent_id) => {
@@ -4142,8 +4139,8 @@ struct LegacyCertRecovery {
     revocation_set: std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
     s4_intake: groups::eviction::RevocationIntake,
     identity_dir: Option<std::path::PathBuf>,
-    owner_trust: owner_trust::OwnerTrust,
-    contact_store: std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
+    /// #1863: also the owner trust and contact store that the eviction uses.
+    seen: RevocationSeenSources,
     discovery_cache: std::sync::Arc<
         tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
     >,
@@ -4683,8 +4680,7 @@ fn spawn_cert_recovery_task(
                     &batch.revocation_set,
                     &batch.s4_intake,
                     batch.identity_dir,
-                    &batch.owner_trust,
-                    &batch.contact_store,
+                    &batch.seen,
                     &batch.discovery_cache,
                     &batch.machine_cache,
                 )
@@ -6860,16 +6856,8 @@ impl HeartbeatContext {
 
             // #1863: a held self-revocation of a subject this node has
             // now seen joins the published set at once.
-            let newly_seen = mark_seen_revocation_subjects(
-                &self.revocation_set,
-                &self.revocation_seen,
-                (
-                    self.identity.agent_id(),
-                    self.identity.machine_id(),
-                    self.identity.user_id(),
-                ),
-            )
-            .await;
+            let newly_seen =
+                mark_seen_revocation_subjects(&self.revocation_set, &self.revocation_seen).await;
             crate::identity_authority::set_revocation_stranger_self_held(
                 self.revocation_set
                     .read()
@@ -7020,10 +7008,16 @@ pub type RevocationGroupSeen = std::sync::Arc<dyn Fn(&identity::AgentId) -> bool
 /// The slot that `x0xd` fills with its [`RevocationGroupSeen`] check.
 type RevocationGroupSeenSlot = std::sync::Arc<std::sync::RwLock<Option<RevocationGroupSeen>>>;
 
-/// #1863: the sources of [`SeenEvidence`] that the heartbeat and the local
-/// apply path read besides the contact store.
+/// #1863: every source of [`SeenEvidence`]. The gossip ingest, the local
+/// apply path and the heartbeat each hold one, and
+/// [`SeenEvidence::gather`] reads all of it, so no caller can leave a
+/// source out.
 #[derive(Clone)]
 struct RevocationSeenSources {
+    own_agent: identity::AgentId,
+    own_machine: identity::MachineId,
+    /// The owner of this agent, whose issued-certificate journal counts.
+    owner: Option<identity::UserId>,
     contact_store: std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
     cert_journal_path: Option<std::path::PathBuf>,
     groups: RevocationGroupSeenSlot,
@@ -7050,90 +7044,72 @@ struct RevocationSeenSources {
 /// verified announce from a fresh key fills the discovery caches and
 /// makes an Unknown contact entry, and applying a revocation blocks its
 /// subject as a contact; none of these is a relationship.
-#[derive(Default)]
 struct SeenEvidence {
-    own_agent: Option<identity::AgentId>,
-    own_machine: Option<identity::MachineId>,
+    own_agent: identity::AgentId,
+    own_machine: identity::MachineId,
     related_contacts: std::collections::HashSet<identity::AgentId>,
     contact_machines: std::collections::HashSet<identity::MachineId>,
     owner_agents: std::collections::HashSet<String>,
     group: Option<RevocationGroupSeen>,
-    owner_trust: Option<owner_trust::OwnerTrust>,
+    owner_trust: owner_trust::OwnerTrust,
 }
 
 impl SeenEvidence {
-    /// Read the contact store. The other sources are added by the caller
-    /// that has them.
-    async fn gather(contact_store: &tokio::sync::RwLock<contacts::ContactStore>) -> Self {
-        let mut evidence = Self::default();
-        let contacts = contact_store.read().await;
-        for contact in contacts.list() {
-            if !matches!(
-                contact.trust_level,
-                contacts::TrustLevel::Known | contacts::TrustLevel::Trusted
-            ) {
-                continue;
+    /// Read every source of "seen" once. This is the only constructor, so
+    /// the gossip ingest, the local apply path and the heartbeat cannot
+    /// differ in what they read.
+    async fn gather(sources: &RevocationSeenSources) -> Self {
+        let mut related_contacts = std::collections::HashSet::new();
+        let mut contact_machines = std::collections::HashSet::new();
+        {
+            let contacts = sources.contact_store.read().await;
+            for contact in contacts.list() {
+                if !matches!(
+                    contact.trust_level,
+                    contacts::TrustLevel::Known | contacts::TrustLevel::Trusted
+                ) {
+                    continue;
+                }
+                related_contacts.insert(contact.agent_id);
+                contact_machines.extend(contact.machines.iter().map(|record| record.machine_id));
             }
-            evidence.related_contacts.insert(contact.agent_id);
-            evidence
-                .contact_machines
-                .extend(contact.machines.iter().map(|record| record.machine_id));
         }
-        evidence
-    }
-
-    /// Add the owner's device roster.
-    fn with_owner_trust(mut self, owner_trust: &owner_trust::OwnerTrust) -> Self {
-        self.owner_trust = Some(owner_trust.clone());
-        self
-    }
-
-    /// Add this daemon's own ids, its owner's journal, its device roster
-    /// and the group check.
-    async fn with_local_sources(
-        mut self,
-        sources: &RevocationSeenSources,
-        own: (
-            identity::AgentId,
-            identity::MachineId,
-            Option<identity::UserId>,
-        ),
-    ) -> Self {
-        let (own_agent, own_machine, owner) = own;
-        self.own_agent = Some(own_agent);
-        self.own_machine = Some(own_machine);
-        if let (Some(owner), Some(path)) = (owner, sources.cert_journal_path.as_deref()) {
+        let mut owner_agents = std::collections::HashSet::new();
+        if let (Some(owner), Some(path)) = (sources.owner, sources.cert_journal_path.as_deref()) {
             let owner_hex = hex::encode(owner.as_bytes());
             for record in profile::IssuedCertRecord::load(path).await {
                 if record.user_id == owner_hex {
-                    self.owner_agents.insert(record.agent_id);
+                    owner_agents.insert(record.agent_id);
                 }
             }
         }
-        self.group = sources
-            .groups
-            .read()
-            .ok()
-            .and_then(|slot| slot.as_ref().map(std::sync::Arc::clone));
-        self.with_owner_trust(&sources.owner_trust)
+        Self {
+            own_agent: sources.own_agent,
+            own_machine: sources.own_machine,
+            related_contacts,
+            contact_machines,
+            owner_agents,
+            group: sources
+                .groups
+                .read()
+                .ok()
+                .and_then(|slot| slot.as_ref().map(std::sync::Arc::clone)),
+            owner_trust: sources.owner_trust.clone(),
+        }
     }
 
     async fn seen(&self, subject: &revocation::SeenSubject) -> bool {
         match subject {
             revocation::SeenSubject::Agent(agent) => {
-                self.own_agent == Some(*agent)
+                self.own_agent == *agent
                     || self.related_contacts.contains(agent)
                     || self.owner_agents.contains(&hex::encode(agent.as_bytes()))
                     || self.group.as_ref().is_some_and(|related| related(agent))
             }
             revocation::SeenSubject::Machine(machine) => {
-                if self.own_machine == Some(*machine) || self.contact_machines.contains(machine) {
-                    return true;
-                }
-                match &self.owner_trust {
-                    Some(owner_trust) => owner_trust.machine_in_owner_roster(machine).await,
-                    None => false,
-                }
+                self.own_machine == *machine
+                    || self.contact_machines.contains(machine)
+                    || self.owner_trust.machine_in_owner_roster(machine).await
             }
         }
     }
@@ -7199,18 +7175,11 @@ pub fn revocation_group_relationship<'a>(
 async fn mark_seen_revocation_subjects(
     revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
     sources: &RevocationSeenSources,
-    own: (
-        identity::AgentId,
-        identity::MachineId,
-        Option<identity::UserId>,
-    ),
 ) -> bool {
     if revocation_set.read().await.stranger_self_revocation_count() == 0 {
         return false;
     }
-    SeenEvidence::gather(&sources.contact_store)
-        .await
-        .with_local_sources(sources, own)
+    SeenEvidence::gather(sources)
         .await
         .mark(revocation_set)
         .await
@@ -15491,7 +15460,8 @@ impl Agent {
         // outbox's barrier (see `share_grant::outbox`).
         let owner_trust_for_listener = self.owner_trust.clone();
         let s4_intake_for_listener = self.s4_revocation_intake.clone();
-        let contact_store_for_evict = std::sync::Arc::clone(&self.contact_store);
+        // #1863: every source of "seen", for the ingest below.
+        let revocation_seen_for_listener = self.revocation_seen_sources();
         // L3 fetch-on-miss: the listener resolves V3 cert digests from the
         // blob cache (hit) or fires a background fetch (miss) — never
         // blocking the discovery pipeline.
@@ -15838,8 +15808,7 @@ impl Agent {
                                     revocation_set: revocation_set.clone(),
                                     s4_intake: s4_intake_for_listener.clone(),
                                     identity_dir: identity_dir_for_listener.clone(),
-                                    owner_trust: owner_trust_for_listener.clone(),
-                                    contact_store: contact_store_for_evict.clone(),
+                                    seen: revocation_seen_for_listener.clone(),
                                     discovery_cache: cache.clone(),
                                     machine_cache: machine_cache.clone(),
                                 })),
@@ -15851,8 +15820,7 @@ impl Agent {
                                 &revocation_set,
                                 &s4_intake_for_listener,
                                 identity_dir_for_listener.clone(),
-                                &owner_trust_for_listener,
-                                &contact_store_for_evict,
+                                &revocation_seen_for_listener,
                                 &cache,
                                 &machine_cache,
                             )
@@ -18296,6 +18264,9 @@ impl Agent {
 
     fn revocation_seen_sources(&self) -> RevocationSeenSources {
         RevocationSeenSources {
+            own_agent: self.identity.agent_id(),
+            own_machine: self.identity.machine_id(),
+            owner: self.identity.user_id(),
             contact_store: std::sync::Arc::clone(&self.contact_store),
             cert_journal_path: self.cert_journal_path.clone(),
             groups: std::sync::Arc::clone(&self.revocation_group_seen),
@@ -18664,16 +18635,7 @@ impl Agent {
         // operator's self-revocation of this agent or machine is always
         // seen, so it is in the immediate publish. A stranger's record
         // handed over by S4 stays unpublished.
-        SeenEvidence::gather(&self.contact_store)
-            .await
-            .with_local_sources(
-                &self.revocation_seen_sources(),
-                (
-                    self.identity.agent_id(),
-                    self.identity.machine_id(),
-                    self.identity.user_id(),
-                ),
-            )
+        SeenEvidence::gather(&self.revocation_seen_sources())
             .await
             .mark(&self.revocation_set)
             .await;
@@ -38498,8 +38460,7 @@ mod tests {
                 revocation_set: std::sync::Arc::clone(&agent.revocation_set),
                 s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: identity_dir.clone(),
-                owner_trust: agent.owner_trust.clone(),
-                contact_store: std::sync::Arc::clone(&agent.contact_store),
+                seen: agent.revocation_seen_sources(),
                 discovery_cache: std::sync::Arc::clone(&agent.identity_discovery_cache),
                 machine_cache: std::sync::Arc::clone(&agent.machine_discovery_cache),
             })),
@@ -39497,6 +39458,9 @@ mod tests {
         let journal = dir.path().join("issued.jsonl");
         let owner_kp = identity::UserKeypair::generate().expect("owner");
         let sources = RevocationSeenSources {
+            own_agent: identity::AgentId([0x01; 32]),
+            own_machine: identity::MachineId([0x02; 32]),
+            owner: Some(owner_kp.user_id()),
             contact_store: std::sync::Arc::clone(&contacts),
             cert_journal_path: Some(journal.clone()),
             groups: std::sync::Arc::clone(&groups),
@@ -39507,11 +39471,6 @@ mod tests {
                 )),
             ),
         };
-        let own = (
-            identity::AgentId([0x01; 32]),
-            identity::MachineId([0x02; 32]),
-            Some(owner_kp.user_id()),
-        );
         let known = identity::AgentKeypair::generate().expect("keypair");
         let unknown = identity::AgentKeypair::generate().expect("keypair");
         let blocked = identity::AgentKeypair::generate().expect("keypair");
@@ -39554,7 +39513,7 @@ mod tests {
                 })
                 .collect::<std::collections::HashSet<identity::AgentId>>()
         };
-        assert!(mark_seen_revocation_subjects(&set, &sources, own).await);
+        assert!(mark_seen_revocation_subjects(&set, &sources).await);
         assert_eq!(
             published(&*set.read().await),
             std::collections::HashSet::from([
@@ -39564,13 +39523,13 @@ mod tests {
             ])
         );
         // Nothing new: the next heartbeat changes nothing.
-        assert!(!mark_seen_revocation_subjects(&set, &sources, own).await);
+        assert!(!mark_seen_revocation_subjects(&set, &sources).await);
         // The user raises a contact to Known: the next heartbeat publishes it.
         contacts
             .write()
             .await
             .set_trust(&later.agent_id(), contacts::TrustLevel::Known);
-        assert!(mark_seen_revocation_subjects(&set, &sources, own).await);
+        assert!(mark_seen_revocation_subjects(&set, &sources).await);
         let guard = set.read().await;
         assert!(published(&guard).contains(&later.agent_id()));
         assert!(!published(&guard).contains(&unknown.agent_id()));
@@ -39621,9 +39580,9 @@ mod tests {
     async fn a_machine_on_a_known_contact_is_seen_and_on_an_unknown_one_is_not() {
         let dir = tempfile::tempdir().expect("dir");
         let set = tokio::sync::RwLock::new(revocation::RevocationSet::new());
-        let contacts = tokio::sync::RwLock::new(contacts::ContactStore::new(
+        let contacts = std::sync::Arc::new(tokio::sync::RwLock::new(contacts::ContactStore::new(
             dir.path().join("contacts.json"),
-        ));
+        )));
         let known_agent = identity::AgentKeypair::generate().expect("keypair");
         let unknown_agent = identity::AgentKeypair::generate().expect("keypair");
         let known_machine = identity::MachineKeypair::generate().expect("keypair");
@@ -39656,7 +39615,12 @@ mod tests {
                 assert!(guard.verify_and_insert(sign(kp), None).expect("insert"));
             }
         }
-        assert!(SeenEvidence::gather(&contacts).await.mark(&set).await);
+        assert!(
+            SeenEvidence::gather(&seen_sources_1863(&contacts, None))
+                .await
+                .mark(&set)
+                .await
+        );
         let guard = set.read().await;
         let published: Vec<_> = guard
             .published_records()
@@ -39772,7 +39736,7 @@ mod tests {
     ) -> (
         std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
         groups::eviction::RevocationIntake,
-        owner_trust::OwnerTrust,
+        RevocationSeenSources,
         std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
         std::sync::Arc<
             tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
@@ -39781,21 +39745,108 @@ mod tests {
             tokio::sync::RwLock<std::collections::HashMap<identity::MachineId, DiscoveredMachine>>,
         >,
     ) {
+        let contacts = std::sync::Arc::new(tokio::sync::RwLock::new(contacts::ContactStore::new(
+            dir.join("contacts.json"),
+        )));
         (
             std::sync::Arc::new(tokio::sync::RwLock::new(revocation::RevocationSet::new())),
             groups::eviction::RevocationIntake::new(),
-            owner_trust::OwnerTrust::new(
+            seen_sources_1863(&contacts, Some(dir.join("issued.jsonl"))),
+            contacts,
+            std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        )
+    }
+
+    /// The sources of "seen" for a node with agent `[0x01; 32]`, machine
+    /// `[0x02; 32]`, no owner and no group check.
+    fn seen_sources_1863(
+        contacts: &std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
+        cert_journal_path: Option<std::path::PathBuf>,
+    ) -> RevocationSeenSources {
+        RevocationSeenSources {
+            own_agent: identity::AgentId([0x01; 32]),
+            own_machine: identity::MachineId([0x02; 32]),
+            owner: None,
+            contact_store: std::sync::Arc::clone(contacts),
+            cert_journal_path,
+            groups: RevocationGroupSeenSlot::default(),
+            owner_trust: owner_trust::OwnerTrust::new(
                 None,
                 std::sync::Arc::new(tokio::sync::RwLock::new(
                     dm_inbox::AuthenticatedMachineBindingCache::default(),
                 )),
             ),
-            std::sync::Arc::new(tokio::sync::RwLock::new(contacts::ContactStore::new(
-                dir.join("contacts.json"),
-            ))),
-            std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-            std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// #1868 review round 4: the gossip ingest reads the group check, like
+    /// the heartbeat. An active member of an approval-only group that this
+    /// node is in self-revokes. The ingest marks it seen. Then the admin's
+    /// eviction removes its row, so the next heartbeat no longer finds the
+    /// relationship. The record must stay in the published set.
+    #[tokio::test]
+    async fn an_evicted_group_member_stays_published_after_the_ingest() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (set, intake, seen, _contacts, discovery, machines) = ingest_1863_fixture(dir.path());
+        let member = identity::AgentKeypair::generate().expect("keypair");
+        let member_hex = hex::encode(member.agent_id().as_bytes());
+        let admin_hex = hex::encode([0x33u8; 32]);
+        let mut info = groups::GroupInfo::with_policy(
+            "g".to_string(),
+            String::new(),
+            identity::AgentId([0x33; 32]),
+            "00112233445566778899aabbccddeeff".to_string(),
+            groups::policy::GroupPolicy {
+                admission: groups::policy::GroupAdmission::InviteOnly,
+                ..groups::policy::GroupPolicy::default()
+            },
+        );
+        info.add_member(
+            hex::encode(seen.own_agent.as_bytes()),
+            groups::GroupRole::Member,
+            None,
+            None,
+        );
+        info.add_member(member_hex.clone(), groups::GroupRole::Member, None, None);
+        let roster = std::sync::Arc::new(std::sync::RwLock::new(info));
+        let local = seen.own_agent;
+        let check_roster = std::sync::Arc::clone(&roster);
+        *seen.groups.write().expect("slot") = Some(std::sync::Arc::new(move |agent| {
+            check_roster
+                .read()
+                .is_ok_and(|info| revocation_group_relationship([&*info], &local, agent))
+        }));
+
+        let record = self_revocation_at(&member, 1_000);
+        apply_legacy_revocation_records(
+            vec![record.clone()],
+            std::collections::HashMap::new(),
+            &set,
+            &intake,
+            Some(dir.path().to_path_buf()),
+            &seen,
+            &discovery,
+            &machines,
         )
+        .await;
+        // The admin's eviction removes the revoked member's row.
+        roster
+            .write()
+            .expect("roster")
+            .remove_member(&member_hex, Some(admin_hex));
+        assert!(!mark_seen_revocation_subjects(&set, &seen).await);
+        let guard = set.read().await;
+        assert_eq!(
+            guard
+                .published_records()
+                .iter()
+                .map(revocation::RevocationRecord::record_hash)
+                .collect::<Vec<_>>(),
+            vec![record.record_hash()],
+            "the ingest marked the member before its eviction"
+        );
+        assert_eq!(guard.stranger_self_revocation_count(), 0);
     }
 
     fn self_revocation_at(
@@ -39819,7 +39870,7 @@ mod tests {
     #[tokio::test]
     async fn a_second_self_revocation_does_not_make_a_stranger_seen() {
         let dir = tempfile::tempdir().expect("dir");
-        let (set, intake, owner, contacts, discovery, machines) = ingest_1863_fixture(dir.path());
+        let (set, intake, seen, contacts, discovery, machines) = ingest_1863_fixture(dir.path());
         let stranger = identity::AgentKeypair::generate().expect("keypair");
         let first = self_revocation_at(&stranger, 2_000);
         let second = self_revocation_at(&stranger, 1_000);
@@ -39830,8 +39881,7 @@ mod tests {
                 &set,
                 &intake,
                 Some(dir.path().to_path_buf()),
-                &owner,
-                &contacts,
+                &seen,
                 &discovery,
                 &machines,
             )
@@ -39881,7 +39931,7 @@ mod tests {
     #[tokio::test]
     async fn announce_then_self_revoke_stays_unpublished() {
         let dir = tempfile::tempdir().expect("dir");
-        let (set, intake, owner, contacts, discovery, machines) = ingest_1863_fixture(dir.path());
+        let (set, intake, seen, contacts, discovery, machines) = ingest_1863_fixture(dir.path());
         let agent = identity::AgentKeypair::generate().expect("keypair");
         let machine = identity::MachineKeypair::generate().expect("keypair");
         // What a verified announce leaves behind.
@@ -39907,8 +39957,7 @@ mod tests {
             &set,
             &intake,
             Some(dir.path().to_path_buf()),
-            &owner,
-            &contacts,
+            &seen,
             &discovery,
             &machines,
         )
@@ -39927,7 +39976,7 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_contact_stays_unpublished() {
         let dir = tempfile::tempdir().expect("dir");
-        let (set, intake, owner, contacts, discovery, machines) = ingest_1863_fixture(dir.path());
+        let (set, intake, seen, contacts, discovery, machines) = ingest_1863_fixture(dir.path());
         let agent = identity::AgentKeypair::generate().expect("keypair");
         contacts
             .write()
@@ -39939,8 +39988,7 @@ mod tests {
             &set,
             &intake,
             Some(dir.path().to_path_buf()),
-            &owner,
-            &contacts,
+            &seen,
             &discovery,
             &machines,
         )
@@ -39952,7 +40000,7 @@ mod tests {
     #[tokio::test]
     async fn the_ingest_marks_an_open_contact_seen_before_it_blocks_it() {
         let dir = tempfile::tempdir().expect("dir");
-        let (set, intake, owner, contacts, discovery, machines) = ingest_1863_fixture(dir.path());
+        let (set, intake, seen, contacts, discovery, machines) = ingest_1863_fixture(dir.path());
         let contact = identity::AgentKeypair::generate().expect("keypair");
         contacts
             .write()
@@ -39965,8 +40013,7 @@ mod tests {
             &set,
             &intake,
             Some(dir.path().to_path_buf()),
-            &owner,
-            &contacts,
+            &seen,
             &discovery,
             &machines,
         )
@@ -41200,8 +41247,7 @@ mod tests {
                 revocation_set: std::sync::Arc::clone(&agent.revocation_set),
                 s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir,
-                owner_trust: agent.owner_trust.clone(),
-                contact_store: std::sync::Arc::clone(&agent.contact_store),
+                seen: agent.revocation_seen_sources(),
                 discovery_cache: std::sync::Arc::clone(&agent.identity_discovery_cache),
                 machine_cache: std::sync::Arc::clone(&agent.machine_discovery_cache),
             })),
@@ -41332,8 +41378,7 @@ mod tests {
                 revocation_set: std::sync::Arc::clone(&agent.revocation_set),
                 s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: identity_dir.clone(),
-                owner_trust: agent.owner_trust.clone(),
-                contact_store: std::sync::Arc::clone(&agent.contact_store),
+                seen: agent.revocation_seen_sources(),
                 discovery_cache: std::sync::Arc::clone(&agent.identity_discovery_cache),
                 machine_cache: std::sync::Arc::clone(&agent.machine_discovery_cache),
             })),
@@ -41473,8 +41518,7 @@ mod tests {
                 revocation_set: std::sync::Arc::clone(&agent.revocation_set),
                 s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: identity_dir.clone(),
-                owner_trust: agent.owner_trust.clone(),
-                contact_store: std::sync::Arc::clone(&agent.contact_store),
+                seen: agent.revocation_seen_sources(),
                 discovery_cache: std::sync::Arc::clone(&agent.identity_discovery_cache),
                 machine_cache: std::sync::Arc::clone(&agent.machine_discovery_cache),
             })),

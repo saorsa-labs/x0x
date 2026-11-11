@@ -151,10 +151,10 @@ hours. Decision (Claude, under David's delegation of 10 Nov 2026):
 - A subject is **seen**, and its self-revocation is published, when this
   daemon has a **relationship** with it that a peer cannot create alone
   for a fresh key (decided 11 Nov 2026, #1868 review round 2). The gossip
-  ingest, the local apply path and the heartbeat use this one rule. The
-  gossip ingest reads only the sources that the revocation changes (the
-  contact store) and the owner's device roster; the heartbeat reads every
-  source within 10 minutes.
+  ingest, the local apply path and the heartbeat use this one rule, and
+  each reads every source below through one constructor
+  (`SeenEvidence::gather`), so no path can leave a source out (#1868
+  review round 4). The heartbeat checks again every 10 minutes.
 
   | Subject | Seen when | Can a peer with no relationship make it for a fresh key? |
   |---|---|---|
@@ -178,10 +178,13 @@ hours. Decision (Claude, under David's delegation of 10 Nov 2026):
   turns it into a removed row. A removed former member is also no longer
   a relationship.
 
-  **Remaining trust in related peers.** An admin of a group that this
-  node is in can add fresh keys as members, and a Known or Trusted
-  contact can announce fresh machines. Their self-revocations are then
-  published. This needs a relationship that the local user or owner made.
+  **Remaining trust in related peers (accepted risk).** An admin of an
+  approval-only group that this node joined can seat many fresh keys as
+  Active members, and each one is then seen: its self-revocation is
+  published. A Known or Trusted contact can announce fresh machines in
+  the same way. This is accepted because joining the group, or raising
+  the contact, needs a local user action. A bound per group is a possible
+  later step (#1867).
 - Applying a revocation blocks its subject as a contact, so a Known
   contact is no longer a relationship after that. A daemon checks the
   rule **before** that change, and keeps the result in memory. The
