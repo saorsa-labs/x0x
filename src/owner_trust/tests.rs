@@ -914,10 +914,12 @@ impl UnknownMachine {
     }
 }
 
-const NON_SYNC_PROTOCOLS: [crate::streams::StreamProtocol; 4] = [
+/// Kinds an enrolled machine with no known agent never gets. `SyncV1`
+/// (#1040) and `ForwardV2` (#1107, whose own gate needs the signed header,
+/// evidence and owner trust) are the only ones routed.
+const NON_SYNC_PROTOCOLS: [crate::streams::StreamProtocol; 3] = [
     crate::streams::StreamProtocol::ForwardV1,
     crate::streams::StreamProtocol::SocksV1,
-    crate::streams::StreamProtocol::ForwardV2,
     crate::streams::StreamProtocol::WebRtcV1,
 ];
 
@@ -931,8 +933,9 @@ async fn enrolled_machine_with_no_known_agent_is_admitted_for_sync_v1() {
     assert!(m.sync_v1_admitted().await);
 }
 
-// #1040: nothing is widened. An enrolled but otherwise unknown machine's
-// forward, SOCKS, and media streams are still denied, and the shared gate
+// #1040: nothing else is widened. An enrolled but otherwise unknown
+// machine's legacy forward, SOCKS, and media streams are still denied, and
+// the shared gate
 // (datagram lane, forward decisions) still says `deny_not_verified`.
 #[tokio::test]
 async fn enrolled_machine_with_no_known_agent_gets_no_other_stream_kind() {
@@ -953,6 +956,17 @@ async fn enrolled_machine_with_no_known_agent_gets_no_other_stream_kind() {
     ));
 }
 
+// #1107: an attested forward from an enrolled machine with no known agent
+// reaches the forward acceptor, whose gate then decides from the signed
+// header and the evidence store. A machine that is not enrolled gets
+// nothing.
+#[tokio::test]
+async fn enrolled_machine_with_no_known_agent_routes_forward_v2_to_its_gate() {
+    let (_owner, m) = UnknownMachine::enrolled().await;
+    assert!(m.cache.read().await.is_empty(), "no agent is known");
+    assert!(m.admits(crate::streams::StreamProtocol::ForwardV2).await);
+}
+
 // #1040: a transport-authenticated machine that is NOT enrolled is still
 // denied its SyncV1 stream.
 #[tokio::test]
@@ -961,6 +975,10 @@ async fn non_enrolled_machine_sync_v1_is_denied() {
     let m = UnknownMachine::new(&owner, &owner, Enrollment::None).await;
     assert!(!m.candidate().await);
     assert!(!m.admits(crate::streams::StreamProtocol::SyncV1).await);
+    assert!(
+        !m.admits(crate::streams::StreamProtocol::ForwardV2).await,
+        "#1107: a machine that is not enrolled gets no forward either"
+    );
     assert!(matches!(
         m.shared_gate().await,
         Err(NetworkError::PeerNotVerified { .. })

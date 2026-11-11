@@ -496,10 +496,25 @@ async fn reevaluate(
             // the forwarder's gate for the attested opener — the same two
             // layers the stream cleared at admission.
             // ADR-0074 §4: same local-only bound as outbound / AttestationVerifyCtx.
-            if let Err(check) =
-                map_gate_outcome(gate_peer_machine_inbound_outcome(ctx, machine).await)
-            {
-                return check;
+            //
+            // #1107: a machine with no agent in the discovery cache has
+            // nothing for the machine-level gate to check, and that gate
+            // denies it. Such a stream was admitted from evidence; the
+            // forwarder's gate below re-reads the same evidence record
+            // (nonblocking) and re-checks owner trust and every revocation,
+            // so it tears the stream down when the record stops being usable.
+            let machine_known = ctx
+                .discovery_cache
+                .read()
+                .await
+                .values()
+                .any(|agent| agent.machine_id == *machine);
+            if machine_known {
+                if let Err(check) =
+                    map_gate_outcome(gate_peer_machine_inbound_outcome(ctx, machine).await)
+                {
+                    return check;
+                }
             }
             match super::authorize_attested_opener(opener, machine, target, policy, verify).await {
                 LocalAuthorityOutcome::Allow(authority) => ReauthCheck::Allow(authority),

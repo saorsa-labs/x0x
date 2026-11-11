@@ -22374,10 +22374,13 @@ impl Agent {
     ///    from a known machine. This matters because an agent can become
     ///    known during the prefix read, and it may be revoked, blocked, or
     ///    not on the connect ACL (#1044 review round 1).
-    /// 2. Otherwise only `SyncV1` from a machine that is STILL in the
-    ///    verified owner enrollment set is admitted: `admit` runs and its
-    ///    result is returned as [`EnrolledOwnerSyncRoute::Admitted`].
-    ///    Everything else is [`EnrolledOwnerSyncRoute::Denied`].
+    /// 2. Otherwise only `SyncV1` or `ForwardV2` from a machine that is
+    ///    STILL in the verified owner enrollment set is admitted: `admit`
+    ///    runs and its result is returned as
+    ///    [`EnrolledOwnerSyncRoute::Admitted`]. Everything else is
+    ///    [`EnrolledOwnerSyncRoute::Denied`]. `ForwardV2` (#1107) goes only
+    ///    to its own acceptor, whose gate needs the signed header, a usable
+    ///    evidence record for that agent on this machine, and owner trust.
     ///
     /// The enrollment (revocation set + device store) is verified first,
     /// each lock in its own scope. The discovery-cache read guard is then
@@ -22396,10 +22399,12 @@ impl Agent {
         protocol: streams::StreamProtocol,
         admit: impl FnOnce() -> T,
     ) -> EnrolledOwnerSyncRoute<T> {
-        let enrolled = protocol == streams::StreamProtocol::SyncV1
-            && owner_trust
-                .is_enrolled_owner_machine(revocation_set, machine_id)
-                .await;
+        let enrolled = matches!(
+            protocol,
+            streams::StreamProtocol::SyncV1 | streams::StreamProtocol::ForwardV2
+        ) && owner_trust
+            .is_enrolled_owner_machine(revocation_set, machine_id)
+            .await;
         let cache = discovery_cache.read().await;
         if cache.values().any(|agent| agent.machine_id == *machine_id) {
             return EnrolledOwnerSyncRoute::SharedGate;
@@ -22626,7 +22631,7 @@ impl Agent {
             &machine_id,
             protocol,
             || {
-                let sender = incoming.registered_sender(streams::StreamProtocol::SyncV1)?;
+                let sender = incoming.registered_sender(protocol)?;
                 let (send, recv) = halves.take()?;
                 let peer_stream =
                     streams::PeerStream::new(Vec::new(), machine_id, protocol, send, recv);
@@ -22640,8 +22645,9 @@ impl Agent {
                     target: "x0x::streams",
                     machine = %hex::encode(machine_id.as_bytes()),
                     outcome = "admit_enrolled_owner_sync",
+                    protocol = ?protocol,
                     delivered,
-                    "SyncV1 stream admitted on verified owner enrollment (no known agent, #1040)"
+                    "stream admitted on verified owner enrollment (no known agent, #1040/#1107)"
                 );
             }
             EnrolledOwnerSyncRoute::Admitted(None) | EnrolledOwnerSyncRoute::Denied => {

@@ -9,6 +9,81 @@ use crate::{
     dm_capability::CapabilityAdvert,
     identity::{AgentCertificate, AgentId, MachineId, UserId},
 };
+/// A verified-shape evidence record for `agent` on `machine`, signed by
+/// both keys, for tests in other modules (#1107).
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+pub(crate) fn record_for_test(
+    agent: &crate::identity::AgentKeypair,
+    machine: &crate::identity::MachineKeypair,
+    ann_time: u64,
+    advert_time: u64,
+) -> EvidenceRecordV1 {
+    use crate::dm::DmCapabilities;
+    use crate::dm_capability::{RegistryTrailer, REGISTRY_TRAILER_MAGIC};
+    let v2 = crate::IdentityAnnouncement {
+        self_name: Some("wire name".into()),
+        agent_id: agent.agent_id(),
+        machine_id: machine.machine_id(),
+        user_id: None,
+        agent_certificate: None,
+        machine_public_key: machine.public_key().as_bytes().to_vec(),
+        machine_signature: vec![],
+        addresses: vec![],
+        announced_at: ann_time / 1000,
+        nat_type: None,
+        can_receive_direct: None,
+        is_relay: None,
+        is_coordinator: None,
+        reachable_via: vec![],
+        relay_candidates: vec![],
+        agent_public_key: agent.public_key().as_bytes().to_vec(),
+    };
+    let mut ann = IdentityAnnouncementV3::build_from_v2(&v2, machine.secret_key(), 0).unwrap();
+    ann.sign_v3_1(machine.secret_key()).unwrap();
+    let mut caps = DmCapabilities::pending();
+    caps.kem_public_key = vec![42; 1184];
+    let mut advert = CapabilityAdvert {
+        protocol_version: crate::dm_capability_service::ADVERT_PROTOCOL_VERSION,
+        agent_id: *agent.agent_id().as_bytes(),
+        machine_id: *machine.machine_id().as_bytes(),
+        created_at_unix_ms: advert_time,
+        capabilities: caps,
+        signature: vec![],
+    };
+    advert.signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        agent.secret_key(),
+        &advert.signed_bytes().unwrap(),
+    )
+    .unwrap()
+    .as_bytes()
+    .to_vec();
+    let mut trailer = RegistryTrailer {
+        registry: Default::default(),
+        signature: vec![],
+    };
+    trailer.signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        agent.secret_key(),
+        &trailer.signed_bytes(&advert).unwrap(),
+    )
+    .unwrap()
+    .as_bytes()
+    .to_vec();
+    let mut bytes = postcard::to_stdvec(&advert).unwrap();
+    bytes.extend_from_slice(REGISTRY_TRAILER_MAGIC);
+    bytes.extend(postcard::to_stdvec(&trailer).unwrap());
+    EvidenceRecordV1 {
+        announcement: announce_v3::serialize_v3_1(&ann).unwrap(),
+        advert: bytes,
+        certificate: None,
+        relation: GROUP,
+        stored_at_ms: 2_000_000_000_000,
+    }
+}
+
+#[cfg(test)]
+#[path = "peer_evidence_forward_opener_tests.rs"]
+mod forward_opener_tests;
 mod runtime;
 #[cfg(test)]
 pub(crate) use runtime::set_w3h_inline_lookups;
@@ -1645,15 +1720,11 @@ const STORE_BUSY: &str = "store_busy";
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        dm::DmCapabilities,
-        dm_capability::{RegistryTrailer, REGISTRY_TRAILER_MAGIC},
-        identity::{AgentKeypair, MachineKeypair, UserKeypair},
-    };
+    use crate::identity::{AgentKeypair, MachineKeypair, UserKeypair};
     use std::sync::atomic::{AtomicBool, Ordering};
     const NOW: u64 = 2_000_000_000_000;
     #[derive(Default)]
-    struct Policy {
+    pub(super) struct Policy {
         peers: Mutex<HashMap<AgentId, u8>>,
         revoked: AtomicBool,
         unavailable: AtomicBool,
@@ -1677,86 +1748,28 @@ mod tests {
             self.peers.lock().unwrap().contains_key(&a)
         }
     }
-    struct Peer {
-        agent: AgentKeypair,
-        machine: MachineKeypair,
+    pub(super) struct Peer {
+        pub(super) agent: AgentKeypair,
+        pub(super) machine: MachineKeypair,
     }
     impl Peer {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             Self {
                 agent: AgentKeypair::generate().unwrap(),
                 machine: MachineKeypair::generate().unwrap(),
             }
         }
-        fn a(&self) -> AgentId {
+        pub(super) fn a(&self) -> AgentId {
             self.agent.agent_id()
         }
-        fn m(&self) -> MachineId {
+        pub(super) fn m(&self) -> MachineId {
             self.machine.machine_id()
         }
-        fn record(&self, ann_time: u64, advert_time: u64) -> EvidenceRecordV1 {
-            let v2 = crate::IdentityAnnouncement {
-                self_name: Some("wire name".into()),
-                agent_id: self.a(),
-                machine_id: self.m(),
-                user_id: None,
-                agent_certificate: None,
-                machine_public_key: self.machine.public_key().as_bytes().to_vec(),
-                machine_signature: vec![],
-                addresses: vec![],
-                announced_at: ann_time / 1000,
-                nat_type: None,
-                can_receive_direct: None,
-                is_relay: None,
-                is_coordinator: None,
-                reachable_via: vec![],
-                relay_candidates: vec![],
-                agent_public_key: self.agent.public_key().as_bytes().to_vec(),
-            };
-            let mut ann =
-                IdentityAnnouncementV3::build_from_v2(&v2, self.machine.secret_key(), 0).unwrap();
-            ann.sign_v3_1(self.machine.secret_key()).unwrap();
-            let mut caps = DmCapabilities::pending();
-            caps.kem_public_key = vec![42; 1184];
-            let mut advert = CapabilityAdvert {
-                protocol_version: crate::dm_capability_service::ADVERT_PROTOCOL_VERSION,
-                agent_id: *self.a().as_bytes(),
-                machine_id: *self.m().as_bytes(),
-                created_at_unix_ms: advert_time,
-                capabilities: caps,
-                signature: vec![],
-            };
-            advert.signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
-                self.agent.secret_key(),
-                &advert.signed_bytes().unwrap(),
-            )
-            .unwrap()
-            .as_bytes()
-            .to_vec();
-            let mut trailer = RegistryTrailer {
-                registry: Default::default(),
-                signature: vec![],
-            };
-            trailer.signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
-                self.agent.secret_key(),
-                &trailer.signed_bytes(&advert).unwrap(),
-            )
-            .unwrap()
-            .as_bytes()
-            .to_vec();
-            let mut bytes = postcard::to_stdvec(&advert).unwrap();
-            bytes.extend_from_slice(REGISTRY_TRAILER_MAGIC);
-            bytes.extend(postcard::to_stdvec(&trailer).unwrap());
-            EvidenceRecordV1 {
-                announcement: announce_v3::serialize_v3_1(&ann).unwrap(),
-                advert: bytes,
-                certificate: None,
-                relation: GROUP,
-                stored_at_ms: NOW,
-            }
+        pub(super) fn record(&self, ann_time: u64, advert_time: u64) -> EvidenceRecordV1 {
+            super::record_for_test(&self.agent, &self.machine, ann_time, advert_time)
         }
     }
-    fn setup(peer: &Peer) -> (tempfile::TempDir, Arc<Policy>, PeerEvidenceStore) {
+    pub(super) fn setup(peer: &Peer) -> (tempfile::TempDir, Arc<Policy>, PeerEvidenceStore) {
         let dir = tempfile::tempdir().unwrap();
         let p = Arc::new(Policy::default());
         p.peers.lock().unwrap().insert(peer.a(), GROUP);
