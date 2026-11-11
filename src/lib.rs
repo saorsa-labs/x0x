@@ -6788,11 +6788,12 @@ impl HeartbeatContext {
         // KB/s fleet-wide (2 stale July test records × 19 KB × every node
         // × every 300 s) on a topic that should be near-silent. Now:
         //
-        // 1. TTL expiry first — records older than 90 days are dropped
-        //    (they target agents nobody has seen for months; the 2 stale
-        //    July testnet records die here).
+        // 1. Collect dead records first. Only a share-grant record whose
+        //    grant is past its signed expiry goes. Agent, machine and
+        //    binding records are never removed because of their age
+        //    (#1108): an age sweep made a revoked key valid again.
         // 2. Publish the full set only when the change_generation advanced
-        //    since our last broadcast (a record was inserted or expired).
+        //    since our last broadcast (a record was inserted or collected).
         // 3. Every 12th heartbeat (12 × 600 s = 2 h at the default
         //    IDENTITY_HEARTBEAT_INTERVAL_SECS), republish regardless
         //    — the partition-tolerance fallback for nodes that joined or
@@ -6802,20 +6803,16 @@ impl HeartbeatContext {
         // Vec<RevocationRecord> on x0x.revocation.v1; old nodes that
         // receive it process it identically.
         {
-            const REVOCATION_RECORD_TTL_SECS: u64 = 90 * 24 * 3600;
             const REVOCATION_FALLBACK_TICKS: u64 = 12;
 
-            let expired = {
+            let collected = {
                 let mut set = self.revocation_set.write().await;
-                set.expire_records_older_than(
-                    REVOCATION_RECORD_TTL_SECS,
-                    Agent::unix_timestamp_secs(),
-                )
+                set.collect_dead_records(Agent::unix_timestamp_secs())
             };
-            if expired > 0 {
+            if collected > 0 {
                 tracing::info!(
-                    expired,
-                    "revocation TTL: expired {expired} record(s) older than 90 days"
+                    collected,
+                    "revocation sweep: removed {collected} record(s) of expired share grants"
                 );
             }
 
@@ -7299,12 +7296,6 @@ pub(crate) async fn persist_share_grant_revocations(
 static SHARE_GRANT_REVOCATIONS_WRITE_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
-/// Retention applied when merging `revocations-v3.bin`: the same rule the
-/// heartbeat sweep applies in memory
-/// ([`revocation::RevocationSet::expire_records_older_than`]; share-grant
-/// records ignore the TTL and are collected at their grant's GC horizon).
-const SHARE_GRANT_REVOCATIONS_TTL_SECS: u64 = 90 * 24 * 3600;
-
 /// How long a v3 writer waits for another process's lock before failing.
 const SHARE_GRANT_REVOCATIONS_LOCK_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(10);
@@ -7401,7 +7392,7 @@ where
     })?;
     merged.merge_v3(live);
     if now_unix != 0 {
-        merged.expire_records_older_than(SHARE_GRANT_REVOCATIONS_TTL_SECS, now_unix);
+        merged.collect_dead_records(now_unix);
     }
     let bytes = merged.to_bytes_v3().map_err(|e| {
         error::IdentityError::Storage(std::io::Error::other(format!("revocations-v3 encode: {e}")))
@@ -11476,8 +11467,9 @@ impl Agent {
         //
         // The refresh runs only for a real requirement (durable ACK or the
         // payload's application bit). `require_payload_capability` fails
-        // only when `required_for_payload` names a bit, so the last
-        // conjunct is defensive: it keeps this gate from starting an
+        // only when `required_for_payload` names a bit: a current advert
+        // lacks it, or (#1158) an obligation-carrying payload has no
+        // current verified advert at all. The last conjunct is defensive: it keeps this gate from starting an
         // addressability flight (#1776) if those two ever diverge.
         let required_application =
             dm::CapabilityRegistry::required_for_payload(&payload).map(|(bit, _)| bit);
@@ -11498,8 +11490,13 @@ impl Agent {
             .await;
             advert_binding = self.capability_store.lookup_binding(to);
         }
-        // ADR 0093: only positive, current advert evidence of missing support
-        // holds product payloads. Unknown capabilities keep existing behaviour.
+        // ADR 0093: positive, current advert evidence of missing support
+        // holds product payloads. #1158 (ruling A, 20 Oct 2026): a share
+        // grant, predecessor relay or requester offer is also held while
+        // the recipient has NO current verified advert, even when a peer
+        // evidence view could address it. The refresh above has asked the
+        // recipient for its advert; the obligation's outbox retries. Every
+        // other payload with unknown capability is sent as before.
         if let Err(error) = self
             .capability_store
             .require_payload_capability(to, &payload)
@@ -38816,11 +38813,11 @@ mod tests {
         .expect("sign")
     }
 
-    /// #1765 review finding 1: a live record that the TTL sweep takes from
-    /// the set before any write held it is not in the bytes of a later
-    /// write. It stays not durable, and no retry waits for it.
+    /// #1765 review finding 1: a live record that leaves the set before
+    /// any write held it is not in the bytes of a later write. It stays
+    /// not durable, and no retry waits for it.
     #[tokio::test]
-    async fn a_swept_revocation_is_not_durable_after_a_later_store_write() {
+    async fn a_taken_revocation_is_not_durable_after_a_later_store_write() {
         let dir = tempfile::tempdir().expect("dir");
         let set = tokio::sync::RwLock::new(revocation::RevocationSet::new());
         let intake = groups::eviction::RevocationIntake::new();
@@ -38831,9 +38828,10 @@ mod tests {
                 .verify_and_insert(record.clone(), None)
                 .expect("insert"));
             intake.note_verified(&record);
-            let swept =
-                guard.expire_records_older_than(90 * 24 * 3600, Agent::unix_timestamp_secs());
-            assert_eq!(swept, 1);
+            // A v1 record never leaves by age (#1108); a rebuild can still
+            // take one from the set.
+            let taken = guard.take_records_where(|_, _| true);
+            assert_eq!(taken.len(), 1);
         }
         persist_s4_revocations(&set, &intake, Some(dir.path()))
             .await

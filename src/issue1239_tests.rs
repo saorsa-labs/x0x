@@ -266,6 +266,29 @@ async fn gossip_fixture(
     ),
     Box<dyn std::error::Error>,
 > {
+    gossip_fixture_with(dir, |kem| dm::DmCapabilities {
+        gossip_inbox: true,
+        kem_public_key: kem,
+        ..dm::DmCapabilities::pending()
+    })
+    .await
+}
+
+/// [`gossip_fixture`] with the capabilities the recipient's stored
+/// peer-evidence advert carries (built from its KEM public key).
+async fn gossip_fixture_with(
+    dir: &std::path::Path,
+    capabilities: impl FnOnce(Vec<u8>) -> dm::DmCapabilities,
+) -> Result<
+    (
+        Agent,
+        identity::AgentId,
+        Arc<peer_evidence::PeerEvidenceStore>,
+        gossip::Subscription,
+        Arc<network::sim::SimFabric>,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let mut agent = agent_in(dir).await?;
     let peer = identity::AgentKeypair::generate()?;
     let machine = identity::MachineKeypair::generate()?;
@@ -309,11 +332,7 @@ async fn gossip_fixture(
         agent_id: recipient.0,
         machine_id: machine.machine_id().0,
         created_at_unix_ms: now,
-        capabilities: dm::DmCapabilities {
-            gossip_inbox: true,
-            kem_public_key: kem.public_bytes,
-            ..dm::DmCapabilities::pending()
-        },
+        capabilities: capabilities(kem.public_bytes),
         signature: vec![],
     };
     advert.signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
@@ -550,6 +569,7 @@ async fn issue1239_lookup_worker_awaits_current_thread_driver() {
 mod address_hints;
 mod connector;
 mod fallback;
+mod issue1158;
 mod pinned_lookup;
 mod share_grant_candidates;
 mod share_grant_lookup;

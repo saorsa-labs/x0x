@@ -479,8 +479,9 @@ struct PersistedRevocation {
 /// In-memory grow-only set of verified revocations.
 ///
 /// Maintains `HashSet`s of revoked agent/machine ids for O(1) gate checks plus
-/// a hash-keyed map of the full records for rebroadcast. Records are only ever
-/// added; there is no removal (no un-revocation).
+/// a hash-keyed map of the full records for rebroadcast. An agent, machine or
+/// binding record is never removed because of its age (no un-revocation,
+/// #1108); see [`RevocationSet::collect_dead_records`].
 ///
 /// Every record in the set has passed [`RevocationRecord::verify_authority`] —
 /// both on first receipt and again when reloaded from disk. Insertion therefore
@@ -493,12 +494,12 @@ pub struct RevocationSet {
     revoked_machines: HashSet<MachineId>,
     records_by_hash: HashMap<[u8; 32], PersistedRevocation>,
     /// ADR-0043 tombstone epochs from ad-hoc binding `RevocationRecord`s
-    /// (`x0x.revocation.v2` carrier). Grow-only; never TTL-swept.
+    /// (`x0x.revocation.v2` carrier). Grow-only; never swept.
     binding_epochs: HashMap<(AgentId, MachineId), u64>,
     /// ADR-0043 tombstone epochs unioned from VERIFIED
     /// `ActivationBundle.retired_bindings` sets (owner-covered by the
     /// bundle signature — not standalone records). Grow-only, order-
-    /// independent; never TTL-swept. Both maps feed
+    /// independent; never swept. Both maps feed
     /// [`Self::is_binding_revoked`].
     bundle_retired_epochs: HashMap<(AgentId, MachineId), u64>,
     /// Ad-hoc binding tombstones indexed by agent (#1659). Kept in step
@@ -508,11 +509,10 @@ pub struct RevocationSet {
     /// with `bundle_retired_epochs` keys.
     bundle_machines_by_agent: HashMap<AgentId, HashSet<MachineId>>,
     /// ADR-0070 revoked share grants, keyed by `(grant_id, owner)`, valued
-    /// by the latest signed `grant_expiry`. Not swept by the 90-day TTL (a
-    /// grant can outlive it); collected once the grant itself is dead
+    /// by the latest signed `grant_expiry`. Collected once the grant itself is dead
     /// (`grant_expiry + SHARE_GRANT_REVOCATION_GC_SLACK_SECS`).
     revoked_share_grants: HashMap<([u8; 32], UserId), u64>,
-    /// Monotonic change counter — incremented on every insert or expiry.
+    /// Monotonic change counter — incremented on every insert or collection.
     /// Publishers compare this to decide whether the set changed since
     /// their last full broadcast (the on-change piggyback gate), avoiding
     /// a full `all_records` comparison per heartbeat.
@@ -1067,16 +1067,6 @@ impl RevocationSet {
             .insert(machine);
     }
 
-    fn forget_binding_machine(&mut self, agent: &AgentId, machine: &MachineId) {
-        let Some(machines) = self.binding_machines_by_agent.get_mut(agent) else {
-            return;
-        };
-        machines.remove(machine);
-        if machines.is_empty() {
-            self.binding_machines_by_agent.remove(agent);
-        }
-    }
-
     /// Machines named by a binding tombstone for `agent`.
     ///
     /// The list is the union of ad-hoc binding records and bundle-retired
@@ -1346,7 +1336,7 @@ impl RevocationSet {
         taken
     }
 
-    /// Monotonic generation counter — changes on every insert or expiry.
+    /// Monotonic generation counter — changes on every insert or collection.
     /// The heartbeat piggyback compares generations: unchanged set ⇒ skip
     /// the publish (except the periodic fallback).
     #[must_use]
@@ -1354,71 +1344,67 @@ impl RevocationSet {
         self.change_generation
     }
 
-    /// Drop records older than `ttl_secs`. Returns the number expired.
+    /// Remove the records whose revoked credential is dead. Returns the
+    /// number removed.
     ///
-    /// A revocation older than the TTL with no renewal is already moot:
-    /// revocations target currently-known agents, and a record that old
-    /// means nobody has seen the agent (or the issuer) for months. The
-    /// 2026-07 stale testnet records (2 records, 19 KB each heartbeat) are
-    /// the motivating case — they cost 222 KB/s fleet-wide on a topic
-    /// that should be silent.
-    pub fn expire_records_older_than(&mut self, ttl_secs: u64, now_unix: u64) -> usize {
-        let cutoff = now_unix.saturating_sub(ttl_secs);
-        let expired: Vec<[u8; 32]> = self
+    /// A revocation stays in force until the revoked credential can no
+    /// longer be used (#1108, David's ruling of 20 Oct 2026). Record age is
+    /// never a reason to remove a record:
+    ///
+    /// - **Agent and Machine** records are kept for good. The record names
+    ///   a key, and a key has no expiry. A retained certificate does not
+    ///   give a safe end date: the owner can have issued a later
+    ///   certificate for the same agent key, and the key can also announce
+    ///   with no certificate.
+    /// - **Binding** tombstones are kept for good (ADR-0043 §7.3).
+    /// - A **share-grant** record is removed when the grant itself is dead:
+    ///   its signed `grant_expiry` plus the skew slack (ADR-0070).
+    pub fn collect_dead_records(&mut self, now_unix: u64) -> usize {
+        let dead: Vec<[u8; 32]> = self
             .records_by_hash
             .iter()
-            // ADR-0043 §7.3: binding tombstones are PERMANENT — a retired
-            // binding must never resurrect, so the TTL sweep skips them.
-            // ADR-0070: a share-grant revocation ignores the TTL (a grant
-            // may outlive it) and is collected only once the revoked grant
-            // is dead: its signed expiry plus the skew slack.
             .filter(|(_, persisted)| match &persisted.record.subject {
-                RevokedSubject::AgentMachineBinding(_) => false,
                 RevokedSubject::ShareGrant(grant) => grant.gc_eligible_at(now_unix),
-                _ => persisted.record.revoked_at < cutoff,
+                RevokedSubject::Agent(_)
+                | RevokedSubject::Machine(_)
+                | RevokedSubject::AgentMachineBinding(_) => false,
             })
             .map(|(hash, _)| *hash)
             .collect();
-        if expired.is_empty() {
+        if dead.is_empty() {
             return 0;
         }
-        for hash in &expired {
-            if let Some(persisted) = self.records_by_hash.remove(hash) {
-                match &persisted.record.subject {
-                    RevokedSubject::Agent(id) => {
-                        self.revoked_agents.remove(id);
-                    }
-                    RevokedSubject::Machine(id) => {
-                        self.revoked_machines.remove(id);
-                    }
-                    // Bindings never reach the expired list (filter
-                    // above); arm kept total for exhaustiveness.
-                    RevokedSubject::AgentMachineBinding(binding) => {
-                        self.binding_epochs
-                            .remove(&(binding.agent, binding.machine));
-                        self.forget_binding_machine(&binding.agent, &binding.machine);
-                    }
-                    // Drop the key only when the LATEST expiry recorded for
-                    // it is past the horizon — a longer-lived record for the
-                    // same grant keeps it revoked.
-                    RevokedSubject::ShareGrant(grant) => {
-                        let key = (grant.grant_id, grant.owner);
-                        if let Some(latest) = self.revoked_share_grants.get(&key).copied() {
-                            let horizon = ShareGrantRevocation {
-                                grant_expiry: latest,
-                                ..*grant
-                            };
-                            if horizon.gc_eligible_at(now_unix) {
-                                self.revoked_share_grants.remove(&key);
-                            }
-                        }
+        for hash in &dead {
+            let Some(persisted) = self.records_by_hash.remove(hash) else {
+                continue;
+            };
+            // Only share-grant records reach this list (filter above).
+            if let RevokedSubject::ShareGrant(grant) = &persisted.record.subject {
+                // Drop the key only when the LATEST expiry recorded for it
+                // is past the horizon — a longer-lived record for the same
+                // grant keeps it revoked.
+                let key = (grant.grant_id, grant.owner);
+                if let Some(latest) = self.revoked_share_grants.get(&key).copied() {
+                    let horizon = ShareGrantRevocation {
+                        grant_expiry: latest,
+                        ..*grant
+                    };
+                    if horizon.gc_eligible_at(now_unix) {
+                        self.revoked_share_grants.remove(&key);
                     }
                 }
             }
         }
         self.change_generation = self.change_generation.saturating_add(1);
         self.notify_change();
-        expired.len()
+        dead.len()
+    }
+
+    /// Old name of [`Self::collect_dead_records`]. `_ttl_secs` is ignored:
+    /// no record is removed because of its age (#1108).
+    #[deprecated(note = "use collect_dead_records; record age no longer removes a record")]
+    pub fn expire_records_older_than(&mut self, _ttl_secs: u64, now_unix: u64) -> usize {
+        self.collect_dead_records(now_unix)
     }
 
     /// Raw insert of an already-verified record. Performs NO cryptographic
@@ -3407,7 +3393,7 @@ mod tests {
 
     mod revocation_cadence {
         use super::super::*;
-        use crate::identity::AgentKeypair;
+        use crate::identity::{AgentKeypair, MachineKeypair, UserKeypair};
 
         /// Build a self-signed revocation record for an agent at the given
         /// timestamp. Self-revocations require no subject certificate.
@@ -3470,63 +3456,128 @@ mod tests {
             );
         }
 
-        /// #380 cadence: the TTL expiry kills the 2 stale July testnet
-        /// records that cost 222 KB/s fleet-wide on the revocation topic.
+        const DAY: u64 = 24 * 3600;
+
+        /// WHY (#1108): a revocation says "this key is not to be trusted".
+        /// The old sweep removed the record 90 days after `revoked_at`, so
+        /// a stolen agent key came back to life on every node. Age must
+        /// never remove the record, also across a restart.
         #[test]
-        fn ttl_expires_stale_records_and_unrevokes_subject() {
+        fn an_old_agent_revocation_stays_in_force_across_sweep_and_restart() {
             let kp = AgentKeypair::generate().expect("agent keypair");
             let mut set = RevocationSet::new();
             let now = 1_800_000_000u64;
 
-            let stale = self_revocation(&kp, now - 91 * 24 * 3600);
-            set.verify_and_insert(stale, None)
-                .expect("stale record verifies");
+            set.verify_and_insert(self_revocation(&kp, now - 91 * DAY), None)
+                .expect("record verifies");
+            assert_eq!(set.collect_dead_records(now), 0, "91 days old: kept");
             assert!(set.is_agent_revoked(&kp.agent_id()));
 
-            let expired = set.expire_records_older_than(90 * 24 * 3600, now);
-            assert_eq!(expired, 1, "the 91-day-old record must expire");
+            // Restart: the store round trip, then the next sweep.
+            let bytes = set.to_bytes().expect("encode");
+            let mut loaded = RevocationSet::from_bytes(&bytes).expect("decode");
+            assert_eq!(loaded.collect_dead_records(now + 100 * 365 * DAY), 0);
             assert!(
-                !set.is_agent_revoked(&kp.agent_id()),
-                "the expired subject is no longer revoked"
+                loaded.is_agent_revoked(&kp.agent_id()),
+                "the agent stays revoked 100 years later"
             );
-            assert!(set.all_records().is_empty());
+            assert_eq!(loaded.all_records().len(), 1);
         }
 
-        /// #380 cadence: fresh records survive the TTL.
+        /// WHY (#1108): a machine key has no expiry, so its revocation has
+        /// no end date.
         #[test]
-        fn ttl_keeps_fresh_records() {
-            let kp = AgentKeypair::generate().expect("agent keypair");
-            let mut set = RevocationSet::new();
+        fn an_old_machine_revocation_stays_in_force() {
+            let kp = MachineKeypair::generate().expect("machine keypair");
             let now = 1_800_000_000u64;
+            let record = RevocationRecord::sign(
+                RevokedSubject::Machine(kp.machine_id()),
+                kp.public_key(),
+                kp.secret_key(),
+                now - 91 * DAY,
+                None,
+            )
+            .expect("sign");
+            let mut set = RevocationSet::new();
+            set.verify_and_insert(record, None).expect("verifies");
 
-            let fresh = self_revocation(&kp, now - 24 * 3600);
-            set.verify_and_insert(fresh, None).expect("fresh verifies");
-
-            let expired = set.expire_records_older_than(90 * 24 * 3600, now);
-            assert_eq!(expired, 0);
-            assert!(set.is_agent_revoked(&kp.agent_id()));
+            assert_eq!(set.collect_dead_records(now), 0);
+            assert!(set.is_machine_revoked(&kp.machine_id()));
         }
 
-        /// #380 cadence: the change generation advances on insert AND on
-        /// expiry — the on-change piggyback key.
+        /// WHY (#1108): the certificate that proved the owner's authority
+        /// can expire, but the record names the agent KEY. The owner can
+        /// have issued a later certificate for the same key, and the key
+        /// can announce with no certificate. So the expiry of the retained
+        /// certificate must not remove the record, in memory or on reload.
         #[test]
-        fn generation_advances_on_insert_and_expiry() {
+        fn an_owner_revocation_stays_after_the_retained_certificate_expires() {
+            let owner = UserKeypair::generate().expect("owner keypair");
+            let agent = AgentKeypair::generate().expect("agent keypair");
+            let now = 1_800_000_000u64;
+            let cert_not_after = now - 30 * DAY;
+            let cert = AgentCertificate::issue_with_expiry(&owner, &agent, Some(cert_not_after))
+                .expect("certificate");
+            let record = RevocationRecord::sign(
+                RevokedSubject::Agent(agent.agent_id()),
+                owner.public_key(),
+                owner.secret_key(),
+                now - 91 * DAY,
+                Some("stolen".to_string()),
+            )
+            .expect("sign");
+            let mut set = RevocationSet::new();
+            set.verify_and_insert(record, Some(&cert))
+                .expect("owner authority verifies");
+
+            assert_eq!(set.collect_dead_records(now), 0);
+            assert!(set.is_agent_revoked(&agent.agent_id()));
+
+            let bytes = set.to_bytes().expect("encode");
+            let mut loaded = RevocationSet::from_bytes(&bytes).expect("decode");
+            assert_eq!(loaded.collect_dead_records(now), 0);
+            assert!(
+                loaded.is_agent_revoked(&agent.agent_id()),
+                "an expired retained certificate must not un-revoke the agent on reload"
+            );
+        }
+
+        /// #380 cadence: the change generation advances on insert and when
+        /// a dead record is collected. A sweep that removes nothing must
+        /// not advance it, or every heartbeat would publish the full set.
+        #[test]
+        fn generation_advances_on_insert_and_collection_only() {
             let kp = AgentKeypair::generate().expect("agent keypair");
+            let owner = UserKeypair::generate().expect("owner keypair");
             let mut set = RevocationSet::new();
             let now = 1_800_000_000u64;
             let gen0 = set.generation();
 
-            let stale = self_revocation(&kp, now - 91 * 24 * 3600);
-            set.verify_and_insert(stale, None).expect("verifies");
+            set.verify_and_insert(self_revocation(&kp, now - 91 * DAY), None)
+                .expect("verifies");
+            let grant = RevocationRecord::sign(
+                RevokedSubject::ShareGrant(ShareGrantRevocation {
+                    grant_id: [7; 32],
+                    owner: owner.user_id(),
+                    grant_expiry: now - 91 * DAY,
+                }),
+                owner.public_key(),
+                owner.secret_key(),
+                now - 92 * DAY,
+                None,
+            )
+            .expect("sign");
+            set.verify_and_insert(grant, None).expect("verifies");
             let gen1 = set.generation();
             assert!(gen1 > gen0, "insert must advance the generation");
 
-            set.expire_records_older_than(90 * 24 * 3600, now);
+            // The dead grant's record goes; the old agent record stays.
+            assert_eq!(set.collect_dead_records(now), 1);
             let gen2 = set.generation();
-            assert!(gen2 > gen1, "expiry must advance the generation");
+            assert!(gen2 > gen1, "collection must advance the generation");
+            assert!(set.is_agent_revoked(&kp.agent_id()));
 
-            // No-op: neither insert nor expiry fires.
-            set.expire_records_older_than(90 * 24 * 3600, now);
+            assert_eq!(set.collect_dead_records(now), 0);
             assert_eq!(set.generation(), gen2, "no-change must not advance");
         }
     }
@@ -3942,7 +3993,7 @@ mod tests {
         );
 
         // Permanence: a sweep far past any TTL keeps the tombstone.
-        let expired = set.expire_records_older_than(60, 10_000_000);
+        let expired = set.collect_dead_records(10_000_000);
         assert_eq!(expired, 0);
         assert!(set.is_binding_revoked(&binding.agent, &machine));
 
@@ -3960,7 +4011,7 @@ mod tests {
         assert!(set2.is_binding_revoked(&binding.agent, &machine));
         assert_eq!(set2.max_revoked_binding_epoch(&binding.agent), Some(3));
         assert!(set2.binding_records().is_empty());
-        assert!(set2.expire_records_older_than(0, u64::MAX) == 0);
+        assert!(set2.collect_dead_records(u64::MAX) == 0);
         assert!(set2.is_binding_revoked(&binding.agent, &machine));
         let mut indexed = set2.binding_tombstone_machines(&binding.agent);
         indexed.sort_by_key(|id| id.0);
@@ -4347,15 +4398,14 @@ mod tests {
             assert!(restored.is_share_grant_revoked(&grant_id, &owner.user_id()));
 
             // Far past the 90-day TTL, but before expiry + slack: kept.
-            let ttl = 90 * 24 * 3600;
             let just_before = grant_expiry + SHARE_GRANT_REVOCATION_GC_SLACK_SECS - 1;
-            assert_eq!(restored.expire_records_older_than(ttl, just_before), 0);
+            assert_eq!(restored.collect_dead_records(just_before), 0);
             assert!(restored.is_share_grant_revoked(&grant_id, &owner.user_id()));
             assert_eq!(restored.share_grant_records().len(), 1);
 
             // At expiry + slack: collected (record and index).
             let horizon = grant_expiry + SHARE_GRANT_REVOCATION_GC_SLACK_SECS;
-            assert_eq!(restored.expire_records_older_than(ttl, horizon), 1);
+            assert_eq!(restored.collect_dead_records(horizon), 1);
             assert!(!restored.is_share_grant_revoked(&grant_id, &owner.user_id()));
             assert!(restored.share_grant_records().is_empty());
 
@@ -4396,7 +4446,7 @@ mod tests {
             insert(&mut set, short);
             insert(&mut set, long);
             let now = 1_000 + SHARE_GRANT_REVOCATION_GC_SLACK_SECS;
-            assert_eq!(set.expire_records_older_than(u64::MAX, now), 1);
+            assert_eq!(set.collect_dead_records(now), 1);
             assert!(set.is_share_grant_revoked(&[0x44; 32], &UserId([0x45; 32])));
         }
 

@@ -514,6 +514,11 @@ Before [#1108](https://github.com/saorsa-labs/x0x/issues/1108) the listing
 showed `agent` and `machine` rows only. A client that reads the listing must
 ignore a `subject_kind` it does not know.
 
+A record does not leave the listing because of its age. Agent, machine and
+binding records stay for good. A share-grant record goes when the grant is
+past `grant_expiry` plus the clock allowance. A daemon older than this rule
+removed agent and machine records 90 days after `revoked_at`.
+
 The listing shows signed records only. A binding that a key-move activation
 bundle retired has no record of its own; `GET /agent/moves` counts it in
 `derived.retired_bindings`.
@@ -1600,6 +1605,8 @@ Notable codes:
 | 404 | `recipient_key_unavailable` | The recipient has published no KEM key, or is entirely unknown to this daemon — **no capability advert and no contact card at all**. A durable send to a stranger answers this, not the 409 below. |
 | 409 | `recipient_key_invalid` | Our view of the recipient's key material has not converged. Transient — retry. |
 | 409 | `recipient_ack_semantics_unavailable` | The send required ADR 0030 durable application-ACK semantics and the recipient advertises no current v2 capability. A peer you hold **any** contact card for lands here rather than on the 404 — including one whose advert has not converged yet, since that peer is known and may simply need upgrading. Returned after one forced targeted capability refresh, so it is fast and deterministic rather than a timeout. The caller retries, surfaces "peer needs upgrade", or resends with `require_durable_app_ack: false` — the daemon never downgrades silently. |
+| 409 | `recipient_capability_pending` | The payload carries a durable obligation (a share grant, a predecessor relay or a requester offer) and the recipient has no current verified capability advert (#1158). Nothing was sent. The daemon asked the recipient for a targeted advert refresh. Retry; the send goes when the advert arrives. Ordinary DMs never get this code. Rust callers get `DmError::RecipientCapabilityPending { capability }`. |
+| 409 | `recipient_capability_unavailable` | As `recipient_capability_pending`, but no verified advert arrived within one advert period (600 s). Nothing was sent. A later advert from the recipient lets a retry go. Rust callers get `DmError::RecipientCapabilityUnavailable { capability }`. |
 | 409 | `idempotency_conflict` | The recipient already holds this `logical_id` bound to different bytes. **Retrying cannot succeed.** Either resend the original bytes under this id, or pick a new `logical_id`. |
 | 413 | `payload_too_large` | Payload exceeds the DM envelope cap. |
 | 504 | `timeout` | The overall send budget ended the send. `DmError::Timeout` can come from the raw-QUIC path, the known-recipient redial, or the relay fallback, as well as from an application ACK that does not arrive within the retry budget. Those paths are capped by the overall send budget. The error variant and the wire format are unchanged. The DM may or may not have arrived. On a durable send the body also includes `strict_gate_ms`, `publish_ms`, `ack_wait_ms`, `elapsed_ms`, and `budget_stage` so the stage that consumed the budget is named. Durable 200 and 504 also include recipient ACK-publish diagnostics `last_ack_publish_ms` and `ack_publish_route_failed` (same fields on `GET /diagnostics/dm`). These are diagnostics, not a latency SLA. |
@@ -3658,6 +3665,20 @@ Each `delivery` entry in the response reports `envelope`: `"v1"` or `"v2"`
 (which payload that recipient was sent, or queued with — a failed v2
 recipient is queued with its signed names, and every outbox retry resends
 the same v2 bytes).
+
+A `delivery` entry with `delivered: false` and `queued: true` gives the hold
+reason in `error`. Two reasons mean the daemon did not send the grant,
+because the recipient has no current verified capability advert (#1158):
+
+- `recipient_capability_pending: <bit>`: the daemon asked the recipient for
+  its advert and waits for it, for at most one advert period (600 s).
+- `recipient_capability_unavailable: <bit>`: no advert arrived in that time.
+
+In both cases the grant stays in the redelivery outbox. The daemon sends it
+when the recipient's verified advert arrives, and otherwise checks again on
+the outbox backoff. `recipient_upgrade_required: <bit>` is different: the
+recipient's current advert lacks the bit, so the recipient must upgrade.
+`<bit>` is `share_grant_v1` or `share_grant_names_v1`.
 
 `x0x grant issue` takes one required positional `<GRANT_JSON>` argument: this
 body as a literal, `@path`, a bare path, or `-` for stdin, plus the optional

@@ -2830,12 +2830,35 @@ pub async fn serve_with_options(
         let offer_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
             let mut shutdown_rx = offer_state.shutdown_notify.subscribe();
+            // #1158: an offer held for an unknown capability is retried
+            // as soon as the authority's verified advert arrives.
+            let mut adverts = offer_state
+                .agent
+                .capability_store()
+                .subscribe_obligation_adverts();
             loop {
                 tokio::select! {
                     _ = shutdown_rx.changed() => break,
                     _ = tokio::time::sleep(Duration::from_millis(500)) => {
                         requester_offer_step(&offer_state).await;
                     }
+                    advert = adverts.recv() => match advert {
+                        Ok(authority) => {
+                            if crate::server::routes::named_groups::nudge_requester_offers_for(&offer_state, &authority).await {
+                                requester_offer_step(&offer_state).await;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        // The store outlives this worker; if the signal
+                        // ever closes, the 500 ms poll still retries.
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            adverts = offer_state
+                                .agent
+                                .capability_store()
+                                .subscribe_obligation_adverts();
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                    },
                 }
             }
         }));
@@ -2915,11 +2938,30 @@ pub async fn serve_with_options(
         let grant_agent = Arc::clone(&agent);
         let mut shutdown_rx = state.shutdown_notify.subscribe();
         bg_tasks.push(tokio::spawn(async move {
+            // #1158: a grant held for an unknown capability is retried as
+            // soon as the recipient's verified advert arrives.
+            let mut adverts = grant_agent
+                .capability_store()
+                .subscribe_obligation_adverts();
             loop {
                 tokio::select! {
                     _ = shutdown_rx.changed() => break,
                     _ = grant_outbox.notified() => {}
                     _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    advert = adverts.recv() => match advert {
+                        Ok(recipient) => {
+                            grant_agent.nudge_share_grant_outbox_for_agent(&recipient);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        // The store outlives this worker; if the signal
+                        // ever closes, the 5 s poll still retries.
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            adverts = grant_agent
+                                .capability_store()
+                                .subscribe_obligation_adverts();
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                        }
+                    },
                 }
                 let _ = grant_agent.share_grant_outbox_step().await;
             }
