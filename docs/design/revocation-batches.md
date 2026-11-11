@@ -145,31 +145,50 @@ hours. Decision (Claude, under David's delegation of 10 Nov 2026):
   store, but leaves it out of the set that it publishes. Pubsub spreads the
   record once when it is first sent. A daemon that was offline then does
   not learn it from the 2-hour publish.
-- A subject is **seen**, and its self-revocation is published, when it is:
-  this daemon's own agent or machine; a contact that is not blocked; a
-  machine listed on a contact that is not blocked; an agent or machine in
-  the discovery cache, or the machine of a discovered agent; an agent in
-  this owner's issued-certificate journal; or a member of a named group in
-  any state. The gossip ingest, the local apply path and the heartbeat use
-  this one rule.
-- **A blocked contact never counts.** Applying a revocation blocks its
-  subject as a contact, and that creates a contact entry for a stranger.
-  If a blocked entry counted, a second self-revocation of the same
-  stranger (a better record of the pair) would find the entry that the
-  first one made, and would be published. Nothing that a revocation
-  creates makes its subject seen.
-- Applying a revocation also removes its subject from the discovery cache.
-  So a daemon checks the rule **before** that removal, and keeps the
-  result in memory. The heartbeat checks again every 10 minutes. A record
-  whose subject becomes seen is published at the next heartbeat.
+- A subject is **seen**, and its self-revocation is published, when this
+  daemon has a **relationship** with it that a peer cannot create alone
+  for a fresh key (decided 11 Nov 2026, #1868 review round 2). The gossip
+  ingest, the local apply path and the heartbeat use this one rule.
+
+  | Subject | Seen when | Can a peer with no relationship make it for a fresh key? |
+  |---|---|---|
+  | agent | it is this daemon's own agent | no |
+  | agent | a contact with trust Known or Trusted | no: only the local user sets this (REST, CLI, GUI) |
+  | agent | in this owner's issued-certificate journal | no: only this owner writes it |
+  | agent | an active or removed member of a named group that this node is an active member of and that needs approval to join (not `OpenJoin`) | no; but an admin of such a group can add members (see below) |
+  | machine | it is this daemon's own machine | no |
+  | machine | in this owner's verified device roster | no: needs this owner's signed enrollment |
+  | machine | listed on a Known or Trusted contact | no; but that contact can list a new machine (see below) |
+
+  **Not seen:** the discovery caches, an Unknown or Blocked contact, a
+  pending entry (a join request) or a banned entry in a group, any member
+  of an `OpenJoin` group. A verified announce from a fresh key fills the
+  discovery caches and makes an Unknown contact entry with its machine;
+  applying a revocation blocks its subject as a contact. None of these is
+  a relationship.
+
+  A removed group member counts because the revocation path removes a
+  revoked member; in a group that needs approval, a member was admitted
+  by an invite, an approval or the owner rule before it could be removed.
+
+  **Remaining trust in related peers.** An admin of a group that this
+  node is in can add fresh keys as members, and a Known or Trusted
+  contact can announce fresh machines. Their self-revocations are then
+  published. This needs a relationship that the local user or owner made.
+- Applying a revocation blocks its subject as a contact, so a Known
+  contact is no longer a relationship after that. A daemon checks the
+  rule **before** that change, and keeps the result in memory. The
+  heartbeat checks again every 10 minutes. A record whose subject gets a
+  relationship later (for example the user raises a contact to Known) is
+  published at the next heartbeat.
 - A mark changes the set's generation, so the next heartbeat publishes.
 - A self-revocation that this daemon applies itself (an operator revokes
   this agent or machine) is marked at once and is in the immediate publish.
-- The mark is in memory only. After a restart, a subject that was seen
-  only as a contact or in the discovery cache before its revocation
-  arrived is a stranger again (the revocation blocked the contact and
-  removed the cache entry), and its record is no longer published. An
-  agent of this owner and a group member stay seen.
+- The mark is in memory only. After a restart, a subject whose only
+  relationship was a Known or Trusted contact is a stranger again (the
+  revocation blocked the contact), and its record is no longer published
+  by this daemon. An agent of this owner, an owner machine and a group
+  member stay seen.
 - Owner revocations, binding tombstones and share-grant records are always
   published.
 - No disk bound: removing a record would make its subject valid again.

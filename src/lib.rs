@@ -3992,13 +3992,13 @@ async fn apply_legacy_revocation_records(
             s4_intake.clone(),
             identity_dir.clone(),
         );
-        // #1863: the eviction below removes the subject from the places
-        // that make it "seen". Mark the subjects that were seen first.
-        // The same rule as the heartbeat (`SeenEvidence`): a blocked
-        // contact never counts, so the blocked entry that the loop below
-        // creates for a stranger is no evidence for a later record.
-        SeenEvidence::gather(contact_store, discovery_cache, machine_cache)
+        // #1863: the eviction below blocks the subject as a contact, so a
+        // Known or Trusted contact stops being a relationship. Mark the
+        // subjects first, by the same rule as the heartbeat
+        // (`SeenEvidence`).
+        SeenEvidence::gather(contact_store)
             .await
+            .with_owner_trust(owner_trust)
             .mark(revocation_set)
             .await;
         for record in newly_inserted {
@@ -6868,8 +6868,6 @@ impl HeartbeatContext {
                     self.identity.machine_id(),
                     self.identity.user_id(),
                 ),
-                &self.cache,
-                &self.machine_cache,
             )
             .await;
             crate::identity_authority::set_revocation_stranger_self_held(
@@ -7008,7 +7006,8 @@ fn raw_dm_history_record(
     })
 }
 
-/// #1863: whether a named group lists an agent as a member, in any state.
+/// #1863: whether a named group gives an agent a relationship with this
+/// node (see [`revocation_group_relationship`]).
 pub type RevocationGroupSeen = std::sync::Arc<dyn Fn(&identity::AgentId) -> bool + Send + Sync>;
 
 /// The slot that `x0xd` fills with its [`RevocationGroupSeen`] check.
@@ -7021,68 +7020,70 @@ struct RevocationSeenSources {
     contact_store: std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
     cert_journal_path: Option<std::path::PathBuf>,
     groups: RevocationGroupSeenSlot,
+    owner_trust: owner_trust::OwnerTrust,
 }
 
 /// What makes a revoked subject "seen" (#1863), read once. The gossip
 /// ingest, the local apply path and the heartbeat use this one rule.
 ///
-/// Seen means: this daemon's own agent or machine; a contact that is not
-/// blocked, or a machine listed on such a contact; a discovered agent or
-/// machine, or the machine of a discovered agent; an agent in this
-/// owner's issued-certificate journal; a member of a named group in any
-/// state. A blocked contact never counts: the revocation path blocks
-/// every revoked agent as a contact and so creates a blocked entry for a
-/// stranger. Nothing that a revocation creates makes its subject seen.
+/// Seen means a relationship that a peer cannot create alone for a fresh
+/// key:
+/// - agent: this daemon's own agent; a contact with trust Known or
+///   Trusted (only the local user sets that); an agent in this owner's
+///   issued-certificate journal (only this owner writes it); an active or
+///   removed member of a named group that this node is an active member
+///   of and that does not admit anyone without approval (see
+///   [`revocation_group_relationship`]).
+/// - machine: this daemon's own machine; a machine in this owner's
+///   verified device roster; a machine listed on a Known or Trusted
+///   contact (recorded from that contact's verified, agent-signed
+///   announcements).
+///
+/// Not seen: the discovery caches, an Unknown or Blocked contact, a
+/// pending or banned group entry, a member of an open-join group. A
+/// verified announce from a fresh key fills the discovery caches and
+/// makes an Unknown contact entry, and applying a revocation blocks its
+/// subject as a contact; none of these is a relationship.
 #[derive(Default)]
 struct SeenEvidence {
     own_agent: Option<identity::AgentId>,
     own_machine: Option<identity::MachineId>,
-    open_contacts: std::collections::HashSet<identity::AgentId>,
-    discovered_agents: std::collections::HashSet<identity::AgentId>,
-    machines: std::collections::HashSet<identity::MachineId>,
+    related_contacts: std::collections::HashSet<identity::AgentId>,
+    contact_machines: std::collections::HashSet<identity::MachineId>,
     owner_agents: std::collections::HashSet<String>,
     group: Option<RevocationGroupSeen>,
+    owner_trust: Option<owner_trust::OwnerTrust>,
 }
 
 impl SeenEvidence {
-    /// Read the contact store and the discovery caches. The other sources
-    /// are added by the caller that has them.
-    async fn gather(
-        contact_store: &tokio::sync::RwLock<contacts::ContactStore>,
-        discovery_cache: &tokio::sync::RwLock<
-            std::collections::HashMap<identity::AgentId, DiscoveredAgent>,
-        >,
-        machine_cache: &tokio::sync::RwLock<
-            std::collections::HashMap<identity::MachineId, DiscoveredMachine>,
-        >,
-    ) -> Self {
+    /// Read the contact store. The other sources are added by the caller
+    /// that has them.
+    async fn gather(contact_store: &tokio::sync::RwLock<contacts::ContactStore>) -> Self {
         let mut evidence = Self::default();
-        {
-            let contacts = contact_store.read().await;
-            for contact in contacts.list() {
-                if contact.trust_level == contacts::TrustLevel::Blocked {
-                    continue;
-                }
-                evidence.open_contacts.insert(contact.agent_id);
-                evidence
-                    .machines
-                    .extend(contact.machines.iter().map(|record| record.machine_id));
+        let contacts = contact_store.read().await;
+        for contact in contacts.list() {
+            if !matches!(
+                contact.trust_level,
+                contacts::TrustLevel::Known | contacts::TrustLevel::Trusted
+            ) {
+                continue;
             }
-        }
-        {
-            let agents = discovery_cache.read().await;
-            evidence.discovered_agents.extend(agents.keys().copied());
+            evidence.related_contacts.insert(contact.agent_id);
             evidence
-                .machines
-                .extend(agents.values().map(|agent| agent.machine_id));
+                .contact_machines
+                .extend(contact.machines.iter().map(|record| record.machine_id));
         }
-        evidence
-            .machines
-            .extend(machine_cache.read().await.keys().copied());
         evidence
     }
 
-    /// Add this daemon's own ids, its owner's journal and the group check.
+    /// Add the owner's device roster.
+    fn with_owner_trust(mut self, owner_trust: &owner_trust::OwnerTrust) -> Self {
+        self.owner_trust = Some(owner_trust.clone());
+        self
+    }
+
+    /// Add this daemon's own ids, its owner's journal, its device roster
+    /// and the group check.
     async fn with_local_sources(
         mut self,
         sources: &RevocationSeenSources,
@@ -7108,23 +7109,25 @@ impl SeenEvidence {
             .read()
             .ok()
             .and_then(|slot| slot.as_ref().map(std::sync::Arc::clone));
-        self
+        self.with_owner_trust(&sources.owner_trust)
     }
 
-    fn seen(&self, subject: &revocation::SeenSubject) -> bool {
+    async fn seen(&self, subject: &revocation::SeenSubject) -> bool {
         match subject {
             revocation::SeenSubject::Agent(agent) => {
                 self.own_agent == Some(*agent)
-                    || self.open_contacts.contains(agent)
-                    || self.discovered_agents.contains(agent)
+                    || self.related_contacts.contains(agent)
                     || self.owner_agents.contains(&hex::encode(agent.as_bytes()))
-                    || self
-                        .group
-                        .as_ref()
-                        .is_some_and(|is_member| is_member(agent))
+                    || self.group.as_ref().is_some_and(|related| related(agent))
             }
             revocation::SeenSubject::Machine(machine) => {
-                self.own_machine == Some(*machine) || self.machines.contains(machine)
+                if self.own_machine == Some(*machine) || self.contact_machines.contains(machine) {
+                    return true;
+                }
+                match &self.owner_trust {
+                    Some(owner_trust) => owner_trust.machine_in_owner_roster(machine).await,
+                    None => false,
+                }
             }
         }
     }
@@ -7136,20 +7139,52 @@ impl SeenEvidence {
             .read()
             .await
             .stranger_self_revocation_subjects();
-        let seen: Vec<revocation::SeenSubject> = strangers
-            .into_iter()
-            .filter(|subject| self.seen(subject))
-            .collect();
+        let mut seen = Vec::new();
+        for subject in strangers {
+            if self.seen(&subject).await {
+                seen.push(subject);
+            }
+        }
         !seen.is_empty() && revocation_set.write().await.mark_seen(seen)
     }
 }
 
+/// Whether a named group gives `subject` a relationship with this node
+/// (#1863): the group is not withdrawn, does not admit anyone without
+/// approval (`OpenJoin`), lists this node as an active member, and lists
+/// `subject` as active or removed. A removed member counts because the
+/// revocation path removes a revoked member; in such a group a member was
+/// admitted by an invite, an approval or the owner rule before it could
+/// be removed. A pending entry (a join request) and a banned entry do not
+/// count.
+#[must_use]
+pub fn revocation_group_relationship<'a>(
+    groups: impl IntoIterator<Item = &'a groups::GroupInfo>,
+    local: &identity::AgentId,
+    subject: &identity::AgentId,
+) -> bool {
+    let local_hex = hex::encode(local.as_bytes());
+    let subject_hex = hex::encode(subject.as_bytes());
+    groups.into_iter().any(|group| {
+        !group.withdrawn
+            && group.policy.admission != groups::policy::GroupAdmission::OpenJoin
+            && group
+                .members_v2
+                .get(&local_hex)
+                .is_some_and(groups::GroupMember::is_active)
+            && group
+                .members_v2
+                .get(&subject_hex)
+                .is_some_and(|member| member.is_active() || member.is_removed())
+    })
+}
+
 /// The heartbeat step of #1863: mark each held self-revocation of a
-/// stranger whose subject this node has seen now (see [`SeenEvidence`]).
-/// The marks are in memory: after a restart, a subject that was seen
-/// only as a contact or in the discovery cache before its revocation
-/// arrived is a stranger again, and its record is no longer published.
-/// Returns `true` when the published set changed.
+/// stranger whose subject this node now has a relationship with (see
+/// [`SeenEvidence`]). The marks are in memory: after a restart, a subject
+/// whose only relationship was a contact that its revocation blocked is a
+/// stranger again, and its record is no longer published. Returns `true`
+/// when the published set changed.
 async fn mark_seen_revocation_subjects(
     revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
     sources: &RevocationSeenSources,
@@ -7158,17 +7193,11 @@ async fn mark_seen_revocation_subjects(
         identity::MachineId,
         Option<identity::UserId>,
     ),
-    discovery_cache: &tokio::sync::RwLock<
-        std::collections::HashMap<identity::AgentId, DiscoveredAgent>,
-    >,
-    machine_cache: &tokio::sync::RwLock<
-        std::collections::HashMap<identity::MachineId, DiscoveredMachine>,
-    >,
 ) -> bool {
     if revocation_set.read().await.stranger_self_revocation_count() == 0 {
         return false;
     }
-    SeenEvidence::gather(&sources.contact_store, discovery_cache, machine_cache)
+    SeenEvidence::gather(&sources.contact_store)
         .await
         .with_local_sources(sources, own)
         .await
@@ -18259,6 +18288,7 @@ impl Agent {
             contact_store: std::sync::Arc::clone(&self.contact_store),
             cert_journal_path: self.cert_journal_path.clone(),
             groups: std::sync::Arc::clone(&self.revocation_group_seen),
+            owner_trust: self.owner_trust.clone(),
         }
     }
 
@@ -18623,23 +18653,19 @@ impl Agent {
         // operator's self-revocation of this agent or machine is always
         // seen, so it is in the immediate publish. A stranger's record
         // handed over by S4 stays unpublished.
-        SeenEvidence::gather(
-            &self.contact_store,
-            &self.identity_discovery_cache,
-            &self.machine_discovery_cache,
-        )
-        .await
-        .with_local_sources(
-            &self.revocation_seen_sources(),
-            (
-                self.identity.agent_id(),
-                self.identity.machine_id(),
-                self.identity.user_id(),
-            ),
-        )
-        .await
-        .mark(&self.revocation_set)
-        .await;
+        SeenEvidence::gather(&self.contact_store)
+            .await
+            .with_local_sources(
+                &self.revocation_seen_sources(),
+                (
+                    self.identity.agent_id(),
+                    self.identity.machine_id(),
+                    self.identity.user_id(),
+                ),
+            )
+            .await
+            .mark(&self.revocation_set)
+            .await;
 
         // 3. Evict from caches.
         self.evict_revoked_subject(&record.subject).await;
@@ -39451,82 +39477,160 @@ mod tests {
         assert!(on_disk.is_agent_revoked(&kp.agent_id()));
     }
 
-    /// #1863: a held self-revocation of a stranger joins the published set
-    /// as soon as its subject is seen: here, when it becomes an open
-    /// contact, and when a named group lists it. A blocked contact is not
-    /// evidence by itself (the gossip ingest blocks every revoked agent).
+    /// #1863 (review round 2): "seen" is a relationship. A Known contact,
+    /// an agent of this owner and a group relationship are published; an
+    /// Unknown or Blocked contact is not; a contact raised to Known later
+    /// is published at the next heartbeat.
     #[tokio::test]
-    async fn a_stranger_self_revocation_is_published_once_a_source_has_seen_it() {
+    async fn only_a_relationship_makes_a_stranger_seen() {
         let dir = tempfile::tempdir().expect("dir");
         let set = tokio::sync::RwLock::new(revocation::RevocationSet::new());
         let contacts = std::sync::Arc::new(tokio::sync::RwLock::new(contacts::ContactStore::new(
             dir.path().join("contacts.json"),
         )));
         let groups: RevocationGroupSeenSlot = RevocationGroupSeenSlot::default();
+        let journal = dir.path().join("issued.jsonl");
+        let owner_kp = identity::UserKeypair::generate().expect("owner");
         let sources = RevocationSeenSources {
             contact_store: std::sync::Arc::clone(&contacts),
-            cert_journal_path: None,
+            cert_journal_path: Some(journal.clone()),
             groups: std::sync::Arc::clone(&groups),
+            owner_trust: owner_trust::OwnerTrust::new(
+                None,
+                std::sync::Arc::new(tokio::sync::RwLock::new(
+                    dm_inbox::AuthenticatedMachineBindingCache::default(),
+                )),
+            ),
         };
-        let discovery = tokio::sync::RwLock::new(std::collections::HashMap::new());
-        let machines = tokio::sync::RwLock::new(std::collections::HashMap::new());
         let own = (
             identity::AgentId([0x01; 32]),
             identity::MachineId([0x02; 32]),
-            None,
+            Some(owner_kp.user_id()),
         );
-        let sign = |kp: &identity::AgentKeypair| {
-            revocation::RevocationRecord::sign(
-                revocation::RevokedSubject::Agent(kp.agent_id()),
-                kp.public_key(),
-                kp.secret_key(),
-                1_000,
-                None,
-            )
-            .expect("sign")
-        };
-        let contact = identity::AgentKeypair::generate().expect("keypair");
+        let known = identity::AgentKeypair::generate().expect("keypair");
+        let unknown = identity::AgentKeypair::generate().expect("keypair");
+        let blocked = identity::AgentKeypair::generate().expect("keypair");
         let member = identity::AgentKeypair::generate().expect("keypair");
-        let stranger = identity::AgentKeypair::generate().expect("keypair");
+        let owned = identity::AgentKeypair::generate().expect("keypair");
+        let later = identity::AgentKeypair::generate().expect("keypair");
         {
             let mut guard = set.write().await;
-            for kp in [&contact, &member, &stranger] {
-                assert!(guard.verify_and_insert(sign(kp), None).expect("insert"));
+            for kp in [&known, &unknown, &blocked, &member, &owned, &later] {
+                assert!(guard
+                    .verify_and_insert(self_revocation_at(kp, 1_000), None)
+                    .expect("insert"));
             }
-            assert!(guard.published_records().is_empty());
         }
-        // A blocked contact entry does not make its agent seen.
-        contacts
-            .write()
-            .await
-            .set_trust(&contact.agent_id(), contacts::TrustLevel::Blocked);
-        assert!(!mark_seen_revocation_subjects(&set, &sources, own, &discovery, &machines).await);
-        // An open contact does.
-        contacts
-            .write()
-            .await
-            .set_trust(&contact.agent_id(), contacts::TrustLevel::Known);
-        assert!(mark_seen_revocation_subjects(&set, &sources, own, &discovery, &machines).await);
-        // So does a group roster.
+        {
+            let mut store = contacts.write().await;
+            store.set_trust(&known.agent_id(), contacts::TrustLevel::Known);
+            store.set_trust(&unknown.agent_id(), contacts::TrustLevel::Unknown);
+            store.set_trust(&blocked.agent_id(), contacts::TrustLevel::Blocked);
+            store.set_trust(&later.agent_id(), contacts::TrustLevel::Unknown);
+        }
         let member_id = member.agent_id();
         *groups.write().expect("slot") =
             Some(std::sync::Arc::new(move |agent| *agent == member_id));
-        assert!(mark_seen_revocation_subjects(&set, &sources, own, &discovery, &machines).await);
-        let guard = set.read().await;
-        let published: std::collections::HashSet<identity::AgentId> = guard
-            .published_records()
-            .iter()
-            .filter_map(|record| match record.subject {
-                revocation::RevokedSubject::Agent(agent) => Some(agent),
-                _ => None,
-            })
-            .collect();
+        let cert = identity::AgentCertificate::issue(&owner_kp, &owned).expect("cert");
+        profile::IssuedCertRecord::append(
+            &journal,
+            &profile::IssuedCertRecord::from_cert(&owner_kp.user_id(), &cert).expect("record"),
+        )
+        .await
+        .expect("journal");
+
+        let published = |guard: &revocation::RevocationSet| {
+            guard
+                .published_records()
+                .iter()
+                .filter_map(|record| match record.subject {
+                    revocation::RevokedSubject::Agent(agent) => Some(agent),
+                    _ => None,
+                })
+                .collect::<std::collections::HashSet<identity::AgentId>>()
+        };
+        assert!(mark_seen_revocation_subjects(&set, &sources, own).await);
         assert_eq!(
-            published,
-            std::collections::HashSet::from([contact.agent_id(), member.agent_id()])
+            published(&*set.read().await),
+            std::collections::HashSet::from([
+                known.agent_id(),
+                member.agent_id(),
+                owned.agent_id()
+            ])
         );
-        assert!(guard.is_agent_revoked(&stranger.agent_id()));
-        assert_eq!(guard.stranger_self_revocation_count(), 1);
+        // Nothing new: the next heartbeat changes nothing.
+        assert!(!mark_seen_revocation_subjects(&set, &sources, own).await);
+        // The user raises a contact to Known: the next heartbeat publishes it.
+        contacts
+            .write()
+            .await
+            .set_trust(&later.agent_id(), contacts::TrustLevel::Known);
+        assert!(mark_seen_revocation_subjects(&set, &sources, own).await);
+        let guard = set.read().await;
+        assert!(published(&guard).contains(&later.agent_id()));
+        assert!(!published(&guard).contains(&unknown.agent_id()));
+        assert!(!published(&guard).contains(&blocked.agent_id()));
+        assert_eq!(guard.stranger_self_revocation_count(), 2);
+    }
+
+    /// #1863: the group rule. Only an active member of the group is a
+    /// relationship, and only in a group that this node is an active
+    /// member of and that needs approval to join. A removed member counts
+    /// (the revocation path removes a revoked member).
+    #[test]
+    fn the_group_relationship_rule() {
+        let local = identity::AgentId([0x11; 32]);
+        let subject = identity::AgentId([0x22; 32]);
+        let group = |admission: groups::policy::GroupAdmission,
+                     subject_state: Option<groups::member::GroupMemberState>,
+                     local_active: bool| {
+            let mut info = groups::GroupInfo::with_policy(
+                "g".to_string(),
+                String::new(),
+                identity::AgentId([0x33; 32]),
+                "00112233445566778899aabbccddeeff".to_string(),
+                groups::policy::GroupPolicy {
+                    admission,
+                    ..groups::policy::GroupPolicy::default()
+                },
+            );
+            if local_active {
+                info.add_member(
+                    hex::encode(local.as_bytes()),
+                    groups::GroupRole::Member,
+                    None,
+                    None,
+                );
+            }
+            if let Some(state) = subject_state {
+                let hex_id = hex::encode(subject.as_bytes());
+                info.add_member(hex_id.clone(), groups::GroupRole::Member, None, None);
+                if let Some(member) = info.members_v2.get_mut(&hex_id) {
+                    member.state = state;
+                }
+            }
+            info
+        };
+        use groups::member::GroupMemberState as S;
+        use groups::policy::GroupAdmission as A;
+        let check =
+            |info: groups::GroupInfo| revocation_group_relationship([&info], &local, &subject);
+        assert!(check(group(A::InviteOnly, Some(S::Active), true)));
+        assert!(check(group(A::RequestAccess, Some(S::Removed), true)));
+        assert!(
+            !check(group(A::RequestAccess, Some(S::Pending), true)),
+            "a join request"
+        );
+        assert!(!check(group(A::InviteOnly, Some(S::Banned), true)));
+        assert!(
+            !check(group(A::OpenJoin, Some(S::Active), true)),
+            "anyone can join"
+        );
+        assert!(
+            !check(group(A::InviteOnly, Some(S::Active), false)),
+            "not this node's group"
+        );
+        assert!(!check(group(A::InviteOnly, None, true)));
     }
 
     /// The gossip ingest of #1863 with empty caches and a contact store in
@@ -39614,6 +39718,103 @@ mod tests {
             "a stranger stays a stranger"
         );
         assert_eq!(guard.stranger_self_revocation_count(), 1);
+    }
+
+    fn discovered_1863(agent: identity::AgentId, machine: identity::MachineId) -> DiscoveredAgent {
+        DiscoveredAgent {
+            self_name: None,
+            cert_digest: None,
+            agent_id: agent,
+            machine_id: machine,
+            user_id: None,
+            addresses: Vec::new(),
+            announced_at: 0,
+            last_seen: 0,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: None,
+            agent_certificate: None,
+            agent_public_key: Vec::new(),
+        }
+    }
+
+    /// #1868 review round 2: a fresh key that announces itself gets an
+    /// Unknown contact entry (with its machine) and a discovery-cache
+    /// entry, with no relationship. Its self-revocation, and the
+    /// self-revocation of its machine, must stay unpublished.
+    #[tokio::test]
+    async fn announce_then_self_revoke_stays_unpublished() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (set, intake, owner, contacts, discovery, machines) = ingest_1863_fixture(dir.path());
+        let agent = identity::AgentKeypair::generate().expect("keypair");
+        let machine = identity::MachineKeypair::generate().expect("keypair");
+        // What a verified announce leaves behind.
+        contacts.write().await.add_machine(
+            &agent.agent_id(),
+            contacts::MachineRecord::new(machine.machine_id(), None),
+        );
+        discovery.write().await.insert(
+            agent.agent_id(),
+            discovered_1863(agent.agent_id(), machine.machine_id()),
+        );
+        let machine_record = revocation::RevocationRecord::sign(
+            revocation::RevokedSubject::Machine(machine.machine_id()),
+            machine.public_key(),
+            machine.secret_key(),
+            1_000,
+            None,
+        )
+        .expect("sign");
+        apply_legacy_revocation_records(
+            vec![self_revocation_at(&agent, 1_000), machine_record],
+            std::collections::HashMap::new(),
+            &set,
+            &intake,
+            Some(dir.path().to_path_buf()),
+            &owner,
+            &contacts,
+            &discovery,
+            &machines,
+        )
+        .await;
+        let guard = set.read().await;
+        assert!(guard.is_agent_revoked(&agent.agent_id()));
+        assert!(guard.is_machine_revoked(&machine.machine_id()));
+        assert!(
+            guard.published_records().is_empty(),
+            "an announce is not a relationship"
+        );
+        assert_eq!(guard.stranger_self_revocation_count(), 2);
+    }
+
+    /// An Unknown contact is not a relationship.
+    #[tokio::test]
+    async fn an_unknown_contact_stays_unpublished() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (set, intake, owner, contacts, discovery, machines) = ingest_1863_fixture(dir.path());
+        let agent = identity::AgentKeypair::generate().expect("keypair");
+        contacts
+            .write()
+            .await
+            .set_trust(&agent.agent_id(), contacts::TrustLevel::Unknown);
+        apply_legacy_revocation_records(
+            vec![self_revocation_at(&agent, 1_000)],
+            std::collections::HashMap::new(),
+            &set,
+            &intake,
+            Some(dir.path().to_path_buf()),
+            &owner,
+            &contacts,
+            &discovery,
+            &machines,
+        )
+        .await;
+        assert!(set.read().await.published_records().is_empty());
     }
 
     /// The ingest marks an open contact as seen before it blocks it.
