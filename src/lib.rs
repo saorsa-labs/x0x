@@ -7020,8 +7020,8 @@ pub type RevocationGroupSeen = std::sync::Arc<dyn Fn(&identity::AgentId) -> bool
 /// The slot that `x0xd` fills with its [`RevocationGroupSeen`] check.
 type RevocationGroupSeenSlot = std::sync::Arc<std::sync::RwLock<Option<RevocationGroupSeen>>>;
 
-/// #1863: what makes a revoked subject "seen" besides the discovery
-/// caches, which the heartbeat reads directly.
+/// #1863: the sources of [`SeenEvidence`] that the heartbeat and the local
+/// apply path read besides the contact store.
 #[derive(Clone)]
 struct RevocationSeenSources {
     contact_store: std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
@@ -7037,17 +7037,16 @@ struct RevocationSeenSources {
 /// key:
 /// - agent: this daemon's own agent; a contact with trust Known or
 ///   Trusted (only the local user sets that); an agent in this owner's
-///   issued-certificate journal (only this owner writes it); an active or
-///   removed member of a named group that this node is an active member
-///   of and that does not admit anyone without approval (see
-///   [`revocation_group_relationship`]).
+///   issued-certificate journal (only this owner writes it); an active
+///   member of an approval-only named group that this node is an active
+///   member of (see [`revocation_group_relationship`]).
 /// - machine: this daemon's own machine; a machine in this owner's
 ///   verified device roster; a machine listed on a Known or Trusted
 ///   contact (recorded from that contact's verified, agent-signed
 ///   announcements).
 ///
 /// Not seen: the discovery caches, an Unknown or Blocked contact, a
-/// pending or banned group entry, a member of an open-join group. A
+/// pending, removed or banned group row, a member of an open-join group. A
 /// verified announce from a fresh key fills the discovery caches and
 /// makes an Unknown contact entry, and applying a revocation blocks its
 /// subject as a contact; none of these is a relationship.
@@ -7157,13 +7156,13 @@ impl SeenEvidence {
 }
 
 /// Whether a named group gives `subject` a relationship with this node
-/// (#1863): the group is not withdrawn, does not admit anyone without
-/// approval (`OpenJoin`), lists this node as an active member, and lists
-/// `subject` as active or removed. A removed member counts because the
-/// revocation path removes a revoked member; in such a group a member was
-/// admitted by an invite, an approval or the owner rule before it could
-/// be removed. A pending entry (a join request) and a banned entry do not
-/// count.
+/// (#1863): the group is not withdrawn, admits only with approval
+/// (`InviteOnly`, `RequestAccess` or `OwnerCertified`; any other variant,
+/// also one this node does not know, does not count), lists this node as
+/// an active member, and lists `subject` as an ACTIVE member. A pending
+/// row (a join request), a removed row and a banned row do not count: a
+/// requester makes a pending row alone, and cancelling or a rejection
+/// turns it into a removed row.
 #[must_use]
 pub fn revocation_group_relationship<'a>(
     groups: impl IntoIterator<Item = &'a groups::GroupInfo>,
@@ -7174,7 +7173,12 @@ pub fn revocation_group_relationship<'a>(
     let subject_hex = hex::encode(subject.as_bytes());
     groups.into_iter().any(|group| {
         !group.withdrawn
-            && group.policy.admission != groups::policy::GroupAdmission::OpenJoin
+            && matches!(
+                group.policy.admission,
+                groups::policy::GroupAdmission::InviteOnly
+                    | groups::policy::GroupAdmission::RequestAccess
+                    | groups::policy::GroupAdmission::OwnerCertified(_)
+            )
             && group
                 .members_v2
                 .get(&local_hex)
@@ -7182,7 +7186,7 @@ pub fn revocation_group_relationship<'a>(
             && group
                 .members_v2
                 .get(&subject_hex)
-                .is_some_and(|member| member.is_active() || member.is_removed())
+                .is_some_and(groups::GroupMember::is_active)
     })
 }
 
@@ -39719,8 +39723,12 @@ mod tests {
         use groups::policy::GroupAdmission as A;
         let check =
             |info: groups::GroupInfo| revocation_group_relationship([&info], &local, &subject);
-        assert!(check(group(A::InviteOnly, Some(S::Active), true)));
-        assert!(check(group(A::RequestAccess, Some(S::Removed), true)));
+        let subject_hex = hex::encode(subject.as_bytes());
+        assert!(
+            check(group(A::InviteOnly, Some(S::Active), true)),
+            "an active member"
+        );
+        assert!(check(group(A::RequestAccess, Some(S::Active), true)));
         assert!(
             !check(group(A::RequestAccess, Some(S::Pending), true)),
             "a join request"
@@ -39731,10 +39739,28 @@ mod tests {
             "anyone can join"
         );
         assert!(
+            !check(group(A::Unknown, Some(S::Active), true)),
+            "an unknown admission variant"
+        );
+        assert!(
             !check(group(A::InviteOnly, Some(S::Active), false)),
             "not this node's group"
         );
         assert!(!check(group(A::InviteOnly, None, true)));
+
+        // #1868 review round 3: a join request that the requester cancels
+        // leaves a Removed row that the requester made alone.
+        let mut cancelled = group(A::RequestAccess, Some(S::Pending), true);
+        assert!(cancelled.clear_pending_joiner(&subject_hex, Some(subject_hex.clone())));
+        assert!(!check(cancelled), "join request, then cancel");
+        // An admin who rejects a spam request leaves the same row.
+        let mut rejected = group(A::RequestAccess, Some(S::Pending), true);
+        assert!(rejected.clear_pending_joiner(&subject_hex, Some(hex::encode([0x33u8; 32]))));
+        assert!(!check(rejected), "a rejected join request");
+        // A removed former member is no longer a relationship.
+        let mut removed = group(A::InviteOnly, Some(S::Active), true);
+        removed.remove_member(&subject_hex, Some(hex::encode([0x33u8; 32])));
+        assert!(!check(removed), "a removed former member");
     }
 
     /// The gossip ingest of #1863 with empty caches and a contact store in

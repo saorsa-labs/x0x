@@ -161,21 +161,22 @@ hours. Decision (Claude, under David's delegation of 10 Nov 2026):
   | agent | it is this daemon's own agent | no |
   | agent | a contact with trust Known or Trusted | no: only the local user sets this (REST, CLI, GUI) |
   | agent | in this owner's issued-certificate journal | no: only this owner writes it |
-  | agent | an active or removed member of a named group that this node is an active member of and that needs approval to join (not `OpenJoin`) | no; but an admin of such a group can add members (see below) |
+  | agent | an active member of a named group that this node is an active member of and that admits only with approval (`InviteOnly`, `RequestAccess`, `OwnerCertified`; an unknown variant does not count) | no; but an admin of such a group can add members (see below) |
   | machine | it is this daemon's own machine | no |
   | machine | in this owner's verified device roster | no: needs this owner's signed enrollment |
   | machine | listed on a Known or Trusted contact | no; but that contact can list a new machine (see below) |
 
   **Not seen:** the discovery caches, an Unknown or Blocked contact, a
-  pending entry (a join request) or a banned entry in a group, any member
-  of an `OpenJoin` group. A verified announce from a fresh key fills the
+  pending, removed or banned row in a group, any member of an `OpenJoin`
+  group. A verified announce from a fresh key fills the
   discovery caches and makes an Unknown contact entry with its machine;
   applying a revocation blocks its subject as a contact. None of these is
   a relationship.
 
-  A removed group member counts because the revocation path removes a
-  revoked member; in a group that needs approval, a member was admitted
-  by an invite, an approval or the owner rule before it could be removed.
+  A removed row does not count. A requester makes a pending row alone (a
+  join request), and cancelling the request, or an admin's rejection,
+  turns it into a removed row. A removed former member is also no longer
+  a relationship.
 
   **Remaining trust in related peers.** An admin of a group that this
   node is in can add fresh keys as members, and a Known or Trusted
@@ -195,8 +196,9 @@ hours. Decision (Claude, under David's delegation of 10 Nov 2026):
 - The mark is in memory only. After a restart, a subject whose only
   relationship was a Known or Trusted contact is a stranger again (the
   revocation blocked the contact), and its record is no longer published
-  by this daemon. An agent of this owner, an owner machine and a group
-  member stay seen.
+  by this daemon. An agent of this owner and an owner machine stay seen.
+  A group member stays seen only while it is active; the revocation path
+  removes a revoked member, so after a restart it is a stranger again.
 - Owner revocations, binding tombstones and share-grant records are always
   published.
 - No disk bound: removing a record would make its subject valid again.

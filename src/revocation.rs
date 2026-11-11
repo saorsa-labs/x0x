@@ -678,14 +678,14 @@ pub struct RevocationSet {
     /// Bundle-retired tombstones indexed by agent (#1659). Kept in step
     /// with `bundle_retired_epochs` keys.
     bundle_machines_by_agent: HashMap<AgentId, HashSet<MachineId>>,
-    /// Subjects of held self-revocations that this node has seen (#1863):
-    /// a contact, a group member, a discovered agent or machine, an agent
-    /// of this owner, or this node itself. A self-revocation of any other
-    /// subject (a stranger) stays in force here but is not published
-    /// again. Only subjects with a held self-revocation are kept. Not
-    /// serialized: after a restart the daemon marks again only the
-    /// subjects that its contacts, discovery cache, owner journal or
-    /// group rosters still show as seen.
+    /// Subjects of held self-revocations that this node has a
+    /// relationship with (#1863): this node itself, a Known or Trusted
+    /// contact, an agent or enrolled machine of this owner, or an active
+    /// member of an approval-only group that this node is in. A
+    /// self-revocation of any other subject (a stranger) stays in force
+    /// here but is not published again. Only subjects with a held
+    /// self-revocation are kept. Not serialized: after a restart the
+    /// daemon marks again the subjects that still have a relationship.
     seen_subjects: HashSet<SeenSubject>,
     /// ADR-0070 revoked share grants, keyed by `(grant_id, owner)`, valued
     /// by the latest signed `grant_expiry`. Collected once the grant itself is dead
