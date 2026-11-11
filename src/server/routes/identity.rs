@@ -1647,6 +1647,18 @@ pub(in crate::server) async fn identity_revoke(
     Json(body): Json<RevokeRequest>,
 ) -> impl IntoResponse {
     use x0x::revocation::RevokedSubject;
+    // #1857: the reason is inside the signed record and is stored by every
+    // peer, so it has a size limit.
+    if body
+        .reason
+        .as_ref()
+        .is_some_and(|reason| reason.len() > x0x::revocation::MAX_REVOCATION_REASON_BYTES)
+    {
+        return bad_request(format!(
+            "reason is longer than {} bytes",
+            x0x::revocation::MAX_REVOCATION_REASON_BYTES
+        ));
+    }
     // ADR-0043 both-fields form: owner-key issued binding tombstone.
     if let (Some(agent_hex), Some(machine_hex)) =
         (body.agent_id.as_deref(), body.machine_id.as_deref())
@@ -1853,9 +1865,17 @@ pub(in crate::server) async fn identity_revocations(
     // Oldest first; the record hash makes the order of equal times stable.
     records.sort_by_cached_key(|r| (r.revoked_at, r.record_hash()));
     let items: Vec<serde_json::Value> = records.iter().map(revocation_row).collect();
+    // #1857: records that are too large to send. While this is not 0, no
+    // peer that waits for a resync can open from this daemon.
+    let unsendable = state
+        .agent
+        .revocation_set()
+        .read()
+        .await
+        .unsendable_record_count();
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "revocations": items })),
+        Json(serde_json::json!({ "revocations": items, "unsendable_records": unsendable })),
     )
 }
 

@@ -892,6 +892,44 @@ async fn t4_far_future_revoked_at_is_rejected() {
     assert_vector_closed("T4", &open);
 }
 
+/// #1857: a daemon that holds 1000 revocations must be able to give all of
+/// them to a peer. The sender side is the production batch encoder; the
+/// receiver side is the real listener, with its 2 MiB limit for one batch.
+///
+/// Fails without the batches: 1000 records are about 5.3 MB as one batch,
+/// the listener ignores that batch whole, and no subject is revoked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_thousand_revocations_reach_a_second_node() {
+    let victim = Victim::start("r1857").await;
+    let now = now_secs();
+    let subjects: Vec<AgentKeypair> = (0..1_000)
+        .map(|_| AgentKeypair::generate().expect("subject key"))
+        .collect();
+    let records: Vec<RevocationRecord> = subjects
+        .iter()
+        .map(|subject| self_revocation(subject, now))
+        .collect();
+
+    let batches = crate::revocation::encode_revocation_batches(&records).expect("batches");
+    let courier = AgentKeypair::generate().expect("courier key");
+    for batch in batches {
+        victim.feed(crate::REVOCATION_TOPIC, &courier, batch).await;
+    }
+    // A sentinel batch after the others: the listener takes messages in
+    // order, so every earlier batch is decided when the sentinel is.
+    victim
+        .feed_revocations(crate::REVOCATION_TOPIC, Vec::new())
+        .await;
+
+    let mut missing = 0;
+    for subject in &subjects {
+        if !victim.revoked(&subject.agent_id()).await {
+            missing += 1;
+        }
+    }
+    assert_eq!(missing, 0, "{missing} of 1000 revocations did not arrive");
+}
+
 /// T5 (audit finding 7): a forged announcement changes X's certificate or
 /// digest, so an OwnerCertified verdict for a correctly seated X stops being
 /// `Clean`.

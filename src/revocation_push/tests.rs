@@ -195,18 +195,20 @@ async fn malformed_and_wrong_subject_pushes_are_dropped() {
     // An oversize payload is refused by the SIZE bound, not by decode: the
     // record is well-formed (it round-trips through plain bincode) and only
     // its unbounded reason pushes it over MAX_GRANT_REVOCATION_PUSH_BYTES.
-    let oversize_record = RevocationRecord::sign(
-        RevokedSubject::ShareGrant(ShareGrantRevocation {
+    // #1857: `sign` refuses a reason this long, so the record is built by
+    // hand, as a peer on an earlier build could send it. The size bound
+    // runs before any signature check.
+    let oversize_record = RevocationRecord {
+        subject: RevokedSubject::ShareGrant(ShareGrantRevocation {
             grant_id: [0x4a; 32],
             owner: owner.user_id(),
             grant_expiry: now_unix() + 86_400,
         }),
-        owner.public_key(),
-        owner.secret_key(),
-        now_unix(),
-        Some("r".repeat(2 * MAX_GRANT_REVOCATION_PUSH_BYTES)),
-    )
-    .expect("sign oversize record");
+        issuer_public_key: owner.public_key().as_bytes().to_vec(),
+        revoked_at: now_unix(),
+        reason: Some("r".repeat(2 * MAX_GRANT_REVOCATION_PUSH_BYTES)),
+        signature: vec![0; 3309],
+    };
     let body = bincode::serialize(&oversize_record).expect("encode");
     let round_trip: RevocationRecord = bincode::deserialize(&body).expect("well-formed record");
     assert_eq!(round_trip.record_hash(), oversize_record.record_hash());

@@ -514,6 +514,26 @@ Before [#1108](https://github.com/saorsa-labs/x0x/issues/1108) the listing
 showed `agent` and `machine` rows only. A client that reads the listing must
 ignore a `subject_kind` it does not know.
 
+The daemon holds one record for each subject and issuer of an agent, machine
+or binding revocation: the one with the earlier `revoked_at`, and for equal
+times the lower record hash (#1857). A later record for the same pair adds
+nothing, and the subject stays revoked.
+
+The answer also has `unsendable_records`: the number of held records that
+are too large for any peer to accept (only a record from an old store can
+be). While it is not 0, a peer that waits for a resync cannot open from this
+daemon; revoke that subject again with a short reason.
+
+A daemon sends its revocation set to peers as one gossip batch when the set
+fits, and as a round of marked batches when it does not; see
+[`docs/design/revocation-batches.md`](design/revocation-batches.md). The
+marker records of a round are never in this listing.
+
+A new record's `reason` is at most 1024 bytes. `POST /identity/revoke` and
+`DELETE /owner/agents/:id` answer `400` above that, and a daemon refuses
+such a record from a peer. The reason is inside the signed record and every
+peer stores it.
+
 A record does not leave the listing because of its age. Agent, machine and
 binding records stay for good. A share-grant record goes when the grant is
 past `grant_expiry` plus the clock allowance. A daemon older than this rule
