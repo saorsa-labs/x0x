@@ -6989,12 +6989,16 @@ fn s4_pending_in_set(
     set: &revocation::RevocationSet,
     s4_intake: &groups::eviction::RevocationIntake,
 ) -> std::collections::BTreeSet<[u8; 32]> {
-    let mut pending = s4_intake.not_durable_hashes();
-    // #1857: a record that the kept record of its pair replaced counts as
-    // held. The store write holds that kept record, which is the same
-    // evidence (same subject, same issuer).
-    pending.retain(|hash| set.contains_hash(hash) || set.holds_replacement_for(hash));
-    pending
+    // #1857, #1864: a record that the kept record of its pair replaced
+    // counts as held. The store write holds that kept record, which is
+    // the same evidence (same subject, same issuer). The check is by
+    // pair, so it holds after any number of replacements.
+    s4_intake
+        .not_durable_pairs()
+        .into_iter()
+        .filter(|(hash, pair)| set.contains_hash(hash) || set.holds_pair(pair))
+        .map(|(hash, _)| hash)
+        .collect()
 }
 
 /// Write the v1 revocation store, which holds every Agent subject, and
@@ -39142,6 +39146,60 @@ mod tests {
         let written = std::fs::read(dir.path().join("revocations.bin")).expect("store");
         let on_disk = revocation::RevocationSet::from_bytes(&written).expect("decode");
         assert!(on_disk.contains_hash(&earlier.record_hash()));
+        assert!(on_disk.is_agent_revoked(&kp.agent_id()));
+    }
+
+    /// #1864 finding 3: a record that S4 waits for is replaced, and many
+    /// more replacements follow before any store write succeeds. The
+    /// first record's evidence is on disk when the kept record of its
+    /// pair is, however many replacements came between.
+    #[tokio::test]
+    async fn a_record_replaced_many_times_before_a_store_write_is_durable() {
+        // More replacements than the old replaced-record memory held (4096).
+        const REPLACEMENTS: u64 = 4_100;
+        let dir = tempfile::tempdir().expect("dir");
+        let set = tokio::sync::RwLock::new(revocation::RevocationSet::new());
+        let intake = groups::eviction::RevocationIntake::new();
+        let kp = identity::AgentKeypair::generate().expect("keypair");
+        let sign = |revoked_at: u64| {
+            revocation::RevocationRecord::sign(
+                revocation::RevokedSubject::Agent(kp.agent_id()),
+                kp.public_key(),
+                kp.secret_key(),
+                revoked_at,
+                None,
+            )
+            .expect("sign")
+        };
+        let first = sign(REPLACEMENTS + 1);
+        {
+            let mut guard = set.write().await;
+            assert!(guard
+                .verify_and_insert(first.clone(), None)
+                .expect("insert"));
+            intake.note_verified(&first);
+            // Each record is earlier than the one before, so each one
+            // takes the place of the one before. No store write runs.
+            for step in 0..REPLACEMENTS {
+                let record = sign(REPLACEMENTS - step);
+                assert!(guard
+                    .verify_and_insert(record.clone(), None)
+                    .expect("insert"));
+                intake.note_verified(&record);
+            }
+            assert_eq!(guard.len(), 1);
+        }
+        assert!(s4_store_write_pending(&set, &intake).await);
+        persist_s4_revocations(&set, &intake, Some(dir.path()))
+            .await
+            .expect("store write");
+        assert!(
+            intake.all_durable(&std::collections::BTreeSet::from([first.record_hash()])),
+            "the first record's evidence is on disk as the kept record of its pair"
+        );
+        assert!(intake.not_durable_hashes().is_empty());
+        let written = std::fs::read(dir.path().join("revocations.bin")).expect("store");
+        let on_disk = revocation::RevocationSet::from_bytes(&written).expect("decode");
         assert!(on_disk.is_agent_revoked(&kp.agent_id()));
     }
 
