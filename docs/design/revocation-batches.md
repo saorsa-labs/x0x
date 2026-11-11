@@ -90,7 +90,8 @@ single-record path is refused with a WARN log line.
 A03). It opens a carrier only from a sender that is a trusted authority:
 
 - A batch with **no marker** is the sender's whole set. The rule of #1116
-  applies as before.
+  applies as before, with one exception for self-revocations (see
+  "Self-revocations of strangers" below).
 - A batch with a **marker** is one part of a round. The daemon keeps one
   open round for each sender and carrier. A part of another round (another
   `set` or `n`) replaces the open round; parts of two rounds are never
@@ -119,7 +120,9 @@ A03). It opens a carrier only from a sender that is a trusted authority:
   of #1857). The offer then stays, the ingest admits that record, and the
   carrier opens when the daemon's held records equal the snapshot's kept
   records, each one verified. A snapshot whose record for the pair is
-  worse than the held one is still refused.
+  worse than the held one is still refused. A held self-revocation that
+  the snapshot has no record of its pair for does not count as omitted
+  (#1863, see below).
 
 Bounds on what a waiting daemon holds for one sender and carrier:
 
@@ -148,7 +151,10 @@ hours. Decision (Claude, under David's delegation of 10 Nov 2026):
 - A subject is **seen**, and its self-revocation is published, when this
   daemon has a **relationship** with it that a peer cannot create alone
   for a fresh key (decided 11 Nov 2026, #1868 review round 2). The gossip
-  ingest, the local apply path and the heartbeat use this one rule.
+  ingest, the local apply path and the heartbeat use this one rule. The
+  gossip ingest reads only the sources that the revocation changes (the
+  contact store) and the owner's device roster; the heartbeat reads every
+  source within 10 minutes.
 
   | Subject | Seen when | Can a peer with no relationship make it for a fresh key? |
   |---|---|---|
@@ -182,6 +188,8 @@ hours. Decision (Claude, under David's delegation of 10 Nov 2026):
   relationship later (for example the user raises a contact to Known) is
   published at the next heartbeat.
 - A mark changes the set's generation, so the next heartbeat publishes.
+- Every publish path reads its records from one function
+  (`revocation_publish_records`), and a test decodes what it sends.
 - A self-revocation that this daemon applies itself (an operator revokes
   this agent or machine) is marked at once and is in the immediate publish.
 - The mark is in memory only. After a restart, a subject whose only

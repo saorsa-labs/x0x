@@ -6900,21 +6900,13 @@ impl HeartbeatContext {
             // whole). The v1 batch stays byte-identical for old peers.
             let publish_lock = self.revocation_set.read().await.publish_lock();
             let _one_round = publish_lock.lock().await;
-            let (binding_records, share_grant_records, records) = {
+            let carriers = {
                 let set = self.revocation_set.read().await;
-                (
-                    set.binding_records(),
-                    set.share_grant_records(),
-                    // #1863: without the self-revocations of strangers.
-                    set.published_records(),
-                )
+                [REVOCATION_V2_TOPIC, REVOCATION_V3_TOPIC, REVOCATION_TOPIC]
+                    .map(|topic| (topic, revocation_publish_records(&set, topic)))
             };
             let mut all_sent = true;
-            for (topic, carrier_records) in [
-                (REVOCATION_V2_TOPIC, binding_records),
-                (REVOCATION_V3_TOPIC, share_grant_records),
-                (REVOCATION_TOPIC, records),
-            ] {
+            for (topic, carrier_records) in carriers {
                 match revocation::encode_revocation_batches(&carrier_records) {
                     Ok(batches) => {
                         for bytes in batches {
@@ -7004,6 +6996,21 @@ fn raw_dm_history_record(
         ingress_sender_agent: None,
         logical_request_id: None,
     })
+}
+
+/// The records that a publish sends on a revocation topic. Every publish
+/// path (the heartbeat and a local revocation) reads its records here.
+/// The v1 topic leaves out the self-revocations of strangers (#1863).
+fn revocation_publish_records(
+    set: &revocation::RevocationSet,
+    topic: &str,
+) -> Vec<revocation::RevocationRecord> {
+    match topic {
+        REVOCATION_V2_TOPIC => set.binding_records(),
+        REVOCATION_V3_TOPIC => set.share_grant_records(),
+        REVOCATION_TOPIC => set.published_records(),
+        _ => Vec::new(),
+    }
 }
 
 /// #1863: whether a named group gives an agent a relationship with this
@@ -18674,18 +18681,12 @@ impl Agent {
         if let Some(rt) = &self.gossip_runtime {
             let publish_lock = self.revocation_set.read().await.publish_lock();
             let _one_round = publish_lock.lock().await;
-            let (topic, records) = {
-                let set = self.revocation_set.read().await;
-                match &record.subject {
-                    revocation::RevokedSubject::AgentMachineBinding(_) => {
-                        (REVOCATION_V2_TOPIC, set.binding_records())
-                    }
-                    revocation::RevokedSubject::ShareGrant(_) => {
-                        (REVOCATION_V3_TOPIC, set.share_grant_records())
-                    }
-                    _ => (REVOCATION_TOPIC, set.published_records()),
-                }
+            let topic = match &record.subject {
+                revocation::RevokedSubject::AgentMachineBinding(_) => REVOCATION_V2_TOPIC,
+                revocation::RevokedSubject::ShareGrant(_) => REVOCATION_V3_TOPIC,
+                _ => REVOCATION_TOPIC,
             };
+            let records = revocation_publish_records(&*self.revocation_set.read().await, topic);
             if let Ok(batches) = revocation::encode_revocation_batches(&records) {
                 for bytes in batches {
                     let _ = rt
@@ -39571,6 +39572,109 @@ mod tests {
         assert!(!published(&guard).contains(&unknown.agent_id()));
         assert!(!published(&guard).contains(&blocked.agent_id()));
         assert_eq!(guard.stranger_self_revocation_count(), 2);
+    }
+
+    /// #1868 review: the publish paths send what `revocation_publish_records`
+    /// gives. On the v1 topic the decoded batches hold a seen subject's
+    /// self-revocation and an owner revocation, and not a stranger's.
+    #[tokio::test]
+    async fn the_v1_publish_leaves_out_a_strangers_self_revocation() {
+        let mut set = revocation::RevocationSet::new();
+        let stranger = identity::AgentKeypair::generate().expect("keypair");
+        let seen = identity::AgentKeypair::generate().expect("keypair");
+        let stranger_record = self_revocation_at(&stranger, 1_000);
+        let seen_record = self_revocation_at(&seen, 1_000);
+        assert!(set
+            .verify_and_insert(stranger_record.clone(), None)
+            .expect("insert"));
+        assert!(set
+            .verify_and_insert(seen_record.clone(), None)
+            .expect("insert"));
+        assert!(set.mark_seen([revocation::SeenSubject::Agent(seen.agent_id())]));
+        let records = revocation_publish_records(&set, REVOCATION_TOPIC);
+        let mut sent = Vec::new();
+        for batch in revocation::encode_revocation_batches(&records).expect("encode") {
+            sent.extend(revocation::decode_revocation_batch(&batch).expect("decode"));
+        }
+        let sent: std::collections::HashSet<[u8; 32]> = sent
+            .iter()
+            .map(revocation::RevocationRecord::record_hash)
+            .collect();
+        assert_eq!(
+            sent,
+            std::collections::HashSet::from([seen_record.record_hash()])
+        );
+        assert!(!sent.contains(&stranger_record.record_hash()));
+        // The store still holds both.
+        assert_eq!(set.all_records().len(), 2);
+        assert!(revocation_publish_records(&set, "x0x.other").is_empty());
+    }
+
+    /// #1868 review: machine subjects. A machine on a Known contact is
+    /// seen; a machine on an Unknown contact (what an announce leaves) is
+    /// not.
+    #[tokio::test]
+    async fn a_machine_on_a_known_contact_is_seen_and_on_an_unknown_one_is_not() {
+        let dir = tempfile::tempdir().expect("dir");
+        let set = tokio::sync::RwLock::new(revocation::RevocationSet::new());
+        let contacts = tokio::sync::RwLock::new(contacts::ContactStore::new(
+            dir.path().join("contacts.json"),
+        ));
+        let known_agent = identity::AgentKeypair::generate().expect("keypair");
+        let unknown_agent = identity::AgentKeypair::generate().expect("keypair");
+        let known_machine = identity::MachineKeypair::generate().expect("keypair");
+        let unknown_machine = identity::MachineKeypair::generate().expect("keypair");
+        {
+            let mut store = contacts.write().await;
+            store.add_machine(
+                &known_agent.agent_id(),
+                contacts::MachineRecord::new(known_machine.machine_id(), None),
+            );
+            store.set_trust(&known_agent.agent_id(), contacts::TrustLevel::Known);
+            store.add_machine(
+                &unknown_agent.agent_id(),
+                contacts::MachineRecord::new(unknown_machine.machine_id(), None),
+            );
+        }
+        let sign = |kp: &identity::MachineKeypair| {
+            revocation::RevocationRecord::sign(
+                revocation::RevokedSubject::Machine(kp.machine_id()),
+                kp.public_key(),
+                kp.secret_key(),
+                1_000,
+                None,
+            )
+            .expect("sign")
+        };
+        {
+            let mut guard = set.write().await;
+            for kp in [&known_machine, &unknown_machine] {
+                assert!(guard.verify_and_insert(sign(kp), None).expect("insert"));
+            }
+        }
+        assert!(SeenEvidence::gather(&contacts).await.mark(&set).await);
+        let guard = set.read().await;
+        let published: Vec<_> = guard
+            .published_records()
+            .iter()
+            .map(|record| record.subject.clone())
+            .collect();
+        assert_eq!(
+            published,
+            vec![revocation::RevokedSubject::Machine(
+                known_machine.machine_id()
+            )]
+        );
+    }
+
+    /// The diagnostics gauge reports the value the heartbeat sets.
+    #[test]
+    fn the_stranger_gauge_is_in_the_diagnostics_counters() {
+        crate::identity_authority::set_revocation_stranger_self_held(7);
+        assert_eq!(
+            crate::identity_authority::counters_json()["revocation_stranger_self_held"],
+            7
+        );
     }
 
     /// #1863: the group rule. Only an active member of the group is a
