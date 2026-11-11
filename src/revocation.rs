@@ -469,14 +469,26 @@ impl RevocationRecord {
         Some(*hasher.finalize().as_bytes())
     }
 
-    /// The order between two records of one pair (#1857). A record whose
-    /// reason is inside the limit comes before one whose reason is over
-    /// it (a legacy record), so that a node keeps, and sends again, a
-    /// record that every peer accepts. Then the earlier `revoked_at` is
-    /// kept, and for equal times the lower record hash. Every node
-    /// computes the same order from the signed bytes.
+    /// The order between two records of one pair (#1857). The lower key
+    /// is kept.
+    ///
+    /// 1. A record whose `revoked_at` is credible comes before one that is
+    ///    far in the future. [`RevocationSet::drop_future_records`]
+    ///    removes a far-future record, so such a record must never take
+    ///    the place of a credible one: the subject would then have no
+    ///    record at all.
+    /// 2. A record whose reason is inside the limit comes before one whose
+    ///    reason is over it (a legacy record), so that a node keeps, and
+    ///    sends again, a record that every peer accepts.
+    /// 3. The earlier `revoked_at`, and for equal times the lower record
+    ///    hash.
+    ///
+    /// Keys 2 and 3 come from the signed bytes. Key 1 also reads the local
+    /// clock; nodes agree on it except within the clock allowance of the
+    /// moment a far-future time is reached.
     fn rank(&self) -> RecordRank {
         (
+            !self.revoked_at_is_credible(unix_now_secs()),
             !reason_within_limit(&self.reason),
             self.revoked_at,
             self.record_hash(),
@@ -517,9 +529,17 @@ struct PersistedRevocation {
 /// The most replaced-record hashes the set remembers for S4.
 const MAX_REPLACED_RECORDS: usize = 4096;
 
-/// The order key of a record inside its pair: `(reason over the limit,
-/// revoked_at, record hash)`. The lower key is kept.
-type RecordRank = (bool, u64, [u8; 32]);
+/// The order key of a record inside its pair: `(revoked_at not credible,
+/// reason over the limit, revoked_at, record hash)`. The lower key is kept.
+type RecordRank = (bool, bool, u64, [u8; 32]);
+
+/// Unix seconds now; 0 when the clock is before the epoch.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
 
 /// One trusted sender's carrier snapshot while a carrier waits for a
 /// resync (#1116).
@@ -537,7 +557,7 @@ impl SnapshotCandidate {
     fn offers(&self, hash: &[u8; 32]) -> bool {
         self.whole
             .as_ref()
-            .is_some_and(|kept| kept.values().any(|(_, _, held)| held == hash))
+            .is_some_and(|kept| kept.values().any(|(_, _, _, held)| held == hash))
             || self
                 .round
                 .as_ref()
@@ -551,7 +571,13 @@ struct OpenRound {
     set: [u8; 32],
     batches: u32,
     parts: HashMap<u32, RoundPart>,
+    /// When the last part arrived. A round that gets no part for
+    /// [`OPEN_ROUND_TIMEOUT`] is dropped when the next part arrives.
+    last_part: std::time::Instant,
 }
+
+/// How long an open round is kept with no new part.
+const OPEN_ROUND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// One batch of a marked round.
 #[derive(Debug, Clone)]
@@ -579,7 +605,7 @@ fn kept_of(
 }
 
 fn kept_hashes(kept: &HashMap<[u8; 32], RecordRank>) -> HashSet<[u8; 32]> {
-    kept.values().map(|(_, _, hash)| *hash).collect()
+    kept.values().map(|(_, _, _, hash)| *hash).collect()
 }
 
 /// Whether `reason` is inside [`MAX_REVOCATION_REASON_BYTES`].
@@ -613,6 +639,8 @@ pub struct RevocationSet {
     /// Records that were held and then replaced by the kept record of
     /// their pair: replaced record hash → pair key. Not serialized.
     replaced: HashMap<[u8; 32], [u8; 32]>,
+    /// The keys of `replaced`, oldest first, for its size bound.
+    replaced_order: std::collections::VecDeque<[u8; 32]>,
     /// ADR-0043 tombstone epochs from ad-hoc binding `RevocationRecord`s
     /// (`x0x.revocation.v2` carrier). Grow-only; never swept.
     binding_epochs: HashMap<(AgentId, MachineId), u64>,
@@ -868,6 +896,9 @@ const ROUND_MARKER_REASON_PREFIX: &str = "x0x-revocation-round-v1";
 /// The most batches one round may have.
 pub(crate) const MAX_ROUND_BATCHES: u32 = 4096;
 
+/// More than the bytes of any round-marker record (about 210).
+const ROUND_MARKER_MAX_BYTES: usize = 512;
+
 /// The most records a waiting node holds for one open round of one sender
 /// (about 700 full batches of real records).
 const MAX_ROUND_RECORDS: usize = 262_144;
@@ -1009,19 +1040,25 @@ fn encode_revocation_batches_with_target(
     let mut groups: Vec<Vec<RevocationRecord>> = Vec::new();
     let mut current: Vec<RevocationRecord> = Vec::new();
     let mut current_bytes = 0usize;
+    // The record hashes that are sent, in order: the round's `set`.
+    let mut sendable: Vec<[u8; 32]> = ordered.iter().map(|(_, hash)| *hash).collect();
     for (record, hash) in &ordered {
         // The framed encoding adds a length prefix per record.
         let size = usize::try_from(bincode::serialized_size(record)?)
             .unwrap_or(usize::MAX)
             .saturating_add(16);
-        if size > MAX_REVOCATION_PAYLOAD_BYTES {
-            // Only a stored legacy record can be this large. It goes out
-            // alone, and every receiver ignores that batch.
+        if size.saturating_add(ROUND_MARKER_MAX_BYTES) > MAX_REVOCATION_PAYLOAD_BYTES {
+            // Only a stored legacy record can be this large. No receiver
+            // accepts a batch that holds it, so it is not sent, and it is
+            // not part of the round or of the round's `set`. (A batch with
+            // this record and no marker would look like a whole set.)
             tracing::warn!(
                 record = %hex::encode(hash),
                 bytes = size,
-                "revocation record is over the size a receiver accepts; peers will not take it from gossip"
+                "revocation record is over the size a receiver accepts; it is not sent to peers"
             );
+            sendable.retain(|held| held != hash);
+            continue;
         }
         if !current.is_empty() && current_bytes.saturating_add(size) > target_bytes {
             groups.push(std::mem::take(&mut current));
@@ -1047,8 +1084,7 @@ fn encode_revocation_batches_with_target(
             "revocation set needs more batches than one round may have; a peer that waits for a resync cannot open from this daemon"
         );
     }
-    let hashes: Vec<[u8; 32]> = ordered.iter().map(|(_, hash)| *hash).collect();
-    let set = round_set_digest(&hashes);
+    let set = round_set_digest(&sendable);
     let mut out = Vec::with_capacity(groups.len());
     for (index, mut group) in groups.into_iter().enumerate() {
         group.push(round_marker_record(&RoundMarker {
@@ -1289,15 +1325,19 @@ impl RevocationSet {
         // ingest admits it (see `verify_and_insert_at`).
         let kept = kept_of(records.iter().map(|record| {
             let rank = record.rank();
-            (record.pair_key().unwrap_or(rank.2), rank)
+            (record.pair_key().unwrap_or(rank.3), rank)
         }));
         let known = self.known_carrier_hashes(carrier);
+        let candidate = self.resync_candidates[index].entry(*sender).or_default();
+        // This batch is the sender's set now. Whatever the sender offered
+        // before (a whole set or an open round) is stale, also when this
+        // batch is refused below.
+        candidate.whole = None;
+        candidate.round = None;
         if !kept_hashes(&kept).is_superset(&known) {
             return;
         }
-        let candidate = self.resync_candidates[index].entry(*sender).or_default();
         candidate.whole = Some(kept);
-        candidate.round = None;
         self.try_complete_carrier(carrier);
     }
 
@@ -1341,7 +1381,7 @@ impl RevocationSet {
             .iter()
             .map(|record| {
                 let rank = record.rank();
-                (record.pair_key().unwrap_or(rank.2), rank)
+                (record.pair_key().unwrap_or(rank.3), rank)
             })
             .collect();
         let known = self.known_carrier_hashes(carrier);
@@ -1349,10 +1389,12 @@ impl RevocationSet {
         // One open round per carrier per sender: a part of another round
         // (the sender's set changed) replaces the open one. Parts of two
         // rounds are never mixed.
-        let same_round = candidate
-            .round
-            .as_ref()
-            .is_some_and(|round| round.set == marker.set && round.batches == marker.batches);
+        let now = std::time::Instant::now();
+        let same_round = candidate.round.as_ref().is_some_and(|round| {
+            round.set == marker.set
+                && round.batches == marker.batches
+                && now.duration_since(round.last_part) <= OPEN_ROUND_TIMEOUT
+        });
         if !same_round {
             // The sender's set is this round now. A whole-set snapshot
             // that it offered earlier is stale and must not open the
@@ -1362,11 +1404,13 @@ impl RevocationSet {
                 set: marker.set,
                 batches: marker.batches,
                 parts: HashMap::new(),
+                last_part: now,
             });
         }
         let Some(round) = candidate.round.as_mut() else {
             return;
         };
+        round.last_part = now;
         if round
             .parts
             .get(&marker.index)
@@ -1780,12 +1824,17 @@ impl RevocationSet {
                         return false;
                     }
                     self.records_by_hash.remove(&held_hash);
-                    // Bounded: a full map is cleared, and S4 then treats
-                    // an old replaced hash as it did before #1857.
-                    if self.replaced.len() >= MAX_REPLACED_RECORDS {
-                        self.replaced.clear();
+                    // Bounded, oldest first: S4 asks about a replaced
+                    // record soon after the replacement (the next store
+                    // write), so the newest entries are the ones it needs.
+                    while self.replaced_order.len() >= MAX_REPLACED_RECORDS {
+                        if let Some(oldest) = self.replaced_order.pop_front() {
+                            self.replaced.remove(&oldest);
+                        }
                     }
-                    self.replaced.insert(held_hash, pair);
+                    if self.replaced.insert(held_hash, pair).is_none() {
+                        self.replaced_order.push_back(held_hash);
+                    }
                 }
             }
             self.pair_index.insert(pair, hash);
@@ -1816,7 +1865,11 @@ impl RevocationSet {
             // Never a revocation, whatever path offers it (#1857). The
             // gossip decoder removes markers, so one that reaches this
             // point came from a store file or a single-record path.
-            tracing::warn!("a revocation round-marker record was offered as a revocation; dropped");
+            // debug, not warn: a remote peer can send one on a
+            // single-record path as often as it likes.
+            tracing::debug!(
+                "a revocation round-marker record was offered as a revocation; dropped"
+            );
             return Err(IdentityError::Revocation(
                 "a round-marker record is not a revocation".to_string(),
             ));
@@ -5010,6 +5063,172 @@ mod tests {
             assert_eq!(set.all_records(), vec![short]);
         }
 
+        /// WHY (review MAJOR): a store from a released daemon can hold two
+        /// records for one subject and issuer: a credible one with a long
+        /// reason, and one far in the future with a short reason. The load
+        /// keeps one record per pair, and then drops far-future records.
+        /// If the far-future record won the pair, the subject would have
+        /// no record left and would not be revoked. It was revoked before
+        /// this change, so it must stay revoked: a far-future record never
+        /// wins a pair.
+        #[test]
+        fn a_far_future_record_never_takes_the_place_of_a_credible_one() {
+            let kp = AgentKeypair::generate().expect("keypair");
+            let credible_long = long_reason_record(&kp, 1_000);
+            let future_short = self_revocation(&kp, u64::MAX, "short");
+            let entry = |record: &RevocationRecord| PersistedRevocation {
+                record: record.clone(),
+                subject_cert: None,
+            };
+
+            // The store file, in both record orders.
+            for order in [
+                [&credible_long, &future_short],
+                [&future_short, &credible_long],
+            ] {
+                let persisted: Vec<PersistedRevocation> = order.iter().map(|r| entry(r)).collect();
+                let mut bytes = REVOCATIONS_FILE_MAGIC.to_vec();
+                bytes.extend_from_slice(&bincode::serialize(&persisted).expect("encode"));
+                let mut loaded = RevocationSet::from_bytes(&bytes).expect("decode");
+                assert_eq!(loaded.all_records(), vec![credible_long.clone()]);
+                loaded.drop_future_records(2_000);
+                assert!(
+                    loaded.is_agent_revoked(&kp.agent_id()),
+                    "the subject stays revoked after the far-future sweep"
+                );
+            }
+
+            // The store merges run the pair rule too.
+            for merge_v3 in [false, true] {
+                let mut live = RevocationSet::new();
+                live.verify_and_insert(future_short.clone(), None)
+                    .expect("ok");
+                let mut disk = RevocationSet::new();
+                disk.verify_and_insert(credible_long.clone(), None)
+                    .expect("ok");
+                if merge_v3 {
+                    live.merge_v3(disk);
+                } else {
+                    live.merge_v2(disk);
+                }
+                live.drop_future_records(2_000);
+                assert!(
+                    live.is_agent_revoked(&kp.agent_id()),
+                    "merge_v3: {merge_v3}"
+                );
+                assert_eq!(live.all_records(), vec![credible_long.clone()]);
+            }
+
+            // A live arrival: the far-future record adds nothing.
+            let mut set = RevocationSet::new();
+            set.verify_and_insert(credible_long.clone(), None)
+                .expect("ok");
+            assert!(!set.verify_and_insert(future_short, None).expect("verifies"));
+            assert_eq!(set.all_records(), vec![credible_long]);
+        }
+
+        /// WHY: S4 asks whether a replaced record's evidence is on disk
+        /// soon after the replacement. The memory of replaced records has
+        /// a size bound; when it is full, the OLDEST entry must go, not
+        /// all of them, or a record that S4 still waits for is forgotten.
+        #[test]
+        fn the_replaced_record_memory_drops_the_oldest_entry_first() {
+            let mut set = RevocationSet::new();
+            let fake = |revoked_at: u64| RevocationRecord {
+                subject: RevokedSubject::Agent(AgentId([0x33; 32])),
+                issuer_public_key: vec![7; 4],
+                revoked_at,
+                reason: None,
+                signature: vec![9; 4],
+            };
+            // Each record is earlier than the one before, so each one
+            // takes the place of the one before.
+            let total = MAX_REPLACED_RECORDS as u64 + 10;
+            let first = fake(total + 1);
+            assert!(set.insert_verified(PersistedRevocation {
+                record: first.clone(),
+                subject_cert: None
+            }));
+            let mut last_replaced = first.record_hash();
+            for step in 0..total {
+                let record = fake(total - step);
+                let hash = record.record_hash();
+                assert!(set.insert_verified(PersistedRevocation {
+                    record,
+                    subject_cert: None
+                }));
+                assert!(set.holds_replacement_for(&last_replaced), "step {step}");
+                last_replaced = hash;
+            }
+            assert_eq!(set.len(), 1);
+            assert_eq!(set.replaced.len(), MAX_REPLACED_RECORDS);
+            assert_eq!(set.replaced_order.len(), MAX_REPLACED_RECORDS);
+            assert!(
+                !set.holds_replacement_for(&first.record_hash()),
+                "the oldest entry was dropped"
+            );
+        }
+
+        /// WHY: a set of one batch must have the bytes it had before
+        /// #1857, so that a released daemon reads it as before. These are
+        /// fixed bytes: plain bincode of the record list, no marker.
+        #[test]
+        fn a_one_batch_set_has_the_bytes_of_before() {
+            let record = RevocationRecord {
+                subject: RevokedSubject::Agent(AgentId([1; 32])),
+                issuer_public_key: vec![7; 4],
+                revoked_at: 1,
+                reason: None,
+                signature: vec![9; 4],
+            };
+            let golden = concat!(
+                "0100000000000000", // one record
+                "00000000",         // RevokedSubject::Agent
+                "0101010101010101010101010101010101010101010101010101010101010101",
+                "0400000000000000",
+                "07070707",         // issuer_public_key
+                "0100000000000000", // revoked_at
+                "00",               // reason: None
+                "0400000000000000",
+                "09090909", // signature
+            );
+            let batches = encode_revocation_batches(std::slice::from_ref(&record)).expect("encode");
+            assert_eq!(batches.len(), 1);
+            assert_eq!(hex::encode(&batches[0]), golden);
+            assert_eq!(
+                decode_revocation_batch(&batches[0]).expect("decode"),
+                vec![record]
+            );
+        }
+
+        /// WHY: a record that no receiver accepts (it is over the receive
+        /// limit by itself) must not be in a round. A batch that held it
+        /// with no marker would look like a whole set to a waiting node.
+        /// It is left out of the batches and out of the round's digest.
+        #[test]
+        fn a_record_over_the_receive_limit_is_left_out_of_the_round() {
+            let mut records: Vec<RevocationRecord> = (0..800).map(sized_fake).collect();
+            let giant = sized_fake_with_reason(9_999, "x".repeat(MAX_REVOCATION_PAYLOAD_BYTES));
+            records.push(giant.clone());
+            let batches = encode_revocation_batches(&records).expect("encode");
+            assert!(batches.len() > 1);
+            let mut sent = Vec::new();
+            let mut sets = HashSet::new();
+            for batch in &batches {
+                assert!(batch.len() < MAX_REVOCATION_PAYLOAD_BYTES);
+                let (part, round) = decode_revocation_batch_with_round(batch).expect("decode");
+                let BatchRound::Part(marker) = round else {
+                    panic!("every batch of the round has a marker");
+                };
+                sets.insert(marker.set);
+                sent.extend(part.iter().map(RevocationRecord::record_hash));
+            }
+            assert!(!sent.contains(&giant.record_hash()));
+            assert_eq!(sent.len(), 800);
+            sent.sort_unstable();
+            assert_eq!(sets, HashSet::from([round_set_digest(&sent)]));
+        }
+
         /// WHY: a trusted resync snapshot can hold a legacy record with a
         /// long reason. If the waiting node dropped it and then opened the
         /// carrier, the subject would not be revoked there. The record is
@@ -5414,6 +5633,26 @@ mod tests {
             assert!(
                 pending(&waiter),
                 "the stale one-batch snapshot must not open the carrier"
+            );
+        }
+
+        /// WHY: the same rule for a newer UNMARKED batch. The sender's
+        /// newest batch is its set of now, also when this node refuses
+        /// that batch. An older whole set from the same sender must not
+        /// open the carrier after it.
+        #[test]
+        fn an_earlier_whole_snapshot_does_not_open_after_a_newer_one_batch_set() {
+            let old = records(2);
+            let newer = records(1);
+            let mut waiter = waiting();
+            let _ = waiter.verify_and_insert_at(old[0].clone(), None, 2_000);
+            waiter.observe_remote_carrier_snapshot(REVOCATION_CARRIER_V1, &SENDER, &old, true);
+            // A newer set that omits a record this node holds: refused.
+            waiter.observe_remote_carrier_snapshot(REVOCATION_CARRIER_V1, &SENDER, &newer, true);
+            let _ = waiter.verify_and_insert_at(old[1].clone(), None, 2_000);
+            assert!(
+                pending(&waiter),
+                "the node holds exactly the OLD set, which is stale"
             );
         }
 

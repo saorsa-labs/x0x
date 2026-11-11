@@ -6837,6 +6837,7 @@ impl HeartbeatContext {
             // #1857: every carrier goes out as one or more batches under
             // the size a receiver accepts (one oversized batch was ignored
             // whole). The v1 batch stays byte-identical for old peers.
+            let _one_round = revocation_publish_lock().await;
             let (binding_records, share_grant_records, records) = {
                 let set = self.revocation_set.read().await;
                 (
@@ -6950,6 +6951,18 @@ pub(crate) const SHARE_GRANT_REVOCATIONS_FILE: &str = "revocations-v3.bin";
 const S4_PERSIST_RETRY_MIN: std::time::Duration = std::time::Duration::from_millis(250);
 /// Largest delay between those retries.
 const S4_PERSIST_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Take the lock that makes "read the set, encode it, publish every batch"
+/// one step for this process (#1857).
+///
+/// A set that needs several batches is a round, named by the digest of the
+/// set. Two publishers at once (the heartbeat and a new revocation) would
+/// send parts of two rounds mixed together, and a peer that waits for a
+/// resync would drop each round when a part of the other arrives.
+pub(crate) async fn revocation_publish_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    LOCK.lock().await
+}
 
 /// The live-route record hashes that a snapshot of `set` holds. Each
 /// live route notes a record under the set's write guard, after the
@@ -18087,6 +18100,7 @@ impl Agent {
 
         // 4. Publish on gossip (best-effort — local enforcement happens regardless).
         if let Some(rt) = &self.gossip_runtime {
+            let _one_round = revocation_publish_lock().await;
             let (topic, records) = {
                 let set = self.revocation_set.read().await;
                 match &record.subject {

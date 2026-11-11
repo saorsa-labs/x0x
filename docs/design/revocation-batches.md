@@ -19,7 +19,17 @@ ignored, and no revocation from that daemon reached any peer.
 | Fits in one batch (at most 2 MiB less 64 KiB of records, about 370 records) | One batch, with no marker. The bytes are the same as before #1857. |
 | Larger | A **round**: several batches. Each batch holds records in record-hash order and ends with one **round-marker record**. |
 
-One record that is larger than the batch size goes in a batch of its own.
+One record that is larger than the batch size goes in a batch of its own,
+with its marker. A record that is over the receive limit by itself (only a
+record from an old store can be) is **not sent**: no receiver accepts a
+batch that holds it. It is left out of the round and out of the round's
+`set`, and the sender logs its hash at WARN. A batch that held it with no
+marker would look like a whole set, so that is never done.
+
+A daemon publishes a set as one step: it reads the set, encodes it and
+sends every batch while it holds one lock for the process. The heartbeat,
+a new revocation and a share-grant revocation use the same lock, so parts
+of two rounds are not sent mixed together.
 
 ## The round-marker record
 
@@ -77,6 +87,39 @@ A03). It opens a carrier only from a sender that is a trusted authority:
   carrier closed until the sender's next full publish (at most 2 hours).
   The daemon logs this state at WARN after each part.
 - A marker from a sender that is not a trusted authority is ignored.
+- A newer batch from a sender, marked or not, replaces what that sender
+  offered before. An older whole set never opens the carrier after it.
+
+Bounds on what a waiting daemon holds for one sender and carrier:
+
+| Bound | Value |
+|---|---|
+| Open rounds | 1 |
+| Batches in a round (`n`) | at most 4096 |
+| Records in an open round | at most 262,144 (about 30 MB of hashes and order keys); over that the round is dropped |
+| Time with no new part | 10 minutes; a part that arrives later starts the round again |
+
+The records of a part are not verified when the part is recorded; they are
+verified when they are ingested. Only a trusted authority can fill this
+state.
+
+## A legacy record with a long reason
+
+A new record's `reason` is at most 1024 bytes. A store from a released
+daemon can hold a record with a longer reason. That record stays in force
+on the daemon that holds it, and it is sent to peers.
+
+- A daemon that waits for a resync admits it from a trusted authority.
+- **A daemon that is not waiting refuses it from gossip.** A new or freshly
+  installed daemon therefore does not learn that a subject is revoked when
+  the ONLY record for it has a long reason.
+
+This is accepted: without a limit, one signature could put megabytes in
+every daemon's store for good, and no released code path makes a long
+reason by itself (the text comes from an operator). What an operator does:
+revoke the subject again with a short reason. The set prefers a record
+with a reason inside the limit for the same subject and issuer, so the new
+record takes the place of the long one and reaches every peer.
 
 ## Released daemons
 
