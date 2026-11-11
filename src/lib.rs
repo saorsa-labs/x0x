@@ -18009,6 +18009,19 @@ impl Agent {
                 "no certificate known for the agent — owner revocation requires it".to_string(),
             )
         })?;
+        // The same check as `DELETE /owner/agents/:id`: refuse early, with a
+        // clear cause, a certificate that this owner did not issue for
+        // this agent.
+        let issued_here = cert.verify().is_ok()
+            && cert.agent_id().is_ok_and(|certified| certified == *agent)
+            && self
+                .user_id()
+                .is_some_and(|owner| cert.user_id().is_ok_and(|issuer| issuer == owner));
+        if !issued_here {
+            return Err(error::IdentityError::Revocation(
+                "the certificate held for the agent was not issued by this owner".to_string(),
+            ));
+        }
         self.revoke_as_owner(&cert, reason).await
     }
 

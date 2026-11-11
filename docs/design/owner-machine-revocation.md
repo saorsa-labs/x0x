@@ -150,6 +150,15 @@ Questions for the decision:
   revocation.
 - **An agent with no placement record** gets no tombstone; the answer
   names it.
+- **Rider tokens.** The action revokes the rider tokens of an agent pinned
+  to the lost machine only. A rider token is checked by the daemon that
+  issued it, against agent revocations and not against binding tombstones.
+  A token of a roaming agent that was on the lost device keeps working on
+  that daemon until it expires (at most 90 days). Revoke it there with
+  `x0x owner riders revoke`.
+- **Other owners' agents.** The placement cache also holds agents of other
+  owners. The action covers only agents that this owner certified, with a
+  placement record that this owner signed.
 
 ## 6. Tests each option would need (RED first)
 

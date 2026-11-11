@@ -72,6 +72,9 @@ pub(in crate::server) struct AgentVerifyRequest {
 /// daemon's own machine (#1108).
 const OWN_MACHINE_REVOKED_WARNING: &str = "This machine is now revoked for good. Other peers refuse it and every agent on it. x0xd does not stop itself: it keeps running and peers refuse it. To use this computer on the network again, stop x0xd, delete machine.key and start x0xd to get a new machine identity.";
 
+/// Serializes own-machine revocations in this process (#1108).
+static OWN_MACHINE_REVOKE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// POST /announce request body.
 #[derive(Debug, Default, Deserialize)]
 pub(in crate::server) struct AnnounceIdentityRequest {
@@ -1693,24 +1696,38 @@ pub(in crate::server) async fn identity_revoke(
         );
     }
     // A repeat must not sign another record: the set has no size limit.
-    if own_machine
-        && state
+    // The lock makes the check and the signing one step, so two calls at
+    // once sign one record.
+    let _own_machine_guard = if own_machine {
+        Some(OWN_MACHINE_REVOKE_LOCK.lock().await)
+    } else {
+        None
+    };
+    if own_machine {
+        let own = RevokedSubject::Machine(state.agent.machine_id());
+        let held = state
             .agent
-            .revocation_set()
-            .read()
+            .all_revocation_records()
             .await
-            .is_machine_revoked(&state.agent.machine_id())
-    {
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "ok": true,
-                "subject": hex::encode(state.agent.machine_id().as_bytes()),
-                "subject_kind": "machine",
-                "already_revoked": true,
-                "warning": OWN_MACHINE_REVOKED_WARNING,
-            })),
-        );
+            .into_iter()
+            .filter(|record| record.subject == own)
+            .min_by_key(|record| (record.revoked_at, record.record_hash()));
+        if let Some(record) = held {
+            // The same fields as the first answer, and the flag.
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "subject": record.subject_hex(),
+                    "subject_kind": record.subject_kind(),
+                    "issuer": hex::encode(record.issuer_public_key_hash()),
+                    "revoked_at": record.revoked_at,
+                    "reason": record.reason,
+                    "already_revoked": true,
+                    "warning": OWN_MACHINE_REVOKED_WARNING,
+                })),
+            );
+        }
     }
     let outcome = if own_machine {
         state.agent.revoke_own_machine(body.reason).await

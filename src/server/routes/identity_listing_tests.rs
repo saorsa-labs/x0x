@@ -260,7 +260,13 @@ async fn own_machine_revoke_signs_with_the_machine_key() {
     let (status, body) = revoke_machine(&state, true, &machine).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["already_revoked"], true);
+    // The repeat answer has the fields of the first answer.
+    assert_eq!(body["subject_kind"], "machine");
+    assert_eq!(body["revoked_at"], records[0].revoked_at);
+    assert_eq!(body["reason"], "retired");
+    assert!(body["issuer"].is_string() && body["warning"].is_string());
     assert_eq!(state.agent.all_revocation_records().await.len(), 1);
+    state.agent.shutdown().await;
 }
 
 /// WHY: a machine revocation cannot be undone, so a session token must
@@ -281,4 +287,6 @@ async fn machine_revoke_refuses_a_session_token_and_another_machine() {
     let set = set.read().await;
     assert!(!set.is_machine_revoked(&state.agent.machine_id()));
     assert!(!set.is_machine_revoked(&other));
+    drop(set);
+    state.agent.shutdown().await;
 }

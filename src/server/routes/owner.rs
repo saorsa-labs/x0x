@@ -773,7 +773,70 @@ pub(in crate::server) struct LoseDeviceRequest {
 const LOSE_DEVICE_OWNER_KEY_WARNING: &str = "This action does not protect your owner key (user.key). If the lost machine held it, whoever has the machine can act as you: certify new agents, sign grants and enroll devices. x0x cannot replace an owner key today. Treat the owner identity as compromised, create a new one and tell your contacts.";
 
 /// The `note` field of a lose-device answer.
-const LOSE_DEVICE_NOTE: &str = "Each listed agent can no longer act from this machine. An agent pinned to this machine is revoked. A roaming agent keeps its identity: if its key was on this machine, revoke it with DELETE /owner/agents/:id. The machine key is not revoked. An agent that you certify later is not covered: run this action again after you certify it. An agent in agents_without_placement has no placement record on this daemon and is not covered: if it ran on this machine, revoke it with DELETE /owner/agents/:id.";
+const LOSE_DEVICE_NOTE: &str = "Each listed agent can no longer act from this machine. An agent pinned to this machine is revoked, with its rider tokens. A roaming agent keeps its identity and its rider tokens: if its key was on this machine, revoke it with DELETE /owner/agents/:id. A rider token that was on this machine still works on the daemon that issued it: revoke it there with DELETE /owner/riders/:id (x0x owner riders revoke). The machine key is not revoked. An agent that you certify later is not covered: run this action again after you certify it. An agent in agents_without_placement has no placement record on this daemon and is not covered: if it ran on this machine, revoke it with DELETE /owner/agents/:id.";
+
+/// Serializes lose-device calls in this process, so that the repeat check
+/// and the signing are one step and two calls at once sign one record.
+static LOSE_DEVICE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// One row of this owner's placement ledger: agent, placement epoch and
+/// the machine the agent is pinned to.
+type LedgerRow = (
+    crate::identity::AgentId,
+    u64,
+    Option<crate::identity::MachineId>,
+);
+
+/// This owner's agents on the placement ledger, in agent-id order, and the
+/// certified agents that have no placement record here.
+///
+/// The placement cache also holds the agents of OTHER owners (activation
+/// bundles from gossip). A row is this owner's only when the owner
+/// certified the agent (it is on the roster) and the placement record
+/// names this owner's key. This owner has no authority over any other row.
+async fn owner_ledger(state: &Arc<AppState>) -> (Vec<LedgerRow>, Vec<String>) {
+    let Some(owner) = state.agent.identity().user_keypair() else {
+        return (Vec::new(), Vec::new());
+    };
+    let owner_key = owner.public_key().as_bytes();
+    let roster: std::collections::BTreeSet<String> = state
+        .agent
+        .owner_issued_certificates()
+        .await
+        .into_iter()
+        .map(|cert| cert.agent_id)
+        .collect();
+    let mut rows: Vec<LedgerRow> = {
+        let move_state = state.agent.move_state();
+        let view = move_state.read().await;
+        view.placement_view()
+            .values()
+            .filter(|record| {
+                record.owner_public_key == owner_key
+                    && roster.contains(&hex::encode(record.agent_id.as_bytes()))
+            })
+            .map(|record| {
+                (
+                    record.agent_id,
+                    record.placement_epoch,
+                    record.placement.pinned_machine(),
+                )
+            })
+            .collect()
+    };
+    rows.sort_by_key(|(agent, _, _)| agent.0);
+    // A binding tombstone needs a placement epoch, so the action cannot
+    // cover an agent with no row; the answer names it for the operator.
+    let without_placement = roster
+        .into_iter()
+        .filter(|agent_hex| {
+            !rows
+                .iter()
+                .any(|(agent, _, _)| hex::encode(agent.as_bytes()) == *agent_hex)
+        })
+        .collect();
+    (rows, without_placement)
+}
 
 /// The answer text for one lose-device revocation step. A step that failed
 /// or is not durable clears `complete`.
@@ -799,8 +862,10 @@ fn revocation_outcome(
 ///
 /// It uses only record kinds that released daemons enforce:
 ///
-/// 1. for each agent on this owner's placement ledger, an owner-signed
-///    binding tombstone `(agent, machine)` at the agent's placement epoch;
+/// 1. for each agent that this owner certified and that has a placement
+///    record signed by this owner, an owner-signed binding tombstone
+///    `(agent, machine)` at the agent's placement epoch. The placement
+///    cache also holds other owners' agents; those are not touched;
 /// 2. for each agent pinned to the machine, an owner-signed agent
 ///    revocation, and a sweep of that agent's rider tokens;
 /// 3. removal of the machine from the owner device set.
@@ -809,7 +874,8 @@ fn revocation_outcome(
 /// whose machine was never confirmed) gets no tombstone; the answer lists
 /// it in `agents_without_placement`.
 ///
-/// A repeat call makes no new record. The machine key is not revoked: no
+/// A repeat call makes no new record; calls run one at a time in this
+/// process. The machine key is not revoked: no
 /// evidence that other peers can check ties a machine to its owner (see
 /// `docs/design/owner-machine-revocation.md`).
 ///
@@ -848,53 +914,8 @@ pub(in crate::server) async fn owner_device_lose(
         );
     }
     let request = body.map(|Json(request)| request).unwrap_or_default();
-
-    // Bring the placement ledger up to date. A refused mint must not stop
-    // a lost-device action: go on with the ledger as it is, and report it.
-    let placement_mint_error = match state.agent.move_mint_placements().await {
-        Ok(_) => None,
-        Err(e) => {
-            tracing::warn!("lose-device: placement mint refused, using the held ledger: {e}");
-            Some(e.to_string())
-        }
-    };
-    // (agent, placement epoch, pinned machine), in a stable order.
-    let mut agents: Vec<(
-        crate::identity::AgentId,
-        u64,
-        Option<crate::identity::MachineId>,
-    )> = {
-        let move_state = state.agent.move_state();
-        let view = move_state.read().await;
-        view.placement_view()
-            .values()
-            .map(|record| {
-                (
-                    record.agent_id,
-                    record.placement_epoch,
-                    record.placement.pinned_machine(),
-                )
-            })
-            .collect()
-    };
-    agents.sort_by_key(|(agent, _, _)| agent.0);
-    // Certified agents that have no placement record here. A binding
-    // tombstone needs a placement epoch, so this action cannot cover
-    // them; the answer names them for the operator.
-    let mut agents_without_placement: Vec<String> = state
-        .agent
-        .owner_issued_certificates()
-        .await
-        .into_iter()
-        .map(|cert| cert.agent_id)
-        .filter(|agent_hex| {
-            !agents
-                .iter()
-                .any(|(agent, _, _)| hex::encode(agent.as_bytes()) == *agent_hex)
-        })
-        .collect();
-    agents_without_placement.sort();
-    agents_without_placement.dedup();
+    // One call at a time: the repeat check and the signing are one step.
+    let _one_call = LOSE_DEVICE_LOCK.lock().await;
 
     let enrolled = match state.owner_sync.as_ref() {
         Some(sync) => sync
@@ -905,6 +926,32 @@ pub(in crate::server) async fn owner_device_lose(
             .any(|enrollment| enrollment.machine_id == machine.0),
         None => false,
     };
+    // The 404 gate reads the ledger as it is, before the mint below writes.
+    let known = enrolled || {
+        let (held, _) = owner_ledger(&state).await;
+        let set = state.agent.revocation_set();
+        let set = set.read().await;
+        held.iter().any(|(agent, _, pinned)| {
+            *pinned == Some(machine) || set.is_binding_revoked(agent, &machine)
+        })
+    };
+    if !known && !request.force {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "this owner has no record of that machine (not enrolled, no agent pinned to it, no earlier tombstone); send {\"force\": true} to act anyway",
+        );
+    }
+
+    // Bring the placement ledger up to date. A refused mint must not stop
+    // a lost-device action: go on with the ledger as it is, and report it.
+    let placement_mint_error = match state.agent.move_mint_placements().await {
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!("lose-device: placement mint refused, using the held ledger: {e}");
+            Some(e.to_string())
+        }
+    };
+    let (agents, agents_without_placement) = owner_ledger(&state).await;
     // What the set held before this call: (binding tombstone, agent revoked).
     let before: Vec<(bool, bool)> = {
         let set = state.agent.revocation_set();
@@ -919,15 +966,6 @@ pub(in crate::server) async fn owner_device_lose(
             })
             .collect()
     };
-    let known = enrolled
-        || agents.iter().any(|(_, _, pinned)| *pinned == Some(machine))
-        || before.iter().any(|(binding, _)| *binding);
-    if !known && !request.force {
-        return api_error(
-            StatusCode::NOT_FOUND,
-            "this owner has no record of that machine (not enrolled, no agent pinned to it); send {\"force\": true} to act anyway",
-        );
-    }
 
     let mut complete = true;
     let mut rows = Vec::with_capacity(agents.len());
@@ -946,6 +984,7 @@ pub(in crate::server) async fn owner_device_lose(
         };
         let pinned_here = *pinned == Some(machine);
         let mut rider_tokens_revoked = 0usize;
+        let mut rider_token_sweep_error: Option<String> = None;
         let agent_state = if !pinned_here {
             "kept".to_string()
         } else {
@@ -970,7 +1009,7 @@ pub(in crate::server) async fn owner_device_lose(
                 Ok(count) => rider_tokens_revoked = count,
                 Err(e) => {
                     complete = false;
-                    tracing::warn!("lose-device: rider-token sweep did not persist: {e}");
+                    rider_token_sweep_error = Some(e.to_string());
                 }
             }
             outcome
@@ -982,6 +1021,7 @@ pub(in crate::server) async fn owner_device_lose(
             "binding": binding,
             "agent": agent_state,
             "rider_tokens_revoked": rider_tokens_revoked,
+            "rider_token_sweep_error": rider_token_sweep_error,
         }));
     }
 
@@ -1769,6 +1809,7 @@ mod lose_device_tests {
             .enrolled_devices()
             .await;
         assert!(devices.iter().all(|device| device.machine_id != LOST.0));
+        state.agent.shutdown().await;
     }
 
     /// WHY: an operator in a hurry runs the action twice. A repeat must
@@ -1795,6 +1836,7 @@ mod lose_device_tests {
         }
         assert_eq!(row(&body, &pinned.agent_id())["agent"], "already_revoked");
         assert_eq!(state.agent.all_revocation_records().await.len(), held);
+        state.agent.shutdown().await;
     }
 
     /// WHY: the action covers the agents that exist when it runs. The
@@ -1827,6 +1869,7 @@ mod lose_device_tests {
         assert!(peer_view(&state)
             .await
             .is_binding_revoked(&later.agent_id(), &LOST));
+        state.agent.shutdown().await;
     }
 
     /// WHY: this is an owner-key signing act, so a 10-minute session token
@@ -1861,5 +1904,95 @@ mod lose_device_tests {
         assert_eq!(status, StatusCode::OK, "force: {body}");
         assert_eq!(body["device_enrollment"], "not_enrolled");
         assert_eq!(body["owner_key_on_device"], "unknown", "never enrolled");
+        state.agent.shutdown().await;
+    }
+
+    /// WHY: the placement cache also holds the agents of other owners
+    /// (activation bundles arrive by gossip). This owner has no authority
+    /// over them. If the action tried to stop them, every call would fail
+    /// and answer 500 for ever, on an emergency route.
+    #[tokio::test]
+    async fn another_owners_agent_in_the_placement_cache_is_not_touched() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = owned_state(dir.path()).await;
+        enroll(&state, LOST).await;
+
+        // Another owner's agent, pinned to the lost machine, in the cache.
+        let other_owner = UserKeypair::generate().unwrap();
+        let foreign = AgentKeypair::generate().unwrap();
+        let foreign_cert = AgentCertificate::issue(&other_owner, &foreign).unwrap();
+        let record = PlacementRecord::sign(
+            foreign.agent_id(),
+            other_owner.public_key().as_bytes(),
+            Placement::Pinned(LOST),
+            0,
+            1_800_000_000,
+            other_owner.secret_key(),
+        )
+        .unwrap();
+        {
+            let move_state = state.agent.move_state();
+            let mut move_state = move_state.write().await;
+            assert!(move_state
+                .cache_placement(
+                    record,
+                    PlacementAuthority::cert_issuer(&foreign_cert).unwrap()
+                )
+                .unwrap());
+            assert!(move_state.placement(&foreign.agent_id()).is_some());
+        }
+
+        let (status, body) = lose(&state, true, &hex::encode(LOST.0), false).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["ok"], true);
+        let foreign_hex = hex::encode(foreign.agent_id().as_bytes());
+        assert!(
+            body["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["agent_id"] != foreign_hex),
+            "{body}"
+        );
+        assert_eq!(body["agents_without_placement"], serde_json::json!([]));
+        let peer = peer_view(&state).await;
+        assert!(!peer.is_binding_revoked(&foreign.agent_id(), &LOST));
+        assert!(!peer.is_agent_revoked(&foreign.agent_id()));
+        assert!(peer.is_binding_revoked(&state.agent.agent_id(), &LOST));
+        state.agent.shutdown().await;
+    }
+
+    /// WHY: when a record is in force but could not be written to disk,
+    /// the operator must see which step to repeat. The answer is 500 with
+    /// the same body, and the other steps still run.
+    #[tokio::test]
+    async fn a_record_that_is_not_durable_gives_500_and_names_the_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = owned_state(dir.path()).await;
+        enroll(&state, LOST).await;
+        // The binding store cannot be read, so the daemon cannot write it.
+        tokio::fs::write(dir.path().join("revocations-v2.bin"), b"unreadable")
+            .await
+            .unwrap();
+
+        let (status, body) = lose(&state, true, &hex::encode(LOST.0), false).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(body["ok"], false);
+        let local_row = row(&body, &state.agent.agent_id());
+        assert!(
+            local_row["binding"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("revoked, not durable")),
+            "{body}"
+        );
+        // The record is in force in memory, and the next step still ran.
+        assert!(state
+            .agent
+            .revocation_set()
+            .read()
+            .await
+            .is_binding_revoked(&state.agent.agent_id(), &LOST));
+        assert_eq!(body["device_enrollment"], "removed");
+        state.agent.shutdown().await;
     }
 }

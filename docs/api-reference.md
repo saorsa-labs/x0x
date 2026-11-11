@@ -244,7 +244,7 @@ The Home Suite campaign (ADRs 0036–0043, plus the 0044–0058 backfills) added
   `GET /diagnostics/ws`.
 
 Open issues for this release are listed in the README's *Known limitations*
-table (#446–#451). This reference documents **219 endpoints — exactly the set
+table (#446–#451). This reference documents **221 endpoints — exactly the set
 `x0x routes` prints** (two further served paths sit outside the registry:
 `/.well-known/agent-card.json` and the `/gui/` alias). The registry in
 `src/api/mod.rs` is the authoritative list. `x0x routes` prints the copy of
@@ -530,7 +530,7 @@ daemon holds:
   The answer has a `warning` field. The revocation cannot be undone: peers
   refuse this machine and every agent on it for good. `x0xd` does not stop
   itself; it keeps running and peers refuse it. A repeat call signs no new
-  record and answers `"already_revoked": true`. To use the computer again,
+  record; it answers the same fields and `"already_revoked": true`. To use the computer again,
   stop `x0xd`, delete `machine.key` and start `x0xd`.
 
 Any other agent or machine id returns `403`: the daemon has no authority
@@ -560,9 +560,9 @@ token and the loaded owner key. Body (all optional): `{"reason": "<text>",
 The daemon does three things, with records that every released daemon
 enforces:
 
-1. For each agent on the owner's placement ledger, it signs a binding
-   revocation `(agent, machine)`. That agent can no longer act from the lost
-   machine.
+1. For each agent that this owner certified and that has a placement record
+   here, it signs a binding revocation `(agent, machine)`. That agent can no
+   longer act from the lost machine. Agents of other owners are not touched.
 2. For each agent **pinned** to the lost machine, it also revokes the agent
    and its rider tokens. The key of a pinned agent was on that machine.
 3. It removes the machine from the owner device set.
@@ -575,7 +575,8 @@ Response:
   "machine_id": "<64-hex>",
   "agents": [
     {"agent_id": "<64-hex>", "placement": "roaming", "pinned_to_this_machine": false,
-     "binding": "revoked", "agent": "kept", "rider_tokens_revoked": 0}
+     "binding": "revoked", "agent": "kept", "rider_tokens_revoked": 0,
+     "rider_token_sweep_error": null}
   ],
   "agents_without_placement": [],
   "placement_mint_error": null,
@@ -604,6 +605,12 @@ Response:
   create a new one and tell your contacts. `owner_key_on_device` is `likely`
   when the machine was in the owner device set, and `unknown` in all other
   cases: the daemon holds no record of which machines hold the key.
+- **Rider tokens.** The action revokes the rider tokens of an agent pinned
+  to the lost machine. A roaming agent keeps its tokens. A rider token that
+  was on the lost machine still works on the daemon that issued it until it
+  expires: revoke it there with `DELETE /owner/riders/:id`
+  (`x0x owner riders revoke`). `rider_token_sweep_error` is `null`, or the
+  cause when the sweep for that agent did not persist.
 - **A roaming agent keeps its identity.** If its key was on the lost
   machine, also revoke that agent with `DELETE /owner/agents/:id`.
 - **The machine key is not revoked.** No evidence that other peers can check
@@ -620,8 +627,11 @@ Response:
 
 Errors: `403` without the durable token; `409` with no owner key, or when
 the machine is the one this daemon runs on (use `POST /identity/revoke`);
-`400` for a bad id; `404` when the owner has no record of the machine (not
-enrolled, no agent pinned to it) and `force` is not `true`.
+`400` for a bad id; `404` when the owner has no record of the machine and
+`force` is not `true`. The owner has a record of a machine that is
+enrolled, that one of its agents is pinned to, or that already has a
+binding tombstone for one of its agents (so a repeat call is not `404`).
+The `404` check runs before the daemon writes anything.
 
 ### Announce request body
 
