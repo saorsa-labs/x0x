@@ -538,6 +538,25 @@ fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// A subject that a key can revoke for itself (#1863).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SeenSubject {
+    /// An agent id.
+    Agent(AgentId),
+    /// A machine id.
+    Machine(MachineId),
+}
+
+impl SeenSubject {
+    pub(crate) fn of(subject: &RevokedSubject) -> Option<Self> {
+        match subject {
+            RevokedSubject::Agent(agent) => Some(Self::Agent(*agent)),
+            RevokedSubject::Machine(machine) => Some(Self::Machine(*machine)),
+            RevokedSubject::AgentMachineBinding(_) | RevokedSubject::ShareGrant(_) => None,
+        }
+    }
+}
+
 /// One trusted sender's carrier snapshot while a carrier waits for a
 /// resync (#1116).
 #[derive(Debug, Clone, Default)]
@@ -659,6 +678,15 @@ pub struct RevocationSet {
     /// Bundle-retired tombstones indexed by agent (#1659). Kept in step
     /// with `bundle_retired_epochs` keys.
     bundle_machines_by_agent: HashMap<AgentId, HashSet<MachineId>>,
+    /// Subjects of held self-revocations that this node has seen (#1863):
+    /// a contact, a group member, a discovered agent or machine, an agent
+    /// of this owner, or this node itself. A self-revocation of any other
+    /// subject (a stranger) stays in force here but is not published
+    /// again. Only subjects with a held self-revocation are kept. Not
+    /// serialized: after a restart the daemon marks again only the
+    /// subjects that its contacts, discovery cache, owner journal or
+    /// group rosters still show as seen.
+    seen_subjects: HashSet<SeenSubject>,
     /// ADR-0070 revoked share grants, keyed by `(grant_id, owner)`, valued
     /// by the latest signed `grant_expiry`. Collected once the grant itself is dead
     /// (`grant_expiry + SHARE_GRANT_REVOCATION_GC_SLACK_SECS`).
@@ -1331,9 +1359,38 @@ impl RevocationSet {
             .filter(|(_, persisted)| subject_carrier(&persisted.record.subject) == Some(carrier))
             .all(|(hash, persisted)| {
                 let key = persisted.record.pair_key().unwrap_or(*hash);
-                kept.get(&key)
-                    .is_some_and(|rank| rank.3 == *hash || *rank <= persisted.record.rank())
+                match kept.get(&key) {
+                    Some(rank) => rank.3 == *hash || *rank <= persisted.record.rank(),
+                    // #1863: a sender does not publish the self-revocation
+                    // of a subject it has not seen. Such an omission is
+                    // not a sign that the sender is behind.
+                    None => persisted.record.is_self_revocation(),
+                }
             })
+    }
+
+    /// Whether the held records of `carrier` agree with a snapshot whose
+    /// kept records are `kept` (#1116, #1863): every kept record is held,
+    /// and every other held record is a self-revocation that has no
+    /// record of its pair in the snapshot. Opening never removes a held
+    /// record, so an ignored self-revocation stays in force.
+    fn snapshot_matches_held(&self, carrier: u8, kept: &HashMap<[u8; 32], RecordRank>) -> bool {
+        let offered = kept_hashes(kept);
+        let held_of_carrier = |hash: &[u8; 32]| {
+            self.records_by_hash
+                .get(hash)
+                .is_some_and(|p| subject_carrier(&p.record.subject) == Some(carrier))
+        };
+        offered.iter().all(held_of_carrier)
+            && self
+                .records_by_hash
+                .iter()
+                .filter(|(_, p)| subject_carrier(&p.record.subject) == Some(carrier))
+                .all(|(hash, p)| {
+                    offered.contains(hash)
+                        || (p.record.is_self_revocation()
+                            && !kept.contains_key(&p.record.pair_key().unwrap_or(*hash)))
+                })
     }
 
     /// Remember one remote sender's whole-set snapshot (#1116): one batch
@@ -1410,13 +1467,14 @@ impl RevocationSet {
         marker: RoundMarker,
         trusted_authority: bool,
     ) {
-        if !trusted_authority || self.resync_carriers & carrier == 0 || records.is_empty() {
+        if !trusted_authority || self.resync_carriers & carrier == 0 {
             return;
         }
         let Some(index) = carrier_index(carrier) else {
             return;
         };
-        if marker.batches == 0
+        if records.is_empty()
+            || marker.batches == 0
             || marker.batches > MAX_ROUND_BATCHES
             || marker.index >= marker.batches
             || records.iter().any(|record| {
@@ -1633,7 +1691,7 @@ impl RevocationSet {
             candidate
                 .whole
                 .as_ref()
-                .is_some_and(|kept| kept_hashes(kept) == known)
+                .is_some_and(|kept| self.snapshot_matches_held(carrier, kept))
         });
         if !agreed {
             return;
@@ -2199,6 +2257,76 @@ impl RevocationSet {
             .filter(|p| is_v1_subject(&p.record.subject))
             .map(|p| p.record.clone())
             .collect()
+    }
+
+    /// Whether `record` is a self-revocation of a subject this node has
+    /// not seen (#1863).
+    fn is_stranger_self_revocation(&self, record: &RevocationRecord) -> bool {
+        SeenSubject::of(&record.subject)
+            .is_some_and(|subject| !self.seen_subjects.contains(&subject))
+            && record.is_self_revocation()
+    }
+
+    /// The records this node publishes on the v1 carrier (#1863): every
+    /// record of [`Self::all_records`] except the self-revocation of a
+    /// stranger. Such a record stays in force here and in
+    /// `revocations.bin`; pubsub spread it once when it arrived. Its
+    /// subject joins this set when the daemon has seen the subject.
+    #[must_use]
+    pub fn published_records(&self) -> Vec<RevocationRecord> {
+        self.records_by_hash
+            .values()
+            .filter(|p| {
+                is_v1_subject(&p.record.subject) && !self.is_stranger_self_revocation(&p.record)
+            })
+            .map(|p| p.record.clone())
+            .collect()
+    }
+
+    /// How many held self-revocations of strangers this node keeps out of
+    /// its published set (#1863).
+    #[must_use]
+    pub fn stranger_self_revocation_count(&self) -> usize {
+        self.records_by_hash
+            .values()
+            .filter(|p| self.is_stranger_self_revocation(&p.record))
+            .count()
+    }
+
+    /// The subjects of held self-revocations of strangers (#1863), each
+    /// one once. The daemon checks them against what it has seen.
+    #[must_use]
+    pub(crate) fn stranger_self_revocation_subjects(&self) -> Vec<SeenSubject> {
+        let subjects: HashSet<SeenSubject> = self
+            .records_by_hash
+            .values()
+            .filter(|p| self.is_stranger_self_revocation(&p.record))
+            .filter_map(|p| SeenSubject::of(&p.record.subject))
+            .collect();
+        subjects.into_iter().collect()
+    }
+
+    /// Mark subjects as seen (#1863). A held self-revocation of a marked
+    /// subject is published from now on. Only a subject with a held
+    /// self-revocation is kept, so the marks never outgrow the records.
+    /// Returns `true` when the published set changed.
+    pub(crate) fn mark_seen(&mut self, subjects: impl IntoIterator<Item = SeenSubject>) -> bool {
+        let strangers: HashSet<SeenSubject> = self
+            .stranger_self_revocation_subjects()
+            .into_iter()
+            .collect();
+        let mut changed = false;
+        for subject in subjects {
+            if strangers.contains(&subject) {
+                changed |= self.seen_subjects.insert(subject);
+            }
+        }
+        if changed {
+            // The published set changed: the heartbeat publishes on a new
+            // generation, also when a mark lands between two heartbeats.
+            self.change_generation = self.change_generation.saturating_add(1);
+        }
+        changed
     }
 
     /// All held records of every subject kind (order unspecified), for
@@ -6347,6 +6475,270 @@ mod tests {
                 }
                 assert!(pending(&waiter), "{marker:?}");
             }
+        }
+    }
+
+    /// #1863: a self-revocation of a subject this node has not seen (a
+    /// stranger) stays in force, but it is not published again.
+    mod stranger_1863 {
+        use super::super::*;
+        use crate::identity::{AgentKeypair, MachineKeypair, UserKeypair};
+
+        const SENDER: AgentId = AgentId([0xA1; 32]);
+
+        fn self_revocation(kp: &AgentKeypair) -> RevocationRecord {
+            RevocationRecord::sign(
+                RevokedSubject::Agent(kp.agent_id()),
+                kp.public_key(),
+                kp.secret_key(),
+                1_000,
+                None,
+            )
+            .expect("sign")
+        }
+
+        fn machine_self_revocation(kp: &MachineKeypair) -> RevocationRecord {
+            RevocationRecord::sign(
+                RevokedSubject::Machine(kp.machine_id()),
+                kp.public_key(),
+                kp.secret_key(),
+                1_000,
+                None,
+            )
+            .expect("sign")
+        }
+
+        fn published_hashes(set: &RevocationSet) -> HashSet<[u8; 32]> {
+            set.published_records()
+                .iter()
+                .map(RevocationRecord::record_hash)
+                .collect()
+        }
+
+        fn waiting() -> RevocationSet {
+            RevocationSet::quarantined_carrier(REVOCATION_CARRIER_V1)
+        }
+
+        fn pending(waiter: &RevocationSet) -> bool {
+            waiter.carrier_resync_pending(REVOCATION_CARRIER_V1)
+        }
+
+        /// What a waiting node does with one trusted whole-set batch.
+        fn receive_whole(waiter: &mut RevocationSet, records: &[RevocationRecord]) {
+            waiter.observe_remote_carrier_batch(
+                REVOCATION_CARRIER_V1,
+                &SENDER,
+                records,
+                BatchRound::Whole,
+                true,
+            );
+            for record in records {
+                let _ = waiter.verify_and_insert_at(record.clone(), None, 2_000);
+            }
+        }
+
+        /// WHY: a stranger's self-revocation costs the attacker one new key
+        /// and one signature, and every node would send it again for good.
+        /// It stays in force here; it is not published again.
+        #[test]
+        fn a_stranger_self_revocation_is_held_but_not_published() {
+            let agent = AgentKeypair::generate().expect("agent");
+            let machine = MachineKeypair::generate().expect("machine");
+            let mut set = RevocationSet::new();
+            let agent_record = self_revocation(&agent);
+            let machine_record = machine_self_revocation(&machine);
+            assert!(set
+                .verify_and_insert(agent_record.clone(), None)
+                .expect("insert"));
+            assert!(set
+                .verify_and_insert(machine_record.clone(), None)
+                .expect("insert"));
+            assert!(set.is_agent_revoked(&agent.agent_id()));
+            assert!(set.is_machine_revoked(&machine.machine_id()));
+            assert_eq!(set.all_records().len(), 2, "the store keeps both");
+            assert!(published_hashes(&set).is_empty());
+            assert_eq!(set.stranger_self_revocation_count(), 2);
+            let strangers: HashSet<SeenSubject> = set
+                .stranger_self_revocation_subjects()
+                .into_iter()
+                .collect();
+            assert_eq!(
+                strangers,
+                HashSet::from([
+                    SeenSubject::Agent(agent.agent_id()),
+                    SeenSubject::Machine(machine.machine_id()),
+                ])
+            );
+        }
+
+        /// WHY: the issue's rule. A held stranger record enters the
+        /// published set as soon as its subject is seen.
+        #[test]
+        fn a_stranger_record_is_published_once_its_subject_is_seen() {
+            let agent = AgentKeypair::generate().expect("agent");
+            let record = self_revocation(&agent);
+            let mut set = RevocationSet::new();
+            assert!(set.verify_and_insert(record.clone(), None).expect("insert"));
+            assert!(published_hashes(&set).is_empty());
+            let generation = set.generation();
+            assert!(
+                set.mark_seen([SeenSubject::Agent(agent.agent_id())]),
+                "marking a held stranger changes the published set"
+            );
+            assert!(
+                set.generation() > generation,
+                "a new generation makes the heartbeat publish"
+            );
+            assert_eq!(
+                published_hashes(&set),
+                HashSet::from([record.record_hash()])
+            );
+            assert_eq!(set.stranger_self_revocation_count(), 0);
+            assert!(
+                !set.mark_seen([SeenSubject::Agent(agent.agent_id())]),
+                "a second mark changes nothing"
+            );
+        }
+
+        /// A mark for a subject with no held record is not kept, so the
+        /// marks cannot grow without a held record behind each one.
+        #[test]
+        fn a_mark_without_a_held_record_is_not_kept() {
+            let agent = AgentKeypair::generate().expect("agent");
+            let mut set = RevocationSet::new();
+            assert!(!set.mark_seen([SeenSubject::Agent(agent.agent_id())]));
+            assert!(set.seen_subjects.is_empty());
+        }
+
+        /// WHY: only a self-revocation is cheap. An owner's revocation of
+        /// an agent it certified is always published.
+        #[test]
+        fn an_owner_revocation_is_always_published() {
+            let owner = UserKeypair::generate().expect("owner");
+            let agent = AgentKeypair::generate().expect("agent");
+            let cert = AgentCertificate::issue(&owner, &agent).expect("cert");
+            let record = RevocationRecord::sign(
+                RevokedSubject::Agent(agent.agent_id()),
+                owner.public_key(),
+                owner.secret_key(),
+                1_000,
+                None,
+            )
+            .expect("sign");
+            let mut set = RevocationSet::new();
+            assert!(set
+                .verify_and_insert(record.clone(), Some(&cert))
+                .expect("insert"));
+            assert_eq!(
+                published_hashes(&set),
+                HashSet::from([record.record_hash()])
+            );
+            assert_eq!(set.stranger_self_revocation_count(), 0);
+        }
+
+        /// WHY (resync rule, #1863 decision (1)): a waiting node holds a
+        /// stranger's self-revocation that it got by the one pubsub spread.
+        /// The sender leaves it out of its set. That omission must not keep
+        /// the carrier closed, and the record stays in force.
+        #[test]
+        fn a_held_omitted_self_revocation_does_not_block_opening() {
+            let stranger = AgentKeypair::generate().expect("stranger");
+            let held = self_revocation(&stranger);
+            let offered = self_revocation(&AgentKeypair::generate().expect("agent"));
+            let mut waiter = waiting();
+            assert!(waiter
+                .verify_and_insert(held.clone(), None)
+                .expect("insert"));
+            receive_whole(&mut waiter, std::slice::from_ref(&offered));
+            assert!(!pending(&waiter), "the carrier opens");
+            assert!(waiter.contains_hash(&held.record_hash()));
+            assert!(waiter.is_agent_revoked(&stranger.agent_id()));
+        }
+
+        /// The rule is for self-revocations only. A held owner revocation
+        /// that the snapshot omits still keeps the carrier closed.
+        #[test]
+        fn a_held_omitted_non_self_record_still_blocks() {
+            let owner = UserKeypair::generate().expect("owner");
+            let agent = AgentKeypair::generate().expect("agent");
+            let cert = AgentCertificate::issue(&owner, &agent).expect("cert");
+            let held = RevocationRecord::sign(
+                RevokedSubject::Agent(agent.agent_id()),
+                owner.public_key(),
+                owner.secret_key(),
+                1_000,
+                None,
+            )
+            .expect("sign");
+            let offered = self_revocation(&AgentKeypair::generate().expect("agent"));
+            let mut waiter = waiting();
+            assert!(waiter.verify_and_insert(held, Some(&cert)).expect("insert"));
+            receive_whole(&mut waiter, std::slice::from_ref(&offered));
+            assert!(pending(&waiter));
+        }
+
+        /// A held self-revocation that the snapshot has keeps the exact
+        /// rule: the carrier opens only when that record has verified.
+        #[test]
+        fn an_offered_self_revocation_must_verify_before_opening() {
+            let offered = self_revocation(&AgentKeypair::generate().expect("agent"));
+            let other = self_revocation(&AgentKeypair::generate().expect("agent"));
+            let mut waiter = waiting();
+            assert!(waiter
+                .verify_and_insert(offered.clone(), None)
+                .expect("insert"));
+            waiter.observe_remote_carrier_batch(
+                REVOCATION_CARRIER_V1,
+                &SENDER,
+                &[offered, other.clone()],
+                BatchRound::Whole,
+                true,
+            );
+            assert!(
+                pending(&waiter),
+                "the offered record `other` is not held yet"
+            );
+            assert!(waiter
+                .verify_and_insert_at(other, None, 2_000)
+                .expect("insert"));
+            assert!(!pending(&waiter));
+        }
+
+        /// WHY (#1865 review item): the design note says that an empty
+        /// batch from a trusted sender removes what it offered before. An
+        /// empty round part did not.
+        #[test]
+        fn an_empty_round_part_drops_the_senders_earlier_snapshot() {
+            let old_set = vec![
+                self_revocation(&AgentKeypair::generate().expect("agent")),
+                self_revocation(&AgentKeypair::generate().expect("agent")),
+            ];
+            let mut waiter = waiting();
+            waiter.observe_remote_carrier_batch(
+                REVOCATION_CARRIER_V1,
+                &SENDER,
+                &old_set,
+                BatchRound::Whole,
+                true,
+            );
+            waiter.observe_remote_carrier_batch(
+                REVOCATION_CARRIER_V1,
+                &SENDER,
+                &[],
+                BatchRound::Part(RoundMarker {
+                    batches: 2,
+                    index: 0,
+                    set: [1u8; 32],
+                }),
+                true,
+            );
+            for record in old_set {
+                let _ = waiter.verify_and_insert_at(record, None, 2_000);
+            }
+            assert!(
+                pending(&waiter),
+                "a stale snapshot must not open the carrier"
+            );
         }
     }
 

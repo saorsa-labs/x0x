@@ -134,6 +134,62 @@ The records of a part are not verified when the part is recorded; they are
 verified when they are ingested. Only a trusted authority can fill this
 state.
 
+## Self-revocations of strangers (#1863)
+
+Any key can revoke itself, and each new key is a new (subject, issuer)
+pair. Without a limit, one new key and one signature put about 5.3 KB in
+every daemon's store for good, and every daemon sent it again every 2
+hours. Decision (Claude, under David's delegation of 10 Nov 2026):
+
+- A daemon keeps the self-revocation of a **stranger** in force and in its
+  store, but leaves it out of the set that it publishes. Pubsub spreads the
+  record once when it is first sent. A daemon that was offline then does
+  not learn it from the 2-hour publish.
+- A subject is **seen**, and its self-revocation is published, when it is:
+  this daemon's own agent or machine; a contact that is not blocked; an
+  agent or machine in the discovery cache; an agent in this owner's
+  issued-certificate journal; or a member of a named group in any state.
+- Receiving a revocation removes its subject from the discovery cache and
+  blocks it as a contact. So a daemon checks these places **when the record
+  arrives**, before that removal, and keeps the result in memory. The
+  heartbeat checks the other places every 10 minutes. A record whose
+  subject becomes seen is published at the next heartbeat.
+- A mark changes the set's generation, so the next heartbeat publishes.
+- A self-revocation that this daemon applies itself (an operator revokes
+  this agent or machine) is marked at once and is in the immediate publish.
+- The mark is in memory only. After a restart, a subject that was seen
+  only as a contact or in the discovery cache before its revocation
+  arrived is a stranger again (the revocation blocked the contact and
+  removed the cache entry), and its record is no longer published. An
+  agent of this owner and a group member stay seen.
+- Owner revocations, binding tombstones and share-grant records are always
+  published.
+- No disk bound: removing a record would make its subject valid again.
+  `GET /diagnostics/gossip` shows the number of held stranger records as
+  `identity_authority.revocation_stranger_self_held`.
+
+**The resync rule changes for self-revocations only.** A daemon that waits
+for a resync compares the sender's set with its held records. The sender
+now leaves out strangers, so a waiting daemon that holds a stranger's
+record (from the one pubsub spread) would never open. So a held
+self-revocation for which the sender's set has **no record of the same
+subject and issuer** does not block opening, in both checks (the cover
+check and the equality check). Every other held record keeps the exact
+rules. Opening never removes a held record, so an ignored record stays in
+force. The cost: an omitted self-revocation is no longer a sign that the
+sender is behind.
+
+**Known gap.** A waiting daemon that lost a self-revocation for a subject
+that only it knows does not get the record back from senders to whom the
+subject is a stranger. It opens without that record. Follow-up:
+[#1867](https://github.com/saorsa-labs/x0x/issues/1867).
+
+**Mixed versions.** A released daemon (v0.48.1 and earlier) that waits for
+a resync compares exact record sets. If it holds a stranger's
+self-revocation, it cannot open from a new sender, only from a released
+sender that still publishes the record. It stays closed (fail closed)
+until a released sender publishes, or it is upgraded. This is accepted.
+
 ## A legacy record with a long reason
 
 A new record's `reason` is at most 1024 bytes. A store from a released

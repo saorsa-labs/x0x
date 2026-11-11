@@ -1647,6 +1647,23 @@ pub async fn serve_with_options(
         }));
     }
 
+    // #1863: a self-revocation of a group member (in any state, also a
+    // removed one) is published again; one of a stranger is not. A
+    // locked roster reads as "not seen": the next heartbeat asks again.
+    let roster_state = Arc::downgrade(&state);
+    agent.set_revocation_group_seen(Arc::new(move |agent_id| {
+        let Some(state) = roster_state.upgrade() else {
+            return false;
+        };
+        let Ok(groups) = state.named_groups.try_read() else {
+            return false;
+        };
+        let agent_hex = hex::encode(agent_id.as_bytes());
+        groups
+            .values()
+            .any(|g| g.members_v2.contains_key(&agent_hex))
+    }));
+
     // ADR 0089: relationship sources are installed before load verification.
     let context_state = Arc::downgrade(&state);
     agent

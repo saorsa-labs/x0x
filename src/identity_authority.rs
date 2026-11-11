@@ -218,6 +218,15 @@ pub(crate) fn note_revocation_future_dropped(count: u64) {
     REVOCATION_FUTURE_DROPPED.fetch_add(count, Ordering::Relaxed);
 }
 
+/// Held self-revocations of strangers, which this node keeps out of its
+/// published revocation set (#1863). A gauge: the heartbeat sets it.
+static REVOCATION_STRANGER_SELF_HELD: AtomicU64 = AtomicU64::new(0);
+
+/// Set the `revocation_stranger_self_held` gauge (#1863).
+pub(crate) fn set_revocation_stranger_self_held(count: u64) {
+    REVOCATION_STRANGER_SELF_HELD.store(count, Ordering::Relaxed);
+}
+
 /// The ADR 0115 counters (process-wide), for `GET /diagnostics/gossip`.
 pub(crate) fn counters_json() -> serde_json::Value {
     serde_json::json!({
@@ -225,6 +234,7 @@ pub(crate) fn counters_json() -> serde_json::Value {
         "activation_bundle_owner_unauthenticated":
             BUNDLE_OWNER_UNAUTHENTICATED.load(Ordering::Relaxed),
         "revocation_future_dropped": REVOCATION_FUTURE_DROPPED.load(Ordering::Relaxed),
+        "revocation_stranger_self_held": REVOCATION_STRANGER_SELF_HELD.load(Ordering::Relaxed),
     })
 }
 

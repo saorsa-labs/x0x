@@ -247,6 +247,17 @@ async fn own_machine_revoke_signs_with_the_machine_key() {
     let mut peer = crate::revocation::RevocationSet::new();
     assert!(peer.verify_and_insert(records[0].clone(), None).unwrap());
     assert!(peer.is_machine_revoked(&machine));
+    // #1863: the daemon's own self-revocation is never a stranger's, so
+    // it is in the set that the daemon publishes.
+    let published = state
+        .agent
+        .revocation_set()
+        .read()
+        .await
+        .published_records();
+    assert!(published
+        .iter()
+        .any(|record| record.record_hash() == records[0].record_hash()));
 
     // The daemon does not stop itself: its own announce call gives the
     // same result as before the revocation (peers are the ones that
