@@ -53,7 +53,9 @@ struct Sender {
 
 struct Rig {
     _dir: tempfile::TempDir,
-    sender: Sender,
+    /// `senders[0]` is the sender under test; `senders[1]` is the control:
+    /// owner-trusted the same way and never revoked.
+    senders: [Sender; 2],
     receiver: Arc<crate::Agent>,
     service: Arc<ExecService>,
     tx: mpsc::Sender<DmTypedPayload>,
@@ -73,6 +75,7 @@ async fn build_receiver(dir: &Path) -> Arc<crate::Agent> {
         .with_agent_key_path(dir.join("rx-agent.key"))
         .with_agent_cert_path(dir.join("rx-agent.cert"))
         .with_user_key(owner)
+        .with_identity_dir(dir.join("identity"))
         .with_contact_store_path(dir.join("rx-contacts.json"))
         .with_peer_cache_disabled()
         .with_network_config(crate::network::NetworkConfig {
@@ -129,24 +132,27 @@ fn owner_acl(dir: &Path) -> ExecPolicy {
     })
 }
 
-/// Build the receiver's past: enrol the sender's machine and persist an
-/// evidence record that carries `cert`. Then run the receiver once, stop it
-/// with `try_shutdown`, and start it again on the same files.
-async fn rig(cert_not_after: Option<u64>) -> Rig {
-    let dir = tempfile::tempdir().expect("tmpdir");
-    let owner = UserKeypair::from_seed(&SEED).expect("owner key");
-    let sender = Sender {
+fn new_sender() -> Sender {
+    Sender {
         agent: AgentKeypair::generate().expect("agent key"),
         machine: MachineKeypair::generate().expect("machine key"),
-    };
+    }
+}
+
+/// Build the receiver's past: enrol both senders' machines and persist an
+/// evidence record for each. Sender 0's certificate expires at
+/// `cert_not_after`. With `revoke_first`, sender 0's agent is revoked on the
+/// running receiver and persisted through `persist_identity_revocation_stores`
+/// before it stops. Then the receiver stops with `try_shutdown` and starts
+/// again on the same files.
+async fn rig(cert_not_after: Option<u64>, revoke_first: bool) -> Rig {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    std::fs::create_dir_all(dir.path().join("identity")).expect("identity dir");
+    let owner = UserKeypair::from_seed(&SEED).expect("owner key");
+    let senders = [new_sender(), new_sender()];
     let now_ms = crate::dm_capability::now_unix_ms();
 
-    // Durable evidence: the sender's record, certificate included.
-    let mut record =
-        crate::peer_evidence::record_for_test(&sender.agent, &sender.machine, now_ms, now_ms);
-    let cert =
-        AgentCertificate::issue_with_expiry(&owner, &sender.agent, cert_not_after).expect("cert");
-    record.certificate = Some(cert.to_storage_bytes().expect("cert bytes"));
+    // Durable evidence: each sender's record, certificate included.
     let seed_store = PeerEvidenceStore::open(
         &dir.path().join("evidence"),
         EvidenceConfig::default(),
@@ -154,32 +160,62 @@ async fn rig(cert_not_after: Option<u64>) -> Rig {
         now_ms,
     )
     .expect("seed store");
-    seed_store
-        .ingest(record, IngestSource::Hello, now_ms)
-        .expect("seed record");
+    for (index, sender) in senders.iter().enumerate() {
+        let mut record =
+            crate::peer_evidence::record_for_test(&sender.agent, &sender.machine, now_ms, now_ms);
+        let not_after = if index == 0 { cert_not_after } else { None };
+        let cert =
+            AgentCertificate::issue_with_expiry(&owner, &sender.agent, not_after).expect("cert");
+        record.certificate = Some(cert.to_storage_bytes().expect("cert bytes"));
+        seed_store
+            .ingest(record, IngestSource::Hello, now_ms)
+            .expect("seed record");
+    }
     seed_store.flush(now_ms, true).expect("flush");
     drop(seed_store);
 
-    // Durable owner state: the sender's machine is enrolled.
+    // Durable owner state: both senders' machines are enrolled.
     let devices = crate::owner_sync::OwnerSyncStore::load(&dir.path().join("sync"))
         .await
         .expect("device store");
-    devices
-        .enroll(
-            crate::owner_sync::OwnerEnrollment::sign(
-                sender.machine.machine_id(),
-                &owner,
-                now_ms / 1000 - 1000,
-                None,
+    for sender in &senders {
+        devices
+            .enroll(
+                crate::owner_sync::OwnerEnrollment::sign(
+                    sender.machine.machine_id(),
+                    &owner,
+                    now_ms / 1000 - 1000,
+                    None,
+                )
+                .expect("enrollment"),
             )
-            .expect("enrollment"),
-        )
-        .await
-        .expect("enroll");
+            .await
+            .expect("enroll");
+    }
     drop(devices);
 
     // Before: the receiver runs on these files, then stops completely.
     let before = build_receiver(dir.path()).await;
+    if revoke_first {
+        let revocation = crate::revocation::RevocationRecord::sign(
+            crate::revocation::RevokedSubject::Agent(senders[0].agent.agent_id()),
+            senders[0].agent.public_key(),
+            senders[0].agent.secret_key(),
+            now_secs(),
+            None,
+        )
+        .expect("revocation");
+        before
+            .revocation_set()
+            .write()
+            .await
+            .verify_and_insert(revocation, None)
+            .expect("insert revocation");
+        before
+            .persist_identity_revocation_stores()
+            .await
+            .expect("revocation persists");
+    }
     before.try_shutdown().await.expect("receiver shuts down");
     assert!(
         before
@@ -194,18 +230,20 @@ async fn rig(cert_not_after: Option<u64>) -> Rig {
 
     // THE RESTART: a fresh process-equivalent on the same files.
     let receiver = build_receiver(dir.path()).await;
-    assert!(
-        receiver
-            .discovered_agent_for_testing(&sender.agent.agent_id())
-            .await
-            .is_none(),
-        "the restarted receiver has no discovery entry for the sender"
-    );
+    for sender in &senders {
+        assert!(
+            receiver
+                .discovered_agent_for_testing(&sender.agent.agent_id())
+                .await
+                .is_none(),
+            "the restarted receiver has no discovery entry for a sender"
+        );
+    }
     let (tx, rx) = mpsc::channel(8);
     let service = ExecService::spawn(Arc::clone(&receiver), owner_acl(dir.path()), rx);
     Rig {
         _dir: dir,
-        sender,
+        senders,
         receiver,
         service,
         tx,
@@ -213,7 +251,7 @@ async fn rig(cert_not_after: Option<u64>) -> Rig {
 }
 
 impl Rig {
-    async fn request(&self, id: u8) {
+    async fn request(&self, who: usize, id: u8) {
         let frame = ExecFrame::Request {
             request_id: ExecRequestId([id; 16]),
             argv: vec!["echo".to_string(), "ok".to_string()],
@@ -223,8 +261,8 @@ impl Rig {
         };
         self.tx
             .send(DmTypedPayload {
-                sender: self.sender.agent.agent_id(),
-                machine_id: self.sender.machine.machine_id(),
+                sender: self.senders[who].agent.agent_id(),
+                machine_id: self.senders[who].machine.machine_id(),
                 payload: encode_frame_payload(&frame).expect("encode"),
                 verified: true,
                 trust_decision: Some(TrustDecision::Unknown),
@@ -267,16 +305,41 @@ impl Rig {
     }
 }
 
+/// Wait until `count` sessions have completed, then return the exit codes
+/// recorded in the audit log (`None` for a signal exit).
+async fn completed_exit_codes(rig: &Rig, count: u64) -> Vec<Option<i64>> {
+    let start = Instant::now();
+    while rig
+        .service
+        .diagnostics_snapshot()
+        .await
+        .totals
+        .sessions_completed
+        < count
+    {
+        assert!(start.elapsed() < REFUSAL_BOUND, "the command never exited");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let log = std::fs::read_to_string(rig._dir.path().join("exec-audit.jsonl")).unwrap_or_default();
+    log.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["event"] == "exit")
+        .map(|event| event["code"].as_i64())
+        .collect()
+}
+
 /// An owner-trusted sender the restarted receiver knows only from the
-/// evidence store and the enrollment is admitted to run the listed command.
+/// evidence store and the enrollment is admitted, and the listed command
+/// runs and exits 0.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exec_from_an_owner_trusted_peer_is_admitted_after_a_cold_restart() {
-    let rig = rig(None).await;
-    rig.request(1).await;
+    let rig = rig(None, false).await;
+    rig.request(0, 1).await;
     let (allowed, trust_denied, other_denied, _) = rig.outcome(1).await;
+    let codes = completed_exit_codes(&rig, 1).await;
     let cache_empty = rig
         .receiver
-        .discovered_agent_for_testing(&rig.sender.agent.agent_id())
+        .discovered_agent_for_testing(&rig.senders[0].agent.agent_id())
         .await
         .is_none();
     rig.stop().await;
@@ -285,23 +348,25 @@ async fn exec_from_an_owner_trusted_peer_is_admitted_after_a_cold_restart() {
         (1, 0, 0),
         "the request must be admitted by owner trust from evidence"
     );
+    assert_eq!(codes, vec![Some(0)], "the command must run and exit 0");
     assert!(
         cache_empty,
         "admission wrote nothing to the discovery cache"
     );
 }
 
-/// A first request is admitted; then the sender's agent is revoked. The next
-/// request is refused with `trust_rejected`, fast, not by a timeout.
+/// A first request is admitted; then the sender's agent is revoked in
+/// memory. The next request is refused with `trust_rejected`, fast, not by
+/// a timeout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exec_is_refused_with_trust_rejected_once_the_known_agent_is_revoked() {
-    let rig = rig(None).await;
-    rig.request(1).await;
+    let rig = rig(None, false).await;
+    rig.request(0, 1).await;
     let control = rig.outcome(1).await;
     let revocation = crate::revocation::RevocationRecord::sign(
-        crate::revocation::RevokedSubject::Agent(rig.sender.agent.agent_id()),
-        rig.sender.agent.public_key(),
-        rig.sender.agent.secret_key(),
+        crate::revocation::RevokedSubject::Agent(rig.senders[0].agent.agent_id()),
+        rig.senders[0].agent.public_key(),
+        rig.senders[0].agent.secret_key(),
         now_secs(),
         None,
     )
@@ -312,7 +377,7 @@ async fn exec_is_refused_with_trust_rejected_once_the_known_agent_is_revoked() {
         .await
         .verify_and_insert(revocation, None)
         .expect("insert revocation");
-    rig.request(2).await;
+    rig.request(0, 2).await;
     let after = rig.outcome(2).await;
     rig.stop().await;
     assert_eq!(
@@ -328,20 +393,55 @@ async fn exec_is_refused_with_trust_rejected_once_the_known_agent_is_revoked() {
     assert!(after.3 < REFUSAL_BOUND, "refusal took {:?}", after.3);
 }
 
+/// The revocation is persisted before the receiver stops
+/// (`persist_identity_revocation_stores`) and must survive the restart:
+/// the revoked sender is refused with `trust_rejected`, while a second,
+/// unrevoked owner-trusted sender on the same restarted receiver is
+/// admitted and its command exits 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exec_refuses_an_agent_revoked_before_the_restart() {
+    let rig = rig(None, true).await;
+    rig.request(1, 1).await;
+    let control = rig.outcome(1).await;
+    let codes = completed_exit_codes(&rig, 1).await;
+    rig.request(0, 2).await;
+    let after = rig.outcome(2).await;
+    rig.stop().await;
+    assert_eq!(
+        (control.0, control.1, control.2),
+        (1, 0, 0),
+        "control: the unrevoked sender is admitted on the restarted receiver"
+    );
+    assert_eq!(codes, vec![Some(0)], "the control command must exit 0");
+    assert_eq!(
+        (after.0, after.1, after.2),
+        (1, 1, 0),
+        "the sender revoked before the restart must be refused with trust_rejected"
+    );
+    assert!(after.3 < REFUSAL_BOUND, "refusal took {:?}", after.3);
+}
+
 /// The sender's certificate is current at the restart, then expires. The
 /// next request is refused with `trust_rejected`, fast, not by a timeout.
+///
+/// The trust clock is the system clock and the agent offers no injection
+/// point, so the window is wide: the control has 20 s after the restart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exec_is_refused_with_trust_rejected_once_the_certificate_has_expired() {
-    // The gate allows `EXPIRY_CLOCK_SKEW_SECS` past `not_after`; the control
-    // runs inside it and the second request runs after it.
-    let expires = now_secs() + 6 - crate::identity::EXPIRY_CLOCK_SKEW_SECS;
-    let rig = rig(Some(expires)).await;
-    rig.request(1).await;
+    // The gate allows `EXPIRY_CLOCK_SKEW_SECS` past `not_after`.
+    let skew = crate::identity::EXPIRY_CLOCK_SKEW_SECS;
+    let expires = now_secs() + 20 - skew;
+    let rig = rig(Some(expires), false).await;
+    rig.request(0, 1).await;
     let control = rig.outcome(1).await;
-    while now_secs() <= expires + crate::identity::EXPIRY_CLOCK_SKEW_SECS + 1 {
+    assert!(
+        now_secs() <= expires + skew,
+        "the control ran after the certificate expired; rerun on a quieter machine"
+    );
+    while now_secs() <= expires + skew + 1 {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    rig.request(2).await;
+    rig.request(0, 2).await;
     let after = rig.outcome(2).await;
     rig.stop().await;
     assert_eq!(
