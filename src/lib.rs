@@ -22534,7 +22534,9 @@ impl Agent {
     /// Unknown relationship peers get only a bounded EvidenceV1 prefix probe.
     /// An enrolled owner machine whose known agents lack only trust gets the
     /// enrolled slot instead ([`Self::admit_enrolled_owner_sync_over_untrusted`],
-    /// #1107). All other denials remain on the shared gate.
+    /// #1107). All other denials remain on the shared gate. Every admission
+    /// for a machine with a known agent sets `known_machine`, so an
+    /// EvidenceV1 prefix on it is rechecked after the prefix read.
     #[allow(clippy::too_many_arguments)]
     async fn admit_stream_before_prefix(
         discovery_cache: &std::sync::Arc<
@@ -22569,7 +22571,10 @@ impl Agent {
                 Err(error::NetworkError::PeerTrustRejected { .. }) => {
                     // #1107: lacking only trust, an enrolled owner machine
                     // gets the enrolled slot; after the prefix only SyncV1
-                    // can use it (dispatch re-judges the machine then).
+                    // can use it (dispatch re-judges the machine then). The
+                    // slot keeps `known_machine`, so an EvidenceV1 prefix on
+                    // it still meets the evidence gate after the prefix read,
+                    // even if the agents' discovery entries vanish meanwhile.
                     if Self::admit_enrolled_owner_sync_over_untrusted(
                         discovery_cache,
                         contact_store,
@@ -22588,6 +22593,7 @@ impl Agent {
                             agents: None,
                             prefix: None,
                             evidence_only: false,
+                            known_machine: true,
                         });
                     }
                     Self::gate_peer_machine_inbound_for_evidence(
@@ -22608,6 +22614,7 @@ impl Agent {
                         agents: None,
                         prefix: Some(limits.admit_prefix(*machine_id)?),
                         evidence_only: true,
+                        known_machine: true,
                     });
                 }
                 Err(_) => return None,
@@ -22616,6 +22623,7 @@ impl Agent {
                 agents: Some(agents),
                 prefix: None,
                 evidence_only: false,
+                known_machine: true,
             });
         }
         if owner_trust
@@ -22626,18 +22634,67 @@ impl Agent {
                 agents: None,
                 prefix: None,
                 evidence_only: false,
+                known_machine: false,
             });
         }
         Some(streams::InboundAdmission {
             agents: None,
             prefix: Some(limits.admit_prefix(*machine_id)?),
             evidence_only: false,
+            known_machine: false,
         })
     }
 
+    /// Post-prefix recheck for an EvidenceV1 stream: `true` refuses it.
+    /// Live denials and relationships are judged again after the prefix
+    /// wait. A previously known machine cannot turn into a stranger bypass
+    /// if its discovery entries disappear during that wait: any machine with
+    /// a known agent at pre-prefix admission
+    /// ([`streams::InboundAdmission::recheck_evidence`], including the #1107
+    /// enrolled slot) meets the evidence gate, which then refuses a machine
+    /// with no known agent left.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn evidence_refused_after_prefix(
+        discovery_cache: &std::sync::Arc<
+            tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+        >,
+        contact_store: &std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
+        revocation_set: &std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+        move_state: &std::sync::Arc<tokio::sync::RwLock<key_move::MoveState>>,
+        connect_policy: &std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>>,
+        owner_trust: &owner_trust::OwnerTrust,
+        machine_id: &identity::MachineId,
+        admission: &streams::InboundAdmission,
+    ) -> bool {
+        let known = discovery_cache
+            .read()
+            .await
+            .values()
+            .any(|a| a.machine_id == *machine_id);
+        let machine_revoked = revocation_set.read().await.is_machine_revoked(machine_id);
+        machine_revoked
+            || ((known || admission.recheck_evidence())
+                && Self::gate_peer_machine_inbound_for_evidence(
+                    discovery_cache,
+                    contact_store,
+                    revocation_set,
+                    move_state,
+                    connect_policy,
+                    owner_trust,
+                    machine_id,
+                    None,
+                    owner_trust::InboundTrustRule::EvidenceRelationship,
+                    false,
+                )
+                .await
+                .is_err())
+    }
+
     /// Dispatch after gate-first admission. EvidenceV1 goes exclusively to its
-    /// evidence acceptor. Known peers retain their gate result; machines with
-    /// no known agent apply [`Self::route_enrolled_owner_sync`]:
+    /// evidence acceptor, after [`Self::evidence_refused_after_prefix`]
+    /// rechecks any machine known at pre-prefix admission. Known peers
+    /// retain their gate result; machines with no known agent apply
+    /// [`Self::route_enrolled_owner_sync`]:
     ///
     /// - An admitted `SyncV1` stream goes to the REGISTERED `SyncV1`
     ///   acceptor only, never the default channel.
@@ -22695,6 +22752,19 @@ impl Agent {
                 return;
             }
         };
+        // The recheck runs while `admission` still holds the prefix slot.
+        let evidence_refused = protocol == streams::StreamProtocol::EvidenceV1
+            && Self::evidence_refused_after_prefix(
+                &discovery_cache,
+                &contact_store,
+                &revocation_set,
+                &move_state,
+                &connect_policy,
+                &owner_trust,
+                &machine_id,
+                &admission,
+            )
+            .await;
         // Keep the pre-identity slot through dispatch, including asynchronous
         // relationship checks. Evidence bodies then hold a separate reservation
         // through queueing and verification.
@@ -22704,32 +22774,7 @@ impl Agent {
         // Acquire both the machine stream slot and aggregate allocation permit
         // before queueing. The lease carries the original body deadline.
         if protocol == streams::StreamProtocol::EvidenceV1 {
-            // Recheck live denials and relationships after the prefix wait.
-            // A previously known machine cannot turn into a stranger bypass
-            // if its discovery entries disappear during that wait.
-            let known = discovery_cache
-                .read()
-                .await
-                .values()
-                .any(|a| a.machine_id == machine_id);
-            let machine_revoked = revocation_set.read().await.is_machine_revoked(&machine_id);
-            if machine_revoked
-                || ((known || admission.agents.is_some() || admission.evidence_only)
-                    && Self::gate_peer_machine_inbound_for_evidence(
-                        &discovery_cache,
-                        &contact_store,
-                        &revocation_set,
-                        &move_state,
-                        &connect_policy,
-                        &owner_trust,
-                        &machine_id,
-                        None,
-                        owner_trust::InboundTrustRule::EvidenceRelationship,
-                        false,
-                    )
-                    .await
-                    .is_err())
-            {
+            if evidence_refused {
                 return;
             }
             if let (Some(sender), Some(lease)) = (

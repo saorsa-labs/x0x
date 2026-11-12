@@ -932,12 +932,52 @@ impl UnknownMachine {
         .await
     }
 
-    /// Pre-prefix: the enrolled slot (no agent list, no stranger pool slot,
-    /// not an evidence probe) that only owner sync can use after the prefix.
+    /// Pre-prefix (#1107, machine with known agents): the enrolled slot (no
+    /// agent list, no stranger pool slot, not an evidence probe, but marked
+    /// as a known machine so EvidenceV1 is rechecked) that only owner sync
+    /// can use after the prefix.
     async fn gets_enrolled_slot(&self) -> bool {
-        self.pre_prefix()
-            .await
-            .is_some_and(|a| a.agents.is_none() && a.prefix.is_none() && !a.evidence_only)
+        self.pre_prefix().await.is_some_and(|a| {
+            a.agents.is_none() && a.prefix.is_none() && !a.evidence_only && a.known_machine
+        })
+    }
+
+    /// The dispatch-time EvidenceV1 recheck for `admission`, run after the
+    /// prefix read: `true` refuses the stream.
+    async fn evidence_refused_after_prefix(
+        &self,
+        admission: &crate::streams::InboundAdmission,
+    ) -> bool {
+        crate::Agent::evidence_refused_after_prefix(
+            &self.cache,
+            &self.contacts,
+            &self.revocations,
+            &self.move_state,
+            &self.connect_policy,
+            &self.trust,
+            &self.machine_id,
+            admission,
+        )
+        .await
+    }
+
+    /// The shared gate under the ADR 0089 evidence-relationship rule, as the
+    /// EvidenceV1 recheck runs it.
+    async fn evidence_gate(&self) -> Result<Vec<AgentId>, NetworkError> {
+        crate::Agent::gate_peer_machine_inbound_for_evidence(
+            &self.cache,
+            &self.contacts,
+            &self.revocations,
+            &self.move_state,
+            &self.connect_policy,
+            &self.trust,
+            &self.machine_id,
+            None,
+            InboundTrustRule::EvidenceRelationship,
+            false,
+        )
+        .await
+        .map_err(|e| e.fail_closed_admission([0; 32]))
     }
 
     /// Both #1107 halves for a machine with known agents.
@@ -1181,6 +1221,80 @@ async fn untrusted_known_agent_on_unenrolled_machine_is_denied() {
         !m.admits_over_untrusted(crate::streams::StreamProtocol::SyncV1)
             .await
     );
+}
+
+// #1876 review (P2): the #1107 enrolled slot is given to a machine whose
+// known agent lacks only trust. If that last agent is revoked during the
+// prefix wait, its discovery entry goes away but the machine stays
+// unrevoked. An EvidenceV1 prefix on that slot must still get the
+// evidence-gate recheck; the machine must not become a stranger bypass.
+#[tokio::test]
+async fn evidence_prefix_on_enrolled_slot_is_rechecked_after_last_agent_revoked() {
+    let (_owner, m) = UnknownMachine::enrolled().await;
+    let agent_kp = m.learn_agent_kp().await;
+    let agent_id = agent_kp.agent_id();
+    let admission = m.pre_prefix().await.expect("admitted");
+    assert!(
+        admission.agents.is_none() && admission.prefix.is_none(),
+        "precondition: the #1107 enrolled slot"
+    );
+    // While the agent is known, the recheck is the evidence gate's verdict.
+    assert_eq!(
+        m.evidence_refused_after_prefix(&admission).await,
+        m.evidence_gate().await.is_err(),
+        "a known agent is judged by the evidence gate"
+    );
+
+    // The agent is revoked during the prefix wait. This applies the effects
+    // of the receive path (`apply_legacy_revocation_records`) directly: the
+    // verified record goes into the revocation set, the agent's discovery
+    // entry is removed, the agent is blocked as a contact, and its
+    // attribution relationship is cleared. The machine is NOT revoked.
+    let record = RevocationRecord::sign(
+        RevokedSubject::Agent(agent_id),
+        agent_kp.public_key(),
+        agent_kp.secret_key(),
+        unix_now_secs(),
+        None,
+    )
+    .expect("sign agent revocation");
+    m.revocations
+        .write()
+        .await
+        .verify_and_insert(record, None)
+        .expect("insert agent revocation");
+    assert!(m.cache.write().await.remove(&agent_id).is_some());
+    m.contacts
+        .write()
+        .await
+        .set_trust(&agent_id, TrustLevel::Blocked);
+    m.trust.set_attribution_relationship(agent_id, false).await;
+    assert!(!m.revocations.read().await.is_machine_revoked(&m.machine_id));
+    assert!(m.cache.read().await.is_empty(), "no agent is known now");
+    assert!(matches!(
+        m.evidence_gate().await,
+        Err(NetworkError::PeerNotVerified { .. })
+    ));
+
+    assert!(
+        m.evidence_refused_after_prefix(&admission).await,
+        "a machine known at pre-prefix must still be rechecked after its agents vanish"
+    );
+}
+
+// #1876 control: an enrolled machine that never had a known agent keeps its
+// #1040 EvidenceV1 behaviour. The post-prefix recheck does not refuse it.
+#[tokio::test]
+async fn evidence_prefix_on_never_known_enrolled_slot_is_not_refused_by_the_recheck() {
+    let (_owner, m) = UnknownMachine::enrolled().await;
+    assert!(m.cache.read().await.is_empty(), "no agent is known");
+    let admission = m.pre_prefix().await.expect("admitted");
+    assert!(admission.agents.is_none() && admission.prefix.is_none());
+    assert!(
+        !admission.recheck_evidence(),
+        "never known: no recheck marker"
+    );
+    assert!(!m.evidence_refused_after_prefix(&admission).await);
 }
 
 /// The shared gate with only missing trust waived (#1107), as the
