@@ -174,6 +174,8 @@ struct Rig {
     /// `senders[0]` is under test; `senders[1]` is the unrevoked control.
     senders: [Node; 2],
     receiver: Node,
+    /// The announcement bytes of each sender's seeded (pre-restart) record.
+    seeded: [Vec<u8>; 2],
 }
 
 /// Build the receiver's past from the senders' real keys, stop it, start it
@@ -186,6 +188,7 @@ async fn rig(revoke_first: bool) -> Rig {
     let s0 = build_sender(dir.path(), "s0").await;
     let s1 = build_sender(dir.path(), "s1").await;
     let now_ms = crate::dm_capability::now_unix_ms();
+    let mut seeded: [Vec<u8>; 2] = Default::default();
 
     // Durable evidence and owner enrollment, from the senders' real keys.
     let seed_store = PeerEvidenceStore::open(
@@ -212,6 +215,7 @@ async fn rig(revoke_first: bool) -> Rig {
             now_ms,
             now_ms,
         );
+        seeded[usize::from(std::ptr::eq(sender, &s1))] = record.announcement.clone();
         seed_store
             .ingest(record, IngestSource::Hello, now_ms)
             .expect("seed record");
@@ -396,6 +400,7 @@ async fn rig(revoke_first: bool) -> Rig {
         dir,
         senders,
         receiver,
+        seeded,
     }
 }
 
@@ -469,10 +474,10 @@ impl Rig {
 /// Certificate recovery from the sender is held for the whole request
 /// (`HOLD_CERTIFICATE_RECOVERY`: no announce-blob fetch, no EvidenceV1
 /// certificate request, no Lookup reply with a certificate). Before the
-/// request, the sender's digest-only announcement has reached the receiver:
-/// its discovery entry names the certificate digest and holds no
-/// certificate. So owner trust can come only from the certificate the
-/// evidence store kept across that announcement.
+/// request, the receiver's evidence store holds the sender's own
+/// digest-only announcement (not the seeded record), and its discovery
+/// entry holds no certificate. So owner trust can come only from the
+/// certificate the evidence store kept across that announcement.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exec_over_dm_is_admitted_after_the_receiver_restarts() {
     use std::sync::atomic::Ordering;
@@ -484,25 +489,42 @@ async fn exec_over_dm_is_admitted_after_the_receiver_restarts() {
         &sender.agent_certificate().and_then(|c| c.user_id().ok()),
         &sender.agent_certificate().cloned(),
     );
+    // Wait until the receiver's EVIDENCE STORE holds the sender's own
+    // digest-only announcement (not the seeded record), so the request is
+    // judged after that announcement was ingested. Discovery must not hold
+    // the certificate either.
+    let store = rig
+        .receiver
+        .agent
+        .peer_evidence()
+        .store()
+        .expect("evidence store");
     let start = Instant::now();
     loop {
-        let entry = rig
+        if let Some(entry) = rig
             .receiver
             .agent
             .discovered_agent_for_testing(&sender.agent_id())
-            .await;
-        if let Some(entry) = entry {
+            .await
+        {
             assert!(
                 entry.agent_certificate.is_none(),
                 "the receiver must not hold the certificate from discovery"
             );
-            if entry.cert_digest == Some(digest) {
-                break;
-            }
+        }
+        let ingested = store
+            .live(sender.agent_id(), crate::dm_capability::now_unix_ms())
+            .is_some_and(|live| {
+                live.announcement != rig.seeded[0]
+                    && crate::announce_v3::deserialize_v3(&live.announcement)
+                        .is_ok_and(|ann| ann.cert_digest == digest)
+            });
+        if ingested {
+            break;
         }
         assert!(
             start.elapsed() < BOUND,
-            "the sender's digest-only announcement never reached the receiver"
+            "the sender's digest-only announcement never reached the evidence store"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

@@ -1079,15 +1079,51 @@ impl PeerEvidenceStore {
     /// Ingest a complete verified pair. A move returns success only after the
     /// new snapshot and its parent directory have been synced, unless this
     /// instance is memory-only (where the move takes effect immediately).
-    pub fn ingest(
+    pub fn ingest(&self, record: EvidenceRecordV1, source: IngestSource, now: u64) -> Result<()> {
+        self.ingest_with_carry(&record, source, now, |candidate, _| {
+            Ok((Arc::new(candidate.verify(now, W_MS)?), true))
+        })
+        .map(|_| ())
+    }
+    /// #1107: carry, check, then store, as one decision.
+    ///
+    /// Each attempt applies [`Self::carry_certificate`] to a fresh copy of
+    /// `record`, runs `check` on it (it verifies the copy, certificate
+    /// included, and says whether to store it), and stores it with
+    /// [`Self::ingest_verified_after_carry`], which runs `allowed` and then
+    /// decides the carry again under the mutation lock. If a certificate
+    /// that the rule would keep was stored after the carry decision, the
+    /// attempt is redone from the carry, so every stored record that has a
+    /// certificate was verified and allowed with it. At most
+    /// [`CARRY_ATTEMPTS`] attempts, then the record is refused. `check`
+    /// gets the attempt index (0-based).
+    pub(crate) fn ingest_with_carry(
         &self,
-        mut record: EvidenceRecordV1,
+        record: &EvidenceRecordV1,
         source: IngestSource,
         now: u64,
-    ) -> Result<()> {
-        let carried = self.carry_certificate(&mut record, now);
-        let view = Arc::new(record.verify(now, W_MS)?);
-        self.ingest_verified_after_carry(record, view, source, now, carried)
+        mut check: impl FnMut(&EvidenceRecordV1, usize) -> Result<(Arc<EvidenceView>, bool)>,
+    ) -> Result<Arc<EvidenceView>> {
+        for attempt in 0..CARRY_ATTEMPTS {
+            let mut candidate = record.clone();
+            let carried = self.carry_certificate(&mut candidate, now);
+            let (view, store) = check(&candidate, attempt)?;
+            if !store {
+                return Ok(view);
+            }
+            match self.ingest_verified_after_carry(
+                candidate,
+                Arc::clone(&view),
+                source,
+                now,
+                carried,
+            ) {
+                Err(EvidenceError::Invalid(reason)) if reason == CARRY_CHANGED => continue,
+                Err(error) => return Err(error),
+                Ok(()) => return Ok(view),
+            }
+        }
+        Err(EvidenceError::Invalid("certificate carry kept changing"))
     }
     /// Ingest a verified record whose certificate bytes came with it.
     pub(crate) fn ingest_verified(
@@ -1101,12 +1137,18 @@ impl PeerEvidenceStore {
     }
     /// [`Self::ingest_verified`] for a record whose certificate was carried
     /// in by [`Self::carry_certificate`] when `carried` is true. The carry is
-    /// decided again under the mutation lock, so deciding and storing are
-    /// one step.
+    /// decided again under the mutation lock, for both outcomes:
+    /// - carried, and the rule now gives nothing (for example an anonymous
+    ///   record landed after consent was withdrawn): the record is refused.
+    ///   This fails safe; the next announcement is ingested afresh.
+    /// - not carried, and the rule now gives a certificate (a Hello stored
+    ///   it since the decision): returns [`CARRY_CHANGED`], and
+    ///   [`Self::ingest_with_carry`] redoes the attempt from the carry, so
+    ///   the record is verified and allowed with that certificate.
     pub(crate) fn ingest_verified_after_carry(
         &self,
         mut record: EvidenceRecordV1,
-        mut view: Arc<EvidenceView>,
+        view: Arc<EvidenceView>,
         source: IngestSource,
         now: u64,
         carried: bool,
@@ -1130,23 +1172,11 @@ impl PeerEvidenceStore {
                     "carried certificate no longer stored",
                 ));
             }
-            if let (false, Some(bytes)) = (carried, now_carry) {
-                // A record holding the certificate this announcement names
-                // was stored since the decision (a Hello with the bytes).
-                // Attach it, as the carry would now: skipping this record
-                // would lose its newer announcement and advert, and storing
-                // it without the certificate would lose that Hello's
-                // certificate. The certificate is the stored, verified one,
-                // current, bound to this agent, and its digest is the one
-                // this signed announcement names, so no new check is needed.
-                let certificate = state.verified.get(&a).and_then(|v| v.certificate.clone());
-                view = Arc::new(EvidenceView {
-                    announcement: view.announcement.clone(),
-                    advert: view.advert.clone(),
-                    certificate,
-                });
-                record.certificate = Some(bytes);
-                record.relation = self.policy.relation(a, m, view.certificate.as_ref(), now);
+            if !carried && now_carry.is_some() {
+                // A Hello stored the certificate this announcement names
+                // after the carry decision. Storing this record without it
+                // would lose that certificate; redo from the carry.
+                return Err(EvidenceError::Invalid(CARRY_CHANGED));
             }
         }
         // A gossip pairing can have been queued before a Hello completed.
@@ -1611,6 +1641,12 @@ fn current(view: &EvidenceView, now: u64, age: u64) -> bool {
             !cert.is_expired(now / 1000) && cert.issued_at() <= now.saturating_add(SKEW_MS) / 1000
         })
 }
+/// #1107: the under-lock carry decision differs from the one made before
+/// verification; [`PeerEvidenceStore::ingest_with_carry`] redoes the attempt.
+const CARRY_CHANGED: &str = "certificate carry changed before store";
+/// #1107: attempts of [`PeerEvidenceStore::ingest_with_carry`] before the
+/// record is refused.
+const CARRY_ATTEMPTS: usize = 3;
 /// #1107: the stored certificate bytes that an announcement without
 /// certificate bytes may keep, under the rule of
 /// [`PeerEvidenceStore::carry_certificate`]. The bytes are the stored bytes

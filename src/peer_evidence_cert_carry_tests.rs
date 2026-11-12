@@ -278,39 +278,66 @@ fn suspended_record_is_not_carried() {
     assert_eq!(fresh.certificate, None);
 }
 
+/// Ingest `gossip` through [`PeerEvidenceStore::ingest_with_carry`]; during
+/// the first attempt, after its carry decision and before its store, the
+/// `hello` record is stored. Returns the number of attempts.
+fn gossip_racing_a_hello(
+    store: &PeerEvidenceStore,
+    gossip: &EvidenceRecordV1,
+    hello: &EvidenceRecordV1,
+) -> usize {
+    let mut attempts = 0;
+    store
+        .ingest_with_carry(gossip, IngestSource::Gossip, NOW, |candidate, attempt| {
+            attempts += 1;
+            if attempt == 0 {
+                assert_eq!(candidate.certificate, None, "nothing to carry yet");
+                store
+                    .ingest(hello.clone(), IngestSource::Hello, NOW)
+                    .unwrap();
+            }
+            Ok((Arc::new(candidate.verify(NOW, W_MS)?), true))
+        })
+        .unwrap();
+    attempts
+}
+
 /// P1 (Greptile on #1882): gossip decides "nothing to carry" while the store
-/// is empty; a Hello then stores the same announcement and advert WITH the
-/// certificate; the gossip copy without bytes reaches the store after. The
-/// store must not replace the Hello's certificate with nothing.
+/// is empty; a Hello then stores the certificate; the newer gossip copy
+/// without bytes reaches the store after. The store redoes the attempt from
+/// the carry: the newer announcement is stored, verified and allowed with
+/// the Hello's certificate.
 #[test]
 fn hello_stored_between_gossip_carry_decision_and_store_keeps_its_certificate() {
     let peer = Peer::new();
     let cert = AgentCertificate::issue(&owner(), &peer.agent).unwrap();
     let (_dir, _policy, store) = setup(&peer);
-    let with_bytes = announce(&peer.agent, &peer.machine, Some(&cert), true, NOW);
-    let mut gossip = with_bytes.clone();
-    gossip.certificate = None;
-    assert!(
-        !store.carry_certificate(&mut gossip, NOW),
-        "nothing stored yet"
+    let hello = announce(&peer.agent, &peer.machine, Some(&cert), true, NOW - 1_000);
+    let gossip = announce(&peer.agent, &peer.machine, Some(&cert), false, NOW);
+    assert_eq!(
+        gossip_racing_a_hello(&store, &gossip, &hello),
+        2,
+        "one redo"
     );
-    let view = Arc::new(gossip.verify(NOW, W_MS).unwrap());
-    store.ingest(with_bytes, IngestSource::Hello, NOW).unwrap();
-    let _ = store.ingest_verified_after_carry(gossip, view, IngestSource::Gossip, NOW, false);
     assert_eq!(
         certificate_of(&store, peer.a(), peer.m()),
         Some(cert.to_storage_bytes().unwrap()),
         "the Hello's certificate must survive the late gossip copy"
     );
+    let live = store.live(peer.a(), NOW).unwrap();
+    assert_eq!(live.certificate, Some(cert.to_storage_bytes().unwrap()));
     assert_eq!(
-        store.live(peer.a(), NOW).and_then(|r| r.certificate),
-        Some(cert.to_storage_bytes().unwrap())
+        announce_v3::deserialize_v3(&live.announcement)
+            .unwrap()
+            .announced_at,
+        NOW / 1000,
+        "the newer gossip announcement is not lost"
     );
 }
 
 /// The same window for a different digest: C is stored; gossip names C2
-/// without bytes (nothing to carry); a Hello stores C2 with bytes; the late
-/// gossip copy must keep C2.
+/// without bytes; a Hello stores C2 with bytes in the window; the redone
+/// gossip copy keeps C2.
 #[test]
 fn hello_with_a_new_certificate_stored_in_the_window_keeps_it() {
     let peer = Peer::new();
@@ -319,16 +346,19 @@ fn hello_with_a_new_certificate_stored_in_the_window_keeps_it() {
         AgentCertificate::issue_with_expiry(&owner(), &peer.agent, Some(NOW / 1000 + 86_400))
             .unwrap();
     let (_dir, _policy, store) = stored_with(&peer, &cert);
-    let with_bytes = announce(&peer.agent, &peer.machine, Some(&renewed), true, NOW);
-    let mut gossip = with_bytes.clone();
-    gossip.certificate = None;
-    assert!(
-        !store.carry_certificate(&mut gossip, NOW),
-        "C2 is not stored yet"
+    let hello = announce(
+        &peer.agent,
+        &peer.machine,
+        Some(&renewed),
+        true,
+        NOW - 1_000,
     );
-    let view = Arc::new(gossip.verify(NOW, W_MS).unwrap());
-    store.ingest(with_bytes, IngestSource::Hello, NOW).unwrap();
-    let _ = store.ingest_verified_after_carry(gossip, view, IngestSource::Gossip, NOW, false);
+    let gossip = announce(&peer.agent, &peer.machine, Some(&renewed), false, NOW);
+    assert_eq!(
+        gossip_racing_a_hello(&store, &gossip, &hello),
+        2,
+        "one redo"
+    );
     assert_eq!(
         certificate_of(&store, peer.a(), peer.m()),
         Some(renewed.to_storage_bytes().unwrap())

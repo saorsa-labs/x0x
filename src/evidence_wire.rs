@@ -608,32 +608,53 @@ pub(crate) fn ingest_hello(
     if ann.machine_id != machine {
         return Err(invalid("Hello does not name transport machine"));
     }
-    let carried = store.is_some_and(|store| store.carry_certificate(&mut record, now));
-    let view = Arc::new(
-        record
-            .verify_budgeted(now, W_MS, &mut || limits.verify())
-            .map_err(io::Error::other)?,
-    );
-    if let Some(cert) = &view.certificate {
-        if announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone())) != ann.cert_digest {
-            return Err(invalid("certificate digest mismatch"));
-        }
+    if crate::announce_blob::certificate_recovery_held() {
+        // Test-only hold: a Hello reply recovers no certificate either.
+        record.certificate = None;
     }
-    if let Some(store) = store.cloned() {
-        if store.related(ann.agent_id, machine, view.certificate.as_ref(), now) {
-            // Reuse the verified view, never pay for an unbudgeted second verify.
-            store
-                .ingest_verified_after_carry(
-                    record,
-                    Arc::clone(&view),
-                    IngestSource::Hello,
-                    now,
-                    carried,
-                )
-                .map_err(io::Error::other)?;
-            return Ok(view);
+    let check = |candidate: &EvidenceRecordV1| -> io::Result<Arc<EvidenceView>> {
+        let view = Arc::new(
+            candidate
+                .verify_budgeted(now, W_MS, &mut || limits.verify())
+                .map_err(io::Error::other)?,
+        );
+        if let Some(cert) = &view.certificate {
+            if announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone()))
+                != ann.cert_digest
+            {
+                return Err(invalid("certificate digest mismatch"));
+            }
         }
-    }
+        Ok(view)
+    };
+    let view = match store {
+        // Carry, verify, relation check and store as one decision; a stored
+        // record is verified with exactly the certificate it keeps.
+        Some(store) => {
+            let mut io_error = None;
+            let mut related = false;
+            let result =
+                store.ingest_with_carry(&record, IngestSource::Hello, now, |candidate, _| {
+                    let view = check(candidate).map_err(|e| {
+                        let reason =
+                            crate::peer_evidence::EvidenceError::Invalid("Hello check failed");
+                        io_error = Some(e);
+                        reason
+                    })?;
+                    related = store.related(ann.agent_id, machine, view.certificate.as_ref(), now);
+                    Ok((view, related))
+                });
+            if let Some(e) = io_error {
+                return Err(e);
+            }
+            let view = result.map_err(io::Error::other)?;
+            if related {
+                return Ok(view);
+            }
+            view
+        }
+        None => check(&record)?,
+    };
     // Network-verified, ingest-fresh bytes only; never seed the binding,
     // discovery or capability registries from persisted evidence.
     capture.capture(
