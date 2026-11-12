@@ -605,10 +605,8 @@ pub(crate) fn ingest_hello(
     if ann.machine_id != machine {
         return Err(invalid("Hello does not name transport machine"));
     }
-    if record.certificate.is_none() {
-        record.certificate = store
-            .cloned()
-            .and_then(|s| s.certificate_for(ann.agent_id, machine, ann.cert_digest, now));
+    if let Some(store) = store {
+        store.carry_certificate(&mut record, now);
     }
     let view = Arc::new(
         record

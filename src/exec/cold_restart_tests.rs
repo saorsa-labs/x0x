@@ -184,7 +184,7 @@ async fn rig(cert_not_after: Option<u64>, revoke_first: bool) -> Rig {
                 crate::owner_sync::OwnerEnrollment::sign(
                     sender.machine.machine_id(),
                     &owner,
-                    now_ms / 1000 - 1000,
+                    now_ms - 1_000,
                     None,
                 )
                 .expect("enrollment"),

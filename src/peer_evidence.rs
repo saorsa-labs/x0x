@@ -19,14 +19,29 @@ pub(crate) fn record_for_test(
     ann_time: u64,
     advert_time: u64,
 ) -> EvidenceRecordV1 {
+    record_with_certificate_for_test(agent, machine, None, ann_time, advert_time)
+}
+
+/// [`record_for_test`] for a sender that announces an owner certificate: the
+/// announcement carries the certificate's digest, as the sender's own Hello
+/// does, so a later Hello with the same certificate keeps the stored one.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+pub(crate) fn record_with_certificate_for_test(
+    agent: &crate::identity::AgentKeypair,
+    machine: &crate::identity::MachineKeypair,
+    certificate: Option<&AgentCertificate>,
+    ann_time: u64,
+    advert_time: u64,
+) -> EvidenceRecordV1 {
     use crate::dm::DmCapabilities;
     use crate::dm_capability::{RegistryTrailer, REGISTRY_TRAILER_MAGIC};
     let v2 = crate::IdentityAnnouncement {
         self_name: Some("wire name".into()),
         agent_id: agent.agent_id(),
         machine_id: machine.machine_id(),
-        user_id: None,
-        agent_certificate: None,
+        user_id: certificate.and_then(|c| c.user_id().ok()),
+        agent_certificate: certificate.cloned(),
         machine_public_key: machine.public_key().as_bytes().to_vec(),
         machine_signature: vec![],
         addresses: vec![],
@@ -75,12 +90,15 @@ pub(crate) fn record_for_test(
     EvidenceRecordV1 {
         announcement: announce_v3::serialize_v3_1(&ann).unwrap(),
         advert: bytes,
-        certificate: None,
+        certificate: certificate.map(|c| c.to_storage_bytes().unwrap()),
         relation: GROUP,
         stored_at_ms: 2_000_000_000_000,
     }
 }
 
+#[cfg(test)]
+#[path = "peer_evidence_cert_carry_tests.rs"]
+mod cert_carry_tests;
 #[cfg(test)]
 #[path = "peer_evidence_forward_opener_tests.rs"]
 mod forward_opener_tests;
@@ -999,19 +1017,59 @@ impl PeerEvidenceStore {
             Some(view.announcement.cert_digest)
         })
     }
-    /// Exact stored certificate for a matching announcement digest, if usable.
-    pub(crate) fn certificate_for(
-        &self,
-        agent: AgentId,
-        machine: MachineId,
-        digest: [u8; 32],
-        now: u64,
-    ) -> Option<Vec<u8>> {
-        let view = self.usable(agent, machine, now)?;
-        if view.announcement.cert_digest != digest {
-            return None;
+    /// #1107: fill in the stored certificate for an announcement that names
+    /// it but carries no certificate bytes.
+    ///
+    /// A V3 announcement carries only the digest of the owner certificate;
+    /// the bytes come by a separate fetch. The stored certificate is kept if
+    /// and only if all of these hold:
+    /// - the record has no certificate bytes;
+    /// - the announcement names a certificate (not the anonymous digest);
+    /// - the store holds a verified record for the same agent on the same
+    ///   machine, not suspended by a move;
+    /// - that record's certificate is current and its digest equals the
+    ///   announcement's signed `cert_digest`.
+    ///
+    /// The carried bytes are the stored bytes. The record is then verified
+    /// as usual, certificate included, so this grants nothing the stored
+    /// record did not hold. Revocation, expiry and owner chaining are still
+    /// checked at each use. Every ingest path calls this before it verifies.
+    pub(crate) fn carry_certificate(&self, record: &mut EvidenceRecordV1, now: u64) {
+        if record.certificate.is_some() {
+            return;
         }
-        view.certificate.as_ref()?.to_storage_bytes().ok()
+        let Ok(ann) = announce_v3::deserialize_v3(&record.announcement) else {
+            return;
+        };
+        if ann.cert_digest == announce_v3::cert_digest(&None, &None) {
+            return;
+        }
+        let Ok(state) = self.state.lock() else {
+            return;
+        };
+        if state.suspended.contains(&ann.agent_id) {
+            return;
+        }
+        let Some(stored) = state.verified.get(&ann.agent_id) else {
+            return;
+        };
+        if stored.announcement.machine_id != ann.machine_id {
+            return;
+        }
+        let Some(cert) = stored.certificate.as_ref() else {
+            return;
+        };
+        if cert.is_expired(now / 1000)
+            || announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone()))
+                != ann.cert_digest
+        {
+            return;
+        }
+        record.certificate = state
+            .file
+            .records
+            .get(&ann.agent_id)
+            .and_then(|stored| stored.certificate.clone());
     }
     /// Latest ingest-fresh live wire bytes, kept separately from stored bytes.
     pub fn live(&self, agent: AgentId, now: u64) -> Option<EvidenceRecordV1> {
@@ -1040,7 +1098,13 @@ impl PeerEvidenceStore {
     /// Ingest a complete verified pair. A move returns success only after the
     /// new snapshot and its parent directory have been synced, unless this
     /// instance is memory-only (where the move takes effect immediately).
-    pub fn ingest(&self, record: EvidenceRecordV1, source: IngestSource, now: u64) -> Result<()> {
+    pub fn ingest(
+        &self,
+        mut record: EvidenceRecordV1,
+        source: IngestSource,
+        now: u64,
+    ) -> Result<()> {
+        self.carry_certificate(&mut record, now);
         let view = Arc::new(record.verify(now, W_MS)?);
         self.ingest_verified(record, view, source, now)
     }
@@ -1061,14 +1125,15 @@ impl PeerEvidenceStore {
         let _mutation = self.lock_mutation()?;
         let mut state = self.lock()?;
         // A gossip pairing can have been queued before a Hello completed.
-        // The same wire pair without its fetched certificate must not undo
-        // that Hello (or cause another material write).
+        // The same wire pair must not undo that Hello (or cause another
+        // material write). Its certificate was carried in by
+        // [`Self::carry_certificate`], so the whole record is compared.
         if source == IngestSource::Gossip
             && state.live.get(&a).is_some_and(|old| {
                 old.source == IngestSource::Hello
                     && old.wire.announcement == record.announcement
                     && old.wire.advert == record.advert
-                    && (record.certificate.is_none() || old.wire.certificate == record.certificate)
+                    && old.wire.certificate == record.certificate
             })
         {
             return Ok(());
@@ -1725,7 +1790,7 @@ mod tests {
     const NOW: u64 = 2_000_000_000_000;
     #[derive(Default)]
     pub(super) struct Policy {
-        peers: Mutex<HashMap<AgentId, u8>>,
+        pub(super) peers: Mutex<HashMap<AgentId, u8>>,
         revoked: AtomicBool,
         unavailable: AtomicBool,
         epoch: std::sync::atomic::AtomicU64,
