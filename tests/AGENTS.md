@@ -4,9 +4,11 @@ Loaded when working on files in `tests/`. The root `AGENTS.md` covers architectu
 
 ## Network safety
 
-Test daemons join the real network. Some in-process tests also dial real seeds — including `nat_traversal_integration.rs` `--ignored` VPS tests, `network_integration.rs`, `vps_e2e_integration.rs`, and `e2e_live_network.sh`. "No daemon started" does not mean "no network". Run all tests via `just test` or `python3 scripts/dev/test-isolated.py` (Linux loopback-only namespace; macOS/Windows fail closed). Plain `cargo nextest run` only for a selector confirmed to open no network.
+Test daemons join the real network. Some in-process tests also dial real seeds — including `nat_traversal_integration.rs` `--ignored` VPS tests, `vps_e2e_integration.rs`, and `e2e_live_network.sh`. "No daemon started" does not mean "no network". Run all tests via `just test` or `python3 scripts/dev/test-isolated.py` (Linux loopback-only namespace; macOS/Windows fail closed). Plain `cargo nextest run` only for a selector confirmed to open no network.
 
 ## Integration tests
+
+A core subset; `tests/` holds many more files.
 
 | File | Coverage |
 |------|---------|
@@ -53,7 +55,7 @@ Test daemons join the real network. Some in-process tests also dial real seeds �
 | `e2e_dogfood_local.sh` | 2-instance local | ~20 assertions, ~5 s. Pre-commit smoke |
 | `e2e_dogfood_groups.sh` | 3-instance local groups | ~29 assertions, ~5 s |
 | `e2e_local_mesh.sh` | 3-instance local DM matrix | 6 directed pairs, no VPS |
-| `e2e_comprehensive.sh` | Local alice+bob+charlie | ~143 assertions, ~2 min |
+| `e2e_comprehensive.sh` | Local alice+bob+charlie | ~2 min |
 | `e2e_live_network.sh` | Local node → live VPS mesh | ~66 assertions; needs VPS up and SSH access |
 | `e2e_vps_mesh.py` | 6 VPS DM matrix | 30 directed pairs via 1 SSH tunnel, ~16 s |
 | `e2e_vps_groups.py` | 6 VPS groups + contacts | up to 49 assertions, ~60 s |
@@ -83,4 +85,4 @@ bash .deployment/health-check.sh --extended
 
 VPS API tokens: `/root/.local/share/x0x/api-token`.
 
-SSH to multiple nodes: use `-o ControlMaster=no -o ControlPath=none -o BatchMode=yes`. The VPS scripts already include these flags.
+SSH to multiple nodes: use `-o ControlMaster=no -o ControlPath=none -o BatchMode=yes`.

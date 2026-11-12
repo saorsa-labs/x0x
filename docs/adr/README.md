@@ -73,8 +73,8 @@ This table is the live allocation table for capability bits. Allocate the next b
 
 - `python3 scripts/check-adr-consolidation.py` — exactly 15 Accepted slots,
   no A16, no extra revision file; each slot's bytes must match the sha256
-  recorded in `consolidated/index.json`, so a slot change needs David's
-  ruling and a visible index update in the same PR.
+  recorded in `consolidated/index.json`, so a slot change needs a visible
+  index update in the same PR (A15, amendment of 12 Nov 2026).
 - `python3 scripts/check-adr-count.py` — the current count stays at 15;
   archive links must be recorded moves.
 - `python3 scripts/adr-governance.py` — archived Accepted bytes and frozen

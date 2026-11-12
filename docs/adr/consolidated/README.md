@@ -49,3 +49,4 @@ These 6 transient records are Proposed, pending a decision:
 
 - `python3 scripts/check-adr-consolidation.py`: verifies exactly 15 Accepted slots; each slot file's bytes must match the sha256 in `index.json`.
 - `python3 scripts/check-adr-count.py`: counts current records; fails if the total exceeds 15.
+- `python3 scripts/adr-governance.py`: protects the archived numbered and transient records; CI runs it on `docs/adr/**` changes.

@@ -59,5 +59,4 @@ How will we know this decision remains correct? Include tests, metrics, audit ch
 
 Do not use this template to create a new ADR or a superseding record. Put the
 rationale in the PR body and existing docs or code comments. Preserve Accepted
-bytes. A wire-format or public-API question needs a `FOR ENGINEER:` line for
-David's decision; record his approval in the PR body or comment.
+bytes. A wire-format or public-API change carries a `FOR ENGINEER:` line in the PR body that states the change; under A15 (amendment of 12 Nov 2026) it needs no separate ruling.
