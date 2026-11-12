@@ -132,6 +132,37 @@ async fn has_name(device: &Device, display: &str) -> bool {
         })
 }
 
+/// Stop a device completely. `Agent::drop` only aborts the heartbeat and the
+/// discovery reaper; the tracked stream-accept task keeps the endpoint alive,
+/// so a plain drop would run the restarted device beside the old one. This
+/// shuts the node down, then asserts the old endpoint is gone: it reports no
+/// node status, and the peer holds no connection to its machine.
+async fn shut_down_fully(device: Device, peer: &Device, machine: crate::owner_sync::MachineId) {
+    let Device { agent, sync } = device;
+    drop(sync);
+    agent.try_shutdown().await.expect("old device shuts down");
+    let network = agent.network().expect("old network");
+    assert!(
+        network.node_status().await.is_none(),
+        "the old endpoint must be gone before the restart"
+    );
+    let peer_network = peer.agent.network().expect("peer network");
+    let old = ant_quic::PeerId(machine.0);
+    let mut connected = true;
+    for _ in 0..50 {
+        connected = peer_network.is_connected(&old).await;
+        if !connected {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        !connected,
+        "the peer still holds a live connection to the old device"
+    );
+    drop(agent);
+}
+
 /// Alice stays up. Bob is enrolled, restarts cold with no consent (same key
 /// files, same sync store, empty caches), and both know the other's agent
 /// anonymously. Every cached entry for the other side has no certificate.
@@ -159,7 +190,7 @@ async fn rig() -> (tempfile::TempDir, Device, Device) {
     let (bob_agent_id, bob_machine) = (bob.agent.agent_id(), bob.agent.machine_id());
 
     // THE RESTART: a fresh process-equivalent on the same files.
-    drop(bob);
+    shut_down_fully(bob, &alice, bob_machine).await;
     let bob_old = alice
         .agent
         .discovered_agent_for_testing(&bob_agent_id)
