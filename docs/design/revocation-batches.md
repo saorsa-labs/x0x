@@ -341,7 +341,11 @@ whose bytes it saw in the last 5 minutes, from any sender
 (`src/storm_control.rs`). The statement has the same bytes from every
 sender, and a waiter needs the statement of its own authority. So for the
 statement only, the guard counts a repeat for each sender. Each other
-payload keeps the rule. One limit stays from before #1867: when many
+payload keeps the rule. The guard drops an envelope whose inner signature
+is wrong, or whose signed topic is not the topic it arrived on, and that
+envelope changes no replay or rate entry. Thus a peer cannot forge the name
+of an authority, or copy the authority's statement from another carrier
+topic, to make the guard drop the genuine statement. One limit stays from before #1867: when many
 daemons hold the same non-empty set, a relay passes only the first copy
 in 5 minutes, so the copy of the waiter's authority can be dropped, and
 the waiter then waits for a later publish.
