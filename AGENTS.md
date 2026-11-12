@@ -1,101 +1,54 @@
 # x0x
 
-Agent-to-agent gossip network for AI systems. Built on `ant-quic` (QUIC with
-post-quantum crypto and NAT traversal) and `saorsa-gossip` (epidemic broadcast,
-CRDT sync, pub/sub). Shipped as the `x0x` crate, the `x0xd` daemon (local REST +
-WebSocket API) and the `x0x` CLI. Non-Rust apps talk to `x0xd` over HTTP; there
-are no FFI bindings.
+Agent-to-agent gossip network. Built on `ant-quic` (QUIC, post-quantum crypto,
+NAT traversal) and `saorsa-gossip` (pub/sub, CRDT sync). Ships as the `x0x`
+crate, the `x0xd` daemon (local REST + WebSocket API) and the `x0x` CLI.
+Non-Rust apps talk to `x0xd` over HTTP; there are no FFI bindings.
 
-## Reference docs (read when relevant)
-- REST + WebSocket API: `docs/api-reference.md`
-- Tests, e2e harnesses, VPS ports: `tests/AGENTS.md`, `TEST_SUITE_GUIDE.md`
-- Self-update: `docs/upgrade-system.md` · CI/CD: `docs/cicd.md`
-- Trust, connectivity, announcements: `docs/trust-and-connectivity.md`
-- Remote exec + ACL: `docs/exec.md`, `docs/design/x0x-exec.md` · Connect ACL: `docs/connect-acl.md`
-- Signed-KV legacy compatibility: `docs/legacy-compat.md`
-- Named groups: `docs/design/named-groups-full-model.md` · Symphony: `docs/symphony-integration.md`
-- Non-Rust integration: `docs/local-apps.md`
+Docs are in `docs/` (start with `docs/api-reference.md`); test detail is in
+`tests/AGENTS.md`.
 
 ## Build and test
-- `just --list` for recipes. Local format, lint and docs checks (a subset of CI):
-  `cargo fmt --all -- --check`,
-  `cargo clippy --all-targets --all-features -- -D warnings`, and
-  `RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps`.
-  Passing them is not a full preflight. The `main` ruleset requires the
-  Format Check, Clippy Lint, Test Suite, Documentation and Build linux-x64-gnu
-  checks, and CI also runs coverage, parity, integration and
-  deployment-authority jobs; see `.github/workflows/` for the full set.
-- `ant-quic` and `saorsa-gossip-*` are exact-pinned (`=`) crates.io versions in
-  `Cargo.toml`, and `Cargo.lock` is tracked. CI and release builds use
-  `--locked`, so a dependency bump is a deliberate `Cargo.toml` + `Cargo.lock`
-  change. Local work against sibling checkouts (`../ant-quic`, `../saorsa-gossip`)
-  needs a temporary `[patch]`, which must not be committed.
-- **Running tests needs isolation.** Test daemons join the real network, so test
-  execution only runs inside a fresh loopback-only Linux network namespace with
-  dropped privileges; macOS/Windows fail closed. Use `just test` / `just test-full`
-  or `python3 scripts/dev/test-isolated.py nextest --all-features -- -E 'test(identity)'`
-  (contract: `nextest <build flags> -- <runtime flags>`). Plain `cargo test` /
-  `cargo nextest run` bypasses the isolation — only use it on a selector you've
-  confirmed is inert. Evidence lands in `target/dev-isolation/run-*`.
+- `just --list` shows the recipes.
+- Required checks on `main`: Format Check, Clippy Lint
+  (`cargo clippy --all-targets --all-features -- -D warnings`), Test Suite,
+  Documentation (`RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps`)
+  and Build linux-x64-gnu.
+- `ant-quic` and `saorsa-gossip-*` are exact-pinned crates.io versions and
+  `Cargo.lock` is tracked; CI builds with `--locked`. A local `[patch]` to a
+  sibling checkout must not be committed.
+- Test daemons join the real network. Run tests with `just test` or
+  `python3 scripts/dev/test-isolated.py nextest --all-features -- -E 'test(name)'`
+  (Linux network namespace; macOS and Windows fail closed). Plain `cargo test`
+  is only for a selector that starts no daemon.
 - Linux cross-build: `cargo zigbuild --release --target x86_64-unknown-linux-gnu --bin x0xd`.
 
 ## Architecture
+Every ID is SHA-256 of an ML-DSA-65 public key:
+- **Machine** (`~/.x0x/machine.key`, auto-generated): the QUIC transport identity.
+- **Agent** (`~/.x0x/agent.key`, auto-generated): portable across machines.
+- **User** (`~/.x0x/user.key`): optional human identity, never auto-generated;
+  it issues the `AgentCertificate` that binds an agent to a user.
 
-Identity is three layers; every ID is SHA-256 of an ML-DSA-65 public key:
-- **Machine** (`~/.x0x/machine.key`, auto-generated) — QUIC transport identity; equals the ant-quic PeerId.
-- **Agent** (`~/.x0x/agent.key`, auto-generated) — portable across machines.
-- **User** (`~/.x0x/user.key`) — optional human identity, **never auto-generated**; issues an `AgentCertificate` binding agent to user.
+Keys are bincode via `storage.rs`. Production code is panic-free; tests may use
+`unwrap`/`expect`.
 
-Keys are bincode-serialized via `storage.rs`, not JSON.
+Layers, bottom to top: `network.rs` (wraps `ant_quic::Node`; seeds in
+`DEFAULT_BOOTSTRAP_PEERS` are hints only), `gossip/`, `presence.rs`, then
+`crdt/`, `kv/`, `mls/`, `groups/`, then `server/` + `api/` (`src/api/mod.rs` is
+the endpoint registry shared by routes and CLI).
 
-Stack, bottom to top:
-1. `network.rs` — wraps `ant_quic::Node`, implements `GossipTransport`. ant-quic owns mDNS, UPnP, bootstrap cache and connection orchestration.
-2. Seeds — `DEFAULT_BOOTSTRAP_PEERS` in `network.rs`, dialled address-only by the join path; it lists UDP/443 first (preferred, traverses networks that block higher UDP ports) and keeps UDP/5483 for pre-ADR-0011 clients. Seeds are hints only.
-3. `gossip/` — thin orchestration over `saorsa-gossip-*`; `GossipRuntime` owns `PubSubManager`.
-4. `presence.rs` — beacons on the Bulk stream, phi-accrual failure detection, FOAF discovery with trust-scoped visibility.
-5. `crdt/` (task lists), `kv/` (replicated KV with access policies), `mls/` (group encryption), `groups/` (named groups; DHT-free discovery via social propagation, BLAKE3 tag shards and presence). Deltas of a group-scoped task list (`x0x.group.<gid>.symphony.<lid>`) in an `MlsEncrypted` group are sealed with the group's current GSS/TreeKEM key, like group KV stores (`crdt/sealed.rs`, #895); personal lists and `SignedPublic` groups stay plaintext.
-6. `server/` + `api/` — `x0xd` REST/WS; `src/api/mod.rs` is the shared endpoint registry that keeps routes and CLI subcommands (`src/cli/`) in sync. `gui/` is embedded HTML via `include_str!`.
+`x0x exec` is off unless the exec ACL sets `[exec].enabled = true`
+(`/etc/x0x/exec-acl.toml`; macOS `/usr/local/etc/x0x/exec-acl.toml`).
 
-Errors: `IdentityError`, `NetworkError`, `PresenceError` in `error.rs`.
-`lib.rs` allows `unwrap_used`/`expect_used` crate-wide for tests; production paths still use `?`.
+Multi-instance daemon: `x0xd --name alice --api-port 12701 --no-hard-coded-bootstrap`.
 
-`x0x exec` is off unless the exec ACL (`/etc/x0x/exec-acl.toml`, macOS `/usr/local/etc/x0x/exec-acl.toml`) sets `[exec].enabled = true`.
-
-`x0xd` flags worth knowing: `--name` (multi-instance), `--api-port`,
-`--no-hard-coded-bootstrap` (config peers kept), `--relay`, `--check`, `--doctor`.
-Example: `x0xd --name alice --api-port 12701 --no-hard-coded-bootstrap`.
-
-## Documentation and communication
-
-The documentation and communication style is in `docs/documentation-style.md`.
-
-## Architecture decisions (ADRs)
-Before changing architecture, protocols, storage formats, crypto, network
-behaviour, public APIs or operational invariants, read the accepted 15 ADR
-set in `docs/adr/consolidated/`. David accepted A01 through A15 on
-7 Nov 2026 (course-correction directive, ruling 2); they are the live
-decision authority. Keep the current ADR pack at 15. Under David's 19 Oct
-2026 ruling, do not add ADR files, including numbered records, transient
-`T-*.md` records or folded overlays. Put the rationale in the PR body and
-existing documentation or code doc comments. Use about 80% ASD-STE100
-style; follow `docs/documentation-style.md`.
-
-If a change touches the wire format or public API, write a `FOR ENGINEER:`
-line describing the change for David's decision. Record any approval in the
-PR body or comment. An approved additive API does not need a new ADR.
-Preserve Accepted records and frozen evidence. Do not create a superseding
-ADR or change an acceptance status as a workaround. A change to an accepted
-slot needs David's ruling.
-
-The numbered records (0001–0116) are the historical archive: their
-`docs/adr/` paths stay as links, and the bytes live in `docs/adr-archive/`.
-Where a slot is silent on a detail an archived accepted record settles, the
-archived record still answers it. The old index and status overlay are
-retired and archived at `docs/adr-archive/legacy-index-and-status-overlay.md`.
-The 17 Accepted transient records are folded into their slots and archived
-under `docs/adr-archive/transient/`; 6 Proposed transients stay open in
-`docs/adr/transient/` (see its README). Do not create A16 or a second
-consolidated series.
-Run `python3 scripts/check-adr-consolidation.py` for the 15-slot checks.
-Run `python3 scripts/check-adr-count.py` for the current-count limit of 15.
-The rules are in `docs/adr/consolidated/README.md`.
+## Decisions
+- The decision record is the 15 slots A01–A15 in `docs/adr/consolidated/`.
+  There are no new ADR files; older numbered records are in `docs/adr-archive/`.
+- A slot change is a dated paragraph in the slot plus its sha256 pin in
+  `index.json`. Check with `python3 scripts/check-adr-consolidation.py` and
+  `python3 scripts/check-adr-count.py`.
+- David delegated design and scope decisions on 10 Nov 2026. A PR that changes
+  a slot, the wire format or the public API says so in its body.
+- Writing style: `docs/documentation-style.md`.
