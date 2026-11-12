@@ -305,27 +305,28 @@ impl Rig {
     }
 }
 
-/// Wait until `count` sessions have completed, then return the exit codes
-/// recorded in the audit log (`None` for a signal exit).
-async fn completed_exit_codes(rig: &Rig, count: u64) -> Vec<Option<i64>> {
+/// Wait for the audit log to hold the exit record of request `id`, then
+/// return its exit code (`None` for a signal exit). The completion counter
+/// moves before the audit line is written, so poll the file itself.
+async fn exit_code_of(rig: &Rig, id: u8) -> Option<i64> {
+    let wanted = ExecRequestId([id; 16]).to_hex();
+    let path = rig._dir.path().join("exec-audit.jsonl");
     let start = Instant::now();
-    while rig
-        .service
-        .diagnostics_snapshot()
-        .await
-        .totals
-        .sessions_completed
-        < count
-    {
-        assert!(start.elapsed() < REFUSAL_BOUND, "the command never exited");
+    loop {
+        let log = std::fs::read_to_string(&path).unwrap_or_default();
+        let exit = log
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|event| event["event"] == "exit" && event["request_id"] == wanted.as_str());
+        if let Some(event) = exit {
+            return event["code"].as_i64();
+        }
+        assert!(
+            start.elapsed() < REFUSAL_BOUND,
+            "no exit record for request {wanted} within {REFUSAL_BOUND:?}"
+        );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    let log = std::fs::read_to_string(rig._dir.path().join("exec-audit.jsonl")).unwrap_or_default();
-    log.lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter(|event| event["event"] == "exit")
-        .map(|event| event["code"].as_i64())
-        .collect()
 }
 
 /// An owner-trusted sender the restarted receiver knows only from the
@@ -336,7 +337,7 @@ async fn exec_from_an_owner_trusted_peer_is_admitted_after_a_cold_restart() {
     let rig = rig(None, false).await;
     rig.request(0, 1).await;
     let (allowed, trust_denied, other_denied, _) = rig.outcome(1).await;
-    let codes = completed_exit_codes(&rig, 1).await;
+    let code = exit_code_of(&rig, 1).await;
     let cache_empty = rig
         .receiver
         .discovered_agent_for_testing(&rig.senders[0].agent.agent_id())
@@ -348,7 +349,7 @@ async fn exec_from_an_owner_trusted_peer_is_admitted_after_a_cold_restart() {
         (1, 0, 0),
         "the request must be admitted by owner trust from evidence"
     );
-    assert_eq!(codes, vec![Some(0)], "the command must run and exit 0");
+    assert_eq!(code, Some(0), "the command must run and exit 0");
     assert!(
         cache_empty,
         "admission wrote nothing to the discovery cache"
@@ -403,7 +404,7 @@ async fn exec_refuses_an_agent_revoked_before_the_restart() {
     let rig = rig(None, true).await;
     rig.request(1, 1).await;
     let control = rig.outcome(1).await;
-    let codes = completed_exit_codes(&rig, 1).await;
+    let code = exit_code_of(&rig, 1).await;
     rig.request(0, 2).await;
     let after = rig.outcome(2).await;
     rig.stop().await;
@@ -412,7 +413,7 @@ async fn exec_refuses_an_agent_revoked_before_the_restart() {
         (1, 0, 0),
         "control: the unrevoked sender is admitted on the restarted receiver"
     );
-    assert_eq!(codes, vec![Some(0)], "the control command must exit 0");
+    assert_eq!(code, Some(0), "the control command must exit 0");
     assert_eq!(
         (after.0, after.1, after.2),
         (1, 1, 0),
