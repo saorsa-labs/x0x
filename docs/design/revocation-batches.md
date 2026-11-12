@@ -178,13 +178,29 @@ hours. Decision (Claude, under David's delegation of 10 Nov 2026):
   turns it into a removed row. A removed former member is also no longer
   a relationship.
 
-  **Remaining trust in related peers (accepted risk).** An admin of an
-  approval-only group that this node joined can seat many fresh keys as
-  Active members, and each one is then seen: its self-revocation is
-  published. A Known or Trusted contact can announce fresh machines in
-  the same way. This is accepted because joining the group, or raising
-  the contact, needs a local user action. A bound per group is a possible
-  later step (#1867).
+  **Remaining trust in related peers (accepted risk).** Accepted by
+  Claude under David's delegation of 10 Nov 2026 (#1868 review round 4,
+  11 Nov 2026), and recorded on #1867.
+
+  - **Who.** An admin of an approval-only group (`InviteOnly`,
+    `RequestAccess`, `OwnerCertified`) that this node joined. Also a
+    Known or Trusted contact.
+  - **What they can do.** The admin can seat many fresh keys as Active
+    members. The contact can announce many fresh machines. Each such
+    key is then seen, so this daemon publishes its self-revocation
+    (about 5.3 KB) every 2 hours and keeps it.
+  - **Limit today.** There is no limit on how many such records one
+    group or one contact can make published.
+  - **Why it is accepted.** Joining the group, or raising the contact
+    to Known or Trusted, needs a local user action. A peer with no
+    relationship cannot do it.
+  - **What the user can do.** Leave the group, or lower the contact.
+    A record that is already marked stays published until the daemon
+    restarts (the mark is in memory only, see below).
+  - **Possible later step.** A limit for each group and each contact
+    on how many held self-revocations it can make published. This is
+    not decided. It is tracked on
+    [#1867](https://github.com/saorsa-labs/x0x/issues/1867).
 - Applying a revocation blocks its subject as a contact, so a Known
   contact is no longer a relationship after that. A daemon checks the
   rule **before** that change, and keeps the result in memory. The
@@ -192,6 +208,19 @@ hours. Decision (Claude, under David's delegation of 10 Nov 2026):
   relationship later (for example the user raises a contact to Known) is
   published at the next heartbeat.
 - A mark changes the set's generation, so the next heartbeat publishes.
+- The group check waits for the roster lock (#1867), on the gossip
+  ingest, the local apply path and the heartbeat. Before, a roster
+  that was locked for write at that moment read as "not seen". On the
+  ingest and the local apply path, the eviction that follows removes
+  the member row, so an active member's self-revocation stayed
+  unpublished. No path holds the roster lock or the revocation-set
+  lock when it makes this check.
+  One check takes the roster lock one time for all the held
+  strangers, so many strangers' records do not make many waits. One
+  window stays: x0xd installs the group check after its listeners
+  start, so a record that arrives in that short time is checked
+  without the groups. The next heartbeat checks it again, if its
+  member row is still there.
 - Every publish path reads its records from one function
   (`revocation_publish_records`), and a test decodes what it sends.
 - A self-revocation that this daemon applies itself (an operator revokes
@@ -221,16 +250,34 @@ sender is behind.
 
 **Known gap.** A waiting daemon that lost a self-revocation for a subject
 that only it knows does not get the record back from senders to whom the
-subject is a stranger. It opens without that record. Follow-up:
+subject is a stranger. It opens without that record. Closing it needs a
+request/response message (a wire change), which is not built; it waits
+for David's decision on #1867. Follow-up:
 [#1867](https://github.com/saorsa-labs/x0x/issues/1867).
 
-**Known stall: an empty published set.** A sender whose held v1 records
-are all self-revocations of strangers publishes an empty set, and an
-empty batch never opens a waiting carrier. If every trusted sender is in
-that state, a waiting daemon stays closed (fail closed) until a sender
-has a record that it publishes. Whether a signed empty statement from an
-authority should open a waiter is open in
-[#1867](https://github.com/saorsa-labs/x0x/issues/1867).
+**Known stall: an empty published set.** A sender whose held v1
+records are all self-revocations of strangers has an empty published
+set. `encode_revocation_batches` of an empty set returns no batch,
+so the sender sends nothing on the v1 topic. A waiting daemon
+therefore gets no snapshot from that sender. An empty batch from a
+trusted sender also never opens a carrier (rule of #1116) and
+removes that sender's earlier offer (#1864). If every trusted
+sender is in that state, the waiting daemon stays closed (fail
+closed) until a trusted sender publishes at least one v1 record (an
+owner revocation, or a self-revocation of a subject that the sender
+has seen), or the operator rebuilds the store
+(`x0x identity rebuild-revocation-store`, A03). A sender is in this
+state when its `identity_authority.revocation_stranger_self_held`
+count is not zero and is equal to its number of v1 records. This
+behaviour does not change now. A
+statement from an authority that its published set is empty (an
+empty batch, or a round marker with no records) would be new
+traffic and a change to the #1116 rule, so it needs David's
+decision. This is an open question on
+[#1867](https://github.com/saorsa-labs/x0x/issues/1867). Before
+#1863 the same stall existed for a network with no revocation at
+all; #1863 widened it to networks whose only records are strangers'
+self-revocations.
 
 **Mixed versions.** A released daemon (v0.48.1 and earlier) that waits for
 a resync compares exact record sets. If it holds a stranger's
