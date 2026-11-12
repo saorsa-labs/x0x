@@ -3068,7 +3068,11 @@ pub(in crate::server) async fn s4_no_eligible_admin_refusal(
 /// Send the first hand-off of every due row to every other eligible admin
 /// whose current verified advert sets `eviction_handoff_v1` (§2, §4). A
 /// known lacking advert is an unsupported attempt; an unknown advert sends
-/// nothing (ADR 0093: unknown support never implies support). The
+/// nothing this pass and asks once for a fresh advert (ADR 0093: unknown
+/// support never implies support; ADR 0110 §4: unknown/expired support
+/// first requests an authenticated advert refresh), so a later pass can
+/// see the capability instead of stalling until something else refreshes
+/// the advert. The
 /// designated admin's own dispatch outcome is recorded against its
 /// attempt (L174), and the outcome-bearing records persist (§2
 /// L170–L173, §5 v3), so `unresolved_designated_admin` and the §4
@@ -3145,7 +3149,23 @@ async fn dispatch_handoffs(state: &Arc<AppState>) {
                         unsupported_outcome = Some(recipient);
                     }
                 }
-                None => {}
+                None => {
+                    // ADR 0110 §4: unknown/expired support first requests
+                    // an authenticated advert refresh; unknown support
+                    // never implies support (ADR 0093), so nothing is
+                    // sent this pass — the detached refresh rebind.rs
+                    // shares asks once, and a later pass sees the advert.
+                    let task_state = Arc::clone(state);
+                    let _spawned = state.spawn_detached(async move {
+                        task_state
+                            .agent
+                            .refresh_application_capability(
+                                agent,
+                                x0x::dm::CapabilityRegistry::EVICTION_HANDOFF_V1,
+                            )
+                            .await;
+                    });
+                }
             }
         }
         if !unsupported.is_empty() {
@@ -7656,6 +7676,17 @@ pub(super) mod tests {
     ) -> anyhow::Result<UdaRestart> {
         let (state, dir) =
             crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let (state, group_id, key, designated, bytes) =
+            uda_open_row_over_state(state, outcome).await?;
+        Ok((state, group_id, key, designated, bytes, dir))
+    }
+
+    /// #1581: the [`uda_state_after_restart`] row shape over a caller's
+    /// state, so a hermetic loopback agent can drive the §4 dispatch.
+    async fn uda_open_row_over_state(
+        state: Arc<AppState>,
+        outcome: Option<s4::DesignatedHandoffOutcome>,
+    ) -> anyhow::Result<(Arc<AppState>, String, EvictionKey, [u8; 32], Vec<u8>)> {
         let local = *state.agent.agent_id().as_bytes();
         // The designated admin is the lowest raw-ID eligible admin, so
         // generate one lower than the local admin: the local node waits
@@ -7724,7 +7755,7 @@ pub(super) mod tests {
         // Restart: the whole S4 state is reloaded from disk.
         *state.revocation_evictions.inner.lock().await = S4Inner::default();
         load_persisted_obligations(&state).await;
-        Ok((state, group_id, key, designated, bytes, dir))
+        Ok((state, group_id, key, designated, bytes))
     }
 
     /// One pass over the [`uda_state_after_restart`] shape, then the
@@ -8314,6 +8345,153 @@ pub(super) mod tests {
             .unsupported_handoff
             .get(&key)
             .is_some_and(|ids| ids.contains(&designated)));
+        Ok(())
+    }
+
+    /// #1581: the dispatch's `None` arm for an unknown or expired advert
+    /// (a card-only binding takes the same path) sends no hand-off this
+    /// pass and asks exactly once per recipient for a fresh advert
+    /// through the shared single-flight registry, so a later pass can see
+    /// the capability instead of stalling until something else refreshes
+    /// the advert.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unknown_or_expired_advert_asks_once_and_sends_nothing() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        // Hermetic plane (the 1575 pattern): loopback bind, no bootstrap,
+        // no mDNS, no port mapping, a network id unique to this run — the
+        // node has nothing to dial and nothing to discover, and the §4
+        // dispatch runs over a real gossip runtime.
+        let network_id = format!(
+            "1581-evict-refresh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default()
+        );
+        let agent = Arc::new(
+            x0x::Agent::builder()
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_peer_cache_disabled()
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_network_config(x0x::network::NetworkConfig {
+                    bind_addr: Some("127.0.0.1:0".parse()?),
+                    bootstrap_nodes: Vec::new(),
+                    port_mapping_enabled: false,
+                    mdns_enabled: false,
+                    network_id: Some(network_id),
+                    ..x0x::network::NetworkConfig::default()
+                })
+                .build()
+                .await?,
+        );
+        agent.join_network().await?;
+        let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+            dir.path(),
+            Arc::clone(&agent),
+        )
+        .await?;
+        let (state, group_id, key, designated, _bytes) =
+            uda_open_row_over_state(state, None).await?;
+
+        // A second eligible admin whose advert sets the bit but was
+        // signed one second inside its TTL, so it ages out on its own:
+        // the dispatch's advert read must answer `None` for it exactly
+        // as for the helper's designated admin, which has no advert at
+        // all. Which of the two the pass designates is immaterial —
+        // every unknown-support recipient takes the same arm.
+        let expired = *x0x::identity::AgentKeypair::generate()?
+            .agent_id()
+            .as_bytes();
+        {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&group_id).expect("the group");
+            info.add_member(
+                hex::encode(expired),
+                GroupRole::Admin,
+                Some(hex::encode(*state.agent.agent_id().as_bytes())),
+                None,
+            );
+            info.recompute_state_hash();
+        }
+        let nearly_stale =
+            now_unix_ms() - (x0x::dm_capability::ADVERT_CACHE_TTL_SECS * 1000 - 1_000);
+        let mut caps = x0x::dm::DmCapabilities::v1_gossip_ready(vec![42; 1184]);
+        caps.application_registry = x0x::dm::CapabilityRegistry {
+            version: 1,
+            bits: u64::MAX,
+        };
+        assert!(
+            state.agent.capability_store().insert(
+                x0x::identity::AgentId(expired),
+                x0x::identity::MachineId([6; 32]),
+                caps,
+                nearly_stale,
+            ),
+            "the advert is inside its signed lifetime when seeded"
+        );
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert_eq!(
+            state.agent.capability_store().verified_registry_supports(
+                &x0x::identity::AgentId(expired),
+                x0x::dm::CapabilityRegistry::EVICTION_HANDOFF_V1
+            ),
+            None,
+            "the expired advert reads as unknown support"
+        );
+        let mut requests = state
+            .agent
+            .subscribe(crate::dm_capability::DM_CAPABILITY_TARGETED_REQUEST_TOPIC)
+            .await?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // One pass derives the designation onto the row; the row has
+        // already dispatched, so the pass queues nothing itself.
+        revocation_eviction_pass(&state).await;
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.pending_dispatch.insert(key.clone());
+        }
+        dispatch_handoffs(&state).await;
+
+        // Exactly one targeted refresh request per unknown-support admin.
+        let mut asked = BTreeSet::new();
+        for _ in 0..2 {
+            let message = tokio::time::timeout(Duration::from_secs(3), requests.recv())
+                .await
+                .expect("one refresh request per unknown-support admin")
+                .expect("the subscription stays live");
+            let asked_id = crate::dm_capability_service::decode_targeted_capability_request(
+                &message.topic,
+                &message.payload,
+            )
+            .expect("a targeted capability request");
+            asked.insert(*asked_id.as_bytes());
+        }
+        assert_eq!(
+            asked,
+            BTreeSet::from([designated, expired]),
+            "each unknown-support admin is asked exactly once"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), requests.recv())
+                .await
+                .is_err(),
+            "no admin is asked a second time inside the flight window"
+        );
+        // Nothing was sent: no designated outcome and no unsupported set.
+        let inner = state.revocation_evictions.inner.lock().await;
+        assert_eq!(
+            inner.store.get(&key).expect("the row").designated_handoff,
+            None,
+            "an unknown advert sends nothing, so no outcome lands"
+        );
+        assert!(
+            !inner.unsupported_handoff.contains_key(&key),
+            "an unknown advert is not a definitive refusal"
+        );
         Ok(())
     }
 
