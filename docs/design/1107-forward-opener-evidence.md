@@ -73,9 +73,33 @@ change.
 
 ## SyncV1
 
-Not changed. The SyncV1 `Proof` is a signature by the owner key, not by an
-agent key, so rule 1 does not hold. An enrolled machine with no known
-agent is still admitted for SyncV1 on its enrollment (#1040).
+The evidence rule above does not apply to `SyncV1`. The `SyncV1` `Proof` is
+a signature by the owner key, not by an agent key, so the signed-header
+requirement in rule 1 does not hold.
+
+Enrollment admission for `SyncV1` is widened by a separate rule (A03
+amendment of 12 Nov 2026, #1107). Before, the enrolled-owner admission path
+required no known agent on the machine (archived ADR 0084 §5). An owner
+device that announces without its user identity is a known agent with no
+trust, so owner sync stopped in both directions once its announce arrived.
+
+For `SyncV1` only, an enrolled and unrevoked owner machine is now admitted on
+its enrollment when every agent known on that machine fails the shared gate
+solely for lack of trust. Every explicit denial still refuses: a blocked
+contact, any revocation, a machine-pin mismatch, a pending resync, an
+expired certificate, a retired binding, a placement denial, an ACL denial,
+or an unclassified result. The outbound sync pass dials under the same
+condition.
+
+Security note: the machine could already get this admission by not
+announcing, so the old rule stopped only honest devices. The session still
+requires the mutual owner-key proof, and all enrollment and revocation checks
+run at each phase. The admitted stream has no agent, goes only to the
+owner-sync acceptor, and writes nothing to the discovery, binding, capability
+or evidence registries.
+
+Wire format, the `Proof` structure, the acceptor checks, and all other
+protocols are unchanged.
 
 ## Mixed versions
 

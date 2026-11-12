@@ -21435,7 +21435,9 @@ impl Agent {
 
     /// #1040: open an owner-sync (`SyncV1`) stream to an enrolled owner
     /// machine that the discovery cache does not know (no agent announced
-    /// on it yet, e.g. right after this device restarted).
+    /// on it yet, e.g. right after this device restarted), or (#1107) whose
+    /// known agents lack only trust
+    /// ([`Self::enrolled_owner_sync_over_untrusted`]; the caller checks it).
     ///
     /// Admission mirrors the inbound branch: the machine must be in this
     /// device's verified owner enrollment set
@@ -21864,7 +21866,7 @@ impl Agent {
             owner_trust,
             machine_id,
             None,
-            false,
+            owner_trust::InboundTrustRule::AcceptRequired,
             local_authority_only,
         )
         .await
@@ -21907,15 +21909,17 @@ impl Agent {
             owner_trust,
             machine_id,
             call_caller,
-            false,
+            owner_trust::InboundTrustRule::AcceptRequired,
             false,
         )
         .await
         .map_err(|e| e.fail_closed_admission(machine_id.0))
     }
 
-    /// Shared gate with a narrow ADR 0089 mode. Only Unknown relationship
-    /// peers gain evidence admission; every other check remains unchanged.
+    /// Shared gate with a per-agent trust rule ([`owner_trust::InboundTrustRule`]).
+    /// The narrow ADR 0089 rule admits only Unknown relationship peers for
+    /// evidence; the #1107 rule waives only missing trust for an
+    /// enrollment-only `SyncV1` handoff. Every other check is unchanged.
     ///
     /// With `local_authority_only`, confirmation and grant evaluation use
     /// non-blocking local evidence only (ADR-0074 §4 reauth); contended
@@ -21932,10 +21936,11 @@ impl Agent {
         owner_trust: &owner_trust::OwnerTrust,
         machine_id: &identity::MachineId,
         call_caller: Option<&identity::AgentId>,
-        evidence_only: bool,
+        rule: owner_trust::InboundTrustRule,
         local_authority_only: bool,
     ) -> Result<Vec<identity::AgentId>, crate::forward::PeerGateError> {
-        use crate::owner_trust::NonblockingEval;
+        use crate::owner_trust::{InboundTrustRule, NonblockingEval};
+        let evidence_only = rule == InboundTrustRule::EvidenceRelationship;
         // Identity gate — resolve ALL agents on this machine from the
         // discovery cache, then check each (revoked → trust). A single
         // non-Accept agent denies the traffic (fail-closed, #192).
@@ -22064,10 +22069,12 @@ impl Agent {
                     machine_id,
                 )
                 .await;
-            let trust_decision = Some(
-                pair.decision
-                    .with_owner_trust(has_connect_grant || has_call_grant || evidence_relationship),
-            );
+            // #1107: `with_owner_trust` lifts only Unknown/AcceptWithFlag, so
+            // the waived rule never lifts Blocked or a machine-pin mismatch.
+            let waived = rule == InboundTrustRule::EnrolledOwnerSync;
+            let trust_decision = Some(pair.decision.with_owner_trust(
+                has_connect_grant || has_call_grant || evidence_relationship || waived,
+            ));
             let (revoked_agent, revoked_machine, resync_required) = {
                 let revoked = revocation_set.read().await;
                 (
@@ -22169,7 +22176,9 @@ impl Agent {
                 confirmed.push(*agent_id);
             }
         }
-        if confirmed.is_empty() {
+        // #1107: the enrollment-only path attributes no agent, so a missing
+        // confirmation is not a deny there.
+        if confirmed.is_empty() && rule != InboundTrustRule::EnrolledOwnerSync {
             tracing::info!(
                 target: "x0x::streams",
                 machine = %hex::encode(machine_id.as_bytes()),
@@ -22182,6 +22191,9 @@ impl Agent {
             .into());
         }
 
+        // #1107: the EnrolledOwnerSync rule returns every agent it judged.
+        let judged = (rule == InboundTrustRule::EnrolledOwnerSync)
+            .then(|| agents.iter().map(|(agent, _)| *agent).collect::<Vec<_>>());
         // Connect-ACL gate input: every surviving routed agent stays listed
         // (fail-closed second layer below).
         let agents: Vec<identity::AgentId> = surviving;
@@ -22218,7 +22230,7 @@ impl Agent {
         }
         // Gate cleared — the ordered, authority-confirmed agent list for
         // the stream/lane handle.
-        Ok(confirmed)
+        Ok(judged.unwrap_or(confirmed))
     }
 
     /// Open the unreliable datagram lane to a verified, trusted peer
@@ -22395,7 +22407,10 @@ impl Agent {
     ///    ([`EnrolledOwnerSyncRoute::SharedGate`]), exactly like a stream
     ///    from a known machine. This matters because an agent can become
     ///    known during the prefix read, and it may be revoked, blocked, or
-    ///    not on the connect ACL (#1044 review round 1).
+    ///    not on the connect ACL (#1044 review round 1). If agents that
+    ///    lack only trust are the reason the shared gate refuses, the
+    ///    caller then applies [`Self::admit_enrolled_owner_sync_over_untrusted`]
+    ///    (#1107, `SyncV1` only).
     /// 2. Otherwise only `SyncV1` or `ForwardV2` from a machine that is
     ///    STILL in the verified owner enrollment set is admitted: `admit`
     ///    runs and its result is returned as
@@ -22439,9 +22454,111 @@ impl Agent {
         EnrolledOwnerSyncRoute::Admitted(admitted)
     }
 
+    /// #1107: enrollment-only `SyncV1` handoff for an enrolled owner machine
+    /// whose KNOWN agents fail the shared gate only for missing trust (for
+    /// example a device that restarted and announced anonymously, with no
+    /// certificate). Without this, such a machine would get less than one
+    /// that had not announced at all.
+    ///
+    /// Call it only after the shared gate refused the stream with
+    /// [`error::NetworkError::PeerTrustRejected`]. A machine that the shared
+    /// gate accepts keeps the shared path and its agent list.
+    ///
+    /// Admits (runs `admit`, returns `Some`) only when all of these are true:
+    /// - `protocol` is `SyncV1`;
+    /// - the machine is in the verified owner enrollment set, checked now;
+    /// - the shared gate passes with the
+    ///   [`owner_trust::InboundTrustRule::EnrolledOwnerSync`] rule. Only
+    ///   Unknown / AcceptWithFlag trust and a missing authority confirmation
+    ///   are waived. Blocked, machine-pin mismatch, revocation, the resync
+    ///   hold, an expired certificate, dead pairings and an Enabled connect
+    ///   ACL still refuse;
+    /// - under the discovery-cache read guard, the machine's known agents are
+    ///   exactly the agents the gate judged. An agent learned meanwhile
+    ///   refuses (fail closed), so no unjudged agent rides the enrollment.
+    ///
+    /// The handoff carries no agent and writes no registry. Lock discipline
+    /// is as for [`Self::route_enrolled_owner_sync`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn admit_enrolled_owner_sync_over_untrusted<T>(
+        discovery_cache: &std::sync::Arc<
+            tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+        >,
+        contact_store: &std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
+        revocation_set: &std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+        move_state: &std::sync::Arc<tokio::sync::RwLock<key_move::MoveState>>,
+        connect_policy: &std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>>,
+        owner_trust: &owner_trust::OwnerTrust,
+        machine_id: &identity::MachineId,
+        protocol: streams::StreamProtocol,
+        admit: impl FnOnce() -> T,
+    ) -> Option<T> {
+        if protocol != streams::StreamProtocol::SyncV1
+            || !owner_trust
+                .is_enrolled_owner_machine(revocation_set, machine_id)
+                .await
+        {
+            return None;
+        }
+        let judged = Self::gate_peer_machine_inbound_for_evidence(
+            discovery_cache,
+            contact_store,
+            revocation_set,
+            move_state,
+            connect_policy,
+            owner_trust,
+            machine_id,
+            None,
+            owner_trust::InboundTrustRule::EnrolledOwnerSync,
+            false,
+        )
+        .await
+        .ok()?;
+        let cache = discovery_cache.read().await;
+        let mut known: Vec<identity::AgentId> = cache
+            .values()
+            .filter(|agent| agent.machine_id == *machine_id)
+            .map(|agent| agent.agent_id)
+            .collect();
+        known.sort_by_key(|agent| agent.0);
+        if known.is_empty() || known != judged {
+            return None;
+        }
+        let admitted = admit();
+        drop(cache);
+        Some(admitted)
+    }
+
+    /// Outbound mirror of [`Self::admit_enrolled_owner_sync_over_untrusted`]
+    /// (#1107): whether an owner-sync dial to the enrolled `machine_id` may
+    /// fall back to [`Self::open_enrolled_owner_sync_stream`] although agents
+    /// are known on it. Same rule, same gate; an explicit deny refuses.
+    pub(crate) async fn enrolled_owner_sync_over_untrusted(
+        &self,
+        machine_id: &identity::MachineId,
+    ) -> bool {
+        Self::admit_enrolled_owner_sync_over_untrusted(
+            &self.identity_discovery_cache,
+            &self.contact_store,
+            &self.revocation_set,
+            &self.move_state,
+            &self.connect_policy,
+            &self.owner_trust,
+            machine_id,
+            streams::StreamProtocol::SyncV1,
+            || (),
+        )
+        .await
+        .is_some()
+    }
+
     /// Keep the main gate-first path independent of strangers' prefix reads.
     /// Unknown relationship peers get only a bounded EvidenceV1 prefix probe.
-    /// All other denials remain on the shared gate.
+    /// An enrolled owner machine whose known agents lack only trust gets the
+    /// enrolled slot instead ([`Self::admit_enrolled_owner_sync_over_untrusted`],
+    /// #1107). All other denials remain on the shared gate. Every admission
+    /// for a machine with a known agent sets `known_machine`, so an
+    /// EvidenceV1 prefix on it is rechecked after the prefix read.
     #[allow(clippy::too_many_arguments)]
     async fn admit_stream_before_prefix(
         discovery_cache: &std::sync::Arc<
@@ -22474,6 +22591,33 @@ impl Agent {
             let agents = match agents {
                 Ok(agents) => agents,
                 Err(error::NetworkError::PeerTrustRejected { .. }) => {
+                    // #1107: lacking only trust, an enrolled owner machine
+                    // gets the enrolled slot; after the prefix only SyncV1
+                    // can use it (dispatch re-judges the machine then). The
+                    // slot keeps `known_machine`, so an EvidenceV1 prefix on
+                    // it still meets the evidence gate after the prefix read,
+                    // even if the agents' discovery entries vanish meanwhile.
+                    if Self::admit_enrolled_owner_sync_over_untrusted(
+                        discovery_cache,
+                        contact_store,
+                        revocation_set,
+                        move_state,
+                        connect_policy,
+                        owner_trust,
+                        machine_id,
+                        streams::StreamProtocol::SyncV1,
+                        || (),
+                    )
+                    .await
+                    .is_some()
+                    {
+                        return Some(streams::InboundAdmission {
+                            agents: None,
+                            prefix: None,
+                            evidence_only: false,
+                            known_machine: true,
+                        });
+                    }
                     Self::gate_peer_machine_inbound_for_evidence(
                         discovery_cache,
                         contact_store,
@@ -22483,7 +22627,7 @@ impl Agent {
                         owner_trust,
                         machine_id,
                         None,
-                        true,
+                        owner_trust::InboundTrustRule::EvidenceRelationship,
                         false,
                     )
                     .await
@@ -22492,6 +22636,7 @@ impl Agent {
                         agents: None,
                         prefix: Some(limits.admit_prefix(*machine_id)?),
                         evidence_only: true,
+                        known_machine: true,
                     });
                 }
                 Err(_) => return None,
@@ -22500,6 +22645,7 @@ impl Agent {
                 agents: Some(agents),
                 prefix: None,
                 evidence_only: false,
+                known_machine: true,
             });
         }
         if owner_trust
@@ -22510,25 +22656,77 @@ impl Agent {
                 agents: None,
                 prefix: None,
                 evidence_only: false,
+                known_machine: false,
             });
         }
         Some(streams::InboundAdmission {
             agents: None,
             prefix: Some(limits.admit_prefix(*machine_id)?),
             evidence_only: false,
+            known_machine: false,
         })
     }
 
+    /// Post-prefix recheck for an EvidenceV1 stream: `true` refuses it.
+    /// Live denials and relationships are judged again after the prefix
+    /// wait. A previously known machine cannot turn into a stranger bypass
+    /// if its discovery entries disappear during that wait: any machine with
+    /// a known agent at pre-prefix admission
+    /// ([`streams::InboundAdmission::recheck_evidence`], including the #1107
+    /// enrolled slot) meets the evidence gate, which then refuses a machine
+    /// with no known agent left.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn evidence_refused_after_prefix(
+        discovery_cache: &std::sync::Arc<
+            tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+        >,
+        contact_store: &std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
+        revocation_set: &std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+        move_state: &std::sync::Arc<tokio::sync::RwLock<key_move::MoveState>>,
+        connect_policy: &std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>>,
+        owner_trust: &owner_trust::OwnerTrust,
+        machine_id: &identity::MachineId,
+        admission: &streams::InboundAdmission,
+    ) -> bool {
+        let known = discovery_cache
+            .read()
+            .await
+            .values()
+            .any(|a| a.machine_id == *machine_id);
+        let machine_revoked = revocation_set.read().await.is_machine_revoked(machine_id);
+        machine_revoked
+            || ((known || admission.recheck_evidence())
+                && Self::gate_peer_machine_inbound_for_evidence(
+                    discovery_cache,
+                    contact_store,
+                    revocation_set,
+                    move_state,
+                    connect_policy,
+                    owner_trust,
+                    machine_id,
+                    None,
+                    owner_trust::InboundTrustRule::EvidenceRelationship,
+                    false,
+                )
+                .await
+                .is_err())
+    }
+
     /// Dispatch after gate-first admission. EvidenceV1 goes exclusively to its
-    /// evidence acceptor. Known peers retain their gate result; machines with
-    /// no known agent apply [`Self::route_enrolled_owner_sync`]:
+    /// evidence acceptor, after [`Self::evidence_refused_after_prefix`]
+    /// rechecks any machine known at pre-prefix admission. Known peers
+    /// retain their gate result; machines with no known agent apply
+    /// [`Self::route_enrolled_owner_sync`]:
     ///
     /// - An admitted `SyncV1` stream goes to the REGISTERED `SyncV1`
     ///   acceptor only, never the default channel.
-    /// - A machine whose agent became known meanwhile goes through the
+    /// - A machine with a known agent (learned meanwhile, or #1107: admitted
+    ///   pre-prefix because its agents lack only trust) goes through the
     ///   shared gate ([`Self::gate_peer_machine_inbound`]: identity, trust,
     ///   pairing and connect ACL) and is routed exactly as the normal
-    ///   accept path routes it.
+    ///   accept path routes it. If that gate refuses for trust only, a
+    ///   `SyncV1` stream gets [`Self::admit_enrolled_owner_sync_over_untrusted`],
+    ///   judged now, after the prefix read.
     /// - Anything else drops the halves (→ QUIC reset) with zero
     ///   application bytes surfaced, logged `deny_not_verified` as the
     ///   shared gate would log it.
@@ -22576,6 +22774,19 @@ impl Agent {
                 return;
             }
         };
+        // The recheck runs while `admission` still holds the prefix slot.
+        let evidence_refused = protocol == streams::StreamProtocol::EvidenceV1
+            && Self::evidence_refused_after_prefix(
+                &discovery_cache,
+                &contact_store,
+                &revocation_set,
+                &move_state,
+                &connect_policy,
+                &owner_trust,
+                &machine_id,
+                &admission,
+            )
+            .await;
         // Keep the pre-identity slot through dispatch, including asynchronous
         // relationship checks. Evidence bodies then hold a separate reservation
         // through queueing and verification.
@@ -22585,32 +22796,7 @@ impl Agent {
         // Acquire both the machine stream slot and aggregate allocation permit
         // before queueing. The lease carries the original body deadline.
         if protocol == streams::StreamProtocol::EvidenceV1 {
-            // Recheck live denials and relationships after the prefix wait.
-            // A previously known machine cannot turn into a stranger bypass
-            // if its discovery entries disappear during that wait.
-            let known = discovery_cache
-                .read()
-                .await
-                .values()
-                .any(|a| a.machine_id == machine_id);
-            let machine_revoked = revocation_set.read().await.is_machine_revoked(&machine_id);
-            if machine_revoked
-                || ((known || admission.agents.is_some() || admission.evidence_only)
-                    && Self::gate_peer_machine_inbound_for_evidence(
-                        &discovery_cache,
-                        &contact_store,
-                        &revocation_set,
-                        &move_state,
-                        &connect_policy,
-                        &owner_trust,
-                        &machine_id,
-                        None,
-                        true,
-                        false,
-                    )
-                    .await
-                    .is_err())
-            {
+            if evidence_refused {
                 return;
             }
             if let (Some(sender), Some(lease)) = (
@@ -22688,7 +22874,7 @@ impl Agent {
                 let Some((send, recv)) = halves.take() else {
                     return;
                 };
-                let Ok(agents) = Self::gate_peer_machine_inbound(
+                let agents = match Self::gate_peer_machine_inbound(
                     &discovery_cache,
                     &contact_store,
                     &revocation_set,
@@ -22698,8 +22884,45 @@ impl Agent {
                     &machine_id,
                 )
                 .await
-                else {
-                    return;
+                {
+                    Ok(agents) => agents,
+                    // #1107: an enrolled machine whose agents lack only trust.
+                    Err(error::NetworkError::PeerTrustRejected { .. }) => {
+                        let delivered = Self::admit_enrolled_owner_sync_over_untrusted(
+                            &discovery_cache,
+                            &contact_store,
+                            &revocation_set,
+                            &move_state,
+                            &connect_policy,
+                            &owner_trust,
+                            &machine_id,
+                            protocol,
+                            || {
+                                let sender = incoming.registered_sender(protocol)?;
+                                let stream = streams::PeerStream::new(
+                                    Vec::new(),
+                                    machine_id,
+                                    protocol,
+                                    send,
+                                    recv,
+                                );
+                                Some(sender.try_send(stream).is_ok())
+                            },
+                        )
+                        .await;
+                        if let Some(Some(delivered)) = delivered {
+                            tracing::info!(
+                                target: "x0x::streams",
+                                machine = %hex::encode(machine_id.as_bytes()),
+                                outcome = "admit_enrolled_owner_sync_untrusted_agent",
+                                protocol = ?protocol,
+                                delivered,
+                                "stream admitted on verified owner enrollment (known agents lack only trust, #1107)"
+                            );
+                        }
+                        return;
+                    }
+                    Err(_) => return,
                 };
                 let peer_stream =
                     streams::PeerStream::new(agents, machine_id, protocol, send, recv);
