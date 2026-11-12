@@ -521,12 +521,17 @@ impl x0x::crdt::TaskDeltaProtector for GroupTaskDeltaProtector {
     ///   live `secret_epoch` cannot move. A GSS share hold (a verified
     ///   removal that waits for its share) is added under it too, so the
     ///   hold cannot start between the check and the publish (#1508 rc17).
+    ///   #1581: the no-eligible-admin boundary is re-asked under the permit
+    ///   too, after the `named_groups` guard drops, so a verified revocation
+    ///   that lands between `seal` and this confirm answers `Stale`.
     /// - TreeKEM: the group's membership lock, then its live ratchet mutex —
     ///   the same order `seal_record` takes them. Every ratchet epoch change
     ///   needs the ratchet mutex.
     ///
     /// Called with no lock held (after `seal` has returned), and takes each
     /// lock once: nothing here re-enters a lock the caller or `seal` holds.
+    /// The #1581 re-check runs only after the `named_groups` guard is
+    /// dropped: the boundary takes its own read of that lock.
     fn confirm_publication<'a>(
         &'a self,
         body: &'a x0x::crdt::sealed::SealedTaskRecordBody,
@@ -564,8 +569,26 @@ impl x0x::crdt::TaskDeltaProtector for GroupTaskDeltaProtector {
                     };
                     let (current_epoch, still_gss, removal_held) =
                         current.ok_or_else(|| unavailable("group is not known"))?;
+                    // #1581: the revocation set is not serialized with the
+                    // `named_groups` read above, so a verified revocation can
+                    // land between `seal` and this confirm and still cover
+                    // every admin seat. Ask `seal`'s boundary again, only
+                    // after the guard is dropped (the boundary takes its own
+                    // `named_groups` read). A hold answers `Stale`; the
+                    // payload re-enters the sealing path, which refuses it.
+                    let withheld = still_gss
+                        && !removal_held
+                        && current_epoch == record.epoch
+                        && super::named_groups::group_ciphertext_withheld(
+                            &state,
+                            &self.group_id,
+                            None,
+                        )
+                        .await
+                        .is_some();
                     Ok(
-                        if still_gss && !removal_held && current_epoch == record.epoch {
+                        if still_gss && !removal_held && current_epoch == record.epoch && !withheld
+                        {
                             x0x::crdt::TaskPublication::Current(
                                 x0x::crdt::TaskPublicationPermit::holding(permit),
                             )
@@ -613,6 +636,13 @@ impl x0x::crdt::TaskDeltaProtector for GroupTaskDeltaProtector {
     /// plane (or became unresolvable or withdrawn) answers `Stale` and the
     /// payload re-enters the sealing path — never plaintext.
     ///
+    /// #1581: `seal` asked the no-eligible-admin boundary before the plane
+    /// chose plaintext, but the revocation set is not serialized with the
+    /// `named_groups` read, so a verified revocation can land between `seal`
+    /// and this confirm. The boundary is re-asked under the permit, after
+    /// the guard drops (it takes its own `named_groups` read); a hold
+    /// answers `Stale` — never plaintext.
+    ///
     /// Called with no lock held (after `seal` returned `None`), and takes
     /// each lock once, in the same order `confirm_publication`'s GSS arm
     /// does: the publication gate, then `named_groups`.
@@ -638,7 +668,17 @@ impl x0x::crdt::TaskDeltaProtector for GroupTaskDeltaProtector {
                     },
                 )
             };
-            Ok(if still_public == Some(true) {
+            // #1581: as in `confirm_publication`'s GSS arm, the revocation
+            // set is not serialized with the `named_groups` read above, so a
+            // verified revocation can land between `seal` and this confirm.
+            // Ask `seal`'s boundary again, only after the guard is dropped
+            // (the boundary takes its own `named_groups` read); a hold
+            // answers `Stale` and the payload re-enters the sealing path.
+            let withheld = still_public == Some(true)
+                && super::named_groups::group_ciphertext_withheld(&state, &self.group_id, None)
+                    .await
+                    .is_some();
+            Ok(if still_public == Some(true) && !withheld {
                 x0x::crdt::TaskPublication::Current(x0x::crdt::TaskPublicationPermit::holding(
                     permit,
                 ))
@@ -2779,6 +2819,42 @@ mod tests {
             ));
         }
 
+        /// #1581: a GSS task record sealed before a verified revocation is
+        /// not published after it. The revocation moves neither the epoch
+        /// nor a pending removal, so before the fix the GSS arm of
+        /// `confirm_publication` checked the plane, the removal hold and the
+        /// epoch only, and answered `Current`.
+        #[tokio::test]
+        async fn gss_task_record_sealed_before_a_revocation_is_not_published() {
+            let (state, _dir) = test_state().await;
+            let admin = AgentKeypair::generate().expect("admin key");
+            let group_key = "b7".repeat(16);
+            let mut info = group_with_foreign_admin(&state, &group_key, &admin);
+            let _ = info.rotate_shared_secret();
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_key.clone(), info);
+            let topic = format!("x0x.group.{group_key}.symphony.board");
+            let protector = group_task_list_binding(&state, &topic)
+                .await
+                .delta_protector
+                .expect("a group-scoped list gets a protector");
+            let Ok(Some(body)) = protector
+                .seal(x0x::kv::KvMutationKind::Delta, b"delta")
+                .await
+            else {
+                panic!("the delta seals before the revocation");
+            };
+
+            revoke_agent(&state, &admin).await;
+            assert!(matches!(
+                protector.confirm_publication(&body).await,
+                Ok(x0x::crdt::TaskPublication::Stale)
+            ));
+        }
+
         /// #1533 rc16 (Codex P2): a pending GSS removal does not mask the
         /// no-eligible-admin hold on key material. With both holds, the
         /// shared boundary reports the removal first; before the fix the
@@ -2847,6 +2923,45 @@ mod tests {
             assert!(matches!(seal_once(&state, &topic).await, Ok(None)));
             revoke_agent(&state, &admin).await;
             assert_withheld(seal_once(&state, &topic).await);
+        }
+
+        /// #1581: a `SignedPublic` task delta that sealed cleanly is not
+        /// published as plaintext once a verified revocation covers every
+        /// admin seat. The revocation leaves the policy alone, so before
+        /// the fix `confirm_plaintext_publication` re-checked the plane
+        /// only and answered `Current`.
+        #[tokio::test]
+        async fn plaintext_delta_sealed_before_a_revocation_is_not_published() {
+            let (state, _dir) = test_state().await;
+            let admin = AgentKeypair::generate().expect("admin key");
+            let group_key = "b8".repeat(16);
+            let mut info = group_with_foreign_admin(&state, &group_key, &admin);
+            info.policy.confidentiality = x0x::groups::GroupConfidentiality::SignedPublic;
+            info.recompute_state_hash();
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_key.clone(), info);
+            let topic = format!("x0x.group.{group_key}.symphony.board");
+            let protector = group_task_list_binding(&state, &topic)
+                .await
+                .delta_protector
+                .expect("a group-scoped list gets a protector");
+            // The public plane seals with `Ok(None)` while the admin seat
+            // is unrevoked.
+            assert!(matches!(
+                protector
+                    .seal(x0x::kv::KvMutationKind::Delta, b"delta")
+                    .await,
+                Ok(None)
+            ));
+
+            revoke_agent(&state, &admin).await;
+            assert!(matches!(
+                protector.confirm_plaintext_publication().await,
+                Ok(x0x::crdt::TaskPublication::Stale)
+            ));
         }
 
         #[tokio::test]
