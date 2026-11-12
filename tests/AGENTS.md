@@ -6,7 +6,7 @@ Loaded when working on files in `tests/`. The root `AGENTS.md` covers architectu
 
 Test daemons join the real network. Some in-process tests also dial real seeds — including `nat_traversal_integration.rs` `--ignored` VPS tests, `network_integration.rs`, `vps_e2e_integration.rs`, and `e2e_live_network.sh`. "No daemon started" does not mean "no network". Run all tests via `just test` or `python3 scripts/dev/test-isolated.py` (Linux loopback-only namespace; macOS/Windows fail closed). Plain `cargo nextest run` only for a selector confirmed to open no network.
 
-## Integration tests (33 files)
+## Integration tests
 
 | File | Coverage |
 |------|---------|
