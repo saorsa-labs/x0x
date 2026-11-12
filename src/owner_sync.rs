@@ -5011,6 +5011,10 @@ impl Drop for OwnerSyncService {
 }
 
 #[cfg(test)]
+#[path = "owner_sync_known_anonymous_tests.rs"]
+mod known_anonymous_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
