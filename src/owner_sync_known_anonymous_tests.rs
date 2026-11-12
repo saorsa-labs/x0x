@@ -219,6 +219,79 @@ async fn dial(from: &Device, to: &Device) -> Result<SessionSummary, (&'static st
     .unwrap_or_else(|_| Err(("timeout", "no answer within 30 s".to_string())))
 }
 
+/// A refusal must come fast, so a dial timeout cannot satisfy a test.
+const REFUSAL_BOUND: Duration = Duration::from_secs(10);
+
+/// A refused dial as the dialer sees it.
+struct Refusal {
+    class: &'static str,
+    message: String,
+    elapsed: Duration,
+}
+
+/// Dial `to` from `from`; `None` means the session succeeded.
+async fn dial_refusal(from: &Device, to: &Device) -> Option<Refusal> {
+    let started = Instant::now();
+    let result = dial(from, to).await;
+    let elapsed = started.elapsed();
+    result.err().map(|(class, message)| Refusal {
+        class,
+        message,
+        elapsed,
+    })
+}
+
+/// The shared inbound gate decision on `receiver` for `peer`'s machine, as
+/// the acceptor runs it. The dialer of an inbound stream sees only a reset,
+/// so the tests read the reason here, on the receiver side.
+async fn inbound_gate_error(
+    receiver: &Device,
+    peer: &Device,
+) -> Option<crate::error::NetworkError> {
+    let agent = &receiver.agent;
+    crate::Agent::gate_peer_machine_inbound(
+        &agent.identity_discovery_cache,
+        &agent.contact_store,
+        &agent.revocation_set,
+        &agent.move_state,
+        &agent.connect_policy,
+        &agent.owner_trust,
+        &peer.agent.machine_id(),
+    )
+    .await
+    .err()
+}
+
+/// Both directions were refused, quickly,
+/// and Alice's own outbound gate naming `outbound_prefix`.
+fn assert_refused(
+    bob_to_alice: Option<Refusal>,
+    alice_to_bob: Option<Refusal>,
+    outbound_prefix: &str,
+) {
+    // bob→alice: the stream is reset, so Bob sees no reason; it is still a
+    // fast refusal and not the 30 s dial timeout.
+    let refused = bob_to_alice.expect("bob→alice must be refused");
+    assert!(
+        refused.class != "timeout" && refused.elapsed < REFUSAL_BOUND,
+        "bob→alice refusal is slow or a timeout: {} after {:?}: {}",
+        refused.class,
+        refused.elapsed,
+        refused.message
+    );
+    // alice→bob: refused at Alice's own outbound gate, with the reason.
+    let refused = alice_to_bob.expect("alice→bob must be refused");
+    assert!(
+        refused.class == "open_stream"
+            && refused.message.starts_with(outbound_prefix)
+            && refused.elapsed < REFUSAL_BOUND,
+        "alice→bob must be refused with `{outbound_prefix}`, got {} after {:?}: {}",
+        refused.class,
+        refused.elapsed,
+        refused.message
+    );
+}
+
 async fn shutdown(alice: Device, bob: Device) {
     alice.agent.shutdown().await;
     bob.agent.shutdown().await;
@@ -306,8 +379,9 @@ async fn owner_sync_is_refused_once_the_known_agent_is_revoked() {
         .expect("insert revocation");
     mint_name(&bob, "bob-after").await;
 
-    let bob_to_alice = dial(&bob, &alice).await;
-    let alice_to_bob = dial(&alice, &bob).await;
+    let bob_to_alice = dial_refusal(&bob, &alice).await;
+    let alice_to_bob = dial_refusal(&alice, &bob).await;
+    let alice_gate = inbound_gate_error(&alice, &bob).await;
     let leaked = has_name(&alice, "bob-after").await;
     shutdown(alice, bob).await;
 
@@ -315,8 +389,15 @@ async fn owner_sync_is_refused_once_the_known_agent_is_revoked() {
         first_ok,
         "control: sync works before the revocation: {first:?}"
     );
-    assert!(bob_to_alice.is_err(), "bob→alice must be refused");
-    assert!(alice_to_bob.is_err(), "alice→bob must be refused");
+    // Alice's inbound gate names the cause: the agent is revoked.
+    assert!(
+        matches!(
+            alice_gate,
+            Some(crate::error::NetworkError::PeerRevoked { .. })
+        ),
+        "alice's gate must refuse bob as revoked, got {alice_gate:?}"
+    );
+    assert_refused(bob_to_alice, alice_to_bob, "stream peer revoked");
     assert!(
         !leaked,
         "bob's record must not reach alice after the revocation"
@@ -357,8 +438,9 @@ async fn owner_sync_is_refused_when_the_cached_certificate_has_expired() {
     let cached_expired = crate::identity::is_expired(cached.cert_not_after, now_secs());
     mint_name(&bob, "bob-after").await;
 
-    let bob_to_alice = dial(&bob, &alice).await;
-    let alice_to_bob = dial(&alice, &bob).await;
+    let bob_to_alice = dial_refusal(&bob, &alice).await;
+    let alice_to_bob = dial_refusal(&alice, &bob).await;
+    let alice_gate = inbound_gate_error(&alice, &bob).await;
     let leaked = has_name(&alice, "bob-after").await;
     shutdown(alice, bob).await;
 
@@ -367,8 +449,16 @@ async fn owner_sync_is_refused_when_the_cached_certificate_has_expired() {
         cached_expired,
         "control: alice's cached certificate is expired"
     );
-    assert!(bob_to_alice.is_err(), "bob→alice must be refused");
-    assert!(alice_to_bob.is_err(), "alice→bob must be refused");
+    // Alice's inbound gate names the cause: not verified (expired), which
+    // is not the revoked refusal.
+    assert!(
+        matches!(
+            alice_gate,
+            Some(crate::error::NetworkError::PeerNotVerified { .. })
+        ),
+        "alice's gate must refuse bob as not verified (expired), got {alice_gate:?}"
+    );
+    assert_refused(bob_to_alice, alice_to_bob, "stream peer not verified");
     assert!(
         !leaked,
         "bob's record must not reach alice with an expired certificate"
