@@ -1263,7 +1263,12 @@ jobs:
   coverage:
     name: Coverage Gate
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    # 185 min: the serialised build below roughly doubles the compile.
+    # With 4 build jobs the compile was about 41 min of the 56-min job
+    # 130773703573 (20:04:41 to 20:45:23). The s3 w3h shards set 185 min
+    # when they serialised for the same exit-143 class (see the shard
+    # job); 150 min held the parallel build only.
+    timeout-minutes: 185
     steps:
       - uses: actions/checkout@v5
 
@@ -1428,8 +1433,18 @@ jobs:
           # the step before the report/ratchet below (bash -e would), and the
           # remaining tests' profile data must still be produced. The job
           # still fails on it — see the status merge at the end.
+          # #1862: one build job for the instrumented compile. Three
+          # coverage runs died before a test ran on 10 Nov 2026: #1855
+          # runs 42894312156 and 42902863828 stopped with exit 143 about
+          # 19 min into the compile, and the main rerun of 42875909838
+          # lost its runner. The w3h shards and the property tests hit
+          # the same 143 class inside `cargo nextest list` and fixed it
+          # with `--build-jobs 1` (see the shard job above and
+          # integration.yml). One rustc/link job at a time halves the
+          # peak. The isolated run reuses these binaries, so only this
+          # host build is serialised.
           coverage_test_status=0
-          bash scripts/ci/nextest-isolated.sh --all-features --workspace -- --no-fail-fast -E '!binary(x0x_0041_synthetic_kill_restart) & !binary(x0x_0041_prefer_newest_test) & !binary(named_group_join_metadata_event)' || coverage_test_status=$?
+          bash scripts/ci/nextest-isolated.sh --all-features --build-jobs 1 --workspace -- --no-fail-fast -E '!binary(x0x_0041_synthetic_kill_restart) & !binary(x0x_0041_prefer_newest_test) & !binary(named_group_join_metadata_event)' || coverage_test_status=$?
           disk_snapshot "after coverage compilation"
           # #607: report and ratchet are still ATTEMPTED after a red test
           # pass; their own failures are captured the same way.
