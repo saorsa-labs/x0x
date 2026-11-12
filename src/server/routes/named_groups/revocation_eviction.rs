@@ -8591,8 +8591,14 @@ pub(super) mod tests {
     /// advert refresh is the hand-off's last chance: it awaits the
     /// bounded single-flight refresh, re-reads the advert and sends
     /// only on `Some(true)`. Here the advert arrives with the bit
-    /// after the dispatch's first support read, inside the refresh
-    /// flight's convergence window. The proof is the §4 hand-off
+    /// only after the dispatch's targeted refresh request has been
+    /// seen on the request topic (the designated admin is the only
+    /// recipient, and a flight that found the bit at its initial
+    /// cache check publishes nothing), so the advert lands inside the
+    /// refresh flight's convergence window and the send can pass only
+    /// through the wait: a dispatch that stops waiting for the
+    /// refresh re-reads before the advert and sends nothing. The
+    /// proof is the §4 hand-off
     /// itself, not just any inbox frame: the received envelope must
     /// unseal with the recipient's own KEM secret and carry an
     /// `X0XEVH1` body naming this row. The row goes through the real
@@ -8664,6 +8670,13 @@ pub(super) mod tests {
                 x0x::dm::dm_inbox_topic(&recipient_id),
             )
             .await;
+        // The targeted-request topic the refresh flight publishes its
+        // one request on. The wait below for the designated admin's
+        // request orders the advert seed after the flight has started.
+        let mut refresh_requests = state
+            .agent
+            .subscribe(crate::dm_capability::DM_CAPABILITY_TARGETED_REQUEST_TOPIC)
+            .await?;
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         revocation_eviction_pass(&state).await;
@@ -8677,8 +8690,32 @@ pub(super) mod tests {
         // The same order the worker loop uses (pass, then dispatch).
         dispatch_handoffs(&state).await;
 
+        // The dispatch returned, but its detached task may not have
+        // started yet: seeding the advert now would let the flight
+        // answer at its initial cache check, and the send would pass
+        // with no wait exercised. So first wait for the designated
+        // admin's targeted refresh request — only a flight that found
+        // no bit publishes one — and only then seed the advert. A
+        // dispatch that stops waiting for the refresh re-reads before
+        // that seed and sends nothing, so this wait is what the send
+        // below must pass through.
+        let message = tokio::time::timeout(Duration::from_secs(3), refresh_requests.recv())
+            .await
+            .expect("the dispatch asks the designated admin for an advert refresh")
+            .expect("the subscription stays live");
+        let asked = crate::dm_capability_service::decode_targeted_capability_request(
+            &message.topic,
+            &message.payload,
+        )
+        .expect("a targeted capability request");
+        assert_eq!(
+            *asked.as_bytes(),
+            designated,
+            "the designated admin is the one recipient asked"
+        );
+
         // The advert arrives with the bit only now — after the
-        // dispatch's support read, inside the flight's convergence
+        // refresh request was seen, inside the flight's convergence
         // window. Its KEM key is real, so the send can seal the
         // envelope to it. The flight returns as soon as the store
         // satisfies the bit (a 50 ms poll), so the 8 s bound also
