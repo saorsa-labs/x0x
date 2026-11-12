@@ -7002,8 +7002,19 @@ fn revocation_publish_records(
 }
 
 /// #1863: whether a named group gives an agent a relationship with this
-/// node (see [`revocation_group_relationship`]).
-pub type RevocationGroupSeen = std::sync::Arc<dyn Fn(&identity::AgentId) -> bool + Send + Sync>;
+/// node (see [`revocation_group_relationship`]). The check gets the agents
+/// to test and returns the ones that have a relationship. It is async, so
+/// it can wait for a roster lock (#1867), and it gets all the agents in
+/// one call, so it takes that lock one time. The agent awaits it with no
+/// revocation-set lock held.
+pub type RevocationGroupSeen = std::sync::Arc<
+    dyn Fn(
+            Vec<identity::AgentId>,
+        )
+            -> futures::future::BoxFuture<'static, std::collections::HashSet<identity::AgentId>>
+        + Send
+        + Sync,
+>;
 
 /// The slot that `x0xd` fills with its [`RevocationGroupSeen`] check.
 type RevocationGroupSeenSlot = std::sync::Arc<std::sync::RwLock<Option<RevocationGroupSeen>>>;
@@ -7098,13 +7109,14 @@ impl SeenEvidence {
         }
     }
 
-    async fn seen(&self, subject: &revocation::SeenSubject) -> bool {
+    /// Every source but the group check, which [`Self::mark`] asks one
+    /// time for all the agents that are left.
+    async fn seen_without_groups(&self, subject: &revocation::SeenSubject) -> bool {
         match subject {
             revocation::SeenSubject::Agent(agent) => {
                 self.own_agent == *agent
                     || self.related_contacts.contains(agent)
                     || self.owner_agents.contains(&hex::encode(agent.as_bytes()))
-                    || self.group.as_ref().is_some_and(|related| related(agent))
             }
             revocation::SeenSubject::Machine(machine) => {
                 self.own_machine == *machine
@@ -7122,10 +7134,20 @@ impl SeenEvidence {
             .await
             .stranger_self_revocation_subjects();
         let mut seen = Vec::new();
+        let mut ask_groups = Vec::new();
         for subject in strangers {
-            if self.seen(&subject).await {
+            if self.seen_without_groups(&subject).await {
                 seen.push(subject);
+            } else if let revocation::SeenSubject::Agent(agent) = &subject {
+                ask_groups.push(*agent);
             }
+        }
+        // #1867: one awaited roster read for all the agents. A read for
+        // each held stranger would let a flood of strangers' records hold
+        // the ingest behind every roster writer.
+        if let (Some(related), false) = (&self.group, ask_groups.is_empty()) {
+            let related = related(ask_groups).await;
+            seen.extend(related.into_iter().map(revocation::SeenSubject::Agent));
         }
         !seen.is_empty() && revocation_set.write().await.mark_seen(seen)
     }
@@ -39499,8 +39521,10 @@ mod tests {
             store.set_trust(&later.agent_id(), contacts::TrustLevel::Unknown);
         }
         let member_id = member.agent_id();
-        *groups.write().expect("slot") =
-            Some(std::sync::Arc::new(move |agent| *agent == member_id));
+        *groups.write().expect("slot") = Some(std::sync::Arc::new(move |mut agents| {
+            agents.retain(|agent| *agent == member_id);
+            Box::pin(std::future::ready(agents.into_iter().collect()))
+        }));
         let cert = identity::AgentCertificate::issue(&owner_kp, &owned).expect("cert");
         profile::IssuedCertRecord::append(
             &journal,
@@ -39818,10 +39842,13 @@ mod tests {
         let roster = std::sync::Arc::new(std::sync::RwLock::new(info));
         let local = seen.own_agent;
         let check_roster = std::sync::Arc::clone(&roster);
-        *seen.groups.write().expect("slot") = Some(std::sync::Arc::new(move |agent| {
-            check_roster
-                .read()
-                .is_ok_and(|info| revocation_group_relationship([&*info], &local, agent))
+        *seen.groups.write().expect("slot") = Some(std::sync::Arc::new(move |mut agents| {
+            agents.retain(|agent| {
+                check_roster
+                    .read()
+                    .is_ok_and(|info| revocation_group_relationship([&*info], &local, agent))
+            });
+            Box::pin(std::future::ready(agents.into_iter().collect()))
         }));
 
         let record = self_revocation_at(&member, 1_000);

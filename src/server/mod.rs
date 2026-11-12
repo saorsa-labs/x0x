@@ -480,26 +480,33 @@ pub fn record_startup_diagnostic(event: &str) {
     let _ = std::io::Write::flush(&mut std::io::stderr());
 }
 
-/// Install the check that reopens a corrupt revocation carrier (#1116).
-///
 /// #1863: the group check of "seen" that `x0xd` installs on its agent. The
 /// rule is [`x0x::revocation_group_relationship`] over the named-group
-/// roster. A locked roster reads as "not seen": the next heartbeat asks
-/// again. The check holds a `Weak`, so the agent does not keep `AppState`
-/// alive.
+/// live roster. The check waits for the roster lock (#1867). A locked
+/// roster must not read as "not seen": the ingest and the local apply path
+/// mark just before an eviction removes the member row. The check takes
+/// the lock one time for all the agents of a call. No caller holds a
+/// `named_groups` guard when it applies a revocation. The check holds a
+/// `Weak`, so the agent does not keep `AppState` alive.
 fn revocation_group_seen_check(state: &Arc<AppState>) -> x0x::RevocationGroupSeen {
     let roster_state = Arc::downgrade(state);
-    Arc::new(move |agent_id| {
-        let Some(state) = roster_state.upgrade() else {
-            return false;
-        };
-        let Ok(groups) = state.named_groups.try_read() else {
-            return false;
-        };
-        x0x::revocation_group_relationship(groups.values(), &state.agent.agent_id(), agent_id)
+    Arc::new(move |mut agents| {
+        let roster_state = roster_state.clone();
+        Box::pin(async move {
+            let Some(state) = roster_state.upgrade() else {
+                return std::collections::HashSet::new();
+            };
+            let local = state.agent.agent_id();
+            let groups = state.named_groups.live_read().await;
+            agents
+                .retain(|agent| x0x::revocation_group_relationship(groups.values(), &local, agent));
+            agents.into_iter().collect()
+        })
     })
 }
 
+/// Install the check that reopens a corrupt revocation carrier (#1116).
+///
 /// A trusted sender is a machine enrolled to the local owner, or an Active
 /// owner or admin in a local group this node belongs to. An explicit
 /// revocation of that agent, machine, or binding does not qualify. The
@@ -6611,5 +6618,152 @@ mod revocation_group_seen_tests {
             guard.is_agent_revoked(&removed.agent_id()),
             "held, unpublished"
         );
+    }
+
+    /// #1867: the local apply path marks while another task holds the
+    /// roster for write. The check waits for the lock, so the active
+    /// member's self-revocation is published. The wrapper tells the test
+    /// when the check starts; then the test releases the roster.
+    #[tokio::test]
+    async fn a_held_roster_lock_still_publishes_an_active_member_1867() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let (state, _dir) = secure_endpoint_test_state().await.expect("state");
+        let active = x0x::identity::AgentKeypair::generate().expect("keypair");
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "g".to_string(),
+            String::new(),
+            x0x::identity::AgentId([0x33; 32]),
+            "00112233445566778899aabbccddeeff".to_string(),
+            x0x::groups::policy::GroupPolicy {
+                admission: x0x::groups::policy::GroupAdmission::InviteOnly,
+                ..x0x::groups::policy::GroupPolicy::default()
+            },
+        );
+        for agent in [state.agent.agent_id(), active.agent_id()] {
+            let hex_id = hex::encode(agent.as_bytes());
+            info.add_member(hex_id, x0x::groups::GroupRole::Member, None, None);
+        }
+        state
+            .named_groups
+            .write()
+            .await
+            .insert("g".to_string(), info);
+        let inner = revocation_group_seen_check(&state);
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let signal = Arc::clone(&reached);
+        state
+            .agent
+            .set_revocation_group_seen(Arc::new(move |agent| {
+                signal.notify_one();
+                inner(agent)
+            }));
+
+        let record = self_revocation(&active);
+        let roster = state.named_groups.write().await;
+        let task_state = Arc::clone(&state);
+        let task_record = record.clone();
+        let apply = tokio::spawn(async move {
+            task_state
+                .agent
+                .ingest_eviction_handoff_revocation(task_record, None)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(60), reached.notified())
+            .await
+            .expect("the apply path reaches the group check");
+        drop(roster);
+        let held = tokio::time::timeout(Duration::from_secs(60), apply)
+            .await
+            .expect("the apply path finishes")
+            .expect("join")
+            .expect("apply");
+        assert!(held);
+        let published = state
+            .agent
+            .revocation_set()
+            .read()
+            .await
+            .published_records()
+            .iter()
+            .map(x0x::revocation::RevocationRecord::record_hash)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            published,
+            vec![record.record_hash()],
+            "a member seen behind a held roster lock is published"
+        );
+    }
+
+    /// #1867: the heartbeat step asks the roster one time for all the held
+    /// strangers, not one time for each. A flood of strangers' records
+    /// then cannot hold the ingest behind every roster writer.
+    #[tokio::test]
+    async fn the_roster_is_read_one_time_for_all_held_strangers_1867() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let (state, _dir) = secure_endpoint_test_state().await.expect("state");
+        let members: Vec<_> = (0..3)
+            .map(|_| x0x::identity::AgentKeypair::generate().expect("keypair"))
+            .collect();
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "g".to_string(),
+            String::new(),
+            x0x::identity::AgentId([0x33; 32]),
+            "00112233445566778899aabbccddeeff".to_string(),
+            x0x::groups::policy::GroupPolicy {
+                admission: x0x::groups::policy::GroupAdmission::InviteOnly,
+                ..x0x::groups::policy::GroupPolicy::default()
+            },
+        );
+        info.add_member(
+            hex::encode(state.agent.agent_id().as_bytes()),
+            x0x::groups::GroupRole::Member,
+            None,
+            None,
+        );
+        let set = state.agent.revocation_set();
+        for member in &members {
+            let hex_id = hex::encode(member.agent_id().as_bytes());
+            info.add_member(hex_id, x0x::groups::GroupRole::Member, None, None);
+            assert!(set
+                .write()
+                .await
+                .verify_and_insert(self_revocation(member), None)
+                .expect("insert"));
+        }
+        state
+            .named_groups
+            .write()
+            .await
+            .insert("g".to_string(), info);
+        let inner = revocation_group_seen_check(&state);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&calls);
+        state
+            .agent
+            .set_revocation_group_seen(Arc::new(move |agents| {
+                count.fetch_add(1, Ordering::SeqCst);
+                inner(agents)
+            }));
+
+        assert!(
+            x0x::mark_seen_revocation_subjects(&set, &state.agent.revocation_seen_sources()).await
+        );
+        // The test home can hold strangers' records of other tests, so
+        // the proof is by record, not by count.
+        let published: Vec<_> = set
+            .read()
+            .await
+            .published_records()
+            .iter()
+            .map(x0x::revocation::RevocationRecord::record_hash)
+            .collect();
+        for member in &members {
+            assert!(published.contains(&self_revocation(member).record_hash()));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one roster read");
     }
 }
