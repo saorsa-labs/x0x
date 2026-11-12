@@ -1018,11 +1018,11 @@ impl PeerEvidenceStore {
         })
     }
     /// #1107: fill in the stored certificate for an announcement that names
-    /// it but carries no certificate bytes.
+    /// it but carries no certificate bytes. Returns whether it did.
     ///
     /// A V3 announcement carries only the digest of the owner certificate;
     /// the bytes come by a separate fetch. The stored certificate is kept if
-    /// and only if all of these hold:
+    /// and only if all of these hold ([`stored_certificate_for`]):
     /// - the record has no certificate bytes;
     /// - the announcement names a certificate (not the anonymous digest);
     /// - the store holds a verified record for the same agent on the same
@@ -1033,43 +1033,24 @@ impl PeerEvidenceStore {
     /// The carried bytes are the stored bytes. The record is then verified
     /// as usual, certificate included, so this grants nothing the stored
     /// record did not hold. Revocation, expiry and owner chaining are still
-    /// checked at each use. Every ingest path calls this before it verifies.
-    pub(crate) fn carry_certificate(&self, record: &mut EvidenceRecordV1, now: u64) {
+    /// checked at each use. Every ingest path that can carry calls this
+    /// before it verifies, and passes the result to
+    /// [`Self::ingest_verified_after_carry`], which decides again under the
+    /// mutation lock: a record stored in between (for example an anonymous
+    /// announcement after a consent withdrawal) wins, and the carried
+    /// record is refused.
+    pub(crate) fn carry_certificate(&self, record: &mut EvidenceRecordV1, now: u64) -> bool {
         if record.certificate.is_some() {
-            return;
+            return false;
         }
         let Ok(ann) = announce_v3::deserialize_v3(&record.announcement) else {
-            return;
+            return false;
         };
-        if ann.cert_digest == announce_v3::cert_digest(&None, &None) {
-            return;
-        }
         let Ok(state) = self.lock() else {
-            return;
+            return false;
         };
-        if state.suspended.contains(&ann.agent_id) {
-            return;
-        }
-        let Some(stored) = state.verified.get(&ann.agent_id) else {
-            return;
-        };
-        if stored.announcement.machine_id != ann.machine_id {
-            return;
-        }
-        let Some(cert) = stored.certificate.as_ref() else {
-            return;
-        };
-        let stored_digest = announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone()));
-        if cert.is_expired(now / 1000) || stored_digest != ann.cert_digest {
-            return;
-        }
-        // The stored bytes on purpose, never a re-serialization: they are
-        // exactly the bytes that were verified when the record was stored.
-        record.certificate = state
-            .file
-            .records
-            .get(&ann.agent_id)
-            .and_then(|stored| stored.certificate.clone());
+        record.certificate = stored_certificate_for(&state, &ann, now);
+        record.certificate.is_some()
     }
     /// Latest ingest-fresh live wire bytes, kept separately from stored bytes.
     pub fn live(&self, agent: AgentId, now: u64) -> Option<EvidenceRecordV1> {
@@ -1104,16 +1085,31 @@ impl PeerEvidenceStore {
         source: IngestSource,
         now: u64,
     ) -> Result<()> {
-        self.carry_certificate(&mut record, now);
+        let carried = self.carry_certificate(&mut record, now);
         let view = Arc::new(record.verify(now, W_MS)?);
-        self.ingest_verified(record, view, source, now)
+        self.ingest_verified_after_carry(record, view, source, now, carried)
     }
+    /// Ingest a verified record whose certificate bytes came with it.
     pub(crate) fn ingest_verified(
+        &self,
+        record: EvidenceRecordV1,
+        view: Arc<EvidenceView>,
+        source: IngestSource,
+        now: u64,
+    ) -> Result<()> {
+        self.ingest_verified_after_carry(record, view, source, now, false)
+    }
+    /// [`Self::ingest_verified`] for a record whose certificate was carried
+    /// in by [`Self::carry_certificate`] when `carried` is true. The carry is
+    /// decided again under the mutation lock, so deciding and storing are
+    /// one step.
+    pub(crate) fn ingest_verified_after_carry(
         &self,
         mut record: EvidenceRecordV1,
         view: Arc<EvidenceView>,
         source: IngestSource,
         now: u64,
+        carried: bool,
     ) -> Result<()> {
         if !allowed(&*self.policy, &view, now) {
             return Err(EvidenceError::Invalid("not a current relationship"));
@@ -1124,6 +1120,12 @@ impl PeerEvidenceStore {
         record.stored_at_ms = now;
         let _mutation = self.lock_mutation()?;
         let mut state = self.lock()?;
+        if carried && stored_certificate_for(&state, &view.announcement, now) != record.certificate
+        {
+            return Err(EvidenceError::Invalid(
+                "carried certificate no longer stored",
+            ));
+        }
         // A gossip pairing can have been queued before a Hello completed.
         // The same wire pair must not undo that Hello (or cause another
         // material write). Its certificate was carried in by
@@ -1584,6 +1586,32 @@ fn current(view: &EvidenceView, now: u64, age: u64) -> bool {
             !cert.is_expired(now / 1000) && cert.issued_at() <= now.saturating_add(SKEW_MS) / 1000
         })
 }
+/// #1107: the stored certificate bytes that an announcement without
+/// certificate bytes may keep, under the rule of
+/// [`PeerEvidenceStore::carry_certificate`]. The bytes are the stored bytes
+/// on purpose, never a re-serialization: they are exactly the bytes that
+/// were verified when the record was stored.
+fn stored_certificate_for(
+    state: &State,
+    ann: &IdentityAnnouncementV3,
+    now: u64,
+) -> Option<Vec<u8>> {
+    if ann.cert_digest == announce_v3::cert_digest(&None, &None)
+        || state.suspended.contains(&ann.agent_id)
+    {
+        return None;
+    }
+    let stored = state.verified.get(&ann.agent_id)?;
+    if stored.announcement.machine_id != ann.machine_id {
+        return None;
+    }
+    let cert = stored.certificate.as_ref()?;
+    let stored_digest = announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone()));
+    if cert.is_expired(now / 1000) || stored_digest != ann.cert_digest {
+        return None;
+    }
+    state.file.records.get(&ann.agent_id)?.certificate.clone()
+}
 fn allowed(policy: &dyn EvidencePolicy, view: &EvidenceView, now: u64) -> bool {
     let a = view.announcement.agent_id;
     let m = view.announcement.machine_id;
@@ -1634,14 +1662,24 @@ impl GossipPairing {
         record: EvidenceRecordV1,
         now: u64,
     ) -> Option<Result<()>> {
-        // Hello has already verified and ingested this exact pair. Do not
-        // repeat crypto outside its wire verify budget or strip a fetched cert.
+        // Hello has already verified and ingested this exact record. Do not
+        // repeat crypto outside its wire verify budget. A record without
+        // certificate bytes matches only when the store's carry rule
+        // (`stored_certificate_for`, #1107) would give it exactly the Hello's
+        // certificate, so this skip and the store decide alike.
         if store.state.lock().is_ok_and(|state| {
             state.live.get(&agent).is_some_and(|live| {
                 live.source == IngestSource::Hello
                     && live.wire.announcement == record.announcement
                     && live.wire.advert == record.advert
-                    && (record.certificate.is_none() || live.wire.certificate == record.certificate)
+                    && (live.wire.certificate == record.certificate
+                        || (record.certificate.is_none()
+                            && announce_v3::deserialize_v3(&record.announcement).is_ok_and(
+                                |ann| {
+                                    stored_certificate_for(&state, &ann, now)
+                                        == live.wire.certificate
+                                },
+                            )))
             })
         }) {
             return None;

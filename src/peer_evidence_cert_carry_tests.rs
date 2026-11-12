@@ -193,3 +193,87 @@ fn foreign_announcement_naming_the_digest_attaches_nothing() {
         "the owner's record is untouched"
     );
 }
+
+fn anonymous_at(peer: &Peer, at: u64) -> EvidenceRecordV1 {
+    announce(&peer.agent, &peer.machine, None, false, at)
+}
+
+/// A carry decided before an anonymous announcement (consent withdrawn) is
+/// stored must not re-store the certificate afterwards. The carried record
+/// ties the anonymous one on announcement second and advert time; the store
+/// decides the carry again under its mutation lock and refuses it.
+#[test]
+fn carry_decided_before_an_anonymous_ingest_is_refused_at_store_time() {
+    let peer = Peer::new();
+    let cert = AgentCertificate::issue(&owner(), &peer.agent).unwrap();
+    let (_dir, _policy, store) = stored_with(&peer, &cert);
+    let mut carried = announce(&peer.agent, &peer.machine, Some(&cert), false, NOW);
+    assert!(
+        store.carry_certificate(&mut carried, NOW),
+        "carry decided while C is stored"
+    );
+    store
+        .ingest(anonymous_at(&peer, NOW), IngestSource::Gossip, NOW)
+        .unwrap();
+    assert_eq!(
+        certificate_of(&store, peer.a(), peer.m()),
+        None,
+        "setup: C dropped"
+    );
+    let view = Arc::new(carried.verify(NOW, W_MS).unwrap());
+    let result = store.ingest_verified_after_carry(carried, view, IngestSource::Gossip, NOW, true);
+    assert!(result.is_err(), "the stale carry must be refused");
+    assert_eq!(certificate_of(&store, peer.a(), peer.m()), None);
+    assert_eq!(store.live(peer.a(), NOW).and_then(|r| r.certificate), None);
+}
+
+/// An older digest-bearing announcement replayed after an anonymous one
+/// gets nothing: the stored record is anonymous.
+#[test]
+fn replayed_older_announcement_after_an_anonymous_one_carries_nothing() {
+    let peer = Peer::new();
+    let cert = AgentCertificate::issue(&owner(), &peer.agent).unwrap();
+    let (_dir, _policy, store) = stored_with(&peer, &cert);
+    store
+        .ingest(anonymous_at(&peer, NOW - 1_000), IngestSource::Gossip, NOW)
+        .unwrap();
+    let mut replay = announce(&peer.agent, &peer.machine, Some(&cert), false, NOW - 3_000);
+    assert!(!store.carry_certificate(&mut replay, NOW));
+    let _ = store.ingest(replay, IngestSource::Gossip, NOW);
+    assert_eq!(certificate_of(&store, peer.a(), peer.m()), None);
+    assert_eq!(store.live(peer.a(), NOW).and_then(|r| r.certificate), None);
+}
+
+/// An expired stored certificate is not carried.
+#[test]
+fn expired_stored_certificate_is_not_carried() {
+    let peer = Peer::new();
+    let then = NOW - 1_000_000;
+    let skew = crate::identity::EXPIRY_CLOCK_SKEW_SECS;
+    let cert =
+        AgentCertificate::issue_with_expiry(&owner(), &peer.agent, Some(NOW / 1000 - skew - 100))
+            .unwrap();
+    let (_dir, _policy, store) = setup(&peer);
+    store
+        .ingest(
+            announce(&peer.agent, &peer.machine, Some(&cert), true, then),
+            IngestSource::Hello,
+            then,
+        )
+        .unwrap();
+    let mut fresh = announce(&peer.agent, &peer.machine, Some(&cert), false, NOW);
+    assert!(!store.carry_certificate(&mut fresh, NOW));
+    assert_eq!(fresh.certificate, None);
+}
+
+/// A record suspended by a move in progress is not a source for a carry.
+#[test]
+fn suspended_record_is_not_carried() {
+    let peer = Peer::new();
+    let cert = AgentCertificate::issue(&owner(), &peer.agent).unwrap();
+    let (_dir, _policy, store) = stored_with(&peer, &cert);
+    store.state.lock().unwrap().suspended.insert(peer.a());
+    let mut fresh = announce(&peer.agent, &peer.machine, Some(&cert), false, NOW);
+    assert!(!store.carry_certificate(&mut fresh, NOW));
+    assert_eq!(fresh.certificate, None);
+}

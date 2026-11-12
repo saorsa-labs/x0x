@@ -485,12 +485,17 @@ async fn exec_over_dm_is_admitted_after_the_receiver_restarts() {
 }
 
 /// The sender's agent was revoked on the receiver before the restart, and
-/// the revocation survived it. The receiver's pub/sub layer refuses every
-/// payload signed by a revoked agent (`incoming_sender_refused`) before any
-/// DM inbox or exec service sees it, and sends nothing back. So the revoked
-/// sender gets no result and no refusal frame; the request never reaches the
-/// exec service. An unrevoked owner sender on the same restarted receiver
-/// gets its result.
+/// the revocation survived it.
+///
+/// Why the revoked sender gets no reply: the receiver's pub/sub layer
+/// refuses every payload signed by a revoked agent
+/// (`DeliveryVerdict::Refused`, A03: revocation reaches every gate) before
+/// the DM inbox or the exec service sees it. No layer that could answer
+/// ever holds the request, so no refusal frame is sent. The test ties the
+/// refusal to this request: a payload from this sender is refused on the
+/// receiver's own DM inbox topic, the exec service receives nothing, and
+/// the sender gets nothing back. An unrevoked owner sender on the same
+/// restarted receiver gets its result.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exec_over_dm_from_an_agent_revoked_before_the_restart_is_refused_unseen() {
     /// Long enough for a delivered request to be refused by the exec
@@ -502,22 +507,28 @@ async fn exec_over_dm_from_an_agent_revoked_before_the_restart_is_refused_unseen
     let diagnostics = rig.receiver.service.diagnostics_snapshot().await.totals;
     let control =
         control.unwrap_or_else(|why| panic!("control: no result: {why}; receiver {diagnostics:?}"));
-    let refused = || {
-        rig.receiver
-            .agent
-            .gossip_runtime
-            .as_ref()
-            .expect("gossip")
-            .pubsub()
-            .stats()
-            .incoming_sender_refused
+    let pubsub = rig
+        .receiver
+        .agent
+        .gossip_runtime
+        .as_ref()
+        .expect("gossip")
+        .pubsub();
+    let revoked = rig.senders[0].agent.agent_id();
+    let inbox_hex =
+        hex::encode(crate::dm::dm_inbox_topic(&rig.receiver.agent.agent_id()).to_bytes());
+    let on_inbox = |refused: &[(String, AgentId)]| {
+        refused
+            .iter()
+            .filter(|(topic, sender)| *sender == revoked && topic.contains(&inbox_hex))
+            .count()
     };
-    let refused_before = refused();
+    let before = on_inbox(&pubsub.refused_senders_for_test());
     let revoked_result = tokio::select! {
         outcome = rig.run(0) => Some(outcome),
         () = tokio::time::sleep(SILENCE) => None,
     };
-    let refused_after = refused();
+    let refused = pubsub.refused_senders_for_test();
     let after = rig.receiver.service.diagnostics_snapshot().await.totals;
     rig.stop().await;
     assert_eq!(control.denial_reason, None, "control: admitted");
@@ -527,8 +538,9 @@ async fn exec_over_dm_from_an_agent_revoked_before_the_restart_is_refused_unseen
         "the revoked sender must get nothing back: {revoked_result:?}"
     );
     assert!(
-        refused_after > refused_before,
-        "the receiver's pub/sub must refuse the revoked sender's payloads"
+        on_inbox(&refused) > before,
+        "a payload from the revoked sender must be refused on the receiver's DM inbox topic \
+         {inbox_hex}; refused so far: {refused:?}"
     );
     assert_eq!(
         after.requests_received, diagnostics.requests_received,

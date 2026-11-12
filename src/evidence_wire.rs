@@ -605,9 +605,7 @@ pub(crate) fn ingest_hello(
     if ann.machine_id != machine {
         return Err(invalid("Hello does not name transport machine"));
     }
-    if let Some(store) = store {
-        store.carry_certificate(&mut record, now);
-    }
+    let carried = store.is_some_and(|store| store.carry_certificate(&mut record, now));
     let view = Arc::new(
         record
             .verify_budgeted(now, W_MS, &mut || limits.verify())
@@ -622,7 +620,13 @@ pub(crate) fn ingest_hello(
         if store.related(ann.agent_id, machine, view.certificate.as_ref(), now) {
             // Reuse the verified view, never pay for an unbudgeted second verify.
             store
-                .ingest_verified(record, Arc::clone(&view), IngestSource::Hello, now)
+                .ingest_verified_after_carry(
+                    record,
+                    Arc::clone(&view),
+                    IngestSource::Hello,
+                    now,
+                    carried,
+                )
                 .map_err(io::Error::other)?;
             return Ok(view);
         }
