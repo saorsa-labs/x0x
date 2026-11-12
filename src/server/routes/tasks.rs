@@ -521,17 +521,23 @@ impl x0x::crdt::TaskDeltaProtector for GroupTaskDeltaProtector {
     ///   live `secret_epoch` cannot move. A GSS share hold (a verified
     ///   removal that waits for its share) is added under it too, so the
     ///   hold cannot start between the check and the publish (#1508 rc17).
-    ///   #1581: the no-eligible-admin boundary is re-asked under the permit
-    ///   too, after the `named_groups` guard drops, so a verified revocation
-    ///   that lands between `seal` and this confirm answers `Stale`.
+    ///   #1581: the no-eligible-admin boundary is also re-asked, after the
+    ///   `named_groups` guard drops (the boundary takes its own read of
+    ///   that lock), so a verified revocation that lands between `seal`
+    ///   and this confirm answers `Stale`. The re-check narrows the window
+    ///   only: revocation ingest takes no publication gate, so a
+    ///   revocation can still land between the re-check and the publish.
     /// - TreeKEM: the group's membership lock, then its live ratchet mutex —
     ///   the same order `seal_record` takes them. Every ratchet epoch change
-    ///   needs the ratchet mutex.
+    ///   needs the ratchet mutex. #1581: the boundary is re-asked with the
+    ///   ratchet held, as `seal_record` asks it, so a revocation that moves
+    ///   no epoch still answers `Stale`.
     ///
     /// Called with no lock held (after `seal` has returned), and takes each
     /// lock once: nothing here re-enters a lock the caller or `seal` holds.
-    /// The #1581 re-check runs only after the `named_groups` guard is
-    /// dropped: the boundary takes its own read of that lock.
+    /// The GSS re-check runs after the `named_groups` guard drops; the
+    /// TreeKEM re-check runs under the membership lock and ratchet, the
+    /// order `seal_record` already uses.
     fn confirm_publication<'a>(
         &'a self,
         body: &'a x0x::crdt::sealed::SealedTaskRecordBody,
@@ -576,9 +582,9 @@ impl x0x::crdt::TaskDeltaProtector for GroupTaskDeltaProtector {
                     // after the guard is dropped (the boundary takes its own
                     // `named_groups` read). A hold answers `Stale`; the
                     // payload re-enters the sealing path, which refuses it.
-                    let withheld = still_gss
-                        && !removal_held
-                        && current_epoch == record.epoch
+                    let record_current =
+                        still_gss && !removal_held && current_epoch == record.epoch;
+                    let withheld = record_current
                         && super::named_groups::group_ciphertext_withheld(
                             &state,
                             &self.group_id,
@@ -586,16 +592,13 @@ impl x0x::crdt::TaskDeltaProtector for GroupTaskDeltaProtector {
                         )
                         .await
                         .is_some();
-                    Ok(
-                        if still_gss && !removal_held && current_epoch == record.epoch && !withheld
-                        {
-                            x0x::crdt::TaskPublication::Current(
-                                x0x::crdt::TaskPublicationPermit::holding(permit),
-                            )
-                        } else {
-                            x0x::crdt::TaskPublication::Stale
-                        },
-                    )
+                    Ok(if record_current && !withheld {
+                        x0x::crdt::TaskPublication::Current(
+                            x0x::crdt::TaskPublicationPermit::holding(permit),
+                        )
+                    } else {
+                        x0x::crdt::TaskPublication::Stale
+                    })
                 }
                 x0x::crdt::sealed::SealedTaskRecordBody::TreeKem(record) => {
                     let group_key = {
@@ -615,7 +618,23 @@ impl x0x::crdt::TaskDeltaProtector for GroupTaskDeltaProtector {
                         .cloned()
                         .ok_or_else(|| unavailable("live TreeKEM ratchet is unavailable"))?;
                     let ratchet = live.lock_owned().await;
-                    Ok(if ratchet.epoch() == record.epoch {
+                    // #1581: a verified revocation that covers every admin
+                    // seat moves neither the epoch nor the ratchet, so the
+                    // epoch check alone still leaves the seal-to-confirm
+                    // window open here. Re-ask `seal`'s boundary with the
+                    // ratchet held, the order `seal_record` asks it in: the
+                    // boundary takes its own `named_groups` read and no
+                    // TreeKEM mutex.
+                    let record_current = ratchet.epoch() == record.epoch;
+                    let withheld = record_current
+                        && super::named_groups::group_ciphertext_withheld(
+                            &state,
+                            &group_key,
+                            Some(&*ratchet),
+                        )
+                        .await
+                        .is_some();
+                    Ok(if record_current && !withheld {
                         x0x::crdt::TaskPublication::Current(
                             x0x::crdt::TaskPublicationPermit::holding((membership_guard, ratchet)),
                         )
@@ -639,9 +658,10 @@ impl x0x::crdt::TaskDeltaProtector for GroupTaskDeltaProtector {
     /// #1581: `seal` asked the no-eligible-admin boundary before the plane
     /// chose plaintext, but the revocation set is not serialized with the
     /// `named_groups` read, so a verified revocation can land between `seal`
-    /// and this confirm. The boundary is re-asked under the permit, after
-    /// the guard drops (it takes its own `named_groups` read); a hold
-    /// answers `Stale` — never plaintext.
+    /// and this confirm. The boundary is re-asked, after the guard drops
+    /// (it takes its own `named_groups` read); a hold answers `Stale` —
+    /// never plaintext. As in the GSS arm, the re-check narrows the window
+    /// only: revocation ingest takes no publication gate.
     ///
     /// Called with no lock held (after `seal` returned `None`), and takes
     /// each lock once, in the same order `confirm_publication`'s GSS arm
@@ -2847,11 +2867,62 @@ mod tests {
             else {
                 panic!("the delta seals before the revocation");
             };
+            // Control: the same record is `Current` before the revocation,
+            // so the `Stale` below is the revocation, not the fixture.
+            assert!(matches!(
+                protector.confirm_publication(&body).await,
+                Ok(x0x::crdt::TaskPublication::Current(_))
+            ));
 
             revoke_agent(&state, &admin).await;
             assert!(matches!(
                 protector.confirm_publication(&body).await,
                 Ok(x0x::crdt::TaskPublication::Stale)
+            ));
+        }
+
+        /// #1581: the re-check holds only while verified revocations cover
+        /// EVERY admin seat. One still-eligible admin is enough, so the
+        /// confirm hook keeps answering `Current` after a partial
+        /// revocation (no false hold).
+        #[tokio::test]
+        async fn gss_task_confirm_stays_current_while_an_admin_seat_is_eligible() {
+            let (state, _dir) = test_state().await;
+            let owner = AgentKeypair::generate().expect("owner key");
+            let second_admin = AgentKeypair::generate().expect("second admin key");
+            let group_key = "bb".repeat(16);
+            let mut info = group_with_foreign_admin(&state, &group_key, &owner);
+            info.add_member(
+                hex::encode(second_admin.agent_id().as_bytes()),
+                x0x::groups::GroupRole::Admin,
+                Some(hex::encode(owner.agent_id().as_bytes())),
+                None,
+            );
+            let _ = info.rotate_shared_secret();
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_key.clone(), info);
+            let topic = format!("x0x.group.{group_key}.symphony.board");
+            let protector = group_task_list_binding(&state, &topic)
+                .await
+                .delta_protector
+                .expect("a group-scoped list gets a protector");
+            let Ok(Some(body)) = protector
+                .seal(x0x::kv::KvMutationKind::Delta, b"delta")
+                .await
+            else {
+                panic!("the delta seals while an admin seat is eligible");
+            };
+            assert!(matches!(
+                protector.confirm_publication(&body).await,
+                Ok(x0x::crdt::TaskPublication::Current(_))
+            ));
+            revoke_agent(&state, &second_admin).await;
+            assert!(matches!(
+                protector.confirm_publication(&body).await,
+                Ok(x0x::crdt::TaskPublication::Current(_))
             ));
         }
 
@@ -3019,6 +3090,76 @@ mod tests {
                 live.lock().await.to_snapshot_bytes().expect("snapshot"),
                 "a refused seal must not advance the send ratchet"
             );
+        }
+
+        /// #1581: a TreeKEM task record sealed before a verified
+        /// revocation is not published after it. The revocation moves
+        /// neither the ratchet epoch nor the membership, so before the
+        /// fix the TreeKEM arm of `confirm_publication` checked the epoch
+        /// only and answered `Current`.
+        #[tokio::test]
+        async fn treekem_task_record_sealed_before_a_revocation_is_not_published() {
+            let (state, _dir) = test_state().await;
+            let admin = AgentKeypair::generate().expect("admin key");
+            let writer = state.agent.agent_id();
+            let group_key = "ba".repeat(16);
+            let group_id = hex::decode(&group_key).expect("group id");
+            let writer_seed = crate::server::routes::named_groups::agent_treekem_seed(
+                state.agent.as_ref(),
+                &group_id,
+            );
+            let mut admin_group =
+                x0x::mls::TreeKemMlsGroup::create(group_id.clone(), admin.agent_id(), &[0xba; 32])
+                    .expect("admin group");
+            let writer_prepared =
+                x0x::mls::TreeKemMlsGroup::prepare_member(writer, &writer_seed).expect("writer kp");
+            let writer_add = admin_group
+                .add_member(writer, writer_prepared.key_package_bytes())
+                .expect("add writer");
+            let writer_group =
+                x0x::mls::TreeKemMlsGroup::join_from_welcome(writer_prepared, &writer_add.welcome)
+                    .expect("writer join");
+            let epoch = writer_group.epoch();
+            let mut info = group_with_foreign_admin(&state, &group_key, &admin);
+            info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+            info.shared_secret = None;
+            info.secret_epoch = epoch;
+            info.security_binding = Some(format!("treekem:epoch={epoch}"));
+            info.recompute_state_hash();
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_key.clone(), info);
+            let live = Arc::new(tokio::sync::Mutex::new(writer_group));
+            state
+                .treekem_groups
+                .write()
+                .await
+                .insert(group_key.clone(), Arc::clone(&live));
+            let topic = format!("x0x.group.{group_key}.symphony.board");
+            let protector = group_task_list_binding(&state, &topic)
+                .await
+                .delta_protector
+                .expect("a group-scoped list gets a protector");
+            let Ok(Some(body)) = protector
+                .seal(x0x::kv::KvMutationKind::Delta, b"delta")
+                .await
+            else {
+                panic!("the delta seals before the revocation");
+            };
+            assert!(matches!(body, SealedTaskRecordBody::TreeKem(_)));
+
+            // Control: the record is `Current` before the revocation.
+            assert!(matches!(
+                protector.confirm_publication(&body).await,
+                Ok(x0x::crdt::TaskPublication::Current(_))
+            ));
+            revoke_agent(&state, &admin).await;
+            assert!(matches!(
+                protector.confirm_publication(&body).await,
+                Ok(x0x::crdt::TaskPublication::Stale)
+            ));
         }
     }
 }

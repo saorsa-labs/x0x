@@ -277,7 +277,8 @@ async fn seal_and_publish(
             }
             tracing::debug!(
                 topic,
-                "group policy left signed-public after a plaintext seal; re-sealing (#1100)"
+                "group policy left signed-public, or a ciphertext hold answered, \
+                 after a plaintext seal; re-sealing (#1100, #1581)"
             );
             continue;
         };
@@ -302,7 +303,8 @@ async fn seal_and_publish(
         }
         tracing::debug!(
             topic,
-            "group epoch moved after sealing a task delta; re-sealing (#975)"
+            "group epoch moved, or a ciphertext hold answered, after sealing \
+             a task delta; re-sealing (#975, #1581)"
         );
     }
     Err(crate::crdt::CrdtError::Gossip(format!(
