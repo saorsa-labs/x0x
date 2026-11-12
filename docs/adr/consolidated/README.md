@@ -30,7 +30,7 @@ File naming: `Axx-rNN-title.md`. Each slot's sha256 is pinned in `index.json`; t
 - Files under `docs/adr/transient/` do not count toward the limit (D242).
 - Archived records in `docs/adr-archive/` do not count.
 - David delegated design decisions on 10 Nov 2026. A slot change made under that delegation is a dated paragraph in the slot that says so, with the `index.json` pin updated. A PR that changes a slot says so in its body.
-- A15: a wire-format or public-API change needs a `FOR ENGINEER:` line for David's decision; his approval is recorded in the PR body or a comment.
+- A wire-format or public-API change carries a `FOR ENGINEER:` line in the PR body that states the change; under A15 (amendment of 12 Nov 2026) it needs no separate ruling.
 
 ## Open proposals
 

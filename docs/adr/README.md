@@ -11,8 +11,7 @@ repository and release governance rules retained from archived ADR 0087.
 David's 19 Oct 2026 ruling stays in force: **do not add ADR files**, including
 numbered records, transient `T-*.md` records and folded overlays. Keep the
 pack at 15. Put rationale in the PR body and existing docs or code doc
-comments. A wire-format or public-API change needs a `FOR ENGINEER:` line for
-David's decision; record approval in the PR body or comment. An approved
+comments. A wire-format or public-API change carries a `FOR ENGINEER:` line in the PR body that states the change; under A15 (amendment of 12 Nov 2026) it needs no separate ruling. An approved
 additive API needs no new ADR. See the
 [current authoring rule](transient/README.md) and the
 [style guide](../documentation-style.md).

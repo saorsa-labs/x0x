@@ -58,6 +58,7 @@ Multi-instance daemon: `x0xd --name alice --api-port 12701 --no-hard-coded-boots
 - David delegated design decisions on 10 Nov 2026; slot amendments made under
   it are dated paragraphs that say so. A PR that changes a slot says so in its
   body.
-- A15: a wire-format or public-API change needs a `FOR ENGINEER:` line for
-  David's decision, and his approval is recorded in the PR body or a comment.
+- A wire-format or public-API change carries a `FOR ENGINEER:` line in the PR
+  body that states the change. Under A15 (amendment of 12 Nov 2026) it needs
+  no separate ruling.
 - Writing style: `docs/documentation-style.md`.
