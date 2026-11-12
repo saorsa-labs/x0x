@@ -465,11 +465,54 @@ impl Rig {
 
 /// An owner-enrolled sender, known to the restarted receiver only from the
 /// evidence store, gets its command run and the result back over DMs.
+///
+/// Certificate recovery from the sender is held for the whole request
+/// (`HOLD_CERTIFICATE_RECOVERY`: no announce-blob fetch, no EvidenceV1
+/// certificate request, no Lookup reply with a certificate). Before the
+/// request, the sender's digest-only announcement has reached the receiver:
+/// its discovery entry names the certificate digest and holds no
+/// certificate. So owner trust can come only from the certificate the
+/// evidence store kept across that announcement.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exec_over_dm_is_admitted_after_the_receiver_restarts() {
+    use std::sync::atomic::Ordering;
+    let hold = &crate::announce_blob::HOLD_CERTIFICATE_RECOVERY;
+    hold.store(true, Ordering::SeqCst);
     let rig = rig(false).await;
-    // No wait for the certificate fetch: the request goes out at once.
+    let sender = rig.senders[0].agent.identity();
+    let digest = crate::announce_v3::cert_digest(
+        &sender.agent_certificate().and_then(|c| c.user_id().ok()),
+        &sender.agent_certificate().cloned(),
+    );
+    let start = Instant::now();
+    loop {
+        let entry = rig
+            .receiver
+            .agent
+            .discovered_agent_for_testing(&sender.agent_id())
+            .await;
+        if let Some(entry) = entry {
+            assert!(
+                entry.agent_certificate.is_none(),
+                "the receiver must not hold the certificate from discovery"
+            );
+            if entry.cert_digest == Some(digest) {
+                break;
+            }
+        }
+        assert!(
+            start.elapsed() < BOUND,
+            "the sender's digest-only announcement never reached the receiver"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     let (result, elapsed) = rig.run(0).await;
+    let entry = rig
+        .receiver
+        .agent
+        .discovered_agent_for_testing(&sender.agent_id())
+        .await;
+    hold.store(false, Ordering::SeqCst);
     let diagnostics = rig.receiver.service.diagnostics_snapshot().await.totals;
     let result = result.unwrap_or_else(|why| panic!("no result: {why}; receiver {diagnostics:?}"));
     assert_eq!(
@@ -478,6 +521,10 @@ async fn exec_over_dm_is_admitted_after_the_receiver_restarts() {
     );
     assert_eq!(result.code, Some(0), "the command must exit 0");
     assert_eq!(String::from_utf8_lossy(&result.stdout), "ok\n");
+    assert!(
+        entry.is_some_and(|e| e.agent_certificate.is_none()),
+        "no certificate reached discovery during the request"
+    );
     let audit = rig.audit_exit(&result).await;
     rig.stop().await;
     assert_eq!(audit, Some(0), "the audit log records exit 0");

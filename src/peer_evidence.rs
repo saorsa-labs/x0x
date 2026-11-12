@@ -1106,7 +1106,7 @@ impl PeerEvidenceStore {
     pub(crate) fn ingest_verified_after_carry(
         &self,
         mut record: EvidenceRecordV1,
-        view: Arc<EvidenceView>,
+        mut view: Arc<EvidenceView>,
         source: IngestSource,
         now: u64,
         carried: bool,
@@ -1120,11 +1120,34 @@ impl PeerEvidenceStore {
         record.stored_at_ms = now;
         let _mutation = self.lock_mutation()?;
         let mut state = self.lock()?;
-        if carried && stored_certificate_for(&state, &view.announcement, now) != record.certificate
-        {
-            return Err(EvidenceError::Invalid(
-                "carried certificate no longer stored",
-            ));
+        // #1107: decide the carry again under this lock, for both outcomes.
+        if carried || record.certificate.is_none() {
+            let now_carry = stored_certificate_for(&state, &view.announcement, now);
+            if carried && now_carry != record.certificate {
+                // A record stored since the decision (for example an
+                // anonymous one after consent was withdrawn) wins.
+                return Err(EvidenceError::Invalid(
+                    "carried certificate no longer stored",
+                ));
+            }
+            if let (false, Some(bytes)) = (carried, now_carry) {
+                // A record holding the certificate this announcement names
+                // was stored since the decision (a Hello with the bytes).
+                // Attach it, as the carry would now: skipping this record
+                // would lose its newer announcement and advert, and storing
+                // it without the certificate would lose that Hello's
+                // certificate. The certificate is the stored, verified one,
+                // current, bound to this agent, and its digest is the one
+                // this signed announcement names, so no new check is needed.
+                let certificate = state.verified.get(&a).and_then(|v| v.certificate.clone());
+                view = Arc::new(EvidenceView {
+                    announcement: view.announcement.clone(),
+                    advert: view.advert.clone(),
+                    certificate,
+                });
+                record.certificate = Some(bytes);
+                record.relation = self.policy.relation(a, m, view.certificate.as_ref(), now);
+            }
         }
         // A gossip pairing can have been queued before a Hello completed.
         // The same wire pair must not undo that Hello (or cause another

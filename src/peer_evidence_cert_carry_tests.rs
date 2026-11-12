@@ -277,3 +277,85 @@ fn suspended_record_is_not_carried() {
     assert!(!store.carry_certificate(&mut fresh, NOW));
     assert_eq!(fresh.certificate, None);
 }
+
+/// P1 (Greptile on #1882): gossip decides "nothing to carry" while the store
+/// is empty; a Hello then stores the same announcement and advert WITH the
+/// certificate; the gossip copy without bytes reaches the store after. The
+/// store must not replace the Hello's certificate with nothing.
+#[test]
+fn hello_stored_between_gossip_carry_decision_and_store_keeps_its_certificate() {
+    let peer = Peer::new();
+    let cert = AgentCertificate::issue(&owner(), &peer.agent).unwrap();
+    let (_dir, _policy, store) = setup(&peer);
+    let with_bytes = announce(&peer.agent, &peer.machine, Some(&cert), true, NOW);
+    let mut gossip = with_bytes.clone();
+    gossip.certificate = None;
+    assert!(
+        !store.carry_certificate(&mut gossip, NOW),
+        "nothing stored yet"
+    );
+    let view = Arc::new(gossip.verify(NOW, W_MS).unwrap());
+    store.ingest(with_bytes, IngestSource::Hello, NOW).unwrap();
+    let _ = store.ingest_verified_after_carry(gossip, view, IngestSource::Gossip, NOW, false);
+    assert_eq!(
+        certificate_of(&store, peer.a(), peer.m()),
+        Some(cert.to_storage_bytes().unwrap()),
+        "the Hello's certificate must survive the late gossip copy"
+    );
+    assert_eq!(
+        store.live(peer.a(), NOW).and_then(|r| r.certificate),
+        Some(cert.to_storage_bytes().unwrap())
+    );
+}
+
+/// The same window for a different digest: C is stored; gossip names C2
+/// without bytes (nothing to carry); a Hello stores C2 with bytes; the late
+/// gossip copy must keep C2.
+#[test]
+fn hello_with_a_new_certificate_stored_in_the_window_keeps_it() {
+    let peer = Peer::new();
+    let cert = AgentCertificate::issue(&owner(), &peer.agent).unwrap();
+    let renewed =
+        AgentCertificate::issue_with_expiry(&owner(), &peer.agent, Some(NOW / 1000 + 86_400))
+            .unwrap();
+    let (_dir, _policy, store) = stored_with(&peer, &cert);
+    let with_bytes = announce(&peer.agent, &peer.machine, Some(&renewed), true, NOW);
+    let mut gossip = with_bytes.clone();
+    gossip.certificate = None;
+    assert!(
+        !store.carry_certificate(&mut gossip, NOW),
+        "C2 is not stored yet"
+    );
+    let view = Arc::new(gossip.verify(NOW, W_MS).unwrap());
+    store.ingest(with_bytes, IngestSource::Hello, NOW).unwrap();
+    let _ = store.ingest_verified_after_carry(gossip, view, IngestSource::Gossip, NOW, false);
+    assert_eq!(
+        certificate_of(&store, peer.a(), peer.m()),
+        Some(renewed.to_storage_bytes().unwrap())
+    );
+}
+
+/// Consent withdrawal still wins in the window: an anonymous gossip record
+/// decided before a Hello with C was stored, and stored after it, leaves
+/// no certificate. A newer certificate-less record is never overridden.
+#[test]
+fn newer_anonymous_record_stored_after_a_hello_with_certificate_still_wins() {
+    let peer = Peer::new();
+    let cert = AgentCertificate::issue(&owner(), &peer.agent).unwrap();
+    let (_dir, _policy, store) = setup(&peer);
+    let mut anonymous = anonymous_at(&peer, NOW);
+    assert!(!store.carry_certificate(&mut anonymous, NOW));
+    let view = Arc::new(anonymous.verify(NOW, W_MS).unwrap());
+    store
+        .ingest(
+            announce(&peer.agent, &peer.machine, Some(&cert), true, EARLIER),
+            IngestSource::Hello,
+            NOW,
+        )
+        .unwrap();
+    store
+        .ingest_verified_after_carry(anonymous, view, IngestSource::Gossip, NOW, false)
+        .unwrap();
+    assert_eq!(certificate_of(&store, peer.a(), peer.m()), None);
+    assert_eq!(store.live(peer.a(), NOW).and_then(|r| r.certificate), None);
+}

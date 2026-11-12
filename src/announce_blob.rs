@@ -90,6 +90,29 @@ pub fn fetch_warranted(cert_digest: &[u8; 32]) -> bool {
     *cert_digest != crate::announce_v3::anonymous_cert_digest()
 }
 
+/// Test-only switch: while set, no certificate is recovered from a peer by
+/// any path (announce-blob fetch, EvidenceV1 certificate request, or a
+/// Lookup reply that carries one). A test sets it to prove that a result
+/// comes from certificate retention alone (#1107). Process-global: nextest
+/// runs each test in its own process.
+#[cfg(test)]
+pub(crate) static HOLD_CERTIFICATE_RECOVERY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether certificate recovery is held ([`HOLD_CERTIFICATE_RECOVERY`]).
+/// Always `false` outside tests.
+#[inline]
+pub(crate) fn certificate_recovery_held() -> bool {
+    #[cfg(test)]
+    {
+        HOLD_CERTIFICATE_RECOVERY.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 /// Build a [`SharedCertPair`] from an initial pair.
 pub fn shared_cert_pair(
     user_id: Option<identity::UserId>,
@@ -442,6 +465,9 @@ impl AnnounceBlobCache {
         agent_id: &identity::AgentId,
         machine_id: &identity::MachineId,
     ) -> Option<Arc<CachedBlob>> {
+        if certificate_recovery_held() {
+            return None;
+        }
         if let Some(hit) = self.get(digest).await {
             return Some(hit);
         }

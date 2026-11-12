@@ -455,6 +455,9 @@ impl Limits {
         }
     }
     fn need_certificate(&self, machine: MachineId, agent: AgentId, digest: [u8; 32]) {
+        if crate::announce_blob::certificate_recovery_held() {
+            return;
+        }
         if let Ok(mut s) = self.state.lock() {
             if let Some(m) = s.machine(machine, Instant::now()) {
                 m.certificate = Some((agent, digest, Instant::now() + DEADLINE));
