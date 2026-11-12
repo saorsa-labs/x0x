@@ -1128,8 +1128,10 @@ impl PeerEvidenceStore {
         }
         // A gossip pairing can have been queued before a Hello completed.
         // The same wire pair must not undo that Hello (or cause another
-        // material write). Its certificate was carried in by
-        // [`Self::carry_certificate`], so the whole record is compared.
+        // material write). The whole record is compared: a certificate-less
+        // copy reaches here with the stored certificate only if the carry
+        // rule kept it (`carry_certificate`, checked again above under this
+        // lock), so it then matches the Hello exactly.
         if source == IngestSource::Gossip
             && state.live.get(&a).is_some_and(|old| {
                 old.source == IngestSource::Hello

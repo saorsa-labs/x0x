@@ -401,8 +401,9 @@ async fn rig(revoke_first: bool) -> Rig {
 
 impl Rig {
     /// Run `echo ok` on the receiver from `senders[who]`, through the same
-    /// call the `x0x exec` route makes. Waits for the sender to learn the
-    /// receiver's DM capabilities first, since gossip carries them.
+    /// call the `x0x exec` route makes, at once and bounded by [`BOUND`].
+    /// The rig has already waited for the sender to learn the receiver's DM
+    /// capabilities.
     async fn run(&self, who: usize) -> (Result<ExecRunResult, String>, Duration) {
         let sender = &self.senders[who];
         let start = Instant::now();
@@ -427,17 +428,16 @@ impl Rig {
         (result, start.elapsed())
     }
 
+    /// Stop every node, even if one fails to stop, then report failures.
     async fn stop(self) {
-        for sender in &self.senders {
-            sender.service.shutdown().await;
-            sender.agent.try_shutdown().await.expect("sender stops");
+        let mut failures = Vec::new();
+        for node in self.senders.iter().chain([&self.receiver]) {
+            node.service.shutdown().await;
+            if let Err(error) = node.agent.try_shutdown().await {
+                failures.push(format!("{}: {error}", node.agent.agent_id()));
+            }
         }
-        self.receiver.service.shutdown().await;
-        self.receiver
-            .agent
-            .try_shutdown()
-            .await
-            .expect("receiver stops");
+        assert!(failures.is_empty(), "nodes failed to stop: {failures:?}");
     }
 
     /// The exit code in the receiver's audit log for the request, polled.
