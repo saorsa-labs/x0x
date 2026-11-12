@@ -13,14 +13,17 @@ Docs are in `docs/` (start with `docs/api-reference.md`); test detail is in
 - Required checks on `main`: Format Check, Clippy Lint
   (`cargo clippy --all-targets --all-features -- -D warnings`), Test Suite,
   Documentation (`RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps`)
-  and Build linux-x64-gnu.
+  and Build linux-x64-gnu. CI runs more jobs than these (coverage, parity,
+  integration, deployment authority); see `.github/workflows/`.
 - `ant-quic` and `saorsa-gossip-*` are exact-pinned crates.io versions and
   `Cargo.lock` is tracked; CI builds with `--locked`. A local `[patch]` to a
   sibling checkout must not be committed.
-- Test daemons join the real network. Run tests with `just test` or
+- Tests can reach the real network: test daemons join it, and some in-process
+  tests (for example the `--ignored` VPS tests) dial the real seeds. Run tests
+  with `just test` or
   `python3 scripts/dev/test-isolated.py nextest --all-features -- -E 'test(name)'`
   (Linux network namespace; macOS and Windows fail closed). Plain `cargo test`
-  is only for a selector that starts no daemon.
+  or `cargo nextest run` is only for a selector confirmed to open no network.
 - Linux cross-build: `cargo zigbuild --release --target x86_64-unknown-linux-gnu --bin x0xd`.
 
 ## Architecture
@@ -30,8 +33,9 @@ Every ID is SHA-256 of an ML-DSA-65 public key:
 - **User** (`~/.x0x/user.key`): optional human identity, never auto-generated;
   it issues the `AgentCertificate` that binds an agent to a user.
 
-Keys are bincode via `storage.rs`. Production code is panic-free; tests may use
-`unwrap`/`expect`.
+Keys are bincode via `storage.rs`. Production paths avoid
+`unwrap`/`expect`/`panic!` by convention: `lib.rs` allows those clippy lints
+crate-wide for tests, so clippy does not catch one.
 
 Layers, bottom to top: `network.rs` (wraps `ant_quic::Node`; seeds in
 `DEFAULT_BOOTSTRAP_PEERS` are hints only), `gossip/`, `presence.rs`, then
