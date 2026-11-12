@@ -6891,11 +6891,11 @@ impl HeartbeatContext {
             let carriers = {
                 let set = self.revocation_set.read().await;
                 [REVOCATION_V2_TOPIC, REVOCATION_V3_TOPIC, REVOCATION_TOPIC]
-                    .map(|topic| (topic, revocation_publish_records(&set, topic)))
+                    .map(|topic| (topic, revocation_heartbeat_batches(&set, topic)))
             };
             let mut all_sent = true;
-            for (topic, carrier_records) in carriers {
-                match revocation::encode_revocation_batches(&carrier_records) {
+            for (topic, encoded) in carriers {
+                match encoded {
                     Ok(batches) => {
                         for bytes in batches {
                             if let Err(e) = self
@@ -6999,6 +6999,32 @@ fn revocation_publish_records(
         REVOCATION_TOPIC => set.published_records(),
         _ => Vec::new(),
     }
+}
+
+/// The batches that the heartbeat sends on a revocation topic. These are
+/// the batches of [`revocation_publish_records`]. When that set is empty
+/// and this node's carrier is open, it is one empty-set statement (#1867),
+/// so a peer that waits for a resync can open. A closed carrier sends
+/// nothing: this node does not know its set. Other publish paths send no
+/// statement.
+fn revocation_heartbeat_batches(
+    set: &revocation::RevocationSet,
+    topic: &str,
+) -> Result<Vec<Vec<u8>>, bincode::Error> {
+    let records = revocation_publish_records(set, topic);
+    let carrier = match topic {
+        REVOCATION_TOPIC => revocation::REVOCATION_CARRIER_V1,
+        REVOCATION_V2_TOPIC => revocation::REVOCATION_CARRIER_V2,
+        REVOCATION_V3_TOPIC => revocation::REVOCATION_CARRIER_V3,
+        _ => return Ok(Vec::new()),
+    };
+    if !records.is_empty() {
+        return revocation::encode_revocation_batches(&records);
+    }
+    if set.carrier_closed(carrier) {
+        return Ok(Vec::new());
+    }
+    Ok(vec![revocation::encode_empty_set_statement()?])
 }
 
 /// #1863: whether a named group gives an agent a relationship with this
@@ -39824,6 +39850,62 @@ mod tests {
         // The store still holds both.
         assert_eq!(set.all_records().len(), 2);
         assert!(revocation_publish_records(&set, "x0x.other").is_empty());
+    }
+
+    /// #1867: the heartbeat sends one empty-set statement for each topic
+    /// whose published set is empty, only while that carrier is open. A
+    /// non-empty set sends the bytes of `encode_revocation_batches`.
+    #[test]
+    fn heartbeat_states_an_empty_set_only_for_an_open_carrier_1867() {
+        let topics = [REVOCATION_TOPIC, REVOCATION_V2_TOPIC, REVOCATION_V3_TOPIC];
+        let carriers = [
+            revocation::REVOCATION_CARRIER_V1,
+            revocation::REVOCATION_CARRIER_V2,
+            revocation::REVOCATION_CARRIER_V3,
+        ];
+        let statement = revocation::encode_empty_set_statement().expect("encode");
+        let open = revocation::RevocationSet::new();
+        for topic in topics {
+            assert_eq!(
+                revocation_heartbeat_batches(&open, topic).expect("encode"),
+                vec![statement.clone()],
+                "{topic}"
+            );
+        }
+        assert!(revocation_heartbeat_batches(&open, "x0x.other")
+            .expect("encode")
+            .is_empty());
+        for (topic, carrier) in topics.into_iter().zip(carriers) {
+            // A carrier that waits for a resync states nothing; the other
+            // carriers still do.
+            let waiting = revocation::RevocationSet::quarantined_carrier(carrier);
+            // A carrier that waits for its rebuild states nothing.
+            let mut reconciling = revocation::RevocationSet::new();
+            reconciling.hold_carrier_until_reconciled(carrier);
+            for closed in [&waiting, &reconciling] {
+                assert!(closed.carrier_closed(carrier));
+                for other in topics {
+                    let sent = revocation_heartbeat_batches(closed, other).expect("encode");
+                    if other == topic {
+                        assert!(sent.is_empty(), "{topic}: a closed carrier states nothing");
+                    } else {
+                        assert_eq!(sent, vec![statement.clone()], "{other}");
+                    }
+                }
+            }
+        }
+        // A non-empty set: the same bytes as before #1867, no statement.
+        let mut held = revocation::RevocationSet::new();
+        let owner = identity::AgentKeypair::generate().expect("keypair");
+        let record = self_revocation_at(&owner, 1_000);
+        assert!(held.verify_and_insert(record, None).expect("insert"));
+        assert!(held.mark_seen([revocation::SeenSubject::Agent(owner.agent_id())]));
+        let records = revocation_publish_records(&held, REVOCATION_TOPIC);
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            revocation_heartbeat_batches(&held, REVOCATION_TOPIC).expect("encode"),
+            revocation::encode_revocation_batches(&records).expect("encode")
+        );
     }
 
     /// #1868 review: machine subjects. A machine on a Known contact is

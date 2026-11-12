@@ -177,7 +177,39 @@ pub fn classify_announce(
 /// re-publish carries a fresh envelope signature, making the wire bytes
 /// unique every time (the same envelope-blindness that hid the announce
 /// storm from the validators until #423).
+///
+/// One payload is keyed per author (#1867): the empty-set statement (about
+/// 250 bytes) has the same bytes for every sender, but a waiting daemon
+/// opens its carrier only on the statement of ITS trusted authority. See
+/// `broadcast_replay_key`.
 pub const INNER_REPLAY_WINDOW: Duration = Duration::from_secs(300);
+
+/// Domain tag for the per-author replay key of the empty-set statement.
+const EMPTY_SET_STATEMENT_KEY_TAG: &[u8] = b"x0x-storm-empty-set-statement-v1";
+
+/// Replay-dedupe key for one inner payload on a broadcast topic.
+///
+/// When `inner` is the empty-set `statement` and the envelope names an
+/// author, the key covers the author too, so each author's statement
+/// passes once per window (#1867). Every other payload keeps the plain
+/// `blake3(inner)` key: identical record sets from many senders still
+/// dedupe network-wide.
+fn broadcast_replay_key(
+    author: Option<[u8; 32]>,
+    inner: &[u8],
+    statement: Option<&[u8]>,
+) -> [u8; 32] {
+    match (author, statement) {
+        (Some(author), Some(statement)) if inner == statement => {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(EMPTY_SET_STATEMENT_KEY_TAG);
+            hasher.update(&author);
+            hasher.update(inner);
+            *hasher.finalize().as_bytes()
+        }
+        _ => *blake3::hash(inner).as_bytes(),
+    }
+}
 
 /// Per-author + inner-payload state for a generic broadcast-topic validator.
 #[derive(Debug, Default)]
@@ -225,6 +257,49 @@ impl BroadcastGuard {
             Verdict::DeliverOnly
         }
     }
+}
+
+/// Classify one wire payload of a guarded broadcast topic.
+///
+/// `topic` is the name of the guarded topic. `statement` is the empty-set
+/// statement of the topic, if the topic has one (see
+/// `broadcast_replay_key`).
+///
+/// Only an envelope that its author signed for this topic can change a
+/// table (PR #1877 review). Two envelopes get `Drop` and change nothing:
+///
+/// - The inner signature is wrong. `decode_v2` returns `Ok` for such an
+///   envelope, with the `sender` that the bytes claim, and any peer can
+///   make these bytes for any author. No subscriber receives an unverified
+///   payload (#1114), so `Drop` loses nothing.
+/// - The signed topic is not `topic`. The heartbeat sends the same
+///   statement bytes on the v2, v3 and v1 topics, so a peer could copy the
+///   v2 statement of an authority to the v1 topic. A publisher on a
+///   guarded topic always signs the name of that topic.
+///
+/// If one of these filled the replay or rate entry of the author it names,
+/// the genuine statement of a trusted authority would get `Drop` or
+/// `DeliverOnly` for the whole window, and a waiting daemon would stay
+/// closed. Bytes that are not a V2 envelope still fail open.
+fn classify_broadcast_wire(
+    guard: &mut BroadcastGuard,
+    topic: &str,
+    payload: &[u8],
+    statement: Option<&[u8]>,
+    now_unix: u64,
+) -> Verdict {
+    let (author, inner_hash) = match crate::gossip::pubsub::decode_v2(payload) {
+        Ok(msg) if !msg.verified || msg.topic != topic => return Verdict::Drop,
+        Ok(msg) => {
+            let author = msg.sender.map(|a| a.0);
+            (
+                author,
+                broadcast_replay_key(author, msg.payload.as_ref(), statement),
+            )
+        }
+        Err(_) => (None, *blake3::hash(payload).as_bytes()),
+    };
+    guard.classify(author, inner_hash, now_unix)
 }
 
 /// Register announce-topic validators as the BASE (content) layer of the
@@ -303,26 +378,28 @@ pub(crate) fn register_announce_validators<T>(
     // generic guard: inner-payload replay dedupe + per-author rate limit.
     // The measured storm migrated here the moment the announce topics were
     // guarded (revocation.v1 hit 405 KB/s of identical stale sets).
-    for topic in [
-        crate::REVOCATION_TOPIC,
-        crate::REVOCATION_V3_TOPIC,
-        "x0x.discovery.groups",
+    // On the revocation topics the empty-set statement is deduped per
+    // author (#1867); see `broadcast_replay_key`.
+    let empty_set_statement = crate::revocation::encode_empty_set_statement().ok();
+    for (topic, statement) in [
+        (crate::REVOCATION_TOPIC, empty_set_statement.clone()),
+        (crate::REVOCATION_V3_TOPIC, empty_set_statement),
+        ("x0x.discovery.groups", None),
     ] {
         let guard = std::sync::Arc::new(std::sync::Mutex::new(BroadcastGuard::default()));
         let validator: saorsa_gossip_pubsub::TopicValidator = {
             let guard = std::sync::Arc::clone(&guard);
             std::sync::Arc::new(move |_topic, payload| {
-                let (author, inner_hash) = match crate::gossip::pubsub::decode_v2(payload) {
-                    Ok(msg) => (
-                        msg.sender.map(|a| a.0),
-                        *blake3::hash(msg.payload.as_ref()).as_bytes(),
-                    ),
-                    Err(_) => (None, *blake3::hash(payload).as_bytes()),
-                };
                 let Ok(mut guard) = guard.lock() else {
                     return ValidationAction::ForwardAndDeliver;
                 };
-                to_action(guard.classify(author, inner_hash, now_unix()))
+                to_action(classify_broadcast_wire(
+                    &mut guard,
+                    topic,
+                    payload,
+                    statement.as_deref(),
+                    now_unix(),
+                ))
             })
         };
         let topic_id = TopicId::from_entity(topic.as_bytes());
@@ -461,6 +538,277 @@ mod tests {
         assert_eq!(
             g.classify(author, set_hash, NOW + INNER_REPLAY_WINDOW.as_secs() + 200),
             Verdict::Forward
+        );
+    }
+
+    fn statement_1867() -> Vec<u8> {
+        crate::revocation::encode_empty_set_statement().unwrap()
+    }
+
+    /// Two authors send the same statement bytes inside the window: both
+    /// pass, because a waiter needs the statement of ITS authority. An
+    /// author that published other bytes inside its forward window gets
+    /// `DeliverOnly` for its statement (rate limit, not replay).
+    #[test]
+    fn statement_from_two_authors_both_pass_1867() {
+        let statement = statement_1867();
+        let mut g = BroadcastGuard::default();
+        let (a, b, c) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let key =
+            |author: [u8; 32]| broadcast_replay_key(Some(author), &statement, Some(&statement));
+        assert_ne!(key(a), key(b));
+        assert_eq!(g.classify(Some(a), key(a), NOW), Verdict::Forward);
+        assert_eq!(g.classify(Some(b), key(b), NOW + 1), Verdict::Forward);
+        // Author c published a record set first, then its statement.
+        let other = broadcast_replay_key(Some(c), b"record set", Some(&statement));
+        assert_eq!(g.classify(Some(c), other, NOW + 2), Verdict::Forward);
+        assert_eq!(g.classify(Some(c), key(c), NOW + 3), Verdict::DeliverOnly);
+    }
+
+    /// The same author's statement repeated inside the window is a replay.
+    #[test]
+    fn statement_repeat_from_one_author_drops_1867() {
+        let statement = statement_1867();
+        let mut g = BroadcastGuard::default();
+        let a = [1u8; 32];
+        let key = broadcast_replay_key(Some(a), &statement, Some(&statement));
+        assert_eq!(g.classify(Some(a), key, NOW), Verdict::Forward);
+        assert_eq!(g.classify(Some(a), key, NOW + 120), Verdict::Drop);
+    }
+
+    /// Any other payload keeps the network-wide key: the same bytes from a
+    /// second author are still a replay (the storm fix is unchanged).
+    #[test]
+    fn same_record_set_from_two_authors_drops_1867() {
+        let statement = statement_1867();
+        let mut g = BroadcastGuard::default();
+        let set = b"identical record set".as_slice();
+        let ka = broadcast_replay_key(Some([1u8; 32]), set, Some(&statement));
+        let kb = broadcast_replay_key(Some([2u8; 32]), set, Some(&statement));
+        assert_eq!(ka, *blake3::hash(set).as_bytes());
+        assert_eq!(ka, kb);
+        assert_eq!(g.classify(Some([1u8; 32]), ka, NOW), Verdict::Forward);
+        assert_eq!(g.classify(Some([2u8; 32]), kb, NOW + 1), Verdict::Drop);
+        // A topic with no statement (group cards) uses the plain key too.
+        let plain = broadcast_replay_key(Some([1u8; 32]), &statement, None);
+        assert_eq!(plain, *blake3::hash(&statement).as_bytes());
+    }
+
+    /// A statement with no envelope author falls back to the plain key.
+    #[test]
+    fn statement_without_author_uses_plain_key_1867() {
+        let statement = statement_1867();
+        let key = broadcast_replay_key(None, &statement, Some(&statement));
+        assert_eq!(key, *blake3::hash(&statement).as_bytes());
+        let mut g = BroadcastGuard::default();
+        assert_eq!(g.classify(None, key, NOW), Verdict::Forward);
+        assert_eq!(g.classify(None, key, NOW + 1), Verdict::Drop);
+    }
+
+    /// A copy of `genuine` with one signature byte changed: the envelope
+    /// still names the same author, but the inner signature is wrong. A
+    /// peer that cannot sign for the author can make these bytes.
+    fn forged_copy_1877(genuine: &[u8]) -> Vec<u8> {
+        let decoded = crate::gossip::pubsub::decode_v2(genuine).unwrap();
+        assert!(decoded.verified);
+        let key_len = decoded.sender_public_key.unwrap().len();
+        // version (1) + agent id (32) + key length (2) + key + sig length (2)
+        let first_signature_byte = 1 + 32 + 2 + key_len + 2;
+        let mut forged = genuine.to_vec();
+        forged[first_signature_byte] ^= 0x01;
+        let decoded = crate::gossip::pubsub::decode_v2(&forged).unwrap();
+        assert!(!decoded.verified, "the forged envelope decodes unverified");
+        forged
+    }
+
+    /// PR #1877 review: an envelope whose inner signature is wrong names an
+    /// author that did not sign it. It must not fill that author's replay
+    /// entry: the author's genuine statement still passes afterwards.
+    #[test]
+    fn forged_statement_does_not_block_the_genuine_statement_1877() {
+        use crate::gossip::pubsub::test_support::{signed_inner_v2, signing_context};
+        let statement = statement_1867();
+        let authority = signing_context();
+        let genuine = signed_inner_v2(
+            &authority,
+            crate::REVOCATION_TOPIC,
+            &bytes::Bytes::from(statement.clone()),
+        );
+        let forged = forged_copy_1877(&genuine);
+        let mut g = BroadcastGuard::default();
+        let forged_verdict = classify_broadcast_wire(
+            &mut g,
+            crate::REVOCATION_TOPIC,
+            &forged,
+            Some(&statement),
+            NOW,
+        );
+        let tables_empty = g.seen_inner.is_empty() && g.rate.last_forward.is_empty();
+        assert_eq!(
+            classify_broadcast_wire(
+                &mut g,
+                crate::REVOCATION_TOPIC,
+                &genuine,
+                Some(&statement),
+                NOW + 1
+            ),
+            Verdict::Forward,
+            "the genuine statement passes after the forgery"
+        );
+        assert!(tables_empty, "no replay or rate entry from a forgery");
+        assert_eq!(
+            forged_verdict,
+            Verdict::Drop,
+            "a forged envelope is not forwarded or delivered"
+        );
+        // The genuine statement is still a replay on its second arrival, and
+        // a later forgery does not change that.
+        assert_eq!(
+            classify_broadcast_wire(
+                &mut g,
+                crate::REVOCATION_TOPIC,
+                &genuine,
+                Some(&statement),
+                NOW + 2
+            ),
+            Verdict::Drop
+        );
+        assert_eq!(
+            classify_broadcast_wire(
+                &mut g,
+                crate::REVOCATION_TOPIC,
+                &forged,
+                Some(&statement),
+                NOW + 3
+            ),
+            Verdict::Drop
+        );
+    }
+
+    /// A forged envelope with other bytes must not use the forward window
+    /// of the author it names: the statement of that author would become
+    /// `DeliverOnly` and stop at this relay. It must not fill the
+    /// network-wide replay key of a record set either.
+    #[test]
+    fn forged_payload_does_not_rate_limit_or_dedupe_the_named_author_1877() {
+        use crate::gossip::pubsub::test_support::{signed_inner_v2, signing_context};
+        let statement = statement_1867();
+        let authority = signing_context();
+        let set = bytes::Bytes::from_static(b"record set");
+        let genuine_set = signed_inner_v2(&authority, crate::REVOCATION_TOPIC, &set);
+        let forged_set = forged_copy_1877(&genuine_set);
+        let mut g = BroadcastGuard::default();
+        let forged_verdict = classify_broadcast_wire(
+            &mut g,
+            crate::REVOCATION_TOPIC,
+            &forged_set,
+            Some(&statement),
+            NOW,
+        );
+        assert_eq!(
+            classify_broadcast_wire(
+                &mut g,
+                crate::REVOCATION_TOPIC,
+                &genuine_set,
+                Some(&statement),
+                NOW + 1
+            ),
+            Verdict::Forward,
+            "the genuine record set is not a replay of the forgery"
+        );
+        assert_eq!(forged_verdict, Verdict::Drop);
+        let mut g = BroadcastGuard::default();
+        classify_broadcast_wire(
+            &mut g,
+            crate::REVOCATION_TOPIC,
+            &forged_set,
+            Some(&statement),
+            NOW,
+        );
+        let genuine_statement = signed_inner_v2(
+            &authority,
+            crate::REVOCATION_TOPIC,
+            &bytes::Bytes::from(statement.clone()),
+        );
+        assert_eq!(
+            classify_broadcast_wire(
+                &mut g,
+                crate::REVOCATION_TOPIC,
+                &genuine_statement,
+                Some(&statement),
+                NOW + 1
+            ),
+            Verdict::Forward,
+            "the forgery did not use the forward window of the author"
+        );
+    }
+
+    /// A statement that the authority signed for another topic (the
+    /// heartbeat sends the same statement bytes on v2, v3 and v1) is not a
+    /// statement on this topic. A peer can copy it here. It must not fill
+    /// the replay entry that the genuine statement on this topic uses.
+    #[test]
+    fn statement_copied_from_another_topic_does_not_block_the_genuine_statement_1877() {
+        use crate::gossip::pubsub::test_support::{signed_inner_v2, signing_context};
+        let statement = statement_1867();
+        let authority = signing_context();
+        let inner = bytes::Bytes::from(statement.clone());
+        let genuine = signed_inner_v2(&authority, crate::REVOCATION_TOPIC, &inner);
+        let mut g = BroadcastGuard::default();
+        let mut copied_verdicts = Vec::new();
+        for other in [crate::REVOCATION_V2_TOPIC, crate::REVOCATION_V3_TOPIC] {
+            let copied = signed_inner_v2(&authority, other, &inner);
+            assert!(crate::gossip::pubsub::decode_v2(&copied).unwrap().verified);
+            copied_verdicts.push(classify_broadcast_wire(
+                &mut g,
+                crate::REVOCATION_TOPIC,
+                &copied,
+                Some(&statement),
+                NOW,
+            ));
+        }
+        let tables_empty = g.seen_inner.is_empty() && g.rate.last_forward.is_empty();
+        assert_eq!(
+            classify_broadcast_wire(
+                &mut g,
+                crate::REVOCATION_TOPIC,
+                &genuine,
+                Some(&statement),
+                NOW + 1
+            ),
+            Verdict::Forward,
+            "the genuine v1 statement passes after the copies"
+        );
+        assert!(tables_empty, "no replay or rate entry from a copy");
+        assert_eq!(copied_verdicts, [Verdict::Drop, Verdict::Drop]);
+    }
+
+    /// The fail-open contract is unchanged: bytes that are not a V2
+    /// envelope keep the whole-payload replay key and forward once.
+    #[test]
+    fn undecodable_broadcast_payload_still_fails_open_1877() {
+        let statement = statement_1867();
+        let mut g = BroadcastGuard::default();
+        let unknown = b"\xF7 future format".as_slice();
+        assert_eq!(
+            classify_broadcast_wire(
+                &mut g,
+                crate::REVOCATION_TOPIC,
+                unknown,
+                Some(&statement),
+                NOW
+            ),
+            Verdict::Forward
+        );
+        assert_eq!(
+            classify_broadcast_wire(
+                &mut g,
+                crate::REVOCATION_TOPIC,
+                unknown,
+                Some(&statement),
+                NOW + 1
+            ),
+            Verdict::Drop
         );
     }
 
