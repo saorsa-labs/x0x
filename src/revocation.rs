@@ -1135,14 +1135,39 @@ fn encode_revocation_batches_with_target(
     Ok(out)
 }
 
+/// The marker of an empty-set statement (#1867): a round of one batch whose
+/// `set` is the digest of no record hashes.
+fn empty_set_statement_marker() -> RoundMarker {
+    RoundMarker {
+        batches: 1,
+        index: 0,
+        set: round_set_digest(&[]),
+    }
+}
+
+/// The batch that states "my published set for this carrier is empty"
+/// (#1867). It holds one record: the round marker of
+/// [`empty_set_statement_marker`]. A daemon that waits for a resync takes
+/// it from a trusted authority as a snapshot of the empty set. Any other
+/// receiver removes the marker and gets no record. Only the heartbeat
+/// sends it, and only for a carrier that is not closed.
+///
+/// # Errors
+/// The bincode encode error.
+pub(crate) fn encode_empty_set_statement() -> Result<Vec<u8>, bincode::Error> {
+    encode_revocation_batch(&[round_marker_record(&empty_set_statement_marker())])
+}
+
 /// Record one remote carrier snapshot (#1116).
 ///
 /// A topic that is not a revocation carrier is ignored. A carrier that is
 /// not waiting is ignored, so a healthy daemon does not take the write
-/// lock. An empty or undecodable payload does not open membership. A
-/// message from `local_agent`, or a message with no sender, is not a
-/// group snapshot. Recording the snapshot does not insert records and
-/// does not by itself open the carrier.
+/// lock. An undecodable payload, or an empty batch with no marker, does
+/// not open membership. An empty-set statement (#1867) from a trusted
+/// authority is a snapshot of the empty set. A message from
+/// `local_agent`, or a message with no sender, is not a group snapshot.
+/// Recording the snapshot does not insert records and does not by itself
+/// open the carrier.
 pub(crate) async fn arm_incoming_revocation_snapshot(
     set: &std::sync::Arc<tokio::sync::RwLock<RevocationSet>>,
     topic: &str,
@@ -1298,6 +1323,14 @@ impl RevocationSet {
         self.resync_carriers & carrier != 0
     }
 
+    /// Whether this carrier waits for a resync or for its rebuild (#1867).
+    /// A daemon with a closed carrier does not know its set, so it must
+    /// not state that the set is empty.
+    #[must_use]
+    pub(crate) fn carrier_closed(&self, carrier: u8) -> bool {
+        (self.resync_carriers | self.reconcile_carriers) & carrier != 0
+    }
+
     /// Install the check that names a trusted snapshot sender (#1116).
     ///
     /// A missing check leaves every carrier closed. The daemon installs
@@ -1396,8 +1429,10 @@ impl RevocationSet {
     /// Remember one remote sender's whole-set snapshot (#1116): one batch
     /// with no round marker.
     ///
-    /// This does not insert records. An untrusted sender, an empty
-    /// snapshot, a record from another carrier, or a snapshot that omits
+    /// This does not insert records. An untrusted sender, an empty batch
+    /// (it never opens; the empty-set statement of #1867 has a marker and
+    /// comes through [`Self::observe_remote_round_part`]), a record from
+    /// another carrier, or a snapshot that omits
     /// a revocation already in the set is ignored. One exception (#1863):
     /// a held self-revocation for which the snapshot has no record of its
     /// pair does not count as omitted. The carrier opens only
@@ -1461,6 +1496,12 @@ impl RevocationSet {
     /// [`Self::observe_remote_carrier_snapshot`] applies to the union. A
     /// marker from a sender that is not a trusted authority is ignored: it
     /// cannot start, extend or close a round.
+    ///
+    /// A part with no record is refused, except the empty-set statement
+    /// (#1867): one batch, index 0, `set` = digest of no hashes. It is a
+    /// complete round whose snapshot is the empty set. It opens the
+    /// carrier only when every held record is a self-revocation with no
+    /// pair in the snapshot; otherwise the sender is behind.
     fn observe_remote_round_part(
         &mut self,
         carrier: u8,
@@ -1475,7 +1516,8 @@ impl RevocationSet {
         let Some(index) = carrier_index(carrier) else {
             return;
         };
-        if records.is_empty()
+        let statement = records.is_empty() && marker == empty_set_statement_marker();
+        if (records.is_empty() && !statement)
             || marker.batches == 0
             || marker.batches > MAX_ROUND_BATCHES
             || marker.index >= marker.batches
@@ -1591,7 +1633,14 @@ impl RevocationSet {
             }
         }
         self.try_complete_carrier(carrier);
-        if self.resync_carriers & carrier != 0 {
+        if statement && self.resync_carriers & carrier != 0 {
+            tracing::warn!(
+                carrier,
+                sender = %hex::encode(sender.as_bytes()),
+                held_records = self.known_carrier_hashes(carrier).len(),
+                "revocation resync: a trusted sender states that its set is empty, but this node holds records that the sender does not have; the carrier stays closed"
+            );
+        } else if self.resync_carriers & carrier != 0 {
             // An operator must be able to tell a round that is not yet
             // complete, or lost a batch, from a hang.
             tracing::warn!(
@@ -1685,10 +1734,8 @@ impl RevocationSet {
         let Some(index) = carrier_index(carrier) else {
             return;
         };
-        let known = self.known_carrier_hashes(carrier);
-        if known.is_empty() {
-            return;
-        }
+        // #1867: a node that holds no record can open. Only the empty-set
+        // statement gives a candidate with no kept record.
         let agreed = self.resync_candidates[index].values().any(|candidate| {
             candidate
                 .whole
@@ -7085,6 +7132,341 @@ mod tests {
             insert(&mut set, share_grant_fake()); // fake signature
             let tampered = set.to_bytes_v3().unwrap();
             assert!(RevocationSet::from_bytes_v3(&tampered).unwrap().is_empty());
+        }
+    }
+
+    // ---- #1867: the empty-set statement ----
+
+    const CARRIER_TOPICS_1867: [(u8, &str); 3] = [
+        (REVOCATION_CARRIER_V1, crate::REVOCATION_TOPIC),
+        (REVOCATION_CARRIER_V2, crate::REVOCATION_V2_TOPIC),
+        (REVOCATION_CARRIER_V3, crate::REVOCATION_V3_TOPIC),
+    ];
+    const AUTHORITY_1867: AgentId = AgentId([0x67; 32]);
+
+    fn waiter_1867(carriers: u8) -> std::sync::Arc<tokio::sync::RwLock<RevocationSet>> {
+        let mut set = RevocationSet::quarantined_carrier(carriers);
+        set.set_snapshot_authority(SnapshotAuthority::new(|sender, _| {
+            *sender == AUTHORITY_1867
+        }));
+        std::sync::Arc::new(tokio::sync::RwLock::new(set))
+    }
+
+    fn self_revocation_1867() -> (RevocationRecord, AgentId) {
+        let key = crate::identity::AgentKeypair::generate().unwrap();
+        let record = RevocationRecord::sign(
+            RevokedSubject::Agent(key.agent_id()),
+            key.public_key(),
+            key.secret_key(),
+            1_000,
+            None,
+        )
+        .unwrap();
+        (record, key.agent_id())
+    }
+
+    fn owner_revocation_1867() -> (RevocationRecord, AgentCertificate) {
+        let revoked = crate::identity::AgentKeypair::generate().unwrap();
+        let owner = crate::identity::UserKeypair::generate().unwrap();
+        let cert = AgentCertificate::issue(&owner, &revoked).unwrap();
+        let record = RevocationRecord::sign(
+            RevokedSubject::Agent(revoked.agent_id()),
+            owner.public_key(),
+            owner.secret_key(),
+            1_000,
+            None,
+        )
+        .unwrap();
+        (record, cert)
+    }
+
+    async fn send_1867(
+        set: &std::sync::Arc<tokio::sync::RwLock<RevocationSet>>,
+        topic: &str,
+        payload: &[u8],
+        sender: AgentId,
+    ) {
+        arm_incoming_revocation_snapshot(set, topic, payload, Some(&sender), None).await;
+    }
+
+    fn marker_only_1867(marker: RoundMarker) -> Vec<u8> {
+        encode_revocation_batch(&[round_marker_record(&marker)]).unwrap()
+    }
+
+    #[test]
+    fn empty_set_statement_is_one_marker_and_no_record_1867() {
+        let bytes = encode_empty_set_statement().unwrap();
+        let (records, round) = decode_revocation_batch_with_round(&bytes).unwrap();
+        assert!(records.is_empty());
+        assert_eq!(
+            round,
+            BatchRound::Part(RoundMarker {
+                batches: 1,
+                index: 0,
+                set: round_set_digest(&[]),
+            })
+        );
+        // An ordinary receiver strips the marker and gets no record.
+        assert!(decode_revocation_batch(&bytes).unwrap().is_empty());
+        // Other publish paths still send nothing for an empty set.
+        assert!(encode_revocation_batches(&[]).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_statement_opens_a_waiter_that_holds_nothing_1867() {
+        for (carrier, topic) in CARRIER_TOPICS_1867 {
+            let set = waiter_1867(carrier);
+            let statement = encode_empty_set_statement().unwrap();
+            send_1867(&set, topic, &statement, AgentId([0x01; 32])).await;
+            assert!(
+                set.read().await.carrier_resync_pending(carrier),
+                "{topic}: an untrusted statement keeps the carrier closed"
+            );
+            send_1867(&set, topic, &statement, AUTHORITY_1867).await;
+            let mut guard = set.write().await;
+            assert!(!guard.carrier_resync_pending(carrier), "{topic} opens");
+            assert!(
+                guard.carrier_closed(carrier),
+                "{topic} waits for the rebuild"
+            );
+            assert_eq!(guard.take_rebuild_pending(), carrier);
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_statement_opens_a_waiter_that_holds_a_strangers_self_revocation_1867() {
+        let set = waiter_1867(REVOCATION_CARRIER_V1);
+        let (record, agent) = self_revocation_1867();
+        assert!(set.write().await.verify_and_insert(record, None).unwrap());
+        let statement = encode_empty_set_statement().unwrap();
+        send_1867(&set, crate::REVOCATION_TOPIC, &statement, AUTHORITY_1867).await;
+        let guard = set.read().await;
+        assert!(!guard.carrier_resync_pending(REVOCATION_CARRIER_V1));
+        assert!(guard.is_agent_revoked(&agent), "the self-revocation stays");
+    }
+
+    #[tokio::test]
+    async fn empty_statement_does_not_open_a_waiter_that_holds_an_owner_revocation_1867() {
+        let set = waiter_1867(REVOCATION_CARRIER_V1);
+        let (record, cert) = owner_revocation_1867();
+        assert!(set
+            .write()
+            .await
+            .verify_and_insert(record, Some(&cert))
+            .unwrap());
+        let statement = encode_empty_set_statement().unwrap();
+        send_1867(&set, crate::REVOCATION_TOPIC, &statement, AUTHORITY_1867).await;
+        assert!(
+            set.read()
+                .await
+                .carrier_resync_pending(REVOCATION_CARRIER_V1),
+            "the sender is behind: the carrier stays closed"
+        );
+    }
+
+    /// An unmarked empty batch, and an empty part with any other marker,
+    /// never open and remove the sender's earlier offer.
+    #[tokio::test]
+    async fn other_empty_batches_stay_closed_and_drop_the_offer_1867() {
+        let bad = [
+            (
+                "unmarked",
+                bincode::serialize(&Vec::<RevocationRecord>::new()).unwrap(),
+            ),
+            (
+                "n=2",
+                marker_only_1867(RoundMarker {
+                    batches: 2,
+                    index: 0,
+                    set: round_set_digest(&[]),
+                }),
+            ),
+            (
+                "wrong set",
+                marker_only_1867(RoundMarker {
+                    batches: 1,
+                    index: 0,
+                    set: [0x07; 32],
+                }),
+            ),
+        ];
+        for (label, payload) in [("control", None)]
+            .into_iter()
+            .chain(bad.iter().map(|(label, bytes)| (*label, Some(bytes))))
+        {
+            let set = waiter_1867(REVOCATION_CARRIER_V1);
+            let (record, _) = self_revocation_1867();
+            let offer = bincode::serialize(&vec![record.clone()]).unwrap();
+            send_1867(&set, crate::REVOCATION_TOPIC, &offer, AUTHORITY_1867).await;
+            if let Some(payload) = payload {
+                send_1867(&set, crate::REVOCATION_TOPIC, payload, AUTHORITY_1867).await;
+                assert!(
+                    set.read()
+                        .await
+                        .carrier_resync_pending(REVOCATION_CARRIER_V1),
+                    "{label}: stays closed"
+                );
+            }
+            assert!(set.write().await.verify_and_insert(record, None).unwrap());
+            assert_eq!(
+                set.read()
+                    .await
+                    .carrier_resync_pending(REVOCATION_CARRIER_V1),
+                payload.is_some(),
+                "{label}: only the kept offer opens the carrier"
+            );
+        }
+    }
+
+    /// A statement replaces the sender's earlier whole snapshot, and a
+    /// later snapshot replaces the statement.
+    #[tokio::test]
+    async fn statement_and_snapshot_replace_each_other_1867() {
+        let (held, cert) = owner_revocation_1867();
+        let (missing, missing_cert) = owner_revocation_1867();
+        let statement = encode_empty_set_statement().unwrap();
+
+        // Whole {held, missing}, then the statement: the whole offer is
+        // stale, so the arrival of `missing` does not open.
+        let set = waiter_1867(REVOCATION_CARRIER_V1);
+        assert!(set
+            .write()
+            .await
+            .verify_and_insert(held.clone(), Some(&cert))
+            .unwrap());
+        let both = encode_revocation_batch(&[held.clone(), missing.clone()]).unwrap();
+        send_1867(&set, crate::REVOCATION_TOPIC, &both, AUTHORITY_1867).await;
+        send_1867(&set, crate::REVOCATION_TOPIC, &statement, AUTHORITY_1867).await;
+        assert!(set
+            .write()
+            .await
+            .verify_and_insert(missing, Some(&missing_cert))
+            .unwrap());
+        assert!(
+            set.read()
+                .await
+                .carrier_resync_pending(REVOCATION_CARRIER_V1),
+            "the statement replaced the whole snapshot"
+        );
+
+        // The statement, then a whole snapshot that matches: it opens.
+        let set = waiter_1867(REVOCATION_CARRIER_V1);
+        assert!(set
+            .write()
+            .await
+            .verify_and_insert(held.clone(), Some(&cert))
+            .unwrap());
+        send_1867(&set, crate::REVOCATION_TOPIC, &statement, AUTHORITY_1867).await;
+        assert!(set
+            .read()
+            .await
+            .carrier_resync_pending(REVOCATION_CARRIER_V1));
+        let one = encode_revocation_batch(&[held]).unwrap();
+        send_1867(&set, crate::REVOCATION_TOPIC, &one, AUTHORITY_1867).await;
+        assert!(!set
+            .read()
+            .await
+            .carrier_resync_pending(REVOCATION_CARRIER_V1));
+    }
+
+    /// End to end: a quarantined store opens from a trusted statement, the
+    /// rebuild writes a valid empty live file, and a reload is open.
+    #[tokio::test]
+    async fn empty_statement_rebuilds_an_open_empty_store_1867() {
+        for (carrier, topic) in CARRIER_TOPICS_1867 {
+            let dir = tempfile::tempdir().unwrap();
+            let empty = RevocationSet::new();
+            let (name, store, mut stored) = match carrier {
+                REVOCATION_CARRIER_V1 => (
+                    "revocations.bin",
+                    crate::storage::RevocationStore::V1,
+                    empty.to_bytes().unwrap(),
+                ),
+                REVOCATION_CARRIER_V2 => (
+                    "revocations-v2.bin",
+                    crate::storage::RevocationStore::V2,
+                    empty.to_bytes_v2().unwrap(),
+                ),
+                _ => (
+                    crate::SHARE_GRANT_REVOCATIONS_FILE,
+                    crate::storage::RevocationStore::V3,
+                    empty.to_bytes_v3().unwrap(),
+                ),
+            };
+            let path = dir.path().join(name);
+            stored.extend_from_slice(b"trailing");
+            tokio::fs::write(&path, &stored).await.unwrap();
+            let mut loaded = crate::storage::read_revocation_store(&path, store, false)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(loaded.carrier_resync_pending(carrier), "{name}");
+            assert!(!path.exists(), "{name}: the bad bytes are quarantined");
+            loaded.set_snapshot_authority(SnapshotAuthority::new(|sender, _| {
+                *sender == AUTHORITY_1867
+            }));
+            let set = std::sync::Arc::new(tokio::sync::RwLock::new(loaded));
+            let statement = encode_empty_set_statement().unwrap();
+            send_1867(&set, topic, &statement, AUTHORITY_1867).await;
+            assert!(set.read().await.revocation_resync_required(), "{name}");
+            crate::persist_completed_revocation_rebuild(&set, Some(dir.path())).await;
+            assert!(!set.read().await.revocation_resync_required(), "{name}");
+            assert!(path.is_file(), "{name}: the live file is written");
+            let again = crate::storage::read_revocation_store(&path, store, false)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                !again.revocation_resync_required(),
+                "{name}: reload is open"
+            );
+            assert!(again.is_empty(), "{name}");
+        }
+    }
+
+    /// A trusted statement does not open a carrier whose quarantine bytes
+    /// cannot be read: the rebuild keeps it closed, so this node sends no
+    /// statement of its own.
+    #[tokio::test]
+    async fn empty_statement_with_unreadable_quarantine_stays_closed_1867() {
+        for (carrier, topic) in CARRIER_TOPICS_1867 {
+            let dir = tempfile::tempdir().unwrap();
+            let (name, store) = match carrier {
+                REVOCATION_CARRIER_V1 => ("revocations.bin", crate::storage::RevocationStore::V1),
+                REVOCATION_CARRIER_V2 => {
+                    ("revocations-v2.bin", crate::storage::RevocationStore::V2)
+                }
+                _ => (
+                    crate::SHARE_GRANT_REVOCATIONS_FILE,
+                    crate::storage::RevocationStore::V3,
+                ),
+            };
+            let path = dir.path().join(name);
+            tokio::fs::write(&path, b"truncated-looking-but-garbage")
+                .await
+                .unwrap();
+            let mut loaded = crate::storage::read_revocation_store(&path, store, false)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(loaded.carrier_resync_pending(carrier), "{name}");
+            assert!(!path.exists(), "{name}: the bad bytes are quarantined");
+            loaded.set_snapshot_authority(SnapshotAuthority::new(|sender, _| {
+                *sender == AUTHORITY_1867
+            }));
+            let set = std::sync::Arc::new(tokio::sync::RwLock::new(loaded));
+            let statement = encode_empty_set_statement().unwrap();
+            send_1867(&set, topic, &statement, AUTHORITY_1867).await;
+            crate::persist_completed_revocation_rebuild(&set, Some(dir.path())).await;
+            assert!(
+                set.read().await.revocation_resync_required(),
+                "{name}: unreadable quarantine keeps the node closed"
+            );
+            assert!(
+                set.read().await.carrier_closed(carrier),
+                "{name}: closed carrier sends no statement"
+            );
+            assert!(!path.exists(), "{name}: no live file is written");
         }
     }
 }

@@ -1,7 +1,8 @@
 # Revocation batches and the round marker (#1857)
 
 Status: built. Decided 11 Nov 2026 by the coordinating Claude session under
-David's delegation of 10 Nov 2026. The rule is in A03 (Revocation).
+David's delegation of 10 Nov 2026; extended 12 Nov 2026 (Decision 2 on
+[#1867](https://github.com/saorsa-labs/x0x/issues/1867)). The rules are in A03 (Revocation).
 
 ## Why
 
@@ -18,6 +19,7 @@ ignored, and no revocation from that daemon reached any peer.
 |---|---|
 | Fits in one batch (at most 2 MiB less 64 KiB of records, about 370 records) | One batch, with no marker. The bytes are the same as before #1857. |
 | Larger | A **round**: several batches. Each batch holds records in record-hash order and ends with one **round-marker record**. |
+| Empty (all held records are strangers' self-revocations, or the carrier has no records), and this daemon's own carrier is open | One **empty-set statement**: a single batch holding one round-marker record with `n=1`, `i=0` and `set` = BLAKE3 over the bytes `x0x-revocation-round-set-v1` only (no record hashes). About 250 bytes. Only the heartbeat sends it: after a change of the set, and at the 2-hour fallback. Not sent while this daemon waits for a resync (it cannot claim its set is empty). Not sent when the set holds only an oversize legacy record (that set is not empty). |
 
 One record that is larger than the batch size goes in a batch of its own,
 with its marker.
@@ -72,6 +74,11 @@ x0x-revocation-round-v1 n=<batches> i=<index> set=<digest>
   sender's set for this carrier, in ascending order. A record hash is
   BLAKE3 of the record's signed bytes (`RevocationRecord::record_hash`).
 
+**Empty-set statement form.** A marker with `n=1`, `i=0` and `set` = BLAKE3
+over the bytes `x0x-revocation-round-set-v1` only (no record hashes appended)
+is the empty-set statement. It is the only valid form of an empty part (a part
+with no data records). An empty part with any other marker form is a bad part.
+
 A marker is about 210 bytes. A receiver knows a marker by its exact
 `issuer_public_key` value. A real ML-DSA-65 public key has 1952 bytes, so
 no real record has that value. A record with that value and any other
@@ -101,6 +108,16 @@ A03). It opens a carrier only from a sender that is a trusted authority:
   rule applies to the union. A lost first, middle or last batch leaves the
   carrier closed until the sender's next full publish (at most 2 hours).
   The daemon logs this state at WARN after each part.
+- An **empty-set statement** (a one-part round with no data records) from a
+  trusted authority counts as that sender's snapshot of the empty set. The
+  existing snapshot rules apply: a waiter with no held record
+  opens; a waiter with only self-revocations for which the sender has no
+  record of the same subject and issuer opens and keeps them in force; a
+  waiter with any other held record stays closed. After the carrier opens,
+  the rebuild writes a valid live file, so a restart does not close again.
+  The rebuild rules do not change: when the quarantine bytes cannot be
+  read, the daemon does not install the snapshot and stays closed until
+  the operator command (A03).
 - A marker from a sender that is not a trusted authority is ignored.
 - A newer batch from a sender, marked or not, replaces what that sender
   offered before. An older whole set never opens the carrier after it.
@@ -108,8 +125,9 @@ A03). It opens a carrier only from a sender that is a trusted authority:
   complete (the same `set`) changes nothing, because the sender publishes
   the same set again every 2 hours.
 - A batch from a trusted sender that the daemon cannot use (a bad marker,
-  a count or index out of range, a record of another carrier, an empty
-  batch) also removes what that sender offered before (#1864). The batch
+  a count or index out of range, a record of another carrier, an unmarked
+  empty batch, or an empty part with any other marker form) also removes
+  what that sender offered before (#1864). The batch
   shows that the sender's set has changed, so the earlier offer is stale.
   The carrier stays closed for that sender until it sends a set that the
   daemon can read.
@@ -248,42 +266,105 @@ rules. Opening never removes a held record, so an ignored record stays in
 force. The cost: an omitted self-revocation is no longer a sign that the
 sender is behind.
 
-**Known gap.** A waiting daemon that lost a self-revocation for a subject
-that only it knows does not get the record back from senders to whom the
-subject is a stranger. It opens without that record. Closing it needs a
-request/response message (a wire change), which is not built; it waits
-for David's decision on #1867. Follow-up:
+**Known limit (decided, #1867).** A waiting daemon that lost a self-revocation
+for a subject that only it knows does not get the record back from senders to
+whom the subject is a stranger. It opens without that record. The
+request/response approach (a waiting daemon asks a trusted authority for every
+record it holds on named subjects) was decided against on 12 Nov 2026 (Claude,
+under David's delegation of 10 Nov 2026). The reasons:
+
+1. It cannot be complete. An authority holds a stranger's self-revocation
+   only if it was online at the one pubsub spread. An answer with no record
+   does not show that no record exists, so the waiter cannot use the answer
+   as a condition to open. It would be best effort only.
+2. It names the waiter's relationships (contacts, also blocked ones, group
+   rosters, the owner's agents) to another party. On a pubsub topic that
+   list is public. A private path is a direct message, and a daemon that
+   waits drops direct messages and DMs, so the hold must open for a new
+   typed DM. A typed DM also needs a capability bit, because a released
+   receiver shows an unknown typed payload as an ordinary DM (archived
+   ADR 0080). That is two message types, a capability bit and a change to
+   the hold.
+3. Most of the effect of the lost record stays on the waiter. Applying a
+   revocation blocks the subject as a contact and removes it from the
+   group rosters. Those stores are not lost with the revocation file. The
+   rebuild also unites every record that it can still read from the
+   quarantine file.
+4. The lost record was the waiter's own data. If this limit must go later,
+   the sound place is the waiter's own disk (a second copy of the store),
+   not a query to peers. This is not decided and not built.
+
+What stays true: the waiting daemon opens without that record. The subject
+stays Blocked as a contact and out of the group rosters, but
+`is_agent_revoked` / `is_machine_revoked` is false for it until the record
+arrives again. Record:
 [#1867](https://github.com/saorsa-labs/x0x/issues/1867).
 
-**Known stall: an empty published set.** A sender whose held v1
-records are all self-revocations of strangers has an empty published
-set. `encode_revocation_batches` of an empty set returns no batch,
-so the sender sends nothing on the v1 topic. A waiting daemon
-therefore gets no snapshot from that sender. An empty batch from a
-trusted sender also never opens a carrier (rule of #1116) and
-removes that sender's earlier offer (#1864). If every trusted
-sender is in that state, the waiting daemon stays closed (fail
-closed) until a trusted sender publishes at least one v1 record (an
-owner revocation, or a self-revocation of a subject that the sender
-has seen), or the operator rebuilds the store
-(`x0x identity rebuild-revocation-store`, A03). A sender is in this
-state when its `identity_authority.revocation_stranger_self_held`
-count is not zero and is equal to its number of v1 records. This
-behaviour does not change now. A
-statement from an authority that its published set is empty (an
-empty batch, or a round marker with no records) would be new
-traffic and a change to the #1116 rule, so it needs David's
-decision. This is an open question on
-[#1867](https://github.com/saorsa-labs/x0x/issues/1867). Before
-#1863 the same stall existed for a network with no revocation at
-all; #1863 widened it to networks whose only records are strangers'
-self-revocations.
+**Empty-set statement (decided 12 Nov 2026, #1867).** A sender whose
+published v1 set holds only strangers' self-revocations has an empty
+published set. Before this decision, that sender sent nothing on the v1
+topic and a waiting daemon got no snapshot from it. A daemon whose
+published set for a carrier is empty now sends an explicit
+**empty-set statement** (a one-part round with no data records; see "What
+a daemon sends" and "The round-marker record"). A waiting daemon that holds
+no record for that carrier opens; a waiting daemon that holds only
+self-revocations for which the sender has no record opens and keeps them in
+force; a waiting daemon that holds any other record stays closed. An
+unmarked empty batch still never opens a carrier and still removes that
+sender's earlier offer (#1864). A sender sends the statement only while
+its own carrier is open. A waiter takes it only from a trusted authority.
+It is a different message from silence, garbage or an unmarked empty
+batch.
+
+**Why the #1116 rule changes for the explicit statement.** (1) Since #1863
+an empty published v1 set is the usual state of a network whose only
+records are strangers' self-revocations, and an empty v2 or v3 set is the
+usual state of most networks. A waiter there stayed closed, with all group
+traffic withheld, until an operator ran the rebuild command. (2) The old
+rule gave little protection. A snapshot is compared only with the records
+that the waiter holds, so a trusted authority that is behind and publishes
+one record opened a waiter in the same way. (3) The statement is explicit,
+and a daemon that itself waits never sends it.
+
+**What this decision gives up.** Before, a waiter that held no record
+opened only from an authority that published at least one record. Now a
+trusted authority with an empty set opens it, for example a machine that
+was enrolled a short time ago. Example: the waiter lost an owner revocation
+of X, and a new machine of the same owner states an empty set first. The
+waiter opens without X until a peer that holds the record publishes it
+again (at most 2 hours). Before, the waiter stayed closed in that time.
+This is accepted: the same result was already possible with a snapshot of
+one record.
+
+**Storm control.** The relay guard on the v1 and v3 topics drops a payload
+whose bytes it saw in the last 5 minutes, from any sender
+(`src/storm_control.rs`). The statement has the same bytes from every
+sender, and a waiter needs the statement of its own authority. So for the
+statement only, the guard counts a repeat for each sender. Each other
+payload keeps the rule. One limit stays from before #1867: when many
+daemons hold the same non-empty set, a relay passes only the first copy
+in 5 minutes, so the copy of the waiter's authority can be dropped, and
+the waiter then waits for a later publish.
+
+A sender is in the empty-v1-set state when its
+`identity_authority.revocation_stranger_self_held` count equals its number
+of v1 records. Opening on a statement does not bring back records that were
+only in the bad file; the same is true for a non-empty snapshot. The
+operator rebuild command (`x0x identity rebuild-revocation-store`, A03) is
+still the way when no trusted authority is reachable or the node holds
+records that no authority publishes.
 
 **Mixed versions.** A released daemon (v0.48.1 and earlier) that waits for
 a resync compares exact record sets. If it holds a stranger's
 self-revocation, it cannot open from a new sender, only from a released
 sender that still publishes the record. It stays closed (fail closed)
 until a released sender publishes, or it is upgraded. This is accepted.
+A released daemon that receives the empty-set statement rejects the marker
+as a record that does not verify, or skips it (see the table in "Released
+daemons"), and applies nothing; the statement batch has no data records.
+A released waiter does not open on the statement (a marked batch never
+opens the released carrier). A new waiter does not open from a released
+authority with an empty set (the released sender sends nothing), as before.
 
 ## A legacy record with a long reason
 
@@ -327,7 +408,7 @@ Read at tags `v0.48.1` and `v0.46.0` (files as of each tag):
 | v1 | `apply_legacy_revocation_records` in `src/lib.rs` (`v0.48.1`); the `DiscoveryMessage::Revocation` arm of the identity listener (`v0.46.0`) | Rejected alone, `debug!("revocation record rejected")`. The other records are applied. No penalty. |
 | v2 | `apply_v2_revocation_records` (`v0.48.1`); the `DiscoveryMessage::RevocationV2` arm (`v0.46.0`) | Rejected alone, `debug!("v2 binding revocation rejected")`. |
 | v3 | `ingest_share_grant_revocations` (both tags) | A record that is not a share-grant subject is skipped with no log line. |
-| Waiter | `observe_remote_carrier_snapshot` and `try_complete_carrier` in `src/revocation.rs` (`v0.48.1`; `v0.46.0` has no waiter) | The carrier opens only when the held record hashes equal a trusted snapshot's hashes. The marker is never held, so a marked batch never opens the carrier. On v2 and v3 the marker is not a subject of that carrier, so the snapshot is ignored. |
+| Waiter | `observe_remote_carrier_snapshot` and `try_complete_carrier` in `src/revocation.rs` (`v0.48.1`; `v0.46.0` has no waiter) | The carrier opens only when the held record hashes equal a trusted snapshot's hashes. The marker is never held, so a marked batch (including an empty-set statement) never opens the carrier. On v2 and v3 the marker is not a subject of that carrier, so the snapshot is ignored. |
 
 The pubsub layer (saorsa-gossip-pubsub 0.5.86 and 0.5.90) scores a peer
 only for a bad signature on the pubsub message
