@@ -1044,7 +1044,7 @@ impl PeerEvidenceStore {
         if ann.cert_digest == announce_v3::cert_digest(&None, &None) {
             return;
         }
-        let Ok(state) = self.state.lock() else {
+        let Ok(state) = self.lock() else {
             return;
         };
         if state.suspended.contains(&ann.agent_id) {
@@ -1059,12 +1059,12 @@ impl PeerEvidenceStore {
         let Some(cert) = stored.certificate.as_ref() else {
             return;
         };
-        if cert.is_expired(now / 1000)
-            || announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone()))
-                != ann.cert_digest
-        {
+        let stored_digest = announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone()));
+        if cert.is_expired(now / 1000) || stored_digest != ann.cert_digest {
             return;
         }
+        // The stored bytes on purpose, never a re-serialization: they are
+        // exactly the bytes that were verified when the record was stored.
         record.certificate = state
             .file
             .records
