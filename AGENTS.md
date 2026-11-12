@@ -34,8 +34,9 @@ Every ID is SHA-256 of an ML-DSA-65 public key:
   it issues the `AgentCertificate` that binds an agent to a user.
 
 Keys are bincode via `storage.rs`. Production paths avoid
-`unwrap`/`expect`/`panic!` by convention: `lib.rs` allows those clippy lints
-crate-wide for tests, so clippy does not catch one.
+`unwrap`/`expect`/`panic!` by convention. Clippy does not catch one: `lib.rs`
+allows `unwrap_used` and `expect_used` crate-wide for tests, and CI does not
+enable `clippy::panic`.
 
 Layers, bottom to top: `network.rs` (wraps `ant_quic::Node`; seeds in
 `DEFAULT_BOOTSTRAP_PEERS` are hints only), `gossip/`, `presence.rs`, then
@@ -45,7 +46,8 @@ the endpoint registry shared by routes and CLI).
 `x0x exec` is off unless the exec ACL sets `[exec].enabled = true`
 (`/etc/x0x/exec-acl.toml`; macOS `/usr/local/etc/x0x/exec-acl.toml`).
 
-Multi-instance daemon: `x0xd --name alice --api-port 12701 --no-hard-coded-bootstrap`.
+Multi-instance daemon: `x0xd --name alice --api-port 12701 --no-hard-coded-bootstrap`
+(the flag drops the built-in seeds; peers in the config file are still dialled).
 
 ## Decisions
 - The decision record is the 15 slots A01–A15 in `docs/adr/consolidated/`.
@@ -53,6 +55,9 @@ Multi-instance daemon: `x0xd --name alice --api-port 12701 --no-hard-coded-boots
 - A slot change is a dated paragraph in the slot plus its sha256 pin in
   `index.json`. Check with `python3 scripts/check-adr-consolidation.py` and
   `python3 scripts/check-adr-count.py`.
-- David delegated design and scope decisions on 10 Nov 2026. A PR that changes
-  a slot, the wire format or the public API says so in its body.
+- David delegated design decisions on 10 Nov 2026; slot amendments made under
+  it are dated paragraphs that say so. A PR that changes a slot says so in its
+  body.
+- A15: a wire-format or public-API change needs a `FOR ENGINEER:` line for
+  David's decision, and his approval is recorded in the PR body or a comment.
 - Writing style: `docs/documentation-style.md`.
