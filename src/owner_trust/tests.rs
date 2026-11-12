@@ -858,6 +858,11 @@ impl UnknownMachine {
     /// would), returning its id. A class A announcement also records the
     /// authenticated binding (ADR 0115 §1).
     async fn learn_agent(&self) -> AgentId {
+        self.learn_agent_kp().await.agent_id()
+    }
+
+    /// [`Self::learn_agent`], keeping the key (to sign a revocation).
+    async fn learn_agent_kp(&self) -> AgentKeypair {
         let agent_kp = AgentKeypair::generate().expect("agent keygen");
         let agent_id = agent_kp.agent_id();
         crate::dm_inbox::record_authenticated_machine_binding(
@@ -890,7 +895,57 @@ impl UnknownMachine {
                 cert_digest: None,
             },
         );
-        agent_id
+        agent_kp
+    }
+
+    /// #1107 post-prefix step, run after the shared gate refused a stream
+    /// from a machine with known agents: is `protocol` admitted on the
+    /// enrollment?
+    async fn admits_over_untrusted(&self, protocol: crate::streams::StreamProtocol) -> bool {
+        crate::Agent::admit_enrolled_owner_sync_over_untrusted(
+            &self.cache,
+            &self.contacts,
+            &self.revocations,
+            &self.move_state,
+            &self.connect_policy,
+            &self.trust,
+            &self.machine_id,
+            protocol,
+            || (),
+        )
+        .await
+        .is_some()
+    }
+
+    /// The accept loop's real pre-prefix admission for this machine.
+    async fn pre_prefix(&self) -> Option<crate::streams::InboundAdmission> {
+        crate::Agent::admit_stream_before_prefix(
+            &self.cache,
+            &self.contacts,
+            &self.revocations,
+            &self.move_state,
+            &self.connect_policy,
+            &self.trust,
+            &self.machine_id,
+            &Arc::new(crate::evidence_wire::Limits::default()),
+        )
+        .await
+    }
+
+    /// Pre-prefix: the enrolled slot (no agent list, no stranger pool slot,
+    /// not an evidence probe) that only owner sync can use after the prefix.
+    async fn gets_enrolled_slot(&self) -> bool {
+        self.pre_prefix()
+            .await
+            .is_some_and(|a| a.agents.is_none() && a.prefix.is_none() && !a.evidence_only)
+    }
+
+    /// Both #1107 halves for a machine with known agents.
+    async fn sync_v1_admitted_over_untrusted(&self) -> bool {
+        self.gets_enrolled_slot().await
+            && self
+                .admits_over_untrusted(crate::streams::StreamProtocol::SyncV1)
+                .await
     }
 
     /// Both halves: what an inbound SyncV1 stream actually gets.
@@ -1043,22 +1098,227 @@ async fn deleted_enrollment_is_denied() {
     assert!(!m.sync_v1_admitted().await);
 }
 
-// #1040: the branch is only for machines with NO known agent. Once any
-// agent is known on the machine, the shared agent-level gate decides (so
-// revoked/blocked/expired agents are never bypassed by the enrollment).
+// #1040/#1107: once an agent is known on the machine, the shared
+// agent-level gate is asked first. A TRUSTED agent keeps the shared-gate
+// path: the stream carries its agent list, not the enrollment-only slot.
 #[tokio::test]
-async fn known_agent_on_enrolled_machine_uses_the_shared_gate() {
+async fn trusted_known_agent_on_enrolled_machine_uses_the_shared_gate() {
     let (_owner, m) = UnknownMachine::enrolled().await;
-    m.learn_agent().await;
-    assert!(!m.candidate().await);
+    let agent_id = m.learn_agent().await;
+    assert!(!m.candidate().await, "not the no-known-agent branch");
+    m.contacts
+        .write()
+        .await
+        .set_trust(&agent_id, TrustLevel::Trusted);
+    assert_eq!(m.shared_gate().await.expect("gate"), vec![agent_id]);
+    let admission = m.pre_prefix().await.expect("admitted");
+    assert_eq!(admission.agents, Some(vec![agent_id]));
+    assert!(admission.prefix.is_none());
 }
 
-// #1044 review round 1 (P2): the pre-prefix check found no known agent, but
-// a BLOCKED agent on the machine becomes known while the prefix is read.
-// The post-prefix routing must send the stream to the shared gate (which
-// denies it), not admit it on the enrollment alone. Deterministic: the
-// agent is learned between the two decisions, with no sleeps. Before the
-// fix the post-prefix step re-checked only the enrollment and admitted.
+// #1107 RED->GREEN: the device restarted and announced anonymously, so the
+// receiver knows a certless agent on the enrolled machine whose trust is
+// only Unknown. SyncV1 is admitted on the enrollment (as if the machine had
+// not announced), with no agent attached and no registry written.
+#[tokio::test]
+async fn untrusted_known_agent_on_enrolled_machine_is_admitted_for_sync_v1() {
+    use crate::streams::StreamProtocol;
+    let (_owner, m) = UnknownMachine::enrolled().await;
+    let agent_id = m.learn_agent().await;
+    assert!(matches!(
+        m.shared_gate().await,
+        Err(NetworkError::PeerTrustRejected { .. })
+    ));
+    let cache_before = format!("{:?}", m.cache.read().await.get(&agent_id));
+    let bindings_before = m.bindings.read().await.agents_on_machine(m.machine_id, 16);
+
+    assert!(m.sync_v1_admitted_over_untrusted().await);
+
+    // Nothing else is widened: other kinds go to the shared gate, which
+    // refuses them; ForwardV2 keeps its own (#1869) no-known-agent rule.
+    for protocol in NON_SYNC_PROTOCOLS
+        .into_iter()
+        .chain([StreamProtocol::ForwardV2])
+    {
+        assert!(!m.admits_over_untrusted(protocol).await, "{protocol:?}");
+        assert_eq!(
+            m.route(protocol).await,
+            crate::EnrolledOwnerSyncRoute::SharedGate
+        );
+    }
+    // The admission granted nothing and wrote nothing.
+    assert_eq!(
+        format!("{:?}", m.cache.read().await.get(&agent_id)),
+        cache_before
+    );
+    assert_eq!(
+        m.bindings.read().await.agents_on_machine(m.machine_id, 16),
+        bindings_before
+    );
+    assert!(m.contacts.read().await.get(&agent_id).is_none());
+    let pair = m
+        .trust
+        .evaluate_pair(
+            &m.contacts,
+            &m.cache,
+            &m.revocations,
+            &agent_id,
+            &m.machine_id,
+        )
+        .await;
+    assert!(!pair.owner_trusted);
+    assert_eq!(pair.decision, TrustDecision::Unknown);
+}
+
+// #1107: an untrusted agent on a machine that is NOT enrolled gets nothing.
+#[tokio::test]
+async fn untrusted_known_agent_on_unenrolled_machine_is_denied() {
+    let owner = UserKeypair::generate().expect("owner keygen");
+    let m = UnknownMachine::new(&owner, &owner, Enrollment::None).await;
+    m.learn_agent().await;
+    assert!(!m.gets_enrolled_slot().await);
+    assert!(
+        !m.admits_over_untrusted(crate::streams::StreamProtocol::SyncV1)
+            .await
+    );
+}
+
+/// The shared gate with only missing trust waived (#1107), as the
+/// enrollment path runs it.
+async fn waived_gate(m: &UnknownMachine) -> Result<Vec<AgentId>, NetworkError> {
+    crate::Agent::gate_peer_machine_inbound_for_evidence(
+        &m.cache,
+        &m.contacts,
+        &m.revocations,
+        &m.move_state,
+        &m.connect_policy,
+        &m.trust,
+        &m.machine_id,
+        None,
+        InboundTrustRule::EnrolledOwnerSync,
+        false,
+    )
+    .await
+    .map_err(|e| e.fail_closed_admission([0; 32]))
+}
+
+// #1107: every explicit deny still wins over the enrollment. Each case
+// keeps an Unknown agent on the enrolled machine and adds one deny; the
+// waived gate names the deny, and neither half admits.
+#[tokio::test]
+async fn explicit_denies_on_enrolled_machine_still_refuse_sync_v1() {
+    #[derive(Debug, Clone, Copy)]
+    enum Deny {
+        Blocked,
+        MachinePin,
+        AgentRevoked,
+        MachineRevoked,
+        ExpiredCert,
+        ConnectAcl,
+        SecondAgentBlocked,
+    }
+    for deny in [
+        Deny::Blocked,
+        Deny::MachinePin,
+        Deny::AgentRevoked,
+        Deny::MachineRevoked,
+        Deny::ExpiredCert,
+        Deny::ConnectAcl,
+        Deny::SecondAgentBlocked,
+    ] {
+        let (_owner, m) = UnknownMachine::enrolled().await;
+        let agent_kp = m.learn_agent_kp().await;
+        let agent_id = agent_kp.agent_id();
+        assert!(waived_gate(&m).await.is_ok(), "{deny:?}: precondition");
+        let record = match deny {
+            Deny::AgentRevoked => Some(RevocationRecord::sign(
+                RevokedSubject::Agent(agent_id),
+                agent_kp.public_key(),
+                agent_kp.secret_key(),
+                unix_now_secs(),
+                None,
+            )),
+            Deny::MachineRevoked => Some(RevocationRecord::sign(
+                RevokedSubject::Machine(m.machine_id),
+                m.machine_kp.public_key(),
+                m.machine_kp.secret_key(),
+                unix_now_secs(),
+                None,
+            )),
+            _ => None,
+        };
+        if let Some(record) = record {
+            m.revocations
+                .write()
+                .await
+                .verify_and_insert(record.expect("sign"), None)
+                .expect("insert");
+        }
+        match deny {
+            Deny::Blocked => m
+                .contacts
+                .write()
+                .await
+                .set_trust(&agent_id, TrustLevel::Blocked),
+            Deny::MachinePin => {
+                let mut contacts = m.contacts.write().await;
+                let other = MachineId([7; 32]);
+                contacts.add_machine(&agent_id, crate::contacts::MachineRecord::new(other, None));
+                assert!(contacts.pin_machine(&agent_id, &other));
+            }
+            Deny::AgentRevoked | Deny::MachineRevoked => {}
+            Deny::ExpiredCert => {
+                if let Some(entry) = m.cache.write().await.get_mut(&agent_id) {
+                    entry.cert_not_after = Some(1);
+                }
+            }
+            Deny::ConnectAcl => {
+                *m.connect_policy
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Arc::new(ConnectPolicy::Enabled(ConnectAcl {
+                        loaded_from: std::path::PathBuf::from("/test/connect-acl.toml"),
+                        loaded_at_unix_ms: 0,
+                        allow: Vec::new(),
+                        owner_allow: Vec::new(),
+                        grant_allow: Vec::new(),
+                    }));
+            }
+            Deny::SecondAgentBlocked => {
+                let second = m.learn_agent().await;
+                m.contacts
+                    .write()
+                    .await
+                    .set_trust(&second, TrustLevel::Blocked);
+            }
+        }
+        let reason = waived_gate(&m).await;
+        let named = match deny {
+            Deny::Blocked | Deny::MachinePin | Deny::SecondAgentBlocked => {
+                matches!(reason, Err(NetworkError::PeerTrustRejected { .. }))
+            }
+            Deny::AgentRevoked => matches!(reason, Err(NetworkError::PeerRevoked { .. })),
+            // A revoked machine is not enrolled any more; the gate also
+            // names the revocation.
+            Deny::MachineRevoked => matches!(reason, Err(NetworkError::PeerRevoked { .. })),
+            Deny::ExpiredCert => matches!(reason, Err(NetworkError::PeerNotVerified { .. })),
+            Deny::ConnectAcl => matches!(reason, Err(NetworkError::PeerNotInConnectAcl { .. })),
+        };
+        assert!(named, "{deny:?}: {reason:?}");
+        assert!(!m.gets_enrolled_slot().await, "{deny:?}: pre-prefix");
+        assert!(
+            !m.admits_over_untrusted(crate::streams::StreamProtocol::SyncV1)
+                .await,
+            "{deny:?}: post-prefix"
+        );
+    }
+}
+
+// #1044 review round 1 (P2), kept for #1107: the pre-prefix check found no
+// known agent, but a BLOCKED agent on the machine becomes known while the
+// prefix is read. The post-prefix routing must send the stream to the
+// shared gate (which denies it), and the #1107 step must not admit it on
+// the enrollment either: an explicit deny is judged at dispatch time.
 #[tokio::test]
 async fn agent_learned_during_prefix_read_goes_through_the_shared_gate() {
     let (_owner, m) = UnknownMachine::enrolled().await;
@@ -1077,6 +1337,10 @@ async fn agent_learned_during_prefix_read_goes_through_the_shared_gate() {
         m.shared_gate().await,
         Err(NetworkError::PeerTrustRejected { .. })
     ));
+    assert!(
+        !m.admits_over_untrusted(crate::streams::StreamProtocol::SyncV1)
+            .await
+    );
 }
 
 // #1044 P2, the ACL arm: the newly known agent is otherwise acceptable

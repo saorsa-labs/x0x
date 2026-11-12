@@ -67,6 +67,26 @@ pub(crate) enum NonblockingEval<T> {
     Busy,
 }
 
+/// Which trust rule the shared inbound machine gate applies per agent
+/// (`Agent::gate_peer_machine_inbound_for_evidence`). Every rule keeps the
+/// gate's other checks: revocation, a pending revocation resync hold (except
+/// `EvidenceRelationship`), certificate expiry, `Blocked`, machine-pin
+/// mismatch, dead pairing, and the connect ACL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InboundTrustRule {
+    /// Every agent needs trust `Accept`.
+    AcceptRequired,
+    /// ADR 0089: an `Unknown` agent with an evidence relationship passes,
+    /// for `EvidenceV1` only. The resync hold does not apply.
+    EvidenceRelationship,
+    /// #1107: missing trust (`Unknown`, `AcceptWithFlag`) and a missing
+    /// authority confirmation are waived. Any other deny still refuses. On
+    /// success the gate returns EVERY agent it judged, so the caller can
+    /// check that the set did not change before an enrollment-only
+    /// `SyncV1` handoff. The result grants the agents nothing.
+    EnrolledOwnerSync,
+}
+
 /// The local owner and the owner device set used to decide owner trust.
 ///
 /// Cheap to clone: the device-set slot is shared, so installing the store

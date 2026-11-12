@@ -4252,6 +4252,18 @@ impl OwnerSyncService {
         }
     }
 
+    /// Dial the enrolled `machine` by its id, on the verified enrollment
+    /// alone (#1040).
+    async fn enrolled_dial(
+        &self,
+        machine: &MachineId,
+    ) -> Result<crate::streams::PeerStream, (&'static str, String)> {
+        self.agent
+            .open_enrolled_owner_sync_stream(machine)
+            .await
+            .map_err(|e| ("enrolled_dial", e.to_string()))
+    }
+
     /// Dial `machine` and run one session as the initiator. Errors retain a
     /// stable class for the pass log; a failed dial never aborts the pass.
     async fn dial_and_sync(
@@ -4305,19 +4317,28 @@ impl OwnerSyncService {
             }
         }
         let stream = match target_agent {
-            Some(target_agent) => self
-                .agent
-                .open_peer_stream(&target_agent, crate::streams::StreamProtocol::SyncV1)
-                .await
-                .map_err(|e| ("open_stream", e.to_string()))?,
             // #1040: no agent announced on the machine yet (e.g. this
             // device restarted with an empty discovery cache). Dial the
             // enrolled machine by its id on the verified enrollment alone.
-            None => self
+            // The same when no known agent has a confirmed pairing.
+            None => self.enrolled_dial(machine).await?,
+            Some(target_agent) => match self
                 .agent
-                .open_enrolled_owner_sync_stream(machine)
+                .open_peer_stream(&target_agent, crate::streams::StreamProtocol::SyncV1)
                 .await
-                .map_err(|e| ("enrolled_dial", e.to_string()))?,
+            {
+                Ok(stream) => stream,
+                // #1107: the agent gate refused for trust, and the known
+                // agents lack only trust. Any explicit deny (Blocked,
+                // revoked, connect ACL, ...) keeps the refusal.
+                Err(e @ crate::error::NetworkError::PeerTrustRejected { .. }) => {
+                    if !self.agent.enrolled_owner_sync_over_untrusted(machine).await {
+                        return Err(("open_stream", e.to_string()));
+                    }
+                    self.enrolled_dial(machine).await?
+                }
+                Err(e) => return Err(("open_stream", e.to_string())),
+            },
         };
         let peer = stream.peer();
         let (mut send, mut recv) = stream.into_split();

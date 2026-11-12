@@ -84,12 +84,15 @@ Owner sync now rests on the owner-signed enrollment alone:
   record, and admits the opener only through a `principal = "owner"` entry
   that lists the target; an exact-pair or grant entry does not (#1107). Any other protocol is denied `deny_not_verified`, as it was
   before. The owner-sync session then
-  still requires the owner-key possession proof. Nothing else is widened: a
-  machine with any known agent goes through the normal agent-level gate, and
-  the shared gate used by the datagram lane and forwards is unchanged. The
+  still requires the owner-key possession proof. For `SyncV1` only, an
+  enrolled machine whose every known agent fails the shared gate solely for
+  lack of trust is also admitted on its enrollment (A03 amendment of 12 Nov
+  2026, #1107); every explicit denial still refuses. The shared gate for the
+  datagram lane and forwards is unchanged. The
   enrollment is verified on every admission; there is no verification cache.
   Admitted streams log `outcome = "admit_enrolled_owner_sync"`.
-- **Outbound.** If no agent is known on an enrolled machine, the sync pass
+- **Outbound.** If no agent is known on an enrolled machine, or every known
+  agent fails the shared gate solely for lack of trust, the sync pass
   dials it by its machine id. Enrollment records carry **no addresses**, so the
   only address source is the bootstrap cache entry for that PeerId. Every dial
   is peer-authenticated, so no other peer can answer it. An existing
