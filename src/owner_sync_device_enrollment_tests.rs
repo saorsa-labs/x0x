@@ -453,61 +453,61 @@ async fn a_protocol_2_session_refuses_a_device_enrollment_entry() {
     let _ = peer.await;
 }
 
+/// The record shape of a binary built before kind 0x05: the same
+/// fields, with kind and value enums that end at `IssuanceJournal`.
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+pub(super) enum OldKind {
+    OwnerProfile,
+    MachineNames,
+    HomePointer,
+    IssuanceJournal,
+}
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+pub(super) enum OldValue {
+    OwnerProfile {
+        human_name: Option<String>,
+    },
+    MachineNames {
+        display_name: Option<String>,
+        machine_name: Option<String>,
+    },
+    HomePointer {
+        group_id: String,
+        policy: GroupPolicy,
+        roster: Vec<HomeRosterEntry>,
+        primary_agent: String,
+        provisioned_at_ms: u64,
+    },
+    IssuanceJournal {
+        agent_id: String,
+        cert_digest: String,
+        issued_at: u64,
+        not_after: Option<u64>,
+    },
+}
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+pub(super) struct OldRecord {
+    kind: OldKind,
+    key: String,
+    value: OldValue,
+    clock: RecordClock,
+    owner_public_key: Vec<u8>,
+    signature: Vec<u8>,
+}
+#[derive(serde::Deserialize)]
+pub(super) struct OldPersisted {
+    pub(super) records: Vec<OldRecord>,
+}
+
 /// After a kind 0x05 record is stored, `records.json` holds only the four
 /// older kinds and still decodes with the four-kind decoder of a binary
 /// built before 0x05; the record is in `enrollment_records.json`, and a
 /// reload sees both files as one register.
 #[tokio::test]
 async fn records_json_stays_decodable_by_a_four_kind_binary() {
-    /// The record shape of a binary built before kind 0x05: the same
-    /// fields, with kind and value enums that end at `IssuanceJournal`.
-    #[derive(serde::Deserialize)]
-    #[allow(dead_code)]
-    enum OldKind {
-        OwnerProfile,
-        MachineNames,
-        HomePointer,
-        IssuanceJournal,
-    }
-    #[derive(serde::Deserialize)]
-    #[allow(dead_code)]
-    enum OldValue {
-        OwnerProfile {
-            human_name: Option<String>,
-        },
-        MachineNames {
-            display_name: Option<String>,
-            machine_name: Option<String>,
-        },
-        HomePointer {
-            group_id: String,
-            policy: GroupPolicy,
-            roster: Vec<HomeRosterEntry>,
-            primary_agent: String,
-            provisioned_at_ms: u64,
-        },
-        IssuanceJournal {
-            agent_id: String,
-            cert_digest: String,
-            issued_at: u64,
-            not_after: Option<u64>,
-        },
-    }
-    #[derive(serde::Deserialize)]
-    #[allow(dead_code)]
-    struct OldRecord {
-        kind: OldKind,
-        key: String,
-        value: OldValue,
-        clock: RecordClock,
-        owner_public_key: Vec<u8>,
-        signature: Vec<u8>,
-    }
-    #[derive(serde::Deserialize)]
-    struct OldPersisted {
-        records: Vec<OldRecord>,
-    }
-
     let dir = tempfile::tempdir().expect("tmpdir");
     let store = OwnerSyncStore::load(dir.path()).await.expect("store");
     let owner_id = owner_kp(OWNER_SEED).user_id();

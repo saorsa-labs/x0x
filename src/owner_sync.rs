@@ -276,8 +276,8 @@ pub struct HomeRosterEntry {
     pub state: GroupMemberState,
 }
 
-/// The value of a Tier-1 record — a closed four-variant enum mirroring
-/// [`SyncKind`] with NO catch-all. Compiling a new variant forces every
+/// The value of a Tier-1 record — a closed enum with one variant per
+/// [`SyncKind`] and NO catch-all. Compiling a new variant forces every
 /// exhaustive match (including [`SyncValue::kind`]) to handle it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -1688,28 +1688,28 @@ impl OwnerSyncStore {
         .await
     }
 
-    /// Write `next` durably as the register, and then make it the register
-    /// in memory (`replace_state`). `held` comes back on success.
+    /// #1107: write the kind 0x05 part of `next` durably to
+    /// `ENROLLMENT_RECORDS_FILE`, when it differs from the register's, and
+    /// make memory the old register with that new part (what the disk then
+    /// holds). No file that a binary built before kind 0x05 reads
+    /// (`RECORDS_FILE`, `JOURNAL_INTENT_FILE`) ever holds a kind 0x05
+    /// record, so a rollback still starts.
     ///
     /// # Errors
     ///
     /// See [`Self::replace_state`].
-    async fn replace_records<H: Send + 'static>(
+    async fn replace_enrollment_part(
         &self,
         mut records: tokio::sync::OwnedRwLockWriteGuard<RecordMap>,
-        next: RecordMap,
-        held: H,
-    ) -> Result<H, SyncError> {
-        // #1107: kind 0x05 records live in their own file, so the register
-        // file keeps only the four kinds an older binary can decode. Write
-        // the enrollment file first, and only when its part changed.
+        next: &RecordMap,
+    ) -> Result<tokio::sync::OwnedRwLockWriteGuard<RecordMap>, SyncError> {
         let enrollment_part = |map: &RecordMap| -> Vec<VersionedRecord> {
             map.values()
                 .filter(|r| r.kind == SyncKind::DeviceEnrollment)
                 .cloned()
                 .collect()
         };
-        let next_enrollments = enrollment_part(&next);
+        let next_enrollments = enrollment_part(next);
         if next_enrollments != enrollment_part(&records) {
             let bytes = serde_json::to_vec(&PersistedRecords {
                 records: next_enrollments,
@@ -1734,6 +1734,26 @@ impl OwnerSyncStore {
                 .await?
                 .0;
         }
+        Ok(records)
+    }
+
+    /// Write `next` durably as the register, and then make it the register
+    /// in memory (`replace_state`). `held` comes back on success.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::replace_state`].
+    async fn replace_records<H: Send + 'static>(
+        &self,
+        records: tokio::sync::OwnedRwLockWriteGuard<RecordMap>,
+        next: RecordMap,
+        held: H,
+    ) -> Result<H, SyncError> {
+        // #1107: kind 0x05 records live in their own file, so the register
+        // file keeps only the four kinds an older binary can decode. The
+        // enrollment file is written first (a no-op when a commit already
+        // wrote it, see `commit_locked`).
+        let records = self.replace_enrollment_part(records, &next).await?;
         let bytes = serde_json::to_vec(&PersistedRecords {
             records: next
                 .values()
@@ -2519,17 +2539,28 @@ impl OwnerSyncStore {
             Some(_) => Self::journal_updates(&records, &next, &touched),
             None => Vec::new(),
         };
+        // #1107: the kind 0x05 records of the batch are made durable on
+        // their own, first: they are independent of the journal records,
+        // and the journal intent never holds them (a binary built before
+        // kind 0x05 cannot decode it, and its recovery would fail closed on
+        // every pass). A stop after this write keeps them stored.
+        let records = self.replace_enrollment_part(records, &next).await?;
         let mut hold = (records, canonical_gate, revocations, held);
         if let Some(path) = journal.filter(|_| !updates.is_empty()) {
             // The intent first: after a stop between the two writes, the
             // journal holds lines that came from these records, and the
             // restart must not take them for unpublished local issuance
             // (see `recover_journal_commit`). The intent holds every
-            // accepted record of the batch, not only the journal ones, so
-            // the recovery commits all of it or none.
-            hold = self
-                .persist_journal_intent(hold, outcome.accepted.clone())
-                .await?;
+            // accepted record of the four older kinds, not only the
+            // journal ones, so the recovery commits all of that part or
+            // none of it. Kind 0x05 records are already durable (above).
+            let intent: Vec<VersionedRecord> = outcome
+                .accepted
+                .iter()
+                .filter(|r| r.kind != SyncKind::DeviceEnrollment)
+                .cloned()
+                .collect();
+            hold = self.persist_journal_intent(hold, intent).await?;
             let owner_hex = hex::encode(owner.0);
             for (record, published) in &updates {
                 hold = self
@@ -8736,6 +8767,76 @@ mod issuance_journal_sync_tests {
             Some(&d2),
             "the journal must end on the later renewal: {lines:?}"
         );
+    }
+
+    /// #1107: a batch with a journal update and a kind 0x05 record stops
+    /// between its writes. The journal intent left behind holds only the
+    /// four older kinds, so a binary built before kind 0x05 decodes it; the
+    /// 0x05 record is already durable, and the recovery after the restart
+    /// ends with both records in the register.
+    #[tokio::test]
+    async fn a_journal_intent_never_holds_a_device_enrollment_record() {
+        use super::tests::{machine, owner_kp};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let local_dir = dir.path().join("local");
+        let (local, _) = journal_device(&local_dir).await;
+        let d1 = journal_value("d1", 100, 5_000);
+        let r1 = remote_record(&remote, &owner, &d1).await;
+        let m = machine(9);
+        let state = DeviceEnrollmentState::Enrolled {
+            enrollment: OwnerEnrollment::sign(m, &owner, 1_000, None).expect("sign"),
+        };
+        let device = VersionedRecord::sign(
+            SyncKind::DeviceEnrollment,
+            &hex::encode(m.0),
+            &SyncValue::DeviceEnrollment {
+                state: state.clone(),
+            },
+            RecordClock {
+                version: device_enrollment_version(&state).expect("version"),
+                signed_at_ms: 1,
+                writer_machine: machine(2).0,
+            },
+            &owner,
+        )
+        .expect("sign record");
+
+        local
+            .stop_between_journal_writes
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let stopped = local.commit_batch(vec![r1, device], &owner.user_id()).await;
+        assert!(stopped.is_err(), "the commit stops between its writes");
+        drop(local);
+
+        let intent = local_dir.join(SYNC_DIR).join(JOURNAL_INTENT_FILE);
+        let old: super::device_enrollment_tests::OldPersisted =
+            serde_json::from_slice(&std::fs::read(&intent).expect("the intent is kept"))
+                .expect("a four-kind binary decodes the journal intent");
+        assert_eq!(old.records.len(), 1, "only the journal record");
+
+        // The restart: the recovery commits the intent.
+        let (local, _) = journal_device(&local_dir).await;
+        local
+            .recover_interrupted_commit(&owner.user_id())
+            .await
+            .expect("recovery");
+        assert_eq!(
+            local.stored_value(SyncKind::IssuanceJournal, "bb").await,
+            Some(d1)
+        );
+        assert_eq!(
+            local
+                .stored_value(SyncKind::DeviceEnrollment, &hex::encode(m.0))
+                .await,
+            Some(SyncValue::DeviceEnrollment { state }),
+            "the kind 0x05 record survives the stop"
+        );
+        assert!(!intent.exists(), "the recovery removes the intent");
     }
 
     /// Codex review of #1545 (758f62c), P2: as in
