@@ -26,13 +26,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-const SEED: [u8; 32] = [0x11; 32];
+pub(super) const SEED: [u8; 32] = [0x11; 32];
 /// A refusal must come fast; a timeout cannot satisfy a test.
 const REFUSAL_BOUND: Duration = Duration::from_secs(10);
 
 /// Admits every record at ingest. The receiver's real policy runs after the
 /// restart; this one only writes the files a past session left behind.
-struct SeedPolicy;
+pub(super) struct SeedPolicy;
 
 impl EvidencePolicy for SeedPolicy {
     fn relation(&self, _: AgentId, _: MachineId, _: Option<&AgentCertificate>, _: u64) -> u8 {
@@ -46,9 +46,9 @@ impl EvidencePolicy for SeedPolicy {
     }
 }
 
-struct Sender {
-    agent: AgentKeypair,
-    machine: MachineKeypair,
+pub(super) struct Sender {
+    pub(super) agent: AgentKeypair,
+    pub(super) machine: MachineKeypair,
 }
 
 struct Rig {
@@ -68,7 +68,7 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-async fn build_receiver(dir: &Path) -> Arc<crate::Agent> {
+pub(super) async fn build_receiver(dir: &Path) -> Arc<crate::Agent> {
     let owner = UserKeypair::from_seed(&SEED).expect("owner key");
     let agent = crate::Agent::builder()
         .with_machine_key(dir.join("rx-machine.key"))
@@ -106,7 +106,7 @@ async fn build_receiver(dir: &Path) -> Arc<crate::Agent> {
     agent
 }
 
-fn owner_acl(dir: &Path) -> ExecPolicy {
+pub(super) fn owner_acl(dir: &Path) -> ExecPolicy {
     ExecPolicy::Enabled(ExecAcl {
         loaded_from: dir.join("exec-acl.toml"),
         loaded_at_unix_ms: 1,
@@ -132,7 +132,7 @@ fn owner_acl(dir: &Path) -> ExecPolicy {
     })
 }
 
-fn new_sender() -> Sender {
+pub(super) fn new_sender() -> Sender {
     Sender {
         agent: AgentKeypair::generate().expect("agent key"),
         machine: MachineKeypair::generate().expect("machine key"),

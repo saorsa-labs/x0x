@@ -98,7 +98,30 @@ const PROOF_MSG_PREFIX: &[u8] = b"x0x-adr0041-proof-v1";
 
 /// Wire protocol version for the SyncV1 handshake. Bumped to 2 in review
 /// R2 (Hello carries a nonce; `Proof` frame added; vectors/records paged).
-pub const SYNC_PROTOCOL_VERSION: u32 = 2;
+/// Bumped to 3 for [`SyncKind::DeviceEnrollment`] (#1107; A02 paragraph of
+/// 13 Nov 2026). A session runs at the lower of the two `Hello` versions;
+/// see [`negotiated_protocol`].
+pub const SYNC_PROTOCOL_VERSION: u32 = 3;
+
+/// The oldest SyncV1 protocol version this node still completes a session
+/// with. A protocol-2 session carries only the four kinds protocol 2 knows.
+pub const MIN_SYNC_PROTOCOL_VERSION: u32 = 2;
+
+/// The first protocol version that carries [`SyncKind::DeviceEnrollment`].
+/// A session below it never sends or accepts a record of that kind.
+pub const DEVICE_ENROLLMENT_PROTOCOL_VERSION: u32 = 3;
+
+/// The protocol version a session runs at, given the version this side sent
+/// in its `Hello` and the version the peer sent: the lower of the two. A
+/// peer version outside [`MIN_SYNC_PROTOCOL_VERSION`]..=[`SYNC_PROTOCOL_VERSION`]
+/// gives `None`, and the session fails closed.
+#[must_use]
+pub fn negotiated_protocol(sent: u32, received: u32) -> Option<u32> {
+    if !(MIN_SYNC_PROTOCOL_VERSION..=SYNC_PROTOCOL_VERSION).contains(&received) {
+        return None;
+    }
+    Some(sent.min(received))
+}
 
 /// Maximum size of one sync frame (length-prefixed payload). Tier-1 records
 /// are tiny; anything larger is hostile or corrupt — fail closed.
@@ -187,17 +210,35 @@ pub enum SyncKind {
     HomePointer = 0x03,
     /// Sub-agent issuance journal — key = agent id hex.
     IssuanceJournal = 0x04,
+    /// Owner device enrollment or its removal — key = machine id hex
+    /// (#1107). Carried only in a protocol-3 session
+    /// ([`DEVICE_ENROLLMENT_PROTOCOL_VERSION`]). Declared last so the
+    /// encoding of the four older kinds does not change.
+    DeviceEnrollment = 0x05,
 }
 
 impl SyncKind {
-    /// All Tier-1 kinds. Length 4 is a load-bearing constant: Tier 3 states
+    /// All Tier-1 kinds. Length 5 is a load-bearing constant: Tier 3 states
     /// that no other state can be emitted.
-    pub const ALL: [SyncKind; 4] = [
+    pub const ALL: [SyncKind; 5] = [
         SyncKind::OwnerProfile,
         SyncKind::MachineNames,
         SyncKind::HomePointer,
         SyncKind::IssuanceJournal,
+        SyncKind::DeviceEnrollment,
     ];
+
+    /// Whether a session at protocol `version` carries this kind.
+    #[must_use]
+    pub const fn carried_at(self, version: u32) -> bool {
+        match self {
+            SyncKind::OwnerProfile
+            | SyncKind::MachineNames
+            | SyncKind::HomePointer
+            | SyncKind::IssuanceJournal => true,
+            SyncKind::DeviceEnrollment => version >= DEVICE_ENROLLMENT_PROTOCOL_VERSION,
+        }
+    }
 
     /// Parse a kind tag. `None` for every unassigned byte.
     #[must_use]
@@ -207,6 +248,7 @@ impl SyncKind {
             0x02 => Some(Self::MachineNames),
             0x03 => Some(Self::HomePointer),
             0x04 => Some(Self::IssuanceJournal),
+            0x05 => Some(Self::DeviceEnrollment),
             _ => None,
         }
     }
@@ -262,6 +304,77 @@ pub enum SyncValue {
         issued_at: u64,
         not_after: Option<u64>,
     },
+    /// The owner device set entry for one machine (key = machine id hex;
+    /// #1107). Declared last so the encoding of the older values does not
+    /// change. The record version is [`device_enrollment_version`].
+    DeviceEnrollment { state: DeviceEnrollmentState },
+}
+
+/// The state a [`SyncValue::DeviceEnrollment`] record carries (#1107).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum DeviceEnrollmentState {
+    /// The machine is enrolled. The value is the original owner-signed
+    /// enrollment; a receiver verifies it again before it uses it.
+    Enrolled { enrollment: OwnerEnrollment },
+    /// The machine was removed from the owner device set at
+    /// `deleted_at_ms` (Unix ms).
+    Removed { deleted_at_ms: u64 },
+}
+
+/// The record version of a [`SyncValue::DeviceEnrollment`] record:
+/// `2·t + (Removed ? 1 : 0)`, where `t` is `enrolled_at_ms` or
+/// `deleted_at_ms` (#1107; A02 paragraph of 13 Nov 2026).
+///
+/// The standard Tier-1 rule (highest version wins) then gives:
+/// a later time wins; at the same millisecond a removal wins; a
+/// re-enrollment needs a newer time than the removal. The version comes
+/// only from the timestamps, so minting the same state again gives the
+/// same version. `None` when `2·t + 1` does not fit in `u64`; such a
+/// record is refused.
+#[must_use]
+pub fn device_enrollment_version(state: &DeviceEnrollmentState) -> Option<u64> {
+    let (t, removed) = match state {
+        DeviceEnrollmentState::Enrolled { enrollment } => (enrollment.enrolled_at_ms, 0),
+        DeviceEnrollmentState::Removed { deleted_at_ms } => (*deleted_at_ms, 1),
+    };
+    // 2·t is even, so adding 1 never overflows once the doubling fits.
+    t.checked_mul(2)?.checked_add(removed)
+}
+
+/// Structural checks of a [`SyncKind::DeviceEnrollment`] record (#1107):
+/// the key is a lowercase machine id hex, an `Enrolled` value names the
+/// machine of its key, and the clock version is
+/// [`device_enrollment_version`] of the value. These checks do not apply
+/// the record; they keep a record with an inconsistent version or key out
+/// of the register.
+fn check_device_enrollment_shape(
+    key: &str,
+    state: &DeviceEnrollmentState,
+    clock: &RecordClock,
+) -> Result<(), SyncError> {
+    let mut machine = [0u8; 32];
+    if key.len() != 64
+        || key.bytes().any(|b| b.is_ascii_uppercase())
+        || hex::decode_to_slice(key, &mut machine).is_err()
+    {
+        return Err(SyncError::MalformedFrame(
+            "device enrollment key is not a machine id hex".into(),
+        ));
+    }
+    if let DeviceEnrollmentState::Enrolled { enrollment } = state {
+        if enrollment.machine_id != machine {
+            return Err(SyncError::MalformedFrame(
+                "device enrollment names another machine than its key".into(),
+            ));
+        }
+    }
+    if device_enrollment_version(state) != Some(clock.version) {
+        return Err(SyncError::MalformedFrame(
+            "device enrollment version does not follow its timestamps".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl SyncValue {
@@ -275,6 +388,7 @@ impl SyncValue {
             SyncValue::MachineNames { .. } => SyncKind::MachineNames,
             SyncValue::HomePointer { .. } => SyncKind::HomePointer,
             SyncValue::IssuanceJournal { .. } => SyncKind::IssuanceJournal,
+            SyncValue::DeviceEnrollment { .. } => SyncKind::DeviceEnrollment,
         }
     }
 }
@@ -415,6 +529,9 @@ impl VersionedRecord {
             .map_err(|e| SyncError::UnsupportedVariant(e.to_string()))?;
         if self.value.kind() != self.kind {
             return Err(SyncError::KindMismatch);
+        }
+        if let SyncValue::DeviceEnrollment { state } = &self.value {
+            check_device_enrollment_shape(&self.key, state, &self.clock)?;
         }
         if self.key.len() > MAX_KEY_BYTES {
             return Err(SyncError::MalformedFrame(format!(
@@ -924,6 +1041,21 @@ pub struct OwnerSyncStore {
     /// Test injection: make the next durable writes fail AFTER the rename
     /// (simulates a post-rename fsync failure). Never set in production.
     fail_after_rename: std::sync::atomic::AtomicBool,
+    /// #1107: the `Hello` version to send to each peer machine. A
+    /// protocol-2 node refuses a `Hello` of any other version, so this
+    /// side sends the remembered version, or [`SYNC_PROTOCOL_VERSION`] for
+    /// a peer it has not met. After each `Hello` it holds the version the
+    /// peer sent; after a completed session it holds the higher of the two
+    /// versions, because the peer accepted the version this side sent. So
+    /// a protocol-2 peer is met at 2 after one refused session, and two
+    /// protocol-3 peers return to 3 after one completed session. Memory
+    /// only: a restart starts at [`SYNC_PROTOCOL_VERSION`] again.
+    peer_protocol: std::sync::Mutex<BTreeMap<[u8; 32], u32>>,
+    /// Test only: this store acts as a node that speaks only this protocol
+    /// version and refuses a `Hello` of any other version, as a node built
+    /// before protocol 3 does.
+    #[cfg(test)]
+    speak_only_protocol: std::sync::Mutex<Option<u32>>,
     /// #449 r3 P2: serializes canonical-Home ADMISSION against readers who
     /// must act on the canonical answer they got.
     ///
@@ -1306,6 +1438,9 @@ impl OwnerSyncStore {
             sessions_ok_tx: tokio::sync::watch::channel(0).0,
             poisoned: Arc::new(std::sync::Mutex::new(None)),
             fail_after_rename: std::sync::atomic::AtomicBool::new(false),
+            peer_protocol: std::sync::Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            speak_only_protocol: std::sync::Mutex::new(None),
             canonical_home_gate: Arc::new(tokio::sync::RwLock::new(())),
             journal_apply: Arc::new(tokio::sync::Mutex::new(())),
             journal_file: std::sync::OnceLock::new(),
@@ -2960,6 +3095,50 @@ impl OwnerSyncStore {
             .map(|record| record.value.clone())
     }
 
+    /// The `Hello` version this side sends to `peer` (#1107).
+    fn hello_protocol_for(&self, peer: &MachineId) -> u32 {
+        #[cfg(test)]
+        if let Some(only) = self.spoken_protocol_for_testing() {
+            return only;
+        }
+        self.peer_protocol
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&peer.0).copied())
+            .map_or(SYNC_PROTOCOL_VERSION, |v| v.min(SYNC_PROTOCOL_VERSION))
+    }
+
+    /// Remember the `Hello` version `peer` sent (#1107).
+    fn remember_peer_protocol(&self, peer: &MachineId, version: u32) {
+        if let Ok(mut map) = self.peer_protocol.lock() {
+            map.insert(peer.0, version);
+        }
+    }
+
+    /// The protocol version of a session that sent `sent` and received
+    /// `received`, or `None` when this store refuses `received`.
+    fn session_protocol(&self, sent: u32, received: u32) -> Option<u32> {
+        #[cfg(test)]
+        if self.spoken_protocol_for_testing().is_some() {
+            return (received == sent).then_some(sent);
+        }
+        negotiated_protocol(sent, received)
+    }
+
+    #[cfg(test)]
+    fn spoken_protocol_for_testing(&self) -> Option<u32> {
+        self.speak_only_protocol.lock().ok().and_then(|v| *v)
+    }
+
+    /// Test only: make this store act as a node that speaks only
+    /// `version` (see `speak_only_protocol`).
+    #[cfg(test)]
+    pub(crate) fn speak_only_protocol_for_testing(&self, version: u32) {
+        if let Ok(mut slot) = self.speak_only_protocol.lock() {
+            *slot = Some(version);
+        }
+    }
+
     /// The per-kind version table (with record hashes) for the handshake.
     pub async fn version_vector(&self) -> Vec<KindVersions> {
         let records = self.records.read().await;
@@ -3305,44 +3484,51 @@ where
     };
 
     // Hello both ways (each side contributes a fresh nonce).
+    // #1107: send the version this peer last sent (a protocol-2 node
+    // refuses any other), or the current one for a peer not met yet.
     let local_nonce = fresh_nonce();
+    let sent_protocol = store.hello_protocol_for(peer_machine);
     let hello = SyncFrame::Hello {
-        protocol_version: SYNC_PROTOCOL_VERSION,
+        protocol_version: sent_protocol,
         machine_id: local_machine.0,
         owner_user_id: owner_id.0,
         nonce: local_nonce,
     };
     write_frame(send, &hello).await?;
-    let peer_nonce = match refuse_unsupported(send, read_frame(recv).await).await? {
-        SyncFrame::Hello {
-            protocol_version,
-            machine_id,
-            owner_user_id,
-            nonce,
-        } => {
-            if protocol_version != SYNC_PROTOCOL_VERSION {
-                return Err(SyncError::ProtocolVersion {
-                    local: SYNC_PROTOCOL_VERSION,
-                    remote: protocol_version,
-                });
+    let (peer_nonce, protocol, peer_protocol) =
+        match refuse_unsupported(send, read_frame(recv).await).await? {
+            SyncFrame::Hello {
+                protocol_version,
+                machine_id,
+                owner_user_id,
+                nonce,
+            } => {
+                if owner_user_id != owner_id.0 {
+                    return Err(SyncError::OwnerMismatch);
+                }
+                if machine_id != peer_machine.0 {
+                    // Hello machine must match the transport-authenticated peer.
+                    return Err(SyncError::MalformedFrame(
+                        "hello machine differs from transport peer".into(),
+                    ));
+                }
+                let Some(protocol) = store.session_protocol(sent_protocol, protocol_version) else {
+                    return Err(SyncError::ProtocolVersion {
+                        local: sent_protocol,
+                        remote: protocol_version,
+                    });
+                };
+                // Remember it only from the transport-authenticated peer
+                // machine, so the next session opens at the version it speaks.
+                store.remember_peer_protocol(peer_machine, protocol_version);
+                (nonce, protocol, protocol_version)
             }
-            if owner_user_id != owner_id.0 {
-                return Err(SyncError::OwnerMismatch);
+            other => {
+                return Err(SyncError::MalformedFrame(format!(
+                    "expected hello, got {other:?}"
+                )));
             }
-            if machine_id != peer_machine.0 {
-                // Hello machine must match the transport-authenticated peer.
-                return Err(SyncError::MalformedFrame(
-                    "hello machine differs from transport peer".into(),
-                ));
-            }
-            nonce
-        }
-        other => {
-            return Err(SyncError::MalformedFrame(format!(
-                "expected hello, got {other:?}"
-            )));
-        }
-    };
+        };
 
     // Mutual owner-key possession proof (review R2 finding 1): each side
     // signs the PEER's nonce bound to both machines and the owner id, and
@@ -3382,9 +3568,13 @@ where
     // Both outbound pagers re-check admission at every page boundary (RC1):
     // a delete or revocation that lands during a blocked page write stops
     // the rest of the stage, version-vector pages included.
-    let local_vector = store.version_vector().await;
+    // A protocol-2 session never sends a kind protocol 2 does not know
+    // (#1107): a protocol-2 node cannot decode it and would abort.
+    let mut local_vector = store.version_vector().await;
+    local_vector.retain(|kv| kv.kind.carried_at(protocol));
     write_paged_vector(send, &local_vector, &admission).await?;
-    let peer_vector = refuse_unsupported(send, read_paged_vector(recv, &admission).await).await?;
+    let peer_vector =
+        refuse_unsupported(send, read_paged_vector(recv, &admission, protocol).await).await?;
     // Phase boundary (pre-ship): nothing leaves this machine after the
     // admission that justified shipping it has lapsed.
     admission.still_admissible().await?;
@@ -3393,7 +3583,8 @@ where
     // bounded pages, ending with Done ("finished shipping"). Done is sent
     // BEFORE reading the peer's records — both sides' reads must be able
     // to complete independently of their own send state.
-    let to_ship = store.records_for_peer(&peer_vector).await;
+    let mut to_ship = store.records_for_peer(&peer_vector).await;
+    to_ship.retain(|record| record.kind.carried_at(protocol));
     summary.shipped = to_ship.len();
     write_paged_records(send, &to_ship, &admission).await?;
     // Last outbound boundary (#1055 RC3): a delete or revocation that
@@ -3412,7 +3603,7 @@ where
     // Verify EVERY record before returning — one forgery aborts
     // with nothing stored (review R2 finding 4). The caller commits the
     // verified batch atomically, outside the session's time budget.
-    let inbound = read_paged_records(recv, &admission).await?;
+    let inbound = read_paged_records(recv, &admission, protocol).await?;
     // Final boundary (pre-commit): an unenroll, expiry or revocation that
     // landed during the records stage takes effect HERE, with nothing
     // committed (#1055).
@@ -3422,6 +3613,9 @@ where
         record.verify_owner(&owner_id)?;
         verified.push(record);
     }
+    // #1107: the peer completed a session that opened at `sent_protocol`,
+    // so it speaks at least that version.
+    store.remember_peer_protocol(peer_machine, sent_protocol.max(peer_protocol));
     Ok(PendingCommit { summary, verified })
 }
 
@@ -3482,6 +3676,7 @@ async fn write_paged_vector<S: AsyncWrite + Unpin>(
 async fn read_paged_vector<R: AsyncRead + Unpin>(
     recv: &mut R,
     admission: &SessionAdmission<'_>,
+    protocol: u32,
 ) -> Result<Vec<KindVersions>, SyncError> {
     let mut merged: BTreeMap<SyncKind, Vec<(String, RecordClock, [u8; 32])>> = BTreeMap::new();
     let mut total = 0usize;
@@ -3490,6 +3685,12 @@ async fn read_paged_vector<R: AsyncRead + Unpin>(
         match read_frame(recv).await? {
             SyncFrame::VersionVector { kinds } => {
                 for kv in kinds {
+                    if !kv.kind.carried_at(protocol) {
+                        return Err(SyncError::MalformedFrame(format!(
+                            "kind {:?} in a protocol-{protocol} session",
+                            kv.kind
+                        )));
+                    }
                     total += kv.entries.len();
                     if total > MAX_VECTOR_ENTRIES {
                         return Err(SyncError::TooManyRecords(format!(
@@ -3512,6 +3713,7 @@ async fn read_paged_vector<R: AsyncRead + Unpin>(
             SyncFrame::VectorEnd => {
                 return Ok(SyncKind::ALL
                     .into_iter()
+                    .filter(|kind| kind.carried_at(protocol))
                     .map(|kind| KindVersions {
                         kind,
                         entries: merged.remove(&kind).unwrap_or_default(),
@@ -3534,12 +3736,19 @@ async fn read_paged_vector<R: AsyncRead + Unpin>(
 async fn read_paged_records<R: AsyncRead + Unpin>(
     recv: &mut R,
     admission: &SessionAdmission<'_>,
+    protocol: u32,
 ) -> Result<Vec<VersionedRecord>, SyncError> {
     let mut records = Vec::new();
     loop {
         admission.still_admissible().await?;
         match read_frame(recv).await? {
             SyncFrame::Records { records: page } => {
+                if let Some(record) = page.iter().find(|r| !r.kind.carried_at(protocol)) {
+                    return Err(SyncError::MalformedFrame(format!(
+                        "kind {:?} in a protocol-{protocol} session",
+                        record.kind
+                    )));
+                }
                 records.extend(page);
                 if records.len() > MAX_RECORDS_PER_SESSION {
                     return Err(SyncError::TooManyRecords(format!(
@@ -4807,6 +5016,9 @@ pub(crate) fn local_names_of(
         // `commit_batch` already wrote the journal file, under the same
         // `journal_apply` hold as the register change (#1542).
         SyncValue::IssuanceJournal { .. } => None,
+        // #1107: device enrollment records are applied to the device set
+        // (PR 2 of #1107), never to the local names.
+        SyncValue::DeviceEnrollment { .. } => None,
     }
 }
 
@@ -5013,6 +5225,10 @@ impl Drop for OwnerSyncService {
 #[cfg(test)]
 #[path = "owner_sync_known_anonymous_tests.rs"]
 mod known_anonymous_tests;
+
+#[cfg(test)]
+#[path = "owner_sync_device_enrollment_tests.rs"]
+mod device_enrollment_tests;
 
 #[cfg(test)]
 mod tests {
@@ -5530,23 +5746,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tier3_surface_is_exactly_the_four_kinds() {
+    async fn tier3_surface_is_exactly_the_five_kinds() {
         // WHY: blocker 32 — the sync surface serializes ONLY Tier-1 kinds;
         // every other kind tag is undecodable (deny-by-default allowlist).
-        assert_eq!(SyncKind::ALL.len(), 4);
+        // #1107 added the fifth, `DeviceEnrollment`.
+        assert_eq!(SyncKind::ALL.len(), 5);
         for byte in 0u8..=255 {
             let decoded = SyncKind::from_u8(byte);
             let known = SyncKind::ALL.iter().any(|k| k.as_u8() == byte);
             assert_eq!(
                 decoded.is_some(),
                 known,
-                "kind tag 0x{byte:02x} must decode iff it is one of the four kinds"
+                "kind tag 0x{byte:02x} must decode iff it is one of the five kinds"
             );
         }
-        // Every one of the four kinds must round-trip through the wire
+        // Every one of the five kinds must round-trip through the wire
         // value enum — these are the only shapes a record can carry.
         let owner = owner_kp(1);
         for kind in SyncKind::ALL {
+            let mut key = "k".to_string();
+            let mut version = 1;
             let value = match kind {
                 SyncKind::OwnerProfile => SyncValue::OwnerProfile {
                     human_name: Some("H".into()),
@@ -5565,11 +5784,18 @@ mod tests {
                     issued_at: 1,
                     not_after: None,
                 },
+                SyncKind::DeviceEnrollment => {
+                    key = hex::encode(machine(3).0);
+                    version = 3;
+                    SyncValue::DeviceEnrollment {
+                        state: DeviceEnrollmentState::Removed { deleted_at_ms: 1 },
+                    }
+                }
             };
             assert_eq!(value.kind(), kind);
-            let record =
-                VersionedRecord::sign(kind, "k", &value, clock(1, 1, 1), &owner).expect("sign");
-            record.verify().expect("all four kinds verify");
+            let record = VersionedRecord::sign(kind, &key, &value, clock(version, 1, 1), &owner)
+                .expect("sign");
+            record.verify().expect("all five kinds verify");
         }
 
         // Behavioral Tier-3 check: kind/value coherence is enforced, so no
@@ -5592,7 +5818,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_kind_tag_fails_record_decode() {
         // WHY: Tier-3 allowlist — bincode deserialization of SyncKind with
-        // an out-of-range discriminant fails, so no fifth kind can arrive.
+        // an out-of-range discriminant fails, so no sixth kind can arrive.
         let bad = bincode::serialize(&SyncKind::OwnerProfile).expect("encode");
         // A u8-repr enum serializes as its tag; corrupt it to 0x2A.
         let mut hostile = bad;
