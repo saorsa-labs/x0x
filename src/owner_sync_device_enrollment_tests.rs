@@ -1278,3 +1278,106 @@ async fn the_service_applies_stored_records_at_start_and_its_pass_mints() {
         "the pass mints the record"
     );
 }
+
+/// A kind 0x05 record whose time is more than the enrollment clock skew
+/// (`ENROLL_EXPIRY_SKEW_MS`, 300 s) in the future is not stored; the other
+/// records of its batch commit. A time within the skew is stored.
+#[tokio::test]
+async fn a_device_enrollment_record_from_the_future_is_not_stored() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let s = OwnerSyncStore::load(dir.path()).await.expect("store");
+    let owner_id = owner_kp(OWNER_SEED).user_id();
+    let (m, n, p) = (machine(9), machine(10), machine(11));
+    let now = now_ms();
+    let outcome = s
+        .commit_batch(
+            vec![
+                device_record(m, enrolled(m, now + ENROLL_EXPIRY_SKEW_MS + 60_000)),
+                device_record(n, removed(now + ENROLL_EXPIRY_SKEW_MS + 60_000)),
+                device_record(p, removed(now + 60_000)),
+                names_record(&hex::encode(machine(1).0)),
+            ],
+            &owner_id,
+        )
+        .await
+        .expect("commit");
+    assert_eq!(outcome.accepted.len(), 2, "p's record and the names record");
+    for (machine_id, stored) in [(m, false), (n, false), (p, true)] {
+        assert_eq!(
+            s.stored_value(SyncKind::DeviceEnrollment, &hex::encode(machine_id.0))
+                .await
+                .is_some(),
+            stored,
+            "{machine_id:?}"
+        );
+    }
+}
+
+fn unsigned_names(key: &str) -> VersionedRecord {
+    VersionedRecord {
+        kind: SyncKind::MachineNames,
+        key: key.to_string(),
+        value: names_value("n"),
+        clock: clock(1, 1, 1),
+        owner_public_key: Vec::new(),
+        signature: Vec::new(),
+    }
+}
+
+/// The two register files share one limit of `MAX_STORED_RECORDS`: a new
+/// key of either kind is refused at the limit, by a commit and by a mint,
+/// and a newer record of a stored key is still accepted.
+#[tokio::test]
+async fn the_store_limit_counts_both_files() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let owner = owner_kp(OWNER_SEED);
+    let owner_id = owner.user_id();
+    let m = machine(9);
+    // Loaded records are not verified, so unsigned fillers will do.
+    let fillers: Vec<VersionedRecord> = (0..MAX_STORED_RECORDS - 2)
+        .map(|i| unsigned_names(&format!("filler-{i}")))
+        .collect();
+    write_records(dir.path(), RECORDS_FILE, fillers);
+    write_records(
+        dir.path(),
+        ENROLLMENT_RECORDS_FILE,
+        vec![device_record(m, enrolled(m, 1_000))],
+    );
+    let s = OwnerSyncStore::load(dir.path()).await.expect("load");
+    assert_eq!(s.records_snapshot().await.len(), MAX_STORED_RECORDS - 1);
+
+    // The last free slot takes a kind 0x05 record.
+    let n = machine(10);
+    let outcome = s
+        .commit_batch(vec![device_record(n, enrolled(n, 1_000))], &owner_id)
+        .await
+        .expect("the last slot");
+    assert_eq!(outcome.accepted.len(), 1);
+
+    // At the limit a new key is refused, whatever its kind.
+    let p = machine(11);
+    for record in [
+        device_record(p, enrolled(p, 1_000)),
+        names_record(&hex::encode(machine(1).0)),
+    ] {
+        let err = s
+            .commit_batch(vec![record], &owner_id)
+            .await
+            .expect_err("a new key at the limit");
+        assert!(matches!(err, SyncError::StoreLimit(_)), "{err:?}");
+    }
+    s.enroll(signed(p, 1_000, None)).await.expect("enroll p");
+    let err = s
+        .mint_device_enrollments(&owner, machine(1))
+        .await
+        .expect_err("a mint of a new key at the limit");
+    assert!(matches!(err, SyncError::StoreLimit(_)), "{err:?}");
+
+    // A newer record of a stored key still replaces it.
+    let outcome = s
+        .commit_batch(vec![device_record(m, removed(1_000))], &owner_id)
+        .await
+        .expect("a stored key at the limit");
+    assert_eq!(outcome.accepted.len(), 1);
+    assert_eq!(s.records_snapshot().await.len(), MAX_STORED_RECORDS);
+}

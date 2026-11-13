@@ -349,6 +349,20 @@ pub fn device_enrollment_version(state: &DeviceEnrollmentState) -> Option<u64> {
     t.checked_mul(2).map(|double| double + removed)
 }
 
+/// The time of a [`SyncKind::DeviceEnrollment`] value (`enrolled_at_ms`
+/// or `deleted_at_ms`); `None` for the other kinds.
+fn device_enrollment_time(value: &SyncValue) -> Option<u64> {
+    match value {
+        SyncValue::DeviceEnrollment {
+            state: DeviceEnrollmentState::Enrolled { enrollment },
+        } => Some(enrollment.enrolled_at_ms),
+        SyncValue::DeviceEnrollment {
+            state: DeviceEnrollmentState::Removed { deleted_at_ms },
+        } => Some(*deleted_at_ms),
+        _ => None,
+    }
+}
+
 /// Structural checks of a [`SyncKind::DeviceEnrollment`] record (#1107):
 /// the key is a lowercase machine id hex, an `Enrolled` value names the
 /// machine of its key, and the clock version is
@@ -2731,10 +2745,27 @@ impl OwnerSyncStore {
         // the batch until `replace_records`.
         let mut touched: BTreeSet<(SyncKind, String)> = BTreeSet::new();
         let mut outcome = CommitOutcome::default();
+        let now_ms = now_unix_ms();
         for record in batch {
             // Re-verify inside the lock: the caller's verification and
             // the commit must not be separated by a store mutation.
             record.verify_owner(owner)?;
+            // #1107: a kind 0x05 record whose time is more than the
+            // enrollment clock skew (`ENROLL_EXPIRY_SKEW_MS`) in the future
+            // is not stored. Its version comes from that time, so it would
+            // otherwise outrank every honest record for the machine until
+            // then. It is not an error: the other records of the batch
+            // commit, and the record is accepted once its time is near.
+            if device_enrollment_time(&record.value)
+                .is_some_and(|t| t > now_ms.saturating_add(ENROLL_EXPIRY_SKEW_MS))
+            {
+                tracing::warn!(
+                    target: "x0x::owner_sync",
+                    key = %record.key,
+                    "device enrollment record from the future not stored"
+                );
+                continue;
+            }
             if next.len() >= MAX_STORED_RECORDS
                 && !next.contains_key(&(record.kind, record.key.clone()))
             {
