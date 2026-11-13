@@ -28,7 +28,7 @@ const DEVICE_B: MachineId = MachineId([0xb2; 32]);
 const BOUND: Duration = Duration::from_secs(10);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "red until PR 2 of #1107 mints and applies DeviceEnrollment records"]
+#[ignore = "red until PR 2 of #1107: PR 2 mints DeviceEnrollment records (skipping a mint when a record with the same version exists), applies received ones, and at start-up re-verifies and applies every stored kind 0x05 record, because PR 1 stores them without applying them"]
 async fn enrollment_made_on_another_owner_device_admits_exec_after_sync() {
     let dir = tempfile::tempdir().expect("tmpdir");
     std::fs::create_dir_all(dir.path().join("identity")).expect("identity dir");

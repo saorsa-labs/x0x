@@ -178,8 +178,14 @@ pub const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// File holding the owner device set, inside `<data_dir>/sync/`.
 const DEVICES_FILE: &str = "devices.json";
-/// File holding the winning versioned records, inside `<data_dir>/sync/`.
+/// File holding the winning versioned records of the four kinds of
+/// protocol 2, inside `<data_dir>/sync/`.
 const RECORDS_FILE: &str = "records.json";
+/// File holding the winning [`SyncKind::DeviceEnrollment`] records, inside
+/// `<data_dir>/sync/` (#1107). They are kept out of [`RECORDS_FILE`] so a
+/// binary built before kind 0x05 can still decode that file and start after
+/// a rollback. Both files are one register in memory.
+const ENROLLMENT_RECORDS_FILE: &str = "enrollment_records.json";
 /// File holding the `IssuanceJournal` records of a commit in progress,
 /// inside `<data_dir>/sync/` (#1542, see `recover_journal_commit`).
 const JOURNAL_INTENT_FILE: &str = "journal-intent.json";
@@ -1044,12 +1050,14 @@ pub struct OwnerSyncStore {
     /// #1107: the `Hello` version to send to each peer machine. A
     /// protocol-2 node refuses a `Hello` of any other version, so this
     /// side sends the remembered version, or [`SYNC_PROTOCOL_VERSION`] for
-    /// a peer it has not met. After each `Hello` it holds the version the
-    /// peer sent; after a completed session it holds the higher of the two
-    /// versions, because the peer accepted the version this side sent. So
-    /// a protocol-2 peer is met at 2 after one refused session, and two
-    /// protocol-3 peers return to 3 after one completed session. Memory
-    /// only: a restart starts at [`SYNC_PROTOCOL_VERSION`] again.
+    /// a peer it has not met. A `Hello` lowers it only when the peer sent a
+    /// lower version than this side sent; otherwise it only rises. A
+    /// completed session raises it to at least the higher of the two
+    /// versions, because the peer accepted the version this side sent, and
+    /// never lowers it. So a protocol-2 peer is met at 2 after one refused
+    /// session, and two protocol-3 peers return to 3 after one completed
+    /// session. Memory only: a restart starts at [`SYNC_PROTOCOL_VERSION`]
+    /// again.
     peer_protocol: std::sync::Mutex<BTreeMap<[u8; 32], u32>>,
     /// Test only: when not 0, this store acts as a node that speaks only
     /// this protocol version and refuses a `Hello` of any other version, as
@@ -1374,6 +1382,7 @@ impl OwnerSyncStore {
         // obligation). So make every state file durable before it is read.
         for file in [
             RECORDS_FILE,
+            ENROLLMENT_RECORDS_FILE,
             DEVICES_FILE,
             APPLY_PENDING_FILE,
             TOMBSTONES_FILE,
@@ -1387,7 +1396,13 @@ impl OwnerSyncStore {
                 ))
             })?;
         }
-        let persisted_records: PersistedRecords = Self::load_json(&dir.join(RECORDS_FILE)).await?;
+        let mut persisted_records: PersistedRecords =
+            Self::load_json(&dir.join(RECORDS_FILE)).await?;
+        let persisted_enrollment_records: PersistedRecords =
+            Self::load_json(&dir.join(ENROLLMENT_RECORDS_FILE)).await?;
+        persisted_records
+            .records
+            .extend(persisted_enrollment_records.records);
         let persisted_devices: PersistedDevices = Self::load_json(&dir.join(DEVICES_FILE)).await?;
         let pending_apply: PersistedPendingApplies =
             Self::load_json(&dir.join(APPLY_PENDING_FILE)).await?;
@@ -1681,12 +1696,50 @@ impl OwnerSyncStore {
     /// See [`Self::replace_state`].
     async fn replace_records<H: Send + 'static>(
         &self,
-        records: tokio::sync::OwnedRwLockWriteGuard<RecordMap>,
+        mut records: tokio::sync::OwnedRwLockWriteGuard<RecordMap>,
         next: RecordMap,
         held: H,
     ) -> Result<H, SyncError> {
+        // #1107: kind 0x05 records live in their own file, so the register
+        // file keeps only the four kinds an older binary can decode. Write
+        // the enrollment file first, and only when its part changed.
+        let enrollment_part = |map: &RecordMap| -> Vec<VersionedRecord> {
+            map.values()
+                .filter(|r| r.kind == SyncKind::DeviceEnrollment)
+                .cloned()
+                .collect()
+        };
+        let next_enrollments = enrollment_part(&next);
+        if next_enrollments != enrollment_part(&records) {
+            let bytes = serde_json::to_vec(&PersistedRecords {
+                records: next_enrollments,
+            })
+            .map_err(|e| SyncError::Io(format!("encode enrollment records: {e}")))?;
+            // Memory after this write: the old register with the new kind
+            // 0x05 part, which is what the disk then holds.
+            let mut mixed: RecordMap = records
+                .iter()
+                .filter(|((kind, _), _)| *kind != SyncKind::DeviceEnrollment)
+                .map(|(k, r)| (k.clone(), r.clone()))
+                .collect();
+            mixed.extend(
+                next.iter()
+                    .filter(|((kind, _), _)| *kind == SyncKind::DeviceEnrollment)
+                    .map(|(k, r)| (k.clone(), r.clone())),
+            );
+            let generation = Arc::clone(&self.generation_tx);
+            let landed = move || Self::kick_generation(&generation);
+            records = self
+                .replace_state(records, mixed, ENROLLMENT_RECORDS_FILE, bytes, (), landed)
+                .await?
+                .0;
+        }
         let bytes = serde_json::to_vec(&PersistedRecords {
-            records: next.values().cloned().collect(),
+            records: next
+                .values()
+                .filter(|r| r.kind != SyncKind::DeviceEnrollment)
+                .cloned()
+                .collect(),
         })
         .map_err(|e| SyncError::Io(format!("encode records: {e}")))?;
         #[cfg(test)]
@@ -3109,14 +3162,37 @@ impl OwnerSyncStore {
             .unwrap_or(SYNC_PROTOCOL_VERSION)
     }
 
-    /// Remember the `Hello` version to send to `peer` next (#1107),
-    /// clamped to the versions this node speaks.
-    fn remember_peer_protocol(&self, peer: &MachineId, version: u32) {
-        let version = version.clamp(MIN_SYNC_PROTOCOL_VERSION, SYNC_PROTOCOL_VERSION);
-        self.peer_protocol
+    /// Update the version remembered for `peer` after its `Hello`
+    /// (#1107). It is lowered only when the peer sent a lower version than
+    /// this side sent (the sign of a protocol-2 node). Otherwise it is never
+    /// lowered, so a `Hello` that another session's stale memory produced
+    /// cannot undo a raise that a later session made.
+    fn note_peer_hello(&self, peer: &MachineId, sent: u32, received: u32) {
+        let received = received.clamp(MIN_SYNC_PROTOCOL_VERSION, SYNC_PROTOCOL_VERSION);
+        let mut map = self
+            .peer_protocol
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(peer.0, version);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next = if received < sent {
+            received
+        } else {
+            map.get(&peer.0).map_or(received, |&cur| cur.max(received))
+        };
+        map.insert(peer.0, next);
+    }
+
+    /// Raise the version remembered for `peer` to at least `version` after
+    /// a completed session (#1107). A completed session never lowers it,
+    /// so two sessions that run at the same time cannot leave both sides
+    /// at protocol 2.
+    fn note_session_completed(&self, peer: &MachineId, version: u32) {
+        let version = version.clamp(MIN_SYNC_PROTOCOL_VERSION, SYNC_PROTOCOL_VERSION);
+        let mut map = self
+            .peer_protocol
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next = map.get(&peer.0).map_or(version, |&cur| cur.max(version));
+        map.insert(peer.0, next);
     }
 
     /// The protocol version of a session that sent `sent` and received
@@ -3530,7 +3606,7 @@ where
                 };
                 // Remember it only from the transport-authenticated peer
                 // machine, so the next session opens at the version it speaks.
-                store.remember_peer_protocol(peer_machine, protocol_version);
+                store.note_peer_hello(peer_machine, sent_protocol, protocol_version);
                 // A completed session shows the peer accepted
                 // `sent_protocol`, so it speaks at least that version.
                 (nonce, protocol, sent_protocol.max(protocol_version))
@@ -3625,7 +3701,7 @@ where
         record.verify_owner(&owner_id)?;
         verified.push(record);
     }
-    store.remember_peer_protocol(peer_machine, version_after_success);
+    store.note_session_completed(peer_machine, version_after_success);
     Ok(PendingCommit { summary, verified })
 }
 

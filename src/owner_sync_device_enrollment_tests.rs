@@ -5,6 +5,8 @@
 
 use std::sync::Arc;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
 use super::tests::{clock, cross_enroll_for_tests, machine, names_value, owner_kp};
 use super::*;
 
@@ -110,6 +112,16 @@ fn new_kind_and_value_go_last_so_the_old_encodings_do_not_change() {
         0u32.to_le_bytes()
     );
     assert_eq!(variant(&names_value("n")), 1u32.to_le_bytes());
+    assert_eq!(
+        variant(&SyncValue::HomePointer {
+            group_id: String::new(),
+            policy: GroupPolicy::default(),
+            roster: vec![],
+            primary_agent: String::new(),
+            provisioned_at_ms: 0,
+        }),
+        2u32.to_le_bytes()
+    );
     assert_eq!(
         variant(&SyncValue::IssuanceJournal {
             agent_id: String::new(),
@@ -439,4 +451,299 @@ async fn a_protocol_2_session_refuses_a_device_enrollment_entry() {
     assert!(matches!(err, SyncError::MalformedFrame(_)), "{err:?}");
     drop((a_send, a_recv));
     let _ = peer.await;
+}
+
+/// After a kind 0x05 record is stored, `records.json` holds only the four
+/// older kinds and still decodes with the four-kind decoder of a binary
+/// built before 0x05; the record is in `enrollment_records.json`, and a
+/// reload sees both files as one register.
+#[tokio::test]
+async fn records_json_stays_decodable_by_a_four_kind_binary() {
+    /// The record shape of a binary built before kind 0x05: the same
+    /// fields, with kind and value enums that end at `IssuanceJournal`.
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    enum OldKind {
+        OwnerProfile,
+        MachineNames,
+        HomePointer,
+        IssuanceJournal,
+    }
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    enum OldValue {
+        OwnerProfile {
+            human_name: Option<String>,
+        },
+        MachineNames {
+            display_name: Option<String>,
+            machine_name: Option<String>,
+        },
+        HomePointer {
+            group_id: String,
+            policy: GroupPolicy,
+            roster: Vec<HomeRosterEntry>,
+            primary_agent: String,
+            provisioned_at_ms: u64,
+        },
+        IssuanceJournal {
+            agent_id: String,
+            cert_digest: String,
+            issued_at: u64,
+            not_after: Option<u64>,
+        },
+    }
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct OldRecord {
+        kind: OldKind,
+        key: String,
+        value: OldValue,
+        clock: RecordClock,
+        owner_public_key: Vec<u8>,
+        signature: Vec<u8>,
+    }
+    #[derive(serde::Deserialize)]
+    struct OldPersisted {
+        records: Vec<OldRecord>,
+    }
+
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let store = OwnerSyncStore::load(dir.path()).await.expect("store");
+    let owner_id = owner_kp(OWNER_SEED).user_id();
+    let m = machine(9);
+    store
+        .commit_batch(
+            vec![
+                device_record(m, enrolled(m, 1_000)),
+                names_record(&hex::encode(machine(1).0)),
+            ],
+            &owner_id,
+        )
+        .await
+        .expect("commit");
+    // A later register write that changes only an older kind keeps the
+    // device record out of records.json too.
+    store
+        .commit_batch(vec![names_record(&hex::encode(machine(2).0))], &owner_id)
+        .await
+        .expect("commit names");
+    drop(store);
+
+    let sync_dir = dir.path().join(SYNC_DIR);
+    let bytes = std::fs::read(sync_dir.join(RECORDS_FILE)).expect("records.json");
+    let old: OldPersisted =
+        serde_json::from_slice(&bytes).expect("a four-kind binary decodes records.json");
+    assert_eq!(old.records.len(), 2, "both names records, no device record");
+
+    let enrollment: PersistedRecords = serde_json::from_slice(
+        &std::fs::read(sync_dir.join(ENROLLMENT_RECORDS_FILE)).expect("enrollment file"),
+    )
+    .expect("decode");
+    assert_eq!(enrollment.records.len(), 1);
+    assert_eq!(enrollment.records[0].kind, SyncKind::DeviceEnrollment);
+
+    let reloaded = OwnerSyncStore::load(dir.path()).await.expect("reload");
+    let records = reloaded.records_snapshot().await;
+    assert_eq!(records.len(), 3, "one register over both files");
+    assert_eq!(device_keys(&records), 1);
+}
+
+/// Copy `from` into `to` under test control: pass the first `hello_len`
+/// bytes once `release_hello` fires (sending `hello_seen` when they have
+/// arrived), then send `rest_seen` when the next byte arrives and hold it
+/// and everything after it until `release_rest` fires.
+async fn gated_relay<R, W>(
+    mut from: R,
+    mut to: W,
+    hello_len: usize,
+    hello_seen: tokio::sync::oneshot::Sender<()>,
+    release_hello: tokio::sync::oneshot::Receiver<()>,
+    rest_seen: tokio::sync::oneshot::Sender<()>,
+    release_rest: tokio::sync::oneshot::Receiver<()>,
+) where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut hello = vec![0u8; hello_len];
+    if from.read_exact(&mut hello).await.is_err() {
+        return;
+    }
+    let _ = hello_seen.send(());
+    let _ = release_hello.await;
+    if to.write_all(&hello).await.is_err() {
+        return;
+    }
+    let mut first = [0u8; 1];
+    let got = from.read(&mut first).await.unwrap_or(0);
+    let _ = rest_seen.send(());
+    let _ = release_rest.await;
+    if got == 1 && to.write_all(&first).await.is_ok() {
+        let _ = tokio::io::copy(&mut from, &mut to).await;
+    }
+    let _ = to.shutdown().await;
+}
+
+/// Bytes of one `Hello` frame on the wire (length prefix included).
+fn hello_frame_len() -> usize {
+    4 + bincode::serialize(&SyncFrame::Hello {
+        protocol_version: 0,
+        machine_id: [0; 32],
+        owner_user_id: [0; 32],
+        nonce: [0; 32],
+    })
+    .expect("encode")
+    .len()
+}
+
+/// The test controls of one direction of a gated session.
+struct Gate {
+    hello_seen: tokio::sync::oneshot::Receiver<()>,
+    release_hello: tokio::sync::oneshot::Sender<()>,
+    rest_seen: tokio::sync::oneshot::Receiver<()>,
+    release_rest: tokio::sync::oneshot::Sender<()>,
+}
+
+/// One side of a session whose inbound bytes pass a [`gated_relay`]: the
+/// side runs `run_sync_session` on `store` and returns its gate.
+fn gated_side(
+    store: &Arc<OwnerSyncStore>,
+    local: MachineId,
+    peer: MachineId,
+) -> (
+    Gate,
+    tokio::io::DuplexStream,
+    tokio::io::DuplexStream,
+    tokio::task::JoinHandle<Result<SessionSummary, SyncError>>,
+) {
+    let hello_len = hello_frame_len();
+    // `out_far` reads what this side sends; `in_far` feeds what it reads.
+    let (out_near, out_far) = tokio::io::duplex(256 * 1024);
+    let (in_near, in_far) = tokio::io::duplex(256 * 1024);
+    let (hello_seen_tx, hello_seen) = tokio::sync::oneshot::channel();
+    let (release_hello, release_hello_rx) = tokio::sync::oneshot::channel();
+    let (rest_seen_tx, rest_seen) = tokio::sync::oneshot::channel();
+    let (release_rest, release_rest_rx) = tokio::sync::oneshot::channel();
+    let (relay_from, relay_to) = tokio::io::duplex(256 * 1024);
+    tokio::spawn(gated_relay(
+        relay_from,
+        in_near,
+        hello_len,
+        hello_seen_tx,
+        release_hello_rx,
+        rest_seen_tx,
+        release_rest_rx,
+    ));
+    let store = Arc::clone(store);
+    let task = tokio::spawn(async move {
+        let (mut recv, _unused) = tokio::io::split(in_far);
+        let (_unused2, mut send) = tokio::io::split(out_near);
+        run_sync_session_with_timeout(
+            Duration::from_secs(30),
+            &mut send,
+            &mut recv,
+            &store,
+            &owner_kp(OWNER_SEED),
+            &local,
+            &peer,
+            |_| {},
+        )
+        .await
+    });
+    (
+        Gate {
+            hello_seen,
+            release_hello,
+            rest_seen,
+            release_rest,
+        },
+        out_far,
+        relay_to,
+        task,
+    )
+}
+
+/// Two sessions on one pair run at the same time. Session S opens on both
+/// sides at protocol 2 from stale memory, but completes only after session
+/// T has moved both sides to 3. A completed session must not lower the
+/// remembered version: both sides stay at 3. (On 9d7aad2e2 both sides
+/// ended at 2 and stayed there.)
+#[tokio::test]
+async fn interleaved_sessions_do_not_leave_both_sides_at_protocol_2() {
+    let (_dir, a, b) = pair().await;
+    let (ma, mb) = (machine(1), machine(2));
+    // a met b as a protocol-2 node: a remembers 2, b remembers nothing.
+    b.speak_only_protocol_for_testing(2);
+    let _ = session(&a, &b).await;
+    b.speak_only_protocol_for_testing(0);
+    assert_eq!(a.hello_protocol_for(&mb), 2);
+    assert_eq!(b.hello_protocol_for(&ma), 3);
+
+    // Wire one gated side to another: what `x` sends goes to `y`'s relay.
+    async fn wire(from: tokio::io::DuplexStream, to: tokio::io::DuplexStream) {
+        let (mut r, _w) = tokio::io::split(from);
+        let (_r2, mut w) = tokio::io::split(to);
+        let _ = tokio::io::copy(&mut r, &mut w).await;
+        let _ = w.shutdown().await;
+    }
+
+    // S, side a: opens at 2. Hold its Hello here, so a has read its
+    // memory before T starts.
+    let (s_a_gate, mut s_a_out, s_a_in, s_a_task) = gated_side(&a, ma, mb);
+    let mut s_a_hello = vec![0u8; hello_frame_len()];
+    s_a_out
+        .read_exact(&mut s_a_hello)
+        .await
+        .expect("S hello from a");
+
+    // T, both sides, starts now: a sends 2, b sends 3.
+    let (t_a_gate, t_a_out, t_a_in, t_a_task) = gated_side(&a, ma, mb);
+    let (t_b_gate, t_b_out, t_b_in, t_b_task) = gated_side(&b, mb, ma);
+    tokio::spawn(wire(t_a_out, t_b_in));
+    tokio::spawn(wire(t_b_out, t_a_in));
+    let _ = t_a_gate.release_hello.send(());
+    let _ = t_b_gate.release_hello.send(());
+    // Both sides of T have read the other's Hello once each wrote its
+    // next frame: a = 3 (received 3), b = 2 (received 2 below its 3).
+    let _ = t_a_gate.rest_seen.await;
+    let _ = t_b_gate.rest_seen.await;
+    assert_eq!(a.hello_protocol_for(&mb), 3);
+    assert_eq!(b.hello_protocol_for(&ma), 2);
+
+    // S, side b: opens at 2 from that memory.
+    let (s_b_gate, s_b_out, mut s_b_in, s_b_task) = gated_side(&b, mb, ma);
+    s_b_in.write_all(&s_a_hello).await.expect("forward S hello");
+    tokio::spawn(wire(s_a_out, s_b_in));
+    tokio::spawn(wire(s_b_out, s_a_in));
+    // Both S Hellos are at the gates, unread: b has read its memory (2).
+    let _ = s_a_gate.hello_seen.await;
+    let _ = s_b_gate.hello_seen.await;
+
+    // T completes: both sides remember 3.
+    let _ = t_a_gate.release_rest.send(());
+    let _ = t_b_gate.release_rest.send(());
+    t_a_task.await.expect("join").expect("T completes on a");
+    t_b_task.await.expect("join").expect("T completes on b");
+    assert_eq!(a.hello_protocol_for(&mb), 3);
+    assert_eq!(b.hello_protocol_for(&ma), 3);
+
+    // Now S, opened at 2 on both sides, runs and completes.
+    let _ = s_a_gate.release_hello.send(());
+    let _ = s_b_gate.release_hello.send(());
+    let _ = s_a_gate.release_rest.send(());
+    let _ = s_b_gate.release_rest.send(());
+    s_a_task.await.expect("join").expect("S completes on a");
+    s_b_task.await.expect("join").expect("S completes on b");
+    let _ = (
+        s_a_gate.rest_seen,
+        s_b_gate.rest_seen,
+        t_a_gate.hello_seen,
+        t_b_gate.hello_seen,
+    );
+
+    assert_eq!(
+        (a.hello_protocol_for(&mb), b.hello_protocol_for(&ma)),
+        (3, 3),
+        "a completed session at protocol 2 must not lower a remembered 3"
+    );
 }
