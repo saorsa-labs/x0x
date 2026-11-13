@@ -64,6 +64,21 @@
       "wire": {
         "bincode": "030000000100000000000000610100000000000000630100000000000000010200000000000000"
       }
+    },
+    {
+      "input": {
+        "DeviceEnrollment": {
+          "state": {
+            "Removed": {
+              "deleted_at_ms": 7
+            }
+          }
+        }
+      },
+      "variant": "DeviceEnrollment",
+      "wire": {
+        "bincode": "04000000010000000700000000000000"
+      }
     }
   ],
   "type": "SyncValue"
