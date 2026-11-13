@@ -100,7 +100,7 @@ const PROOF_MSG_PREFIX: &[u8] = b"x0x-adr0041-proof-v1";
 /// R2 (Hello carries a nonce; `Proof` frame added; vectors/records paged).
 /// Bumped to 3 for [`SyncKind::DeviceEnrollment`] (#1107; A02 paragraph of
 /// 13 Nov 2026). A session runs at the lower of the two `Hello` versions;
-/// see [`negotiated_protocol`].
+/// see `negotiated_protocol`.
 pub const SYNC_PROTOCOL_VERSION: u32 = 3;
 
 /// The oldest SyncV1 protocol version this node still completes a session
@@ -114,9 +114,10 @@ pub const DEVICE_ENROLLMENT_PROTOCOL_VERSION: u32 = 3;
 /// The protocol version a session runs at, given the version this side sent
 /// in its `Hello` and the version the peer sent: the lower of the two. A
 /// peer version outside [`MIN_SYNC_PROTOCOL_VERSION`]..=[`SYNC_PROTOCOL_VERSION`]
-/// gives `None`, and the session fails closed.
+/// gives `None`, and the session fails closed. `sent` is this side's own
+/// version and is trusted to be in range.
 #[must_use]
-pub fn negotiated_protocol(sent: u32, received: u32) -> Option<u32> {
+pub(crate) fn negotiated_protocol(sent: u32, received: u32) -> Option<u32> {
     if !(MIN_SYNC_PROTOCOL_VERSION..=SYNC_PROTOCOL_VERSION).contains(&received) {
         return None;
     }
@@ -339,7 +340,7 @@ pub fn device_enrollment_version(state: &DeviceEnrollmentState) -> Option<u64> {
         DeviceEnrollmentState::Removed { deleted_at_ms } => (*deleted_at_ms, 1),
     };
     // 2·t is even, so adding 1 never overflows once the doubling fits.
-    t.checked_mul(2)?.checked_add(removed)
+    t.checked_mul(2).map(|double| double + removed)
 }
 
 /// Structural checks of a [`SyncKind::DeviceEnrollment`] record (#1107):
@@ -353,11 +354,10 @@ fn check_device_enrollment_shape(
     state: &DeviceEnrollmentState,
     clock: &RecordClock,
 ) -> Result<(), SyncError> {
+    // Decode, then encode again: this refuses a wrong length, non-hex and
+    // uppercase in one canonical comparison.
     let mut machine = [0u8; 32];
-    if key.len() != 64
-        || key.bytes().any(|b| b.is_ascii_uppercase())
-        || hex::decode_to_slice(key, &mut machine).is_err()
-    {
+    if hex::decode_to_slice(key, &mut machine).is_err() || hex::encode(machine) != key {
         return Err(SyncError::MalformedFrame(
             "device enrollment key is not a machine id hex".into(),
         ));
@@ -1051,11 +1051,11 @@ pub struct OwnerSyncStore {
     /// protocol-3 peers return to 3 after one completed session. Memory
     /// only: a restart starts at [`SYNC_PROTOCOL_VERSION`] again.
     peer_protocol: std::sync::Mutex<BTreeMap<[u8; 32], u32>>,
-    /// Test only: this store acts as a node that speaks only this protocol
-    /// version and refuses a `Hello` of any other version, as a node built
-    /// before protocol 3 does.
+    /// Test only: when not 0, this store acts as a node that speaks only
+    /// this protocol version and refuses a `Hello` of any other version, as
+    /// a node built before protocol 3 does.
     #[cfg(test)]
-    speak_only_protocol: std::sync::Mutex<Option<u32>>,
+    speak_only_protocol: std::sync::atomic::AtomicU32,
     /// #449 r3 P2: serializes canonical-Home ADMISSION against readers who
     /// must act on the canonical answer they got.
     ///
@@ -1440,7 +1440,7 @@ impl OwnerSyncStore {
             fail_after_rename: std::sync::atomic::AtomicBool::new(false),
             peer_protocol: std::sync::Mutex::new(BTreeMap::new()),
             #[cfg(test)]
-            speak_only_protocol: std::sync::Mutex::new(None),
+            speak_only_protocol: std::sync::atomic::AtomicU32::new(0),
             canonical_home_gate: Arc::new(tokio::sync::RwLock::new(())),
             journal_apply: Arc::new(tokio::sync::Mutex::new(())),
             journal_file: std::sync::OnceLock::new(),
@@ -3098,45 +3098,56 @@ impl OwnerSyncStore {
     /// The `Hello` version this side sends to `peer` (#1107).
     fn hello_protocol_for(&self, peer: &MachineId) -> u32 {
         #[cfg(test)]
-        if let Some(only) = self.spoken_protocol_for_testing() {
+        if let Some(only) = self.speak_only_protocol() {
             return only;
         }
         self.peer_protocol
             .lock()
-            .ok()
-            .and_then(|map| map.get(&peer.0).copied())
-            .map_or(SYNC_PROTOCOL_VERSION, |v| v.min(SYNC_PROTOCOL_VERSION))
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&peer.0)
+            .copied()
+            .unwrap_or(SYNC_PROTOCOL_VERSION)
     }
 
-    /// Remember the `Hello` version `peer` sent (#1107).
+    /// Remember the `Hello` version to send to `peer` next (#1107),
+    /// clamped to the versions this node speaks.
     fn remember_peer_protocol(&self, peer: &MachineId, version: u32) {
-        if let Ok(mut map) = self.peer_protocol.lock() {
-            map.insert(peer.0, version);
-        }
+        let version = version.clamp(MIN_SYNC_PROTOCOL_VERSION, SYNC_PROTOCOL_VERSION);
+        self.peer_protocol
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(peer.0, version);
     }
 
     /// The protocol version of a session that sent `sent` and received
-    /// `received`, or `None` when this store refuses `received`.
+    /// `received`, or `None` when this store refuses `received`. Only the
+    /// test emulation of a protocol-2 node differs from
+    /// [`negotiated_protocol`].
     fn session_protocol(&self, sent: u32, received: u32) -> Option<u32> {
         #[cfg(test)]
-        if self.spoken_protocol_for_testing().is_some() {
+        if self.speak_only_protocol().is_some() {
             return (received == sent).then_some(sent);
         }
         negotiated_protocol(sent, received)
     }
 
     #[cfg(test)]
-    fn spoken_protocol_for_testing(&self) -> Option<u32> {
-        self.speak_only_protocol.lock().ok().and_then(|v| *v)
+    fn speak_only_protocol(&self) -> Option<u32> {
+        match self
+            .speak_only_protocol
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => None,
+            version => Some(version),
+        }
     }
 
     /// Test only: make this store act as a node that speaks only
-    /// `version` (see `speak_only_protocol`).
+    /// `version` (see the `speak_only_protocol` field).
     #[cfg(test)]
     pub(crate) fn speak_only_protocol_for_testing(&self, version: u32) {
-        if let Ok(mut slot) = self.speak_only_protocol.lock() {
-            *slot = Some(version);
-        }
+        self.speak_only_protocol
+            .store(version, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The per-kind version table (with record hashes) for the handshake.
@@ -3483,9 +3494,8 @@ where
         peer: peer_machine,
     };
 
-    // Hello both ways (each side contributes a fresh nonce).
-    // #1107: send the version this peer last sent (a protocol-2 node
-    // refuses any other), or the current one for a peer not met yet.
+    // Hello both ways (each side contributes a fresh nonce), at the version
+    // remembered for this peer (#1107; see `OwnerSyncStore::peer_protocol`).
     let local_nonce = fresh_nonce();
     let sent_protocol = store.hello_protocol_for(peer_machine);
     let hello = SyncFrame::Hello {
@@ -3495,7 +3505,7 @@ where
         nonce: local_nonce,
     };
     write_frame(send, &hello).await?;
-    let (peer_nonce, protocol, peer_protocol) =
+    let (peer_nonce, protocol, version_after_success) =
         match refuse_unsupported(send, read_frame(recv).await).await? {
             SyncFrame::Hello {
                 protocol_version,
@@ -3521,7 +3531,9 @@ where
                 // Remember it only from the transport-authenticated peer
                 // machine, so the next session opens at the version it speaks.
                 store.remember_peer_protocol(peer_machine, protocol_version);
-                (nonce, protocol, protocol_version)
+                // A completed session shows the peer accepted
+                // `sent_protocol`, so it speaks at least that version.
+                (nonce, protocol, sent_protocol.max(protocol_version))
             }
             other => {
                 return Err(SyncError::MalformedFrame(format!(
@@ -3613,9 +3625,7 @@ where
         record.verify_owner(&owner_id)?;
         verified.push(record);
     }
-    // #1107: the peer completed a session that opened at `sent_protocol`,
-    // so it speaks at least that version.
-    store.remember_peer_protocol(peer_machine, sent_protocol.max(peer_protocol));
+    store.remember_peer_protocol(peer_machine, version_after_success);
     Ok(PendingCommit { summary, verified })
 }
 
@@ -3669,6 +3679,18 @@ async fn write_paged_vector<S: AsyncWrite + Unpin>(
     write_frame(send, &SyncFrame::VectorEnd).await?;
     Ok(())
 }
+/// Refuse `kind` in a session at `protocol` when that protocol does not
+/// carry it (#1107: kind 0x05 in a protocol-2 session).
+fn ensure_carried(kind: SyncKind, protocol: u32) -> Result<(), SyncError> {
+    if kind.carried_at(protocol) {
+        Ok(())
+    } else {
+        Err(SyncError::MalformedFrame(format!(
+            "kind {kind:?} in a protocol-{protocol} session"
+        )))
+    }
+}
+
 /// Read paged version frames until the explicit [`SyncFrame::VectorEnd`]
 /// terminator. Total entries are capped ([`MAX_VECTOR_ENTRIES`]). Between
 /// pages the session's admission is re-validated — a peer that dribbles
@@ -3685,12 +3707,7 @@ async fn read_paged_vector<R: AsyncRead + Unpin>(
         match read_frame(recv).await? {
             SyncFrame::VersionVector { kinds } => {
                 for kv in kinds {
-                    if !kv.kind.carried_at(protocol) {
-                        return Err(SyncError::MalformedFrame(format!(
-                            "kind {:?} in a protocol-{protocol} session",
-                            kv.kind
-                        )));
-                    }
+                    ensure_carried(kv.kind, protocol)?;
                     total += kv.entries.len();
                     if total > MAX_VECTOR_ENTRIES {
                         return Err(SyncError::TooManyRecords(format!(
@@ -3743,11 +3760,8 @@ async fn read_paged_records<R: AsyncRead + Unpin>(
         admission.still_admissible().await?;
         match read_frame(recv).await? {
             SyncFrame::Records { records: page } => {
-                if let Some(record) = page.iter().find(|r| !r.kind.carried_at(protocol)) {
-                    return Err(SyncError::MalformedFrame(format!(
-                        "kind {:?} in a protocol-{protocol} session",
-                        record.kind
-                    )));
+                for record in &page {
+                    ensure_carried(record.kind, protocol)?;
                 }
                 records.extend(page);
                 if records.len() > MAX_RECORDS_PER_SESSION {
