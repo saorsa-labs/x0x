@@ -1185,6 +1185,15 @@ pub struct OwnerSyncStore {
     /// Test injection: fail the next register write before its rename.
     #[cfg(test)]
     fail_next_register_write: std::sync::atomic::AtomicBool,
+    /// Test injections: fail the staging, or the rename, of the next
+    /// enrollment file write.
+    #[cfg(test)]
+    fail_next_enrollment_stage: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_next_enrollment_rename: std::sync::atomic::AtomicBool,
+    /// Test injection: hold the next register write in its task.
+    #[cfg(test)]
+    register_write_pause: std::sync::Mutex<Option<JournalCheckPause>>,
     /// Test injection: fail every synced journal append.
     #[cfg(test)]
     fail_journal_append: std::sync::atomic::AtomicBool,
@@ -1479,6 +1488,12 @@ impl OwnerSyncStore {
             #[cfg(test)]
             fail_next_register_write: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
+            fail_next_enrollment_stage: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_enrollment_rename: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            register_write_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
             fail_journal_append: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_next_discharge: std::sync::atomic::AtomicBool::new(false),
@@ -1526,20 +1541,9 @@ impl OwnerSyncStore {
         bytes: &[u8],
         fail_after_rename: bool,
     ) -> Result<(), DurableWriteError> {
-        use tokio::io::AsyncWriteExt as _;
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = path.with_extension(format!("tmp-{}-{unique}", std::process::id()));
-        let mut file = tokio::fs::File::create(&tmp)
+        let tmp = Self::stage_file(path, bytes)
             .await
             .map_err(DurableWriteError::BeforeRename)?;
-        file.write_all(bytes)
-            .await
-            .map_err(DurableWriteError::BeforeRename)?;
-        file.sync_all()
-            .await
-            .map_err(DurableWriteError::BeforeRename)?;
-        drop(file);
         crate::profile::rename_file(&tmp, path)
             .await
             .map_err(DurableWriteError::BeforeRename)?;
@@ -1550,28 +1554,99 @@ impl OwnerSyncStore {
                 "injected post-rename fsync failure",
             )));
         }
-        // fsync the renamed file and the parent directory so the new name
-        // survives a crash. (Directory fds support fsync on Unix.)
-        let target = tokio::fs::File::open(path)
+        Self::sync_renamed(path)
             .await
-            .map_err(DurableWriteError::AfterRename)?;
-        target
-            .sync_all()
-            .await
-            .map_err(DurableWriteError::AfterRename)?;
+            .map_err(DurableWriteError::AfterRename)
+    }
+
+    /// Write `bytes` to a unique temp file next to `path` and fsync it.
+    /// Returns the temp path; on error the temp file is removed.
+    async fn stage_file(path: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
+        use tokio::io::AsyncWriteExt as _;
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tmp-{}-{unique}", std::process::id()));
+        let staged = async {
+            let mut file = tokio::fs::File::create(&tmp).await?;
+            file.write_all(bytes).await?;
+            file.sync_all().await
+        }
+        .await;
+        match staged {
+            Ok(()) => Ok(tmp),
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// fsync the renamed file `path` and its parent directory, so the new
+    /// name survives a crash. (Directory fds support fsync on Unix.)
+    async fn sync_renamed(path: &Path) -> std::io::Result<()> {
+        tokio::fs::File::open(path).await?.sync_all().await?;
         #[cfg(unix)]
         if let Some(parent) = path.parent() {
-            let dir = tokio::fs::File::open(parent)
-                .await
-                .map_err(DurableWriteError::AfterRename)?;
-            dir.sync_all()
-                .await
-                .map_err(DurableWriteError::AfterRename)?;
+            tokio::fs::File::open(parent).await?.sync_all().await?;
         }
-        #[cfg(not(unix))]
-        let _ = path.parent();
         #[cfg(test)]
         crate::profile::crash_sim::note_durable(path);
+        Ok(())
+    }
+
+    /// #1107: write both register files (`enrollment` only when it
+    /// changes). Both temp files are staged before any rename, and
+    /// `RECORDS_FILE` is renamed first (see `replace_records`). The error
+    /// holds how many files were renamed before it (0, 1 or 2). The
+    /// `fail_*` flags are test injections.
+    async fn write_register_files(
+        records: (&Path, &[u8]),
+        enrollment: Option<(&Path, &[u8])>,
+        fail_stage_enrollment: bool,
+        fail_second_rename: bool,
+        fail_after_rename: bool,
+    ) -> Result<(), (u8, std::io::Error)> {
+        let injected = |what: &str| std::io::Error::other(format!("injected {what} failure"));
+        let tmp = Self::stage_file(records.0, records.1)
+            .await
+            .map_err(|e| (0, e))?;
+        let tmp_enrollment = match enrollment {
+            Some(_) if fail_stage_enrollment => Err(injected("enrollment stage")),
+            Some((path, bytes)) => Self::stage_file(path, bytes).await.map(|t| Some((t, path))),
+            None => Ok(None),
+        };
+        let tmp_enrollment = match tmp_enrollment {
+            Ok(staged) => staged,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return Err((0, e));
+            }
+        };
+        if let Err(e) = crate::profile::rename_file(&tmp, records.0).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            if let Some((staged, _)) = &tmp_enrollment {
+                let _ = tokio::fs::remove_file(staged).await;
+            }
+            return Err((0, e));
+        }
+        if let Some((staged, path)) = &tmp_enrollment {
+            let renamed = if fail_second_rename {
+                Err(injected("second rename"))
+            } else {
+                crate::profile::rename_file(staged, path).await
+            };
+            if let Err(e) = renamed {
+                let _ = tokio::fs::remove_file(staged).await;
+                return Err((1, e));
+            }
+        }
+        if fail_after_rename {
+            return Err((2, injected("post-rename fsync")));
+        }
+        Self::sync_renamed(records.0).await.map_err(|e| (2, e))?;
+        if let Some((_, path)) = tmp_enrollment {
+            Self::sync_renamed(path).await.map_err(|e| (2, e))?;
+        }
         Ok(())
     }
 
@@ -1595,9 +1670,10 @@ impl OwnerSyncStore {
 
     /// #1545: run `work` to its end in its own task, and wait for its
     /// output. A cancelled caller stops only its wait. Every durable write
-    /// of the store runs in this way: the register, the device set and
-    /// the tombstones through `replace_state`, the pending applies and the
-    /// journal intent directly, and the profile save through the server.
+    /// of the store runs in this way: the register (`replace_records`),
+    /// the device set and the tombstones through `replace_state`, the
+    /// pending applies and the journal intent directly, and the profile
+    /// save through the server.
     /// The owned guards of the state that a write changes move into
     /// `work`, and stay held until the write and the memory update after
     /// it are done: no later writer can start before the write lands, and
@@ -1688,80 +1764,42 @@ impl OwnerSyncStore {
         .await
     }
 
-    /// #1107: write the kind 0x05 part of `next` durably to
-    /// `ENROLLMENT_RECORDS_FILE`, when it differs from the register's, and
-    /// make memory the old register with that new part (what the disk then
-    /// holds). No file that a binary built before kind 0x05 reads
-    /// (`RECORDS_FILE`, `JOURNAL_INTENT_FILE`) ever holds a kind 0x05
-    /// record, so a rollback still starts.
+    /// Write `next` as the register, then make it the register in memory,
+    /// in one task (`run_to_completion`) that owns `records` and `held`.
+    /// #1107: kind 0x05 records go to `ENROLLMENT_RECORDS_FILE`, so no
+    /// file an older binary reads holds one. `RECORDS_FILE` is renamed
+    /// first: a stop between the two renames then stores no kind 0x05
+    /// record that no commit returned as accepted, and a later session
+    /// delivers those records again as new.
     ///
     /// # Errors
     ///
-    /// See [`Self::replace_state`].
-    async fn replace_enrollment_part(
-        &self,
-        mut records: tokio::sync::OwnedRwLockWriteGuard<RecordMap>,
-        next: &RecordMap,
-    ) -> Result<tokio::sync::OwnedRwLockWriteGuard<RecordMap>, SyncError> {
-        let enrollment_part = |map: &RecordMap| -> Vec<VersionedRecord> {
-            map.values()
-                .filter(|r| r.kind == SyncKind::DeviceEnrollment)
-                .cloned()
-                .collect()
-        };
-        let next_enrollments = enrollment_part(next);
-        if next_enrollments != enrollment_part(&records) {
-            let bytes = serde_json::to_vec(&PersistedRecords {
-                records: next_enrollments,
-            })
-            .map_err(|e| SyncError::Io(format!("encode enrollment records: {e}")))?;
-            // Memory after this write: the old register with the new kind
-            // 0x05 part, which is what the disk then holds.
-            let mut mixed: RecordMap = records
-                .iter()
-                .filter(|((kind, _), _)| *kind != SyncKind::DeviceEnrollment)
-                .map(|(k, r)| (k.clone(), r.clone()))
-                .collect();
-            mixed.extend(
-                next.iter()
-                    .filter(|((kind, _), _)| *kind == SyncKind::DeviceEnrollment)
-                    .map(|(k, r)| (k.clone(), r.clone())),
-            );
-            let generation = Arc::clone(&self.generation_tx);
-            let landed = move || Self::kick_generation(&generation);
-            records = self
-                .replace_state(records, mixed, ENROLLMENT_RECORDS_FILE, bytes, (), landed)
-                .await?
-                .0;
-        }
-        Ok(records)
-    }
-
-    /// Write `next` durably as the register, and then make it the register
-    /// in memory (`replace_state`). `held` comes back on success.
-    ///
-    /// # Errors
-    ///
-    /// See [`Self::replace_state`].
+    /// [`SyncError::Io`] before the first rename: memory and both files
+    /// stay as they were. [`SyncError::Poisoned`] after a rename: memory
+    /// takes what the disk holds, and the store is poisoned.
     async fn replace_records<H: Send + 'static>(
         &self,
-        records: tokio::sync::OwnedRwLockWriteGuard<RecordMap>,
+        mut records: tokio::sync::OwnedRwLockWriteGuard<RecordMap>,
         next: RecordMap,
         held: H,
     ) -> Result<H, SyncError> {
-        // #1107: kind 0x05 records live in their own file, so the register
-        // file keeps only the four kinds an older binary can decode. The
-        // enrollment file is written first (a no-op when a commit already
-        // wrote it, see `commit_locked`).
-        let records = self.replace_enrollment_part(records, &next).await?;
-        let bytes = serde_json::to_vec(&PersistedRecords {
-            records: next
-                .values()
-                .filter(|r| r.kind != SyncKind::DeviceEnrollment)
+        let part = |map: &RecordMap, enrollment: bool| -> Vec<VersionedRecord> {
+            map.values()
+                .filter(|r| (r.kind == SyncKind::DeviceEnrollment) == enrollment)
                 .cloned()
-                .collect(),
-        })
-        .map_err(|e| SyncError::Io(format!("encode records: {e}")))?;
+                .collect()
+        };
+        let encode = |records: Vec<VersionedRecord>| {
+            serde_json::to_vec(&PersistedRecords { records })
+                .map_err(|e| SyncError::Io(format!("encode records: {e}")))
+        };
+        let bytes = encode(part(&next, false))?;
+        let enrollments = part(&next, true);
+        let enrollment_bytes = if enrollments == part(&records, true) {
+            None
+        } else {
+            Some(encode(enrollments)?)
+        };
         #[cfg(test)]
         if self
             .fail_next_register_write
@@ -1769,11 +1807,69 @@ impl OwnerSyncStore {
         {
             return Err(SyncError::Io("injected register write failure".into()));
         }
+        #[cfg(test)]
+        let (fail_stage, fail_second_rename, pause) = (
+            self.fail_next_enrollment_stage
+                .swap(false, std::sync::atomic::Ordering::Relaxed),
+            self.fail_next_enrollment_rename
+                .swap(false, std::sync::atomic::Ordering::Relaxed),
+            self.register_write_pause
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
+        #[cfg(not(test))]
+        let (fail_stage, fail_second_rename) = (false, false);
+        let fail_after_rename = self.fail_after_rename_for_testing();
+        let (records_path, enrollment_path) = (
+            self.dir.join(RECORDS_FILE),
+            self.dir.join(ENROLLMENT_RECORDS_FILE),
+        );
+        let poisoned = Arc::clone(&self.poisoned);
         let generation = Arc::clone(&self.generation_tx);
-        let landed = move || Self::kick_generation(&generation);
-        self.replace_state(records, next, RECORDS_FILE, bytes, held, landed)
+        self.run_to_completion(async move {
+            #[cfg(test)]
+            if let Some((reached, release)) = pause {
+                let _ = reached.send(());
+                let _ = release.await;
+            }
+            let enrollment = enrollment_bytes
+                .as_deref()
+                .map(|bytes| (enrollment_path.as_path(), bytes));
+            let failed = match Self::write_register_files(
+                (&records_path, &bytes),
+                enrollment,
+                fail_stage,
+                fail_second_rename,
+                fail_after_rename,
+            )
             .await
-            .map(|(_, held)| held)
+            {
+                Ok(()) => None,
+                Err((0, io)) => return Err(SyncError::Io(format!("persist register: {io}"))),
+                Err(failed) => Some(failed),
+            };
+            // Memory takes what the disk holds, even when it is not
+            // durable. Never roll memory back below an advanced disk.
+            if matches!(failed, Some((1, _))) {
+                // Only `RECORDS_FILE` is new: the old kind 0x05 part stays.
+                records.retain(|(kind, _), _| *kind == SyncKind::DeviceEnrollment);
+                records.extend(
+                    next.into_iter()
+                        .filter(|((kind, _), _)| *kind != SyncKind::DeviceEnrollment),
+                );
+            } else {
+                *records = next;
+            }
+            Self::kick_generation(&generation);
+            if let Some((_, io)) = failed {
+                let e = SyncError::Poisoned(format!("register replaced but not durable: {io}"));
+                Self::poison_slot(&poisoned, e.to_string());
+                return Err(e);
+            }
+            Ok(held)
+        })
+        .await
     }
 
     /// Write `next` durably as the device set, and then make it the device
@@ -2367,11 +2463,13 @@ impl OwnerSyncStore {
 
     /// Commit a verified batch atomically (review R2 finding 4): all
     /// classification decisions are made against a copy of the register,
-    /// all accepted records inserted into it, and ONE file write persists
+    /// all accepted records inserted into it, and ONE register write persists
     /// the result. The copy becomes the register only once that write is
     /// done (`replace_records`). On any failure the register keeps its
     /// **pre-batch** state, and the error propagates. A partial batch is
-    /// never committed or advertised.
+    /// never committed or advertised. The one exception poisons the
+    /// store: a write that fails after a rename leaves memory as the disk
+    /// holds it (`replace_records`).
     ///
     /// Records must have been verified (`verify_owner`) by the caller.
     /// #1545: a caller that is cancelled leaves the register as before
@@ -2539,12 +2637,6 @@ impl OwnerSyncStore {
             Some(_) => Self::journal_updates(&records, &next, &touched),
             None => Vec::new(),
         };
-        // #1107: the kind 0x05 records of the batch are made durable on
-        // their own, first: they are independent of the journal records,
-        // and the journal intent never holds them (a binary built before
-        // kind 0x05 cannot decode it, and its recovery would fail closed on
-        // every pass). A stop after this write keeps them stored.
-        let records = self.replace_enrollment_part(records, &next).await?;
         let mut hold = (records, canonical_gate, revocations, held);
         if let Some(path) = journal.filter(|_| !updates.is_empty()) {
             // The intent first: after a stop between the two writes, the
@@ -2553,7 +2645,9 @@ impl OwnerSyncStore {
             // (see `recover_journal_commit`). The intent holds every
             // accepted record of the four older kinds, not only the
             // journal ones, so the recovery commits all of that part or
-            // none of it. Kind 0x05 records are already durable (above).
+            // none of it. #1107: it never holds a kind 0x05 record (a
+            // binary built before kind 0x05 cannot decode one); after a
+            // stop, a later session delivers those again as new.
             let intent: Vec<VersionedRecord> = outcome
                 .accepted
                 .iter()
@@ -5350,6 +5444,10 @@ mod known_anonymous_tests;
 #[cfg(test)]
 #[path = "owner_sync_device_enrollment_tests.rs"]
 mod device_enrollment_tests;
+
+#[cfg(test)]
+#[path = "owner_sync_register_write_tests.rs"]
+mod register_write_tests;
 
 #[cfg(test)]
 mod tests {
@@ -8771,9 +8869,10 @@ mod issuance_journal_sync_tests {
 
     /// #1107: a batch with a journal update and a kind 0x05 record stops
     /// between its writes. The journal intent left behind holds only the
-    /// four older kinds, so a binary built before kind 0x05 decodes it; the
-    /// 0x05 record is already durable, and the recovery after the restart
-    /// ends with both records in the register.
+    /// four older kinds, so a binary built before kind 0x05 decodes it.
+    /// The stopped commit stores no 0x05 record; the recovery after the
+    /// restart stores the journal record, and a later delivery of the 0x05
+    /// record is accepted.
     #[tokio::test]
     async fn a_journal_intent_never_holds_a_device_enrollment_record() {
         use super::tests::{machine, owner_kp};
@@ -8809,7 +8908,9 @@ mod issuance_journal_sync_tests {
         local
             .stop_between_journal_writes
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        let stopped = local.commit_batch(vec![r1, device], &owner.user_id()).await;
+        let stopped = local
+            .commit_batch(vec![r1, device.clone()], &owner.user_id())
+            .await;
         assert!(stopped.is_err(), "the commit stops between its writes");
         drop(local);
 
@@ -8829,12 +8930,14 @@ mod issuance_journal_sync_tests {
             local.stored_value(SyncKind::IssuanceJournal, "bb").await,
             Some(d1)
         );
+        let key = hex::encode(m.0);
+        let stored = local.stored_value(SyncKind::DeviceEnrollment, &key).await;
+        assert_eq!(stored, None, "the stopped commit stores no 0x05 record");
+        let again = local.commit_batch(vec![device], &owner.user_id()).await;
+        assert_eq!(again.expect("again").accepted.len(), 1, "it is new");
         assert_eq!(
-            local
-                .stored_value(SyncKind::DeviceEnrollment, &hex::encode(m.0))
-                .await,
-            Some(SyncValue::DeviceEnrollment { state }),
-            "the kind 0x05 record survives the stop"
+            local.stored_value(SyncKind::DeviceEnrollment, &key).await,
+            Some(SyncValue::DeviceEnrollment { state })
         );
         assert!(!intent.exists(), "the recovery removes the intent");
     }
