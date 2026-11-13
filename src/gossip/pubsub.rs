@@ -159,6 +159,10 @@ pub fn inner_verify_stats() -> InnerVerifyStatsSnapshot {
 /// lost. Exposed via `GET /diagnostics/gossip`.
 #[derive(Debug, Default)]
 pub struct PubSubStats {
+    /// Test-only: (subscription topic, sender) of each payload refused for a
+    /// revoked or blocked sender, so a test can tie a refusal to a message.
+    #[cfg(test)]
+    pub(crate) refused_senders: std::sync::Mutex<Vec<(String, AgentId)>>,
     /// Successful `publish()` calls (encoded + handed to PlumTree).
     pub publish_total: AtomicU64,
     /// `publish()` that failed at encoding/signing or PlumTree handoff.
@@ -1208,6 +1212,10 @@ fn count_refused_deliveries(stats: &PubSubStats, sub_topic: &str, sender: &Agent
     stats
         .incoming_sender_refused
         .fetch_add(waiting, Ordering::Relaxed);
+    #[cfg(test)]
+    if let Ok(mut refused) = stats.refused_senders.lock() {
+        refused.push((sub_topic.to_string(), *sender));
+    }
     if sender_refusal_log_due(&stats.sender_refusal_logged_at_ms) {
         tracing::debug!(
             topic = %sub_topic,
@@ -2704,6 +2712,17 @@ impl PubSubManager {
     /// drop signal the test harness uses to prove 100 % delivery under load.
     pub fn stats(&self) -> PubSubStatsSnapshot {
         self.stats.snapshot()
+    }
+
+    /// Test-only: the (subscription topic, sender) pairs refused for a
+    /// revoked or blocked sender so far.
+    #[cfg(test)]
+    pub(crate) fn refused_senders_for_test(&self) -> Vec<(String, AgentId)> {
+        self.stats
+            .refused_senders
+            .lock()
+            .map(|refused| refused.clone())
+            .unwrap_or_default()
     }
 
     /// Record a `fan_out == 0` publish and return whether to `warn!`.

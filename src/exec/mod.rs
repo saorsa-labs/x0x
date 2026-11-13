@@ -13,6 +13,8 @@ pub mod service;
 
 #[cfg(test)]
 mod cold_restart_tests;
+#[cfg(test)]
+mod dm_cold_restart_tests;
 
 pub use acl::{
     compose_exec_policy, default_exec_acl_path, exec_reload_compatible, load_exec_policy,

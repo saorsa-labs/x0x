@@ -582,6 +582,9 @@ fn ingest_found(
         &record.advert,
         record.certificate.as_deref(),
     )?;
+    if record.certificate.is_some() && crate::announce_blob::certificate_recovery_held() {
+        return Err(invalid("certificate recovery held"));
+    }
     if !limits.verify() {
         return Err(invalid("evidence verify budget"));
     }
