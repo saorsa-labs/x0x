@@ -43,14 +43,14 @@ use x0x::identity::AgentKeypair;
 
 // ============================== Helpers ====================================
 
-fn unix_ms() -> u64 {
+pub(super) fn unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
 }
 
-async fn s_state() -> (Arc<AppState>, tempfile::TempDir) {
+pub(super) async fn s_state() -> (Arc<AppState>, tempfile::TempDir) {
     let (state, dir) = secure_endpoint_test_state().await.expect("secure state");
     (state, dir)
 }
@@ -59,7 +59,7 @@ fn fresh_kp() -> AgentKeypair {
     AgentKeypair::generate().expect("agent keypair")
 }
 
-fn local_hex(state: &AppState) -> String {
+pub(super) fn local_hex(state: &AppState) -> String {
     hex::encode(state.agent.agent_id().as_bytes())
 }
 
@@ -139,14 +139,14 @@ fn predecessor_event(
 }
 
 #[derive(Clone)]
-struct RelayEntry {
-    envelope: Vec<u8>,
-    digest: [u8; 32],
-    request_id: String,
-    byte_size: usize,
+pub(super) struct RelayEntry {
+    pub(super) envelope: Vec<u8>,
+    pub(super) digest: [u8; 32],
+    pub(super) request_id: String,
+    pub(super) byte_size: usize,
 }
 
-fn build_relay_entry(
+pub(super) fn build_relay_entry(
     requester_kp: &AgentKeypair,
     topic: &str,
     group_key: &str,
@@ -169,7 +169,7 @@ fn build_relay_entry(
 /// whose commit is `None`, so the handler-driven New row needs a commit to
 /// exercise the apply code path. The other restart-driven fixtures short-
 /// circuit before apply and keep `commit: None`.
-fn build_relay_entry_with_commit(
+pub(super) fn build_relay_entry_with_commit(
     requester_kp: &AgentKeypair,
     topic: &str,
     group_key: &str,
@@ -198,7 +198,7 @@ fn build_relay_entry_with_commit(
     }
 }
 
-fn bound_join_request(
+pub(super) fn bound_join_request(
     entry: &RelayEntry,
     group_key: &str,
     requester_hex: &str,
@@ -276,7 +276,7 @@ async fn install_group(state: &AppState, group_key: &str, witness_count: usize) 
 /// `PrivateSecure` (InviteOnly), which the apply rejects for JoinRequestCreated
 /// (mod.rs:6805). The handler-driven New row exercises the apply path, so it
 /// installs a group with `PublicRequestSecure` admission.
-async fn install_group_with_policy(
+pub(super) async fn install_group_with_policy(
     state: &AppState,
     group_key: &str,
     witness_count: usize,
@@ -311,7 +311,7 @@ async fn install_group_with_policy(
 /// `verify_structure` (commit signature/state_hash) and `validate_apply`
 /// (prev_state_hash chain, revision monotonicity, signer authority) all pass
 /// against the pre-mutation group.
-fn signed_request_join_commit(
+pub(super) fn signed_request_join_commit(
     group: &x0x::groups::GroupInfo,
     requester_kp: &AgentKeypair,
 ) -> x0x::groups::GroupStateCommit {
@@ -337,7 +337,7 @@ fn signed_request_join_commit(
     .expect("sign JoinRequestCreated commit")
 }
 
-async fn group_topic(state: &AppState, group_key: &str) -> String {
+pub(super) async fn group_topic(state: &AppState, group_key: &str) -> String {
     state
         .named_groups
         .read()
@@ -352,7 +352,7 @@ async fn save_relay(state: &AppState) -> std::io::Result<AtomicWriteOutcome> {
     save_predecessor_relay_outbox(state).await
 }
 
-async fn save_roster(state: &AppState) -> std::io::Result<AtomicWriteOutcome> {
+pub(super) async fn save_roster(state: &AppState) -> std::io::Result<AtomicWriteOutcome> {
     save_named_groups_checked(state).await
 }
 
@@ -380,7 +380,7 @@ async fn relay_outbox_total(state: &AppState) -> usize {
         .count()
 }
 
-async fn listener_admission_is_none(state: &AppState) -> bool {
+pub(super) async fn listener_admission_is_none(state: &AppState) -> bool {
     state.pending_listener_admission.lock().await.is_none()
 }
 
@@ -1726,7 +1726,7 @@ async fn pr291_expired_reoffer_exact_envelope_does_not_refresh_clock() {
 /// Drive the requester-signed offer through the extracted handler using
 /// the production path. The handler is the same function the typed-DM
 /// receiver loop calls per incoming payload.
-async fn offer_via_handler(
+pub(super) async fn offer_via_handler(
     state: &Arc<AppState>,
     local_hex: &str,
     entry: &RelayEntry,
@@ -2587,7 +2587,7 @@ async fn pr291_metadata_first_repair_re_offers_after_real_apply() {
 
 /// How the requester's signed commit goes stale against the authority.
 #[derive(Clone, Copy, Debug)]
-enum StaleCommit {
+pub(super) enum StaleCommit {
     /// Issue #1840 route 2: the requester sealed over an owner-only stub
     /// while the authority's roster has more members.
     StubRoster,
@@ -2598,7 +2598,7 @@ enum StaleCommit {
 
 /// Build a requester-signed `JoinRequestCreated` relay entry whose commit
 /// cannot apply to the authority's current state of `gk`.
-async fn stale_request_entry(
+pub(super) async fn stale_request_entry(
     state: &AppState,
     gk: &str,
     request_id: &str,
