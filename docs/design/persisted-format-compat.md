@@ -205,7 +205,7 @@ HEAD adds `GroupSigned` (5) and `TreeKemEncrypted` (6).
 | Causal approval queue | `causal_approval_queue.json` | JSON | `NamedGroupMetadataEvent` + 4 fields, all `serde(default)` | SAFE | |
 | Predecessor relay outbox | `predecessor_relay_outbox.json` | JSON | No | SAFE | |
 | Public-group bootstrap outbox | `public_group_bootstrap_outbox.json` | JSON `{version: 1}` | Struct unchanged; loader now refuses `fork_quarantine` | SAFE | v0.45.0 already stripped `fork_quarantine` when writing these |
-| Requester-offer outbox | `requester_offer_outbox.json` | JSON | New in 0.46 | n/a | |
+| Requester-offer outbox | `requester_offer_outbox.json` | JSON | New in 0.46. #1840 adds the optional obligation field `refusal` (`reason`, `retryable`, `refused_at_ms`), written only for a refused offer | SAFE | A build without #1840 ignores `refusal` and offers the envelope again |
 | CRDT / directory subscriptions | `crdt-subscriptions.json`, `directory-subscriptions.json` | JSON | No | SAFE | |
 | Rider tokens, home marker | `rider-tokens.json`, `home.json` | JSON | No | SAFE | |
 | API token/port, instance lock | `api.token`, `api.port`, `instance.lock` | text | No (lock code moved to `file_lock.rs`) | SAFE | |

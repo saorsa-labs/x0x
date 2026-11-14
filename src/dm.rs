@@ -151,8 +151,20 @@ impl CapabilityRegistry {
     /// junk DM and release a durable ACK).
     pub const SHARE_GRANT_NAMES_V1: u64 = 1 << 14;
 
+    /// Issue #1840 (David's ruling, 10 Nov 2026 08:10 GMT: "typed DM"):
+    /// accepts the join-request outcome (`x0x-group-join-outcome-v1\0`)
+    /// that an authority sends when its validation refuses a
+    /// `JoinRequestCreated` offer. Bit 16, the next free bit. The sender
+    /// needs POSITIVE evidence: an authority sends the outcome only to a
+    /// requester whose current verified advert has this bit, because an
+    /// old receiver would show the payload as an ordinary DM. ROUTE-GATED
+    /// like `grant_revocation_push_v1`: [`Self::current`] leaves it out
+    /// and [`Self::advertised`] adds it when the typed route is registered.
+    pub const JOIN_REQUEST_OUTCOME_V1: u64 = 1 << 16;
+
     /// The routes supported by every receiver of this release.
-    /// Route-gated bits (`grant_revocation_push_v1`) are NOT here: they are
+    /// Route-gated bits (`grant_revocation_push_v1`,
+    /// `join_request_outcome_v1`) are NOT here: they are
     /// added per daemon by [`Self::advertised`] from the typed routes the
     /// DM inbox actually registered, so a library embedder that never wires
     /// the route never advertises the bit.
@@ -180,16 +192,19 @@ impl CapabilityRegistry {
     /// The registry a READY receiver advertises, given the prefixes of the
     /// typed routes its DM inbox registered. ADR 0080 §1:
     /// `grant_revocation_push_v1` is route-gated — the bit is advertised
-    /// only when the push route is registered and ready; everything in
-    /// [`Self::current`] is unconditional.
+    /// only when the push route is registered and ready. #1840:
+    /// `join_request_outcome_v1` is route-gated in the same way. Everything
+    /// in [`Self::current`] is unconditional.
     #[must_use]
     pub fn advertised<P: AsRef<[u8]>>(route_prefixes: impl IntoIterator<Item = P>) -> Self {
         let mut registry = Self::current();
-        if route_prefixes
-            .into_iter()
-            .any(|p| p.as_ref() == crate::revocation_push::GRANT_REVOCATION_PUSH_PREFIX)
-        {
-            registry.bits |= Self::GRANT_REVOCATION_PUSH_V1;
+        for prefix in route_prefixes {
+            let prefix = prefix.as_ref();
+            if prefix == crate::revocation_push::GRANT_REVOCATION_PUSH_PREFIX {
+                registry.bits |= Self::GRANT_REVOCATION_PUSH_V1;
+            } else if prefix == crate::groups::join_outcome::JOIN_REQUEST_OUTCOME_DM_PREFIX {
+                registry.bits |= Self::JOIN_REQUEST_OUTCOME_V1;
+            }
         }
         registry
     }
@@ -230,6 +245,8 @@ impl CapabilityRegistry {
             Some((Self::KEY_REPUBLISH_V1, "key_republish_v1"))
         } else if payload.starts_with(crate::revocation_push::GRANT_REVOCATION_PUSH_PREFIX) {
             Some((Self::GRANT_REVOCATION_PUSH_V1, "grant_revocation_push_v1"))
+        } else if payload.starts_with(crate::groups::join_outcome::JOIN_REQUEST_OUTCOME_DM_PREFIX) {
+            Some((Self::JOIN_REQUEST_OUTCOME_V1, "join_request_outcome_v1"))
         } else {
             None
         }
