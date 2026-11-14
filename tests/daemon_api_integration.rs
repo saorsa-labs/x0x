@@ -1143,6 +1143,34 @@ async fn daemon_api_direct_connections() {
     assert!(r["connections"].is_array());
 }
 
+/// #1109: the receipt query answers `unknown` for a logical id this daemon
+/// never sent under, and refuses a malformed one.
+#[tokio::test]
+#[ignore]
+async fn daemon_api_direct_receipt_unknown_and_invalid() {
+    let d = daemon().await;
+    let peer = "ab".repeat(32);
+    let r: Value = ca(&d)
+        .get(d.url(&format!("/direct/receipts/never-sent?agent_id={peer}")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["ok"], true, "body: {r}");
+    assert_eq!(r["status"], "unknown", "body: {r}");
+    assert_eq!(r["logical_id"], "never-sent", "body: {r}");
+    let bad = ca(&d)
+        .get(d.url(&format!("/direct/receipts/Never%20Sent?agent_id={peer}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = bad.json().await.unwrap();
+    assert_eq!(body["error"], "invalid_logical_id", "body: {body}");
+}
+
 #[tokio::test]
 #[ignore]
 async fn daemon_api_direct_events_sse() {

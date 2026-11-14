@@ -1515,6 +1515,15 @@ enum DirectSub {
     },
     /// List established direct connections.
     Connections,
+    /// Show the outcome of a durable send by its logical id (#1109):
+    /// delivered, delivered_late, pending or unknown. Use it after a 504
+    /// (`outcome: "ack_unknown"`) to learn whether a late ACK arrived.
+    Receipt {
+        /// The `--logical-id` the send used.
+        logical_id: String,
+        /// Recipient agent ID (hex).
+        agent_id: String,
+    },
     /// Stream incoming direct messages.
     Events {
         /// Replay the N most recent stored DM rows before the `live`
@@ -2959,6 +2968,10 @@ async fn run(
                 .await
             }
             DirectSub::Connections => commands::direct::connections(&client).await,
+            DirectSub::Receipt {
+                logical_id,
+                agent_id,
+            } => commands::direct::receipt(&client, &logical_id, &agent_id).await,
             DirectSub::Events { backfill } => commands::direct::events(&client, backfill).await,
         },
         Commands::Groups { sub } => match sub {
