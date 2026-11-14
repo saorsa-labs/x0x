@@ -72,6 +72,19 @@ round. A sibling fork that split below the window is not detected. ADR
 0110 stays Accepted and its text is unchanged. The code and this slot
 carry the change.
 
+Amendment of 14 Nov 2026 (#1427), made under the design delegation of
+10 Nov 2026. A TreeKEM member that was down longer than the last
+metadata resend (60 s) can have missed a commit, and with no later
+traffic nothing else asks for it. After its start, such a member asks the
+other members of each TreeKEM group for a catch-up page, on the bounded
+epoch-ahead rounds. The daemon records its up time every 15 s to measure
+the outage. A first start and a shorter outage ask nothing, since the
+resends cover them. Each served page goes through the usual response
+checks. Not covered yet: a member that stays up through a network
+outage, and a serving node that restarted since the commit (its catch-up
+log is in memory). A saved log must not serve a commit that S4 still
+holds as delivery-pending after a restart. No wire format or API changes.
+
 [A08](A08-r01-groups-home-membership-and-repair.md) defines valid group-state and fork recovery. A09 must not bypass that authority to obtain keys faster.
 
 ## Security claims
