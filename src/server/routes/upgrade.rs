@@ -2046,7 +2046,7 @@ pub(in crate::server) async fn clear_upgrade_hold(
     };
     #[cfg(not(unix))]
     {
-        let _ = &state;
+        let _ = (&state, version);
         refuse(
             StatusCode::NOT_IMPLEMENTED,
             "release probe holds exist only on Unix installs".into(),
