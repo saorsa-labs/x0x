@@ -32,7 +32,7 @@ use super::routes::{
     ListenerRegistration, NamedGroupMetadataEvent, ParkedRoleUpdate, PendingCausalApproval,
     PendingJoinAttempt, PendingJoinRefusal, PendingJoinResult, PendingTreeKemMetadataEvent,
     PendingWelcome, PendingWelcomeReceive, PredecessorRelayObligation, RestSubscription,
-    WelcomeFetchWaiter,
+    SelfPublishedReleaseManifests, WelcomeFetchWaiter,
 };
 use super::sse::SseEvent;
 use super::ws::{SharedTopicState, WsOutboundStats, WsSession};
@@ -1402,6 +1402,11 @@ pub(super) struct AppState {
     pub(super) upgrade_apply_lock: Arc<Mutex<()>>,
     /// Bounds HTTP staging waits without holding the shared replacement lock.
     pub(super) http_upgrade_wait_lock: Arc<Mutex<()>>,
+    /// Release-topic payloads this daemon published itself. Shared by
+    /// `/upgrade/apply` and the gossip/fallback/startup publishers so the
+    /// gossip driver neither rebroadcasts nor re-submits its own
+    /// self-delivered announcement (#1169).
+    pub(super) self_published_release_manifests: Arc<Mutex<SelfPublishedReleaseManifests>>,
     /// Actual boot identity; unavailable identity refuses HTTP update only.
     #[cfg(unix)]
     pub(super) upgrade_staging: Option<super::routes::StartupStagingContext>,
