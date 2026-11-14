@@ -26,6 +26,33 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// Where a store content change came from (#1094 `kv:changed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KvChangeOrigin {
+    /// A write or delete through this daemon's own handle.
+    Local,
+    /// A peer's record or delta that merged into the local replica.
+    Remote,
+}
+
+/// One change notice for an open store (#1094). It carries no keys and no
+/// values: a subscriber reads the store through its own authorised path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvStoreChanged {
+    /// The store's topic (the id the REST API uses).
+    pub topic: String,
+    /// Where the change came from.
+    pub origin: KvChangeOrigin,
+}
+
+/// The agent-wide channel a store sends its change notices to.
+#[derive(Debug, Clone)]
+struct KvChangeSink {
+    tx: tokio::sync::broadcast::Sender<KvStoreChanged>,
+    topic: String,
+}
+
 /// Local, process-lifetime counters for one open store. Snapshots are not
 /// atomic across fields and do not establish a causal per-request receipt.
 #[derive(Default)]
@@ -47,6 +74,8 @@ struct StateSyncCounters {
     digest_beacons_sent: AtomicU64,
     digest_beacon_divergences: AtomicU64,
     digest_beacon_wakes_deferred: AtomicU64,
+    /// #1094: where change notices go; set once before the loops start.
+    change_sink: std::sync::OnceLock<KvChangeSink>,
 }
 
 /// Cumulative state-sync activity for one currently open local store.
@@ -80,6 +109,23 @@ pub struct StateSyncSnapshot {
 }
 
 impl StateSyncCounters {
+    /// Send a change notice if a sink is attached. A send with no
+    /// subscriber is not an error: nobody is listening.
+    fn note_change(&self, origin: KvChangeOrigin) {
+        if let Some(sink) = self.change_sink.get() {
+            let _ = sink.tx.send(KvStoreChanged {
+                topic: sink.topic.clone(),
+                origin,
+            });
+        }
+    }
+
+    /// One counted remote merge: the counter and the change notice.
+    fn note_remote_merge(&self) {
+        self.incoming_record_merges.fetch_add(1, Ordering::Relaxed);
+        self.note_change(KvChangeOrigin::Remote);
+    }
+
     fn snapshot(&self) -> StateSyncSnapshot {
         let get = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         StateSyncSnapshot {
@@ -1841,6 +1887,23 @@ impl KvStoreSync {
         self.state_sync_counters.snapshot()
     }
 
+    /// Send this store's change notices (#1094 `kv:changed`) to `tx`. Set
+    /// once, before [`Self::start`]; a second call is ignored. Without a
+    /// sink the store sends nothing.
+    pub fn set_change_sink(&self, tx: tokio::sync::broadcast::Sender<KvStoreChanged>) {
+        let _ = self.state_sync_counters.change_sink.set(KvChangeSink {
+            tx,
+            topic: self.topic.clone(),
+        });
+    }
+
+    /// Send a change notice for a change this daemon made or merged outside
+    /// the sync loops (a local write, or a direct-delivery delta). Call it
+    /// once the content has changed, whatever persist and publish then do.
+    pub fn note_change(&self, origin: KvChangeOrigin) {
+        self.state_sync_counters.note_change(origin);
+    }
+
     /// Attach the group security/authorization context and refresh hook.
     ///
     /// MUST be called before [`start`](Self::start): the loops capture the
@@ -2022,9 +2085,7 @@ impl KvStoreSync {
             .await;
         if matches!(merged, Ok(Some(true))) {
             if let Some(counters) = counters {
-                counters
-                    .incoming_record_merges
-                    .fetch_add(1, Ordering::Relaxed);
+                counters.note_remote_merge();
             }
         }
         merged.is_ok()
@@ -3467,9 +3528,7 @@ impl KvStoreSync {
                         .await
                     };
                     if merged {
-                        listener_counters
-                            .incoming_record_merges
-                            .fetch_add(1, Ordering::Relaxed);
+                        listener_counters.note_remote_merge();
                         if let Some(ctx) = loop_persist_ctx.as_ref() {
                             let _ = persist_snapshot(&store, ctx).await;
                         }
@@ -3597,9 +3656,7 @@ impl KvStoreSync {
                         // remote merges continue — replication must not
                         // wedge on this node's disk.
                         if merged {
-                            listener_counters
-                                .incoming_record_merges
-                                .fetch_add(1, Ordering::Relaxed);
+                            listener_counters.note_remote_merge();
                             #[cfg(test)]
                             listener_receive_merged_test.notify_one();
                             if let Some(ctx) = loop_persist_ctx.as_ref() {
@@ -9783,6 +9840,48 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::mem::take(&mut *guard)
+    }
+
+    /// WHY (#1094 `kv:changed`): a remote delta that the listener merges
+    /// sends exactly one change notice, with the store topic and origin
+    /// `Remote`; `note_change` sends a `Local` one; a store with no sink
+    /// sends nothing and does not fail.
+    #[tokio::test]
+    async fn issue1094_a_merged_remote_delta_sends_one_change_notice() {
+        let fx = retire_fixture("store/1094-change").await;
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        fx.sync.set_change_sink(tx);
+        let loops = start_joinable(&fx.sync).await;
+        publish_late_delta(&fx).await;
+        let change = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("a merged delta sends a notice")
+            .expect("notice");
+        assert_eq!(
+            change,
+            KvStoreChanged {
+                topic: "store/1094-change".to_string(),
+                origin: KvChangeOrigin::Remote,
+            }
+        );
+        assert!(fx.sync.read().await.get("late-key").is_some());
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "one merge, one notice"
+        );
+        fx.sync.note_change(KvChangeOrigin::Local);
+        assert_eq!(
+            rx.try_recv().expect("local notice").origin,
+            KvChangeOrigin::Local
+        );
+        fx.sync.cancel_sync_and_drain().await;
+        join_loops(loops).await;
+
+        let quiet = retire_fixture("store/1094-no-sink").await;
+        quiet.sync.note_change(KvChangeOrigin::Local);
     }
 
     async fn join_loops(loops: Vec<tokio::task::JoinHandle<()>>) {

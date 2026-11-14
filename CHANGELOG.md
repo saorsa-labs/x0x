@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`kv:changed` SSE event on `GET /events` (#1094).** A KV store this
+  daemon has open sends one event per 200 ms window when it changes (local
+  write or delete, merged peer record, direct delta): `store_id` and the
+  set of `origins`, no keys or values. A `lagged` event says notices were
+  lost. Library: `Agent::subscribe_kv_changes`.
 - **A join request that the group owner refuses gets a typed outcome (#1840).**
   The owner's daemon sends the requester a direct message with a reason:
   `stale`, `already_member`, `banned`, `pending_exists` or `invalid`. Only
