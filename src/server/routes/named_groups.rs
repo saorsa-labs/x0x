@@ -35,7 +35,8 @@ pub(in crate::server) use group_recovery::{
 };
 pub(in crate::server) use revocation_eviction::owner_recovery::sign_recovery_mandate;
 pub(in crate::server) use revocation_eviction::{
-    run_revocation_eviction_worker, s4_no_eligible_admin_refusal, S4Runtime,
+    load_revocation_eviction_store, run_revocation_eviction_worker, s4_no_eligible_admin_refusal,
+    S4Runtime,
 };
 pub(in crate::server) use seat_cert_fetch::{
     cert_evidence_deadline_elapsed, clear_cert_evidence_stamps, clear_cert_evidence_stamps_for,
@@ -5522,9 +5523,14 @@ fn evaluate_fork_evidence_candidate(
             classification,
         )
     };
-    match claimed_parent {
-        Some(parent) => {
-            let signer_snapshot = parent.roster.get(&commit.committed_by);
+    // #1797: a joiner holds no link at its invite base; the base roster
+    // stands in for a conflicting commit that chains from that base.
+    let parent_roster = claimed_parent
+        .map(|parent| &parent.roster)
+        .or_else(|| invite_base_roster_for_parent(current, commit));
+    match parent_roster {
+        Some(parent_roster) => {
+            let signer_snapshot = parent_roster.get(&commit.committed_by);
             let active_admin_at_parent = signer_snapshot.is_some_and(|snap| {
                 snap.state == x0x::groups::GroupMemberState::Active
                     && snap.role.at_least(x0x::groups::GroupRole::Admin)
@@ -5656,6 +5662,30 @@ fn mandate_anchors_commit_under_trusted_owner(
     })
 }
 
+/// #1797: the roster at the joiner's invite base, when `commit` chains
+/// directly from that base (`prev_state_hash` is the base hash and the
+/// revision is the next one). A joiner retains the links its inviter
+/// serves but not the base link, so without this a conflicting commit
+/// from the base (a removed admin's inviter seats the joiner on its fork)
+/// has no retained predecessor and never authenticates. The projection
+/// counts only while it re-derives the signed `base_roster_root`. It is
+/// the same base the joiner seeded its roster from and validated the
+/// served chain against (`validate_alternate_chain`), so it adds no new
+/// trust root.
+fn invite_base_roster_for_parent<'a>(
+    current: &'a x0x::groups::GroupInfo,
+    commit: &x0x::groups::state_commit::GroupStateCommit,
+) -> Option<&'a BTreeMap<String, x0x::groups::RosterMemberSnapshot>> {
+    let lineage = current.invite_lineage.as_ref()?;
+    let chains_from_base = !lineage.base_roster.is_empty()
+        && commit.revision == lineage.base_revision.saturating_add(1)
+        && commit.prev_state_hash.as_deref() == Some(lineage.base_hash.as_str());
+    (chains_from_base
+        && x0x::groups::state_commit::roster_root_of_projection(&lineage.base_roster)
+            == lineage.base_roster_root)
+        .then_some(&lineage.base_roster)
+}
+
 /// #468 A5 (r4): the pure candidate-authentication step shared by the
 /// live apply wrapper and journal recovery — structure/signature
 /// verification plus committer-was-active-admin in the retained
@@ -5675,7 +5705,9 @@ fn fork_candidate_authenticated(
         .iter()
         .rev()
         .find(|rc| rc.commit.revision == commit.revision.saturating_sub(1))
-        .and_then(|predecessor| predecessor.roster.get(&commit.committed_by))
+        .map(|predecessor| &predecessor.roster)
+        .or_else(|| invite_base_roster_for_parent(current, commit))
+        .and_then(|roster| roster.get(&commit.committed_by))
         .is_some_and(|snap| {
             snap.state == x0x::groups::GroupMemberState::Active
                 && snap.role.at_least(x0x::groups::GroupRole::Admin)
@@ -8404,6 +8436,8 @@ async fn prepare_rebind_journal_for_groups(
         write_home_suite_sidecar_journal(&state.treekem_dir, &tx, &home_suite_json)
             .await
             .map_err(|e| anyhow::anyhow!("Home-Suite sidecar journal write: {e}"))?;
+        #[cfg(test)]
+        tests::issue1368_crash_matrix::take_crash_image(state, "rebind-1-hsjournal");
         journals_ours = true;
         let journal = TreeKemNamedPersistJournal {
             version: TREEKEM_NAMED_JOURNAL_VERSION,
@@ -8434,6 +8468,8 @@ async fn prepare_rebind_journal_for_groups(
             }
             Err(e) => return Err(anyhow::anyhow!("TreeKEM journal write: {e}")),
         }
+        #[cfg(test)]
+        tests::issue1368_crash_matrix::take_crash_image(state, "rebind-2-journal");
         Ok(RebindOutcome::Rebound)
     }
     .await;
@@ -8467,6 +8503,8 @@ async fn apply_rebind_journal_snapshot(state: &AppState, group_id: &str) -> anyh
     // file is durable — a crash anywhere before the deletes is replayed
     // forward by the still-present journals.
     apply_home_suite_sidecar_journal(state, group_id).await?;
+    #[cfg(test)]
+    tests::issue1368_crash_matrix::take_crash_image(state, "rebind-3-sidecar");
     match persist_treekem_snapshot_bytes_typed(
         &state.treekem_dir,
         group_id,
@@ -8491,6 +8529,8 @@ async fn apply_rebind_journal_snapshot(state: &AppState, group_id: &str) -> anyh
         }
         Err(e) => return Err(anyhow::anyhow!("snapshot write: {e}")),
     }
+    #[cfg(test)]
+    tests::issue1368_crash_matrix::take_crash_image(state, "rebind-4-snapshot");
     // Restore the repaired group into the live map when it was missing.
     rebind_restore_live_group(state, group_id).await;
     if let Err(e) = tokio::fs::remove_file(&journal_path).await {
@@ -8498,7 +8538,11 @@ async fn apply_rebind_journal_snapshot(state: &AppState, group_id: &str) -> anyh
             return Err(anyhow::anyhow!("TreeKEM journal cleanup: {e}"));
         }
     }
+    #[cfg(test)]
+    tests::issue1368_crash_matrix::take_crash_image(state, "rebind-5-journal-removed");
     remove_home_suite_sidecar_journal(&state.treekem_dir, group_id).await;
+    #[cfg(test)]
+    tests::issue1368_crash_matrix::take_crash_image(state, "rebind-6-done");
     Ok(())
 }
 
@@ -10032,14 +10076,22 @@ fn recovery_seat_may_receive_key_package(
         .is_some_and(|member| member.state == x0x::groups::GroupMemberState::Removed)
 }
 
-/// #1113 / #1567: a Removed seat may take back its KeyPackage bytes from
-/// the member's own signed `MemberJoined`, with no inviter attestation,
-/// when the bytes hash to the KeyPackage hash that the verified roster
-/// commits for the seat. A Welcome joiner needs this: its roster has no
-/// `added_by` for the members seated before it (the v4 invite roster is a
-/// projection without it), so the inviter attestation never verifies
-/// there. The leaf-removal proof of a self-leave reads these bytes.
-fn removed_seat_self_signed_key_package(
+/// #1113 / #1567 / #1583: an Active or Removed seat may take its
+/// KeyPackage bytes from the member's own signed `MemberJoined`, with no
+/// inviter attestation, when the bytes hash to the KeyPackage hash that
+/// the verified roster commits for the seat. The admin-signed roster
+/// commit already names these exact bytes, so a member cannot substitute
+/// a fresh package: a different package has a different hash.
+///
+/// A Welcome joiner needs this: its roster has no `added_by` for the
+/// members seated before it (the v4 invite roster is a projection without
+/// it), so the inviter attestation never verifies there. The leaf-removal
+/// proof of a self-leave reads these bytes. #1583: a removal of an Active
+/// seat needs them too, and the attested form reaches other members only
+/// in one direct message from the seating admin (gossip `MemberAdded`
+/// carries no `member_joined_recovery`), so catch-up accepts and serves
+/// the self-signed form.
+fn seat_self_signed_key_package(
     info: &x0x::groups::GroupInfo,
     event: &NamedGroupMetadataEvent,
 ) -> bool {
@@ -10051,14 +10103,14 @@ fn removed_seat_self_signed_key_package(
     else {
         return false;
     };
+    if !recovery_seat_may_receive_key_package(info, member_agent_id) {
+        return false;
+    }
     let seat_commits_bytes = info.members_v2.get(member_agent_id).is_some_and(|member| {
-        member.state == x0x::groups::GroupMemberState::Removed
-            && member
-                .treekem_key_package_hash
-                .as_deref()
-                .is_some_and(|expected| {
-                    blake3::hash(kp_b64.as_bytes()).to_hex().as_str() == expected
-                })
+        member
+            .treekem_key_package_hash
+            .as_deref()
+            .is_some_and(|expected| blake3::hash(kp_b64.as_bytes()).to_hex().as_str() == expected)
     });
     seat_commits_bytes && verify_member_joined_key_package_event(event)
 }
@@ -11037,7 +11089,7 @@ async fn apply_recovered_member_key_package_locked(
             return false;
         };
         if !verify_authority_attested_member_joined_recovery(info, event)
-            && !removed_seat_self_signed_key_package(info, event)
+            && !seat_self_signed_key_package(info, event)
         {
             tracing::warn!(
                 group_id = %LogHexId::group(group_id),
@@ -11203,7 +11255,10 @@ pub(in crate::server) async fn holds_member_key_package_for_removal(
         .treekem_member_key_packages
         .get(&key)
         .await
-        .is_some_and(|event| verify_authority_attested_member_joined_recovery(&info, &event))
+        .is_some_and(|event| {
+            verify_authority_attested_member_joined_recovery(&info, &event)
+                || seat_self_signed_key_package(&info, &event)
+        })
 }
 
 async fn recover_member_treekem_key_package_locked(
@@ -12768,7 +12823,10 @@ async fn member_keyed_treekem_catchup_response(
         .treekem_member_key_packages
         .find_for_member(log_keys, target_member_id)
         .await
-        .filter(|event| verify_authority_attested_member_joined_recovery(&info, event));
+        .filter(|event| {
+            verify_authority_attested_member_joined_recovery(&info, event)
+                || seat_self_signed_key_package(&info, event)
+        });
     Some(TreeKemCatchupResponse {
         message_type: "treekem_catchup_response".to_string(),
         group_id: request.group_id.clone(),
@@ -13763,7 +13821,7 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                     .map(|(_, ev)| ev)
                     .filter(|ev| {
                         verify_authority_attested_member_joined_recovery(&response_info, ev)
-                            || removed_seat_self_signed_key_package(&response_info, ev)
+                            || seat_self_signed_key_package(&response_info, ev)
                     });
                 // A survivor may relay a signed removal. The transport sender
                 // is that survivor. The author is the verified commit signer.
@@ -26164,12 +26222,24 @@ pub(super) async fn join_group_via_invite_inner(
             // the authenticated invite committed to, before any seat.
             // Intermediate commits that apply before our own seat cannot
             // lose the base this way (v3 review item 5).
+            let signed_base_roster_root = view.signed_roster_root();
             info.invite_lineage = Some(x0x::groups::InviteLineage {
                 base_revision: view.base_state_revision,
                 base_hash: view.base_state_hash.clone(),
+                // #1797: keep the base projection only when it re-derives
+                // the signed root (a v6 join with no fetched roster keeps
+                // none).
+                base_roster: if x0x::groups::state_commit::roster_root_of_projection(
+                    effective_base_roster,
+                ) == signed_base_roster_root
+                {
+                    effective_base_roster.clone()
+                } else {
+                    BTreeMap::new()
+                },
                 // #646: the signed root — carried on v6, re-derived from
                 // the inline projection on v4 (same value either way).
-                base_roster_root: view.signed_roster_root(),
+                base_roster_root: signed_base_roster_root,
                 seated_at_revision: None,
                 corroborated: false,
                 fork_evidence: None,
@@ -39387,6 +39457,8 @@ async fn persist_treekem_and_named_groups_atomic_locked(
     .await
     .map_err(before_commit)?;
     #[cfg(test)]
+    tests::issue1368_crash_matrix::take_crash_image(state, "seal-1-hsjournal");
+    #[cfg(test)]
     if state.named_groups_save_fault.load(Ordering::SeqCst) == SaveFault::JournalWriteFails as u8 {
         return Err(before_commit(anyhow::anyhow!(
             "TreeKEM journal write: test fault"
@@ -39409,6 +39481,8 @@ async fn persist_treekem_and_named_groups_atomic_locked(
         }
         Err(e) => return Err(before_commit(anyhow::anyhow!("TreeKEM journal write: {e}"))),
     }
+    #[cfg(test)]
+    tests::issue1368_crash_matrix::take_crash_image(state, "seal-2-journal");
     // 2) Live files, each now repairable from the journals above.
     // #1187: past the commit point, a failure that does NOT durably commit
     // the named half discards the journal pair, so a restart agrees with the
@@ -39424,6 +39498,8 @@ async fn persist_treekem_and_named_groups_atomic_locked(
         discard_unless_kept(state, group_id_hex, keep_journals).await;
         anyhow::bail!("Home-Suite sidecar replacement did not occur");
     }
+    #[cfg(test)]
+    tests::issue1368_crash_matrix::take_crash_image(state, "seal-3-sidecar");
     match persist_treekem_snapshot_bytes_typed(&state.treekem_dir, group_id_hex, snapshot_envelope)
         .await
     {
@@ -39446,6 +39522,8 @@ async fn persist_treekem_and_named_groups_atomic_locked(
             return Err(anyhow::anyhow!("treekem snapshot write: {e}"));
         }
     }
+    #[cfg(test)]
+    tests::issue1368_crash_matrix::take_crash_image(state, "seal-4-snapshot");
     match repair_withdrawn_named_groups_json_and_wipe_key_material_locked(
         state,
         group_id_hex,
@@ -39519,6 +39597,8 @@ async fn persist_treekem_and_named_groups_atomic_locked(
             anyhow::bail!("named groups replacement did not occur");
         }
     }
+    #[cfg(test)]
+    tests::issue1368_crash_matrix::take_crash_image(state, "seal-5-named");
     // #732 r8: the durable install converges the same way (see the
     // ReplacedNotDurable arm).
     {
@@ -39533,6 +39613,8 @@ async fn persist_treekem_and_named_groups_atomic_locked(
                 .context(format!("TreeKEM journal cleanup: {e}")));
         }
     }
+    #[cfg(test)]
+    tests::issue1368_crash_matrix::take_crash_image(state, "seal-6-journal-removed");
     // #458 r3: this group's state is now durable (journal replayed or both
     // files written) — it is no longer an unconfirmed join stub.
     state
@@ -39542,6 +39624,8 @@ async fn persist_treekem_and_named_groups_atomic_locked(
         .remove(group_id_hex);
     // #451 (merged main): the sidecar journal completes with the legacy one.
     remove_home_suite_sidecar_journal(&state.treekem_dir, group_id_hex).await;
+    #[cfg(test)]
+    tests::issue1368_crash_matrix::take_crash_image(state, "seal-7-done");
     Ok(())
 }
 
@@ -45376,6 +45460,8 @@ async fn save_named_groups_store_checked(
         }
         sidecar_rollback = Some(pre_sidecar_bytes);
     }
+    #[cfg(test)]
+    tests::issue1368_crash_matrix::take_crash_image(state, "save-1-sidecar");
     // #470/#471 fault shape: the sidecar above has already been written;
     // failing HERE reproduces the documented #471 split outcome
     // (sidecar new / named old) through the production path — which the
@@ -45415,6 +45501,8 @@ async fn save_named_groups_store_checked(
             tracing::error!("Failed to save named groups: {e}");
             e
         });
+    #[cfg(test)]
+    tests::issue1368_crash_matrix::take_crash_image(state, "save-2-named");
     // #471: the named write did NOT land (pre-rename failure or no
     // replacement) while the sidecar above already did — the split this
     // ordinary save path has no journal to repair. Undo the sidecar half
@@ -53332,6 +53420,7 @@ pub(in crate::server) mod tests {
     mod issue1288_bootstrap_outbox_shutdown;
     mod issue1347_join_request_token_class;
     pub(in crate::server) mod issue1366_public_listener;
+    pub(in crate::server) mod issue1368_crash_matrix;
     mod issue1569_owner_certified_placeholder;
     mod issue1570_held_back_cards;
     mod issue1570_held_back_rebind;
@@ -54225,6 +54314,7 @@ pub(in crate::server) mod tests {
             upgrade_check_cache: Mutex::new(None),
             upgrade_apply_lock: Arc::new(Mutex::new(())),
             http_upgrade_wait_lock: Arc::new(Mutex::new(())),
+            self_published_release_manifests: Default::default(),
             #[cfg(unix)]
             upgrade_staging: None,
             api_token: "test-token".to_string(),
@@ -65438,6 +65528,7 @@ pub(in crate::server) mod tests {
         stable_group_id: String,
         member_id: AgentId,
         member_hex: String,
+        member_keypair: x0x::identity::AgentKeypair,
         event: NamedGroupMetadataEvent,
         group: Arc<Mutex<x0x::mls::TreeKemMlsGroup>>,
         initial_epoch: u64,
@@ -65601,6 +65692,7 @@ pub(in crate::server) mod tests {
             stable_group_id,
             member_id,
             member_hex,
+            member_keypair,
             event,
             group,
             initial_epoch,
@@ -71438,6 +71530,51 @@ pub(in crate::server) mod tests {
         Ok(())
     }
 
+    /// WHY (#1583): removing an Active seat needs that member's KeyPackage.
+    /// The attested form reaches other members only in one direct message
+    /// from the seating admin (gossip `MemberAdded` carries no
+    /// `member_joined_recovery`), so a member that missed it could never
+    /// remove the seat. The member's own signed `MemberJoined` now counts
+    /// for an Active seat when its bytes hash to the roster-committed
+    /// `treekem_key_package_hash`, and catch-up serves that form.
+    #[tokio::test]
+    async fn issue1583_active_seat_takes_committed_key_package_from_self_signed_member_joined(
+    ) -> Result<()> {
+        let fixture = member_joined_treekem_fixture(0x9b, 0x9c).await?;
+        let state = &fixture.state;
+        let group_id = fixture.group_id.clone();
+        let member_hex = fixture.member_hex.clone();
+        let inviter_hex = hex::encode(state.agent.agent_id().as_bytes());
+        insert_active_member_without_kp(state, &group_id, &member_hex, &inviter_hex).await;
+        let self_signed = without_recovery_attestation(fixture.event.clone());
+        let committed_kp = match &self_signed {
+            NamedGroupMetadataEvent::MemberJoined {
+                treekem_key_package_b64: Some(kp),
+                ..
+            } => kp.clone(),
+            _ => anyhow::bail!("fixture carries a KeyPackage"),
+        };
+        assert!(
+            !holds_member_key_package_for_removal(state, &group_id, &member_hex).await,
+            "control: no package is held before recovery"
+        );
+
+        assert!(
+            apply_recovered_member_key_package(state, &self_signed).await,
+            "#1583: the self-signed committed bytes install on an Active seat"
+        );
+        assert_eq!(
+            member_treekem_kp(state, &group_id, &member_hex).await,
+            Some(committed_kp),
+            "the installed bytes are the roster-committed package"
+        );
+        assert!(
+            holds_member_key_package_for_removal(state, &group_id, &member_hex).await,
+            "the removal precondition now holds"
+        );
+        Ok(())
+    }
+
     /// WP-TK1 CRITICAL — fail-closed recovery gate (issue #205): a recovered
     /// key-package install is authenticated THREE independent ways, each of
     /// which alone must refuse the install. (1) The member's ML-DSA-65 signature
@@ -71463,12 +71600,24 @@ pub(in crate::server) mod tests {
         let valid_event = fixture.event.clone();
 
         // A compromised target can self-sign a fresh package after joining.
-        // Member authentication alone is therefore insufficient: without the
-        // inviter's post-acceptance countersignature, recovery must reject it.
-        let member_only_event = without_recovery_attestation(valid_event.clone());
+        // Member authentication alone is therefore insufficient: a package
+        // whose hash the roster does not commit is refused without the
+        // inviter's post-acceptance countersignature (#1583 accepts the
+        // self-signed form only for the committed bytes).
+        let fresh_prepared =
+            x0x::mls::TreeKemMlsGroup::prepare_member(fixture.member_id, &[0xed; 32])?;
+        let member_only_event = resign_member_joined_key_package(
+            without_recovery_attestation(valid_event.clone()),
+            &fixture.member_keypair,
+            BASE64.encode(fresh_prepared.key_package_bytes()),
+        )?;
+        assert!(
+            verify_member_joined_key_package_event(&member_only_event),
+            "control: the fresh package is genuinely member-signed"
+        );
         assert!(
             !apply_recovered_member_key_package(state, &member_only_event).await,
-            "member-signed package without inviter acceptance is refused"
+            "member-signed fresh package without inviter acceptance is refused"
         );
         assert!(
             member_treekem_kp(state, &group_id, &member_hex)
@@ -72919,6 +73068,51 @@ pub(in crate::server) mod tests {
         assert_eq!(body["error"], "member_key_package_pending");
         assert_eq!(body["retry"], true);
         Ok(())
+    }
+
+    /// Re-sign a `MemberJoined` as its member with different KeyPackage
+    /// bytes (a member self-signing a fresh package after joining).
+    fn resign_member_joined_key_package(
+        mut event: NamedGroupMetadataEvent,
+        member_keypair: &x0x::identity::AgentKeypair,
+        new_key_package_b64: String,
+    ) -> Result<NamedGroupMetadataEvent> {
+        if let NamedGroupMetadataEvent::MemberJoined {
+            group_id,
+            stable_group_id,
+            member_agent_id,
+            member_public_key_b64,
+            role,
+            display_name,
+            inviter_agent_id,
+            invite_secret,
+            ts_ms,
+            treekem_key_package_b64,
+            signature_b64,
+            ..
+        } = &mut event
+        {
+            let canonical = canonical_member_joined_bytes(
+                group_id,
+                stable_group_id.as_deref(),
+                member_agent_id,
+                member_public_key_b64,
+                *role,
+                display_name.as_deref(),
+                inviter_agent_id,
+                invite_secret,
+                *ts_ms,
+                Some(&new_key_package_b64),
+            );
+            let signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+                member_keypair.secret_key(),
+                &canonical,
+            )
+            .map_err(|e| anyhow::anyhow!("re-sign MemberJoined: {e:?}"))?;
+            *treekem_key_package_b64 = Some(new_key_package_b64);
+            *signature_b64 = BASE64.encode(signature.as_bytes());
+        }
+        Ok(event)
     }
 
     fn without_recovery_attestation(mut event: NamedGroupMetadataEvent) -> NamedGroupMetadataEvent {
