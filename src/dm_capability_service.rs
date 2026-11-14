@@ -38,8 +38,17 @@ pub(crate) const UNICAST_REPLY_TRAILER_TAG: u8 = 0x01;
 /// the response topic.
 pub(crate) const UNICAST_RESPONSE_DOMAIN: &[u8] = b"x0x/caps/v1/unicast-response\0";
 
-/// #504: bound on one direct answer. A slower send falls back to the topic.
-const UNICAST_RESPONSE_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+/// #504: bound on one cycle's direct answers, sent concurrently. Any send
+/// not done by then falls back to the topic, so the publisher loop never
+/// waits longer than this.
+const UNICAST_RESPONSE_SEND_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// #504: how long a request-triggered answer waits for the request's other
+/// carrier copy.
+const REQUEST_CARRIER_COALESCE: Duration = Duration::from_millis(200);
+
+/// #504: most direct answers in one cycle; more requesters get the topic.
+const MAX_UNICAST_RESPONSES_PER_CYCLE: usize = 8;
 
 /// A verified requester can make one peer republish public data, but must not
 /// be able to amplify traffic without bound. Exactly one daemon answers a
@@ -378,15 +387,25 @@ impl UnicastResponder {
         if !self.network.is_connected(&peer).await {
             return false;
         }
-        matches!(
-            tokio::time::timeout(
-                UNICAST_RESPONSE_SEND_TIMEOUT,
-                self.network
-                    .send_direct(&peer, self_agent_id.as_bytes(), frame),
-            )
-            .await,
-            Ok(Ok(()))
-        )
+        self.network
+            .send_direct(&peer, self_agent_id.as_bytes(), frame)
+            .await
+            .is_ok()
+    }
+}
+
+/// #504 (review: amplification): the machine to answer directly. Only the
+/// requester's own verified binding (its signed advert in the capability
+/// store) qualifies. A reply-to naming any other machine, or a requester
+/// with no binding here, is answered on the topic: a verified agent cannot
+/// point direct answers at a machine that is not its own.
+pub(crate) fn unicast_target(
+    reply_to: Option<MachineId>,
+    requester_binding: Option<MachineId>,
+) -> Option<MachineId> {
+    match (reply_to, requester_binding) {
+        (Some(named), Some(bound)) if named == bound => Some(named),
+        _ => None,
     }
 }
 
@@ -402,8 +421,14 @@ struct PendingRequests {
 }
 
 impl PendingRequests {
-    fn note(&mut self, (requester, reply_to): (AgentId, Option<MachineId>), unicast_enabled: bool) {
-        match reply_to {
+    fn note(
+        &mut self,
+        (requester, reply_to): (AgentId, Option<MachineId>),
+        unicast_enabled: bool,
+        store: &CapabilityStore,
+    ) {
+        let bound = store.lookup_binding(&requester).map(|b| b.machine_id);
+        match unicast_target(reply_to, bound) {
             Some(machine) if unicast_enabled => {
                 self.unicast.insert(requester, machine);
             }
@@ -720,6 +745,7 @@ impl CapabilityAdvertService {
         let publisher_pubsub = Arc::clone(&pubsub);
         let publisher_signing = Arc::clone(&signing);
         let mut publisher_caps_rx = caps_rx;
+        let publisher_store = Arc::clone(&store);
         let publisher = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(FIRST_PUBLISH_DELAY_MS)).await;
             // L3 retirement: in on-demand mode (periodic == false) there is
@@ -762,7 +788,7 @@ impl CapabilityAdvertService {
                     if let Some(observer) = &observation {
                         observer.record(ServiceEvent::Consumed);
                     }
-                    requests.note(request, unicast.is_some());
+                    requests.note(request, unicast.is_some(), &publisher_store);
                     targeted_response_pending = true;
                 }
                 let caps_snapshot = publisher_caps_rx.borrow().clone();
@@ -800,7 +826,7 @@ impl CapabilityAdvertService {
                                 Some(request) => {
                                     #[cfg(test)]
                                     if let Some(observer) = &observation { observer.record(ServiceEvent::Consumed); }
-                                    requests.note(request, unicast.is_some());
+                                    requests.note(request, unicast.is_some(), &publisher_store);
                                     targeted_response_pending = true;
                                 },
                                 None => requests_open = false,
@@ -864,24 +890,49 @@ impl CapabilityAdvertService {
                                     &publisher_signing.public_key_bytes,
                                     &bytes,
                                 );
-                                for machine in targets {
-                                    let sent = match &frame {
-                                        Some(frame) => {
-                                            responder
-                                                .send(self_agent_id, MachineId(machine), frame)
-                                                .await
+                                if targets.len() > MAX_UNICAST_RESPONSES_PER_CYCLE {
+                                    topic_due = true;
+                                }
+                                let direct: Vec<[u8; 32]> = targets
+                                    .into_iter()
+                                    .take(MAX_UNICAST_RESPONSES_PER_CYCLE)
+                                    .collect();
+                                match &frame {
+                                    Some(frame) if !direct.is_empty() => {
+                                        // Concurrent, and bounded as one
+                                        // batch: the loop waits at most
+                                        // UNICAST_RESPONSE_SEND_TIMEOUT.
+                                        let sends = direct.iter().map(|machine| {
+                                            responder.send(
+                                                self_agent_id,
+                                                MachineId(*machine),
+                                                frame,
+                                            )
+                                        });
+                                        match tokio::time::timeout(
+                                            UNICAST_RESPONSE_SEND_TIMEOUT,
+                                            futures::future::join_all(sends),
+                                        )
+                                        .await
+                                        {
+                                            Ok(results) => {
+                                                for (machine, sent) in direct.iter().zip(results) {
+                                                    if sent {
+                                                        tracing::debug!(
+                                                            target: "dm.trace",
+                                                            stage = "capability_advert_response_unicast",
+                                                            machine = %hex::encode(machine),
+                                                        );
+                                                    } else {
+                                                        topic_due = true;
+                                                    }
+                                                }
+                                            }
+                                            Err(_) => topic_due = true,
                                         }
-                                        None => false,
-                                    };
-                                    if sent {
-                                        tracing::debug!(
-                                            target: "dm.trace",
-                                            stage = "capability_advert_response_unicast",
-                                            machine = %hex::encode(machine),
-                                        );
-                                    } else {
-                                        topic_due = true;
                                     }
+                                    Some(_) => {}
+                                    None => topic_due |= !direct.is_empty(),
                                 }
                             } else if !targets.is_empty() {
                                 topic_due = true;
@@ -1002,7 +1053,7 @@ impl CapabilityAdvertService {
                                 Some(request) => {
                                     #[cfg(test)]
                                     if let Some(observer) = &observation { observer.record(ServiceEvent::Consumed); }
-                                    requests.note(request, unicast.is_some());
+                                    requests.note(request, unicast.is_some(), &publisher_store);
                                     targeted_response_pending = true;
                                     let now = tokio::time::Instant::now();
                                     let earliest = last_targeted_response_at.map_or(now, |last| {
@@ -1017,6 +1068,16 @@ impl CapabilityAdvertService {
                                         // #656: this cycle answers on the
                                         // targeted response topic only.
                                         steady_cycle = false;
+                                        // #504: a request comes on two
+                                        // carriers (Critical with the
+                                        // reply-to, warm without). Wait for
+                                        // the other copy, so one cycle sees
+                                        // both and a direct answer is not
+                                        // doubled on the topic. The loop
+                                        // top drains it.
+                                        if unicast.is_some() {
+                                            tokio::time::sleep(REQUEST_CARRIER_COALESCE).await;
+                                        }
                                         break;
                                     }
                                     // Bring the wake-up forward to the first
