@@ -1018,23 +1018,46 @@ function navigate(view,data){
 function navigateSpace(id,app){navigate('space',{spaceId:id,spaceApp:app||'chat'})}
 function navigateDm(agentId){navigate('dm',{dmTarget:agentId})}
 // #893 deep links: `/gui#/dm/<agent_id>`, `#/groups/<group_id>[/<app>]`,
+// `#/scratch/<group_id>` (#1094: alias of `#/groups/<group_id>/scratch`),
 // or a top-level view (`#/people`, `#/network`, …). Ids must be hex:
 // several views interpolate them into inline onclick handlers, and a link
 // can come from anyone.
 const HASH_VIEWS=['home','homespace','discover','people','network','presence','mls','admin','settings','constitution','about'];
-const HASH_SPACE_APPS=['chat','board','files','swarm','feed','wiki','web'];
+const HASH_SPACE_APPS=['chat','board','files','swarm','feed','wiki','web','scratch'];
 function applyHashRoute(){
   const p=String(location.hash||'').replace(/^#\/?/,'').split('/').filter(Boolean);
   const hex=s=>/^[0-9a-f]{16,128}$/i.test(s||'');
   if(p[0]==='dm'&&p.length===2&&hex(p[1])){navigateDm(p[1].toLowerCase());return true}
   if(p[0]==='groups'&&(p.length===2||p.length===3)&&hex(p[1])&&(!p[2]||HASH_SPACE_APPS.includes(p[2]))){navigateSpace(p[1].toLowerCase(),p[2]);return true}
+  if(p[0]==='scratch'&&p.length===2&&hex(p[1])){navigateSpace(p[1].toLowerCase(),'scratch');return true}
   if(p.length===1&&HASH_VIEWS.includes(p[0])){navigate(p[0]);return true}
   if(p.length)toast('Unknown GUI view link: #/'+p.join('/'),'warning');
   return false;
 }
 
 // Utility
-function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
+// HTML escaper for text AND quoted attribute values: it escapes both quote
+// kinds as well as &, < and > (#1893 review: the old textContent/innerHTML
+// escaper left `"` alone, so a value inside an attribute could close it).
+function esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
+// One clickable list card for a key read from a store. A key is written by
+// any group writer, so it never enters an HTML string: the label is set with
+// textContent and the click handler closes over the value (#1893 review).
+function storeKeyCard(label,hint,onClick,labelFont){
+  const card=document.createElement('div');
+  card.className='card mb';card.style.cursor='pointer';
+  const t=document.createElement('div');
+  t.style.font=labelFont||'500 13px var(--sans)';t.style.color='var(--cy)';
+  t.textContent=String(label);
+  card.appendChild(t);
+  if(hint){
+    const h=document.createElement('div');
+    h.style.fontSize='11px';h.style.color='var(--tx3)';h.style.marginTop='2px';
+    h.textContent=hint;card.appendChild(h);
+  }
+  card.addEventListener('click',onClick);
+  return card;
+}
 // JS-string escaper for use inside onclick='...' inline handlers.
 // Escapes quotes, backslashes, and control chars so the value is safe inside a JS string literal.
 function escJs(s){return String(s||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'\\"').replace(/</g,'\\x3c').replace(/>/g,'\\x3e')}
@@ -1851,8 +1874,8 @@ function renderSidebar(){
       });
       sh+='<div class="channel-item" onclick="showCreateChannel(\''+g.group_id+'\')" style="color:var(--tx3)"><span class="hash">+</span><span>Add channel</span></div>';
       // Other apps
-      const appIcons={board:'&#128203;',files:'&#128193;',swarm:'&#128029;',feed:'&#128240;',wiki:'&#128214;',web:'&#127760;'};
-      const apps=['board','files','swarm','feed','wiki','web'];
+      const appIcons={board:'&#128203;',files:'&#128193;',swarm:'&#128029;',feed:'&#128240;',wiki:'&#128214;',web:'&#127760;',scratch:'&#128221;'};
+      const apps=['board','files','swarm','feed','wiki','web','scratch'];
       apps.forEach(a=>{
         sh+='<div class="sb-item'+(sapp===a?' active':'')+'" onclick="navigateSpace(\''+g.group_id+'\',\''+a+'\')">';
         sh+='<span class="icon">'+appIcons[a]+'</span><span>'+a.charAt(0).toUpperCase()+a.slice(1)+'</span></div>';
@@ -2305,7 +2328,7 @@ function renderSpace(){
   const app=S.get('spaceApp');
   const g=(S.get('groups')||[]).find(x=>x.group_id===sid);
   const name=g?g.name:short(sid);
-  const tabs=['chat','board','files','swarm','feed','wiki','web'];
+  const tabs=['chat','board','files','swarm','feed','wiki','web','scratch'];
   return `<div class="row mb" style="justify-content:space-between;align-items:center">
     <h2 style="margin:0">${esc(name)}</h2>
     <div class="row" style="gap:4px">
@@ -2388,6 +2411,7 @@ async function mountSpace(){
     case 'feed':renderSpaceFeed(el,sid);break;
     case 'wiki':renderSpaceWiki(el,sid);break;
     case 'web':renderSpaceWeb(el,sid);break;
+    case 'scratch':renderSpaceScratch(el,sid);break;
     default:renderSpaceChat(el,sid);
   }
 }
@@ -3485,10 +3509,7 @@ async function loadWikiPages(sid){
   }
   const keys=(r.keys||[]).map(k=>typeof k==='string'?k:k.key||k);
   if(keys.length>0){
-    el.innerHTML=keys.map(k=>`<div class="card mb" style="cursor:pointer" data-wiki-sid="${esc(sid)}" data-wiki-slug="${esc(k)}" onclick="editWikiPage(this.dataset.wikiSid,this.dataset.wikiSlug)">
-      <div style="font:500 13px var(--sans);color:var(--cy)">${esc(k)}</div>
-      <div style="font-size:11px;color:var(--tx3);margin-top:2px">Click to edit</div>
-    </div>`).join('');
+    el.replaceChildren(...keys.map(k=>storeKeyCard(k,'Click to edit',()=>editWikiPage(sid,k))));
   }else{
     el.innerHTML='<div style="color:var(--tx3);font-size:12px;padding:8px">No wiki pages yet. Create one above.</div>';
   }
@@ -3515,6 +3536,122 @@ async function editWikiPage(sid,slug){
   const v=r.value===undefined||r.value===null?'':r.value;
   try{document.getElementById('wiki-content').value=u8decode(v)}catch(e){document.getElementById('wiki-content').value=String(v)}
   document.getElementById('wiki-editor').style.display='block';
+}
+
+// --- Space: Scratch (#1094) ---
+// The group's sealed last-writer-wins `scratch` store (A10): short shared
+// notes for the people and agents of this space. It is opened like the Wiki
+// store (POST /groups/:id/stores, group-bound, never the generic store) and
+// addressed only by the id the opener returns. A rider token with the
+// `scratch:read` / `scratch:read_write` scope reaches the same store.
+let currentScratchKey='';
+
+function renderSpaceScratch(el,sid){
+  el.innerHTML=`<p style="font-size:12px;color:var(--tx3);margin-bottom:12px">Scratch is this space's shared notepad: keys with short text values, last writer wins. Values are sealed to the group like the other space stores.</p>
+  <div class="row mb"><input id="scratch-key" placeholder="Key (e.g. todo)"><button class="pri" onclick="createScratchKey('${sid}')">New key</button></div>
+  <div id="scratch-keys"></div>
+  <div id="scratch-editor" style="display:none" class="mt">
+    <h3 id="scratch-title"></h3>
+    <textarea id="scratch-value" rows="8" style="width:100%;resize:vertical;font-family:var(--mono);font-size:12px"></textarea>
+    <div id="scratch-error" class="mt" style="display:none;font-size:12px;color:var(--rd)"></div>
+    <div class="row mt"><button class="pri" onclick="saveScratchKey('${sid}')">Save</button><button onclick="deleteScratchKey('${sid}')">Delete</button><button onclick="document.getElementById('scratch-editor').style.display='none'">Cancel</button></div>
+  </div>`;
+  loadScratchKeys(sid);
+}
+
+function scratchError(msg){
+  const e=document.getElementById('scratch-error');
+  if(!e)return;
+  if(!msg){e.style.display='none';e.textContent='';return}
+  e.textContent=msg;e.style.display='block';
+}
+
+function createScratchKey(sid){
+  const key=document.getElementById('scratch-key').value.trim();
+  if(!key)return;
+  currentScratchKey=key;
+  document.getElementById('scratch-title').textContent=key;
+  document.getElementById('scratch-value').value='';
+  document.getElementById('scratch-editor').style.display='block';
+  document.getElementById('scratch-key').value='';
+  scratchError('');
+}
+
+async function loadScratchKeys(sid){
+  const el=document.getElementById('scratch-keys');if(!el)return;
+  const st=await openSpacePageStore(sid,'scratch');
+  if(!st.ok){spacePagesUnavailable(el,st.reason);return}
+  if(!spacePageStoreCurrent(sid,st)){spacePagesUnavailable(el,SPACE_POLICY_MOVED_BEFORE);return}
+  const r=await api('/stores/'+encSeg(st.id)+'/keys');
+  if(!spacePageStoreCurrent(sid,st)){spacePagesUnavailable(el,SPACE_POLICY_MOVED_AFTER_READ);return}
+  if(!r||!r._http_ok){
+    spacePagesUnavailable(el,'Could not list the scratch keys of this space. '+apiError(r));
+    return;
+  }
+  const keys=(r.keys||[]).map(k=>typeof k==='string'?k:k.key||k);
+  if(keys.length>0){
+    el.replaceChildren(...keys.map(k=>storeKeyCard(k,'',()=>editScratchKey(sid,k),'500 13px var(--mono)')));
+  }else{
+    el.innerHTML='<div style="color:var(--tx3);font-size:12px;padding:8px">No scratch keys yet. Add one above.</div>';
+  }
+}
+
+async function editScratchKey(sid,key){
+  const list=document.getElementById('scratch-keys');
+  const st=await openSpacePageStore(sid,'scratch');
+  if(!st.ok){spacePagesUnavailable(list,st.reason);return}
+  if(!spacePageStoreCurrent(sid,st)){spacePagesUnavailable(list,SPACE_POLICY_MOVED_BEFORE);return}
+  const r=await api('/stores/'+encSeg(st.id)+'/'+encSeg(key));
+  if(!spacePageStoreCurrent(sid,st)){spacePagesUnavailable(list,SPACE_POLICY_MOVED_AFTER_READ);return}
+  // A failed read leaves any open editor and its draft as they are.
+  if(!r||!r._http_ok){spacePagesUnavailable(list,'Could not open "'+key+'". '+apiError(r));return}
+  // The user may have left this space's Scratch tab while the read ran: do
+  // not open another space's key in the editor that is now on screen.
+  if(S.get('view')!=='space'||S.get('spaceId')!==sid||S.get('spaceApp')!=='scratch')return;
+  currentScratchKey=key;
+  scratchError('');
+  document.getElementById('scratch-title').textContent=key;
+  const v=r.value===undefined||r.value===null?'':r.value;
+  try{document.getElementById('scratch-value').value=u8decode(v)}catch(e){document.getElementById('scratch-value').value=String(v)}
+  document.getElementById('scratch-editor').style.display='block';
+}
+
+async function saveScratchKey(sid){
+  // Capture the key and value once: the user can open another key while the
+  // requests below are in flight, and the save must still go to this one.
+  const key=currentScratchKey;
+  const value=document.getElementById('scratch-value').value;
+  scratchError('');
+  if(!key){scratchError('Choose or create a key first.');return}
+  const st=await openSpacePageStore(sid,'scratch');
+  if(!st.ok){scratchError(st.reason);return}
+  if(!spacePageStoreCurrent(sid,st)){scratchError(SPACE_POLICY_MOVED_BEFORE);return}
+  const r=await api('/stores/'+encSeg(st.id)+'/'+encSeg(key),{method:'PUT',body:JSON.stringify({value:u8encode(value),content_type:'text/plain'})});
+  if(!r||!r._http_ok){scratchError('Not saved. '+apiError(r));return}
+  if(r._http_status===202&&r.published===false){scratchError('Saved locally; not yet published to the group. '+String(r.reason||''));return}
+  if(!spacePageStoreCurrent(sid,st)){scratchError(SPACE_POLICY_MOVED_AFTER_WRITE);return}
+  // Close the editor only if it still shows the key that was saved.
+  if(currentScratchKey===key)document.getElementById('scratch-editor').style.display='none';
+  toast('Saved "'+key+'" on this device','success');
+  loadScratchKeys(sid);
+}
+
+async function deleteScratchKey(sid){
+  const key=currentScratchKey;
+  scratchError('');
+  if(!key)return;
+  const st=await openSpacePageStore(sid,'scratch');
+  if(!st.ok){scratchError(st.reason);return}
+  if(!spacePageStoreCurrent(sid,st)){scratchError(SPACE_POLICY_MOVED_BEFORE);return}
+  const r=await api('/stores/'+encSeg(st.id)+'/'+encSeg(key),{method:'DELETE'});
+  if(!r||!r._http_ok){scratchError('Not deleted. '+apiError(r));return}
+  if(!spacePageStoreCurrent(sid,st)){scratchError(SPACE_POLICY_MOVED_AFTER_WRITE);return}
+  if(currentScratchKey===key){
+    document.getElementById('scratch-editor').style.display='none';
+    currentScratchKey='';
+  }
+  toast('Deleted on this device','success');
+  loadScratchKeys(sid);
 }
 
 // --- Space: Web ---
@@ -3590,9 +3727,7 @@ async function loadWebPages(sid){
   }
   const keys=(r.keys||[]).map(k=>typeof k==='string'?k:k.key||k);
   if(keys.length>0){
-    el.innerHTML=keys.map(k=>`<div class="card mb" style="cursor:pointer" data-web-sid="${esc(sid)}" data-web-path="${esc(k)}" onclick="previewWebPage(this.dataset.webSid,this.dataset.webPath)">
-      <span style="color:var(--cy)">${esc(k)}</span>
-    </div>`).join('');
+    el.replaceChildren(...keys.map(k=>storeKeyCard(k,'',()=>previewWebPage(sid,k),'inherit')));
     previewWebPage(sid,keys[0]);
   }else{
     el.innerHTML='<div style="color:var(--tx3);font-size:12px">No pages published yet.</div>';

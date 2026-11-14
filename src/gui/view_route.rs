@@ -1,7 +1,8 @@
 //! Rust-side GUI view grammar (ADR 0083 §4).
 //!
 //! Mirrors `applyHashRoute` in `x0x-gui.html`: `dm/<hex>`,
-//! `groups/<hex>[/<HASH_SPACE_APPS>]`, and the `HASH_VIEWS` singletons.
+//! `groups/<hex>[/<HASH_SPACE_APPS>]`, `scratch/<hex>` (an alias of
+//! `groups/<hex>/scratch`, #1094), and the `HASH_VIEWS` singletons.
 //! Anything else is `invalid_view`.
 
 /// Top-level hash views accepted by `applyHashRoute` (keep in lock-step with
@@ -22,7 +23,9 @@ pub const HASH_VIEWS: &[&str] = &[
 
 /// Space-app suffixes accepted under `#/groups/<id>/<app>` (keep in lock-step
 /// with `HASH_SPACE_APPS` in `src/gui/x0x-gui.html`).
-pub const HASH_SPACE_APPS: &[&str] = &["chat", "board", "files", "swarm", "feed", "wiki", "web"];
+pub const HASH_SPACE_APPS: &[&str] = &[
+    "chat", "board", "files", "swarm", "feed", "wiki", "web", "scratch",
+];
 
 /// A validated GUI deep-link route.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +103,12 @@ pub fn parse(view: &str) -> Result<ParsedView, InvalidView> {
             group_id: group_id.to_ascii_lowercase(),
             app: None,
         }),
+        // #1094: `scratch/<group_id>` is the short form of
+        // `groups/<group_id>/scratch`; it parses to the same canonical route.
+        ["scratch", group_id] if is_hex_id(group_id) => Ok(ParsedView::Group {
+            group_id: group_id.to_ascii_lowercase(),
+            app: Some("scratch"),
+        }),
         ["groups", group_id, app] if is_hex_id(group_id) => {
             let app = *app;
             HASH_SPACE_APPS
@@ -150,6 +159,33 @@ mod tests {
                 app: None,
             }
         );
+    }
+
+    /// WHY (#1094): the scratch store has a GUI deep link. Both the long
+    /// form and the `scratch/<id>` alias parse to the canonical
+    /// `groups/<id>/scratch` route; a bad id or extra segment is refused.
+    #[test]
+    fn issue1094_scratch_deep_link_parses_to_the_group_scratch_app() {
+        let hex = "AB".repeat(16);
+        let want = ParsedView::Group {
+            group_id: hex.to_ascii_lowercase(),
+            app: Some("scratch"),
+        };
+        assert_eq!(parse(&format!("#/scratch/{hex}")).unwrap(), want);
+        assert_eq!(parse(&format!("groups/{hex}/scratch")).unwrap(), want);
+        assert_eq!(
+            want.as_route(),
+            format!("groups/{}/scratch", hex.to_ascii_lowercase())
+        );
+        assert!(parse("scratch/zz").is_err());
+        assert!(parse("scratch").is_err());
+        assert!(parse(&format!("scratch/{hex}/x")).is_err());
+        let html = include_str!("x0x-gui.html");
+        assert!(
+            html.contains("if(p[0]==='scratch'&&p.length===2&&hex(p[1])){navigateSpace(p[1].toLowerCase(),'scratch')"),
+            "x0x-gui.html applyHashRoute must accept the same alias"
+        );
+        assert!(html.contains("case 'scratch':renderSpaceScratch(el,sid)"));
     }
 
     #[test]

@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **GUI scratch app and deep link (#1094).** Each space has a Scratch tab
+  for the group's sealed `scratch` store: list keys, view, edit, save and
+  delete short text values. `#/groups/<id>/scratch` and the short form
+  `#/scratch/<id>` open it, in the GUI and through `POST /gui/show`.
 - **A join request that the group owner refuses gets a typed outcome (#1840).**
   The owner's daemon sends the requester a direct message with a reason:
   `stale`, `already_member`, `banned`, `pending_exists` or `invalid`. Only
