@@ -993,8 +993,10 @@ carrier, only when that member's current verified advert sets
   stays on the group's `admin_availability.owner_recovery.owner` until the
   promoted member commits.
 - `409 Conflict` — `{"ok": false, "error": "recovery_not_needed" |
-  "recovery_member_ineligible" | "recovery_group_quarantined" |
-  "recovery_head_mismatch", "group_id"}`.
+  "waiting_for_active_admin" | "recovery_member_ineligible" |
+  "recovery_group_quarantined" | "recovery_head_mismatch", "group_id"}`.
+  `waiting_for_active_admin` means the roster has no Active admin seat at
+  all, so there is no revoked admin to replace.
 - `403 Forbidden` — a session token, or `recovery_signer_not_owner` (the
   group's owner is not this node's user key).
 - `404 Not Found` — the group is not known on this node.
@@ -2145,6 +2147,7 @@ every wait. A wait always names its cause; it does not stop silently.
 |---|---|---|
 | `DELETE /groups/:id/members/:agent_id`, `POST /groups/:id/ban/:agent_id`, `POST /groups/:id/state/seal` | `202 Accepted` | `{"ok": true, "queued": true, "status": "waiting_for_designated_admin", "group_id", "target", "request": "remove" \| "ban" \| "seal", "waiting": {"cause", "designated_admin", "detail": "rank", "local_rank", "remaining_ms", "fallback_at_unix_ms"}}`. The target has an open obligation and this admin's fallback time has not come. The request is queued. It does not rekey early. |
 | `DELETE /groups/:id/members/:agent_id`, `POST /groups/:id/ban/:agent_id`, `POST /groups/:id/state/seal` | `202 Accepted` | `{"ok": true, "queued": true, "status": <cause>, "group_id", "target", "request", "waiting": {"cause"}}` with cause `waiting_for_head_sync`, `waiting_for_durable_intake` or `local_committer_ineligible`. This admin is designated or past its fallback time, but the S4 evaluation does not let it seal yet. The daemon checks again under the group's membership lock, just before any change. The request is queued. Nothing is sealed from a stale head. |
+| `POST /groups/:id/ban/:agent_id` (TreeKEM group, target with no seat and no leaf) | `200 OK` / `409 Conflict` | #1540: the ban is roster-only — no TreeKEM commit, no epoch change — and answers `{"ok": true, "revision", "roster_only": true}`. While another Active member's current verified advert lacks application bit 17 (`roster_only_ban_v1`) it answers 409 `{"ok": false, "error": "waiting_for_receiver_upgrade", "capability": "roster_only_ban_v1", "members": [<agent hex>...]}` and changes nothing. |
 | Group sends, invites, member adds, seals, `POST /groups/:id/secure/encrypt` | `409 Conflict` | `{"ok": false, "error": "waiting_for_eligible_admin_revocation", "reason": ..., "state", "revoked_admins", "exit": "owner_recovery" \| "group_admin_revoked", "group_id"}`. No eligible admin remains, so no new message, admission or key can reach a revoked admin key. |
 | Same routes | `410 Gone` | `{"ok": false, "error": "group_admin_revoked", "reason": ..., "state", "revoked_admins", "exit", "recreate_offer", "group_id"}`. A group without `OwnerCertified` admission whose admins are all revoked. This is final for the group. |
 | `POST /groups/:id/secure/encrypt` (GSS plane) | `424 Failed Dependency` | `{"ok": false, "error": "no shared secret available — await welcome or ask admin to re-share"}`. The caller is an active member that holds no group secret and no verified-removal hold: an encrypted-group joiner still waiting for its welcome share. The keyless survivor of the 409 row below is not this state — its hold is what separates the two answers.
@@ -2386,7 +2389,8 @@ legacy-decoded container:
   seat (with its TreeKEM leaf, with one GSS rotation, or the roster seat
   alone in a `SignedPublic` group) and makes the promoted member Admin.
   Receivers accept it only under the §4b(1) rule. Typed refusals:
-  `recovery_not_needed`, `recovery_head_mismatch`,
+  `recovery_not_needed`, `waiting_for_active_admin` (no Active admin
+  seat), `recovery_head_mismatch`,
   `recovery_signer_not_owner`, `recovery_member_ineligible`,
   `recovery_proof_invalid`, `recovery_group_quarantined`. The promoted
   member holds the commit while a known Active member's current advert
@@ -3849,6 +3853,7 @@ no push; the retry does.
 |---|---|---|---|
 | GET | `/upgrade` | — (CLI does not call this) | Daemon-side check for updates (release manifests over the `x0x/release` gossip topic; GitHub first-discovery fallback). Read-only: a check that finds a newer release announces nothing and never leads to an install on this node (#1169, Engineer ruling 3 Nov 2026 17:40 GMT) |
 | POST | `/upgrade/apply` | `x0x upgrade --apply` | Daemon applies the latest verified release manifest with transactional restart; the observed release is announced on `x0x/release` before the apply work (#1169) |
+| POST | `/upgrade/clear-hold?version=<v>` | `x0x upgrade --clear-hold <v>` | Authenticated, recorded local clear of this install's failed-release probe hold for exactly `<v>` (D190, #1376). `200` `{cleared:true, version, cause, transaction_id}` after a durable receipt (`<daemon>.upgrade-probe.json.cleared`) and removal of the hold; `404` when no failed-release hold exists for `<v>`; `409` for recovery-failed or an unresolved probe record (never cleared locally) or while another upgrade runs; `400` for a missing or non-semver version; `501` off Unix. A newer release clears such a hold by itself |
 | GET | `/diagnostics/upgrade` | `x0x diagnostics upgrade` | Local version + update policy + version/policy digest for the M1 census (#1383; no update check runs, nothing is announced) |
 
 **Version/policy digest (#1383).** `GET /diagnostics/upgrade` reports the

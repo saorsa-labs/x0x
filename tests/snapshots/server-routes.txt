@@ -198,6 +198,7 @@ POST  /files/accept/:id                                   accept-file           
 POST  /files/reject/:id                                   reject-file               body: reason                  Reject incoming transfer
 GET  /upgrade                                            upgrade                                                 Daemon-side check for updates over x0x/release manifests (CLI x0x upgrade --check reads GitHub and calls local /health)
 POST  /upgrade/apply                                      upgrade --apply           query: now                    Daemon applies the latest verified release manifest with transactional restart (CLI x0x upgrade --apply delegates to this authenticated route)
+POST  /upgrade/clear-hold                                 upgrade --clear-hold      query: version                Authenticated, recorded local clear of this install's failed-release probe hold for one version (D190); never clears recovery-failed
 GET  /ws                                                 ws                                                      General-purpose WebSocket session
 GET  /ws/direct                                          ws direct                 query: backfill               WebSocket session for direct messaging
 GET  /ws/sessions                                        ws sessions                                             List WebSocket sessions
@@ -224,4 +225,4 @@ DELETE  /names/pins/:name                                   names unpin         
 POST  /names/accept                                       names accept              body: label                   Apply a pending grant-names suggestion (ADR 0079)
 DELETE  /names/suggestions/:label                           names dismiss                                           Drop a pending grant-names suggestion
 
-222 endpoints total
+224 endpoints total

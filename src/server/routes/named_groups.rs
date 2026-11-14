@@ -2465,6 +2465,11 @@ pub(in crate::server) enum NamedGroupMetadataEvent {
         treekem_epoch: Option<u64>,
         #[serde(default)]
         commit: Option<x0x::groups::GroupStateCommit>,
+        /// #1540: the target's committed TreeKEM KeyPackage, carried by a
+        /// roster-only ban (no TreeKEM commit) so every receiver can check
+        /// its own tree for the target's leaf with the same evidence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_key_package_b64: Option<String>,
     },
     MemberUnbanned {
         group_id: String,
@@ -9533,13 +9538,15 @@ fn authorized_treekem_membership_event_for_queue(
                 && treekem_epoch.is_none();
             admin_remove || self_leave
         }
+        // #1540: a roster-only ban (no TreeKEM commit, no epoch) queues the
+        // same way; its apply re-checks that the target holds no leaf.
         NamedGroupMetadataEvent::MemberBanned {
             actor,
             commit: Some(_),
-            treekem_commit_b64: Some(_),
-            treekem_epoch: Some(_),
+            treekem_commit_b64,
+            treekem_epoch,
             ..
-        } => {
+        } if treekem_commit_b64.is_some() == treekem_epoch.is_some() => {
             actor == sender_hex
                 && info
                     .caller_role(actor)
@@ -18571,6 +18578,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             treekem_commit_b64,
             treekem_epoch,
             commit,
+            target_key_package_b64,
             ..
         } => {
             let Some(commit) = commit else {
@@ -18583,16 +18591,35 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return banned_reject("actor_not_admin_or_not_sender", &resolved_group_key);
             }
             let treekem_payload = if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
-                let Some(commit_b64) = treekem_commit_b64 else {
-                    return banned_reject("treekem_commit_b64_absent", &resolved_group_key);
-                };
-                let Some(epoch) = treekem_epoch else {
-                    return banned_reject("treekem_epoch_absent", &resolved_group_key);
-                };
-                Some((commit_b64, epoch))
+                match (treekem_commit_b64, treekem_epoch) {
+                    (Some(commit_b64), Some(epoch)) => Some((commit_b64, epoch)),
+                    // #1540: the roster-only ban of a member that holds no
+                    // seat on this node's roster and, by the KeyPackage the
+                    // event carries, no leaf in this node's tree.
+                    (None, None)
+                        if treekem_ban_is_roster_only(
+                            state,
+                            &resolved_group_key,
+                            &info,
+                            &agent_id,
+                            target_key_package_b64.as_deref(),
+                        )
+                        .await =>
+                    {
+                        None
+                    }
+                    (None, _) => {
+                        return banned_reject("treekem_commit_b64_absent", &resolved_group_key);
+                    }
+                    (Some(_), None) => {
+                        return banned_reject("treekem_epoch_absent", &resolved_group_key);
+                    }
+                }
             } else {
                 None
             };
+            let roster_only = info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+                && treekem_payload.is_none();
             let current = info.clone();
             let Ok(mut next) = apply_stateful_event_with_evidence(
                 state,
@@ -18610,10 +18637,15 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     // inserts its Guest-role Banned entry there; keeping
                     // the marker's Member role would bind a different
                     // roster root than main's shape.
-                    if next.join_seat_key_marker_only(&agent_id) {
-                        next.members_v2.remove(&agent_id);
+                    if roster_only {
+                        // #1540: the sender's normalised banned row.
+                        apply_roster_only_ban_row(next, &agent_id, &actor);
+                    } else {
+                        if next.join_seat_key_marker_only(&agent_id) {
+                            next.members_v2.remove(&agent_id);
+                        }
+                        next.ban_member(&agent_id, Some(actor.clone()));
                     }
-                    next.ban_member(&agent_id, Some(actor.clone()));
                     if let Some((_, epoch)) = treekem_payload.as_ref() {
                         next.secret_epoch = *epoch;
                         next.security_binding = Some(format!("treekem:epoch={epoch}"));
@@ -20881,6 +20913,7 @@ pub(in crate::server) async fn apply_listener_metadata_event(
     // post-advance state until the swap.
     let group_id = named_group_metadata_event_group_id(&event).to_string();
     let group_id_for_rearm = group_id.clone();
+    let policy_update = matches!(event, NamedGroupMetadataEvent::PolicyUpdated { .. });
     // Boxed: the apply future is large; keep it off this caller's frame.
     let applied = state
         .run_shielded(Box::pin(async move {
@@ -20908,6 +20941,11 @@ pub(in crate::server) async fn apply_listener_metadata_event(
     // apply did not move the cursor (refusals, cache updates).
     if applied.is_some() {
         maybe_rearm_stopped_treekem_pages(state, &group_id_for_rearm, None).await;
+    }
+    // #1366: a remote policy change from either transport (topic or direct
+    // lane) moves the public listener, after the apply locks are released.
+    if policy_update && applied.as_ref().is_some_and(|result| result.accepted) {
+        reconcile_public_message_listener(state, &group_id_for_rearm).await;
     }
     applied
 }
@@ -24093,6 +24131,10 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
             return;
         }
     }
+    // #1366 test hook: let a concurrent install run between the check
+    // above and the insert below, as a slow subscribe does.
+    #[cfg(test)]
+    tokio::task::yield_now().await;
     let topic = x0x::groups::public_topic_for(&group_id);
     let mut sub = match state.agent.subscribe(&topic).await {
         Ok(s) => s,
@@ -24106,6 +24148,8 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
     let topic_for_log = topic.clone();
     let mut shutdown_rx = state.shutdown_notify.subscribe();
     let handle = tokio::spawn(async move {
+        #[cfg(test)]
+        let _live = tests::issue1366_public_listener::LiveListener::start(&group_id_for_listener);
         tracing::info!(topic = %topic_for_log, "E: public-message listener subscribed");
         loop {
             tokio::select! {
@@ -24143,7 +24187,83 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
         handle.abort();
         return;
     }
+    // #1366: the checks above ran without this write lock. A concurrent
+    // call can have installed a listener since: keep that one and stop this
+    // one, so no handle is overwritten and left running. A concurrent
+    // policy change can have made the group `MlsEncrypted` or withdrawn
+    // since: read the desired state again under this lock (lock order:
+    // `public_message_tasks`, then `named_groups`; no path takes them the
+    // other way round), so a reconcile that ran in between is not undone.
+    let wanted = public_message_listener_wanted(&*state.named_groups.read().await, &group_id);
+    if tasks.contains_key(&group_id) || wanted.is_some_and(|(_, wanted)| !wanted) {
+        handle.abort();
+        return;
+    }
     tasks.insert(group_id, handle);
+}
+
+/// #1366: the stable id of `group_id` and whether its public-message
+/// listener must run: the group is not withdrawn and not `MlsEncrypted`
+/// (the rule of [`ensure_named_group_listeners`]). `None`: the group is
+/// not stored.
+fn public_message_listener_wanted(
+    groups: &HashMap<String, x0x::groups::GroupInfo>,
+    group_id: &str,
+) -> Option<(String, bool)> {
+    groups
+        .get(group_id)
+        .or_else(|| {
+            groups
+                .values()
+                .find(|info| info.stable_group_id() == group_id)
+        })
+        .map(|info| {
+            (
+                info.stable_group_id().to_string(),
+                !info.withdrawn
+                    && info.policy.confidentiality
+                        != x0x::groups::GroupConfidentiality::MlsEncrypted,
+            )
+        })
+}
+
+/// #1366: start or stop the public-message listener of `group_id` to match
+/// the stored group: it runs when the group is stored, not withdrawn and
+/// not `MlsEncrypted` (the rule of [`ensure_named_group_listeners`]), and
+/// is stopped otherwise. A policy change calls it, so a flip to
+/// `SignedPublic` does not drop the first public messages until a restart,
+/// and a flip to `MlsEncrypted` drops the subscription. The caller holds
+/// no group lock.
+pub(in crate::server) async fn reconcile_public_message_listener(
+    state: &Arc<AppState>,
+    group_id: &str,
+) {
+    let wanted = public_message_listener_wanted(&*state.named_groups.read().await, group_id);
+    let Some((stable_id, wanted)) = wanted else {
+        return;
+    };
+    if wanted {
+        // The insert reads the desired state again under the registry lock.
+        spawn_public_message_listener(Arc::clone(state), stable_id).await;
+        return;
+    }
+    // #1366 test hook: let a concurrent policy change run between the
+    // decision above and the removal below.
+    #[cfg(test)]
+    tokio::task::yield_now().await;
+    let mut tasks = state.public_message_tasks.write().await;
+    // A later policy change can have made the listener wanted again, and
+    // its reconcile can have installed it: read the desired state again
+    // under the registry lock, so this removal does not undo it.
+    let still_unwanted =
+        public_message_listener_wanted(&*state.named_groups.read().await, &stable_id)
+            .is_none_or(|(_, wanted)| !wanted);
+    if !still_unwanted {
+        return;
+    }
+    if let Some(handle) = tasks.remove(&stable_id) {
+        handle.abort();
+    }
 }
 
 /// POST /groups/:id/invite — generate an invite link (admin+; body optional).
@@ -34661,6 +34781,8 @@ pub(in crate::server) async fn update_group_policy(
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     spawn_named_group_event_delivery_to_active_members(&state, &delivery_roster, &event, &[]);
     maybe_publish_group_card_after_state_change(&state, &id).await;
+    // #1366: the confidentiality may have changed.
+    reconcile_public_message_listener(&state, &id).await;
 
     (
         StatusCode::OK,
@@ -34921,6 +35043,7 @@ pub(in crate::server) async fn ban_group_member(
         treekem_commit_b64: None,
         treekem_epoch: None,
         commit: Some(commit),
+        target_key_package_b64: None,
     };
     // ADR 0110 §5 (#1508 review): the same prepare barrier as the TreeKEM
     // ban. When S4 runs this ban, its exact event is durable BEFORE the
@@ -35082,6 +35205,28 @@ async fn ban_treekem_group_member(
             info.stable_group_id().to_string(),
         )
     };
+    // #1540: a target with no seat and no leaf is banned roster-only: no
+    // TreeKEM removal exists for it, and the ban still closes its rejoin.
+    if treekem_ban_is_roster_only(
+        &state,
+        &id,
+        &next,
+        &agent_id_hex,
+        roster_only_ban_key_package(&next, &agent_id_hex).as_deref(),
+    )
+    .await
+    {
+        return ban_treekem_member_roster_only(
+            state,
+            id,
+            next,
+            metadata_topic,
+            event_group_id,
+            agent_id_hex,
+            caller_hex,
+        )
+        .await;
+    }
     // Issue #205: resolve the target's TreeKEM KeyPackage with on-demand
     // recovery, mirroring it onto the cloned snapshot so the banned member's
     // package survives the write-back.
@@ -35174,6 +35319,7 @@ async fn ban_treekem_group_member(
         treekem_commit_b64: Some(base64::engine::general_purpose::STANDARD.encode(treekem_commit)),
         treekem_epoch: Some(treekem_epoch),
         commit: Some(commit),
+        target_key_package_b64: None,
     };
     // ADR 0110 §5 (#1508 review): an S4 ban passes the same prepare
     // barrier as an S4 removal. Its exact event is durable in the prepared
@@ -35271,6 +35417,197 @@ async fn ban_treekem_group_member(
     (
         StatusCode::OK,
         Json(serde_json::json!({ "ok": true, "revision": revision })),
+    )
+}
+
+/// #1540: the `error` of a roster-only ban that waits for every other
+/// Active member's advert to carry `roster_only_ban_v1`.
+pub(in crate::server) const ROSTER_ONLY_BAN_UPGRADE_WAIT: &str = "waiting_for_receiver_upgrade";
+
+/// #1540: the committed TreeKEM KeyPackage of `agent_id_hex` on `info`
+/// (bytes whose hash the row commits), the evidence a roster-only ban
+/// carries in `target_key_package_b64`.
+pub(in crate::server) fn roster_only_ban_key_package(
+    info: &x0x::groups::GroupInfo,
+    agent_id_hex: &str,
+) -> Option<String> {
+    info.members_v2
+        .get(agent_id_hex)
+        .and_then(current_member_treekem_key_package)
+}
+
+/// #1540: whether a TreeKEM ban of `agent_id_hex` may be roster-only, with
+/// `key_package_b64` as the evidence: the sender passes the row's
+/// committed KeyPackage ([`roster_only_ban_key_package`]), a receiver the
+/// one the event carries, so both decide from the same bytes. All must
+/// hold:
+/// - the target holds no seat on `info` (no row, a key-only join marker,
+///   or a `Removed`/`Banned` row);
+/// - a KeyPackage is given, and when this node's row of the target commits
+///   a KeyPackage hash, the bytes match it (a hash-only row checks too);
+/// - this node has a tree, and the tree answers `Some(false)` for that
+///   KeyPackage. `None` (no evidence) is never read as "no leaf" (#1508
+///   review P1), so a self-leaver that may still hold a leaf takes the
+///   full TreeKEM removal.
+///
+/// Leaf credentials are unlinkable across groups, so without a KeyPackage
+/// no node can attribute a leaf to the target: a target with no committed
+/// KeyPackage is never banned roster-only.
+pub(in crate::server) async fn treekem_ban_is_roster_only(
+    state: &AppState,
+    group_id: &str,
+    info: &x0x::groups::GroupInfo,
+    agent_id_hex: &str,
+    key_package_b64: Option<&str>,
+) -> bool {
+    let row = info.members_v2.get(agent_id_hex);
+    let seated = row.is_some_and(|member| {
+        matches!(
+            member.state,
+            x0x::groups::GroupMemberState::Active | x0x::groups::GroupMemberState::Pending
+        )
+    }) && !info.join_seat_key_marker_only(agent_id_hex);
+    if seated {
+        return false;
+    }
+    let Some(kp_b64) = key_package_b64 else {
+        return false;
+    };
+    if let Some(expected) = row.and_then(|member| member.treekem_key_package_hash.as_deref()) {
+        if blake3::hash(kp_b64.as_bytes()).to_hex().as_str() != expected {
+            return false;
+        }
+    }
+    let (Ok(target), Ok(kp)) = (parse_agent_id_hex(agent_id_hex), BASE64.decode(kp_b64)) else {
+        return false;
+    };
+    let Some(group) = state.treekem_groups.read().await.get(group_id).cloned() else {
+        return false;
+    };
+    let present = group.lock().await.member_leaf_present(&target, Some(&kp));
+    present == Some(false)
+}
+
+/// #1540: the one banned-row shape of a roster-only ban, written by the
+/// sender and every receiver alike: the target's row is replaced by
+/// `ban_member`'s fresh `Guest`/`Banned` row with no certificate and no
+/// KeyPackage. A `Removed` row is outside the roster root while a
+/// `Banned` row is inside it with its role and certificate digest, so a
+/// receiver that never held the row (or holds a different one) must
+/// still compute the sender's root.
+pub(in crate::server) fn apply_roster_only_ban_row(
+    info: &mut x0x::groups::GroupInfo,
+    agent_id_hex: &str,
+    actor_hex: &str,
+) {
+    info.members_v2.remove(agent_id_hex);
+    info.ban_member(agent_id_hex, Some(actor_hex.to_string()));
+}
+
+/// #1540: the roster-only ban of a TreeKEM member that holds no seat and
+/// no leaf (David's design approval of 21 Oct 2026 on #1508, item c). The
+/// signed `MemberBanned` carries no TreeKEM commit and changes no epoch;
+/// it closes the target's rejoin window. Published only while every other
+/// Active or Pending member's current verified advert carries `roster_only_ban_v1`;
+/// otherwise 409 `waiting_for_receiver_upgrade` names the members whose
+/// advert lacks it (a released receiver refuses the event). The caller
+/// holds the group's membership lock.
+async fn ban_treekem_member_roster_only(
+    state: Arc<AppState>,
+    id: String,
+    mut next: x0x::groups::GroupInfo,
+    metadata_topic: String,
+    event_group_id: String,
+    agent_id_hex: String,
+    caller_hex: String,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let capabilities = state.agent.capability_store();
+    // Pending seats receive membership events too, so they count.
+    let lacking: Vec<String> = next
+        .members_v2
+        .values()
+        .filter(|member| {
+            matches!(
+                member.state,
+                x0x::groups::GroupMemberState::Active | x0x::groups::GroupMemberState::Pending
+            )
+        })
+        .map(|member| member.agent_id.clone())
+        .filter(|member| *member != caller_hex && *member != agent_id_hex)
+        .filter(|member| {
+            parse_agent_id_hex(member).map_or(true, |agent| {
+                capabilities.verified_registry_supports(
+                    &agent,
+                    x0x::dm::CapabilityRegistry::ROSTER_ONLY_BAN_V1,
+                ) != Some(true)
+            })
+        })
+        .collect();
+    if !lacking.is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": ROSTER_ONLY_BAN_UPGRADE_WAIT,
+                "capability": "roster_only_ban_v1",
+                "members": lacking,
+            })),
+        );
+    }
+    let signing_kp = state.agent.identity().agent_keypair();
+    let now_ms = now_millis_u64();
+    let target_key_package_b64 = roster_only_ban_key_package(&next, &agent_id_hex);
+    next.roster_revision = next.roster_revision.saturating_add(1);
+    let revision = next.roster_revision;
+    apply_roster_only_ban_row(&mut next, &agent_id_hex, &caller_hex);
+    let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await {
+        Ok(commit) => commit,
+        Err(e) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("seal failed: {e}"),
+            );
+        }
+    };
+    quiesce_member_join_egress(&state, &id, &agent_id_hex).await;
+    let persisted = persist_named_group_info(&state, &id, next.clone()).await;
+    purge_join_artifacts_if_ineligible(&state, &id, &agent_id_hex).await;
+    if !matches!(persisted, Ok(AtomicWriteOutcome::Durable)) {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "named-group state is not directory-durable",
+        );
+    }
+    let event = NamedGroupMetadataEvent::MemberBanned {
+        group_id: event_group_id,
+        revision,
+        actor: caller_hex,
+        agent_id: agent_id_hex.clone(),
+        secret_epoch: None,
+        treekem_commit_b64: None,
+        treekem_epoch: None,
+        commit: Some(commit),
+        target_key_package_b64,
+    };
+    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    remember_treekem_membership_event(&state, &event).await;
+    spawn_named_group_event_delivery_to_active_members(
+        &state,
+        &next,
+        &event,
+        std::slice::from_ref(&agent_id_hex),
+    );
+    spawn_group_control_event_redelivery(
+        &state,
+        &metadata_topic,
+        &next,
+        &event,
+        std::slice::from_ref(&agent_id_hex),
+    );
+    maybe_publish_group_card_after_state_change(&state, &id).await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "revision": revision, "roster_only": true })),
     )
 }
 
@@ -53329,7 +53666,9 @@ pub(in crate::server) mod tests {
     pub(in crate::server) mod issue1275_listener_apply_shield;
     mod issue1288_bootstrap_outbox_shutdown;
     mod issue1347_join_request_token_class;
+    pub(in crate::server) mod issue1366_public_listener;
     pub(in crate::server) mod issue1368_crash_matrix;
+    mod issue1540_roster_only_ban;
     mod issue1569_owner_certified_placeholder;
     mod issue1570_held_back_cards;
     mod issue1570_held_back_rebind;
@@ -67738,6 +68077,7 @@ pub(in crate::server) mod tests {
             treekem_commit_b64: Some("Yw==".to_string()),
             treekem_epoch: Some(3),
             commit: Some(fake_group_state_commit(&group_id, 6, &admin_hex)),
+            target_key_package_b64: None,
         };
         assert!(authorized_treekem_membership_event_for_queue(
             &info,
@@ -69333,6 +69673,7 @@ pub(in crate::server) mod tests {
             treekem_commit_b64: Some("Yw==".to_string()),
             treekem_epoch: Some(1),
             commit: None,
+            target_key_package_b64: None,
         };
         assert!(!treekem_metadata_event_requires_phase3(&member_banned));
 
@@ -69394,6 +69735,7 @@ pub(in crate::server) mod tests {
             treekem_commit_b64: Some("Yw==".to_string()),
             treekem_epoch: Some(3),
             commit: Some(fake_commit(3, "state-2")),
+            target_key_package_b64: None,
         };
 
         assert_eq!(treekem_membership_event_sort_key(&ban_epoch_3), (3, 3));
