@@ -19,7 +19,7 @@
       "revision": 1,
       "path": "A02-r01-identity-keys-and-device-enrollment.md",
       "title": "Identity Keys and Device Enrollment",
-      "sha256": "d9b9ea12f4beca5bffe6afa97200279b39495fa4633715eca0b1225ce15438ff"
+      "sha256": "201936384200895db0aa07c689354f99b20e69a205eef3f19c1a761399b4a349"
     },
     {
       "id": "A03",
@@ -61,14 +61,14 @@
       "revision": 1,
       "path": "A08-r01-groups-home-membership-and-repair.md",
       "title": "Groups Home Membership and Repair",
-      "sha256": "2dd21c75a8e9231249b9a908461deddcb835d8679a9c6dee63111cc7579eee53"
+      "sha256": "842ddaff7f571fc668167b009384409420056b12f791ef6195c711629a0040e2"
     },
     {
       "id": "A09",
       "revision": 1,
       "path": "A09-r01-group-encryption-and-key-changes.md",
       "title": "Group Encryption and Key Changes",
-      "sha256": "07668af7d0eacd6768641070625725e81669a9b37325717b341e5d961873e41f"
+      "sha256": "30c40a0bc5a22c912e1b8e7f34a51a3d7c7e6ec23de4281326c28c7bf056b1dc"
     },
     {
       "id": "A10",
@@ -103,7 +103,7 @@
       "revision": 1,
       "path": "A14-r01-health-updates-and-recovery.md",
       "title": "Health Updates and Recovery",
-      "sha256": "bb476e6351af665138a2d15cc194372b99f9c14e89a3edd1ac2a18b7bc843e2d"
+      "sha256": "af2ec09c8789754b6a59bc167d0ec8f3d28d322c2ec341bc602539dbe28690e3"
     },
     {
       "id": "A15",
