@@ -429,6 +429,26 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         async { tokio::time::sleep(OFFLINE).await },
     )
     .await?;
+    // V measures its outage from the up time it last recorded, on the wall
+    // clock. With the shim that clock is virtual, so the record is already
+    // OFFLINE old. Without it (the default nextest profile) the ten virtual
+    // minutes pass in moments of real time, so write the record V would
+    // hold after a real ten-minute outage.
+    let backdated = silent && !crate::w3h_inline::shim_active();
+    if backdated {
+        let alive = sim.data_dir("V")?.join("treekem-alive");
+        let ago_ms = u64::try_from(OFFLINE.as_millis())?;
+        let last_up = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis()
+            .saturating_sub(u128::from(ago_ms));
+        ensure!(
+            alive.exists(),
+            "INFRA: V left no up-time record at {}",
+            alive.display()
+        );
+        std::fs::write(&alive, last_up.to_string())?;
+    }
     // Hold V's application traffic until the preconditions are witnessed,
     // so nothing can move V past e before the deliberate write. The silent
     // arm has no deliberate write: V's own start must move it.
@@ -549,7 +569,8 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     quiet.set(false);
     if silent {
         receipt.note(format!(
-            "pubsub frames toward V dropped until the catch-up check={quiet_dropped}"
+            "pubsub frames toward V dropped until the catch-up check={quiet_dropped}; \
+             up-time record backdated (no shim)={backdated}"
         ));
     }
 
