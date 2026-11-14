@@ -68,7 +68,8 @@ This table is the live allocation table for capability bits. Allocate the next b
 | 14 | `share_grant_names_v1` | Understands the `x0x-sharegrant-v2\0` typed route: the v1 grant plus an owner-signed names section (grant-carried name defaults). Senders use the v2 envelope only toward a grantee whose verified advert sets this bit | ADR 0079 (accepted 2026-09-27; next free bit) |
 | 15 | `grant_revocation_push_v1` | Accepts the single-record grant revocation push (`x0x-grant-revocation-push-v1`) and ingests it through the shared v3 revocation path; the sender needs POSITIVE evidence (push only to a current verified advert that has the bit) | #1003 (course-correction directive ruling 3e, 7 Nov 2026; design: archived ADR 0080 under slot A03; bit 15 per David's wire approval — bit 14 was concurrently claimed by PR #1826, which pushed first) |
 | 16 | `join_request_outcome_v1` | Accepts the join-request outcome typed DM (`x0x-group-join-outcome-v1`) that an authority sends when its validation refuses a `JoinRequestCreated` offer; the sender needs POSITIVE evidence (send only to a current verified advert that has this bit); route-gated, advertised only when the typed route is registered | #1840 (David's ruling, 10 Nov 2026 08:10 GMT; next free bit) |
-| 17–63 | unallocated | Must not be advertised until allocated | — |
+| 17 | `roster_only_ban_v1` | Accepts the roster-only `MemberBanned` of a TreeKEM group (the ban of a member with no ratchet leaf: no TreeKEM commit, no epoch change); an admin publishes one only while every other Active member's current verified advert sets this bit | #1540 (David's design approval of 21 Oct 2026 on #1508, item c; bit chosen 14 Nov 2026 by Claude under David's delegation of 10 Nov 2026; next free bit) |
+| 18–63 | unallocated | Must not be advertised until allocated | — |
 
 ## Checks
 

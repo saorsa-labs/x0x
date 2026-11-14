@@ -67,8 +67,10 @@ const S4_WORKER_TICK: Duration = Duration::from_secs(1);
 /// After a failed commit attempt the worker retries no sooner than this.
 const S4_COMMIT_RETRY: Duration = Duration::from_secs(5);
 
-/// Retry interval of a queued ban whose target holds no seat.
-const S4_UNSEATED_BAN_RETRY: Duration = Duration::from_secs(60);
+/// Retry interval of a queued ban held by `waiting_for_receiver_upgrade`:
+/// the roster-only ban of a leafless target waits for every other Active
+/// member's advert to carry `roster_only_ban_v1` (#1540).
+const S4_RECEIVER_UPGRADE_BAN_RETRY: Duration = Duration::from_secs(60);
 
 /// A manual request that §2 queued instead of rekeying early.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4223,14 +4225,16 @@ async fn drive_queued_bans(state: &Arc<AppState>) {
                 error = body.get("error").and_then(serde_json::Value::as_str).unwrap_or_default(),
                 "ADR 0110 S4: a queued manual ban could not be applied yet; retrying"
             );
-            // A TreeKEM ban of a target with no leaf cannot run through
-            // the existing route; it applies once the target is seated
-            // again (a rejoin), so retry slowly while it is not.
-            let seated = seat_target(info, &target_hex);
-            let retry = if seated {
-                S4_COMMIT_RETRY
+            // #1540: a TreeKEM ban of a target with no leaf is roster-only
+            // and runs through the same route. It waits only while an
+            // Active member's advert lacks `roster_only_ban_v1`, which an
+            // upgrade ends, so that refusal retries slowly.
+            let upgrade_wait = body.get("error").and_then(serde_json::Value::as_str)
+                == Some(super::ROSTER_ONLY_BAN_UPGRADE_WAIT);
+            let retry = if upgrade_wait {
+                S4_RECEIVER_UPGRADE_BAN_RETRY
             } else {
-                S4_UNSEATED_BAN_RETRY
+                S4_COMMIT_RETRY
             };
             inner
                 .ban_next_attempt
