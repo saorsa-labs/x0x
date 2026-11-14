@@ -1560,6 +1560,7 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 | POST | `/machines/connect` | `x0x machines connect <machine_id>` | Establish a machine-id transport connection |
 | POST | `/direct/send` | `x0x direct send <agent_id> <message> [--require-ack-ms <ms>] [--prefer-raw-quic-if-connected <BOOL>] [--raw-quic-receive-ack-ms <ms>] [--stop-fallback-on-raw-error] [--require-gossip] [--no-durable-ack] [--logical-id <token>]` | Send a direct base64 payload. Durable-by-default since v0.38.0 |
 | GET | `/direct/connections` | `x0x direct connections` | List active direct connections |
+| GET | `/direct/receipts/:logical_id?agent_id=<hex>` | `x0x direct receipt <logical_id> <agent_id>` | Outcome of a durable send made under `logical_id` to `agent_id`: `delivered`, `delivered_late`, `pending` or `unknown` (#1109). See [Durable send receipts](#durable-send-receipts-1109) |
 | GET | `/history/message/:msg_id` | `x0x history message` | Point lookup of one durable history row by exposed `msg_id` (64 hex; canonical group ids need `?scope=`); 404 when absent, 400 on malformed id. Same record shape as `/history` (issue #319) |
 | GET | `/direct/events` | `x0x direct events` | SSE stream of direct messages; `?backfill=N` requests up to N stored `dm:` rows as `history_direct_message` events before a `live` marker and live frames (ADR-0023 §7). The attempt is best-effort; reconcile through [`/history`](#durable-history-adr-0023) |
 
@@ -1680,7 +1681,7 @@ Notable codes:
 | 409 | `recipient_capability_unavailable` | As `recipient_capability_pending`, but no verified advert arrived within one advert period (600 s). Nothing was sent. A later advert from the recipient lets a retry go. Rust callers get `DmError::RecipientCapabilityUnavailable { capability }`. |
 | 409 | `idempotency_conflict` | The recipient already holds this `logical_id` bound to different bytes. **Retrying cannot succeed.** Either resend the original bytes under this id, or pick a new `logical_id`. |
 | 413 | `payload_too_large` | Payload exceeds the DM envelope cap. |
-| 504 | `timeout` | The overall send budget ended the send. `DmError::Timeout` can come from the raw-QUIC path, the known-recipient redial, or the relay fallback, as well as from an application ACK that does not arrive within the retry budget. Those paths are capped by the overall send budget. The error variant and the wire format are unchanged. The DM may or may not have arrived. On a durable send the body also includes `strict_gate_ms`, `publish_ms`, `ack_wait_ms`, `elapsed_ms`, and `budget_stage` so the stage that consumed the budget is named. Durable 200 and 504 also include recipient ACK-publish diagnostics `last_ack_publish_ms` and `ack_publish_route_failed` (same fields on `GET /diagnostics/dm`). These are diagnostics, not a latency SLA. |
+| 504 | `timeout` | The overall send budget ended the send. `DmError::Timeout` can come from the raw-QUIC path, the known-recipient redial, or the relay fallback, as well as from an application ACK that does not arrive within the retry budget. Those paths are capped by the overall send budget. The error variant and the wire format are unchanged. The DM may or may not have arrived. On a durable send the body also includes `strict_gate_ms`, `publish_ms`, `ack_wait_ms`, `elapsed_ms`, and `budget_stage` so the stage that consumed the budget is named. Durable 200 and 504 also include recipient ACK-publish diagnostics `last_ack_publish_ms` and `ack_publish_route_failed` (same fields on `GET /diagnostics/dm`). These are diagnostics, not a latency SLA. A durable 504 also has `outcome: "ack_unknown"` and `logical_id` (the caller's token, or null); query [`GET /direct/receipts/:logical_id`](#durable-send-receipts-1109) to learn whether the ACK arrived late (#1109). |
 
 The two 409s prescribe opposite repairs and must not be conflated in client
 code: `recipient_ack_semantics_unavailable` means *retry later or tell the user
@@ -1715,6 +1716,33 @@ true` advert after re-serialization and drops it (self-healing once both sides
 upgrade); old→new *strict* durable DMs answer `409
 recipient_ack_semantics_unavailable` until the old side upgrades. Plan
 upgrades as a coordinated roll-forward.
+
+### Durable send receipts (#1109)
+
+A durable send that answers 504 (`outcome: "ack_unknown"`) did not learn the outcome. The recipient may hold the message. Do not resend a second copy to find out. Ask the daemon:
+
+```
+GET /direct/receipts/order-42?agent_id=8a3f...
+```
+
+```json
+{
+  "ok": true,
+  "logical_id": "order-42",
+  "agent_id": "8a3f...",
+  "request_id": "5c1e...",
+  "status": "delivered_late"
+}
+```
+
+| `status` | Meaning |
+|---|---|
+| `delivered` | The recipient's v2 ACK arrived inside the send budget |
+| `delivered_late` | The v2 ACK arrived after the send returned. The recipient holds the message |
+| `pending` | A send is waiting, or gave up and no ACK has arrived yet |
+| `unknown` | No record: no durable send under this id to this agent, or the record expired |
+
+The key is the pair (`logical_id`, `agent_id`), because a logical id is scoped to one recipient. Only sends that supplied `logical_id` can be queried. Records are kept in memory for 10 minutes after the send resolved or gave up, at most 4,096, oldest dropped first; a restart forgets them. Only an `Accepted` v2 ACK from the exact recipient agent and machine counts. A malformed `logical_id` or `agent_id` answers 400 `invalid_logical_id` or `invalid_agent_id`. Decision: [A07](adr/consolidated/A07-r01-messages-receipts-history-and-retry.md) (amendment of 14 Nov 2026).
 
 ### `/direct/events` SSE message shape
 
