@@ -14,6 +14,10 @@ All notable changes to this project will be documented in this file.
   most 90 days (default 90), and delivers it; the old grant stays valid to its
   own expiry, so there is no gap. CLI: `x0x grant renew <id> [--ttl-secs N]
   [--no-names]`.
+- **GUI scratch app and deep link (#1094).** Each space has a Scratch tab
+  for the group's sealed `scratch` store: list keys, view, edit, save and
+  delete short text values. `#/groups/<id>/scratch` and the short form
+  `#/scratch/<id>` open it, in the GUI and through `POST /gui/show`.
 - **`kv:changed` SSE event on `GET /events` (#1094).** A KV store this
   daemon has open sends one event per 200 ms window when it changes (local
   write or delete, merged peer record, direct delta): `store_id` and the
