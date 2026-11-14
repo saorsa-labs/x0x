@@ -1035,12 +1035,14 @@ no gossip, binds nothing, and takes no instance lock.
    gossip and feeds this node's own apply owner — a background install
    triggered by a read, which no credential gate on a GET can justify.
    Self-delivery also applies to the apply-path announcement: the
-   applying node's own gossip listener receives it back and, with gossip
-   updates on, feeds the same version to its background apply owner — a
-   duplicate attempt of an operator-requested release, serialized by the
-   shared apply lock and version dedup. Recording announcements as
-   self-published so the driver skips that needs the shared tracker on
-   the daemon state (#1774).
+   applying node's own gossip listener receives it back. The route
+   records its payload as published by `/upgrade/apply` in the shared
+   self-published tracker on the daemon state before it publishes, so
+   the gossip driver neither rebroadcasts that echo nor submits it to the
+   background apply owner: the route already applies that release
+   (#1169). Echoes of the driver's own rebroadcasts, fallback-poll
+   publishes and the start-up broadcast are not rebroadcast again but are
+   still submitted; the owner's version dedup absorbs them.
 5. **Authenticated HTTP apply**: Verify the release and wait for staging, then
    recheck admission under the install lock before replacement. The CLI
    `upgrade --apply` uses this route; `--now` skips only the staging delay.
