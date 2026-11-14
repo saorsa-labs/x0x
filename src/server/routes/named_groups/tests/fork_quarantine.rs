@@ -84,6 +84,7 @@ async fn sealed_group_with_lineage(
         base_revision: info.state_revision,
         base_hash: info.state_hash.clone(),
         base_roster_root: String::new(),
+        base_roster: Default::default(),
         seated_at_revision: None,
         corroborated: false,
         fork_evidence: None,
@@ -1058,6 +1059,7 @@ async fn adr0064_explicit_seal_without_owner_user_key_does_not_clear() -> Result
         base_revision: info.state_revision,
         base_hash: info.state_hash.clone(),
         base_roster_root: String::new(),
+        base_roster: Default::default(),
         seated_at_revision: None,
         corroborated: false,
         fork_evidence: None,
@@ -1148,6 +1150,7 @@ async fn cert_sealed_group_with_lineage(
         base_revision: info.state_revision,
         base_hash: info.state_hash.clone(),
         base_roster_root: String::new(),
+        base_roster: Default::default(),
         seated_at_revision: None,
         corroborated: false,
         fork_evidence: None,
@@ -2729,6 +2732,7 @@ fn lineage_for(info: &x0x::groups::GroupInfo) -> x0x::groups::InviteLineage {
         base_revision: 1,
         base_hash: info.state_hash.clone(),
         base_roster_root: String::new(),
+        base_roster: Default::default(),
         seated_at_revision: None,
         corroborated: false,
         fork_evidence: None,
@@ -4729,6 +4733,7 @@ async fn issue732_mixed_lineage_aliases_keep_retained_evidence_and_refuse_the_id
             base_revision: 5,
             base_hash: lineage_bearing.state_hash.clone(),
             base_roster_root: String::new(),
+            base_roster: Default::default(),
             seated_at_revision: None,
             corroborated: false,
             fork_evidence: Some(evidence.clone()),
@@ -4882,6 +4887,7 @@ async fn issue732_install_refuses_when_a_marker_already_exists_despite_an_empty_
         base_revision: 5,
         base_hash: lineage_bearing.state_hash.clone(),
         base_roster_root: String::new(),
+        base_roster: Default::default(),
         seated_at_revision: None,
         corroborated: false,
         fork_evidence: None,
@@ -5478,5 +5484,154 @@ async fn issue1103_record_clear_preserves_unrelated_raw_writer() -> Result<()> {
     assert!(treekem_snapshot_envelope_matches_info(&envelope, &cleared));
     assert!(!treekem_journal_path(&state.treekem_dir, group_id).exists());
     assert!(!treekem_home_suite_journal_path(&state.treekem_dir, group_id).exists());
+    Ok(())
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// #1797 — a joiner seated on a removed admin's fork at the shared head.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Which base roster the #1797 joiner fixture keeps on its lineage.
+enum Issue1797Base {
+    /// The invite's projection, re-deriving the signed root (the fix).
+    Signed,
+    /// No projection (a record from before #1797, or a v6 join whose
+    /// roster was not fetched) — main's behaviour for every joiner.
+    Missing,
+    /// A projection that does not re-derive the signed root.
+    Tampered,
+}
+
+/// ADR 0109 §10 H-S3-d2 in-process: A (creator) and X (admin) share the
+/// base r. X seats J (the local daemon) at r+1′ on its own fork; J keeps
+/// only X's served link, not the base link. A's r+1 removes X from r and
+/// reaches J. Returns J's record after the apply plus the removal commit.
+async fn issue1797_joiner_after_base_admin_removal(
+    base_kind: Issue1797Base,
+) -> Result<(
+    x0x::groups::GroupInfo,
+    x0x::groups::state_commit::GroupStateCommit,
+    String,
+)> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let group_id = "e7".repeat(32);
+    let a = AgentKeypair::generate()?;
+    let x = AgentKeypair::generate()?;
+    let a_hex = hex::encode(crate::identity::AgentId::from_public_key(a.public_key()).as_bytes());
+    let x_hex = hex::encode(crate::identity::AgentId::from_public_key(x.public_key()).as_bytes());
+    let j_hex = hex::encode(state.agent.agent_id().as_bytes());
+
+    let mut base = x0x::groups::GroupInfo::with_policy(
+        "issue1797".to_string(),
+        String::new(),
+        crate::identity::AgentId::from_public_key(a.public_key()),
+        group_id.clone(),
+        invite_only_policy(),
+    );
+    base.add_member(
+        x_hex.clone(),
+        x0x::groups::GroupRole::Admin,
+        Some(a_hex.clone()),
+        None,
+    );
+    base.seal_commit(&a, now_millis_u64())?;
+    let base_roster = x0x::groups::state_commit::roster_projection(&base.members_v2);
+    let base_roster_root = x0x::groups::state_commit::roster_root_of_projection(&base_roster);
+
+    // X's fork seats J at r+1′. J retains only that served link.
+    let mut joiner = base.clone();
+    joiner.add_member(
+        j_hex,
+        x0x::groups::GroupRole::Member,
+        Some(x_hex.clone()),
+        None,
+    );
+    joiner.seal_commit(&x, now_millis_u64())?;
+    let seated_at = joiner.state_revision;
+    joiner
+        .commit_log
+        .retain(|link| link.commit.revision == seated_at);
+    let kept_roster = match base_kind {
+        Issue1797Base::Signed => base_roster.clone(),
+        Issue1797Base::Missing => BTreeMap::new(),
+        Issue1797Base::Tampered => {
+            let mut forged = base_roster.clone();
+            forged.remove(&a_hex);
+            forged
+        }
+    };
+    joiner.invite_lineage = Some(x0x::groups::InviteLineage {
+        base_revision: base.state_revision,
+        base_hash: base.state_hash.clone(),
+        base_roster_root,
+        base_roster: kept_roster,
+        seated_at_revision: Some(seated_at),
+        ..Default::default()
+    });
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), joiner);
+
+    // A's r+1 removes X from the shared base.
+    let mut removal = base.clone();
+    removal.remove_member(&x_hex, Some(a_hex.clone()));
+    removal.seal_commit(&a, now_millis_u64())?;
+    let removal_commit = removal
+        .commit_log
+        .last()
+        .context("removal sealed")?
+        .commit
+        .clone();
+    assert_eq!(
+        removal_commit.revision, seated_at,
+        "both branches claim r+1"
+    );
+
+    let refused = apply_commit(&state, &group_id, removal_commit.clone(), "a-removes-x").await?;
+    assert!(refused.is_err(), "J on X's branch cannot apply A's r+1");
+    Ok((live_record(&state, &group_id).await, removal_commit, a_hex))
+}
+
+/// WHY (#1797, ADR 0109 §10 H-S3-d2, D77 "exposure contained"). A joiner
+/// keeps the links its inviter serves, not the invite base. When a removed
+/// admin's invite base is the last shared head, the conflicting removal
+/// chains from that base, so the retained-predecessor check found no link
+/// at r and J stayed Active on the fork with no marker. The lineage now
+/// keeps the signed base roster, and A — an active admin at r — is
+/// authenticated from it.
+///
+/// Negative controls: with no base roster (main's behaviour) or a roster
+/// that does not re-derive the signed root, J records nothing — the
+/// unauthenticated-conflict invariant holds.
+#[tokio::test]
+async fn issue1797_joiner_on_removed_admins_fork_quarantines_from_its_invite_base() -> Result<()> {
+    let (record, removal, a_hex) =
+        issue1797_joiner_after_base_admin_removal(Issue1797Base::Signed).await?;
+    assert!(
+        record.is_fork_quarantined(),
+        "#1797: J must hold a marker naming A's r+1"
+    );
+    let evidence = record
+        .invite_lineage
+        .as_ref()
+        .and_then(|lineage| lineage.fork_evidence.as_ref())
+        .context("evidence recorded")?;
+    assert_eq!(evidence.revision, removal.revision);
+    assert_eq!(evidence.state_hash, removal.state_hash);
+    assert_eq!(evidence.committed_by, a_hex);
+
+    let (missing, _, _) = issue1797_joiner_after_base_admin_removal(Issue1797Base::Missing).await?;
+    assert!(
+        !missing.is_fork_quarantined(),
+        "without a base roster the conflict stays unauthenticated"
+    );
+    let (tampered, _, _) =
+        issue1797_joiner_after_base_admin_removal(Issue1797Base::Tampered).await?;
+    assert!(
+        !tampered.is_fork_quarantined(),
+        "a base roster that does not re-derive the signed root is ignored"
+    );
     Ok(())
 }
