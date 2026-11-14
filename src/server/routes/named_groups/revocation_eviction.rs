@@ -146,6 +146,10 @@ pub(in crate::server) struct S4Runtime {
     /// [`S4Runtime::awaiting_startup_load`] sets it; the startup load
     /// clears it.
     awaiting_load: std::sync::atomic::AtomicBool,
+    /// Test builds: whether `api.port` already existed when the last S4
+    /// load began (#1597 item 5c ordering test).
+    #[cfg(test)]
+    port_published_at_load: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -275,6 +279,8 @@ impl S4Runtime {
             inner: tokio::sync::Mutex::new(S4Inner::default()),
             evs_writer: tokio::sync::Mutex::new(()),
             awaiting_load: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            port_published_at_load: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -4638,8 +4644,12 @@ async fn persist_obligations(state: &AppState) -> bool {
     let runtime = &state.revocation_evictions;
     let _writer = runtime.evs_writer.lock().await;
     // #1597 item 5c: before the startup load the file still holds the
-    // previous boot's rows, which memory does not. The change stays dirty
-    // and not durable; the first write after the load carries it.
+    // previous boot's rows, which memory does not, so nothing is written
+    // and the answer is "not durable". The load then replaces the store
+    // (rows and queued bans) with the file: a change made before it is not
+    // carried. The daemon awaits the load before it serves the API, so no
+    // request can make one; a trigger re-derives from its durable source
+    // on the next pass. Only the `.evh` load merges memory with the file.
     if runtime.load_pending() {
         return false;
     }
@@ -4946,6 +4956,11 @@ pub(super) async fn verified_pending_copies(path: &FsPath) -> (Vec<([u8; 16], Pa
 async fn load_persisted_obligations(state: &AppState) {
     let runtime = &state.revocation_evictions;
     let _writer = runtime.evs_writer.lock().await;
+    #[cfg(test)]
+    runtime.port_published_at_load.store(
+        state.data_dir.join("api.port").exists(),
+        std::sync::atomic::Ordering::SeqCst,
+    );
     let path = evs_path(state);
     // §5 and "ADR 0094 trial": inside an uncommitted trial the load only
     // reads. It starts no quarantine transaction, writes no replacement
@@ -11136,6 +11151,85 @@ pub(super) mod tests {
             .map_err(|error| anyhow::anyhow!("{error:?}"))?;
         assert!(written.contains_key(&kept) && written.contains_key(&early));
         state.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1597 item 5c: the daemon reads the S4 store before it publishes
+    /// `api.port`, so no API request can run before the load. A real
+    /// daemon starts on a data dir that holds an `.evs` row; when `serve`
+    /// returns, the startup load has run, it began while `api.port` did
+    /// not exist yet, and it read the file. Red with the `mod.rs` load
+    /// removed: the worker loads after the port is published.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_daemon_loads_the_s4_store_before_it_publishes_the_api_port() -> anyhow::Result<()>
+    {
+        let root = tempfile::tempdir()?;
+        let data = root.path().join("data");
+        std::fs::create_dir_all(&data)?;
+        let mut store = ObligationStore::new();
+        store.intake(
+            &EvictionKey::new("1597".to_string(), [5; 32]),
+            s4::EvictionTrigger::AgentRevocation {
+                record_hash: [7; 32],
+                record_bytes: vec![7],
+            },
+            None,
+            now_unix_ms(),
+            [0; 16],
+        );
+        let bytes = s4::encode_evs(&s4::EvsBodyV1 {
+            rebuilt_from: Vec::new(),
+            rows: store.to_rows(),
+        })?;
+        std::fs::write(data.join(s4::EVS_FILE_NAME), bytes)?;
+        let config: crate::server::DaemonConfig = serde_json::from_value(serde_json::json!({
+            "bind_address": "127.0.0.1:0",
+            "api_address": "127.0.0.1:0",
+            "data_dir": data,
+            "identity_dir": root.path().join("identity"),
+            "bootstrap_peers": [],
+            "mdns_enabled": false,
+            "port_mapping_enabled": false,
+            "network_id": format!(
+                "x0x.test.1597.s4load.{}.{:08x}",
+                std::process::id(),
+                rand::random::<u32>()
+            )
+        }))?;
+        let options = crate::server::ServeOptions {
+            skip_update_check: true,
+            cli_no_port_mapping: true,
+            cli_disable_peer_cache: true,
+            self_update_enabled: false,
+            ..crate::server::ServeOptions::default()
+        };
+        let handle = tokio::time::timeout(
+            Duration::from_secs(60),
+            crate::server::serve_with_options(config, options),
+        )
+        .await??;
+        let state = handle
+            .test_state
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("live daemon state"))?;
+        assert!(data.join("api.port").exists(), "the port is published");
+        assert!(
+            !state.revocation_evictions.load_pending(),
+            "the startup load ran before serve returned"
+        );
+        assert!(
+            !state
+                .revocation_evictions
+                .port_published_at_load
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the load began before api.port was written"
+        );
+        assert!(
+            state.revocation_evictions.inner.lock().await.file_exists,
+            "the load read the previous boot's .evs"
+        );
+        drop(state);
+        tokio::time::timeout(Duration::from_secs(60), handle.shutdown_and_wait()).await??;
         Ok(())
     }
 }
