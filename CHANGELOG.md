@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **GUI scratch app and deep link (#1094).** Each space has a Scratch tab
+  for the group's sealed `scratch` store: list keys, view, edit, save and
+  delete short text values. `#/groups/<id>/scratch` and the short form
+  `#/scratch/<id>` open it, in the GUI and through `POST /gui/show`.
 - **Read-only `GET /diagnostics/sidecar-quarantine` (#1597, D148).** It lists
   each ADR 0108 §5a quarantined sidecar copy (pending or history) with its
   `txid` and size in bytes, plus `count` and `total_bytes`. It does not change
