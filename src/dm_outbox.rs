@@ -373,46 +373,60 @@ impl DmObligationStore {
 
     /// Admit `obligation` durably. A repeat with the same bytes is
     /// [`DmObligationAdmission::AlreadyHeld`]; other bytes under the same
-    /// logical id are refused; at a cap the caller is refused, so a local
-    /// caller cannot evict other obligations.
+    /// logical id are refused; at a cap the caller is refused. The check and
+    /// the write run under the outbox's persistence lock, so concurrent
+    /// admissions cannot both pass the check, and nothing held is ever
+    /// replaced or evicted.
     pub async fn admit(
         &self,
         obligation: DmObligation,
     ) -> Result<DmObligationAdmission, DmObligationRefusal> {
-        {
-            let entries = self.entries.read().await;
-            let held = entries
-                .get(&obligation.recipient_agent_id)
-                .and_then(|list| list.iter().find(|o| o.logical_id == obligation.logical_id));
-            if let Some(held) = held {
-                return if held.payload == obligation.payload {
-                    Ok(DmObligationAdmission::AlreadyHeld)
-                } else {
-                    Err(DmObligationRefusal::IdempotencyConflict)
-                };
-            }
-            let partition = entries.get(&obligation.recipient_agent_id);
-            let partition_count = partition.map_or(0, Vec::len);
-            let partition_bytes: usize = partition
-                .map(|list| list.iter().map(OutboxRecord::byte_size).sum())
-                .unwrap_or(0);
-            let total: usize = entries.values().map(Vec::len).sum();
-            let total_bytes: usize = entries
-                .values()
-                .flatten()
-                .map(OutboxRecord::byte_size)
-                .sum();
-            let size = obligation.payload.len();
-            if partition_count >= DM_OBLIGATION_CAPS.per_partition
-                || partition_bytes.saturating_add(size) > DM_OBLIGATION_CAPS.per_partition_bytes
-                || total >= DM_OBLIGATION_CAPS.total
-                || total_bytes.saturating_add(size) > DM_OBLIGATION_CAPS.total_bytes
-            {
-                return Err(DmObligationRefusal::Full);
-            }
+        /// Why the locked check did not insert.
+        enum Held {
+            Same,
+            Refused(DmObligationRefusal),
         }
-        match self.outbox().insert(obligation).await {
-            Ok(()) => Ok(DmObligationAdmission::Admitted),
+        let recipient = obligation.recipient_agent_id.clone();
+        let logical_id = obligation.logical_id.clone();
+        let payload = obligation.payload.clone();
+        let checked = self
+            .outbox()
+            .insert_checked(obligation, |entries| {
+                let partition = entries.get(&recipient);
+                if let Some(held) =
+                    partition.and_then(|list| list.iter().find(|o| o.logical_id == logical_id))
+                {
+                    return Err(if held.payload == payload {
+                        Held::Same
+                    } else {
+                        Held::Refused(DmObligationRefusal::IdempotencyConflict)
+                    });
+                }
+                let partition_count = partition.map_or(0, Vec::len);
+                let partition_bytes: usize = partition
+                    .map(|list| list.iter().map(OutboxRecord::byte_size).sum())
+                    .unwrap_or(0);
+                let total: usize = entries.values().map(Vec::len).sum();
+                let total_bytes: usize = entries
+                    .values()
+                    .flatten()
+                    .map(OutboxRecord::byte_size)
+                    .sum();
+                let size = payload.len();
+                if partition_count >= DM_OBLIGATION_CAPS.per_partition
+                    || partition_bytes.saturating_add(size) > DM_OBLIGATION_CAPS.per_partition_bytes
+                    || total >= DM_OBLIGATION_CAPS.total
+                    || total_bytes.saturating_add(size) > DM_OBLIGATION_CAPS.total_bytes
+                {
+                    return Err(Held::Refused(DmObligationRefusal::Full));
+                }
+                Ok(())
+            })
+            .await;
+        match checked {
+            Ok(Ok(())) => Ok(DmObligationAdmission::Admitted),
+            Ok(Err(Held::Same)) => Ok(DmObligationAdmission::AlreadyHeld),
+            Ok(Err(Held::Refused(refusal))) => Err(refusal),
             // After the rename the obligation is on disk and in memory
             // (#1101); only the directory fsync is unconfirmed.
             Err(e) if e.crossed_rename() => Ok(DmObligationAdmission::Admitted),
@@ -429,16 +443,32 @@ impl DmObligationStore {
             .await
     }
 
+    /// Recipients that hold at least one obligation.
+    pub async fn recipients(&self) -> Vec<AgentId> {
+        self.entries
+            .read()
+            .await
+            .values()
+            .flatten()
+            .filter_map(DmObligation::recipient)
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     /// One worker pass at `now_ms`: expire obligations past their deadline,
-    /// send up to [`DM_OBLIGATION_SENDS_PER_PASS`] due ones with
-    /// `base_config` plus the obligation's logical request id, record final
-    /// outcomes in `acks`, and persist the new schedule.
+    /// end those to a `blocked` recipient as `failed`, send up to
+    /// [`DM_OBLIGATION_SENDS_PER_PASS`] due ones with `base_config` plus the
+    /// obligation's logical request id (each send bounded by the time left
+    /// before its deadline), record final outcomes in `acks`, and persist the
+    /// new schedule.
     pub(crate) async fn step<S: ObligationSender + Sync>(
         &self,
         sender: &S,
         self_agent: AgentId,
         base_config: &DmSendConfig,
         acks: &InFlightAcks,
+        blocked: impl Fn(&AgentId) -> bool,
         now_ms: u64,
     ) -> DmObligationPass {
         let due = self.outbox().due(now_ms).await;
@@ -468,6 +498,14 @@ impl DmObligationStore {
                 resolved.push(obligation);
                 continue;
             }
+            if blocked(&recipient) {
+                // The trust check ran at admission; a block since then ends
+                // the obligation without another send.
+                acks.record_outcome(request_id, recipient, DmReceiptStatus::Failed);
+                pass.failed.push(obligation.logical_id.clone());
+                resolved.push(obligation);
+                continue;
+            }
             if now_ms >= obligation.deliver_until_ms {
                 acks.record_outcome(request_id, recipient, DmReceiptStatus::Expired);
                 pass.expired.push(obligation.logical_id.clone());
@@ -479,10 +517,26 @@ impl DmObligationStore {
             }
         }
         let sends = to_send.iter().map(|(obligation, recipient, request_id)| {
+            // No attempt runs past the deadline: the send's own budget and an
+            // outer bound are both clamped to the time left. A send cut off
+            // here abandons its waiter, so a late ACK is still recorded.
+            let time_left = std::time::Duration::from_millis(
+                obligation.deliver_until_ms.saturating_sub(now_ms),
+            );
             let mut config = base_config.clone();
             config.require_durable_app_ack = true;
             config.logical_request_id = Some(*request_id);
-            sender.send(*recipient, obligation.payload.clone(), config)
+            config.timeout_per_attempt = config.timeout_per_attempt.min(time_left);
+            let send = sender.send(*recipient, obligation.payload.clone(), config);
+            async move {
+                match tokio::time::timeout(time_left, send).await {
+                    Ok(result) => result,
+                    Err(_) => Err(DmError::Timeout {
+                        retries: 0,
+                        elapsed: time_left,
+                    }),
+                }
+            }
         });
         let results = futures::future::join_all(sends).await;
         // (recipient hex, logical id, error code) of each retried attempt.

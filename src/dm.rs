@@ -2595,11 +2595,14 @@ impl InFlightAcks {
             return;
         };
         let binding = match ledger.entries.get(request_id) {
+            // An expired obligation keeps the binding of its last abandoned
+            // waiter; one with no pinned machine (no attempt was ever bound)
+            // is never upgraded by an ACK.
             Some(entry)
-                if matches!(
-                    entry.status,
-                    DmReceiptStatus::Pending | DmReceiptStatus::Expired
-                ) && entry.expires > now
+                if (entry.status == DmReceiptStatus::Pending
+                    || (entry.status == DmReceiptStatus::Expired
+                        && entry.binding.expected_machine.is_some()))
+                    && entry.expires > now
                     && binding_matches(
                         &entry.binding,
                         protocol_version,
@@ -2711,16 +2714,19 @@ impl InFlightAcks {
             {
                 return;
             }
-            ledger.record(
-                request_id,
-                status,
-                ReceiptBinding {
+            // Keep the binding of the last abandoned waiter (its pinned
+            // machine), so only that machine's ACK can upgrade the record.
+            let binding = ledger
+                .entries
+                .get(&request_id)
+                .filter(|entry| entry.expires > now)
+                .map(|entry| entry.binding)
+                .unwrap_or(ReceiptBinding {
                     expected_recipient: recipient,
                     expected_machine: None,
                     protocol_version: DM_PROTOCOL_DURABLE_ACK,
-                },
-                now,
-            );
+                });
+            ledger.record(request_id, status, binding, now);
         }
     }
 

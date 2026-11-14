@@ -1758,7 +1758,7 @@ The daemon stores it durably (`<data_dir>/dm_obligations.json`, survives a resta
 {"ok": true, "accepted": true, "already_held": false, "logical_id": "order-42", "agent_id": "8a3f...", "request_id": "5c1e...", "deliver_until": 1763200000000, "status": "pending"}
 ```
 
-It then sends again with the same `logical_id` until the recipient's v2 ACK (`delivered`), the deadline (`expired`) or a final refusal (`failed`). A recipient with no capability advert yet is held, not refused with 409; it is tried again as soon as its verified advert arrives. Without a `logical_id` the daemon makes one (`dm-<hex>`) and returns it. While held, the receipt reads `pending` with an `obligation` object: `deliver_until`, `attempts`, `next_attempt_at` and `last_error` (the error code of the last attempt). Repeating the same body is answered 202 with `already_held: true`.
+It then sends again with the same `logical_id` until the recipient's v2 ACK (`delivered`), the deadline (`expired`) or a final refusal (`failed`, also when you block the recipient meanwhile). No attempt runs past the deadline. A recipient with no capability advert yet is held, not refused with 409; it is tried again as soon as its verified advert arrives. Without a `logical_id` the daemon makes one (`dm-<hex>`) and returns it. While held, the receipt reads `pending` with an `obligation` object: `deliver_until`, `attempts`, `next_attempt_at` and `last_error` (the error code of the last attempt). Repeating the same body is answered 202 with `already_held: true`.
 
 | Status | `error` | When |
 |---|---|---|

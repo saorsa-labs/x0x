@@ -4201,6 +4201,20 @@ async fn dm_obligation_step(state: &AppState) {
     if store.is_empty().await {
         return;
     }
+    // #1109: the trust check runs again on every pass, so a recipient
+    // blocked after admission gets no further send.
+    let blocked: std::collections::HashSet<AgentId> = {
+        let recipients = store.recipients().await;
+        let contacts = state.contacts.read().await;
+        recipients
+            .into_iter()
+            .filter(|agent| {
+                contacts.get(agent).is_some_and(|contact| {
+                    contact.trust_level == x0x::contacts::TrustLevel::Blocked
+                })
+            })
+            .collect()
+    };
     let acks = state.agent.dm_inflight_acks();
     let pass = store
         .step(
@@ -4208,6 +4222,7 @@ async fn dm_obligation_step(state: &AppState) {
             state.agent.agent_id(),
             &direct_message_send_config(),
             &acks,
+            |agent| blocked.contains(agent),
             now_millis_u64(),
         )
         .await;

@@ -90,7 +90,7 @@ async fn issue1109_cold_recipient_is_held_then_delivered_on_advert() {
     let sender = Scripted::with(vec![Err(no_v2_advert()), Ok(())]);
     let config = DmSendConfig::default();
 
-    let first = store.step(&sender, ME, &config, &acks, T0).await;
+    let first = store.step(&sender, ME, &config, &acks, |_| false, T0).await;
     assert_eq!(first.retried, vec!["order-1".to_string()]);
     let kept = store.find(&PEER, "order-1").await.expect("still held");
     assert_eq!(kept.retry_count, 1);
@@ -101,12 +101,16 @@ async fn issue1109_cold_recipient_is_held_then_delivered_on_advert() {
     assert!(kept.next_retry_at_ms > T0 + 1_000, "the retry waits");
 
     // Not due yet: nothing is sent.
-    let idle = store.step(&sender, ME, &config, &acks, T0 + 1_000).await;
+    let idle = store
+        .step(&sender, ME, &config, &acks, |_| false, T0 + 1_000)
+        .await;
     assert_eq!(idle, DmObligationPass::default());
 
     // The verified advert arrives.
     assert!(store.nudge_for(&PEER, T0 + 1_000).await);
-    let second = store.step(&sender, ME, &config, &acks, T0 + 1_000).await;
+    let second = store
+        .step(&sender, ME, &config, &acks, |_| false, T0 + 1_000)
+        .await;
     assert_eq!(second.delivered, vec!["order-1".to_string()]);
     assert!(store.is_empty().await);
     assert_eq!(
@@ -145,6 +149,7 @@ async fn issue1109_restart_mid_obligation_resumes() {
                 ME,
                 &DmSendConfig::default(),
                 &InFlightAcks::new(),
+                |_| false,
                 T0,
             )
             .await;
@@ -167,6 +172,7 @@ async fn issue1109_restart_mid_obligation_resumes() {
             ME,
             &DmSendConfig::default(),
             &acks,
+            |_| false,
             held.next_retry_at_ms,
         )
         .await;
@@ -178,7 +184,8 @@ async fn issue1109_restart_mid_obligation_resumes() {
 }
 
 /// #1109: past the deadline nothing more is sent; the receipt reads
-/// `expired`. A matching late v2 ACK still upgrades it to `delivered_late`.
+/// `expired`. A late v2 ACK upgrades it to `delivered_late` only from the
+/// machine the last abandoned attempt was bound to.
 #[tokio::test]
 async fn issue1109_deadline_expiry_reads_expired() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -188,14 +195,38 @@ async fn issue1109_deadline_expiry_reads_expired() {
         .admit(obligation("order-3", b"late", T0 + 10_000))
         .await
         .expect("admitted");
+    // An earlier attempt bound to machine 0x09 gave up (its tombstone).
+    let _rx = acks.register_for_protocol(
+        request_id("order-3"),
+        DM_PROTOCOL_DURABLE_ACK,
+        PEER,
+        Some(MachineId([0x09; 32])),
+    );
+    acks.abandon(&request_id("order-3"));
     let sender = Scripted::with(vec![]);
     let pass = store
-        .step(&sender, ME, &DmSendConfig::default(), &acks, T0 + 10_000)
+        .step(
+            &sender,
+            ME,
+            &DmSendConfig::default(),
+            &acks,
+            |_| false,
+            T0 + 10_000,
+        )
         .await;
     assert_eq!(pass.expired, vec!["order-3".to_string()]);
     assert!(sender.sent().is_empty(), "no send after the deadline");
     assert!(store.is_empty().await);
     let rid = request_id("order-3");
+    assert_eq!(acks.receipt_status(&rid), DmReceiptStatus::Expired);
+    // Another machine of the same agent does not match the binding.
+    assert!(!acks.resolve_for_protocol(
+        &rid,
+        DM_PROTOCOL_DURABLE_ACK,
+        PEER,
+        MachineId([0x0a; 32]),
+        DmAckOutcome::Accepted,
+    ));
     assert_eq!(acks.receipt_status(&rid), DmReceiptStatus::Expired);
     assert!(!acks.resolve_for_protocol(
         &rid,
@@ -222,7 +253,7 @@ async fn issue1109_final_refusal_reads_failed() {
         reason: "blocked".to_string(),
     })]);
     let pass = store
-        .step(&sender, ME, &DmSendConfig::default(), &acks, T0)
+        .step(&sender, ME, &DmSendConfig::default(), &acks, |_| false, T0)
         .await;
     assert_eq!(pass.failed, vec!["order-4".to_string()]);
     assert!(store.is_empty().await);
@@ -300,4 +331,201 @@ async fn issue1109_sidecar_is_owner_only() {
         .permissions()
         .mode();
     assert_eq!(mode & 0o777, 0o600);
+}
+
+/// #1109 review: an obligation that expires with no bound attempt keeps no
+/// machine, so no ACK can turn it into a delivery.
+#[tokio::test]
+async fn issue1109_expiry_without_a_bound_attempt_refuses_any_ack() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = DmObligationStore::new(dir.path());
+    let acks = InFlightAcks::new();
+    store
+        .admit(obligation("order-9", b"never sent", T0 + 10))
+        .await
+        .expect("admitted");
+    let sender = Scripted::with(vec![]);
+    store
+        .step(
+            &sender,
+            ME,
+            &DmSendConfig::default(),
+            &acks,
+            |_| false,
+            T0 + 10,
+        )
+        .await;
+    let rid = request_id("order-9");
+    for machine in [0x01_u8, 0x09, 0xff] {
+        assert!(!acks.resolve_for_protocol(
+            &rid,
+            DM_PROTOCOL_DURABLE_ACK,
+            PEER,
+            MachineId([machine; 32]),
+            DmAckOutcome::Accepted,
+        ));
+        assert_eq!(acks.receipt_status(&rid), DmReceiptStatus::Expired);
+    }
+}
+
+/// #1109 review: two concurrent admissions under the same logical id with
+/// different bytes cannot both pass the check; the first is kept, the
+/// second is refused, and nothing is replaced.
+#[tokio::test]
+async fn issue1109_concurrent_admission_never_replaces() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = DmObligationStore::new(dir.path());
+    let (a, b) = tokio::join!(
+        store.admit(obligation("race-1", b"first", T0 + 600_000)),
+        store.admit(obligation("race-1", b"second", T0 + 600_000)),
+    );
+    let outcomes = [a.clone(), b.clone()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|o| **o == Ok(DmObligationAdmission::Admitted))
+            .count(),
+        1,
+        "exactly one admission: {outcomes:?}"
+    );
+    assert!(
+        outcomes.contains(&Err(DmObligationRefusal::IdempotencyConflict)),
+        "the other is refused: {outcomes:?}"
+    );
+    let held = store.find(&PEER, "race-1").await.expect("held");
+    let winner: &[u8] = if a.is_ok() { b"first" } else { b"second" };
+    assert_eq!(held.payload, winner, "the admitted bytes were not replaced");
+    assert_eq!(store.len().await, 1);
+}
+
+/// #1109 review: at one free slot, two concurrent admissions of distinct
+/// ids admit exactly one; the cap is never exceeded and nothing is evicted.
+#[tokio::test]
+async fn issue1109_concurrent_admission_at_the_cap_admits_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = DmObligationStore::new(dir.path());
+    for n in 0..DM_OBLIGATION_CAPS.per_partition - 1 {
+        store
+            .admit(obligation(&format!("fill-{n}"), b"x", T0 + 600_000))
+            .await
+            .expect("under the cap");
+    }
+    let (a, b) = tokio::join!(
+        store.admit(obligation("last-a", b"x", T0 + 600_000)),
+        store.admit(obligation("last-b", b"x", T0 + 600_000)),
+    );
+    let outcomes = [a, b];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|o| **o == Ok(DmObligationAdmission::Admitted))
+            .count(),
+        1,
+        "{outcomes:?}"
+    );
+    assert!(
+        outcomes.contains(&Err(DmObligationRefusal::Full)),
+        "{outcomes:?}"
+    );
+    assert_eq!(store.len().await, DM_OBLIGATION_CAPS.per_partition);
+    assert!(
+        store.find(&PEER, "fill-0").await.is_some(),
+        "nothing evicted"
+    );
+}
+
+/// #1109 review: a recipient blocked after admission gets no further send;
+/// the obligation ends as `failed`.
+#[tokio::test]
+async fn issue1109_recipient_blocked_after_admission_reads_failed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = DmObligationStore::new(dir.path());
+    let acks = InFlightAcks::new();
+    store
+        .admit(obligation("order-10", b"hi", T0 + 600_000))
+        .await
+        .expect("admitted");
+    assert_eq!(store.recipients().await, vec![PEER]);
+    let sender = Scripted::with(vec![Ok(())]);
+    let pass = store
+        .step(
+            &sender,
+            ME,
+            &DmSendConfig::default(),
+            &acks,
+            |agent| *agent == PEER,
+            T0,
+        )
+        .await;
+    assert_eq!(pass.failed, vec!["order-10".to_string()]);
+    assert!(sender.sent().is_empty(), "no send to a blocked recipient");
+    assert!(store.is_empty().await);
+    assert_eq!(
+        acks.receipt_status(&request_id("order-10")),
+        DmReceiptStatus::Failed
+    );
+}
+
+/// A sender that never answers, to prove the per-send deadline clamp.
+struct Stalled {
+    seen_timeout: StdMutex<Option<std::time::Duration>>,
+}
+
+impl ObligationSender for Stalled {
+    async fn send(
+        &self,
+        _to: AgentId,
+        _payload: Vec<u8>,
+        config: DmSendConfig,
+    ) -> Result<(), DmError> {
+        if let Ok(mut seen) = self.seen_timeout.lock() {
+            *seen = Some(config.timeout_per_attempt);
+        }
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+}
+
+/// #1109 review: an attempt never runs past the deadline. The send budget
+/// and an outer bound are clamped to the time left; the cut-off attempt is
+/// a retry and the next pass expires the obligation.
+#[tokio::test(start_paused = true)]
+async fn issue1109_late_attempt_is_clamped_to_the_time_left() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = DmObligationStore::new(dir.path());
+    let acks = InFlightAcks::new();
+    store
+        .admit(obligation("order-11", b"hi", T0 + 250))
+        .await
+        .expect("admitted");
+    let sender = Stalled {
+        seen_timeout: StdMutex::new(None),
+    };
+    let started = tokio::time::Instant::now();
+    let pass = store
+        .step(&sender, ME, &DmSendConfig::default(), &acks, |_| false, T0)
+        .await;
+    assert_eq!(pass.retried, vec!["order-11".to_string()]);
+    assert!(
+        started.elapsed() <= std::time::Duration::from_millis(250),
+        "the attempt stopped at the deadline: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        sender.seen_timeout.lock().ok().and_then(|s| *s),
+        Some(std::time::Duration::from_millis(250))
+    );
+    let held = store.find(&PEER, "order-11").await.expect("held");
+    assert_eq!(held.last_error.as_deref(), Some("timeout"));
+    let expired = store
+        .step(
+            &sender,
+            ME,
+            &DmSendConfig::default(),
+            &acks,
+            |_| false,
+            held.next_retry_at_ms.max(T0 + 250),
+        )
+        .await;
+    assert_eq!(expired.expired, vec!["order-11".to_string()]);
 }

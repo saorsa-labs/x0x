@@ -239,6 +239,27 @@ impl<'a, T: OutboxRecord> Outbox<'a, T> {
         self.persist_then_commit(next).await
     }
 
+    /// Insert `entry` only when `admit` accepts the stored set, and persist.
+    /// `admit` and the write run under the persistence lock, so two callers
+    /// cannot both pass a check that only one of them fits (#1109). Nothing
+    /// is replaced or evicted: `admit` must refuse a held id and a full set.
+    /// `Ok(Err(e))` is `admit`'s refusal, with nothing changed.
+    pub(crate) async fn insert_checked<E>(
+        &self,
+        entry: T,
+        admit: impl FnOnce(&OutboxMap<T>) -> Result<(), E>,
+    ) -> Result<Result<(), E>, DurableWriteError> {
+        let _guard = self.persist_lock.lock().await;
+        let mut next = self.entries.read().await.clone();
+        if let Err(refusal) = admit(&next) {
+            return Ok(Err(refusal));
+        }
+        next.entry(entry.partition().to_string())
+            .or_default()
+            .push(entry);
+        self.persist_then_commit(next).await.map(Ok)
+    }
+
     /// Replace the stored entry that has `entry`'s partition and id, and
     /// persist. Nothing changes, and `Ok(false)` is returned, when no such
     /// entry is stored or `accept` refuses the stored one. The check and
