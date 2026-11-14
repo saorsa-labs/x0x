@@ -347,6 +347,7 @@ async fn pre_welcome_page_applies_ban_state_only() -> anyhow::Result<()> {
         treekem_commit_b64: treekem_commit_b64(),
         treekem_epoch: Some(TREEKEM_EPOCH),
         commit: Some(ban.clone()),
+        target_key_package_b64: None,
     };
     let mut stub = base.clone();
     arm(&mut stub, vec![ban.state_hash.clone()], &owner);
@@ -504,6 +505,7 @@ async fn pre_welcome_ban_without_armed_sequence_is_refused() -> anyhow::Result<(
         treekem_commit_b64: treekem_commit_b64(),
         treekem_epoch: Some(TREEKEM_EPOCH),
         commit: Some(ban),
+        target_key_package_b64: None,
     };
     let key = install_stub(&state, base.clone()).await?;
     let trace = refusal_trace(&state, &key, &owner, event).await;

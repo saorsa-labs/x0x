@@ -35,6 +35,46 @@ async fn ban(state: &Arc<AppState>, target_hex: &str) -> (StatusCode, serde_json
     body_of(response).await
 }
 
+/// [`treekem_ban_is_roster_only`] with the row's committed KeyPackage as
+/// the evidence, as the sender passes it.
+async fn roster_only(state: &AppState, info: &x0x::groups::GroupInfo, target: &str) -> bool {
+    treekem_ban_is_roster_only(
+        state,
+        GROUP,
+        info,
+        target,
+        roster_only_ban_key_package(info, target).as_deref(),
+    )
+    .await
+}
+
+/// The admin's roster-only ban of `target` on `info`, built as the sender
+/// builds it: the normalised banned row and the target's committed
+/// KeyPackage as evidence.
+fn roster_only_ban_event(
+    info: &x0x::groups::GroupInfo,
+    admin_kp: &AgentKeypair,
+    admin_hex: &str,
+    target: &str,
+) -> Result<NamedGroupMetadataEvent> {
+    let mut next = info.clone();
+    next.roster_revision = next.roster_revision.saturating_add(1);
+    let revision = next.roster_revision;
+    apply_roster_only_ban_row(&mut next, target, admin_hex);
+    let commit = next.seal_commit(admin_kp, now_millis_u64())?;
+    Ok(NamedGroupMetadataEvent::MemberBanned {
+        group_id: GROUP.to_string(),
+        revision,
+        actor: admin_hex.to_string(),
+        agent_id: target.to_string(),
+        secret_epoch: None,
+        treekem_commit_b64: None,
+        treekem_epoch: None,
+        commit: Some(commit),
+        target_key_package_b64: roster_only_ban_key_package(info, target),
+    })
+}
+
 /// Seed `agent`'s current verified advert with `bits`.
 fn seed_advert(state: &AppState, agent: &x0x::identity::AgentId, bits: u64) {
     let mut caps = x0x::dm::DmCapabilities::v1_gossip_ready(vec![42; 1184]);
@@ -133,11 +173,11 @@ async fn a_leafless_member_is_banned_roster_only_behind_the_capability_gate() ->
         let groups = f.state.named_groups.read().await;
         let info = groups.get(GROUP).expect("group");
         assert!(
-            treekem_ban_is_roster_only(&f.state, GROUP, info, &f.removed_hex).await,
+            roster_only(&f.state, info, &f.removed_hex).await,
             "R holds no seat and no leaf"
         );
         assert!(
-            !treekem_ban_is_roster_only(&f.state, GROUP, info, &witness_hex).await,
+            !roster_only(&f.state, info, &witness_hex).await,
             "a seated member is never banned roster-only"
         );
     }
@@ -193,7 +233,7 @@ async fn a_self_leaver_that_still_holds_a_leaf_gets_the_treekem_removal() -> Res
         let groups = f.state.named_groups.read().await;
         let info = groups.get(GROUP).expect("group");
         assert!(
-            !treekem_ban_is_roster_only(&f.state, GROUP, info, &f.removed_hex).await,
+            !roster_only(&f.state, info, &f.removed_hex).await,
             "R still holds a leaf"
         );
     }
@@ -255,12 +295,12 @@ async fn no_leaf_evidence_is_never_read_as_no_leaf() -> Result<()> {
     info.set_member_treekem_key_package(&local_hex, BASE64.encode(&local_kp));
     info.remove_member(&removed_hex, Some(admin_hex.clone()));
     assert!(
-        !treekem_ban_is_roster_only(&state, GROUP, &info, &removed_hex).await,
+        !roster_only(&state, &info, &removed_hex).await,
         "no KeyPackage and an unattributed leaf: no evidence"
     );
     let stranger = hex::encode(AgentKeypair::generate()?.agent_id().as_bytes());
     assert!(
-        !treekem_ban_is_roster_only(&state, GROUP, &info, &stranger).await,
+        !roster_only(&state, &info, &stranger).await,
         "a row-less target of a partly attributed tree: no evidence"
     );
     let removed_kp = x0x::mls::TreeKemMlsGroup::prepare_member(removed_id, &[8u8; 32])?
@@ -268,7 +308,7 @@ async fn no_leaf_evidence_is_never_read_as_no_leaf() -> Result<()> {
         .to_vec();
     info.set_member_treekem_key_package(&removed_hex, BASE64.encode(&removed_kp));
     assert!(
-        treekem_ban_is_roster_only(&state, GROUP, &info, &removed_hex).await,
+        roster_only(&state, &info, &removed_hex).await,
         "the committed KeyPackage proves R holds no leaf"
     );
     Ok(())
@@ -338,23 +378,8 @@ async fn a_member_applies_the_roster_only_ban_of_a_leafless_member() -> Result<(
         Arc::new(tokio::sync::Mutex::new(local_tree)),
     );
 
-    let roster_only_ban = |target: &str| -> Result<NamedGroupMetadataEvent> {
-        let mut next = info.clone();
-        next.roster_revision = next.roster_revision.saturating_add(1);
-        let revision = next.roster_revision;
-        next.ban_member(target, Some(admin_hex.clone()));
-        let commit = next.seal_commit(&admin_kp, now_millis_u64())?;
-        Ok(NamedGroupMetadataEvent::MemberBanned {
-            group_id: GROUP.to_string(),
-            revision,
-            actor: admin_hex.clone(),
-            agent_id: target.to_string(),
-            secret_epoch: None,
-            treekem_commit_b64: None,
-            treekem_epoch: None,
-            commit: Some(commit),
-        })
-    };
+    let roster_only_ban =
+        |target: &str| roster_only_ban_event(&info, &admin_kp, &admin_hex, target);
 
     // Naming this node's own seat (it holds a leaf): refused.
     let seated = apply_named_group_metadata_event(
@@ -381,6 +406,136 @@ async fn a_member_applies_the_roster_only_ban_of_a_leafless_member() -> Result<(
     assert!(after.is_banned(&removed_hex));
     assert_eq!(after.secret_epoch, epoch, "no epoch change");
     assert!(after.has_active_member(&local_hex));
+    Ok(())
+}
+
+/// #1898 review: sender and receivers must agree. The admin node bans R
+/// roster-only through the route. A member L that never held R's row, and
+/// the same L with only R's KeyPackage hash (no bytes), both apply the
+/// admin's event from the KeyPackage it carries and reach the sender's
+/// state hash: every side writes the same normalised banned row. Red on
+/// the previous head: L refused (`treekem_commit_b64_absent`, no
+/// evidence) or computed another roster root (Guest row vs Member row).
+#[tokio::test]
+async fn row_less_and_hash_only_receivers_agree_with_the_sender() -> Result<()> {
+    let (receiver, _rdir) = secure_endpoint_test_state().await?;
+    let (sender, _sdir) = secure_endpoint_test_state().await?;
+    let local = receiver.agent.agent_id();
+    let local_hex = hex::encode(local.as_bytes());
+    let admin_id = sender.agent.agent_id();
+    let admin_hex = hex::encode(admin_id.as_bytes());
+    let group_id_bytes = hex::decode(GROUP)?;
+
+    // The admin's tree: R joins and is removed, then L joins by Welcome,
+    // so L's tree never knew R.
+    let admin_seed = super::super::agent_treekem_seed(sender.agent.as_ref(), &group_id_bytes);
+    let mut admin_tree =
+        x0x::mls::TreeKemMlsGroup::create(group_id_bytes.clone(), admin_id, &admin_seed)?;
+    let removed_id = AgentKeypair::generate()?.agent_id();
+    let removed_hex = hex::encode(removed_id.as_bytes());
+    let removed_kp = x0x::mls::TreeKemMlsGroup::prepare_member(removed_id, &[8u8; 32])?
+        .key_package_bytes()
+        .to_vec();
+    admin_tree.add_member(removed_id, &removed_kp)?;
+    admin_tree.remove_member_verified(removed_id, &removed_kp)?;
+    let local_seed = super::super::agent_treekem_seed(receiver.agent.as_ref(), &group_id_bytes);
+    let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(local, &local_seed)?;
+    let local_kp = prepared.key_package_bytes().to_vec();
+    let added = admin_tree.add_member(local, &local_kp)?;
+    let local_tree = x0x::mls::TreeKemMlsGroup::join_from_welcome(prepared, &added.welcome)?;
+    let epoch = admin_tree.epoch();
+
+    let mut info = x0x::groups::GroupInfo::new(
+        "ban-1540".to_string(),
+        String::new(),
+        admin_id,
+        GROUP.into(),
+    );
+    info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+    for (id, kp) in [(&local_hex, &local_kp), (&removed_hex, &removed_kp)] {
+        info.add_member(
+            id.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        info.set_member_treekem_key_package(id, BASE64.encode(kp));
+    }
+    info.remove_member(&removed_hex, Some(admin_hex.clone()));
+    info.secret_epoch = epoch;
+    info.security_binding = Some(format!("treekem:epoch={epoch}"));
+    info.recompute_state_hash();
+    sender
+        .named_groups
+        .write()
+        .await
+        .insert(GROUP.to_string(), info.clone());
+    sender.treekem_groups.write().await.insert(
+        GROUP.to_string(),
+        Arc::new(tokio::sync::Mutex::new(admin_tree)),
+    );
+    receiver.treekem_groups.write().await.insert(
+        GROUP.to_string(),
+        Arc::new(tokio::sync::Mutex::new(local_tree)),
+    );
+
+    // The sender bans R roster-only through the route.
+    seed_advert(&sender, &local, x0x::dm::CapabilityRegistry::current().bits);
+    let (status, body) = ban(&sender, &removed_hex).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["roster_only"], true);
+    let sent_hash = sender.named_groups.read().await[GROUP].state_hash.clone();
+
+    // The same event, built as the sender builds it, reaches the same head.
+    let event = roster_only_ban_event(
+        &info,
+        sender.agent.identity().agent_keypair(),
+        &admin_hex,
+        &removed_hex,
+    )?;
+    let NamedGroupMetadataEvent::MemberBanned {
+        target_key_package_b64,
+        commit: Some(commit),
+        ..
+    } = &event
+    else {
+        unreachable!("a roster-only MemberBanned");
+    };
+    assert_eq!(
+        commit.state_hash, sent_hash,
+        "the test event matches the route"
+    );
+    assert_eq!(
+        target_key_package_b64.as_deref(),
+        Some(BASE64.encode(&removed_kp).as_str()),
+        "the event carries R's committed KeyPackage"
+    );
+
+    // Receiver variants of the same head: no row for R, and a hash-only row.
+    let mut row_less = info.clone();
+    row_less.members_v2.remove(&removed_hex);
+    let mut hash_only = info.clone();
+    hash_only
+        .members_v2
+        .get_mut(&removed_hex)
+        .expect("R's row")
+        .treekem_key_package_b64 = None;
+    for (name, view) in [("row-less", row_less), ("hash-only", hash_only)] {
+        assert_eq!(view.state_hash, info.state_hash, "{name}: same head");
+        receiver
+            .named_groups
+            .write()
+            .await
+            .insert(GROUP.to_string(), view);
+        let applied =
+            apply_named_group_metadata_event(&receiver, event.clone(), admin_id, true, None).await;
+        assert!(applied.accepted, "{name} receiver applies: {applied:?}");
+        let groups = receiver.named_groups.read().await;
+        let after = &groups[GROUP];
+        assert!(after.is_banned(&removed_hex), "{name}");
+        assert_eq!(after.state_hash, sent_hash, "{name}: the sender's head");
+        assert_eq!(after.secret_epoch, epoch, "{name}: no epoch change");
+    }
     Ok(())
 }
 

@@ -3072,6 +3072,7 @@ async fn every_stateful_event_variant_routes_conflicts_through_the_wrapper() -> 
             treekem_commit_b64: None,
             treekem_epoch: None,
             commit: Some(conflicting_commit(&state, &group_id, signer, false).await?),
+            target_key_package_b64: None,
         };
         let result =
             apply_named_group_metadata_event(&state, event, authority_id, true, None).await;

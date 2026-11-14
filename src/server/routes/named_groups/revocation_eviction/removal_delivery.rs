@@ -934,6 +934,7 @@ mod tests {
             treekem_commit_b64: Some("Y29tbWl0".to_string()),
             treekem_epoch: Some(3),
             commit: Some(commit("p", "r")),
+            target_key_package_b64: None,
         };
         let bytes = serde_json::to_vec(&event).unwrap_or_default();
         let saved = decode_saved_removal(&bytes).expect("a saved ban decodes");

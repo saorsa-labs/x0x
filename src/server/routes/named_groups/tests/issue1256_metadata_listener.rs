@@ -175,6 +175,7 @@ async fn removing_or_banning_another_member_keeps_listener() -> Result<()> {
                 treekem_commit_b64: None,
                 treekem_epoch: None,
                 commit: Some(commit),
+                target_key_package_b64: None,
             }
         } else {
             NamedGroupMetadataEvent::MemberRemoved {
@@ -241,6 +242,7 @@ async fn self_removal_ban_and_group_deletion_stop_listener() -> Result<()> {
                 treekem_commit_b64: None,
                 treekem_epoch: None,
                 commit,
+                target_key_package_b64: None,
             },
             _ => NamedGroupMetadataEvent::GroupDeleted {
                 group_id: STABLE.to_string(),

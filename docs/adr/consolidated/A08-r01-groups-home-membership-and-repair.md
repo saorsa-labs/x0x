@@ -108,9 +108,17 @@ under his delegation of design decisions of 10 Nov 2026
 group, the ban of a member that holds no seat (no row, a key-only join
 marker, or a `Removed` or `Banned` row) and no ratchet leaf carries no
 TreeKEM commit and no epoch; it is a signed roster change that closes the
-member's rejoin window. A receiver applies it only when the target holds
-no seat on its roster and its tree reports no leaf for the target; a
-target with a leaf still needs the TreeKEM removal. An admin publishes it
+member's rejoin window. The event carries the target's committed TreeKEM
+KeyPackage (`target_key_package_b64`), because leaf credentials are
+unlinkable and no node can attribute a leaf without it; a target with no
+committed KeyPackage is not banned roster-only. The sender and each
+receiver decide from those same bytes: the target holds no seat on its
+roster, the bytes match the row's KeyPackage hash when the row has one,
+and its own tree answers that no leaf holds that KeyPackage. No evidence
+is never read as no leaf, so a target with a leaf still needs the TreeKEM
+removal. Every side writes one banned-row shape (a fresh `Guest`/`Banned`
+row with no certificate), so a receiver without the target's row reaches
+the sender's roster root. An admin publishes it
 only while every other Active member's current verified advert carries
 application bit 17, `roster_only_ban_v1`; otherwise the ban route answers
 409 `waiting_for_receiver_upgrade` with the members whose advert lacks the

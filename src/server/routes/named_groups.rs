@@ -2464,6 +2464,11 @@ pub(in crate::server) enum NamedGroupMetadataEvent {
         treekem_epoch: Option<u64>,
         #[serde(default)]
         commit: Option<x0x::groups::GroupStateCommit>,
+        /// #1540: the target's committed TreeKEM KeyPackage, carried by a
+        /// roster-only ban (no TreeKEM commit) so every receiver can check
+        /// its own tree for the target's leaf with the same evidence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_key_package_b64: Option<String>,
     },
     MemberUnbanned {
         group_id: String,
@@ -18515,6 +18520,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             treekem_commit_b64,
             treekem_epoch,
             commit,
+            target_key_package_b64,
             ..
         } => {
             let Some(commit) = commit else {
@@ -18530,13 +18536,15 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 match (treekem_commit_b64, treekem_epoch) {
                     (Some(commit_b64), Some(epoch)) => Some((commit_b64, epoch)),
                     // #1540: the roster-only ban of a member that holds no
-                    // seat on this node's roster and no leaf in its tree.
+                    // seat on this node's roster and, by the KeyPackage the
+                    // event carries, no leaf in this node's tree.
                     (None, None)
                         if treekem_ban_is_roster_only(
                             state,
                             &resolved_group_key,
                             &info,
                             &agent_id,
+                            target_key_package_b64.as_deref(),
                         )
                         .await =>
                     {
@@ -18552,6 +18560,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             } else {
                 None
             };
+            let roster_only = info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+                && treekem_payload.is_none();
             let current = info.clone();
             let Ok(mut next) = apply_stateful_event_with_evidence(
                 state,
@@ -18569,10 +18579,15 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     // inserts its Guest-role Banned entry there; keeping
                     // the marker's Member role would bind a different
                     // roster root than main's shape.
-                    if next.join_seat_key_marker_only(&agent_id) {
-                        next.members_v2.remove(&agent_id);
+                    if roster_only {
+                        // #1540: the sender's normalised banned row.
+                        apply_roster_only_ban_row(next, &agent_id, &actor);
+                    } else {
+                        if next.join_seat_key_marker_only(&agent_id) {
+                            next.members_v2.remove(&agent_id);
+                        }
+                        next.ban_member(&agent_id, Some(actor.clone()));
                     }
-                    next.ban_member(&agent_id, Some(actor.clone()));
                     if let Some((_, epoch)) = treekem_payload.as_ref() {
                         next.secret_epoch = *epoch;
                         next.security_binding = Some(format!("treekem:epoch={epoch}"));
@@ -34868,6 +34883,7 @@ pub(in crate::server) async fn ban_group_member(
         treekem_commit_b64: None,
         treekem_epoch: None,
         commit: Some(commit),
+        target_key_package_b64: None,
     };
     // ADR 0110 §5 (#1508 review): the same prepare barrier as the TreeKEM
     // ban. When S4 runs this ban, its exact event is durable BEFORE the
@@ -35031,7 +35047,15 @@ async fn ban_treekem_group_member(
     };
     // #1540: a target with no seat and no leaf is banned roster-only: no
     // TreeKEM removal exists for it, and the ban still closes its rejoin.
-    if treekem_ban_is_roster_only(&state, &id, &next, &agent_id_hex).await {
+    if treekem_ban_is_roster_only(
+        &state,
+        &id,
+        &next,
+        &agent_id_hex,
+        roster_only_ban_key_package(&next, &agent_id_hex).as_deref(),
+    )
+    .await
+    {
         return ban_treekem_member_roster_only(
             state,
             id,
@@ -35135,6 +35159,7 @@ async fn ban_treekem_group_member(
         treekem_commit_b64: Some(base64::engine::general_purpose::STANDARD.encode(treekem_commit)),
         treekem_epoch: Some(treekem_epoch),
         commit: Some(commit),
+        target_key_package_b64: None,
     };
     // ADR 0110 §5 (#1508 review): an S4 ban passes the same prepare
     // barrier as an S4 removal. Its exact event is durable in the prepared
@@ -35239,23 +35264,44 @@ async fn ban_treekem_group_member(
 /// Active member's advert to carry `roster_only_ban_v1`.
 pub(in crate::server) const ROSTER_ONLY_BAN_UPGRADE_WAIT: &str = "waiting_for_receiver_upgrade";
 
-/// #1540: whether a TreeKEM ban of `agent_id_hex` is roster-only. The
-/// target holds no seat on `info` (no row, a key-only join marker, or a
-/// `Removed`/`Banned` row) and this node's tree gives positive evidence
-/// that it holds no ratchet leaf: [`roster_treekem_leaf_presence`] answers
-/// `Some(false)` for its row (the tree checked against the committed
-/// KeyPackage, or every leaf of the tree belongs to another identified
-/// member). A row-less target needs the second rule. `None` is no
-/// evidence and is never read as "no leaf" (#1508 review P1), so a
-/// self-leaver that may still hold a leaf takes the full TreeKEM removal.
-/// A group with no loaded tree has no evidence either.
+/// #1540: the committed TreeKEM KeyPackage of `agent_id_hex` on `info`
+/// (bytes whose hash the row commits), the evidence a roster-only ban
+/// carries in `target_key_package_b64`.
+pub(in crate::server) fn roster_only_ban_key_package(
+    info: &x0x::groups::GroupInfo,
+    agent_id_hex: &str,
+) -> Option<String> {
+    info.members_v2
+        .get(agent_id_hex)
+        .and_then(current_member_treekem_key_package)
+}
+
+/// #1540: whether a TreeKEM ban of `agent_id_hex` may be roster-only, with
+/// `key_package_b64` as the evidence: the sender passes the row's
+/// committed KeyPackage ([`roster_only_ban_key_package`]), a receiver the
+/// one the event carries, so both decide from the same bytes. All must
+/// hold:
+/// - the target holds no seat on `info` (no row, a key-only join marker,
+///   or a `Removed`/`Banned` row);
+/// - a KeyPackage is given, and when this node's row of the target commits
+///   a KeyPackage hash, the bytes match it (a hash-only row checks too);
+/// - this node has a tree, and the tree answers `Some(false)` for that
+///   KeyPackage. `None` (no evidence) is never read as "no leaf" (#1508
+///   review P1), so a self-leaver that may still hold a leaf takes the
+///   full TreeKEM removal.
+///
+/// Leaf credentials are unlinkable across groups, so without a KeyPackage
+/// no node can attribute a leaf to the target: a target with no committed
+/// KeyPackage is never banned roster-only.
 pub(in crate::server) async fn treekem_ban_is_roster_only(
     state: &AppState,
     group_id: &str,
     info: &x0x::groups::GroupInfo,
     agent_id_hex: &str,
+    key_package_b64: Option<&str>,
 ) -> bool {
-    let seated = info.members_v2.get(agent_id_hex).is_some_and(|member| {
+    let row = info.members_v2.get(agent_id_hex);
+    let seated = row.is_some_and(|member| {
         matches!(
             member.state,
             x0x::groups::GroupMemberState::Active | x0x::groups::GroupMemberState::Pending
@@ -35264,29 +35310,38 @@ pub(in crate::server) async fn treekem_ban_is_roster_only(
     if seated {
         return false;
     }
-    let Ok(target) = parse_agent_id_hex(agent_id_hex) else {
+    let Some(kp_b64) = key_package_b64 else {
+        return false;
+    };
+    if let Some(expected) = row.and_then(|member| member.treekem_key_package_hash.as_deref()) {
+        if blake3::hash(kp_b64.as_bytes()).to_hex().as_str() != expected {
+            return false;
+        }
+    }
+    let (Ok(target), Ok(kp)) = (parse_agent_id_hex(agent_id_hex), BASE64.decode(kp_b64)) else {
         return false;
     };
     let Some(group) = state.treekem_groups.read().await.get(group_id).cloned() else {
         return false;
     };
-    let guard = group.lock().await;
-    let presence = roster_treekem_leaf_presence(&guard, info);
-    let present = match presence.get(agent_id_hex) {
-        Some(present) => *present,
-        None => {
-            let accounted = presence
-                .values()
-                .filter(|present| **present == Some(true))
-                .count();
-            match guard.member_leaf_present(&target, None) {
-                Some(true) => Some(true),
-                _ if accounted >= guard.member_count() as usize => Some(false),
-                _ => None,
-            }
-        }
-    };
+    let present = group.lock().await.member_leaf_present(&target, Some(&kp));
     present == Some(false)
+}
+
+/// #1540: the one banned-row shape of a roster-only ban, written by the
+/// sender and every receiver alike: the target's row is replaced by
+/// `ban_member`'s fresh `Guest`/`Banned` row with no certificate and no
+/// KeyPackage. A `Removed` row is outside the roster root while a
+/// `Banned` row is inside it with its role and certificate digest, so a
+/// receiver that never held the row (or holds a different one) must
+/// still compute the sender's root.
+pub(in crate::server) fn apply_roster_only_ban_row(
+    info: &mut x0x::groups::GroupInfo,
+    agent_id_hex: &str,
+    actor_hex: &str,
+) {
+    info.members_v2.remove(agent_id_hex);
+    info.ban_member(agent_id_hex, Some(actor_hex.to_string()));
 }
 
 /// #1540: the roster-only ban of a TreeKEM member that holds no seat and
@@ -35341,12 +35396,10 @@ async fn ban_treekem_member_roster_only(
     }
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
+    let target_key_package_b64 = roster_only_ban_key_package(&next, &agent_id_hex);
     next.roster_revision = next.roster_revision.saturating_add(1);
     let revision = next.roster_revision;
-    if next.join_seat_key_marker_only(&agent_id_hex) {
-        next.members_v2.remove(&agent_id_hex);
-    }
-    next.ban_member(&agent_id_hex, Some(caller_hex.clone()));
+    apply_roster_only_ban_row(&mut next, &agent_id_hex, &caller_hex);
     let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await {
         Ok(commit) => commit,
         Err(e) => {
@@ -35374,6 +35427,7 @@ async fn ban_treekem_member_roster_only(
         treekem_commit_b64: None,
         treekem_epoch: None,
         commit: Some(commit),
+        target_key_package_b64,
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     remember_treekem_membership_event(&state, &event).await;
@@ -67840,6 +67894,7 @@ pub(in crate::server) mod tests {
             treekem_commit_b64: Some("Yw==".to_string()),
             treekem_epoch: Some(3),
             commit: Some(fake_group_state_commit(&group_id, 6, &admin_hex)),
+            target_key_package_b64: None,
         };
         assert!(authorized_treekem_membership_event_for_queue(
             &info,
@@ -69435,6 +69490,7 @@ pub(in crate::server) mod tests {
             treekem_commit_b64: Some("Yw==".to_string()),
             treekem_epoch: Some(1),
             commit: None,
+            target_key_package_b64: None,
         };
         assert!(!treekem_metadata_event_requires_phase3(&member_banned));
 
@@ -69496,6 +69552,7 @@ pub(in crate::server) mod tests {
             treekem_commit_b64: Some("Yw==".to_string()),
             treekem_epoch: Some(3),
             commit: Some(fake_commit(3, "state-2")),
+            target_key_package_b64: None,
         };
 
         assert_eq!(treekem_membership_event_sort_key(&ban_epoch_3), (3, 3));
