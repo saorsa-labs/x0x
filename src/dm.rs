@@ -2174,6 +2174,13 @@ pub enum DmReceiptStatus {
     /// This daemon holds no record: no durable send with this id, or the
     /// record expired or was evicted.
     Unknown,
+    /// A `deliver_until` obligation reached its deadline without a v2 ACK.
+    /// The recipient may still hold the message; nothing more is sent.
+    Expired,
+    /// A `deliver_until` obligation stopped on a refusal that a retry
+    /// cannot change (trust rejection, pairing denial, idempotency
+    /// conflict, payload too large).
+    Failed,
 }
 
 impl DmReceiptStatus {
@@ -2185,7 +2192,18 @@ impl DmReceiptStatus {
             Self::DeliveredLate => "delivered_late",
             Self::Pending => "pending",
             Self::Unknown => "unknown",
+            Self::Expired => "expired",
+            Self::Failed => "failed",
         }
+    }
+
+    /// A final outcome: nothing more will be sent for this request.
+    #[must_use]
+    pub fn is_final(self) -> bool {
+        matches!(
+            self,
+            Self::Delivered | Self::DeliveredLate | Self::Expired | Self::Failed
+        )
     }
 }
 
@@ -2556,8 +2574,9 @@ impl InFlightAcks {
         }
     }
 
-    /// #1109: turn a pending tombstone into `delivered_late` when a late ACK
-    /// carries the exact binding the abandoned waiter held. Anything else
+    /// #1109: turn a pending tombstone (or an expired `deliver_until`
+    /// obligation) into `delivered_late` when a late ACK carries the exact
+    /// binding the record holds. Anything else
     /// (no tombstone, a mismatched sender, machine or protocol, a refusal
     /// outcome) changes nothing.
     fn resolve_late(
@@ -2577,8 +2596,10 @@ impl InFlightAcks {
         };
         let binding = match ledger.entries.get(request_id) {
             Some(entry)
-                if entry.status == DmReceiptStatus::Pending
-                    && entry.expires > now
+                if matches!(
+                    entry.status,
+                    DmReceiptStatus::Pending | DmReceiptStatus::Expired
+                ) && entry.expires > now
                     && binding_matches(
                         &entry.binding,
                         protocol_version,
@@ -2625,12 +2646,10 @@ impl InFlightAcks {
         };
         // A retry under the same logical id must not hide an earlier
         // proof of delivery behind a fresh `pending`.
-        if ledger.status(request_id, now).is_some_and(|status| {
-            matches!(
-                status,
-                DmReceiptStatus::Delivered | DmReceiptStatus::DeliveredLate
-            )
-        }) {
+        if ledger
+            .status(request_id, now)
+            .is_some_and(DmReceiptStatus::is_final)
+        {
             return;
         }
         ledger.record(*request_id, DmReceiptStatus::Pending, waiter.binding(), now);
@@ -2652,7 +2671,7 @@ impl InFlightAcks {
             .ok()
             .and_then(|mut ledger| ledger.status(request_id, now));
         match recorded {
-            Some(status @ (DmReceiptStatus::Delivered | DmReceiptStatus::DeliveredLate)) => status,
+            Some(status) if status.is_final() => status,
             _ if self
                 .inner
                 .get(request_id)
@@ -2662,6 +2681,46 @@ impl InFlightAcks {
             }
             Some(status) => status,
             None => DmReceiptStatus::Unknown,
+        }
+    }
+
+    /// #1109: record the final outcome of a `deliver_until` obligation for
+    /// `request_id` to `recipient` (delivered, expired or failed), so the
+    /// receipt query reports it after the obligation leaves the outbox.
+    pub fn record_outcome(
+        &self,
+        request_id: [u8; 16],
+        recipient: AgentId,
+        status: DmReceiptStatus,
+    ) {
+        let now = Instant::now();
+        if let Ok(mut ledger) = self.receipts.lock() {
+            // An ACK may already have recorded a delivery; keep it.
+            if status != DmReceiptStatus::Delivered
+                && ledger.status(&request_id, now).is_some_and(|recorded| {
+                    matches!(
+                        recorded,
+                        DmReceiptStatus::Delivered | DmReceiptStatus::DeliveredLate
+                    )
+                })
+            {
+                return;
+            }
+            if status == DmReceiptStatus::Delivered
+                && ledger.status(&request_id, now) == Some(DmReceiptStatus::DeliveredLate)
+            {
+                return;
+            }
+            ledger.record(
+                request_id,
+                status,
+                ReceiptBinding {
+                    expected_recipient: recipient,
+                    expected_machine: None,
+                    protocol_version: DM_PROTOCOL_DURABLE_ACK,
+                },
+                now,
+            );
         }
     }
 

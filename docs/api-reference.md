@@ -1558,9 +1558,9 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 |---|---|---|---|
 | POST | `/agents/connect` | `x0x direct connect <agent_id>` | Establish a direct connection |
 | POST | `/machines/connect` | `x0x machines connect <machine_id>` | Establish a machine-id transport connection |
-| POST | `/direct/send` | `x0x direct send <agent_id> <message> [--require-ack-ms <ms>] [--prefer-raw-quic-if-connected <BOOL>] [--raw-quic-receive-ack-ms <ms>] [--stop-fallback-on-raw-error] [--require-gossip] [--no-durable-ack] [--logical-id <token>]` | Send a direct base64 payload. Durable-by-default since v0.38.0 |
+| POST | `/direct/send` | `x0x direct send <agent_id> <message> [--require-ack-ms <ms>] [--prefer-raw-quic-if-connected <BOOL>] [--raw-quic-receive-ack-ms <ms>] [--stop-fallback-on-raw-error] [--require-gossip] [--no-durable-ack] [--logical-id <token>] [--deliver-until <unix_ms> \| --deliver-for <secs>]` | Send a direct base64 payload. Durable-by-default since v0.38.0. With `deliver_until`, async durable delivery answered 202 ([#1109](#async-delivery-deliver_until)) |
 | GET | `/direct/connections` | `x0x direct connections` | List active direct connections |
-| GET | `/direct/receipts/:logical_id?agent_id=<hex>` | `x0x direct receipt <logical_id> <agent_id>` | Outcome of a durable send made under `logical_id` to `agent_id`: `delivered`, `delivered_late`, `pending` or `unknown` (#1109). See [Durable send receipts](#durable-send-receipts-1109) |
+| GET | `/direct/receipts/:logical_id?agent_id=<hex>` | `x0x direct receipt <logical_id> <agent_id>` | Outcome of a durable send made under `logical_id` to `agent_id`: `delivered`, `delivered_late`, `pending`, `expired`, `failed` or `unknown` (#1109). See [Durable send receipts](#durable-send-receipts-1109) |
 | GET | `/history/message/:msg_id` | `x0x history message` | Point lookup of one durable history row by exposed `msg_id` (64 hex; canonical group ids need `?scope=`); 404 when absent, 400 on malformed id. Same record shape as `/history` (issue #319) |
 | GET | `/direct/events` | `x0x direct events` | SSE stream of direct messages; `?backfill=N` requests up to N stored `dm:` rows as `history_direct_message` events before a `live` marker and live frames (ADR-0023 §7). The attempt is best-effort; reconcile through [`/history`](#durable-history-adr-0023) |
 
@@ -1741,6 +1741,35 @@ GET /direct/receipts/order-42?agent_id=8a3f...
 | `delivered_late` | The v2 ACK arrived after the send returned. The recipient holds the message |
 | `pending` | A send is waiting, or gave up and no ACK has arrived yet |
 | `unknown` | No record: no durable send under this id to this agent, or the record expired |
+| `expired` | A `deliver_until` send reached its deadline without the v2 ACK. Nothing more is sent |
+| `failed` | A `deliver_until` send stopped on a refusal a retry cannot change (trust rejection, pairing denial, idempotency conflict, payload too large) |
+
+#### Async delivery: `deliver_until`
+
+Add `deliver_until` (unix-epoch milliseconds, at most 7 days ahead) to a durable `POST /direct/send` to hand the message to the daemon instead of waiting:
+
+```json
+{"agent_id": "8a3f...", "payload": "aGk=", "logical_id": "order-42", "deliver_until": 1763200000000}
+```
+
+The daemon stores it durably (`<data_dir>/dm_obligations.json`, survives a restart) and answers **202**:
+
+```json
+{"ok": true, "accepted": true, "already_held": false, "logical_id": "order-42", "agent_id": "8a3f...", "request_id": "5c1e...", "deliver_until": 1763200000000, "status": "pending"}
+```
+
+It then sends again with the same `logical_id` until the recipient's v2 ACK (`delivered`), the deadline (`expired`) or a final refusal (`failed`). A recipient with no capability advert yet is held, not refused with 409; it is tried again as soon as its verified advert arrives. Without a `logical_id` the daemon makes one (`dm-<hex>`) and returns it. While held, the receipt reads `pending` with an `obligation` object: `deliver_until`, `attempts`, `next_attempt_at` and `last_error` (the error code of the last attempt). Repeating the same body is answered 202 with `already_held: true`.
+
+| Status | `error` | When |
+|---|---|---|
+| 400 | `deliver_until_requires_durable_ack` | `require_durable_app_ack: false` with `deliver_until` |
+| 400 | `deliver_until_with_require_ack_ms` | `require_ack_ms` with `deliver_until` |
+| 400 | `deliver_until_in_past` / `deliver_until_too_far` | Not after now, or more than 7 days ahead |
+| 409 | `idempotency_conflict` | This `logical_id` to this agent is held with other bytes |
+| 413 | `payload_too_large` | Over the DM payload limit |
+| 429 | `dm_outbox_full` | 256 held (or 4 MiB) for this recipient, or 2,048 (32 MiB) in all; nothing is evicted |
+
+CLI: `x0x direct send <agent_id> <message> --logical-id order-42 --deliver-for 600` (or `--deliver-until <unix_ms>`). Decision: [A07](adr/consolidated/A07-r01-messages-receipts-history-and-retry.md) (amendment of 14 Nov 2026).
 
 The key is the pair (`logical_id`, `agent_id`), because a logical id is scoped to one recipient. Only sends that supplied `logical_id` can be queried. Records are kept in memory for 10 minutes after the send resolved or gave up, at most 4,096, oldest dropped first; a restart forgets them. Only an `Accepted` v2 ACK from the exact recipient agent and machine counts. A malformed `logical_id` or `agent_id` answers 400 `invalid_logical_id` or `invalid_agent_id`. Decision: [A07](adr/consolidated/A07-r01-messages-receipts-history-and-retry.md) (amendment of 14 Nov 2026).
 

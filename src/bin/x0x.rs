@@ -1512,6 +1512,17 @@ enum DirectSub {
         /// after a round trip to the daemon, which refuses the same pair.
         #[arg(long, conflicts_with = "no_durable_ack")]
         logical_id: Option<String>,
+        /// Deliver asynchronously until this unix-epoch time in milliseconds
+        /// (#1109). The daemon stores the message, answers 202 with the
+        /// logical id, and retries until the recipient's durable ACK or the
+        /// deadline; a recipient with no capability advert yet is held, not
+        /// refused. Check the outcome with `x0x direct receipt`. Needs
+        /// durable delivery: the daemon refuses it with --no-durable-ack.
+        #[arg(long, value_name = "UNIX_MS", conflicts_with_all = ["require_ack_ms", "deliver_for"])]
+        deliver_until: Option<u64>,
+        /// As --deliver-until, as a number of seconds from now.
+        #[arg(long, value_name = "SECONDS", conflicts_with = "require_ack_ms")]
+        deliver_for: Option<u64>,
     },
     /// List established direct connections.
     Connections,
@@ -2952,7 +2963,14 @@ async fn run(
                 require_gossip,
                 no_durable_ack,
                 logical_id,
+                deliver_until,
+                deliver_for,
             } => {
+                let deliver_until = deliver_until.or_else(|| {
+                    deliver_for.map(|secs| {
+                        x0x::dm::now_unix_ms().saturating_add(secs.saturating_mul(1000))
+                    })
+                });
                 commands::direct::send(
                     &client,
                     &agent_id,
@@ -2964,6 +2982,7 @@ async fn run(
                     require_gossip,
                     !no_durable_ack,
                     logical_id.as_deref(),
+                    deliver_until,
                 )
                 .await
             }

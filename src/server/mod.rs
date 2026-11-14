@@ -78,8 +78,8 @@ use routes::{
     create_discovery_subscription, create_group_invite, create_group_kv_store, create_join_request,
     create_kv_store, create_mls_group, create_mls_welcome, create_named_group, create_task_list,
     daemon_shutdown_hook, delete_contact, delete_discovery_subscription, delete_kv_value,
-    delete_machine, direct_connections, direct_message_send_config, direct_receipt, direct_send,
-    discover_groups, discover_groups_nearby, discovered_agent, discovered_agents,
+    delete_machine, direct_connections, direct_message_send_config, direct_receipt,
+    direct_send_body, discover_groups, discover_groups_nearby, discovered_agent, discovered_agents,
     discovered_machine, discovered_machines, dispatch_join_result_message,
     dispatch_welcome_blob_message, dm_diagnostics, enroll_device, ensure_named_group_listeners,
     evaluate_trust, exec_cancel, exec_diagnostics, exec_run, exec_sessions, file_accept_handler,
@@ -1903,6 +1903,17 @@ pub async fn serve_with_options(
     if let Err(error) = load_requester_offer_outbox(&state).await {
         tracing::error!("#908 startup: requester offer outbox not loaded: {error}");
     }
+    // #1109: the DM obligation outbox loads fail-visible, never blocking: a
+    // malformed sidecar is moved aside and the outbox starts empty.
+    {
+        let store = Arc::new(crate::dm_outbox::DmObligationStore::new(&config.data_dir));
+        if let Err(error) = store.load(now_millis_u64()).await {
+            tracing::error!("#1109 startup: dm obligation outbox not loaded: {error}");
+        }
+        if !state.agent.install_dm_obligations(store) {
+            tracing::warn!("#1109 startup: dm obligation outbox already installed on this agent");
+        }
+    }
     // ADR 0030 §5 fail-closed: a malformed or over-cap bootstrap outbox aborts
     // startup rather than silently dropping delivery obligations the authority
     // has already promised.
@@ -2894,6 +2905,48 @@ pub async fn serve_with_options(
         }));
     }
 
+    // #1109: durable `deliver_until` DM worker. A short poll sends a newly
+    // admitted obligation at once (its first attempt is due at admission);
+    // the #1158 advert signal makes a cold recipient's obligations due as
+    // soon as its verified capability advert arrives.
+    {
+        let obligation_state = Arc::clone(&state);
+        bg_tasks.push(tokio::spawn(async move {
+            let mut shutdown_rx = obligation_state.shutdown_notify.subscribe();
+            let mut adverts = obligation_state
+                .agent
+                .capability_store()
+                .subscribe_obligation_adverts();
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                        dm_obligation_step(&obligation_state).await;
+                    }
+                    advert = adverts.recv() => match advert {
+                        Ok(recipient) => {
+                            let nudged = match obligation_state.agent.dm_obligations() {
+                                Some(store) => store.nudge_for(&recipient, now_millis_u64()).await,
+                                None => false,
+                            };
+                            if nudged {
+                                dm_obligation_step(&obligation_state).await;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            adverts = obligation_state
+                                .agent
+                                .capability_store()
+                                .subscribe_obligation_adverts();
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                    },
+                }
+            }
+        }));
+    }
+
     // ADR 0030 §5: strict v2 signed-public bootstrap listener. Unlike the
     // legacy unprefixed fan-out, this route resolves the authenticated DM
     // completion only after the consent gate and a directory-durable install,
@@ -3255,7 +3308,7 @@ pub async fn serve_with_options(
         .route("/stores/:id/:key", delete(delete_kv_value))
         // Direct messaging endpoints
         .route("/agents/connect", post(connect_agent))
-        .route("/direct/send", post(direct_send))
+        .route("/direct/send", post(direct_send_body))
         .route("/direct/connections", get(direct_connections))
         .route("/direct/receipts/:logical_id", get(direct_receipt))
         .route("/direct/events", get(direct_events_sse))
@@ -4140,6 +4193,36 @@ async fn start_dm_inbox_when_gossip_ready(
 }
 
 /// Parse a 64-character hex string into an AgentId.
+/// #1109: one pass of the DM obligation worker (see `crate::dm_outbox`).
+async fn dm_obligation_step(state: &AppState) {
+    let Some(store) = state.agent.dm_obligations() else {
+        return;
+    };
+    if store.is_empty().await {
+        return;
+    }
+    let acks = state.agent.dm_inflight_acks();
+    let pass = store
+        .step(
+            state.agent.as_ref(),
+            state.agent.agent_id(),
+            &direct_message_send_config(),
+            &acks,
+            now_millis_u64(),
+        )
+        .await;
+    if !(pass.delivered.is_empty() && pass.expired.is_empty() && pass.failed.is_empty()) {
+        tracing::info!(
+            target: "x0x::direct",
+            delivered = pass.delivered.len(),
+            expired = pass.expired.len(),
+            failed = pass.failed.len(),
+            retried = pass.retried.len(),
+            "dm obligation pass"
+        );
+    }
+}
+
 fn parse_agent_id_hex(hex_str: &str) -> Result<AgentId, String> {
     let bytes = hex::decode(hex_str).map_err(|e| format!("invalid hex: {e}"))?;
     if bytes.len() != 32 {
