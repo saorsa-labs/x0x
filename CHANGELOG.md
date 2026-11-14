@@ -39,7 +39,9 @@ All notable changes to this project will be documented in this file.
   answer next (#504 follow-up).** A responder that answers by unicast skips
   its topic answer, so a lost direct frame left the requester without the
   advert (the W3-H #1776 blind window). When a request that carried the
-  machine id ends with no binding, later requests to that responder omit it
+  machine id ends without the flight's own requirement met (a usable
+  binding, the durable-ACK capability or the application bit; a stale
+  stored binding does not count), later requests to that responder omit it
   for 10 minutes. No wire format change.
 
 - **The consent to disclose the user identity now survives a restart (#1107).**

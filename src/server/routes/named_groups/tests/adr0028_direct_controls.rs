@@ -1597,6 +1597,13 @@ async fn b8_final_expiry_check_linearizes_with_journal_installation() {
     timeout(Duration::from_secs(5), entered.notified())
         .await
         .expect("B8 reached the final authorization barrier within 5s");
+    // The mutant that samples the clock before the barrier passes only
+    // when the proof is still live at the barrier. A setup slower than the
+    // margin would let it pass, so require that here.
+    assert!(
+        unix_ms() < expires_at_ms,
+        "the setup must reach the barrier before the proof expires"
+    );
     // A fixed monotonic sleep is not enough: the handler's check reads the
     // wall clock, and a wall clock that lags the monotonic one by more than
     // the margin let the approval through (200) on a loaded VM. Wait until

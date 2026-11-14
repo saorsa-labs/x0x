@@ -8367,18 +8367,9 @@ impl Drop for CapabilityRefreshGuard {
     }
 }
 
-/// Publish exactly one targeted capability request for `recipient`, then wait
-/// (bounded) for the signed response to be ingested.
-///
-/// ADR 0030 §2 specifies "one forced targeted capability refresh" — a single
-/// publish, not a retry loop. Returning early on a cache hit keeps a strict
-/// send that raced an in-flight advert from paying the full window.
-///
-/// Returns whether the targeted request was published successfully, which
-/// is what starts the requester-side cooldown. A deadline or shutdown
-/// before the publish completes returns `false` at once. A failed publish
-/// returns `false` at once for an addressability flight; a strict flight
-/// still waits out its convergence window, as before #1776.
+/// The published flag of [`run_strict_capability_refresh_outcome`], for
+/// the tests written against it.
+#[cfg(test)]
 async fn run_strict_capability_refresh(
     recipient: identity::AgentId,
     required_application: Option<u64>,
@@ -8388,6 +8379,79 @@ async fn run_strict_capability_refresh(
     deadline: tokio::time::Instant,
     publish: impl std::future::Future<Output = error::NetworkResult<()>> + Send,
 ) -> bool {
+    run_strict_capability_refresh_outcome(
+        recipient,
+        required_application,
+        require_durable_ack,
+        capability_store,
+        shutdown_token,
+        deadline,
+        publish,
+    )
+    .await
+    .published
+}
+
+/// What one strict capability refresh flight did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StrictRefreshOutcome {
+    /// The flight published its targeted request (starts the cooldown).
+    published: bool,
+    /// The flight's own requirement held when it ended: a durable-ACK
+    /// binding, the application bit, or a gossip-usable binding. A stale
+    /// binding that was already stored does not count.
+    converged: bool,
+}
+
+/// #504 follow-up: record whether a flight that asked for a direct reply
+/// got its answer, judged by the flight's own requirement. A durable-ACK
+/// (ADR 0030) or application-bit (ADR 0093) flight starts with a stale
+/// binding already stored, so "any binding" would always count as answered.
+fn note_capability_refresh_unicast_outcome(
+    registry: &CapabilityRefreshRegistry,
+    recipient: &identity::AgentId,
+    asked_for_direct_reply: bool,
+    outcome: StrictRefreshOutcome,
+) {
+    if asked_for_direct_reply && outcome.published {
+        registry.note_unicast_answer(recipient, outcome.converged);
+    }
+}
+
+/// #504 follow-up: the machine a targeted request names for a direct
+/// reply. None while the direct listener is not running, or while the
+/// recipient's last direct answer was missed (it then answers on the topic).
+fn capability_refresh_reply_to(
+    direct_listener_started: bool,
+    registry: &CapabilityRefreshRegistry,
+    recipient: &identity::AgentId,
+    local_machine: identity::MachineId,
+) -> Option<identity::MachineId> {
+    (direct_listener_started && !registry.unicast_answer_missed(recipient)).then_some(local_machine)
+}
+
+/// Publish exactly one targeted capability request for `recipient`, then wait
+/// (bounded) for the signed response to be ingested.
+///
+/// ADR 0030 §2 specifies "one forced targeted capability refresh" — a single
+/// publish, not a retry loop. Returning early on a cache hit keeps a strict
+/// send that raced an in-flight advert from paying the full window.
+///
+/// Returns whether the targeted request was published successfully, which
+/// is what starts the requester-side cooldown, and whether the flight's
+/// requirement held when it ended. A deadline or shutdown
+/// before the publish completes returns `false` at once. A failed publish
+/// returns `false` at once for an addressability flight; a strict flight
+/// still waits out its convergence window, as before #1776.
+async fn run_strict_capability_refresh_outcome(
+    recipient: identity::AgentId,
+    required_application: Option<u64>,
+    require_durable_ack: bool,
+    capability_store: std::sync::Arc<dm_capability::CapabilityStore>,
+    shutdown_token: tokio_util::sync::CancellationToken,
+    deadline: tokio::time::Instant,
+    publish: impl std::future::Future<Output = error::NetworkResult<()>> + Send,
+) -> StrictRefreshOutcome {
     let ready = || {
         let binding = capability_store.lookup_binding(&recipient);
         // #1776: a flight with neither a durable-ack nor an application-bit
@@ -8408,7 +8472,10 @@ async fn run_strict_capability_refresh(
             })
     };
     if ready() {
-        return false;
+        return StrictRefreshOutcome {
+            published: false,
+            converged: true,
+        };
     }
 
     let published = tokio::select! {
@@ -8421,7 +8488,10 @@ async fn run_strict_capability_refresh(
     // nothing can answer it. A strict flight keeps the convergence wait it
     // had before #1776, so the strict gate's refusal timing is unchanged.
     let Some(published) = published else {
-        return false;
+        return StrictRefreshOutcome {
+            published: false,
+            converged: ready(),
+        };
     };
     let published = match published {
         Ok(()) => true,
@@ -8436,20 +8506,27 @@ async fn run_strict_capability_refresh(
         }
     };
     if !published && !require_durable_ack && required_application.is_none() {
-        return false;
+        return StrictRefreshOutcome {
+            published: false,
+            converged: ready(),
+        };
     }
 
+    let outcome = |converged| StrictRefreshOutcome {
+        published,
+        converged,
+    };
     loop {
         if ready() {
-            return published;
+            return outcome(true);
         }
         if tokio::time::Instant::now() >= deadline {
-            return published;
+            return outcome(false);
         }
         tokio::select! {
             _ = tokio::time::sleep(CAPABILITY_REFRESH_POLL_INTERVAL) => {}
-            () = tokio::time::sleep_until(deadline) => return published,
-            () = shutdown_token.cancelled() => return published,
+            () = tokio::time::sleep_until(deadline) => return outcome(ready()),
+            () = shutdown_token.cancelled() => return outcome(ready()),
         }
     }
 }
@@ -12615,11 +12692,13 @@ impl Agent {
         // listener that ingests it is running; the topic stays the fallback.
         // A recipient whose direct answer did not arrive last time answers
         // on the topic instead (the topic answer reaches relay-only paths).
-        let reply_to = (self
-            .direct_listener_started
-            .load(std::sync::atomic::Ordering::Acquire)
-            && !self.capability_refreshes.unicast_answer_missed(&recipient))
-        .then(|| self.identity.machine_id());
+        let reply_to = capability_refresh_reply_to(
+            self.direct_listener_started
+                .load(std::sync::atomic::Ordering::Acquire),
+            &self.capability_refreshes,
+            &recipient,
+            self.identity.machine_id(),
+        );
         let registry = std::sync::Arc::clone(&self.capability_refreshes);
 
         let purpose = if require_durable_ack || required_application.is_some() {
@@ -12631,8 +12710,7 @@ impl Agent {
             recipient,
             purpose,
             move |mut guard, completion_tx| async move {
-                let store = std::sync::Arc::clone(&capability_store);
-                guard.published = run_strict_capability_refresh(
+                let outcome = run_strict_capability_refresh_outcome(
                     recipient,
                     required_application,
                     require_durable_ack,
@@ -12644,12 +12722,13 @@ impl Agent {
                     ),
                 )
                 .await;
-                if reply_to.is_some() && guard.published {
-                    registry.note_unicast_answer(
-                        &recipient,
-                        store.lookup_binding(&recipient).is_some(),
-                    );
-                }
+                guard.published = outcome.published;
+                note_capability_refresh_unicast_outcome(
+                    &registry,
+                    &recipient,
+                    reply_to.is_some(),
+                    outcome,
+                );
                 completion_tx.send_replace(CapabilityRefreshState::Finished);
                 drop(guard);
             },
@@ -31445,6 +31524,101 @@ mod tests {
             2,
             "two recipients means two flights, not three"
         );
+    }
+
+    /// #504 follow-up review: a durable-ACK flight (ADR 0030) starts with a
+    /// stale binding already stored. When its direct answer is lost, the
+    /// flight's own requirement still fails, so it counts as a miss, and the
+    /// next request omits the reply-to machine. "Any binding" would have
+    /// counted it as answered and kept it on the lost direct path.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_binding_flight_records_a_missed_direct_answer() {
+        let recipient = identity::AgentId([0x94_u8; 32]);
+        let peer_machine = identity::MachineId([0x95_u8; 32]);
+        let local_machine = identity::MachineId([0x96_u8; 32]);
+        let store = std::sync::Arc::new(dm_capability::CapabilityStore::new());
+        assert!(store.insert(
+            recipient,
+            peer_machine,
+            dm::DmCapabilities::v1_gossip_ready(vec![7_u8; 1184]),
+            dm_capability::now_unix_ms(),
+        ));
+        let registry = CapabilityRefreshRegistry::default();
+        assert_eq!(
+            capability_refresh_reply_to(true, &registry, &recipient, local_machine),
+            Some(local_machine),
+            "with no miss the request asks for a direct reply"
+        );
+        assert_eq!(
+            capability_refresh_reply_to(false, &registry, &recipient, local_machine),
+            None,
+            "no direct listener, no direct reply"
+        );
+
+        // The direct answer is lost: nothing new reaches the store.
+        let lost = run_strict_capability_refresh_outcome(
+            recipient,
+            None,
+            true,
+            std::sync::Arc::clone(&store),
+            tokio_util::sync::CancellationToken::new(),
+            tokio::time::Instant::now() + CAPABILITY_REFRESH_CONVERGENCE_WAIT,
+            async { Ok(()) },
+        )
+        .await;
+        assert_eq!(
+            lost,
+            StrictRefreshOutcome {
+                published: true,
+                converged: false,
+            }
+        );
+        assert!(
+            store.lookup_binding(&recipient).is_some(),
+            "the stale binding is still stored"
+        );
+        note_capability_refresh_unicast_outcome(&registry, &recipient, true, lost);
+        assert!(registry.unicast_answer_missed(&recipient));
+        assert_eq!(
+            capability_refresh_reply_to(true, &registry, &recipient, local_machine),
+            None,
+            "after a miss the next request asks for the topic answer"
+        );
+
+        // A topic answer brings the durable-ACK advert: the flight converges
+        // and the miss is cleared.
+        let answering_store = std::sync::Arc::clone(&store);
+        let answered = run_strict_capability_refresh_outcome(
+            recipient,
+            None,
+            true,
+            std::sync::Arc::clone(&store),
+            tokio_util::sync::CancellationToken::new(),
+            tokio::time::Instant::now() + CAPABILITY_REFRESH_CONVERGENCE_WAIT,
+            async move {
+                assert!(answering_store.insert(
+                    recipient,
+                    peer_machine,
+                    dm::DmCapabilities::v2_durable_gossip_ready(vec![7_u8; 1184]),
+                    dm_capability::now_unix_ms().saturating_add(1),
+                ));
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(
+            answered,
+            StrictRefreshOutcome {
+                published: true,
+                converged: true,
+            }
+        );
+        note_capability_refresh_unicast_outcome(&registry, &recipient, true, answered);
+        assert!(!registry.unicast_answer_missed(&recipient));
+
+        // A flight that did not ask for a direct reply records nothing.
+        note_capability_refresh_unicast_outcome(&registry, &recipient, false, lost);
+        assert!(!registry.unicast_answer_missed(&recipient));
     }
 
     /// #504 follow-up: a request that asked for a direct reply and got no
