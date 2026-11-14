@@ -140,7 +140,7 @@ async fn served_record(state: &AppState, group_id: &str) -> Result<RecordView> {
 
 /// A TreeKEM group whose baseline (named store and bound snapshot) is
 /// durable on disk, with no journal left behind.
-async fn rebind_fixture(byte: u8) -> Result<MemberJoinedTreeKemFixture> {
+pub(super) async fn rebind_fixture(byte: u8) -> Result<MemberJoinedTreeKemFixture> {
     let fixture = member_joined_treekem_fixture(byte, byte).await?;
     let baseline = fixture
         .state
@@ -162,7 +162,7 @@ async fn rebind_fixture(byte: u8) -> Result<MemberJoinedTreeKemFixture> {
 
 /// Rename the group through the production HTTP handler (a metadata-only
 /// seal: the TreeKEM rebind path) and return the reported status.
-async fn rename_via_api(fixture: &MemberJoinedTreeKemFixture, name: &str) -> StatusCode {
+pub(super) async fn rename_via_api(fixture: &MemberJoinedTreeKemFixture, name: &str) -> StatusCode {
     update_named_group(
         State(Arc::clone(&fixture.state)),
         Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
@@ -212,18 +212,18 @@ async fn assert_rebind_restart_agrees(
 /// A TreeKEM group in which this node is a member, with a durable baseline
 /// at `base_epoch`, plus a real authority commit that adds one more member
 /// and moves the group to `expected_epoch`.
-struct SealFixture {
-    state: Arc<AppState>,
+pub(super) struct SealFixture {
+    pub(super) state: Arc<AppState>,
     _dir: tempfile::TempDir,
-    group_id: String,
+    pub(super) group_id: String,
     next: x0x::groups::GroupInfo,
     commit: Vec<u8>,
-    base_epoch: u64,
-    expected_epoch: u64,
-    added_hex: String,
+    pub(super) base_epoch: u64,
+    pub(super) expected_epoch: u64,
+    pub(super) added_hex: String,
 }
 
-async fn seal_fixture(byte: u8) -> Result<SealFixture> {
+pub(super) async fn seal_fixture(byte: u8) -> Result<SealFixture> {
     let (state, dir) = secure_endpoint_test_state().await?;
     let group_id = format!("{byte:02x}").repeat(32);
     let group_id_bytes = hex::decode(&group_id)?;
@@ -298,7 +298,7 @@ async fn seal_fixture(byte: u8) -> Result<SealFixture> {
 
 /// Apply the authority commit through the production seal path (the
 /// gossip `MemberAdded` apply calls this; on error it reports REJECTED).
-async fn apply_seal(fixture: &SealFixture) -> anyhow::Result<()> {
+pub(super) async fn apply_seal(fixture: &SealFixture) -> anyhow::Result<()> {
     let group = fixture
         .state
         .treekem_groups

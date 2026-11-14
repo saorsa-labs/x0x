@@ -54,6 +54,12 @@ Before seating works, the joining device must already be **owned by the same own
 
 That setup is human-managed and documented in the README's [*Add a second device*](https://github.com/saorsa-labs/x0x/blob/main/README.md#quickstart) step: put the **same** user key on the new machine, either by re-deriving it from the 32-byte seed (`x0x user-id create <path> --from-seed <HEX>` — same seed, same `UserId` on any machine) or by copying the `user.key` file yourself. A plain `x0x user-id create` with no seed generates a **random** key and therefore a different owner. The seed and the key file are yours to hold and move; the daemon never fetches either, and no agent can retrieve them for you. If your existing key was generated randomly, there is no seed to recover — copy the file.
 
+**A device without the owner key (#1860).** You can keep `user.key` on one device and run the others on an owner-issued certificate. This limits the harm of a lost ordinary device: it does not hold your owner identity. On the new device, read its agent public key (`GET /agent`, field `agent_public_key`). On the device with `user.key`, issue a certificate for it (`POST /owner/agents/issue` with `{"agent_public_key":"<HEX>","mode":"acp"}`, or `x0x owner agents issue <HEX>`). Base64-decode `certificate.storage_b64` from the answer into the new device's `agent.cert` (beside its `agent.key`; the default is `~/.x0x/agent.cert`) and restart its daemon. The daemon loads the certificate only when it binds that device's agent and its owner signature verifies; otherwise it runs with no owner identity. Limits:
+
+- The device cannot issue or renew certificates, sign grants or enroll devices. A renewal comes from the device with `user.key`. An expired certificate leaves the agent unreachable for pinned messages until it is renewed.
+- Home seating, enrollment and sync of the device follow the usual steps, run on the device with `user.key`.
+- x0x has no owner-key rotation. If the device with `user.key` is lost, the owner identity is lost or compromised: create a new one and tell your contacts.
+
 Then, on the seating device:
 
 - read the joining device's agent id there with `x0x agent` (it must be a different agent);
