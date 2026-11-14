@@ -46,6 +46,10 @@ pub(in crate::server) use seat_cert_fetch::{
 
 #[cfg(test)]
 mod issue1229_stored_delivery;
+mod join_request_outcome;
+pub(in crate::server) use join_request_outcome::{
+    handle_join_request_outcome_typed_payload, send_join_request_refusal,
+};
 pub(in crate::server) mod join_sequence;
 mod requester_offer;
 pub(in crate::server) use requester_offer::{
@@ -1280,6 +1284,11 @@ pub(in crate::server) struct ApplyMetadataResult {
     /// neither is a refusal whose fork evidence was found but not
     /// installed durably.
     pub(in crate::server) refused_without_mutation: bool,
+    /// Issue #1840 (ask 4): why validation refused the request. `Some` only
+    /// together with `refused_without_mutation`. The listener sends it to
+    /// the requester as a typed outcome (`join_request_outcome`).
+    pub(in crate::server) refusal_reason:
+        Option<x0x::groups::join_outcome::JoinRequestRefusalReason>,
 }
 
 impl ApplyMetadataResult {
@@ -1289,6 +1298,7 @@ impl ApplyMetadataResult {
         should_exit: false,
         pre_mutation_group: None,
         refused_without_mutation: false,
+        refusal_reason: None,
     };
 
     /// Issue #1840: a `JoinRequestCreated` refused by validation, with no
@@ -1298,7 +1308,16 @@ impl ApplyMetadataResult {
         should_exit: false,
         pre_mutation_group: None,
         refused_without_mutation: true,
+        refusal_reason: None,
     };
+
+    /// Issue #1840: [`Self::REFUSED_WITHOUT_MUTATION`] with its reason.
+    fn refused(reason: x0x::groups::join_outcome::JoinRequestRefusalReason) -> Self {
+        Self {
+            refusal_reason: Some(reason),
+            ..Self::REFUSED_WITHOUT_MUTATION
+        }
+    }
 
     /// Event accepted and persisted; re-check whether the subscriber
     /// should exit. Roster changes do not rotate the metadata topic.
@@ -1307,6 +1326,7 @@ impl ApplyMetadataResult {
         should_exit: true,
         pre_mutation_group: None,
         refused_without_mutation: false,
+        refusal_reason: None,
     };
 
     /// Event accepted and persisted; subscriber should continue
@@ -1316,6 +1336,7 @@ impl ApplyMetadataResult {
         should_exit: false,
         pre_mutation_group: None,
         refused_without_mutation: false,
+        refusal_reason: None,
     };
 }
 
@@ -5502,9 +5523,14 @@ fn evaluate_fork_evidence_candidate(
             classification,
         )
     };
-    match claimed_parent {
-        Some(parent) => {
-            let signer_snapshot = parent.roster.get(&commit.committed_by);
+    // #1797: a joiner holds no link at its invite base; the base roster
+    // stands in for a conflicting commit that chains from that base.
+    let parent_roster = claimed_parent
+        .map(|parent| &parent.roster)
+        .or_else(|| invite_base_roster_for_parent(current, commit));
+    match parent_roster {
+        Some(parent_roster) => {
+            let signer_snapshot = parent_roster.get(&commit.committed_by);
             let active_admin_at_parent = signer_snapshot.is_some_and(|snap| {
                 snap.state == x0x::groups::GroupMemberState::Active
                     && snap.role.at_least(x0x::groups::GroupRole::Admin)
@@ -5636,6 +5662,30 @@ fn mandate_anchors_commit_under_trusted_owner(
     })
 }
 
+/// #1797: the roster at the joiner's invite base, when `commit` chains
+/// directly from that base (`prev_state_hash` is the base hash and the
+/// revision is the next one). A joiner retains the links its inviter
+/// serves but not the base link, so without this a conflicting commit
+/// from the base (a removed admin's inviter seats the joiner on its fork)
+/// has no retained predecessor and never authenticates. The projection
+/// counts only while it re-derives the signed `base_roster_root`. It is
+/// the same base the joiner seeded its roster from and validated the
+/// served chain against (`validate_alternate_chain`), so it adds no new
+/// trust root.
+fn invite_base_roster_for_parent<'a>(
+    current: &'a x0x::groups::GroupInfo,
+    commit: &x0x::groups::state_commit::GroupStateCommit,
+) -> Option<&'a BTreeMap<String, x0x::groups::RosterMemberSnapshot>> {
+    let lineage = current.invite_lineage.as_ref()?;
+    let chains_from_base = !lineage.base_roster.is_empty()
+        && commit.revision == lineage.base_revision.saturating_add(1)
+        && commit.prev_state_hash.as_deref() == Some(lineage.base_hash.as_str());
+    (chains_from_base
+        && x0x::groups::state_commit::roster_root_of_projection(&lineage.base_roster)
+            == lineage.base_roster_root)
+        .then_some(&lineage.base_roster)
+}
+
 /// #468 A5 (r4): the pure candidate-authentication step shared by the
 /// live apply wrapper and journal recovery — structure/signature
 /// verification plus committer-was-active-admin in the retained
@@ -5655,7 +5705,9 @@ fn fork_candidate_authenticated(
         .iter()
         .rev()
         .find(|rc| rc.commit.revision == commit.revision.saturating_sub(1))
-        .and_then(|predecessor| predecessor.roster.get(&commit.committed_by))
+        .map(|predecessor| &predecessor.roster)
+        .or_else(|| invite_base_roster_for_parent(current, commit))
+        .and_then(|roster| roster.get(&commit.committed_by))
         .is_some_and(|snap| {
             snap.state == x0x::groups::GroupMemberState::Active
                 && snap.role.at_least(x0x::groups::GroupRole::Admin)
@@ -10012,14 +10064,22 @@ fn recovery_seat_may_receive_key_package(
         .is_some_and(|member| member.state == x0x::groups::GroupMemberState::Removed)
 }
 
-/// #1113 / #1567: a Removed seat may take back its KeyPackage bytes from
-/// the member's own signed `MemberJoined`, with no inviter attestation,
-/// when the bytes hash to the KeyPackage hash that the verified roster
-/// commits for the seat. A Welcome joiner needs this: its roster has no
-/// `added_by` for the members seated before it (the v4 invite roster is a
-/// projection without it), so the inviter attestation never verifies
-/// there. The leaf-removal proof of a self-leave reads these bytes.
-fn removed_seat_self_signed_key_package(
+/// #1113 / #1567 / #1583: an Active or Removed seat may take its
+/// KeyPackage bytes from the member's own signed `MemberJoined`, with no
+/// inviter attestation, when the bytes hash to the KeyPackage hash that
+/// the verified roster commits for the seat. The admin-signed roster
+/// commit already names these exact bytes, so a member cannot substitute
+/// a fresh package: a different package has a different hash.
+///
+/// A Welcome joiner needs this: its roster has no `added_by` for the
+/// members seated before it (the v4 invite roster is a projection without
+/// it), so the inviter attestation never verifies there. The leaf-removal
+/// proof of a self-leave reads these bytes. #1583: a removal of an Active
+/// seat needs them too, and the attested form reaches other members only
+/// in one direct message from the seating admin (gossip `MemberAdded`
+/// carries no `member_joined_recovery`), so catch-up accepts and serves
+/// the self-signed form.
+fn seat_self_signed_key_package(
     info: &x0x::groups::GroupInfo,
     event: &NamedGroupMetadataEvent,
 ) -> bool {
@@ -10031,14 +10091,14 @@ fn removed_seat_self_signed_key_package(
     else {
         return false;
     };
+    if !recovery_seat_may_receive_key_package(info, member_agent_id) {
+        return false;
+    }
     let seat_commits_bytes = info.members_v2.get(member_agent_id).is_some_and(|member| {
-        member.state == x0x::groups::GroupMemberState::Removed
-            && member
-                .treekem_key_package_hash
-                .as_deref()
-                .is_some_and(|expected| {
-                    blake3::hash(kp_b64.as_bytes()).to_hex().as_str() == expected
-                })
+        member
+            .treekem_key_package_hash
+            .as_deref()
+            .is_some_and(|expected| blake3::hash(kp_b64.as_bytes()).to_hex().as_str() == expected)
     });
     seat_commits_bytes && verify_member_joined_key_package_event(event)
 }
@@ -11017,7 +11077,7 @@ async fn apply_recovered_member_key_package_locked(
             return false;
         };
         if !verify_authority_attested_member_joined_recovery(info, event)
-            && !removed_seat_self_signed_key_package(info, event)
+            && !seat_self_signed_key_package(info, event)
         {
             tracing::warn!(
                 group_id = %LogHexId::group(group_id),
@@ -11183,7 +11243,10 @@ pub(in crate::server) async fn holds_member_key_package_for_removal(
         .treekem_member_key_packages
         .get(&key)
         .await
-        .is_some_and(|event| verify_authority_attested_member_joined_recovery(&info, &event))
+        .is_some_and(|event| {
+            verify_authority_attested_member_joined_recovery(&info, &event)
+                || seat_self_signed_key_package(&info, &event)
+        })
 }
 
 async fn recover_member_treekem_key_package_locked(
@@ -12748,7 +12811,10 @@ async fn member_keyed_treekem_catchup_response(
         .treekem_member_key_packages
         .find_for_member(log_keys, target_member_id)
         .await
-        .filter(|event| verify_authority_attested_member_joined_recovery(&info, event));
+        .filter(|event| {
+            verify_authority_attested_member_joined_recovery(&info, event)
+                || seat_self_signed_key_package(&info, event)
+        });
     Some(TreeKemCatchupResponse {
         message_type: "treekem_catchup_response".to_string(),
         group_id: request.group_id.clone(),
@@ -13743,7 +13809,7 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                     .map(|(_, ev)| ev)
                     .filter(|ev| {
                         verify_authority_attested_member_joined_recovery(&response_info, ev)
-                            || removed_seat_self_signed_key_package(&response_info, ev)
+                            || seat_self_signed_key_package(&response_info, ev)
                     });
                 // A survivor may relay a signed removal. The transport sender
                 // is that survivor. The author is the verified commit signer.
@@ -18780,30 +18846,44 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // to release its marker. Two cases stay plain REJECTED and keep
             // the marker: fork evidence that was found but not installed
             // durably, and the persist failures below.
+            use x0x::groups::join_outcome::JoinRequestRefusalReason as Reason;
             let Some(commit) = commit else {
-                return ApplyMetadataResult::REFUSED_WITHOUT_MUTATION;
+                return ApplyMetadataResult::refused(Reason::Invalid);
             };
             if sender_hex != requester_agent_id {
-                return ApplyMetadataResult::REFUSED_WITHOUT_MUTATION;
+                return ApplyMetadataResult::refused(Reason::Invalid);
             }
-            if info.policy.admission != x0x::groups::GroupAdmission::RequestAccess {
-                return ApplyMetadataResult::REFUSED_WITHOUT_MUTATION;
-            }
+            // #1840 disclosure rule (PR #1850 review r1). The reason goes to
+            // the requester, who can be any agent that knows the group id.
+            // It may name only (a) a fact about the requester itself, or
+            // (b) `Stale`: "your copy of this group is not current". It
+            // must not show WHICH owner-state check refused. So the facts
+            // about the requester are read first, and the admission policy
+            // and a request id that the roster already holds answer
+            // `Stale`, the same as a commit over a wrong head. `Invalid`
+            // is only for what the envelope alone decides (above, and the
+            // structural checks of the validator), or for validator checks
+            // that run after the revision and the chain matched.
+            // The request-id row below is for direct callers only: the
+            // listener classes an offer whose request id the roster holds
+            // as a repair before it applies, and sends no outcome for it.
             if info.has_active_member(&requester_agent_id) {
-                return ApplyMetadataResult::REFUSED_WITHOUT_MUTATION;
+                return ApplyMetadataResult::refused(Reason::AlreadyMember);
             }
             if info.is_banned(&requester_agent_id) {
-                return ApplyMetadataResult::REFUSED_WITHOUT_MUTATION;
+                return ApplyMetadataResult::refused(Reason::Banned);
             }
             if info
                 .join_requests
                 .values()
                 .any(|r| r.requester_agent_id == requester_agent_id && r.is_pending())
             {
-                return ApplyMetadataResult::REFUSED_WITHOUT_MUTATION;
+                return ApplyMetadataResult::refused(Reason::PendingExists);
             }
-            if info.join_requests.contains_key(&request_id) {
-                return ApplyMetadataResult::REFUSED_WITHOUT_MUTATION;
+            if info.policy.admission != x0x::groups::GroupAdmission::RequestAccess
+                || info.join_requests.contains_key(&request_id)
+            {
+                return ApplyMetadataResult::refused(Reason::Stale);
             }
             let current = info.clone();
             // The central hook ([`apply_stateful_event_with_evidence`]),
@@ -18854,7 +18934,16 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     return if evidence_not_durable {
                         ApplyMetadataResult::REJECTED
                     } else {
-                        ApplyMetadataResult::REFUSED_WITHOUT_MUTATION
+                        // One reason for a commit behind the head, off the
+                        // chain, or over another roster: the validator
+                        // checks the revision before the chain, so two
+                        // reasons would let a prober read the revision.
+                        ApplyMetadataResult::refused(match error {
+                            x0x::groups::ApplyError::StaleRevision { .. }
+                            | x0x::groups::ApplyError::PrevHashMismatch { .. }
+                            | x0x::groups::ApplyError::StateHashMismatch { .. } => Reason::Stale,
+                            _ => Reason::Invalid,
+                        })
                     };
                 }
             };
@@ -18898,6 +18987,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 should_exit: false,
                 pre_mutation_group: Some(current),
                 refused_without_mutation: false,
+                refusal_reason: None,
             }
         }
         NamedGroupMetadataEvent::JoinRequestApproved {
@@ -21438,6 +21528,7 @@ pub(in crate::server) async fn get_named_group(
     // ADR 0109 §8: the additive `recovery` object (absent when S3 holds no
     // state for the group).
     let s3_recovery = group_recovery::recovery_json(&state, &info).await;
+    let own_join_request = join_request_outcome::own_join_request_json(&state, &info).await;
 
     (
         StatusCode::OK,
@@ -21460,6 +21551,9 @@ pub(in crate::server) async fn get_named_group(
             // PR #370 review item 2: clients must be able to distinguish a
             // retained withdrawn tombstone from a live group.
             "withdrawn": info.withdrawn,
+            // #1840: this daemon's own pending join request and, when the
+            // authority refused it, the typed reason. `null` otherwise.
+            "own_join_request": own_join_request,
             "metadata_topic": info.metadata_topic,
             "policy": info.policy,
             "policy_revision": info.policy_revision,
@@ -26028,12 +26122,24 @@ pub(super) async fn join_group_via_invite_inner(
             // the authenticated invite committed to, before any seat.
             // Intermediate commits that apply before our own seat cannot
             // lose the base this way (v3 review item 5).
+            let signed_base_roster_root = view.signed_roster_root();
             info.invite_lineage = Some(x0x::groups::InviteLineage {
                 base_revision: view.base_state_revision,
                 base_hash: view.base_state_hash.clone(),
+                // #1797: keep the base projection only when it re-derives
+                // the signed root (a v6 join with no fetched roster keeps
+                // none).
+                base_roster: if x0x::groups::state_commit::roster_root_of_projection(
+                    effective_base_roster,
+                ) == signed_base_roster_root
+                {
+                    effective_base_roster.clone()
+                } else {
+                    BTreeMap::new()
+                },
                 // #646: the signed root — carried on v6, re-derived from
                 // the inline projection on v4 (same value either way).
-                base_roster_root: view.signed_roster_root(),
+                base_roster_root: signed_base_roster_root,
                 seated_at_revision: None,
                 corroborated: false,
                 fork_evidence: None,
@@ -35426,6 +35532,7 @@ pub(in crate::server) async fn create_join_request(
                 first_seen_ms: now_ms,
                 next_retry_at_ms: now_ms,
                 retry_count: 0,
+                refusal: None,
             };
             if let Err(error) = insert_requester_offer_obligation(&state, obligation).await {
                 // Fail-visible fallback: the pre-#908 one-shot shape, so
@@ -53209,6 +53316,7 @@ pub(in crate::server) mod tests {
     mod issue1685_catchup_page_no_progress;
     #[cfg(unix)]
     mod issue1809_secret_file_mode;
+    mod issue1840_join_request_outcome;
     mod issue1840_sequence;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
@@ -54055,6 +54163,7 @@ pub(in crate::server) mod tests {
             )),
             treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
             treekem_catchup_refusals: StdMutex::new(HashMap::new()),
+            join_request_outcome_sends: StdMutex::new(HashMap::new()),
             group_membership_locks: RwLock::new(HashMap::new()),
             reseat_stagings: Default::default(),
             treekem_groups: crate::server::reseat_scope::ScopedGroupMap::default(),
@@ -65296,6 +65405,7 @@ pub(in crate::server) mod tests {
         stable_group_id: String,
         member_id: AgentId,
         member_hex: String,
+        member_keypair: x0x::identity::AgentKeypair,
         event: NamedGroupMetadataEvent,
         group: Arc<Mutex<x0x::mls::TreeKemMlsGroup>>,
         initial_epoch: u64,
@@ -65459,6 +65569,7 @@ pub(in crate::server) mod tests {
             stable_group_id,
             member_id,
             member_hex,
+            member_keypair,
             event,
             group,
             initial_epoch,
@@ -71296,6 +71407,51 @@ pub(in crate::server) mod tests {
         Ok(())
     }
 
+    /// WHY (#1583): removing an Active seat needs that member's KeyPackage.
+    /// The attested form reaches other members only in one direct message
+    /// from the seating admin (gossip `MemberAdded` carries no
+    /// `member_joined_recovery`), so a member that missed it could never
+    /// remove the seat. The member's own signed `MemberJoined` now counts
+    /// for an Active seat when its bytes hash to the roster-committed
+    /// `treekem_key_package_hash`, and catch-up serves that form.
+    #[tokio::test]
+    async fn issue1583_active_seat_takes_committed_key_package_from_self_signed_member_joined(
+    ) -> Result<()> {
+        let fixture = member_joined_treekem_fixture(0x9b, 0x9c).await?;
+        let state = &fixture.state;
+        let group_id = fixture.group_id.clone();
+        let member_hex = fixture.member_hex.clone();
+        let inviter_hex = hex::encode(state.agent.agent_id().as_bytes());
+        insert_active_member_without_kp(state, &group_id, &member_hex, &inviter_hex).await;
+        let self_signed = without_recovery_attestation(fixture.event.clone());
+        let committed_kp = match &self_signed {
+            NamedGroupMetadataEvent::MemberJoined {
+                treekem_key_package_b64: Some(kp),
+                ..
+            } => kp.clone(),
+            _ => anyhow::bail!("fixture carries a KeyPackage"),
+        };
+        assert!(
+            !holds_member_key_package_for_removal(state, &group_id, &member_hex).await,
+            "control: no package is held before recovery"
+        );
+
+        assert!(
+            apply_recovered_member_key_package(state, &self_signed).await,
+            "#1583: the self-signed committed bytes install on an Active seat"
+        );
+        assert_eq!(
+            member_treekem_kp(state, &group_id, &member_hex).await,
+            Some(committed_kp),
+            "the installed bytes are the roster-committed package"
+        );
+        assert!(
+            holds_member_key_package_for_removal(state, &group_id, &member_hex).await,
+            "the removal precondition now holds"
+        );
+        Ok(())
+    }
+
     /// WP-TK1 CRITICAL — fail-closed recovery gate (issue #205): a recovered
     /// key-package install is authenticated THREE independent ways, each of
     /// which alone must refuse the install. (1) The member's ML-DSA-65 signature
@@ -71321,12 +71477,24 @@ pub(in crate::server) mod tests {
         let valid_event = fixture.event.clone();
 
         // A compromised target can self-sign a fresh package after joining.
-        // Member authentication alone is therefore insufficient: without the
-        // inviter's post-acceptance countersignature, recovery must reject it.
-        let member_only_event = without_recovery_attestation(valid_event.clone());
+        // Member authentication alone is therefore insufficient: a package
+        // whose hash the roster does not commit is refused without the
+        // inviter's post-acceptance countersignature (#1583 accepts the
+        // self-signed form only for the committed bytes).
+        let fresh_prepared =
+            x0x::mls::TreeKemMlsGroup::prepare_member(fixture.member_id, &[0xed; 32])?;
+        let member_only_event = resign_member_joined_key_package(
+            without_recovery_attestation(valid_event.clone()),
+            &fixture.member_keypair,
+            BASE64.encode(fresh_prepared.key_package_bytes()),
+        )?;
+        assert!(
+            verify_member_joined_key_package_event(&member_only_event),
+            "control: the fresh package is genuinely member-signed"
+        );
         assert!(
             !apply_recovered_member_key_package(state, &member_only_event).await,
-            "member-signed package without inviter acceptance is refused"
+            "member-signed fresh package without inviter acceptance is refused"
         );
         assert!(
             member_treekem_kp(state, &group_id, &member_hex)
@@ -72777,6 +72945,51 @@ pub(in crate::server) mod tests {
         assert_eq!(body["error"], "member_key_package_pending");
         assert_eq!(body["retry"], true);
         Ok(())
+    }
+
+    /// Re-sign a `MemberJoined` as its member with different KeyPackage
+    /// bytes (a member self-signing a fresh package after joining).
+    fn resign_member_joined_key_package(
+        mut event: NamedGroupMetadataEvent,
+        member_keypair: &x0x::identity::AgentKeypair,
+        new_key_package_b64: String,
+    ) -> Result<NamedGroupMetadataEvent> {
+        if let NamedGroupMetadataEvent::MemberJoined {
+            group_id,
+            stable_group_id,
+            member_agent_id,
+            member_public_key_b64,
+            role,
+            display_name,
+            inviter_agent_id,
+            invite_secret,
+            ts_ms,
+            treekem_key_package_b64,
+            signature_b64,
+            ..
+        } = &mut event
+        {
+            let canonical = canonical_member_joined_bytes(
+                group_id,
+                stable_group_id.as_deref(),
+                member_agent_id,
+                member_public_key_b64,
+                *role,
+                display_name.as_deref(),
+                inviter_agent_id,
+                invite_secret,
+                *ts_ms,
+                Some(&new_key_package_b64),
+            );
+            let signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+                member_keypair.secret_key(),
+                &canonical,
+            )
+            .map_err(|e| anyhow::anyhow!("re-sign MemberJoined: {e:?}"))?;
+            *treekem_key_package_b64 = Some(new_key_package_b64);
+            *signature_b64 = BASE64.encode(signature.as_bytes());
+        }
+        Ok(event)
     }
 
     fn without_recovery_attestation(mut event: NamedGroupMetadataEvent) -> NamedGroupMetadataEvent {

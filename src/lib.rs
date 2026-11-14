@@ -7933,6 +7933,23 @@ async fn dispatch_raw_direct_after_gates(
         return dm_inbox::TypedRouteOutcome::RejectedPrefix;
     }
 
+    // #1840: the same catch-all for a verified join-request outcome that
+    // no typed route consumed (the startup window, a trust-rejected
+    // sender). It is not a user DM. Dropping it loses nothing: the
+    // requester's offer obligation is kept, and its next offer gets a
+    // new outcome once the authority's 30 s send limit has passed.
+    if verified && data.starts_with(groups::join_outcome::JOIN_REQUEST_OUTCOME_DM_PREFIX) {
+        tracing::debug!(
+            target: "x0x::direct",
+            stage = "recv_join_outcome_dropped",
+            reason = "not_ready",
+            sender = %network::hex_prefix(&sender.0, 4),
+            payload_bytes = data.len(),
+            "verified join-request outcome not consumed by a typed route; dropped"
+        );
+        return dm_inbox::TypedRouteOutcome::RejectedPrefix;
+    }
+
     // N12: an UNVERIFIED frame whose bytes claim a typed protocol route is
     // (the static production table covers the inbox-not-ready startup window)
     // not a user DM. The typed router already refuses unverified frames;
@@ -30097,6 +30114,45 @@ mod tests {
                 .expect("verified ordinary DMs still delivered")
                 .payload,
             ordinary
+        );
+    }
+
+    /// #1840 (PR #1850 review r1): a VERIFIED join-request outcome that
+    /// arrives in the startup window (no registered typed route) is
+    /// dropped. RED without the drop in `dispatch_raw_direct_after_gates`:
+    /// the generic bus shows the outcome bytes as an ordinary DM.
+    #[tokio::test]
+    async fn raw_path_verified_join_outcome_is_dropped_before_inbox_starts() {
+        let dm = direct::DirectMessaging::new();
+        let mut generic = dm.subscribe();
+        let no_routes: Vec<dm_inbox::DmTypedPayloadRoute> = Vec::new();
+        let payload = groups::join_outcome::JoinRequestOutcome {
+            group_id: "g".to_string(),
+            request_id: "r".to_string(),
+            envelope_digest: "ab".repeat(32),
+            reason: groups::join_outcome::JoinRequestRefusalReason::Stale,
+        }
+        .encode()
+        .expect("encode");
+        let outcome = dispatch_raw_direct_after_gates(
+            &dm,
+            None,
+            &no_routes,
+            RawDirectDelivery {
+                sender: identity::AgentId([0x99; 32]),
+                machine_id: identity::MachineId([0x9a; 32]),
+                data: payload.clone(),
+                verified: true,
+                trust_decision: Some(trust::TrustDecision::Accept),
+                observed_origin: None,
+                digest: direct::dm_payload_digest_hex(&payload),
+            },
+        )
+        .await;
+        assert_eq!(outcome, dm_inbox::TypedRouteOutcome::RejectedPrefix);
+        assert!(
+            generic.try_recv().is_none(),
+            "a verified join-request outcome must never reach the generic bus"
         );
     }
 

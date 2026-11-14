@@ -19,7 +19,7 @@
       "revision": 1,
       "path": "A02-r01-identity-keys-and-device-enrollment.md",
       "title": "Identity Keys and Device Enrollment",
-      "sha256": "6908b1754ff4ce9a368410ddce51bc1a107356fb011d26a5040c305d81ec46dc"
+      "sha256": "83492337567c9b0de73139f29994665b6486063eedd6392ea2153af49134f4cc"
     },
     {
       "id": "A03",
@@ -61,14 +61,14 @@
       "revision": 1,
       "path": "A08-r01-groups-home-membership-and-repair.md",
       "title": "Groups Home Membership and Repair",
-      "sha256": "58a96da4d869b867e16c7ff97bc1c2d995968eea4e3d36d03ecb76a8e1b424cf"
+      "sha256": "2dd21c75a8e9231249b9a908461deddcb835d8679a9c6dee63111cc7579eee53"
     },
     {
       "id": "A09",
       "revision": 1,
       "path": "A09-r01-group-encryption-and-key-changes.md",
       "title": "Group Encryption and Key Changes",
-      "sha256": "272609cbcfda7febcf052a16b7a653606918c0eb773a100e353342a585816a10"
+      "sha256": "3f32db069798b2a5a1a6360745b4bd9fc675533912ccbe2a9974749ea5a13a09"
     },
     {
       "id": "A10",
