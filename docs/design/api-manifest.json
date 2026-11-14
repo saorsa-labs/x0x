@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 221,
+  "endpoint_count": 222,
   "endpoints": [
     {
       "category": "status",
@@ -1829,6 +1829,24 @@
       "path": "/direct/connections",
       "request": {
         "kind": "none"
+      }
+    },
+    {
+      "category": "direct",
+      "cli_name": "direct receipt",
+      "description": "Durable send outcome by logical_id (delivered, delivered_late, pending, unknown)",
+      "method": "GET",
+      "path": "/direct/receipts/:logical_id",
+      "request": {
+        "fields": [
+          {
+            "cli": "AGENT_ID",
+            "in": "query",
+            "name": "agent_id",
+            "required": true
+          }
+        ],
+        "kind": "fields"
       }
     },
     {
