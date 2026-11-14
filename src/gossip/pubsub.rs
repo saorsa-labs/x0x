@@ -10485,8 +10485,107 @@ mod tests {
     /// #1226: refuse an unsigned inner envelope before either eager forwarding
     /// or lazy advertisement. A later IWANT must not retrieve the rejected ID.
     /// Signed V2/V3 controls prove the same subscribed/unsubscribed paths work.
+    ///
+    /// #1346 hold: 0.5.88 refuses a fresh unsigned inner V1 at the
+    /// validator, but only 0.5.89 carries that refusal across payload
+    /// replays (saorsa-gossip #116), which this test's rewrapped-ID and
+    /// IWANT assertions need. While ant-quic is =0.27.62 the family stays
+    /// at 0.5.88 (0.5.89 pins ant-quic =0.27.60, 0.5.90 pins =0.27.61),
+    /// so the test fails with the reason below instead of asserting
+    /// behaviour the pinned dependency does not carry — the failure is the
+    /// visible record of the gap. The first family release that accepts
+    /// ant-quic 0.27.62 re-arms the assertions with no edit.
+    fn pinned_pubsub_carries_refusal_replays() -> bool {
+        lock_carries_pubsub_refusal_replays(include_str!("../../Cargo.lock"))
+    }
+
+    /// The guard body, over raw lock text so a synthetic lock can exercise
+    /// it. Returns false when the lock holds no `saorsa-gossip-pubsub`
+    /// entry: zero matching entries once passed `.all()` vacuously, so a
+    /// dropped pin would quietly disarm the guard (#1772 review). A
+    /// matching entry whose version is missing or unparsable also fails.
+    fn lock_carries_pubsub_refusal_replays(lock: &str) -> bool {
+        let parsed: toml::Value = match toml::from_str(lock) {
+            Ok(parsed) => parsed,
+            Err(_) => return false,
+        };
+        let mut saw_pubsub = false;
+        for package in parsed
+            .get("package")
+            .and_then(|packages| packages.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let name = package.get("name").and_then(|name| name.as_str());
+            if name != Some("saorsa-gossip-pubsub") {
+                continue;
+            }
+            saw_pubsub = true;
+            // A missing or unparsable version must fail, not pass.
+            let carries = package
+                .get("version")
+                .and_then(|version| version.as_str())
+                .and_then(|version| semver::Version::parse(version).ok())
+                .is_some_and(|version| version >= semver::Version::new(0, 5, 89));
+            if !carries {
+                return false;
+            }
+        }
+        saw_pubsub
+    }
+
+    /// A minimal Cargo.lock-shaped TOML pinning the pubsub crate at
+    /// `version` (#1772 review fixtures).
+    fn lock_with_pubsub_pin(version: &str) -> String {
+        format!(
+            "[[package]]\nname = \"unrelated-crate\"\nversion = \"1.0.0\"\n\n\
+             [[package]]\nname = \"saorsa-gossip-pubsub\"\nversion = \"{version}\"\n"
+        )
+    }
+
+    /// Zero matching entries passed vacuously before; a lock without the
+    /// pubsub pin must fail the guard (#1772 review).
+    #[test]
+    fn lock_carries_refusal_replays_fails_without_pubsub_entry() {
+        let lock = "[[package]]\nname = \"unrelated-crate\"\nversion = \"1.0.0\"\n";
+        assert!(!lock_carries_pubsub_refusal_replays(lock));
+    }
+
+    /// The real pin: 0.5.88, which the #1346 hold keeps in force.
+    #[test]
+    fn lock_carries_refusal_replays_fails_at_0_5_88() {
+        assert!(!lock_carries_pubsub_refusal_replays(&lock_with_pubsub_pin(
+            "0.5.88"
+        )));
+    }
+
+    /// 0.5.89 carries the refusal replay (saorsa-gossip #116).
+    #[test]
+    fn lock_carries_refusal_replays_passes_at_0_5_89() {
+        assert!(lock_carries_pubsub_refusal_replays(&lock_with_pubsub_pin(
+            "0.5.89"
+        )));
+    }
+
+    /// A matching name whose version does not parse must fail the guard.
+    #[test]
+    fn lock_carries_refusal_replays_fails_on_unparsable_version() {
+        assert!(!lock_carries_pubsub_refusal_replays(&lock_with_pubsub_pin(
+            "not-a-semver"
+        )));
+    }
+
     #[tokio::test]
     async fn issue1226_unsigned_inner_v1_is_not_forwarded_or_served() {
+        if !pinned_pubsub_carries_refusal_replays() {
+            panic!(
+                "issue1226 stands down: pinned saorsa-gossip-pubsub lacks the \
+                 0.5.89 replay-refusal carry-over (saorsa-gossip #116; \
+                 ant-quic =0.27.62 hold, #1346). The pin choice is with \
+                 David and PR #1772 must not merge while it stands — this \
+                 failure keeps that gap visible instead of passing silently."
+            );
+        }
         // Match SG's existing anti-entropy wire enum. A digest may contain
         // retained dedupe IDs; it must never cause refused bytes to be served.
         #[derive(Debug, serde::Serialize, serde::Deserialize)]
