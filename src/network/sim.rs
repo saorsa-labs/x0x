@@ -323,6 +323,8 @@ struct FabricState {
     by_addr: BTreeMap<SocketAddr, Key>,
     links: BTreeMap<(Key, Key), LinkState>,
     pair_ordinals: BTreeMap<(Key, Key), u64>,
+    /// Streams opened so far, per `(opener, acceptor)` direction. See
+    /// [`SimFabric::open_stream`] for how this becomes a lane ordinal.
     stream_ordinals: BTreeMap<(Key, Key), u32>,
     open_streams: Vec<(u64, Arc<StreamPair>)>,
     partitions: BTreeSet<(Key, Key)>,
@@ -754,7 +756,12 @@ impl SimFabric {
 
     fn render(&self, state: &FabricState, events: &[TraceEvent], title: &str) -> String {
         let mut nodes: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        let mut links: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        // Per pair, `(virtual time, is a stream event, text)`, sorted before
+        // rendering (#1245). At one instant, connection events keep their
+        // recorded order (an open then a close is causal), and stream events
+        // follow them in text order: streams opened or read by different
+        // tasks at one instant must not depend on task order.
+        let mut links: BTreeMap<String, Vec<(Duration, bool, String)>> = BTreeMap::new();
         let mut lanes: BTreeMap<String, BTreeMap<u64, String>> = BTreeMap::new();
         let mut fates: BTreeMap<(String, u64), String> = BTreeMap::new();
         let mut deliveries: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -790,10 +797,14 @@ impl SimFabric {
                     } else {
                         format!("{nb}~{na}")
                     };
-                    links.entry(key).or_default().push(format!(
-                        "#{ordinal} {}@{}us",
-                        if *open { "open" } else { "close" },
-                        micros(*at)
+                    links.entry(key).or_default().push((
+                        *at,
+                        false,
+                        format!(
+                            "#{ordinal} {}@{}us",
+                            if *open { "open" } else { "close" },
+                            micros(*at)
+                        ),
                     ));
                 }
                 TraceEvent::Write { index, fault } => {
@@ -884,10 +895,11 @@ impl SimFabric {
                     } else {
                         format!("{nb}~{na}")
                     };
-                    links
-                        .entry(key)
-                        .or_default()
-                        .push(format!("stream{ordinal} {na}->{nb} open@{}us", micros(*at)));
+                    links.entry(key).or_default().push((
+                        *at,
+                        true,
+                        format!("stream{ordinal} {na}->{nb} open@{}us", micros(*at)),
+                    ));
                 }
                 TraceEvent::StreamFinRead { lane, at } => {
                     let (na, nb) = (Self::name(state, &lane.src), Self::name(state, &lane.dst));
@@ -896,10 +908,14 @@ impl SimFabric {
                     } else {
                         format!("{nb}~{na}")
                     };
-                    links.entry(key).or_default().push(format!(
-                        "{} {na}->{nb} fin-read@{}us",
-                        lane.class.name(),
-                        micros(*at)
+                    links.entry(key).or_default().push((
+                        *at,
+                        true,
+                        format!(
+                            "{} {na}->{nb} fin-read@{}us",
+                            lane.class.name(),
+                            micros(*at)
+                        ),
                     ));
                 }
             }
@@ -924,6 +940,22 @@ impl SimFabric {
             }
         };
         section(&mut out, "nodes", &nodes);
+        let links: BTreeMap<String, Vec<String>> = links
+            .into_iter()
+            .map(|(key, mut items)| {
+                // A stable sort: equal keys keep their recorded order.
+                items.sort_by(|(at_a, stream_a, text_a), (at_b, stream_b, text_b)| {
+                    at_a.cmp(at_b).then(stream_a.cmp(stream_b)).then_with(|| {
+                        if *stream_a && *stream_b {
+                            text_a.cmp(text_b)
+                        } else {
+                            std::cmp::Ordering::Equal
+                        }
+                    })
+                });
+                (key, items.into_iter().map(|(_, _, text)| text).collect())
+            })
+            .collect();
         section(&mut out, "links", &links);
         let _ = writeln!(out, "[lanes]");
         for (lane, writes) in &lanes {
@@ -1316,11 +1348,16 @@ impl SimFabric {
             );
             return Err(not_connected(&PeerId(to)));
         };
+        // One counter per opener direction, so two streams opened in
+        // opposite directions at the same virtual instant get the same
+        // ordinals in either task order (#1245). Even ordinals are opened by
+        // the pair's lower key and odd ordinals by the higher key, so the
+        // ordinal still names one stream of the pair.
         let ordinal = {
-            let next = state.stream_ordinals.entry(key).or_insert(0);
-            let ordinal = *next;
+            let next = state.stream_ordinals.entry((from, to)).or_insert(0);
+            let count = *next;
             *next = next.saturating_add(1);
-            ordinal
+            count.saturating_mul(2).saturating_add(u32::from(from > to))
         };
         let stream = Arc::new(StreamPair::default());
         state.open_streams.push((generation, Arc::clone(&stream)));
@@ -2834,6 +2871,32 @@ mod fabric_tests {
             .expect("accept");
         assert_eq!(peer, key(1), "the acceptor learns the opener");
         (a, b, a_send, a_recv, b_send, b_recv)
+    }
+
+    /// Two streams opened in opposite directions at the same virtual instant
+    /// are independent events, so the order in which their tasks ran must
+    /// not change the canonical trace (#1245: the shared per-pair ordinal
+    /// and the link-list order both followed task order).
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn w3h_fabric_same_instant_opposite_stream_opens_trace_is_order_free() {
+        async fn trace(a_first: bool) -> String {
+            let fabric = SimFabric::new(28);
+            let (a, b) = two_links(&fabric).await;
+            let (a_open, b_open) = if a_first {
+                let a_open = a.open_bi(&key(2)).expect("A opens");
+                (a_open, b.open_bi(&key(1)).expect("B opens"))
+            } else {
+                let b_open = b.open_bi(&key(1)).expect("B opens");
+                (a.open_bi(&key(2)).expect("A opens"), b_open)
+            };
+            drop((a_open, b_open));
+            fabric.canonical_trace()
+        }
+        let a_first = trace(true).await;
+        let b_first = trace(false).await;
+        assert!(a_first.contains("A->B open@"), "{a_first}");
+        assert!(a_first.contains("B->A open@"), "{a_first}");
+        assert_eq!(a_first, b_first, "same-instant opens depend on task order");
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

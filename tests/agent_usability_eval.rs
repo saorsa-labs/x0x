@@ -454,11 +454,22 @@ async fn serve_one_onboard_request(stream: &mut tokio::net::TcpStream) -> std::i
     let path = head.split(' ').nth(1).unwrap_or_default();
     let (status, body) = match path {
         "/health" => ("200 OK", serde_json::json!({ "ok": true }).to_string()),
-        "/agent/card" => (
+        // `x0x onboard` GETs /onboard (with card-delivery query params)
+        // since the daemon became the recipe's single renderer; the stub
+        // answers with the REAL recipe through the same shared module the
+        // daemon handler uses, so the doc-surface tests keep scoring the
+        // shipped renderer's bytes.
+        p if p == "/onboard" || p.starts_with("/onboard?") => (
             "200 OK",
             serde_json::json!({
-                "card": { "agent_id": STUB_INVITER_AGENT_ID },
-                "link": STUB_INVITER_CARD_LINK
+                "ok": true,
+                "inviter_agent_id": STUB_INVITER_AGENT_ID,
+                "card_delivery": "file",
+                "card_link": STUB_INVITER_CARD_LINK,
+                "recipe": x0x::onboard::recipe_text(
+                    STUB_INVITER_AGENT_ID,
+                    &x0x::onboard::Card::File("x0x-invite-card.txt"),
+                ),
             })
             .to_string(),
         ),

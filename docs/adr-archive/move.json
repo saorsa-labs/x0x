@@ -615,6 +615,108 @@
       "to": "docs/adr-archive/0116-local-history-retention-policy.md",
       "link": "../adr-archive/0116-local-history-retention-policy.md",
       "sha256": "13057dd17ada731d1cc614bcfa7156891079ee97df954a9772a6bf8b8daad68e"
+    },
+    {
+      "from": "docs/adr/transient/T-0089-ordinary-send-load-barrier-fallback.md",
+      "to": "docs/adr-archive/transient/T-0089-ordinary-send-load-barrier-fallback.md",
+      "link": "../../adr-archive/transient/T-0089-ordinary-send-load-barrier-fallback.md",
+      "sha256": "012d651b314c467077c6ef082d87ff7cd6a423e97451ff70089914f4833d6adb"
+    },
+    {
+      "from": "docs/adr/transient/T-alternate-bearers.md",
+      "to": "docs/adr-archive/transient/T-alternate-bearers.md",
+      "link": "../../adr-archive/transient/T-alternate-bearers.md",
+      "sha256": "034b131082c285ee558f3f0e22dec50007db92aeb44c3766f3bb65a77fc2ba0c"
+    },
+    {
+      "from": "docs/adr/transient/T-ant-quic-0-27-61-transport-hardening.md",
+      "to": "docs/adr-archive/transient/T-ant-quic-0-27-61-transport-hardening.md",
+      "link": "../../adr-archive/transient/T-ant-quic-0-27-61-transport-hardening.md",
+      "sha256": "b2993901b517dbea9448c32d4362e8d77047ce2b1531b9a47176fa0a57383065"
+    },
+    {
+      "from": "docs/adr/transient/T-doctor-json-summary.md",
+      "to": "docs/adr-archive/transient/T-doctor-json-summary.md",
+      "link": "../../adr-archive/transient/T-doctor-json-summary.md",
+      "sha256": "2d2b7fa9a669e320b3a34ef7a3657884bcdc2afc56d7c2ddfe80b902b538d80d"
+    },
+    {
+      "from": "docs/adr/transient/T-file-control-ack.md",
+      "to": "docs/adr-archive/transient/T-file-control-ack.md",
+      "link": "../../adr-archive/transient/T-file-control-ack.md",
+      "sha256": "fbcd3a38daebab1609cca4dc03cae53d3ac53c899b86b2adc5ba70380bfd8cb6"
+    },
+    {
+      "from": "docs/adr/transient/T-goal-e-rule-5.md",
+      "to": "docs/adr-archive/transient/T-goal-e-rule-5.md",
+      "link": "../../adr-archive/transient/T-goal-e-rule-5.md",
+      "sha256": "ce0a11966040fd0105a1d637c3bfe9d5b7be07a2d9851e649182ebfb7ca83f33"
+    },
+    {
+      "from": "docs/adr/transient/T-installed-catchup-admin-consent.md",
+      "to": "docs/adr-archive/transient/T-installed-catchup-admin-consent.md",
+      "link": "../../adr-archive/transient/T-installed-catchup-admin-consent.md",
+      "sha256": "d500041d71352e86e4398f0e60a562c92459efc6e50959add42c90c741d8407c"
+    },
+    {
+      "from": "docs/adr/transient/T-join-loss-pacing.md",
+      "to": "docs/adr-archive/transient/T-join-loss-pacing.md",
+      "link": "../../adr-archive/transient/T-join-loss-pacing.md",
+      "sha256": "b3995eab7013397abe618c022e7f428a510b0623ee017456f55a871deda22071"
+    },
+    {
+      "from": "docs/adr/transient/T-projects-and-agent-rental.md",
+      "to": "docs/adr-archive/transient/T-projects-and-agent-rental.md",
+      "link": "../../adr-archive/transient/T-projects-and-agent-rental.md",
+      "sha256": "f87eb27f820c56a818c48422793fdbf2f2671578ccbcf023acedc485de7367a9"
+    },
+    {
+      "from": "docs/adr/transient/T-relay-refuse-unsigned-inner-v1.md",
+      "to": "docs/adr-archive/transient/T-relay-refuse-unsigned-inner-v1.md",
+      "link": "../../adr-archive/transient/T-relay-refuse-unsigned-inner-v1.md",
+      "sha256": "1691e8b9905d99fff215bc5b7c6b242d4667f567e8a9fb392f49951493d97fea"
+    },
+    {
+      "from": "docs/adr/transient/T-revocation-store-corrupt.md",
+      "to": "docs/adr-archive/transient/T-revocation-store-corrupt.md",
+      "link": "../../adr-archive/transient/T-revocation-store-corrupt.md",
+      "sha256": "e8ce59af9c51d6e9293964745c8a4b6c3129530035a361b7ed602de389fe4ca4"
+    },
+    {
+      "from": "docs/adr/transient/T-self-leave-catchup-author.md",
+      "to": "docs/adr-archive/transient/T-self-leave-catchup-author.md",
+      "link": "../../adr-archive/transient/T-self-leave-catchup-author.md",
+      "sha256": "fcecbb70fe26b5c1d6d2cb32634c8743f494a5d378b1b617149612b87e4d3bda"
+    },
+    {
+      "from": "docs/adr/transient/T-self-leave-mixed-version-break.md",
+      "to": "docs/adr-archive/transient/T-self-leave-mixed-version-break.md",
+      "link": "../../adr-archive/transient/T-self-leave-mixed-version-break.md",
+      "sha256": "a1c59ebd3b343b0ff5ed02b65a7b226bf25c2d1d138b06f397974cf0c1801a87"
+    },
+    {
+      "from": "docs/adr/transient/T-self-leave-rekey-committer.md",
+      "to": "docs/adr-archive/transient/T-self-leave-rekey-committer.md",
+      "link": "../../adr-archive/transient/T-self-leave-rekey-committer.md",
+      "sha256": "45903ae03e45cc9bf17be3cdb194dd146749dab6b771e6e76f22f680c3f8fc93"
+    },
+    {
+      "from": "docs/adr/transient/T-self-leave-relay-commit-binding.md",
+      "to": "docs/adr-archive/transient/T-self-leave-relay-commit-binding.md",
+      "link": "../../adr-archive/transient/T-self-leave-relay-commit-binding.md",
+      "sha256": "c2465f78a03cfaf54ec666da7c75104ef77b8822e0a0fa0999b24fe53393a2c4"
+    },
+    {
+      "from": "docs/adr/transient/T-self-update-host-backup-guard.md",
+      "to": "docs/adr-archive/transient/T-self-update-host-backup-guard.md",
+      "link": "../../adr-archive/transient/T-self-update-host-backup-guard.md",
+      "sha256": "7a87352981af49859d02d3f0c711740ed1b00f6f5fc12fe659bb7d71999a4391"
+    },
+    {
+      "from": "docs/adr/transient/T-signed-public-kv-revision-catchup.md",
+      "to": "docs/adr-archive/transient/T-signed-public-kv-revision-catchup.md",
+      "link": "../../adr-archive/transient/T-signed-public-kv-revision-catchup.md",
+      "sha256": "7e97b9ba0072d16af36222a2ed310f5bd2c42c24a5c58d9caf6d658f8f64182c"
     }
   ]
 }

@@ -38,7 +38,7 @@ clap = { version = "4.5", features = ["derive"] }
 dashmap = "6.1"
 dirs = "5.0"
 postcard = { version = "1.1", features = ["use-std"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 hex = "0.4"
 if-addrs = "0.13"
 axum = { version = "0.7", features = ["ws"] }
@@ -51,8 +51,9 @@ rand = "0.8"
 # #1346: the family stays at 0.5.88 while ant-quic is =0.27.62 — 0.5.89
 # pins ant-quic =0.27.60 and 0.5.90 pins =0.27.61 exactly, so neither
 # resolves against =0.27.62. Move the family to the first release that
-# accepts 0.27.62; that release re-arms the #1226 guard
-# (src/gossip/pubsub.rs) and re-supersedes this producer premise.
+# accepts 0.27.62 (saorsa-gossip#127, to be released as 0.5.91); that
+# release re-arms the #1226 guard (src/gossip/pubsub.rs) and retires the
+# held 0.5.88 producer premise.
 saorsa-gossip-coordinator = "=0.5.88"
 saorsa-gossip-crdt-sync = "=0.5.88"
 saorsa-gossip-groups = "=0.5.88"
@@ -131,6 +132,9 @@ profile-heap = ["dep:dhat"]
 # Voice/video adapters for saorsa-webrtc: X0xSignaling over DMs and
 # X0xLinkTransport over ADR-0022 byte streams (StreamProtocol::WebRtcV1).
 voice = ["dep:saorsa-webrtc-core", "dep:saorsa-webrtc-codecs"]
+# The dormant M2 `x0x-launcher` binary (#1375). Held out of default builds,
+# `cargo install` and the published crate until the activation slice.
+m2-launcher = []
 
 [build-dependencies]
 # Reuse the existing fips204 graph; no keypair is retained or committed.
@@ -181,6 +185,14 @@ name = "x0xd-forge-injector"
 path = "src/bin/x0xd_forge_injector.rs"
 test = false
 
+# Unlike the bins above, `test = true`: the launcher module's unit tests run
+# in this target (and in no other target that CI tests).
+[[bin]]
+name = "x0x-launcher"
+path = "src/bin/x0x-launcher.rs"
+test = true
+required-features = ["m2-launcher"]
+
 [[bench]]
 name = "gossip_dispatch_throughput"
 harness = false
@@ -207,6 +219,7 @@ members = [
     ".",
     "tests/harness",
 ]
+
 
 # #703: the 100k signing-path test spends most CPU time in Keccak. Optimize
 # only its concrete crypto path in `test`; dev and release stay unchanged.

@@ -1,98 +1,52 @@
 # The 15 ADR set
 
-The 15-slot direction is confirmed by David (D198), as is the approximately
-80% ASD-STE100 writing target. This set records that direction for team review.
-Start with A01, A04, A07 and A15.
+David accepted A01 through A15 on 7 November 2026. The numbered source records are in `docs/adr-archive/` with their old `docs/adr/` paths kept as links recorded in `move.json`.
 
-The 15 records are **Proposed replacements**. Their transfer checks remain
-open. Confirmation of the direction does not declare every unresolved detail
-accepted or every feature shipped. The existing accepted ADRs, status overlay,
-frozen evidence and active issue gates still govern implementation.
+## Slots
 
-## Read the decisions
-
-| ID | Decision | Replacement status |
+| ID | Decision | File |
 |---|---|---|
-| A01 | [Purpose and Product Limits](A01-r01-purpose-and-product-limits.md) | Proposed |
-| A02 | [Identity Keys and Device Enrollment](A02-r01-identity-keys-and-device-enrollment.md) | Proposed |
-| A03 | [Trust Permissions Sharing and Revocation](A03-r01-trust-permissions-sharing-and-revocation.md) | Proposed |
-| A04 | [Agent Attachment and Inbound Events](A04-r01-agent-attachment-and-inbound-events.md) | Proposed |
-| A05 | [Connectivity Discovery and Names](A05-r01-connectivity-discovery-and-names.md) | Proposed |
-| A06 | [Gossip Relay Roles and Resource Limits](A06-r01-gossip-relay-roles-and-resource-limits.md) | Proposed |
-| A07 | [Messages Receipts History and Retry](A07-r01-messages-receipts-history-and-retry.md) | Proposed |
-| A08 | [Groups Home Membership and Repair](A08-r01-groups-home-membership-and-repair.md) | Proposed |
-| A09 | [Group Encryption and Key Changes](A09-r01-group-encryption-and-key-changes.md) | Proposed |
-| A10 | [Shared Data Files and Synchronization](A10-r01-shared-data-files-and-synchronization.md) | Proposed |
-| A11 | [Local API Applications and Human Interface](A11-r01-local-api-applications-and-human-interface.md) | Proposed |
-| A12 | [Agent Teams Delegation and Task Coordination](A12-r01-agent-teams-delegation-and-task-coordination.md) | Proposed |
-| A13 | [Voice and Video](A13-r01-voice-and-video.md) | Proposed |
-| A14 | [Health Updates and Recovery](A14-r01-health-updates-and-recovery.md) | Proposed |
-| A15 | [Compatibility Validation and Decision Rules](A15-r01-compatibility-validation-and-decision-rules.md) | Proposed |
+| A01 | Purpose and Product Limits | [A01-r01-purpose-and-product-limits.md](A01-r01-purpose-and-product-limits.md) |
+| A02 | Identity Keys and Device Enrollment | [A02-r01-identity-keys-and-device-enrollment.md](A02-r01-identity-keys-and-device-enrollment.md) |
+| A03 | Trust Permissions Sharing and Revocation | [A03-r01-trust-permissions-sharing-and-revocation.md](A03-r01-trust-permissions-sharing-and-revocation.md) |
+| A04 | Agent Attachment and Inbound Events | [A04-r01-agent-attachment-and-inbound-events.md](A04-r01-agent-attachment-and-inbound-events.md) |
+| A05 | Connectivity Discovery and Names | [A05-r01-connectivity-discovery-and-names.md](A05-r01-connectivity-discovery-and-names.md) |
+| A06 | Gossip Relay Roles and Resource Limits | [A06-r01-gossip-relay-roles-and-resource-limits.md](A06-r01-gossip-relay-roles-and-resource-limits.md) |
+| A07 | Messages Receipts History and Retry | [A07-r01-messages-receipts-history-and-retry.md](A07-r01-messages-receipts-history-and-retry.md) |
+| A08 | Groups Home Membership and Repair | [A08-r01-groups-home-membership-and-repair.md](A08-r01-groups-home-membership-and-repair.md) |
+| A09 | Group Encryption and Key Changes | [A09-r01-group-encryption-and-key-changes.md](A09-r01-group-encryption-and-key-changes.md) |
+| A10 | Shared Data Files and Synchronization | [A10-r01-shared-data-files-and-synchronization.md](A10-r01-shared-data-files-and-synchronization.md) |
+| A11 | Local API Applications and Human Interface | [A11-r01-local-api-applications-and-human-interface.md](A11-r01-local-api-applications-and-human-interface.md) |
+| A12 | Agent Teams Delegation and Task Coordination | [A12-r01-agent-teams-delegation-and-task-coordination.md](A12-r01-agent-teams-delegation-and-task-coordination.md) |
+| A13 | Voice and Video | [A13-r01-voice-and-video.md](A13-r01-voice-and-video.md) |
+| A14 | Health Updates and Recovery | [A14-r01-health-updates-and-recovery.md](A14-r01-health-updates-and-recovery.md) |
+| A15 | Compatibility Validation and Decision Rules | [A15-r01-compatibility-validation-and-decision-rules.md](A15-r01-compatibility-validation-and-decision-rules.md) |
 
-## Keep no more than 15 current ADRs
+File naming: `Axx-rNN-title.md`. Each slot's sha256 is pinned in `index.json`; the slot content must match.
 
-1. Use only A01 through A15 for the consolidated set. Do not create A16.
-2. Preserve accepted revisions as exact historical records. Never rewrite
-   an accepted record to make room for a new decision.
-3. Keep wire layouts, full state machines and detailed test plans in linked
-   specifications. A specification cannot change an accepted guarantee.
-4. Target 500 to 1,000 words in each ADR. Review a record above 1,500 words.
-5. Use the [documentation style guide](../../documentation-style.md), including
-   the approximately 80% ASD-STE100 style target.
+## Limits
 
-The limit applies to current decisions after transfer. Archived records and
-past accepted revisions do not count. David's 19 Oct 2026 ruling prohibits
-new ADR files, including transient records, folded overlays and extra slot
-revisions. Put rationale in the PR body and existing docs or code comments.
-Route wire-format or public-API questions with a `FOR ENGINEER:` line for
-David's decision. Record approval in the PR; an approved additive API needs
-no new ADR. See the [current authoring rule](../transient/README.md).
+- Use only A01–A15. Do not create A16 or any new ADR files.
+- Files under `docs/adr/transient/` do not count toward the limit (D242).
+- Archived records in `docs/adr-archive/` do not count.
+- David delegated design decisions on 10 Nov 2026. A slot change made under that delegation is a dated paragraph in the slot that says so, with the `index.json` pin updated. A PR that changes a slot says so in its body.
+- A wire-format or public-API change carries a `FOR ENGINEER:` line in the PR body that states the change; under A15 (amendment of 12 Nov 2026) it needs no separate ruling.
 
-Slot revisions stay Proposed; the transition check rejects an Accepted slot.
-Keep reserved numbers and existing team gates. The historical numbered lanes
-and transfer rules do not authorize adding files. The transition check does
-not support multiple revision files per slot; see
-[coverage gaps](../TOOLING.md#transition-check-coverage).
+## Open proposals
 
-`python3 scripts/check-adr-count.py` counts the current records. The limit
-is 15. This file is the plan. David accepted the transfer on 10 Oct 2026.
-A numbered ADR in the [transfer map](TRANSFER.md) keeps its `docs/adr/` path
-as a link. Its bytes live in `docs/adr-archive/` and stay outside the count.
-David placed ADR 0115 in A02 and ADR 0116 in A07 on 10 Oct 2026. They are
-in that map. ADR 0115 also touches A03. ADR 0116 also touches A08 and cites
-ADR 0030. Those are secondary links, not second placements. Files under
-`docs/adr/transient/` do not count (D242). This exclusion does not permit
-new transient files. Another numbered ADR outside
-that directory, or an A16 record, makes the count exceed 15 and the check fails.
+These 6 transient records are Proposed, pending a decision:
 
-## Transfer before activation
+| Record | Target slot |
+|---|---|
+| [T-one-sided-peer-link](../transient/T-one-sided-peer-link.md) | A05 |
+| [T-open-envelope-actor](../transient/T-open-envelope-actor.md) | A03 |
+| [T-pubsub-required-signing-context](../transient/T-pubsub-required-signing-context.md) | A06 |
+| [T-revocation-snapshot-authority](../transient/T-revocation-snapshot-authority.md) | A02 |
+| [T-self-leave-catchup-before-seal](../transient/T-self-leave-catchup-before-seal.md) | A07 |
+| [T-self-leave-fork-quarantine-clear](../transient/T-self-leave-fork-quarantine-clear.md) | A14 |
 
-The [record map](TRANSFER.md) assigns all 100 source ADRs to a primary slot.
-It is not a claim that every clause has been transferred.
+## Checks
 
-- Record each important old rule as retained, changed by an accepted decision,
-  retired by a human decision, or unresolved. Keep its evidence and test owner.
-- Reconcile open design work with its owners and current GitHub state.
-- Keep Proposed source decisions visibly unresolved until they are accepted.
-- Add revision-aware acceptance and immutable-history checks before any
-  consolidated record becomes Accepted. The transition check rejects early
-  acceptance. The existing governance checks continue to protect old records.
-- Let David accept the replacement revision and its transfer record. Record
-  the exact old decisions it supersedes and when that takes effect.
-- Update the index, code references, governance rules and documentation mirror
-  together. Move old files only after link and frozen-evidence checks pass.
-
-Do not use this consolidation to remove a release, security, compatibility or
-active-team gate. Do not combine the archive move with a protocol change.
-
-## Review material and checks
-
-- [Architecture review and research](../../reviews/2026-10-05-architecture/README.md)
-- [Original HTML review](../../reviews/2026-10-05-architecture/x0x-review.html)
-- [GitHub-readable review](../../reviews/2026-10-05-architecture/x0x-review.md)
-- [Machine-readable slot index](index.json)
-- [Legacy decision index and status overlay](../README.md)
-
-Run `python3 scripts/check-adr-consolidation.py` for the 15-slot transition
-check. Run `python3 scripts/adr-governance.py` for the existing ADR protections.
-The language target requires editorial review; it is not a mechanical score.
+- `python3 scripts/check-adr-consolidation.py`: verifies exactly 15 Accepted slots; each slot file's bytes must match the sha256 in `index.json`.
+- `python3 scripts/check-adr-count.py`: counts current records; fails if the total exceeds 15.
+- `python3 scripts/adr-governance.py`: protects the archived numbered and transient records; CI runs it on `docs/adr/**` changes.

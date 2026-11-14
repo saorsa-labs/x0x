@@ -39,7 +39,7 @@ poisoning → §7.4.
 | ML-KEM-768 `AgentKemKeypair` (serde, decapsulate) | shipped | `src/groups/kem_envelope.rs:41` |
 | KEM seal/open — **32-byte plaintext only** | shipped | `src/groups/kem_envelope.rs:140`, `:176` |
 | Revocation records + grow-only set; whole-`Vec` v1 wire (publish + receive) | shipped | `src/revocation.rs:47`, `:164`; `src/lib.rs:2951-2958`, `:7689-7695`, topic `:484` |
-| 90-day revocation TTL sweep | shipped | `src/revocation.rs:398`, driven `src/lib.rs:2761` |
+| Revocation sweep: removes only the records of dead share grants; agent, machine and binding records are kept for good (#1108; the 90-day age sweep is removed) | shipped | `RevocationSet::collect_dead_records` in `src/revocation.rs`, driven by the heartbeat in `src/lib.rs` |
 | Stream gates: `Agent::gate_peer_outbound`, `Agent::gate_peer_machine_inbound`, shared `streams::stream_gate` | shipped | `src/lib.rs:10497`, `:10557` |
 | Gossip-DM gate: origin attestation resolve + revoked-sender drop | shipped | `src/dm_inbox.rs:1231`, `:1302`, `:2171` |
 | Direct-QUIC DM delivery gate (`direct::inbound_peer_revoked`) | shipped | `src/lib.rs:10313-10327`, `src/direct.rs:128` |
@@ -420,8 +420,9 @@ tombstone.
 
 ### 7.3 Permanence
 
-`expire_records_older_than` (`src/revocation.rs:398-423`, driven at
-`src/lib.rs:2761`) skips binding records. Permanent, grow-only —
+The heartbeat sweep (`collect_dead_records` in `src/revocation.rs`) never
+removes a binding record. Since #1108 it also keeps agent and machine
+records. Permanent, grow-only —
 ADR-0018's original rule, restored for the subject class where
 resurrection is a security hole. In the derived view this is literal:
 `ActivationBundle` records are never garbage-collected from

@@ -1637,3 +1637,819 @@ async fn evidence_backed_peer_resolves_name_without_authenticated_cache() {
     assert_eq!(machine.agent_id, Some(real_id));
     local.shutdown().await;
 }
+
+// ─── ADR 0079 §2: grant-carried name defaults ───────────────────────────────
+
+fn defaults(owner: UserId, owner_name: &str, machines: &[(u8, &str)]) -> GrantNameDefaults {
+    GrantNameDefaults {
+        owner,
+        owner_name: Some(owner_name.to_string()),
+        machines: machines
+            .iter()
+            .map(|(b, n)| (MachineId([*b; 32]), (*n).to_string()))
+            .collect(),
+        // These tests exercise the label rules, so every machine counts as
+        // hosting a granted agent; the hosting gate has its own tests.
+        verified_hosts: machines.iter().map(|(b, _)| [*b; 32]).collect(),
+    }
+}
+
+/// WHY (ADR 0079 §2): "a default applies once and is never rebound" — a
+/// later trusted grant carrying a different name is reported as
+/// `name_changed` and the first label stands; the same conflict is not
+/// recorded twice.
+#[tokio::test]
+async fn later_grant_with_a_different_name_is_reported_not_applied() {
+    let store = NameStore::in_memory();
+    let bob = UserId([0xbb; 32]);
+    let applied = store
+        .apply_grant_names(&defaults(bob, "Bob Smith", &[]), true, NOW)
+        .await
+        .unwrap();
+    assert!(applied.owner_bound);
+    assert_eq!(applied.owner_label.as_deref(), Some("bob-smith"));
+
+    let applied = store
+        .apply_grant_names(&defaults(bob, "Robert Smith", &[]), true, NOW + 1)
+        .await
+        .unwrap();
+    assert!(!applied.owner_bound);
+    assert_eq!(applied.conflicts, 1, "{applied:?}");
+    assert_eq!(
+        store.owner("bob-smith").await.unwrap().map(|b| b.user_id),
+        Some(bob),
+        "the first bind stands"
+    );
+    assert!(store.owner("robert-smith").await.unwrap().is_none());
+    let (_, conflicts) = store.pending().await.unwrap();
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].case, ConflictCase::NameChanged);
+    assert_eq!(conflicts[0].offered, "robert-smith");
+
+    // The identical conflict is deduplicated.
+    let applied = store
+        .apply_grant_names(&defaults(bob, "Robert Smith", &[]), true, NOW + 2)
+        .await
+        .unwrap();
+    assert_eq!(applied.conflicts, 0, "{applied:?}");
+    let (_, conflicts) = store.pending().await.unwrap();
+    assert_eq!(conflicts.len(), 1);
+}
+
+/// WHY (ADR 0079 §2): a label already bound to another key is `label_taken`
+/// for owners and machines alike; nothing rebinds.
+#[tokio::test]
+async fn taken_labels_are_reported_not_rebound() {
+    let store = NameStore::in_memory();
+    let bob = UserId([0xbb; 32]);
+    let carol = UserId([0xcc; 32]);
+    store
+        .bind_owner("bob-smith", carol, BindSource::Manual, NOW)
+        .await
+        .unwrap();
+    let applied = store
+        .apply_grant_names(&defaults(bob, "Bob Smith", &[]), true, NOW + 1)
+        .await
+        .unwrap();
+    assert!(!applied.owner_bound);
+    assert_eq!(applied.conflicts, 1);
+    assert_eq!(
+        store.owner("bob-smith").await.unwrap().map(|b| b.user_id),
+        Some(carol)
+    );
+
+    // Machine label taken under the same owner.
+    let applied = store
+        .apply_grant_names(&defaults(bob, "Bobby", &[(0x01, "Studio")]), true, NOW + 2)
+        .await
+        .unwrap();
+    assert_eq!(applied.machine_pins, ["machine:studio.bobby"]);
+    let applied = store
+        .apply_grant_names(&defaults(bob, "Bobby", &[(0x02, "Studio")]), true, NOW + 3)
+        .await
+        .unwrap();
+    assert!(applied.machine_pins.is_empty(), "{applied:?}");
+    assert_eq!(applied.conflicts, 1);
+    assert_eq!(
+        store
+            .get_pin("machine:studio.bobby")
+            .await
+            .unwrap()
+            .map(|p| p.id),
+        Some([0x01; 32]),
+        "the first machine pin stands"
+    );
+}
+
+/// WHY (ADR 0079 §2, #1831 ZCode review): a machine already labelled under
+/// that owner gets no second label from a grant default. A later grant that
+/// carries a different name for it is reported as a `name_changed`
+/// `default_conflict` and is not applied; the first label stands. The same
+/// name again, or the same report again, records nothing.
+#[tokio::test]
+async fn a_later_grant_renaming_a_machine_is_reported_not_applied() {
+    let store = NameStore::in_memory();
+    let bob = UserId([0xbb; 32]);
+    let first = store
+        .apply_grant_names(&defaults(bob, "Bob", &[(0x01, "Studio")]), true, NOW)
+        .await
+        .unwrap();
+    assert_eq!(first.machine_pins, ["machine:studio.bob"]);
+
+    // The same name again is not a conflict.
+    let same = store
+        .apply_grant_names(&defaults(bob, "Bob", &[(0x01, "Studio")]), true, NOW + 1)
+        .await
+        .unwrap();
+    assert!(same.machine_pins.is_empty(), "{same:?}");
+    assert_eq!(same.conflicts, 0, "{same:?}");
+    assert!(store.pending().await.unwrap().1.is_empty());
+
+    // A later grant carries a different name for the same machine.
+    let renamed = defaults(bob, "Bob", &[(0x01, "Renamed Studio")]);
+    let applied = store
+        .apply_grant_names(&renamed, true, NOW + 2)
+        .await
+        .unwrap();
+    assert!(applied.machine_pins.is_empty(), "{applied:?}");
+    assert_eq!(applied.conflicts, 1, "the rename is reported: {applied:?}");
+    assert!(
+        store
+            .get_pin("machine:renamed-studio.bob")
+            .await
+            .unwrap()
+            .is_none(),
+        "the new name is not applied"
+    );
+    assert_eq!(
+        store
+            .get_pin("machine:studio.bob")
+            .await
+            .unwrap()
+            .map(|p| p.id),
+        Some([0x01; 32]),
+        "the first label stands"
+    );
+    let (suggestions, conflicts) = store.pending().await.unwrap();
+    assert!(suggestions.is_empty(), "{suggestions:?}");
+    assert_eq!(
+        conflicts,
+        vec![NameConflict {
+            kind: ConflictKind::Machine,
+            case: ConflictCase::NameChanged,
+            label: "studio".to_string(),
+            held: "studio".to_string(),
+            offered: "renamed-studio".to_string(),
+            offered_name: "Renamed Studio".to_string(),
+            reported_at: NOW + 2,
+            from: Some(bob),
+        }]
+    );
+
+    // The identical report is deduplicated.
+    let again = store
+        .apply_grant_names(&renamed, true, NOW + 3)
+        .await
+        .unwrap();
+    assert_eq!(again.conflicts, 0, "{again:?}");
+    assert_eq!(store.pending().await.unwrap().1.len(), 1);
+
+    // The report needs no hosting evidence: the machine is already pinned
+    // under this owner, and nothing is suggested for it.
+    let mut unverified = defaults(bob, "Bob", &[(0x01, "Third Name")]);
+    unverified.verified_hosts = BTreeSet::new();
+    let applied = store
+        .apply_grant_names(&unverified, true, NOW + 4)
+        .await
+        .unwrap();
+    assert_eq!(applied.conflicts, 1, "{applied:?}");
+    assert!(!applied.suggested, "{applied:?}");
+
+    // Another machine of the same owner still gets its own default.
+    let applied = store
+        .apply_grant_names(&defaults(bob, "Bob", &[(0x02, "Laptop")]), true, NOW + 5)
+        .await
+        .unwrap();
+    assert_eq!(applied.machine_pins, ["machine:laptop.bob"]);
+    assert_eq!(applied.conflicts, 0, "{applied:?}");
+
+    // Machine labels are unique only under one owner: another owner's
+    // identical rename is its own report, not a duplicate of Bob's.
+    let carol = UserId([0xcc; 32]);
+    store
+        .apply_grant_names(
+            &defaults(carol, "Carol", &[(0x03, "Studio")]),
+            true,
+            NOW + 6,
+        )
+        .await
+        .unwrap();
+    let applied = store
+        .apply_grant_names(
+            &defaults(carol, "Carol", &[(0x03, "Renamed Studio")]),
+            true,
+            NOW + 7,
+        )
+        .await
+        .unwrap();
+    assert_eq!(applied.conflicts, 1, "{applied:?}");
+}
+
+/// WHY (ADR 0079 §2): suggestions and conflicts persist across restart,
+/// and a pre-ADR-0079 names.json (no new fields) still loads.
+#[tokio::test]
+async fn suggestions_and_conflicts_persist_and_old_files_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = NameStore::path_in(dir.path());
+    let bob = UserId([0xbb; 32]);
+    {
+        let store = NameStore::load(path.clone()).await;
+        let applied = store
+            .apply_grant_names(&defaults(bob, "Bob Smith", &[(0x01, "Studio")]), false, NOW)
+            .await
+            .unwrap();
+        assert!(applied.suggested);
+        // A different user offering the same label is a conflict.
+        let applied = store
+            .apply_grant_names(
+                &defaults(UserId([0xcc; 32]), "Bob Smith", &[]),
+                false,
+                NOW + 1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(applied.conflicts, 1);
+    }
+    let store = NameStore::load(path.clone()).await;
+    assert!(store.load_error().is_none(), "{:?}", store.load_error());
+    let (suggestions, conflicts) = store.pending().await.unwrap();
+    assert_eq!(suggestions.get("bob-smith").map(|s| s.user_id), Some(bob));
+    assert_eq!(
+        suggestions
+            .get("bob-smith")
+            .map(|s| s.machines.clone())
+            .unwrap_or_default(),
+        vec![(MachineId([0x01; 32]), "Studio".to_string())]
+    );
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].case, ConflictCase::LabelTaken);
+
+    // Accept applies and the result persists.
+    let applied = store.accept_suggestion("bob-smith", NOW + 2).await.unwrap();
+    assert!(applied.owner_bound);
+    let reloaded = NameStore::load(path.clone()).await;
+    assert_eq!(
+        reloaded.owner("bob-smith").await.unwrap().map(|b| b.source),
+        Some(BindSource::Grant)
+    );
+    let (suggestions, _) = reloaded.pending().await.unwrap();
+    assert!(suggestions.is_empty(), "accepted suggestion removed");
+
+    // A file without the ADR 0079 fields (pre-upgrade daemon) loads.
+    let old = serde_json::json!({
+        "version": 1,
+        "owners": {
+            "carol": {
+                "user_id": "cc".repeat(32),
+                "bound_at": 1,
+                "source": "manual",
+            },
+        },
+        "pins": {},
+    });
+    tokio::fs::write(&path, serde_json::to_vec_pretty(&old).unwrap())
+        .await
+        .unwrap();
+    let old_store = NameStore::load(path).await;
+    assert!(
+        old_store.load_error().is_none(),
+        "{:?}",
+        old_store.load_error()
+    );
+    assert!(old_store.owner("carol").await.unwrap().is_some());
+    let (suggestions, conflicts) = old_store.pending().await.unwrap();
+    assert!(suggestions.is_empty() && conflicts.is_empty());
+}
+
+/// WHY (ADR 0079 §2): a stranger's suggestion never touches bindings, a
+/// re-send refreshes it idempotently, and dismiss drops it.
+#[tokio::test]
+async fn suggestions_are_inert_until_accepted_and_can_be_dismissed() {
+    let store = NameStore::in_memory();
+    let bob = UserId([0xbb; 32]);
+    let first = defaults(bob, "Bob", &[(0x01, "Studio")]);
+    store.apply_grant_names(&first, false, NOW).await.unwrap();
+    // Identical re-send: still one suggestion.
+    store
+        .apply_grant_names(&first, false, NOW + 1)
+        .await
+        .unwrap();
+    let (owners, pins) = store.snapshot().await.unwrap();
+    assert!(
+        owners.is_empty() && pins.is_empty(),
+        "suggestions are inert"
+    );
+    let (suggestions, _) = store.pending().await.unwrap();
+    assert_eq!(suggestions.len(), 1);
+    assert!(store.dismiss_suggestion("bob").await.unwrap());
+    assert!(!store.dismiss_suggestion("bob").await.unwrap());
+    let (suggestions, _) = store.pending().await.unwrap();
+    assert!(suggestions.is_empty());
+}
+
+/// WHY (#1826 review, LOW): one stranger owner holds at most one pending
+/// suggestion. A later grant with another owner name replaces the earlier
+/// suggestion, so one owner cannot fill the table with labels.
+#[tokio::test]
+async fn one_owner_holds_at_most_one_suggestion() {
+    let store = NameStore::in_memory();
+    let mallory = UserId([0x77; 32]);
+    for i in 0..40u64 {
+        let applied = store
+            .apply_grant_names(
+                &defaults(mallory, &format!("Mallory {i}"), &[]),
+                false,
+                NOW + i,
+            )
+            .await
+            .unwrap();
+        assert!(applied.suggested, "{applied:?}");
+    }
+    let (suggestions, _) = store.pending().await.unwrap();
+    assert_eq!(suggestions.len(), 1, "{:?}", suggestions.keys());
+    assert!(
+        suggestions.contains_key("mallory-39"),
+        "the latest one is kept"
+    );
+
+    // Another owner still gets its own suggestion.
+    store
+        .apply_grant_names(&defaults(UserId([0x66; 32]), "Carol", &[]), false, NOW + 50)
+        .await
+        .unwrap();
+    assert_eq!(store.pending().await.unwrap().0.len(), 2);
+}
+
+/// WHY (#1826 review, LOW): one owner holds at most
+/// `MAX_CONFLICTS_PER_OWNER` conflict reports. Its further reports drop its
+/// own oldest, and another owner's report stays. The owner of each report
+/// survives a reload.
+#[tokio::test]
+async fn conflicts_are_capped_per_owner_and_keep_their_owner_across_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = NameStore::path_in(dir.path());
+    let bob = UserId([0xbb; 32]);
+    let carol = UserId([0xcc; 32]);
+    let dave = UserId([0xdd; 32]);
+    {
+        let store = NameStore::load(path.clone()).await;
+        // Carol's one report: her default label is held by Bob.
+        store
+            .bind_owner("bob", bob, BindSource::Manual, NOW)
+            .await
+            .unwrap();
+        let applied = store
+            .apply_grant_names(&defaults(carol, "Bob", &[]), true, NOW)
+            .await
+            .unwrap();
+        assert_eq!(applied.conflicts, 1);
+        // Dave pins machine 1 as "studio", then offers 20 more machines
+        // under the same label: 20 label_taken reports from Dave.
+        store
+            .apply_grant_names(&defaults(dave, "Dave", &[(1, "Studio")]), true, NOW)
+            .await
+            .unwrap();
+        for b in 2..=21u8 {
+            let applied = store
+                .apply_grant_names(
+                    &defaults(dave, "Dave", &[(b, "Studio")]),
+                    true,
+                    NOW + u64::from(b),
+                )
+                .await
+                .unwrap();
+            assert_eq!(applied.conflicts, 1, "machine {b}: {applied:?}");
+        }
+        let (_, conflicts) = store.pending().await.unwrap();
+        let from_dave = conflicts.iter().filter(|c| c.from == Some(dave)).count();
+        assert_eq!(from_dave, MAX_CONFLICTS_PER_OWNER);
+        assert!(
+            conflicts.iter().any(|c| c.from == Some(carol)),
+            "another owner's report is not pushed out"
+        );
+        let newest = conflicts.iter().rfind(|c| c.from == Some(dave));
+        assert_eq!(
+            newest.map(|c| c.offered.clone()),
+            Some(hex::encode([21u8; 32]))
+        );
+    }
+    let store = NameStore::load(path).await;
+    assert!(store.load_error().is_none(), "{:?}", store.load_error());
+    let (_, conflicts) = store.pending().await.unwrap();
+    assert_eq!(
+        conflicts.iter().filter(|c| c.from == Some(dave)).count(),
+        MAX_CONFLICTS_PER_OWNER
+    );
+    assert!(conflicts.iter().any(|c| c.from == Some(carol)));
+}
+
+/// WHY (#1826 review, MEDIUM 2): a trusted owner's machine default without
+/// verified hosting evidence is held as a suggestion, never pinned, so it
+/// cannot squat a label. Hosted machines in the same grant still pin.
+#[tokio::test]
+async fn trusted_machine_default_needs_hosting_evidence() {
+    let store = NameStore::in_memory();
+    let bob = UserId([0xbb; 32]);
+    let mut offered = defaults(bob, "Bob", &[(0x01, "Studio"), (0x02, "Laptop")]);
+    offered.verified_hosts = BTreeSet::from([[0x01; 32]]);
+    let applied = store.apply_grant_names(&offered, true, NOW).await.unwrap();
+    assert!(applied.owner_bound);
+    assert_eq!(applied.machine_pins, ["machine:studio.bob"]);
+    assert!(applied.suggested, "{applied:?}");
+    assert!(store.get_pin("machine:laptop.bob").await.unwrap().is_none());
+    let (suggestions, _) = store.pending().await.unwrap();
+    assert_eq!(
+        suggestions.get("bob").map(|s| s.machines.clone()),
+        Some(vec![(MachineId([0x02; 32]), "Laptop".to_string())])
+    );
+
+    // Without evidence an unrelated machine cannot take a label first: the
+    // later hosted machine named the same gets it.
+    let mut squat = defaults(bob, "Bob", &[(0x03, "Desk")]);
+    squat.verified_hosts = BTreeSet::new();
+    store
+        .apply_grant_names(&squat, true, NOW + 1)
+        .await
+        .unwrap();
+    let applied = store
+        .apply_grant_names(&defaults(bob, "Bob", &[(0x04, "Desk")]), true, NOW + 2)
+        .await
+        .unwrap();
+    assert_eq!(applied.machine_pins, ["machine:desk.bob"]);
+    assert_eq!(
+        store
+            .get_pin("machine:desk.bob")
+            .await
+            .unwrap()
+            .map(|p| p.id),
+        Some([0x04; 32])
+    );
+}
+
+/// WHY (#1826 review r3, item 3): a stranger's stale suggestion under a
+/// label must not swallow the machines of the trusted owner who later binds
+/// that label. Binding the label evicts the other owner's suggestion, so
+/// the bound owner's unverified machines are kept as its own suggestion.
+#[tokio::test]
+async fn binding_a_label_evicts_another_owners_stale_suggestion() {
+    let store = NameStore::in_memory();
+    let mallory = UserId([0x77; 32]);
+    let bob = UserId([0xbb; 32]);
+    let applied = store
+        .apply_grant_names(&defaults(mallory, "Bob", &[]), false, NOW)
+        .await
+        .unwrap();
+    assert!(applied.suggested);
+    let mut offered = defaults(bob, "Bob", &[(0x05, "Studio")]);
+    offered.verified_hosts = BTreeSet::new();
+    let applied = store
+        .apply_grant_names(&offered, true, NOW + 1)
+        .await
+        .unwrap();
+    assert!(applied.owner_bound, "{applied:?}");
+    assert!(applied.suggested, "{applied:?}");
+    let (suggestions, _) = store.pending().await.unwrap();
+    let held = suggestions.get("bob").expect("bob's suggestion");
+    assert_eq!(held.user_id, bob, "the stranger's stale suggestion is gone");
+    assert_eq!(
+        held.machines,
+        vec![(MachineId([0x05; 32]), "Studio".to_string())]
+    );
+
+    // A manual bind evicts another owner's suggestion under that label too.
+    store
+        .apply_grant_names(&defaults(mallory, "Carol", &[]), false, NOW + 2)
+        .await
+        .unwrap();
+    assert!(store.pending().await.unwrap().0.contains_key("carol"));
+    store
+        .bind_owner("carol", UserId([0xcc; 32]), BindSource::Manual, NOW + 3)
+        .await
+        .unwrap();
+    assert!(!store.pending().await.unwrap().0.contains_key("carol"));
+}
+
+/// A distinct stranger owner key for table-bound tests.
+fn stranger(i: usize) -> UserId {
+    let mut bytes = [0x40; 32];
+    bytes[..8].copy_from_slice(&(i as u64).to_be_bytes());
+    UserId(bytes)
+}
+
+/// WHY (#1826 ZCode review, test gap 1): the suggestion table holds at most
+/// `MAX_SUGGESTIONS`. A new stranger owner is then refused and nothing is
+/// stored, an owner already in the table can still refresh, and a
+/// `names.json` with more than `MAX_SUGGESTIONS` suggestions is refused at
+/// load (fail closed).
+#[tokio::test]
+async fn suggestion_table_refuses_a_new_owner_when_full_and_on_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = NameStore::path_in(dir.path());
+    let store = NameStore::load(path.clone()).await;
+    for i in 0..MAX_SUGGESTIONS {
+        let applied = store
+            .apply_grant_names(
+                &defaults(stranger(i), &format!("Stranger {i}"), &[]),
+                false,
+                NOW,
+            )
+            .await
+            .unwrap();
+        assert!(applied.suggested, "suggestion {i}: {applied:?}");
+    }
+    assert_eq!(store.pending().await.unwrap().0.len(), MAX_SUGGESTIONS);
+
+    let late = format!("Stranger {MAX_SUGGESTIONS}");
+    let applied = store
+        .apply_grant_names(
+            &defaults(stranger(MAX_SUGGESTIONS), &late, &[]),
+            false,
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+    assert!(!applied.suggested, "{applied:?}");
+    assert_eq!(applied.owner_label, None);
+    assert_eq!(applied.conflicts, 0);
+    let (suggestions, conflicts) = store.pending().await.unwrap();
+    assert_eq!(suggestions.len(), MAX_SUGGESTIONS);
+    assert!(!suggestions.contains_key(&format!("stranger-{MAX_SUGGESTIONS}")));
+    assert!(
+        suggestions
+            .values()
+            .all(|s| s.user_id != stranger(MAX_SUGGESTIONS)),
+        "nothing is stored for the refused owner"
+    );
+    assert!(conflicts.is_empty());
+
+    // An owner already in the full table may replace its own suggestion.
+    let applied = store
+        .apply_grant_names(&defaults(stranger(0), "Renamed Zero", &[]), false, NOW + 2)
+        .await
+        .unwrap();
+    assert!(applied.suggested, "{applied:?}");
+    let (suggestions, _) = store.pending().await.unwrap();
+    assert_eq!(suggestions.len(), MAX_SUGGESTIONS);
+    assert!(suggestions.contains_key("renamed-zero"));
+    assert!(!suggestions.contains_key("stranger-0"));
+
+    // A full table reloads; one more suggestion in the file fails closed.
+    drop(store);
+    let reloaded = NameStore::load(path.clone()).await;
+    assert!(
+        reloaded.load_error().is_none(),
+        "{:?}",
+        reloaded.load_error()
+    );
+    assert_eq!(reloaded.pending().await.unwrap().0.len(), MAX_SUGGESTIONS);
+    drop(reloaded);
+    let mut file: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let extra = file["suggestions"]["renamed-zero"].clone();
+    file["suggestions"]["one-too-many"] = extra;
+    std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+    let over = NameStore::load(path).await;
+    let error = over.load_error().expect("an oversized file is refused");
+    assert!(error.contains("size bounds"), "{error}");
+    assert!(
+        over.pending().await.is_err(),
+        "a refused file serves nothing"
+    );
+}
+
+fn conflict_from(owner: UserId, n: usize) -> NameConflict {
+    NameConflict {
+        kind: ConflictKind::Machine,
+        case: ConflictCase::LabelTaken,
+        label: format!("box-{n}.owner"),
+        held: hex::encode([0x01; 32]),
+        offered: format!("{}-{n}", hex::encode(owner.as_bytes())),
+        offered_name: format!("Box {n}"),
+        reported_at: NOW + n as u64,
+        from: Some(owner),
+    }
+}
+
+/// WHY (#1826 ZCode review, test gap 2): when the conflict table holds
+/// `MAX_CONFLICTS` and the reporting owner is under its own
+/// `MAX_CONFLICTS_PER_OWNER` cap, the globally oldest report is dropped.
+/// This needs more than `MAX_CONFLICTS / MAX_CONFLICTS_PER_OWNER` owners.
+#[test]
+fn full_conflict_table_drops_the_oldest_report_for_an_owner_under_its_cap() {
+    let owners = MAX_CONFLICTS / MAX_CONFLICTS_PER_OWNER;
+    let mut state = NamesState::default();
+    let mut n = 0;
+    for o in 0..owners {
+        for _ in 0..MAX_CONFLICTS_PER_OWNER {
+            assert!(record_conflict(&mut state, conflict_from(stranger(o), n)));
+            n += 1;
+        }
+    }
+    assert_eq!(state.conflicts.len(), MAX_CONFLICTS);
+    let oldest = state.conflicts[0].clone();
+    assert_eq!(oldest.from, Some(stranger(0)));
+
+    let newcomer = conflict_from(stranger(owners), n);
+    assert!(record_conflict(&mut state, newcomer.clone()));
+    assert_eq!(
+        state.conflicts.len(),
+        MAX_CONFLICTS,
+        "the table stays bounded"
+    );
+    assert!(
+        !state.conflicts.contains(&oldest),
+        "the oldest report is gone"
+    );
+    assert_eq!(state.conflicts.last(), Some(&newcomer));
+    assert_eq!(
+        state
+            .conflicts
+            .iter()
+            .filter(|c| c.from == Some(stranger(0)))
+            .count(),
+        MAX_CONFLICTS_PER_OWNER - 1
+    );
+    for o in 1..owners {
+        assert_eq!(
+            state
+                .conflicts
+                .iter()
+                .filter(|c| c.from == Some(stranger(o)))
+                .count(),
+            MAX_CONFLICTS_PER_OWNER,
+            "owner {o} keeps its reports"
+        );
+    }
+}
+
+/// WHY (#1826 ZCode review, test gap 3): `Agent::verified_grant_hosts` is
+/// the hosting gate for machine-name defaults. A granted agent that is
+/// discovered, whose certificate chains to the grant owner and whose
+/// machine binding is authenticated, makes its machine a verified host, so
+/// the default pins through the real gate. An agent certified by another
+/// user, and an agent that is not in the grant, add nothing.
+#[tokio::test]
+async fn verified_grant_hosts_returns_the_authenticated_machine_and_it_pins() {
+    let dir = tempfile::tempdir().unwrap();
+    let local = crate::Agent::builder()
+        .with_machine_key(dir.path().join("machine.key"))
+        .with_agent_key_path(dir.path().join("agent.key"))
+        .with_agent_cert_path(dir.path().join("agent.cert"))
+        .with_user_key_path(dir.path().join("user.key"))
+        .with_identity_dir(dir.path())
+        .with_contact_store_path(dir.path().join("contacts.json"))
+        .with_peer_cache_disabled()
+        .build()
+        .await
+        .unwrap();
+    let now = crate::dm_capability::now_unix_ms() / 1000;
+
+    let bob = user();
+    let mallory = user();
+    let host_kp = agent();
+    let host_machine = MachineId([0x31; 32]);
+    let forged_kp = agent();
+    let forged_machine = MachineId([0x32; 32]);
+    let outside_kp = agent();
+    let outside_machine = MachineId([0x33; 32]);
+    for (kp, machine, issuer) in [
+        (&host_kp, host_machine, &bob),
+        (&forged_kp, forged_machine, &mallory),
+        (&outside_kp, outside_machine, &bob),
+    ] {
+        let id = kp.agent_id();
+        let cert = AgentCertificate::issue(issuer, kp).unwrap();
+        local
+            .record_authenticated_binding_for_testing(id, machine, now)
+            .await;
+        local.identity_discovery_cache.write().await.insert(
+            id,
+            discovered_named(id, machine, bob.user_id(), cert, "srv"),
+        );
+    }
+    let grant = crate::share_grant::ShareGrant::sign(
+        &bob,
+        [8; 32],
+        Grantee::Agent(local.agent_id()),
+        vec![host_kp.agent_id(), forged_kp.agent_id()],
+        vec![ShareCap::Connect { ports: vec![22] }],
+        now.saturating_sub(10),
+        now + 3600,
+    )
+    .unwrap();
+
+    let hosts = local.verified_grant_hosts(&grant).await;
+    assert_eq!(hosts, BTreeSet::from([host_machine.0]));
+
+    let store = NameStore::in_memory();
+    let offered = GrantNameDefaults {
+        owner: bob.user_id(),
+        owner_name: Some("Bob".to_string()),
+        machines: vec![
+            (host_machine, "Studio".to_string()),
+            (forged_machine, "Laptop".to_string()),
+        ],
+        verified_hosts: hosts,
+    };
+    let applied = store.apply_grant_names(&offered, true, now).await.unwrap();
+    assert_eq!(applied.machine_pins, ["machine:studio.bob"], "{applied:?}");
+    assert_eq!(
+        store
+            .get_pin("machine:studio.bob")
+            .await
+            .unwrap()
+            .map(|p| p.id),
+        Some(host_machine.0)
+    );
+    assert!(store.get_pin("machine:laptop.bob").await.unwrap().is_none());
+    local.shutdown().await;
+}
+
+/// A `names.json` body with `suggestions` pending suggestions and
+/// `conflicts` conflict reports, each from a distinct owner.
+fn names_file_json(suggestions: usize, conflicts: usize) -> serde_json::Value {
+    let suggestions: serde_json::Map<String, serde_json::Value> = (0..suggestions)
+        .map(|i| {
+            (
+                format!("s-{i}"),
+                serde_json::json!({
+                    "user_id": hex::encode(stranger(i).as_bytes()),
+                    "owner_name": format!("S {i}"),
+                    "machines": [],
+                    "suggested_at": NOW,
+                }),
+            )
+        })
+        .collect();
+    let conflicts: Vec<serde_json::Value> = (0..conflicts)
+        .map(|i| {
+            serde_json::json!({
+                "kind": "owner",
+                "case": "label_taken",
+                "label": "bob",
+                "held": "bb".repeat(32),
+                "offered": hex::encode(stranger(i).as_bytes()),
+                "offered_name": "Bob",
+                "reported_at": NOW,
+                "from": hex::encode(stranger(i).as_bytes()),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "version": 1,
+        "owners": {},
+        "pins": {},
+        "suggestions": suggestions,
+        "conflicts": conflicts,
+    })
+}
+
+/// WHY (#1826 ZCode review, test gap 1): `names.json` is refused at load
+/// when it holds more than `MAX_SUGGESTIONS` suggestions or more than
+/// `MAX_CONFLICTS` conflict reports. A file at exactly both bounds loads.
+#[tokio::test]
+async fn load_refuses_suggestions_or_conflicts_over_their_bounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = NameStore::path_in(dir.path());
+    let write = |body: serde_json::Value| {
+        let path = path.clone();
+        async move {
+            tokio::fs::write(&path, serde_json::to_vec(&body).unwrap())
+                .await
+                .unwrap();
+        }
+    };
+
+    write(names_file_json(MAX_SUGGESTIONS, MAX_CONFLICTS)).await;
+    let store = NameStore::load(path.clone()).await;
+    assert!(store.load_error().is_none(), "{:?}", store.load_error());
+    let (suggestions, conflicts) = store.pending().await.unwrap();
+    assert_eq!(suggestions.len(), MAX_SUGGESTIONS);
+    assert_eq!(conflicts.len(), MAX_CONFLICTS);
+
+    for (suggestions, conflicts) in [(MAX_SUGGESTIONS + 1, 0), (0, MAX_CONFLICTS + 1)] {
+        write(names_file_json(suggestions, conflicts)).await;
+        let store = NameStore::load(path.clone()).await;
+        let error = store.load_error().map(str::to_string);
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|e| e.contains("exceeds its size bounds")),
+            "{suggestions} suggestions, {conflicts} conflicts: {error:?}"
+        );
+        assert!(
+            store.pending().await.is_err(),
+            "an over-bound store is not usable"
+        );
+    }
+}

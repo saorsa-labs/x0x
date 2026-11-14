@@ -98,6 +98,30 @@ fn extract_query_token(query: Option<&str>) -> Option<String> {
     None
 }
 
+/// Issue #1094 defence in depth for the rider scratch rows: when an
+/// admitted path addresses a `/stores/:id/*` topic whose store is OPEN,
+/// that store must be group-bound (sealed or group-signed). A personal
+/// store created at a scratch-shaped topic never admits a rider. An
+/// unopened topic passes — the handler answers its ordinary 404. The
+/// non-`/stores` scratch row (`POST /groups/:id/stores`) also passes:
+/// its handler re-runs the admission on the resolved group binding.
+async fn scratch_store_group_bound(state: &AppState, path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/stores/") else {
+        return true;
+    };
+    let Some(id_enc) = rest.split('/').next() else {
+        return false;
+    };
+    let Some(store_id) = super::rider_auth::percent_decode_segment(id_enc) else {
+        return false;
+    };
+    let handle = { state.kv_stores.read().await.get(&store_id).cloned() };
+    match handle {
+        Some(handle) => handle.is_encrypted().await || handle.is_group_signed().await,
+        None => true,
+    }
+}
+
 /// Bearer-token authentication middleware.
 ///
 /// Thin wrapper around [`authorize`]: extracts the header/query tokens into
@@ -196,7 +220,14 @@ pub(super) async fn auth_middleware(
                 )
                     .into_response();
             }
-            if !super::rider_auth::rider_route_allowed(&method, &path, &rider.scopes) {
+            let allowed = super::rider_auth::rider_route_allowed(&method, &path, &rider.scopes)
+                || (super::rider_auth::rider_scratch_route_allowed(
+                    &method,
+                    &path,
+                    &rider.scopes,
+                    &rider.groups,
+                ) && scratch_store_group_bound(&state, &path).await);
+            if !allowed {
                 if method == axum::http::Method::POST && path == "/gui/show" {
                     return (
                         StatusCode::FORBIDDEN,
@@ -466,18 +497,21 @@ fn is_grants_path(path: &str) -> bool {
 }
 
 /// `true` for the ADR-0074 §1 name routes: `/names`, `/names/resolve`,
-/// `/names/owners`, `/names/machines`, and `/names/{owners,pins}/<segment>`.
+/// `/names/owners`, `/names/machines`, `/names/accept`, and
+/// `/names/{owners,pins,suggestions}/<segment>`.
 fn is_names_path(path: &str) -> bool {
     if matches!(
         path,
-        "/names" | "/names/resolve" | "/names/owners" | "/names/machines"
+        "/names" | "/names/resolve" | "/names/owners" | "/names/machines" | "/names/accept"
     ) {
         return true;
     }
-    ["/names/owners/", "/names/pins/"].iter().any(|base| {
-        path.strip_prefix(base)
-            .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
-    })
+    ["/names/owners/", "/names/pins/", "/names/suggestions/"]
+        .iter()
+        .any(|base| {
+            path.strip_prefix(base)
+                .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
+        })
 }
 
 /// `true` for exactly `/groups/<nonempty-id>/quarantine/clear`.
@@ -1563,6 +1597,8 @@ mod tests {
                 "/names/machines",
                 "/names/owners/bob",
                 "/names/pins/agent:studio.bob",
+                "/names/accept",
+                "/names/suggestions/bob-smith",
             ] {
                 assert!(
                     requires_durable_owner(&method, path),
@@ -1576,6 +1612,9 @@ mod tests {
             "/namesx",
             "/names/owners/",
             "/names/pins/a/b",
+            "/names/accept/x",
+            "/names/suggestions/",
+            "/names/suggestions/a/b",
         ] {
             assert!(!is_names_path(path), "{path} must not be classified");
         }

@@ -25,10 +25,12 @@ mod messaging;
 pub(crate) mod named_groups;
 pub(in crate::server) mod names;
 mod network;
+mod onboard;
 mod owner;
 mod presence;
 mod profile;
 pub(crate) mod public_group_bootstrap_outbox;
+mod sidecar_quarantine;
 pub(super) mod status;
 pub(super) mod stores;
 mod sync;
@@ -126,8 +128,8 @@ pub(super) use named_groups::{
     GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE,
 };
 pub(super) use names::{
-    names_list, names_machine_label, names_owner_bind, names_owner_unbind, names_resolve,
-    names_unpin,
+    names_accept, names_dismiss, names_list, names_machine_label, names_owner_bind,
+    names_owner_unbind, names_resolve, names_unpin, owner_is_known_or_trusted_contact,
 };
 pub(super) use network::{
     ack_diagnostics, bootstrap_cache_stats, connectivity_diagnostics, dm_diagnostics,
@@ -135,14 +137,16 @@ pub(super) use network::{
     probe_peer_handler, relay_diagnostics, state_sync_diagnostics, transport_diagnostics,
     upgrade_diagnostics,
 };
+pub(super) use onboard::get_onboard;
 pub(super) use owner::{
-    owner_agents_issue, owner_agents_revoke, owner_group_recovery_mandate, owner_machines,
-    owner_riders_issue, owner_riders_list, owner_riders_revoke,
+    owner_agents_issue, owner_agents_revoke, owner_device_lose, owner_group_recovery_mandate,
+    owner_machines, owner_riders_issue, owner_riders_list, owner_riders_revoke,
 };
 pub(super) use presence::{
     presence, presence_find, presence_foaf, presence_online, presence_status,
 };
 pub(super) use profile::{get_profile, owner_agents, update_profile};
+pub(super) use sidecar_quarantine::sidecar_quarantine_diagnostics;
 pub(super) use status::{
     get_constitution, get_constitution_json, health, shutdown_handler, status,
 };

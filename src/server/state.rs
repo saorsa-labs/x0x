@@ -978,6 +978,11 @@ pub(super) struct AppState {
     pub(super) mls_groups_path: PathBuf,
     /// Authority-signed MemberAdded results staged by an anchor for joiner polling.
     pub(super) pending_join_results: RwLock<HashMap<String, PendingJoinResult>>,
+    /// #646: per-(stable group, roster root) slots for the content-addressed
+    /// base-roster fetch of v6 invites — the joins parked on that key, each
+    /// bound to the inviter its invite names. Replies are never cached.
+    pub(super) base_roster_fetch_slots:
+        StdMutex<HashMap<String, Vec<crate::server::routes::named_groups::BaseRosterWaiter>>>,
     /// Expected inviter for a pending TreeKEM join-result response, keyed by
     /// stable group id + joining member id. Transient process-local state.
     pub(super) expected_join_result_inviters: StdMutex<HashMap<String, ExpectedJoinResultInviter>>,
@@ -1062,6 +1067,11 @@ pub(super) struct AppState {
     /// listener: one in-flight handler per `(group, member)`, a per-group
     /// share and a global cap.
     pub(super) join_result_fetch_admission: crate::server::routes::named_groups::FairAdmission,
+    /// #646 (review r6): fair, coalescing admission for base-roster serve
+    /// handlers — its OWN pool (never shared with join-result fetch
+    /// recovery), coalesced per invite by the secret hash, with a small
+    /// per-group share and global cap.
+    pub(super) base_roster_serve_admission: crate::server::routes::named_groups::FairAdmission,
     /// ADR 0107 (r5 G8): fair, coalescing admission for join-result chunk
     /// tasks: one in-flight task per chunk, a per-group share and a global
     /// cap. A fetch is validated (staged copy, existing sequence) first.
@@ -1255,8 +1265,23 @@ pub(super) struct AppState {
     /// Watson item 5: in-memory pending listener admission journal.
     /// Mirrors the durable sidecar field. Cleared after both request apply
     /// and obligation save complete.
+    ///
+    /// Single-writer invariant: after startup, only the predecessor-relay
+    /// typed-DM receiver task writes this slot
+    /// (`handle_predecessor_relay_typed_payload`), and that task awaits each
+    /// payload to completion in arrival order. The startup loader
+    /// (`load_predecessor_relay_outbox`) writes it before that task runs.
+    /// The #1840 release therefore takes the slot without an identity
+    /// re-check: the marker it finds is the one the same call wrote or
+    /// matched. A second writer, or a concurrent receiver, must add that
+    /// re-check first.
     pub(super) pending_listener_admission:
         Mutex<Option<crate::server::routes::named_groups::PendingListenerAdmission>>,
+    /// Issue #1840: join requests the authority refused only because the
+    /// requester sealed over a head that is partial or used, in arrival
+    /// order. Memory only; rebuilt from the requesters' re-offers.
+    pub(super) join_sequencer:
+        Mutex<crate::server::routes::named_groups::join_sequence::JoinSequencer>,
     /// Bounded per-group log of locally authored/applied TreeKEM membership
     /// events used to satisfy explicit catch-up requests.
     pub(super) treekem_event_log: RwLock<HashMap<String, VecDeque<NamedGroupMetadataEvent>>>,

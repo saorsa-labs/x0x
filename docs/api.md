@@ -8,7 +8,9 @@ the `x0x` CLI consume it so routes and CLI commands stay in lockstep
 (`x0x routes` prints them at runtime). For request/response examples and
 the WebSocket protocol details, see [api-reference.md](api-reference.md).
 
-The daemon currently exposes **153 endpoints**. Authentication is by bearer
+The daemon currently exposes **221 endpoints**; the tables below are an
+at-a-glance subset ([api-reference.md](api-reference.md) covers the full
+set). Authentication is by bearer
 token (`Authorization: Bearer …`). The token is auto-discovered from
 `~/.local/share/x0x/api-token` (Linux) or
 `~/Library/Application Support/x0x/api-token` (macOS).
@@ -36,7 +38,7 @@ token (`Authorization: Bearer …`). The token is auto-discovered from
 | POST | `/agent/card/import` | `x0x agent import` | Import identity card into contacts |
 | POST | `/agent/sign` | `x0x agent sign` | Detached ML-DSA-65 signature over a caller-supplied payload |
 | POST | `/agent/verify` | `x0x agent verify` | Verify a detached ML-DSA-65 signature against a caller-supplied public key |
-| POST | `/identity/revoke` | `x0x identity revoke` | Revoke the daemon's own agent, or an owner-authorized agent–machine binding; see [supported forms](api-reference.md#key-revocation) |
+| POST | `/identity/revoke` | `x0x identity revoke` | Revoke the daemon's own agent or machine, or an owner-authorized agent–machine binding; see [supported forms](api-reference.md#key-revocation) |
 | GET | `/identity/revocations` | `x0x identity revocations` | List all revocation records held by this daemon |
 | GET | `/profile` | `x0x profile` | Stored self-profile names (human/display/machine, ADR-0036) |
 | PUT | `/profile` | `x0x profile set` | Partial update of self-profile names (persists across restart) |
@@ -62,6 +64,7 @@ token (`Authorization: Bearer …`). The token is auto-discovered from
 | GET | `/diagnostics/ack` | `x0x diagnostics ack` | ACK-v2 per-stage latency buckets and outcome counters |
 | GET | `/diagnostics/connect` | `x0x diagnostics connect` | Connect-ACL policy summary and stream allow/deny counters |
 | GET | `/diagnostics/ws` | `x0x diagnostics ws` | WebSocket outbound-queue health: capacity and drop/slow-consumer-close counters |
+| GET | `/diagnostics/sidecar-quarantine` | `x0x diagnostics sidecar-quarantine` | Read-only. Lists each ADR 0108 §5a quarantined sidecar copy (`revocation-evictions.evs`, `.evh` and `.rdc`, `treekem/*.evjournal` and `*.orcpend`, `group-recovery/*.grecov`) with `sidecar`, `file`, `path`, `txid`, `state` (`pending` or `history`) and `size` in bytes, plus `count`, `total_bytes` and `scan_errors`. Copies are never deleted automatically (D148) |
 
 ## Presence
 

@@ -135,6 +135,10 @@ enum Commands {
         /// Consent to share human identity.
         #[arg(long)]
         consent: bool,
+        /// Withdraw the recorded consent to share human identity, then
+        /// announce without it. Cannot be combined with --include-user.
+        #[arg(long, conflicts_with = "include_user")]
+        withdraw_consent: bool,
     },
     /// List connected gossip peers.
     Peers,
@@ -463,6 +467,18 @@ enum NamesSub {
         #[arg(value_name = "NAME")]
         name: String,
     },
+    /// Apply a pending grant-names suggestion (ADR 0079).
+    Accept {
+        /// The suggested owner label (see `x0x names list`).
+        #[arg(value_name = "LABEL")]
+        label: String,
+    },
+    /// Drop a pending grant-names suggestion.
+    Dismiss {
+        /// The suggested owner label.
+        #[arg(value_name = "LABEL")]
+        label: String,
+    },
 }
 
 /// `x0x names owner` sub-actions.
@@ -510,6 +526,10 @@ enum GrantSub {
         /// "caps":["dm",{"connect":{"ports":[22]}}],"ttl_secs":86400}'.
         #[arg(value_name = "GRANT_JSON")]
         grant: String,
+        /// ADR 0079: withhold the owner and machine names from this grant
+        /// (every recipient then gets the plain v1 payload).
+        #[arg(long)]
+        no_names: bool,
     },
     /// List grants this install's owner issued, with status.
     List,
@@ -694,6 +714,23 @@ enum OwnerSub {
     },
     /// M1 machine census over owner-sync (#1383): devices + local version digest.
     Machines,
+    /// Lost-device action: stop this owner's agents on a lost machine (#1108).
+    ///
+    /// Signs a binding tombstone for each of your agents on that machine,
+    /// revokes each agent pinned to it and removes it from your device
+    /// set. Run it on another of your devices. It does not revoke the
+    /// machine key, and it does not cover an agent you certify later.
+    LoseDevice {
+        /// Hex machine id of the lost device (see `x0x owner machines`).
+        #[arg(value_name = "MACHINE_ID")]
+        machine_id: String,
+        /// Optional reason stored in each revocation record.
+        #[arg(long, value_name = "REASON")]
+        reason: Option<String>,
+        /// Act on a machine that this owner has no record of.
+        #[arg(long)]
+        force: bool,
+    },
     /// Derived placement ledger (ADR-0043 Pinned/Roaming + mint status).
     Placement,
     /// Owner actions on named groups (ADR 0110 §4b(1) recovery).
@@ -983,6 +1020,8 @@ enum DiagnosticsSub {
     Connect,
     /// Print WebSocket outbound-queue health (capacity, drops, slow-consumer closes).
     Ws,
+    /// Print each quarantined sidecar copy with its size (read-only, D148).
+    SidecarQuarantine,
     /// Print durable-history writer/reaper counters (ADR-0023).
     History,
 }
@@ -1092,13 +1131,17 @@ enum AuthSub {
 /// Key lifecycle sub-actions (`x0x identity revoke`, `x0x identity revocations`).
 #[derive(Subcommand)]
 enum IdentitySub {
-    /// Revoke this daemon's agent or an owner-authorized agent–machine binding.
+    /// Revoke this daemon's agent or machine, or an owner-authorized
+    /// agent–machine binding.
     ///
-    /// With one id, only this daemon's own agent is supported. The daemon
-    /// signs with its agent key; it cannot revoke its machine or another
-    /// agent through this form. For a registered sub-agent, use
-    /// `x0x owner agents revoke <AGENT_ID>`. Both ids plus --move-epoch select
-    /// an owner-signed binding revocation and require the durable API token.
+    /// With one id, only this daemon's own agent or own machine is
+    /// supported. The daemon signs with that key; it cannot revoke another
+    /// agent or machine through this form. Revoking the own machine needs
+    /// the durable API token and cannot be undone. For a registered
+    /// sub-agent, use `x0x owner agents revoke <AGENT_ID>`. For a lost
+    /// device, use `x0x owner lose-device <MACHINE_ID>`. Both ids plus
+    /// --move-epoch select an owner-signed binding revocation and require
+    /// the durable API token.
     Revoke {
         /// Agent ID to revoke (hex, 64 chars).
         #[arg(long)]
@@ -2514,6 +2557,19 @@ async fn run(
             }) => commands::identity::owner_riders_revoke(&client, token_id).await,
             Some(OwnerSub::Placement) => commands::identity::owner_placement(&client).await,
             Some(OwnerSub::Machines) => commands::identity::owner_machines(&client).await,
+            Some(OwnerSub::LoseDevice {
+                machine_id,
+                reason,
+                force,
+            }) => {
+                commands::identity::owner_lose_device(
+                    &client,
+                    &machine_id,
+                    reason.as_deref(),
+                    force,
+                )
+                .await
+            }
         },
         Commands::Move { sub } => match sub {
             MoveSub::Authorize {
@@ -2611,7 +2667,8 @@ async fn run(
         Commands::Announce {
             include_user,
             consent,
-        } => commands::identity::announce(&client, include_user, consent).await,
+            withdraw_consent,
+        } => commands::identity::announce(&client, include_user, consent, withdraw_consent).await,
         Commands::Peers => commands::network::peers(&client).await,
         Commands::Presence { sub } => match sub {
             None => commands::network::presence(&client).await,
@@ -2656,6 +2713,9 @@ async fn run(
             DiagnosticsSub::Exec => commands::exec::diagnostics(&client).await,
             DiagnosticsSub::Connect => commands::network::diagnostics_connect(&client).await,
             DiagnosticsSub::Ws => commands::network::diagnostics_ws(&client).await,
+            DiagnosticsSub::SidecarQuarantine => {
+                commands::network::diagnostics_sidecar_quarantine(&client).await
+            }
             DiagnosticsSub::History => commands::history::diagnostics(&client).await,
         },
         Commands::History { sub } => match sub {
@@ -3436,7 +3496,9 @@ async fn run(
             }
         },
         Commands::Grant { sub } => match sub {
-            GrantSub::Issue { grant } => commands::grant::issue(&client, &grant).await,
+            GrantSub::Issue { grant, no_names } => {
+                commands::grant::issue(&client, &grant, no_names).await
+            }
             GrantSub::List => commands::grant::list(&client).await,
             GrantSub::Revoke { id } => commands::grant::revoke(&client, &id).await,
             GrantSub::Received => commands::grant::received(&client).await,
@@ -3456,6 +3518,8 @@ async fn run(
                 }
             },
             NamesSub::Unpin { name } => commands::names::unpin(&client, &name).await,
+            NamesSub::Accept { label } => commands::names::accept(&client, &label).await,
+            NamesSub::Dismiss { label } => commands::names::dismiss(&client, &label).await,
         },
         Commands::Onboard {
             json,
@@ -3915,6 +3979,26 @@ mod tests {
     upgrade_now_cli_regression_tests!();
     use super::*;
 
+    // #1107: `--withdraw-consent` cannot be combined with `--include-user`.
+    #[test]
+    fn announce_withdraw_consent_conflicts_with_include_user() -> anyhow::Result<()> {
+        let refused =
+            Cli::try_parse_from(["x0x", "announce", "--withdraw-consent", "--include-user"]);
+        match refused {
+            Err(e) => assert_eq!(e.kind(), clap::error::ErrorKind::ArgumentConflict),
+            Ok(_) => anyhow::bail!("the two flags must conflict"),
+        }
+        let cli = Cli::try_parse_from(["x0x", "announce", "--withdraw-consent"])?;
+        match cli.command {
+            Commands::Announce {
+                include_user: false,
+                consent: false,
+                withdraw_consent: true,
+            } => Ok(()),
+            _ => anyhow::bail!("expected announce with only withdraw_consent set"),
+        }
+    }
+
     #[test]
     fn bare_presence_alias_parses_without_nested_subcommand() -> anyhow::Result<()> {
         let cli = Cli::try_parse_from(["x0x", "presence"])?;
@@ -3941,6 +4025,26 @@ mod tests {
                 gui_view_fragment(Some(bad)).is_err(),
                 "{bad} must be rejected"
             );
+        }
+        Ok(())
+    }
+
+    /// WHY (ADR 0079, #1831 review): `x0x grant issue --no-names` reaches
+    /// the command as `no_names = true`; without the flag it is `false`.
+    #[test]
+    fn grant_issue_no_names_flag_parses() -> anyhow::Result<()> {
+        for (args, expected) in [
+            (vec!["x0x", "grant", "issue", "{}", "--no-names"], true),
+            (vec!["x0x", "grant", "issue", "{}"], false),
+        ] {
+            let cli = Cli::try_parse_from(args)?;
+            let Commands::Grant {
+                sub: GrantSub::Issue { no_names, .. },
+            } = cli.command
+            else {
+                anyhow::bail!("expected grant issue");
+            };
+            assert_eq!(no_names, expected);
         }
         Ok(())
     }

@@ -4,17 +4,30 @@ GET  /health                                             health                 
 GET  /status                                             status                                                  Runtime status with uptime
 POST  /shutdown                                           stop                                                    Gracefully stop the daemon
 POST  /auth/session                                       auth session                                            Exchange the durable API token for a short-lived browser session token
+POST  /auth/session/refresh                               auth refresh                                            Swap a live session token for a fresh one (12h cap from the original mint)
 GET  /constitution                                       constitution                                            Display the x0x Constitution (Markdown)
 GET  /constitution/json                                  constitution --json                                     Constitution with version metadata (JSON)
+GET  /groups/:id/stores/:app/legacy-imports/:source_id   group store legacy download  query: idempotency_key        Download the exact reviewed legacy Wiki/Web snapshot without changing it
+GET  /stores                                             store list                                              List key-value stores
+POST  /stores                                             store create              body: name,topic,policy       Create key-value store
+POST  /stores/:id/join                                    store join                body: expected_owner,policy   Join existing store
+POST  /groups/:id/stores                                  group store create        body: name                    Open a creator-anchored group store: signed plaintext for SignedPublic, encrypted for MlsEncrypted GSS; current group policy gates writes
+GET  /groups/:id/stores/:app/legacy-imports              group store legacy imports                                List local legacy Wiki/Web snapshots with durable import and local sync-publication status
+POST  /groups/:id/stores/:app/legacy-imports/:source_id   group store legacy import  body: source_digest,idempotency_key  Import a reviewed local legacy Wiki/Web snapshot and offer its retained history for shared-space sync
+GET  /stores/:id/keys                                    store keys                                              List keys in store
+PUT  /stores/:id/:key                                    store put                 body: value,content_type      Put value in store
+GET  /stores/:id/:key                                    store get                                               Get value from store
+DELETE  /stores/:id/:key                                    store rm                                                Remove key from store
 GET  /agent                                              agent                                                   Agent identity info
 POST  /announce                                           announce                  body: include_user_identity,human_consent  Announce identity to network
 GET  /agent/user-id                                      agent user-id                                           Current agent user ID
 GET  /agent/card                                         agent card                query: display_name,include_groups,include_local_addresses  Generate shareable identity card
 GET  /introduction                                       agent introduction        query: peer                   Introduction card with trust-scoped disclosure
+GET  /onboard                                            onboard                   query: card,card_file         Install-and-join recipe that teaches another agent to DM you
 POST  /agent/card/import                                  agent import              body: card,trust_level        Import agent card to contacts
 POST  /agent/sign                                         agent sign                body: context,payload_b64     Detached ML-DSA-65 signature over a caller-supplied payload
 POST  /agent/verify                                       agent verify              body: payload_b64,signature_b64,public_key_b64,context,algorithm  Verify a detached ML-DSA-65 signature against a caller-supplied public key
-POST  /identity/revoke                                    identity revoke           body: agent_id,machine_id,move_epoch,reason  Issue a signed revocation for an agent-id or machine-id keypair
+POST  /identity/revoke                                    identity revoke           body: agent_id,machine_id,move_epoch,reason  Revoke the daemon's own agent or machine, or an owner-authorized agent-machine binding
 GET  /identity/revocations                               identity revocations                                    List all revocation records held by this daemon
 POST  /agent/move                                         move authorize            body: agent_id,to_machine,placement,pin  Owner-authorize an agent move (chain MoveAuthorization; source seals)
 POST  /agent/move/export                                  move export               passthrough                   Source machine seals the export envelope + ExportReceipt
@@ -28,11 +41,14 @@ GET  /owner/agents/:id/placement                         owner agents placement 
 GET  /profile                                            profile                                                 Daemon self-profile names (human/display/machine)
 PUT  /profile                                            profile set               body: human_name,display_name,machine_name  Update stored self-profile names (partial update)
 GET  /owner/agents                                       owner agents                                            Roster of agents certified by this install's owner (journal-backed; survives restarts)
+GET  /owner/machines                                     owner machines                                          M1 machine census over owner-sync: enrolled devices + last-sync status + local version/policy digest (#1383)
+POST  /owner/devices/:machine_id/lose                     owner lose-device         body: reason,force            Lost-device action: binding tombstones for the owner's agents on that machine, revocation of agents pinned to it, removal from the device set (#1108)
 POST  /owner/agents/issue                                 owner agents issue        body: agent_public_key,mode,label,not_after  Owner-sign an AgentCertificate over a harness-submitted agent public key (ADR-0039)
 DELETE  /owner/agents/:id                                   owner agents revoke       body: reason                  ADR-0018 owner issuer-revocation of a registered sub-agent
-POST  /owner/riders                                       owner riders issue        body: sub_agent_id,groups,label,ttl_secs,delegation  Mint a scoped rider token for a registered rider-mode sub-agent (ADR-0039; the required harness-signed delegation is supplied via --delegation-payload-b64/--delegation-signature)
+POST  /owner/riders                                       owner riders issue        body: sub_agent_id,groups,scopes,label,ttl_secs,delegation  Mint a scoped rider token for a registered rider-mode sub-agent (ADR-0039; scopes is a string list, default empty; defined scopes: gui:show, scratch:read, scratch:read_write; the required harness-signed delegation is supplied via --delegation-payload-b64/--delegation-signature)
 GET  /owner/riders                                       owner riders                                            List rider-token records (no secrets; hashed identifiers only)
 DELETE  /owner/riders/:id                                   owner riders revoke                                     Revoke a rider token; it fails on the next request
+POST  /owner/groups/:id/recovery-mandate                  owner groups recovery-mandate  body: promoted_agent_id       ADR 0110 §4b(1): owner-sign an OwnerRecoveryMandateV1 promoting one certified member when every admin of an OwnerCertified group is revoked
 GET  /sync/devices                                       sync devices                                            ADR-0041 Tier-1: enrolled owner devices + last-sync status
 POST  /sync/devices/enroll                                sync enroll               body: machine_id,ttl_secs     Owner-key-sign a DeviceEnrollment for a machine (ADR-0041 Tier-1; owner-gated)
 DELETE  /sync/devices/:machine_id                           sync revoke                                             Remove a machine from the owner device set (ADR-0041 Tier-1; owner-gated)
@@ -54,11 +70,14 @@ GET  /diagnostics/connectivity                           diagnostics connectivit
 GET  /diagnostics/ack                                    diagnostics ack                                         ACK-v2 per-stage latency buckets and outcome counters
 GET  /diagnostics/gossip                                 diagnostics gossip                                      PubSub drop-detection counters (publish/deliver deltas)
 GET  /diagnostics/transport                              diagnostics transport                                   Transport connection accounting (zombie-connection hunt, #368)
+GET  /diagnostics/upgrade                                diagnostics upgrade                                     Local version + update-policy digest for the M1 census (#1383; local only, no wire change)
 GET  /diagnostics/relay                                  diagnostics relay                                       ADR-0035 relay-decentralization metering: advert census + inbound-dialer evidence
-GET  /diagnostics/dm                                     diagnostics dm                                          Direct-message send/receive counters and per-peer health
+GET  /diagnostics/dm                                     diagnostics dm            query: agent                  Direct-message send/receive counters and per-peer health
 GET  /diagnostics/groups                                 diagnostics groups                                      Per-group ingest counters, listener state, and drop buckets
 GET  /diagnostics/history                                diagnostics history                                     Durable-history writer/reaper counters (ADR-0023)
+GET  /diagnostics/state-sync                             diagnostics state-sync                                  Local state-sync counters for currently open KV stores
 GET  /diagnostics/ws                                     diagnostics ws                                          WebSocket outbound-queue health: capacity and drop/slow-consumer-close counters
+GET  /diagnostics/sidecar-quarantine                     diagnostics sidecar-quarantine                                Read-only list of each quarantined sidecar copy (ADR 0108 §5a) with its size (D148)
 POST  /peers/:peer_id/probe                               peer probe                query: timeout_ms             Active ant-quic probe_peer liveness + RTT (ant-quic 0.27.2 #173)
 GET  /peers/:peer_id/health                              peer health                                             Connection health snapshot for a peer (ant-quic 0.27.1 #170)
 GET  /peers/events                                       peer events                                             SSE stream of peer lifecycle events (ant-quic 0.27.1 #171)
@@ -73,13 +92,15 @@ GET  /history/message/:msg_id                            history message        
 GET  /history/scopes                                     history scopes            query: after_scope,limit      Enumerate history scopes holding retained rows, with row count and newest seen_at_ms
 GET  /history/search                                     history search            query: scope,q,since_ms,until_ms,limit,before_id  Full-text search over text history payloads (scope optional: omit to search all scopes)
 GET  /history/stats                                      history stats                                           History row counts, database size, and retention bounds
+GET  /history/policy                                     history policy                                          Local history policy in force (ADR 0116): rules, defaults, pins and counters (owner-only)
+POST  /history/retain                                     history retain            body: max_rows,budget_ms      Trim local history now under its startup policy, within a row and time budget (ADR 0116, owner-only)
 DELETE  /history                                            history purge             query: scope                  Purge one scope from the local history store (local-only)
 GET  /diagnostics/exec                                   diagnostics exec                                        Remote exec counters, warnings, active sessions, and ACL summary
 POST  /exec/run                                           exec                      body: agent_id,argv,stdin_b64,timeout_ms,cwd  Run a strictly allowlisted non-interactive command on a remote daemon
 POST  /exec/cancel                                        exec cancel               body: request_id,agent_id     Cancel an in-flight remote exec request
 GET  /exec/sessions                                      exec sessions                                           List local pending and remote active exec sessions
 GET  /diagnostics/connect                                diagnostics connect                                     Connect-ACL policy summary and stream allow/deny counters
-POST  /forwards                                           forward add               body: local_addr,peer_agent,target_host,target_port  Add a local port forward to a peer's loopback service
+POST  /forwards                                           forward add               body: local_addr,peer_agent,target_host,target_port,ephemeral  Add a local port forward to a peer's loopback service
 GET  /forwards                                           forward list                                            List registered port forwards
 DELETE  /forwards/:local_addr                               forward rm                                              Remove a port forward by its local bind address
 GET  /streams                                            streams                                                 Active forward-stream count + connect-ACL counters
@@ -114,6 +135,12 @@ POST  /machines/connect                                   machines connect      
 POST  /direct/send                                        direct send               body: agent_id,payload,prefer_raw_quic_if_connected,raw_quic_receive_ack_ms,stop_fallback_on_raw_error,require_gossip,require_ack_ms,require_durable_app_ack,logical_id  Send direct message
 GET  /direct/connections                                 direct connections                                      List direct connections
 GET  /direct/events                                      direct events             query: backfill               Stream direct messages
+POST  /calls                                              call                      body: agent_id,video          Ring an agent (audio, optionally video); callee must pass trust and connect-ACL gates
+GET  /calls                                              call list                                               List calls with gate and lifecycle counters
+GET  /calls/:id                                          call show                                               Show one call's lifecycle state
+POST  /calls/:id/accept                                   call accept                                             Answer a ringing incoming call
+POST  /calls/:id/reject                                   call reject                                             Decline a ringing incoming call
+POST  /calls/:id/hangup                                   call hangup                                             End or cancel a call
 POST  /groups                                             group create              body: name,description,display_name,preset,policy  Create named group
 GET  /groups                                             group list                                              List groups
 GET  /groups/:id                                         group info                                              Get group info
@@ -125,6 +152,7 @@ GET  /groups/:id/messages                                group messages         
 POST  /groups/:id/delegate                                group delegate            body: to_agent,scope,verbs,expiry_ms,task,parent  Issue a signed delegation (effective on durable history commit)
 GET  /groups/:id/delegations                             group delegations                                       List effective delegations re-derived from durable history
 POST  /groups/:id/invite                                  group invite              body: expiry_secs             Generate invite link
+POST  /groups/:id/quarantine/clear                        groups quarantine clear   body: force,reason            Manually clear the local fork-quarantine marker (owner-key node clear or --force with --reason)
 POST  /groups/join                                        group join                body: invite,display_name,mode,expected_owner_user_id  Join group via invite (mode=home with --home --owner pins the expected Home owner, #468/#469)
 GET  /groups/:id/join-status                             group join-status                                       Pending-join status with the typed terminal outcome (#477)
 PUT  /groups/:id/display-name                            group set-name            body: name                    Set display name in group
@@ -136,6 +164,9 @@ POST  /groups/:id/state/withdraw                          group delete          
 PATCH  /groups/:id                                         group update              body: name,description        Update group name/description (admin+)
 PATCH  /groups/:id/policy                                  group policy              body: preset,discoverability,admission,confidentiality,read_access,write_access  Update group policy (admin+)
 PATCH  /groups/:id/members/:agent_id/role                  group set-role            body: role                    Change a member's role (admin+)
+POST  /groups/:id/members/:agent_id/reseat                group reseat              body: reason,basis            Re-seat a forked or removed node by hand under a signed authorisation (admin+, ADR 0109 §3)
+GET  /groups/:id/recovery                                group recovery                                          Show this node's ADR 0109 recovery state, and on an admin the pending requesters and issued re-seats
+POST  /groups/:id/members/:agent_id/certificate/rebind    group rebind-certificate  body: certificate             Self-rebind this agent's renewed certificate into its seat before the cutoff (ADR 0110 §4a)
 POST  /groups/:id/ban/:agent_id                           group ban                                               Ban a member (admin+)
 DELETE  /groups/:id/ban/:agent_id                           group unban                                             Unban a member (admin+)
 GET  /groups/:id/requests                                group requests                                          List join requests (admin+)
@@ -159,24 +190,36 @@ POST  /task-lists                                         tasks create          
 GET  /task-lists/:id/tasks                               tasks show                                              Show tasks in list
 POST  /task-lists/:id/tasks                               tasks add                 body: title,description       Add task to list
 PATCH  /task-lists/:id/tasks/:tid                          tasks claim / tasks complete  body: action,fence_token,delegation  Claim or complete a task (action: claim|complete)
-GET  /stores                                             store list                                              List key-value stores
-POST  /stores                                             store create              body: name,topic,policy       Create key-value store
-POST  /stores/:id/join                                    store join                body: expected_owner,policy   Join existing store
-POST  /groups/:id/stores                                  group store create        body: name                    Open a group-scoped encrypted store bound to a named secure group (#341); member-gated, group must be MlsEncrypted on the GSS plane
-GET  /stores/:id/keys                                    store keys                                              List keys in store
-PUT  /stores/:id/:key                                    store put                 body: value,content_type      Put value in store
-GET  /stores/:id/:key                                    store get                                               Get value from store
-DELETE  /stores/:id/:key                                    store rm                                                Remove key from store
 POST  /files/send                                         send-file                 passthrough                   Send file to agent
 GET  /files/transfers                                    transfers                                               List file transfers
 GET  /files/transfers/:id                                transfer-status                                         Transfer status
 POST  /files/accept/:id                                   accept-file                                             Accept incoming transfer
 POST  /files/reject/:id                                   reject-file               body: reason                  Reject incoming transfer
 GET  /upgrade                                            upgrade                                                 Daemon-side check for updates over x0x/release manifests (CLI x0x upgrade --check reads GitHub and calls local /health)
-POST  /upgrade/apply                                      upgrade --apply                                         Daemon applies the latest verified release manifest with transactional restart (CLI x0x upgrade --apply delegates to this authenticated route)
+POST  /upgrade/apply                                      upgrade --apply           query: now                    Daemon applies the latest verified release manifest with transactional restart (CLI x0x upgrade --apply delegates to this authenticated route)
 GET  /ws                                                 ws                                                      General-purpose WebSocket session
 GET  /ws/direct                                          ws direct                 query: backfill               WebSocket session for direct messaging
 GET  /ws/sessions                                        ws sessions                                             List WebSocket sessions
 GET  /gui                                                gui                                                     Open the embedded GUI
+POST  /gui/show                                           show                      body: view,target_machine     Show a GUI view on this machine or, with --on, on an owner machine
+GET  /acl/connect                                        acl connect list                                        List connect ACL entries (TOML floor + API-managed) and reload status
+POST  /acl/connect                                        acl connect add           passthrough                   Add an API-managed connect ACL entry (TOML entry schema as JSON)
+DELETE  /acl/connect/:id                                    acl connect rm                                          Remove an API-managed connect ACL entry (floor entries: 409)
+GET  /acl/exec                                           acl exec list                                           List exec ACL entries (TOML floor + API-managed) and reload status
+POST  /acl/exec                                           acl exec add              passthrough                   Add an API-managed exec ACL entry (TOML entry schema as JSON)
+DELETE  /acl/exec/:id                                       acl exec rm                                             Remove an API-managed exec ACL entry (floor entries: 409)
+POST  /acl/reload                                         acl reload                                              Re-read the connect/exec ACL floors and overlays; rejects keep the last good ACL
+GET  /grants                                             grant list                                              List share grants this install's owner issued, with status
+POST  /grants                                             grant issue               body: grantee_user,grantee_agent,agents,caps,not_before,expiry,ttl_secs,deliver_to,include_names  Sign a share grant with the owner key, store it, and deliver it by durable DM
+DELETE  /grants/:id                                         grant revoke                                            Revoke a share grant (owner key; gossiped on x0x.revocation.v3 and pushed directly to capable recipients)
+GET  /grants/received                                    grant received                                          List share grants that name this install as grantee
+GET  /names                                              names list                                              List owner petnames and pinned names
+POST  /names/resolve                                      names resolve             body: name                    Resolve [agent:|machine:]<label>.<owner> locally; pins the name at first use
+POST  /names/owners                                       names owner add           body: label,user_id           Bind a local owner petname to a user id (frozen at first bind)
+DELETE  /names/owners/:label                                names owner rm                                          Remove a local owner petname and every pin under it
+POST  /names/machines                                     names machine label       body: name,machine_id         Label a shared machine (machine:<label>.<owner> -> machine id)
+DELETE  /names/pins/:name                                   names unpin                                             Drop a TOFU pin so the name re-pins at next use
+POST  /names/accept                                       names accept              body: label                   Apply a pending grant-names suggestion (ADR 0079)
+DELETE  /names/suggestions/:label                           names dismiss                                           Drop a pending grant-names suggestion
 
-178 endpoints total
+221 endpoints total

@@ -40,20 +40,21 @@ The daemon REST surface owns installation and restart and is governed by the dae
 ### 7.3 Diagnostics
 
 ```bash
-x0x diagnostics <area>              # connectivity|ack|gossip|transport|relay|dm|groups|history|connect|ws|exec
+x0x diagnostics <area>              # connectivity|ack|gossip|transport|relay|dm|groups|history|connect|ws|sidecar-quarantine|exec
 x0x peer probe|health|events        # per-peer liveness, health snapshot, SSE lifecycle
 x0x network status                  # NAT type, external addrs, direct capability
 ```
 
-The complete read-only snapshot inventory is `/diagnostics/connectivity`
+The read-only snapshots are `/diagnostics/connectivity`
 (NodeStatus: UPnP, NAT, relay, mDNS), `/diagnostics/ack` (ACK-v2 latency
 buckets), `/diagnostics/gossip` (drop detection and participation),
 `/diagnostics/transport` (connection accounting), `/diagnostics/relay` (ADR-0035
 metering), `/diagnostics/dm` (DM counters and per-peer state),
-`/diagnostics/groups` (ingest and drop buckets; ADR-0064 fork-quarantine and owner-mandate counters, plus per-agent `mandate_capability` rows — see the [fork quarantine runbook](https://github.com/saorsa-labs/x0x/blob/main/docs/runbooks/fork-quarantine.md)), `/diagnostics/history`
+`/diagnostics/groups` (ingest and drop buckets; ADR-0064 fork-quarantine and owner-mandate counters, plus per-agent `mandate_capability` rows; runbook link in §7.4), `/diagnostics/history`
 (writer/reaper), `/diagnostics/connect` (ACL allow/deny),
-`/diagnostics/ws` (outbound-queue health), and `/diagnostics/exec` (counters
-and ACL summary).
+`/diagnostics/ws` (outbound-queue health), `/diagnostics/sidecar-quarantine`
+(quarantined sidecar copies, sizes), and `/diagnostics/exec` (counters and ACL
+summary).
 
 The three routes detailed below are `GET` with no request body and require the
 normal local bearer token. They return snapshots, not SLAs or proof that a peer
@@ -88,7 +89,7 @@ Use the [full API reference](https://github.com/saorsa-labs/x0x/blob/main/docs/a
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Second device can't join owner's Home (`no agent certificate resolved` / `pending`) | a BODYLESS announce publishes the anonymous digest, which the owner can never resolve (#447 single-announce admission is fixed in v0.41.0) | `POST /announce` with `{"include_user_identity":true,"human_consent":true}` (repeat after any daemon restart — consent is not persisted), then `x0x group join --home --owner <owner-user-id> <invite>`; a `pending` join clears once the joiner's owner-issued certificate reaches the Home authority and the committed add reaches the joiner |
+| Second device can't join owner's Home (`no agent certificate resolved` / `pending`) | a BODYLESS announce publishes the anonymous digest, which the owner can never resolve (#447 single-announce admission is fixed in v0.41.0) | `POST /announce` with `{"include_user_identity":true,"human_consent":true}` (once; it survives restarts, #1107), then `x0x group join --home --owner <owner-user-id> <invite>`; a `pending` join clears once the joiner's owner-issued certificate reaches the Home authority and the committed add reaches the joiner |
 | Two Homes for one owner | this device holds a Home that lost the `("home")` election — `GET /home` shows `state:"adoption_pending"` and names `canonical_group_id` | on the device holding the canonical Home, as the human with the durable token: `x0x home seat <this device's agent id>`, then on this device `x0x group join <invite> --home --owner <owner_user_id>`. The local Home stays usable meanwhile. Duplicates are read-only inventory (`retirement:"manual_only"`) — do NOT delete one, an empty `evidence_against_deletion` is not a safe-delete signal |
 | Strict (durable-ack) DM → 409 `recipient_ack_semantics_unavailable` | no current usable signed, machine-bound v2 advert for the recipient after one refresh (missing/unconverged, expired, v1-only, gossip-unready, bad machine binding); v0.40.x peers interoperate via frozen v1 adverts (#448 fixed); no auto-fallback | retry later, or resend with `require_durable_app_ack:false` (v1 best-effort) |
 | Peer rejects your agent card | #450: ownerless cards interoperate with v0.40.x; owner-named v2 cards are rejected by pre-ADR-0036 peers by design | upgrade the verifying peer |

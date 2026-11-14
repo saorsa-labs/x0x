@@ -324,9 +324,54 @@ The private pair engine is implemented and tested, but no live apply path calls
 it yet. Activation requires the S2c host inventory and the S3a acknowledged
 flush, whose daemon-side owner and arm-and-flush control listener now exist
 (see [Acknowledged shutdown flush](#acknowledged-shutdown-flush-supervised-exit)
-below); launcher-coordinated host transactions remain the missing piece.
-The current apply path still uses its existing single-binary replacement flow.
-Do not infer pair rollback or launcher protection from this dormant module.
+below). The launcher-side flush receipt, reap check and pair restore code
+now exists too, but it is switched off (`ENABLED = false`) and no apply path
+calls it; activation of launcher-coordinated host transactions is what
+remains. The current apply path still uses its existing single-binary
+replacement flow. Do not infer pair rollback or launcher protection from this
+dormant module.
+
+The dormant launcher trial (`src/upgrade/launcher/run.rs`) bounds a candidate
+start. It reserves each attempt durably before exec, so a failed exec still
+counts. The limits are at most 3 attempts, 120 s to readiness per attempt,
+60 s of stable health and a 660 s total trial, with 10 s between attempts.
+These values are provisional until David rules on them. When the attempts
+or the total budget run out, the cause is Failed, and a later service stop
+does not change it. Exhausted attempts also stay Failed after a reboot; this
+reading of ADR 0094 is provisional until David rules on it. A
+reboot before the launcher sees the run-out total budget is Interrupted,
+because the launcher cannot tell when the deadline passed. A changed boot, a launcher restart during exec or
+rollback, or a service stop while attempts remain is Interrupted. The
+launcher then restores the previous pair and starts the restored daemon. For
+a service stop, the restore happens on the next launcher start; the candidate
+bytes stay installed until then. A restarted launcher resumes an interrupted
+rollback and starts only a missing restored child, at most 3 times. The
+trial keeps its first rollback cause. Until the host journal reaches
+Restored, a Failed cause there replaces an Interrupted one, so the journal
+cause, which decides the hold, can differ from the trial cause. After
+Restored, the journal cause does not change. A failed reap or a failed restored start stops automatic
+recovery (`RecoveryFailed`) until an operator repairs the host.
+
+The `x0x-launcher` binary builds only with the non-default `m2-launcher`
+cargo feature. Default builds and `cargo install` of the published crate do
+not build it until the activation slice. The launcher gives a candidate its boot
+permit as one JSON line on descriptor 3 (`X0X_M2_BOOT_FD=3`). This contract is
+provisional and dormant; it is frozen before `ENABLED = true`.
+
+While activation is held, the dormant launcher child cannot brick a daemon
+start. `x0xd` reads `X0X_M2_BOOT_FD` before runtime creation; a marker with
+no launcher permit behind it (an unrelated or missing descriptor 3) is
+dropped with one warning line and the daemon starts normally. ADR 0094 §6
+itself governs unknown or corrupt recovery records. The held-boot path
+applies that rule to the boot marker by analogy: fail closed means "start
+the configured binary normally and report degraded", never brick startup.
+The degraded report in the code is one warning line on stderr. The refusal
+covers only a permit present on descriptor 3: one that fails its checks,
+or one the process cannot verify. On a non-Linux Unix host, every well-formed
+permit refuses the boot today, because the process-custody identity check
+needs Linux `/proc`. When activation turns the engine on, the full boot
+barrier applies as specified: permit checks, boot record write, then the
+barrier ack.
 
 The engine checks a verified release plan and durable passing probes under the
 existing daemon and managed-CLI install locks. It checks the installed hashes
@@ -562,6 +607,40 @@ dead-job state as the missing-`KeepAlive` case above: fix the unit
 service. Fleet caveat (ADR-0011): the self-updater restarts only
 `x0xd.service` — after any upgrade, restored or successful, restart
 `x0xd-443` too or it keeps serving the old image.
+
+**Stable launcher (dormant).** `x0x-launcher` becomes the stable
+recovery actor that ADR 0094 §5 requires when M2 activation is on. M2
+trial ownership is held, so the binary is dormant and recovers nothing.
+Its passthrough mode is a provisional interim mode that ADR 0094 does not
+describe: it does not own a child, so it cannot meet the ADR's manager ->
+launcher -> child readback. Run as `x0x-launcher /absolute/path/x0xd [args]`, it becomes
+`x0xd` by `exec` and keeps the direct job's one-process signal and exit
+semantics. The daemon path must be absolute. The launcher never searches
+`PATH`. A missing or relative daemon path exits 64 (`EX_USAGE`). A failed
+`exec` exits 75 (`EX_TEMPFAIL`); `Restart=always` retries it as for a
+direct unit. `Restart=always` also restarts on exit 64, so a unit that
+binds the launcher must set `RestartPreventExitStatus=64`: a wrong
+`ExecStart` then stops the job and does not restart it every 5 s. The
+argv contract and the exit codes are provisional and dormant. They are
+frozen before `ENABLED = true`, like the fd 3 boot contract. The launcher strips a stray `X0X_M2_BOOT_FD` from the daemon's
+environment before the `exec`. While activation is held, `x0xd` ignores a
+stray `X0X_M2_BOOT_FD` with one warning. It refuses to start only for a
+permit present on descriptor 3 that fails its checks or cannot be
+verified (see
+[Dormant pair transaction](#dormant-pair-transaction-m2-s2e)). The
+launcher sits outside the daemon/CLI swap set. The daemon updater never
+replaces it.
+
+No tracked unit binds the launcher yet, and default builds do not build it
+(it needs the `m2-launcher` feature). ADR 0094 §5 preconditions for
+binding a fleet unit include: the separately signed launcher artifact in
+the release payload, verified for hash, version, account rights and journal-reader support;
+`install.sh` or `x0x autostart --repair` shipping it beside `x0xd`; an
+M2-capable daemon installed first under the existing direct job; the
+authority-inventory check accepting a launcher-owned `ExecStart`; and the
+`KillMode` and restart readbacks accepting launcher-owned jobs. Until
+these hold, a launcher-bound unit would refuse every self-update. The unit
+switch also needs David's approval because it changes production hosts.
 
 #### 2. Restore the known-good binary
 
@@ -938,9 +1017,31 @@ no gossip, binds nothing, and takes no instance lock.
 ## Update Flow (for x0xd)
 
 1. **Startup (background, post-bind)**: after the API listener is bound — and as a non-blocking background task, so an unreachable GitHub never delays API readiness (#1086) — check GitHub for a new release and apply it if found (the startup manifest broadcast is a separate task, run by `broadcast_current_manifest`)
-2. **Gossip listener**: Receive manifests on `x0x/releases` topic, verify signature, rebroadcast, apply if newer
+2. **Gossip listener**: Receive manifests on `x0x/release` topic, verify signature, rebroadcast, apply if newer
 3. **GitHub poller**: Periodic fallback poll, broadcast discovered manifests to gossip
-4. **Authenticated HTTP apply**: Verify the release and wait for staging, then
+4. **Announce on first observation** (#1169): the publish points that
+   predate #1169 are the startup manifest broadcast
+   (`broadcast_current_manifest`, on every launch; the startup check's own
+   publish site is dormant because the daemon runs it with no agent), the
+   fallback poll and the gossip relay. #1169 adds the one that stayed
+   silent: a manual `/upgrade/apply` announces the signed manifest on the
+   release topic before its apply work, so subscribed peers start their
+   update check from the announcement instead of their own fallback poll.
+   The GitHub poll cadence does not change (A14 / ADR 0045): gossip is
+   the fast path. The announcement is bounded (10 s) and best effort;
+   peer rebroadcast limiting and the apply owner's dedup handle repeats.
+   The read-only `/upgrade` check announces nothing (Engineer ruling
+   3 Nov 2026 17:40 GMT): a check-path announce self-delivers through
+   gossip and feeds this node's own apply owner — a background install
+   triggered by a read, which no credential gate on a GET can justify.
+   Self-delivery also applies to the apply-path announcement: the
+   applying node's own gossip listener receives it back and, with gossip
+   updates on, feeds the same version to its background apply owner — a
+   duplicate attempt of an operator-requested release, serialized by the
+   shared apply lock and version dedup. Recording announcements as
+   self-published so the driver skips that needs the shared tracker on
+   the daemon state (#1774).
+5. **Authenticated HTTP apply**: Verify the release and wait for staging, then
    recheck admission under the install lock before replacement. The CLI
    `upgrade --apply` uses this route; `--now` skips only the staging delay.
 
@@ -951,8 +1052,10 @@ durable hold.
 
 `x0xd --skip-update-check` disables self-update for that process invocation. It
 suppresses the startup GitHub check, gossip-delivered apply, manifest broadcast,
-fallback polling, and manual `/upgrade/apply`. The setting is not persisted;
-launching the daemon normally later restores the configured updater behavior.
+fallback polling, and manual `/upgrade/apply`. The `/upgrade` check keeps
+answering; it is read-only and never announces, with or without the flag. The
+setting is not persisted; launching the daemon normally later restores the
+configured updater behavior.
 
 All nodes verify and rebroadcast manifests (symmetric propagation — no privileged bootstrap role).
 

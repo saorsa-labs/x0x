@@ -217,6 +217,7 @@ fn owner_sync_enums_match_main() {
             "MachineNames",
             "HomePointer",
             "IssuanceJournal",
+            "DeviceEnrollment",
         ],
     );
     check::<crate::owner_sync::SyncValue>(
@@ -227,6 +228,7 @@ fn owner_sync_enums_match_main() {
             "MachineNames",
             "HomePointer",
             "IssuanceJournal",
+            "DeviceEnrollment",
         ],
     );
     check::<crate::owner_sync::SyncFrame>(
@@ -268,7 +270,7 @@ fn grant_delegation_and_move_enums_match_main() {
     check::<crate::share_grant::ShareCap>(
         "ShareCap",
         BINCODE,
-        &["Dm", "Exec", "Connect", "GroupInvite", "Call"],
+        &["Dm", "Exec", "Connect", "GroupInvite", "Call", "Data"],
     );
     check::<crate::delegation::AuthorityScope>("AuthorityScope", JSON, &["TaskExecute", "SendAs"]);
     check::<crate::delegation::DelegationVerb>(
@@ -932,7 +934,12 @@ fn closed_sets_stay_closed() {
             "{byte:#x}"
         );
     }
-    for byte in [0x00u8, 0x05, 0xff] {
+    // 0x05 is `DeviceEnrollment` (#1107); the first free kind byte is 0x06.
+    assert_eq!(
+        crate::owner_sync::SyncKind::from_u8(0x05),
+        Some(crate::owner_sync::SyncKind::DeviceEnrollment)
+    );
+    for byte in [0x00u8, 0x06, 0xff] {
         assert_eq!(
             crate::owner_sync::SyncKind::from_u8(byte),
             None,

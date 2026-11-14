@@ -2210,6 +2210,112 @@ fn open_parked_share(state: &AppState, share: &ParkedShare) -> Option<(u64, [u8;
     Some((*secret_epoch, secret))
 }
 
+/// Test builds only: park a held event for [`promoted_admin_secret`]'s
+/// walk (#1775 item 2).
+#[cfg(test)]
+pub(super) async fn seed_held_event_for_test(
+    state: &AppState,
+    stable_group_id: &str,
+    event: super::super::NamedGroupMetadataEvent,
+    author: AgentId,
+    prev_state_hash: Option<String>,
+) {
+    let mut inner = state.revocation_evictions.inner.lock().await;
+    inner.orc.held_events.push(HeldEvent {
+        stable_group_id: stable_group_id.to_string(),
+        event,
+        author,
+        prev_state_hash,
+        at: Instant::now(),
+    });
+}
+
+/// The held events and parked early shares of `stable_group_id` that
+/// a walk may use: retained, and from no revoked agent. A revoked agent
+/// signs no step and sends no trusted share, as in the ordinary apply's
+/// revocation gate. A revoked agent is not added either (the
+/// OwnerCertified add check).
+async fn live_held_chain(
+    state: &AppState,
+    stable_group_id: &str,
+) -> (Vec<HeldEvent>, Vec<ParkedShare>) {
+    let now = Instant::now();
+    let (held, parked): (Vec<HeldEvent>, Vec<ParkedShare>) = {
+        let inner = state.revocation_evictions.inner.lock().await;
+        (
+            inner
+                .orc
+                .held_events
+                .iter()
+                .filter(|held| {
+                    held.stable_group_id == stable_group_id
+                        && now.saturating_duration_since(held.at) <= ORC_RETAIN_TTL
+                })
+                .cloned()
+                .collect(),
+            inner
+                .orc
+                .early_shares
+                .iter()
+                .filter(|share| {
+                    share.stable_group_id == stable_group_id
+                        && now.saturating_duration_since(share.at) <= ORC_RETAIN_TTL
+                })
+                .cloned()
+                .collect(),
+        )
+    };
+    let revocation_set = state.agent.revocation_set();
+    let revoked = revocation_set.read().await;
+    (
+        held.into_iter()
+            .filter(|held| {
+                !revoked.is_agent_revoked(&held.author)
+                    && match &held.event {
+                        super::super::NamedGroupMetadataEvent::MemberAdded { agent_id, .. } => {
+                            super::super::parse_agent_id_hex(agent_id)
+                                .is_ok_and(|agent| !revoked.is_agent_revoked(&agent))
+                        }
+                        _ => true,
+                    }
+            })
+            .collect::<Vec<_>>(),
+        parked
+            .into_iter()
+            .filter(|share| !revoked.is_agent_revoked(&share.sender))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// #1775 (Engineer ruling, 4 Nov): the lower-case hex author of the
+/// held step that raises the secret epoch to `secret_epoch` on the
+/// verified walk from `result`, or `None`. Each step is checked as
+/// [`promoted_admin_secret`] checks it ([`next_held_state`]), so the
+/// author is an admin of the roster its step chains on. A superseded or
+/// promoted install parks a later secret only when this author sealed
+/// it: that key is the held chain's own, and its commit needs it.
+pub(in crate::server) async fn held_raise_author(
+    state: &AppState,
+    result: &GroupInfo,
+    secret_epoch: u64,
+) -> Option<String> {
+    let (held, _) = live_held_chain(state, result.stable_group_id()).await;
+    let mut cursor = result.clone();
+    for _ in 0..held.len() {
+        if cursor.secret_epoch >= secret_epoch {
+            return None;
+        }
+        let (step, next) = held
+            .iter()
+            .find_map(|held| next_held_state(&cursor, held).map(|next| (held, next)))?;
+        if next.secret_epoch == secret_epoch {
+            return Some(hex::encode(step.author.as_bytes()));
+        }
+        cursor = next;
+    }
+    None
+}
+
 /// What [`promoted_admin_secret`] found for a waiting GSS transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::server) enum LaterAdminKey {
@@ -2255,66 +2361,20 @@ pub(in crate::server) enum LaterAdminKey {
 /// epoch. Catch-up seals the current secret only, so after such a rotation
 /// no holder seals `epoch`'s secret any more. A share of the later epoch
 /// from an admin of that later roster gives [`LaterAdminKey::Superseded`].
+/// #1775 item 2: so does the later rotation's own share that installed
+/// directly while its event waits held — the installed secret's record
+/// must name the held step's author — so an unpinned later secret from
+/// its own author strands no wait.
 pub(in crate::server) async fn promoted_admin_secret(
     state: &AppState,
     result: &GroupInfo,
     epoch: u64,
 ) -> Option<LaterAdminKey> {
     let stable_group_id = result.stable_group_id().to_string();
-    let now = Instant::now();
-    let (held, parked): (Vec<HeldEvent>, Vec<ParkedShare>) = {
-        let inner = state.revocation_evictions.inner.lock().await;
-        (
-            inner
-                .orc
-                .held_events
-                .iter()
-                .filter(|held| {
-                    held.stable_group_id == stable_group_id
-                        && now.saturating_duration_since(held.at) <= ORC_RETAIN_TTL
-                })
-                .cloned()
-                .collect(),
-            inner
-                .orc
-                .early_shares
-                .iter()
-                .filter(|share| {
-                    share.stable_group_id == stable_group_id
-                        && now.saturating_duration_since(share.at) <= ORC_RETAIN_TTL
-                })
-                .cloned()
-                .collect(),
-        )
-    };
-    if parked.is_empty() {
-        return None;
-    }
-    // A revoked agent signs no step and sends no trusted share, as in the
-    // ordinary apply's revocation gate. A revoked agent is not added either
-    // (the OwnerCertified add check).
-    let (held, parked) = {
-        let revocation_set = state.agent.revocation_set();
-        let revoked = revocation_set.read().await;
-        (
-            held.into_iter()
-                .filter(|held| {
-                    !revoked.is_agent_revoked(&held.author)
-                        && match &held.event {
-                            super::super::NamedGroupMetadataEvent::MemberAdded {
-                                agent_id, ..
-                            } => super::super::parse_agent_id_hex(agent_id)
-                                .is_ok_and(|agent| !revoked.is_agent_revoked(&agent)),
-                            _ => true,
-                        }
-                })
-                .collect::<Vec<_>>(),
-            parked
-                .into_iter()
-                .filter(|share| !revoked.is_agent_revoked(&share.sender))
-                .collect::<Vec<_>>(),
-        )
-    };
+    // #1775 item 2: no parked share is needed when the walk's own step
+    // author sealed the installed later secret, so the walk runs with an
+    // empty park too.
+    let (held, parked) = live_held_chain(state, &stable_group_id).await;
     // A share of the roster's own epoch from an admin of that roster.
     let admin_share = |roster: &GroupInfo| {
         parked
@@ -2329,6 +2389,18 @@ pub(in crate::server) async fn promoted_admin_secret(
                 _ => None,
             })
     };
+    // #1775 item 2 (claude review round 1): the later rotation's share can
+    // install directly while its event waits held on this transition's
+    // result, so no parked share exists to find. The installed secret
+    // takes the superseded exit when the walk's own step author sealed
+    // it: the held chain replays and commits the later epoch, so an
+    // unpinned later secret from its own author strands no wait — and a
+    // secret from any other sender still does not end one.
+    let installed = group_by_stable(state, &stable_group_id).await;
+    // #1775 rounds 5 and 7: the author of the step that raised the
+    // epoch to each height owns that height's key — a later step's
+    // author, raising further, owns only its own.
+    let mut raises: Vec<(u64, String)> = Vec::new();
     let mut cursor = result.clone();
     // Each step moves the revision up, so the walk ends; the bound keeps it
     // to the held set.
@@ -2340,8 +2412,35 @@ pub(in crate::server) async fn promoted_admin_secret(
                 LaterAdminKey::Superseded
             });
         }
-        match held.iter().find_map(|held| next_held_state(&cursor, held)) {
-            Some(next) => cursor = next,
+        let raise_author = installed.as_ref().and_then(|(_, installed)| {
+            raises
+                .iter()
+                .rev()
+                .find(|(epoch, _)| *epoch == installed.secret_epoch)
+                .map(|(_, author)| author.clone())
+        });
+        if let (Some(author), Some((key, installed))) = (&raise_author, &installed) {
+            if cursor.secret_epoch > epoch
+                && installed.secret_epoch == cursor.secret_epoch
+                && installed.shared_secret.is_some()
+                && cursor
+                    .caller_role(author)
+                    .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin))
+                && super::super::gss_share_hold::share_sent_by(state, key, installed, author)
+            {
+                return Some(LaterAdminKey::Superseded);
+            }
+        }
+        match held
+            .iter()
+            .find_map(|held| next_held_state(&cursor, held).map(|next| (held, next)))
+        {
+            Some((held, next)) => {
+                if next.secret_epoch > cursor.secret_epoch {
+                    raises.push((next.secret_epoch, hex::encode(held.author.as_bytes())));
+                }
+                cursor = next;
+            }
             None => return None,
         }
     }
@@ -2362,7 +2461,12 @@ pub(in crate::server) async fn promoted_admin_secret(
 /// admin's removal or ban with or without a rotation, a member's own
 /// leave, and the request-based admission steps (a request, its approval,
 /// rejection or cancellation).
+///
+/// #1606: the role update, rename, policy update, unban, rejection and
+/// cancellation steps call the ordinary apply's own pure steps
+/// ([`super::super::event_steps`]), so the two cannot drift apart.
 fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
+    use super::super::event_steps as steps;
     use super::super::NamedGroupMetadataEvent as Event;
     let commit = super::super::named_group_metadata_event_commit(&held.event)?;
     if commit.prev_state_hash.as_deref() != Some(cursor.state_hash.as_str()) {
@@ -2376,6 +2480,9 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
                 .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin))
     };
     let next = match &held.event {
+        // #1578 rc11 (audit): the join's key-only marker row is not a
+        // seat — the replay stops on it, exactly as the apply side parks a
+        // role update for a member that has not landed.
         Event::MemberRoleUpdated {
             revision,
             actor,
@@ -2383,31 +2490,9 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
             role,
             ..
         } => {
-            // #1578 rc11 (audit): the join's key-only marker row is not
-            // a seat — the replay stops on it, exactly as the apply
-            // side parks a role update for a member that has not
-            // landed.
-            let target = cursor
-                .members_v2
-                .get(agent_id)
-                .filter(|_| !cursor.join_seat_key_marker_only(agent_id))?;
-            if !admin(actor)
-                || target.is_removed()
-                || target.is_banned()
-                || *role == x0x::groups::GroupRole::Owner
-            {
-                return None;
-            }
-            super::super::apply_stateful_event_to_group(
-                cursor,
-                commit,
-                x0x::groups::ActionKind::AdminOrHigher,
-                |next| {
-                    next.roster_revision =
-                        super::super::adopt_roster_revision(next.roster_revision, *revision);
-                    next.set_member_role(agent_id, *role);
-                },
-            )
+            let (action, mutate) =
+                steps::role_update(cursor, &author, *revision, actor, agent_id, *role).ok()?;
+            super::super::apply_stateful_event_to_group(cursor, commit, action, mutate)
         }
         Event::GroupMetadataUpdated {
             revision,
@@ -2416,25 +2501,17 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
             description,
             ..
         } => {
-            if !admin(actor) {
-                return None;
-            }
-            super::super::apply_stateful_event_to_group(
+            let (action, mutate) = steps::metadata_update(
                 cursor,
-                commit,
-                x0x::groups::ActionKind::AdminOrHigher,
-                |next| {
-                    next.roster_revision =
-                        super::super::adopt_roster_revision(next.roster_revision, *revision);
-                    if let Some(name) = name.clone() {
-                        next.name = name;
-                    }
-                    if let Some(description) = description.clone() {
-                        next.description = description;
-                    }
-                    next.updated_at = commit.committed_at;
-                },
+                &author,
+                *revision,
+                actor,
+                name,
+                description,
+                commit.committed_at,
             )
+            .ok()?;
+            super::super::apply_stateful_event_to_group(cursor, commit, action, mutate)
         }
         // #1508 rc16 (Codex P1): an admin's GSS add between the removal
         // and a promotion. It seats a Member only and keeps the epoch.
@@ -2513,23 +2590,15 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
             policy,
             ..
         } => {
-            if !admin(actor)
-                || cursor
-                    .policy
-                    .admission
-                    .owner_certified_user_id()
-                    .is_some_and(|owner| policy.admission.owner_certified_user_id() != Some(owner))
-            {
+            // #1606: the walk also checks the event's actor field. The
+            // ordinary apply checks only the commit signer's authority.
+            // The walk is the stricter side, so it fails safe.
+            if !admin(actor) {
                 return None;
             }
-            super::super::apply_stateful_event_to_group(
-                cursor,
-                commit,
-                x0x::groups::ActionKind::AdminOrHigher,
-                |next| {
-                    super::super::set_policy_update(next, *revision, policy, commit.committed_at)
-                },
-            )
+            let (action, mutate) =
+                steps::policy_update(cursor, *revision, policy, commit.committed_at).ok()?;
+            super::super::apply_stateful_event_to_group(cursor, commit, action, mutate)
         }
         Event::MemberUnbanned {
             revision,
@@ -2537,19 +2606,19 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
             agent_id,
             ..
         } => {
-            if !admin(actor) || cursor.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+            if cursor.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
                 return None;
             }
-            super::super::apply_stateful_event_to_group(
+            let (action, mutate) = steps::unban(
                 cursor,
-                commit,
-                x0x::groups::ActionKind::AdminOrHigher,
-                |next| {
-                    next.roster_revision =
-                        super::super::adopt_roster_revision(next.roster_revision, *revision);
-                    next.unban_member(agent_id);
-                },
+                &author,
+                *revision,
+                actor,
+                agent_id,
+                commit.committed_at,
             )
+            .ok()?;
+            super::super::apply_stateful_event_to_group(cursor, commit, action, mutate)
         }
         // #1533 rc17 (Codex P1): an active member's own GSS leave between
         // the removal and a promotion, checked as the ordinary self-leave
@@ -2784,50 +2853,35 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
             )
         }
         Event::JoinRequestRejected {
-            request_id, actor, ..
+            request_id,
+            actor,
+            requester_agent_id,
+            request_binding,
+            ..
         } => {
-            if !admin(actor)
-                || !cursor
-                    .join_requests
-                    .get(request_id)
-                    .is_some_and(|request| request.is_pending())
-            {
-                return None;
-            }
-            super::super::apply_stateful_event_to_group(
+            let (action, mutate) = steps::join_request_rejected(
                 cursor,
-                commit,
-                x0x::groups::ActionKind::AdminOrHigher,
-                |next| {
-                    super::super::set_join_request_rejected(
-                        next,
-                        request_id,
-                        actor,
-                        commit.committed_at,
-                    )
+                &author,
+                steps::RejectedRequest {
+                    request_id,
+                    actor,
+                    requester_agent_id,
+                    request_binding: request_binding.as_deref(),
                 },
+                commit,
             )
+            .ok()?;
+            super::super::apply_stateful_event_to_group(cursor, commit, action, mutate)
         }
         Event::JoinRequestCancelled {
             request_id,
             requester_agent_id,
             ..
         } => {
-            if *requester_agent_id != author
-                || !cursor.join_requests.get(request_id).is_some_and(|request| {
-                    request.is_pending() && request.requester_agent_id == *requester_agent_id
-                })
-            {
-                return None;
-            }
-            super::super::apply_stateful_event_to_group(
-                cursor,
-                commit,
-                x0x::groups::ActionKind::NonMemberRequest,
-                |next| {
-                    super::super::set_join_request_cancelled(next, request_id, requester_agent_id)
-                },
-            )
+            let (action, mutate) =
+                steps::join_request_cancelled(cursor, &author, request_id, requester_agent_id)
+                    .ok()?;
+            super::super::apply_stateful_event_to_group(cursor, commit, action, mutate)
         }
         _ => return None,
     }
@@ -2876,13 +2930,31 @@ fn gss_rotation_step(
 /// checks every signer's authority on the chain. Nothing is applied here.
 /// Bounded by [`ORC_STASH_CAP`] and [`ORC_RETAIN_TTL`]. Returns whether
 /// the event was held now (not held before).
+///
+/// #1623: the replay and the walk apply a held commit as its commit signer,
+/// not as `sender`, the peer that delivered it. A `JoinRequestRejected`
+/// with no binding has only that sender to tie its `request_id` to the
+/// signer. So it is held only when `sender` is `commit.committed_by`. A
+/// bound reject is held from any verified sender; its binding is checked
+/// at the replay and at the walk.
 pub(in crate::server) async fn hold_unchained_event(
     state: &AppState,
     event: &super::super::NamedGroupMetadataEvent,
+    sender: &AgentId,
 ) -> bool {
     let Some(commit) = super::super::named_group_metadata_event_commit(event) else {
         return false;
     };
+    if matches!(
+        event,
+        super::super::NamedGroupMetadataEvent::JoinRequestRejected {
+            request_binding: None,
+            ..
+        }
+    ) && hex::encode(sender.as_bytes()) != commit.committed_by
+    {
+        return false;
+    }
     let group_id = super::super::named_group_metadata_event_group_id(event);
     let Some(info) = ({
         let groups = state.named_groups.read().await;
@@ -3033,8 +3105,12 @@ async fn replay_early_shares(state: &Arc<AppState>, stable_group_id: &str) {
 
 /// After a GSS recovery or crypto-only exclusion installed here: apply the
 /// held commits that chain on it, then the parked shares. Call it with no
-/// group lock held: both re-enter the ordinary apply.
+/// group lock held: both re-enter the ordinary apply. #1775 (claude
+/// review round 11): the displaced later secret re-delivers first, so a
+/// held rotation of its epoch finds its own sender's key in and commits
+/// with it.
 pub(super) async fn replay_after_gss_install(state: &Arc<AppState>, stable_group_id: &str) {
+    redeliver_parked_secret(state, stable_group_id).await;
     replay_held_events(state, stable_group_id).await;
     replay_early_shares(state, stable_group_id).await;
 }
@@ -3043,8 +3119,135 @@ pub(super) async fn replay_after_gss_install(state: &Arc<AppState>, stable_group
 /// held commits that now chain on it and, if one applied (a later admin's
 /// promotion), the parked shares of that group.
 pub(in crate::server) async fn replay_after_commit(state: &Arc<AppState>, stable_group_id: &str) {
+    redeliver_parked_secret(state, stable_group_id).await;
     if replay_held_events(state, stable_group_id).await {
         replay_early_shares(state, stable_group_id).await;
+    }
+}
+
+/// #1775 (claude review round 11, Engineer ruling 4 Nov): re-deliver the
+/// parked secret a wait's own share displaced — or the held raise
+/// author's later key that a promoted or superseded install dropped —
+/// once the head commits the displacing wait's epoch. The re-delivery is a fresh `SecureShareDelivered` sealed to
+/// this node through the ordinary share path, so every guard, the
+/// install and the sender record run exactly as for a delivery, and the
+/// later rotation's commit lands with its key: an honest reordering
+/// stalls on no share re-delivery, which no retry owes. A record whose
+/// epoch a head already committed, or whose value a secret of its epoch
+/// or a later one replaced, is stale and goes; so is a record whose
+/// sender is revoked, demoted below Admin, or gone (round 12) — the
+/// apply would refuse that re-delivery for ever. Call it with no group
+/// lock held, and before the held events replay. Round 12: the share
+/// apply calls it after an accepted share too, because a keyless commit
+/// can commit the displacing wait's epoch with no later commit that
+/// would carry the re-delivery.
+pub(in crate::server) async fn redeliver_parked_secret(
+    state: &Arc<AppState>,
+    stable_group_id: &str,
+) {
+    // The hold files load lazily, and nothing loads them at boot: after a
+    // restart, the first caller may be this one (a `Duplicate` replay),
+    // so the parked map must be loaded before it is read (claude review
+    // at 818f565e).
+    super::super::gss_share_hold::ensure_loaded(state).await;
+    if super::super::gss_share_hold::parks_no_secret(state) {
+        return;
+    }
+    // #1574 item 5: the drop decisions below read the committed map, not
+    // a candidate that a failed write rolls back (claude review at
+    // 5e389451).
+    let Some((group_key, info)) = ({
+        let _committed = state.named_groups_persistence_lock.lock().await;
+        group_by_stable(state, stable_group_id).await
+    }) else {
+        return;
+    };
+    let Some(parked) = super::super::gss_share_hold::parked_secret(state, &group_key) else {
+        return;
+    };
+    if !super::super::gss_share_hold::parked_secret_reinstalls(&parked, &info) {
+        // Early, not stale: the displacing wait still lives (no head
+        // commits its epoch), so the record stays — re-delivering now
+        // would swap the key back under the wait that displaced it.
+        let committed = x0x::groups::crypto_exclusion::committed_secret_epoch(&info);
+        if parked.secret_epoch <= committed || parked.secret_epoch <= info.secret_epoch {
+            super::super::gss_share_hold::forget_parked_secret(state, &group_key, &parked).await;
+        }
+        return;
+    }
+    let sender = hex::decode(&parked.sender)
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .map(AgentId);
+    let secret = <[u8; 32]>::try_from(parked.secret.as_slice()).ok();
+    let (Some(sender), Some(secret)) = (sender, secret) else {
+        // A record that cannot name its sender or a secret value is
+        // damaged; it can re-deliver nothing.
+        super::super::gss_share_hold::forget_parked_secret(state, &group_key, &parked).await;
+        return;
+    };
+    {
+        // A revoked agent sends no trusted share: the ordinary apply
+        // would refuse the re-delivery for ever, so the record goes.
+        let revocation_set = state.agent.revocation_set();
+        let revoked = revocation_set.read().await;
+        if revoked.is_agent_revoked(&sender) {
+            drop(revoked);
+            super::super::gss_share_hold::forget_parked_secret(state, &group_key, &parked).await;
+            return;
+        }
+    }
+    if !info.active_members().any(|member| {
+        member.agent_id.eq_ignore_ascii_case(&parked.sender)
+            && member.role.at_least(x0x::groups::GroupRole::Admin)
+    }) {
+        // #1775 review round 12: a sender the current roster holds below
+        // Admin — demoted, or gone — can commit no rotation this key
+        // would serve, and the apply refuses its share for ever, so the
+        // record goes instead of re-sealing on every replay.
+        super::super::gss_share_hold::forget_parked_secret(state, &group_key, &parked).await;
+        return;
+    }
+    if super::super::gss_share_hold::removes_share_actor(
+        state,
+        &group_key,
+        &parked.sender,
+        parked.secret_epoch,
+    ) {
+        // A held removal or ban of the sender waits at or below the
+        // parked epoch: the share apply refuses this key, so the record
+        // goes instead of re-sealing on every replay (claude review at
+        // 5e389451).
+        super::super::gss_share_hold::forget_parked_secret(state, &group_key, &parked).await;
+        return;
+    }
+    use base64::Engine as _;
+    let recipient_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let recipient_kem_b64 =
+        base64::engine::general_purpose::STANDARD.encode(&state.agent_kem_keypair.public_bytes);
+    match super::super::build_secure_share_event(
+        &group_key,
+        &recipient_hex,
+        &recipient_kem_b64,
+        &parked.sender,
+        &secret,
+        parked.secret_epoch,
+    ) {
+        Ok(event) => {
+            let took =
+                super::super::apply_named_group_metadata_event(state, event, sender, true, None)
+                    .await;
+            if took.accepted {
+                super::super::gss_share_hold::forget_parked_secret(state, &group_key, &parked)
+                    .await;
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                group_id = %super::super::LogHexId::group(&group_key),
+                "#1775 parked share not re-sealed for re-delivery: {error:?}"
+            );
+        }
     }
 }
 
@@ -6574,8 +6777,14 @@ mod restart_tests {
     async fn report_head(author: &AppState, survivor: &AppState, stable: &str) -> Result<()> {
         let head = head_of(survivor, stable).await.context("survivor head")?;
         let survivor_hex = hex::encode(survivor.agent.agent_id().as_bytes());
-        super::super::note_catchup_head(author, &[stable.to_string()], &survivor_hex, Some(&head))
-            .await;
+        super::super::note_catchup_head(
+            author,
+            &[stable.to_string()],
+            &survivor_hex,
+            Some(&head),
+            None,
+        )
+        .await;
         Ok(())
     }
 
@@ -7879,6 +8088,544 @@ mod restart_tests {
         );
         restarted.agent.shutdown().await;
         b.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// `info` as JSON without each member's `joined_at` and `updated_at`:
+    /// the roster setters stamp them from the local clock, so two runs of
+    /// one step can differ there by a millisecond. The state hash does
+    /// not bind them.
+    fn member_clock_free(info: &GroupInfo) -> Result<serde_json::Value> {
+        let mut value = serde_json::to_value(info)?;
+        if let Some(members) = value["members_v2"].as_object_mut() {
+            for member in members.values_mut().filter_map(|m| m.as_object_mut()) {
+                member.remove("joined_at");
+                member.remove("updated_at");
+            }
+        }
+        Ok(value)
+    }
+
+    /// #1606: the GSS held-chain walk and the ordinary apply reach the
+    /// same decision and the same state on a mixed chain: a join request,
+    /// its approval, a promotion, a rename, a policy update, a ban, an
+    /// unban, a rejection and a cancellation, plus refused steps (a
+    /// promotion to Owner, a member's rename, a rename in a member's name,
+    /// a promotion of an agent with no seat, a rejection of a request that
+    /// is not pending, a cancellation by another agent or of a request that
+    /// is not pending). Every step chains on the head, so only the event
+    /// rules decide. #1606 review: a policy update in the name of a member,
+    /// or of an admin that did not send it, is the one place where the two
+    /// sides differ today. The walk refuses it and the apply accepts it
+    /// (FOR ENGINEER in #1825); the test pins both decisions.
+    #[tokio::test]
+    async fn the_walk_and_the_ordinary_apply_agree_on_a_mixed_chain() -> Result<()> {
+        use super::super::super as ng;
+        use x0x::groups::GroupRole;
+        let dir = tempfile::tempdir()?;
+        let state = offline_daemon(dir.path(), None).await?;
+        let keys = (0..5)
+            .map(|_| x0x::identity::AgentKeypair::generate())
+            .collect::<Result<Vec<_>, _>>()?;
+        let [admin, joiner, second, third, member] = &keys[..] else {
+            anyhow::bail!("five keys");
+        };
+        let id = |kp: &x0x::identity::AgentKeypair| hex::encode(kp.agent_id().as_bytes());
+        let mut cursor = GroupInfo::with_policy(
+            "parity".to_string(),
+            "desc".to_string(),
+            admin.agent_id(),
+            "ab".repeat(32),
+            x0x::groups::GroupPolicyPreset::PublicRequestSecure.to_policy(),
+        );
+        let local = hex::encode(state.agent.agent_id().as_bytes());
+        cursor.add_member(local, GroupRole::Member, None, None);
+        cursor.add_member(id(member), GroupRole::Member, None, None);
+        cursor.seal_commit(admin, ng::now_millis_u64())?;
+        hold_persisted(&state, &cursor).await?;
+        let gid = cursor.stable_group_id().to_string();
+        let mut policy = cursor.policy.clone();
+        policy.discoverability = x0x::groups::GroupDiscoverability::ListedToContacts;
+        let request = |kp: &x0x::identity::AgentKeypair, rid: &str| x0x::groups::JoinRequest {
+            request_id: rid.to_string(),
+            group_id: gid.clone(),
+            requester_agent_id: id(kp),
+            requester_user_id: None,
+            requested_role: GroupRole::Member,
+            message: None,
+            treekem_key_package_b64: None,
+            created_at: 7,
+            reviewed_at: None,
+            reviewed_by: None,
+            status: x0x::groups::JoinRequestStatus::Pending,
+            predecessor_envelope_digest: None,
+            predecessor_first_seen_ms: None,
+        };
+        let (j, m, a) = (id(joiner), id(member), id(admin));
+        let (listed, open) = (policy.clone(), cursor.policy.clone());
+        let created = |kp| {
+            serde_json::json!({"event": "join_request_created", "ts": 7,
+            "request_id": format!("r{}", id(kp)), "requester_agent_id": id(kp)})
+        };
+        // (label, signer, accepted, event fields; the commit and the
+        // group, revision and actor fields are added below.)
+        let chain = [
+            ("join request", joiner, true, created(joiner)),
+            (
+                "approval",
+                admin,
+                true,
+                serde_json::json!({"event": "join_request_approved",
+                "request_id": format!("r{j}"), "requester_agent_id": j}),
+            ),
+            (
+                "promotion to Owner",
+                admin,
+                false,
+                serde_json::json!({
+                "event": "member_role_updated", "agent_id": j, "role": GroupRole::Owner}),
+            ),
+            (
+                "promotion",
+                admin,
+                true,
+                serde_json::json!({
+                "event": "member_role_updated", "agent_id": j, "role": GroupRole::Admin}),
+            ),
+            (
+                "member rename",
+                member,
+                false,
+                serde_json::json!({
+                "event": "group_metadata_updated", "name": "renamed"}),
+            ),
+            (
+                "rename",
+                joiner,
+                true,
+                serde_json::json!({
+                "event": "group_metadata_updated", "name": "renamed"}),
+            ),
+            (
+                "rename in a member's name",
+                joiner,
+                false,
+                serde_json::json!({
+                "event": "group_metadata_updated", "name": "other", "actor": m}),
+            ),
+            (
+                "policy update",
+                joiner,
+                true,
+                serde_json::json!({
+                "event": "policy_updated", "policy": listed}),
+            ),
+            (
+                "policy update in a member's name",
+                joiner,
+                true,
+                serde_json::json!({"event": "policy_updated", "policy": open, "actor": m}),
+            ),
+            (
+                "policy update in another admin's name",
+                joiner,
+                true,
+                serde_json::json!({"event": "policy_updated", "policy": listed, "actor": a}),
+            ),
+            (
+                "ban",
+                joiner,
+                true,
+                serde_json::json!({"event": "member_banned", "agent_id": m}),
+            ),
+            (
+                "unban",
+                admin,
+                true,
+                serde_json::json!({"event": "member_unbanned", "agent_id": m}),
+            ),
+            (
+                "promotion of an agent with no seat",
+                admin,
+                false,
+                serde_json::json!({"event": "member_role_updated", "agent_id": id(second),
+                "role": GroupRole::Admin}),
+            ),
+            ("second request", second, true, created(second)),
+            ("third request", third, true, created(third)),
+            (
+                "rejection",
+                admin,
+                true,
+                serde_json::json!({"event": "join_request_rejected",
+                "request_id": format!("r{}", id(second)), "requester_agent_id": id(second)}),
+            ),
+            (
+                "rejection of a resolved request",
+                admin,
+                false,
+                serde_json::json!({
+                "event": "join_request_rejected", "request_id": format!("r{}", id(second)),
+                "requester_agent_id": id(second)}),
+            ),
+            (
+                "cancellation by another agent",
+                admin,
+                false,
+                serde_json::json!({"event": "join_request_cancelled",
+                "request_id": format!("r{}", id(third)), "requester_agent_id": id(third)}),
+            ),
+            (
+                "cancellation",
+                third,
+                true,
+                serde_json::json!({"event": "join_request_cancelled",
+                "request_id": format!("r{}", id(third)), "requester_agent_id": id(third)}),
+            ),
+            (
+                "cancellation of a resolved request",
+                third,
+                false,
+                serde_json::json!({"event": "join_request_cancelled",
+                "request_id": format!("r{}", id(third)), "requester_agent_id": id(third)}),
+            ),
+        ];
+        // The steps that the apply accepts and the walk refuses.
+        let walk_refuses = [
+            "policy update in a member's name",
+            "policy update in another admin's name",
+        ];
+        let mut accepted = 0;
+        for (label, signer, accept, mut fields) in chain {
+            // The author's side: the same change, sealed by the signer.
+            let mut next = cursor.clone();
+            let revision = next.roster_revision.saturating_add(1);
+            let at = ng::now_millis_u64();
+            let field = |name: &str| fields[name].as_str().unwrap_or_default().to_string();
+            let (agent, rid, actor) = (field("agent_id"), field("request_id"), id(signer));
+            match fields["event"].as_str() {
+                Some("join_request_created") => {
+                    ng::set_join_request_created(&mut next, request(signer, &rid), None)
+                }
+                Some("join_request_approved") => ng::set_join_request_approved(
+                    &mut next,
+                    &rid,
+                    &actor,
+                    &field("requester_agent_id"),
+                    revision,
+                    at,
+                ),
+                Some("member_role_updated") => {
+                    next.set_member_role(&agent, serde_json::from_value(fields["role"].clone())?)
+                }
+                Some("group_metadata_updated") => next.name = field("name"),
+                Some("policy_updated") => ng::set_policy_update(
+                    &mut next,
+                    revision,
+                    &serde_json::from_value(fields["policy"].clone())?,
+                    at,
+                ),
+                Some("member_banned") => next.ban_member(&agent, Some(actor.clone())),
+                Some("member_unbanned") => next.unban_member(&agent),
+                Some("join_request_rejected") => {
+                    ng::set_join_request_rejected(&mut next, &rid, &actor, at)
+                }
+                _ => ng::set_join_request_cancelled(&mut next, &rid, &field("requester_agent_id")),
+            }
+            next.updated_at = at;
+            next.roster_revision = revision;
+            let commit = next.seal_commit(signer, at)?;
+            fields["group_id"] = gid.clone().into();
+            fields["revision"] = revision.into();
+            if fields.get("actor").is_none() {
+                fields["actor"] = actor.into();
+            }
+            fields["commit"] = serde_json::to_value(&commit)?;
+            let event: ng::NamedGroupMetadataEvent = serde_json::from_value(fields)?;
+            // The walk's side, then the ordinary apply's side.
+            let held = HeldEvent {
+                stable_group_id: gid.clone(),
+                event: event.clone(),
+                author: signer.agent_id(),
+                prev_state_hash: Some(cursor.state_hash.clone()),
+                at: Instant::now(),
+            };
+            let walked = next_held_state(&cursor, &held);
+            let applied =
+                ng::apply_named_group_metadata_event(&state, event, signer.agent_id(), true, None)
+                    .await
+                    .accepted;
+            let (_, stored) = group_by_stable(&state, &gid).await.context("loaded")?;
+            let walk_accepts = accept && !walk_refuses.contains(&label);
+            assert_eq!(
+                walked.is_some(),
+                walk_accepts,
+                "{label}: the walk's decision"
+            );
+            assert_eq!(applied, accept, "{label}: the apply's decision");
+            match (walked, applied) {
+                (Some(walked), _) => {
+                    assert_eq!(
+                        member_clock_free(&walked)?,
+                        member_clock_free(&stored)?,
+                        "{label}: the walk and the apply reach the same state"
+                    );
+                    cursor = walked;
+                    accepted += 1;
+                }
+                (None, true) => {
+                    cursor = stored;
+                    accepted += 1;
+                }
+                (None, false) => {
+                    assert_eq!(stored.state_hash, cursor.state_hash, "{label}: no change")
+                }
+            }
+        }
+        assert_eq!(accepted, 13, "every accepting step ran");
+        // The apply parked the promotion of the agent with no seat (#876);
+        // the walk only refused it.
+        let (key, _) = group_by_stable(&state, &gid).await.context("loaded")?;
+        let parked = state
+            .parked_role_updates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+            .map_or(0, Vec::len);
+        assert_eq!(
+            parked, 1,
+            "the apply parks the role update for the unseated agent"
+        );
+        state.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1623: the hold applies a held commit as its commit signer, not as
+    /// the peer that delivered it. So a peer that relays a reject with no
+    /// binding, around the signer's genuine commit and with another
+    /// request named, must not get it into the hold. RED before: that copy
+    /// was held first and applied, and the other request became Rejected.
+    /// A bound copy stays relayable: the binding refuses a re-labelled one
+    /// at the replay, and the walk, and the genuine one applies.
+    #[tokio::test]
+    async fn issue1623_relayed_unbound_reject_is_not_held() -> Result<()> {
+        use super::super::super as ng;
+        use x0x::groups::{GroupRole, JoinRequestStatus};
+        let dir = tempfile::tempdir()?;
+        let state = offline_daemon(dir.path(), None).await?;
+        let keys = (0..4)
+            .map(|_| x0x::identity::AgentKeypair::generate())
+            .collect::<Result<Vec<_>, _>>()?;
+        let [admin, relay, first, second] = &keys[..] else {
+            anyhow::bail!("four keys");
+        };
+        let id = |kp: &x0x::identity::AgentKeypair| hex::encode(kp.agent_id().as_bytes());
+        let mut base = GroupInfo::with_policy(
+            "issue1623-held".to_string(),
+            "desc".to_string(),
+            admin.agent_id(),
+            "cd".repeat(32),
+            x0x::groups::GroupPolicyPreset::PublicRequestSecure.to_policy(),
+        );
+        let local = hex::encode(state.agent.agent_id().as_bytes());
+        base.add_member(local, GroupRole::Member, None, None);
+        base.add_member(id(relay), GroupRole::Member, None, None);
+        let gid = base.stable_group_id().to_string();
+        for (kp, rid) in [(first, "r1"), (second, "r2")] {
+            let mut request = x0x::groups::JoinRequest::new(gid.clone(), id(kp), None, 7);
+            request.request_id = rid.to_string();
+            ng::set_join_request_created(&mut base, request, None);
+        }
+        base.seal_commit(admin, ng::now_millis_u64())?;
+        hold_persisted(&state, &base).await?;
+        // The signer's side: a rename, then the reject of `r1` on it.
+        let a = id(admin);
+        let at = ng::now_millis_u64();
+        let mut renamed = base.clone();
+        renamed.name = "renamed".to_string();
+        renamed.updated_at = at;
+        renamed.roster_revision += 1;
+        let rename_commit = renamed.seal_commit(admin, at)?;
+        let rename: ng::NamedGroupMetadataEvent = serde_json::from_value(serde_json::json!({
+            "event": "group_metadata_updated", "group_id": gid, "name": "renamed",
+            "revision": renamed.roster_revision, "actor": a, "commit": rename_commit}))?;
+        let mut rejected = renamed.clone();
+        ng::set_join_request_rejected(&mut rejected, "r1", &a, at);
+        rejected.updated_at = at;
+        rejected.roster_revision += 1;
+        let commit = rejected.seal_commit(admin, at)?;
+        let reject = |request_id: &str, requester: &x0x::identity::AgentKeypair, bound: bool| {
+            let mut fields = serde_json::json!({
+                "event": "join_request_rejected", "group_id": gid, "actor": a,
+                "request_id": request_id, "requester_agent_id": id(requester),
+                "commit": commit});
+            if bound {
+                // The signer's binding of `r1`, on every bound copy.
+                fields["request_binding"] =
+                    serde_json::Value::String(x0x::groups::state_commit::sign_join_request_reject(
+                        &commit,
+                        "r1",
+                        &id(first),
+                        admin,
+                    )?);
+            }
+            Ok::<ng::NamedGroupMetadataEvent, anyhow::Error>(serde_json::from_value(fields)?)
+        };
+        let genuine = reject("r1", first, true)?;
+        let bound_relabel = reject("r2", second, true)?;
+        let unbound_relabel = reject("r2", second, false)?;
+
+        // The walk: the bound copies, as the commit signer.
+        let held = |event: &ng::NamedGroupMetadataEvent| HeldEvent {
+            stable_group_id: gid.clone(),
+            event: event.clone(),
+            author: admin.agent_id(),
+            prev_state_hash: Some(renamed.state_hash.clone()),
+            at: Instant::now(),
+        };
+        assert!(
+            next_held_state(&renamed, &held(&bound_relabel)).is_none(),
+            "the walk refuses a bound reject that names another request"
+        );
+        let walked = next_held_state(&renamed, &held(&genuine)).context("the genuine reject")?;
+        assert_eq!(walked.state_hash, rejected.state_hash);
+
+        // The lagging node: a peer relays the three copies before the
+        // rename, so none chains on the head yet.
+        for event in [&unbound_relabel, &bound_relabel, &genuine] {
+            let applied = ng::apply_named_group_metadata_event(
+                &state,
+                event.clone(),
+                relay.agent_id(),
+                true,
+                None,
+            )
+            .await;
+            assert!(!applied.accepted, "nothing chains on the head yet");
+        }
+        // The signer's own copy with no binding (a signer older than
+        // #1623) is still held.
+        let _ = ng::apply_named_group_metadata_event(
+            &state,
+            reject("r1", first, false)?,
+            admin.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        let held_unbound = {
+            let inner = state.revocation_evictions.inner.lock().await;
+            inner
+                .orc
+                .held_events
+                .iter()
+                .filter(|held| {
+                    matches!(
+                        &held.event,
+                        ng::NamedGroupMetadataEvent::JoinRequestRejected {
+                            request_binding: None,
+                            request_id,
+                            ..
+                        } if request_id == "r2"
+                    )
+                })
+                .count()
+        };
+        let held_all = state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .orc
+            .held_events
+            .len();
+        // The rename arrives; the held commits that chain on it replay.
+        let applied =
+            ng::apply_named_group_metadata_event(&state, rename, admin.agent_id(), true, None)
+                .await;
+        assert!(applied.accepted, "the rename applies");
+        replay_held_events(&state, &gid).await;
+
+        let (_, stored) = group_by_stable(&state, &gid).await.context("loaded")?;
+        let status = |rid: &str| stored.join_requests.get(rid).map(|request| request.status);
+        assert_eq!(
+            (held_unbound, held_all, status("r1"), status("r2")),
+            (
+                0,
+                3,
+                Some(JoinRequestStatus::Rejected),
+                Some(JoinRequestStatus::Pending)
+            ),
+            "(relayed unbound relabels held, all held, r1, r2)"
+        );
+        assert_eq!(
+            stored.state_hash, rejected.state_hash,
+            "the head is the reject"
+        );
+        state.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1606 review: the walk refuses an unban on the TreeKEM plane, though
+    /// the shared step and the commit check accept it. The plane rule is
+    /// the walk's own: the same unban on the GSS plane (the control) is
+    /// walked.
+    #[test]
+    fn the_walk_refuses_a_treekem_unban() -> Result<()> {
+        use super::super::super::event_steps as steps;
+        use x0x::mls::SecureGroupPlane;
+        let (admin, banned) = (
+            x0x::identity::AgentKeypair::generate()?,
+            x0x::identity::AgentKeypair::generate()?,
+        );
+        let (a, b) = (
+            hex::encode(admin.agent_id().as_bytes()),
+            hex::encode(banned.agent_id().as_bytes()),
+        );
+        for (plane, walked) in [
+            (SecureGroupPlane::Gss, true),
+            (SecureGroupPlane::TreeKem, false),
+        ] {
+            let mut cursor =
+                GroupInfo::new("t".into(), "d".into(), admin.agent_id(), "cd".repeat(32));
+            cursor.add_member(b.clone(), x0x::groups::GroupRole::Member, None, None);
+            cursor.ban_member(&b, Some(a.clone()));
+            cursor.secure_plane = plane;
+            cursor.seal_commit(&admin, 1)?;
+            let revision = cursor.roster_revision.saturating_add(1);
+            let step = || steps::unban(&cursor, &a, revision, &a, &b, 2).ok();
+            let (_, mutate) = step().context("the shared step accepts")?;
+            let mut next = cursor.clone();
+            mutate(&mut next);
+            next.roster_revision = revision;
+            let commit = next.seal_commit(&admin, 2)?;
+            let (action, mutate) = step().context("the shared step accepts")?;
+            anyhow::ensure!(
+                super::super::super::apply_stateful_event_to_group(
+                    &cursor, &commit, action, mutate
+                )
+                .is_ok(),
+                "{plane:?}: the commit check accepts the unban"
+            );
+            let held = HeldEvent {
+                stable_group_id: cursor.stable_group_id().to_string(),
+                event: super::super::super::NamedGroupMetadataEvent::MemberUnbanned {
+                    group_id: cursor.stable_group_id().to_string(),
+                    revision,
+                    actor: a.clone(),
+                    agent_id: b.clone(),
+                    commit: Some(commit),
+                },
+                author: admin.agent_id(),
+                prev_state_hash: Some(cursor.state_hash.clone()),
+                at: Instant::now(),
+            };
+            assert_eq!(
+                next_held_state(&cursor, &held).is_some(),
+                walked,
+                "{plane:?}: the walk's decision"
+            );
+        }
         Ok(())
     }
 }

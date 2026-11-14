@@ -53,6 +53,60 @@ pub const OWNER_ATTESTED_GAP_REASON: &str = "owner_attested_stale_base_gap";
 
 /// Links per ATA; a longer gap takes more than one segment.
 pub const ATA_MAX_LINKS: usize = 64;
+
+/// The links-per-ATA limit that this thread applies (§11). It is
+/// [`ATA_MAX_LINKS`], except in a test build where the thread holds an
+/// `AtaMaxLinksOverride`.
+///
+/// Every check of a segment's length uses this value: the issuer when it
+/// builds a segment, and the subject when it verifies one.
+#[must_use]
+pub(crate) fn ata_max_links() -> usize {
+    #[cfg(test)]
+    if let Some(links) = ATA_MAX_LINKS_OVERRIDE.with(std::cell::Cell::get) {
+        return links;
+    }
+    ATA_MAX_LINKS
+}
+
+#[cfg(test)]
+thread_local! {
+    static ATA_MAX_LINKS_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test builds only: sets [`ata_max_links`] for the current thread until
+/// the guard drops (ADR 0109 Validation table, rows H-S3-s and H-S3-q:
+/// "segment length set by test configuration").
+///
+/// The value is per thread, not per daemon. A W3-H case runs all of its
+/// daemons on the one test thread (`block_on_paused` builds a
+/// current-thread runtime), so every node in the case uses the same
+/// limit, as the issuer and the subject must. Other tests on other
+/// threads keep [`ATA_MAX_LINKS`]. Work on a blocking-pool thread also
+/// keeps [`ATA_MAX_LINKS`]; no segment check runs there.
+#[cfg(test)]
+#[must_use = "the limit returns to its earlier value when the guard drops"]
+pub(crate) struct AtaMaxLinksOverride {
+    previous: Option<usize>,
+}
+
+#[cfg(test)]
+impl AtaMaxLinksOverride {
+    /// Sets the limit to `links` (at least 1) on this thread.
+    pub(crate) fn set(links: usize) -> Self {
+        let links = links.max(1);
+        let previous = ATA_MAX_LINKS_OVERRIDE.with(|cell| cell.replace(Some(links)));
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for AtaMaxLinksOverride {
+    fn drop(&mut self) {
+        ATA_MAX_LINKS_OVERRIDE.with(|cell| cell.set(self.previous));
+    }
+}
 /// The subject accepts an ATA only when `issued_at_ms` is this close to its
 /// own clock. It applies at arming only.
 pub const ATA_ARM_WINDOW: Duration = Duration::from_secs(10 * 60);
@@ -264,11 +318,11 @@ impl AtaFields {
             .finish()
     }
 
-    /// The segment's shape: 1 to [`ATA_MAX_LINKS`] links, ending at
+    /// The segment's shape: 1 to [`ata_max_links`] links, ending at
     /// `from_revision + len`.
     fn segment_well_formed(&self) -> bool {
         let len = self.sequence.len();
-        (1..=ATA_MAX_LINKS).contains(&len)
+        (1..=ata_max_links()).contains(&len)
             && self
                 .from_revision
                 .checked_add(len as u64)
@@ -519,8 +573,8 @@ pub fn signer_is_active_admin(info: &GroupInfo, agent_hex: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChainPosition {
     /// The head is a commit on the admin's chain, behind its head: these
-    /// are the next link hashes (at most [`ATA_MAX_LINKS`]) and the last
-    /// one's revision.
+    /// are the next link hashes (at most [`ATA_MAX_LINKS`], or a test
+    /// build's lower limit) and the last one's revision.
     Behind {
         /// The next link hashes after the subject's head.
         sequence: Vec<String>,
@@ -582,7 +636,7 @@ pub fn chain_position(
     let mut cursor = head_state_hash.to_string();
     let mut expected = head_revision;
     let mut sequence = Vec::new();
-    for entry in next.into_iter().take(ATA_MAX_LINKS) {
+    for entry in next.into_iter().take(ata_max_links()) {
         expected = expected.saturating_add(1);
         if entry.commit.revision != expected
             || entry.commit.prev_state_hash.as_deref() != Some(cursor.as_str())
@@ -1600,7 +1654,10 @@ pub struct ReseatJournalV1 {
     pub authorisation: ReseatAuthorisation,
     /// The re-seat invite link.
     pub invite: String,
-    /// BLAKE3 of the full live record (JSON) at journal time.
+    /// BLAKE3 of the live record's canonical JSON at journal time
+    /// ([`ReseatJournalV1::digest_record`], #1652). Journals an older
+    /// binary wrote hold the plain-JSON digest;
+    /// [`ReseatJournalV1::staged_result_ready`] still matches both.
     pub record_digest: [u8; 32],
     /// The journal phase.
     pub phase: ReseatPhase,
@@ -1614,10 +1671,46 @@ pub struct ReseatJournalV1 {
     pub started_at_ms: u64,
 }
 
+/// The domain tag of the canonical journal record digest (#1652), in the
+/// style of `x0x.policy-hash.v1` and `x0x.group-genesis-hash.v1`.
+const RESEAT_RECORD_DIGEST_DOMAIN: &[u8] = b"x0x.reseat-record-digest.v1";
+
 impl ReseatJournalV1 {
-    /// BLAKE3 of a record's JSON, as [`Self::record_digest`] holds it.
+    /// BLAKE3 of a record's canonical JSON, as [`Self::record_digest`]
+    /// holds it (#1652). Plain `serde_json::to_vec(&GroupInfo)` is not a
+    /// canonical encoding: `issued_invites` and
+    /// `issued_invite_secrets` are hash tables, so their JSON key and
+    /// element order is per-process iteration order and the digest of an
+    /// unchanged record changes across a restart. Canonical here is the
+    /// record as a `serde_json::Value` — every object's keys sorted,
+    /// because `serde_json::Map` is a `BTreeMap` without the
+    /// `preserve_order` feature — with the invite-secrets array replaced
+    /// by the sorted set, prefixed with the `x0x.reseat-record-digest.v1`
+    /// domain tag. Every other serialized collection in `GroupInfo` is a
+    /// `BTreeMap`, `BTreeSet` or `Vec`,
+    /// which already serialise in a fixed order; a new unordered field
+    /// must be canonicalised here too (and this function returns `None`
+    /// if the secrets field it expects is absent, so a rename fails
+    /// closed instead of hashing a non-canonical encoding).
     #[must_use]
     pub fn digest_record(record: &GroupInfo) -> Option<[u8; 32]> {
+        let mut value = serde_json::to_value(record).ok()?;
+        let mut secrets: Vec<String> = record.issued_invite_secrets.iter().cloned().collect();
+        secrets.sort();
+        *value.get_mut("issued_invite_secrets")? =
+            serde_json::Value::Array(secrets.into_iter().map(serde_json::Value::String).collect());
+        let bytes = serde_json::to_vec(&value).ok()?;
+        let mut preimage = Vec::with_capacity(RESEAT_RECORD_DIGEST_DOMAIN.len() + bytes.len());
+        preimage.extend_from_slice(RESEAT_RECORD_DIGEST_DOMAIN);
+        preimage.extend_from_slice(&bytes);
+        Some(*blake3::hash(&preimage).as_bytes())
+    }
+
+    /// The pre-#1652 construction: BLAKE3 of plain `serde_json::to_vec`.
+    /// Kept only so [`Self::staged_result_ready`] still recognises the
+    /// original of a journal an older binary wrote; journals this binary
+    /// writes hold the canonical digest.
+    fn legacy_digest_record(record: &GroupInfo) -> Option<[u8; 32]> {
         serde_json::to_vec(record)
             .ok()
             .map(|bytes| *blake3::hash(&bytes).as_bytes())
@@ -1639,7 +1732,9 @@ impl ReseatJournalV1 {
     /// authorisation, not only to the seat:
     /// - the phase is past [`ReseatPhase::Prepared`]: the staging was open
     ///   durably before the staged join started;
-    /// - the record is not the journalled original (digest);
+    /// - the record is not the journalled original (digest): its canonical
+    ///   digest, or the pre-#1652 plain-JSON digest of a journal an older
+    ///   binary wrote;
     /// - it is the authorised group, uncontained (or holding only the
     ///   journalled original's marker, which the staged record holds until
     ///   the swap lifts it), and its head is past the authorisation's invite
@@ -1652,7 +1747,12 @@ impl ReseatJournalV1 {
         if self.phase == ReseatPhase::Prepared {
             return false;
         }
-        if Self::digest_record(live).is_none_or(|digest| digest == self.record_digest) {
+        let Some(canonical) = Self::digest_record(live) else {
+            return false;
+        };
+        if canonical == self.record_digest
+            || Self::legacy_digest_record(live).is_some_and(|digest| digest == self.record_digest)
+        {
             return false;
         }
         live.stable_group_id() == self.authorisation.fields.group
@@ -2475,6 +2575,61 @@ mod tests {
         }
     }
 
+    /// The H-S3-s/H-S3-q test seam: an override of 2 bounds signing,
+    /// verification and `chain_position` on this thread only, and the
+    /// guard puts [`ATA_MAX_LINKS`] back when it drops.
+    #[test]
+    fn ata_max_links_override_is_per_thread_and_scoped() {
+        let admin = keypair();
+        let with_links = |count: usize| {
+            let mut segment = fields(&admin);
+            segment.sequence = (0..count).map(|i| format!("s{i}")).collect();
+            segment.segment_terminal_revision = 4 + count as u64;
+            segment
+        };
+        let three = AdminTerminalAttestation::sign(with_links(3), &admin).expect("sign at 64");
+        assert_eq!(ata_max_links(), ATA_MAX_LINKS);
+        {
+            let _limit = AtaMaxLinksOverride::set(2);
+            assert_eq!(ata_max_links(), 2);
+            assert_eq!(
+                std::thread::spawn(ata_max_links).join().expect("thread"),
+                ATA_MAX_LINKS,
+                "another thread keeps the default"
+            );
+            assert!(AdminTerminalAttestation::sign(with_links(2), &admin).is_ok());
+            assert_eq!(
+                AdminTerminalAttestation::sign(with_links(3), &admin),
+                Err(RecoveryRefusal::BadSegment)
+            );
+            assert_eq!(three.verify_signature(), Err(RecoveryRefusal::BadSegment));
+
+            let mut info = signed_group(&admin);
+            let (base_revision, base_hash) = (info.state_revision, info.state_hash.clone());
+            for step in 0..4 {
+                info.name = format!("rename-{step}");
+                info.seal_commit(&admin, 10_000 + step).expect("seal");
+            }
+            match chain_position(&info, base_revision, &base_hash) {
+                ChainPosition::Behind {
+                    sequence,
+                    terminal_revision,
+                } => {
+                    assert_eq!(sequence.len(), 2);
+                    assert_eq!(terminal_revision, base_revision + 2);
+                }
+                other => panic!("expected Behind, got {other:?}"),
+            }
+            {
+                let _inner = AtaMaxLinksOverride::set(0);
+                assert_eq!(ata_max_links(), 1, "the floor is one link");
+            }
+            assert_eq!(ata_max_links(), 2, "the inner guard restores 2");
+        }
+        assert_eq!(ata_max_links(), ATA_MAX_LINKS);
+        assert!(three.verify_signature().is_ok());
+    }
+
     /// §4 "Placeholder": a non-empty, all-Removed roster, which released
     /// binaries' `migrate_from_v1` leaves alone (an empty roster would
     /// seat the creator as Admin).
@@ -2604,7 +2759,7 @@ mod tests {
         ReseatJournalV1 {
             authorisation,
             invite: String::new(),
-            record_digest: *blake3::hash(&live_record).as_bytes(),
+            record_digest: ReseatJournalV1::digest_record(original).expect("digest"),
             phase: ReseatPhase::Prepared,
             live_key: original.mls_group_id.clone(),
             live_record,
@@ -2676,6 +2831,135 @@ mod tests {
         let mut public = keyless.clone();
         public.policy.confidentiality = crate::groups::GroupConfidentiality::SignedPublic;
         assert!(journal.staged_result_ready(&public, &subject, false));
+    }
+
+    /// A record with entries in both serialized hash-table fields
+    /// (`issued_invites`, `issued_invite_secrets`), whose JSON order is
+    /// per-process iteration order (#1652).
+    fn invite_heavy_record(admin: &AgentKeypair) -> GroupInfo {
+        let subject = "ab".repeat(32);
+        let mut original = GroupInfo::new(
+            "g".to_string(),
+            String::new(),
+            admin.agent_id(),
+            "ef".repeat(32),
+        );
+        original.add_member(
+            subject,
+            GroupRole::Member,
+            Some(hex::encode(admin.agent_id().as_bytes())),
+            None,
+        );
+        original.seal_commit(admin, 1_000).expect("seal");
+        for n in 0..12_u64 {
+            original.issued_invites.insert(
+                format!("secret-{n:02}"),
+                crate::groups::IssuedInviteRecord {
+                    created_at_secs: n,
+                    expires_at_secs: 0,
+                    max_role: crate::groups::GroupRole::Member,
+                    consumed_by: (n % 2 == 0).then(|| format!("consumer-{n}")),
+                    consumed_at_ms: None,
+                    intended_joiner: (n % 3 == 0).then(|| format!("joiner-{n}")),
+                    origin: crate::groups::InviteOrigin::Explicit,
+                    signed_link: None,
+                    base_roster_root: None,
+                },
+            );
+            original
+                .issued_invite_secrets
+                .insert(format!("invite-{n:02}"));
+        }
+        original
+    }
+
+    /// #1652: the journal digest is over a canonical encoding, pinned
+    /// here byte for byte — the domain tag, the record as a
+    /// `serde_json::Value` (every object's keys sorted) and the
+    /// invite-secrets array sorted. Before the fix the digest was BLAKE3
+    /// of plain `serde_json::to_vec(&GroupInfo)`, whose field order is
+    /// the struct's declaration order and whose hash-table fields follow
+    /// iteration order.
+    #[test]
+    fn reseat_record_digest_is_over_canonical_json() {
+        let admin = keypair();
+        let original = invite_heavy_record(&admin);
+        let digest = ReseatJournalV1::digest_record(&original).expect("digest");
+        let mut canonical = serde_json::to_value(&original).expect("value");
+        let mut secrets: Vec<String> = original.issued_invite_secrets.iter().cloned().collect();
+        secrets.sort();
+        *canonical
+            .get_mut("issued_invite_secrets")
+            .expect("secrets member") =
+            serde_json::Value::Array(secrets.into_iter().map(serde_json::Value::String).collect());
+        let mut preimage = b"x0x.reseat-record-digest.v1".to_vec();
+        preimage.extend_from_slice(&serde_json::to_vec(&canonical).expect("json"));
+        assert_eq!(digest, *blake3::hash(&preimage).as_bytes());
+    }
+
+    /// #1652: the digest of an unchanged record survives a JSON round
+    /// trip, which rebuilds both hash tables with fresh random seeds.
+    /// Before the fix the same record digested differently after a
+    /// restart, so the originality guard in `staged_result_ready` could
+    /// stop recognising the journalled original.
+    #[test]
+    fn reseat_record_digest_survives_a_json_round_trip() {
+        let admin = keypair();
+        let original = invite_heavy_record(&admin);
+        let reloaded =
+            serde_json::from_str::<GroupInfo>(&serde_json::to_string(&original).expect("json"))
+                .expect("round trip");
+        assert_eq!(
+            ReseatJournalV1::digest_record(&original).expect("digest"),
+            ReseatJournalV1::digest_record(&reloaded).expect("digest"),
+        );
+    }
+
+    /// #1652: a journal an older binary wrote holds the pre-fix digest,
+    /// BLAKE3 of plain `serde_json::to_vec`. `staged_result_ready` still
+    /// recognises the journalled original against it (fail closed) and a
+    /// genuine staged result stays ready. The invite base sits one
+    /// revision under the original's head, so the original passes every
+    /// other readiness check: the legacy comparison alone refuses it,
+    /// and this test fails when that comparison is removed. The
+    /// JSON-reloaded original is the restart case: the fresh hash-table
+    /// order defeats the legacy digest (the #1652 defect), while the
+    /// canonical digest this binary journals still recognises it.
+    #[test]
+    fn staged_result_ready_still_matches_a_legacy_journal_digest() {
+        let admin = keypair();
+        let subject = "ab".repeat(32);
+        let original = invite_heavy_record(&admin);
+        let legacy = *blake3::hash(&serde_json::to_vec(&original).expect("json")).as_bytes();
+        let mut journal = journal_fixture(&admin, &original);
+        journal.record_digest = legacy;
+        journal.phase = ReseatPhase::Staging;
+        // One revision under the original's head, so the original is past
+        // the invite base like a staged result (the readiness check reads
+        // the fields, not the signature).
+        journal.authorisation.fields.invite_base_revision = original.state_revision - 1;
+        assert!(!journal.staged_result_ready(&original, &subject, true));
+        // A restart reloads the original from the journal's JSON, so both
+        // hash tables come back with fresh seeds. The legacy digest was
+        // over the writing process's iteration order and cannot match the
+        // reloaded record, so this guard alone does not refuse it: across
+        // a restart the caller refuses the original by head
+        // (`is_journalled_original`), and the canonical digest below is
+        // what keeps this guard itself restart-proof.
+        let reloaded =
+            serde_json::from_str::<GroupInfo>(&serde_json::to_string(&original).expect("json"))
+                .expect("round trip");
+        assert!(journal.staged_result_ready(&reloaded, &subject, true));
+        let mut canonical = journal_fixture(&admin, &original);
+        canonical.phase = ReseatPhase::Staging;
+        canonical.authorisation.fields.invite_base_revision = original.state_revision - 1;
+        assert!(!canonical.staged_result_ready(&reloaded, &subject, true));
+        // A genuine staged result stays ready under either journal.
+        let mut staged = original.clone();
+        staged.name = "staged".to_string();
+        staged.seal_commit(&admin, 2_000).expect("seal");
+        assert!(journal.staged_result_ready(&staged, &subject, true));
+        assert!(canonical.staged_result_ready(&staged, &subject, true));
     }
 
     #[test]

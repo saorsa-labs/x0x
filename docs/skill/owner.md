@@ -20,7 +20,7 @@ x0x home rename "David's Home"                 # renamable (sealed state update)
 
 Home always keeps ≥1 agent placed `Roaming` so it is *designed* to follow the user across machines — nominal in v1 while the move ceremony is gated off ([SKILL.md](../../SKILL.md) §5.2).
 
-**Second owner device joining the Home (#447, fixed in v0.41.0).** On the new device, run `POST /announce` **with body** `{"include_user_identity":true,"human_consent":true}` before joining, **and again after every restart of that daemon** (including a self-update restart: the consent is not persisted, so the daemon falls back to the anonymous announce until the human consents again) — a bodyless announce publishes the ANONYMOUS cert digest, which the owner can never resolve. Then join with `x0x group join --home --owner <owner-user-id> <invite>` (the owner id is shown by `x0x home`); the certified join is admitted from that single announce, and a join that arrives before the certificate is visible stays in a typed `pending` state instead of wedging. Uncertified joiners holding a stolen invite are always rejected — the gate fails closed.
+**Second owner device joining the Home (#447, fixed in v0.41.0).** On the new device, run `POST /announce` **with body** `{"include_user_identity":true,"human_consent":true}` before joining. The consent is durable (#1107): the daemon records it in `user-consent.bin` in the identity directory and announces with the owner identity again after every restart, including a self-update restart, with no new announce. To withdraw it, run `x0x announce --withdraw-consent` (`POST /announce` with `{"withdraw_consent":true}`). A bodyless announce publishes the ANONYMOUS cert digest, which the owner can never resolve. Then join with `x0x group join --home --owner <owner-user-id> <invite>` (the owner id is shown by `x0x home`); the certified join is admitted from that single announce, and a join that arrives before the certificate is visible stays in a typed `pending` state instead of wedging. Uncertified joiners holding a stolen invite are always rejected — the gate fails closed.
 
 **A pending join lives in memory only.** Until the joiner observes its own
 `MemberAdded` commit from the Home authority, the join is a stub that is
@@ -124,6 +124,14 @@ Rider tokens are **deny-by-default**: every route not listed returns **403** bef
 Rider sends are signed by the daemon's key but carry a provenance envelope **inside the signed bytes** (sub_agent_id, token id/hash, scope, and the sub-agent-signed delegation capability, ~10 KB) — receivers verify the embedded owner certificate and capability signature, then enforce policy against the **sub-agent**. A daemon can only speak for sub-agents that explicitly authorized it. For Home (`MlsEncrypted`/TreeKEM) the sub-agent must also hold a roster role; TreeKEM member adds need a `treekem_key_package_b64` from the target (an ACP-attached instance provides one).
 
 **Lifecycle:** revoke a token (`DELETE /owner/riders/:id`) → it fails on the next request, no restart. Revoke the sub-agent (`DELETE /owner/agents/:id`, ADR-0018 issuer revocation) → its tokens die too and the roster shows `revoked: true`.
+
+**Lost device:** on another of your devices, find the machine id with `x0x owner machines`, then:
+
+```bash
+x0x owner lose-device <MACHINE_ID>   # POST /owner/devices/:machine_id/lose (durable token)
+```
+
+Each of your agents with a placement record stops working from that machine (the answer lists the others in `agents_without_placement`); an agent pinned to it is revoked with its rider tokens; the machine leaves your device set. A rider token that was on the lost device still works on its issuing daemon: `x0x owner riders revoke <TOKEN_ID>` there. A roaming agent keeps its identity: if its key was on the lost device, also run `x0x owner agents revoke <AGENT_ID>`. The machine key is not revoked, and an agent you certify later is not covered (run it again). **If the lost device held your `user.key`, the thief holds your owner identity:** lose-device does not help, and x0x has no owner-key rotation. Create a new owner identity and tell your contacts.
 
 ### 3.4 Durable token vs session token — and issue #446
 

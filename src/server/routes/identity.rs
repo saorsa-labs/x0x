@@ -68,6 +68,13 @@ pub(in crate::server) struct AgentVerifyRequest {
     algorithm: Option<serde_json::Value>,
 }
 
+/// The `warning` field of a `POST /identity/revoke` answer that revoked this
+/// daemon's own machine (#1108).
+const OWN_MACHINE_REVOKED_WARNING: &str = "This machine is now revoked for good. Other peers refuse it and every agent on it. x0xd does not stop itself: it keeps running and peers refuse it. To use this computer on the network again, stop x0xd, delete machine.key and start x0xd to get a new machine identity.";
+
+/// Serializes own-machine revocations in this process (#1108).
+static OWN_MACHINE_REVOKE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// POST /announce request body.
 #[derive(Debug, Default, Deserialize)]
 pub(in crate::server) struct AnnounceIdentityRequest {
@@ -75,6 +82,10 @@ pub(in crate::server) struct AnnounceIdentityRequest {
     include_user_identity: bool,
     #[serde(default)]
     human_consent: bool,
+    /// #1107: withdraw the recorded consent to user-identity disclosure
+    /// before this (anonymous) announce.
+    #[serde(default)]
+    withdraw_consent: bool,
 }
 
 /// GET /agent
@@ -89,6 +100,14 @@ pub(in crate::server) async fn agent_info(
             agent_id: hex::encode(state.agent.agent_id().as_bytes()),
             machine_id: hex::encode(state.agent.machine_id().as_bytes()),
             user_id: state.agent.user_id().map(|u| hex::encode(u.as_bytes())),
+            agent_public_key: hex::encode(
+                state
+                    .agent
+                    .identity()
+                    .agent_keypair()
+                    .public_key()
+                    .as_bytes(),
+            ),
             kem_public_key_b64: BASE64.encode(&state.agent_kem_keypair.public_bytes),
             human_name: profile.human_name.clone(),
             display_name: profile.display_name.clone(),
@@ -299,16 +318,53 @@ pub(in crate::server) async fn announce_identity(
         )
         .into_response();
     }
+    // #1107: withdrawing the consent is the owner's decision, like giving
+    // it. The durable record and the in-memory flag are cleared before the
+    // anonymous announce, so a failed publish cannot leave consent on.
+    if req.withdraw_consent {
+        if req.include_user_identity {
+            return bad_request(
+                "withdraw_consent cannot be combined with include_user_identity: true",
+            )
+            .into_response();
+        }
+        if !actor.is_durable_owner() {
+            return api_error(
+                StatusCode::FORBIDDEN,
+                "withdrawing the user-identity consent requires the durable API token (owner act)",
+            )
+            .into_response();
+        }
+        if let Err(e) = state.agent.withdraw_user_identity_consent().await {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not remove the user-identity consent record: {e}"),
+            )
+            .into_response();
+        }
+    }
     match state
         .agent
         .announce_identity(req.include_user_identity, req.human_consent)
         .await
     {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
+        Ok(()) => {
+            let mut body = serde_json::json!({
                 "ok": true,
                 "include_user_identity": req.include_user_identity,
+            });
+            if req.withdraw_consent {
+                body["consent_withdrawn"] = serde_json::Value::Bool(true);
+            }
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        // The withdrawal is already done when the announce fails; say so.
+        Err(e) if req.withdraw_consent => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("{e}"),
+                "consent_withdrawn": true,
             })),
         )
             .into_response(),
@@ -541,9 +597,17 @@ pub(in crate::server) fn populate_invite_base_state_v4(
     // #1023: the digest-only projection — the invite link is DM-budgeted
     // and is not a certificate carrier; the bytes travel with the
     // retained-commit chain instead.
-    invite.base_roster = Some(x0x::groups::state_commit::roster_projection_digest_only(
-        &info.members_v2,
-    ));
+    // #646 r3 (blocker 2): this helper ALWAYS carries the projection
+    // inline (v4) — past the cap, `sign_v4` refuses `base_roster` as
+    // oversize exactly as before #646, so a caller like
+    // `mint_reseat_invite` never signs or stores an invite its redeem
+    // side (`check_reseat_invite`, which requires the inline roster)
+    // cannot use. The ordinary mint path opts into the v6
+    // content-addressed carrier through
+    // [`populate_invite_base_state`].
+    let projection = x0x::groups::state_commit::roster_projection_digest_only(&info.members_v2);
+    invite.base_roster = Some(projection);
+    invite.base_roster_root = None;
     invite.base_members_v2 = None;
     // #469 D1: exact public-meta snapshot — the precise input of
     // `compute_public_meta_hash`, so the joiner recomputes the base state
@@ -565,6 +629,34 @@ pub(in crate::server) fn populate_invite_base_state_v4(
     invite.base_security_binding = info.security_binding.clone();
 }
 
+/// #646 (D13): the v6-capable mint population for the ORDINARY invite
+/// path (`assemble_signed_v4_invite`). A projection past the inline cap
+/// no longer rides the link: the invite becomes v6 and carries the
+/// projection's CONTENT ADDRESS (its roster root); the joiner fetches the
+/// projection from the inviter and admits it only when it re-derives this
+/// signed root. At or under the cap the invite stays v4, byte-identical
+/// to pre-#646 links. The re-seat path keeps
+/// [`populate_invite_base_state_v4`]: its redeem side needs the inline
+/// roster (r3 blocker 2).
+pub(in crate::server) fn populate_invite_base_state(
+    invite: &mut x0x::groups::invite::SignedInvite,
+    info: &x0x::groups::GroupInfo,
+    intended_joiner: Option<x0x::identity::AgentId>,
+) {
+    populate_invite_base_state_v4(invite, info, intended_joiner);
+    let over_cap = invite
+        .base_roster
+        .as_ref()
+        .is_some_and(|roster| roster.len() > x0x::groups::invite::MAX_INVITE_ROSTER_ENTRIES);
+    if over_cap {
+        let projection = invite.base_roster.take().unwrap_or_default();
+        invite.version = x0x::groups::invite::INVITE_VERSION_V6;
+        invite.base_roster_root = Some(x0x::groups::state_commit::roster_root_of_projection(
+            &projection,
+        ));
+    }
+}
+
 /// GET /agent/card — generate a shareable identity card.
 ///
 /// r3 (Fable 1): owner-axis groups (Home metadata or an OwnerCertified
@@ -582,45 +674,7 @@ pub(in crate::server) async fn get_agent_card(
     axum::extract::Query(query): axum::extract::Query<CardQuery>,
 ) -> impl IntoResponse {
     let agent_id = state.agent.agent_id();
-    let machine_id = hex::encode(state.agent.machine_id().as_bytes());
-    // ADR-0036: the stored profile's display_name is the source of truth.
-    // `?display_name=` is DEPRECATED — still accepted as a fallback for
-    // callers that never set a profile, but a stored name always wins, so
-    // cards can no longer disagree with what the daemon announces.
-    let profile = state.profile.read().await;
-    let display_name = profile
-        .display_name
-        .clone()
-        .or(query.display_name)
-        .unwrap_or_default();
-
-    let mut card = x0x::groups::card::AgentCard::new(display_name, &agent_id, &machine_id);
-    card.owner_name = profile.human_name.clone();
-    // ADR 0030 §3: the card must carry the same protocol version the mesh
-    // advert claims. Hardcoding v1 here made an imported card contradict the
-    // live advert, and a lower-version card import would then have to be
-    // ignored by the capability store.
-    card.dm_capabilities = Some(
-        state
-            .agent
-            .current_dm_capabilities()
-            .with_kem_public_key(state.agent_kem_keypair.public_bytes.clone()),
-    );
-
-    // Add user ID if available
-    card.user_id = state.agent.user_id().map(|u| hex::encode(u.as_bytes()));
-
-    // Observed addresses and interface hints remain public-only by default.
-    if let Some(network) = state.agent.network() {
-        if let Some(ns) = network.node_status().await {
-            card.addresses = card_addresses(
-                ns.local_addr,
-                &ns.external_addrs,
-                x0x::collect_local_interface_addrs(ns.local_addr.port()),
-                query.include_local_addresses,
-            );
-        }
-    }
+    let mut card = build_base_card(&state, query.display_name, query.include_local_addresses).await;
 
     // Optionally include group invite links (#469 E3 transaction):
     // reuse-or-mint under the group's membership lock, durably persisted
@@ -805,7 +859,69 @@ pub(in crate::server) async fn get_agent_card(
         }
     }
 
-    // Include stores
+    let link = finish_signed_card(&state, &mut card).await;
+
+    Json(serde_json::json!({
+        "ok": true,
+        "card": card,
+        "link": link,
+    }))
+}
+
+/// Build the base identity card every card surface shares: identity ids,
+/// display name (the stored profile wins, ADR-0036), DM capabilities (ADR
+/// 0030 §3: the card carries the same protocol version the mesh advert
+/// claims) and public-only reachability hints. Group invites and stores
+/// are each caller's own concern.
+pub(in crate::server) async fn build_base_card(
+    state: &Arc<AppState>,
+    display_name_fallback: Option<String>,
+    include_local_addresses: bool,
+) -> x0x::groups::card::AgentCard {
+    let agent_id = state.agent.agent_id();
+    let machine_id = hex::encode(state.agent.machine_id().as_bytes());
+    let profile = state.profile.read().await;
+    let display_name = profile
+        .display_name
+        .clone()
+        .or(display_name_fallback)
+        .unwrap_or_default();
+
+    let mut card = x0x::groups::card::AgentCard::new(display_name, &agent_id, &machine_id);
+    card.owner_name = profile.human_name.clone();
+    drop(profile);
+    card.dm_capabilities = Some(
+        state
+            .agent
+            .current_dm_capabilities()
+            .with_kem_public_key(state.agent_kem_keypair.public_bytes.clone()),
+    );
+
+    card.user_id = state.agent.user_id().map(|u| hex::encode(u.as_bytes()));
+
+    // Observed addresses and interface hints remain public-only by default.
+    if let Some(network) = state.agent.network() {
+        if let Some(ns) = network.node_status().await {
+            card.addresses = card_addresses(
+                ns.local_addr,
+                &ns.external_addrs,
+                x0x::collect_local_interface_addrs(ns.local_addr.port()),
+                include_local_addresses,
+            );
+        }
+    }
+    card
+}
+
+/// Attach the replicated-store listing, sign the card (ADR-0017) so its
+/// reachability hints and capability advertisements are tamper-evident in
+/// transit, and return the link encoding. Signing should not fail for a
+/// valid keypair; degrade to an unsigned card with a warning rather than
+/// failing the request.
+pub(in crate::server) async fn finish_signed_card(
+    state: &Arc<AppState>,
+    card: &mut x0x::groups::card::AgentCard,
+) -> String {
     let stores = state.kv_stores.read().await;
     for topic in stores.keys() {
         card.stores.push(x0x::groups::card::CardStore {
@@ -813,22 +929,13 @@ pub(in crate::server) async fn get_agent_card(
             topic: topic.clone(),
         });
     }
+    drop(stores);
 
-    // Sign the card (ADR-0017) so its reachability hints and capability
-    // advertisements are tamper-evident in transit. Signing should not fail
-    // for a valid keypair; degrade to an unsigned card with a warning rather
-    // than failing the request.
     if let Err(e) = card.sign(state.agent.identity().agent_keypair()) {
         tracing::warn!("failed to sign agent card: {e}");
     }
 
-    let link = card.to_link();
-
-    Json(serde_json::json!({
-        "ok": true,
-        "card": card,
-        "link": link,
-    }))
+    card.to_link()
 }
 
 /// GET /.well-known/agent-card.json — A2A-compatible discovery card (ADR-0017).
@@ -1459,6 +1566,10 @@ pub(in crate::server) struct AgentData {
     agent_id: String,
     machine_id: String,
     user_id: Option<String>,
+    /// Hex of the agent's ML-DSA-65 public key (#1108). `agent_id` is the
+    /// identity hash of this key. It is the value that
+    /// `POST /owner/agents/issue` takes as `agent_public_key`.
+    agent_public_key: String,
     /// Base64 of the agent's ML-KEM-768 public key. Used by other daemons to
     /// seal group-shared-secret envelopes to this agent.
     kem_public_key_b64: String,
@@ -1536,6 +1647,18 @@ pub(in crate::server) async fn identity_revoke(
     Json(body): Json<RevokeRequest>,
 ) -> impl IntoResponse {
     use x0x::revocation::RevokedSubject;
+    // #1857: the reason is inside the signed record and is stored by every
+    // peer, so it has a size limit.
+    if body
+        .reason
+        .as_ref()
+        .is_some_and(|reason| reason.len() > x0x::revocation::MAX_REVOCATION_REASON_BYTES)
+    {
+        return bad_request(format!(
+            "reason is longer than {} bytes",
+            x0x::revocation::MAX_REVOCATION_REASON_BYTES
+        ));
+    }
     // ADR-0043 both-fields form: owner-key issued binding tombstone.
     if let (Some(agent_hex), Some(machine_hex)) =
         (body.agent_id.as_deref(), body.machine_id.as_deref())
@@ -1612,14 +1735,58 @@ pub(in crate::server) async fn identity_revoke(
         (None, None) => return bad_request("supply exactly one of agent_id or machine_id"),
     };
 
-    let issuer_keypair = state.agent.identity().agent_keypair();
-    match state
-        .agent
-        .revoke(issuer_keypair, subject, body.reason, None)
-        .await
-    {
+    // #1108: this daemon's own machine. Only the machine key can revoke a
+    // machine, and this daemon holds that key. Any other machine id falls
+    // through to the agent-key signer and is refused with 403.
+    let own_machine = matches!(
+        &subject,
+        RevokedSubject::Machine(machine) if *machine == state.agent.machine_id()
+    );
+    if own_machine && !actor.is_durable_owner() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "revoking this daemon's machine requires the durable API token (not a session token)",
+        );
+    }
+    // A repeat must not sign another record: the set has no size limit.
+    // The lock makes the check and the signing one step, so two calls at
+    // once sign one record.
+    let _own_machine_guard = if own_machine {
+        Some(OWN_MACHINE_REVOKE_LOCK.lock().await)
+    } else {
+        None
+    };
+    if own_machine {
+        let held = state.agent.own_machine_revocation().await;
+        if let Some(record) = held {
+            // The same fields as the first answer, and the flag.
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "subject": record.subject_hex(),
+                    "subject_kind": record.subject_kind(),
+                    "issuer": hex::encode(record.issuer_public_key_hash()),
+                    "revoked_at": record.revoked_at,
+                    "reason": record.reason,
+                    "already_revoked": true,
+                    "warning": OWN_MACHINE_REVOKED_WARNING,
+                })),
+            );
+        }
+    }
+    let outcome = if own_machine {
+        state.agent.revoke_own_machine(body.reason).await
+    } else {
+        let issuer_keypair = state.agent.identity().agent_keypair();
+        state
+            .agent
+            .revoke(issuer_keypair, subject, body.reason, None)
+            .await
+    };
+    match outcome {
         Ok(record) => {
-            let resp = serde_json::json!({
+            let mut resp = serde_json::json!({
                 "ok": true,
                 "subject": record.subject_hex(),
                 "subject_kind": record.subject_kind(),
@@ -1627,6 +1794,9 @@ pub(in crate::server) async fn identity_revoke(
                 "revoked_at": record.revoked_at,
                 "reason": record.reason,
             });
+            if own_machine {
+                resp["warning"] = serde_json::json!(OWN_MACHINE_REVOKED_WARNING);
+            }
             (StatusCode::OK, Json(resp))
         }
         Err(e @ x0x::error::IdentityError::Storage(_)) => api_error(
@@ -1650,28 +1820,68 @@ pub(in crate::server) async fn identity_revoke(
     }
 }
 
-/// GET /identity/revocations — list all revocation records held by this daemon.
+/// One row of `GET /identity/revocations`.
+///
+/// `subject`, `subject_kind`, `issuer`, `revoked_at` and `reason` are in
+/// every row. The other fields name the parts of the subject and depend on
+/// `subject_kind` (#1108).
+fn revocation_row(record: &x0x::revocation::RevocationRecord) -> serde_json::Value {
+    use x0x::revocation::RevokedSubject;
+
+    let mut row = serde_json::json!({
+        "subject": record.subject_hex(),
+        "subject_kind": record.subject_kind(),
+        "issuer": hex::encode(record.issuer_public_key_hash()),
+        "revoked_at": record.revoked_at,
+        "reason": record.reason,
+    });
+    match &record.subject {
+        RevokedSubject::Agent(agent) => {
+            row["agent_id"] = serde_json::json!(hex::encode(agent.as_bytes()));
+        }
+        RevokedSubject::Machine(machine) => {
+            row["machine_id"] = serde_json::json!(hex::encode(machine.as_bytes()));
+        }
+        RevokedSubject::AgentMachineBinding(binding) => {
+            row["agent_id"] = serde_json::json!(hex::encode(binding.agent.as_bytes()));
+            row["machine_id"] = serde_json::json!(hex::encode(binding.machine.as_bytes()));
+            row["move_epoch"] = serde_json::json!(binding.move_epoch);
+        }
+        RevokedSubject::ShareGrant(grant) => {
+            row["grant_id"] = serde_json::json!(hex::encode(grant.grant_id));
+            row["owner"] = serde_json::json!(hex::encode(grant.owner.as_bytes()));
+            row["grant_expiry"] = serde_json::json!(grant.grant_expiry);
+        }
+    }
+    row
+}
+
+/// GET /identity/revocations — list every revocation record held by this
+/// daemon: agent, machine, binding and share-grant subjects (#1108).
 pub(in crate::server) async fn identity_revocations(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let records = state.agent.revocation_records().await;
-    let items: Vec<serde_json::Value> = records
-        .iter()
-        .map(|r| {
-            serde_json::json!({
-                "subject": r.subject_hex(),
-                "subject_kind": r.subject_kind(),
-                "issuer": hex::encode(r.issuer_public_key_hash()),
-                "revoked_at": r.revoked_at,
-                "reason": r.reason,
-            })
-        })
-        .collect();
+    let mut records = state.agent.all_revocation_records().await;
+    // Oldest first; the record hash makes the order of equal times stable.
+    records.sort_by_cached_key(|r| (r.revoked_at, r.record_hash()));
+    let items: Vec<serde_json::Value> = records.iter().map(revocation_row).collect();
+    // #1857: records that are too large to send. While this is not 0, no
+    // peer that waits for a resync can open from this daemon.
+    let unsendable = state
+        .agent
+        .revocation_set()
+        .read()
+        .await
+        .unsendable_record_count();
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "revocations": items })),
+        Json(serde_json::json!({ "revocations": items, "unsendable_records": unsendable })),
     )
 }
+
+#[cfg(test)]
+#[path = "identity_listing_tests.rs"]
+mod listing_tests;
 
 #[cfg(test)]
 mod owner_act_tests {
@@ -2228,6 +2438,194 @@ mod owner_act_tests {
             StatusCode::BAD_REQUEST,
             "plain announce stays session-allowed (400 = gossip runtime absent, NOT 403)"
         );
+        Ok(())
+    }
+
+    /// #1107: withdrawing the consent is an owner act, and it cannot be
+    /// combined with a disclosure.
+    #[tokio::test]
+    async fn owner_act_matrix_withdraw_consent() -> anyhow::Result<()> {
+        let (state, _dir) = matrix_state().await?;
+        let app = matrix_router(Arc::clone(&state));
+        let withdraw = serde_json::json!({ "withdraw_consent": true });
+
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/announce",
+            &session_token(&state).await,
+            withdraw.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "session bearer: {json}");
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/announce",
+            &rider_token(&state).await,
+            withdraw.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "rider token: {json}");
+
+        // Durable clears the gate and the withdrawal runs; the fixture
+        // agent has no gossip runtime, so the anonymous announce after it
+        // answers 400 with the handler's own error.
+        let (status, json) = call(&app, "POST", "/announce", DURABLE, withdraw).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "durable: {json}");
+        assert!(
+            json["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("gossip runtime")),
+            "the withdrawal passed and the announce failed: {json}"
+        );
+        assert_eq!(
+            json["consent_withdrawn"], true,
+            "a failed announce still reports the withdrawal: {json}"
+        );
+
+        let both = serde_json::json!({
+            "include_user_identity": true,
+            "human_consent": true,
+            "withdraw_consent": true,
+        });
+        let (status, json) = call(&app, "POST", "/announce", DURABLE, both).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "combined: {json}");
+        assert!(
+            json["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("withdraw_consent cannot be combined")),
+            "combined request is refused before any change: {json}"
+        );
+        Ok(())
+    }
+
+    /// The next identity announce frame on the announce topic. The v3
+    /// `payload_version` is `0` for an anonymous announce.
+    async fn next_announce_frame(
+        wire: &mut crate::gossip::pubsub::Subscription,
+    ) -> crate::announce_v3::IdentityAnnouncementV3 {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let msg = tokio::time::timeout_at(deadline, wire.recv())
+                .await
+                .expect("an identity announcement was published")
+                .expect("the wire subscription stays open");
+            if crate::announce_v3::is_v3_payload(&msg.payload) {
+                return crate::announce_v3::deserialize_v3(&msg.payload)
+                    .expect("the identity announce wire frame decodes");
+            }
+        }
+    }
+
+    /// A real loopback agent with its identity directory at `dir`, so the
+    /// consent record path is `dir/user-consent.bin`.
+    async fn consent_state(dir: &std::path::Path) -> anyhow::Result<Arc<AppState>> {
+        let user = crate::identity::UserKeypair::from_seed(&[0x42; 32])?;
+        let config = crate::network::NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse()?),
+            bootstrap_nodes: Vec::new(),
+            network_id: Some(format!("withdraw-consent-{}", rand::random::<u32>())),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..crate::network::NetworkConfig::default()
+        };
+        let agent = Arc::new(
+            crate::Agent::builder()
+                .with_identity_dir(dir)
+                .with_machine_key(dir.join("machine.key"))
+                .with_agent_key_path(dir.join("agent.key"))
+                .with_agent_cert_path(dir.join("agent.cert"))
+                .with_user_key(user)
+                .with_contact_store_path(dir.join("contacts.json"))
+                .with_peer_cache_disabled()
+                .with_network_config(config)
+                .build()
+                .await?,
+        );
+        crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(dir, agent).await
+    }
+
+    /// #1107: the durable owner token withdraws the consent through
+    /// `POST /announce`. The answer is 200 with `consent_withdrawn`, the
+    /// record file is gone, and the announce published by the withdrawal
+    /// and the next ordinary announce are both anonymous on the wire.
+    #[tokio::test]
+    async fn withdraw_consent_removes_the_record_and_announces_anonymously() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = consent_state(dir.path()).await?;
+        let agent = Arc::clone(&state.agent);
+        let app = matrix_router(Arc::clone(&state));
+        let mut wire = agent.subscribe(crate::IDENTITY_ANNOUNCE_TOPIC).await?;
+        let record = dir.path().join("user-consent.bin");
+
+        let consent = serde_json::json!({ "include_user_identity": true, "human_consent": true });
+        let (status, json) = call(&app, "POST", "/announce", DURABLE, consent).await;
+        assert_eq!(status, StatusCode::OK, "consented announce: {json}");
+        assert!(record.exists(), "the consented announce writes the record");
+        assert_ne!(
+            next_announce_frame(&mut wire).await.payload_version,
+            0,
+            "the consented announce is an identity announce"
+        );
+        assert!(agent.user_identity_consented());
+
+        let withdraw = serde_json::json!({ "withdraw_consent": true });
+        let (status, json) = call(&app, "POST", "/announce", DURABLE, withdraw).await;
+        assert_eq!(status, StatusCode::OK, "withdrawal: {json}");
+        assert_eq!(json["consent_withdrawn"], true, "withdrawal: {json}");
+        assert!(!record.exists(), "the withdrawal removes the record");
+        assert!(!agent.user_identity_consented());
+        assert_eq!(
+            next_announce_frame(&mut wire).await.payload_version,
+            0,
+            "the announce published by the withdrawal is anonymous"
+        );
+
+        // The next ordinary announce, in a later second, is anonymous too.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let (status, json) = call(&app, "POST", "/announce", DURABLE, serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::OK, "plain announce: {json}");
+        assert!(json.get("consent_withdrawn").is_none(), "{json}");
+        assert_eq!(
+            next_announce_frame(&mut wire).await.payload_version,
+            0,
+            "the next announce after the withdrawal is anonymous"
+        );
+        assert!(!record.exists(), "an anonymous announce writes no record");
+        agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1107: the record can be neither removed nor emptied (a directory
+    /// is at its path). The withdrawal answers 500 and the daemon stops the
+    /// disclosure for this run.
+    #[tokio::test]
+    async fn withdraw_consent_storage_failure_answers_500() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let record = dir.path().join("user-consent.bin");
+        std::fs::create_dir(&record)?;
+        std::fs::write(record.join("blocker"), b"x")?;
+        let state = consent_state(dir.path()).await?;
+        let app = matrix_router(Arc::clone(&state));
+
+        let consent = serde_json::json!({ "include_user_identity": true, "human_consent": true });
+        let (status, json) = call(&app, "POST", "/announce", DURABLE, consent).await;
+        assert_eq!(status, StatusCode::OK, "consented announce: {json}");
+        assert!(state.agent.user_identity_consented());
+
+        let withdraw = serde_json::json!({ "withdraw_consent": true });
+        let (status, json) = call(&app, "POST", "/announce", DURABLE, withdraw).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{json}");
+        assert!(
+            json["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("could not remove the user-identity consent record")),
+            "{json}"
+        );
+        assert!(json.get("consent_withdrawn").is_none(), "{json}");
+        assert!(!state.agent.user_identity_consented());
+        state.agent.shutdown().await;
         Ok(())
     }
 

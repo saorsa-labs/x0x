@@ -128,8 +128,34 @@ impl CapabilityRegistry {
     /// main's silent drop, so an older peer never records the refusal
     /// as a durable DM-history row.
     pub const TREEKEM_CATCHUP_REFUSAL_V1: u64 = 1 << 13;
+    /// #1003 (ADR 0080, archived; slot A03): accepts the single-record
+    /// grant revocation push (`x0x-grant-revocation-push-v1\0`) and
+    /// ingests it through the shared v3 revocation path. Bit 15: bit 14
+    /// was taken first by PR #1826's `share_grant_names_v1` (ADR 0079 v2
+    /// envelope), so this allocation was deconflicted to the next free
+    /// bit on 8 Nov 2026. The push sender needs POSITIVE
+    /// evidence: it pushes only to a peer whose current verified advert
+    /// HAS this bit (unknown or expired state means "no push"), because an
+    /// old receiver would show the payload as an ordinary DM. The bit is
+    /// ROUTE-GATED (ADR 0080 §1): [`Self::current`] leaves it out, and a
+    /// receiver advertises it only when its typed route for the push
+    /// prefix is registered and ready ([`Self::advertised`]).
+    pub const GRANT_REVOCATION_PUSH_V1: u64 = 1 << 15;
 
-    /// The routes supported by this release's ready receiver.
+    /// ADR 0079: understands the `x0x-sharegrant-v2\0` typed route (the v1
+    /// grant plus an owner-signed names section). Bit 14, the next free bit
+    /// after #1657's `treekem_catchup_refusal_v1` (bit 13). Senders send
+    /// the v2 envelope only to a grantee whose verified advert carries this
+    /// bit; every other grantee gets the unchanged v1 payload, so old peers
+    /// never see the new prefix (their generic inbox would record it as a
+    /// junk DM and release a durable ACK).
+    pub const SHARE_GRANT_NAMES_V1: u64 = 1 << 14;
+
+    /// The routes supported by every receiver of this release.
+    /// Route-gated bits (`grant_revocation_push_v1`) are NOT here: they are
+    /// added per daemon by [`Self::advertised`] from the typed routes the
+    /// DM inbox actually registered, so a library embedder that never wires
+    /// the route never advertises the bit.
     pub const fn current() -> Self {
         Self {
             version: 1,
@@ -146,8 +172,26 @@ impl CapabilityRegistry {
                 | Self::GUI_SHOW_V1
                 | Self::JOIN_PENDING_NOTICE_V1
                 | Self::KEY_REPUBLISH_V1
-                | Self::TREEKEM_CATCHUP_REFUSAL_V1,
+                | Self::TREEKEM_CATCHUP_REFUSAL_V1
+                | Self::SHARE_GRANT_NAMES_V1,
         }
+    }
+
+    /// The registry a READY receiver advertises, given the prefixes of the
+    /// typed routes its DM inbox registered. ADR 0080 §1:
+    /// `grant_revocation_push_v1` is route-gated — the bit is advertised
+    /// only when the push route is registered and ready; everything in
+    /// [`Self::current`] is unconditional.
+    #[must_use]
+    pub fn advertised<P: AsRef<[u8]>>(route_prefixes: impl IntoIterator<Item = P>) -> Self {
+        let mut registry = Self::current();
+        if route_prefixes
+            .into_iter()
+            .any(|p| p.as_ref() == crate::revocation_push::GRANT_REVOCATION_PUSH_PREFIX)
+        {
+            registry.bits |= Self::GRANT_REVOCATION_PUSH_V1;
+        }
+        registry
     }
 
     /// Require the bit for a typed product payload. Ordinary DMs are unchanged.
@@ -163,6 +207,8 @@ impl CapabilityRegistry {
     pub(crate) fn required_for_payload(payload: &[u8]) -> Option<(u64, &'static str)> {
         if payload.starts_with(crate::share_grant::SHARE_GRANT_DM_PREFIX) {
             Some((Self::SHARE_GRANT_V1, "share_grant_v1"))
+        } else if payload.starts_with(crate::share_grant::names::SHARE_GRANT_V2_DM_PREFIX) {
+            Some((Self::SHARE_GRANT_NAMES_V1, "share_grant_names_v1"))
         } else if payload.starts_with(b"X0X-GROUP-PREDECESSOR-RELAY-V1\n") {
             Some((Self::PREDECESSOR_OFFER_V1, "predecessor_offer_v1"))
         } else if payload.starts_with(crate::groups::eviction::EVICTION_HANDOFF_PREFIX) {
@@ -182,9 +228,28 @@ impl CapabilityRegistry {
             Some((Self::GUI_SHOW_V1, "gui_show_v1"))
         } else if payload.starts_with(crate::groups::key_republish::KEY_REPUBLISH_PREFIX) {
             Some((Self::KEY_REPUBLISH_V1, "key_republish_v1"))
+        } else if payload.starts_with(crate::revocation_push::GRANT_REVOCATION_PUSH_PREFIX) {
+            Some((Self::GRANT_REVOCATION_PUSH_V1, "grant_revocation_push_v1"))
         } else {
             None
         }
+    }
+
+    /// The bit for a typed payload that carries a durable obligation: a
+    /// share grant (v1 or the names envelope) or a predecessor relay or
+    /// requester offer (#1158). `None` for every other payload.
+    ///
+    /// These are held while the recipient has no current verified advert
+    /// (see [`crate::dm_capability::CapabilityStore::require_payload_capability`]).
+    /// An older peer does not route these prefixes: it can record the
+    /// bytes as an ordinary DM and release an ACK, and the sender would
+    /// then drop an obligation that was never met.
+    pub(crate) fn obligation_for_payload(payload: &[u8]) -> Option<(u64, &'static str)> {
+        Self::required_for_payload(payload).filter(|(bit, _)| {
+            *bit == Self::SHARE_GRANT_V1
+                || *bit == Self::SHARE_GRANT_NAMES_V1
+                || *bit == Self::PREDECESSOR_OFFER_V1
+        })
     }
 
     /// Unknown registry versions never imply support.
@@ -821,6 +886,14 @@ pub(crate) fn millis_since(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// The message prefix of the [`DmError::EnvelopeConstruction`] that
+/// `send_direct` returns when this node's ADR-0043 B/P pairing policy
+/// refuses the recipient's machine. A caller that must tell this
+/// definitive policy refusal from other envelope failures (the ADR 0110
+/// S4 designated hand-off outcome) matches on it, so every producer
+/// builds its message from this constant.
+pub(crate) const RECIPIENT_PAIRING_DENIED: &str = "recipient pairing denied";
+
 /// Errors surfaced by the gossip DM path. See design doc §"Error model".
 #[derive(Debug, thiserror::Error)]
 pub enum DmError {
@@ -828,6 +901,27 @@ pub enum DmError {
     /// and retry after the recipient upgrades or advertises again.
     #[error("recipient_upgrade_required: {capability}")]
     RecipientUpgradeRequired {
+        /// Required named registry bit (ADR 0093).
+        capability: &'static str,
+    },
+
+    /// #1158: an obligation-carrying typed send (share grant, predecessor
+    /// relay, requester offer) has no current verified capability advert
+    /// for the recipient, and the wait of one advert period
+    /// ([`crate::dm_capability::OBLIGATION_CAPABILITY_WAIT_SECS`]) is still
+    /// running. Nothing was sent. A targeted advert refresh was requested;
+    /// keep the obligation and retry.
+    #[error("recipient_capability_pending: {capability}")]
+    RecipientCapabilityPending {
+        /// Required named registry bit (ADR 0093).
+        capability: &'static str,
+    },
+
+    /// #1158: as [`Self::RecipientCapabilityPending`], but no verified
+    /// advert arrived within one advert period. Nothing was sent and the
+    /// obligation is kept; a later advert from the recipient releases it.
+    #[error("recipient_capability_unavailable: {capability}")]
+    RecipientCapabilityUnavailable {
         /// Required named registry bit (ADR 0093).
         capability: &'static str,
     },
@@ -911,6 +1005,18 @@ pub enum DmError {
     /// rejected the sender.
     #[error("recipient rejected: {reason}")]
     RecipientRejected { reason: String },
+
+    /// The local ADR-0043 §9 B/P gate denied the `(agent, machine)` pairing
+    /// that the send resolved, so nothing was sent. Check B: a tombstone
+    /// retired the binding. Check P: a current placement record pins the
+    /// agent to another machine. This is a local policy refusal, not a
+    /// transient fault: a retry fails the same way until the recipient's
+    /// binding or placement changes.
+    #[error("recipient pairing denied (ADR-0043 B/P): {denial:?}")]
+    RecipientPairingDenied {
+        /// Which check denied the pairing.
+        denial: crate::key_move::PairingDenial,
+    },
 
     /// Local gossip publish failed — typically because the mesh is not
     /// joined yet or the inbox topic has no active peers. Distinct from

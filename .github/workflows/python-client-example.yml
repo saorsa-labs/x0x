@@ -1,0 +1,108 @@
+name: Python Client Example
+
+# Keeps examples/python-client honest: lint + strict type-check on every
+# touch, and a two-daemon loopback DM round-trip (inside the standard CI
+# network-isolation namespace) when the example or the API surface changes.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'examples/python-client/**'
+      - '.github/workflows/python-client-example.yml'
+      - 'src/api/**'
+      - 'src/server/**'
+      - 'docs/api-reference.md'
+      - 'src/lib.rs'
+      - 'src/dm*.rs'
+      - 'Cargo.lock'
+      - 'scripts/ci/isolated-runtime.py'
+      - 'scripts/ci/apt-install.sh'
+  pull_request:
+    paths:
+      - 'examples/python-client/**'
+      - '.github/workflows/python-client-example.yml'
+      - 'src/api/**'
+      - 'src/server/**'
+      - 'docs/api-reference.md'
+      - 'src/lib.rs'
+      - 'src/dm*.rs'
+      - 'Cargo.lock'
+      - 'scripts/ci/isolated-runtime.py'
+      - 'scripts/ci/apt-install.sh'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # CMake 4 runner images reject the bundled opus in audiopus_sys (#1816).
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  CMAKE_x86_64_unknown_linux_gnu: ${{ github.workspace }}/scripts/ci/cmake-policy-min.sh
+  RUSTFLAGS: "-D warnings"
+  # Match the isolated-runtime debuginfo profile (#1789). The rust-cache
+  # entry is this workflow's own: there is no shared-key, and the feature
+  # set differs from the integration workflow.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+
+jobs:
+  typecheck-lint:
+    name: Python Example Typecheck & Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install checkers (pinned)
+        run: python3 -m pip install 'mypy==1.15.0' 'ruff==0.9.6'
+      - name: Ruff lint
+        run: ruff check examples/python-client
+      - name: Mypy strict
+        run: mypy --strict examples/python-client
+
+  demo-e2e:
+    name: Python Example Demo (two-daemon DM)
+    runs-on: ubuntu-latest
+    needs: typecheck-lint
+    # One debug build of x0xd plus a demo of about 3 minutes.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Symlink dependencies
+        run: |
+          mkdir -p .deps
+          git clone --depth 1 https://github.com/saorsa-labs/ant-quic .deps/ant-quic || true
+          git clone --depth 1 https://github.com/saorsa-labs/saorsa-gossip .deps/saorsa-gossip || true
+          ln -sf "$(pwd)/.deps/ant-quic" ../ant-quic
+          ln -sf "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Use the system Opus so audiopus_sys finds it with pkg-config and
+      # does not build its bundled copy with CMake (#1816).
+      - name: Install Opus (libopus-dev, pkg-config)
+        run: |
+          scripts/ci/apt-install.sh --no-install-recommends libopus-dev pkg-config
+          pkg-config --modversion opus
+      - name: Build x0xd
+        run: cargo build --locked --bin x0xd
+      - name: Run demo in the isolation namespace
+        # tests/AGENTS.md: anything that starts a daemon runs inside the
+        # loopback-only namespace. The demo's own config is already hermetic
+        # (--no-hard-coded-bootstrap, loopback bind, mDNS off); the namespace
+        # makes that fail-closed.
+        env:
+          # Deadline for the isolated demo only (the build is a separate
+          # step); isolated-runtime.py stops the child when it expires.
+          X0X_RUNTIME_TIMEOUT_SECONDS: 900
+        run: |
+          python3 scripts/ci/isolated-runtime.py \
+            python3 examples/python-client/demo.py --x0xd target/debug/x0xd

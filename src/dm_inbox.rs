@@ -46,16 +46,18 @@ pub const GROUP_PREDECESSOR_RELAY_DM_PREFIX: &[u8] = b"X0X-GROUP-PREDECESSOR-REL
 ///
 /// `PUBLIC_GROUP_BOOTSTRAP_DM_PREFIX` is defined in the server layer; its
 /// literal is repeated here and pinned equal by a server-side test.
-pub(crate) const PRODUCTION_TYPED_DM_PREFIXES: [&[u8]; 9] = [
+pub(crate) const PRODUCTION_TYPED_DM_PREFIXES: [&[u8]; 11] = [
     crate::exec::EXEC_DM_PREFIX,
     GROUP_PREDECESSOR_RELAY_DM_PREFIX,
     crate::share_grant::SHARE_GRANT_DM_PREFIX,
+    crate::share_grant::names::SHARE_GRANT_V2_DM_PREFIX,
     crate::history::classify::GROUP_PUBLIC_MESSAGE_DM_PREFIX,
     crate::history::classify::KV_STORE_DELTA_DM_PREFIX,
     b"X0X-PUBLIC-GROUP-BOOTSTRAP-V2\n",
     crate::gui::remote::SHOW_REQUEST_PREFIX,
     crate::gui::remote::SHOW_RESULT_PREFIX,
     crate::gui::remote::ACTIVITY_PREFIX,
+    crate::revocation_push::GRANT_REVOCATION_PUSH_PREFIX,
 ];
 
 /// Whether these bytes claim one of the production typed-DM protocols
@@ -490,6 +492,19 @@ pub struct AuthenticatedMachineBindingCache {
     clock: u64,
     /// ADR-0074 §4: wake open-stream reauth after a retained-machine change.
     change_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// #901: roster members that had no retained binding at a roster
+    /// resolve. Counts resolve-time misses, not distinct agents. Internal;
+    /// the debug line in [`Self::note_roster_misses`] reports it.
+    roster_members_without_binding: u64,
+    /// #901: the part of [`Self::roster_members_without_binding`] where
+    /// this cache still attributes a machine to the agent, so the capacity
+    /// bound dropped the retained binding.
+    roster_members_evicted: u64,
+    /// Last roster-miss debug line, monotonic milliseconds.
+    roster_miss_log_ms: u64,
+    /// Test seam (#901): binding-resolve write-lock acquisitions.
+    #[cfg(test)]
+    resolve_lock_takes: u64,
 }
 
 impl Default for AuthenticatedMachineBindingCache {
@@ -538,6 +553,11 @@ impl Default for AuthenticatedMachineBindingCache {
             capacity: AUTHENTICATED_MACHINE_BINDING_CAPACITY,
             clock: 0,
             change_notify: None,
+            roster_members_without_binding: 0,
+            roster_members_evicted: 0,
+            roster_miss_log_ms: 0,
+            #[cfg(test)]
+            resolve_lock_takes: 0,
         }
     }
 }
@@ -553,7 +573,7 @@ impl AuthenticatedMachineBindingCache {
     }
 
     #[cfg(test)]
-    fn with_capacity(capacity: usize) -> Self {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             entries: std::collections::HashMap::new(),
             by_machine: Default::default(),
@@ -598,6 +618,11 @@ impl AuthenticatedMachineBindingCache {
             capacity: capacity.max(1),
             clock: 0,
             change_notify: None,
+            roster_members_without_binding: 0,
+            roster_members_evicted: 0,
+            roster_miss_log_ms: 0,
+            #[cfg(test)]
+            resolve_lock_takes: 0,
         }
     }
 
@@ -2059,6 +2084,86 @@ impl AuthenticatedMachineBindingCache {
         self.recency.insert((tick.0, tick.1, agent_id.0));
         Some(binding)
     }
+
+    /// Resolve every member of one group roster, in roster order (#901).
+    ///
+    /// Each member with a retained binding is touched in the LRU order, as
+    /// one [`Self::resolve`] per member does. A member without a retained
+    /// binding yields `None`: missing evidence gives no machine.
+    ///
+    /// The misses are counted. `local` is this daemon's own agent and is
+    /// not counted, because its machine is never a roster peer.
+    fn resolve_roster(&mut self, agents: &[AgentId], local: &AgentId) -> Vec<Option<MachineId>> {
+        let mut machines = Vec::with_capacity(agents.len());
+        let mut without_binding = 0u64;
+        let mut evicted = 0u64;
+        let mut evicted_sample = None;
+        for agent in agents {
+            let machine = self.resolve(agent);
+            if machine.is_none() && agent != local {
+                without_binding += 1;
+                // Attribution outlives LRU eviction of the retained binding
+                // (#1659), so it shows that a binding was held and dropped.
+                // It is bounded too: when it is gone, the miss is counted
+                // only in `without_binding`.
+                if self.accepted_machines.contains_key(agent) {
+                    evicted += 1;
+                    evicted_sample.get_or_insert(*agent);
+                }
+            }
+            machines.push(machine);
+        }
+        self.note_roster_misses(without_binding, evicted, evicted_sample);
+        machines
+    }
+
+    /// Count roster members without a retained binding. At most one debug
+    /// line per warning interval reports an evicted member.
+    fn note_roster_misses(&mut self, without_binding: u64, evicted: u64, sample: Option<AgentId>) {
+        self.roster_members_without_binding = self
+            .roster_members_without_binding
+            .saturating_add(without_binding);
+        self.roster_members_evicted = self.roster_members_evicted.saturating_add(evicted);
+        let Some(agent) = sample else {
+            return;
+        };
+        let now = monotonic_ms();
+        if !warn_interval_open(self.roster_miss_log_ms, now) {
+            return;
+        }
+        self.roster_miss_log_ms = now.max(1);
+        tracing::debug!(
+            agent = %hex::encode(agent.as_bytes()),
+            evicted_in_roster = evicted,
+            evicted_total = self.roster_members_evicted,
+            without_binding_total = self.roster_members_without_binding,
+            capacity = self.capacity,
+            "#901: roster member's authenticated binding was evicted; no eager preference until it announces again"
+        );
+    }
+
+    /// `(without binding, of which evicted)` roster-resolve misses (#901).
+    #[cfg(test)]
+    pub(crate) fn roster_binding_misses(&self) -> (u64, u64) {
+        (
+            self.roster_members_without_binding,
+            self.roster_members_evicted,
+        )
+    }
+
+    /// Test seam (#901): binding-resolve write-lock acquisitions.
+    #[cfg(test)]
+    pub(crate) fn resolve_lock_takes(&self) -> u64 {
+        self.resolve_lock_takes
+    }
+
+    #[cfg(test)]
+    fn count_resolve_lock_take(&mut self) {
+        self.resolve_lock_takes += 1;
+    }
+
+    #[cfg(not(test))]
+    fn count_resolve_lock_take(&mut self) {}
 }
 
 /// Shared retained cache of authenticated agent→machine bindings.
@@ -2244,14 +2349,34 @@ pub(crate) async fn authenticated_machine_binding_evidence(
     bindings: &AuthenticatedMachineBindings,
     agent_id: &AgentId,
 ) -> Option<AuthenticatedMachineBinding> {
-    bindings.write().await.resolve_evidence(agent_id)
+    let mut cache = bindings.write().await;
+    cache.count_resolve_lock_take();
+    cache.resolve_evidence(agent_id)
 }
 
 pub(crate) async fn authenticated_machine_binding(
     bindings: &AuthenticatedMachineBindings,
     agent_id: &AgentId,
 ) -> Option<MachineId> {
-    bindings.write().await.resolve(agent_id)
+    let mut cache = bindings.write().await;
+    cache.count_resolve_lock_take();
+    cache.resolve(agent_id)
+}
+
+/// The retained machine of every member of one group roster, in roster
+/// order, under one write-lock acquisition (#901).
+///
+/// A `None` entry has no authenticated binding and must get no preference.
+/// `local` is this daemon's own agent; see
+/// `AuthenticatedMachineBindingCache::resolve_roster`.
+pub(crate) async fn authenticated_roster_machine_bindings(
+    bindings: &AuthenticatedMachineBindings,
+    agents: &[AgentId],
+    local: &AgentId,
+) -> Vec<Option<MachineId>> {
+    let mut cache = bindings.write().await;
+    cache.count_resolve_lock_take();
+    cache.resolve_roster(agents, local)
 }
 
 #[cfg(test)]
@@ -3966,6 +4091,21 @@ impl InboxPipeline {
             // withholds (the sender will retry).
             {
                 let sender_agent = AgentId(envelope.sender_agent_id);
+                // #1455: pin the sender's machine as the owner of THEIR
+                // inbox topic BEFORE the warm pass below, so this receiver's
+                // bounded EAGER set for the ACK publish carries the frame to
+                // the sender itself instead of a bystander that refuses
+                // unsubscribed pass-through (the send path records the same
+                // ownership from the resolved recipient machine).
+                // Origin-gated like the connected-map registration below
+                // (#927): an unattested machine claim must not steer eager
+                // selection.
+                if origin_authenticated {
+                    self.pubsub.note_dm_inbox_owner(
+                        crate::dm::dm_inbox_topic(&sender_agent),
+                        sender_machine_id,
+                    );
+                }
                 crate::dm_inbox::warm_reverse_ack_topics(
                     self.pubsub.as_ref(),
                     &self.self_agent_id,
@@ -4009,13 +4149,39 @@ impl InboxPipeline {
             return;
         }
 
+        let (typed_route, typed_route_outcome) =
+            Self::matching_typed_route(&self.typed_payload_routes, &plaintext.payload);
+        // ADR 0080 §4: the grant-revocation push prefix — and ONLY that
+        // prefix — is owned unconditionally on every DM ingress path. With
+        // no route claiming it (the startup window, or a library embedder
+        // that never wires the route) the payload reaches neither DM
+        // history nor the generic subscribers, on the gossip path exactly
+        // as on the raw path. Dropped BEFORE the dedupe claim and with the
+        // ACK withheld, so a sender retry still lands once the route
+        // exists. Every other prefix, and any frame a registered route's
+        // validator refused, keeps the documented generic path (a
+        // validator returning false leaves the bytes on the generic DM
+        // path; the refusal is marked in the history row).
+        if typed_route.is_none()
+            && plaintext
+                .payload
+                .starts_with(crate::revocation_push::GRANT_REVOCATION_PUSH_PREFIX)
+        {
+            tracing::debug!(
+                target: "dm.trace",
+                stage = "inbound_push_prefix_unrouted",
+                reason = "not_ready",
+                request_id = %hex::encode(envelope.request_id),
+                sender = %crate::logging::LogAgentId::from(&sender_agent_id),
+                "gossip DM carries a grant-revocation push no route claims; dropped"
+            );
+            return;
+        }
         // Reserve bounded typed-route capacity before claiming dedupe. A full
         // predecessor channel cannot justify an Accepted ACK: the sender's
         // obligation must remain pending so it can retry. The permit makes
         // capacity admission atomic with the claim across the primary inbox
         // and legacy-bus subscription loops.
-        let (typed_route, typed_route_outcome) =
-            Self::matching_typed_route(&self.typed_payload_routes, &plaintext.payload);
         let typed_permit = if let Some(route) = typed_route {
             match route.sender.try_reserve() {
                 Ok(permit) => Some(permit),
@@ -4198,6 +4364,27 @@ impl InboxPipeline {
             return DurableAckDecision::Withheld("typed_route_not_durable");
         }
         let is_durable_typed_route = typed_route_durable == Some(true);
+
+        // ADR 0080 §4: same push-prefix ownership as the v1 path — with no
+        // route claiming the grant-revocation push prefix, the payload
+        // reaches neither DM history nor the generic subscribers. The v2
+        // ACK is withheld like any other refusal (a #1003 push sender never
+        // waits for an ACK at all). ONLY this prefix: every other payload,
+        // including one a registered route's validator refused, keeps the
+        // generic durable path.
+        if typed_route_durable.is_none()
+            && application_payload.starts_with(crate::revocation_push::GRANT_REVOCATION_PUSH_PREFIX)
+        {
+            tracing::debug!(
+                target: "dm.trace",
+                stage = "inbound_durable_push_prefix_unrouted",
+                reason = "not_ready",
+                request_id = %hex::encode(request_id),
+                sender = %hex::encode(sender_agent_id.as_bytes()),
+                "durable gossip DM carries a grant-revocation push no route claims; dropped"
+            );
+            return DurableAckDecision::Withheld("push_prefix_unrouted");
+        }
 
         // 1. Per-logical-request lock. Serializes the primary inbox and the
         //    legacy-bus copy of the same envelope so neither can observe a
@@ -5618,6 +5805,249 @@ mod tests {
             .await;
 
         assert_eq!(decision, DurableAckDecision::Withheld("commit_failed"));
+    }
+
+    /// ADR 0080 §4 on the GOSSIP v1 path: a #1003 grant-revocation push on
+    /// a daemon with the DEFAULT inbox config — no typed routes, as in a
+    /// library embedder or the startup window — must reach neither the
+    /// generic subscribers nor the dedupe/ACK path. RED without the
+    /// gossip-path push-prefix drop: the payload is broadcast as an
+    /// ordinary DM.
+    #[tokio::test]
+    async fn gossip_v1_production_prefix_without_route_is_dropped() {
+        let sender = test_keypair();
+        let machine = MachineId([0xE1; 32]);
+        let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
+        assert!(
+            harness.pipeline.typed_payload_routes.is_empty(),
+            "default config: no routes"
+        );
+
+        let mut payload = crate::revocation_push::GRANT_REVOCATION_PUSH_PREFIX.to_vec();
+        payload.extend_from_slice(b"push-record-bytes");
+        let mut envelope = craft_unsigned_payload_envelope_versioned(
+            &harness,
+            &sender,
+            machine,
+            0x81,
+            DM_PROTOCOL_V1,
+            payload.clone(),
+        );
+        sign_envelope_with_agent(&mut envelope, &sender);
+        let key = envelope.dedupe_key();
+        let body = match envelope.body.clone() {
+            DmBody::Payload(p) => p,
+            _ => panic!("payload body"),
+        };
+        harness
+            .pipeline
+            .handle_payload(
+                envelope,
+                body,
+                machine,
+                PayloadOrigin::Retained,
+                sender.public_key().as_bytes().to_vec(),
+                false,
+            )
+            .await;
+        assert_no_delivery(&mut harness.receiver).await;
+        assert!(
+            harness.pipeline.cache.lookup(&key).is_none(),
+            "dropped before the dedupe claim: a retry still lands once the route exists"
+        );
+
+        // Control: an ordinary payload through the same inbox IS delivered.
+        let ordinary = b"ordinary gossip DM".to_vec();
+        let mut envelope = craft_unsigned_payload_envelope_versioned(
+            &harness,
+            &sender,
+            machine,
+            0x82,
+            DM_PROTOCOL_V1,
+            ordinary.clone(),
+        );
+        sign_envelope_with_agent(&mut envelope, &sender);
+        let body = match envelope.body.clone() {
+            DmBody::Payload(p) => p,
+            _ => panic!("payload body"),
+        };
+        harness
+            .pipeline
+            .handle_payload(
+                envelope,
+                body,
+                machine,
+                PayloadOrigin::Retained,
+                sender.public_key().as_bytes().to_vec(),
+                false,
+            )
+            .await;
+        let shown = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("delivery wait")
+            .expect("ordinary DM delivered");
+        assert_eq!(shown.payload, ordinary);
+    }
+
+    /// ADR 0080 §4 on the GOSSIP v2-durable path: the same ownership — with
+    /// no registered route the push payload is withheld before DM history
+    /// and the generic subscribers, like any other refusal (the sender
+    /// keeps its bounded retry). RED without the durable-path drop: a
+    /// committed DM-history row and a generic broadcast. ONLY the push
+    /// prefix is owned this way; see the validator-refused tests below.
+    #[tokio::test]
+    async fn gossip_v2_production_prefix_without_route_is_withheld() {
+        let sender = test_keypair();
+        let machine = MachineId([0xE2; 32]);
+        let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
+        let _service = attach_history(&mut harness);
+        let history = harness.pipeline.history.clone().expect("history handle");
+        assert!(harness.pipeline.typed_payload_routes.is_empty());
+
+        let mut payload = crate::revocation_push::GRANT_REVOCATION_PUSH_PREFIX.to_vec();
+        payload.extend_from_slice(b"push-record-bytes");
+        let mut envelope = craft_unsigned_payload_envelope_versioned(
+            &harness,
+            &sender,
+            machine,
+            0x83,
+            DM_PROTOCOL_DURABLE_ACK,
+            payload.clone(),
+        );
+        sign_envelope_with_agent(&mut envelope, &sender);
+        let decision = harness
+            .pipeline
+            .handle_payload_durable(
+                envelope,
+                payload,
+                TrustDecision::Accept,
+                machine,
+                true,
+                sender.public_key().as_bytes().to_vec(),
+                false,
+            )
+            .await;
+        assert_eq!(
+            decision,
+            DurableAckDecision::Withheld("push_prefix_unrouted")
+        );
+        assert_no_delivery(&mut harness.receiver).await;
+        assert!(
+            committed_rows(&history, &sender, 0x83).is_empty(),
+            "no DM-history row for an unrouted production typed frame"
+        );
+    }
+
+    /// Round 6 (David: "Fold into #1829"): the gossip drop owns ONLY the
+    /// push prefix. A frame that a registered VALIDATED route refused —
+    /// here a production prefix whose validator returns false, e.g. a
+    /// signed non-predecessor event — keeps the documented generic path on
+    /// gossip v1: delivered to subscribers (the history row marks the
+    /// refused prefix). RED against the round-5 drop, which swallowed every
+    /// production prefix and silently dropped such user DMs.
+    #[tokio::test]
+    async fn gossip_v1_validator_refused_production_frame_still_delivered() {
+        let sender = test_keypair();
+        let machine = MachineId([0xE3; 32]);
+        let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
+        let (tx, mut typed_rx) = mpsc::channel::<DmTypedPayload>(4);
+        harness.pipeline.typed_payload_routes = vec![DmTypedPayloadRoute {
+            prefix: b"X0X-GROUP-PREDECESSOR-RELAY-V1\n".to_vec(),
+            sender: tx,
+            durable_completion: false,
+            validator: Some(|_| false),
+        }];
+
+        let payload = b"X0X-GROUP-PREDECESSOR-RELAY-V1\nnot-a-predecessor-event".to_vec();
+        let mut envelope = craft_unsigned_payload_envelope_versioned(
+            &harness,
+            &sender,
+            machine,
+            0x84,
+            DM_PROTOCOL_V1,
+            payload.clone(),
+        );
+        sign_envelope_with_agent(&mut envelope, &sender);
+        let body = match envelope.body.clone() {
+            DmBody::Payload(p) => p,
+            _ => panic!("payload body"),
+        };
+        harness
+            .pipeline
+            .handle_payload(
+                envelope,
+                body,
+                machine,
+                PayloadOrigin::Retained,
+                sender.public_key().as_bytes().to_vec(),
+                false,
+            )
+            .await;
+        assert!(
+            typed_rx.try_recv().is_err(),
+            "the validator refused it: never on the typed route"
+        );
+        let shown = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("delivery wait")
+            .expect("validator-refused frame stays on the generic DM path");
+        assert_eq!(shown.payload, payload);
+    }
+
+    /// Round 6: the v2-durable twin — a validator-refused production-prefix
+    /// frame keeps the generic durable path (dispatched to subscribers,
+    /// committed, Acked), instead of being withheld until the sender's
+    /// retries expire. RED against the round-5 drop.
+    #[tokio::test]
+    async fn gossip_v2_validator_refused_production_frame_still_delivered() {
+        let sender = test_keypair();
+        let machine = MachineId([0xE4; 32]);
+        let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
+        let _service = attach_history(&mut harness);
+        let (tx, mut typed_rx) = mpsc::channel::<DmTypedPayload>(4);
+        harness.pipeline.typed_payload_routes = vec![DmTypedPayloadRoute {
+            prefix: b"X0X-GROUP-PREDECESSOR-RELAY-V1\n".to_vec(),
+            sender: tx,
+            durable_completion: false,
+            validator: Some(|_| false),
+        }];
+
+        let payload = b"X0X-GROUP-PREDECESSOR-RELAY-V1\nnot-a-predecessor-event".to_vec();
+        let mut envelope = craft_unsigned_payload_envelope_versioned(
+            &harness,
+            &sender,
+            machine,
+            0x85,
+            DM_PROTOCOL_DURABLE_ACK,
+            payload.clone(),
+        );
+        sign_envelope_with_agent(&mut envelope, &sender);
+        let decision = harness
+            .pipeline
+            .handle_payload_durable(
+                envelope,
+                payload.clone(),
+                TrustDecision::Accept,
+                machine,
+                true,
+                sender.public_key().as_bytes().to_vec(),
+                false,
+            )
+            .await;
+        assert_eq!(
+            decision,
+            DurableAckDecision::Acked {
+                protocol_version: DM_PROTOCOL_DURABLE_ACK,
+                accepted: true,
+            },
+            "a validator-refused frame keeps the generic durable path"
+        );
+        assert!(typed_rx.try_recv().is_err());
+        let shown = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("delivery wait")
+            .expect("validator-refused frame delivered to subscribers");
+        assert_eq!(shown.payload, payload);
     }
 
     /// Happy path: commit lands first, then a v2-stamped ACK, and the schema

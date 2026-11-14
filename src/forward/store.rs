@@ -763,6 +763,20 @@ pub(crate) fn restore_decision_classified(
     let same_agent = resolved.agent_id == Some(record.pinned_agent_id);
     let same_machine =
         record.kind != NameKind::Machine || resolved.machine_id == Some(record.pinned_machine_id);
+    // Right after a restart the pinned machine can resolve before the agent
+    // it announces is rediscovered. No agent is not a different key, so
+    // retry like an unknown name instead of giving up for the daemon run.
+    if record.kind == NameKind::Machine
+        && resolved.kind == NameKind::Machine
+        && same_machine
+        && resolved.agent_id.is_none()
+    {
+        return Err(Transient(format!(
+            "unknown_name: {name} reaches its pinned machine {} but its agent is not \
+             discovered yet",
+            hex::encode(record.pinned_machine_id.as_bytes()),
+        )));
+    }
     if resolved.kind != record.kind || !same_agent || !same_machine {
         return Err(Permanent(format!(
             "{NAME_CHANGED}: {name} now resolves to {} agent {} machine {}, but the forward \

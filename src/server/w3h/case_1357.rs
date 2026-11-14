@@ -331,6 +331,11 @@ struct Arm {
     restart_a: bool,
     /// D calls the public remove API on B after the trigger.
     manual: bool,
+    /// ADR 0110 L427: seeing `unresolved_designated_admin` is part of
+    /// this row's pass condition. With the designated admin held off the
+    /// fabric, a waiting rank must expose the unresolved designated route
+    /// naming it through the public status before its fallback time.
+    unresolved_cause: bool,
     check: Check,
     bound: Bound,
     /// The admin that must sign the exclusion commit on every survivor
@@ -357,6 +362,7 @@ const IDLE: Arm = Arm {
     trigger: Trigger::SelfRevoke,
     restart_a: false,
     manual: false,
+    unresolved_cause: false,
     check: Check::Healthy,
     bound: Bound::Completion,
     committer: None,
@@ -408,6 +414,7 @@ const MANUAL_DURING_WINDOW: Arm = Arm {
     trigger: Trigger::SelfRevoke,
     restart_a: false,
     manual: true,
+    unresolved_cause: true,
     check: Check::ManualQueued,
     bound: Bound::Fallback,
     committer: None,
@@ -421,6 +428,7 @@ const MANUAL_WITHOUT_OBLIGATION: Arm = Arm {
     check: Check::Healthy,
     bound: Bound::Completion,
     cause: CAUSE_NO_OBLIGATION,
+    unresolved_cause: false,
     ..MANUAL_DURING_WINDOW
 };
 
@@ -435,10 +443,18 @@ const MANUAL_WITHOUT_OBLIGATION: Arm = Arm {
 /// observed by hand-off 6–265 ms after t = 0, and H (11.1–13.1 s) was set
 /// by A's restart sync wait from process start, which the case now waits
 /// out before t = 0.
+///
+/// `unresolved_cause` stays `false` in this arm (#1581 review r7,
+/// finding 8): the L427 typed-cause assertion runs in the manual flow
+/// below (`s4_fallback_rank_manual`), and here A is reachable — the
+/// held paths release at W/2, so D's and E's dispatches against it
+/// reach an exchange before W ends and record `exchange_reached`, never
+/// an unresolved route.
 const LATE_OBSERVATION: Arm = Arm {
     survivors: &["A", "D", "E", "C"],
     hold: Hold::AllPathsUntilHalfW,
     manual: false,
+    unresolved_cause: false,
     check: Check::Healthy,
     bound: Bound::Fallback,
     committer: Some("A"),
@@ -446,8 +462,15 @@ const LATE_OBSERVATION: Arm = Arm {
     ..MANUAL_DURING_WINDOW
 };
 
+/// `unresolved_cause` stays `false` here too (#1581 review r7,
+/// finding 8): A is off the fabric, so D's and E's unresolved routes
+/// toward it are real, but this arm's verdict is the ranked fallback
+/// reaching H — the L427 pass condition is asserted by
+/// `s4_fallback_rank_manual`, which holds A off the fabric through the
+/// same wait.
 const STALLED_A_FALLBACK: Arm = Arm {
     manual: false,
+    unresolved_cause: false,
     check: Check::Healthy,
     cause: CAUSE_STALLED,
     ..MANUAL_DURING_WINDOW
@@ -1595,6 +1618,77 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
             "S4 status at the early read: {}",
             statuses(sim, labels, &group).await?
         ));
+        // ADR 0110 L427: seeing `unresolved_designated_admin` is part
+        // of this row's pass condition. A is off the fabric, so D's and
+        // E's outbound dispatches against it complete with no exchange
+        // and no definitive failure, and a waiting rank (D until its
+        // fallback at W, E until W + Δ) exposes the unresolved
+        // designated route naming A through the public status during W
+        // (L171: the label holds through W, not forever), before its
+        // fallback time.
+        if arm.unresolved_cause {
+            let timing = timing();
+            let deadline = started
+                .saturating_add(timing.designated_window)
+                .saturating_sub(secs(2));
+            let mut unresolved_at: Option<Duration> = None;
+            let waited = sim
+                .until(
+                    "a waiting rank shows unresolved_designated_admin naming A",
+                    deadline
+                        .saturating_sub(sim.fabric().now())
+                        .max(Duration::from_millis(1)),
+                    async |s: &Sim| {
+                        for label in ["D", "E"] {
+                            let Ok((status, body)) = s
+                                .request(label, Method::GET, &format!("/groups/{group}"), None)
+                                .await
+                            else {
+                                continue;
+                            };
+                            if !status.is_success() {
+                                continue;
+                            }
+                            let shown =
+                                body["revocation_evictions"].as_array().is_some_and(|rows| {
+                                    rows.iter().any(|row| {
+                                        row["target"].as_str() == Some(b_hex.as_str())
+                                            && row["waiting"]["cause"].as_str()
+                                                == Some("unresolved_designated_admin")
+                                            && row["waiting"]["designated_admin"]
+                                                .as_str()
+                                                .is_some_and(|named| {
+                                                    named.eq_ignore_ascii_case(&a_hex)
+                                                })
+                                    })
+                                });
+                            if shown {
+                                unresolved_at = Some(s.fabric().now());
+                                return true;
+                            }
+                        }
+                        false
+                    },
+                )
+                .await;
+            receipt.evidence(
+                "a_waiting_rank_shows_unresolved_designated_admin_naming_a",
+                unresolved_at.is_some() && waited.is_ok(),
+                format!(
+                    "unresolved cause shown on a waiting rank {:?} after t=0 \
+                     (D's fallback is at W = {:?}, E's at W + Δ = {:?}); poll {}",
+                    unresolved_at,
+                    timing.designated_window,
+                    timing.fallback_offset(2),
+                    if waited.is_ok() {
+                        "completed"
+                    } else {
+                        "hit its deadline"
+                    },
+                ),
+                at(sim),
+            );
+        }
     }
 
     if arm.check == Check::NoEarlySibling {

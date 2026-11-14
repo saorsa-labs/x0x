@@ -667,6 +667,7 @@ fn raw_entry(grant: &ShareGrant, to: AgentId, now: u64) -> PendingGrantDelivery 
         deadline: grant.expiry,
         next_attempt_at: now,
         attempts: 0,
+        names: None,
     }
 }
 
@@ -844,17 +845,29 @@ impl PausedSend {
 }
 
 /// Shared body of the two race tests: with a send of `grant` paused in
-/// flight, `revoke` (polled exactly once) must NOT be able to make the
-/// revocation effective — it must wait at the barrier until the pass has
-/// finished. Deterministic: a single `now_or_never` poll, no timers. With
-/// the barrier removed, that one poll inserts the revocation synchronously
-/// (before any I/O await) and the assertion fails.
+/// flight, `revoke` must NOT be able to complete — it must park at the
+/// #926 barrier until the pass has finished, so no new send or enqueue of
+/// the grant can follow its return. The revoke is DRIVEN concurrently for
+/// 250 ms, not poked with one poll: a single `Pending` poll proves nothing
+/// here, because without the barrier the first poll parks in the persist
+/// (the in-process write lock plus fs I/O on the blocking pool) and then
+/// completes. With the barrier it can NEVER finish while the pass holds
+/// the gate, however long it is driven; with the barrier removed (the
+/// case-7 mutation: drop 6b, or the local barrier) it finishes during the
+/// pause and the select panics.
+///
+/// `in_force_during_wait` pins what the drive did to the in-memory set: a
+/// LOCAL revoke takes the gate BEFORE it records (ADR 0077), so the
+/// revocation is NOT in force while it waits; a remote carrier (gossip or
+/// the #1003 push) inserts in memory first and waits in step 6b
+/// (ADR 0080 §4 / D139), so it IS already in force.
 async fn assert_revoke_waits_for_in_flight_send<R>(
     world: &World,
     outbox: &GrantRedeliveryOutbox,
     receiver: &Receiver,
     grant: &ShareGrant,
     revoke: R,
+    in_force_during_wait: bool,
 ) where
     R: std::future::Future<Output = ()>,
 {
@@ -872,14 +885,21 @@ async fn assert_revoke_waits_for_in_flight_send<R>(
     );
 
     tokio::pin!(revoke);
-    assert!(revoke.as_mut().now_or_never().is_none());
-    assert!(
-        !world
+    tokio::select! {
+        () = revoke.as_mut() => {
+            panic!("the revoke completed while a send of the grant was in flight")
+        }
+        () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+    }
+    assert_eq!(
+        world
             .revocations
             .read()
             .await
             .is_share_grant_revoked(&grant.grant_id, &grant.owner),
-        "a revocation took effect while a send of the grant was in flight"
+        in_force_during_wait,
+        "local: gate before record (ADR 0077); remote: in force in memory \
+         during the 6b wait (ADR 0080 §4 / D139)"
     );
 
     paused.release.notify_one();
@@ -930,13 +950,16 @@ async fn local_revoke_is_ordered_after_an_in_flight_send() {
     let revoke = async {
         world.revoke(&grant, &identity_dir, &outbox).await.unwrap();
     };
-    assert_revoke_waits_for_in_flight_send(&world, &outbox, &receiver, &grant, revoke).await;
+    assert_revoke_waits_for_in_flight_send(&world, &outbox, &receiver, &grant, revoke, false).await;
 }
 
-/// WHY (review r2 P1): a revocation delivered by GOSSIP (the
-/// `x0x.revocation.v3` carrier) must be ordered against redelivery exactly
-/// like a local one — it takes the same barrier through `OwnerTrust`, so a
-/// queued send cannot slip out after it took effect.
+/// WHY (review r2 P1; re-pinned to D139 by #1003 review round 1): a
+/// revocation delivered by GOSSIP (the `x0x.revocation.v3` carrier) runs
+/// ADR 0080 §4 step 6's split — 6a inserts in memory at once (the
+/// revocation is in force while the send is still in flight), then 6b
+/// waits at the same `OwnerTrust` barrier, so the ingest cannot RETURN
+/// until the in-flight pass has finished and no new send or enqueue of the
+/// grant can follow it.
 #[tokio::test]
 async fn gossiped_revoke_is_ordered_after_an_in_flight_send() {
     let world = World::new().await;
@@ -968,7 +991,7 @@ async fn gossiped_revoke_is_ordered_after_an_in_flight_send() {
             .await
         );
     };
-    assert_revoke_waits_for_in_flight_send(&world, &outbox, &receiver, &grant, revoke).await;
+    assert_revoke_waits_for_in_flight_send(&world, &outbox, &receiver, &grant, revoke, true).await;
     // The gossiped revocation is durable too.
     let bytes = std::fs::read(identity_dir.join(crate::SHARE_GRANT_REVOCATIONS_FILE)).unwrap();
     assert!(RevocationSet::from_bytes_v3(&bytes)
@@ -1728,5 +1751,148 @@ async fn revocation_resync_hold_keeps_queued_grant_delivery() {
         })
         .await;
     assert_eq!(resumed.delivered, 1, "{resumed:?}");
+    assert!(outbox.is_empty());
+}
+
+/// WHY (ADR 0079): a pre-0079 outbox file — entries with no `names` field —
+/// still loads (migrated in memory, rewritten in the current format on the
+/// next persist), while a tampered names attachment fails the file closed.
+#[tokio::test]
+async fn pre_adr0079_outbox_file_loads_and_a_tampered_names_attachment_fails_closed() {
+    let world = World::new().await;
+    let grant = world.grant(1, 3_600);
+    // Legacy on-disk layout: positional bincode without the trailing
+    // `names` Option (field order of the pre-0079 struct).
+    let legacy = vec![(
+        world.a1,
+        grant.clone(),
+        world.now,
+        world.now + 600,
+        world.now,
+        0u32,
+    )];
+    let mut bytes = b"X0GO".to_vec();
+    bytes.extend_from_slice(&bincode::serialize(&legacy).unwrap());
+    std::fs::write(world.outbox_path(), bytes).unwrap();
+    let outbox = world.outbox(world.now).await;
+    assert!(outbox.load_error().is_none(), "{:?}", outbox.load_error());
+    let pending = outbox.pending();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].recipient, world.a1);
+    assert_eq!(pending[0].names, None, "legacy entries migrate as v1");
+
+    // A names attachment that does not verify against its grant fails the
+    // whole file closed (nothing silently dropped or rewritten).
+    let bogus = super::super::names::SignedGrantNames {
+        names: super::super::names::GrantNames {
+            owner_name: Some("Mallory".to_string()),
+            machines: Vec::new(),
+        },
+        signature: vec![0u8; 4],
+    };
+    let entry = PendingGrantDelivery {
+        recipient: world.a1,
+        grant: grant.clone(),
+        queued_at: world.now,
+        deadline: world.now + 600,
+        next_attempt_at: world.now,
+        attempts: 0,
+        names: Some(bogus),
+    };
+    write_raw_outbox(&world.outbox_path(), &[entry]);
+    let outbox = world.outbox(world.now).await;
+    assert!(
+        outbox
+            .load_error()
+            .is_some_and(|e| e.contains("names attachment")),
+        "{:?}",
+        outbox.load_error()
+    );
+    assert!(outbox.pending().is_empty());
+}
+
+/// WHY (#1831 review nit): a pre-0079 outbox file with several entries
+/// loads every entry in order, each migrated as v1.
+#[tokio::test]
+async fn pre_adr0079_outbox_file_with_several_entries_migrates_all() {
+    let world = World::new().await;
+    let first = world.grant(1, 3_600);
+    let second = world.grant(2, 3_600);
+    let other = recipient(9);
+    let legacy = vec![
+        (
+            world.a1,
+            first.clone(),
+            world.now,
+            world.now + 600,
+            world.now,
+            0u32,
+        ),
+        (
+            other,
+            second.clone(),
+            world.now,
+            world.now + 600,
+            world.now,
+            2u32,
+        ),
+    ];
+    let mut bytes = b"X0GO".to_vec();
+    bytes.extend_from_slice(&bincode::serialize(&legacy).unwrap());
+    std::fs::write(world.outbox_path(), bytes).unwrap();
+    let outbox = world.outbox(world.now).await;
+    assert!(outbox.load_error().is_none(), "{:?}", outbox.load_error());
+    let pending = outbox.pending();
+    assert_eq!(pending.len(), 2);
+    let find = |grant: &ShareGrant| {
+        pending
+            .iter()
+            .find(|p| p.grant == *grant)
+            .cloned()
+            .expect("entry migrated")
+    };
+    let a = find(&first);
+    assert_eq!(
+        (a.recipient, a.attempts, a.names.clone()),
+        (world.a1, 0, None)
+    );
+    let b = find(&second);
+    assert_eq!((b.recipient, b.attempts, b.names.clone()), (other, 2, None));
+}
+
+/// WHY (#1831 review nit): a valid v2 entry reloaded from disk retries with
+/// the exact v2 bytes and request id the first send used.
+#[tokio::test]
+async fn reloaded_v2_entry_retries_with_the_exact_v2_bytes() {
+    let world = World::new().await;
+    let grant = world.grant(3, 3_600);
+    let envelope = super::super::names::ShareGrantV2::sign(
+        &world.owner,
+        grant.clone(),
+        super::super::names::GrantNames {
+            owner_name: Some("Bob Smith".to_string()),
+            machines: Vec::new(),
+        },
+    )
+    .unwrap();
+    let (expected_payload, expected_id) =
+        super::super::names::grant_delivery_request_v2(&envelope).unwrap();
+    let mut entry = raw_entry(&grant, world.a1, world.now);
+    entry.names = Some(envelope.attachment());
+    write_raw_outbox(&world.outbox_path(), &[entry]);
+
+    let outbox = world.outbox(world.now).await;
+    assert!(outbox.load_error().is_none(), "{:?}", outbox.load_error());
+    assert_eq!(outbox.pending().len(), 1);
+    let sent: std::sync::Mutex<Vec<(Vec<u8>, [u8; 16])>> = std::sync::Mutex::new(Vec::new());
+    let report = outbox
+        .step(world.now, &world.revocations, |_to, payload, id| {
+            sent.lock().unwrap().push((payload, id));
+            async { Ok(()) }
+        })
+        .await;
+    assert_eq!(report.delivered, 1, "{report:?}");
+    let sent = sent.into_inner().unwrap();
+    assert_eq!(sent, vec![(expected_payload, expected_id)]);
     assert!(outbox.is_empty());
 }

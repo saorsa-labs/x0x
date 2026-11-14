@@ -8,6 +8,13 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # CMake 4 (ubuntu-26.04 runners) rejects the bundled opus in audiopus_sys
+  # 0.2.2 (cmake_minimum_required < 3.5). The env var alone did not reach the
+  # configure call in CI, so the cmake crate also runs a wrapper that adds
+  # -DCMAKE_POLICY_VERSION_MINIMUM=3.5. See scripts/ci/cmake-policy-min.sh
+  # (#1816). Do not pin or downgrade cmake.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  CMAKE_x86_64_unknown_linux_gnu: ${{ github.workspace }}/scripts/ci/cmake-policy-min.sh
 
 jobs:
   validate-release-metadata:
@@ -232,8 +239,7 @@ jobs:
       - name: Prepare ARM64 packaged verification
         if: matrix.platform == 'linux-arm64-gnu'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y qemu-user libc6-arm64-cross libgcc-s1-arm64-cross
+          scripts/ci/apt-install.sh qemu-user libc6-arm64-cross libgcc-s1-arm64-cross
 
       - name: Download public signing controls
         uses: actions/download-artifact@v5

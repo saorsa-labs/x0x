@@ -89,6 +89,7 @@ async fn a_slow_page_send_does_not_hold_the_catchup_listener() -> Result<()> {
         events: Vec::new(),
         truncated: false,
         responder_state_hash: Some(String::new()),
+        responder_state_revision: None,
     })?;
     let next = tokio::time::timeout(
         STEP,

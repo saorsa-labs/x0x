@@ -27,7 +27,7 @@ use saorsa_gossip_transport::GossipTransport;
 #[cfg(test)]
 use saorsa_gossip_types::MessageHeader;
 use saorsa_gossip_types::{MessageKind, PeerHealthOracle, PeerId, TopicId, TopicPriority};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -159,6 +159,10 @@ pub fn inner_verify_stats() -> InnerVerifyStatsSnapshot {
 /// lost. Exposed via `GET /diagnostics/gossip`.
 #[derive(Debug, Default)]
 pub struct PubSubStats {
+    /// Test-only: (subscription topic, sender) of each payload refused for a
+    /// revoked or blocked sender, so a test can tie a refusal to a message.
+    #[cfg(test)]
+    pub(crate) refused_senders: std::sync::Mutex<Vec<(String, AgentId)>>,
     /// Successful `publish()` calls (encoded + handed to PlumTree).
     pub publish_total: AtomicU64,
     /// `publish()` that failed at encoding/signing or PlumTree handoff.
@@ -1208,6 +1212,10 @@ fn count_refused_deliveries(stats: &PubSubStats, sub_topic: &str, sender: &Agent
     stats
         .incoming_sender_refused
         .fetch_add(waiting, Ordering::Relaxed);
+    #[cfg(test)]
+    if let Ok(mut refused) = stats.refused_senders.lock() {
+        refused.push((sub_topic.to_string(), *sender));
+    }
     if sender_refusal_log_due(&stats.sender_refusal_logged_at_ms) {
         tracing::debug!(
             topic = %sub_topic,
@@ -1292,6 +1300,8 @@ pub struct Subscription {
     topic_id_by_name: Arc<std::sync::RwLock<HashMap<String, TopicId>>>,
     /// Live subscribed transport ids used by the Leaf C0 refuse gate.
     subscribed_topic_ids: Arc<std::sync::RwLock<HashSet<TopicId>>>,
+    /// #731: marked before the last subscriber leaves the subscribed set.
+    publisher_topics: Arc<super::participation::PublisherTopics>,
     /// Group classification and SG preference cleared with the last subscriber.
     group_topic_by_id: Arc<RwLock<HashMap<TopicId, GroupTopicBinding>>>,
     plumtree: Arc<PlumtreePubSub<PubSubTransport>>,
@@ -1390,6 +1400,7 @@ impl Drop for Subscription {
         let topic_ref_counts = self.topic_ref_counts.clone();
         let topic_id_by_name = self.topic_id_by_name.clone();
         let subscribed_topic_ids = self.subscribed_topic_ids.clone();
+        let publisher_topics = self.publisher_topics.clone();
         let group_topic_by_id = self.group_topic_by_id.clone();
         let plumtree = self.plumtree.clone();
         let group_preference_apply_locks = self.group_preference_apply_locks.clone();
@@ -1422,6 +1433,9 @@ impl Drop for Subscription {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .remove(&topic);
                     if let Some(topic_id) = topic_id {
+                        // #731: this path keeps the sg cache, which still
+                        // holds other peers' messages.
+                        publisher_topics.note_unsubscribed(topic_id, Instant::now());
                         subscribed_topic_ids
                             .write()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1543,6 +1557,11 @@ pub struct PubSubManager {
     /// task drains the receiver so a quiet hold cannot fill the channel
     /// and drop the PlumTree registration.
     membership_holds: Arc<RwLock<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    /// #1455: DM inbox topic id → the machine that owns (subscribes to)
+    /// that inbox. The durable send path records the capability-resolved
+    /// recipient machine so Leaf membership promotes the actual subscriber
+    /// into the bounded EAGER set. See [`Self::note_dm_inbox_owner`].
+    dm_inbox_owners: Mutex<DmInboxOwnerRegistry>,
     /// Issue #380: Leaf skips pass-through eager-set refresh.
     participation: ParticipationMode,
     /// Why this process selected Leaf or Full (diagnostics / startup log).
@@ -1610,6 +1629,9 @@ pub struct PubSubManager {
     unsubscribed_refused_frames: AtomicU64,
     unsubscribed_refused_bytes: AtomicU64,
     unsubscribed_refused_graft_equiv: AtomicU64,
+    /// #731: topics this Leaf published to recently. The C0 gate still
+    /// lets IWANT through on them so the node serves its own messages.
+    publisher_topics: Arc<super::participation::PublisherTopics>,
     /// Last `fan_out == 0` warn per group, used to rate-limit issue #296.
     zero_fanout_warns: Mutex<HashMap<String, Instant>>,
     /// Test-only: topic ids last passed to `set_topic_peers`.
@@ -1641,6 +1663,10 @@ impl PublishFanoutOutcome {
         (self.fan_out, self.observed_counts)
     }
 }
+
+#[cfg(test)]
+#[path = "pubsub/issue901_tests.rs"]
+mod issue901_tests;
 
 #[cfg(test)]
 mod observed_fanout_controls {
@@ -2103,10 +2129,7 @@ impl PubSubManager {
         let rosters = self.group_rosters.read().await;
         let binding = match kv_group_id {
             Some(id) => rosters.get(&id).map(|roster| roster.active_agents.clone()),
-            None => rosters
-                .iter()
-                .find(|(_, roster)| roster.metadata_topic == name)
-                .map(|(_, roster)| roster.active_agents.clone()),
+            None => Self::sole_metadata_roster(&rosters, name),
         };
         #[cfg(test)]
         {
@@ -2137,6 +2160,26 @@ impl PubSubManager {
         drop(rosters);
     }
 
+    /// The active roster of the one group whose metadata topic is `name`.
+    ///
+    /// A group card or invite sets the metadata topic, so two local group
+    /// records can name the same topic. A first-match lookup then follows
+    /// the roster map's random hash order, and the winner changes between
+    /// installs (#901). When more than one roster claims `name`, no roster
+    /// gets a preference. The topic keeps its ordinary eager membership.
+    fn sole_metadata_roster(
+        rosters: &HashMap<String, GroupEagerRoster>,
+        name: &str,
+    ) -> Option<Vec<AgentId>> {
+        let mut claims = rosters
+            .values()
+            .filter(|roster| roster.metadata_topic == name);
+        match (claims.next(), claims.next()) {
+            (Some(roster), None) => Some(roster.active_agents.clone()),
+            _ => None,
+        }
+    }
+
     async fn clear_group_topic_preference_locked(&self, topic_id: TopicId) {
         if self
             .group_topic_by_id
@@ -2165,10 +2208,15 @@ impl PubSubManager {
         let local = self.transport.local_peer_id();
         let mut ranked = Vec::new();
         let mut seen = HashSet::new();
-        for agent in agents {
-            if let Some(machine) =
-                crate::dm_inbox::authenticated_machine_binding(&identity.bindings, &agent).await
-            {
+        // #901: one cache write lock for the whole roster, not one per member.
+        let machines = crate::dm_inbox::authenticated_roster_machine_bindings(
+            &identity.bindings,
+            &agents,
+            &self.signing.agent_id,
+        )
+        .await;
+        for (agent, machine) in agents.into_iter().zip(machines) {
+            if let Some(machine) = machine {
                 // Raw Direct frames carry an untrusted AgentId prefix and can
                 // overwrite the reachability map. Only an independently
                 // authenticated binding may authorize a roster preference.
@@ -2363,6 +2411,7 @@ impl PubSubManager {
             #[cfg(test)]
             admitted_transport_id_reads: reads,
             membership_holds: Arc::new(RwLock::new(HashMap::new())),
+            dm_inbox_owners: Mutex::new(DmInboxOwnerRegistry::default()),
             participation: ParticipationMode::Leaf,
             participation_reason: "default_leaf".to_string(),
             passthrough_refresh_runs: AtomicU64::new(0),
@@ -2395,6 +2444,7 @@ impl PubSubManager {
             unsubscribed_refused_frames: AtomicU64::new(0),
             unsubscribed_refused_bytes: AtomicU64::new(0),
             unsubscribed_refused_graft_equiv: AtomicU64::new(0),
+            publisher_topics: Arc::default(),
             #[cfg(test)]
             refreshed_topic_ids: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -2664,6 +2714,17 @@ impl PubSubManager {
         self.stats.snapshot()
     }
 
+    /// Test-only: the (subscription topic, sender) pairs refused for a
+    /// revoked or blocked sender so far.
+    #[cfg(test)]
+    pub(crate) fn refused_senders_for_test(&self) -> Vec<(String, AgentId)> {
+        self.stats
+            .refused_senders
+            .lock()
+            .map(|refused| refused.clone())
+            .unwrap_or_default()
+    }
+
     /// Record a `fan_out == 0` publish and return whether to `warn!`.
     ///
     /// Increments [`PubSubStats::publish_zero_fanout`]. Skips the warn when
@@ -2818,6 +2879,7 @@ impl PubSubManager {
                 generation,
                 topic_id_by_name: Arc::clone(&self.topic_id_by_name),
                 subscribed_topic_ids: Arc::clone(&self.subscribed_topic_ids),
+                publisher_topics: Arc::clone(&self.publisher_topics),
                 group_topic_by_id: Arc::clone(&self.group_topic_by_id),
                 plumtree: Arc::clone(&self.plumtree),
                 group_preference_apply_locks: Arc::clone(&self.group_preference_apply_locks),
@@ -2920,6 +2982,7 @@ impl PubSubManager {
                 generation,
                 topic_id_by_name: Arc::clone(&self.topic_id_by_name),
                 subscribed_topic_ids: Arc::clone(&self.subscribed_topic_ids),
+                publisher_topics: Arc::clone(&self.publisher_topics),
                 group_topic_by_id: Arc::clone(&self.group_topic_by_id),
                 plumtree: Arc::clone(&self.plumtree),
                 group_preference_apply_locks: Arc::clone(&self.group_preference_apply_locks),
@@ -2985,6 +3048,7 @@ impl PubSubManager {
                 generation,
                 topic_id_by_name: Arc::clone(&self.topic_id_by_name),
                 subscribed_topic_ids: Arc::clone(&self.subscribed_topic_ids),
+                publisher_topics: Arc::clone(&self.publisher_topics),
                 group_topic_by_id: Arc::clone(&self.group_topic_by_id),
                 plumtree: Arc::clone(&self.plumtree),
                 group_preference_apply_locks: Arc::clone(&self.group_preference_apply_locks),
@@ -3079,6 +3143,7 @@ impl PubSubManager {
             generation,
             topic_id_by_name: Arc::clone(&self.topic_id_by_name),
             subscribed_topic_ids: Arc::clone(&self.subscribed_topic_ids),
+            publisher_topics: Arc::clone(&self.publisher_topics),
             group_topic_by_id: Arc::clone(&self.group_topic_by_id),
             plumtree: Arc::clone(&self.plumtree),
             group_preference_apply_locks: Arc::clone(&self.group_preference_apply_locks),
@@ -3264,6 +3329,11 @@ impl PubSubManager {
         let envelope_bytes = Some(Bytes::clone(&encoded));
 
         self.register_dynamic_topic_priority(&topic, topic_id);
+        // #731: record before PlumTree sends the first IHAVE, so a lazy
+        // subscriber's IWANT for this publish cannot meet the C0 gate first.
+        if !self.participation.forwards_passthrough() {
+            self.publisher_topics.record(topic_id, Instant::now());
+        }
         // Classification linearizes here. A roster commit overlapping this
         // publish may affect the next send; a completed writer reconciles
         // every still-known group binding before it returns.
@@ -3609,6 +3679,23 @@ impl PubSubManager {
         if !leaf_refuses_unsubscribed_passthrough(self.participation, subscribed, header.kind) {
             return false;
         }
+        // #731: a publisher serves IWANT for its own messages on a topic it
+        // does not subscribe to. `allows_iwant` is false for
+        // `UNSUBSCRIBE_QUIET` (120 s, which covers the bounded sg key-cache
+        // replay) after the topic was last subscribed. After that the cache
+        // normally holds only this node's publishes, because this gate
+        // refuses every frame that could add another peer's message. sg
+        // replays a queued key-cache frame without an age check, so a peer
+        // that stalls the replay can still add one stale entry; that replay
+        // already bypassed C0 before #731. The lock runs only on this refuse
+        // path.
+        if header.kind == MessageKind::IWant
+            && self
+                .publisher_topics
+                .allows_iwant(&header.topic, Instant::now())
+        {
+            return false;
+        }
         self.unsubscribed_refused_frames
             .fetch_add(1, Ordering::Relaxed);
         self.unsubscribed_refused_bytes
@@ -3663,6 +3750,10 @@ impl PubSubManager {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(topic);
+        // #731: mark first, so an IWANT that sees the topic unsubscribed
+        // before `plumtree.unsubscribe` empties the cache is still refused.
+        self.publisher_topics
+            .note_unsubscribed(topic_id, Instant::now());
         self.subscribed_topic_ids
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3878,6 +3969,27 @@ impl PubSubManager {
         self.apply_preferred_eager_peer(plane, topic_ids).await;
     }
 
+    /// #1455: record the machine that owns `topic_id` — the recipient of a
+    /// direct message owns their own inbox topic. A Leaf publisher's bounded
+    /// EAGER set is chosen without any subscription signal (the gossip wire
+    /// has no SUBSCRIBE message; tied PeerScores resolve by hash order), so
+    /// on a plane with bystander daemons the single EAGER inbox frame can
+    /// land on a Leaf that refuses unsubscribed pass-through and never reach
+    /// the subscriber — the durable send then pays the 250 ms legacy bus
+    /// fallback. The recorded owner outranks the C5b Full/bootstrap
+    /// preference while it stays on the connected plane.
+    pub(crate) fn note_dm_inbox_owner(&self, topic_id: TopicId, owner: MachineId) {
+        lock_std(&self.dm_inbox_owners).note(topic_id, PeerId::new(owner.0));
+    }
+
+    /// #1455: the recorded inbox owner, but only while it is a member of
+    /// `plane`. A recipient that moved machines or went offline must not
+    /// pin eager selection; the caller falls back to the stock choice.
+    fn dm_inbox_owner_on_plane(&self, topic_id: TopicId, plane: &[PeerId]) -> Option<PeerId> {
+        let owner = lock_std(&self.dm_inbox_owners).get(&topic_id)?;
+        plane.contains(&owner).then_some(owner)
+    }
+
     /// Pre-subscribe a topic id (C4) so the first later `publish_topic_id`
     /// is not the PlumTree join. Idempotent. Leaf-safe: uses
     /// [`Self::subscribe_topic_id`] (subscribed path) and does not walk
@@ -4045,6 +4157,14 @@ impl PubSubManager {
             return;
         }
         let preferred = membership.preferred;
+        // #1455: on a Leaf writer an inbox owner recorded by the durable
+        // send path outranks the C5b Full/bootstrap pick — the owner is the
+        // one peer known to subscribe to this topic. #807 stays intact: the
+        // Full arm above returned already, so Full never forces a preferred
+        // eager peer.
+        let preferred = self
+            .dm_inbox_owner_on_plane(topic_id, &membership.full)
+            .or(preferred);
         if self.group_topic_by_id.read().await.contains_key(&topic_id) {
             // The singular SG wrapper replaces the entire persistent set.
             // Preserve an existing roster preference through membership
@@ -4105,6 +4225,36 @@ struct TopicMembership {
     full: Vec<PeerId>,
     /// The actual selected Full/bootstrap peer for C5b, when connected.
     preferred: Option<PeerId>,
+}
+
+/// #1455: bounded inbox-owner registry for the durable DM send path.
+/// FIFO eviction keeps a long-lived daemon at O(CAP) entries; an evicted or
+/// stale owner is inert because the preference applies only while the owner
+/// is on the current connected plane.
+#[derive(Default)]
+struct DmInboxOwnerRegistry {
+    owners: HashMap<TopicId, PeerId>,
+    order: VecDeque<TopicId>,
+}
+
+impl DmInboxOwnerRegistry {
+    const CAP: usize = 512;
+
+    fn note(&mut self, topic: TopicId, owner: PeerId) {
+        if !self.owners.contains_key(&topic) {
+            if self.order.len() >= Self::CAP {
+                if let Some(evicted) = self.order.pop_front() {
+                    self.owners.remove(&evicted);
+                }
+            }
+            self.order.push_back(topic);
+        }
+        self.owners.insert(topic, owner);
+    }
+
+    fn get(&self, topic: &TopicId) -> Option<PeerId> {
+        self.owners.get(topic).copied()
+    }
 }
 
 impl TopicMembership {
@@ -6705,6 +6855,144 @@ mod tests {
             role_for(&manager, topic, other_eager),
             "excluded",
             "the disconnected eager peer must leave the topic"
+        );
+    }
+
+    /// WHY (#1455): with bystander daemons on the plane a Leaf publisher
+    /// picks its two EAGER targets with no subscription signal — tied
+    /// PeerScores resolve in per-process-randomised hash order, so the
+    /// single inbox EAGER frame can land on Leaves that refuse unsubscribed
+    /// pass-through and never reach the recipient; the durable send then
+    /// pays the 250 ms legacy bus fallback. The send path records the
+    /// recipient machine as the inbox owner, and Leaf membership promotes
+    /// that owner eager ahead of the C5b Full/bootstrap choice while it
+    /// stays connected. With the pin the owner seat is deterministic; the
+    /// sweep at the end covers five independent owner draws so a regression
+    /// that drops the pin slips through only ~(2/7)^5 of the time.
+    #[tokio::test]
+    async fn leaf_dm_inbox_owner_is_promoted_eager_over_bystanders() {
+        let bystanders = [[1; 32], [2; 32], [3; 32], [4; 32], [5; 32], [6; 32]];
+        let owner = [7; 32];
+        let mut plane = bystanders.to_vec();
+        plane.push(owner);
+        let manager =
+            membership_manager(2, None, plane.iter().copied().map(PeerId::new).collect()).await;
+        let name = "x0x/dm/v1/inbox/1455-owner-eager";
+        let topic = TopicId::new([95; 32]);
+        // No subscribe call: the sender is not subscribed to the
+        // recipient's inbox (no trusted direct connect), so the publish
+        // itself must form the topic membership — the production cold shape.
+        manager.note_dm_inbox_owner(topic, MachineId(owner));
+        manager
+            .publish_topic_id(name.into(), topic, Bytes::from("dm-1455-a"))
+            .await
+            .unwrap();
+        await_frame_to(&manager, owner, MessageKind::Eager).await;
+        assert_eq!(role_for(&manager, topic, owner), "eager");
+        // The Leaf ceiling still caps EAGER fan-out at two: the owner plus
+        // one hash-order bystander; every other bystander stays a lazy
+        // member (IHAVE/IWANT-repair-eligible).
+        let roles = plane_roles(&manager, topic, &plane);
+        assert_eq!(
+            roles.iter().filter(|(_, role)| role == "eager").count(),
+            2,
+            "eager degree stays capped: {roles:?}"
+        );
+        assert_eq!(
+            roles.iter().filter(|(_, role)| role == "lazy").count(),
+            bystanders.len() - 1,
+            "remaining bystanders stay lazy members: {roles:?}"
+        );
+
+        // A later publish re-applies membership idempotently; the owner
+        // must stay eager rather than churn.
+        manager
+            .publish_topic_id(name.into(), topic, Bytes::from("dm-1455-b"))
+            .await
+            .unwrap();
+        assert_eq!(role_for(&manager, topic, owner), "eager");
+
+        // The recipient leaves the plane (moved or offline): the stale
+        // owner preference must lapse and the degree refill from the plane
+        // instead of holding a disconnected peer eager.
+        set_plane(&manager, bystanders.to_vec());
+        manager
+            .publish_topic_id(name.into(), topic, Bytes::from("dm-1455-c"))
+            .await
+            .unwrap();
+        assert_ne!(
+            role_for(&manager, topic, owner),
+            "eager",
+            "a disconnected owner must not stay eager"
+        );
+        assert_eq!(
+            plane_roles(&manager, topic, &bystanders)
+                .iter()
+                .filter(|(_, role)| role == "eager")
+                .count(),
+            2,
+            "degree refills from the plane after the owner leaves"
+        );
+
+        // Sweep further owners on fresh topics: saorsa-gossip resolves tied
+        // scores in per-process-randomised hash order, so ONE owner-topic
+        // can miss its owner by luck. Five independent owner draws miss all
+        // five seats only ~(2/7)^5 of the time, which is what makes this
+        // test a usable pre-fix discriminator.
+        for (index, sweep_owner) in [[8; 32], [9; 32], [10; 32], [11; 32]]
+            .into_iter()
+            .enumerate()
+        {
+            let sweep_topic = TopicId::new([96 + index as u8; 32]);
+            let mut sweep_plane = bystanders.to_vec();
+            sweep_plane.push(sweep_owner);
+            set_plane(&manager, sweep_plane);
+            manager.note_dm_inbox_owner(sweep_topic, MachineId(sweep_owner));
+            manager
+                .publish_topic_id(
+                    format!("x0x/dm/v1/inbox/1455-sweep-{index}"),
+                    sweep_topic,
+                    Bytes::from(format!("sweep-{index}")),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                role_for(&manager, sweep_topic, sweep_owner),
+                "eager",
+                "sweep owner {index} must hold an eager seat on its own topic"
+            );
+        }
+    }
+
+    /// #1455: the owner registry is bounded — a daemon that DMs thousands
+    /// of agents must not grow it without limit, and eviction is FIFO so a
+    /// re-noted topic keeps its place instead of duplicating queue entries.
+    #[test]
+    fn dm_inbox_owner_registry_is_bounded_fifo() {
+        let mut registry = DmInboxOwnerRegistry::default();
+        let id_for = |i: u32| {
+            let mut bytes = [0u8; 32];
+            bytes[..4].copy_from_slice(&i.to_le_bytes());
+            bytes
+        };
+        for i in 0..u32::try_from(DmInboxOwnerRegistry::CAP).expect("cap fits u32") {
+            let bytes = id_for(i);
+            registry.note(TopicId::new(bytes), PeerId::new(bytes));
+        }
+        let oldest = TopicId::new(id_for(0));
+        assert!(registry.get(&oldest).is_some());
+        // Re-noting a known topic must not grow the FIFO queue past CAP.
+        registry.note(oldest, PeerId::new([0xEE; 32]));
+        assert!(registry.get(&oldest).is_some(), "re-note keeps the topic");
+        registry.note(TopicId::new([0xAA; 32]), PeerId::new([0xAA; 32]));
+        assert!(
+            registry.get(&oldest).is_none(),
+            "the CAP+1-th distinct topic evicts the oldest entry"
+        );
+        assert_eq!(
+            registry.get(&TopicId::new([0xAA; 32])),
+            Some(PeerId::new([0xAA; 32])),
+            "the newest note survives the eviction"
         );
     }
 
@@ -11050,6 +11338,10 @@ mod closed_input_tests {
         assert_eq!(recv_from_either(&mut first, &mut second).await, Some(47));
     }
 }
+
+#[cfg(test)]
+#[path = "pubsub/issue731_tests.rs"]
+mod issue731_tests;
 
 /// SG76: marker-aware inbound routing gates, proven without sockets.
 ///

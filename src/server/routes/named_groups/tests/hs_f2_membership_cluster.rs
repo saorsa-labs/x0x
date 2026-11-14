@@ -7340,6 +7340,7 @@ async fn forking_catchup_responder_adopts_nothing_under_anchored_gap() -> Result
             events: vec![fork_event],
             truncated: false,
             responder_state_hash: None,
+            responder_state_revision: None,
         },
     )
     .await;
@@ -7509,6 +7510,7 @@ async fn forking_catchup_policy_page_leaves_group_state_untouched() -> Result<()
             events: vec![policy_event],
             truncated: false,
             responder_state_hash: None,
+            responder_state_revision: None,
         },
     )
     .await;
@@ -7781,6 +7783,7 @@ async fn honest_multicommit_gap_converges_page_by_page_under_gate() -> Result<()
                 events: vec![page_event],
                 truncated: false,
                 responder_state_hash: None,
+                responder_state_revision: None,
             },
         )
         .await;
@@ -7826,6 +7829,7 @@ async fn honest_multicommit_gap_converges_page_by_page_under_gate() -> Result<()
             events: vec![treekem_event],
             truncated: false,
             responder_state_hash: None,
+            responder_state_revision: None,
         },
     )
     .await;
@@ -8000,6 +8004,7 @@ async fn stale_record_in_one_group_does_not_block_another() -> Result<()> {
             events: vec![],
             truncated: false,
             responder_state_hash: None,
+            responder_state_revision: None,
         },
     )
     .await;
@@ -8088,6 +8093,7 @@ async fn two_admin_real_invite_stub(
         &authority_hex,
         &stage.group_id,
         &joiner_hex,
+        None,
         None,
         None,
     );

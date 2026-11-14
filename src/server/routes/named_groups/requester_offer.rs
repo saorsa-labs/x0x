@@ -31,6 +31,10 @@
 //! pending join request itself remains durably recorded in the group
 //! state, and the authority can still observe the `JoinRequestCreated`
 //! metadata event on the group topic).
+//!
+//! #1365 (D18): the commit, caps, retry and boot-load logic is the
+//! generic [`Outbox`]. This module keeps the record, its sidecar codec
+//! (the v1 bytes are unchanged), the liveness check and the send.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -45,9 +49,18 @@ use super::{
     CAUSAL_RELAY_RETRY_SECS, GROUP_PREDECESSOR_RELAY_DM_PREFIX,
 };
 use crate::server::state::AppState;
+use crate::storage::outbox::{Outbox, OutboxCaps, OutboxMap, OutboxRecord, Settled};
 
 /// Sidecar format version.
 const REQUESTER_OFFER_OUTBOX_VERSION: u32 = 1;
+
+/// The ADR 0028 caps (the relay outbox's bounds).
+const REQUESTER_OFFER_CAPS: OutboxCaps = OutboxCaps {
+    per_partition: CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
+    per_partition_bytes: CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
+    total: CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
+    total_bytes: CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
+};
 
 /// A durable requester→authority predecessor-offer obligation (#908).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +95,83 @@ struct RequesterOfferOutboxFile {
     by_group: HashMap<String, Vec<RequesterOfferObligation>>,
 }
 
+impl OutboxRecord for RequesterOfferObligation {
+    const LABEL: &'static str = "requester offer outbox";
+
+    fn partition(&self) -> &str {
+        &self.group_id
+    }
+
+    fn id(&self) -> &str {
+        &self.request_id
+    }
+
+    fn first_seen_ms(&self) -> u64 {
+        self.first_seen_ms
+    }
+
+    fn byte_size(&self) -> usize {
+        self.byte_size
+    }
+
+    fn next_retry_at_ms(&self) -> u64 {
+        self.next_retry_at_ms
+    }
+
+    fn retry_count(&self) -> u32 {
+        self.retry_count
+    }
+
+    fn set_schedule(&mut self, retry_count: u32, next_retry_at_ms: u64) {
+        self.retry_count = retry_count;
+        self.next_retry_at_ms = next_retry_at_ms;
+    }
+
+    /// #942 M3: `byte_size` must match the envelope it describes and the
+    /// digest must be its blake3.
+    fn check(&self) -> Result<(), String> {
+        if self.byte_size != self.envelope_bytes.len() {
+            return Err(format!("byte_size mismatch on {}", self.request_id));
+        }
+        if blake3::hash(&self.envelope_bytes).as_bytes() != &self.digest {
+            return Err(format!("digest mismatch on {}", self.request_id));
+        }
+        Ok(())
+    }
+
+    fn encode(map: &OutboxMap<Self>) -> Result<Vec<u8>, String> {
+        let file = RequesterOfferOutboxFile {
+            version: REQUESTER_OFFER_OUTBOX_VERSION,
+            by_group: map.clone(),
+        };
+        serde_json::to_vec(&file)
+            .map_err(|e| format!("failed to encode requester offer outbox: {e}"))
+    }
+
+    fn decode(bytes: &[u8], path: &Path) -> Result<OutboxMap<Self>, String> {
+        let file: RequesterOfferOutboxFile = serde_json::from_slice(bytes)
+            .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+        if file.version != REQUESTER_OFFER_OUTBOX_VERSION {
+            return Err(format!(
+                "{}: unsupported requester offer outbox version {} (expected {REQUESTER_OFFER_OUTBOX_VERSION})",
+                path.display(),
+                file.version
+            ));
+        }
+        Ok(file.by_group)
+    }
+}
+
+/// The requester offer outbox over the daemon's state cells.
+fn outbox(state: &AppState) -> Outbox<'_, RequesterOfferObligation> {
+    Outbox::new(
+        &state.requester_offer_outbox,
+        &state.requester_offer_outbox_path,
+        &state.requester_offer_outbox_persistence_lock,
+        REQUESTER_OFFER_CAPS,
+    )
+}
+
 /// Insert (or replace, on a repeated `(group, request_id)`) one
 /// obligation, enforcing the ADR 0028 caps, and persist durably. The
 /// in-memory map changes only after the durable write succeeds; a
@@ -93,207 +183,35 @@ pub(in crate::server) async fn insert_requester_offer_obligation(
     state: &AppState,
     obligation: RequesterOfferObligation,
 ) -> Result<(), String> {
-    let _guard = state.requester_offer_outbox_persistence_lock.lock().await;
-    let snapshot = state.requester_offer_outbox.read().await.clone();
-    let mut next = snapshot.clone();
-    let group = next.entry(obligation.group_id.clone()).or_default();
-    group.retain(|o| o.request_id != obligation.request_id);
-    group.push(obligation);
-    enforce_caps(&mut next);
-    match save_requester_offer_outbox(state, &next).await {
-        Ok(()) => {}
-        Err(e) if e.crossed_rename() => {
-            // #1101: the rename already happened — disk holds `next`.
-            // Commit memory so they agree (a later save from stale memory
-            // would silently drop the durable obligation), and still
-            // report the error: durability is unconfirmed.
-            *state.requester_offer_outbox.write().await = next;
-            return Err(format!(
-                "applied, but durability is not confirmed (directory fsync failed): {e}; \
-                 the change is in effect"
-            ));
-        }
-        Err(e) => return Err(format!("failed to write requester offer outbox: {e}")),
+    match outbox(state).insert(obligation).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.crossed_rename() => Err(format!(
+            "applied, but durability is not confirmed (directory fsync failed): {e}; \
+             the change is in effect"
+        )),
+        Err(e) => Err(format!("failed to write requester offer outbox: {e}")),
     }
-    *state.requester_offer_outbox.write().await = next;
-    Ok(())
-}
-
-/// Enforce the per-group and per-daemon envelope/byte caps, evicting the
-/// OLDEST obligations first (the relay outbox's policy). Pure, so the
-/// eviction order is directly testable.
-fn enforce_caps(by_group: &mut HashMap<String, Vec<RequesterOfferObligation>>) {
-    for list in by_group.values_mut() {
-        list.sort_by_key(|o| o.first_seen_ms);
-        while list.len() > CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP
-            || list.iter().map(|o| o.byte_size).sum::<usize>()
-                > CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP
-        {
-            list.remove(0);
-            if list.is_empty() {
-                break;
-            }
-        }
-    }
-    loop {
-        let count: usize = by_group.values().map(|l| l.len()).sum();
-        let bytes: usize = by_group
-            .values()
-            .flat_map(|l| l.iter().map(|o| o.byte_size))
-            .sum();
-        if count <= CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP
-            && bytes <= CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP
-        {
-            break;
-        }
-        // Evict the single oldest obligation daemon-wide (a linear scan;
-        // the store is capped at ~1024 entries).
-        let mut oldest: Option<(String, usize)> = None;
-        for (group, list) in by_group.iter() {
-            for (idx, obligation) in list.iter().enumerate() {
-                let better = match &oldest {
-                    None => true,
-                    Some((og, oidx)) => {
-                        obligation.first_seen_ms < by_group[og][*oidx].first_seen_ms
-                    }
-                };
-                if better {
-                    oldest = Some((group.clone(), idx));
-                }
-            }
-        }
-        let Some((group, idx)) = oldest else { break };
-        if let Some(list) = by_group.get_mut(&group) {
-            if idx < list.len() {
-                list.remove(idx);
-            }
-        }
-    }
-    by_group.retain(|_, list| !list.is_empty());
-}
-
-/// Durable sidecar write (temp, fsync, 0600, rename, dir fsync — the
-/// same helper the owner key and the grant store use). The typed error
-/// says whether the rename had already happened when a failure arrived
-/// (issue #1101).
-async fn save_requester_offer_outbox(
-    state: &AppState,
-    by_group: &HashMap<String, Vec<RequesterOfferObligation>>,
-) -> Result<(), crate::storage::DurableWriteError> {
-    let file = RequesterOfferOutboxFile {
-        version: REQUESTER_OFFER_OUTBOX_VERSION,
-        by_group: by_group.clone(),
-    };
-    let bytes = serde_json::to_vec(&file).map_err(|e| {
-        crate::storage::DurableWriteError::BeforeRename(std::io::Error::other(format!(
-            "failed to encode requester offer outbox: {e}"
-        )))
-    })?;
-    crate::storage::write_private_bytes_durable_typed(&state.requester_offer_outbox_path, bytes)
-        .await
-        .map_err(|e| e.with_path(&state.requester_offer_outbox_path))
 }
 
 /// Load the outbox at boot. Missing ⇒ empty. Malformed, wrong version, or
-/// over the daemon caps ⇒ empty + an error log (fail-visible, never
-/// blocking startup; the file is left untouched for the operator).
-async fn validate_requester_offer_bytes(
-    bytes: &[u8],
-    path: &Path,
-) -> Result<RequesterOfferOutboxFile, String> {
-    // #942 M3: pre-parse file-size guard — a sidecar within the daemon
-    // caps is at most ~4x the byte cap expanded (JSON Vec<u8>), so
-    // anything larger is corruption, not loadable state.
-    let size_guard = CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP
-        .saturating_mul(4)
-        .saturating_add(1 << 20);
-    if bytes.len() > size_guard {
-        return Err(format!(
-            "{}: requester offer outbox file is {} bytes (over the {:?}-byte guard)",
-            path.display(),
-            bytes.len(),
-            size_guard
-        ));
-    }
-    let file: RequesterOfferOutboxFile = serde_json::from_slice(bytes)
-        .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
-    if file.version != REQUESTER_OFFER_OUTBOX_VERSION {
-        return Err(format!(
-            "{}: unsupported requester offer outbox version {} (expected {REQUESTER_OFFER_OUTBOX_VERSION})",
-            path.display(),
-            file.version
-        ));
-    }
-    let count: usize = file.by_group.values().map(|l| l.len()).sum();
-    let total_bytes: usize = file
-        .by_group
-        .values()
-        .flat_map(|l| l.iter().map(|o| o.byte_size))
-        .sum();
-    let mut rejection: Option<String> = None;
-    if count > CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP
-        || total_bytes > CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP
-    {
-        rejection = Some(format!(
-            "exceeds daemon caps ({count} envelopes, {total_bytes} bytes)"
-        ));
-    }
-    // #942 M3: per-group caps + accounting consistency — byte_size must
-    // match the envelope it describes and the digest must be its blake3.
-    for (group, list) in &file.by_group {
-        if list.len() > CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP
-            || list.iter().map(|o| o.byte_size).sum::<usize>()
-                > CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP
-        {
-            rejection = Some(format!("group {group} exceeds per-group caps"));
-            break;
-        }
-        for o in list {
-            if o.byte_size != o.envelope_bytes.len() {
-                rejection = Some(format!("byte_size mismatch on {}", o.request_id));
-                break;
-            }
-            if blake3::hash(&o.envelope_bytes).as_bytes() != &o.digest {
-                rejection = Some(format!("digest mismatch on {}", o.request_id));
-                break;
-            }
-        }
-        if rejection.is_some() {
-            break;
-        }
-    }
-    if let Some(reason) = rejection {
-        return Err(format!(
-            "{}: requester offer outbox {reason}",
-            path.display()
-        ));
-    }
-
-    // (the caller installs the parsed store)
-    let _ = path;
-    Ok(file)
+/// over the daemon caps ⇒ empty + an error, and the file is moved aside
+/// (#942 M2) so the operator keeps the evidence and the next insert
+/// writes a fresh sidecar.
+pub(in crate::server) async fn load_requester_offer_outbox(state: &AppState) -> Result<(), String> {
+    outbox(state).load(now_millis_u64()).await
 }
 
-pub(in crate::server) async fn load_requester_offer_outbox(state: &AppState) -> Result<(), String> {
-    let path: &Path = &state.requester_offer_outbox_path;
-    let bytes = match crate::w3h_inline::fs::read(path).await {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(format!("failed to read {}: {e}", path.display())),
-    };
-    // Run the strict validation on the raw bytes; on ANY rejection, move
-    // the file aside (#942 M2) so the operator keeps the evidence AND the
-    // next insert writes a fresh sidecar instead of silently overwriting
-    // a file we refused to load.
-    let outcome = validate_requester_offer_bytes(&bytes, path).await;
-    if let Err(error) = outcome {
-        let aside = path.with_extension(format!("corrupt-{}", now_millis_u64()));
-        let _ = crate::w3h_inline::fs::rename(path, &aside).await;
-        return Err(format!("{error} (file moved aside to {})", aside.display()));
-    }
-    let file = validate_requester_offer_bytes(&bytes, path).await?;
-    *state.requester_offer_outbox.write().await = file.by_group;
-    Ok(())
+/// #1158: `authority`'s capability advert arrived while an offer to it
+/// was held. Make its queued offers due now, so the next worker pass
+/// sends them.
+pub(in crate::server) async fn nudge_requester_offers_for(
+    state: &AppState,
+    authority: &crate::identity::AgentId,
+) -> bool {
+    let authority_hex = hex::encode(authority.as_bytes());
+    outbox(state)
+        .nudge(now_millis_u64(), |o| o.authority_agent_id == authority_hex)
+        .await
 }
 
 /// Is the obligation's join still live — pending, in a live group? When
@@ -319,15 +237,10 @@ async fn offer_still_live(state: &AppState, obligation: &RequesterOfferObligatio
 /// discipline).
 pub(in crate::server) async fn requester_offer_step(state: &std::sync::Arc<AppState>) {
     let now_ms = now_millis_u64();
-    let due: Vec<RequesterOfferObligation> = {
-        let outbox = state.requester_offer_outbox.read().await;
-        outbox
-            .values()
-            .flatten()
-            .filter(|o| o.next_retry_at_ms <= now_ms)
-            .cloned()
-            .collect()
-    };
+    // #942 r4/r5 (B8): `due` is in send order — FIRST ATTEMPTS ahead of
+    // retries, oldest-due within each class — so a brand-new offer is
+    // attempted in the FIRST pass even behind a full retry backlog.
+    let due = outbox(state).due(now_ms).await;
     if due.is_empty() {
         return;
     }
@@ -340,24 +253,13 @@ pub(in crate::server) async fn requester_offer_step(state: &std::sync::Arc<AppSt
             resolved.push(obligation);
         }
     }
-    // #942 r4 (bounded pass): oldest-due-first and a per-pass SEND
-    // budget — a hundred slow strict sends can no longer starve a
-    // brand-new obligation behind one 500 ms-tick pass. Unserved
-    // obligations stay due for the next tick.
-    let mut to_send = std::mem::take(&mut to_send);
-    // #942 r5 (B8): FIRST ATTEMPTS ahead of retries — a brand-new offer
-    // is attempted in the FIRST pass even behind a full backlog of
-    // overdue retries; oldest-due within each class.
-    to_send.sort_by_key(|o| (o.retry_count > 0, o.next_retry_at_ms));
+    // #942 r4 (bounded pass): a per-pass SEND budget — a hundred slow
+    // strict sends can no longer starve a brand-new obligation behind
+    // one 500 ms-tick pass. Unserved obligations stay due for the next
+    // tick.
     const REQUESTER_OFFER_PASS_BUDGET: usize = 16;
-    let mut pass_budget: usize = REQUESTER_OFFER_PASS_BUDGET;
-    // (group_id, delivered) per send attempt.
     let mut attempts: Vec<(RequesterOfferObligation, bool)> = Vec::new();
-    for obligation in to_send {
-        if pass_budget == 0 {
-            break;
-        }
-        pass_budget = pass_budget.saturating_sub(1);
+    for obligation in to_send.into_iter().take(REQUESTER_OFFER_PASS_BUDGET) {
         let Ok(authority) = parse_agent_id_hex(&obligation.authority_agent_id) else {
             attempts.push((obligation, false));
             continue;
@@ -397,63 +299,30 @@ pub(in crate::server) async fn requester_offer_step(state: &std::sync::Arc<AppSt
         attempts.push((obligation, delivered));
     }
     // Settle under the persistence lock: mutate → durable write → count.
-    let _guard = state.requester_offer_outbox_persistence_lock.lock().await;
-    let snapshot = state.requester_offer_outbox.read().await.clone();
-    let mut next = snapshot.clone();
-    let mut delivered_groups: Vec<String> = Vec::new();
-    let mut dropped_resolved: Vec<String> = Vec::new();
+    // #942 B1: a FAILED send never leaves the store — the bounded
+    // backoff caps the retry INTERVAL (the 240 s tail repeats), not the
+    // attempt count.
+    match outbox(state)
+        .settle(now_ms, &resolved, &attempts, CAUSAL_RELAY_RETRY_SECS)
+        .await
     {
-        for obligation in &resolved {
-            if remove_obligation(&mut next, obligation) {
-                dropped_resolved.push(obligation.group_id.clone());
+        Settled::Committed { delivered, dropped } => {
+            // Persist-before-count: diagnostics advance only on a durable
+            // store.
+            for group_id in &delivered {
+                state
+                    .groups_diagnostics
+                    .record_requester_offer_delivered(group_id);
+            }
+            for group_id in &dropped {
+                state
+                    .groups_diagnostics
+                    .record_requester_offer_resolved_drop(group_id);
             }
         }
-        for (obligation, delivered) in &attempts {
-            let Some(list) = next.get_mut(&obligation.group_id) else {
-                continue;
-            };
-            let Some(live) = list
-                .iter_mut()
-                .find(|o| o.request_id == obligation.request_id)
-            else {
-                continue;
-            };
-            if *delivered {
-                delivered_groups.push(obligation.group_id.clone());
-                live.retry_count = live.retry_count.saturating_add(1);
-            } else {
-                // #942 B1: bounded INTERVAL, unbounded ATTEMPTS — past the
-                // schedule's end the retry cadence stays at the last
-                // offset (240 s) until ACK/resolution/caps.
-                live.retry_count = live.retry_count.saturating_add(1);
-                let delay_secs = CAUSAL_RELAY_RETRY_SECS[(live.retry_count as usize)
-                    .saturating_sub(1)
-                    .min(CAUSAL_RELAY_RETRY_SECS.len() - 1)];
-                live.next_retry_at_ms = now_ms.saturating_add(delay_secs * 1000);
-            }
-        }
-        // Delivered obligations leave the store. #942 B1: a FAILED send
-        // never does — the bounded backoff caps the retry INTERVAL, not
-        // the attempt count; the obligation lives until the authority
-        // ACKs, the join resolves, or the store caps evict it.
-        for (obligation, delivered) in &attempts {
-            if !*delivered {
-                continue;
-            }
-            if let Some(list) = next.get_mut(&obligation.group_id) {
-                list.retain(|o| o.request_id != obligation.request_id);
-            }
-        }
-        next.retain(|_, list| !list.is_empty());
-    }
-    match save_requester_offer_outbox(state, &next).await {
-        Ok(()) => {}
-        Err(e) if e.crossed_rename() => {
-            // #1101: the rename already happened — disk holds `next`.
-            // Commit `next` so memory agrees with disk, removing the
-            // divergence the old #942 M4 rollback-to-snapshot analysis had
-            // to argue was merely benign (redundant re-delivery of an
-            // ACKed offer). Diagnostics stay uncounted: they advance only
+        Settled::Unconfirmed(e) => {
+            // #1101: the rename already happened — disk and memory hold
+            // the new set. Diagnostics stay uncounted: they advance only
             // on a confirmed durable write.
             tracing::error!(
                 error = %e,
@@ -461,48 +330,14 @@ pub(in crate::server) async fn requester_offer_step(state: &std::sync::Arc<AppSt
                  (directory fsync failed); the change is in effect — committing the disk \
                  state to memory"
             );
-            *state.requester_offer_outbox.write().await = next;
-            return;
         }
-        Err(e) => {
+        Settled::RolledBack(e) => {
             tracing::error!(
                 error = %e,
                 "#908: failed to persist requester offer outbox; rolling back this pass"
             );
-            // Before the rename the file still holds the snapshot's bytes:
-            // rolling memory back keeps the two in agreement.
-            *state.requester_offer_outbox.write().await = snapshot;
-            return;
         }
     }
-    *state.requester_offer_outbox.write().await = next;
-    // Persist-before-count: diagnostics advance only on a durable store.
-    for group_id in &delivered_groups {
-        state
-            .groups_diagnostics
-            .record_requester_offer_delivered(group_id);
-    }
-    for group_id in &dropped_resolved {
-        state
-            .groups_diagnostics
-            .record_requester_offer_resolved_drop(group_id);
-    }
-}
-
-fn remove_obligation(
-    by_group: &mut HashMap<String, Vec<RequesterOfferObligation>>,
-    obligation: &RequesterOfferObligation,
-) -> bool {
-    let Some(list) = by_group.get_mut(&obligation.group_id) else {
-        return false;
-    };
-    let before = list.len();
-    list.retain(|o| o.request_id != obligation.request_id);
-    let after = list.len();
-    if after == 0 {
-        by_group.remove(&obligation.group_id);
-    }
-    before != after
 }
 
 /// Test-only view of the live store.
@@ -510,19 +345,13 @@ fn remove_obligation(
 pub(in crate::server) async fn requester_offer_snapshot(
     state: &AppState,
 ) -> Vec<RequesterOfferObligation> {
-    state
-        .requester_offer_outbox
-        .read()
-        .await
-        .values()
-        .flatten()
-        .cloned()
-        .collect()
+    outbox(state).snapshot().await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::outbox::enforce_caps;
 
     fn obligation(group: &str, request: &str, first_seen_ms: u64) -> RequesterOfferObligation {
         RequesterOfferObligation {
@@ -548,7 +377,7 @@ mod tests {
                 .map(|i| obligation("g", &format!("r{i}"), i as u64))
                 .collect(),
         );
-        enforce_caps(&mut by_group);
+        enforce_caps(&mut by_group, &REQUESTER_OFFER_CAPS);
         let list = &by_group["g"];
         assert_eq!(list.len(), CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP);
         // The OLDEST (smallest first_seen_ms) were evicted.
@@ -571,7 +400,7 @@ mod tests {
                 vec![obligation(&format!("g{g}"), "r", g as u64)],
             );
         }
-        enforce_caps(&mut by_group);
+        enforce_caps(&mut by_group, &REQUESTER_OFFER_CAPS);
         let count: usize = by_group.values().map(|l| l.len()).sum();
         assert_eq!(count, CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP);
         // The OLDEST groups' obligations were evicted: group "g0" (first

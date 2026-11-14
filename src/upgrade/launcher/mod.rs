@@ -1,14 +1,32 @@
-//! Private, dormant S3b engine. No installer or daemon apply path calls it.
-//! The complete inventory issuer and host coordinator remain separate gates.
+//! Private, dormant S3b engine. Only the `x0x-launcher` and `x0xd` binaries
+//! include it; no installer or daemon apply path calls it. The only live
+//! calls are the launcher's exec passthrough (`forward`) and `candidate_boot`
+//! at x0xd start, which ignores a stray `X0X_M2_BOOT_FD` with one warning
+//! while activation is held and refuses only a present permit that fails
+//! its checks (ADR 0094 §6). The complete inventory issuer and host
+//! coordinator remain separate gates.
 #![allow(dead_code)]
 
 mod child;
+mod control;
 mod filesystem;
+pub(crate) mod forward;
 #[path = "../journal.rs"]
 mod journal;
 #[path = "../probe.rs"]
 mod probe;
+mod recovery;
+mod run;
+
+pub(crate) fn candidate_boot(version: &str) -> io::Result<()> {
+    child::candidate_boot(version)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod lifecycle;
+
 const ENABLED: bool = false;
+
 impl Clock {
     fn now() -> io::Result<Self> {
         let clock = probe::ProbeClock::now()?;
@@ -19,12 +37,9 @@ impl Clock {
     }
 }
 
-pub(crate) fn candidate_boot(version: &str) -> io::Result<()> {
-    child::candidate_boot(version)
-}
-pub(crate) fn candidate_boot_for_fixture(version: &str) -> io::Result<()> {
-    child::candidate_boot_owned(version)
-}
+#[cfg(all(test, unix))]
+mod testkit;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -32,6 +47,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+// Trial limits from the D192 direction. `MAX_ATTEMPTS`, `TRIAL_MS` and
+// `READY_MS` are PROVISIONAL and unruled: David has not set them (ADR 0094
+// open questions). The launcher is dormant, so they gate nothing live yet.
 const TRIAL_MS: u64 = 660_000;
 const READY_MS: u64 = 120_000;
 const STABLE_MS: u64 = 60_000;
@@ -82,7 +100,15 @@ struct Trial {
     ready_since_ms: Option<u64>,
     child: Option<Identity>,
     phase: Phase,
+    /// Last per-attempt failure, for diagnostics only. It never classifies.
     cause: Option<String>,
+    /// The rollback cause, fixed when rollback first begins. A launcher
+    /// restart that re-enters rollback keeps it (ADR 0094 S4).
+    verdict: Option<journal::Cause>,
+    /// Restored-child starts, each reserved before spawn and bounded by
+    /// `MAX_ATTEMPTS`. The S3c coordinator retires the trial once the
+    /// restored host is resolved.
+    restored_starts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -111,17 +137,38 @@ impl Trial {
             child: None,
             phase: Phase::Armed,
             cause: None,
+            verdict: None,
+            restored_starts: 0,
         })
     }
 
-    fn check_budget(&self, clock: &Clock) -> io::Result<()> {
+    /// The rollback cause when the trial budget no longer allows work.
+    fn expired(&self, clock: &Clock) -> Option<journal::Cause> {
         if self.boot != clock.boot || clock.ms < self.started_ms {
-            return Err(invalid("interrupted: boot changed or clock regressed"));
+            return Some(cause(
+                journal::CauseClass::Interrupted,
+                "boot changed or clock regressed",
+            ));
         }
-        if clock.ms >= self.deadline_ms {
-            return Err(invalid("failed: total trial deadline reached"));
+        (clock.ms >= self.deadline_ms)
+            .then(|| cause(journal::CauseClass::Failed, "total trial deadline reached"))
+    }
+
+    fn check_budget(&self, clock: &Clock) -> io::Result<()> {
+        match self.expired(clock) {
+            Some(cause) => Err(invalid(cause.reason)),
+            None => Ok(()),
         }
-        Ok(())
+    }
+
+    /// A failed reap or restored start leaves no safe automatic step. The
+    /// durable RecoveryFailed marker is the operator signal; a failed marker
+    /// save must not mask the error that caused it.
+    fn recovery_failed(&mut self, path: &Path, error: io::Error) -> io::Error {
+        self.phase = Phase::RecoveryFailed;
+        self.cause = Some(error.to_string());
+        let _ = self.save(path);
+        error
     }
 
     /// Persist the attempt before exec. A failed spawn consumes this attempt.
@@ -148,7 +195,7 @@ impl Trial {
         }
         if let Some(since) = self.ready_since_ms {
             if !healthy {
-                return Err(invalid("failed: stable health lost"));
+                return Err(invalid("stable health lost"));
             }
             if clock.ms >= since.saturating_add(STABLE_MS) {
                 self.phase = Phase::Provisional;
@@ -157,7 +204,7 @@ impl Trial {
             }
         } else {
             if clock.ms >= self.attempt_deadline_ms {
-                return Err(invalid("failed: readiness deadline reached"));
+                return Err(invalid("readiness deadline reached"));
             }
             if healthy {
                 self.ready_since_ms = Some(clock.ms);
@@ -178,8 +225,11 @@ impl Trial {
                     || old.started_ms != self.started_ms
                     || old.deadline_ms != self.deadline_ms
                     || old.attempts > self.attempts
-                    || (matches!(old.phase, Phase::Stopped | Phase::RecoveryFailed)
-                        && old.phase != self.phase)
+                    || old.restored_starts > self.restored_starts
+                    || (old.phase == Phase::RecoveryFailed && self.phase != old.phase)
+                    // A stopped trial may only roll back (ADR 0094 S4).
+                    || (old.phase == Phase::Stopped
+                        && !matches!(self.phase, Phase::Stopped | Phase::RollingBack))
                 {
                     return Err(invalid("existing trial cannot be replaced or reset"));
                 }
@@ -224,6 +274,8 @@ fn validate_trial(bytes: &[u8]) -> io::Result<()> {
             child.pid == 0 || (trial.phase != Phase::Restored && child.boot != trial.boot)
         })
         || trial.attempt_deadline_ms > trial.deadline_ms
+        || trial.restored_starts > MAX_ATTEMPTS
+        || (matches!(trial.phase, Phase::Restored) && trial.verdict.is_none())
     {
         return Err(invalid("invalid launcher trial"));
     }
@@ -236,6 +288,13 @@ fn digest(value: &impl Serialize) -> io::Result<[u8; 32]> {
 
 fn invalid(reason: impl std::fmt::Display) -> io::Error {
     io::Error::other(reason.to_string())
+}
+
+fn cause(class: journal::CauseClass, reason: impl Into<String>) -> journal::Cause {
+    journal::Cause {
+        class,
+        reason: reason.into(),
+    }
 }
 
 #[cfg(test)]
@@ -260,18 +319,30 @@ mod tests {
     }
 
     #[test]
-    fn attempts_survive_reload_and_exec_failure() {
+    fn a_reserved_attempt_survives_reload() {
         let (_dir, path, mut trial, clock) = fixture();
         trial.phase = Phase::Authorized;
         trial.reserve(&path, &clock).unwrap();
-        // Real failed exec: no candidate code can run a boot counter.
-        assert!(std::process::Command::new(path.with_file_name("absent"))
-            .spawn()
-            .is_err());
         let saved = Trial::load(&path, &trial.binding, "alice").unwrap();
         assert_eq!(saved.attempts, 1);
         assert_eq!(saved.deadline_ms, clock.ms + TRIAL_MS);
         assert_eq!(saved.phase, Phase::Booting);
+    }
+
+    /// A failed reap or restored start marks the trial RecoveryFailed, and
+    /// no later save can move it out of that phase.
+    #[test]
+    fn recovery_failed_is_durable_and_final() {
+        let (_dir, path, mut trial, clock) = fixture();
+        trial.phase = Phase::Authorized;
+        trial.reserve(&path, &clock).unwrap();
+        let error = trial.recovery_failed(&path, invalid("child reap timeout"));
+        assert_eq!(error.to_string(), "child reap timeout");
+        let mut saved = Trial::load(&path, &trial.binding, "alice").unwrap();
+        assert_eq!(saved.phase, Phase::RecoveryFailed);
+        assert_eq!(saved.cause.as_deref(), Some("child reap timeout"));
+        saved.phase = Phase::RollingBack;
+        assert!(saved.save(&path).is_err());
     }
 
     #[test]
@@ -318,7 +389,36 @@ mod tests {
     }
 
     #[test]
-    fn readiness_and_stable_health_are_both_bounded() {
+    fn a_foreign_boot_restored_child_blocks_the_recovery_failed_save() {
+        let (_dir, path, mut trial, clock) = fixture();
+        trial.phase = Phase::Authorized;
+        trial.reserve(&path, &clock).unwrap();
+        trial.phase = Phase::Restored;
+        trial.verdict = Some(cause(journal::CauseClass::Interrupted, "candidate exited"));
+        trial.child = Some(Identity {
+            pid: 2,
+            start: 3,
+            boot: "boot-0".into(),
+        });
+        trial.save(&path).unwrap();
+        // Only Restored may hold a child from another boot, so the exhausted
+        // restored-start path must clear it before RecoveryFailed.
+        let mut kept = trial.clone();
+        kept.recovery_failed(&path, invalid("restored starts exhausted"));
+        assert_eq!(
+            Trial::load(&path, &trial.binding, "alice").unwrap().phase,
+            Phase::Restored
+        );
+        trial.child = None;
+        trial.recovery_failed(&path, invalid("restored starts exhausted"));
+        assert_eq!(
+            Trial::load(&path, &trial.binding, "alice").unwrap().phase,
+            Phase::RecoveryFailed
+        );
+    }
+
+    #[test]
+    fn stable_health_after_readiness_commits_provisional() {
         let (_dir, path, mut trial, clock) = fixture();
         trial.phase = Phase::Authorized;
         trial.reserve(&path, &clock).unwrap();
@@ -356,6 +456,29 @@ mod tests {
             Trial::load(&path, &trial.binding, "alice").unwrap().phase,
             Phase::Provisional
         );
+    }
+
+    /// Per-attempt failures are plain errors; they never carry a cause
+    /// class (the rollback verdict is typed, set by `run::rollback`).
+    #[test]
+    fn readiness_deadline_and_lost_health_fail_the_attempt() {
+        let (_dir, path, mut trial, clock) = fixture();
+        trial.phase = Phase::Authorized;
+        trial.reserve(&path, &clock).unwrap();
+        trial.child = Some(Identity {
+            pid: 2,
+            start: 3,
+            boot: clock.boot.clone(),
+        });
+        let late = Clock {
+            ms: clock.ms + READY_MS,
+            ..clock.clone()
+        };
+        let error = trial.observe_health(&path, &late, false).unwrap_err();
+        assert_eq!(error.to_string(), "readiness deadline reached");
+        assert!(!trial.observe_health(&path, &clock, true).unwrap());
+        let error = trial.observe_health(&path, &clock, false).unwrap_err();
+        assert_eq!(error.to_string(), "stable health lost");
     }
 
     #[test]

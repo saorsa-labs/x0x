@@ -612,8 +612,21 @@ impl PeerStream {
 pub(crate) struct InboundAdmission {
     pub(crate) agents: Option<Vec<crate::identity::AgentId>>,
     pub(crate) prefix: Option<crate::evidence_wire::PrefixLease>,
-    /// A known Unknown relationship peer: recheck it even if discovery vanishes.
+    /// The known Unknown relationship evidence-probe slot (ADR 0089).
     pub(crate) evidence_only: bool,
+    /// The machine had a known agent at pre-prefix admission. An EvidenceV1
+    /// prefix is rechecked against the evidence gate even if its discovery
+    /// entries vanish during the prefix wait (#1107 enrolled slot included).
+    pub(crate) known_machine: bool,
+}
+
+impl InboundAdmission {
+    /// Whether an EvidenceV1 prefix on this admission must be rechecked
+    /// against the evidence gate after the prefix read, whatever discovery
+    /// says then. Covers every marker of a machine known before the prefix.
+    pub(crate) fn recheck_evidence(&self) -> bool {
+        self.known_machine || self.agents.is_some() || self.evidence_only
+    }
 }
 
 /// First agent of a stream's agent list, `None` when the list is empty

@@ -54,9 +54,6 @@ const POLL: Duration = Duration::from_millis(20);
 /// bound (`IDENTITY_ANNOUNCEMENT_CLOCK_SKEW_SECS`, 30 s, src/lib.rs:1903)
 /// and it beats every genuine beat (`>=` at src/lib.rs:2818).
 const ATTACKER_LEAD_SECS: u64 = 20;
-/// The daemon's revocation sweep TTL (`REVOCATION_RECORD_TTL_SECS`,
-/// src/lib.rs:4262).
-const REVOCATION_RECORD_TTL_SECS: u64 = 90 * 24 * 3600;
 const DAY_SECS: u64 = 86_400;
 
 fn now_secs() -> u64 {
@@ -843,17 +840,17 @@ async fn t3_raw_first_resolution_never_selects_the_attacker_machine() {
 }
 
 /// T4 (audit finding 1, lifetime): a revocation whose `revoked_at` is far in
-/// the future is accepted, and the 90-day sweep never removes it.
+/// the future must be refused on receipt.
 ///
-/// Fails on main: `verify_authority` (src/revocation.rs:284) has no bound on
-/// `revoked_at`, and the sweep keeps every record with
-/// `revoked_at >= now - ttl` (src/revocation.rs:645).
+/// Failed before ADR 0115: `verify_authority` had no bound on `revoked_at`.
+/// Since #1108 no agent or machine record leaves the set because of its
+/// age, so the receipt check is the only guard on this timestamp.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn t4_far_future_revoked_at_is_rejected_and_cannot_outlive_the_ttl() {
+async fn t4_far_future_revoked_at_is_rejected() {
     let victim = Victim::start("t4").await;
     let now = now_secs();
 
-    // CONTROL: a current record is accepted, and the sweep expires it.
+    // CONTROL: a current record is accepted, and the sweep keeps it (#1108).
     let current = AgentKeypair::generate().expect("current subject key");
     victim
         .feed_revocations(
@@ -866,13 +863,10 @@ async fn t4_far_future_revoked_at_is_rejected_and_cannot_outlive_the_ttl() {
         "T4 CONTROL FAILED (not the vector): a current self-revocation must be accepted"
     );
     let mut swept = victim.agent.revocation_set().read().await.clone();
-    swept.expire_records_older_than(
-        REVOCATION_RECORD_TTL_SECS,
-        now + REVOCATION_RECORD_TTL_SECS + DAY_SECS,
-    );
+    swept.collect_dead_records(now + 91 * DAY_SECS);
     assert!(
-        !swept.is_agent_revoked(&current.agent_id()),
-        "T4 CONTROL FAILED (not the vector): the sweep must expire a current record after its TTL"
+        swept.is_agent_revoked(&current.agent_id()),
+        "T4 CONTROL FAILED (not the vector): the sweep must keep a current record past 90 days"
     );
 
     // VECTOR
@@ -893,17 +887,47 @@ async fn t4_far_future_revoked_at_is_rejected_and_cannot_outlive_the_ttl() {
         open.push("revoked_at = now + 1 day was accepted".to_string());
     }
     if victim.revoked(&forever.agent_id()).await {
-        let mut swept = victim.agent.revocation_set().read().await.clone();
-        swept.expire_records_older_than(
-            REVOCATION_RECORD_TTL_SECS,
-            now.saturating_add(100 * 365 * DAY_SECS),
-        );
-        open.push(format!(
-            "revoked_at = u64::MAX was accepted; a sweep 100 years later still enforces it: {}",
-            swept.is_agent_revoked(&forever.agent_id())
-        ));
+        open.push("revoked_at = u64::MAX was accepted".to_string());
     }
     assert_vector_closed("T4", &open);
+}
+
+/// #1857: a daemon that holds 1000 revocations must be able to give all of
+/// them to a peer. The sender side is the production batch encoder; the
+/// receiver side is the real listener, with its 2 MiB limit for one batch.
+///
+/// Fails without the batches: 1000 records are about 5.3 MB as one batch,
+/// the listener ignores that batch whole, and no subject is revoked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_thousand_revocations_reach_a_second_node() {
+    let victim = Victim::start("r1857").await;
+    let now = now_secs();
+    let subjects: Vec<AgentKeypair> = (0..1_000)
+        .map(|_| AgentKeypair::generate().expect("subject key"))
+        .collect();
+    let records: Vec<RevocationRecord> = subjects
+        .iter()
+        .map(|subject| self_revocation(subject, now))
+        .collect();
+
+    let batches = crate::revocation::encode_revocation_batches(&records).expect("batches");
+    let courier = AgentKeypair::generate().expect("courier key");
+    for batch in batches {
+        victim.feed(crate::REVOCATION_TOPIC, &courier, batch).await;
+    }
+    // A sentinel batch after the others: the listener takes messages in
+    // order, so every earlier batch is decided when the sentinel is.
+    victim
+        .feed_revocations(crate::REVOCATION_TOPIC, Vec::new())
+        .await;
+
+    let mut missing = 0;
+    for subject in &subjects {
+        if !victim.revoked(&subject.agent_id()).await {
+            missing += 1;
+        }
+    }
+    assert_eq!(missing, 0, "{missing} of 1000 revocations did not arrive");
 }
 
 /// T5 (audit finding 7): a forged announcement changes X's certificate or

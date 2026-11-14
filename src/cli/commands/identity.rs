@@ -92,14 +92,33 @@ pub async fn owner_machines(client: &DaemonClient) -> Result<()> {
 }
 
 /// `x0x announce` — POST /announce
-pub async fn announce(client: &DaemonClient, include_user: bool, consent: bool) -> Result<()> {
+pub async fn announce(
+    client: &DaemonClient,
+    include_user: bool,
+    consent: bool,
+    withdraw_consent: bool,
+) -> Result<()> {
     client.ensure_running().await?;
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "include_user_identity": include_user,
         "human_consent": consent,
     });
+    // #1107: sent only when asked, so the body an older daemon sees is
+    // unchanged for an ordinary announce.
+    if withdraw_consent {
+        body["withdraw_consent"] = serde_json::Value::Bool(true);
+    }
     let resp = client.post("/announce", &body).await?;
     print_value(client.format(), &resp);
+    // #1107: a daemon older than `withdraw_consent` ignores the unknown
+    // field, announces, and answers 200. Without this check the operator
+    // would believe the consent is withdrawn while that daemon still
+    // discloses the identity.
+    if withdraw_consent && resp.get("consent_withdrawn") != Some(&serde_json::Value::Bool(true)) {
+        bail!(
+            "this daemon did not withdraw the consent; it is older than the withdraw_consent option — upgrade it, or restart it to drop the in-memory consent"
+        );
+    }
     Ok(())
 }
 
@@ -235,11 +254,13 @@ pub async fn verify(
 
 /// `x0x identity revoke` — POST /identity/revoke
 ///
-/// The one-id form supports revoking the daemon's own agent. The daemon signs
-/// with its agent key and supplies no subject certificate, so this form cannot
-/// issue machine-signed or user-authority revocations. Use `x0x owner agents
-/// revoke` for a registered sub-agent. Both ids plus `move_epoch` select the
-/// separate owner-signed binding form, which requires the durable API token.
+/// The one-id form supports revoking the daemon's own agent (signed with the
+/// agent key) or its own machine (signed with the machine key, durable API
+/// token). It supplies no subject certificate, so it cannot issue
+/// user-authority revocations. Use `x0x owner agents revoke` for a registered
+/// sub-agent and `x0x owner lose-device` for a lost device. Both ids plus
+/// `move_epoch` select the separate owner-signed binding form, which requires
+/// the durable API token.
 pub async fn revoke(
     client: &DaemonClient,
     agent_id: Option<&str>,
@@ -268,7 +289,8 @@ pub async fn revoke(
 
 /// `x0x identity revocations` — GET /identity/revocations
 ///
-/// Lists all revocation records held by this daemon.
+/// Lists every revocation record held by this daemon: agent, machine,
+/// binding and share-grant subjects. Each row has a `subject_kind`.
 pub async fn revocations(client: &DaemonClient) -> Result<()> {
     client.run_get("/identity/revocations").await
 }
@@ -439,6 +461,29 @@ pub async fn owner_agents_revoke(
     let body = serde_json::json!({ "reason": reason });
     let resp = client
         .delete_with_body(&format!("/owner/agents/{agent_id}"), &body)
+        .await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x owner lose-device` — POST /owner/devices/:machine_id/lose (#1108).
+pub async fn owner_lose_device(
+    client: &DaemonClient,
+    machine_id: &str,
+    reason: Option<&str>,
+    force: bool,
+) -> Result<()> {
+    // The id goes into the URL path: refuse anything that is not an id.
+    if machine_id.len() != 64 || !machine_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("MACHINE_ID must be 64 hex characters (see `x0x owner machines`)");
+    }
+    client.ensure_running().await?;
+    let mut body = serde_json::json!({ "force": force });
+    if let Some(reason) = reason {
+        body["reason"] = serde_json::json!(reason);
+    }
+    let resp = client
+        .post(&format!("/owner/devices/{machine_id}/lose"), &body)
         .await?;
     print_value(client.format(), &resp);
     Ok(())
@@ -710,6 +755,25 @@ mod tests {
         assert_eq!(body["reason"], "superseded");
     }
 
+    /// WHY: the machine id goes into the URL path. A value that is not an
+    /// id must not reach the daemon as a path.
+    #[tokio::test]
+    async fn owner_lose_device_refuses_a_value_that_is_not_a_machine_id() {
+        let (client, captured, _shutdown) = capture_client().await;
+        for bad in ["zz", "../agents/issue", &"ab".repeat(31), &"zz".repeat(32)] {
+            assert!(owner_lose_device(&client, bad, None, false).await.is_err());
+        }
+        assert!(captured.lock().unwrap().is_empty(), "no request was sent");
+
+        owner_lose_device(&client, &"cd".repeat(32), Some("lost"), true)
+            .await
+            .unwrap();
+        let (path, body) = captured.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(path, format!("/owner/devices/{}/lose", "cd".repeat(32)));
+        assert_eq!(body["reason"], "lost");
+        assert_eq!(body["force"], true);
+    }
+
     /// WHY (review r2, finding 2): the ADR-0043 binding form must serialize.
     #[tokio::test]
     async fn identity_revoke_serializes_move_epoch() {
@@ -867,8 +931,64 @@ mod tests {
         let mock_resp = serde_json::json!({"announced": true});
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
-        let result = announce(&client, true, true).await;
+        let result = announce(&client, true, true, false).await;
         assert!(result.is_ok(), "announce should succeed: {:?}", result);
+    }
+
+    /// #1107: `x0x announce --withdraw-consent` sends `withdraw_consent`,
+    /// and an ordinary announce does not send the field at all.
+    #[tokio::test]
+    async fn announce_withdraw_consent_request_body() {
+        use crate::cli::commands::test_support::start_capturing_mock_server;
+        let (url, _shutdown, captured) =
+            start_capturing_mock_server(serde_json::json!({"ok": true, "consent_withdrawn": true}))
+                .await;
+        let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
+
+        announce(&client, false, false, true).await.unwrap();
+        let (path, body) = captured.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(path, "/announce");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "include_user_identity": false,
+                "human_consent": false,
+                "withdraw_consent": true,
+            })
+        );
+
+        announce(&client, true, true, false).await.unwrap();
+        let (_, body) = captured.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({ "include_user_identity": true, "human_consent": true })
+        );
+    }
+
+    /// #1107: a daemon older than `withdraw_consent` answers 200 with no
+    /// `consent_withdrawn`. The CLI must fail, not report success. An
+    /// ordinary announce to the same daemon still succeeds.
+    #[tokio::test]
+    async fn announce_withdraw_consent_fails_when_the_daemon_did_not_withdraw() {
+        for old_daemon_answer in [
+            serde_json::json!({"ok": true, "include_user_identity": false}),
+            serde_json::json!({"ok": true, "consent_withdrawn": false}),
+        ] {
+            let (url, _shutdown) = start_mock_server(old_daemon_answer).await;
+            let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
+            let error = announce(&client, false, false, true)
+                .await
+                .expect_err("no consent_withdrawn: true in the answer");
+            assert!(
+                error
+                    .to_string()
+                    .contains("this daemon did not withdraw the consent"),
+                "{error}"
+            );
+            announce(&client, false, false, false)
+                .await
+                .expect("an ordinary announce does not need the field");
+        }
     }
 
     #[tokio::test]

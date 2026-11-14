@@ -62,6 +62,9 @@ class ShardPlanTest(unittest.TestCase):
             's3-c3': 'w3h_1356_control_s3_c3_owner_reseats_owner_axis_node',
             's3-d8': 'w3h_1356_control_s3_d8_removal_basis_reseats_owner_axis_node',
             's3-d3': 'w3h_1356_control_s3_d3_authorisation_refusals_typed',
+            's3-1661': 'w3h_1356_red_1661_welcome_lost_after_readmission_ends_typed',
+            's3-rm2': 'w3h_1356_control_s3_rm2_reseat_mandate_refusals_typed',
+            's3-d2': 'w3h_1356_control_s3_d2_fork_exposure_contained',
         }
         assigned = SHARDS.assign(self.names)
         for group, name in rows.items():
@@ -69,6 +72,31 @@ class ShardPlanTest(unittest.TestCase):
         self.assertEqual(SHARDS.group_of(
             'w3h_1356_red_s3_c_promoted_admin_reseats_owner_axis_node_more'), 's3')
         self.assertFalse(set(rows.values()) & set(assigned.get('s3', [])))
+
+    def test_rm4_variants_share_their_own_shard(self):
+        # The H-S3-rm4 variants run the H-S3-c prefix, so they stay out of
+        # `s3` and share one split shard.
+        assigned = SHARDS.assign(self.names)
+        rm4 = [name for name in self.names if name.startswith('w3h_1356_control_s3_rm4_')]
+        self.assertTrue(rm4)
+        self.assertEqual(sorted(assigned.get('s3-rm4', [])), sorted(rm4))
+        self.assertFalse(set(rm4) & set(assigned.get('s3', [])))
+
+    def test_gate_requires_h_s3_d2_green(self):
+        # H-S3-d2 (#1572) is a gating row: the W3-H gate step fails when
+        # its receipts are absent (`--require`) or not GREEN (`--expect`).
+        case = 'w3h_1356_control_s3_d2_fork_exposure_contained'
+        self.assertIn(case, self.names)
+        workflow = (SHARDS.ROOT / '.github' / 'workflows' / 'ci.yml').read_text(
+            encoding='utf-8')
+        start = workflow.index('- name: W3-H gate (verdict-stable reruns, D196)')
+        end = workflow.find('\n      - ', start + 1)
+        step = workflow[start:] if end == -1 else workflow[start:end]
+        self.assertIn('scripts/ci/w3h-trace-check.py', step)
+        args = step.split()
+        self.assertIn(case, [args[i + 1] for i, a in enumerate(args[:-1]) if a == '--require'])
+        self.assertIn(f'{case}=GREEN',
+                      [args[i + 1] for i, a in enumerate(args[:-1]) if a == '--expect'])
 
     def test_split_parts_run_the_full_rerun_count_together(self):
         # D196: the gate counts exactly RUNS receipts per case, so the

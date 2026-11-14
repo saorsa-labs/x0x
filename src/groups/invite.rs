@@ -128,6 +128,17 @@ pub struct SignedInvite {
     /// the announce/discovery cache, matching the authoritative digest).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_roster: Option<BTreeMap<String, crate::groups::state_commit::RosterMemberSnapshot>>,
+    /// #646 (D13/W4): the CONTENT ADDRESS of the base roster projection —
+    /// the roster root (`roster_root_of_projection`), hex BLAKE3. Present
+    /// exactly on v6 invites, whose Active+Banned roster exceeds
+    /// [`MAX_INVITE_ROSTER_ENTRIES`] and therefore no longer rides the
+    /// link: the joiner fetches the projection out of band from the
+    /// inviter and admits it only when it re-derives this signed root.
+    /// serde-default: pre-#646 decoders ignore the field and old invites
+    /// decode without it. A v4 invite never carries it (refused as
+    /// malformed — it would ride outside the frozen v4 signed bytes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_roster_root: Option<String>,
     /// #469: the agent this invite was minted for, if addressed. The
     /// authority compares it with `MemberJoined.member_agent_id` before
     /// consuming the secret (issue #469/A4); any other agent's join is
@@ -164,8 +175,22 @@ pub struct SignedInvite {
 
 // ─── #469 InviteV4: signing domains, caps, signed view ───────────────────
 
-/// Current invite wire-format version (#469).
+/// Invite wire-format version whose roster rides the link inline (#469).
 pub const INVITE_VERSION_V4: u8 = 4;
+
+/// #646: invite wire-format version whose base roster is CONTENT-ADDRESSED
+/// (`base_roster_root`) instead of inline. Minted exactly when the
+/// Active+Banned projection exceeds [`MAX_INVITE_ROSTER_ENTRIES`]; smaller
+/// rosters keep minting v4, byte-identical to pre-#646 links. A pre-#646
+/// joiner refuses a v6 link with the existing typed `invite_unsigned`
+/// (such joiners could never receive an over-cap invite before — minting
+/// one was refused).
+///
+/// Version 5 is RESERVED, never minted and refused as unsupported: David
+/// ruled on 9 Nov 2026 ("Yes, renumber") that it stays with archived ADR
+/// 0112's addressed, expiring invite design (D99/D104), together with the
+/// `x0x.invite.v5*` domain strings.
+pub const INVITE_VERSION_V6: u8 = 6;
 
 /// Domain prefix for the v4 canonical signed bytes.
 pub const INVITE_V4_CANONICAL_DOMAIN: &[u8] = b"x0x.invite.v4\0";
@@ -175,6 +200,14 @@ pub const INVITE_V4_INVITER_DOMAIN: &[u8] = b"x0x.invite.v4.inviter\0";
 /// Domain prefix for the owner user-key countersignature over the
 /// canonical bytes.
 pub const INVITE_V4_OWNER_DOMAIN: &[u8] = b"x0x.invite.v4.owner\0";
+/// #646: domain prefix for the v6 canonical signed bytes (the layout
+/// appends `base_roster_root` to the frozen v4 field order).
+pub const INVITE_V6_CANONICAL_DOMAIN: &[u8] = b"x0x.invite.v6\0";
+/// #646: domain prefix for the inviter signature over v6 canonical bytes.
+pub const INVITE_V6_INVITER_DOMAIN: &[u8] = b"x0x.invite.v6.inviter\0";
+/// #646: domain prefix for the owner countersignature over v6 canonical
+/// bytes.
+pub const INVITE_V6_OWNER_DOMAIN: &[u8] = b"x0x.invite.v6.owner\0";
 
 // ─── D5: per-field caps ──────────────────────────────────────────────────
 //
@@ -215,6 +248,19 @@ pub const INVITE_MAX_HOME_PRIMARY_AGENT_BYTES: usize = 64;
 /// constant is raised OR lowered off the derived maximum. The final
 /// encoded-size check remains authoritative regardless.
 pub const MAX_INVITE_ROSTER_ENTRIES: usize = 20;
+
+/// #646: maximum Active+Banned projection entries a CONTENT-ADDRESSED
+/// (v6) invite may stand for. The projection no longer rides the link —
+/// the bound is the out-of-band fetch answer: one `base_roster` reply
+/// (group id, roster root and the digest-only projection as JSON) must
+/// fit the 49 152-byte gossip DM ceiling ([`crate::dm::MAX_PAYLOAD_BYTES`]).
+/// A worst-case projection entry (64-hex id, longest role/state strings,
+/// both 64-hex hash fields) measures ~260 B of JSON; 128 entries put the
+/// worst-case reply around 33 KiB — comfortably inside the ceiling, with
+/// the margin pinned by `base_roster_reply_fits_dm_budget` in the server
+/// tests. Rosters past this bound refuse at mint with the same typed
+/// `invite_too_large` as before #646.
+pub const MAX_FETCHED_BASE_ROSTER_ENTRIES: usize = 128;
 
 /// Typed refusal reasons for v4 invite verification (#469 A2). These are
 /// the `reason` strings counted by `invites_refused{reason}` and surfaced
@@ -343,6 +389,80 @@ pub struct InviteSignedViewV4 {
     pub expires_at: u64,
     /// Intended joiner agent id (hex), when addressed.
     pub intended_joiner: Option<String>,
+    /// #646 (v6): the signed CONTENT ADDRESS of the base roster — its
+    /// roster root. `Some` exactly on v6 views, whose inline `base_roster`
+    /// above is EMPTY; `None` on every v4 view and EXCLUDED from v4
+    /// canonical bytes (the frozen pre-#646 layout serialized by the
+    /// private `InviteSignedViewV4Frozen` shadow), so v4 signatures stay
+    /// byte-identical.
+    pub base_roster_root: Option<String>,
+}
+
+/// #646: the FROZEN pre-#646 v4 canonical layout — field-for-field (and in
+/// the exact order of) `InviteSignedViewV4` as it stood when the v4
+/// canonical bytes were pinned, WITHOUT `base_roster_root`. v4 canonical
+/// bytes serialize THIS shadow so a pre-#646 verifier recomputes identical
+/// bytes. NEVER reorder, insert into, or retype this struct: the
+/// `canonical_bytes_pinned_vector` digest pin enforces it.
+#[derive(Serialize)]
+struct InviteSignedViewV4Frozen<'a> {
+    version: u8,
+    group_id: &'a str,
+    stable_group_id: &'a str,
+    group_created_at: u64,
+    group_name: &'a str,
+    group_description: &'a Option<String>,
+    genesis_creation_nonce: &'a Option<String>,
+    creator: &'a str,
+    public_meta: &'a crate::groups::state_commit::GroupPublicMeta,
+    base_home: &'a Option<crate::groups::HomeMetadata>,
+    secure_plane: &'a Option<crate::mls::SecureGroupPlane>,
+    policy: &'a Option<crate::groups::policy::GroupPolicy>,
+    base_state_revision: u64,
+    base_state_hash: &'a str,
+    base_prev_state_hash: &'a Option<String>,
+    base_roster: &'a BTreeMap<String, crate::groups::state_commit::RosterMemberSnapshot>,
+    base_secret_epoch: u64,
+    base_security_binding: &'a Option<String>,
+    inviter: &'a str,
+    inviter_public_key_b64: &'a str,
+    owner_public_key_b64: &'a Option<String>,
+    secret_hash: &'a [u8; 32],
+    created_at: u64,
+    expires_at: u64,
+    intended_joiner: &'a Option<String>,
+}
+
+impl<'a> InviteSignedViewV4Frozen<'a> {
+    fn of(view: &'a InviteSignedViewV4) -> Self {
+        Self {
+            version: view.version,
+            group_id: &view.group_id,
+            stable_group_id: &view.stable_group_id,
+            group_created_at: view.group_created_at,
+            group_name: &view.group_name,
+            group_description: &view.group_description,
+            genesis_creation_nonce: &view.genesis_creation_nonce,
+            creator: &view.creator,
+            public_meta: &view.public_meta,
+            base_home: &view.base_home,
+            secure_plane: &view.secure_plane,
+            policy: &view.policy,
+            base_state_revision: view.base_state_revision,
+            base_state_hash: &view.base_state_hash,
+            base_prev_state_hash: &view.base_prev_state_hash,
+            base_roster: &view.base_roster,
+            base_secret_epoch: view.base_secret_epoch,
+            base_security_binding: &view.base_security_binding,
+            inviter: &view.inviter,
+            inviter_public_key_b64: &view.inviter_public_key_b64,
+            owner_public_key_b64: &view.owner_public_key_b64,
+            secret_hash: &view.secret_hash,
+            created_at: view.created_at,
+            expires_at: view.expires_at,
+            intended_joiner: &view.intended_joiner,
+        }
+    }
 }
 
 impl InviteSignedViewV4 {
@@ -393,6 +513,7 @@ impl InviteSignedViewV4 {
             version,
             public_meta,
             base_roster,
+            base_roster_root,
             intended_joiner,
             creator,
             inviter_public_key_b64,
@@ -401,7 +522,7 @@ impl InviteSignedViewV4 {
             owner_countersignature_b64: _owner_countersignature,
         } = invite;
 
-        if *version != INVITE_VERSION_V4 {
+        if *version != INVITE_VERSION_V4 && *version != INVITE_VERSION_V6 {
             return Err(InviteRefusal::Unsigned);
         }
         // v4 carries the projection; a fat legacy roster alongside is a
@@ -417,7 +538,30 @@ impl InviteSignedViewV4 {
         let group_created_at = (*group_created_at).ok_or(InviteRefusal::Unsigned)?;
         let base_state_revision = (*base_state_revision).ok_or(InviteRefusal::Unsigned)?;
         let base_state_hash = base_state_hash.clone().ok_or(InviteRefusal::Unsigned)?;
-        let base_roster = base_roster.clone().ok_or(InviteRefusal::Unsigned)?;
+        // #646: the roster carrier is version-exact. v4 carries the inline
+        // projection and MUST NOT carry a content address (it would ride
+        // outside the frozen v4 signed bytes); v6 carries the content
+        // address (strict 64 lowercase hex) and MUST NOT carry an inline
+        // projection.
+        let (base_roster, base_roster_root) = if *version == INVITE_VERSION_V6 {
+            if base_roster.is_some() {
+                return Err(InviteRefusal::Malformed);
+            }
+            let root = base_roster_root.clone().ok_or(InviteRefusal::Unsigned)?;
+            if root.len() != 64
+                || !root
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            {
+                return Err(InviteRefusal::Malformed);
+            }
+            (BTreeMap::new(), Some(root))
+        } else {
+            if base_roster_root.is_some() {
+                return Err(InviteRefusal::Malformed);
+            }
+            (base_roster.clone().ok_or(InviteRefusal::Unsigned)?, None)
+        };
         let base_secret_epoch = (*base_secret_epoch).ok_or(InviteRefusal::Unsigned)?;
         // r3 (Codex 6): the policy and crypto plane ride the view
         // VERBATIM — a v4 invite MUST carry both, so a missing field is
@@ -491,20 +635,62 @@ impl InviteSignedViewV4 {
             created_at: *created_at,
             expires_at: *expires_at,
             intended_joiner: intended_joiner.clone(),
+            base_roster_root,
         })
     }
 
-    /// Canonical signed bytes: `INVITE_V4_CANONICAL_DOMAIN ‖
-    /// postcard(view)`. Deterministic; pinned by a byte-vector test.
+    /// Canonical signed bytes. v4: `INVITE_V4_CANONICAL_DOMAIN ‖
+    /// postcard(frozen pre-#646 layout)` — byte-identical to every v4
+    /// signature ever minted, pinned by a byte-vector test. v6 (#646):
+    /// `INVITE_V6_CANONICAL_DOMAIN ‖ postcard(view)` — the same field
+    /// order with `base_roster_root` appended (and an empty inline
+    /// roster).
     ///
     /// # Errors
     ///
     /// Returns the postcard error on serialization failure.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, postcard::Error> {
-        let mut out = Vec::with_capacity(INVITE_V4_CANONICAL_DOMAIN.len() + 1024);
-        out.extend_from_slice(INVITE_V4_CANONICAL_DOMAIN);
-        out.extend_from_slice(&postcard::to_stdvec(self)?);
+        let (domain, payload) = if self.version >= INVITE_VERSION_V6 {
+            (INVITE_V6_CANONICAL_DOMAIN, postcard::to_stdvec(self)?)
+        } else {
+            (
+                INVITE_V4_CANONICAL_DOMAIN,
+                postcard::to_stdvec(&InviteSignedViewV4Frozen::of(self))?,
+            )
+        };
+        let mut out = Vec::with_capacity(domain.len() + payload.len());
+        out.extend_from_slice(domain);
+        out.extend_from_slice(&payload);
         Ok(out)
+    }
+
+    /// #646: the SIGNED roster root this view commits to — the carried
+    /// content address on a v6 view, and the root re-derived from the
+    /// inline projection on a v4 view. This is the value the base state
+    /// hash must commit to on both versions.
+    #[must_use]
+    pub fn signed_roster_root(&self) -> String {
+        self.base_roster_root.clone().unwrap_or_else(|| {
+            crate::groups::state_commit::roster_root_of_projection(&self.base_roster)
+        })
+    }
+}
+
+/// #646: the inviter-signature domain for an invite wire version.
+fn inviter_domain(version: u8) -> &'static [u8] {
+    if version >= INVITE_VERSION_V6 {
+        INVITE_V6_INVITER_DOMAIN
+    } else {
+        INVITE_V4_INVITER_DOMAIN
+    }
+}
+
+/// #646: the owner-countersignature domain for an invite wire version.
+fn owner_domain(version: u8) -> &'static [u8] {
+    if version >= INVITE_VERSION_V6 {
+        INVITE_V6_OWNER_DOMAIN
+    } else {
+        INVITE_V4_OWNER_DOMAIN
     }
 }
 /// Error returned when an encoded invite link exceeds the safe DM budget.
@@ -585,6 +771,7 @@ impl SignedInvite {
             version: INVITE_VERSION_V4,
             public_meta: None,
             base_roster: None,
+            base_roster_root: None,
             intended_joiner: None,
             creator: None,
             inviter_public_key_b64: String::new(),
@@ -850,7 +1037,7 @@ impl SignedInvite {
         let canonical = view
             .canonical_bytes()
             .map_err(|e| format!("invite canonical bytes: {e}"))?;
-        let mut inviter_input = INVITE_V4_INVITER_DOMAIN.to_vec();
+        let mut inviter_input = inviter_domain(self.version).to_vec();
         inviter_input.extend_from_slice(&canonical);
         let sig = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
             inviter_kp.secret_key(),
@@ -859,7 +1046,7 @@ impl SignedInvite {
         .map_err(|e| format!("inviter sign: {e:?}"))?;
         self.inviter_signature_b64 = B64_STD.encode(sig.as_bytes());
         if let Some(owner) = owner_kp {
-            let mut owner_input = INVITE_V4_OWNER_DOMAIN.to_vec();
+            let mut owner_input = owner_domain(self.version).to_vec();
             owner_input.extend_from_slice(&canonical);
             let sig = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
                 owner.secret_key(),
@@ -931,7 +1118,7 @@ impl SignedInvite {
             .map_err(|_| InviteRefusal::InviterSignatureInvalid)?;
         let sig = ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&sig_bytes)
             .map_err(|_| InviteRefusal::InviterSignatureInvalid)?;
-        let mut inviter_input = INVITE_V4_INVITER_DOMAIN.to_vec();
+        let mut inviter_input = inviter_domain(self.version).to_vec();
         inviter_input.extend_from_slice(&canonical);
         if ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
             &inviter_key,
@@ -1004,7 +1191,7 @@ impl SignedInvite {
                         })
                 })
                 .map_err(|_| InviteRefusal::OwnerCountersignatureInvalid)?;
-            let mut owner_input = INVITE_V4_OWNER_DOMAIN.to_vec();
+            let mut owner_input = owner_domain(self.version).to_vec();
             owner_input.extend_from_slice(&canonical);
             if ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
                 &owner_key,
@@ -1458,6 +1645,7 @@ mod tests {
             created_at: 1_700_000_000,
             expires_at: 1_700_086_400,
             intended_joiner: None,
+            base_roster_root: None,
         }
     }
 
@@ -2352,6 +2540,246 @@ mod tests {
         assert_eq!(err.limit, INVITE_LINK_MAX_BYTES);
         assert_eq!(err.actual, over_budget.to_link().len());
         assert!(err.actual > INVITE_LINK_MAX_BYTES);
+    }
+
+    // ─── #646: v6 content-addressed base roster ──────────────────────────
+
+    /// A digest-only projection with `n` Active members — over the inline
+    /// cap when `n > MAX_INVITE_ROSTER_ENTRIES`.
+    fn projection_of(n: usize) -> BTreeMap<String, RosterMemberSnapshot> {
+        (0..n)
+            .map(|i| {
+                (
+                    format!("{i:064x}"),
+                    RosterMemberSnapshot {
+                        role: GroupRole::Member,
+                        state: GroupMemberState::Active,
+                        treekem_key_package_hash: Some("0f".repeat(32)),
+                        certificate_digest: Some("5a".repeat(32)),
+                        certificate: None,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Deterministic v6 fixture: the v4 fixture retargeted at a 50-member
+    /// roster carried by CONTENT ADDRESS. Returns the invite and the
+    /// out-of-band projection it stands for.
+    fn v6_fixture(
+        inviter_kp: &AgentKeypair,
+        owner_kp: Option<&UserKeypair>,
+    ) -> (SignedInvite, BTreeMap<String, RosterMemberSnapshot>) {
+        let roster = projection_of(50);
+        let mut invite = v4_fixture(inviter_kp, owner_kp);
+        invite.version = INVITE_VERSION_V6;
+        invite.base_roster = None;
+        invite.base_roster_root = Some(crate::groups::state_commit::roster_root_of_projection(
+            &roster,
+        ));
+        (invite, roster)
+    }
+
+    #[test]
+    fn v6_content_addressed_invite_signs_verifies_and_round_trips() {
+        let inviter_kp = AgentKeypair::generate().expect("agent keypair");
+        let (mut invite, roster) = v6_fixture(&inviter_kp, None);
+        invite.sign_v4(&inviter_kp, None).expect("sign v6");
+        assert_eq!(invite.verify_v4_signatures(), Ok(()));
+
+        let view = InviteSignedViewV4::from_invite(&invite).expect("v6 view");
+        assert_eq!(view.version, INVITE_VERSION_V6);
+        assert!(
+            view.base_roster.is_empty(),
+            "v6 views carry no inline roster"
+        );
+        assert_eq!(
+            view.signed_roster_root(),
+            crate::groups::state_commit::roster_root_of_projection(&roster),
+            "the signed root IS the projection's content address"
+        );
+        let canonical = view.canonical_bytes().expect("canonical bytes");
+        assert!(
+            canonical.starts_with(INVITE_V6_CANONICAL_DOMAIN),
+            "v6 canonical bytes open with the v6 domain"
+        );
+
+        // The link is roster-size independent and far under the budget.
+        let link = invite.encode_link().expect("v6 link fits");
+        let restored = SignedInvite::from_link(&link).expect("parse v6 link");
+        assert_eq!(restored.version, INVITE_VERSION_V6);
+        assert_eq!(restored.base_roster, None);
+        assert_eq!(restored.base_roster_root, invite.base_roster_root);
+        assert_eq!(restored.verify_v4_signatures(), Ok(()));
+
+        // The content address is SIGNED: a swapped root breaks the
+        // inviter signature.
+        let mut tampered = invite.clone();
+        tampered.base_roster_root = Some("f".repeat(64));
+        assert_eq!(
+            tampered.verify_v4_signatures(),
+            Err(InviteRefusal::InviterSignatureInvalid)
+        );
+    }
+
+    #[test]
+    fn v6_owner_axis_countersignature_rides_the_v6_domain() {
+        let inviter_kp = AgentKeypair::generate().expect("agent keypair");
+        let owner_kp = UserKeypair::generate().expect("user keypair");
+        let (mut invite, _) = v6_fixture(&inviter_kp, Some(&owner_kp));
+        invite
+            .sign_v4(&inviter_kp, Some(&owner_kp))
+            .expect("sign owner-axis v6");
+        assert_eq!(invite.verify_v4_signatures(), Ok(()));
+        let mut stripped = invite.clone();
+        stripped.owner_countersignature_b64 = None;
+        assert_eq!(
+            stripped.verify_v4_signatures(),
+            Err(InviteRefusal::OwnerCountersignatureMissing)
+        );
+    }
+
+    #[test]
+    fn v6_structural_rules_fail_closed() {
+        let inviter_kp = AgentKeypair::generate().expect("agent keypair");
+        let (invite, roster) = v6_fixture(&inviter_kp, None);
+
+        // v6 must NOT carry an inline projection next to the address.
+        let mut t = invite.clone();
+        t.base_roster = Some(roster.clone());
+        assert_eq!(
+            InviteSignedViewV4::from_invite(&t),
+            Err(InviteRefusal::Malformed)
+        );
+        // v6 without the content address is unsigned.
+        let mut t = invite.clone();
+        t.base_roster_root = None;
+        assert_eq!(
+            InviteSignedViewV4::from_invite(&t),
+            Err(InviteRefusal::Unsigned)
+        );
+        // The address is strict 64 lowercase hex.
+        for bad in ["ab", &"A".repeat(64), &"zz".repeat(32)] {
+            let mut t = invite.clone();
+            t.base_roster_root = Some(bad.to_string());
+            assert_eq!(
+                InviteSignedViewV4::from_invite(&t),
+                Err(InviteRefusal::Malformed),
+                "root {bad:?} must be malformed"
+            );
+        }
+        // A v4 invite must NOT carry a content address (it would ride
+        // outside the frozen v4 signed bytes).
+        let mut t = v4_fixture(&inviter_kp, None);
+        t.base_roster_root = Some("ab".repeat(32));
+        assert_eq!(
+            InviteSignedViewV4::from_invite(&t),
+            Err(InviteRefusal::Malformed)
+        );
+        // Future versions stay refused.
+        let mut t = invite.clone();
+        t.version = 7;
+        assert_eq!(
+            InviteSignedViewV4::from_invite(&t),
+            Err(InviteRefusal::Unsigned)
+        );
+    }
+
+    /// #646: a pre-#646 node parses a v6 link (every new field defaults /
+    /// is ignored) and refuses it with the TYPED version gate — exactly
+    /// how it treats any future version, never a parse error. Pinned by
+    /// deserializing v6 JSON into the frozen v0.40.4 replica.
+    #[test]
+    fn v6_link_fails_closed_on_old_nodes() {
+        let inviter_kp = AgentKeypair::generate().expect("agent keypair");
+        let (mut invite, _) = v6_fixture(&inviter_kp, None);
+        invite.sign_v4(&inviter_kp, None).expect("sign v6");
+        let json = serde_json::to_string(&invite).expect("serialize v6 invite");
+        let old: replica_v0_40_4::SignedInvite =
+            serde_json::from_str(&json).expect("v6 invite JSON parses on the v0.40.4 replica");
+        assert_eq!(old.group_name, "fixture group");
+        // A v0.41+ node (v4-only verifier) refuses on the version gate.
+        // Simulate its view constructor: version != 4 → Unsigned.
+        let mut as_seen_by_v4_only = invite.clone();
+        as_seen_by_v4_only.version = INVITE_VERSION_V4;
+        // A v4-only node never reaches the signature (its gate fires on
+        // the raw version field first); this pins that a v6 blob cannot
+        // masquerade as v4 either.
+        assert_eq!(
+            InviteSignedViewV4::from_invite(&as_seen_by_v4_only),
+            Err(InviteRefusal::Malformed)
+        );
+    }
+
+    /// David's 9 Nov 2026 ruling ("Yes, renumber"): invite version 5 and
+    /// the `x0x.invite.v5*` domains stay RESERVED for archived ADR 0112's
+    /// addressed, expiring design (D99/D104). A version-5 link — whatever
+    /// carrier shape it claims — is refused as unsupported at the typed
+    /// version gate and never reaches a signature check.
+    #[test]
+    fn version_5_is_reserved_and_refused() {
+        let inviter_kp = AgentKeypair::generate().expect("agent keypair");
+        // Content-addressed shape relabelled 5.
+        let (mut invite, roster) = v6_fixture(&inviter_kp, None);
+        invite.sign_v4(&inviter_kp, None).expect("sign v6");
+        invite.version = 5;
+        assert_eq!(
+            InviteSignedViewV4::from_invite(&invite),
+            Err(InviteRefusal::Unsigned)
+        );
+        // Inline (v4) shape relabelled 5 is equally unsupported.
+        let mut inline = invite.clone();
+        inline.base_roster = Some(roster);
+        inline.base_roster_root = None;
+        assert_eq!(
+            InviteSignedViewV4::from_invite(&inline),
+            Err(InviteRefusal::Unsigned)
+        );
+    }
+
+    /// Pinned BLAKE3-256 (hex) over the canonical bytes of the fixed-field
+    /// v6 view below — the v6 counterpart of
+    /// [`PINNED_VIEW_CANONICAL_BLAKE3`]: any field reorder, insertion or
+    /// representation change in the v6 signed layout, or a change to the
+    /// v6 domain strings, moves this digest and fails the pin.
+    const PINNED_V6_VIEW_CANONICAL_BLAKE3: &str =
+        "e97bcbcd6564e1ad4cc300df7ef58db71a922f9f320c6fe61712e71cf5a0c9bd";
+
+    /// The fixed-field v6 view: the v4 pinned view re-carried as content
+    /// address (no inline roster, a fixed root), version 6.
+    fn pinned_v6_view() -> InviteSignedViewV4 {
+        let mut view = pinned_view();
+        view.version = INVITE_VERSION_V6;
+        view.base_roster = BTreeMap::new();
+        view.base_roster_root = Some("de".repeat(32));
+        view
+    }
+
+    #[test]
+    fn canonical_bytes_pinned_vector_v6() {
+        assert_eq!(INVITE_V6_CANONICAL_DOMAIN, b"x0x.invite.v6\0".as_slice());
+        assert_eq!(
+            INVITE_V6_INVITER_DOMAIN,
+            b"x0x.invite.v6.inviter\0".as_slice()
+        );
+        assert_eq!(INVITE_V6_OWNER_DOMAIN, b"x0x.invite.v6.owner\0".as_slice());
+        let view = pinned_v6_view();
+        let canonical = view.canonical_bytes().expect("canonical bytes");
+        assert!(
+            canonical.starts_with(INVITE_V6_CANONICAL_DOMAIN),
+            "v6 canonical bytes must open with the v6 signing domain"
+        );
+        assert_eq!(
+            canonical,
+            pinned_v6_view()
+                .canonical_bytes()
+                .expect("canonical bytes (rebuild)")
+        );
+        assert_eq!(
+            hex::encode(blake3::hash(&canonical).as_bytes()),
+            PINNED_V6_VIEW_CANONICAL_BLAKE3,
+            "the v6 canonical layout or domain moved"
+        );
     }
 
     // ─── r3 (Fable 5): v0.40.4 cross-version fixtures ────────────────────
