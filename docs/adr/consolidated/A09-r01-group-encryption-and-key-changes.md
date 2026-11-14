@@ -72,6 +72,8 @@ round. A sibling fork that split below the window is not detected. ADR
 0110 stays Accepted and its text is unchanged. The code and this slot
 carry the change.
 
+**Amendment, 14 Nov 2026 (Claude, under David's delegation of 10 Nov 2026; #1583).** A removal of an Active TreeKEM seat needs that member's KeyPackage. The authority-attested form reached other members only in one direct message from the seating admin, because gossip `MemberAdded` carries no `member_joined_recovery`. A member that missed that message could not remove the seat. Decision (option 1, no wire change): KeyPackage recovery accepts the member's own signed `MemberJoined` for an Active seat, as it already did for a Removed seat (#1113), only when the bytes hash to the `treekem_key_package_hash` that the verified roster commits for the seat. Catch-up also serves that form. The admin-signed roster commit already names the bytes, so a member cannot substitute a fresh package. Option 2 (publish `member_joined_recovery` on gossip) is not taken.
+
 [A08](A08-r01-groups-home-membership-and-repair.md) defines valid group-state and fork recovery. A09 must not bypass that authority to obtain keys faster.
 
 ## Security claims
