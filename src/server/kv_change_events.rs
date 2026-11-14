@@ -1,20 +1,21 @@
-//! `kv:changed` SSE events (#1094).
+//! `kv:changed` and `task:changed` SSE events (#1094).
 //!
-//! Every KV store the agent opens sends a change notice to one agent-wide
-//! channel ([`crate::Agent::subscribe_kv_changes`]): one per local write or
-//! delete, and one per merged remote record or delta. This task turns the
-//! notices into `kv:changed` events on the daemon broadcast (`GET /events`).
+//! Every KV store and task list the agent opens sends a change notice to an
+//! agent-wide channel ([`crate::Agent::subscribe_kv_changes`],
+//! [`crate::Agent::subscribe_task_changes`]): one per local mutation and one
+//! per merged remote record or delta. One task per channel turns the notices
+//! into events on the daemon broadcast (`GET /events`).
 //!
 //! Bursts are merged: the first notice opens a window of
-//! [`KV_CHANGE_COALESCE`]; at its end the task emits ONE event per store
-//! that changed in it, with the set of origins. A sync burst of a hundred
-//! records therefore costs one event, not a hundred. An event names the
-//! store and the origins only; a client reads the store to see what
+//! [`CHANGE_COALESCE`]; at its end the task emits ONE event per store (or
+//! list) that changed in it, with the set of origins. A sync burst of a
+//! hundred records therefore costs one event, not a hundred. An event names
+//! the store or list and the origins only; a client reads it to see what
 //! changed, through its own authorised path.
 //!
-//! When the task falls behind and the channel drops notices, it emits one
-//! `kv:changed` event with `"store_id": null` and `"lagged": true`: the
-//! client must re-read every store it shows.
+//! When a task falls behind and its channel drops notices, it emits one
+//! event with a `null` id and `"lagged": true`: the client must re-read
+//! every store or list it shows.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -25,28 +26,62 @@ use tokio::sync::broadcast::error::RecvError;
 
 use super::sse::SseEvent;
 use super::state::AppState;
+use crate::crdt::TaskListChanged;
 use crate::kv::{KvChangeOrigin, KvStoreChanged};
 
 /// The merge window for change notices.
-const KV_CHANGE_COALESCE: Duration = Duration::from_millis(200);
+const CHANGE_COALESCE: Duration = Duration::from_millis(200);
 
-/// The SSE event type.
-const KV_CHANGED_EVENT: &str = "kv:changed";
-
-/// The stores that changed in one window, with their origins.
-type Pending = BTreeMap<String, BTreeSet<KvChangeOrigin>>;
-
-/// Start the forwarder for the daemon's agent.
-pub(super) fn spawn(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
-    let rx = state.agent.subscribe_kv_changes();
-    let tx = state.broadcast_tx.clone();
-    tokio::spawn(forward(rx, tx, KV_CHANGE_COALESCE))
+/// A change notice the forwarder can merge.
+trait ChangeNotice: Clone + Send + 'static {
+    /// The SSE event type.
+    const EVENT: &'static str;
+    /// The JSON field that names the store or list.
+    const ID_FIELD: &'static str;
+    /// The topic and the origin.
+    fn into_parts(self) -> (String, KvChangeOrigin);
 }
 
-/// Forward notices from `rx` to `tx` as merged `kv:changed` events, until
-/// `rx` closes (the agent is gone).
-async fn forward(
-    mut rx: broadcast::Receiver<KvStoreChanged>,
+impl ChangeNotice for KvStoreChanged {
+    const EVENT: &'static str = "kv:changed";
+    const ID_FIELD: &'static str = "store_id";
+    fn into_parts(self) -> (String, KvChangeOrigin) {
+        (self.topic, self.origin)
+    }
+}
+
+impl ChangeNotice for TaskListChanged {
+    const EVENT: &'static str = "task:changed";
+    const ID_FIELD: &'static str = "list_id";
+    fn into_parts(self) -> (String, KvChangeOrigin) {
+        (self.topic, self.origin)
+    }
+}
+
+/// The topics that changed in one window, with their origins.
+type Pending = BTreeMap<String, BTreeSet<KvChangeOrigin>>;
+
+/// Start the forwarders for the daemon's agent.
+pub(super) fn spawn(state: Arc<AppState>) -> [tokio::task::JoinHandle<()>; 2] {
+    let tx = state.broadcast_tx.clone();
+    [
+        tokio::spawn(forward(
+            state.agent.subscribe_kv_changes(),
+            tx.clone(),
+            CHANGE_COALESCE,
+        )),
+        tokio::spawn(forward(
+            state.agent.subscribe_task_changes(),
+            tx,
+            CHANGE_COALESCE,
+        )),
+    ]
+}
+
+/// Forward notices from `rx` to `tx` as merged events, until `rx` closes
+/// (the agent is gone).
+async fn forward<T: ChangeNotice>(
+    mut rx: broadcast::Receiver<T>,
     tx: broadcast::Sender<SseEvent>,
     window: Duration,
 ) {
@@ -67,13 +102,10 @@ async fn forward(
             }
         }
         if lagged {
-            emit(&tx, serde_json::json!({ "store_id": null, "lagged": true }));
+            emit_lagged::<T>(&tx);
         }
-        for (store_id, origins) in pending {
-            emit(
-                &tx,
-                serde_json::json!({ "store_id": store_id, "origins": origins }),
-            );
+        for (id, origins) in pending {
+            emit_changed::<T>(&tx, id, origins);
         }
         if closed {
             return;
@@ -82,17 +114,15 @@ async fn forward(
 }
 
 /// Add one receive result to the window. Returns whether `rx` is closed.
-fn absorb(
-    received: Result<KvStoreChanged, RecvError>,
+fn absorb<T: ChangeNotice>(
+    received: Result<T, RecvError>,
     pending: &mut Pending,
     lagged: &mut bool,
 ) -> bool {
     match received {
         Ok(change) => {
-            pending
-                .entry(change.topic)
-                .or_default()
-                .insert(change.origin);
+            let (topic, origin) = change.into_parts();
+            pending.entry(topic).or_default().insert(origin);
             false
         }
         Err(RecvError::Lagged(_)) => {
@@ -103,10 +133,42 @@ fn absorb(
     }
 }
 
-fn emit(tx: &broadcast::Sender<SseEvent>, data: serde_json::Value) {
+/// `{ID_FIELD: id, "origins": [...]}` for one store or list.
+fn emit_changed<T: ChangeNotice>(
+    tx: &broadcast::Sender<SseEvent>,
+    id: String,
+    origins: BTreeSet<KvChangeOrigin>,
+) {
+    send::<T>(
+        tx,
+        serde_json::json!(id),
+        "origins",
+        serde_json::json!(origins),
+    );
+}
+
+/// `{ID_FIELD: null, "lagged": true}`: notices were lost.
+fn emit_lagged<T: ChangeNotice>(tx: &broadcast::Sender<SseEvent>) {
+    send::<T>(
+        tx,
+        serde_json::Value::Null,
+        "lagged",
+        serde_json::json!(true),
+    );
+}
+
+fn send<T: ChangeNotice>(
+    tx: &broadcast::Sender<SseEvent>,
+    id: serde_json::Value,
+    field: &str,
+    value: serde_json::Value,
+) {
+    let mut data = serde_json::Map::new();
+    data.insert(T::ID_FIELD.to_string(), id);
+    data.insert(field.to_string(), value);
     let _ = tx.send(SseEvent {
-        event_type: KV_CHANGED_EVENT.to_string(),
-        data,
+        event_type: T::EVENT.to_string(),
+        data: serde_json::Value::Object(data),
     });
 }
 
@@ -160,6 +222,39 @@ mod tests {
             serde_json::json!({"store_id": "store-a", "origins": ["remote"]})
         );
 
+        drop(ntx);
+        task.await.unwrap();
+    }
+
+    /// WHY (#1094 `task:changed`): task-list notices give `task:changed`
+    /// events keyed by `list_id`, merged the same way.
+    #[tokio::test(start_paused = true)]
+    async fn issue1094_task_notices_give_task_changed_events() {
+        let (ntx, nrx) = broadcast::channel(16);
+        let (etx, mut erx) = broadcast::channel(16);
+        let task = tokio::spawn(forward(nrx, etx, Duration::from_millis(200)));
+        for origin in [
+            KvChangeOrigin::Local,
+            KvChangeOrigin::Remote,
+            KvChangeOrigin::Local,
+        ] {
+            ntx.send(TaskListChanged {
+                topic: "list-a".to_string(),
+                origin,
+            })
+            .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let event = erx.recv().await.unwrap();
+        assert_eq!(event.event_type, "task:changed");
+        assert_eq!(
+            event.data,
+            serde_json::json!({"list_id": "list-a", "origins": ["local", "remote"]})
+        );
+        assert!(matches!(
+            erx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
         drop(ntx);
         task.await.unwrap();
     }
