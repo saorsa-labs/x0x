@@ -52,6 +52,8 @@ Pinned agents remain bound to their approved machine. Existing placement records
 
 Enrollment and certificate issuance must require owner authority. Discovery provides possible addresses; it does not grant ownership or permission.
 
+A device may run with an owner-issued agent certificate and no user key (amended 14 Nov 2026 by Claude under David's delegation of design decisions of 10 Nov 2026; [#1860](https://github.com/saorsa-labs/x0x/issues/1860)). Production loads `agent.cert` alone when it binds the device's agent and its owner signature verifies; any other file is ignored and the device runs with no user identity. This keeps `user.key` on fewer devices, so a lost ordinary device does not give away the owner identity. Such a device cannot issue or renew its own certificate: a renewal comes from a device that holds the owner key, and an expired certificate leaves the agent unreachable for pinned messages until it is renewed. There is still no owner-key rotation or succession: a lost owner key means a new owner identity. That design waits for the owner-key storage and recovery policy under Matters to settle.
+
 Names are labels for verified identities. Changing a display name must not change the identity or silently replace a pinned target.
 
 ## Local protection and recovery

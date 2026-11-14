@@ -981,9 +981,9 @@ impl Identity {
         }
     }
     /// Create an Identity that holds an owner-issued agent certificate but
-    /// not the owner's user key: a certificate-only device. Only test
-    /// builds create one (W3-H, #1572): production loads `agent.cert` only
-    /// beside the user key.
+    /// not the owner's user key: a certificate-only device (#1860, A02).
+    /// The agent builder creates one when `agent.cert` binds this agent and
+    /// verifies; the owner key stays on another device.
     pub(crate) fn new_with_certificate(
         machine_keypair: MachineKeypair,
         agent_keypair: AgentKeypair,

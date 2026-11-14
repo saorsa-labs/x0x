@@ -846,6 +846,14 @@ All six are owner-only: every `/owner/*` route rejects a rider token with
 `403` in the auth middleware before any handler runs. `409` when the
 daemon has no owner user key.
 
+**Certificate-only device (#1860).** `certificate.storage_b64` in the
+issuance answer is the `agent.cert` file format. A daemon with no user key
+loads `agent.cert` at start when the certificate binds its agent and its
+owner signature verifies, and then announces the issuer as its user. It can
+adopt a renewal from the owner, but it cannot issue one; an expired
+certificate leaves it unreachable for pinned messages. See
+[Owner, Home, and riders](skill/owner.md).
+
 **Issuance** takes `{ "agent_public_key": <hex ML-DSA-65 public key>,
 "mode": "acp"|"rider", "label"?: string, "not_after"?: unix-seconds }`.
 The harness generates and custodies the keypair; the daemon never sees
