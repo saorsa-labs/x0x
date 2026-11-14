@@ -1244,8 +1244,8 @@ own `MemberAdded`, mint a fresh invite rather than replaying the link.
 
 All five answer `409` when no owner identity is configured. Sync replicates
 owner state **owner-to-owner only** — Tier 1: profile/names, the Home
-history, DMs, and exec data
-never replicate, and no third party receives the state. Inbound SyncV1 streams
+pointer, the issuance journal and the owner device set (#1107). Group
+history, DMs, and exec data never replicate, and no third party receives the state. Inbound SyncV1 streams
 are refused at the enrollment gate unless the enrollment signature and
 currency (expiry) verify — corrupt, foreign-key, or stale enrollments never
 open the sync gate; non-enrolled machines are refused at stream accept.
@@ -1260,10 +1260,17 @@ open the sync gate; non-enrolled machines are refused at stream accept.
   "devices": [
     {"machine_id":"e55130…","enrolled_at_ms":1788090728080,
      "expires_at_ms":null,"last_session_ms":null,"last_session_ok":null,
-     "is_this_machine":true}
+     "is_this_machine":true,"record_source":"local",
+     "record_writer_machine_id":"e55130…"}
   ]
 }
 ```
+
+`record_source` (#1107) says where the device's synced enrollment record
+(Tier-1 kind 0x05) came from: `"local"` when this machine wrote it,
+`"synced"` when another owner device wrote it (`record_writer_machine_id`
+names that device), and `null` when no record holds this enrollment yet (the
+next sync pass writes it).
 
 **POST /sync/devices/enroll** request — `machine_id` optional (64-hex;
 omitted = enroll THIS machine), `ttl_secs` optional (bounds the enrollment's
@@ -1301,12 +1308,15 @@ ruling).
 }
 ```
 
-**Enrollment is per-machine and must be bilateral.** A daemon dials sync only
+**The first session needs a bilateral enrollment.** A daemon dials sync only
 to machines in *its own* enrolled set (minus itself), and the receiving side
 accepts a stream only from a machine *it* has enrolled. Two machines sync
 when each holds the other's enrollment — run `enroll` on **both** machines,
 each naming the other's machine id (plus itself), or no session is ever
-established.
+established. After that, enrollments and removals sync (Tier-1 kind 0x05,
+SyncV1 protocol 3, #1107): a machine enrolled or removed on one device is
+enrolled or removed on every owner device that syncs with it. A peer on
+protocol 2 does not receive them.
 
 **Trust prerequisite:** SyncV1 rides ADR-0022 byte streams through the same
 stream gate as every other protocol — each side's peer-trust decision for the

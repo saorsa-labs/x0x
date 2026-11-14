@@ -280,7 +280,7 @@ x0x sync devices                   # GET /sync/devices — enrolled devices + la
 x0x sync revoke <machine_id>       # DELETE /sync/devices/:machine_id — next stream from it is refused
 ```
 
-- **Tier 1 — replicates today:** exactly four record kinds — owner profile, per-machine agent/machine names, the Home roster + policy pointer, and the sub-agent issuance journal (small signed state-commits over the sync stream; last-writer-wins by commit height).
+- **Tier 1 — replicates today:** exactly five record kinds — owner profile, per-machine agent/machine names, the Home roster + policy pointer, the sub-agent issuance journal, and the owner device set (enrollments and removals, SyncV1 protocol 3 only, #1107) (small signed state-commits over the sync stream; last-writer-wins by commit height).
 - **Tier 2 — pull-on-demand Home history: DESIGNED, NOT SHIPPED.** ADR-0041 defines it, but the current SyncV1 module implements Tier 1 only; there is no peer history backfill. `GET /history?scope=group:<gid>` is a purely LOCAL query against your own durable history.
 - **Tier 3 — never replicates:** non-Home group history, DM history, exec session state. Per-machine, full stop.
 

@@ -473,6 +473,13 @@ pub(in crate::server) struct SyncDeviceEntry {
     last_session_ok: Option<bool>,
     #[serde(rename = "is_this_machine")]
     is_this_machine: bool,
+    /// #1107: `"local"` when this machine wrote the synced kind 0x05 record
+    /// for the enrollment, `"synced"` when another owner device wrote it,
+    /// `null` when no record holds this enrollment yet.
+    record_source: Option<&'static str>,
+    /// #1107: hex machine id of the record's writer; `null` with
+    /// `record_source`.
+    record_writer_machine_id: Option<String>,
 }
 
 /// GET /sync/devices response body.
@@ -498,6 +505,7 @@ pub(in crate::server) async fn get_sync_devices(
     };
     let this_machine = state.agent.machine_id();
     let statuses = sync.store().session_statuses().await;
+    let writers = sync.store().device_enrollment_writers().await;
     let mut devices: Vec<SyncDeviceEntry> = sync
         .store()
         .enrolled_devices()
@@ -505,6 +513,7 @@ pub(in crate::server) async fn get_sync_devices(
         .into_iter()
         .map(|enrollment| {
             let status = statuses.get(&enrollment.machine_id);
+            let writer = writers.get(&enrollment.machine_id);
             SyncDeviceEntry {
                 machine_id: hex::encode(enrollment.machine_id),
                 enrolled_at_ms: enrollment.enrolled_at_ms,
@@ -512,6 +521,14 @@ pub(in crate::server) async fn get_sync_devices(
                 last_session_ms: status.map(|s| s.last_session_ms),
                 last_session_ok: status.map(|s| s.last_session_ok),
                 is_this_machine: enrollment.machine_id == this_machine.0,
+                record_source: writer.map(|w| {
+                    if *w == this_machine.0 {
+                        "local"
+                    } else {
+                        "synced"
+                    }
+                }),
+                record_writer_machine_id: writer.map(hex::encode),
             }
         })
         .collect();
@@ -2386,6 +2403,96 @@ mod tests {
                 .is_some_and(|error| error.contains("enrollment_tombstoned")),
             "the refusal must name its cause: {body:?}"
         );
+        Ok(())
+    }
+
+    /// #1107: `GET /sync/devices` names the source of each enrollment's
+    /// kind 0x05 record: `"local"` when this machine minted it, `"synced"`
+    /// with the writer when another owner device wrote it, and `null` when
+    /// no record holds the enrollment yet.
+    #[tokio::test]
+    async fn sync_devices_reports_the_record_source() -> anyhow::Result<()> {
+        use crate::owner_sync::{
+            device_enrollment_version, DeviceEnrollmentState, OwnerEnrollment, RecordClock,
+            SyncKind, SyncValue, VersionedRecord,
+        };
+        let dir = tempfile::tempdir()?;
+        let state = crate::server::routes::home::tests::owned_state(dir.path(), [0x5D; 32]).await?;
+        let sync = state.owner_sync.as_ref().expect("owned state wires sync");
+        let owner = state
+            .agent
+            .identity()
+            .user_keypair()
+            .expect("owned state has a user key");
+        let this = state.agent.machine_id();
+        let (minted, learned, fresh) = ([0x51; 32], [0x52; 32], [0x53; 32]);
+        let writer = [0x54; 32];
+        let store = sync.store();
+        for m in [this.0, minted] {
+            store
+                .enroll(OwnerEnrollment::sign(
+                    crate::identity::MachineId(m),
+                    owner,
+                    1_000,
+                    None,
+                )?)
+                .await?;
+        }
+        store.mint_device_enrollments(owner, this).await?;
+        let enrollment =
+            OwnerEnrollment::sign(crate::identity::MachineId(learned), owner, 2_000, None)?;
+        let value = DeviceEnrollmentState::Enrolled { enrollment };
+        let record = VersionedRecord::sign(
+            SyncKind::DeviceEnrollment,
+            &hex::encode(learned),
+            &SyncValue::DeviceEnrollment {
+                state: value.clone(),
+            },
+            RecordClock {
+                version: device_enrollment_version(&value).expect("version fits"),
+                signed_at_ms: 2_000,
+                writer_machine: writer,
+            },
+            owner,
+        )?;
+        store
+            .commit_batch(vec![record.clone()], &owner.user_id())
+            .await?;
+        store
+            .apply_device_enrollments(&[record], &owner.user_id(), &this)
+            .await;
+        store
+            .enroll(OwnerEnrollment::sign(
+                crate::identity::MachineId(fresh),
+                owner,
+                3_000,
+                None,
+            )?)
+            .await?;
+
+        let (status, Json(body)) = get_sync_devices(State(Arc::clone(&state))).await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        let row = |m: [u8; 32]| {
+            body["devices"]
+                .as_array()
+                .and_then(|rows| {
+                    rows.iter()
+                        .find(|r| r["machine_id"] == hex::encode(m))
+                        .cloned()
+                })
+                .unwrap_or_default()
+        };
+        for m in [this.0, minted] {
+            assert_eq!(row(m)["record_source"], "local", "{body:?}");
+            assert_eq!(row(m)["record_writer_machine_id"], hex::encode(this.0));
+        }
+        assert_eq!(row(learned)["record_source"], "synced", "{body:?}");
+        assert_eq!(
+            row(learned)["record_writer_machine_id"],
+            hex::encode(writer)
+        );
+        assert!(row(fresh)["record_source"].is_null(), "{body:?}");
+        assert!(row(fresh)["record_writer_machine_id"].is_null());
         Ok(())
     }
 }
