@@ -7,9 +7,10 @@
 //! owner machine (the `ENROLLED` owner-trust bit) and exec on B must admit
 //! a request from M's agent.
 //!
-//! Red until PR 2 of #1107: PR 1 adds the `DeviceEnrollment` kind and
-//! protocol 3, but nothing mints a record from an enrollment or applies
-//! one to the device set, so B never learns M.
+//! PR 2 of #1107: A mints `DeviceEnrollment` records for its device set
+//! (in a daemon, the reconcile pass that each enroll kicks), and B applies
+//! the committed records to its device set. An ADR-0018 revocation of M
+//! still overrides the synced enrollment.
 
 use super::cold_restart_tests::{build_receiver, new_sender, owner_acl, SeedPolicy, SEED};
 use super::protocol::{encode_frame_payload, ExecFrame, ExecRequestId};
@@ -27,9 +28,10 @@ const DEVICE_A: MachineId = MachineId([0xa1; 32]);
 const DEVICE_B: MachineId = MachineId([0xb2; 32]);
 const BOUND: Duration = Duration::from_secs(10);
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "red until PR 2 of #1107: PR 2 mints DeviceEnrollment records (skipping a mint when a record with the same version exists), applies received ones, and at start-up re-verifies and applies every stored kind 0x05 record, because PR 1 stores them without applying them"]
-async fn enrollment_made_on_another_owner_device_admits_exec_after_sync() {
+/// The ENROLLED owner-trust bit B holds for M after the sync, and B's exec
+/// totals (allowed, denied) for one request from M's agent. With
+/// `revoke_m`, B holds an ADR-0018 revocation of M before the request.
+async fn sync_then_exec(revoke_m: bool) -> (Option<u8>, (u64, u64)) {
     let dir = tempfile::tempdir().expect("tmpdir");
     std::fs::create_dir_all(dir.path().join("identity")).expect("identity dir");
     let owner = UserKeypair::from_seed(&SEED).expect("owner key");
@@ -75,6 +77,14 @@ async fn enrollment_made_on_another_owner_device_admits_exec_after_sync() {
         "B starts without M"
     );
 
+    // The records the daemon's reconcile pass mints for each device set.
+    a.mint_device_enrollments(&owner, DEVICE_A)
+        .await
+        .expect("a mints");
+    b.mint_device_enrollments(&owner, DEVICE_B)
+        .await
+        .expect("b mints");
+
     // One session between A and B, then A goes offline.
     let (client, server) = tokio::io::duplex(256 * 1024);
     let (mut a_recv, mut a_send) = tokio::io::split(server);
@@ -109,6 +119,23 @@ async fn enrollment_made_on_another_owner_device_admits_exec_after_sync() {
 
     // B runs on its own files; A is gone.
     let receiver = build_receiver(dir.path()).await;
+    if revoke_m {
+        let now_secs = now_ms / 1_000;
+        let record = crate::revocation::RevocationRecord::sign(
+            crate::revocation::RevokedSubject::Machine(m),
+            sender.machine.public_key(),
+            sender.machine.secret_key(),
+            now_secs,
+            None,
+        )
+        .expect("sign machine revocation");
+        receiver
+            .revocation_set()
+            .write()
+            .await
+            .verify_and_insert(record, None)
+            .expect("insert machine revocation");
+    }
     let relation = {
         let revoked = receiver.revocation_set();
         let revoked = revoked.read().await;
@@ -151,15 +178,30 @@ async fn enrollment_made_on_another_owner_device_admits_exec_after_sync() {
     };
     service.shutdown().await;
     receiver.try_shutdown().await.expect("receiver stops");
-
-    assert_eq!(
+    (
         relation.map(|r| r & crate::peer_evidence::ENROLLED),
+        (totals.requests_allowed, totals.requests_denied),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn enrollment_made_on_another_owner_device_admits_exec_after_sync() {
+    let (enrolled, totals) = sync_then_exec(false).await;
+    assert_eq!(
+        enrolled,
         Some(crate::peer_evidence::ENROLLED),
         "B must hold M as an enrolled owner machine after syncing with A"
     );
+    assert_eq!(totals, (1, 0), "exec on B must admit M's agent");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_synced_enrollment_of_a_revoked_machine_stays_denied() {
+    let (enrolled, totals) = sync_then_exec(true).await;
     assert_eq!(
-        (totals.requests_allowed, totals.requests_denied),
-        (1, 0),
-        "exec on B must admit M's agent"
+        enrolled,
+        Some(crate::peer_evidence::ENROLLED),
+        "the enrollment itself is applied"
     );
+    assert_eq!(totals.0, 0, "exec on B must not admit a revoked machine");
 }

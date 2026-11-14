@@ -1,7 +1,7 @@
 #![cfg(test)]
-//! #1107 Fix 4, PR 1: the `DeviceEnrollment` kind (0x05), its record
-//! version rule, and SyncV1 protocol 3 with negotiation down to protocol 2.
-//! Minting and applying the records come in PR 2.
+//! #1107 Fix 4: the `DeviceEnrollment` kind (0x05), its record version
+//! rule, SyncV1 protocol 3 with negotiation down to protocol 2 (PR 1), and
+//! minting and applying the records (PR 2).
 
 use std::sync::Arc;
 
@@ -288,7 +288,7 @@ async fn protocol_3_peers_sync_a_device_enrollment_record() {
     assert_eq!(rb.accepted, 1);
     let key = hex::encode(m.0);
     let held = b.stored_value(SyncKind::DeviceEnrollment, &key).await;
-    assert!(held.is_some(), "b holds the record; applying it is PR 2");
+    assert!(held.is_some(), "b holds the record");
     assert_eq!(
         held,
         a.stored_value(SyncKind::DeviceEnrollment, &key).await,
@@ -746,4 +746,662 @@ async fn interleaved_sessions_do_not_leave_both_sides_at_protocol_2() {
         (3, 3),
         "a completed session at protocol 2 must not lower a remembered 3"
     );
+}
+
+// ───────── PR 2: minting and applying ─────────
+
+fn now_ms() -> u64 {
+    now_unix_ms()
+}
+
+fn signed(machine_id: MachineId, at_ms: u64, expires_at_ms: Option<u64>) -> OwnerEnrollment {
+    OwnerEnrollment::sign(machine_id, &owner_kp(OWNER_SEED), at_ms, expires_at_ms).expect("sign")
+}
+
+async fn mint(store: &OwnerSyncStore, local: MachineId) -> usize {
+    store
+        .mint_device_enrollments(&owner_kp(OWNER_SEED), local)
+        .await
+        .expect("mint")
+}
+
+fn device_hashes(records: &[VersionedRecord]) -> Vec<(String, [u8; 32])> {
+    records
+        .iter()
+        .filter(|r| r.kind == SyncKind::DeviceEnrollment)
+        .map(|r| (r.key.clone(), r.record_hash()))
+        .collect()
+}
+
+/// An enrollment made on device a reaches device b through one session.
+/// Each device ignores the record about its own machine.
+#[tokio::test]
+async fn an_enrollment_minted_on_one_device_is_applied_on_the_other() {
+    let (_dir, a, b) = pair().await;
+    let owner_id = owner_kp(OWNER_SEED).user_id();
+    let m = machine(9);
+    a.enroll(signed(m, now_ms() - 1_000, None))
+        .await
+        .expect("a enrolls m");
+    assert_eq!(mint(&a, machine(1)).await, 2, "machine 2 and m");
+    assert_eq!(mint(&b, machine(2)).await, 1, "machine 1");
+    assert!(!b.is_enrolled(&m, &owner_id).await);
+
+    let (ra, rb) = session(&a, &b).await;
+    ra.expect("a completes");
+    rb.expect("b completes");
+    assert!(b.is_enrolled(&m, &owner_id).await, "b applied m");
+    let b_devices: Vec<[u8; 32]> = b
+        .enrolled_devices()
+        .await
+        .iter()
+        .map(|e| e.machine_id)
+        .collect();
+    assert!(
+        !b_devices.contains(&machine(2).0),
+        "b ignores the record about itself"
+    );
+    let a_devices: Vec<[u8; 32]> = a
+        .enrolled_devices()
+        .await
+        .iter()
+        .map(|e| e.machine_id)
+        .collect();
+    assert!(
+        !a_devices.contains(&machine(1).0),
+        "a ignores the record about itself"
+    );
+    // Applying made no new record: the versions come from the timestamps.
+    assert_eq!(mint(&a, machine(1)).await, 0);
+    assert_eq!(mint(&b, machine(2)).await, 0);
+}
+
+/// A removal on device a reaches device b and wins over an enrollment of
+/// the same millisecond. A replayed older `Enrolled` record is refused
+/// afterwards; a re-enrollment with a newer time admits the machine again.
+#[tokio::test]
+async fn a_removal_propagates_and_wins_at_equal_time_and_a_replay_is_refused() {
+    let (_dir, a, b) = pair().await;
+    let owner_id = owner_kp(OWNER_SEED).user_id();
+    let m = machine(9);
+    let t = now_ms() - 10_000;
+    a.enroll(signed(m, t, None)).await.expect("a enrolls m");
+    b.enroll(signed(m, t, None)).await.expect("b enrolls m");
+    mint(&a, machine(1)).await;
+    mint(&b, machine(2)).await;
+    let (ra, rb) = session(&a, &b).await;
+    ra.expect("a completes");
+    rb.expect("b completes");
+    assert!(b.is_enrolled(&m, &owner_id).await);
+
+    // a removes m at the enrollment's own millisecond.
+    assert!(a.unenroll_at(&m, t).await.expect("a removes m"));
+    assert_eq!(mint(&a, machine(1)).await, 1, "the Removed record");
+    let (ra, rb) = session(&a, &b).await;
+    ra.expect("a completes");
+    rb.expect("b completes");
+    assert!(
+        !b.is_enrolled(&m, &owner_id).await,
+        "the removal wins at equal time"
+    );
+    assert!(!a.is_enrolled(&m, &owner_id).await);
+    let key = hex::encode(m.0);
+    assert_eq!(
+        b.stored_value(SyncKind::DeviceEnrollment, &key).await,
+        Some(SyncValue::DeviceEnrollment { state: removed(t) })
+    );
+    assert_eq!(
+        mint(&b, machine(2)).await,
+        0,
+        "b's own state gives the same version"
+    );
+    assert_eq!(
+        device_hashes(&a.records_snapshot().await),
+        device_hashes(&b.records_snapshot().await),
+        "both devices hold the same records"
+    );
+
+    // A replay of the older Enrolled record: the register keeps Removed,
+    // and applying it does not admit m again.
+    let replay = device_record(m, enrolled(m, t));
+    let outcome = b
+        .commit_batch(vec![replay.clone()], &owner_id)
+        .await
+        .expect("commit");
+    assert!(
+        outcome.accepted.is_empty(),
+        "the older record is superseded"
+    );
+    b.apply_device_enrollments(&[replay], &owner_id, &machine(2))
+        .await;
+    assert!(
+        !b.is_enrolled(&m, &owner_id).await,
+        "the replay does not admit m"
+    );
+
+    // A re-enrollment needs a newer time than the removal.
+    a.enroll(signed(m, t + 1, None)).await.expect("re-enroll");
+    assert_eq!(mint(&a, machine(1)).await, 1);
+    let (ra, rb) = session(&a, &b).await;
+    ra.expect("a completes");
+    rb.expect("b completes");
+    assert!(
+        b.is_enrolled(&m, &owner_id).await,
+        "the newer enrollment admits m"
+    );
+}
+
+/// A synced enrollment that has expired is stored but not applied, so the
+/// machine stays denied.
+#[tokio::test]
+async fn an_expired_enrollment_stays_denied() {
+    let (_dir, a, b) = pair().await;
+    let owner_id = owner_kp(OWNER_SEED).user_id();
+    let m = machine(9);
+    let day = 86_400_000;
+    a.enroll(signed(m, now_ms() - 2 * day, Some(now_ms() - day)))
+        .await
+        .expect("a stores the expired enrollment");
+    assert_eq!(mint(&a, machine(1)).await, 2);
+    let (ra, rb) = session(&a, &b).await;
+    ra.expect("a completes");
+    rb.expect("b completes");
+    assert!(
+        b.stored_value(SyncKind::DeviceEnrollment, &hex::encode(m.0))
+            .await
+            .is_some(),
+        "b stores the record"
+    );
+    assert!(
+        !b.is_enrolled(&m, &owner_id).await,
+        "an expired enrollment stays denied"
+    );
+    assert!(
+        !b.enrolled_devices()
+            .await
+            .iter()
+            .any(|e| e.machine_id == m.0),
+        "it is not applied"
+    );
+}
+
+/// At start a device applies every stored kind 0x05 record (a device that
+/// ran PR 1 stored them without applying them) and mints records for its
+/// local device set. A restart after that mints nothing new.
+#[tokio::test]
+async fn a_restart_applies_stored_records_and_mints_nothing_new() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let owner = owner_kp(OWNER_SEED);
+    let owner_id = owner.user_id();
+    let (m, n, p, q) = (machine(9), machine(10), machine(11), machine(12));
+    let path = dir.path().join("s");
+    {
+        let s = OwnerSyncStore::load(&path).await.expect("store");
+        s.enroll(signed(n, 1_500, None)).await.expect("enroll n");
+        s.enroll(signed(p, 3_000, None)).await.expect("enroll p");
+        s.enroll(signed(q, 5_000, None)).await.expect("enroll q");
+        // Stored as PR 1 stores them: in the register, not applied.
+        s.commit_batch(
+            vec![
+                device_record(m, enrolled(m, 1_000)),
+                device_record(n, removed(2_000)),
+                // Older than q's local enrollment: it must not remove q.
+                device_record(q, removed(4_000)),
+            ],
+            &owner_id,
+        )
+        .await
+        .expect("commit");
+        assert!(!s.is_enrolled(&m, &owner_id).await);
+        assert!(s.is_enrolled(&n, &owner_id).await);
+    }
+    let s = OwnerSyncStore::load(&path).await.expect("restart");
+    let minted = s
+        .reconcile_device_enrollments(&owner, machine(1))
+        .await
+        .expect("reconcile");
+    assert!(
+        s.is_enrolled(&m, &owner_id).await,
+        "the stored Enrolled is applied"
+    );
+    assert!(
+        !s.is_enrolled(&n, &owner_id).await,
+        "the stored Removed is applied"
+    );
+    assert!(s.is_enrolled(&p, &owner_id).await);
+    assert!(
+        s.is_enrolled(&q, &owner_id).await,
+        "an older removal keeps q"
+    );
+    assert_eq!(
+        minted, 2,
+        "p had no record; q's enrollment is newer than its record"
+    );
+    assert_eq!(
+        s.stored_value(SyncKind::DeviceEnrollment, &hex::encode(q.0))
+            .await,
+        Some(SyncValue::DeviceEnrollment {
+            state: DeviceEnrollmentState::Enrolled {
+                enrollment: signed_like(&s, q).await
+            }
+        })
+    );
+    let before = device_hashes(&s.records_snapshot().await);
+    assert_eq!(before.len(), 4);
+    drop(s);
+
+    let s = OwnerSyncStore::load(&path).await.expect("second restart");
+    let minted = s
+        .reconcile_device_enrollments(&owner, machine(1))
+        .await
+        .expect("reconcile");
+    assert_eq!(minted, 0, "a restart mints nothing new");
+    assert_eq!(device_hashes(&s.records_snapshot().await), before);
+}
+
+/// At start, every stored kind 0x05 record is verified again before it is
+/// applied. The records are written straight into the enrollment file, so
+/// no ingest check runs on them: an expired enrollment, an inner enrollment
+/// signed by another key, and an enrollment that names another machine than
+/// its key are not admitted. A valid record in the same file is.
+#[tokio::test]
+async fn a_restart_does_not_admit_an_invalid_stored_record() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let owner = owner_kp(OWNER_SEED);
+    let owner_id = owner.user_id();
+    let (expired, foreign, wrong, valid) = (machine(9), machine(10), machine(11), machine(12));
+    let named = machine(13);
+    let day = 86_400_000;
+    let at = now_ms() - 2 * day;
+    let stranger = OwnerEnrollment::sign(foreign, &owner_kp(99), at, None).expect("sign");
+    write_records(
+        dir.path(),
+        ENROLLMENT_RECORDS_FILE,
+        vec![
+            device_record(
+                expired,
+                DeviceEnrollmentState::Enrolled {
+                    enrollment: signed(expired, at, Some(now_ms() - day)),
+                },
+            ),
+            device_record(
+                foreign,
+                DeviceEnrollmentState::Enrolled {
+                    enrollment: stranger,
+                },
+            ),
+            // Key `wrong`, inner enrollment for `named`.
+            device_record(
+                wrong,
+                DeviceEnrollmentState::Enrolled {
+                    enrollment: signed(named, at, None),
+                },
+            ),
+            device_record(valid, enrolled(valid, at)),
+        ],
+    );
+    let s = OwnerSyncStore::load(dir.path()).await.expect("start");
+    assert_eq!(device_hashes(&s.records_snapshot().await).len(), 4);
+    s.reconcile_device_enrollments(&owner, machine(1))
+        .await
+        .expect("reconcile");
+    let applied: Vec<[u8; 32]> = s
+        .enrolled_devices()
+        .await
+        .iter()
+        .map(|e| e.machine_id)
+        .collect();
+    assert_eq!(applied, vec![valid.0], "only the valid record is admitted");
+    assert!(s.is_enrolled(&valid, &owner_id).await);
+    for m in [expired, foreign, wrong, named] {
+        assert!(!s.is_enrolled(&m, &owner_id).await);
+    }
+}
+
+async fn signed_like(store: &OwnerSyncStore, machine_id: MachineId) -> OwnerEnrollment {
+    store
+        .enrolled_devices()
+        .await
+        .into_iter()
+        .find(|e| e.machine_id == machine_id.0)
+        .expect("enrolled")
+}
+
+/// A `Hello` of a lower version lowers the remembered version; only a
+/// durable commit raises it back to the version this side sent. A session
+/// whose commit fails leaves it lowered.
+#[tokio::test]
+async fn a_failed_commit_does_not_raise_the_remembered_version() {
+    let (dir, a, b) = pair().await;
+    a.speak_only_protocol_for_testing(2);
+    let _ = session(&a, &b).await; // b learns: a speaks 2
+    let _ = session(&a, &b).await;
+    assert_eq!(b.hello_protocol_for(&machine(1)), 2);
+
+    // a "upgrades" (a fresh store remembers nothing, so it sends 3) and
+    // b holds a record a lacks, so a has a batch to commit.
+    drop(a);
+    let a = Arc::new(
+        OwnerSyncStore::load(&dir.path().join("a"))
+            .await
+            .expect("reload a"),
+    );
+    b.commit_batch(
+        vec![names_record(&hex::encode(machine(2).0))],
+        &owner_kp(OWNER_SEED).user_id(),
+    )
+    .await
+    .expect("b record");
+    a.fail_next_register_write
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let (ra, rb) = session(&a, &b).await;
+    assert!(ra.is_err(), "a's commit fails");
+    rb.expect("b completes");
+    assert_eq!(
+        a.hello_protocol_for(&machine(2)),
+        2,
+        "b's Hello of 2 lowered it, and no durable commit raised it"
+    );
+
+    let (ra, _rb) = session(&a, &b).await;
+    ra.expect("a completes");
+    assert_eq!(
+        a.hello_protocol_for(&machine(2)),
+        3,
+        "a durable commit raises it"
+    );
+}
+
+fn write_records(dir: &Path, file: &str, records: Vec<VersionedRecord>) {
+    let sync = dir.join(SYNC_DIR);
+    std::fs::create_dir_all(&sync).expect("sync dir");
+    std::fs::write(
+        sync.join(file),
+        serde_json::to_vec(&PersistedRecords { records }).expect("encode"),
+    )
+    .expect("write");
+}
+
+/// A key in both files keeps the record that wins, whichever file holds it.
+#[tokio::test]
+async fn load_keeps_the_winning_record_when_a_key_is_in_both_files() {
+    let m = machine(9);
+    let older = device_record(m, enrolled(m, 1_000));
+    let newer = device_record(m, removed(1_000));
+    for (in_records, in_enrollments) in [(&older, &newer), (&newer, &older)] {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        write_records(dir.path(), RECORDS_FILE, vec![in_records.clone()]);
+        write_records(
+            dir.path(),
+            ENROLLMENT_RECORDS_FILE,
+            vec![in_enrollments.clone()],
+        );
+        let s = OwnerSyncStore::load(dir.path()).await.expect("load");
+        assert_eq!(
+            s.stored_value(SyncKind::DeviceEnrollment, &hex::encode(m.0))
+                .await,
+            Some(SyncValue::DeviceEnrollment {
+                state: removed(1_000)
+            })
+        );
+    }
+}
+
+/// Without the enrollment file a device loads the four older kinds; with a
+/// corrupt one it refuses to start, as for every other state file.
+#[tokio::test]
+async fn a_missing_enrollment_file_loads_and_a_corrupt_one_refuses_to_start() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let owner_id = owner_kp(OWNER_SEED).user_id();
+    let m = machine(9);
+    {
+        let s = OwnerSyncStore::load(dir.path()).await.expect("store");
+        s.commit_batch(
+            vec![
+                names_record(&hex::encode(machine(1).0)),
+                device_record(m, enrolled(m, 1_000)),
+            ],
+            &owner_id,
+        )
+        .await
+        .expect("commit");
+    }
+    let file = dir.path().join(SYNC_DIR).join(ENROLLMENT_RECORDS_FILE);
+    std::fs::remove_file(&file).expect("remove");
+    let s = OwnerSyncStore::load(dir.path())
+        .await
+        .expect("loads without the file");
+    let records = s.records_snapshot().await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].kind, SyncKind::MachineNames);
+    drop(s);
+
+    std::fs::write(&file, b"{not json").expect("corrupt");
+    let err = OwnerSyncStore::load(dir.path())
+        .await
+        .err()
+        .expect("a corrupt enrollment file refuses the start");
+    assert!(err.to_string().contains(ENROLLMENT_RECORDS_FILE), "{err}");
+}
+
+/// A peer at protocol 2 that sends a kind 0x05 record in a records page is
+/// refused, and nothing is committed.
+#[tokio::test]
+async fn a_protocol_2_session_refuses_a_device_enrollment_record_page() {
+    let (_dir, a, _b) = pair().await;
+    let (client, server) = tokio::io::duplex(256 * 1024);
+    let (mut a_recv, mut a_send) = tokio::io::split(server);
+    let (mut p_recv, mut p_send) = tokio::io::split(client);
+    let owner = owner_kp(OWNER_SEED);
+    let owner_id = owner.user_id().0;
+    let m = machine(9);
+    let record = device_record(m, enrolled(m, 1_000));
+
+    let peer = tokio::spawn(async move {
+        let signer = owner_kp(OWNER_SEED);
+        write_frame(
+            &mut p_send,
+            &SyncFrame::Hello {
+                protocol_version: 2,
+                machine_id: machine(2).0,
+                owner_user_id: owner_id,
+                nonce: fresh_nonce(),
+            },
+        )
+        .await?;
+        let a_nonce = match read_frame(&mut p_recv).await? {
+            SyncFrame::Hello { nonce, .. } => nonce,
+            other => return Err(SyncError::MalformedFrame(format!("{other:?}"))),
+        };
+        let msg = proof_message(&a_nonce, &machine(2).0, &machine(1).0, &owner_id);
+        let sig = sign_with_ml_dsa(signer.secret_key(), &msg)
+            .map_err(|e| SyncError::ChallengeFailed(format!("{e:?}")))?;
+        write_frame(
+            &mut p_send,
+            &SyncFrame::Proof {
+                signature: sig.as_bytes().to_vec(),
+            },
+        )
+        .await?;
+        let _ = read_frame(&mut p_recv).await?; // a's proof
+        write_frame(&mut p_send, &SyncFrame::VersionVector { kinds: vec![] }).await?;
+        write_frame(&mut p_send, &SyncFrame::VectorEnd).await?;
+        write_frame(
+            &mut p_send,
+            &SyncFrame::Records {
+                records: vec![record],
+            },
+        )
+        .await?;
+        write_frame(&mut p_send, &SyncFrame::Done).await?;
+        while read_frame(&mut p_recv).await.is_ok() {}
+        Ok::<(), SyncError>(())
+    });
+
+    let err = run_sync_session_with_timeout(
+        Duration::from_secs(10),
+        &mut a_send,
+        &mut a_recv,
+        &a,
+        &owner,
+        &machine(1),
+        &machine(2),
+        |_| {},
+    )
+    .await
+    .expect_err("a kind 0x05 record in a protocol-2 session must be refused");
+    assert!(matches!(err, SyncError::MalformedFrame(_)), "{err:?}");
+    assert_eq!(
+        device_keys(&a.records_snapshot().await),
+        0,
+        "nothing committed"
+    );
+    assert!(!a.is_enrolled(&m, &owner.user_id()).await);
+    drop((a_send, a_recv));
+    let _ = peer.await;
+}
+
+/// The service applies the stored kind 0x05 records when it starts, before
+/// any session, and its reconcile pass mints a record for an enrollment
+/// made after the start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_service_applies_stored_records_at_start_and_its_pass_mints() {
+    super::tests::install_loopback_socket_boundary();
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let seed = OWNER_SEED;
+    let owner_id = owner_kp(seed).user_id();
+    let (m, n) = (machine(9), machine(10));
+    {
+        let s = OwnerSyncStore::load(&dir.path().join("alice"))
+            .await
+            .expect("store");
+        s.commit_batch(vec![device_record(m, enrolled(m, 1_000))], &owner_id)
+            .await
+            .expect("stored, not applied");
+        assert!(!s.is_enrolled(&m, &owner_id).await);
+    }
+    let (_agent, service) = super::tests::live_owner_device(dir.path(), "alice", [seed; 32]).await;
+    let store = service.store();
+    assert!(store.is_enrolled(&m, &owner_id).await, "applied at start");
+
+    store
+        .enroll(signed(n, now_ms() - 1_000, None))
+        .await
+        .expect("enroll n");
+    let key = hex::encode(n.0);
+    assert!(store
+        .stored_value(SyncKind::DeviceEnrollment, &key)
+        .await
+        .is_none());
+    service.reconcile_local_state().await.expect("pass");
+    assert!(
+        store
+            .stored_value(SyncKind::DeviceEnrollment, &key)
+            .await
+            .is_some(),
+        "the pass mints the record"
+    );
+}
+
+/// A kind 0x05 record whose time is more than the enrollment clock skew
+/// (`ENROLL_EXPIRY_SKEW_MS`, 300 s) in the future is not stored; the other
+/// records of its batch commit. A time within the skew is stored.
+#[tokio::test]
+async fn a_device_enrollment_record_from_the_future_is_not_stored() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let s = OwnerSyncStore::load(dir.path()).await.expect("store");
+    let owner_id = owner_kp(OWNER_SEED).user_id();
+    let (m, n, p) = (machine(9), machine(10), machine(11));
+    let now = now_ms();
+    let outcome = s
+        .commit_batch(
+            vec![
+                device_record(m, enrolled(m, now + ENROLL_EXPIRY_SKEW_MS + 60_000)),
+                device_record(n, removed(now + ENROLL_EXPIRY_SKEW_MS + 60_000)),
+                device_record(p, removed(now + 60_000)),
+                names_record(&hex::encode(machine(1).0)),
+            ],
+            &owner_id,
+        )
+        .await
+        .expect("commit");
+    assert_eq!(outcome.accepted.len(), 2, "p's record and the names record");
+    for (machine_id, stored) in [(m, false), (n, false), (p, true)] {
+        assert_eq!(
+            s.stored_value(SyncKind::DeviceEnrollment, &hex::encode(machine_id.0))
+                .await
+                .is_some(),
+            stored,
+            "{machine_id:?}"
+        );
+    }
+}
+
+fn unsigned_names(key: &str) -> VersionedRecord {
+    VersionedRecord {
+        kind: SyncKind::MachineNames,
+        key: key.to_string(),
+        value: names_value("n"),
+        clock: clock(1, 1, 1),
+        owner_public_key: Vec::new(),
+        signature: Vec::new(),
+    }
+}
+
+/// The two register files share one limit of `MAX_STORED_RECORDS`: a new
+/// key of either kind is refused at the limit, by a commit and by a mint,
+/// and a newer record of a stored key is still accepted.
+#[tokio::test]
+async fn the_store_limit_counts_both_files() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let owner = owner_kp(OWNER_SEED);
+    let owner_id = owner.user_id();
+    let m = machine(9);
+    // Loaded records are not verified, so unsigned fillers will do.
+    let fillers: Vec<VersionedRecord> = (0..MAX_STORED_RECORDS - 2)
+        .map(|i| unsigned_names(&format!("filler-{i}")))
+        .collect();
+    write_records(dir.path(), RECORDS_FILE, fillers);
+    write_records(
+        dir.path(),
+        ENROLLMENT_RECORDS_FILE,
+        vec![device_record(m, enrolled(m, 1_000))],
+    );
+    let s = OwnerSyncStore::load(dir.path()).await.expect("load");
+    assert_eq!(s.records_snapshot().await.len(), MAX_STORED_RECORDS - 1);
+
+    // The last free slot takes a kind 0x05 record.
+    let n = machine(10);
+    let outcome = s
+        .commit_batch(vec![device_record(n, enrolled(n, 1_000))], &owner_id)
+        .await
+        .expect("the last slot");
+    assert_eq!(outcome.accepted.len(), 1);
+
+    // At the limit a new key is refused, whatever its kind.
+    let p = machine(11);
+    for record in [
+        device_record(p, enrolled(p, 1_000)),
+        names_record(&hex::encode(machine(1).0)),
+    ] {
+        let err = s
+            .commit_batch(vec![record], &owner_id)
+            .await
+            .expect_err("a new key at the limit");
+        assert!(matches!(err, SyncError::StoreLimit(_)), "{err:?}");
+    }
+    s.enroll(signed(p, 1_000, None)).await.expect("enroll p");
+    let err = s
+        .mint_device_enrollments(&owner, machine(1))
+        .await
+        .expect_err("a mint of a new key at the limit");
+    assert!(matches!(err, SyncError::StoreLimit(_)), "{err:?}");
+
+    // A newer record of a stored key still replaces it.
+    let outcome = s
+        .commit_batch(vec![device_record(m, removed(1_000))], &owner_id)
+        .await
+        .expect("a stored key at the limit");
+    assert_eq!(outcome.accepted.len(), 1);
+    assert_eq!(s.records_snapshot().await.len(), MAX_STORED_RECORDS);
 }
