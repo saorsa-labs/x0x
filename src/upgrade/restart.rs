@@ -3423,6 +3423,7 @@ pub fn run_upgrade_handoff(handoff_path: &Path) -> i32 {
         &data_dir,
         health_timeout,
         &handoff.to_version,
+        HealthGate::Candidate,
     );
     match new_outcome {
         SpawnHealthOutcome::Healthy => {
@@ -3459,6 +3460,7 @@ pub fn run_upgrade_handoff(handoff_path: &Path) -> i32 {
         &data_dir,
         health_timeout,
         &handoff.from_version,
+        HealthGate::Restored,
     ) {
         SpawnHealthOutcome::Healthy => {
             finish_success(handoff_path, &handoff, &handoff.from_version, "restored");
@@ -3521,6 +3523,7 @@ fn spawn_and_await_health(
     data_dir: &Path,
     health_timeout: Duration,
     expected_version: &str,
+    gate: HealthGate,
 ) -> SpawnHealthOutcome {
     let mut cmd = std::process::Command::new(binary);
     cmd.args(build_spawn_args(&handoff.argv));
@@ -3547,7 +3550,7 @@ fn spawn_and_await_health(
         Ok(child) => child,
         Err(e) => return SpawnHealthOutcome::SpawnFailed(e),
     };
-    if wait_for_health(handoff, data_dir, health_timeout, expected_version) {
+    if wait_for_health(handoff, data_dir, health_timeout, expected_version, gate) {
         drop(child);
         SpawnHealthOutcome::Healthy
     } else {
@@ -3640,11 +3643,12 @@ fn wait_for_health(
     data_dir: &Path,
     timeout: Duration,
     expected_version: &str,
+    gate: HealthGate,
 ) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(addr) = resolve_health_addr(handoff, data_dir) {
-            if http_health_ok(addr, expected_version) {
+            if http_health_ok(addr, expected_version, gate) {
                 return true;
             }
         }
@@ -3736,6 +3740,16 @@ struct HealthProbe {
     verdict: Option<HealthProbeVerdict>,
 }
 
+/// Which leg of the handoff a health wait judges (#1377).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HealthGate {
+    /// The new release: a failed local check (M1 `error`) blocks commit.
+    Candidate,
+    /// The restored previous release: only `ok` and the version decide, so
+    /// a host-level failure cannot also refuse the last good binary.
+    Restored,
+}
+
 /// The overall level of the M1 verdict object on `/health`.
 #[derive(serde::Deserialize)]
 struct HealthProbeVerdict {
@@ -3747,11 +3761,14 @@ struct HealthProbeVerdict {
 /// `ok == true` and `version == expected_version`. A bare 200 — from an old
 /// image still bound to the address, or a foreign listener — never commits
 /// the restart, and a truncated or malformed body fails closed.
-/// An M1 verdict of `error` (a failed local check: critical disk or missing
-/// identity) never commits either: D193 makes local checks block commit
-/// (#1377). `degraded` still commits; peer reachability is not judged here.
+/// For the candidate leg only, an M1 verdict of `error` (a failed local
+/// check: critical disk or missing identity) never commits either: D193
+/// makes local checks block commit (#1377). `degraded` still commits; peer
+/// reachability is not judged here. The restored leg ignores the verdict: a
+/// host-level `error` fails the restored binary too, and refusing it would
+/// reap the last good daemon and leave the node with none.
 /// `/health` is auth-exempt on the daemon API.
-fn http_health_ok(addr: SocketAddr, expected_version: &str) -> bool {
+fn http_health_ok(addr: SocketAddr, expected_version: &str, gate: HealthGate) -> bool {
     let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(2)) else {
         return false;
     };
@@ -3792,9 +3809,10 @@ fn http_health_ok(addr: SocketAddr, expected_version: &str) -> bool {
         Ok(probe) => {
             probe.ok
                 && probe.version == expected_version
-                && probe
-                    .verdict
-                    .is_none_or(|verdict| verdict.verdict != "error")
+                && (gate == HealthGate::Restored
+                    || probe
+                        .verdict
+                        .is_none_or(|verdict| verdict.verdict != "error"))
         }
         Err(_) => false,
     }
@@ -5534,8 +5552,8 @@ mod tests {
                 ("503 Service Unavailable".to_string(), health_body("1.2.3")),
             ],
         );
-        assert!(http_health_ok(addr, "1.2.3"));
-        assert!(!http_health_ok(addr, "1.2.3"));
+        assert!(http_health_ok(addr, "1.2.3", HealthGate::Candidate));
+        assert!(!http_health_ok(addr, "1.2.3", HealthGate::Candidate));
         server.join().unwrap();
     }
 
@@ -5546,7 +5564,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = serve_responses(listener, vec![("200 OK".to_string(), health_body("9.9.7"))]);
-        assert!(!http_health_ok(addr, "9.9.9"));
+        assert!(!http_health_ok(addr, "9.9.9", HealthGate::Candidate));
         server.join().unwrap();
     }
 
@@ -5574,14 +5592,57 @@ mod tests {
             ],
         );
         assert!(
-            !http_health_ok(addr, "1.2.3"),
+            !http_health_ok(addr, "1.2.3", HealthGate::Candidate),
             "an M1 error verdict must not commit"
         );
-        assert!(http_health_ok(addr, "1.2.3"), "degraded still commits");
-        assert!(http_health_ok(addr, "1.2.3"), "ok commits");
         assert!(
-            http_health_ok(addr, "1.2.3"),
+            http_health_ok(addr, "1.2.3", HealthGate::Candidate),
+            "degraded still commits"
+        );
+        assert!(
+            http_health_ok(addr, "1.2.3", HealthGate::Candidate),
+            "ok commits"
+        );
+        assert!(
+            http_health_ok(addr, "1.2.3", HealthGate::Candidate),
             "a pre-M1 body commits as before"
+        );
+        server.join().unwrap();
+    }
+
+    /// #1903 review: rollback under a host-level M1 `error` (critical disk,
+    /// missing identity). The candidate is refused, but the restored
+    /// previous release reports the same host `error` and must still be
+    /// accepted, or the helper reaps the last good daemon.
+    #[test]
+    fn restored_leg_accepts_200_with_a_host_level_m1_error_verdict() {
+        let body = |version: &str| {
+            format!(
+                "{{\"ok\":true,\"status\":\"ok\",\"version\":\"{version}\",\
+                 \"verdict\":{{\"verdict\":\"error\",\"reasons\":[],\"inputs\":{{}}}}}}"
+            )
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_responses(
+            listener,
+            vec![
+                ("200 OK".to_string(), body("2.0.0")),
+                ("200 OK".to_string(), body("1.0.0")),
+                ("200 OK".to_string(), body("2.0.0")),
+            ],
+        );
+        assert!(
+            !http_health_ok(addr, "2.0.0", HealthGate::Candidate),
+            "the candidate under a host error does not commit"
+        );
+        assert!(
+            http_health_ok(addr, "1.0.0", HealthGate::Restored),
+            "the restored release under the same host error is accepted"
+        );
+        assert!(
+            !http_health_ok(addr, "1.0.0", HealthGate::Restored),
+            "the restored leg still checks the version"
         );
         server.join().unwrap();
     }
@@ -5602,9 +5663,9 @@ mod tests {
                 ("200 OK".to_string(), not_ok),
             ],
         );
-        assert!(!http_health_ok(addr, "1.2.3"));
-        assert!(!http_health_ok(addr, "1.2.3"));
-        assert!(!http_health_ok(addr, "1.2.3"));
+        assert!(!http_health_ok(addr, "1.2.3", HealthGate::Candidate));
+        assert!(!http_health_ok(addr, "1.2.3", HealthGate::Candidate));
+        assert!(!http_health_ok(addr, "1.2.3", HealthGate::Candidate));
         server.join().unwrap();
     }
 
@@ -5621,7 +5682,7 @@ mod tests {
             "x".repeat(HEALTH_RESPONSE_CAP + 1024)
         );
         let server = serve_responses(listener, vec![("200 OK".to_string(), oversized)]);
-        assert!(!http_health_ok(addr, "1.2.3"));
+        assert!(!http_health_ok(addr, "1.2.3", HealthGate::Candidate));
         server.join().unwrap();
     }
     #[test]
