@@ -999,6 +999,65 @@ async fn a_restart_applies_stored_records_and_mints_nothing_new() {
     assert_eq!(device_hashes(&s.records_snapshot().await), before);
 }
 
+/// At start, every stored kind 0x05 record is verified again before it is
+/// applied. The records are written straight into the enrollment file, so
+/// no ingest check runs on them: an expired enrollment, an inner enrollment
+/// signed by another key, and an enrollment that names another machine than
+/// its key are not admitted. A valid record in the same file is.
+#[tokio::test]
+async fn a_restart_does_not_admit_an_invalid_stored_record() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let owner = owner_kp(OWNER_SEED);
+    let owner_id = owner.user_id();
+    let (expired, foreign, wrong, valid) = (machine(9), machine(10), machine(11), machine(12));
+    let named = machine(13);
+    let day = 86_400_000;
+    let at = now_ms() - 2 * day;
+    let stranger = OwnerEnrollment::sign(foreign, &owner_kp(99), at, None).expect("sign");
+    write_records(
+        dir.path(),
+        ENROLLMENT_RECORDS_FILE,
+        vec![
+            device_record(
+                expired,
+                DeviceEnrollmentState::Enrolled {
+                    enrollment: signed(expired, at, Some(now_ms() - day)),
+                },
+            ),
+            device_record(
+                foreign,
+                DeviceEnrollmentState::Enrolled {
+                    enrollment: stranger,
+                },
+            ),
+            // Key `wrong`, inner enrollment for `named`.
+            device_record(
+                wrong,
+                DeviceEnrollmentState::Enrolled {
+                    enrollment: signed(named, at, None),
+                },
+            ),
+            device_record(valid, enrolled(valid, at)),
+        ],
+    );
+    let s = OwnerSyncStore::load(dir.path()).await.expect("start");
+    assert_eq!(device_hashes(&s.records_snapshot().await).len(), 4);
+    s.reconcile_device_enrollments(&owner, machine(1))
+        .await
+        .expect("reconcile");
+    let applied: Vec<[u8; 32]> = s
+        .enrolled_devices()
+        .await
+        .iter()
+        .map(|e| e.machine_id)
+        .collect();
+    assert_eq!(applied, vec![valid.0], "only the valid record is admitted");
+    assert!(s.is_enrolled(&valid, &owner_id).await);
+    for m in [expired, foreign, wrong, named] {
+        assert!(!s.is_enrolled(&m, &owner_id).await);
+    }
+}
+
 async fn signed_like(store: &OwnerSyncStore, machine_id: MachineId) -> OwnerEnrollment {
     store
         .enrolled_devices()
