@@ -649,6 +649,118 @@ fn inspect_admission_inner(
     }
 }
 
+/// Durable receipt of the most recent local hold clear (D190). It sits beside
+/// the probe record and never matches the debris sweep patterns.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HoldClearReceipt {
+    pub schema_version: u32,
+    pub record_kind: String,
+    pub install: PathBuf,
+    pub version: String,
+    pub cause: ProbeCause,
+    pub transaction_id: String,
+    pub cleared_at_unix: u64,
+}
+
+/// What a local clear request found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HoldClear {
+    /// The failed-release hold for this version was recorded and removed.
+    Cleared(HoldClearReceipt),
+    /// No failed-release hold exists for this version. Nothing changed.
+    NotHeld,
+}
+
+pub(crate) fn clear_receipt_path(install: &Path) -> io::Result<PathBuf> {
+    let state = state_path(install)?;
+    let mut name = state
+        .file_name()
+        .ok_or_else(|| invalid("probe record has no filename"))?
+        .to_os_string();
+    name.push(".cleared");
+    Ok(state.with_file_name(name))
+}
+
+fn validate_clear_receipt(bytes: &[u8]) -> io::Result<()> {
+    let receipt: HoldClearReceipt = serde_json::from_slice(bytes).map_err(invalid)?;
+    if receipt.schema_version != 1
+        || receipt.record_kind != "probe_hold_cleared"
+        || !receipt.install.is_absolute()
+    {
+        return Err(invalid("invalid probe hold clear receipt"));
+    }
+    Ok(())
+}
+
+/// D190: an authenticated, recorded local clear of a failed-release hold.
+///
+/// The caller holds the install lock and has authenticated the request. Only
+/// a `FailedHold` record for exactly `version` is cleared. Recovery-failed,
+/// an unresolved or running record, and a latched barrier failure are never
+/// cleared: they refuse with `RecoveryFailed` and every record is kept. The
+/// receipt is durable before the hold is removed, so a crash between the two
+/// leaves the hold in place with the receipt naming the intent; a repeat
+/// request then completes the clear.
+pub(crate) fn clear_failed_hold(install: &Path, version: &str) -> Result<HoldClear, ProbeRefusal> {
+    let path = state_path(install).map_err(recovery_error)?;
+    match journal::read_auxiliary_record(&uncertainty_path(install).map_err(recovery_error)?) {
+        Ok(_) => {
+            return Err(ProbeRefusal::RecoveryFailed {
+                reason: "probe terminalization is unresolved; records preserved".into(),
+            });
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(recovery_error(error)),
+    }
+    if is_latched(&path) {
+        return Err(ProbeRefusal::RecoveryFailed {
+            reason: "a probe record barrier failed in this process".into(),
+        });
+    }
+    let Some(state) = read_state(install).map_err(recovery_error)? else {
+        return Ok(HoldClear::NotHeld);
+    };
+    match state.phase {
+        ProbePhase::RecoveryFailed | ProbePhase::Running => {
+            return Err(ProbeRefusal::RecoveryFailed {
+                reason: format!(
+                    "probe record for {} is {:?}; a local clear never resolves it",
+                    state.version, state.phase
+                ),
+            });
+        }
+        ProbePhase::FailedHold if state.version == version => {}
+        _ => return Ok(HoldClear::NotHeld),
+    }
+    let cause = state
+        .cause
+        .ok_or_else(|| recovery_error("failed probe hold has no cause"))?;
+    let receipt = HoldClearReceipt {
+        schema_version: 1,
+        record_kind: "probe_hold_cleared".into(),
+        install: state.install.clone(),
+        version: state.version.clone(),
+        cause,
+        transaction_id: state.transaction_id.clone(),
+        cleared_at_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0),
+    };
+    let receipt_path = clear_receipt_path(install).map_err(recovery_error)?;
+    journal::write_auxiliary_record(&receipt_path, &receipt, validate_clear_receipt)
+        .map_err(|error| recovery_error(format!("hold clear receipt not durable: {error}")))?;
+    std::fs::remove_file(&path)
+        .map_err(|error| recovery_error(format!("hold record not removed: {error}")))?;
+    if let Some(parent) = path.parent() {
+        journal::open_for_sync(parent, true)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| recovery_error(format!("hold removal not durable: {error}")))?;
+    }
+    Ok(HoldClear::Cleared(receipt))
+}
+
 fn interrupt_state(state: &mut ProbeState, cause: ProbeCause, clock: &ProbeClock) {
     state.cause = Some(cause);
     state.boot_id.clone_from(&clock.boot_id);

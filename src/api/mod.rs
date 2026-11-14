@@ -1835,6 +1835,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         category: "upgrade",
         request: RequestSpec::Fields(&[RequestField::query("now", false)]),
     },
+    EndpointDef {
+        method: Method::Post,
+        path: "/upgrade/clear-hold",
+        cli_name: "upgrade --clear-hold",
+        description: "Authenticated, recorded local clear of this install's failed-release probe hold for one version (D190); never clears recovery-failed",
+        category: "upgrade",
+        request: RequestSpec::Fields(&[RequestField::query("version", true)]),
+    },
     // ── WebSocket ───────────────────────────────────────────────────────
     EndpointDef {
         method: Method::Get,

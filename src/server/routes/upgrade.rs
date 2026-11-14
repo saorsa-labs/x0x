@@ -2001,6 +2001,112 @@ pub(in crate::server) async fn apply_upgrade(
     }
 }
 
+/// `POST /upgrade/clear-hold?version=<v>` (D190, #1376).
+#[derive(serde::Deserialize)]
+pub(in crate::server) struct UpgradeClearHoldQuery {
+    version: String,
+}
+
+/// D190: an authenticated, recorded local clear of this install's
+/// failed-release probe hold for exactly `version`. A newer release already
+/// clears such a hold by itself; this route lets an operator retry the held
+/// release. It never clears recovery-failed or an unresolved record, and it
+/// refuses while another upgrade operation holds the in-process apply lock.
+pub(in crate::server) async fn clear_upgrade_hold(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<UpgradeClearHoldQuery>,
+) -> Response {
+    let refuse = |status: StatusCode, error: String| {
+        (
+            status,
+            Json(serde_json::json!({ "ok": false, "cleared": false, "error": error })),
+        )
+            .into_response()
+    };
+    if !state.self_update_enabled {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "cleared": false,
+                "reason": "self-update disabled for this process"
+            })),
+        )
+            .into_response();
+    }
+    if semver::Version::parse(&query.version).is_err() {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            format!("version {:?} is not a semantic version", query.version),
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = &state;
+        refuse(
+            StatusCode::NOT_IMPLEMENTED,
+            "release probe holds exist only on Unix installs".into(),
+        )
+    }
+    #[cfg(unix)]
+    {
+        let Ok(_apply_guard) = state.upgrade_apply_lock.try_lock() else {
+            return refuse(StatusCode::CONFLICT, "upgrade already in progress".into());
+        };
+        // Resolve the install on this task: the executable observation is
+        // per thread in tests and must not move to the blocking pool.
+        let install = match crate::upgrade::apply::current_binary_path().and_then(|path| {
+            path.canonicalize()
+                .map_err(|error| x0x::upgrade::UpgradeError::Other(error.to_string()))
+        }) {
+            Ok(install) => install,
+            Err(error) => {
+                return refuse(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("install path unavailable: {error}"),
+                )
+            }
+        };
+        let version = query.version.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let _host_lock = crate::upgrade::acquire_host_upgrade_lock(&install)
+                .map_err(|error| error.to_string())?;
+            crate::upgrade::probe::clear_failed_hold(&install, &version)
+                .map_err(|error| error.to_string())
+        })
+        .await;
+        match outcome {
+            Ok(Ok(crate::upgrade::probe::HoldClear::Cleared(receipt))) => {
+                tracing::info!(
+                    version = %receipt.version,
+                    cause = ?receipt.cause,
+                    "Failed-release hold cleared by an authenticated local request"
+                );
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "ok": true,
+                        "cleared": true,
+                        "version": receipt.version,
+                        "cause": receipt.cause,
+                        "transaction_id": receipt.transaction_id,
+                    })),
+                )
+                    .into_response()
+            }
+            Ok(Ok(crate::upgrade::probe::HoldClear::NotHeld)) => refuse(
+                StatusCode::NOT_FOUND,
+                format!("no failed-release hold for {}", query.version),
+            ),
+            Ok(Err(error)) => refuse(StatusCode::CONFLICT, error),
+            Err(error) => refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("hold clear worker failed: {error}"),
+            ),
+        }
+    }
+}
+
 /// D185 is limited to the rollout delay; authentication remains on the route.
 #[derive(Default, serde::Deserialize)]
 pub(in crate::server) struct UpgradeApplyQuery {
@@ -2688,6 +2794,154 @@ mod tests {
                 .is_err(),
             "nothing may self-deliver on the release topic from a check"
         );
+    }
+
+    /// A fake install with one probe record in `phase` for `version`.
+    #[cfg(unix)]
+    fn install_with_probe_record(
+        dir: &std::path::Path,
+        version: &str,
+        phase: crate::upgrade::probe::ProbePhase,
+        cause: crate::upgrade::probe::ProbeCause,
+    ) -> PathBuf {
+        let install = dir.join("x0xd");
+        std::fs::write(&install, b"installed daemon").expect("install fixture");
+        let install = install.canonicalize().expect("canonical install");
+        let state = crate::upgrade::probe::ProbeState {
+            schema_version: 1,
+            record_kind: "probe".into(),
+            install: install.clone(),
+            version: version.into(),
+            platform: "test-platform".into(),
+            archive_sha256: [7; 32],
+            transaction_id: uuid::Uuid::new_v4().to_string(),
+            attempt: 1,
+            phase,
+            cause: Some(cause),
+            last_pid: None,
+            boot_id: "test-boot".into(),
+            retry_remaining_ms: 0,
+            retry_deadline_ms: 0,
+            daemon_sha256: None,
+            cli_sha256: None,
+        };
+        crate::upgrade::journal::write_auxiliary_record(
+            &crate::upgrade::probe::state_path(&install).expect("state path"),
+            &state,
+            |_| Ok(()),
+        )
+        .expect("probe record fixture");
+        install
+    }
+
+    // #1376 / D190: an authenticated local clear removes a failed-release
+    // hold for exactly that version, records a durable receipt, and the
+    // held release is admitted again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clear_upgrade_hold_route_records_and_removes_a_failed_hold() {
+        use crate::upgrade::probe::{self, Admission, ProbeCause, ProbePhase};
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = loopback_gossip_agent(dir.path()).await;
+        let state = upgrade_route_state(Arc::clone(&agent), dir.path()).await;
+        let install = install_with_probe_record(
+            dir.path(),
+            "9.9.9",
+            ProbePhase::FailedHold,
+            ProbeCause::VersionMismatch,
+        );
+        let _install = crate::upgrade::apply::current_binary_path_seam::install(install.clone());
+        assert!(
+            matches!(
+                probe::inspect_admission(&install, "9.9.9"),
+                Err(probe::ProbeRefusal::Held { .. })
+            ),
+            "fixture: the release starts held"
+        );
+
+        let clear = |version: &str| {
+            clear_upgrade_hold(
+                State(Arc::clone(&state)),
+                Query(UpgradeClearHoldQuery {
+                    version: version.into(),
+                }),
+            )
+        };
+        let (status, body) = route_response_json(clear("9.9.8").await).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "another version: {body}");
+        assert!(probe::read_state(&install).expect("read").is_some());
+
+        let (status, body) = route_response_json(clear("9.9.9").await).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["cleared"], serde_json::json!(true));
+        assert_eq!(body["cause"], serde_json::json!("version_mismatch"));
+        assert!(
+            probe::read_state(&install).expect("read").is_none(),
+            "the hold record is removed"
+        );
+        let receipt: probe::HoldClearReceipt = serde_json::from_slice(
+            &crate::upgrade::journal::read_auxiliary_record(
+                &probe::clear_receipt_path(&install).expect("receipt path"),
+            )
+            .expect("durable receipt"),
+        )
+        .expect("receipt decodes");
+        assert_eq!(receipt.version, "9.9.9");
+        assert_eq!(receipt.cause, ProbeCause::VersionMismatch);
+        assert_eq!(
+            probe::inspect_admission(&install, "9.9.9").expect("admitted"),
+            Admission::Ready
+        );
+
+        let (status, body) = route_response_json(clear("9.9.9").await).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a repeat finds no hold: {body}"
+        );
+        let (status, _) = route_response_json(clear("not-a-version").await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // D190: recovery-failed is never cleared by the local route; the record
+    // stays and admission still refuses.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clear_upgrade_hold_route_never_clears_recovery_failed() {
+        use crate::upgrade::probe::{self, ProbeCause, ProbePhase};
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = loopback_gossip_agent(dir.path()).await;
+        let state = upgrade_route_state(Arc::clone(&agent), dir.path()).await;
+        let install = install_with_probe_record(
+            dir.path(),
+            "9.9.9",
+            ProbePhase::RecoveryFailed,
+            ProbeCause::HoldWriteFailed,
+        );
+        let _install = crate::upgrade::apply::current_binary_path_seam::install(install.clone());
+
+        let (status, body) = route_response_json(
+            clear_upgrade_hold(
+                State(Arc::clone(&state)),
+                Query(UpgradeClearHoldQuery {
+                    version: "9.9.9".into(),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["cleared"], serde_json::json!(false));
+        let kept = probe::read_state(&install)
+            .expect("read")
+            .expect("record kept");
+        assert_eq!(kept.phase, ProbePhase::RecoveryFailed);
+        assert!(!probe::clear_receipt_path(&install).expect("path").exists());
+        assert!(matches!(
+            probe::inspect_admission(&install, "9.9.9"),
+            Err(probe::ProbeRefusal::RecoveryFailed { .. })
+        ));
     }
 
     /// The apply path is the one announcing route: an explicit owner
