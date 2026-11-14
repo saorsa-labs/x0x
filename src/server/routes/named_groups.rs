@@ -35,7 +35,8 @@ pub(in crate::server) use group_recovery::{
 };
 pub(in crate::server) use revocation_eviction::owner_recovery::sign_recovery_mandate;
 pub(in crate::server) use revocation_eviction::{
-    run_revocation_eviction_worker, s4_no_eligible_admin_refusal, S4Runtime,
+    load_revocation_eviction_store, run_revocation_eviction_worker, s4_no_eligible_admin_refusal,
+    S4Runtime,
 };
 pub(in crate::server) use seat_cert_fetch::{
     cert_evidence_deadline_elapsed, clear_cert_evidence_stamps, clear_cert_evidence_stamps_for,

@@ -54,7 +54,7 @@ struct KeptHandoffsV1 {
     handoffs: Vec<KeptHandoffV1>,
 }
 
-fn path(state: &AppState) -> PathBuf {
+pub(super) fn path(state: &AppState) -> PathBuf {
     state.data_dir.join(FILE_NAME)
 }
 
@@ -73,7 +73,9 @@ fn encode(kept: &BTreeMap<EvictionKey, ExpiryHandoff>) -> Result<Vec<u8>, postca
     encode_local_file(HEADER_V1, &file)
 }
 
-fn decode(bytes: &[u8]) -> Result<BTreeMap<EvictionKey, ExpiryHandoff>, SidecarDecodeError> {
+pub(super) fn decode(
+    bytes: &[u8],
+) -> Result<BTreeMap<EvictionKey, ExpiryHandoff>, SidecarDecodeError> {
     let file: KeptHandoffsV1 = decode_local_file(PREFIX, MAX_SUPPORTED_VERSION, bytes)?;
     Ok(file
         .handoffs
@@ -98,6 +100,11 @@ pub(super) async fn persist(state: &AppState) {
     }
     let runtime = &state.revocation_evictions;
     let _writer = runtime.evs_writer.lock().await;
+    // #1597 item 5c: the file is not read yet; the set stays dirty and the
+    // first write after the load (which merges the file) carries it.
+    if runtime.load_pending() {
+        return;
+    }
     let bytes = {
         let mut inner = runtime.inner.lock().await;
         if !inner.expiry_handoffs_dirty || inner.expiry_handoffs_newer_file {

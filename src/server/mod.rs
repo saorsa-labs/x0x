@@ -1404,7 +1404,7 @@ pub async fn serve_with_options(
         reseat_stagings: Default::default(),
         treekem_groups: reseat_scope::ScopedGroupMap::new(treekem_groups),
         treekem_dir,
-        revocation_evictions: routes::named_groups::S4Runtime::default(),
+        revocation_evictions: routes::named_groups::S4Runtime::awaiting_startup_load(),
         group_recovery: routes::named_groups::S3Runtime::awaiting_restore(),
         ws_sessions: RwLock::new(HashMap::new()),
         ws_topics: RwLock::new(HashMap::new()),
@@ -1918,6 +1918,13 @@ pub async fn serve_with_options(
         )
         .await);
     }
+
+    // ADR 0110 S4 (#1597 item 5c): read the obligation store and the kept
+    // expiry hand-offs before the API serves or the worker runs. The load
+    // is fail-visible (a damaged file is quarantined, a newer one runs
+    // memory-only), never fatal; until it ends no writer replaces either
+    // file.
+    routes::named_groups::load_revocation_eviction_store(&state).await;
 
     // Publish the API port only after every fallible causal-state loader has
     // completed. A rejected sidecar therefore leaves no listener task and no
