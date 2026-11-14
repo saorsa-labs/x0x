@@ -2004,7 +2004,8 @@ pub(in crate::server) async fn apply_upgrade(
 /// `POST /upgrade/clear-hold?version=<v>` (D190, #1376).
 #[derive(serde::Deserialize)]
 pub(in crate::server) struct UpgradeClearHoldQuery {
-    version: String,
+    #[serde(default)]
+    version: Option<String>,
 }
 
 /// D190: an authenticated, recorded local clear of this install's
@@ -2034,12 +2035,15 @@ pub(in crate::server) async fn clear_upgrade_hold(
         )
             .into_response();
     }
-    if semver::Version::parse(&query.version).is_err() {
+    let Some(version) = query
+        .version
+        .filter(|version| semver::Version::parse(version).is_ok())
+    else {
         return refuse(
             StatusCode::BAD_REQUEST,
-            format!("version {:?} is not a semantic version", query.version),
+            "query parameter version must be a semantic version".into(),
         );
-    }
+    };
     #[cfg(not(unix))]
     {
         let _ = &state;
@@ -2067,11 +2071,11 @@ pub(in crate::server) async fn clear_upgrade_hold(
                 )
             }
         };
-        let version = query.version.clone();
+        let requested = version.clone();
         let outcome = tokio::task::spawn_blocking(move || {
             let _host_lock = crate::upgrade::acquire_host_upgrade_lock(&install)
                 .map_err(|error| error.to_string())?;
-            crate::upgrade::probe::clear_failed_hold(&install, &version)
+            crate::upgrade::probe::clear_failed_hold(&install, &requested)
                 .map_err(|error| error.to_string())
         })
         .await;
@@ -2096,7 +2100,7 @@ pub(in crate::server) async fn clear_upgrade_hold(
             }
             Ok(Ok(crate::upgrade::probe::HoldClear::NotHeld)) => refuse(
                 StatusCode::NOT_FOUND,
-                format!("no failed-release hold for {}", query.version),
+                format!("no failed-release hold for {version}"),
             ),
             Ok(Err(error)) => refuse(StatusCode::CONFLICT, error),
             Err(error) => refuse(
@@ -2863,7 +2867,7 @@ mod tests {
             clear_upgrade_hold(
                 State(Arc::clone(&state)),
                 Query(UpgradeClearHoldQuery {
-                    version: version.into(),
+                    version: Some(version.into()),
                 }),
             )
         };
@@ -2924,7 +2928,7 @@ mod tests {
             clear_upgrade_hold(
                 State(Arc::clone(&state)),
                 Query(UpgradeClearHoldQuery {
-                    version: "9.9.9".into(),
+                    version: Some("9.9.9".into()),
                 }),
             )
             .await,

@@ -314,8 +314,11 @@ enum Commands {
         /// Clear this install's failed-release hold for VERSION (recorded by
         /// the daemon). A newer release clears such a hold by itself. Never
         /// clears a recovery-failed state.
-        #[arg(long, value_name = "VERSION", conflicts_with_all = ["check", "apply", "force"])]
-        clear_hold: Option<String>,
+        #[arg(long, requires = "version", conflicts_with_all = ["check", "apply", "force"])]
+        clear_hold: bool,
+        /// Release version for --clear-hold.
+        #[arg(requires = "clear_hold")]
+        version: Option<String>,
     },
     /// WebSocket session info. [dev]
     #[command(hide = true)]
@@ -2310,7 +2313,7 @@ async fn run(
             check,
             apply,
             force,
-            clear_hold: None,
+            clear_hold: false,
             ..
         } if *check || !*apply => {
             return commands::upgrade::run(*check, *force, name, api).await;
@@ -3398,12 +3401,19 @@ async fn run(
             }
         },
         Commands::Upgrade {
-            clear_hold: Some(version),
+            clear_hold: true,
+            version: Some(version),
             ..
         } => {
-            // D190: the daemon records the clear under its install lock.
-            let version = semver::Version::parse(&version)
-                .map_err(|error| anyhow::anyhow!("--clear-hold needs a version: {error}"))?;
+            // D190: the daemon validates the version and records the clear
+            // under its install lock. Only semver characters reach the query.
+            if version.is_empty()
+                || !version
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+            {
+                anyhow::bail!("--clear-hold needs a release version such as 0.48.2");
+            }
             let response = client
                 .post_empty(&format!("/upgrade/clear-hold?version={version}"))
                 .await?;
