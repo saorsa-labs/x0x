@@ -95,6 +95,16 @@ pub const MAX_GRANT_DATA_FIELD_BYTES: usize = 128;
 /// access going with [`Agent::renew_share_grant`](crate::Agent::renew_share_grant).
 pub const MAX_SHARE_GRANT_LIFETIME_SECS: u64 = 90 * 24 * 60 * 60;
 
+/// How far a grant's `not_before` may lie ahead of the accepting daemon's
+/// clock, for clock skew only (A03 paragraph of 14 Nov 2026, #1350
+/// follow-up). Without this bound an owner could sign a chain of future
+/// grants, each within [`MAX_SHARE_GRANT_LIFETIME_SECS`], and hand out
+/// access for years in one go. With it, access lasts at most
+/// [`MAX_SHARE_GRANT_LIFETIME_SECS`] plus this allowance past the moment a
+/// daemon accepts the grant; longer access needs a renewal signed later, by
+/// an owner that is still online.
+pub const MAX_SHARE_GRANT_START_LEAD_SECS: u64 = 600;
+
 /// Who a grant is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -413,6 +423,23 @@ impl ShareGrant {
         if self.expiry.saturating_sub(self.not_before) > MAX_SHARE_GRANT_LIFETIME_SECS {
             return Err(ShareGrantError::Invalid(format!(
                 "grant lifetime exceeds the maximum of {MAX_SHARE_GRANT_LIFETIME_SECS} seconds (90 days); renew the grant instead"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The start rule (#1350 follow-up): `not_before` is at most
+    /// [`MAX_SHARE_GRANT_START_LEAD_SECS`] after `now_unix`. Checked in
+    /// [`ShareGrantStore::accept`], which issue and receipt both go through;
+    /// a held grant is not checked again.
+    ///
+    /// # Errors
+    /// [`ShareGrantError::Invalid`] when the grant starts later.
+    pub fn check_start(&self, now_unix: u64) -> Result<(), ShareGrantError> {
+        if self.not_before > now_unix.saturating_add(MAX_SHARE_GRANT_START_LEAD_SECS) {
+            return Err(ShareGrantError::Invalid(format!(
+                "grant starts more than {MAX_SHARE_GRANT_START_LEAD_SECS} seconds in the future; \
+                 issue it when it should start"
             )));
         }
         Ok(())
@@ -1011,6 +1038,7 @@ impl ShareGrantStore {
     ) -> Result<DmTypedPayloadCompletion, WriteRefusal<ShareGrantError>> {
         grant.verify()?;
         grant.check_lifetime()?;
+        grant.check_start(now_unix)?;
         if now_unix >= grant.expiry {
             return Err(ShareGrantError::Expired.into());
         }

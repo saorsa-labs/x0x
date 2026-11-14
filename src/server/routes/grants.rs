@@ -889,6 +889,25 @@ mod tests {
                 "{window}: {json}"
             );
         }
+        // #1350 follow-up: a grant that starts a day from now is refused.
+        let tomorrow = unix_now_secs() + 86_400;
+        let (status, json) = send(
+            &app,
+            owner_req(
+                "POST",
+                "/grants",
+                &body(serde_json::json!({"not_before": tomorrow, "ttl_secs": 3_600})),
+            )?,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "future start: {json}");
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("in the future"),
+            "{json}"
+        );
         let (status, json) = send(&app, owner_req("GET", "/grants", "")?).await?;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(

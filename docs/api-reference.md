@@ -3715,7 +3715,9 @@ a typed `403`.
   `expiry - not_before` is at most 90 days (7776000 s); a longer grant is
   refused with `400` and nothing is stored (#1350). To keep access going,
   renew the grant (below).
-- `not_before` (optional, Unix seconds): default is now.
+- `not_before` (optional, Unix seconds): default is now. It may be at most
+  600 s in the future (clock skew); a later start is refused with `400`.
+  Issue a grant when it should start, and renew it to extend it.
 - `deliver_to` (optional, 64-hex agent ids): more agents to deliver the grant
   to.
 - `include_names` (optional, default `true`): ADR 0079 — carry the owner's
@@ -3771,6 +3773,9 @@ body as a literal, `@path`, a bare path, or `-` for stdin, plus the optional
 it signs one (`POST /grants` answers `400`) and when it receives one: a
 longer grant from an older peer is not stored and its DM is not ACKed. A
 grant stored before this rule keeps loading and runs to its own expiry.
+A daemon also refuses a grant whose `not_before` is more than 600 s ahead of
+its own clock, so a chain of pre-signed future grants cannot extend access
+past 90 days; each renewal must be signed when it is due.
 
 `POST /grants/:id/renew` takes an optional body (an empty body takes every
 default; unknown fields are refused):
