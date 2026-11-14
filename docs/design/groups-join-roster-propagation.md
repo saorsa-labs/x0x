@@ -45,6 +45,31 @@ from the embedded public key, requires that sender to equal
 Decoded JSON re-published under an authority signature is not equivalent and
 must be rejected as predecessor evidence.
 
+### Refused offers: the join-request outcome (#1840)
+
+When the authority's validation refuses a direct offer before any roster
+write, it releases its admission journal marker and sends one typed DM to
+the requester: `x0x-group-join-outcome-v1\0` followed by JSON
+`{group_id, request_id, envelope_digest, reason}`
+(`src/groups/join_outcome.rs`).
+
+- The authority sends it only to the authenticated sender of the offer, only
+  when that agent's verified capability advert has `join_request_outcome_v1`
+  (bit 16), and at most once per envelope digest in 30 s. The send is best
+  effort and has no application ACK.
+- `reason` is `stale` (retryable), `already_member`, `banned`,
+  `pending_exists` or `invalid`. `stale` is one reason for every refusal
+  that depends on the authority's group state (revision, chain head, roster,
+  admission policy). The other reasons are facts about the requester or its
+  envelope. A requester therefore cannot read the authority's state from the
+  reason.
+- The requester accepts the outcome only from the authority it offered the
+  envelope to, and only when group id, request id and envelope digest equal
+  its own pending offer. It stores the refusal on the offer obligation, stops
+  the offer of that envelope, and shows it as `own_join_request` on
+  `GET /groups/:id`. The roster is not changed.
+- A durability failure on the authority is not a refusal and sends nothing.
+
 ### Producer and relay flow
 
 1. The requester creates the serialized event once, obtains its signed V2

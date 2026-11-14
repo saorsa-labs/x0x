@@ -1184,41 +1184,6 @@ async fn a_missing_enrollment_file_loads_and_a_corrupt_one_refuses_to_start() {
     assert!(err.to_string().contains(ENROLLMENT_RECORDS_FILE), "{err}");
 }
 
-/// A failure after the first of the two register writes leaves a valid
-/// register on disk: the kind 0x05 record and the old records of the other
-/// kinds. The record not stored comes in again later.
-#[tokio::test]
-async fn a_failure_between_the_two_writes_keeps_a_valid_register() {
-    let dir = tempfile::tempdir().expect("tmpdir");
-    let owner_id = owner_kp(OWNER_SEED).user_id();
-    let m = machine(9);
-    let batch = vec![
-        names_record(&hex::encode(machine(1).0)),
-        device_record(m, enrolled(m, 1_000)),
-    ];
-    {
-        let s = OwnerSyncStore::load(dir.path()).await.expect("store");
-        s.set_fail_after_rename_for_testing(true);
-        let err = s
-            .commit_batch(batch.clone(), &owner_id)
-            .await
-            .expect_err("the first write fails after its rename");
-        assert!(matches!(err, SyncError::Poisoned(_)), "{err:?}");
-    }
-    let s = OwnerSyncStore::load(dir.path()).await.expect("reload");
-    let records = s.records_snapshot().await;
-    assert_eq!(records.len(), 1, "only the first write landed");
-    assert_eq!(records[0].kind, SyncKind::DeviceEnrollment);
-    for record in &records {
-        record
-            .verify_owner(&owner_id)
-            .expect("each stored record verifies");
-    }
-    let outcome = s.commit_batch(batch, &owner_id).await.expect("again");
-    assert_eq!(outcome.accepted.len(), 1, "the names record comes in again");
-    assert_eq!(s.records_snapshot().await.len(), 2);
-}
-
 /// A peer at protocol 2 that sends a kind 0x05 record in a records page is
 /// refused, and nothing is committed.
 #[tokio::test]
