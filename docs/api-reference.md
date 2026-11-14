@@ -3711,7 +3711,10 @@ a typed `403`.
   evaluates it; the remote read/write surface that consumes it is the A4
   sharing-completeness slice and is not yet wired.
 - `expiry` (Unix seconds) or `ttl_secs` (seconds from `not_before`): set
-  exactly one, else `400`. Grants must expire.
+  exactly one, else `400`. Grants must expire. The window
+  `expiry - not_before` is at most 90 days (7776000 s); a longer grant is
+  refused with `400` and nothing is stored (#1350). To keep access going,
+  renew the grant (below).
 - `not_before` (optional, Unix seconds): default is now.
 - `deliver_to` (optional, 64-hex agent ids): more agents to deliver the grant
   to.
@@ -3761,6 +3764,34 @@ body as a literal, `@path`, a bare path, or `-` for stdin, plus the optional
 | POST | `/grants` | `x0x grant issue <GRANT_JSON>` | Sign a share grant with the owner key, store it, and deliver it by durable DM |
 | DELETE | `/grants/:id` | `x0x grant revoke <id>` | Revoke a share grant (owner key; revocation gossiped on `x0x.revocation.v3` and pushed directly to capable recipients) |
 | GET | `/grants/received` | `x0x grant received` | List share grants that name this install as grantee |
+| POST | `/grants/:id/renew` | `x0x grant renew <id> [--ttl-secs N] [--deliver-to <agent>]... [--no-names]` | Renew an issued share grant: sign a new grant with the same grantee, agents and caps, valid from now (at most 90 days), and deliver it |
+
+**Lifetime and renewal (#1350).** A share grant lasts at most 90 days
+(`expiry - not_before` ≤ 7776000 s). The daemon refuses a longer grant when
+it signs one (`POST /grants` answers `400`) and when it receives one: a
+longer grant from an older peer is not stored and its DM is not ACKed. A
+grant stored before this rule keeps loading and runs to its own expiry.
+
+`POST /grants/:id/renew` takes an optional body (an empty body takes every
+default; unknown fields are refused):
+
+```json
+{ "ttl_secs": 7776000, "deliver_to": ["<64-hex agent id>"], "include_names": true }
+```
+
+- `ttl_secs` (optional): the renewal's lifetime from now, 1 to 7776000;
+  default 7776000 (90 days). Out of range is `400`.
+- `deliver_to`, `include_names`: as for `POST /grants`.
+
+The renewal is a NEW grant (new `grant_id`) with the same grantee, agents
+and caps, valid from now. The response is the `POST /grants` response plus
+`renews` (the old grant id). The old grant is not changed and stays valid to
+its own expiry, so a renewal that is delivered before that expiry leaves the
+grantee no gap. On the wire a renewal is an ordinary grant, so older peers
+accept it. `404` when this install did not issue the grant; `400` when the
+grant is revoked. A renewal after the old expiry also works, but the grantee
+has no grant between the two windows. Revoking access after a renewal needs
+`DELETE` of each grant that is still active.
 
 **Direct revocation push (#1003).** A successful `DELETE /grants/:id` also
 pushes the one signed revocation record, as a typed DM

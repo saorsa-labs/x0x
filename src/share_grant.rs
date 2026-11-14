@@ -89,6 +89,12 @@ pub const MAX_STORED_GRANTS: usize = 1024;
 /// Maximum byte length of a `Data` capability's `group` or `store` field.
 pub const MAX_GRANT_DATA_FIELD_BYTES: usize = 128;
 
+/// The longest validity window (`expiry - not_before`) of a share grant:
+/// 90 days (D35, A03 paragraph of 14 Nov 2026, #1350). A longer grant is
+/// refused when it is signed and when a store accepts it. An owner keeps
+/// access going with [`Agent::renew_share_grant`](crate::Agent::renew_share_grant).
+pub const MAX_SHARE_GRANT_LIFETIME_SECS: u64 = 90 * 24 * 60 * 60;
+
 /// Who a grant is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -394,6 +400,24 @@ impl ShareGrant {
         Ok(())
     }
 
+    /// The lifetime rule (#1350): `expiry - not_before` is at most
+    /// [`MAX_SHARE_GRANT_LIFETIME_SECS`].
+    ///
+    /// It is not part of [`Self::validate`], so a grant stored before the
+    /// rule existed still loads and runs to its own expiry. New grants meet
+    /// it at [`Self::sign`] and at [`ShareGrantStore::accept`].
+    ///
+    /// # Errors
+    /// [`ShareGrantError::Invalid`] when the window is longer.
+    pub fn check_lifetime(&self) -> Result<(), ShareGrantError> {
+        if self.expiry.saturating_sub(self.not_before) > MAX_SHARE_GRANT_LIFETIME_SECS {
+            return Err(ShareGrantError::Invalid(format!(
+                "grant lifetime exceeds the maximum of {MAX_SHARE_GRANT_LIFETIME_SECS} seconds (90 days); renew the grant instead"
+            )));
+        }
+        Ok(())
+    }
+
     /// Full verification: [`Self::validate`], the owner key hashes to
     /// `owner`, and the signature verifies over [`Self::signed_bytes`].
     ///
@@ -419,8 +443,9 @@ impl ShareGrant {
     /// into one capability.
     ///
     /// # Errors
-    /// [`ShareGrantError::Invalid`] if the result fails [`Self::validate`],
-    /// or [`ShareGrantError::BadSignature`] if signing fails.
+    /// [`ShareGrantError::Invalid`] if the result fails [`Self::validate`]
+    /// or [`Self::check_lifetime`], or [`ShareGrantError::BadSignature`] if
+    /// signing fails.
     pub fn sign(
         owner_key: &UserKeypair,
         grant_id: [u8; 32],
@@ -464,6 +489,7 @@ impl ShareGrant {
             signature: Vec::new(),
         };
         grant.validate()?;
+        grant.check_lifetime()?;
         let signature = sign_with_ml_dsa(owner_key.secret_key(), &grant.signed_bytes())
             .map_err(|e| ShareGrantError::BadSignature(format!("signing failed: {e:?}")))?;
         grant.signature = signature.as_bytes().to_vec();
@@ -984,6 +1010,7 @@ impl ShareGrantStore {
         now_unix: u64,
     ) -> Result<DmTypedPayloadCompletion, WriteRefusal<ShareGrantError>> {
         grant.verify()?;
+        grant.check_lifetime()?;
         if now_unix >= grant.expiry {
             return Err(ShareGrantError::Expired.into());
         }
@@ -1930,6 +1957,52 @@ impl crate::Agent {
         )?;
         store.accept(grant.clone(), unix_now_secs()).await?;
         Ok(grant)
+    }
+
+    /// Renew an issued grant (#1350): sign a NEW grant with a new id and
+    /// the same grantee, agents and capabilities, valid from `now_unix`
+    /// for `ttl_secs` (at most [`MAX_SHARE_GRANT_LIFETIME_SECS`]), and
+    /// store it as issued. The old grant is not changed and runs to its
+    /// own expiry, so when the renewal is delivered before that expiry the
+    /// grantee has no gap. On the wire a renewal is an ordinary grant, so
+    /// older peers accept it.
+    ///
+    /// The caller delivers the returned grant, as for
+    /// [`Self::issue_share_grant`].
+    ///
+    /// # Errors
+    /// `NotForUs` when this install did not issue `grant_id`; `Invalid`
+    /// when the old grant is revoked, `ttl_secs` is 0 or above the cap, or
+    /// a shared agent no longer has a known certificate from this owner;
+    /// plus the errors of [`Self::issue_share_grant`].
+    pub async fn renew_share_grant(
+        &self,
+        grant_id: &[u8; 32],
+        ttl_secs: u64,
+        now_unix: u64,
+    ) -> Result<ShareGrant, ShareGrantError> {
+        if ttl_secs == 0 || ttl_secs > MAX_SHARE_GRANT_LIFETIME_SECS {
+            return Err(ShareGrantError::Invalid(format!(
+                "ttl_secs must be between 1 and {MAX_SHARE_GRANT_LIFETIME_SECS} (90 days)"
+            )));
+        }
+        let store = self
+            .share_grant_store()
+            .ok_or_else(|| ShareGrantError::Store("no grant store installed".into()))?;
+        let old = store.issued(grant_id).ok_or(ShareGrantError::NotForUs)?;
+        if self.is_share_grant_revoked(&old).await {
+            return Err(ShareGrantError::Invalid(
+                "a revoked grant cannot be renewed".into(),
+            ));
+        }
+        self.issue_share_grant(
+            old.grantee,
+            old.agents,
+            old.caps.into_iter().collect(),
+            now_unix,
+            now_unix.saturating_add(ttl_secs),
+        )
+        .await
     }
 
     /// Whether `agent` is this daemon's own agent (with a certificate from

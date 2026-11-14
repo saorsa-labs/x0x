@@ -1100,6 +1100,13 @@ const PINNED_MANUAL_BODY_ENDPOINTS: &[(&str, &str, &[&str])] = &[
     ("POST", "/groups/:id/invite", &["expiry_secs"]),
     // raw Bytes -> serde GroupCard passthrough (import_group_card)
     ("POST", "/groups/cards/import", &[]),
+    // #1350: raw Bytes, an empty body takes the defaults, any other body
+    // must parse strictly (grants_renew)
+    (
+        "POST",
+        "/grants/:id/renew",
+        &["deliver_to", "include_names", "ttl_secs"],
+    ),
 ];
 
 #[test]

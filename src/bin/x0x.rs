@@ -540,6 +540,23 @@ enum GrantSub {
     },
     /// List grants that name this install as grantee.
     Received,
+    /// Renew an issued grant: sign a new grant with the same grantee,
+    /// agents and caps, valid from now (default and maximum 90 days), and
+    /// deliver it. The old grant stays valid to its own expiry.
+    Renew {
+        /// Grant id (64 hex chars) from `list`.
+        id: String,
+        /// Lifetime of the renewal in seconds (default and maximum 7776000,
+        /// 90 days).
+        #[arg(long)]
+        ttl_secs: Option<u64>,
+        /// More agents (64 hex chars) to deliver the renewal to; repeatable.
+        #[arg(long = "deliver-to", value_name = "AGENT_ID")]
+        deliver_to: Vec<String>,
+        /// ADR 0079: withhold the owner and machine names from the renewal.
+        #[arg(long)]
+        no_names: bool,
+    },
 }
 
 /// `x0x acl` sub-actions.
@@ -3502,6 +3519,12 @@ async fn run(
             GrantSub::List => commands::grant::list(&client).await,
             GrantSub::Revoke { id } => commands::grant::revoke(&client, &id).await,
             GrantSub::Received => commands::grant::received(&client).await,
+            GrantSub::Renew {
+                id,
+                ttl_secs,
+                deliver_to,
+                no_names,
+            } => commands::grant::renew(&client, &id, ttl_secs, &deliver_to, no_names).await,
         },
         Commands::Names { sub } => match sub {
             NamesSub::List => commands::names::list(&client).await,

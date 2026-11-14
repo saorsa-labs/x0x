@@ -96,6 +96,12 @@
           "in": "body",
           "name": "human_consent",
           "required": false
+        },
+        {
+          "cli": "--withdraw-consent",
+          "in": "body",
+          "name": "withdraw_consent",
+          "required": false
         }
       ],
       "kind": "fields"
@@ -3619,6 +3625,36 @@
     "category": "grants",
     "request": {
       "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/grants/:id/renew",
+    "cli_name": "grant renew",
+    "description": "Renew an issued share grant: sign a new grant with the same grantee, agents and caps, valid from now (at most 90 days), and deliver it",
+    "category": "grants",
+    "request": {
+      "fields": [
+        {
+          "cli": "default",
+          "in": "body",
+          "name": "ttl_secs",
+          "required": false
+        },
+        {
+          "cli": "default",
+          "in": "body",
+          "name": "deliver_to",
+          "required": false
+        },
+        {
+          "cli": "--no-names",
+          "in": "body",
+          "name": "include_names",
+          "required": false
+        }
+      ],
+      "kind": "fields"
     }
   },
   {
