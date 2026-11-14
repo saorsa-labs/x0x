@@ -1400,6 +1400,7 @@ pub async fn serve_with_options(
         )),
         treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
         treekem_catchup_refusals: StdMutex::new(HashMap::new()),
+        join_request_outcome_sends: StdMutex::new(HashMap::new()),
         group_membership_locks: RwLock::new(HashMap::new()),
         reseat_stagings: Default::default(),
         treekem_groups: reseat_scope::ScopedGroupMap::new(treekem_groups),
@@ -4054,6 +4055,15 @@ async fn start_dm_inbox_when_gossip_ready(
                 GROUP_PREDECESSOR_RELAY_DM_PREFIX,
                 predecessor_relay_route_tx.clone(),
                 valid_predecessor_relay_typed_dm,
+            )
+            // #1840: the join-request outcome (the authority's typed
+            // refusal of an offer) shares the predecessor channel: one
+            // consumer, two prefixes, and the handler branches on the
+            // prefix. Not validated: a malformed outcome must end in the
+            // handler, never be shown as a generic DM.
+            .with_durable_typed_payload_route(
+                x0x::groups::join_outcome::JOIN_REQUEST_OUTCOME_DM_PREFIX,
+                predecessor_relay_route_tx.clone(),
             );
         // ADR-0070 §2: durable, never validated-and-fallthrough — a
         // malformed grant must fail the handler (ACK withheld), never be
@@ -4319,8 +4329,16 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
     // unavailable on purpose (indurable journal transitions) — the
     // sender's retry schedule re-offers.
     let completion = typed.completion.take();
-    let outcome =
-        handle_predecessor_relay_typed_payload_inner(relay_state, local_agent_hex, typed).await;
+    // #1840: the requester-side outcome of a refused offer arrives on the
+    // same channel under its own prefix.
+    let outcome = if typed
+        .payload
+        .starts_with(x0x::groups::join_outcome::JOIN_REQUEST_OUTCOME_DM_PREFIX)
+    {
+        routes::named_groups::handle_join_request_outcome_typed_payload(relay_state, &typed).await
+    } else {
+        handle_predecessor_relay_typed_payload_inner(relay_state, local_agent_hex, typed).await
+    };
     if let Some(tx) = completion {
         let _ = tx.send(outcome);
     }
@@ -5032,6 +5050,20 @@ async fn handle_predecessor_relay_typed_payload_inner(
                         outcome = "refused",
                         "ADR 0028: request refused by validation without mutation; admission journal released"
                     );
+                    // #1840 ask 4: tell the requester, once the release
+                    // is durable. Had the marker stayed, the requester's
+                    // re-offer is what retries the release, so no outcome
+                    // is sent then.
+                    if let Some(reason) = apply_result.refusal_reason {
+                        routes::named_groups::send_join_request_refusal(
+                            relay_state,
+                            &group_id_str,
+                            &request_id,
+                            typed.sender,
+                            digest_bytes,
+                            reason,
+                        );
+                    }
                     // Issue #1840: a requester that sealed over a partial
                     // or used head waits for its turn, in arrival order.
                     // The queue needs no journal lock.

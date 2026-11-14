@@ -18,6 +18,7 @@ pub mod directory;
 pub mod discovery;
 pub mod eviction;
 pub mod invite;
+pub mod join_outcome;
 pub mod kem_envelope;
 pub mod key_republish;
 pub mod kv_context;
