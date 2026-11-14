@@ -1350,12 +1350,21 @@ pub fn evaluate_row(row: &ObligationRow, ctx: &RowContext<'_>, timing: &S4Timing
 /// in-boot part runs on the monotonic clock (`tokio::time::Instant`, so a
 /// paused test clock drives it too), so a wall-clock change or a rollback
 /// never renews W.
+///
+/// #1581: the monotonic clock stops while the host is suspended
+/// (`CLOCK_MONOTONIC` on Linux), so W alone would run late after a sleep.
+/// The in-boot part is the larger of the monotonic delta and the delta of
+/// the suspend-inclusive boot clock ([`boot_clock_now`]), which is never
+/// set back either. Under `cfg(test)` (unit and W3-H runs) the boot clock
+/// is off and the virtual clock alone drives the budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowBudget {
     /// Budget consumed by earlier boots.
     pub consumed_before_boot: Duration,
     /// The monotonic instant at which this boot started counting.
     pub counting_since: tokio::time::Instant,
+    /// The boot clock at `counting_since`, when the platform has one.
+    pub counting_since_boot: Option<Duration>,
 }
 
 impl RowBudget {
@@ -1365,14 +1374,27 @@ impl RowBudget {
         Self {
             consumed_before_boot,
             counting_since: now,
+            counting_since_boot: boot_clock_now(),
         }
     }
 
     /// The elapsed budget at `now`.
     #[must_use]
     pub fn elapsed(&self, now: tokio::time::Instant) -> Duration {
+        self.elapsed_at(now, boot_clock_now())
+    }
+
+    /// The elapsed budget at `now`, with `boot_now` the boot clock read at
+    /// the same moment.
+    #[must_use]
+    pub fn elapsed_at(&self, now: tokio::time::Instant, boot_now: Option<Duration>) -> Duration {
+        let monotonic = now.saturating_duration_since(self.counting_since);
+        let suspend_inclusive = match (boot_now, self.counting_since_boot) {
+            (Some(boot_now), Some(since)) => boot_now.saturating_sub(since),
+            _ => Duration::ZERO,
+        };
         self.consumed_before_boot
-            .saturating_add(now.saturating_duration_since(self.counting_since))
+            .saturating_add(monotonic.max(suspend_inclusive))
     }
 
     /// An earlier verified hand-off may shorten a budget: move T_obs back
@@ -1380,6 +1402,46 @@ impl RowBudget {
     pub fn shorten(&mut self, earlier_by: Duration) {
         self.consumed_before_boot = self.consumed_before_boot.saturating_add(earlier_by);
     }
+}
+
+/// #1581: the suspend-inclusive boot clock that [`RowBudget`] reads, or
+/// `None` under `cfg(test)`, where the paused virtual clock alone drives
+/// the budget.
+#[must_use]
+pub fn boot_clock_now() -> Option<Duration> {
+    if cfg!(test) {
+        None
+    } else {
+        read_boot_clock()
+    }
+}
+
+/// The time since boot including suspend: `CLOCK_BOOTTIME` on Linux and
+/// Android, `CLOCK_MONOTONIC` on Apple platforms (it counts sleep there).
+/// `None` on other platforms or when the read fails.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn read_boot_clock() -> Option<Duration> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const CLOCK: libc::clockid_t = libc::CLOCK_BOOTTIME;
+    #[cfg(target_vendor = "apple")]
+    const CLOCK: libc::clockid_t = libc::CLOCK_MONOTONIC;
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `now` is a valid, writable `timespec` for the call.
+    let result = unsafe { libc::clock_gettime(CLOCK, &mut now) };
+    if result != 0 {
+        return None;
+    }
+    let secs = u64::try_from(now.tv_sec).ok()?;
+    let nanos = u32::try_from(now.tv_nsec).ok()?;
+    Some(Duration::new(secs, nanos))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn read_boot_clock() -> Option<Duration> {
+    None
 }
 
 /// Convert a duration to whole milliseconds, saturating.
@@ -2309,6 +2371,58 @@ mod tests {
         assert!(own_expiry_trigger_due(100, 101 + EXPIRY_TOLERANCE_SECS));
         assert!(!raw_expiry_passed(100, 100));
         assert!(raw_expiry_passed(100, 101));
+    }
+
+    /// #1581: a host suspend stops the monotonic clock but not the boot
+    /// clock, so the budget counts the suspended time and the fallback
+    /// is not late. A boot clock behind the monotonic one never lowers
+    /// the budget, and with no boot clock the monotonic delta alone runs.
+    #[test]
+    fn budget_counts_a_host_suspend() {
+        let now = tokio::time::Instant::now();
+        let budget = RowBudget {
+            consumed_before_boot: Duration::from_secs(1),
+            counting_since: now,
+            counting_since_boot: Some(Duration::from_secs(100)),
+        };
+        // 2 s monotonic, 30 s on the boot clock (28 s suspended).
+        assert_eq!(
+            budget.elapsed_at(now + Duration::from_secs(2), Some(Duration::from_secs(130))),
+            Duration::from_secs(31)
+        );
+        // The boot clock behind: the monotonic delta stands.
+        assert_eq!(
+            budget.elapsed_at(now + Duration::from_secs(5), Some(Duration::from_secs(101))),
+            Duration::from_secs(6)
+        );
+        assert_eq!(
+            budget.elapsed_at(now + Duration::from_secs(5), None),
+            Duration::from_secs(6)
+        );
+        let no_clock = RowBudget {
+            counting_since_boot: None,
+            ..budget
+        };
+        assert_eq!(
+            no_clock.elapsed_at(now + Duration::from_secs(5), Some(Duration::from_secs(900))),
+            Duration::from_secs(6)
+        );
+        // The test build keeps the virtual clock alone.
+        assert_eq!(boot_clock_now(), None);
+        assert_eq!(
+            RowBudget::resume(Duration::ZERO, now).counting_since_boot,
+            None
+        );
+    }
+
+    /// #1581: the platform boot clock reads and never goes back.
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn the_boot_clock_reads_and_never_goes_back() {
+        let first = read_boot_clock().expect("the boot clock reads");
+        let second = read_boot_clock().expect("the boot clock reads");
+        assert!(second >= first);
+        assert!(first > Duration::ZERO);
     }
 
     #[test]

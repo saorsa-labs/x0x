@@ -3098,9 +3098,11 @@ async fn send_one_handoff(
 /// advert (ADR 0093: unknown support never implies support) sends nothing
 /// from the dispatch loop itself; its detached task awaits the bounded
 /// single-flight advert refresh (ADR 0110 §4, about 3 s), re-reads the
-/// advert and sends the hand-off only on `Some(true)` — a `Some(false)`
-/// or still-unknown advert sends nothing, and the dispatch is not
-/// retried (one attempt per row). The
+/// advert and sends the hand-off only on `Some(true)`. A `Some(false)`
+/// after the refresh records the same unsupported attempt as the
+/// synchronous read; a still-unknown advert sends nothing and is logged
+/// ([`refreshed_handoff_dispatch`]). The dispatch is not retried (one
+/// attempt per row). The
 /// designated admin's own dispatch outcome is recorded against its
 /// attempt (L174), and the outcome-bearing records persist (§2
 /// L170–L173, §5 v3), so `unresolved_designated_admin` and the §4
@@ -3174,14 +3176,16 @@ async fn dispatch_handoffs(state: &Arc<AppState>) {
                     // which makes this detached task the hand-off's last
                     // chance: it awaits the bounded single-flight refresh
                     // (about 3 s, no lock held across the await), re-reads
-                    // the advert and sends only on `Some(true)`. A
-                    // `Some(false)` or still-unknown advert sends nothing;
-                    // the dispatch is not retried.
+                    // the advert and sends only on `Some(true)`; a
+                    // `Some(false)` records the unsupported attempt and a
+                    // still-unknown advert sends nothing. The dispatch is
+                    // not retried.
                     let designated_attempt = attempt
                         .filter(|_| Some(recipient) == designated)
                         .map(|attempt| (key.clone(), attempt));
                     let send_state = Arc::clone(state);
                     let bytes = payload.clone();
+                    let row_key = key.clone();
                     let _spawned = state.spawn_detached(async move {
                         send_state
                             .agent
@@ -3190,18 +3194,22 @@ async fn dispatch_handoffs(state: &Arc<AppState>) {
                                 x0x::dm::CapabilityRegistry::EVICTION_HANDOFF_V1,
                             )
                             .await;
-                        if send_state
+                        let support = send_state
                             .agent
                             .capability_store()
                             .verified_registry_supports(
                                 &agent,
                                 x0x::dm::CapabilityRegistry::EVICTION_HANDOFF_V1,
-                            )
-                            != Some(true)
-                        {
-                            return;
-                        }
-                        send_one_handoff(send_state, recipient, bytes, designated_attempt).await;
+                            );
+                        refreshed_handoff_dispatch(
+                            send_state,
+                            row_key,
+                            recipient,
+                            support,
+                            bytes,
+                            designated_attempt,
+                        )
+                        .await;
                     });
                 }
             }
@@ -3226,6 +3234,57 @@ async fn dispatch_handoffs(state: &Arc<AppState>) {
                 s4::DesignatedHandoffOutcome::Unsupported,
             )
             .await;
+        }
+    }
+}
+
+/// #1581 (#1881 review): the dispatch of one hand-off after its advert
+/// refresh. `Some(true)` sends it. `Some(false)` is the same definitive
+/// lack the synchronous arm of [`dispatch_handoffs`] records: the
+/// recipient joins the row's `unsupported_handoff` set and, for the
+/// designated admin, its attempt records `Unsupported` (ADR 0110 §4).
+/// `None` (the refresh brought no current advert) sends nothing and is
+/// logged; the dispatch is not retried.
+async fn refreshed_handoff_dispatch(
+    state: Arc<AppState>,
+    key: EvictionKey,
+    recipient: [u8; 32],
+    support: Option<bool>,
+    payload: Vec<u8>,
+    designated_attempt: Option<(EvictionKey, u64)>,
+) {
+    match support {
+        Some(true) => {
+            send_one_handoff(state, recipient, payload, designated_attempt).await;
+        }
+        Some(false) => {
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .unsupported_handoff
+                .entry(key)
+                .or_default()
+                .insert(recipient);
+            if let Some((key, attempt)) = designated_attempt {
+                record_designated_handoff(
+                    &state,
+                    &key,
+                    attempt,
+                    recipient,
+                    s4::DesignatedHandoffOutcome::Unsupported,
+                )
+                .await;
+            }
+        }
+        None => {
+            tracing::info!(
+                group_id = %super::LogHexId::group(&key.stable_group_id),
+                recipient = %x0x::logging::LogAgentId::from(&x0x::identity::AgentId(recipient)),
+                designated = designated_attempt.is_some(),
+                "ADR 0110 S4: the advert refresh brought no current eviction_handoff_v1 advert; the hand-off is not sent"
+            );
         }
     }
 }
@@ -8386,6 +8445,69 @@ pub(super) mod tests {
         Ok(())
     }
 
+    /// #1581 (#1881 review items 1 and 3): after the advert refresh, a
+    /// `Some(false)` read is the same definitive lack as the synchronous
+    /// arm — the designated admin joins `unsupported_handoff` and its
+    /// attempt records `Unsupported` — while a still-unknown read records
+    /// nothing. Red on main, where the post-refresh read only returned.
+    #[tokio::test]
+    async fn a_lacking_advert_after_the_refresh_records_the_unsupported_outcome(
+    ) -> anyhow::Result<()> {
+        let (state, _group_id, key, designated, _bytes, _dir) =
+            uda_state_after_restart(None).await?;
+        revocation_eviction_pass(&state).await;
+        let attempt = {
+            let inner = state.revocation_evictions.inner.lock().await;
+            let row = inner.store.get(&key).expect("the row");
+            assert_eq!(row.designated, Some(designated));
+            row.first_dispatch_unix_ms.expect("the row has dispatched")
+        };
+
+        // Still unknown after the refresh: nothing is recorded.
+        refreshed_handoff_dispatch(
+            Arc::clone(&state),
+            key.clone(),
+            designated,
+            None,
+            Vec::new(),
+            Some((key.clone(), attempt)),
+        )
+        .await;
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            assert_eq!(
+                inner.store.get(&key).expect("the row").designated_handoff,
+                None,
+                "an unknown advert is not an outcome"
+            );
+            assert!(!inner.unsupported_handoff.contains_key(&key));
+        }
+
+        // A lacking advert after the refresh: the unsupported attempt.
+        refreshed_handoff_dispatch(
+            Arc::clone(&state),
+            key.clone(),
+            designated,
+            Some(false),
+            Vec::new(),
+            Some((key.clone(), attempt)),
+        )
+        .await;
+        let inner = state.revocation_evictions.inner.lock().await;
+        assert_eq!(
+            inner.store.get(&key).expect("the row").designated_handoff,
+            Some(s4::DesignatedHandoffRecord {
+                designated,
+                outcome: s4::DesignatedHandoffOutcome::Unsupported,
+            })
+        );
+        assert!(inner
+            .unsupported_handoff
+            .get(&key)
+            .is_some_and(|ids| ids.contains(&designated)));
+        Ok(())
+    }
+
     /// #1581: the dispatch's `None` arm for an unknown or expired
     /// advert (a card-only binding, which carries no verified advert,
     /// reads the same) sends no hand-off and asks exactly once per
@@ -8468,8 +8590,14 @@ pub(super) mod tests {
             );
             info.recompute_state_hash();
         }
+        // Real KEM keys, so the inbox check below can unseal anything sent
+        // to these two recipients and tell a hand-off from other traffic.
+        let expired_kem = crate::groups::kem_envelope::AgentKemKeypair::generate()
+            .expect("a KEM keypair for the expired advert");
+        let card_only_kem = crate::groups::kem_envelope::AgentKemKeypair::generate()
+            .expect("a KEM keypair for the card");
         let nearly_stale = now_unix_ms() - (x0x::dm_capability::ADVERT_CACHE_TTL_SECS * 1000 - 500);
-        let mut caps = x0x::dm::DmCapabilities::v1_gossip_ready(vec![42; 1184]);
+        let mut caps = x0x::dm::DmCapabilities::v1_gossip_ready(expired_kem.public_bytes.to_vec());
         caps.application_registry = x0x::dm::CapabilityRegistry {
             version: 1,
             bits: u64::MAX,
@@ -8487,7 +8615,7 @@ pub(super) mod tests {
             state.agent.capability_store().insert_from_card(
                 x0x::identity::AgentId(card_only),
                 x0x::identity::MachineId([7; 32]),
-                x0x::dm::DmCapabilities::v1_gossip_ready(vec![42; 1184]),
+                x0x::dm::DmCapabilities::v1_gossip_ready(card_only_kem.public_bytes.to_vec()),
                 now_unix_ms(),
             ),
             "the card-only binding is seeded"
@@ -8513,6 +8641,29 @@ pub(super) mod tests {
             .agent
             .subscribe(crate::dm_capability::DM_CAPABILITY_TARGETED_REQUEST_TOPIC)
             .await?;
+        // #1881 review item 2: every recipient's DM inbox topic, subscribed
+        // the way the inbox service does, so "sends nothing" is checked
+        // per recipient on the wire and not only by the designated
+        // admin's recorded outcome. The designated admin has no advert,
+        // so nothing can be sealed to it; the other two hold real keys.
+        let mut inboxes = Vec::new();
+        for (id, kem) in [
+            (designated, None),
+            (expired, Some(&expired_kem)),
+            (card_only, Some(&card_only_kem)),
+        ] {
+            let recipient_id = x0x::identity::AgentId(id);
+            let inbox = state
+                .agent
+                .pubsub()
+                .expect("the hermetic plane runs a gossip runtime")
+                .subscribe_topic_id(
+                    crate::dm_inbox::DmInboxService::inbox_topic_name(&recipient_id),
+                    x0x::dm::dm_inbox_topic(&recipient_id),
+                )
+                .await;
+            inboxes.push((id, kem, inbox));
+        }
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // One pass derives the designation onto the row; the row has
@@ -8571,6 +8722,37 @@ pub(super) mod tests {
         // a gossip-inbox publish) — these assertions hold only because
         // no send ran.
         tokio::time::sleep(Duration::from_millis(2_000)).await;
+        for (id, kem, inbox) in &mut inboxes {
+            // Drain what the topic holds. Other DM traffic (the head-sync
+            // catch-up asks) may ride it; no frame may unseal to an
+            // `X0XEVH1` hand-off body.
+            while let Ok(Some(message)) =
+                tokio::time::timeout(Duration::from_millis(200), inbox.recv()).await
+            {
+                let Some(envelope) = x0x::dm::DmEnvelope::from_wire_bytes(&message.payload).ok()
+                else {
+                    continue;
+                };
+                let x0x::dm::DmBody::Payload(sealed) = &envelope.body else {
+                    continue;
+                };
+                let Some(kem) = kem else {
+                    panic!(
+                        "nothing can be sealed to {} (no advert)",
+                        hex::encode(&id[..4])
+                    );
+                };
+                let Ok(plaintext) = x0x::dm::decrypt_payload(kem, sealed, &envelope.aead_aad())
+                else {
+                    continue;
+                };
+                assert!(
+                    s4::decode_handoff(&plaintext.payload).is_err(),
+                    "no hand-off reaches the inbox of {}",
+                    hex::encode(&id[..4])
+                );
+            }
+        }
         let inner = state.revocation_evictions.inner.lock().await;
         assert_eq!(
             inner.store.get(&key).expect("the row").designated_handoff,

@@ -53,7 +53,7 @@
 //! damaged file is. A v1 file still loads: every field v2 added is
 //! optional.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex as StdMutex;
 use std::time::Instant;
@@ -116,6 +116,13 @@ struct ExclusionHold {
     /// ([`removes_share_actor`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     removed: Vec<String>,
+    /// #1581: the members a hold that the cap dropped moved into
+    /// `removed`, each with the lowest epoch it was removed at. A share of
+    /// such a member at that epoch or later stays unauthorized, although
+    /// this hold's own epoch is later ([`removes_share_actor`]). Keys are
+    /// lower-case hex.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    moved_from: BTreeMap<String, u64>,
     /// #1766: the lower-case hex actors of the crypto-only exclusions that
     /// wait on this hold. An uncommitted secret of its epoch ends the hold
     /// only when one of them sealed it ([`hold_live`]). `None` is a hold
@@ -314,11 +321,15 @@ pub(super) fn removes_share_actor(
             .get(group_key)
             .is_some_and(|list| {
                 list.iter().any(|hold| {
-                    hold.secret_epoch <= share_epoch
+                    (hold.secret_epoch <= share_epoch
                         && hold
                             .removed
                             .iter()
-                            .any(|member| member.eq_ignore_ascii_case(actor_hex))
+                            .any(|member| member.eq_ignore_ascii_case(actor_hex)))
+                        || hold
+                            .moved_from
+                            .get(&actor_hex.to_ascii_lowercase())
+                            .is_some_and(|epoch| *epoch <= share_epoch)
                 })
             })
 }
@@ -846,6 +857,7 @@ fn absorb(state: &AppState, file: HoldFile) {
             }) {
                 Some(kept) => {
                     merge_removed(kept, hold.removed);
+                    merge_moved_from(&mut kept.moved_from, hold.moved_from);
                     // #1775: a merge keeps every actor; an unknown actor
                     // list stays unknown.
                     merge_actors(&mut kept.actors, hold.actors);
@@ -1007,7 +1019,9 @@ fn push_exclusion(state: &AppState, group_key: &str, hold: ExclusionHold) -> boo
         kept.parent_state_hash == hold.parent_state_hash && kept.secret_epoch == hold.secret_epoch
     }) {
         let before = kept.removed.len() + kept.actors.as_ref().map_or(0, Vec::len);
+        let moved_before = kept.moved_from.clone();
         merge_removed(kept, hold.removed);
+        merge_moved_from(&mut kept.moved_from, hold.moved_from);
         // #1775 item 3: a live re-park knows its actor, so a non-empty
         // list replaces an unknown one loaded from a pre-#1771 file (an
         // empty list — an evicted removal — would turn "unknown" into
@@ -1025,7 +1039,8 @@ fn push_exclusion(state: &AppState, group_key: &str, hold: ExclusionHold) -> boo
             merge_actors(&mut actors, hold.actors);
         }
         kept.actors = actors;
-        return kept.removed.len() + kept.actors.as_ref().map_or(0, Vec::len) != before;
+        return kept.removed.len() + kept.actors.as_ref().map_or(0, Vec::len) != before
+            || kept.moved_from != moved_before;
     }
     list.push(hold);
     while list.len() > super::PARKED_ROLE_UPDATE_CAP {
@@ -1044,7 +1059,18 @@ fn push_exclusion(state: &AppState, group_key: &str, hold: ExclusionHold) -> boo
                 // not end a later epoch's wait (that would fail open).
                 // The dropped exclusion's frame retries and re-parks its
                 // hold, so its actor check returns with it.
+                // #1581: each moved member keeps the dropped epoch in
+                // `moved_from`, so its share of that epoch or later is
+                // still refused although `next` is later.
                 if let Some(next) = list.iter_mut().min_by_key(|kept| kept.secret_epoch) {
+                    let mut moved = dropped.moved_from;
+                    for member in &dropped.removed {
+                        moved
+                            .entry(member.to_ascii_lowercase())
+                            .and_modify(|epoch| *epoch = (*epoch).min(dropped.secret_epoch))
+                            .or_insert(dropped.secret_epoch);
+                    }
+                    merge_moved_from(&mut next.moved_from, moved);
                     merge_removed(next, dropped.removed);
                 }
             }
@@ -1052,6 +1078,15 @@ fn push_exclusion(state: &AppState, group_key: &str, hold: ExclusionHold) -> boo
         }
     }
     true
+}
+
+/// #1581: fold `more` into `kept`, keeping each member's lowest epoch.
+fn merge_moved_from(kept: &mut BTreeMap<String, u64>, more: BTreeMap<String, u64>) {
+    for (member, epoch) in more {
+        kept.entry(member.to_ascii_lowercase())
+            .and_modify(|kept| *kept = (*kept).min(epoch))
+            .or_insert(epoch);
+    }
 }
 
 /// Add `members` to `hold`'s removed members, once each.
@@ -1110,6 +1145,7 @@ pub(super) fn keep_evicted_removal(
                 // #1775: an evicted removal waits for no actor's share;
                 // its actors are known to be none.
                 actors: Some(Vec::new()),
+                moved_from: BTreeMap::new(),
             },
         );
     }
@@ -1137,6 +1173,7 @@ pub(super) async fn hold_exclusion(
             secret_epoch,
             removed: Vec::new(),
             actors: Some(vec![actor_hex.to_ascii_lowercase()]),
+            moved_from: BTreeMap::new(),
         },
     );
     drop(gss_gate);
@@ -2036,6 +2073,7 @@ pub(in crate::server) mod test_seam {
                 secret_epoch,
                 removed: vec![removed_hex.to_ascii_lowercase()],
                 actors: Some(Vec::new()),
+                moved_from: BTreeMap::new(),
             },
         );
     }
@@ -3204,6 +3242,53 @@ mod tests {
         );
     }
 
+    /// #1581 (rc19 strip at the cap boundary): when the cap drops the
+    /// lowest hold, its removed member moves to the next hold of a later
+    /// epoch and keeps the dropped epoch, so the member's share of that
+    /// epoch is still refused. Red on main, where the moved member was
+    /// checked against the later epoch only. The moved epoch also
+    /// survives a restart.
+    #[tokio::test]
+    async fn a_member_moved_by_the_cap_keeps_its_removal_epoch() {
+        let (state, _dir) = test_state().await;
+        let group_key = "g".to_string();
+        let removed = "cc".repeat(32);
+        let actor = "aa".repeat(32);
+        test_seam::force_removal_hold(&state, &group_key, 1, &removed);
+        assert!(removes_share_actor(&state, &group_key, &removed, 1));
+        for epoch in 2..=(super::super::PARKED_ROLE_UPDATE_CAP as u64 + 1) {
+            hold_exclusion(&state, &group_key, "p", epoch, &actor).await;
+        }
+        let epochs: Vec<u64> = state
+            .gss_share_holds
+            .exclusions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&group_key)
+            .map(|list| list.iter().map(|hold| hold.secret_epoch).collect())
+            .unwrap_or_default();
+        assert!(!epochs.contains(&1), "the cap dropped the epoch-1 hold");
+        assert!(
+            removes_share_actor(&state, &group_key, &removed, 1),
+            "the moved member's share of the dropped epoch stays refused"
+        );
+        assert!(
+            !removes_share_actor(&state, &group_key, &removed, 0),
+            "a share from before the removal is not refused"
+        );
+        assert!(
+            removes_share_actor(&state, &group_key, &removed.to_ascii_uppercase(), 1),
+            "the actor match is case-insensitive"
+        );
+        persist_logged(&state, &group_key).await;
+        test_seam::simulate_restart(&state).await;
+        ensure_loaded(&state).await;
+        assert!(
+            removes_share_actor(&state, &group_key, &removed, 1),
+            "the moved epoch survives a restart"
+        );
+    }
+
     /// #1775: the cap eviction does not move the dropped hold's waiting
     /// actors to a later epoch's hold — an actor of the dropped epoch may
     /// not end a later epoch's wait (that would fail open). Its exclusion
@@ -3276,6 +3361,7 @@ mod tests {
             secret_epoch: 2,
             removed: vec!["aa".repeat(32)],
             actors: None,
+            moved_from: BTreeMap::new(),
         };
         merge_removed(&mut hold, vec!["AA".repeat(32)]);
         assert_eq!(
@@ -3307,6 +3393,7 @@ mod tests {
             secret_epoch: 2,
             removed: Vec::new(),
             actors: Some(Vec::new()),
+            moved_from: BTreeMap::new(),
         };
         assert!(
             republish_releases(&keyless, &live),
