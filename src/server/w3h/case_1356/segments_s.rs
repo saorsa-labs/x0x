@@ -204,7 +204,7 @@ impl Run {
 }
 
 /// The hold on J's writes at the segment end.
-struct MuteAtEnd {
+pub(super) struct MuteAtEnd {
     released: Arc<AtomicBool>,
     dropped: Arc<AtomicUsize>,
 }
@@ -217,7 +217,7 @@ impl MuteAtEnd {
     /// can get out before the latch. If that write is J's request, A's
     /// answer from `end` arrives before the restart, and the case reports
     /// INFRA (a hold leak). After the latch, every such write is dropped.
-    fn install(sim: &Sim, group: &str, end: u64) -> Result<Self> {
+    pub(super) fn install(sim: &Sim, group: &str, end: u64) -> Result<Self> {
         use crate::network::sim::{Fault, LaneClass};
         let j = sim.peer("J")?.0;
         let state = Arc::downgrade(&sim.state("J")?);
@@ -256,7 +256,7 @@ impl MuteAtEnd {
         Ok(Self { released, dropped })
     }
 
-    fn release(&self, sim: &Sim) -> usize {
+    pub(super) fn release(&self, sim: &Sim) -> usize {
         self.released.store(true, Ordering::SeqCst);
         sim.fabric()
             .mark("fault: J's writes pass again".to_string());
@@ -265,7 +265,7 @@ impl MuteAtEnd {
 }
 
 /// A's S3 answers to J in `rx`, as `(from, entries)`.
-fn drain_answers(
+pub(super) fn drain_answers(
     rx: &mut crate::direct::DirectMessageReceiver,
     a_id: &crate::identity::AgentId,
     into: &mut Vec<(u64, usize)>,
@@ -283,14 +283,14 @@ fn drain_answers(
 }
 
 /// J's head (read first) and `recovery` text now.
-async fn poll_j(sim: &Sim, group: &str) -> Option<(View, Option<String>, String)> {
+pub(super) async fn poll_j(sim: &Sim, group: &str) -> Option<(View, Option<String>, String)> {
     let j = view_now(sim, "J", group).await.ok()?;
     let status = status_now(sim, "J", group).await.ok()??;
     let text = recovery_text(&status.recovery);
     Some((j, status.membership, text))
 }
 
-fn push_new<T: PartialEq + Clone>(list: &mut Vec<T>, item: &T) {
+pub(super) fn push_new<T: PartialEq + Clone>(list: &mut Vec<T>, item: &T) {
     if !list.contains(item) {
         list.push(item.clone());
     }

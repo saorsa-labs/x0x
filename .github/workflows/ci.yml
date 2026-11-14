@@ -769,8 +769,9 @@ jobs:
     # `PARTS` in w3h-shards.py). The #1661 welcome-lost row has its own
     # group too (`s3-1661.1` and `s3-1661.2`, 10 reruns each), the
     # H-S3-rm4 variants share `s3-rm4.1` and `s3-rm4.2`, H-S3-rm2 has its
-    # own group (`s3-rm2.1` and `s3-rm2.2`, 10 reruns each), and H-S3-d2 has
-    # `s3-d2`. A group is omitted when the tree has no matching test.
+    # own group (`s3-rm2.1` and `s3-rm2.2`, 10 reruns each), H-S3-d2 has
+    # `s3-d2`, and H-S3-q has `s3-q`. A group is omitted when the tree has
+    # no matching test.
     name: W3-H shard plan
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -1096,6 +1097,8 @@ jobs:
           --expect w3h_1356_control_s3_s_two_link_segments_across_a_restart=GREEN
           --require w3h_1356_control_s3_x_attestation_conflict_stops_at_common_prefix
           --expect w3h_1356_control_s3_x_attestation_conflict_stops_at_common_prefix=GREEN
+          --require w3h_1356_red_s3_q_joiner_unreadable_sidecar
+          --expect w3h_1356_red_s3_q_joiner_unreadable_sidecar=RED
           --require w3h_1356_red_s3_forked_node_shows_reseat_required
           --expect w3h_1356_red_s3_forked_node_shows_reseat_required=GREEN
           --require w3h_1356_control_s3_forked_node_not_auto_recovered
