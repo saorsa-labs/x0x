@@ -14,6 +14,12 @@ All notable changes to this project will be documented in this file.
   most 90 days (default 90), and delivers it; the old grant stays valid to its
   own expiry, so there is no gap. CLI: `x0x grant renew <id> [--ttl-secs N]
   [--no-names]`.
+- **A join request that the group owner refuses gets a typed outcome (#1840).**
+  The owner's daemon sends the requester a direct message with a reason:
+  `stale`, `already_member`, `banned`, `pending_exists` or `invalid`. Only
+  `stale` is retryable. `GET /groups/:id` shows it as
+  `own_join_request.status = "refused"` with a `refusal` object. Both daemons
+  must advertise capability bit 16; an older daemon keeps the old behaviour.
 - **Read-only `GET /diagnostics/sidecar-quarantine` (#1597, D148).** It lists
   each ADR 0108 §5a quarantined sidecar copy (pending or history) with its
   `txid` and size in bytes, plus `count` and `total_bytes`. It does not change

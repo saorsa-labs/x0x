@@ -1784,7 +1784,7 @@ token. A session token is refused before the body is read.
 |---|---|---|---|
 | POST | `/groups` | `x0x group create <name>` | Create a named group |
 | GET | `/groups` | `x0x group list` | List named groups |
-| GET | `/groups/:id` | `x0x group info <group_id>` | Get group info |
+| GET | `/groups/:id` | `x0x group info <group_id>` | Get group info. `own_join_request` is this daemon's own pending join request on the group, or `null`: `request_id`, `created_at` and `status` (`pending` or `refused`). When the group's authority refused the request (#1840), `refusal` gives `reason` (`stale`, `already_member`, `banned`, `pending_exists`, `invalid` or `unknown`), `retryable` and `refused_at` (Unix ms; the time this daemon received the refusal, not the time the authority refused). A refused request is not sent again. Cancel it before you file a new one. `retryable` is `true` only for `stale`: this daemon's copy of the group is not current, and a new request made from a current group card can succeed. If this daemon loses the stored refusal (its offer store is over its limit), `status` reads `pending` again |
 | GET | `/groups/:id/members` | `x0x group members <group_id>` | List named-group members |
 | POST | `/groups/:id/members` | `x0x group add-member <group_id> <agent_id> [--display-name <n>] [--key-package <b64>]` | Admin-authored member add (propagates to subscribed peers). `--key-package` carries the base64 TreeKEM key package required for direct adds to encrypted groups |
 | DELETE | `/groups/:id/members/:agent_id` | `x0x group remove-member <group_id> <agent_id>` | Admin-authored member removal (propagates to subscribed peers) |
@@ -1805,7 +1805,7 @@ token. A session token is refused before the body is read.
 | POST | `/groups/:id/members/:agent_id/reseat` | `x0x group reseat <group_id> <agent_id> --reason <text> --basis <json>` | **ADR 0109 §3**: re-seat a forked or removed node by hand. See [Ownerless attestation and re-seat](#ownerless-attestation-and-re-seat-adr-0109-s3) |
 | GET | `/groups/:id/recovery` | `x0x group recovery <group_id>` | **ADR 0109 §8**: this node's `recovery` object, the sidecar file, and on an admin the pending requesters and issued re-seats |
 | GET | `/groups/:id/requests` | `x0x group requests <group_id>` | List join requests. Requires a local admin seat. Token class: [join-request admin](#authentication-and-token-classes) (#1347). A session token is accepted, except on a Home or an `OwnerCertified` group, which needs the durable API token |
-| POST | `/groups/:id/requests` | `x0x group request-access <group_id>` | Submit a join request |
+| POST | `/groups/:id/requests` | `x0x group request-access <group_id>` | Submit a join request. `201` means the request is stored locally and will be offered to the group's authority; it does not mean the authority took it. Read `own_join_request` on `GET /groups/:id` for a later refusal (#1840) |
 | POST | `/groups/:id/requests/:request_id/approve` | `x0x group approve-request <group_id> <request_id>` | Approve a join request (admin-authored). Same token class as the list (#1347) |
 | POST | `/groups/:id/requests/:request_id/reject` | `x0x group reject-request <group_id> <request_id>` | Reject a join request (admin-authored). Same token class as the list (#1347) |
 | DELETE | `/groups/:id/requests/:request_id` | `x0x group cancel-request <group_id> <request_id>` | Cancel your own pending request. An owner credential (session or durable) is enough; the request must belong to this daemon |
