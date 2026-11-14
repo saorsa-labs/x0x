@@ -1177,7 +1177,15 @@ async fn run_gossip_update_driver<S, Publish, PublishFuture>(
                 Instant::now(),
             )
         };
-        if decision == ReleaseRebroadcastDecision::SkipNotNewer {
+        // #1169: a self-published payload came back by gossip self-delivery.
+        // Whoever published it (`/upgrade/apply`, the fallback poll, the
+        // startup broadcast) already owns its apply decision, so it is
+        // neither rebroadcast nor submitted again.
+        if matches!(
+            decision,
+            ReleaseRebroadcastDecision::SkipNotNewer
+                | ReleaseRebroadcastDecision::SkipSelfPublished
+        ) {
             continue;
         }
         if decision == ReleaseRebroadcastDecision::Rebroadcast {
@@ -1922,15 +1930,16 @@ pub(in crate::server) async fn apply_upgrade(
     // After the lock drop: a bounded-but-slow publish must not hold the
     // shared replacement lock away from background and startup applies.
     // The only announcing route: an explicit owner action on a release
-    // this node is already installing. Self-delivery does return the
-    // announcement to this node's own gossip listener, so with gossip
-    // updates on the same version also enters the background apply owner
-    // — a duplicate attempt of an operator-requested release, serialized
-    // by the shared apply lock and version dedup, not a new install
-    // decision. Recording the payload as self-published (so the driver
-    // skips the rebroadcast and the submit) needs the shared tracker on
-    // AppState (src/server/mod.rs, held by #1774).
+    // this node is already installing. Self-delivery returns the
+    // announcement to this node's own gossip listener. The payload is recorded as self-published first, so the
+    // gossip driver skips both the rebroadcast and the submit when the
+    // announcement self-delivers: this route already owns the apply.
     {
+        state
+            .self_published_release_manifests
+            .lock()
+            .await
+            .record_payload(&release.gossip_payload, Instant::now());
         let agent = Arc::clone(&state.agent);
         announce_observed_release(&release, move |payload| async move {
             agent
@@ -2454,6 +2463,101 @@ mod tests {
         }
     }
 
+    /// A release this node can apply here: the shared fixture's only asset
+    /// targets Linux x64, and the background owner refuses a manifest
+    /// without this platform's asset before it records anything.
+    fn submittable_release(version: &str) -> VerifiedRelease {
+        let mut manifest = manifest_with_version(version);
+        manifest.assets[0].target = x0x::upgrade::manifest::current_platform_target()
+            .expect("tests run on a supported platform")
+            .to_string();
+        let manifest_json = serde_json::to_vec(&manifest).expect("serialize manifest fixture");
+        let payload = x0x::upgrade::manifest::encode_signed_manifest(&manifest_json, b"announce");
+        VerifiedRelease {
+            manifest,
+            manifest_json,
+            signature: b"announce".to_vec(),
+            gossip_payload: payload,
+        }
+    }
+
+    /// Run the real gossip driver over one release and report how many
+    /// rebroadcasts it published and which version the background slot
+    /// selected.
+    async fn drive_one_gossip_release(
+        verified: VerifiedRelease,
+        self_published: Arc<Mutex<SelfPublishedReleaseManifests>>,
+    ) -> (usize, Option<String>) {
+        let submit = BackgroundSubmit::default();
+        let (_keep_running, shutdown) = watch::channel(false);
+        let published = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&published);
+        run_gossip_update_driver(
+            futures::stream::iter([verified]),
+            submit.clone(),
+            self_published,
+            move |_| {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Ok(()) }
+            },
+            shutdown,
+        )
+        .await;
+        let selected = submit
+            .slot
+            .lock()
+            .unwrap()
+            .latest
+            .as_ref()
+            .map(|release| release.manifest.version.clone());
+        (
+            published.load(std::sync::atomic::Ordering::SeqCst),
+            selected,
+        )
+    }
+
+    // #1169: `/upgrade/apply` announces and then applies itself. The
+    // announcement self-delivers to this node's gossip listener; before the
+    // fix the driver skipped only the rebroadcast and still queued the same
+    // release on the background owner — a second apply of an
+    // operator-requested release.
+    #[tokio::test]
+    async fn self_published_release_is_not_resubmitted_to_the_background_owner() {
+        let version = version_newer_than_current();
+        let verified = submittable_release(&version);
+        let self_published = Arc::new(Mutex::new(SelfPublishedReleaseManifests::default()));
+        self_published
+            .lock()
+            .await
+            .record_payload(&verified.gossip_payload, Instant::now());
+
+        let (rebroadcasts, selected) = drive_one_gossip_release(verified, self_published).await;
+
+        assert_eq!(
+            rebroadcasts, 0,
+            "a self-published payload is not rebroadcast"
+        );
+        assert_eq!(
+            selected, None,
+            "a self-delivered announcement must not queue a second apply"
+        );
+    }
+
+    /// Control for the test above: the same release from a peer is
+    /// rebroadcast once and queued, so the fixture is one the background
+    /// owner accepts.
+    #[tokio::test]
+    async fn peer_published_release_is_rebroadcast_and_submitted() {
+        let version = version_newer_than_current();
+        let verified = submittable_release(&version);
+        let self_published = Arc::new(Mutex::new(SelfPublishedReleaseManifests::default()));
+
+        let (rebroadcasts, selected) = drive_one_gossip_release(verified, self_published).await;
+
+        assert_eq!(rebroadcasts, 1);
+        assert_eq!(selected, Some(version));
+    }
+
     #[tokio::test]
     async fn observed_release_announcement_publishes_the_signed_payload() {
         let verified = verified_release_with_version(&version_newer_than_current());
@@ -2750,6 +2854,17 @@ mod tests {
             &received.payload[..],
             expected_payload.as_slice(),
             "the announced payload is the verified gossip payload"
+        );
+        assert!(
+            state
+                .self_published_release_manifests
+                .lock()
+                .await
+                .contains_recent_digest(
+                    &release_manifest_payload_digest(&expected_payload),
+                    Instant::now()
+                ),
+            "the route records its announcement so the gossip driver skips its self-delivery"
         );
     }
 

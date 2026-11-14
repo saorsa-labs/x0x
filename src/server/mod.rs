@@ -1428,6 +1428,9 @@ pub async fn serve_with_options(
         upgrade_check_cache: Mutex::new(None),
         upgrade_apply_lock: Arc::new(Mutex::new(())),
         http_upgrade_wait_lock: Arc::new(Mutex::new(())),
+        self_published_release_manifests: Arc::new(Mutex::new(
+            SelfPublishedReleaseManifests::default(),
+        )),
         #[cfg(unix)]
         upgrade_staging,
         api_token,
@@ -2155,8 +2158,7 @@ pub async fn serve_with_options(
         }
     }));
 
-    let self_published_release_manifests =
-        Arc::new(Mutex::new(SelfPublishedReleaseManifests::default()));
+    let self_published_release_manifests = Arc::clone(&state.self_published_release_manifests);
 
     // Reclaim upgrade debris left by previous failed/interrupted attempts:
     // orphaned `.x0x-upgrade-*` temp dirs and `*.x0xold-*` sidelined binaries.

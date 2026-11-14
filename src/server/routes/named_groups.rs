@@ -54082,6 +54082,7 @@ pub(in crate::server) mod tests {
             upgrade_check_cache: Mutex::new(None),
             upgrade_apply_lock: Arc::new(Mutex::new(())),
             http_upgrade_wait_lock: Arc::new(Mutex::new(())),
+            self_published_release_manifests: Default::default(),
             #[cfg(unix)]
             upgrade_staging: None,
             api_token: "test-token".to_string(),
