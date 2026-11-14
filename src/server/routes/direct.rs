@@ -107,6 +107,23 @@ pub(in crate::server) struct DirectSendRequest {
     pub(in crate::server) logical_id: Option<String>,
 }
 
+/// The `POST /direct/send` body: every [`DirectSendRequest`] field plus the
+/// #1109 async field. A separate wrapper so the request struct (built by
+/// tests elsewhere) keeps its shape.
+#[derive(Debug, Deserialize)]
+pub(in crate::server) struct DirectSendBody {
+    #[serde(flatten)]
+    pub(in crate::server) request: DirectSendRequest,
+    /// #1109: deliver asynchronously until this unix-epoch time in
+    /// milliseconds. The daemon stores the message durably, answers 202 with
+    /// the `logical_id`, and retries with that id until the recipient's v2
+    /// ACK, the deadline, or a final refusal. A recipient with no v2 advert
+    /// yet is held, not refused. Query the outcome with
+    /// `GET /direct/receipts/{logical_id}`.
+    #[serde(default)]
+    pub(in crate::server) deliver_until: Option<u64>,
+}
+
 /// A request the route refuses before any send is attempted, carrying the
 /// exact wire contract (`error` code + `detail`) the caller sees.
 #[derive(Debug)]
@@ -189,6 +206,160 @@ fn direct_send_config_for_request(
         config.logical_request_id = Some(logical_id.request_id(self_agent_id, recipient));
     }
     Ok(config)
+}
+
+/// #1109: validate `deliver_until` against the rest of the request. `None`
+/// keeps the synchronous send unchanged.
+fn deliver_until_for_request(
+    req: &DirectSendRequest,
+    deliver_until: Option<u64>,
+    config: &x0x::dm::DmSendConfig,
+    now_ms: u64,
+) -> Result<Option<u64>, DirectSendRequestRejection> {
+    let Some(deliver_until) = deliver_until else {
+        return Ok(None);
+    };
+    let refuse = |code: &'static str, detail: String| DirectSendRequestRejection {
+        status: StatusCode::BAD_REQUEST,
+        code,
+        detail,
+    };
+    if !config.require_durable_app_ack {
+        return Err(refuse(
+            "deliver_until_requires_durable_ack",
+            "deliver_until retries until the recipient's durable ACK; \
+             remove require_durable_app_ack: false or drop deliver_until"
+                .to_string(),
+        ));
+    }
+    if req.require_ack_ms.is_some() {
+        return Err(refuse(
+            "deliver_until_with_require_ack_ms",
+            "require_ack_ms probes the peer after a synchronous send; \
+             a deliver_until send returns before any attempt"
+                .to_string(),
+        ));
+    }
+    if deliver_until <= now_ms {
+        return Err(refuse(
+            "deliver_until_in_past",
+            format!("deliver_until {deliver_until} is not after now ({now_ms}); unix-epoch milliseconds"),
+        ));
+    }
+    if deliver_until - now_ms > x0x::dm_outbox::DM_DELIVER_UNTIL_MAX_MS {
+        return Err(refuse(
+            "deliver_until_too_far",
+            format!(
+                "deliver_until is more than {} ms from now",
+                x0x::dm_outbox::DM_DELIVER_UNTIL_MAX_MS
+            ),
+        ));
+    }
+    Ok(Some(deliver_until))
+}
+
+/// #1109: admit a `deliver_until` send and answer 202 (or the refusal).
+async fn admit_deliver_until(
+    state: &AppState,
+    req: &DirectSendRequest,
+    recipient: x0x::identity::AgentId,
+    payload: Vec<u8>,
+    deliver_until: u64,
+    now_ms: u64,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use x0x::dm_outbox::{DmObligation, DmObligationAdmission, DmObligationRefusal};
+    if payload.len() > x0x::dm::MAX_PAYLOAD_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "payload_too_large",
+                "detail": format!(
+                    "payload is {} bytes; the limit is {}",
+                    payload.len(),
+                    x0x::dm::MAX_PAYLOAD_BYTES
+                ),
+            })),
+        );
+    }
+    // A caller that gave no logical id gets one: the obligation needs a
+    // stable id for every retry and for the receipt query.
+    let logical_id = match &req.logical_id {
+        Some(raw) => x0x::dm::DmLogicalId::parse(raw),
+        None => x0x::dm::DmLogicalId::parse(&format!(
+            "dm-{}",
+            hex::encode(crate::dm_send::fresh_request_id())
+        )),
+    };
+    let logical_id = match logical_id {
+        Ok(id) => id,
+        Err(detail) => {
+            return DirectSendRequestRejection {
+                status: StatusCode::BAD_REQUEST,
+                code: "invalid_logical_id",
+                detail,
+            }
+            .into_response();
+        }
+    };
+    let obligation = DmObligation::new(
+        state.agent.agent_id(),
+        recipient,
+        &logical_id,
+        payload,
+        deliver_until,
+        now_ms,
+    );
+    let request_id = obligation.request_id.clone();
+    let Some(store) = state.agent.dm_obligations() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "dm_outbox_unavailable",
+                "detail": "this daemon has no deliver_until outbox",
+            })),
+        );
+    };
+    match store.admit(obligation).await {
+        Ok(admission) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "ok": true,
+                "accepted": true,
+                "already_held": admission == DmObligationAdmission::AlreadyHeld,
+                "logical_id": logical_id.as_str(),
+                "agent_id": hex::encode(recipient.as_bytes()),
+                "request_id": request_id,
+                "deliver_until": deliver_until,
+                "status": "pending",
+            })),
+        ),
+        Err(DmObligationRefusal::IdempotencyConflict) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "idempotency_conflict",
+                "detail": "a deliver_until send with this logical_id to this agent is held with other bytes",
+            })),
+        ),
+        Err(DmObligationRefusal::Full) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "dm_outbox_full",
+                "detail": "the deliver_until outbox is at its cap; retry after held sends finish",
+            })),
+        ),
+        Err(DmObligationRefusal::Storage(detail)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "dm_outbox_write_failed",
+                "detail": detail,
+            })),
+        ),
+    }
 }
 
 /// POST /agents/connect — connect to a discovered agent.
@@ -318,14 +489,37 @@ pub(in crate::server) async fn connect_machine(
     }
 }
 
-/// POST /direct/send — send a direct message to a connected agent.
+/// POST /direct/send — send a direct message to a connected agent, or
+/// (#1109, `deliver_until`) admit it for durable async delivery.
+pub(in crate::server) async fn direct_send_body(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
+    Json(body): Json<DirectSendBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    direct_send_request(state, actor, body.request, body.deliver_until).await
+}
+
+/// The synchronous `POST /direct/send` handler shape (no `deliver_until`),
+/// kept for the handler tests that build a [`DirectSendRequest`].
+#[cfg(test)]
 pub(in crate::server) async fn direct_send(
     State(state): State<Arc<AppState>>,
     axum::extract::Extension(actor): axum::extract::Extension<
         crate::server::rider_auth::ActorContext,
     >,
     Json(req): Json<DirectSendRequest>,
-) -> impl IntoResponse {
+) -> (StatusCode, Json<serde_json::Value>) {
+    direct_send_request(state, actor, req, None).await
+}
+
+async fn direct_send_request(
+    state: Arc<AppState>,
+    actor: crate::server::rider_auth::ActorContext,
+    req: DirectSendRequest,
+    deliver_until: Option<u64>,
+) -> (StatusCode, Json<serde_json::Value>) {
     let agent_id = match parse_agent_id_hex(&req.agent_id) {
         Ok(id) => id,
         Err(e) => {
@@ -344,6 +538,11 @@ pub(in crate::server) async fn direct_send(
         Err(rejection) => return rejection.into_response(),
     };
     let durable = send_config.require_durable_app_ack;
+    let now_ms = x0x::dm::now_unix_ms();
+    let deliver_until = match deliver_until_for_request(&req, deliver_until, &send_config, now_ms) {
+        Ok(deliver_until) => deliver_until,
+        Err(rejection) => return rejection.into_response(),
+    };
 
     // Check trust level before sending — reject blocked agents
     {
@@ -389,6 +588,10 @@ pub(in crate::server) async fn direct_send(
                 "error": "reserved exec payloads via /direct/send require the durable API token (not a session token)"
             })),
         );
+    }
+
+    if let Some(deliver_until) = deliver_until {
+        return admit_deliver_until(&state, &req, agent_id, payload, deliver_until, now_ms).await;
     }
 
     match state
@@ -677,10 +880,34 @@ fn direct_receipt_body(
     }))
 }
 
+/// #1109: add a held `deliver_until` obligation to a receipt body. A final
+/// status in the ledger wins; otherwise a held obligation reads `pending`
+/// with its schedule and the last attempt's error code.
+fn attach_obligation(body: &mut serde_json::Value, held: Option<&x0x::dm_outbox::DmObligation>) {
+    let Some(held) = held else {
+        return;
+    };
+    let final_status = matches!(
+        body["status"].as_str(),
+        Some("delivered" | "delivered_late" | "expired" | "failed")
+    );
+    if !final_status {
+        body["status"] = serde_json::json!("pending");
+    }
+    body["obligation"] = serde_json::json!({
+        "deliver_until": held.deliver_until_ms,
+        "attempts": held.retry_count,
+        "next_attempt_at": held.next_retry_at_ms,
+        "last_error": held.last_error,
+    });
+}
+
 /// GET /direct/receipts/{logical_id}?agent_id=<hex> — #1109: what this daemon
 /// knows about a durable send it made under `logical_id` to `agent_id`:
-/// `delivered`, `delivered_late`, `pending` or `unknown`. Records live for
-/// ten minutes after the send resolved or gave up.
+/// `delivered`, `delivered_late`, `pending`, `expired`, `failed` or
+/// `unknown`. Ledger records live for ten minutes after the send resolved or
+/// gave up; a held `deliver_until` obligation reads `pending` with its
+/// schedule.
 pub(in crate::server) async fn direct_receipt(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(logical_id): axum::extract::Path<String>,
@@ -688,7 +915,15 @@ pub(in crate::server) async fn direct_receipt(
 ) -> impl IntoResponse {
     let acks = state.agent.dm_inflight_acks();
     match direct_receipt_body(&logical_id, &query.agent_id, state.agent.agent_id(), &acks) {
-        Ok(body) => (StatusCode::OK, Json(body)),
+        Ok(mut body) => {
+            if let Ok(recipient) = parse_agent_id_hex(&query.agent_id) {
+                if let Some(store) = state.agent.dm_obligations() {
+                    let held = store.find(&recipient, &logical_id).await;
+                    attach_obligation(&mut body, held.as_ref());
+                }
+            }
+            (StatusCode::OK, Json(body))
+        }
         Err(rejection) => rejection.into_response(),
     }
 }
@@ -1201,6 +1436,101 @@ mod tests {
         let other = hex::encode(test_agent_id(3).as_bytes());
         let elsewhere = direct_receipt_body("order-42", &other, me, &acks).expect("valid");
         assert_eq!(elsewhere["status"], "unknown");
+    }
+
+    /// #1109: the `deliver_until` body field rides beside every flattened
+    /// request field.
+    #[test]
+    fn issue1109_send_body_flattens_the_request_and_reads_deliver_until() {
+        let body: DirectSendBody = serde_json::from_value(serde_json::json!({
+            "agent_id": "ab",
+            "payload": "aGk=",
+            "logical_id": "order-7",
+            "require_durable_app_ack": true,
+            "deliver_until": 1_700_000_000_000_u64,
+        }))
+        .expect("body parses");
+        assert_eq!(body.deliver_until, Some(1_700_000_000_000));
+        assert_eq!(body.request.logical_id.as_deref(), Some("order-7"));
+        assert_eq!(body.request.require_durable_app_ack, Some(true));
+        let plain: DirectSendBody =
+            serde_json::from_value(serde_json::json!({"agent_id": "ab", "payload": "aGk="}))
+                .expect("body parses");
+        assert_eq!(plain.deliver_until, None);
+    }
+
+    /// #1109: `deliver_until` is validated before anything is sent; without
+    /// it the synchronous send is unchanged.
+    #[test]
+    fn issue1109_deliver_until_is_validated() {
+        let now = 1_000_000_u64;
+        let check = |value: serde_json::Value, deliver_until: Option<u64>| {
+            let req = parse_request(value);
+            let config = direct_send_config_for_request(&req, test_agent_id(1), test_agent_id(2))
+                .expect("valid request");
+            deliver_until_for_request(&req, deliver_until, &config, now)
+        };
+        let base = serde_json::json!({"agent_id": "ab", "payload": "aGk="});
+        assert_eq!(check(base.clone(), None).expect("no field"), None);
+        assert_eq!(
+            check(base.clone(), Some(now + 60_000)).expect("a minute ahead"),
+            Some(now + 60_000)
+        );
+        let code = |value: serde_json::Value, deliver_until: u64| {
+            check(value, Some(deliver_until)).expect_err("refused").code
+        };
+        assert_eq!(code(base.clone(), now), "deliver_until_in_past");
+        assert_eq!(
+            code(
+                base.clone(),
+                now + x0x::dm_outbox::DM_DELIVER_UNTIL_MAX_MS + 1
+            ),
+            "deliver_until_too_far"
+        );
+        assert_eq!(
+            code(
+                serde_json::json!({"agent_id": "ab", "payload": "aGk=", "require_durable_app_ack": false}),
+                now + 60_000
+            ),
+            "deliver_until_requires_durable_ack"
+        );
+        assert_eq!(
+            code(
+                serde_json::json!({"agent_id": "ab", "payload": "aGk=", "require_ack_ms": 500}),
+                now + 60_000
+            ),
+            "deliver_until_with_require_ack_ms"
+        );
+    }
+
+    /// #1109: a held obligation reads `pending` with its schedule; a final
+    /// ledger status wins over it.
+    #[test]
+    fn issue1109_receipt_reads_a_held_obligation() {
+        let logical_id = x0x::dm::DmLogicalId::parse("order-8").expect("valid");
+        let mut held = x0x::dm_outbox::DmObligation::new(
+            test_agent_id(1),
+            test_agent_id(2),
+            &logical_id,
+            b"hi".to_vec(),
+            9_000,
+            1_000,
+        );
+        held.last_error = Some("recipient_ack_semantics_unavailable".to_string());
+        let mut unknown = serde_json::json!({"status": "unknown"});
+        attach_obligation(&mut unknown, Some(&held));
+        assert_eq!(unknown["status"], "pending");
+        assert_eq!(unknown["obligation"]["deliver_until"], 9_000);
+        assert_eq!(
+            unknown["obligation"]["last_error"],
+            "recipient_ack_semantics_unavailable"
+        );
+        let mut delivered = serde_json::json!({"status": "delivered"});
+        attach_obligation(&mut delivered, Some(&held));
+        assert_eq!(delivered["status"], "delivered");
+        let mut none = serde_json::json!({"status": "unknown"});
+        attach_obligation(&mut none, None);
+        assert_eq!(none["status"], "unknown");
     }
 
     /// #1109: malformed keys are refused, not answered `unknown`.

@@ -1004,8 +1004,30 @@ fn struct_fields(sources: &[(String, String)]) -> BTreeMap<String, BTreeMap<Stri
             rest = after;
         }
     }
+    // `#[serde(flatten)] field: Type` contributes Type's fields (one level;
+    // the /direct/send body wraps DirectSendRequest this way, #1109).
+    let flattened: Vec<(String, String, String)> = out
+        .iter()
+        .flat_map(|(name, fields)| {
+            fields.iter().filter_map(move |(field, ty)| {
+                field
+                    .strip_prefix(FLATTEN_MARK)
+                    .map(|f| (name.clone(), f.to_string(), ty.clone()))
+            })
+        })
+        .collect();
+    for (name, field, ty) in flattened {
+        let inner = out.get(&ty).cloned().unwrap_or_default();
+        if let Some(fields) = out.get_mut(&name) {
+            fields.remove(&format!("{FLATTEN_MARK}{field}"));
+            fields.extend(inner);
+        }
+    }
     out
 }
+
+/// Key prefix [`parse_struct_fields`] gives a `#[serde(flatten)]` field.
+const FLATTEN_MARK: &str = "..";
 
 fn strip_test_mods(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
@@ -1042,8 +1064,13 @@ fn flat_brace_close(body: &str) -> usize {
 
 fn parse_struct_fields(body: &str) -> BTreeMap<String, String> {
     let mut fields = BTreeMap::new();
+    let mut flatten_next = false;
     for line in body.lines() {
         let trimmed = line.trim_start();
+        if trimmed.starts_with("#[serde(flatten") {
+            flatten_next = true;
+            continue;
+        }
         if trimmed.starts_with('#')
             || trimmed.starts_with("//")
             || trimmed.starts_with("pub(crate)")
@@ -1067,7 +1094,11 @@ fn parse_struct_fields(body: &str) -> BTreeMap<String, String> {
             && !keywords().contains(&name)
         {
             let ty = tail.split(',').next().unwrap_or("").trim().to_string();
-            fields.insert(name.to_string(), ty);
+            if std::mem::take(&mut flatten_next) {
+                fields.insert(format!("{FLATTEN_MARK}{name}"), ty);
+            } else {
+                fields.insert(name.to_string(), ty);
+            }
         }
     }
     fields

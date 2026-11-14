@@ -38,6 +38,7 @@ pub async fn send(
     require_gossip: bool,
     require_durable_app_ack: bool,
     logical_id: Option<&str>,
+    deliver_until: Option<u64>,
 ) -> Result<()> {
     client.ensure_running().await?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(message.as_bytes());
@@ -65,6 +66,9 @@ pub async fn send(
     }
     if let Some(logical_id) = logical_id {
         body["logical_id"] = serde_json::json!(logical_id);
+    }
+    if let Some(deliver_until) = deliver_until {
+        body["deliver_until"] = serde_json::json!(deliver_until);
     }
     let resp = client.post("/direct/send", &body).await?;
     print_value(client.format(), &resp);
@@ -166,6 +170,7 @@ mod tests {
             false,
             true,
             None,
+            None,
         )
         .await;
         assert!(result.is_ok(), "send should succeed: {:?}", result);
@@ -186,6 +191,7 @@ mod tests {
             false,
             false,
             true,
+            None,
             None,
         )
         .await;
@@ -217,6 +223,7 @@ mod tests {
             false,
             false,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -231,6 +238,7 @@ mod tests {
             false,
             false,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -244,6 +252,7 @@ mod tests {
             false,
             false,
             false,
+            None,
             None,
         )
         .await
@@ -301,6 +310,7 @@ mod tests {
             false,
             true,
             Some("order-7"),
+            None,
         )
         .await
         .unwrap();
@@ -314,6 +324,7 @@ mod tests {
             false,
             false,
             false,
+            None,
             None,
         )
         .await
