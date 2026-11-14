@@ -8120,6 +8120,15 @@ struct CapabilityRefreshRegistryState {
     /// pre-cooldown behaviour) disables the check.
     last_finished: std::collections::HashMap<CapabilityRefreshKey, tokio::time::Instant>,
     cooldown: std::time::Duration,
+    /// #504 follow-up: recipients that did not answer a request that asked
+    /// for a direct reply, with the time of that miss (tokio clock, like
+    /// `last_finished`). While an entry is younger than
+    /// [`CAPABILITY_UNICAST_MISS_TTL`], requests to that recipient omit the
+    /// reply-to machine, so the recipient answers on the topic. A direct
+    /// frame can be lost where the topic still delivers (a path that only
+    /// relays reach), and the responder skips its topic answer once it has
+    /// sent the direct one.
+    unicast_missed: std::collections::HashMap<[u8; 32], tokio::time::Instant>,
 }
 /// Bounded, recipient-keyed single-flight registry for strict capability
 /// discovery.
@@ -8290,6 +8299,38 @@ impl CapabilityRefreshRegistry {
         }
     }
 
+    /// Whether the last request to `recipient` that asked for a direct
+    /// reply got no answer within [`CAPABILITY_UNICAST_MISS_TTL`].
+    fn unicast_answer_missed(&self, recipient: &identity::AgentId) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            state
+                .unicast_missed
+                .get(&recipient.0)
+                .is_some_and(|missed_at| missed_at.elapsed() < CAPABILITY_UNICAST_MISS_TTL)
+        })
+    }
+
+    /// Records whether a request to `recipient` that asked for a direct
+    /// reply was answered. A miss makes later requests ask for the topic
+    /// answer; an answer clears the miss.
+    fn note_unicast_answer(&self, recipient: &identity::AgentId, answered: bool) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if answered {
+            state.unicast_missed.remove(&recipient.0);
+            return;
+        }
+        state
+            .unicast_missed
+            .retain(|_, missed_at| missed_at.elapsed() < CAPABILITY_UNICAST_MISS_TTL);
+        if state.unicast_missed.len() < CAPABILITY_UNICAST_MISS_LIMIT {
+            state
+                .unicast_missed
+                .insert(recipient.0, tokio::time::Instant::now());
+        }
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.state
@@ -8298,6 +8339,15 @@ impl CapabilityRefreshRegistry {
             .unwrap_or_default()
     }
 }
+
+/// #504 follow-up: how long a missed direct answer makes requests to that
+/// recipient ask for the topic answer instead.
+const CAPABILITY_UNICAST_MISS_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// #504 follow-up: the most recipients with a recorded missed direct
+/// answer. A full table records no new miss; those requests keep asking
+/// for a direct reply, as before.
+const CAPABILITY_UNICAST_MISS_LIMIT: usize = 1024;
 
 struct CapabilityRefreshGuard {
     registry: std::sync::Arc<CapabilityRefreshRegistry>,
@@ -12563,10 +12613,14 @@ impl Agent {
         let deadline = tokio::time::Instant::now() + CAPABILITY_REFRESH_CONVERGENCE_WAIT;
         // #504 (A06): ask for the answer as a direct frame when the direct
         // listener that ingests it is running; the topic stays the fallback.
-        let reply_to = self
+        // A recipient whose direct answer did not arrive last time answers
+        // on the topic instead (the topic answer reaches relay-only paths).
+        let reply_to = (self
             .direct_listener_started
             .load(std::sync::atomic::Ordering::Acquire)
-            .then(|| self.identity.machine_id());
+            && !self.capability_refreshes.unicast_answer_missed(&recipient))
+        .then(|| self.identity.machine_id());
+        let registry = std::sync::Arc::clone(&self.capability_refreshes);
 
         let purpose = if require_durable_ack || required_application.is_some() {
             CapabilityRefreshPurpose::Requirement
@@ -12577,6 +12631,7 @@ impl Agent {
             recipient,
             purpose,
             move |mut guard, completion_tx| async move {
+                let store = std::sync::Arc::clone(&capability_store);
                 guard.published = run_strict_capability_refresh(
                     recipient,
                     required_application,
@@ -12589,6 +12644,12 @@ impl Agent {
                     ),
                 )
                 .await;
+                if reply_to.is_some() && guard.published {
+                    registry.note_unicast_answer(
+                        &recipient,
+                        store.lookup_binding(&recipient).is_some(),
+                    );
+                }
                 completion_tx.send_replace(CapabilityRefreshState::Finished);
                 drop(guard);
             },
@@ -31390,6 +31451,34 @@ mod tests {
     /// recipient each published their own targeted request. A completed
     /// flight must start a cooldown during which the gate fails fast
     /// (`Unavailable`), and a zero cooldown preserves the old behaviour.
+
+    /// #504 follow-up: a request that asked for a direct reply and got no
+    /// answer makes later requests to that recipient ask for the topic
+    /// answer, until an answer arrives or the miss ages out.
+    #[tokio::test(start_paused = true)]
+    async fn capability_refresh_unicast_miss_falls_back_to_the_topic_answer() {
+        let recipient = identity::AgentId([0x82_u8; 32]);
+        let other = identity::AgentId([0x83_u8; 32]);
+        let registry = CapabilityRefreshRegistry::default();
+        assert!(!registry.unicast_answer_missed(&recipient));
+        registry.note_unicast_answer(&recipient, false);
+        assert!(
+            registry.unicast_answer_missed(&recipient),
+            "a missed direct answer must make the next request ask for the topic answer"
+        );
+        assert!(!registry.unicast_answer_missed(&other));
+        registry.note_unicast_answer(&recipient, true);
+        assert!(
+            !registry.unicast_answer_missed(&recipient),
+            "an answer clears the miss"
+        );
+        registry.note_unicast_answer(&recipient, false);
+        tokio::time::advance(CAPABILITY_UNICAST_MISS_TTL).await;
+        assert!(
+            !registry.unicast_answer_missed(&recipient),
+            "a miss ages out after the TTL"
+        );
+    }
     #[tokio::test]
     async fn capability_refresh_registry_cooldown_blocks_immediate_reflight() {
         let recipient = identity::AgentId([0x81_u8; 32]);

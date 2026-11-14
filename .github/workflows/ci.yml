@@ -1170,6 +1170,10 @@ jobs:
           --expect w3h_1765_red_newer_file_revocation_waits_for_store_write=GREEN
           --require w3h_1776_delayed_fresh_joiner_fetches_the_welcome
           --expect w3h_1776_delayed_fresh_joiner_fetches_the_welcome=GREEN
+          --require w3h_1776_delayed_fresh_joiner_fetches_the_welcome_seed2
+          --expect w3h_1776_delayed_fresh_joiner_fetches_the_welcome_seed2=GREEN
+          --require w3h_1776_delayed_fresh_joiner_fetches_the_welcome_seed4
+          --expect w3h_1776_delayed_fresh_joiner_fetches_the_welcome_seed4=GREEN
           --require w3h_1623_red_pre_welcome_joiner_applies_removal_and_ban_links
           --expect w3h_1623_red_pre_welcome_joiner_applies_removal_and_ban_links=GREEN
 
