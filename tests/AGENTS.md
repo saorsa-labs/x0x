@@ -1,186 +1,88 @@
 # tests/ — Test Suite Reference
 
-Loaded when working on files in `tests/`. The root `AGENTS.md` covers
-architecture and how to run tests in isolation.
+Loaded when working on files in `tests/`. The root `AGENTS.md` covers architecture and how to run tests in isolation.
 
-## Ordinary shared Wiki/Web testnet acceptance
+## Network safety
 
-`e2e_vps_kv.py` is the strict ordinary group-store segment for #565. It is
-testnet-only and separate from legacy-import and GUI acceptance. The scenario
-must take the creator offline and restart a writer, so it fails before opening
-tunnels unless the operator supplies `--allow-service-restart`. Only
-`x0xd-testnet.service` is addressed, and a previously-active creator is
-restored in `finally`.
+Test daemons join the real network. Some in-process tests also dial real seeds — including `nat_traversal_integration.rs` `--ignored` VPS tests, `vps_e2e_integration.rs`, and `e2e_live_network.sh`. "No daemon started" does not mean "no network". Run all tests via `just test` or `python3 scripts/dev/test-isolated.py` (Linux loopback-only namespace; macOS/Windows fail closed). Plain `cargo nextest run` only for a selector confirmed to open no network.
 
-```bash
-python3 tests/e2e_vps_kv.py --network test \
-  --tokens-file tests/.vps-tokens-test.env \
-  --allow-service-restart --report /absolute/path/phase-kv.json
-```
+## Integration tests
 
-The report contains assertion labels, status codes, store identifiers and
-content hashes, never bearer tokens or page bytes. Success here does not cover
-legacy migration or browser/GUI rendering.
+A core subset; `tests/` holds many more files.
 
-## Survivor rekey testnet acceptance (#1216)
-
-`e2e_vps_survivor_rekey.py` checks the rekey after a member is removed or
-banned, on a GSS (MlsEncrypted, legacy plane) group and a TreeKEM
-(`private_secure`) group. It needs at least five `--nodes`: the first removes
-and bans, the second-last is removed, the last is banned, and the rest
-survive. `--variant plain` and `--variant restart` (default: both) each build
-fresh groups. In `restart` the remover's `x0xd-testnet.service` restarts
-10-20 s before each removal, so that variant needs `--allow-service-restart`.
-
-A case passes only if every survivor decrypts a message sealed after the
-removal (rekey latency recorded per survivor), no excluded node decrypts it
-during a further `--watch-secs` window (the target, and in the ban case the
-member removed earlier), survivors' rosters drop the target, GSS answers the
-explicit recipient-ineligible refusal to a re-seal, and a banned target's
-re-join is never seated. Only exact typed responses count as an exclusion or a
-refusal; transport errors, 5xx, untyped 4xx, fork quarantine and malformed
-reads make a check INCONCLUSIVE, which stays inconclusive in the report
-`verdict` and the exit code (0 pass, 1 fail, 3 inconclusive). The D60 "no
-later key" check is claimed only with key evidence: the node's last decrypt
-answer came from its key material, and an epoch mismatch must report its local
-epoch. A removed member that answers the membership gate first is listed under
-`limitations` instead. A GSS share-install journal line can only fail the
-check; its absence is never evidence. Journal windows start at each node's own
-clock, read before the action. Key readiness is proven by decrypting, never by
-roster state (#1214). Nothing assumes one binary (#1208): each node's live
-version and running sha256 are recorded and, with the eph `testnet-hosts.json`
-next to the tokens file, must equal what was deployed to that node.
-
-```bash
-python3 -B tests/e2e_vps_survivor_rekey.py --network test \
-  --tokens-file "${X0X_TESTNET_TOKENS_FILE:?source testnet-hosts.env after deploy}" \
-  --nodes nyc sfo helsinki nuremberg singapore \
-  --variant plain --variant restart --allow-service-restart \
-  --report /absolute/path/rekey.json
-```
-
-On an ephemeral run, use `$E fixture --run ID rekey --receipts DIR` once the
-testnet-ephemeral skill registers `rekey`. The report holds labels, status
-codes, response classes, epochs, latencies and per-node versions, never
-tokens, ciphertexts, invites or log text. Pure-python tests:
-`test_e2e_vps_survivor_rekey.py`. Details: `TEST_SUITE_GUIDE.md` §7f.
-
-## Integration Test Organization
-
-33 integration test files in `tests/` (curated core subset; the directory holds more):
-
-| File | Tests |
-|------|-------|
-| `agent_usability_eval.rs` | #1174 agent-usability eval: a deterministic scripted agent driven only by `x0x onboard` output + the core SKILL.md sends a DM, joins a group, writes a scratch KV value on a two-daemon hermetic pair. Daemon-backed, `#[ignore]`; the fast half (doc-surface check on the real `x0x onboard` output, changed-method/nonexistent-command negative controls, CLI-deadline kill+reap proof) runs un-ignored |
+| File | Coverage |
+|------|---------|
+| `agent_usability_eval.rs` | Scripted agent: DM, group join, scratch KV on a hermetic pair. `#[ignore]`; fast half runs un-ignored |
 | `identity_integration.rs` | Three-layer identity, keypair management, certificates |
 | `identity_unification_test.rs` | machine_id == ant-quic PeerId, announcement key derivation |
-| `trust_evaluation_test.rs` | TrustEvaluator decisions, machine pinning, ContactStore mutations |
-| `announcement_test.rs` | Announcement round-trips, NAT fields, discovery cache, reachability |
-| `connectivity_test.rs` | ReachabilityInfo heuristics, ConnectOutcome, connect_to_agent() |
+| `trust_evaluation_test.rs` | TrustEvaluator, machine pinning, ContactStore |
+| `announcement_test.rs` | Announcement round-trips, NAT fields, discovery cache |
+| `connectivity_test.rs` | ReachabilityInfo, ConnectOutcome, connect_to_agent() |
 | `identity_announcement_integration.rs` | Signature verification, TTL expiry, shard topics |
 | `crdt_integration.rs` | TaskList CRUD, state transitions |
-| `crdt_convergence_concurrent.rs` | Concurrent CRDT operations converging |
-| `crdt_partition_tolerance.rs` | Network partition and recovery |
+| `crdt_convergence_concurrent.rs` | Concurrent CRDT convergence |
+| `crdt_partition_tolerance.rs` | Partition and recovery |
 | `mls_integration.rs` | Group encryption, key rotation |
-| `f1_gss_remove_live.rs` | F1/ADR-0010: admin remove (`DELETE /groups/:id/members/:agent_id`) rotates the GSS secret — epoch advances, survivor still decrypts, removed member locked out. Daemon-backed, `--ignored`; run via `just adr-gates-f1-live`. Validated to FAIL against a pre-F1 build (ADR-0025 observation completeness). **Note: the `D.2` block in `e2e_named_groups.sh` covers the *ban* path, which rotated pre-F1 — it cannot observe this defect.** |
+| `f1_gss_remove_live.rs` | Admin remove rotates GSS secret. `--ignored`; run via `just adr-gates-f1-live` |
 | `network_integration.rs` | Bootstrap connection |
 | `network_timeout.rs` | Connection timeouts |
 | `nat_traversal_integration.rs` | NAT hole-punching |
 | `comprehensive_integration.rs` | End-to-end workflows |
 | `scale_testing.rs` | Performance with many agents |
-| `presence_foaf_integration.rs` | Presence beacons, FOAF discovery, trust-scoped visibility |
+| `presence_foaf_integration.rs` | Presence beacons, FOAF, trust-scoped visibility |
 | `presence_wiring_test.rs` | PresenceWrapper lifecycle, config defaults, shutdown |
-| `presence_integration.rs` | Presence API surface: subscribe, cached_agent, foaf_peer_candidates |
-| `kv_store_integration.rs` | KV store CRUD, access policies, CRDT sync |
-| `kv_first_join_bootstrap.rs` | Issue #96: cold first-join state bootstrap via state-sync side topic (daemon-backed, `--ignored`) |
-| `kv_signed_store_auth.rs` | Signed-store local-write enforcement: joiner PUT/DELETE -> 403, owner learned via signed OwnerAnnounce (daemon-backed, `--ignored`) |
-| `tasklist_first_join_bootstrap.rs` | Task-list cold first-join bootstrap via state-sync side topic + LWW-clock delta merge (daemon-backed, `--ignored`) |
-| `local_topics.rs` | Issue #89: `local:` topics deliver same-daemon only, never gossipped (daemon-backed, `--ignored`) |
+| `presence_integration.rs` | subscribe, cached_agent, foaf_peer_candidates |
+| `kv_store_integration.rs` | KV CRUD, access policies, CRDT sync |
+| `kv_first_join_bootstrap.rs` | Cold first-join bootstrap. Daemon-backed, `--ignored` |
+| `kv_signed_store_auth.rs` | Signed-store local-write enforcement. Daemon-backed, `--ignored` |
+| `tasklist_first_join_bootstrap.rs` | Task-list cold first-join + LWW delta merge. Daemon-backed, `--ignored` |
+| `local_topics.rs` | `local:` topics same-daemon only. Daemon-backed, `--ignored` |
 | `named_group_integration.rs` | Named groups, invites, join/leave, display names |
-| `owner_retirement.rs` | ADR-0016 Slice 2: owner retirement / flat Admin authority at the `GroupInfo` + state-commit layer |
-| `membership_authority.rs` | ADR-0016 Slice 3: add/remove/ban authority via library primitives (handler enforcement lives in `src/server/mod.rs` in-crate tests) |
-| `last_admin_invariant.rs` | ADR-0016 R2: no commit may leave a live group with zero active admins, enforced at the state-commit choke-point |
-| `invite_authority.rs` | ADR-0016 Slice 4: invite-issue authority and creator provenance from base-state |
+| `owner_retirement.rs` | Owner retirement / flat Admin authority |
+| `membership_authority.rs` | add/remove/ban authority |
+| `last_admin_invariant.rs` | No commit leaves zero active admins |
+| `invite_authority.rs` | Invite-issue authority and creator provenance |
 | `bootstrap_cache_integration.rs` | Bootstrap cache persistence, quality scoring |
-| `constitution_integration.rs` | Constitution embedding and serving |
 | `daemon_api_integration.rs` | Daemon REST API endpoint coverage |
 | `direct_messaging_integration.rs` | Direct send/receive, connection lifecycle |
-| `file_transfer_integration.rs` | File send, accept, reject, progress |
-| `gossip_cache_adapter_integration.rs` | Gossip cache adapter wrapping bootstrap cache |
-| `rendezvous_integration.rs` | Rendezvous shard discovery |
 | `upgrade_integration.rs` | Self-update manifest signing, verification, rollout |
-| `upgrade_launcher_passthrough.rs` | Dormant x0x-launcher exec passthrough (unix, m2-launcher feature) |
 | `vps_e2e_integration.rs` | VPS bootstrap node end-to-end |
 
-Test pattern: `TempDir` for key isolation, `#[tokio::test]` for async, `tempfile` crate for temp directories.
+## E2E scripts
 
-## E2E Test Scripts
+| Script | Scope | Notes |
+|--------|-------|-------|
+| `e2e_dogfood_local.sh` | 2-instance local | ~20 assertions, ~5 s. Pre-commit smoke |
+| `e2e_dogfood_groups.sh` | 3-instance local groups | ~29 assertions, ~5 s |
+| `e2e_local_mesh.sh` | 3-instance local DM matrix | 6 directed pairs, no VPS |
+| `e2e_comprehensive.sh` | Local alice+bob+charlie | ~2 min |
+| `e2e_live_network.sh` | Local node → live VPS mesh | ~66 assertions; needs VPS up and SSH access |
+| `e2e_vps_mesh.py` | 6 VPS DM matrix | 30 directed pairs via 1 SSH tunnel, ~16 s |
+| `e2e_vps_groups.py` | 6 VPS groups + contacts | up to 49 assertions, ~60 s |
+| `e2e_vps.sh` | 6 VPS SSH-per-call | ~102 assertions, ~4 min |
+| `e2e_vps_kv.py` | Testnet group-store | Needs `--allow-service-restart`; testnet only |
+| `e2e_vps_survivor_rekey.py` | Testnet GSS + TreeKEM rekey | Needs `--nodes` (≥5), `--allow-service-restart` for `restart` variant |
+| `e2e_deploy.sh` | Build + deploy to 6 VPS nodes | `--mesh-verify` chains Phase A + B after deploy |
 
-Bash + Python test harnesses in `tests/` for end-to-end validation:
-
-| Script | Scope | Assertions | What it tests |
-|--------|-------|-----------|---------------|
-| `e2e_comprehensive.sh` | Local (alice+bob+charlie) | ~143 | ALL 75+ endpoints, 18 categories: contacts lifecycle, machine pinning, trust eval (5 paths), MLS full lifecycle (add/remove/re-add), named groups (invite validation, leave/rejoin), KV stores (multi-key, update), presence (all 6 endpoints), seedless bootstrap |
-| `e2e_live_network.sh` | Local → live VPS mesh | ~66 | Local node joins real bootstrap network, bidirectional: direct messaging, pub/sub, MLS groups with VPS members, named group invites across network, presence discovery |
-| `e2e_vps.sh` | 6 VPS bootstrap nodes (legacy SSH-per-call) | ~102 | All 6 nodes: cross-continent direct messaging (NYC→Sydney), multi-continent MLS, named groups, KV stores, contact blocking, presence FOAF, constitution on all nodes. **Dominated by SSH RTT to Singapore/Sydney — use the dogfood-family harnesses for clean cross-region results.** |
-| `e2e_vps_mesh.py` | Phase A — 6 VPS DM matrix (mesh-relay) | 30 directed pairs | All-pairs DM matrix driven through x0x's own DMs via 1 SSH tunnel to an anchor. ~16 s wall-clock, zero harness flakes. See [`TEST_SUITE_GUIDE.md`](../TEST_SUITE_GUIDE.md) §7b. |
-| `e2e_vps_groups.py` | Phase B — 6 VPS groups + contacts dogfood | up to 49 | Anchor creates a `public_open` group, DMs invites to all runners, each posts a group message, contacts add/Trust/Block/remove cycle per node. See §7c. |
-| `e2e_local_mesh.sh` | Local 3-node Phase A smoke | 6 directed pairs | Boots alice/bob/charlie + a runner each, runs `e2e_vps_mesh.py --no-tunnel` against alice. Proves the protocol without SSH. |
-| `e2e_dogfood_groups.sh` | Phase B — local 3-instance groups + contacts | 29 | Same dogfood as §7c but local. ~5 s wall-clock. |
-| `e2e_dogfood_local.sh` | Phase D — fast 2-instance pre-commit smoke | 20 | Identity + contacts + DM round-trip + group lifecycle (incl. authority-committed join), all via DMs. ~5 s wall-clock; targets every-commit cadence. See §7e. |
-| `e2e_deploy.sh` | Build + deploy to VPS (with optional mesh verification) | ~24 | Cross-compile, upload `x0xd` **and** the mesh test runner (`x0x-test-runner.service`) to 6 nodes, verify health/version/mesh, collect API tokens. **`--mesh-verify` flag** chains Phase A + Phase B verification onto the deploy via 1 SSH tunnel. See §7d. |
-
-## Running E2E Tests
+Quick commands:
 
 ```bash
-# 1. Build release binary
-cargo build --release
-
-# 2. PRE-COMMIT SMOKE (Phase D, ~5 s, no VPS, no SSH)
 bash tests/e2e_dogfood_local.sh
-
-# 3. Local 3-instance dogfood (Phase B, contacts + groups, ~5 s)
 bash tests/e2e_dogfood_groups.sh
-
-# 4. Local Phase-A DM matrix smoke (3 daemons, no VPS, no SSH)
-bash tests/e2e_local_mesh.sh
-
-# 5. Local comprehensive test (legacy curl-driven, ~2 min)
-bash tests/e2e_comprehensive.sh
-
-# 6. Live network test (local node joins real bootstrap, ~3 min)
-#    Requires: VPS nodes running, SSH access
-bash tests/e2e_live_network.sh
-
-# 7. Deploy to VPS — cross-compile + push x0xd + push runner + verify (~5 min)
-#    Add --mesh-verify to chain Phase A + B verification via 1 SSH tunnel
-bash tests/e2e_deploy.sh                          # SSH-only verification
-bash tests/e2e_deploy.sh --mesh-verify            # + Phase A + B mesh checks
-
-# 8a. VPS Phase-A DM matrix (RECOMMENDED for cross-region DM proof, ~16 s)
 python3 tests/e2e_vps_mesh.py --anchor nyc --discover-secs 30 --settle-secs 60
-
-# 8b. VPS Phase-B groups + contacts dogfood (up to 49 assertions, ~60 s)
 python3 tests/e2e_vps_groups.py --anchor nyc --discover-secs 45
-
-# 8c. VPS legacy SSH-per-call test (still useful for surface coverage, ~4 min)
-bash tests/e2e_vps.sh
-
-# 9. Health check (quick VPS status)
-bash .deployment/health-check.sh              # basic
-bash .deployment/health-check.sh --extended   # with peer counts
+bash tests/e2e_deploy.sh --mesh-verify
+bash .deployment/health-check.sh --extended
 ```
 
-## VPS Port Configuration
+## VPS ports
 
-| Port | Protocol | Purpose | Binding |
-|------|----------|---------|---------|
-| **5483** | UDP/QUIC | Transport (gossip network) | `[::]:5483` or `0.0.0.0:5483` |
-| **12600** | TCP/HTTP | REST API on VPS nodes | `127.0.0.1:12600` (configured in `/etc/x0x/config.toml`) |
-| **12700** | TCP/HTTP | REST API default (local dev) | `127.0.0.1:12700` (default when no config) |
+| Port | Protocol | Purpose |
+|------|----------|---------|
+| 5483 | UDP/QUIC | Transport (gossip network) |
+| 12600 | TCP/HTTP | REST API on VPS nodes (`127.0.0.1:12600`, `/etc/x0x/config.toml`) |
+| 12700 | TCP/HTTP | REST API default for local dev |
 
-VPS API tokens are at `/root/.local/share/x0x/api-token` on Linux nodes.
+VPS API tokens: `/root/.local/share/x0x/api-token`.
 
-## SSH Notes for macOS
-
-When running tests that SSH to multiple VPS nodes sequentially, use `-o ControlMaster=no -o ControlPath=none -o BatchMode=yes` to avoid SSH multiplexing hangs. The health check and VPS test scripts already include these flags.
+SSH to multiple nodes: use `-o ControlMaster=no -o ControlPath=none -o BatchMode=yes`.

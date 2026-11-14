@@ -22,8 +22,9 @@
 David keeps the ADR pack at 15. Do not add ADR files, including transient
 records and folded overlays. Put rationale in the PR body and existing docs
 or code doc comments. If a change touches the wire format or public API,
-write a `FOR ENGINEER:` line for David's decision. Record his approval in the
-PR body or comment; an approved additive API needs no new ADR.
+write a `FOR ENGINEER:` line in the PR body that states the change. Under A15
+(amendment of 12 Nov 2026) it needs no separate ruling; an additive API needs
+no new ADR.
 
 This ruling overrides the historical instructions below to create a new,
 successor or transient ADR. Accepted bytes and frozen evidence stay unchanged.

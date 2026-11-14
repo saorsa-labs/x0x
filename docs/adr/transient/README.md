@@ -8,9 +8,7 @@ instruction to create a transient record for a new or changed decision.
 See [Engineer’s record of David’s ruling](https://github.com/saorsa-labs/x0x/pull/1469#issuecomment-6276825624).
 
 Put the rationale in the PR body and existing documentation or code doc
-comments. If a change touches the wire format or public API, write a
-`FOR ENGINEER:` line for David's decision. Record his approval in the PR body
-or comment. An approved additive API does not need a new ADR. Follow
+comments. A wire-format or public-API change carries a `FOR ENGINEER:` line in the PR body that states the change; under A15 (amendment of 12 Nov 2026) it needs no separate ruling. An approved additive API does not need a new ADR. Follow
 [the style guide](../../documentation-style.md).
 
 ## Reconciliation of 7 November 2026

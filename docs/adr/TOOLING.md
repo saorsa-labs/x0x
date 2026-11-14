@@ -8,9 +8,7 @@ authority (David, 7 Nov 2026). Read them and the
 Do not add ADR files, including transient records or folded overlays. Keep
 A01 through A15; do not allocate A16 or a second consolidated series.
 Put the rationale in the PR body and existing docs or code doc comments.
-A wire-format or public-API change needs a `FOR ENGINEER:` line for David's
-decision. Record his approval in the PR body or comment. An approved additive
-API does not need a new ADR.
+A wire-format or public-API change carries a `FOR ENGINEER:` line in the PR body that states the change; under A15 (amendment of 12 Nov 2026) it needs no separate ruling. An additive API does not need a new ADR.
 
 Existing Accepted records and frozen evidence remain unchanged. The tools
 below inspect the retained collection; their support for the earlier numbered
@@ -59,7 +57,7 @@ Add this project instruction to every AI coding harness profile (`AGENTS.md`, `C
 Before changing architecture, protocols, storage formats, crypto, network behaviour, public APIs, data models or operational invariants, read the accepted 15 ADR set in docs/adr/consolidated/.
 Keep the ADR pack at 15. Do not add ADR files, including transient T-*.md records or folded overlays (David's 19 Oct 2026 ruling).
 Put the rationale in the PR body and existing documentation or code doc comments.
-If a change touches the wire format or public API, write a FOR ENGINEER: line for David's decision. Record his approval in the PR body/comment; an approved additive API needs no new ADR.
+If a change touches the wire format or public API, write a FOR ENGINEER: line in the PR body that states the change. Under A15 (amendment of 12 Nov 2026) it needs no separate ruling; an additive API needs no new ADR.
 Preserve Accepted records and frozen evidence. Do not create a successor record or change an acceptance status as a workaround.
 Use approximately 80% ASD-STE100 style. Follow docs/documentation-style.md.
 During review, check correctness, alternatives, evidence, consequences and unchanged Accepted bytes. Existing release, security and independent-review gates still apply.

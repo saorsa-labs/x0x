@@ -87,7 +87,11 @@ async fn approve_status(state: &Arc<AppState>, group_key: &str, request_id: &str
 
 /// Real requester-signed V2 pub/sub envelope (same construction as
 /// `pubsub::encode_v2` using only public ML-DSA-65 primitives).
-fn sign_v2_envelope(kp: &AgentKeypair, topic: &str, event: &NamedGroupMetadataEvent) -> Vec<u8> {
+pub(super) fn sign_v2_envelope(
+    kp: &AgentKeypair,
+    topic: &str,
+    event: &NamedGroupMetadataEvent,
+) -> Vec<u8> {
     use ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa;
 
     let payload = serde_json::to_vec(event).expect("serialize event");

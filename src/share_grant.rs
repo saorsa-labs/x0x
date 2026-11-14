@@ -2170,6 +2170,13 @@ impl crate::Agent {
         !agents.is_empty() && outbox.nudge(&agents, unix_now_secs())
     }
 
+    /// #1158: `agent`'s verified capability advert arrived. Make every
+    /// queued grant delivery to it due now.
+    pub fn nudge_share_grant_outbox_for_agent(&self, agent: &AgentId) -> bool {
+        self.share_grant_outbox()
+            .is_some_and(|outbox| outbox.nudge(&[*agent], unix_now_secs()))
+    }
+
     /// Revoke an issued grant (owner key only): sign a
     /// [`crate::revocation::RevokedSubject::ShareGrant`] record, apply it
     /// locally (effective at the next evaluation, no restart), durably
@@ -2229,15 +2236,19 @@ impl crate::Agent {
         // here and the owner's other installs should learn it. The caller
         // still gets the error (a 5xx), and a retry rewrites both files.
         if let Some(rt) = &self.gossip_runtime {
+            let publish_lock = self.revocation_set.read().await.publish_lock();
+            let _one_round = publish_lock.lock().await;
             let records = self.revocation_set.read().await.share_grant_records();
-            if let Ok(bytes) = crate::revocation::encode_revocation_batch(&records) {
-                let _ = rt
-                    .pubsub()
-                    .publish(
-                        crate::REVOCATION_V3_TOPIC.to_string(),
-                        bytes::Bytes::from(bytes),
-                    )
-                    .await;
+            if let Ok(batches) = crate::revocation::encode_revocation_batches(&records) {
+                for bytes in batches {
+                    let _ = rt
+                        .pubsub()
+                        .publish(
+                            crate::REVOCATION_V3_TOPIC.to_string(),
+                            bytes::Bytes::from(bytes),
+                        )
+                        .await;
+                }
             }
         }
         durable.map(|()| record)

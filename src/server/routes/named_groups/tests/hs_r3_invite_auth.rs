@@ -3146,6 +3146,7 @@ async fn every_stateful_event_variant_routes_conflicts_through_the_wrapper() -> 
             actor: authority_hex.clone(),
             requester_agent_id: requester_hex.clone(),
             commit: Some(conflicting_commit(&state, &group_id, signer, false).await?),
+            request_binding: None,
         };
         let result =
             apply_named_group_metadata_event(&state, event, authority_id, true, None).await;

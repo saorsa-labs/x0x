@@ -2853,14 +2853,22 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
             )
         }
         Event::JoinRequestRejected {
-            request_id, actor, ..
+            request_id,
+            actor,
+            requester_agent_id,
+            request_binding,
+            ..
         } => {
             let (action, mutate) = steps::join_request_rejected(
                 cursor,
                 &author,
-                request_id,
-                actor,
-                commit.committed_at,
+                steps::RejectedRequest {
+                    request_id,
+                    actor,
+                    requester_agent_id,
+                    request_binding: request_binding.as_deref(),
+                },
+                commit,
             )
             .ok()?;
             super::super::apply_stateful_event_to_group(cursor, commit, action, mutate)
@@ -2922,13 +2930,31 @@ fn gss_rotation_step(
 /// checks every signer's authority on the chain. Nothing is applied here.
 /// Bounded by [`ORC_STASH_CAP`] and [`ORC_RETAIN_TTL`]. Returns whether
 /// the event was held now (not held before).
+///
+/// #1623: the replay and the walk apply a held commit as its commit signer,
+/// not as `sender`, the peer that delivered it. A `JoinRequestRejected`
+/// with no binding has only that sender to tie its `request_id` to the
+/// signer. So it is held only when `sender` is `commit.committed_by`. A
+/// bound reject is held from any verified sender; its binding is checked
+/// at the replay and at the walk.
 pub(in crate::server) async fn hold_unchained_event(
     state: &AppState,
     event: &super::super::NamedGroupMetadataEvent,
+    sender: &AgentId,
 ) -> bool {
     let Some(commit) = super::super::named_group_metadata_event_commit(event) else {
         return false;
     };
+    if matches!(
+        event,
+        super::super::NamedGroupMetadataEvent::JoinRequestRejected {
+            request_binding: None,
+            ..
+        }
+    ) && hex::encode(sender.as_bytes()) != commit.committed_by
+    {
+        return false;
+    }
     let group_id = super::super::named_group_metadata_event_group_id(event);
     let Some(info) = ({
         let groups = state.named_groups.read().await;
@@ -8369,6 +8395,172 @@ mod restart_tests {
         assert_eq!(
             parked, 1,
             "the apply parks the role update for the unseated agent"
+        );
+        state.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1623: the hold applies a held commit as its commit signer, not as
+    /// the peer that delivered it. So a peer that relays a reject with no
+    /// binding, around the signer's genuine commit and with another
+    /// request named, must not get it into the hold. RED before: that copy
+    /// was held first and applied, and the other request became Rejected.
+    /// A bound copy stays relayable: the binding refuses a re-labelled one
+    /// at the replay, and the walk, and the genuine one applies.
+    #[tokio::test]
+    async fn issue1623_relayed_unbound_reject_is_not_held() -> Result<()> {
+        use super::super::super as ng;
+        use x0x::groups::{GroupRole, JoinRequestStatus};
+        let dir = tempfile::tempdir()?;
+        let state = offline_daemon(dir.path(), None).await?;
+        let keys = (0..4)
+            .map(|_| x0x::identity::AgentKeypair::generate())
+            .collect::<Result<Vec<_>, _>>()?;
+        let [admin, relay, first, second] = &keys[..] else {
+            anyhow::bail!("four keys");
+        };
+        let id = |kp: &x0x::identity::AgentKeypair| hex::encode(kp.agent_id().as_bytes());
+        let mut base = GroupInfo::with_policy(
+            "issue1623-held".to_string(),
+            "desc".to_string(),
+            admin.agent_id(),
+            "cd".repeat(32),
+            x0x::groups::GroupPolicyPreset::PublicRequestSecure.to_policy(),
+        );
+        let local = hex::encode(state.agent.agent_id().as_bytes());
+        base.add_member(local, GroupRole::Member, None, None);
+        base.add_member(id(relay), GroupRole::Member, None, None);
+        let gid = base.stable_group_id().to_string();
+        for (kp, rid) in [(first, "r1"), (second, "r2")] {
+            let mut request = x0x::groups::JoinRequest::new(gid.clone(), id(kp), None, 7);
+            request.request_id = rid.to_string();
+            ng::set_join_request_created(&mut base, request, None);
+        }
+        base.seal_commit(admin, ng::now_millis_u64())?;
+        hold_persisted(&state, &base).await?;
+        // The signer's side: a rename, then the reject of `r1` on it.
+        let a = id(admin);
+        let at = ng::now_millis_u64();
+        let mut renamed = base.clone();
+        renamed.name = "renamed".to_string();
+        renamed.updated_at = at;
+        renamed.roster_revision += 1;
+        let rename_commit = renamed.seal_commit(admin, at)?;
+        let rename: ng::NamedGroupMetadataEvent = serde_json::from_value(serde_json::json!({
+            "event": "group_metadata_updated", "group_id": gid, "name": "renamed",
+            "revision": renamed.roster_revision, "actor": a, "commit": rename_commit}))?;
+        let mut rejected = renamed.clone();
+        ng::set_join_request_rejected(&mut rejected, "r1", &a, at);
+        rejected.updated_at = at;
+        rejected.roster_revision += 1;
+        let commit = rejected.seal_commit(admin, at)?;
+        let reject = |request_id: &str, requester: &x0x::identity::AgentKeypair, bound: bool| {
+            let mut fields = serde_json::json!({
+                "event": "join_request_rejected", "group_id": gid, "actor": a,
+                "request_id": request_id, "requester_agent_id": id(requester),
+                "commit": commit});
+            if bound {
+                // The signer's binding of `r1`, on every bound copy.
+                fields["request_binding"] =
+                    serde_json::Value::String(x0x::groups::state_commit::sign_join_request_reject(
+                        &commit,
+                        "r1",
+                        &id(first),
+                        admin,
+                    )?);
+            }
+            Ok::<ng::NamedGroupMetadataEvent, anyhow::Error>(serde_json::from_value(fields)?)
+        };
+        let genuine = reject("r1", first, true)?;
+        let bound_relabel = reject("r2", second, true)?;
+        let unbound_relabel = reject("r2", second, false)?;
+
+        // The walk: the bound copies, as the commit signer.
+        let held = |event: &ng::NamedGroupMetadataEvent| HeldEvent {
+            stable_group_id: gid.clone(),
+            event: event.clone(),
+            author: admin.agent_id(),
+            prev_state_hash: Some(renamed.state_hash.clone()),
+            at: Instant::now(),
+        };
+        assert!(
+            next_held_state(&renamed, &held(&bound_relabel)).is_none(),
+            "the walk refuses a bound reject that names another request"
+        );
+        let walked = next_held_state(&renamed, &held(&genuine)).context("the genuine reject")?;
+        assert_eq!(walked.state_hash, rejected.state_hash);
+
+        // The lagging node: a peer relays the three copies before the
+        // rename, so none chains on the head yet.
+        for event in [&unbound_relabel, &bound_relabel, &genuine] {
+            let applied = ng::apply_named_group_metadata_event(
+                &state,
+                event.clone(),
+                relay.agent_id(),
+                true,
+                None,
+            )
+            .await;
+            assert!(!applied.accepted, "nothing chains on the head yet");
+        }
+        // The signer's own copy with no binding (a signer older than
+        // #1623) is still held.
+        let _ = ng::apply_named_group_metadata_event(
+            &state,
+            reject("r1", first, false)?,
+            admin.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        let held_unbound = {
+            let inner = state.revocation_evictions.inner.lock().await;
+            inner
+                .orc
+                .held_events
+                .iter()
+                .filter(|held| {
+                    matches!(
+                        &held.event,
+                        ng::NamedGroupMetadataEvent::JoinRequestRejected {
+                            request_binding: None,
+                            request_id,
+                            ..
+                        } if request_id == "r2"
+                    )
+                })
+                .count()
+        };
+        let held_all = state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .orc
+            .held_events
+            .len();
+        // The rename arrives; the held commits that chain on it replay.
+        let applied =
+            ng::apply_named_group_metadata_event(&state, rename, admin.agent_id(), true, None)
+                .await;
+        assert!(applied.accepted, "the rename applies");
+        replay_held_events(&state, &gid).await;
+
+        let (_, stored) = group_by_stable(&state, &gid).await.context("loaded")?;
+        let status = |rid: &str| stored.join_requests.get(rid).map(|request| request.status);
+        assert_eq!(
+            (held_unbound, held_all, status("r1"), status("r2")),
+            (
+                0,
+                3,
+                Some(JoinRequestStatus::Rejected),
+                Some(JoinRequestStatus::Pending)
+            ),
+            "(relayed unbound relabels held, all held, r1, r2)"
+        );
+        assert_eq!(
+            stored.state_hash, rejected.state_hash,
+            "the head is the reject"
         );
         state.agent.shutdown().await;
         Ok(())

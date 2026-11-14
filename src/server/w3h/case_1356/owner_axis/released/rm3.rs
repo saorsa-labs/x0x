@@ -15,7 +15,9 @@
 //! (r+4 first). This is how the row releases the chain to M on real
 //! sockets. A v0.46.1 that starts minutes later is not given r+4 (seen in
 //! a run), so each variant starts it at once. In (i), M then restarts on
-//! the candidate, and A seals one more rename.
+//! the candidate; once A verifies its advert, A seals one more rename,
+//! and keeps sealing one while M still lacks r+4, because the rename
+//! publishes once and a restarted member can miss that single publish.
 //!
 //! Desired result. (i) v0.46.1 refuses r+4 as `owner_mandate_missing` and
 //! keeps r+3; the candidate then applies r+4. (ii) v0.46.1 warn-accepts
@@ -38,6 +40,10 @@ const FIRST_SEEN_AGO_MS: u64 = 2 * 86_400_000;
 const CHAIN_WAIT: Duration = Duration::from_secs(180);
 /// How long the refusing M is watched after its first refusal.
 const HOLD: Duration = Duration::from_secs(30);
+/// How long [`applies`] waits between chain releases.
+const RELEASE_SLICE: Duration = Duration::from_secs(30);
+/// How many extra renames [`applies`] seals while M still lacks r+4.
+const RELEASES: usize = 4;
 
 /// Wait until A's head is past `revision`, or `RESEAT_BOUND` ends.
 async fn head_past(a: &Real, group: &str, revision: u64) -> Result<View> {
@@ -52,9 +58,13 @@ async fn head_past(a: &Real, group: &str, revision: u64) -> Result<View> {
 }
 
 /// Wait until `node` holds the commit with `hash` (its head or its commit
-/// log), or `RESEAT_BOUND` ends.
-async fn applies(node: &Real, group: &str, hash: &str) -> Result<bool> {
+/// log), or `RESEAT_BOUND` ends. A `MemberAdded` has no resend schedule, so
+/// each `RELEASE_SLICE` without the hash, `a` seals one more rename (at
+/// most `RELEASES`): every rename publishes fresh later-state traffic, and
+/// a member that missed an earlier publish is released by the next one.
+async fn applies(a: &Real, node: &Real, group: &str, hash: &str) -> Result<bool> {
     let deadline = tokio::time::Instant::now() + RESEAT_BOUND;
+    let (mut releases, mut next) = (0, tokio::time::Instant::now() + RELEASE_SLICE);
     loop {
         let held = {
             let groups = node.state.named_groups.read().await;
@@ -64,6 +74,11 @@ async fn applies(node: &Real, group: &str, hash: &str) -> Result<bool> {
         };
         if held || tokio::time::Instant::now() > deadline {
             return Ok(held);
+        }
+        if releases < RELEASES && tokio::time::Instant::now() > next {
+            rename(a, group, "w3h rm3 candidate re-release").await?;
+            releases += 1;
+            next = tokio::time::Instant::now() + RELEASE_SLICE;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -319,13 +334,21 @@ async fn older_receiver(
         let (rev, missing, _, raw) =
             run_released(files, &a, names, HOLD, |_, missing, _| missing > 0).await?;
         // Restarted on the candidate; A's next rename (r+6) releases the
-        // chain again.
+        // chain again. A verifies the restarted M's advert first, as the
+        // released arm and rm1's restart do: the rename publishes once, and
+        // a member A has no fresh advert for can miss that publish (seen in
+        // a run, #1880 r2: M stayed at r+3 while A reached r+6).
         let m = serve_real(&m_dir, &plane, grace).await?;
         m.join(a.udp).await?;
         a.join(m.udp).await?;
-        let latest = rename(&a, group, "w3h rm3 candidate").await?;
-        let applied = applies(&m, group, &head.state_hash).await?;
-        let after = m.view(group).await?;
+        let m_advert = a.advert(m_hex, true).await?;
+        ensure!(
+            m_advert == Some(true),
+            "INFRA: A lacks the restarted M's advert ({m_advert:?})"
+        );
+        rename(&a, group, "w3h rm3 candidate").await?;
+        let applied = applies(&a, &m, group, &head.state_hash).await?;
+        let (after, latest) = (m.view(group).await?, a.view(group).await?);
         m.stop().await?;
         // Catch-up past r+4 is not the row's claim; the note records it.
         receipt.note(format!(

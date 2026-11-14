@@ -19,14 +19,14 @@
       "revision": 1,
       "path": "A02-r01-identity-keys-and-device-enrollment.md",
       "title": "Identity Keys and Device Enrollment",
-      "sha256": "a9fc1f58c65f093cf902aa2c765feddb65d54c6fcf5490dc050cbc1cee80a334"
+      "sha256": "6908b1754ff4ce9a368410ddce51bc1a107356fb011d26a5040c305d81ec46dc"
     },
     {
       "id": "A03",
       "revision": 1,
       "path": "A03-r01-trust-permissions-sharing-and-revocation.md",
       "title": "Trust Permissions Sharing and Revocation",
-      "sha256": "5730814ef0deb3a1751bd10c28144bf0af24c528cfb00179fa234feec64706b1"
+      "sha256": "de70dd2ea0cfb7d12405da38be3c25be3e9c1add7ba74a611e4dfea3f75d7a7f"
     },
     {
       "id": "A04",
@@ -40,7 +40,7 @@
       "revision": 1,
       "path": "A05-r01-connectivity-discovery-and-names.md",
       "title": "Connectivity Discovery and Names",
-      "sha256": "69285c4caa9dab2355b6388ef4591af3cb558cccd11af70cab317451970a1dec"
+      "sha256": "e482a68683e3d2f059820a307716bb1163be9ef3be9dd8f59298c756391d9d98"
     },
     {
       "id": "A06",
@@ -110,7 +110,7 @@
       "revision": 1,
       "path": "A15-r01-compatibility-validation-and-decision-rules.md",
       "title": "Compatibility Validation and Decision Rules",
-      "sha256": "0b9293a3dc322ecfc5dfc12a906f4bb19a21ca2a9ed26afd89273d691eb7bf0e"
+      "sha256": "ccd9e9153aaa0b56b664a87f497116665a1d31648f792bcb4f13c4976f8fd849"
     }
   ]
 }

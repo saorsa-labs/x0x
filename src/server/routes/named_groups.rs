@@ -49,10 +49,11 @@ mod join_request_outcome;
 pub(in crate::server) use join_request_outcome::{
     handle_join_request_outcome_typed_payload, send_join_request_refusal,
 };
+pub(in crate::server) mod join_sequence;
 mod requester_offer;
 pub(in crate::server) use requester_offer::{
-    insert_requester_offer_obligation, load_requester_offer_outbox, requester_offer_step,
-    RequesterOfferObligation,
+    insert_requester_offer_obligation, load_requester_offer_outbox, nudge_requester_offers_for,
+    requester_offer_step, RequesterOfferObligation,
 };
 
 use super::super::state::{AppState, TreeKemCatchupRefusalNote};
@@ -2524,6 +2525,13 @@ pub(in crate::server) enum NamedGroupMetadataEvent {
         requester_agent_id: String,
         #[serde(default)]
         commit: Option<x0x::groups::GroupStateCommit>,
+        /// #1623: the hex ML-DSA-65 signature of the commit signer that
+        /// names the rejected request
+        /// (`state_commit::join_request_reject_signable_bytes`). `None` is
+        /// the form of a signer older than #1623; the field is then not
+        /// on the wire. Receivers: `event_steps::reject_names_its_request`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_binding: Option<String>,
     },
     JoinRequestCancelled {
         group_id: String,
@@ -15721,8 +15729,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event(
 ) -> ApplyMetadataResult {
     // ADR 0110 S4 (#1508 rc12): a commit that chains on a GSS owner
     // recovery not yet installed here waits for it.
-    let newly_held =
-        verified && revocation_eviction::owner_recovery::hold_unchained_event(state, &event).await;
+    let newly_held = verified
+        && revocation_eviction::owner_recovery::hold_unchained_event(state, &event, &sender).await;
     let held_group = newly_held.then(|| named_group_metadata_event_group_id(&event).to_string());
     let applied = apply_named_group_metadata_event_with_binding(
         state,
@@ -19210,11 +19218,19 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
         NamedGroupMetadataEvent::JoinRequestRejected {
             request_id,
             actor,
+            requester_agent_id,
             commit,
+            request_binding,
             ..
         } => {
             let Some(commit) = commit else {
                 return ApplyMetadataResult::REJECTED;
+            };
+            let reject = event_steps::RejectedRequest {
+                request_id: &request_id,
+                actor: &actor,
+                requester_agent_id: &requester_agent_id,
+                request_binding: request_binding.as_deref(),
             };
             // #1623 (ADR 0109 §2 rule (b)): read once, so the gate and
             // the no-record branch below decide on the same answer.
@@ -19243,8 +19259,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // pending" for a page link that the gate above admitted (the
             // next hash of an armed attested sequence). It applies that
             // link state-only. The page sender must be the event's
-            // `actor` and an Active admin; the commit does not cover
-            // `actor` or `request_id`, and the commit's own signer and
+            // `actor` and an Active admin. The commit does not cover
+            // `actor` or `request_id`, so the event must also name the
+            // request that the commit signer rejected (#1623,
+            // `reject_names_its_request`). The commit's own signer and
             // hashes are checked by the apply below. No request record is
             // made from the event. A request record that the node does
             // hold keeps the ordinary step.
@@ -19257,19 +19275,15 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         && info
                             .caller_role(&actor)
                             .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin));
-                    if !admin_signed {
+                    if !admin_signed || !event_steps::reject_names_its_request(&commit, reject) {
                         return ApplyMetadataResult::REJECTED;
                     }
                     action = x0x::groups::ActionKind::AdminOrHigher;
                     Box::new(|_| {})
                 } else {
-                    let Ok((step_action, step_mutate)) = event_steps::join_request_rejected(
-                        &info,
-                        &sender_hex,
-                        &request_id,
-                        &actor,
-                        commit.committed_at,
-                    ) else {
+                    let Ok((step_action, step_mutate)) =
+                        event_steps::join_request_rejected(&info, &sender_hex, reject, &commit)
+                    else {
                         return ApplyMetadataResult::REJECTED;
                     };
                     action = step_action;
@@ -36597,6 +36611,23 @@ pub(in crate::server) async fn reject_join_request(
         (metadata_topic, event_group_id, requester_hex, commit, next)
     };
 
+    // #1623: the commit covers no join request, so its signer names the
+    // rejected request in a second signature. It signs before the persist,
+    // so a failure leaves the head where it was.
+    let request_binding = match x0x::groups::state_commit::sign_join_request_reject(
+        &commit,
+        &request_id,
+        &requester_hex,
+        signing_kp,
+    ) {
+        Ok(binding) => binding,
+        Err(e) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("reject binding failed: {e}"),
+            );
+        }
+    };
     if !matches!(
         persist_named_group_info(&state, &id, next).await,
         Ok(AtomicWriteOutcome::Durable)
@@ -36614,6 +36645,7 @@ pub(in crate::server) async fn reject_join_request(
         actor: caller_hex,
         requester_agent_id: requester_hex.clone(),
         commit: Some(commit),
+        request_binding: Some(request_binding),
     };
     // #1623: the signer serves this chain link on TreeKEM catch-up pages.
     remember_treekem_membership_event(&state, &event).await;
@@ -53224,6 +53256,7 @@ pub(in crate::server) mod tests {
     #[cfg(unix)]
     mod issue1809_secret_file_mode;
     mod issue1840_join_request_outcome;
+    mod issue1840_sequence;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue646_base_roster_fetch;
@@ -53974,6 +54007,7 @@ pub(in crate::server) mod tests {
             cert_unresolvable_since: StdMutex::new(HashMap::new()),
             pending_b8_compensation: Mutex::new(None),
             pending_listener_admission: Mutex::new(None),
+            join_sequencer: Mutex::new(Default::default()),
             group_metadata_tasks: RwLock::new(HashMap::new()),
             group_card_cache: RwLock::new(HashMap::new()),
             directory_cache: RwLock::new(x0x::groups::DirectoryShardCache::default()),

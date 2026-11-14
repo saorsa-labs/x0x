@@ -252,6 +252,23 @@ impl CapabilityRegistry {
         }
     }
 
+    /// The bit for a typed payload that carries a durable obligation: a
+    /// share grant (v1 or the names envelope) or a predecessor relay or
+    /// requester offer (#1158). `None` for every other payload.
+    ///
+    /// These are held while the recipient has no current verified advert
+    /// (see [`crate::dm_capability::CapabilityStore::require_payload_capability`]).
+    /// An older peer does not route these prefixes: it can record the
+    /// bytes as an ordinary DM and release an ACK, and the sender would
+    /// then drop an obligation that was never met.
+    pub(crate) fn obligation_for_payload(payload: &[u8]) -> Option<(u64, &'static str)> {
+        Self::required_for_payload(payload).filter(|(bit, _)| {
+            *bit == Self::SHARE_GRANT_V1
+                || *bit == Self::SHARE_GRANT_NAMES_V1
+                || *bit == Self::PREDECESSOR_OFFER_V1
+        })
+    }
+
     /// Unknown registry versions never imply support.
     pub fn supports(self, bit: u64) -> bool {
         self.version == 1 && self.bits & bit == bit
@@ -901,6 +918,27 @@ pub enum DmError {
     /// and retry after the recipient upgrades or advertises again.
     #[error("recipient_upgrade_required: {capability}")]
     RecipientUpgradeRequired {
+        /// Required named registry bit (ADR 0093).
+        capability: &'static str,
+    },
+
+    /// #1158: an obligation-carrying typed send (share grant, predecessor
+    /// relay, requester offer) has no current verified capability advert
+    /// for the recipient, and the wait of one advert period
+    /// ([`crate::dm_capability::OBLIGATION_CAPABILITY_WAIT_SECS`]) is still
+    /// running. Nothing was sent. A targeted advert refresh was requested;
+    /// keep the obligation and retry.
+    #[error("recipient_capability_pending: {capability}")]
+    RecipientCapabilityPending {
+        /// Required named registry bit (ADR 0093).
+        capability: &'static str,
+    },
+
+    /// #1158: as [`Self::RecipientCapabilityPending`], but no verified
+    /// advert arrived within one advert period. Nothing was sent and the
+    /// obligation is kept; a later advert from the recipient releases it.
+    #[error("recipient_capability_unavailable: {capability}")]
+    RecipientCapabilityUnavailable {
         /// Required named registry bit (ADR 0093).
         capability: &'static str,
     },

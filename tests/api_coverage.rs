@@ -103,6 +103,11 @@ const COVERED: &[CoveredEndpoint] = &[
     ),
     covered!(
         Post,
+        "/owner/devices/:machine_id/lose",
+        lose_device_stops_owner_agents_on_that_machine
+    ),
+    covered!(
+        Post,
         "/owner/agents/issue",
         rider_issuance_journals_and_roster_lists
     ),

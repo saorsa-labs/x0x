@@ -219,6 +219,16 @@ impl ConnectAcl {
         !self.owner_allow.is_empty()
     }
 
+    /// Whether a `principal = "owner"` entry lists `target`. Exact-pair and
+    /// grant entries are not consulted. Used for an opener known only from
+    /// evidence (#1107, A03), which only an owner entry may admit.
+    #[must_use]
+    pub fn owner_entry_allows(&self, target: &SocketAddr) -> bool {
+        self.owner_allow
+            .iter()
+            .any(|e| e.targets.iter().any(|t| t.matches(target)))
+    }
+
     /// Whether any entry names this requester: an exact `(agent, machine)`
     /// pair, or — only when `owner_trusted` — a `principal = "owner"` entry.
     ///

@@ -210,6 +210,22 @@ impl<'a, T: OutboxRecord> Outbox<'a, T> {
         due
     }
 
+    /// Make every entry that `matches` due at `now_ms` (#1158: the
+    /// recipient's capability advert arrived). Returns whether any entry
+    /// matched. In memory only: the persisted schedule is merely later,
+    /// which is safe. The retry count is unchanged.
+    pub(crate) async fn nudge(&self, now_ms: u64, matches: impl Fn(&T) -> bool) -> bool {
+        let mut nudged = false;
+        for entry in self.entries.write().await.values_mut().flatten() {
+            if matches(entry) {
+                let due = entry.next_retry_at_ms().min(now_ms);
+                entry.set_schedule(entry.retry_count(), due);
+                nudged = true;
+            }
+        }
+        nudged
+    }
+
     /// Insert `entry` (replacing the same partition and id), enforce the
     /// caps and persist. Memory changes only on a durable write, or on a
     /// failure after the rename (then the error is still returned).

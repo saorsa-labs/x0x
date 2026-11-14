@@ -224,7 +224,8 @@ User identity disclosure is strictly opt-in:
 - `user.key` is NEVER auto-generated
 - The `announce_identity()` API requires `human_consent: true` to include `user_id`
 - A `user_identity_consented` AtomicBool makes consent "sticky" across heartbeats
-- Once given, subsequent heartbeats continue to include `user_id` until daemon restart
+- Once given, subsequent heartbeats continue to include `user_id`. Since #1107 the consent is durable: the daemon records it in `user-consent.bin` in the identity directory and loads it at the next start
+- To withdraw it, run `x0x announce --withdraw-consent`
 - `agent.cert` is validated against current keys at announcement time, not just at creation
 
 ## Architecture Decision

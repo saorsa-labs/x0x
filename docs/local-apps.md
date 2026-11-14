@@ -222,7 +222,7 @@ signed bytes, and receivers verify the full owner-cert → sub-agent-key
 
 ## Available Endpoints
 
-x0xd exposes 218 REST endpoints (the registry in `src/api/mod.rs` is
+x0xd exposes 221 REST endpoints (the registry in `src/api/mod.rs` is
 authoritative). `x0x routes` prints the registry that is compiled into the
 CLI. It does not send a request to a daemon. Key categories:
 

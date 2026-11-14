@@ -47,8 +47,7 @@ jobs:
       # does not build its bundled copy with CMake (#1816).
       - name: Install Opus (libopus-dev, pkg-config)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libopus-dev pkg-config
+          scripts/ci/apt-install.sh --no-install-recommends libopus-dev pkg-config
           pkg-config --modversion opus
       - name: Run guardian tests
         run: |
@@ -555,8 +554,7 @@ jobs:
       # does not build its bundled copy with CMake (#1816).
       - name: Install Opus (libopus-dev, pkg-config)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libopus-dev pkg-config
+          scripts/ci/apt-install.sh --no-install-recommends libopus-dev pkg-config
           pkg-config --modversion opus
       # Pin the bytes before any runtime: build the suite without
       # executing it, so discovery below reuses binaries that already

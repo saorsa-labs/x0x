@@ -139,8 +139,8 @@ pub(super) use network::{
 };
 pub(super) use onboard::get_onboard;
 pub(super) use owner::{
-    owner_agents_issue, owner_agents_revoke, owner_group_recovery_mandate, owner_machines,
-    owner_riders_issue, owner_riders_list, owner_riders_revoke,
+    owner_agents_issue, owner_agents_revoke, owner_device_lose, owner_group_recovery_mandate,
+    owner_machines, owner_riders_issue, owner_riders_list, owner_riders_revoke,
 };
 pub(super) use presence::{
     presence, presence_find, presence_foaf, presence_online, presence_status,

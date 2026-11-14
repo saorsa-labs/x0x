@@ -100,7 +100,7 @@ Auth-class labels used throughout this reference:
   (#1347)** below.
   Payload-conditional durable gates (body or prefix inspected, enforced
   in the handler): `POST /announce` **with
-  `include_user_identity: true`**, and `POST /direct/send` / WS
+  `include_user_identity: true` or `withdraw_consent: true`**, and `POST /direct/send` / WS
   `send_direct` carrying a reserved `x0x-exec-v1\0` exec frame.
   The same two generic send paths refuse `x0x-gui-show-v1\0`,
   `x0x-gui-show-result-v1\0`, and `x0x-gui-activity-v1\0` for every
@@ -110,7 +110,7 @@ Auth-class labels used throughout this reference:
   Rider tokens authenticate in the `Authorization` header only.
 
 **#446 resolution notes:** `POST /announce` without
-`include_user_identity` and `PATCH /groups/:id` on ordinary
+`include_user_identity` and without `withdraw_consent`, and `PATCH /groups/:id` on ordinary
  (non-Home) groups stay bearer — no credential or capability is
 involved. `DELETE /groups/:id` requires **active membership** for any
 group (self-leave is its purpose; a non-member cannot delete the local
@@ -244,7 +244,7 @@ The Home Suite campaign (ADRs 0036–0043, plus the 0044–0058 backfills) added
   `GET /diagnostics/ws`.
 
 Open issues for this release are listed in the README's *Known limitations*
-table (#446–#451). This reference documents **218 endpoints — exactly the set
+table (#446–#451). This reference documents **221 endpoints — exactly the set
 `x0x routes` prints** (two further served paths sit outside the registry:
 `/.well-known/agent-card.json` and the `/gui/` alias). The registry in
 `src/api/mod.rs` is the authoritative list. `x0x routes` prints the copy of
@@ -462,7 +462,7 @@ contains the same sentence as the startup error log. See
 
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
-| GET | `/agent` | `x0x agent` | Local agent identity |
+| GET | `/agent` | `x0x agent` | Local agent identity, with the agent public key (`agent_public_key`) |
 | POST | `/announce` | `x0x announce` | Re-announce identity to the network |
 | GET | `/agent/user-id` | `x0x agent user-id` | Current user ID if configured |
 | GET | `/agent/card` | `x0x agent card [DISPLAY_NAME] [--include-groups] [--include-local-addresses]` | Generate a shareable, signed identity card (`--include-local-addresses` adds loopback/RFC1918 addresses for local testnet cards; off by default so shared cards don't leak unroutable addresses) |
@@ -472,18 +472,98 @@ contains the same sentence as the startup error log. See
 | POST | `/agent/sign` | `x0x agent sign` | Detached ML-DSA-65 signature over caller-supplied bytes |
 | POST | `/agent/verify` | `x0x agent verify` | Verify a detached ML-DSA-65 signature against a caller-supplied public key |
 | GET | `/introduction` | `x0x agent introduction` | Trust-gated introduction card (`?peer=<64-hex>` scopes it to that peer's trust) |
-| POST | `/identity/revoke` | `x0x identity revoke [--agent-id <hex>] [--machine-id <hex>] [--move-epoch <n>] [--reason <text>]` | Revoke the daemon's own agent, or an owner-authorized agent–machine binding; see [Key revocation](#key-revocation) for the supported forms |
-| GET | `/identity/revocations` | `x0x identity revocations` | List signed identity revocations known to this daemon |
+| POST | `/identity/revoke` | `x0x identity revoke [--agent-id <hex>] [--machine-id <hex>] [--move-epoch <n>] [--reason <text>]` | Revoke the daemon's own agent or machine, or an owner-authorized agent–machine binding; see [Key revocation](#key-revocation) for the supported forms |
+| GET | `/identity/revocations` | `x0x identity revocations` | List every signed revocation record this daemon holds: agent, machine, binding and share-grant subjects |
+
+### Agent identity response
+
+`GET /agent` returns `agent_id`, `machine_id`, `user_id` (or `null`),
+`agent_public_key`, `kem_public_key_b64` and, when they are set, the profile
+names `human_name`, `display_name` and `machine_name`.
+
+- `agent_public_key` — the agent's ML-DSA-65 public key in hex (1952 bytes,
+  3904 hex characters). `agent_id` is the SHA-256 of the domain separator
+  `AUTONOMI_PEER_ID_V2:` followed by these key bytes. This is the value that
+  `POST /owner/agents/issue` takes as `agent_public_key`.
+- `kem_public_key_b64` — the agent's ML-KEM-768 public key in base64.
+
+### Revocation listing
+
+`GET /identity/revocations` returns `{"revocations": [...]}` with one row for
+each signed revocation record that this daemon holds. The rows are in
+`revoked_at` order, oldest first. Each row has these fields:
+
+- `subject_kind` — `agent`, `machine`, `binding` or `share_grant`.
+- `subject` — one hex id for the subject: the agent id (`agent` and
+  `binding`), the machine id (`machine`) or the grant id (`share_grant`).
+- `issuer` — hex SHA-256 of the issuer's public key bytes. This value has no
+  domain separator, so it is not an agent, machine or user id.
+- `revoked_at` — Unix seconds.
+- `reason` — text, or `null`.
+
+The other fields name each part of the subject:
+
+| `subject_kind` | More fields |
+|---|---|
+| `agent` | `agent_id` |
+| `machine` | `machine_id` |
+| `binding` | `agent_id`, `machine_id`, `move_epoch` |
+| `share_grant` | `grant_id`, `owner` (the grantor's user id), `grant_expiry` (Unix seconds) |
+
+Before [#1108](https://github.com/saorsa-labs/x0x/issues/1108) the listing
+showed `agent` and `machine` rows only. A client that reads the listing must
+ignore a `subject_kind` it does not know.
+
+The daemon holds one record for each subject and issuer of an agent, machine
+or binding revocation: the one with the earlier `revoked_at`, and for equal
+times the lower record hash (#1857). A later record for the same pair adds
+nothing, and the subject stays revoked.
+
+The answer also has `unsendable_records`: the number of held records that
+are too large for any peer to accept (only a record from an old store can
+be). While it is not 0, a peer that waits for a resync cannot open from this
+daemon; revoke that subject again with a short reason.
+
+A daemon sends its published revocation set to peers as one gossip batch when
+the set fits, and as a round of marked batches when it does not; see
+[`docs/design/revocation-batches.md`](design/revocation-batches.md). The
+marker records of a round are never in this listing. The published set is the
+held set without the self-revocation of a key that this daemon has no
+relationship with (#1863). The daemon still holds and enforces such a record,
+and this listing still shows it.
+
+A new record's `reason` is at most 1024 bytes. `POST /identity/revoke` and
+`DELETE /owner/agents/:id` answer `400` above that, and a daemon refuses
+such a record from a peer. The reason is inside the signed record and every
+peer stores it.
+
+A record does not leave the listing because of its age. Agent, machine and
+binding records stay for good. A share-grant record goes when the grant is
+past `grant_expiry` plus the clock allowance. A daemon older than this rule
+removed agent and machine records 90 days after `revoked_at`.
+
+The listing shows signed records only. A binding that a key-move activation
+bundle retired has no record of its own; `GET /agent/moves` counts it in
+`derived.retired_bindings`.
 
 ### Key revocation
 
-The one-id form of `POST /identity/revoke` signs with the daemon's agent key
-and supplies no subject certificate. It supports `agent_id` set to this
-daemon's own agent. It cannot issue machine-signed or user-authority
-revocations: revoking this daemon's machine or another agent through this
-form returns `403`. Loading an owner key or an agent certificate does not
-change the signer used by this form. This limitation is tracked in
-[#1108](https://github.com/saorsa-labs/x0x/issues/1108).
+The one-id form of `POST /identity/revoke` revokes an identity whose key this
+daemon holds:
+
+- `agent_id` set to this daemon's own agent: the daemon signs with its agent
+  key.
+- `machine_id` set to this daemon's own machine: the daemon signs with its
+  machine key. This needs the durable API token (`403` for a session token).
+  The answer has a `warning` field. The revocation cannot be undone: peers
+  refuse this machine and every agent on it for good. `x0xd` does not stop
+  itself; it keeps running and peers refuse it. A repeat call signs no new
+  record; it answers the same fields and `"already_revoked": true`. To use the computer again,
+  stop `x0xd`, delete `machine.key` and start `x0xd`.
+
+Any other agent or machine id returns `403`: the daemon has no authority
+over it. Loading an owner key or an agent certificate does not change the
+signer used by this form.
 
 To revoke a registered sub-agent, use `DELETE /owner/agents/:id` (CLI:
 `x0x owner agents revoke <AGENT_ID>`). That separate route requires the
@@ -497,18 +577,148 @@ After the selected form's token check, neither id, malformed ids, or both ids
 without `move_epoch` return `400`. The binding form rejects a session token
 with `403` before these field checks.
 
+### Lost device
+
+`POST /owner/devices/:machine_id/lose` (CLI: `x0x owner lose-device
+<MACHINE_ID> [--reason <text>] [--force]`) stops this owner's agents on a
+lost machine. Run it on another of your devices. It needs the durable API
+token and the loaded owner key. Body (all optional): `{"reason": "<text>",
+"force": false}`.
+
+The daemon does three things, with records that every released daemon
+enforces:
+
+1. For each agent that this owner certified and that has a placement record
+   here, it signs a binding revocation `(agent, machine)`. That agent can no
+   longer act from the lost machine. Agents of other owners are not touched.
+2. For each agent **pinned** to the lost machine, it also revokes the agent
+   and its rider tokens. The key of a pinned agent was on that machine.
+3. It removes the machine from the owner device set.
+
+Response:
+
+```json
+{
+  "ok": true,
+  "store_write_error": null,
+  "machine_id": "<64-hex>",
+  "agents": [
+    {"agent_id": "<64-hex>", "placement": "roaming", "pinned_to_this_machine": false,
+     "binding": "revoked", "agent": "kept", "rider_tokens_revoked": 0,
+     "rider_token_sweep_error": null}
+  ],
+  "agents_without_placement": [],
+  "placement_mint_error": null,
+  "device_enrollment": "removed",
+  "machine_key_revoked": false,
+  "owner_key_on_device": "likely",
+  "owner_key_warning": "<text>",
+  "covers_agents_certified_later": false,
+  "note": "<text>"
+}
+```
+
+- `binding` is `revoked` or `already_revoked`. `agent` is `kept`, `revoked`
+  or `already_revoked`. `device_enrollment` is `removed`, `not_enrolled` or
+  `no_device_set`. A failed step puts `failed: <cause>` or `revoked, not
+  durable: <cause>` in that field, and the answer is `500` with `ok: false`
+  and the same body.
+- `placement_mint_error` is `null`, or the cause when the daemon could not
+  bring the placement ledger up to date. The action then used the ledger
+  it held.
+- A repeat call signs no new record. Every call writes the agent/machine
+  store and the binding store again from the held records, so a repeat
+  makes a record durable that an earlier call left `revoked, not durable`
+  after a write failure. `store_write_error` is `null`, or the cause when
+  that write failed; the answer is then `500`. One cause does not go away
+  with a repeat: a store that x0xd found unreadable is quarantined and is
+  not written until it is rebuilt (`x0x identity rebuild-revocation-store`)
+  or resynced; see [troubleshooting](troubleshooting.md). The record is in
+  force in memory and is published in both cases.
+- **Your owner key is not protected.** If the lost machine held `user.key`,
+  whoever has the machine can act as you: certify agents, sign grants and
+  enroll devices. This action does not help with that, and x0x cannot
+  replace an owner key today. Treat the owner identity as compromised,
+  create a new one and tell your contacts. `owner_key_on_device` is `likely`
+  when the machine was in the owner device set, and `unknown` in all other
+  cases: the daemon holds no record of which machines hold the key.
+- **Rider tokens.** The action revokes the rider tokens of an agent pinned
+  to the lost machine. A roaming agent keeps its tokens. A rider token that
+  was on the lost machine still works on the daemon that issued it until it
+  expires: revoke it there with `DELETE /owner/riders/:id`
+  (`x0x owner riders revoke`). `rider_token_sweep_error` is `null`, or the
+  cause when the sweep for that agent did not persist.
+- **A roaming agent keeps its identity.** If its key was on the lost
+  machine, also revoke that agent with `DELETE /owner/agents/:id`.
+- **The machine key is not revoked.** No evidence that other peers can check
+  ties a machine to its owner; see
+  [`docs/design/owner-machine-revocation.md`](design/owner-machine-revocation.md).
+  A new agent with no certificate on that machine is a stranger to every
+  peer.
+- **An agent that you certify later is not covered.** Run the action again
+  after you certify it.
+- **`agents_without_placement`** lists certified agents that have no
+  placement record on this daemon (an ACP agent whose machine was never
+  confirmed). The action cannot cover them. If one ran on the lost machine,
+  revoke it with `DELETE /owner/agents/:id`.
+
+Errors: `403` without the durable token; `409` with no owner key, or when
+the machine is the one this daemon runs on (use `POST /identity/revoke`);
+`400` for a bad id; `404` when the owner has no record of the machine and
+`force` is not `true`. The owner has a record of a machine that is
+enrolled, that one of its agents is pinned to, or that already has a
+binding tombstone for one of its agents (so a repeat call is not `404`).
+The `404` check runs before the daemon writes anything.
+
 ### Announce request body
 
 ```json
 {
   "include_user_identity": false,
-  "human_consent": false
+  "human_consent": false,
+  "withdraw_consent": false
 }
 ```
 
 Notes:
 - Set `include_user_identity: true` only when the daemon has a configured user key.
 - Set `human_consent: true` when intentionally sharing human identity.
+
+**Consent is durable (#1107).** A successful announce with both
+`include_user_identity: true` and `human_consent: true` records the
+consent in `user-consent.bin` in the identity directory, next to the keys
+(mode `0600` on Unix). The daemon loads the record at each start, before
+the first announce. The startup announce and every heartbeat then carry
+the user ID and the agent certificate. You do not need to repeat the
+announce after a restart.
+
+The record names the user and the agent that consented. It applies only
+when the daemon starts with the same agent key and a certificate from the
+same user. With another user key, another agent key, or no certificate,
+the daemon announces without the user identity. A missing or damaged
+record means "not consented". It never stops the daemon.
+
+**Withdraw the consent.** Send `{"withdraw_consent": true}` (CLI:
+`x0x announce --withdraw-consent`). This needs the durable API token. The
+daemon removes the record, stops including the user identity, and then
+publishes an announce without it. The response has
+`"consent_withdrawn": true`. `withdraw_consent` together with
+`include_user_identity: true` returns `400` for the durable token; a
+session or rider token gets `403` first. A daemon older than this option
+ignores the field: it announces and returns `200` with no
+`consent_withdrawn`, and its consent stays on. Always check for
+`"consent_withdrawn": true`. The CLI does this and exits non-zero with a
+message when the field is absent; upgrade that daemon, or restart it to
+drop its in-memory consent. The record is removed before
+the announce: if the announce fails, the request returns `400` with
+`"consent_withdrawn": true`, and the consent stays withdrawn. If the daemon
+can neither remove nor empty the record (a storage error), the request
+returns `500` and no announce is sent. This run then announces without the
+identity, but the record is still on disk and the consent returns at the
+next start: correct the storage fault and send the withdrawal again.
+Withdrawal does not make peers forget an
+identity that they already saw. A peer drops the cached certificate when
+it receives a later announce without the identity.
 
 ### Agent card query params
 
@@ -1012,7 +1222,9 @@ No multi-device convergence or roster-merge claim is made.
 **Second owner device joining (#447).** A single explicit
 `POST /announce` with body `{"include_user_identity":true,"human_consent":true}`
 on the joining device is sufficient — a bodyless announce publishes the
-anonymous certificate digest, which the owner can never resolve. A join that
+anonymous certificate digest, which the owner can never resolve. The consent
+is durable (#1107): after a restart the device announces with the certificate
+again, with no second announce. A join that
 arrives before the certificate is visible is retained in a typed `pending`
 state (`retain_pending_owner_cert_join`) and retried when the evidence lands
 (`retry_pending_owner_cert_joins`), rather than wedging. There is no
@@ -1028,8 +1240,9 @@ own `MemberAdded`, mint a fresh invite rather than replaying the link.
 | POST | `/sync/devices/enroll` | `x0x sync enroll` | durable-owner (#446) | Owner-key-sign a DeviceEnrollment for a machine |
 | DELETE | `/sync/devices/:machine_id` | `x0x sync revoke <MACHINE_ID>` | durable-owner (#446) | Remove a machine from the device set |
 | GET | `/owner/machines` | `x0x owner machines` | owner (riders denied) | M1 machine census: enrolled devices + last-sync status + this machine's version/policy digest (#1383) |
+| POST | `/owner/devices/:machine_id/lose` | `x0x owner lose-device <MACHINE_ID>` | durable-owner | Lost-device action; see [Lost device](#lost-device) |
 
-All three answer `409` when no owner identity is configured. Sync replicates
+All five answer `409` when no owner identity is configured. Sync replicates
 owner state **owner-to-owner only** — Tier 1: profile/names, the Home
 history, DMs, and exec data
 never replicate, and no third party receives the state. Inbound SyncV1 streams
@@ -1463,6 +1676,8 @@ Notable codes:
 | 404 | `recipient_key_unavailable` | The recipient has published no KEM key, or is entirely unknown to this daemon — **no capability advert and no contact card at all**. A durable send to a stranger answers this, not the 409 below. |
 | 409 | `recipient_key_invalid` | Our view of the recipient's key material has not converged. Transient — retry. |
 | 409 | `recipient_ack_semantics_unavailable` | The send required ADR 0030 durable application-ACK semantics and the recipient advertises no current v2 capability. A peer you hold **any** contact card for lands here rather than on the 404 — including one whose advert has not converged yet, since that peer is known and may simply need upgrading. Returned after one forced targeted capability refresh, so it is fast and deterministic rather than a timeout. The caller retries, surfaces "peer needs upgrade", or resends with `require_durable_app_ack: false` — the daemon never downgrades silently. |
+| 409 | `recipient_capability_pending` | The payload carries a durable obligation (a share grant, a predecessor relay or a requester offer) and the recipient has no current verified capability advert (#1158). Nothing was sent. The daemon asked the recipient for a targeted advert refresh. Retry; the send goes when the advert arrives. Ordinary DMs never get this code. Rust callers get `DmError::RecipientCapabilityPending { capability }`. |
+| 409 | `recipient_capability_unavailable` | As `recipient_capability_pending`, but no verified advert arrived within one advert period (600 s). Nothing was sent. A later advert from the recipient lets a retry go. Rust callers get `DmError::RecipientCapabilityUnavailable { capability }`. |
 | 409 | `idempotency_conflict` | The recipient already holds this `logical_id` bound to different bytes. **Retrying cannot succeed.** Either resend the original bytes under this id, or pick a new `logical_id`. |
 | 413 | `payload_too_large` | Payload exceeds the DM envelope cap. |
 | 504 | `timeout` | The overall send budget ended the send. `DmError::Timeout` can come from the raw-QUIC path, the known-recipient redial, or the relay fallback, as well as from an application ACK that does not arrive within the retry budget. Those paths are capped by the overall send budget. The error variant and the wire format are unchanged. The DM may or may not have arrived. On a durable send the body also includes `strict_gate_ms`, `publish_ms`, `ack_wait_ms`, `elapsed_ms`, and `budget_stage` so the stage that consumed the budget is named. Durable 200 and 504 also include recipient ACK-publish diagnostics `last_ack_publish_ms` and `ack_publish_route_failed` (same fields on `GET /diagnostics/dm`). These are diagnostics, not a latency SLA. |
@@ -3522,6 +3737,20 @@ Each `delivery` entry in the response reports `envelope`: `"v1"` or `"v2"`
 recipient is queued with its signed names, and every outbox retry resends
 the same v2 bytes).
 
+A `delivery` entry with `delivered: false` and `queued: true` gives the hold
+reason in `error`. Two reasons mean the daemon did not send the grant,
+because the recipient has no current verified capability advert (#1158):
+
+- `recipient_capability_pending: <bit>`: the daemon asked the recipient for
+  its advert and waits for it, for at most one advert period (600 s).
+- `recipient_capability_unavailable: <bit>`: no advert arrived in that time.
+
+In both cases the grant stays in the redelivery outbox. The daemon sends it
+when the recipient's verified advert arrives, and otherwise checks again on
+the outbox backoff. `recipient_upgrade_required: <bit>` is different: the
+recipient's current advert lacks the bit, so the recipient must upgrade.
+`<bit>` is `share_grant_v1` or `share_grant_names_v1`.
+
 `x0x grant issue` takes one required positional `<GRANT_JSON>` argument: this
 body as a literal, `@path`, a bare path, or `-` for stdin, plus the optional
 `--no-names` flag.
@@ -4032,7 +4261,7 @@ All diagnostics endpoints require the normal local daemon bearer token and retur
 |---|---|---|---|
 | GET | `/diagnostics/connectivity` | `x0x diagnostics connectivity` | ant-quic NodeStatus snapshot (UPnP, NAT, relay, mDNS) |
 | GET | `/diagnostics/ack` | `x0x diagnostics ack` | ACK-v2 per-stage latency buckets and outcome counters |
-| GET | `/diagnostics/gossip` | `x0x diagnostics gossip` | PubSub drop-detection counters (publish/deliver deltas) plus Leaf/Full participation (`participation.mode`, `passthrough_refresh_runs`, C0 `relay_bytes` = non-subscribed forward, `unsubscribed_refused_frames`), plus [experimental named egress meters](504-slice1-experimental.md) (`subscribed_topics`, `outbound_by_topic_named`, `egress_budget` — including effective `egress_budget.byte_policy`, requested `byte_policy_requested`, and sg's `egress_budget.leaf_egress` snapshot with `shed_suppressed`), plus the first-class Leaf-egress summary (#945, ADR-0078 precondition) `leaf_egress` — `byte_policy` (the effective, sg-accepted policy), `applies_to_leaf`, `soft_exceeded` / `hard_exceeded` (EgressMeter exceed-sample counters), `subscribed_outbound_bytes_per_sec_60s`, `epidemic_forward_bytes` / `epidemic_forward_msgs` (the subscribed-topic epidemic-forward totals from `participation`), and `leaf_egress_snapshot` (the sg snapshot verbatim) — plus inbound attribution (`inbound_by_topic`, keys documented in [diagnostics.md](diagnostics.md#inbound-by-topic-counters-674)), plus [#1170 per-kind efficiency counters](diagnostics.md#per-kind-efficiency-counters-1170--track-e-m1) (`per_kind.current` and `per_kind.last_completed`, each with `since_ts`, `window_secs`, `kinds.<kind>.{bus_dispatched,bus_dropped,delivered,published}`, and `health.bus_pressure_kinds`; `last_completed` is null until the first rotation), plus [#288 soak instrumentation](diagnostics.md#soak-instrumentation-288): `uptime_secs`, `inner_envelope_verify.{count,failed,total_ns}`, `dispatcher.<lane>.over_100ms_count`, plus ADR 0115 `identity_authority` — `identity_announce_unauthenticated`, `activation_bundle_owner_unauthenticated`, `revocation_future_dropped` and `quarantine.{enabled,started_at,pending_records,pending_bundles,lapsed}` |
+| GET | `/diagnostics/gossip` | `x0x diagnostics gossip` | PubSub drop-detection counters (publish/deliver deltas) plus Leaf/Full participation (`participation.mode`, `passthrough_refresh_runs`, C0 `relay_bytes` = non-subscribed forward, `unsubscribed_refused_frames`), plus [experimental named egress meters](504-slice1-experimental.md) (`subscribed_topics`, `outbound_by_topic_named`, `egress_budget` — including effective `egress_budget.byte_policy`, requested `byte_policy_requested`, and sg's `egress_budget.leaf_egress` snapshot with `shed_suppressed`), plus the first-class Leaf-egress summary (#945, ADR-0078 precondition) `leaf_egress` — `byte_policy` (the effective, sg-accepted policy), `applies_to_leaf`, `soft_exceeded` / `hard_exceeded` (EgressMeter exceed-sample counters), `subscribed_outbound_bytes_per_sec_60s`, `epidemic_forward_bytes` / `epidemic_forward_msgs` (the subscribed-topic epidemic-forward totals from `participation`), and `leaf_egress_snapshot` (the sg snapshot verbatim) — plus inbound attribution (`inbound_by_topic`, keys documented in [diagnostics.md](diagnostics.md#inbound-by-topic-counters-674)), plus [#1170 per-kind efficiency counters](diagnostics.md#per-kind-efficiency-counters-1170--track-e-m1) (`per_kind.current` and `per_kind.last_completed`, each with `since_ts`, `window_secs`, `kinds.<kind>.{bus_dispatched,bus_dropped,delivered,published}`, and `health.bus_pressure_kinds`; `last_completed` is null until the first rotation), plus [#288 soak instrumentation](diagnostics.md#soak-instrumentation-288): `uptime_secs`, `inner_envelope_verify.{count,failed,total_ns}`, `dispatcher.<lane>.over_100ms_count`, plus ADR 0115 `identity_authority` — `identity_announce_unauthenticated`, `activation_bundle_owner_unauthenticated`, `revocation_future_dropped`, `revocation_stranger_self_held` (#1863: held self-revocations of strangers, not published again) and `quarantine.{enabled,started_at,pending_records,pending_bundles,lapsed}` |
 | GET | `/diagnostics/transport` | `x0x diagnostics transport` | Transport connection accounting (zombie-connection hunt, #368) |
 | GET | `/diagnostics/dm` | `x0x diagnostics dm [--agent <id>]` | Bounded local per-peer digest observations plus direct-message send/receive counters, per-peer health, last durable-send stage timers (`last_durable_send`), recipient ACK-publish diagnostics (`last_ack_publish_ms`, `stats.ack_publish_route_failed`), capability-advert freshness pre-check counter (`caps_advert_prefiltered_stale`, #674) |
 | GET | `/diagnostics/groups` | `x0x diagnostics groups` | Per-group ingest counters, listener state, and drop buckets |

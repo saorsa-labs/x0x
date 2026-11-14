@@ -44,6 +44,11 @@ jobs:
           # nextest controls (X0X_MESH_GROUP_LIVE=1) where binaries exist.
           python3 -B scripts/ci/test_nextest_mesh_serialization.py -v
 
+      # #1871: the apt retry paths, with fake dpkg-query, apt-get and sleep
+      # commands. It changes no runner packages and does not wait.
+      - name: Test the apt-install.sh retry paths
+        run: bash scripts/ci/test_apt_install.sh
+
       - name: Install Rust 1.95.0
         uses: dtolnay/rust-toolchain@master
         with:
@@ -1258,6 +1263,13 @@ jobs:
   coverage:
     name: Coverage Gate
     runs-on: ubuntu-latest
+    # 150 min holds the serialised build below: the full job measured
+    # 75m48s (job 130877153343) and 64m21s on a same-head rerun (job
+    # 130941943108). The parallel baseline, job 130773703573, compiled
+    # for 11m26s (20:04:45 to 20:16:11), then ran 8573 tests in about
+    # 27.5 min. Its disk banners (20:04:41 to 20:45:23) bracket the
+    # whole nextest call, so they are build plus tests, not the compile
+    # alone.
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v5
@@ -1423,8 +1435,19 @@ jobs:
           # the step before the report/ratchet below (bash -e would), and the
           # remaining tests' profile data must still be produced. The job
           # still fails on it — see the status merge at the end.
+          # #1862: one build job for the instrumented compile. Three
+          # coverage runs died before a test ran on 10 Nov 2026: #1855
+          # runs 42894312156 and 42902863828 stopped with exit 143
+          # about 13 min into the compile (12m55s and 13m09s), and the
+          # main rerun of 42875909838 lost its runner. The w3h shards
+          # and the property tests hit the same 143 class inside
+          # `cargo nextest list` and fixed it with `--build-jobs 1`
+          # (see the shard job above and integration.yml). The default
+          # was 4 concurrent rustc/link jobs on the 4 vCPUs; one at a
+          # time cuts the peak from about 4 to 1. The isolated run
+          # reuses these binaries, so only this host build is serialised.
           coverage_test_status=0
-          bash scripts/ci/nextest-isolated.sh --all-features --workspace -- --no-fail-fast -E '!binary(x0x_0041_synthetic_kill_restart) & !binary(x0x_0041_prefer_newest_test) & !binary(named_group_join_metadata_event)' || coverage_test_status=$?
+          bash scripts/ci/nextest-isolated.sh --all-features --build-jobs 1 --workspace -- --no-fail-fast -E '!binary(x0x_0041_synthetic_kill_restart) & !binary(x0x_0041_prefer_newest_test) & !binary(named_group_join_metadata_event)' || coverage_test_status=$?
           disk_snapshot "after coverage compilation"
           # #607: report and ratchet are still ATTEMPTED after a red test
           # pass; their own failures are captured the same way.
