@@ -438,7 +438,7 @@ async fn asymmetric_signed_capability_convergence_over_relay() {
             assert_eq!(connected.0, to.machine_id().0);
         }
         for agent in &agents { agent.gossip_runtime.as_ref().unwrap().pubsub().refresh_topic_peers().await; }
-        dm_capability_service::publish_targeted_capability_request(r.gossip_runtime.as_ref().unwrap().pubsub(), s.agent_id()).await.expect("request S capability through real PubSub");
+        dm_capability_service::publish_targeted_capability_request(r.gossip_runtime.as_ref().unwrap().pubsub(), s.agent_id(), None).await.expect("request S capability through real PubSub");
         until("relay observes sender extension", || r.capability_store.lookup(&s.agent_id()).is_some_and(|c| c.digest_support)).await;
         assert!(!baseline(r, s));
         assert_eq!(r.capability_store.lookup_binding(&s.agent_id()).unwrap().machine_id, s.machine_id());

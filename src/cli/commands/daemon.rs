@@ -978,6 +978,20 @@ pub(crate) fn classify_launchd_job(plist: &serde_json::Value) -> RepairVerdict {
         }
     }
 
+    // ADR 0094 (#1379): launchd's process-group cleanup is what removes a
+    // surviving child when the job stops or its supervisor dies. A job that
+    // sets `AbandonProcessGroup` keeps orphans alive across a restart, so an
+    // old and a new daemon could share the data roots. Report it, whether or
+    // not the job already carries the marker; the repair never edits it.
+    if plist.get("AbandonProcessGroup") == Some(&serde_json::Value::Bool(true)) {
+        return RepairVerdict::Refused(
+            "job sets `AbandonProcessGroup`, so launchd does not remove x0xd's process \
+             group when the job stops and an orphaned daemon can outlive its \
+             replacement; remove that key by hand"
+                .to_string(),
+        );
+    }
+
     let env = plist.get("EnvironmentVariables");
     let already = env
         .and_then(|e| e.get(crate::upgrade::restart::SUPERVISED_ENV_VAR))
@@ -1633,6 +1647,31 @@ mod tests {
             )),
             RepairVerdict::Refused(_)
         ));
+    }
+
+    /// #1379: `AbandonProcessGroup` defeats launchd's process-group cleanup,
+    /// so the repair refuses it, even on a job that already has the marker.
+    /// `AbandonProcessGroup: false` is launchd's default and is accepted.
+    #[test]
+    fn repair_refuses_jobs_that_abandon_their_process_group() {
+        let mut job = serde_json::json!({
+            "Label": "com.example.x0xd",
+            "ProgramArguments": ["/usr/local/bin/x0xd"],
+            "KeepAlive": true,
+            "AbandonProcessGroup": true,
+        });
+        assert!(matches!(
+            classify_launchd_job(&job),
+            RepairVerdict::Refused(reason) if reason.contains("AbandonProcessGroup")
+        ));
+        job["EnvironmentVariables"] =
+            serde_json::json!({ crate::upgrade::restart::SUPERVISED_ENV_VAR: "1" });
+        assert!(matches!(
+            classify_launchd_job(&job),
+            RepairVerdict::Refused(reason) if reason.contains("AbandonProcessGroup")
+        ));
+        job["AbandonProcessGroup"] = serde_json::Value::Bool(false);
+        assert_eq!(classify_launchd_job(&job), RepairVerdict::AlreadySupervised);
     }
 
     #[test]
