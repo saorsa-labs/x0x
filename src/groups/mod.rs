@@ -100,6 +100,14 @@ pub struct InviteLineage {
     pub base_hash: String,
     /// Roster root over the invite's projection at the base revision.
     pub base_roster_root: String,
+    /// #1797: the invite's roster projection at the base revision, kept
+    /// when it re-derives `base_roster_root`. A joiner retains the links
+    /// its inviter serves, not the base link, so this is the only record
+    /// of who was an admin at the base. Fork evidence reads it for a
+    /// conflicting commit that chains directly from the base. Empty on
+    /// older records and when the projection was not available.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub base_roster: BTreeMap<String, state_commit::RosterMemberSnapshot>,
     /// Revision at which THIS daemon's own seat landed (`None` = pending:
     /// the stub exists but the seat has not been observed yet).
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -5501,9 +5501,14 @@ fn evaluate_fork_evidence_candidate(
             classification,
         )
     };
-    match claimed_parent {
-        Some(parent) => {
-            let signer_snapshot = parent.roster.get(&commit.committed_by);
+    // #1797: a joiner holds no link at its invite base; the base roster
+    // stands in for a conflicting commit that chains from that base.
+    let parent_roster = claimed_parent
+        .map(|parent| &parent.roster)
+        .or_else(|| invite_base_roster_for_parent(current, commit));
+    match parent_roster {
+        Some(parent_roster) => {
+            let signer_snapshot = parent_roster.get(&commit.committed_by);
             let active_admin_at_parent = signer_snapshot.is_some_and(|snap| {
                 snap.state == x0x::groups::GroupMemberState::Active
                     && snap.role.at_least(x0x::groups::GroupRole::Admin)
@@ -5635,6 +5640,30 @@ fn mandate_anchors_commit_under_trusted_owner(
     })
 }
 
+/// #1797: the roster at the joiner's invite base, when `commit` chains
+/// directly from that base (`prev_state_hash` is the base hash and the
+/// revision is the next one). A joiner retains the links its inviter
+/// serves but not the base link, so without this a conflicting commit
+/// from the base (a removed admin's inviter seats the joiner on its fork)
+/// has no retained predecessor and never authenticates. The projection
+/// counts only while it re-derives the signed `base_roster_root`. It is
+/// the same base the joiner seeded its roster from and validated the
+/// served chain against (`validate_alternate_chain`), so it adds no new
+/// trust root.
+fn invite_base_roster_for_parent<'a>(
+    current: &'a x0x::groups::GroupInfo,
+    commit: &x0x::groups::state_commit::GroupStateCommit,
+) -> Option<&'a BTreeMap<String, x0x::groups::RosterMemberSnapshot>> {
+    let lineage = current.invite_lineage.as_ref()?;
+    let chains_from_base = !lineage.base_roster.is_empty()
+        && commit.revision == lineage.base_revision.saturating_add(1)
+        && commit.prev_state_hash.as_deref() == Some(lineage.base_hash.as_str());
+    (chains_from_base
+        && x0x::groups::state_commit::roster_root_of_projection(&lineage.base_roster)
+            == lineage.base_roster_root)
+        .then_some(&lineage.base_roster)
+}
+
 /// #468 A5 (r4): the pure candidate-authentication step shared by the
 /// live apply wrapper and journal recovery — structure/signature
 /// verification plus committer-was-active-admin in the retained
@@ -5654,7 +5683,9 @@ fn fork_candidate_authenticated(
         .iter()
         .rev()
         .find(|rc| rc.commit.revision == commit.revision.saturating_sub(1))
-        .and_then(|predecessor| predecessor.roster.get(&commit.committed_by))
+        .map(|predecessor| &predecessor.roster)
+        .or_else(|| invite_base_roster_for_parent(current, commit))
+        .and_then(|roster| roster.get(&commit.committed_by))
         .is_some_and(|snap| {
             snap.state == x0x::groups::GroupMemberState::Active
                 && snap.role.at_least(x0x::groups::GroupRole::Admin)
@@ -26027,12 +26058,24 @@ pub(super) async fn join_group_via_invite_inner(
             // the authenticated invite committed to, before any seat.
             // Intermediate commits that apply before our own seat cannot
             // lose the base this way (v3 review item 5).
+            let signed_base_roster_root = view.signed_roster_root();
             info.invite_lineage = Some(x0x::groups::InviteLineage {
                 base_revision: view.base_state_revision,
                 base_hash: view.base_state_hash.clone(),
+                // #1797: keep the base projection only when it re-derives
+                // the signed root (a v6 join with no fetched roster keeps
+                // none).
+                base_roster: if x0x::groups::state_commit::roster_root_of_projection(
+                    effective_base_roster,
+                ) == signed_base_roster_root
+                {
+                    effective_base_roster.clone()
+                } else {
+                    BTreeMap::new()
+                },
                 // #646: the signed root — carried on v6, re-derived from
                 // the inline projection on v4 (same value either way).
-                base_roster_root: view.signed_roster_root(),
+                base_roster_root: signed_base_roster_root,
                 seated_at_revision: None,
                 corroborated: false,
                 fork_evidence: None,
