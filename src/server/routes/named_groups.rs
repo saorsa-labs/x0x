@@ -8404,6 +8404,8 @@ async fn prepare_rebind_journal_for_groups(
         write_home_suite_sidecar_journal(&state.treekem_dir, &tx, &home_suite_json)
             .await
             .map_err(|e| anyhow::anyhow!("Home-Suite sidecar journal write: {e}"))?;
+        #[cfg(test)]
+        tests::issue1368_crash_matrix::take_crash_image(state, "rebind-1-hsjournal");
         journals_ours = true;
         let journal = TreeKemNamedPersistJournal {
             version: TREEKEM_NAMED_JOURNAL_VERSION,
@@ -8434,6 +8436,8 @@ async fn prepare_rebind_journal_for_groups(
             }
             Err(e) => return Err(anyhow::anyhow!("TreeKEM journal write: {e}")),
         }
+        #[cfg(test)]
+        tests::issue1368_crash_matrix::take_crash_image(state, "rebind-2-journal");
         Ok(RebindOutcome::Rebound)
     }
     .await;
@@ -8467,6 +8471,8 @@ async fn apply_rebind_journal_snapshot(state: &AppState, group_id: &str) -> anyh
     // file is durable — a crash anywhere before the deletes is replayed
     // forward by the still-present journals.
     apply_home_suite_sidecar_journal(state, group_id).await?;
+    #[cfg(test)]
+    tests::issue1368_crash_matrix::take_crash_image(state, "rebind-3-sidecar");
     match persist_treekem_snapshot_bytes_typed(
         &state.treekem_dir,
         group_id,
@@ -8491,6 +8497,8 @@ async fn apply_rebind_journal_snapshot(state: &AppState, group_id: &str) -> anyh
         }
         Err(e) => return Err(anyhow::anyhow!("snapshot write: {e}")),
     }
+    #[cfg(test)]
+    tests::issue1368_crash_matrix::take_crash_image(state, "rebind-4-snapshot");
     // Restore the repaired group into the live map when it was missing.
     rebind_restore_live_group(state, group_id).await;
     if let Err(e) = tokio::fs::remove_file(&journal_path).await {
@@ -8498,7 +8506,11 @@ async fn apply_rebind_journal_snapshot(state: &AppState, group_id: &str) -> anyh
             return Err(anyhow::anyhow!("TreeKEM journal cleanup: {e}"));
         }
     }
+    #[cfg(test)]
+    tests::issue1368_crash_matrix::take_crash_image(state, "rebind-5-journal-removed");
     remove_home_suite_sidecar_journal(&state.treekem_dir, group_id).await;
+    #[cfg(test)]
+    tests::issue1368_crash_matrix::take_crash_image(state, "rebind-6-done");
     Ok(())
 }
 
@@ -39297,6 +39309,8 @@ async fn persist_treekem_and_named_groups_atomic_locked(
     .await
     .map_err(before_commit)?;
     #[cfg(test)]
+    tests::issue1368_crash_matrix::take_crash_image(state, "seal-1-hsjournal");
+    #[cfg(test)]
     if state.named_groups_save_fault.load(Ordering::SeqCst) == SaveFault::JournalWriteFails as u8 {
         return Err(before_commit(anyhow::anyhow!(
             "TreeKEM journal write: test fault"
@@ -39319,6 +39333,8 @@ async fn persist_treekem_and_named_groups_atomic_locked(
         }
         Err(e) => return Err(before_commit(anyhow::anyhow!("TreeKEM journal write: {e}"))),
     }
+    #[cfg(test)]
+    tests::issue1368_crash_matrix::take_crash_image(state, "seal-2-journal");
     // 2) Live files, each now repairable from the journals above.
     // #1187: past the commit point, a failure that does NOT durably commit
     // the named half discards the journal pair, so a restart agrees with the
@@ -39334,6 +39350,8 @@ async fn persist_treekem_and_named_groups_atomic_locked(
         discard_unless_kept(state, group_id_hex, keep_journals).await;
         anyhow::bail!("Home-Suite sidecar replacement did not occur");
     }
+    #[cfg(test)]
+    tests::issue1368_crash_matrix::take_crash_image(state, "seal-3-sidecar");
     match persist_treekem_snapshot_bytes_typed(&state.treekem_dir, group_id_hex, snapshot_envelope)
         .await
     {
@@ -39356,6 +39374,8 @@ async fn persist_treekem_and_named_groups_atomic_locked(
             return Err(anyhow::anyhow!("treekem snapshot write: {e}"));
         }
     }
+    #[cfg(test)]
+    tests::issue1368_crash_matrix::take_crash_image(state, "seal-4-snapshot");
     match repair_withdrawn_named_groups_json_and_wipe_key_material_locked(
         state,
         group_id_hex,
@@ -39429,6 +39449,8 @@ async fn persist_treekem_and_named_groups_atomic_locked(
             anyhow::bail!("named groups replacement did not occur");
         }
     }
+    #[cfg(test)]
+    tests::issue1368_crash_matrix::take_crash_image(state, "seal-5-named");
     // #732 r8: the durable install converges the same way (see the
     // ReplacedNotDurable arm).
     {
@@ -39443,6 +39465,8 @@ async fn persist_treekem_and_named_groups_atomic_locked(
                 .context(format!("TreeKEM journal cleanup: {e}")));
         }
     }
+    #[cfg(test)]
+    tests::issue1368_crash_matrix::take_crash_image(state, "seal-6-journal-removed");
     // #458 r3: this group's state is now durable (journal replayed or both
     // files written) — it is no longer an unconfirmed join stub.
     state
@@ -39452,6 +39476,8 @@ async fn persist_treekem_and_named_groups_atomic_locked(
         .remove(group_id_hex);
     // #451 (merged main): the sidecar journal completes with the legacy one.
     remove_home_suite_sidecar_journal(&state.treekem_dir, group_id_hex).await;
+    #[cfg(test)]
+    tests::issue1368_crash_matrix::take_crash_image(state, "seal-7-done");
     Ok(())
 }
 
@@ -45286,6 +45312,8 @@ async fn save_named_groups_store_checked(
         }
         sidecar_rollback = Some(pre_sidecar_bytes);
     }
+    #[cfg(test)]
+    tests::issue1368_crash_matrix::take_crash_image(state, "save-1-sidecar");
     // #470/#471 fault shape: the sidecar above has already been written;
     // failing HERE reproduces the documented #471 split outcome
     // (sidecar new / named old) through the production path — which the
@@ -45325,6 +45353,8 @@ async fn save_named_groups_store_checked(
             tracing::error!("Failed to save named groups: {e}");
             e
         });
+    #[cfg(test)]
+    tests::issue1368_crash_matrix::take_crash_image(state, "save-2-named");
     // #471: the named write did NOT land (pre-rename failure or no
     // replacement) while the sidecar above already did — the split this
     // ordinary save path has no journal to repair. Undo the sidecar half
@@ -53241,6 +53271,7 @@ pub(in crate::server) mod tests {
     pub(in crate::server) mod issue1275_listener_apply_shield;
     mod issue1288_bootstrap_outbox_shutdown;
     mod issue1347_join_request_token_class;
+    pub(in crate::server) mod issue1368_crash_matrix;
     mod issue1569_owner_certified_placeholder;
     mod issue1570_held_back_cards;
     mod issue1570_held_back_rebind;
