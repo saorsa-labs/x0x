@@ -3286,6 +3286,7 @@ pub async fn serve_with_options(
         // Upgrade
         .route("/upgrade", get(check_upgrade))
         .route("/upgrade/apply", post(apply_upgrade))
+        .route("/upgrade/clear-hold", post(routes::clear_upgrade_hold))
         // Network diagnostics
         .route("/network/bootstrap-cache", get(bootstrap_cache_stats))
         .route("/diagnostics/connectivity", get(connectivity_diagnostics))

@@ -311,6 +311,14 @@ enum Commands {
         /// Does not bypass the daemon's apply checks.
         #[arg(long)]
         force: bool,
+        /// Clear this install's failed-release hold for VERSION (recorded by
+        /// the daemon). A newer release clears such a hold by itself. Never
+        /// clears a recovery-failed state.
+        #[arg(long, requires = "version", conflicts_with_all = ["check", "apply", "force"])]
+        clear_hold: bool,
+        /// Release version for --clear-hold.
+        #[arg(requires = "clear_hold")]
+        version: Option<String>,
     },
     /// WebSocket session info. [dev]
     #[command(hide = true)]
@@ -2305,6 +2313,7 @@ async fn run(
             check,
             apply,
             force,
+            clear_hold: false,
             ..
         } if *check || !*apply => {
             return commands::upgrade::run(*check, *force, name, api).await;
@@ -3391,6 +3400,26 @@ async fn run(
                 .await
             }
         },
+        Commands::Upgrade {
+            clear_hold: true,
+            version: Some(version),
+            ..
+        } => {
+            // D190: the daemon validates the version and records the clear
+            // under its install lock. Only semver characters reach the query.
+            if version.is_empty()
+                || !version
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+            {
+                anyhow::bail!("--clear-hold needs a release version such as 0.48.2");
+            }
+            let response = client
+                .post_empty(&format!("/upgrade/clear-hold?version={version}"))
+                .await?;
+            x0x::cli::print_value(client.format(), &response);
+            Ok(())
+        }
         Commands::Upgrade { now, .. } => {
             // The serving daemon owns installation and its writer lock. The
             // existing client carries the selected instance and bearer token.

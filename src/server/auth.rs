@@ -447,6 +447,9 @@ pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
                     | "/home/rename"
                     | "/home/seat"
                     | "/upgrade/apply"
+                    // #1376 / D190: the local hold clear re-admits a held
+                    // release, an owner act like the apply itself.
+                    | "/upgrade/clear-hold"
                     // #1228: opening an envelope exposes a raw group secret.
                     | "/groups/secure/open-envelope"
                     // ADR 0116 §4: the runtime history trim.
@@ -992,6 +995,7 @@ mod tests {
             (Method::POST, "/home/rename"),
             (Method::POST, "/home/seat"),
             (Method::POST, "/upgrade/apply"),
+            (Method::POST, "/upgrade/clear-hold"),
             (Method::POST, "/gui/show"),
         ] {
             // The route is classified durable-owner…
