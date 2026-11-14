@@ -22,6 +22,10 @@ All notable changes to this project will be documented in this file.
   sibling of `kv:changed`: one event per list per 200 ms window on a local
   mutation or a merged peer delta, with `list_id` and `origins`, no task
   content. Library: `Agent::subscribe_task_changes`.
+- **A share grant may start at most 600 s in the future (#1350 follow-up).**
+  A daemon refuses (`POST /grants` 400; no store and no ACK on receipt) a
+  grant whose `not_before` is more than 600 s ahead of its clock, so a
+  chain of pre-signed grants cannot extend access past 90 days.
 - **`kv:changed` SSE event on `GET /events` (#1094).** A KV store this
   daemon has open sends one event per 200 ms window when it changes (local
   write or delete, merged peer record, direct delta): `store_id` and the
