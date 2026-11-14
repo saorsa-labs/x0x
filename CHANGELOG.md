@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`task:changed` SSE event on `GET /events` (#1094).** The task-list
+  sibling of `kv:changed`: one event per list per 200 ms window on a local
+  mutation or a merged peer delta, with `list_id` and `origins`, no task
+  content. Library: `Agent::subscribe_task_changes`.
 - **`kv:changed` SSE event on `GET /events` (#1094).** A KV store this
   daemon has open sends one event per 200 ms window when it changes (local
   write or delete, merged peer record, direct delta): `store_id` and the

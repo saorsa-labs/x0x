@@ -366,9 +366,9 @@ impl PinnedMachineSource {
 /// the verified sources of its recipient's machine.
 const PINNED_RESOLUTION_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// Buffer of the agent-wide KV change channel (#1094). A subscriber that
+/// Buffer of each agent-wide change channel, KV and task list (#1094). A subscriber that
 /// falls further behind than this loses the oldest notices.
-const KV_CHANGE_CHANNEL_CAPACITY: usize = 1024;
+const CHANGE_CHANNEL_CAPACITY: usize = 1024;
 
 /// x0x #1150 (r7b): the transport operations raw-QUIC target resolution
 /// uses (connection state, send-readiness repair, discovery redial).
@@ -831,6 +831,9 @@ pub struct Agent {
     /// #1094: change notices of every KV store this agent opens
     /// ([`Agent::subscribe_kv_changes`]).
     kv_changes: tokio::sync::broadcast::Sender<kv::KvStoreChanged>,
+    /// #1094: change notices of every task list this agent opens
+    /// ([`Agent::subscribe_task_changes`]).
+    task_changes: tokio::sync::broadcast::Sender<crdt::TaskListChanged>,
     /// Single-flight registry for ADR 0030 strict capability refreshes, so
     /// concurrent strict sends to one recipient publish a single targeted
     /// request between them.
@@ -17249,6 +17252,18 @@ impl Agent {
         self.kv_changes.subscribe()
     }
 
+    /// Subscribe to change notices of every task list this agent opens
+    /// (#1094): one notice per local mutation (add, claim, complete,
+    /// reorder, board migration) and per merged remote delta. As
+    /// [`Self::subscribe_kv_changes`], a notice names the topic and the
+    /// origin only.
+    #[must_use]
+    pub fn subscribe_task_changes(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crdt::TaskListChanged> {
+        self.task_changes.subscribe()
+    }
+
     /// Clone the shared capability store.
     #[must_use]
     pub fn capability_store(&self) -> std::sync::Arc<dm_capability::CapabilityStore> {
@@ -23695,6 +23710,7 @@ impl Agent {
                 e
             )))
         })?;
+        sync.set_change_sink(self.task_changes.clone());
 
         // Arm persistence BEFORE start so no merged delta can land
         // unpersisted, and write an initial snapshot so the file exists from
@@ -25499,7 +25515,8 @@ impl AgentBuilder {
             #[cfg(test)]
             consented_publish_test_gate: std::sync::Mutex::new(None),
             capability_store: std::sync::Arc::new(dm_capability::CapabilityStore::new()),
-            kv_changes: tokio::sync::broadcast::channel(KV_CHANGE_CHANNEL_CAPACITY).0,
+            kv_changes: tokio::sync::broadcast::channel(CHANGE_CHANNEL_CAPACITY).0,
+            task_changes: tokio::sync::broadcast::channel(CHANGE_CHANNEL_CAPACITY).0,
             capability_refreshes: std::sync::Arc::new(CapabilityRefreshRegistry::default()),
             #[cfg(test)]
             capability_convergence_observer: std::sync::Mutex::new(None),
@@ -25921,6 +25938,7 @@ impl TaskListHandle {
             let delta = crdt::TaskListDelta::for_add(task_id, task, tag, version);
             (task_id, version, delta)
         };
+        self.sync.note_change(kv::KvChangeOrigin::Local);
         // Durability before announcement (#557, mirrors the kv put path):
         // persist the committed mutation and DO NOT publish if the snapshot
         // fails — announcing state the disk never saw loses it on restart.
@@ -26004,6 +26022,7 @@ impl TaskListHandle {
             delta
         };
         let count = delta.added_tasks.len();
+        self.sync.note_change(kv::KvChangeOrigin::Local);
         self.sync.persist().await.map_err(|e| {
             error::IdentityError::Storage(std::io::Error::other(format!(
                 "board migration applied locally but snapshot persistence FAILED ({e}); \
@@ -26121,6 +26140,7 @@ impl TaskListHandle {
                 advisory,
             )
         };
+        self.sync.note_change(kv::KvChangeOrigin::Local);
         // Durability before announcement (#557): see add_task_versioned.
         self.sync.persist().await.map_err(|e| {
             error::IdentityError::Storage(std::io::Error::other(format!(
@@ -26220,6 +26240,7 @@ impl TaskListHandle {
                 advisory,
             )
         };
+        self.sync.note_change(kv::KvChangeOrigin::Local);
         // Durability before announcement (#557): see add_task_versioned.
         self.sync.persist().await.map_err(|e| {
             error::IdentityError::Storage(std::io::Error::other(format!(
@@ -26324,6 +26345,7 @@ impl TaskListHandle {
                 list.current_version(),
             )
         };
+        self.sync.note_change(kv::KvChangeOrigin::Local);
         // Durability before announcement (#557): see add_task_versioned.
         self.sync.persist().await.map_err(|e| {
             error::IdentityError::Storage(std::io::Error::other(format!(
