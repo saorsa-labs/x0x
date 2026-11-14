@@ -59,6 +59,8 @@ Gossip fan-out must reflect usable transport connections. Stale discovery entrie
 
 No bandwidth-saving change may silently weaken the promised delivery or revocation behavior.
 
+A targeted capability answer goes by unicast when the requester asks for it; the response topic stays the fallback (amended 14 Nov 2026 by Claude under David's delegation of design decisions of 10 Nov 2026; [#504](https://github.com/saorsa-labs/x0x/issues/504)). A requester may append its machine id to a request on `x0x/caps/v1/request/targeted-v2` (tag `0x01`, then the 32 bytes); the warm carrier never takes it. A responder that is already connected to that machine sends its signed advert as one direct frame (`x0x/caps/v1/unicast-response\0`, the responder's agent public key, the advert) and skips the topic answer for that requester. With no connection, a failed send, or a request without the machine id, it answers on the topic as before. The receiver accepts the frame only when the key derives to the frame's sender, the advert signature verifies, and the advert names the transport peer as its machine. Capability bit 18 `caps_unicast_response_v1` declares that an agent takes the direct frame. Responders from before this change ignore the trailer and answer on the topic. This does not change any shed or priority rule.
+
 ## Consequences
 
 Ordinary devices have a bounded network role. Overload can delay or refuse work, and best-effort traffic can be lost. Operators need clear counters and measured budgets to choose relay capacity.

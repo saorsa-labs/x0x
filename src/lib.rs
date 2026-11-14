@@ -12554,6 +12554,12 @@ impl Agent {
         let capability_store = std::sync::Arc::clone(&self.capability_store);
         let shutdown_token = self.shutdown_token.clone();
         let deadline = tokio::time::Instant::now() + CAPABILITY_REFRESH_CONVERGENCE_WAIT;
+        // #504 (A06): ask for the answer as a direct frame when the direct
+        // listener that ingests it is running; the topic stays the fallback.
+        let reply_to = self
+            .direct_listener_started
+            .load(std::sync::atomic::Ordering::Acquire)
+            .then(|| self.identity.machine_id());
 
         let purpose = if require_durable_ack || required_application.is_some() {
             CapabilityRefreshPurpose::Requirement
@@ -12571,7 +12577,9 @@ impl Agent {
                     capability_store,
                     shutdown_token,
                     deadline,
-                    dm_capability_service::publish_targeted_capability_request(&pubsub, recipient),
+                    dm_capability_service::publish_targeted_capability_request(
+                        &pubsub, recipient, reply_to,
+                    ),
                 )
                 .await;
                 completion_tx.send_replace(CapabilityRefreshState::Finished);
@@ -17280,6 +17288,12 @@ impl Agent {
             std::sync::Arc::clone(&self.capability_store),
             std::time::Duration::from_secs(dm_capability::ADVERT_PUBLISH_INTERVAL_SECS),
             self.legacy_announce,
+            // #504: a targeted answer goes direct to a connected requester.
+            self.network
+                .as_ref()
+                .map(|network| dm_capability_service::UnicastResponder {
+                    network: std::sync::Arc::clone(network),
+                }),
             #[cfg(test)]
             convergence_observer,
         )
@@ -17379,12 +17393,15 @@ impl Agent {
         // the advertised registry from the routes THIS inbox registers,
         // before `config` moves into the service: the bit goes out only
         // when the push route is registered and ready.
-        let advertised_registry = dm::CapabilityRegistry::advertised(
+        let mut advertised_registry = dm::CapabilityRegistry::advertised(
             config
                 .typed_payload_routes
                 .iter()
                 .map(|route| route.prefix.as_slice()),
         );
+        // #504 (A06): this agent takes a targeted capability answer as a
+        // direct frame (its direct listener ingests it).
+        advertised_registry.bits |= dm::CapabilityRegistry::CAPS_UNICAST_RESPONSE_V1;
         let signing = std::sync::Arc::new(gossip::SigningContext::from_keypair(
             self.identity.agent_keypair(),
         ));
@@ -21011,6 +21028,8 @@ impl Agent {
         // catch-up refusal so the requester knows who refused. AgentId is
         // Copy, so the capture needs no clone.
         let local_agent_id = self.identity.agent_id();
+        // #504: the store a direct targeted capability answer lands in.
+        let unicast_caps_store = std::sync::Arc::clone(&self.capability_store);
 
         self.spawn_tracked(async move {
             tracing::info!(target: "x0x::direct", stage = "listener", "direct message listener started");
@@ -21275,6 +21294,30 @@ impl Agent {
                             }
                         }
                     }
+                    continue;
+                }
+
+                // #504 (A06): a targeted capability answer sent by unicast.
+                // It carries its own proof (key, advert signature, machine)
+                // and is ingested as the response topic would; it never
+                // reaches the DM paths below.
+                if let Some((public_key, advert)) =
+                    dm_capability_service::decode_unicast_capability_response(&data)
+                {
+                    let ingested = dm_capability_service::ingest_unicast_capability_response(
+                        &unicast_caps_store,
+                        local_agent_id,
+                        sender,
+                        machine_id,
+                        public_key,
+                        advert,
+                    );
+                    tracing::debug!(
+                        target: "dm.trace",
+                        stage = "capability_advert_unicast_received",
+                        sender = %hex::encode(sender.as_bytes()),
+                        ingested,
+                    );
                     continue;
                 }
 
@@ -46593,6 +46636,9 @@ mod peer_connected_handler_integration_tests {
 
 #[cfg(test)]
 mod asymmetric_capability_convergence_tests;
+
+#[cfg(test)]
+mod caps_unicast_504_tests;
 
 #[cfg(test)]
 mod legacy_bus_interop_tests;
