@@ -139,6 +139,17 @@ pub(in crate::server) struct S4Runtime {
     inner: tokio::sync::Mutex<S4Inner>,
     /// ADR 0108 §5a writer lock for `revocation-evictions.evs`.
     evs_writer: tokio::sync::Mutex<()>,
+    /// #1597 item 5c: the daemon has not read the `.evs` and `.evh` files
+    /// of this boot yet. No writer replaces either file while this is set,
+    /// so a change made before the load (a gossip receipt, an early API
+    /// call) can never overwrite the obligations of the previous boot.
+    /// [`S4Runtime::awaiting_startup_load`] sets it; the startup load
+    /// clears it.
+    awaiting_load: std::sync::atomic::AtomicBool,
+    /// Test builds: whether `api.port` already existed when the last S4
+    /// load began (#1597 item 5c ordering test).
+    #[cfg(test)]
+    port_published_at_load: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -267,7 +278,26 @@ impl S4Runtime {
             boot_instant: Instant::now(),
             inner: tokio::sync::Mutex::new(S4Inner::default()),
             evs_writer: tokio::sync::Mutex::new(()),
+            awaiting_load: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            port_published_at_load: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// The daemon runtime: no `.evs` or `.evh` write until
+    /// [`load_revocation_eviction_store`] has read both files (#1597 item
+    /// 5c). [`Self::new`] and [`Default`] start with nothing to read.
+    pub(in crate::server) fn awaiting_startup_load() -> Self {
+        let runtime = Self::default();
+        runtime
+            .awaiting_load
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        runtime
+    }
+
+    /// The startup load of this boot has not run yet.
+    fn load_pending(&self) -> bool {
+        self.awaiting_load.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// §2 restart rule, the minimum part only: the bounded restart sync
@@ -1232,7 +1262,11 @@ pub(in crate::server) async fn run_revocation_eviction_worker(state: Arc<AppStat
         restart_sync_wait_ms = s4::duration_ms(timing.restart_sync_wait),
         "ADR 0110 S4 timing values"
     );
-    load_persisted_obligations(&state).await;
+    // The daemon loads the store before it serves (#1597 item 5c); this
+    // load only runs for a runtime that started without it.
+    if state.revocation_evictions.load_pending() {
+        load_persisted_obligations(&state).await;
+    }
     let notify = state.agent.s4_revocation_intake().notified();
     loop {
         // §5: re-scan on host commit; the load then does what the trial
@@ -4609,6 +4643,16 @@ fn evjournal_path(state: &AppState, stable_group_id: &str) -> PathBuf {
 async fn persist_obligations(state: &AppState) -> bool {
     let runtime = &state.revocation_evictions;
     let _writer = runtime.evs_writer.lock().await;
+    // #1597 item 5c: before the startup load the file still holds the
+    // previous boot's rows, which memory does not, so nothing is written
+    // and the answer is "not durable". The load then replaces the store
+    // (rows and queued bans) with the file: a change made before it is not
+    // carried. The daemon awaits the load before it serves the API, so no
+    // request can make one; a trigger re-derives from its durable source
+    // on the next pass. Only the `.evh` load merges memory with the file.
+    if runtime.load_pending() {
+        return false;
+    }
     let snapshot = {
         let mut inner = runtime.inner.lock().await;
         match begin_persist(&mut inner, host_commit_gate_open(state)) {
@@ -4912,6 +4956,11 @@ pub(super) async fn verified_pending_copies(path: &FsPath) -> (Vec<([u8; 16], Pa
 async fn load_persisted_obligations(state: &AppState) {
     let runtime = &state.revocation_evictions;
     let _writer = runtime.evs_writer.lock().await;
+    #[cfg(test)]
+    runtime.port_published_at_load.store(
+        state.data_dir.join("api.port").exists(),
+        std::sync::atomic::Ordering::SeqCst,
+    );
     let path = evs_path(state);
     // §5 and "ADR 0094 trial": inside an uncommitted trial the load only
     // reads. It starts no quarantine transaction, writes no replacement
@@ -5096,6 +5145,18 @@ async fn load_persisted_obligations(state: &AppState) {
         }
     }
     handoff_log::load(state, gate_open).await;
+    // Both files are read; writers may replace them from now on. This load
+    // holds the writer lock, so no writer runs between the read and here.
+    runtime
+        .awaiting_load
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// #1597 item 5c: the daemon's startup load of the S4 store, awaited
+/// before the API port is published, so no request, worker pass or
+/// receipt write can replace the `.evs` or `.evh` before they are read.
+pub(in crate::server) async fn load_revocation_eviction_store(state: &AppState) {
+    load_persisted_obligations(state).await;
 }
 
 /// Read every `.evjournal` in the TreeKEM directory and classify it (§5).
@@ -11006,5 +11067,169 @@ pub(super) mod tests {
             "a group outside the open set keeps its share-seal generation"
         );
         state.agent.shutdown().await;
+    }
+
+    /// #1597 item 5c: a write asked for before the startup load (an early
+    /// manual ban, a verified expiry hand-off receipt) never replaces the
+    /// previous boot's `.evs` or `.evh`. The load reads both files, keeps
+    /// the receipt, and the first write after it carries the receipt with
+    /// the kept hand-off.
+    #[tokio::test]
+    async fn a_write_before_the_startup_load_keeps_the_previous_boot_files() -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let kept = EvictionKey::new("1597".to_string(), [1; 32]);
+        let early = EvictionKey::new("1597".to_string(), [2; 32]);
+        let handoff = |received_unix_ms| ExpiryHandoff {
+            certificate_digest: "ab".repeat(32),
+            received_unix_ms,
+        };
+        let boot_id = state.revocation_evictions.boot_id;
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.store.intake(
+                &kept,
+                s4::EvictionTrigger::AgentRevocation {
+                    record_hash: [7; 32],
+                    record_bytes: vec![7],
+                },
+                None,
+                now_unix_ms(),
+                boot_id,
+            );
+            inner.dirty = true;
+            inner.expiry_handoffs.insert(kept.clone(), handoff(42));
+            inner.expiry_handoffs_dirty = true;
+        }
+        assert!(persist_obligations(&state).await, "the row is durable");
+        handoff_log::persist(&state).await;
+        let evs_before = std::fs::read(evs_path(&state))?;
+        let evh_before = std::fs::read(handoff_log::path(&state))?;
+
+        // Restart: memory is empty and the files are not read yet.
+        *state.revocation_evictions.inner.lock().await = S4Inner::default();
+        state
+            .revocation_evictions
+            .awaiting_load
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.queued_bans.insert(early.clone(), now_unix_ms());
+            inner.dirty = true;
+            inner.expiry_handoffs.insert(early.clone(), handoff(43));
+            inner.expiry_handoffs_dirty = true;
+        }
+        assert!(
+            !persist_obligations(&state).await,
+            "a change before the load is not durable"
+        );
+        handoff_log::persist(&state).await;
+        assert_eq!(
+            std::fs::read(evs_path(&state))?,
+            evs_before,
+            "the .evs of the previous boot is not replaced before the load"
+        );
+        assert_eq!(
+            std::fs::read(handoff_log::path(&state))?,
+            evh_before,
+            "the .evh of the previous boot is not replaced before the load"
+        );
+
+        load_revocation_eviction_store(&state).await;
+        assert!(!state.revocation_evictions.load_pending());
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            assert!(inner.store.get(&kept).is_some(), "the kept row is loaded");
+            assert!(inner.expiry_handoffs.contains_key(&kept));
+            assert!(
+                inner.expiry_handoffs.contains_key(&early),
+                "the receipt made before the load is kept"
+            );
+        }
+        handoff_log::persist(&state).await;
+        let written = handoff_log::decode(&std::fs::read(handoff_log::path(&state))?)
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        assert!(written.contains_key(&kept) && written.contains_key(&early));
+        state.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1597 item 5c: the daemon reads the S4 store before it publishes
+    /// `api.port`, so no API request can run before the load. A real
+    /// daemon starts on a data dir that holds an `.evs` row; when `serve`
+    /// returns, the startup load has run, it began while `api.port` did
+    /// not exist yet, and it read the file. Red with the `mod.rs` load
+    /// removed: the worker loads after the port is published.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_daemon_loads_the_s4_store_before_it_publishes_the_api_port() -> anyhow::Result<()>
+    {
+        let root = tempfile::tempdir()?;
+        let data = root.path().join("data");
+        std::fs::create_dir_all(&data)?;
+        let mut store = ObligationStore::new();
+        store.intake(
+            &EvictionKey::new("1597".to_string(), [5; 32]),
+            s4::EvictionTrigger::AgentRevocation {
+                record_hash: [7; 32],
+                record_bytes: vec![7],
+            },
+            None,
+            now_unix_ms(),
+            [0; 16],
+        );
+        let bytes = s4::encode_evs(&s4::EvsBodyV1 {
+            rebuilt_from: Vec::new(),
+            rows: store.to_rows(),
+        })?;
+        std::fs::write(data.join(s4::EVS_FILE_NAME), bytes)?;
+        let config: crate::server::DaemonConfig = serde_json::from_value(serde_json::json!({
+            "bind_address": "127.0.0.1:0",
+            "api_address": "127.0.0.1:0",
+            "data_dir": data,
+            "identity_dir": root.path().join("identity"),
+            "bootstrap_peers": [],
+            "mdns_enabled": false,
+            "port_mapping_enabled": false,
+            "network_id": format!(
+                "x0x.test.1597.s4load.{}.{:08x}",
+                std::process::id(),
+                rand::random::<u32>()
+            )
+        }))?;
+        let options = crate::server::ServeOptions {
+            skip_update_check: true,
+            cli_no_port_mapping: true,
+            cli_disable_peer_cache: true,
+            self_update_enabled: false,
+            ..crate::server::ServeOptions::default()
+        };
+        let handle = tokio::time::timeout(
+            Duration::from_secs(60),
+            crate::server::serve_with_options(config, options),
+        )
+        .await??;
+        let state = handle
+            .test_state
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("live daemon state"))?;
+        assert!(data.join("api.port").exists(), "the port is published");
+        assert!(
+            !state.revocation_evictions.load_pending(),
+            "the startup load ran before serve returned"
+        );
+        assert!(
+            !state
+                .revocation_evictions
+                .port_published_at_load
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the load began before api.port was written"
+        );
+        assert!(
+            state.revocation_evictions.inner.lock().await.file_exists,
+            "the load read the previous boot's .evs"
+        );
+        drop(state);
+        tokio::time::timeout(Duration::from_secs(60), handle.shutdown_and_wait()).await??;
+        Ok(())
     }
 }
