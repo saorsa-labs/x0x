@@ -1036,7 +1036,28 @@ function applyHashRoute(){
 }
 
 // Utility
-function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
+// HTML escaper for text AND quoted attribute values: it escapes both quote
+// kinds as well as &, < and > (#1893 review: the old textContent/innerHTML
+// escaper left `"` alone, so a value inside an attribute could close it).
+function esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
+// One clickable list card for a key read from a store. A key is written by
+// any group writer, so it never enters an HTML string: the label is set with
+// textContent and the click handler closes over the value (#1893 review).
+function storeKeyCard(label,hint,onClick,labelFont){
+  const card=document.createElement('div');
+  card.className='card mb';card.style.cursor='pointer';
+  const t=document.createElement('div');
+  t.style.font=labelFont||'500 13px var(--sans)';t.style.color='var(--cy)';
+  t.textContent=String(label);
+  card.appendChild(t);
+  if(hint){
+    const h=document.createElement('div');
+    h.style.fontSize='11px';h.style.color='var(--tx3)';h.style.marginTop='2px';
+    h.textContent=hint;card.appendChild(h);
+  }
+  card.addEventListener('click',onClick);
+  return card;
+}
 // JS-string escaper for use inside onclick='...' inline handlers.
 // Escapes quotes, backslashes, and control chars so the value is safe inside a JS string literal.
 function escJs(s){return String(s||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'\\"').replace(/</g,'\\x3c').replace(/>/g,'\\x3e')}
@@ -3488,10 +3509,7 @@ async function loadWikiPages(sid){
   }
   const keys=(r.keys||[]).map(k=>typeof k==='string'?k:k.key||k);
   if(keys.length>0){
-    el.innerHTML=keys.map(k=>`<div class="card mb" style="cursor:pointer" data-wiki-sid="${esc(sid)}" data-wiki-slug="${esc(k)}" onclick="editWikiPage(this.dataset.wikiSid,this.dataset.wikiSlug)">
-      <div style="font:500 13px var(--sans);color:var(--cy)">${esc(k)}</div>
-      <div style="font-size:11px;color:var(--tx3);margin-top:2px">Click to edit</div>
-    </div>`).join('');
+    el.replaceChildren(...keys.map(k=>storeKeyCard(k,'Click to edit',()=>editWikiPage(sid,k))));
   }else{
     el.innerHTML='<div style="color:var(--tx3);font-size:12px;padding:8px">No wiki pages yet. Create one above.</div>';
   }
@@ -3572,9 +3590,7 @@ async function loadScratchKeys(sid){
   }
   const keys=(r.keys||[]).map(k=>typeof k==='string'?k:k.key||k);
   if(keys.length>0){
-    el.innerHTML=keys.map(k=>`<div class="card mb" style="cursor:pointer" data-scratch-sid="${esc(sid)}" data-scratch-key="${esc(k)}" onclick="editScratchKey(this.dataset.scratchSid,this.dataset.scratchKey)">
-      <div style="font:500 13px var(--mono);color:var(--cy)">${esc(k)}</div>
-    </div>`).join('');
+    el.replaceChildren(...keys.map(k=>storeKeyCard(k,'',()=>editScratchKey(sid,k),'500 13px var(--mono)')));
   }else{
     el.innerHTML='<div style="color:var(--tx3);font-size:12px;padding:8px">No scratch keys yet. Add one above.</div>';
   }
@@ -3589,6 +3605,9 @@ async function editScratchKey(sid,key){
   if(!spacePageStoreCurrent(sid,st)){spacePagesUnavailable(list,SPACE_POLICY_MOVED_AFTER_READ);return}
   // A failed read leaves any open editor and its draft as they are.
   if(!r||!r._http_ok){spacePagesUnavailable(list,'Could not open "'+key+'". '+apiError(r));return}
+  // The user may have left this space's Scratch tab while the read ran: do
+  // not open another space's key in the editor that is now on screen.
+  if(S.get('view')!=='space'||S.get('spaceId')!==sid||S.get('spaceApp')!=='scratch')return;
   currentScratchKey=key;
   scratchError('');
   document.getElementById('scratch-title').textContent=key;
@@ -3598,32 +3617,39 @@ async function editScratchKey(sid,key){
 }
 
 async function saveScratchKey(sid){
+  // Capture the key and value once: the user can open another key while the
+  // requests below are in flight, and the save must still go to this one.
+  const key=currentScratchKey;
   const value=document.getElementById('scratch-value').value;
   scratchError('');
-  if(!currentScratchKey){scratchError('Choose or create a key first.');return}
+  if(!key){scratchError('Choose or create a key first.');return}
   const st=await openSpacePageStore(sid,'scratch');
   if(!st.ok){scratchError(st.reason);return}
   if(!spacePageStoreCurrent(sid,st)){scratchError(SPACE_POLICY_MOVED_BEFORE);return}
-  const r=await api('/stores/'+encSeg(st.id)+'/'+encSeg(currentScratchKey),{method:'PUT',body:JSON.stringify({value:u8encode(value),content_type:'text/plain'})});
+  const r=await api('/stores/'+encSeg(st.id)+'/'+encSeg(key),{method:'PUT',body:JSON.stringify({value:u8encode(value),content_type:'text/plain'})});
   if(!r||!r._http_ok){scratchError('Not saved. '+apiError(r));return}
   if(r._http_status===202&&r.published===false){scratchError('Saved locally; not yet published to the group. '+String(r.reason||''));return}
   if(!spacePageStoreCurrent(sid,st)){scratchError(SPACE_POLICY_MOVED_AFTER_WRITE);return}
-  document.getElementById('scratch-editor').style.display='none';
-  toast('Saved on this device','success');
+  // Close the editor only if it still shows the key that was saved.
+  if(currentScratchKey===key)document.getElementById('scratch-editor').style.display='none';
+  toast('Saved "'+key+'" on this device','success');
   loadScratchKeys(sid);
 }
 
 async function deleteScratchKey(sid){
+  const key=currentScratchKey;
   scratchError('');
-  if(!currentScratchKey)return;
+  if(!key)return;
   const st=await openSpacePageStore(sid,'scratch');
   if(!st.ok){scratchError(st.reason);return}
   if(!spacePageStoreCurrent(sid,st)){scratchError(SPACE_POLICY_MOVED_BEFORE);return}
-  const r=await api('/stores/'+encSeg(st.id)+'/'+encSeg(currentScratchKey),{method:'DELETE'});
+  const r=await api('/stores/'+encSeg(st.id)+'/'+encSeg(key),{method:'DELETE'});
   if(!r||!r._http_ok){scratchError('Not deleted. '+apiError(r));return}
   if(!spacePageStoreCurrent(sid,st)){scratchError(SPACE_POLICY_MOVED_AFTER_WRITE);return}
-  document.getElementById('scratch-editor').style.display='none';
-  currentScratchKey='';
+  if(currentScratchKey===key){
+    document.getElementById('scratch-editor').style.display='none';
+    currentScratchKey='';
+  }
   toast('Deleted on this device','success');
   loadScratchKeys(sid);
 }
@@ -3701,9 +3727,7 @@ async function loadWebPages(sid){
   }
   const keys=(r.keys||[]).map(k=>typeof k==='string'?k:k.key||k);
   if(keys.length>0){
-    el.innerHTML=keys.map(k=>`<div class="card mb" style="cursor:pointer" data-web-sid="${esc(sid)}" data-web-path="${esc(k)}" onclick="previewWebPage(this.dataset.webSid,this.dataset.webPath)">
-      <span style="color:var(--cy)">${esc(k)}</span>
-    </div>`).join('');
+    el.replaceChildren(...keys.map(k=>storeKeyCard(k,'',()=>previewWebPage(sid,k),'inherit')));
     previewWebPage(sid,keys[0]);
   }else{
     el.innerHTML='<div style="color:var(--tx3);font-size:12px">No pages published yet.</div>';

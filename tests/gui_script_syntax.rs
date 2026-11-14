@@ -171,3 +171,86 @@ fn parse_gate_uses_browser_script_grammar() {
          accepted — `node --check` wrongly rejects it as a CommonJS binding"
     );
 }
+
+/// Cut one top-level `function NAME(...){...}` out of the GUI script: from
+/// its `function` keyword to the first line that is exactly `}` (or, for a
+/// one-line function, to the end of that line).
+fn extract_function<'a>(script: &'a str, name: &str) -> &'a str {
+    let start = script
+        .find(&format!("\nfunction {name}("))
+        .map(|i| i + 1)
+        .unwrap_or_else(|| panic!("function {name} not found in the GUI script"));
+    let rest = &script[start..];
+    let first_line_end = rest.find('\n').unwrap_or(rest.len());
+    if rest[..first_line_end].trim_end().ends_with('}') {
+        return &rest[..first_line_end];
+    }
+    let end = rest
+        .find("\n}\n")
+        .unwrap_or_else(|| panic!("function {name} has no closing line"));
+    &rest[..end + 2]
+}
+
+/// WHY (#1893 review, XSS): store keys are written by any group writer and
+/// the GUI holds the API token. A key such as `x" onmouseover="…` or
+/// `<img onerror=…>` must never become markup. `esc()` must escape both
+/// quote kinds as well as `<`, `>` and `&`, and the Scratch/Wiki/Web key
+/// lists must build their cards with DOM calls (label via `textContent`,
+/// handler via a closure), never by putting the key into an HTML string.
+#[test]
+fn issue1094_store_keys_never_become_markup() {
+    let script = extract_main_script(GUI_HTML);
+    let esc = extract_function(script, "esc");
+    let card = extract_function(script, "storeKeyCard");
+    let probe = format!(
+        r#"{esc}
+{card}
+const evil = 'x" onmouseover="alert(1)<img src=x onerror=alert(2)>\'&';
+const out = esc(evil);
+for (const bad of ['"', "'", '<', '>']) {{
+  if (out.includes(bad)) throw new Error('esc left ' + bad + ' in ' + out);
+}}
+if (esc(null) !== '' || esc(undefined) !== '' || esc(0) !== '0') throw new Error('esc defaults changed');
+// A minimal DOM: records how each element is filled.
+const made = [];
+globalThis.document = {{ createElement(tag) {{
+  const el = {{ tag, style: {{}}, children: [], listeners: [], textContent: undefined,
+    set innerHTML(v) {{ throw new Error('storeKeyCard must not set innerHTML: ' + v); }},
+    appendChild(c) {{ this.children.push(c); }},
+    addEventListener(t, f) {{ this.listeners.push([t, f]); }} }};
+  made.push(el); return el; }} }};
+let clicked = null;
+const c = storeKeyCard(evil, 'Click to edit', () => {{ clicked = evil; }});
+if (c.children[0].textContent !== evil) throw new Error('label is not the raw key');
+if (c.listeners.length !== 1 || c.listeners[0][0] !== 'click') throw new Error('no click handler');
+c.listeners[0][1]();
+if (clicked !== evil) throw new Error('handler did not receive the raw key');
+"#
+    );
+    let out = Command::new("node")
+        .arg("-e")
+        .arg(&probe)
+        .output()
+        .expect("node is required for the GUI script gates");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for attr in ["data-wiki-slug=", "data-scratch-key=", "data-web-path="] {
+        assert!(
+            !GUI_HTML.contains(attr),
+            "{attr} is back: a store key is being put into an HTML attribute"
+        );
+    }
+    for list in [
+        "editWikiPage(sid,k)",
+        "editScratchKey(sid,k)",
+        "previewWebPage(sid,k)",
+    ] {
+        assert!(
+            GUI_HTML.contains("storeKeyCard(k,") && GUI_HTML.contains(list),
+            "the key list for {list} must use storeKeyCard"
+        );
+    }
+}
