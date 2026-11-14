@@ -199,3 +199,143 @@ async fn issue1366_restart_keeps_only_the_public_listeners_the_state_needs() -> 
     assert_eq!(live(&secure_stable), 0);
     Ok(())
 }
+
+async fn store_confidentiality(
+    state: &AppState,
+    group_id: &str,
+    confidentiality: x0x::groups::GroupConfidentiality,
+) {
+    if let Some(info) = state.named_groups.write().await.get_mut(group_id) {
+        info.policy.confidentiality = confidentiality;
+    }
+}
+
+/// An install decided while the group was public must not land after a
+/// flip to `MlsEncrypted`. The flip's own reconcile can run before or
+/// after the install's insert; either way no listener may stay.
+#[tokio::test]
+async fn issue1366_install_overtaken_by_a_flip_to_mls_installs_nothing() -> Result<()> {
+    let group_id = "1366-overtaken-install-key";
+    let (state, _dir, stable) =
+        fixture(group_id, x0x::groups::GroupConfidentiality::SignedPublic).await?;
+    // The install passes its checks and parks at the test hook.
+    let install = tokio::spawn(reconcile_public_message_listener_owned(
+        Arc::clone(&state),
+        group_id.to_string(),
+    ));
+    tokio::task::yield_now().await;
+    store_confidentiality(
+        &state,
+        group_id,
+        x0x::groups::GroupConfidentiality::MlsEncrypted,
+    )
+    .await;
+    install.await?;
+    settle().await;
+    assert!(
+        !registered(&state, &stable).await,
+        "#1366: an install overtaken by a flip to MlsEncrypted must not register a listener"
+    );
+    assert_eq!(
+        live(&stable),
+        0,
+        "#1366: and must not leave its task running"
+    );
+    reconcile_public_message_listener(&state, group_id).await;
+    settle().await;
+    assert!(!registered(&state, &stable).await);
+    Ok(())
+}
+
+/// A removal decided while the group was `MlsEncrypted` must not remove the
+/// listener that a later flip back to public installed.
+#[tokio::test]
+async fn issue1366_removal_overtaken_by_a_flip_to_public_keeps_the_listener() -> Result<()> {
+    let group_id = "1366-overtaken-removal-key";
+    let (state, _dir, stable) =
+        fixture(group_id, x0x::groups::GroupConfidentiality::SignedPublic).await?;
+    reconcile_public_message_listener(&state, group_id).await;
+    settle().await;
+    assert!(
+        registered(&state, &stable).await,
+        "baseline: the listener runs"
+    );
+
+    store_confidentiality(
+        &state,
+        group_id,
+        x0x::groups::GroupConfidentiality::MlsEncrypted,
+    )
+    .await;
+    // The removal decides "not wanted" and parks at the test hook.
+    let removal = tokio::spawn(reconcile_public_message_listener_owned(
+        Arc::clone(&state),
+        group_id.to_string(),
+    ));
+    tokio::task::yield_now().await;
+    store_confidentiality(
+        &state,
+        group_id,
+        x0x::groups::GroupConfidentiality::SignedPublic,
+    )
+    .await;
+    reconcile_public_message_listener(&state, group_id).await;
+    removal.await?;
+    settle().await;
+    assert!(
+        registered(&state, &stable).await && live(&stable) == 1,
+        "#1366: an overtaken removal must not stop the listener a SignedPublic group needs"
+    );
+    Ok(())
+}
+
+/// A remote `PolicyUpdated` (the listener apply both transports use) moves
+/// the public listener with no restart.
+#[tokio::test]
+async fn issue1366_remote_policy_update_starts_the_public_listener() -> Result<()> {
+    let group_id = "1366-remote-policy-key";
+    let (state, _dir, stable) =
+        fixture(group_id, x0x::groups::GroupConfidentiality::MlsEncrypted).await?;
+    ensure_named_group_listeners(Arc::clone(&state), group_id).await;
+    settle().await;
+    assert!(!registered(&state, &stable).await, "no public listener yet");
+
+    let parent = state
+        .named_groups
+        .read()
+        .await
+        .get(group_id)
+        .cloned()
+        .context("fixture record")?;
+    let mut next = parent.clone();
+    next.policy.confidentiality = x0x::groups::GroupConfidentiality::SignedPublic;
+    next.policy_revision = next.policy_revision.saturating_add(1);
+    let event = NamedGroupMetadataEvent::PolicyUpdated {
+        group_id: parent.stable_group_id().to_string(),
+        revision: next.policy_revision,
+        actor: hex::encode(state.agent.agent_id().as_bytes()),
+        policy: next.policy.clone(),
+        commit: Some(sign_metadata_terminality_commit(
+            &parent,
+            &next,
+            &state,
+            now_millis_u64(),
+        )),
+    };
+    let applied =
+        apply_listener_metadata_event(&state, event, state.agent.agent_id(), true, None).await;
+    assert!(
+        applied.as_ref().is_some_and(|result| result.accepted),
+        "the signed PolicyUpdated applies"
+    );
+    settle().await;
+    assert!(
+        registered(&state, &stable).await && live(&stable) == 1,
+        "#1366: a remote flip to SignedPublic starts the public listener without a restart"
+    );
+    Ok(())
+}
+
+async fn reconcile_public_message_listener_owned(state: Arc<AppState>, group_id: String) {
+    reconcile_public_message_listener(&state, &group_id).await;
+}
