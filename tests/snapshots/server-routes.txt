@@ -19,7 +19,7 @@ PUT  /stores/:id/:key                                    store put              
 GET  /stores/:id/:key                                    store get                                               Get value from store
 DELETE  /stores/:id/:key                                    store rm                                                Remove key from store
 GET  /agent                                              agent                                                   Agent identity info
-POST  /announce                                           announce                  body: include_user_identity,human_consent  Announce identity to network
+POST  /announce                                           announce                  body: include_user_identity,human_consent,withdraw_consent  Announce identity to network
 GET  /agent/user-id                                      agent user-id                                           Current agent user ID
 GET  /agent/card                                         agent card                query: display_name,include_groups,include_local_addresses  Generate shareable identity card
 GET  /introduction                                       agent introduction        query: peer                   Introduction card with trust-scoped disclosure
@@ -134,6 +134,7 @@ POST  /agents/connect                                     direct connect        
 POST  /machines/connect                                   machines connect          body: machine_id              Connect to machine
 POST  /direct/send                                        direct send               body: agent_id,payload,prefer_raw_quic_if_connected,raw_quic_receive_ack_ms,stop_fallback_on_raw_error,require_gossip,require_ack_ms,require_durable_app_ack,logical_id  Send direct message
 GET  /direct/connections                                 direct connections                                      List direct connections
+GET  /direct/receipts/:logical_id                        direct receipt            query: agent_id               Durable send outcome by logical_id (delivered, delivered_late, pending, unknown)
 GET  /direct/events                                      direct events             query: backfill               Stream direct messages
 POST  /calls                                              call                      body: agent_id,video          Ring an agent (audio, optionally video); callee must pass trust and connect-ACL gates
 GET  /calls                                              call list                                               List calls with gate and lifecycle counters
@@ -222,4 +223,4 @@ DELETE  /names/pins/:name                                   names unpin         
 POST  /names/accept                                       names accept              body: label                   Apply a pending grant-names suggestion (ADR 0079)
 DELETE  /names/suggestions/:label                           names dismiss                                           Drop a pending grant-names suggestion
 
-221 endpoints total
+222 endpoints total

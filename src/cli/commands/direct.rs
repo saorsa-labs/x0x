@@ -76,6 +76,19 @@ pub async fn connections(client: &DaemonClient) -> Result<()> {
     client.run_get("/direct/connections").await
 }
 
+/// `x0x direct receipt` — GET /direct/receipts/{logical_id}?agent_id=...
+///
+/// #1109: reports what this daemon knows about a durable send made under
+/// `logical_id` to `agent_id`: `delivered`, `delivered_late`, `pending` or
+/// `unknown`. A logical id uses only `[a-z0-9-_.:]`, so it needs no escaping
+/// in the path.
+pub async fn receipt(client: &DaemonClient, logical_id: &str, agent_id: &str) -> Result<()> {
+    let path = format!("/direct/receipts/{logical_id}");
+    let resp = client.get_query(&path, &[("agent_id", agent_id)]).await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
 /// `x0x direct events` — stream GET /direct/events
 pub async fn events(client: &DaemonClient, backfill: Option<usize>) -> Result<()> {
     client.ensure_running().await?;
