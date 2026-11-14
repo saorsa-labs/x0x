@@ -763,6 +763,35 @@ async fn issue1840_outcome_send_limits() {
     );
 }
 
+/// A reason that a later daemon adds. The requester stores it as
+/// `unknown`, which is terminal, and does not offer the envelope again.
+#[tokio::test]
+async fn issue1840_unknown_reason_is_stored_as_terminal() {
+    let pair = pair(0x1840_0450).await;
+    let (entry, payload) = refused_offer(&pair, StaleCommit::StubRoster).await;
+    let body = String::from_utf8(payload).expect("utf-8 outcome");
+    assert!(body.contains(r#""reason":"stale""#), "fixture: {body}");
+    let later = body
+        .replace(r#""reason":"stale""#, r#""reason":"from_the_future""#)
+        .into_bytes();
+    deliver_to_requester(&pair, pair.owner.agent.agent_id(), later, true).await;
+
+    let refusal = recorded_refusal(&pair).await.expect("refusal recorded");
+    assert_eq!(refusal.reason, "unknown");
+    assert!(!refusal.retryable);
+    let shown = own_join_request(&pair).await;
+    assert_eq!(shown["status"], "refused", "{shown}");
+    assert_eq!(shown["refusal"]["reason"], "unknown");
+    assert_eq!(shown["refusal"]["retryable"], false);
+    assert_eq!(
+        find_requester_offer(&pair.requester, &pair.gk, REQUEST_ID)
+            .await
+            .expect("the offer obligation is kept")
+            .digest,
+        entry.digest
+    );
+}
+
 /// After a refusal the client cancels the request and files a new one.
 /// The refused obligation is dropped and the new request starts clean.
 #[tokio::test]

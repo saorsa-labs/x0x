@@ -18818,6 +18818,9 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // is only for what the envelope alone decides (above, and the
             // structural checks of the validator), or for validator checks
             // that run after the revision and the chain matched.
+            // The request-id row below is for direct callers only: the
+            // listener classes an offer whose request id the roster holds
+            // as a repair before it applies, and sends no outcome for it.
             if info.has_active_member(&requester_agent_id) {
                 return ApplyMetadataResult::refused(Reason::AlreadyMember);
             }
