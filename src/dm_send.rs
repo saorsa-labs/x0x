@@ -667,7 +667,9 @@ fn gossip_publish_receipt(request_id: [u8; 16], retries_used: u8) -> DmReceipt {
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         if !self.resolved {
-            self.inflight.cancel(&self.request_id);
+            // #1109: a durable waiter leaves a tombstone, so an ACK that
+            // arrives after this send gave up is still recorded.
+            self.inflight.abandon(&self.request_id);
         }
     }
 }
@@ -929,6 +931,38 @@ mod tests {
             let _guard = InFlightGuard::new(Arc::clone(&inflight), request_id);
         }
         assert_eq!(inflight.outstanding(), 0);
+    }
+
+    /// #1109: dropping the guard of an unresolved durable send (budget spent
+    /// or the send future dropped by an outer deadline) leaves a tombstone,
+    /// so a late v2 ACK is recorded instead of discarded.
+    #[test]
+    fn issue1109_inflight_guard_drop_keeps_a_durable_tombstone() {
+        let inflight = Arc::new(InFlightAcks::new());
+        let request_id = [0x8a; 16];
+        let recipient = AgentId([0x77; 32]);
+        let machine = crate::identity::MachineId([0x78; 32]);
+        let _rx = inflight.register_for_protocol(
+            request_id,
+            crate::dm::DM_PROTOCOL_DURABLE_ACK,
+            recipient,
+            Some(machine),
+        );
+        {
+            let _guard = InFlightGuard::new(Arc::clone(&inflight), request_id);
+        }
+        assert_eq!(inflight.outstanding(), 0);
+        assert!(!inflight.resolve_for_protocol(
+            &request_id,
+            crate::dm::DM_PROTOCOL_DURABLE_ACK,
+            recipient,
+            machine,
+            DmAckOutcome::Accepted,
+        ));
+        assert_eq!(
+            inflight.receipt_status(&request_id),
+            crate::dm::DmReceiptStatus::DeliveredLate
+        );
     }
 
     #[test]

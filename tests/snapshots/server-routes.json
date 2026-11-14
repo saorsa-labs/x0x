@@ -96,6 +96,12 @@
           "in": "body",
           "name": "human_consent",
           "required": false
+        },
+        {
+          "cli": "--withdraw-consent",
+          "in": "body",
+          "name": "withdraw_consent",
+          "required": false
         }
       ],
       "kind": "fields"
@@ -1821,6 +1827,24 @@
     "category": "direct",
     "request": {
       "kind": "none"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/direct/receipts/:logical_id",
+    "cli_name": "direct receipt",
+    "description": "Durable send outcome by logical_id (delivered, delivered_late, pending, unknown)",
+    "category": "direct",
+    "request": {
+      "fields": [
+        {
+          "cli": "AGENT_ID",
+          "in": "query",
+          "name": "agent_id",
+          "required": true
+        }
+      ],
+      "kind": "fields"
     }
   },
   {

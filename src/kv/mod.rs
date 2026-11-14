@@ -45,5 +45,5 @@ pub use store::{
     key_agent_prefix, AccessPolicy, AnchorChannel, KvStore, KvStoreId, OwnershipSource,
     OwnershipStatus, MAX_SELFKEYED_BYTES_PER_AGENT, MAX_SELFKEYED_KEYS_PER_AGENT,
 };
-pub use sync::KvStoreSync;
+pub use sync::{KvChangeOrigin, KvStoreChanged, KvStoreSync};
 pub use treekem::{SharedTreeKemKvProtector, TreeKemKvProtector, TreeKemKvStoreRecordV1};

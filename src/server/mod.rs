@@ -29,6 +29,7 @@ mod gui_show_remote;
 /// registry — the ERROR-event count is the verdict's log input.
 pub mod health_verdict;
 mod instance_lock;
+mod kv_change_events;
 mod legacy_store_migration;
 pub(crate) mod reseat_scope;
 mod rider_auth;
@@ -78,13 +79,13 @@ use routes::{
     create_discovery_subscription, create_group_invite, create_group_kv_store, create_join_request,
     create_kv_store, create_mls_group, create_mls_welcome, create_named_group, create_task_list,
     daemon_shutdown_hook, delete_contact, delete_discovery_subscription, delete_kv_value,
-    delete_machine, direct_connections, direct_message_send_config, direct_send, discover_groups,
-    discover_groups_nearby, discovered_agent, discovered_agents, discovered_machine,
-    discovered_machines, dispatch_join_result_message, dispatch_welcome_blob_message,
-    dm_diagnostics, enroll_device, ensure_named_group_listeners, evaluate_trust, exec_cancel,
-    exec_diagnostics, exec_run, exec_sessions, file_accept_handler, file_reject_handler,
-    file_send_handler, file_transfer_status_handler, file_transfers_handler, find_agent,
-    forward_add, forward_list, forward_remove, get_a2a_agent_card, get_agent_card,
+    delete_machine, direct_connections, direct_message_send_config, direct_receipt, direct_send,
+    discover_groups, discover_groups_nearby, discovered_agent, discovered_agents,
+    discovered_machine, discovered_machines, dispatch_join_result_message,
+    dispatch_welcome_blob_message, dm_diagnostics, enroll_device, ensure_named_group_listeners,
+    evaluate_trust, exec_cancel, exec_diagnostics, exec_run, exec_sessions, file_accept_handler,
+    file_reject_handler, file_send_handler, file_transfer_status_handler, file_transfers_handler,
+    find_agent, forward_add, forward_list, forward_remove, get_a2a_agent_card, get_agent_card,
     get_constitution, get_constitution_json, get_group_card, get_group_join_status,
     get_group_public_messages, get_group_state, get_group_state_commits, get_kv_value,
     get_mls_group, get_named_group, get_named_group_members, get_onboard, get_profile,
@@ -1430,6 +1431,9 @@ pub async fn serve_with_options(
         upgrade_check_cache: Mutex::new(None),
         upgrade_apply_lock: Arc::new(Mutex::new(())),
         http_upgrade_wait_lock: Arc::new(Mutex::new(())),
+        self_published_release_manifests: Arc::new(Mutex::new(
+            SelfPublishedReleaseManifests::default(),
+        )),
         #[cfg(unix)]
         upgrade_staging,
         api_token,
@@ -2031,6 +2035,8 @@ pub async fn serve_with_options(
     // Phase E: subscribe to a stable global SignedPublic message fallback so
     // first messages are not dependent on a brand-new per-group topic tree.
     bg_tasks.extend(spawn_global_public_message_listener(Arc::clone(&state)).await);
+    // #1094: `kv:changed` SSE events from the agent's KV change notices.
+    bg_tasks.push(kv_change_events::spawn(Arc::clone(&state)));
 
     // Invite-auth #468/#469 (design v6 E2d / v7 F1): the member-certificate
     // bridge. `cert_events_rx` was subscribed before the AppState groups
@@ -2167,8 +2173,7 @@ pub async fn serve_with_options(
         routes::named_groups::retry_treekem_start_catchup(&join_rekey_state);
     }));
 
-    let self_published_release_manifests =
-        Arc::new(Mutex::new(SelfPublishedReleaseManifests::default()));
+    let self_published_release_manifests = Arc::clone(&state.self_published_release_manifests);
 
     // Reclaim upgrade debris left by previous failed/interrupted attempts:
     // orphaned `.x0x-upgrade-*` temp dirs and `*.x0xold-*` sidelined binaries.
@@ -3275,6 +3280,7 @@ pub async fn serve_with_options(
         .route("/agents/connect", post(connect_agent))
         .route("/direct/send", post(direct_send))
         .route("/direct/connections", get(direct_connections))
+        .route("/direct/receipts/:logical_id", get(direct_receipt))
         .route("/direct/events", get(direct_events_sse))
         // MLS group encryption endpoints
         .route("/mls/groups", post(create_mls_group))
