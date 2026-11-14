@@ -8557,7 +8557,7 @@ impl Agent {
         &self,
         renewal: &identity::AgentCertificate,
     ) -> error::Result<CertificateRenewalAdoption> {
-        // No path means no user identity, so no certificate to renew.
+        // No path means no certificate in use, so none to renew.
         let Some(path) = self.agent_cert_path.as_deref() else {
             return Ok(CertificateRenewalAdoption::Refused(
                 identity::CertificateRenewalRefusal::NoCurrentCertificate,
@@ -24377,25 +24377,18 @@ fn schedule_reconnect(
 }
 
 /// The owner-issued certificate a certificate-only device (no user key)
-/// loads from `path`: test builds only (W3-H, #1572), and only when it
-/// verifies and binds `agent`. Production keeps loading `agent.cert` only
-/// beside the user key, so this is always `None` there.
-#[cfg(test)]
+/// loads from `path` (#1860, A02): only when it binds `agent` and its owner
+/// signature verifies. Any other file (another agent's certificate, a bad
+/// signature, unreadable bytes) is ignored, and the device runs with no
+/// user identity. An expired certificate still loads, so that a renewal
+/// from the owner can replace it ([`Agent::adopt_own_certificate_renewal`]).
 async fn certificate_only_cert(
-    path: Option<&std::path::Path>,
+    path: &std::path::Path,
     agent: &identity::AgentKeypair,
 ) -> Option<identity::AgentCertificate> {
-    let cert = storage::load_agent_certificate_from(path?).await.ok()?;
+    let cert = storage::load_agent_certificate_from(path).await.ok()?;
     let binds_agent = cert.agent_id().is_ok_and(|id| id == agent.agent_id());
     (binds_agent && cert.verify().is_ok()).then_some(cert)
-}
-
-#[cfg(not(test))]
-async fn certificate_only_cert(
-    _path: Option<&std::path::Path>,
-    _agent: &identity::AgentKeypair,
-) -> Option<identity::AgentCertificate> {
-    None
 }
 
 impl AgentBuilder {
@@ -24879,10 +24872,19 @@ impl AgentBuilder {
             cert_journal_path = journal_path;
             identity::Identity::new_with_user(machine_keypair, agent_keypair, user_kp, cert)
         } else {
-            let certificate_only =
-                certificate_only_cert(self.agent_cert_path.as_deref(), &agent_keypair).await;
+            // #1860: a device without the user key runs on an owner-issued
+            // certificate when one binds this agent. Only an explicit
+            // certificate path is read (x0xd always sets one): a library
+            // agent on default paths never picks up a host-wide file.
+            let cert_path = self.agent_cert_path.clone();
+            let certificate_only = match cert_path.as_deref() {
+                Some(p) => certificate_only_cert(p, &agent_keypair).await,
+                None => None,
+            };
             match certificate_only {
                 Some(cert) => {
+                    // The path lets a renewal from the owner replace it.
+                    agent_cert_path = cert_path;
                     identity::Identity::new_with_certificate(machine_keypair, agent_keypair, cert)
                 }
                 None => identity::Identity::new(machine_keypair, agent_keypair),
@@ -29364,21 +29366,33 @@ mod tests {
         agent.shutdown().await;
     }
 
-    /// W3-H (#1572): a test build loads an owner-issued `agent.cert` with
-    /// no user key only when it binds this agent; the announce then names
-    /// the certificate's issuer.
+    /// #1860 (W3-H #1572): a device with no user key loads an
+    /// owner-issued `agent.cert` only when it binds this agent and its
+    /// signature verifies; the announce then names the certificate's
+    /// issuer, and the path is kept so a renewal can replace it. A
+    /// certificate for another agent, or one with a bad signature, is
+    /// ignored.
     #[tokio::test]
     async fn certificate_only_device_loads_its_own_certificate() {
         let owner = identity::UserKeypair::generate().expect("owner user key");
         let agent_kp = identity::AgentKeypair::generate().expect("agent key");
         let other = identity::AgentKeypair::generate().expect("other agent key");
-        for (issued_to, loads) in [(&agent_kp, true), (&other, false)] {
+        for (issued_to, bad_signature, loads) in [
+            (&agent_kp, false, true),
+            (&other, false, false),
+            (&agent_kp, true, false),
+        ] {
             let dir = tempfile::tempdir().expect("tempdir");
             let cert_path = dir.path().join("agent.cert");
             let cert = identity::AgentCertificate::issue(&owner, issued_to).expect("issue");
-            storage::save_agent_certificate_to(&cert, cert_path.clone())
-                .await
-                .expect("save cert");
+            let mut bytes = cert.to_storage_bytes().expect("encode cert");
+            if bad_signature {
+                // The last signature byte (a v1 certificate ends with its
+                // signature, then the 8-byte issue time).
+                let at = bytes.len() - 9;
+                bytes[at] ^= 0x01;
+            }
+            std::fs::write(&cert_path, &bytes).expect("save cert");
             storage::save_agent_keypair_to(&agent_kp, dir.path().join("agent.key"))
                 .await
                 .expect("save agent key");
@@ -29394,6 +29408,11 @@ mod tests {
             let identity = agent.identity();
             assert_eq!(identity.user_id(), None, "no user key: not the owner");
             assert_eq!(identity.agent_certificate().is_some(), loads);
+            assert_eq!(
+                agent.agent_cert_path.is_some(),
+                loads,
+                "a renewal can replace only a loaded certificate"
+            );
             let disclosed = loads.then(|| owner.user_id());
             assert_eq!(identity.disclosed_user_id(), disclosed);
             // The blob responder serves the pair the announce advertises
