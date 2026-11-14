@@ -1399,6 +1399,7 @@ pub async fn serve_with_options(
             routes::named_groups::TREEKEM_CATCHUP_SERVE_SLOTS,
         )),
         treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
+        treekem_start_catchup_pending: Default::default(),
         treekem_catchup_refusals: StdMutex::new(HashMap::new()),
         join_request_outcome_sends: StdMutex::new(HashMap::new()),
         group_membership_locks: RwLock::new(HashMap::new()),
@@ -2161,6 +2162,9 @@ pub async fn serve_with_options(
                 tracing::error!("Failed to join network: {e}");
             }
         }
+        // #1427: a start catch-up that ran during a slow bootstrap asks
+        // again now that the join has ended.
+        routes::named_groups::retry_treekem_start_catchup(&join_rekey_state);
     }));
 
     let self_published_release_manifests =

@@ -1304,6 +1304,10 @@ pub(super) struct AppState {
     /// task runs; each later observation updates the entry.
     pub(super) treekem_epoch_ahead_targets:
         Mutex<HashMap<String, crate::server::routes::named_groups::EpochAheadTarget>>,
+    /// #1427: the keys of the TreeKEM groups whose start catch-up has not
+    /// succeeded since an outage past the last metadata resend. The
+    /// outage record on disk stays until this set is empty.
+    pub(super) treekem_start_catchup_pending: std::sync::Mutex<std::collections::HashSet<String>>,
     /// #1657 (ADR 0110 §3): the latest typed TreeKEM catch-up refusal
     /// this daemon received, per group, keyed by the group id its own
     /// request used. Surfaced in the operator log at receive time and

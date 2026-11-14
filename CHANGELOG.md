@@ -30,6 +30,17 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **A TreeKEM member that was down past the last metadata resend asks for
+  the commits it missed after it starts (#1427).** With no later traffic,
+  such a member stayed at its old epoch. When its last recorded up time is
+  more than 60 s old, the daemon asks the other members of each TreeKEM
+  group for a catch-up page at start, and again when the network join ends,
+  so a slow bootstrap does not end the catch-up. Two new local files are in
+  the data directory: `treekem-alive` (the last up time, written every 15 s)
+  and `treekem-catchup-pending` (the outage record, kept until each group's
+  catch-up succeeds, so the next start asks again). A first start and a
+  shorter outage ask nothing. No wire format or API changes.
+
 - **The consent to disclose the user identity now survives a restart (#1107).**
   A successful `POST /announce` with `include_user_identity: true` and
   `human_consent: true` writes `user-consent.bin` (mode `0600`) in the

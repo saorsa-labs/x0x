@@ -79,9 +79,13 @@ Amendment of 14 Nov 2026 (#1427), made under the design delegation of
 metadata resend (60 s) can have missed a commit, and with no later
 traffic nothing else asks for it. After its start, such a member asks the
 other members of each TreeKEM group for a catch-up page, on the bounded
-epoch-ahead rounds. The daemon records its up time every 15 s to measure
-the outage. A first start and a shorter outage ask nothing, since the
-resends cover them. Each served page goes through the usual response
+epoch-ahead rounds, as the group's one epoch-ahead task. It asks again
+when the network join ends, since the start rounds can end before a slow
+bootstrap reaches a member. The daemon records its up time every 15 s to
+measure the outage, and keeps an outage record until each group's
+catch-up succeeds (its epoch moves, or a member reports the local head),
+so the next start asks again. A first start and a shorter outage ask
+nothing, since the resends cover them. Each served page goes through the usual response
 checks. Not covered yet: a member that stays up through a network
 outage, and a serving node that restarted since the commit (its catch-up
 log is in memory). A saved log must not serve a commit that S4 still
