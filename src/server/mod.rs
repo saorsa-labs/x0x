@@ -29,6 +29,7 @@ mod gui_show_remote;
 /// registry — the ERROR-event count is the verdict's log input.
 pub mod health_verdict;
 mod instance_lock;
+mod kv_change_events;
 mod legacy_store_migration;
 pub(crate) mod reseat_scope;
 mod rider_auth;
@@ -2023,6 +2024,9 @@ pub async fn serve_with_options(
     // Phase E: subscribe to a stable global SignedPublic message fallback so
     // first messages are not dependent on a brand-new per-group topic tree.
     bg_tasks.extend(spawn_global_public_message_listener(Arc::clone(&state)).await);
+    // #1094: `kv:changed` / `task:changed` SSE events from the agent's
+    // KV and task-list change notices.
+    bg_tasks.extend(kv_change_events::spawn(Arc::clone(&state)));
 
     // Invite-auth #468/#469 (design v6 E2d / v7 F1): the member-certificate
     // bridge. `cert_events_rx` was subscribed before the AppState groups
