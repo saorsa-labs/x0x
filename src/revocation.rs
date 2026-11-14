@@ -263,6 +263,11 @@ impl RevocationRecord {
         revoked_at: u64,
         reason: Option<String>,
     ) -> Result<Self, IdentityError> {
+        if !reason_within_limit(&reason) {
+            return Err(IdentityError::Revocation(format!(
+                "reason is longer than {MAX_REVOCATION_REASON_BYTES} bytes"
+            )));
+        }
         let issuer_pub_bytes = issuer_public_key.as_bytes().to_vec();
         let message = Self::canonical_message(&subject, &issuer_pub_bytes, revoked_at, &reason);
         let signature = sign_with_ml_dsa(issuer_secret_key, &message).map_err(|e| {
@@ -435,14 +440,59 @@ impl RevocationRecord {
     }
 
     /// SHA-256 of the issuer public key bytes, for compact display in REST
-    /// responses.  This is deterministic given the issuer keypair and matches
-    /// the AgentId/MachineId derivation when the issuer is self-revoking.
+    /// responses. This is a plain SHA-256 with no domain separator, so it is
+    /// NOT equal to the issuer's AgentId, MachineId or UserId.
     #[must_use]
     pub fn issuer_public_key_hash(&self) -> [u8; 32] {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(&self.issuer_public_key);
         hasher.finalize().into()
+    }
+
+    /// The `(subject, issuer)` pair of this record, as one key (#1857).
+    ///
+    /// `None` for a share-grant subject: those records are collected when
+    /// the grant ends, and the set keeps every one of them.
+    pub(crate) fn pair_key(&self) -> Option<[u8; 32]> {
+        if matches!(self.subject, RevokedSubject::ShareGrant(_)) {
+            return None;
+        }
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"x0x-revocation-pair-v1");
+        hasher.update(&[self.subject.tag()]);
+        match self.subject.binding_subject_bytes() {
+            Some(bytes) => hasher.update(&bytes),
+            None => hasher.update(self.subject.id_bytes()),
+        };
+        hasher.update(&self.issuer_public_key);
+        Some(*hasher.finalize().as_bytes())
+    }
+
+    /// The order between two records of one pair (#1857). The lower key
+    /// is kept.
+    ///
+    /// 1. A record whose `revoked_at` is credible comes before one that is
+    ///    far in the future. [`RevocationSet::drop_future_records`]
+    ///    removes a far-future record, so such a record must never take
+    ///    the place of a credible one: the subject would then have no
+    ///    record at all.
+    /// 2. A record whose reason is inside the limit comes before one whose
+    ///    reason is over it (a legacy record), so that a node keeps, and
+    ///    sends again, a record that every peer accepts.
+    /// 3. The earlier `revoked_at`, and for equal times the lower record
+    ///    hash.
+    ///
+    /// Keys 2 and 3 come from the signed bytes. Key 1 also reads the local
+    /// clock; nodes agree on it except within the clock allowance of the
+    /// moment a far-future time is reached.
+    fn rank(&self) -> RecordRank {
+        (
+            !self.revoked_at_is_credible(unix_now_secs()),
+            !reason_within_limit(&self.reason),
+            self.revoked_at,
+            self.record_hash(),
+        )
     }
 
     /// BLAKE3 hash of the canonical (signed) message, used for de-duplication.
@@ -476,11 +526,120 @@ struct PersistedRevocation {
     subject_cert: Option<AgentCertificate>,
 }
 
+/// The order key of a record inside its pair: `(revoked_at not credible,
+/// reason over the limit, revoked_at, record hash)`. The lower key is kept.
+type RecordRank = (bool, bool, u64, [u8; 32]);
+
+/// Unix seconds now; 0 when the clock is before the epoch.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// A subject that a key can revoke for itself (#1863).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SeenSubject {
+    /// An agent id.
+    Agent(AgentId),
+    /// A machine id.
+    Machine(MachineId),
+}
+
+impl SeenSubject {
+    pub(crate) fn of(subject: &RevokedSubject) -> Option<Self> {
+        match subject {
+            RevokedSubject::Agent(agent) => Some(Self::Agent(*agent)),
+            RevokedSubject::Machine(machine) => Some(Self::Machine(*machine)),
+            RevokedSubject::AgentMachineBinding(_) | RevokedSubject::ShareGrant(_) => None,
+        }
+    }
+}
+
+/// One trusted sender's carrier snapshot while a carrier waits for a
+/// resync (#1116).
+#[derive(Debug, Clone, Default)]
+struct SnapshotCandidate {
+    /// A complete snapshot: one unmarked batch, or every batch of one
+    /// marked round with a matching set digest (#1857). Pair key (record
+    /// hash for a share grant) → rank of the record this set would keep.
+    whole: Option<HashMap<[u8; 32], RecordRank>>,
+    /// The `set` of the round that gave `whole`; `None` when `whole` came
+    /// from an unmarked batch. A repeat of the same round keeps `whole`.
+    whole_set: Option<[u8; 32]>,
+    /// The one open round of this sender for this carrier.
+    round: Option<OpenRound>,
+}
+
+impl SnapshotCandidate {
+    fn offers(&self, hash: &[u8; 32]) -> bool {
+        self.whole
+            .as_ref()
+            .is_some_and(|kept| kept.values().any(|(_, _, _, held)| held == hash))
+            || self
+                .round
+                .as_ref()
+                .is_some_and(|round| round.parts.values().any(|part| part.hashes.contains(hash)))
+    }
+}
+
+/// The batches seen so far of one marked round.
+#[derive(Debug, Clone)]
+struct OpenRound {
+    set: [u8; 32],
+    batches: u32,
+    parts: HashMap<u32, RoundPart>,
+    /// When the last part arrived. A round that gets no part for
+    /// [`OPEN_ROUND_TIMEOUT`] is dropped when the next part arrives.
+    last_part: std::time::Instant,
+}
+
+/// How long an open round is kept with no new part.
+const OPEN_ROUND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// One batch of a marked round.
+#[derive(Debug, Clone)]
+struct RoundPart {
+    /// Record hashes of the batch, sorted.
+    hashes: Vec<[u8; 32]>,
+    offered: Vec<([u8; 32], RecordRank)>,
+}
+
+/// The pair-rule view of a list of records: pair key (record hash for a
+/// share grant) → rank of the record that is kept.
+fn kept_of(
+    offered: impl IntoIterator<Item = ([u8; 32], RecordRank)>,
+) -> HashMap<[u8; 32], RecordRank> {
+    let mut kept: HashMap<[u8; 32], RecordRank> = HashMap::new();
+    for (key, rank) in offered {
+        match kept.get(&key) {
+            Some(held) if *held <= rank => {}
+            _ => {
+                kept.insert(key, rank);
+            }
+        }
+    }
+    kept
+}
+
+fn kept_hashes(kept: &HashMap<[u8; 32], RecordRank>) -> HashSet<[u8; 32]> {
+    kept.values().map(|(_, _, _, hash)| *hash).collect()
+}
+
+/// Whether `reason` is inside [`MAX_REVOCATION_REASON_BYTES`].
+fn reason_within_limit(reason: &Option<String>) -> bool {
+    reason
+        .as_ref()
+        .is_none_or(|reason| reason.len() <= MAX_REVOCATION_REASON_BYTES)
+}
+
 /// In-memory grow-only set of verified revocations.
 ///
 /// Maintains `HashSet`s of revoked agent/machine ids for O(1) gate checks plus
-/// a hash-keyed map of the full records for rebroadcast. Records are only ever
-/// added; there is no removal (no un-revocation).
+/// a hash-keyed map of the full records for rebroadcast. An agent, machine or
+/// binding record is never removed because of its age (no un-revocation,
+/// #1108); see [`RevocationSet::collect_dead_records`].
 ///
 /// Every record in the set has passed [`RevocationRecord::verify_authority`] —
 /// both on first receipt and again when reloaded from disk. Insertion therefore
@@ -492,13 +651,25 @@ pub struct RevocationSet {
     revoked_agents: HashSet<AgentId>,
     revoked_machines: HashSet<MachineId>,
     records_by_hash: HashMap<[u8; 32], PersistedRevocation>,
+    /// The one record held for each `(subject, issuer)` pair of an agent,
+    /// machine or binding subject (#1857): pair key → record hash. Kept in
+    /// step with `records_by_hash`.
+    pair_index: HashMap<[u8; 32], [u8; 32]>,
+    /// Makes "read the set, encode it, publish every batch" one step for
+    /// the agent that owns this set (#1857). A set that needs several
+    /// batches is a round, named by the digest of the set. Two publishers
+    /// at once (the heartbeat and a new revocation) would send parts of
+    /// two rounds mixed together, and a peer that waits for a resync
+    /// would drop each round when a part of the other arrives. Not
+    /// serialized.
+    publish_lock: Arc<tokio::sync::Mutex<()>>,
     /// ADR-0043 tombstone epochs from ad-hoc binding `RevocationRecord`s
-    /// (`x0x.revocation.v2` carrier). Grow-only; never TTL-swept.
+    /// (`x0x.revocation.v2` carrier). Grow-only; never swept.
     binding_epochs: HashMap<(AgentId, MachineId), u64>,
     /// ADR-0043 tombstone epochs unioned from VERIFIED
     /// `ActivationBundle.retired_bindings` sets (owner-covered by the
     /// bundle signature — not standalone records). Grow-only, order-
-    /// independent; never TTL-swept. Both maps feed
+    /// independent; never swept. Both maps feed
     /// [`Self::is_binding_revoked`].
     bundle_retired_epochs: HashMap<(AgentId, MachineId), u64>,
     /// Ad-hoc binding tombstones indexed by agent (#1659). Kept in step
@@ -507,12 +678,20 @@ pub struct RevocationSet {
     /// Bundle-retired tombstones indexed by agent (#1659). Kept in step
     /// with `bundle_retired_epochs` keys.
     bundle_machines_by_agent: HashMap<AgentId, HashSet<MachineId>>,
+    /// Subjects of held self-revocations that this node has a
+    /// relationship with (#1863): this node itself, a Known or Trusted
+    /// contact, an agent or enrolled machine of this owner, or an active
+    /// member of an approval-only group that this node is in. A
+    /// self-revocation of any other subject (a stranger) stays in force
+    /// here but is not published again. Only subjects with a held
+    /// self-revocation are kept. Not serialized: after a restart the
+    /// daemon marks again the subjects that still have a relationship.
+    seen_subjects: HashSet<SeenSubject>,
     /// ADR-0070 revoked share grants, keyed by `(grant_id, owner)`, valued
-    /// by the latest signed `grant_expiry`. Not swept by the 90-day TTL (a
-    /// grant can outlive it); collected once the grant itself is dead
+    /// by the latest signed `grant_expiry`. Collected once the grant itself is dead
     /// (`grant_expiry + SHARE_GRANT_REVOCATION_GC_SLACK_SECS`).
     revoked_share_grants: HashMap<([u8; 32], UserId), u64>,
-    /// Monotonic change counter — incremented on every insert or expiry.
+    /// Monotonic change counter — incremented on every insert or collection.
     /// Publishers compare this to decide whether the set changed since
     /// their last full broadcast (the on-change piggyback gate), avoiding
     /// a full `all_records` comparison per heartbeat.
@@ -530,7 +709,7 @@ pub struct RevocationSet {
     /// Remote snapshots offered for a waiting carrier. Index 0 is v1, 1 is
     /// v2, 2 is v3. The key is the sending agent. Ordinary ingestion does
     /// not write this map and does not open the carrier.
-    resync_candidates: [HashMap<AgentId, HashSet<[u8; 32]>>; 3],
+    resync_candidates: [HashMap<AgentId, SnapshotCandidate>; 3],
     /// Carriers whose verified resync has not been written to the live path.
     rebuild_pending: u8,
     /// Set when the quarantine rename failed. Status then says the live
@@ -684,7 +863,7 @@ pub(crate) fn encode_revocation_batch(
     Ok(out)
 }
 
-/// Decode a revocation batch in either framing.
+/// Decode a revocation batch in either framing, without its round marker.
 ///
 /// In a framed batch, a record with a subject variant this node does not
 /// know is skipped, counted and logged; every other record is kept, so
@@ -692,11 +871,36 @@ pub(crate) fn encode_revocation_batch(
 /// malformed record refuses the whole batch. A legacy batch decodes as a
 /// whole, as before; an unknown variant in it is counted and logged.
 ///
+/// A round-marker record (#1857) is not a revocation. It is removed here,
+/// so no ingest path sees one.
+///
 /// # Errors
 /// [`crate::wire_compat::WireDecodeError`].
 pub(crate) fn decode_revocation_batch(
     payload: &[u8],
 ) -> Result<Vec<RevocationRecord>, WireDecodeError> {
+    decode_revocation_batch_with_round(payload).map(|(records, _)| records)
+}
+
+/// [`decode_revocation_batch`], and what the batch says about its round.
+///
+/// # Errors
+/// [`crate::wire_compat::WireDecodeError`].
+pub(crate) fn decode_revocation_batch_with_round(
+    payload: &[u8],
+) -> Result<(Vec<RevocationRecord>, BatchRound), WireDecodeError> {
+    let decoded = decode_revocation_batch_raw(payload)?;
+    let (markers, records): (Vec<RevocationRecord>, Vec<RevocationRecord>) =
+        decoded.into_iter().partition(is_round_marker);
+    let round = match markers.as_slice() {
+        [] => BatchRound::Whole,
+        [marker] => parse_round_marker(marker).map_or(BatchRound::Invalid, BatchRound::Part),
+        _ => BatchRound::Invalid,
+    };
+    Ok((records, round))
+}
+
+fn decode_revocation_batch_raw(payload: &[u8]) -> Result<Vec<RevocationRecord>, WireDecodeError> {
     let Some(framed) = payload.strip_prefix(REVOCATION_BATCH_FRAMED_MAGIC.as_slice()) else {
         return wire_compat::decode_bincode("RevocationBatch", payload);
     };
@@ -712,14 +916,258 @@ pub(crate) fn decode_revocation_batch(
     Ok(records)
 }
 
+/// The `issuer_public_key` bytes of a round-marker record (#1857). A real
+/// ML-DSA-65 public key has 1952 bytes, so no real record carries this
+/// value, and a marker never passes any signature check.
+pub(crate) const ROUND_MARKER_ISSUER: &[u8] = b"x0x-revocation-round-marker-v1";
+
+/// The first word of a round marker's `reason`.
+const ROUND_MARKER_REASON_PREFIX: &str = "x0x-revocation-round-v1";
+
+/// The most batches one round may have.
+pub(crate) const MAX_ROUND_BATCHES: u32 = 512;
+
+/// More than the bytes of any round-marker record (about 210).
+const ROUND_MARKER_MAX_BYTES: usize = 512;
+
+/// The most records a waiting node holds for one open round of one sender:
+/// [`MAX_ROUND_BATCHES`] batches of 512 records. A full batch of real
+/// records holds about 370, so a round inside the batch bound is always
+/// inside this bound; the batch bound is the real limit for an honest
+/// sender (about 190,000 records).
+const MAX_ROUND_RECORDS: usize = MAX_ROUND_BATCHES as usize * 512;
+
+/// What a round-marker record says: this batch is batch `index` of
+/// `batches`, and `set` is the BLAKE3 digest of the sorted record hashes of
+/// the sender's whole set for the carrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RoundMarker {
+    pub(crate) batches: u32,
+    pub(crate) index: u32,
+    pub(crate) set: [u8; 32],
+}
+
+/// What a decoded batch says about its round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatchRound {
+    /// No marker: the batch is the sender's whole set, as before #1857.
+    Whole,
+    /// One valid marker: the batch is one part of a round.
+    Part(RoundMarker),
+    /// A marker that does not parse, or more than one marker. The batch is
+    /// never a snapshot.
+    Invalid,
+}
+
+/// Whether `record` is a round marker (#1857). The test is the exact
+/// issuer tag. A marker is never a revocation: it is not verified, stored,
+/// listed, counted or sent again.
+#[must_use]
+pub(crate) fn is_round_marker(record: &RevocationRecord) -> bool {
+    record.issuer_public_key == ROUND_MARKER_ISSUER
+}
+
+/// The digest that names a round: BLAKE3 over the sorted record hashes.
+fn round_set_digest(sorted_hashes: &[[u8; 32]]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"x0x-revocation-round-set-v1");
+    for hash in sorted_hashes {
+        hasher.update(hash);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+/// The marker record that ends batch `index` of a round.
+fn round_marker_record(marker: &RoundMarker) -> RevocationRecord {
+    RevocationRecord {
+        subject: RevokedSubject::Machine(MachineId([0u8; 32])),
+        issuer_public_key: ROUND_MARKER_ISSUER.to_vec(),
+        revoked_at: 0,
+        reason: Some(format!(
+            "{ROUND_MARKER_REASON_PREFIX} n={} i={} set={}",
+            marker.batches,
+            marker.index,
+            hex::encode(marker.set)
+        )),
+        signature: Vec::new(),
+    }
+}
+
+/// Read a round marker. `None` for any shape other than the exact one that
+/// [`round_marker_record`] writes, and for a count or index out of range.
+fn parse_round_marker(record: &RevocationRecord) -> Option<RoundMarker> {
+    if record.subject != RevokedSubject::Machine(MachineId([0u8; 32]))
+        || record.revoked_at != 0
+        || !record.signature.is_empty()
+    {
+        return None;
+    }
+    let reason = record.reason.as_deref()?;
+    let mut words = reason.split(' ');
+    if words.next()? != ROUND_MARKER_REASON_PREFIX {
+        return None;
+    }
+    let batches: u32 = words.next()?.strip_prefix("n=")?.parse().ok()?;
+    let index: u32 = words.next()?.strip_prefix("i=")?.parse().ok()?;
+    let set_hex = words.next()?.strip_prefix("set=")?;
+    if words.next().is_some() || batches == 0 || batches > MAX_ROUND_BATCHES || index >= batches {
+        return None;
+    }
+    let set: [u8; 32] = hex::decode(set_hex).ok()?.try_into().ok()?;
+    let marker = RoundMarker {
+        batches,
+        index,
+        set,
+    };
+    // Only the canonical text is a marker (no other spelling of a number).
+    (round_marker_record(&marker).reason.as_deref() == Some(reason)).then_some(marker)
+}
+
+/// The most bytes one received revocation batch may have. A larger payload
+/// is ignored whole. Released daemons use the same number.
+pub(crate) const MAX_REVOCATION_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
+
+/// The most bytes of records in one published batch (#1857): the receive
+/// limit less 64 KiB, about 370 records. A set that fitted in one batch
+/// before #1857 is still one batch, with the same bytes; only a set that
+/// did not arrive at all before is sent as several batches.
+pub(crate) const REVOCATION_BATCH_TARGET_BYTES: usize = MAX_REVOCATION_PAYLOAD_BYTES - 64 * 1024;
+
+/// The longest `reason` a new record may carry (#1857). The reason is
+/// inside the signed bytes, so a long one cannot be cut: the record is
+/// refused when it is signed here or when it arrives from a peer. A record
+/// already in the store is kept.
+pub const MAX_REVOCATION_REASON_BYTES: usize = 1024;
+
+/// Encode `records` for one carrier as one or more batches (#1857).
+///
+/// A set that fits in one batch is one [`encode_revocation_batch`] payload
+/// with no marker: the bytes a released daemon sends and reads today. A
+/// larger set is a ROUND of several batches. Each batch of a round is a
+/// complete payload that ends with one round-marker record (see
+/// `docs/design/revocation-batches.md`): a released daemon applies the real
+/// records and rejects the marker alone; a daemon that waits for a resync
+/// opens only on a complete round. One record that is larger than the
+/// target goes in a batch of its own. The records are put in record-hash
+/// order, so the same set gives the same batches on every node.
+///
+/// # Errors
+/// The bincode encode error.
+pub(crate) fn encode_revocation_batches(
+    records: &[RevocationRecord],
+) -> Result<Vec<Vec<u8>>, bincode::Error> {
+    encode_revocation_batches_with_target(records, REVOCATION_BATCH_TARGET_BYTES)
+}
+
+/// [`encode_revocation_batches`] with the batch size as a parameter.
+fn encode_revocation_batches_with_target(
+    records: &[RevocationRecord],
+    target_bytes: usize,
+) -> Result<Vec<Vec<u8>>, bincode::Error> {
+    let mut ordered: Vec<(&RevocationRecord, [u8; 32])> = records
+        .iter()
+        .filter(|record| !is_round_marker(record))
+        .map(|record| (record, record.record_hash()))
+        .collect();
+    ordered.sort_by_key(|(_, hash)| *hash);
+
+    let mut groups: Vec<Vec<RevocationRecord>> = Vec::new();
+    let mut current: Vec<RevocationRecord> = Vec::new();
+    let mut current_bytes = 0usize;
+    // The round's `set` is every record hash of the carrier set, in order,
+    // also the hash of a record that cannot be sent.
+    let set_hashes: Vec<[u8; 32]> = ordered.iter().map(|(_, hash)| *hash).collect();
+    let mut unsendable = 0usize;
+    for (record, hash) in &ordered {
+        // The framed encoding adds a length prefix per record.
+        let size = usize::try_from(bincode::serialized_size(record)?)
+            .unwrap_or(usize::MAX)
+            .saturating_add(16);
+        if size.saturating_add(ROUND_MARKER_MAX_BYTES) > MAX_REVOCATION_PAYLOAD_BYTES {
+            // Only a stored legacy record can be this large. No receiver
+            // accepts a batch that holds it, so it is not sent. Its hash
+            // STAYS in the round's `set`, and every batch of this publish
+            // carries a marker: the offered records then never match the
+            // set, so no waiting node opens from this sender with this
+            // subject not revoked.
+            tracing::warn!(
+                record = %hex::encode(hash),
+                bytes = size,
+                "revocation record is over the size a receiver accepts; it is not sent to peers, and no peer that waits for a resync can open from this daemon until a record with a short reason takes its place"
+            );
+            unsendable = unsendable.saturating_add(1);
+            continue;
+        }
+        if !current.is_empty() && current_bytes.saturating_add(size) > target_bytes {
+            groups.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current_bytes = current_bytes.saturating_add(size);
+        current.push((*record).clone());
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    if groups.len() <= 1 && unsendable == 0 {
+        // One batch: no marker, the bytes of before #1857.
+        return groups
+            .iter()
+            .map(|group| encode_revocation_batch(group))
+            .collect();
+    }
+    let batches = u32::try_from(groups.len()).unwrap_or(u32::MAX);
+    if batches > MAX_ROUND_BATCHES {
+        tracing::warn!(
+            batches,
+            "revocation set needs more batches than one round may have; a peer that waits for a resync cannot open from this daemon"
+        );
+    }
+    let set = round_set_digest(&set_hashes);
+    let mut out = Vec::with_capacity(groups.len());
+    for (index, mut group) in groups.into_iter().enumerate() {
+        group.push(round_marker_record(&RoundMarker {
+            batches,
+            index: u32::try_from(index).unwrap_or(u32::MAX),
+            set,
+        }));
+        out.push(encode_revocation_batch(&group)?);
+    }
+    Ok(out)
+}
+
+/// The marker of an empty-set statement (#1867): a round of one batch whose
+/// `set` is the digest of no record hashes.
+fn empty_set_statement_marker() -> RoundMarker {
+    RoundMarker {
+        batches: 1,
+        index: 0,
+        set: round_set_digest(&[]),
+    }
+}
+
+/// The batch that states "my published set for this carrier is empty"
+/// (#1867). It holds one record: the round marker of
+/// [`empty_set_statement_marker`]. A daemon that waits for a resync takes
+/// it from a trusted authority as a snapshot of the empty set. Any other
+/// receiver removes the marker and gets no record. Only the heartbeat
+/// sends it, and only for a carrier that is not closed.
+///
+/// # Errors
+/// The bincode encode error.
+pub(crate) fn encode_empty_set_statement() -> Result<Vec<u8>, bincode::Error> {
+    encode_revocation_batch(&[round_marker_record(&empty_set_statement_marker())])
+}
+
 /// Record one remote carrier snapshot (#1116).
 ///
 /// A topic that is not a revocation carrier is ignored. A carrier that is
 /// not waiting is ignored, so a healthy daemon does not take the write
-/// lock. An empty or undecodable payload does not open membership. A
-/// message from `local_agent`, or a message with no sender, is not a
-/// group snapshot. Recording the snapshot does not insert records and
-/// does not by itself open the carrier.
+/// lock. An undecodable payload, or an empty batch with no marker, does
+/// not open membership. An empty-set statement (#1867) from a trusted
+/// authority is a snapshot of the empty set. A message from
+/// `local_agent`, or a message with no sender, is not a group snapshot.
+/// Recording the snapshot does not insert records and does not by itself
+/// open the carrier.
 pub(crate) async fn arm_incoming_revocation_snapshot(
     set: &std::sync::Arc<tokio::sync::RwLock<RevocationSet>>,
     topic: &str,
@@ -742,7 +1190,7 @@ pub(crate) async fn arm_incoming_revocation_snapshot(
     if !set.read().await.carrier_resync_pending(carrier) {
         return;
     }
-    let Ok(records) = decode_revocation_batch(payload) else {
+    let Ok((records, round)) = decode_revocation_batch_with_round(payload) else {
         return;
     };
     let trusted = {
@@ -754,7 +1202,7 @@ pub(crate) async fn arm_incoming_revocation_snapshot(
     };
     set.write()
         .await
-        .observe_remote_carrier_snapshot(carrier, sender, &records, trusted);
+        .observe_remote_carrier_batch(carrier, sender, &records, round, trusted);
 }
 
 impl RevocationSet {
@@ -875,6 +1323,14 @@ impl RevocationSet {
         self.resync_carriers & carrier != 0
     }
 
+    /// Whether this carrier waits for a resync or for its rebuild (#1867).
+    /// A daemon with a closed carrier does not know its set, so it must
+    /// not state that the set is empty.
+    #[must_use]
+    pub(crate) fn carrier_closed(&self, carrier: u8) -> bool {
+        (self.resync_carriers | self.reconcile_carriers) & carrier != 0
+    }
+
     /// Install the check that names a trusted snapshot sender (#1116).
     ///
     /// A missing check leaves every carrier closed. The daemon installs
@@ -884,11 +1340,102 @@ impl RevocationSet {
         self.snapshot_authority = Some(authority);
     }
 
-    /// Remember one remote sender's carrier snapshot (#1116).
+    /// Remember one batch that a remote sender offers for a waiting carrier
+    /// (#1116, #1857). `round` says whether the batch is the sender's
+    /// whole set or one part of a marked round.
+    pub(crate) fn observe_remote_carrier_batch(
+        &mut self,
+        carrier: u8,
+        sender: &AgentId,
+        records: &[RevocationRecord],
+        round: BatchRound,
+        trusted_authority: bool,
+    ) {
+        match round {
+            BatchRound::Whole => {
+                self.observe_remote_carrier_snapshot(carrier, sender, records, trusted_authority);
+            }
+            BatchRound::Part(marker) => {
+                self.observe_remote_round_part(carrier, sender, records, marker, trusted_authority);
+            }
+            // A batch with a bad marker is never a snapshot. From a
+            // trusted sender it still says that the sender's set is a
+            // newer round now, so what the sender offered before is
+            // stale (#1864).
+            BatchRound::Invalid => {
+                if trusted_authority {
+                    self.drop_sender_candidate(carrier, sender);
+                }
+            }
+        }
+    }
+
+    /// Forget what `sender` offered for a waiting carrier (#1864): a
+    /// whole set and an open round. The carrier then cannot open on that
+    /// offer. A trusted sender's batch that this node cannot use as a
+    /// snapshot calls this, because the batch still shows that the
+    /// sender's set has changed.
+    fn drop_sender_candidate(&mut self, carrier: u8, sender: &AgentId) {
+        if let Some(index) = carrier_index(carrier) {
+            self.resync_candidates[index].remove(sender);
+        }
+    }
+
+    /// Whether a snapshot whose kept records are `kept` covers every
+    /// record this set holds for `carrier` (#1857, #1864): the snapshot
+    /// has the held record, or it has a record of the same pair that this
+    /// set would keep in its place. A covered record's subject is revoked
+    /// in the sender's set also.
+    fn snapshot_covers_held(&self, carrier: u8, kept: &HashMap<[u8; 32], RecordRank>) -> bool {
+        self.records_by_hash
+            .iter()
+            .filter(|(_, persisted)| subject_carrier(&persisted.record.subject) == Some(carrier))
+            .all(|(hash, persisted)| {
+                let key = persisted.record.pair_key().unwrap_or(*hash);
+                match kept.get(&key) {
+                    Some(rank) => rank.3 == *hash || *rank <= persisted.record.rank(),
+                    // #1863: a sender does not publish the self-revocation
+                    // of a subject it has not seen. Such an omission is
+                    // not a sign that the sender is behind.
+                    None => persisted.record.is_self_revocation(),
+                }
+            })
+    }
+
+    /// Whether the held records of `carrier` agree with a snapshot whose
+    /// kept records are `kept` (#1116, #1863): every kept record is held,
+    /// and every other held record is a self-revocation that has no
+    /// record of its pair in the snapshot. Opening never removes a held
+    /// record, so an ignored self-revocation stays in force.
+    fn snapshot_matches_held(&self, carrier: u8, kept: &HashMap<[u8; 32], RecordRank>) -> bool {
+        let offered = kept_hashes(kept);
+        let held_of_carrier = |hash: &[u8; 32]| {
+            self.records_by_hash
+                .get(hash)
+                .is_some_and(|p| subject_carrier(&p.record.subject) == Some(carrier))
+        };
+        offered.iter().all(held_of_carrier)
+            && self
+                .records_by_hash
+                .iter()
+                .filter(|(_, p)| subject_carrier(&p.record.subject) == Some(carrier))
+                .all(|(hash, p)| {
+                    offered.contains(hash)
+                        || (p.record.is_self_revocation()
+                            && !kept.contains_key(&p.record.pair_key().unwrap_or(*hash)))
+                })
+    }
+
+    /// Remember one remote sender's whole-set snapshot (#1116): one batch
+    /// with no round marker.
     ///
-    /// This does not insert records. An untrusted sender, an empty
-    /// snapshot, a record from another carrier, or a snapshot that omits
-    /// a revocation already in the set is ignored. The carrier opens only
+    /// This does not insert records. An untrusted sender, an empty batch
+    /// (it never opens; the empty-set statement of #1867 has a marker and
+    /// comes through [`Self::observe_remote_round_part`]), a record from
+    /// another carrier, or a snapshot that omits
+    /// a revocation already in the set is ignored. One exception (#1863):
+    /// a held self-revocation for which the snapshot has no record of its
+    /// pair does not count as omitted. The carrier opens only
     /// when a trusted authority has offered a snapshot whose records have
     /// all verified and match the records already in the set.
     pub(crate) fn observe_remote_carrier_snapshot(
@@ -898,25 +1445,213 @@ impl RevocationSet {
         records: &[RevocationRecord],
         trusted_authority: bool,
     ) {
-        if !trusted_authority || self.resync_carriers & carrier == 0 || records.is_empty() {
+        if !trusted_authority || self.resync_carriers & carrier == 0 {
             return;
         }
         let Some(index) = carrier_index(carrier) else {
             return;
         };
-        if records
-            .iter()
-            .any(|record| subject_carrier(&record.subject) != Some(carrier))
+        // This batch is the sender's set now. Whatever the sender offered
+        // before (a whole set or an open round) is stale, also when this
+        // batch is refused below.
+        self.drop_sender_candidate(carrier, sender);
+        if records.is_empty()
+            || records.iter().any(|record| {
+                is_round_marker(record) || subject_carrier(&record.subject) != Some(carrier)
+            })
         {
             return;
         }
-        let hashes: HashSet<[u8; 32]> = records.iter().map(RevocationRecord::record_hash).collect();
-        let known = self.known_carrier_hashes(carrier);
-        if !hashes.is_superset(&known) {
+        // #1857: this set holds one record per (subject, issuer) pair. A
+        // sender that holds more (a released daemon) is compared by the
+        // records this set would keep. A record with a long reason stays
+        // in the snapshot: the sender is a trusted authority, so the
+        // ingest admits it (see `verify_and_insert_at`).
+        let kept = kept_of(records.iter().map(|record| {
+            let rank = record.rank();
+            (record.pair_key().unwrap_or(rank.3), rank)
+        }));
+        // #1864: a held record is covered when the snapshot has it or has
+        // the record that takes its place here. The offer must stay for
+        // the second case: the ingest admits a long-reason record only
+        // while a trusted snapshot offers it. The carrier still opens
+        // only when the held records equal the snapshot's kept records
+        // (`try_complete_carrier`), after each one has verified.
+        if !self.snapshot_covers_held(carrier, &kept) {
             return;
         }
-        self.resync_candidates[index].insert(*sender, hashes);
+        self.resync_candidates[index]
+            .entry(*sender)
+            .or_default()
+            .whole = Some(kept);
         self.try_complete_carrier(carrier);
+    }
+
+    /// Remember one part of a marked round from a remote sender (#1857).
+    ///
+    /// A part is never a snapshot by itself. The sender's snapshot exists
+    /// only when this node has every part of ONE round (same `set`, same
+    /// count) and the digest of all the offered record hashes equals
+    /// `set`. Then the whole-set rule of
+    /// [`Self::observe_remote_carrier_snapshot`] applies to the union. A
+    /// marker from a sender that is not a trusted authority is ignored: it
+    /// cannot start, extend or close a round.
+    ///
+    /// A part with no record is refused, except the empty-set statement
+    /// (#1867): one batch, index 0, `set` = digest of no hashes. It is a
+    /// complete round whose snapshot is the empty set. It opens the
+    /// carrier only when every held record is a self-revocation with no
+    /// pair in the snapshot; otherwise the sender is behind.
+    fn observe_remote_round_part(
+        &mut self,
+        carrier: u8,
+        sender: &AgentId,
+        records: &[RevocationRecord],
+        marker: RoundMarker,
+        trusted_authority: bool,
+    ) {
+        if !trusted_authority || self.resync_carriers & carrier == 0 {
+            return;
+        }
+        let Some(index) = carrier_index(carrier) else {
+            return;
+        };
+        let statement = records.is_empty() && marker == empty_set_statement_marker();
+        if (records.is_empty() && !statement)
+            || marker.batches == 0
+            || marker.batches > MAX_ROUND_BATCHES
+            || marker.index >= marker.batches
+            || records.iter().any(|record| {
+                is_round_marker(record) || subject_carrier(&record.subject) != Some(carrier)
+            })
+        {
+            // Not a part this node can use. It still shows that the
+            // sender's set has changed, so the earlier offer is stale
+            // (#1864).
+            self.drop_sender_candidate(carrier, sender);
+            return;
+        }
+        let mut hashes: Vec<[u8; 32]> = records.iter().map(RevocationRecord::record_hash).collect();
+        hashes.sort_unstable();
+        let offered: Vec<([u8; 32], RecordRank)> = records
+            .iter()
+            .map(|record| {
+                let rank = record.rank();
+                (record.pair_key().unwrap_or(rank.3), rank)
+            })
+            .collect();
+        let candidate = self.resync_candidates[index].entry(*sender).or_default();
+        // One open round per carrier per sender: a part of another round
+        // (the sender's set changed) replaces the open one. Parts of two
+        // rounds are never mixed.
+        if candidate.whole.is_some() && candidate.whole_set == Some(marker.set) {
+            // A repeat publish of the round that this node already holds
+            // complete: the snapshot is still the sender's set.
+            self.try_complete_carrier(carrier);
+            return;
+        }
+        let now = std::time::Instant::now();
+        let same_round = candidate.round.as_ref().is_some_and(|round| {
+            round.set == marker.set
+                && round.batches == marker.batches
+                && now.duration_since(round.last_part) <= OPEN_ROUND_TIMEOUT
+        });
+        if !same_round {
+            // The sender's set is this round now. A whole-set snapshot
+            // that it offered earlier is stale and must not open the
+            // carrier any more.
+            candidate.whole = None;
+            candidate.whole_set = None;
+            candidate.round = Some(OpenRound {
+                set: marker.set,
+                batches: marker.batches,
+                parts: HashMap::new(),
+                last_part: now,
+            });
+        }
+        let Some(round) = candidate.round.as_mut() else {
+            return;
+        };
+        round.last_part = now;
+        if round
+            .parts
+            .get(&marker.index)
+            .is_some_and(|held| held.hashes != hashes)
+        {
+            // The same index with other content: refuse the new part.
+            return;
+        }
+        // The records of a part are not verified here, so bound what one
+        // sender can make this node hold. Over the bound, the round is
+        // dropped and the carrier stays closed.
+        // A repeat of a part at the same index is not counted twice.
+        let round_records: usize = round
+            .parts
+            .iter()
+            .filter(|(index, _)| **index != marker.index)
+            .map(|(_, part)| part.hashes.len())
+            .sum();
+        if round_records.saturating_add(hashes.len()) > MAX_ROUND_RECORDS {
+            tracing::warn!(
+                carrier,
+                sender = %hex::encode(sender.as_bytes()),
+                "revocation resync: a round offers more records than this node holds for one sender; the round is dropped"
+            );
+            candidate.round = None;
+            return;
+        }
+        round
+            .parts
+            .insert(marker.index, RoundPart { hashes, offered });
+        let parts_held = round.parts.len();
+        let mut complete = None;
+        if u32::try_from(parts_held).ok() == Some(round.batches) {
+            let mut all: Vec<[u8; 32]> = round
+                .parts
+                .values()
+                .flat_map(|part| part.hashes.iter().copied())
+                .collect();
+            all.sort_unstable();
+            all.dedup();
+            if round_set_digest(&all) == round.set {
+                let kept = kept_of(
+                    round
+                        .parts
+                        .values()
+                        .flat_map(|part| part.offered.iter().copied()),
+                );
+                complete = Some((kept, round.set));
+            }
+        }
+        if let Some((kept, set)) = complete {
+            // The whole-set rule (see `observe_remote_carrier_snapshot`).
+            if self.snapshot_covers_held(carrier, &kept) {
+                let candidate = self.resync_candidates[index].entry(*sender).or_default();
+                candidate.whole = Some(kept);
+                candidate.whole_set = Some(set);
+                candidate.round = None;
+            }
+        }
+        self.try_complete_carrier(carrier);
+        if statement && self.resync_carriers & carrier != 0 {
+            tracing::warn!(
+                carrier,
+                sender = %hex::encode(sender.as_bytes()),
+                held_records = self.known_carrier_hashes(carrier).len(),
+                "revocation resync: a trusted sender states that its set is empty, but this node holds records that the sender does not have; the carrier stays closed"
+            );
+        } else if self.resync_carriers & carrier != 0 {
+            // An operator must be able to tell a round that is not yet
+            // complete, or lost a batch, from a hang.
+            tracing::warn!(
+                carrier,
+                sender = %hex::encode(sender.as_bytes()),
+                parts_held,
+                parts_in_round = marker.batches,
+                held_records = self.known_carrier_hashes(carrier).len(),
+                "revocation resync: the carrier stays closed. It opens when every batch of one round from a trusted sender has arrived and matches the held records. If a batch was lost, the next chance is the sender's next full publish (up to 2 hours)"
+            );
+        }
     }
 
     /// Insert a fully verified snapshot without treating it as group proof.
@@ -971,7 +1706,13 @@ impl RevocationSet {
             let cert = record
                 .needs_certificate_authority()
                 .and_then(|agent| certs.get(&agent));
-            let _ = self.verify_and_insert_at(record, cert, now_unix);
+            // The pre-check above verified every record. This path is an
+            // authenticated group resync, so the reason limit of open
+            // gossip does not apply: dropping a record here would open
+            // the carrier with its subject not revoked.
+            if self.verify_and_insert(record, cert).is_err() {
+                return false;
+            }
         }
         // The snapshot is accepted when its resync bit clears. Admission
         // stays closed until the rebuild releases the reconcile hold.
@@ -993,13 +1734,14 @@ impl RevocationSet {
         let Some(index) = carrier_index(carrier) else {
             return;
         };
-        let known = self.known_carrier_hashes(carrier);
-        if known.is_empty() {
-            return;
-        }
-        let agreed = self.resync_candidates[index]
-            .values()
-            .any(|hashes| hashes == &known);
+        // #1867: a node that holds no record can open. Only the empty-set
+        // statement gives a candidate with no kept record.
+        let agreed = self.resync_candidates[index].values().any(|candidate| {
+            candidate
+                .whole
+                .as_ref()
+                .is_some_and(|kept| self.snapshot_matches_held(carrier, kept))
+        });
         if !agreed {
             return;
         }
@@ -1065,16 +1807,6 @@ impl RevocationSet {
             .entry(agent)
             .or_default()
             .insert(machine);
-    }
-
-    fn forget_binding_machine(&mut self, agent: &AgentId, machine: &MachineId) {
-        let Some(machines) = self.binding_machines_by_agent.get_mut(agent) else {
-            return;
-        };
-        machines.remove(machine);
-        if machines.is_empty() {
-            self.binding_machines_by_agent.remove(agent);
-        }
     }
 
     /// Machines named by a binding tombstone for `agent`.
@@ -1215,6 +1947,79 @@ impl RevocationSet {
         self.records_by_hash.contains_key(hash)
     }
 
+    /// The lock a publisher holds while it reads this set, encodes it and
+    /// sends every batch (#1857).
+    #[must_use]
+    pub(crate) fn publish_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(&self.publish_lock)
+    }
+
+    /// Whether the set already gives everything `record` would give
+    /// (#1857): it holds this record, or it holds the record that is kept
+    /// for the same `(subject, issuer)` pair. A caller can skip a covered
+    /// record with no signature check. The subject of a covered record is
+    /// revoked in this set.
+    #[must_use]
+    pub fn covers(&self, record: &RevocationRecord) -> bool {
+        let hash = record.record_hash();
+        if self.records_by_hash.contains_key(&hash) {
+            return true;
+        }
+        record
+            .pair_key()
+            .and_then(|pair| self.pair_index.get(&pair))
+            .and_then(|held| self.records_by_hash.get(held))
+            .is_some_and(|held| held.record.rank() <= record.rank())
+    }
+
+    /// Whether a trusted authority offered this record in a resync
+    /// snapshot for a carrier that still waits (#1116). Only a trusted
+    /// sender's batch reaches the candidate store.
+    fn offered_by_trusted_snapshot(&self, hash: &[u8; 32]) -> bool {
+        self.resync_candidates
+            .iter()
+            .any(|carrier| carrier.values().any(|candidate| candidate.offers(hash)))
+    }
+
+    /// Whether the set holds a record for the `(subject, issuer)` pair
+    /// with this key (#1857, #1864). The S4 store write uses it: evidence
+    /// for a record that was replaced is on disk when the kept record of
+    /// its pair is. S4 keeps the pair key of each record it waits for, so
+    /// this set keeps no memory of replaced records and has no bound to
+    /// run over.
+    #[must_use]
+    pub(crate) fn holds_pair(&self, pair: &[u8; 32]) -> bool {
+        self.pair_index.contains_key(pair)
+    }
+
+    /// Put a verified record in the record map under the one-record-per-pair
+    /// rule (#1857). Returns `false` when the set already covers it. The
+    /// subject indices are not touched: both records of a pair name the
+    /// same subject, so a replacement cannot un-revoke anything.
+    fn admit(&mut self, persisted: PersistedRevocation) -> bool {
+        if is_round_marker(&persisted.record) {
+            // A round marker is never stored (#1857).
+            return false;
+        }
+        let hash = persisted.record.record_hash();
+        if self.records_by_hash.contains_key(&hash) {
+            return false;
+        }
+        if let Some(pair) = persisted.record.pair_key() {
+            if let Some(held_hash) = self.pair_index.get(&pair).copied() {
+                if let Some(held) = self.records_by_hash.get(&held_hash) {
+                    if held.record.rank() <= persisted.record.rank() {
+                        return false;
+                    }
+                    self.records_by_hash.remove(&held_hash);
+                }
+            }
+            self.pair_index.insert(pair, hash);
+        }
+        self.records_by_hash.insert(hash, persisted);
+        true
+    }
+
     /// Verify a record's authority, then insert it. Returns `true` if it was
     /// newly added, `false` if already present (idempotent).
     ///
@@ -1233,6 +2038,19 @@ impl RevocationSet {
         record: RevocationRecord,
         subject_cert: Option<&AgentCertificate>,
     ) -> Result<bool, IdentityError> {
+        if is_round_marker(&record) {
+            // Never a revocation, whatever path offers it (#1857). The
+            // gossip decoder removes markers, so one that reaches this
+            // point came from a store file or a single-record path.
+            // debug, not warn: a remote peer can send one on a
+            // single-record path as often as it likes.
+            tracing::debug!(
+                "a revocation round-marker record was offered as a revocation; dropped"
+            );
+            return Err(IdentityError::Revocation(
+                "a round-marker record is not a revocation".to_string(),
+            ));
+        }
         record.verify_authority(subject_cert)?;
         // Retain the certificate only when it was actually needed to prove
         // authority (issuer-revocation). Self-revocations re-verify without it.
@@ -1270,6 +2088,13 @@ impl RevocationSet {
             return Err(IdentityError::Revocation(format!(
                 "revoked_at {} is more than {REVOCATION_MAX_FUTURE_SKEW_SECS} s ahead of local time {now_unix}",
                 record.revoked_at
+            )));
+        }
+        if !reason_within_limit(&record.reason)
+            && !self.offered_by_trusted_snapshot(&record.record_hash())
+        {
+            return Err(IdentityError::Revocation(format!(
+                "reason is longer than {MAX_REVOCATION_REASON_BYTES} bytes"
             )));
         }
         self.verify_and_insert(record, subject_cert)
@@ -1333,6 +2158,7 @@ impl RevocationSet {
         self.binding_epochs.clear();
         self.binding_machines_by_agent.clear();
         self.revoked_share_grants.clear();
+        self.pair_index.clear();
         let remaining: Vec<PersistedRevocation> = self
             .records_by_hash
             .drain()
@@ -1346,7 +2172,7 @@ impl RevocationSet {
         taken
     }
 
-    /// Monotonic generation counter — changes on every insert or expiry.
+    /// Monotonic generation counter — changes on every insert or collection.
     /// The heartbeat piggyback compares generations: unchanged set ⇒ skip
     /// the publish (except the periodic fallback).
     #[must_use]
@@ -1354,71 +2180,67 @@ impl RevocationSet {
         self.change_generation
     }
 
-    /// Drop records older than `ttl_secs`. Returns the number expired.
+    /// Remove the records whose revoked credential is dead. Returns the
+    /// number removed.
     ///
-    /// A revocation older than the TTL with no renewal is already moot:
-    /// revocations target currently-known agents, and a record that old
-    /// means nobody has seen the agent (or the issuer) for months. The
-    /// 2026-07 stale testnet records (2 records, 19 KB each heartbeat) are
-    /// the motivating case — they cost 222 KB/s fleet-wide on a topic
-    /// that should be silent.
-    pub fn expire_records_older_than(&mut self, ttl_secs: u64, now_unix: u64) -> usize {
-        let cutoff = now_unix.saturating_sub(ttl_secs);
-        let expired: Vec<[u8; 32]> = self
+    /// A revocation stays in force until the revoked credential can no
+    /// longer be used (#1108, David's ruling of 20 Oct 2026). Record age is
+    /// never a reason to remove a record:
+    ///
+    /// - **Agent and Machine** records are kept for good. The record names
+    ///   a key, and a key has no expiry. A retained certificate does not
+    ///   give a safe end date: the owner can have issued a later
+    ///   certificate for the same agent key, and the key can also announce
+    ///   with no certificate.
+    /// - **Binding** tombstones are kept for good (ADR-0043 §7.3).
+    /// - A **share-grant** record is removed when the grant itself is dead:
+    ///   its signed `grant_expiry` plus the skew slack (ADR-0070).
+    pub fn collect_dead_records(&mut self, now_unix: u64) -> usize {
+        let dead: Vec<[u8; 32]> = self
             .records_by_hash
             .iter()
-            // ADR-0043 §7.3: binding tombstones are PERMANENT — a retired
-            // binding must never resurrect, so the TTL sweep skips them.
-            // ADR-0070: a share-grant revocation ignores the TTL (a grant
-            // may outlive it) and is collected only once the revoked grant
-            // is dead: its signed expiry plus the skew slack.
             .filter(|(_, persisted)| match &persisted.record.subject {
-                RevokedSubject::AgentMachineBinding(_) => false,
                 RevokedSubject::ShareGrant(grant) => grant.gc_eligible_at(now_unix),
-                _ => persisted.record.revoked_at < cutoff,
+                RevokedSubject::Agent(_)
+                | RevokedSubject::Machine(_)
+                | RevokedSubject::AgentMachineBinding(_) => false,
             })
             .map(|(hash, _)| *hash)
             .collect();
-        if expired.is_empty() {
+        if dead.is_empty() {
             return 0;
         }
-        for hash in &expired {
-            if let Some(persisted) = self.records_by_hash.remove(hash) {
-                match &persisted.record.subject {
-                    RevokedSubject::Agent(id) => {
-                        self.revoked_agents.remove(id);
-                    }
-                    RevokedSubject::Machine(id) => {
-                        self.revoked_machines.remove(id);
-                    }
-                    // Bindings never reach the expired list (filter
-                    // above); arm kept total for exhaustiveness.
-                    RevokedSubject::AgentMachineBinding(binding) => {
-                        self.binding_epochs
-                            .remove(&(binding.agent, binding.machine));
-                        self.forget_binding_machine(&binding.agent, &binding.machine);
-                    }
-                    // Drop the key only when the LATEST expiry recorded for
-                    // it is past the horizon — a longer-lived record for the
-                    // same grant keeps it revoked.
-                    RevokedSubject::ShareGrant(grant) => {
-                        let key = (grant.grant_id, grant.owner);
-                        if let Some(latest) = self.revoked_share_grants.get(&key).copied() {
-                            let horizon = ShareGrantRevocation {
-                                grant_expiry: latest,
-                                ..*grant
-                            };
-                            if horizon.gc_eligible_at(now_unix) {
-                                self.revoked_share_grants.remove(&key);
-                            }
-                        }
+        for hash in &dead {
+            let Some(persisted) = self.records_by_hash.remove(hash) else {
+                continue;
+            };
+            // Only share-grant records reach this list (filter above).
+            if let RevokedSubject::ShareGrant(grant) = &persisted.record.subject {
+                // Drop the key only when the LATEST expiry recorded for it
+                // is past the horizon — a longer-lived record for the same
+                // grant keeps it revoked.
+                let key = (grant.grant_id, grant.owner);
+                if let Some(latest) = self.revoked_share_grants.get(&key).copied() {
+                    let horizon = ShareGrantRevocation {
+                        grant_expiry: latest,
+                        ..*grant
+                    };
+                    if horizon.gc_eligible_at(now_unix) {
+                        self.revoked_share_grants.remove(&key);
                     }
                 }
             }
         }
         self.change_generation = self.change_generation.saturating_add(1);
         self.notify_change();
-        expired.len()
+        dead.len()
+    }
+
+    /// Old name of [`Self::collect_dead_records`]. `_ttl_secs` is ignored:
+    /// no record is removed because of its age (#1108).
+    #[deprecated(note = "use collect_dead_records; record age no longer removes a record")]
+    pub fn expire_records_older_than(&mut self, _ttl_secs: u64, now_unix: u64) -> usize {
+        self.collect_dead_records(now_unix)
     }
 
     /// Raw insert of an already-verified record. Performs NO cryptographic
@@ -1429,8 +2251,7 @@ impl RevocationSet {
     /// records that were already in the set while it rebuilds the indices.
     /// Returns `true` if new.
     fn insert_verified(&mut self, persisted: PersistedRevocation) -> bool {
-        let hash = persisted.record.record_hash();
-        if self.records_by_hash.contains_key(&hash) {
+        if is_round_marker(&persisted.record) || self.covers(&persisted.record) {
             return false;
         }
         match &persisted.record.subject {
@@ -1463,14 +2284,16 @@ impl RevocationSet {
                 *entry = (*entry).max(grant.grant_expiry);
             }
         }
-        self.records_by_hash.insert(hash, persisted);
+        self.admit(persisted);
         self.change_generation = self.change_generation.saturating_add(1);
         self.notify_change();
         true
     }
 
-    /// All held records for the V1 wire (`Agent`/`Machine` subjects only,
-    /// order unspecified), for rebroadcast/anti-entropy.
+    /// All held records with an `Agent`/`Machine` subject (order
+    /// unspecified), for the `revocations.bin` store. The v1 publish uses
+    /// [`Self::published_records`], which leaves out the self-revocations
+    /// of strangers (#1863).
     ///
     /// ADR-0043 §7.4: the v1 batch is one whole `Vec<RevocationRecord>`
     /// that legacy peers deserialize in full — an unknown variant would
@@ -1485,6 +2308,111 @@ impl RevocationSet {
             .filter(|p| is_v1_subject(&p.record.subject))
             .map(|p| p.record.clone())
             .collect()
+    }
+
+    /// Whether `record` is a self-revocation of a subject this node has
+    /// not seen (#1863).
+    fn is_stranger_self_revocation(&self, record: &RevocationRecord) -> bool {
+        SeenSubject::of(&record.subject)
+            .is_some_and(|subject| !self.seen_subjects.contains(&subject))
+            && record.is_self_revocation()
+    }
+
+    /// The records this node publishes on the v1 carrier (#1863): every
+    /// record of [`Self::all_records`] except the self-revocation of a
+    /// stranger. Such a record stays in force here and in
+    /// `revocations.bin`; pubsub spread it once when it arrived. Its
+    /// subject joins this set when the daemon has seen the subject.
+    #[must_use]
+    pub fn published_records(&self) -> Vec<RevocationRecord> {
+        self.records_by_hash
+            .values()
+            .filter(|p| {
+                is_v1_subject(&p.record.subject) && !self.is_stranger_self_revocation(&p.record)
+            })
+            .map(|p| p.record.clone())
+            .collect()
+    }
+
+    /// How many held self-revocations of strangers this node keeps out of
+    /// its published set (#1863).
+    #[must_use]
+    pub fn stranger_self_revocation_count(&self) -> usize {
+        self.records_by_hash
+            .values()
+            .filter(|p| self.is_stranger_self_revocation(&p.record))
+            .count()
+    }
+
+    /// The subjects of held self-revocations of strangers (#1863), each
+    /// one once. The daemon checks them against what it has seen.
+    #[must_use]
+    pub(crate) fn stranger_self_revocation_subjects(&self) -> Vec<SeenSubject> {
+        let subjects: HashSet<SeenSubject> = self
+            .records_by_hash
+            .values()
+            .filter(|p| self.is_stranger_self_revocation(&p.record))
+            .filter_map(|p| SeenSubject::of(&p.record.subject))
+            .collect();
+        subjects.into_iter().collect()
+    }
+
+    /// Mark subjects as seen (#1863). A held self-revocation of a marked
+    /// subject is published from now on. Only a subject with a held
+    /// self-revocation is kept, so the marks never outgrow the records.
+    /// Returns `true` when the published set changed.
+    pub(crate) fn mark_seen(&mut self, subjects: impl IntoIterator<Item = SeenSubject>) -> bool {
+        let strangers: HashSet<SeenSubject> = self
+            .stranger_self_revocation_subjects()
+            .into_iter()
+            .collect();
+        let mut changed = false;
+        for subject in subjects {
+            if strangers.contains(&subject) {
+                changed |= self.seen_subjects.insert(subject);
+            }
+        }
+        if changed {
+            // The published set changed: the heartbeat publishes on a new
+            // generation, also when a mark lands between two heartbeats.
+            self.change_generation = self.change_generation.saturating_add(1);
+        }
+        changed
+    }
+
+    /// All held records of every subject kind (order unspecified), for
+    /// local display such as `GET /identity/revocations` (#1108).
+    ///
+    /// This is NOT a wire or storage view. `revocations.bin` uses
+    /// [`Self::all_records`] and the v1 carrier uses
+    /// [`Self::published_records`], because an old daemon cannot decode a
+    /// binding or share-grant subject. Tombstones that came
+    /// from a move bundle are not records and are not included; see
+    /// [`Self::is_binding_revoked`].
+    #[must_use]
+    pub fn all_subject_records(&self) -> Vec<RevocationRecord> {
+        self.records_by_hash
+            .values()
+            .map(|p| p.record.clone())
+            .collect()
+    }
+
+    /// How many held records are over the size a receiver accepts and so
+    /// are never sent to peers (#1857). While this is not 0, no peer that
+    /// waits for a resync can open from this daemon.
+    #[must_use]
+    pub fn unsendable_record_count(&self) -> usize {
+        self.records_by_hash
+            .values()
+            .filter(|persisted| {
+                bincode::serialized_size(&persisted.record).is_ok_and(|size| {
+                    usize::try_from(size)
+                        .unwrap_or(usize::MAX)
+                        .saturating_add(16 + ROUND_MARKER_MAX_BYTES)
+                        > MAX_REVOCATION_PAYLOAD_BYTES
+                })
+            })
+            .count()
     }
 
     /// All held share-grant records for the `x0x.revocation.v3` carrier and
@@ -1680,11 +2608,8 @@ impl RevocationSet {
                 changed = true;
             }
         }
-        for (hash, persisted) in other.records_by_hash {
-            if let std::collections::hash_map::Entry::Vacant(slot) =
-                self.records_by_hash.entry(hash)
-            {
-                slot.insert(persisted);
+        for persisted in other.records_by_hash.into_values() {
+            if self.admit(persisted) {
                 changed = true;
             }
         }
@@ -1713,8 +2638,8 @@ impl RevocationSet {
                 }
             }
         }
-        for (hash, persisted) in other.records_by_hash {
-            self.records_by_hash.entry(hash).or_insert(persisted);
+        for persisted in other.records_by_hash.into_values() {
+            self.admit(persisted);
         }
     }
 
@@ -2240,11 +3165,15 @@ mod tests {
     /// A snapshot that omits a known revocation cannot open it either.
     #[tokio::test]
     async fn partial_snapshot_omitting_known_revocation_keeps_the_hold_1116() {
+        // An owner revocation: #1863 lets a waiter ignore an omitted
+        // self-revocation, so the known record here is not one.
         let revoked = crate::identity::AgentKeypair::generate().unwrap();
+        let owner = crate::identity::UserKeypair::generate().unwrap();
+        let cert = AgentCertificate::issue(&owner, &revoked).unwrap();
         let record = RevocationRecord::sign(
             RevokedSubject::Agent(revoked.agent_id()),
-            revoked.public_key(),
-            revoked.secret_key(),
+            owner.public_key(),
+            owner.secret_key(),
             1_000,
             None,
         )
@@ -2293,7 +3222,7 @@ mod tests {
         assert!(set
             .write()
             .await
-            .verify_and_insert(record.clone(), None)
+            .verify_and_insert(record.clone(), Some(&cert))
             .unwrap());
         arm_incoming_revocation_snapshot(
             &set,
@@ -2350,7 +3279,9 @@ mod tests {
         )
         .await;
         assert!(
-            set.read().await.revocation_resync_required(),
+            set.read()
+                .await
+                .carrier_resync_pending(REVOCATION_CARRIER_V1),
             "a trusted snapshot that omits a known revocation stays closed"
         );
         let admin = AgentId([0xE5; 32]);
@@ -3391,7 +4322,7 @@ mod tests {
 
     mod revocation_cadence {
         use super::super::*;
-        use crate::identity::AgentKeypair;
+        use crate::identity::{AgentKeypair, MachineKeypair, UserKeypair};
 
         /// Build a self-signed revocation record for an agent at the given
         /// timestamp. Self-revocations require no subject certificate.
@@ -3442,7 +4373,11 @@ mod tests {
             loaded
                 .verify_and_insert(self_revocation(&other, u64::MAX), None)
                 .expect("legacy far-future record");
-            assert_eq!(loaded.drop_future_records(now), 2);
+            // #1857: the current record for `kp` took the place of its
+            // far-future record (the earlier `revoked_at` is kept), so one
+            // far-future record is left to drop.
+            assert_eq!(loaded.len(), 2);
+            assert_eq!(loaded.drop_future_records(now), 1);
             assert_eq!(loaded.len(), 1);
             assert!(
                 loaded.is_agent_revoked(&kp.agent_id()),
@@ -3454,63 +4389,128 @@ mod tests {
             );
         }
 
-        /// #380 cadence: the TTL expiry kills the 2 stale July testnet
-        /// records that cost 222 KB/s fleet-wide on the revocation topic.
+        const DAY: u64 = 24 * 3600;
+
+        /// WHY (#1108): a revocation says "this key is not to be trusted".
+        /// The old sweep removed the record 90 days after `revoked_at`, so
+        /// a stolen agent key came back to life on every node. Age must
+        /// never remove the record, also across a restart.
         #[test]
-        fn ttl_expires_stale_records_and_unrevokes_subject() {
+        fn an_old_agent_revocation_stays_in_force_across_sweep_and_restart() {
             let kp = AgentKeypair::generate().expect("agent keypair");
             let mut set = RevocationSet::new();
             let now = 1_800_000_000u64;
 
-            let stale = self_revocation(&kp, now - 91 * 24 * 3600);
-            set.verify_and_insert(stale, None)
-                .expect("stale record verifies");
+            set.verify_and_insert(self_revocation(&kp, now - 91 * DAY), None)
+                .expect("record verifies");
+            assert_eq!(set.collect_dead_records(now), 0, "91 days old: kept");
             assert!(set.is_agent_revoked(&kp.agent_id()));
 
-            let expired = set.expire_records_older_than(90 * 24 * 3600, now);
-            assert_eq!(expired, 1, "the 91-day-old record must expire");
+            // Restart: the store round trip, then the next sweep.
+            let bytes = set.to_bytes().expect("encode");
+            let mut loaded = RevocationSet::from_bytes(&bytes).expect("decode");
+            assert_eq!(loaded.collect_dead_records(now + 100 * 365 * DAY), 0);
             assert!(
-                !set.is_agent_revoked(&kp.agent_id()),
-                "the expired subject is no longer revoked"
+                loaded.is_agent_revoked(&kp.agent_id()),
+                "the agent stays revoked 100 years later"
             );
-            assert!(set.all_records().is_empty());
+            assert_eq!(loaded.all_records().len(), 1);
         }
 
-        /// #380 cadence: fresh records survive the TTL.
+        /// WHY (#1108): a machine key has no expiry, so its revocation has
+        /// no end date.
         #[test]
-        fn ttl_keeps_fresh_records() {
-            let kp = AgentKeypair::generate().expect("agent keypair");
-            let mut set = RevocationSet::new();
+        fn an_old_machine_revocation_stays_in_force() {
+            let kp = MachineKeypair::generate().expect("machine keypair");
             let now = 1_800_000_000u64;
+            let record = RevocationRecord::sign(
+                RevokedSubject::Machine(kp.machine_id()),
+                kp.public_key(),
+                kp.secret_key(),
+                now - 91 * DAY,
+                None,
+            )
+            .expect("sign");
+            let mut set = RevocationSet::new();
+            set.verify_and_insert(record, None).expect("verifies");
 
-            let fresh = self_revocation(&kp, now - 24 * 3600);
-            set.verify_and_insert(fresh, None).expect("fresh verifies");
-
-            let expired = set.expire_records_older_than(90 * 24 * 3600, now);
-            assert_eq!(expired, 0);
-            assert!(set.is_agent_revoked(&kp.agent_id()));
+            assert_eq!(set.collect_dead_records(now), 0);
+            assert!(set.is_machine_revoked(&kp.machine_id()));
         }
 
-        /// #380 cadence: the change generation advances on insert AND on
-        /// expiry — the on-change piggyback key.
+        /// WHY (#1108): the certificate that proved the owner's authority
+        /// can expire, but the record names the agent KEY. The owner can
+        /// have issued a later certificate for the same key, and the key
+        /// can announce with no certificate. So the expiry of the retained
+        /// certificate must not remove the record, in memory or on reload.
         #[test]
-        fn generation_advances_on_insert_and_expiry() {
+        fn an_owner_revocation_stays_after_the_retained_certificate_expires() {
+            let owner = UserKeypair::generate().expect("owner keypair");
+            let agent = AgentKeypair::generate().expect("agent keypair");
+            let now = 1_800_000_000u64;
+            let cert_not_after = now - 30 * DAY;
+            let cert = AgentCertificate::issue_with_expiry(&owner, &agent, Some(cert_not_after))
+                .expect("certificate");
+            let record = RevocationRecord::sign(
+                RevokedSubject::Agent(agent.agent_id()),
+                owner.public_key(),
+                owner.secret_key(),
+                now - 91 * DAY,
+                Some("stolen".to_string()),
+            )
+            .expect("sign");
+            let mut set = RevocationSet::new();
+            set.verify_and_insert(record, Some(&cert))
+                .expect("owner authority verifies");
+
+            assert_eq!(set.collect_dead_records(now), 0);
+            assert!(set.is_agent_revoked(&agent.agent_id()));
+
+            let bytes = set.to_bytes().expect("encode");
+            let mut loaded = RevocationSet::from_bytes(&bytes).expect("decode");
+            assert_eq!(loaded.collect_dead_records(now), 0);
+            assert!(
+                loaded.is_agent_revoked(&agent.agent_id()),
+                "an expired retained certificate must not un-revoke the agent on reload"
+            );
+        }
+
+        /// #380 cadence: the change generation advances on insert and when
+        /// a dead record is collected. A sweep that removes nothing must
+        /// not advance it, or every heartbeat would publish the full set.
+        #[test]
+        fn generation_advances_on_insert_and_collection_only() {
             let kp = AgentKeypair::generate().expect("agent keypair");
+            let owner = UserKeypair::generate().expect("owner keypair");
             let mut set = RevocationSet::new();
             let now = 1_800_000_000u64;
             let gen0 = set.generation();
 
-            let stale = self_revocation(&kp, now - 91 * 24 * 3600);
-            set.verify_and_insert(stale, None).expect("verifies");
+            set.verify_and_insert(self_revocation(&kp, now - 91 * DAY), None)
+                .expect("verifies");
+            let grant = RevocationRecord::sign(
+                RevokedSubject::ShareGrant(ShareGrantRevocation {
+                    grant_id: [7; 32],
+                    owner: owner.user_id(),
+                    grant_expiry: now - 91 * DAY,
+                }),
+                owner.public_key(),
+                owner.secret_key(),
+                now - 92 * DAY,
+                None,
+            )
+            .expect("sign");
+            set.verify_and_insert(grant, None).expect("verifies");
             let gen1 = set.generation();
             assert!(gen1 > gen0, "insert must advance the generation");
 
-            set.expire_records_older_than(90 * 24 * 3600, now);
+            // The dead grant's record goes; the old agent record stays.
+            assert_eq!(set.collect_dead_records(now), 1);
             let gen2 = set.generation();
-            assert!(gen2 > gen1, "expiry must advance the generation");
+            assert!(gen2 > gen1, "collection must advance the generation");
+            assert!(set.is_agent_revoked(&kp.agent_id()));
 
-            // No-op: neither insert nor expiry fires.
-            set.expire_records_older_than(90 * 24 * 3600, now);
+            assert_eq!(set.collect_dead_records(now), 0);
             assert_eq!(set.generation(), gen2, "no-change must not advance");
         }
     }
@@ -3926,7 +4926,7 @@ mod tests {
         );
 
         // Permanence: a sweep far past any TTL keeps the tombstone.
-        let expired = set.expire_records_older_than(60, 10_000_000);
+        let expired = set.collect_dead_records(10_000_000);
         assert_eq!(expired, 0);
         assert!(set.is_binding_revoked(&binding.agent, &machine));
 
@@ -3944,7 +4944,7 @@ mod tests {
         assert!(set2.is_binding_revoked(&binding.agent, &machine));
         assert_eq!(set2.max_revoked_binding_epoch(&binding.agent), Some(3));
         assert!(set2.binding_records().is_empty());
-        assert!(set2.expire_records_older_than(0, u64::MAX) == 0);
+        assert!(set2.collect_dead_records(u64::MAX) == 0);
         assert!(set2.is_binding_revoked(&binding.agent, &machine));
         let mut indexed = set2.binding_tombstone_machines(&binding.agent);
         indexed.sort_by_key(|id| id.0);
@@ -4059,6 +5059,1747 @@ mod tests {
 
     /// ADR-0070 slice 3: share-grant revocations and the old-decoder
     /// guarantees of the v1/v2 carriers.
+    /// #1857: the set is not swept by age (#1108), so its size and its
+    /// gossip must stay inside limits by other rules.
+    mod batches_and_pairs {
+        use super::super::*;
+        use crate::identity::{AgentKeypair, UserKeypair};
+
+        fn self_revocation(kp: &AgentKeypair, revoked_at: u64, reason: &str) -> RevocationRecord {
+            RevocationRecord::sign(
+                RevokedSubject::Agent(kp.agent_id()),
+                kp.public_key(),
+                kp.secret_key(),
+                revoked_at,
+                Some(reason.to_string()),
+            )
+            .expect("sign")
+        }
+
+        /// A record with the byte sizes of a real one and no valid
+        /// signature (for codec tests, which do not verify).
+        fn sized_fake(tag: u32) -> RevocationRecord {
+            sized_fake_with_reason(tag, "r".to_string())
+        }
+
+        fn sized_fake_with_reason(tag: u32, reason: String) -> RevocationRecord {
+            let mut id = [0u8; 32];
+            id[..4].copy_from_slice(&tag.to_le_bytes());
+            RevocationRecord {
+                subject: RevokedSubject::Agent(AgentId(id)),
+                issuer_public_key: vec![7; 1952],
+                revoked_at: 1_800_000_000,
+                reason: Some(reason),
+                signature: vec![9; 3309],
+            }
+        }
+
+        /// Every batch is at most the target plus one record, and under
+        /// the size a receiver accepts.
+        fn assert_batches_fit(batches: &[Vec<u8>]) {
+            for batch in batches {
+                // The encoder closes a batch before its estimate passes
+                // the target; the header and one round marker (under 300
+                // bytes) are the only extra.
+                assert!(batch.len() <= REVOCATION_BATCH_TARGET_BYTES + 512);
+                assert!(batch.len() < MAX_REVOCATION_PAYLOAD_BYTES);
+            }
+        }
+
+        /// A signed record with a reason over the limit, as a released
+        /// daemon could have made it (`sign` refuses it now).
+        fn long_reason_record(kp: &AgentKeypair, revoked_at: u64) -> RevocationRecord {
+            let subject = RevokedSubject::Agent(kp.agent_id());
+            let issuer = kp.public_key().as_bytes().to_vec();
+            let reason = Some("x".repeat(MAX_REVOCATION_REASON_BYTES + 1));
+            let message =
+                RevocationRecord::canonical_message(&subject, &issuer, revoked_at, &reason);
+            let signature = sign_with_ml_dsa(kp.secret_key(), &message).expect("sign");
+            RevocationRecord {
+                subject,
+                issuer_public_key: issuer,
+                revoked_at,
+                reason,
+                signature: signature.as_bytes().to_vec(),
+            }
+        }
+
+        /// WHY: one key can sign any number of records for one subject
+        /// (a new time or a new reason each). With no age sweep, each one
+        /// stayed for good and was sent again every two hours. The set
+        /// must hold one record for each subject and issuer.
+        #[test]
+        fn more_records_for_one_subject_and_issuer_do_not_grow_the_set() {
+            let kp = AgentKeypair::generate().expect("keypair");
+            let mut set = RevocationSet::new();
+            let first = self_revocation(&kp, 1_000, "first");
+            assert!(set
+                .verify_and_insert(first.clone(), None)
+                .expect("verifies"));
+
+            for n in 0..20u64 {
+                let later = self_revocation(&kp, 1_001 + n, &format!("again {n}"));
+                assert!(
+                    !set.verify_and_insert(later.clone(), None)
+                        .expect("verifies"),
+                    "a later record for the same pair adds nothing"
+                );
+                assert!(set.covers(&later), "and the set covers it");
+                assert!(!set.contains_hash(&later.record_hash()));
+            }
+            assert_eq!(set.len(), 1);
+            assert_eq!(set.all_records(), vec![first]);
+            assert!(set.is_agent_revoked(&kp.agent_id()));
+
+            // The file a restart reads holds one record too.
+            let loaded =
+                RevocationSet::from_bytes(&set.to_bytes().expect("encode")).expect("decode");
+            assert_eq!(loaded.len(), 1);
+        }
+
+        /// WHY: every node must keep the SAME record, or two nodes never
+        /// agree on the set (the #1116 resync compares record hashes). The
+        /// rule is the earlier `revoked_at`, then the lower hash. A
+        /// replacement must never leave the subject not revoked.
+        #[test]
+        fn every_arrival_order_keeps_the_same_record_and_the_subject_stays_revoked() {
+            let kp = AgentKeypair::generate().expect("keypair");
+            let early = self_revocation(&kp, 1_000, "early");
+            let late = self_revocation(&kp, 2_000, "late");
+            let same_time = self_revocation(&kp, 1_000, "same time, other reason");
+            let winner_of_tie = if early.record_hash() < same_time.record_hash() {
+                early.clone()
+            } else {
+                same_time.clone()
+            };
+
+            let mut stores = Vec::new();
+            for order in [
+                [&early, &late, &same_time],
+                [&early, &same_time, &late],
+                [&late, &early, &same_time],
+                [&late, &same_time, &early],
+                [&same_time, &early, &late],
+                [&same_time, &late, &early],
+            ] {
+                let mut set = RevocationSet::new();
+                for record in order {
+                    set.verify_and_insert(record.clone(), None)
+                        .expect("verifies");
+                    assert!(
+                        set.is_agent_revoked(&kp.agent_id()),
+                        "the subject is revoked after every step"
+                    );
+                }
+                assert_eq!(set.all_records(), vec![winner_of_tie.clone()]);
+                // A restart reads the same record back.
+                let bytes = set.to_bytes().expect("encode");
+                let loaded = RevocationSet::from_bytes(&bytes).expect("decode");
+                assert_eq!(loaded.all_records(), vec![winner_of_tie.clone()]);
+                assert!(loaded.is_agent_revoked(&kp.agent_id()));
+                stores.push(bytes);
+            }
+            assert!(
+                stores.windows(2).all(|pair| pair[0] == pair[1]),
+                "every arrival order writes the same store bytes"
+            );
+        }
+
+        /// WHY: the move epoch is part of a binding subject. Tombstones for
+        /// two epochs are two subjects, and both must stay: the highest
+        /// epoch orders placement records. Two records for ONE epoch are
+        /// one pair.
+        #[test]
+        fn binding_tombstones_with_different_epochs_are_separate_pairs() {
+            let owner = UserKeypair::generate().expect("owner");
+            let agent = AgentKeypair::generate().expect("agent");
+            let cert = AgentCertificate::issue(&owner, &agent).expect("cert");
+            let machine = MachineId([0x4D; 32]);
+            let tombstone = |epoch: u64, revoked_at: u64| {
+                RevocationRecord::sign(
+                    RevokedSubject::AgentMachineBinding(AgentMachineBinding {
+                        agent: agent.agent_id(),
+                        machine,
+                        move_epoch: epoch,
+                    }),
+                    owner.public_key(),
+                    owner.secret_key(),
+                    revoked_at,
+                    None,
+                )
+                .expect("sign")
+            };
+            let mut set = RevocationSet::new();
+            assert!(set
+                .verify_and_insert(tombstone(1, 1_000), Some(&cert))
+                .expect("ok"));
+            assert!(set
+                .verify_and_insert(tombstone(3, 1_000), Some(&cert))
+                .expect("ok"));
+            assert!(
+                !set.verify_and_insert(tombstone(3, 2_000), Some(&cert))
+                    .expect("ok"),
+                "a second record for epoch 3 is the same pair"
+            );
+            assert_eq!(set.binding_records().len(), 2);
+            assert_eq!(set.max_revoked_binding_epoch(&agent.agent_id()), Some(3));
+            assert!(set.is_binding_revoked(&agent.agent_id(), &machine));
+        }
+
+        /// WHY: the store merges (`merge_v2`, `merge_v3`) also put records
+        /// in the set. They must follow the pair rule for bindings, and
+        /// must keep every share-grant record (those are exempt).
+        #[test]
+        fn store_merges_follow_the_pair_rule() {
+            let owner = UserKeypair::generate().expect("owner");
+            let agent = AgentKeypair::generate().expect("agent");
+            let cert = AgentCertificate::issue(&owner, &agent).expect("cert");
+            let machine = MachineId([0x4D; 32]);
+            let tombstone = |revoked_at: u64| {
+                RevocationRecord::sign(
+                    RevokedSubject::AgentMachineBinding(AgentMachineBinding {
+                        agent: agent.agent_id(),
+                        machine,
+                        move_epoch: 2,
+                    }),
+                    owner.public_key(),
+                    owner.secret_key(),
+                    revoked_at,
+                    None,
+                )
+                .expect("sign")
+            };
+            let early = tombstone(1_000);
+            let mut live = RevocationSet::new();
+            live.verify_and_insert(tombstone(2_000), Some(&cert))
+                .expect("ok");
+            let mut disk = RevocationSet::new();
+            disk.verify_and_insert(early.clone(), Some(&cert))
+                .expect("ok");
+            live.merge_v2(disk);
+            assert_eq!(live.binding_records(), vec![early]);
+            assert!(live.is_binding_revoked(&agent.agent_id(), &machine));
+
+            let grant = |revoked_at: u64| {
+                RevocationRecord::sign(
+                    RevokedSubject::ShareGrant(ShareGrantRevocation {
+                        grant_id: [0x61; 32],
+                        owner: owner.user_id(),
+                        grant_expiry: 5_000,
+                    }),
+                    owner.public_key(),
+                    owner.secret_key(),
+                    revoked_at,
+                    None,
+                )
+                .expect("sign")
+            };
+            let mut live = RevocationSet::new();
+            live.verify_and_insert(grant(1_000), None).expect("ok");
+            let mut disk = RevocationSet::new();
+            disk.verify_and_insert(grant(2_000), None).expect("ok");
+            live.merge_v3(disk);
+            assert_eq!(
+                live.share_grant_records().len(),
+                2,
+                "share-grant records are exempt from the pair rule"
+            );
+        }
+
+        /// WHY: a store from an earlier build can hold a record with a
+        /// long reason. Peers refuse that record from gossip, so a node
+        /// that kept sending it would not spread the revocation. A record
+        /// for the same pair with a reason inside the limit is preferred,
+        /// whatever its time. The subject stays revoked through the change.
+        #[test]
+        fn a_record_inside_the_limit_takes_the_place_of_a_stored_long_one() {
+            let kp = AgentKeypair::generate().expect("keypair");
+            let long = long_reason_record(&kp, 1_000);
+            let short = self_revocation(&kp, 2_000, "short");
+
+            let mut set = RevocationSet::new();
+            assert!(set.verify_and_insert(long.clone(), None).expect("stored"));
+            assert!(set
+                .verify_and_insert_at(short.clone(), None, 3_000)
+                .expect("accepted"));
+            assert!(set.is_agent_revoked(&kp.agent_id()));
+            assert_eq!(set.all_records(), vec![short.clone()]);
+            let batches = encode_revocation_batches(&set.all_records()).expect("encode");
+            assert_eq!(
+                decode_revocation_batch(&batches[0]).expect("decode"),
+                vec![short.clone()]
+            );
+
+            // The other order: the long record adds nothing.
+            let mut set = RevocationSet::new();
+            assert!(set.verify_and_insert(short.clone(), None).expect("ok"));
+            assert!(!set.verify_and_insert(long, None).expect("verifies"));
+            assert_eq!(set.all_records(), vec![short]);
+        }
+
+        /// WHY (review MAJOR): a store from a released daemon can hold two
+        /// records for one subject and issuer: a credible one with a long
+        /// reason, and one far in the future with a short reason. The load
+        /// keeps one record per pair, and then drops far-future records.
+        /// If the far-future record won the pair, the subject would have
+        /// no record left and would not be revoked. It was revoked before
+        /// this change, so it must stay revoked: a far-future record never
+        /// wins a pair.
+        #[test]
+        fn a_far_future_record_never_takes_the_place_of_a_credible_one() {
+            let kp = AgentKeypair::generate().expect("keypair");
+            let credible_long = long_reason_record(&kp, 1_000);
+            let future_short = self_revocation(&kp, u64::MAX, "short");
+            let entry = |record: &RevocationRecord| PersistedRevocation {
+                record: record.clone(),
+                subject_cert: None,
+            };
+
+            // The store file, in both record orders.
+            for order in [
+                [&credible_long, &future_short],
+                [&future_short, &credible_long],
+            ] {
+                let persisted: Vec<PersistedRevocation> = order.iter().map(|r| entry(r)).collect();
+                let mut bytes = REVOCATIONS_FILE_MAGIC.to_vec();
+                bytes.extend_from_slice(&bincode::serialize(&persisted).expect("encode"));
+                let mut loaded = RevocationSet::from_bytes(&bytes).expect("decode");
+                assert_eq!(loaded.all_records(), vec![credible_long.clone()]);
+                loaded.drop_future_records(2_000);
+                assert!(
+                    loaded.is_agent_revoked(&kp.agent_id()),
+                    "the subject stays revoked after the far-future sweep"
+                );
+            }
+
+            // The store merges run the pair rule too.
+            for merge_v3 in [false, true] {
+                let mut live = RevocationSet::new();
+                live.verify_and_insert(future_short.clone(), None)
+                    .expect("ok");
+                let mut disk = RevocationSet::new();
+                disk.verify_and_insert(credible_long.clone(), None)
+                    .expect("ok");
+                if merge_v3 {
+                    live.merge_v3(disk);
+                } else {
+                    live.merge_v2(disk);
+                }
+                live.drop_future_records(2_000);
+                assert!(
+                    live.is_agent_revoked(&kp.agent_id()),
+                    "merge_v3: {merge_v3}"
+                );
+                assert_eq!(live.all_records(), vec![credible_long.clone()]);
+            }
+
+            // A live arrival: the far-future record adds nothing.
+            let mut set = RevocationSet::new();
+            set.verify_and_insert(credible_long.clone(), None)
+                .expect("ok");
+            assert!(!set.verify_and_insert(future_short, None).expect("verifies"));
+            assert_eq!(set.all_records(), vec![credible_long]);
+        }
+
+        /// WHY: a set of one batch must have the bytes it had before
+        /// #1857, so that a released daemon reads it as before. These are
+        /// fixed bytes: plain bincode of the record list, no marker.
+        #[test]
+        fn a_one_batch_set_has_the_bytes_of_before() {
+            let record = RevocationRecord {
+                subject: RevokedSubject::Agent(AgentId([1; 32])),
+                issuer_public_key: vec![7; 4],
+                revoked_at: 1,
+                reason: None,
+                signature: vec![9; 4],
+            };
+            let golden = concat!(
+                "0100000000000000", // one record
+                "00000000",         // RevokedSubject::Agent
+                "0101010101010101010101010101010101010101010101010101010101010101",
+                "0400000000000000",
+                "07070707",         // issuer_public_key
+                "0100000000000000", // revoked_at
+                "00",               // reason: None
+                "0400000000000000",
+                "09090909", // signature
+            );
+            let batches = encode_revocation_batches(std::slice::from_ref(&record)).expect("encode");
+            assert_eq!(batches.len(), 1);
+            assert_eq!(hex::encode(&batches[0]), golden);
+            assert_eq!(
+                decode_revocation_batch(&batches[0]).expect("decode"),
+                vec![record]
+            );
+        }
+
+        /// WHY: a record that no receiver accepts (it is over the receive
+        /// limit by itself) cannot be sent. Its hash stays in the round's
+        /// digest and every batch keeps a marker, so the batches never
+        /// look like the sender's whole set.
+        #[test]
+        fn a_record_over_the_receive_limit_is_not_sent_but_stays_in_the_digest() {
+            let mut records: Vec<RevocationRecord> = (0..800).map(sized_fake).collect();
+            let giant = sized_fake_with_reason(9_999, "x".repeat(MAX_REVOCATION_PAYLOAD_BYTES));
+            records.push(giant.clone());
+            let batches = encode_revocation_batches(&records).expect("encode");
+            assert!(batches.len() > 1);
+            let mut sent = Vec::new();
+            let mut sets = HashSet::new();
+            for batch in &batches {
+                assert!(batch.len() < MAX_REVOCATION_PAYLOAD_BYTES);
+                let (part, round) = decode_revocation_batch_with_round(batch).expect("decode");
+                let BatchRound::Part(marker) = round else {
+                    panic!("every batch of the round has a marker");
+                };
+                sets.insert(marker.set);
+                sent.extend(part.iter().map(RevocationRecord::record_hash));
+            }
+            assert!(!sent.contains(&giant.record_hash()));
+            assert_eq!(sent.len(), 800);
+            sent.sort_unstable();
+            let mut all = sent.clone();
+            all.push(giant.record_hash());
+            all.sort_unstable();
+            assert_eq!(sets, HashSet::from([round_set_digest(&all)]));
+            assert_ne!(sets, HashSet::from([round_set_digest(&sent)]));
+
+            // When the rest fits one batch, that batch still has a marker.
+            let few = vec![sized_fake(1), sized_fake(2), giant];
+            let batches = encode_revocation_batches(&few).expect("encode");
+            assert_eq!(batches.len(), 1);
+            let (part, round) = decode_revocation_batch_with_round(&batches[0]).expect("decode");
+            assert_eq!(part.len(), 2);
+            assert!(matches!(round, BatchRound::Part(marker) if marker.batches == 1));
+        }
+
+        /// WHY: a trusted resync snapshot can hold a legacy record with a
+        /// long reason. If the waiting node dropped it and then opened the
+        /// carrier, the subject would not be revoked there. The record is
+        /// admitted when a trusted authority offered it, and only then.
+        #[test]
+        fn a_long_reason_record_in_a_trusted_resync_is_admitted_and_revokes() {
+            let kp = AgentKeypair::generate().expect("keypair");
+            let long = long_reason_record(&kp, 1_000);
+
+            let mut open_gossip = RevocationSet::quarantined_carrier(REVOCATION_CARRIER_V1);
+            open_gossip.observe_remote_carrier_snapshot(
+                REVOCATION_CARRIER_V1,
+                &AgentId([0xB2; 32]),
+                std::slice::from_ref(&long),
+                false,
+            );
+            assert!(
+                open_gossip
+                    .verify_and_insert_at(long.clone(), None, 3_000)
+                    .is_err(),
+                "a sender that is not a trusted authority does not lift the limit"
+            );
+
+            let mut held = RevocationSet::quarantined_carrier(REVOCATION_CARRIER_V1);
+            held.observe_remote_carrier_snapshot(
+                REVOCATION_CARRIER_V1,
+                &AgentId([0xA1; 32]),
+                std::slice::from_ref(&long),
+                true,
+            );
+            assert!(held.carrier_resync_pending(REVOCATION_CARRIER_V1));
+            assert!(held
+                .verify_and_insert_at(long.clone(), None, 3_000)
+                .expect("admitted from the trusted snapshot"));
+            assert!(held.is_agent_revoked(&kp.agent_id()));
+            assert!(!held.carrier_resync_pending(REVOCATION_CARRIER_V1));
+
+            // The authenticated group resync path admits it too.
+            let mut group = RevocationSet::quarantined_carrier(REVOCATION_CARRIER_V1);
+            group.apply_group_revocation_resync(vec![long], 3_000);
+            assert!(group.is_agent_revoked(&kp.agent_id()));
+        }
+
+        /// WHY: another issuer is another pair. An owner's record for an
+        /// agent and the agent's own record are both kept: each one has
+        /// its own authority.
+        #[test]
+        fn two_issuers_for_one_subject_are_both_kept() {
+            let owner = UserKeypair::generate().expect("owner");
+            let agent = AgentKeypair::generate().expect("agent");
+            let cert = AgentCertificate::issue(&owner, &agent).expect("cert");
+            let by_owner = RevocationRecord::sign(
+                RevokedSubject::Agent(agent.agent_id()),
+                owner.public_key(),
+                owner.secret_key(),
+                1_000,
+                None,
+            )
+            .expect("sign");
+            let mut set = RevocationSet::new();
+            assert!(set
+                .verify_and_insert(by_owner, Some(&cert))
+                .expect("verifies"));
+            assert!(set
+                .verify_and_insert(self_revocation(&agent, 2_000, "self"), None)
+                .expect("verifies"));
+            assert_eq!(set.len(), 2);
+        }
+
+        /// WHY: a receiver ignores a whole batch above 2 MiB, about 380
+        /// records. One batch for a larger set meant that NO revocation
+        /// from that daemon reached any peer. Several batches, each one
+        /// well under the limit, carry every record.
+        #[test]
+        fn a_large_set_is_sent_as_batches_under_the_receive_limit() {
+            let records: Vec<RevocationRecord> = (0..1_000).map(sized_fake).collect();
+            assert!(
+                encode_revocation_batch(&records).expect("encode").len()
+                    > MAX_REVOCATION_PAYLOAD_BYTES,
+                "one batch of this set is over the limit a receiver accepts"
+            );
+
+            let batches = encode_revocation_batches(&records).expect("encode");
+            assert!(batches.len() > 1);
+            let mut seen = HashSet::new();
+            assert_batches_fit(&batches);
+            // A set that fitted in one batch before is still one batch,
+            // with the bytes of before: plain bincode, no marker.
+            let mut one: Vec<RevocationRecord> = records[..370].to_vec();
+            one.sort_by_key(RevocationRecord::record_hash);
+            assert_eq!(
+                encode_revocation_batches(&records[..370]).expect("encode"),
+                vec![bincode::serialize(&one).expect("encode")]
+            );
+            // Every batch of a round ends with exactly one marker, and the
+            // markers name one round.
+            let mut rounds = HashSet::new();
+            for (index, batch) in batches.iter().enumerate() {
+                let raw = decode_revocation_batch_raw(batch).expect("decode");
+                assert_eq!(raw.iter().filter(|r| is_round_marker(r)).count(), 1);
+                assert!(raw.last().is_some_and(is_round_marker));
+                let (_, round) = decode_revocation_batch_with_round(batch).expect("decode");
+                let BatchRound::Part(marker) = round else {
+                    panic!("batch {index} has no valid marker");
+                };
+                assert_eq!(marker.index as usize, index);
+                assert_eq!(marker.batches as usize, batches.len());
+                rounds.insert(marker.set);
+            }
+            assert_eq!(rounds.len(), 1);
+            for batch in &batches {
+                for record in decode_revocation_batch(batch).expect("a released decoder reads it") {
+                    seen.insert(record.record_hash());
+                }
+            }
+            assert_eq!(seen.len(), 1_000, "every record is in some batch");
+
+            // The same set gives the same batches in any input order.
+            let mut reversed = records.clone();
+            reversed.reverse();
+            assert_eq!(
+                encode_revocation_batches(&reversed).expect("encode"),
+                batches
+            );
+            // A small set is still one batch, with the bytes of today.
+            assert_eq!(
+                encode_revocation_batches(&records[..2])
+                    .expect("encode")
+                    .len(),
+                1
+            );
+            assert!(encode_revocation_batches(&[]).expect("encode").is_empty());
+
+            // The longest reason a record may carry, on every record.
+            let long: Vec<RevocationRecord> = (0..1_000)
+                .map(|tag| sized_fake_with_reason(tag, "x".repeat(MAX_REVOCATION_REASON_BYTES)))
+                .collect();
+            let long_batches = encode_revocation_batches(&long).expect("encode");
+            assert_batches_fit(&long_batches);
+            let carried: usize = long_batches
+                .iter()
+                .map(|batch| decode_revocation_batch(batch).expect("decode").len())
+                .sum();
+            assert_eq!(carried, 1_000);
+        }
+
+        /// WHY: a store written before this change can hold more records
+        /// than one batch carries. After a restart the daemon must still
+        /// hold every subject as revoked and must send them all.
+        #[test]
+        fn an_over_limit_store_still_loads_and_goes_out_in_batches() {
+            let keys: Vec<AgentKeypair> = (0..420)
+                .map(|_| AgentKeypair::generate().expect("keypair"))
+                .collect();
+            let mut set = RevocationSet::new();
+            for kp in &keys {
+                set.verify_and_insert(self_revocation(kp, 1_000, "r"), None)
+                    .expect("verifies");
+            }
+            let bytes = set.to_bytes().expect("encode");
+            assert!(bytes.len() > MAX_REVOCATION_PAYLOAD_BYTES, "over one batch");
+
+            let loaded = RevocationSet::from_bytes(&bytes).expect("decode");
+            assert!(keys
+                .iter()
+                .all(|kp| loaded.is_agent_revoked(&kp.agent_id())));
+            let batches = encode_revocation_batches(&loaded.all_records()).expect("encode");
+            assert!(batches.len() > 1);
+            let mut sent = 0;
+            assert_batches_fit(&batches);
+            for batch in &batches {
+                sent += decode_revocation_batch(batch).expect("decode").len();
+            }
+            assert_eq!(sent, 420);
+        }
+
+        /// WHY: the reason is inside the signed bytes and had no limit, so
+        /// one signature could put megabytes in every node's store. A new
+        /// record with a long reason is refused where it is signed and
+        /// where it arrives. A record that is already in a store is kept:
+        /// refusing it at load would un-revoke its subject.
+        #[test]
+        fn a_long_reason_is_refused_for_new_records_and_kept_for_stored_ones() {
+            let kp = AgentKeypair::generate().expect("keypair");
+            let at_limit = "x".repeat(MAX_REVOCATION_REASON_BYTES);
+            let over = "x".repeat(MAX_REVOCATION_REASON_BYTES + 1);
+            assert!(RevocationRecord::sign(
+                RevokedSubject::Agent(kp.agent_id()),
+                kp.public_key(),
+                kp.secret_key(),
+                1_000,
+                Some(over),
+            )
+            .is_err());
+
+            // A record as a released daemon could have signed it.
+            let long = long_reason_record(&kp, 1_000);
+
+            let mut fresh = RevocationSet::new();
+            assert!(
+                fresh
+                    .verify_and_insert_at(long.clone(), None, 1_000)
+                    .is_err(),
+                "refused when it arrives from a peer"
+            );
+            assert!(!fresh.is_agent_revoked(&kp.agent_id()));
+            let other = AgentKeypair::generate().expect("keypair");
+            assert!(fresh
+                .verify_and_insert_at(self_revocation(&other, 1_000, &at_limit), None, 1_000)
+                .expect("a reason at the limit is accepted"));
+
+            // Already stored (the load path has no bound): kept.
+            let mut stored = RevocationSet::new();
+            assert!(stored.verify_and_insert(long, None).expect("verifies"));
+            let loaded =
+                RevocationSet::from_bytes(&stored.to_bytes().expect("encode")).expect("decode");
+            assert!(loaded.is_agent_revoked(&kp.agent_id()));
+        }
+
+        /// WHY (#1116): a node that waits for a resync opens a carrier when
+        /// a trusted snapshot matches its own records. A released daemon
+        /// can hold two records for one pair; this node keeps one. The
+        /// snapshot must be compared by the records this node would keep,
+        /// or the carrier never opens against such a daemon.
+        #[test]
+        fn a_resync_snapshot_with_two_records_for_one_pair_still_opens_the_carrier() {
+            let kp = AgentKeypair::generate().expect("keypair");
+            let kept = self_revocation(&kp, 1_000, "kept");
+            let extra = self_revocation(&kp, 2_000, "extra");
+            let mut held = RevocationSet::quarantined_carrier(REVOCATION_CARRIER_V1);
+            held.apply_group_revocation_resync(vec![kept.clone()], 3_000);
+            assert!(
+                held.carrier_resync_pending(REVOCATION_CARRIER_V1),
+                "one insert is not a snapshot"
+            );
+
+            held.observe_remote_carrier_snapshot(
+                REVOCATION_CARRIER_V1,
+                &AgentId([0xA1; 32]),
+                &[kept, extra],
+                true,
+            );
+            assert!(
+                !held.carrier_resync_pending(REVOCATION_CARRIER_V1),
+                "the trusted snapshot is accepted"
+            );
+        }
+    }
+
+    /// #1857: a set above one batch goes out as a ROUND. A node that waits
+    /// for a resync must never open on a part of a round, and a released
+    /// daemon must not be worse off than before.
+    mod round_marker {
+        use super::super::*;
+        use crate::identity::AgentKeypair;
+
+        const SENDER: AgentId = AgentId([0xA1; 32]);
+        /// Two real records fit in one batch of this size.
+        const SMALL_TARGET: usize = 12 * 1024;
+
+        fn records(count: usize) -> Vec<RevocationRecord> {
+            (0..count)
+                .map(|_| {
+                    let kp = AgentKeypair::generate().expect("keypair");
+                    RevocationRecord::sign(
+                        RevokedSubject::Agent(kp.agent_id()),
+                        kp.public_key(),
+                        kp.secret_key(),
+                        1_000,
+                        None,
+                    )
+                    .expect("sign")
+                })
+                .collect()
+        }
+
+        /// The batches of one round for `set`, as the sender publishes them.
+        fn round(set: &[RevocationRecord]) -> Vec<Vec<u8>> {
+            let batches = encode_revocation_batches_with_target(set, SMALL_TARGET).expect("encode");
+            assert!(batches.len() >= 3, "the test needs a round of 3 or more");
+            batches
+        }
+
+        /// What a new waiting node does with one gossip batch: record the
+        /// sender's offer, then ingest the records.
+        fn receive(waiter: &mut RevocationSet, batch: &[u8], trusted: bool) {
+            let (records, round) = decode_revocation_batch_with_round(batch).expect("decode");
+            waiter.observe_remote_carrier_batch(
+                REVOCATION_CARRIER_V1,
+                &SENDER,
+                &records,
+                round,
+                trusted,
+            );
+            for record in records {
+                let _ = waiter.verify_and_insert_at(record, None, 2_000);
+            }
+        }
+
+        fn waiting() -> RevocationSet {
+            RevocationSet::quarantined_carrier(REVOCATION_CARRIER_V1)
+        }
+
+        fn pending(waiter: &RevocationSet) -> bool {
+            waiter.carrier_resync_pending(REVOCATION_CARRIER_V1)
+        }
+
+        /// WHY (review blocker): the waiter starts with nothing and ingests
+        /// each batch as it arrives. After batch 1 its held records equal
+        /// batch 1. It must NOT open then: the other batches are not held.
+        /// It opens only when the whole round is in.
+        #[test]
+        fn a_waiter_with_nothing_opens_only_on_the_complete_round() {
+            let set = records(6);
+            let batches = round(&set);
+            let mut waiter = waiting();
+            for (index, batch) in batches.iter().enumerate() {
+                assert!(pending(&waiter), "closed before batch {index}");
+                receive(&mut waiter, batch, true);
+            }
+            assert!(!pending(&waiter), "the complete round opens the carrier");
+            assert_eq!(waiter.len(), 6, "no marker was stored");
+        }
+
+        /// WHY: a lost batch means the waiter holds a partial set. It must
+        /// stay closed, whichever batch is lost.
+        #[test]
+        fn a_round_with_a_lost_batch_stays_closed() {
+            let set = records(6);
+            let batches = round(&set);
+            for lost in [0, 1, batches.len() - 1] {
+                let mut waiter = waiting();
+                for (index, batch) in batches.iter().enumerate() {
+                    if index != lost {
+                        receive(&mut waiter, batch, true);
+                    }
+                }
+                assert!(pending(&waiter), "closed with batch {lost} lost");
+                // The lost batch arrives later (the next publish): open.
+                receive(&mut waiter, &batches[lost], true);
+                assert!(!pending(&waiter));
+            }
+        }
+
+        /// WHY: the sender's set can change in the middle of a round. Parts
+        /// of two rounds must never be read as one snapshot.
+        #[test]
+        fn parts_of_two_rounds_are_not_mixed() {
+            let first = records(6);
+            let mut second = first.clone();
+            second.extend(records(1));
+            let round_a = round(&first);
+            let round_b = round(&second);
+
+            let mut waiter = waiting();
+            receive(&mut waiter, &round_a[0], true);
+            for batch in &round_b[1..] {
+                receive(&mut waiter, batch, true);
+            }
+            assert!(pending(&waiter), "round B has no batch 0 yet");
+            for batch in &round_a[1..] {
+                receive(&mut waiter, batch, true);
+            }
+            assert!(
+                pending(&waiter),
+                "round A parts restart round A; B is dropped"
+            );
+            for batch in &round_b {
+                receive(&mut waiter, batch, true);
+            }
+            assert!(!pending(&waiter), "the complete round B opens");
+            assert_eq!(waiter.len(), 7);
+        }
+
+        /// WHY: a sender offers its whole set as one batch, and later its
+        /// set grows into a round. The old one-batch snapshot is stale. If
+        /// the waiter kept it, it could open on that old set while it
+        /// holds only part of the sender's set of now.
+        #[test]
+        fn an_earlier_whole_snapshot_does_not_open_after_a_round_starts() {
+            let old = records(2);
+            let mut grown = old.clone();
+            grown.extend(records(4));
+            let mut waiter = waiting();
+            // The old snapshot is offered while the waiter holds nothing
+            // of it yet.
+            waiter.observe_remote_carrier_snapshot(REVOCATION_CARRIER_V1, &SENDER, &old, true);
+            // A part of the new round arrives (not ingested: lost records).
+            let batches = round(&grown);
+            let (part, marker) = decode_revocation_batch_with_round(&batches[0]).expect("decode");
+            waiter.observe_remote_carrier_batch(
+                REVOCATION_CARRIER_V1,
+                &SENDER,
+                &part,
+                marker,
+                true,
+            );
+            // The waiter now comes to hold exactly the OLD set.
+            for record in old {
+                let _ = waiter.verify_and_insert_at(record, None, 2_000);
+            }
+            assert!(
+                pending(&waiter),
+                "the stale one-batch snapshot must not open the carrier"
+            );
+        }
+
+        /// WHY: the same rule for a newer UNMARKED batch. The sender's
+        /// newest batch is its set of now, also when this node refuses
+        /// that batch. An older whole set from the same sender must not
+        /// open the carrier after it.
+        #[test]
+        fn an_earlier_whole_snapshot_does_not_open_after_a_newer_one_batch_set() {
+            let old = records(2);
+            let newer = records(1);
+            let mut waiter = waiting();
+            let _ = waiter.verify_and_insert_at(old[0].clone(), None, 2_000);
+            waiter.observe_remote_carrier_snapshot(REVOCATION_CARRIER_V1, &SENDER, &old, true);
+            // A newer set that omits a record this node holds: refused.
+            waiter.observe_remote_carrier_snapshot(REVOCATION_CARRIER_V1, &SENDER, &newer, true);
+            let _ = waiter.verify_and_insert_at(old[1].clone(), None, 2_000);
+            assert!(
+                pending(&waiter),
+                "the node holds exactly the OLD set, which is stale"
+            );
+        }
+
+        /// A signed self-revocation that is over the receive limit by
+        /// itself, as only an old store can hold.
+        fn unsendable_record() -> RevocationRecord {
+            let kp = AgentKeypair::generate().expect("keypair");
+            let subject = RevokedSubject::Agent(kp.agent_id());
+            let issuer = kp.public_key().as_bytes().to_vec();
+            let reason = Some("x".repeat(MAX_REVOCATION_PAYLOAD_BYTES));
+            let message = RevocationRecord::canonical_message(&subject, &issuer, 1_000, &reason);
+            let signature = sign_with_ml_dsa(kp.secret_key(), &message).expect("sign");
+            RevocationRecord {
+                subject,
+                issuer_public_key: issuer,
+                revoked_at: 1_000,
+                reason,
+                signature: signature.as_bytes().to_vec(),
+            }
+        }
+
+        /// WHY (review MAJOR): a sender holds a record that cannot be sent.
+        /// A waiting node that opened from that sender would hold the set
+        /// MINUS that record, with its subject not revoked. The node must
+        /// stay closed, whether the rest needs a round or fits one batch.
+        /// A released waiter must stay closed too.
+        #[test]
+        fn a_waiter_never_opens_from_a_sender_that_holds_an_unsendable_record() {
+            // (a) The rest needs a round.
+            let mut set = records(6);
+            set.push(unsendable_record());
+            let mut waiter = waiting();
+            for batch in &round(&set) {
+                receive(&mut waiter, batch, true);
+            }
+            assert_eq!(waiter.len(), 6);
+            assert!(pending(&waiter), "the round can never match its digest");
+
+            // (b) The rest fits one batch.
+            let mut set = records(2);
+            set.push(unsendable_record());
+            let batches =
+                encode_revocation_batches_with_target(&set, SMALL_TARGET).expect("encode");
+            assert_eq!(batches.len(), 1);
+            let mut waiter = waiting();
+            receive(&mut waiter, &batches[0], true);
+            assert_eq!(waiter.len(), 2);
+            assert!(
+                pending(&waiter),
+                "one batch from this sender is not its whole set"
+            );
+
+            let mut released = ReleasedWaiter::new();
+            assert_eq!(released.receive(&batches[0]), 2);
+            assert!(!released.open, "a released waiter stays closed too");
+        }
+
+        /// WHY: the sender publishes the same set again every two hours.
+        /// A waiting node that holds the complete round must keep it when
+        /// a part of the SAME round arrives again, or it could never open
+        /// while its own ingest is still behind.
+        #[test]
+        fn a_repeat_of_the_same_round_keeps_the_complete_snapshot() {
+            let set = records(6);
+            let batches = round(&set);
+            let mut waiter = waiting();
+            // Every part is offered; nothing is ingested yet.
+            for batch in &batches {
+                let (part, marker) = decode_revocation_batch_with_round(batch).expect("decode");
+                waiter.observe_remote_carrier_batch(
+                    REVOCATION_CARRIER_V1,
+                    &SENDER,
+                    &part,
+                    marker,
+                    true,
+                );
+            }
+            assert!(pending(&waiter));
+            // The sender publishes again: part 0 of the same round.
+            let (part, marker) = decode_revocation_batch_with_round(&batches[0]).expect("decode");
+            waiter.observe_remote_carrier_batch(
+                REVOCATION_CARRIER_V1,
+                &SENDER,
+                &part,
+                marker,
+                true,
+            );
+            // The ingest catches up.
+            for record in set {
+                let _ = waiter.verify_and_insert_at(record, None, 2_000);
+            }
+            assert!(!pending(&waiter), "the complete round still stands");
+        }
+
+        /// WHY: only a trusted authority can offer a snapshot. A marker
+        /// from any other sender must not start, extend or close a round.
+        #[test]
+        fn a_round_from_an_untrusted_sender_is_ignored() {
+            let set = records(6);
+            let mut waiter = waiting();
+            for batch in &round(&set) {
+                receive(&mut waiter, batch, false);
+            }
+            assert_eq!(waiter.len(), 6, "ordinary ingest still takes the records");
+            assert!(pending(&waiter));
+        }
+
+        /// WHY: the marker is not signed by itself, so the waiter must
+        /// check what it says. A wrong set digest, a wrong count, an index
+        /// out of range or a changed part must never open the carrier.
+        #[test]
+        fn a_forged_or_bad_marker_never_opens_the_carrier() {
+            let set = records(6);
+            let good = round(&set);
+            let parts: Vec<Vec<RevocationRecord>> = good
+                .iter()
+                .map(|batch| decode_revocation_batch(batch).expect("decode"))
+                .collect();
+            let count = parts.len() as u32;
+            let batch_with = |records: &[RevocationRecord], marker: RoundMarker| {
+                let mut group = records.to_vec();
+                group.push(round_marker_record(&marker));
+                encode_revocation_batch(&group).expect("encode")
+            };
+
+            // A wrong digest: every part arrives, the set does not match.
+            let mut waiter = waiting();
+            for (index, part) in parts.iter().enumerate() {
+                let marker = RoundMarker {
+                    batches: count,
+                    index: index as u32,
+                    set: [0x66; 32],
+                };
+                receive(&mut waiter, &batch_with(part, marker), true);
+            }
+            assert!(pending(&waiter), "wrong set digest");
+
+            // A round that claims fewer batches than the set needs.
+            let (_, real) = decode_revocation_batch_with_round(&good[0]).expect("decode");
+            let BatchRound::Part(real) = real else {
+                panic!("marker")
+            };
+            let mut waiter = waiting();
+            let short = RoundMarker {
+                batches: 1,
+                index: 0,
+                set: real.set,
+            };
+            receive(&mut waiter, &batch_with(&parts[0], short), true);
+            assert!(pending(&waiter), "one part cannot be the whole set");
+
+            // Markers that do not parse are never a snapshot.
+            for reason in [
+                "x0x-revocation-round-v1 n=0 i=0 set=00".to_string(),
+                format!(
+                    "x0x-revocation-round-v1 n=2 i=2 set={}",
+                    hex::encode([1u8; 32])
+                ),
+                format!(
+                    "x0x-revocation-round-v1 n=513 i=0 set={}",
+                    hex::encode([1u8; 32])
+                ),
+                format!(
+                    "x0x-revocation-round-v1 n=02 i=0 set={}",
+                    hex::encode([1u8; 32])
+                ),
+                "something else".to_string(),
+            ] {
+                let mut bad = round_marker_record(&real);
+                bad.reason = Some(reason.clone());
+                assert!(is_round_marker(&bad));
+                assert_eq!(parse_round_marker(&bad), None, "{reason}");
+                let mut group = parts[0].clone();
+                group.push(bad);
+                let batch = encode_revocation_batch(&group).expect("encode");
+                let (records, round) = decode_revocation_batch_with_round(&batch).expect("decode");
+                assert_eq!(round, BatchRound::Invalid);
+                assert_eq!(records.len(), parts[0].len(), "the marker is removed");
+                let mut waiter = waiting();
+                receive(&mut waiter, &batch, true);
+                assert!(pending(&waiter), "a bad marker never opens: {reason}");
+            }
+
+            // The same index with other content is refused.
+            let mut waiter = waiting();
+            receive(&mut waiter, &good[0], true);
+            let swapped = RoundMarker { index: 0, ..real };
+            receive(&mut waiter, &batch_with(&parts[1], swapped), true);
+            for batch in &good[1..] {
+                receive(&mut waiter, batch, true);
+            }
+            assert!(
+                !pending(&waiter),
+                "the first part 0 was kept and the round is whole"
+            );
+        }
+
+        /// WHY: a marker is not a revocation. No path may store, list or
+        /// send it, and a store file that holds one must load without it.
+        #[test]
+        fn a_marker_is_never_stored_listed_or_sent() {
+            let marker = round_marker_record(&RoundMarker {
+                batches: 2,
+                index: 0,
+                set: [7; 32],
+            });
+            assert!(marker
+                .reason
+                .as_ref()
+                .is_some_and(|r| r.len() < MAX_REVOCATION_REASON_BYTES));
+            assert_eq!(marker.revoked_at, 0);
+            assert!(
+                marker.verify_authority(None).is_err(),
+                "it can never verify"
+            );
+
+            let mut set = RevocationSet::new();
+            assert!(set.verify_and_insert(marker.clone(), None).is_err());
+            assert!(set
+                .verify_and_insert_at(marker.clone(), None, 2_000)
+                .is_err());
+            assert!(!set.insert_verified(PersistedRevocation {
+                record: marker.clone(),
+                subject_cert: None,
+            }));
+            assert!(!set.covers(&marker));
+            assert!(set.is_empty());
+            assert!(set.all_subject_records().is_empty());
+            assert!(!set.is_machine_revoked(&MachineId([0u8; 32])));
+
+            // A store file with a marker in it (it should never exist).
+            let real = records(1);
+            let persisted = vec![
+                PersistedRevocation {
+                    record: real[0].clone(),
+                    subject_cert: None,
+                },
+                PersistedRevocation {
+                    record: marker.clone(),
+                    subject_cert: None,
+                },
+            ];
+            let mut bytes = REVOCATIONS_FILE_MAGIC.to_vec();
+            bytes.extend_from_slice(&bincode::serialize(&persisted).expect("encode"));
+            let loaded = RevocationSet::from_bytes(&bytes).expect("decode");
+            assert_eq!(loaded.all_subject_records(), real);
+
+            // The encoder drops a marker that is handed to it.
+            let mut with_marker = real.clone();
+            with_marker.push(marker);
+            assert_eq!(
+                encode_revocation_batches(&with_marker).expect("encode"),
+                vec![bincode::serialize(&real).expect("encode")]
+            );
+        }
+
+        /// The resync rule of a RELEASED daemon (v0.48.1,
+        /// `observe_remote_carrier_snapshot` + `try_complete_carrier`),
+        /// ported here: one batch is a whole snapshot, and the carrier
+        /// opens when the held hashes equal a trusted snapshot's hashes.
+        struct ReleasedWaiter {
+            known: HashSet<[u8; 32]>,
+            candidate: Option<HashSet<[u8; 32]>>,
+            open: bool,
+        }
+
+        impl ReleasedWaiter {
+            fn new() -> Self {
+                Self {
+                    known: HashSet::new(),
+                    candidate: None,
+                    open: false,
+                }
+            }
+
+            /// A released daemon decodes the batch as a plain record list
+            /// (it does not know the marker), arms the snapshot, then
+            /// applies each record on its own: a record that does not
+            /// verify is rejected alone.
+            fn receive(&mut self, batch: &[u8]) -> usize {
+                let records: Vec<RevocationRecord> =
+                    bincode::deserialize(batch).expect("a released decoder reads the batch");
+                // observe_remote_carrier_snapshot (trusted sender).
+                if !records.is_empty()
+                    && records
+                        .iter()
+                        .all(|r| subject_carrier(&r.subject) == Some(REVOCATION_CARRIER_V1))
+                {
+                    let hashes: HashSet<[u8; 32]> =
+                        records.iter().map(RevocationRecord::record_hash).collect();
+                    if hashes.is_superset(&self.known) {
+                        self.candidate = Some(hashes);
+                        self.try_complete();
+                    }
+                }
+                // apply_legacy_revocation_records.
+                let mut applied = 0;
+                for record in records {
+                    if record.verify_authority(None).is_ok() {
+                        self.known.insert(record.record_hash());
+                        applied += 1;
+                        self.try_complete();
+                    }
+                }
+                applied
+            }
+
+            fn try_complete(&mut self) {
+                if !self.known.is_empty() && self.candidate.as_ref() == Some(&self.known) {
+                    self.open = true;
+                }
+            }
+        }
+
+        /// WHY (requirement b): a released daemon must not be worse off
+        /// than before. Before, a set above one batch did not arrive and
+        /// its carrier stayed closed. With a round it must still stay
+        /// closed (the marker never verifies, so it is never held), while
+        /// ordinary ingest applies every real record. A set of one batch
+        /// has no marker and opens as before.
+        #[test]
+        fn a_released_waiter_stays_closed_on_a_round_and_opens_on_one_batch() {
+            let set = records(6);
+            let mut released = ReleasedWaiter::new();
+            let mut applied = 0;
+            for batch in &round(&set) {
+                applied += released.receive(batch);
+                assert!(
+                    !released.open,
+                    "a marked batch never opens a released waiter"
+                );
+            }
+            assert_eq!(
+                applied, 6,
+                "every real record of every marked batch is applied"
+            );
+
+            let small = records(2);
+            let one = encode_revocation_batches_with_target(&small, SMALL_TARGET).expect("encode");
+            assert_eq!(one.len(), 1);
+            let mut released = ReleasedWaiter::new();
+            assert_eq!(released.receive(&one[0]), 2);
+            assert!(released.open, "one unmarked batch opens as before");
+
+            // The same single batch opens a new waiter too.
+            let mut waiter = waiting();
+            receive(&mut waiter, &one[0], true);
+            assert!(!pending(&waiter));
+        }
+    }
+
+    /// #1864: three review findings on the batch and round code of #1857.
+    mod recovery_1864 {
+        use super::super::*;
+        use crate::identity::AgentKeypair;
+
+        const SENDER: AgentId = AgentId([0xA1; 32]);
+        const SMALL_TARGET: usize = 12 * 1024;
+
+        fn waiting() -> RevocationSet {
+            RevocationSet::quarantined_carrier(REVOCATION_CARRIER_V1)
+        }
+
+        fn pending(waiter: &RevocationSet) -> bool {
+            waiter.carrier_resync_pending(REVOCATION_CARRIER_V1)
+        }
+
+        /// A signed record with a reason over the limit, as a released
+        /// daemon could have made it (`sign` refuses it now).
+        fn long_reason_record(kp: &AgentKeypair, revoked_at: u64) -> RevocationRecord {
+            let subject = RevokedSubject::Agent(kp.agent_id());
+            let issuer = kp.public_key().as_bytes().to_vec();
+            let reason = Some("x".repeat(MAX_REVOCATION_REASON_BYTES + 1));
+            let message =
+                RevocationRecord::canonical_message(&subject, &issuer, revoked_at, &reason);
+            let signature = sign_with_ml_dsa(kp.secret_key(), &message).expect("sign");
+            RevocationRecord {
+                subject,
+                issuer_public_key: issuer,
+                revoked_at,
+                reason,
+                signature: signature.as_bytes().to_vec(),
+            }
+        }
+
+        fn short_record(revoked_at: u64) -> RevocationRecord {
+            let kp = AgentKeypair::generate().expect("keypair");
+            RevocationRecord::sign(
+                RevokedSubject::Agent(kp.agent_id()),
+                kp.public_key(),
+                kp.secret_key(),
+                revoked_at,
+                None,
+            )
+            .expect("sign")
+        }
+
+        /// What a waiting node does with one gossip batch: record the
+        /// sender's offer, then ingest the records.
+        fn receive(waiter: &mut RevocationSet, batch: &[u8], trusted: bool) {
+            let (records, round) = decode_revocation_batch_with_round(batch).expect("decode");
+            waiter.observe_remote_carrier_batch(
+                REVOCATION_CARRIER_V1,
+                &SENDER,
+                &records,
+                round,
+                trusted,
+            );
+            for record in records {
+                let _ = waiter.verify_and_insert_at(record, None, 2_000);
+            }
+        }
+
+        /// A marked batch whose marker the decoder refuses (a count over
+        /// the round limit, as the encoder sends above 512 batches).
+        fn batch_with_invalid_marker(records: &[RevocationRecord]) -> Vec<u8> {
+            let mut marker = round_marker_record(&RoundMarker {
+                batches: 2,
+                index: 0,
+                set: [1u8; 32],
+            });
+            marker.reason = Some(format!(
+                "x0x-revocation-round-v1 n={} i=0 set={}",
+                MAX_ROUND_BATCHES + 1,
+                hex::encode([1u8; 32])
+            ));
+            let mut group = records.to_vec();
+            group.push(marker);
+            let batch = encode_revocation_batch(&group).expect("encode");
+            let (_, round) = decode_revocation_batch_with_round(&batch).expect("decode");
+            assert_eq!(round, BatchRound::Invalid);
+            batch
+        }
+
+        /// WHY (finding 1): the waiting node holds a legacy record (reason
+        /// over the limit). The trusted sender holds a better record of
+        /// the same pair, also with a long reason. The snapshot does not
+        /// list the held record's hash, but it covers the held record:
+        /// this node keeps the sender's record in its place. The offer
+        /// must stay, or the long-reason replacement is refused and every
+        /// repeat fails in the same way.
+        #[test]
+        fn a_better_legacy_record_of_a_held_pair_completes_recovery() {
+            let kp = AgentKeypair::generate().expect("keypair");
+            let held = long_reason_record(&kp, 1_500);
+            let better = long_reason_record(&kp, 1_000);
+            let mut waiter = waiting();
+            assert!(waiter
+                .verify_and_insert(held.clone(), None)
+                .expect("insert"));
+            assert!(pending(&waiter));
+
+            let batch = encode_revocation_batch(std::slice::from_ref(&better)).expect("encode");
+            receive(&mut waiter, &batch, true);
+            assert!(
+                waiter.contains_hash(&better.record_hash()),
+                "the trusted sender's long-reason record is admitted"
+            );
+            assert!(!waiter.contains_hash(&held.record_hash()));
+            assert!(waiter.is_agent_revoked(&kp.agent_id()));
+            assert!(!pending(&waiter), "recovery completes");
+        }
+
+        /// The same case when the sender's set is a marked round.
+        #[test]
+        fn a_better_legacy_record_of_a_held_pair_completes_a_round() {
+            let keys: Vec<AgentKeypair> = (0..6)
+                .map(|_| AgentKeypair::generate().expect("keypair"))
+                .collect();
+            let held = long_reason_record(&keys[0], 1_500);
+            let set: Vec<RevocationRecord> = keys
+                .iter()
+                .map(|kp| long_reason_record(kp, 1_000))
+                .collect();
+            let batches =
+                encode_revocation_batches_with_target(&set, SMALL_TARGET).expect("encode");
+            assert!(batches.len() >= 2, "the test needs a round");
+            // The batch with the better record of the held pair arrives
+            // last, so the round completes while the old record is held.
+            let better = set[0].record_hash();
+            let (last, first): (Vec<&Vec<u8>>, Vec<&Vec<u8>>) = batches.iter().partition(|batch| {
+                decode_revocation_batch(batch)
+                    .expect("decode")
+                    .iter()
+                    .any(|record| record.record_hash() == better)
+            });
+            assert_eq!(last.len(), 1);
+            let mut waiter = waiting();
+            assert!(waiter.verify_and_insert(held, None).expect("insert"));
+            for batch in first.into_iter().chain(last) {
+                receive(&mut waiter, batch, true);
+            }
+            assert_eq!(waiter.len(), set.len());
+            assert!(!pending(&waiter), "recovery completes on this round");
+        }
+
+        /// The snapshot stays refused when it does not cover a held
+        /// record: the sender's record of the pair is worse, so this node
+        /// would keep its own record and the two sets differ.
+        #[test]
+        fn a_worse_record_of_a_held_pair_does_not_complete_recovery() {
+            let kp = AgentKeypair::generate().expect("keypair");
+            let held = long_reason_record(&kp, 1_000);
+            let worse = long_reason_record(&kp, 1_500);
+            let mut waiter = waiting();
+            assert!(waiter
+                .verify_and_insert(held.clone(), None)
+                .expect("insert"));
+            let batch = encode_revocation_batch(std::slice::from_ref(&worse)).expect("encode");
+            receive(&mut waiter, &batch, true);
+            assert!(waiter.contains_hash(&held.record_hash()));
+            assert!(pending(&waiter));
+        }
+
+        /// A snapshot that covers a held record by a better record opens
+        /// nothing until that better record has verified here.
+        #[test]
+        fn a_covering_snapshot_does_not_open_before_its_record_verifies() {
+            let kp = AgentKeypair::generate().expect("keypair");
+            let held = long_reason_record(&kp, 1_500);
+            let mut forged = long_reason_record(&kp, 1_000);
+            forged.signature = vec![0u8; forged.signature.len()];
+            let mut waiter = waiting();
+            assert!(waiter
+                .verify_and_insert(held.clone(), None)
+                .expect("insert"));
+            let batch = encode_revocation_batch(std::slice::from_ref(&forged)).expect("encode");
+            receive(&mut waiter, &batch, true);
+            assert!(waiter.contains_hash(&held.record_hash()));
+            assert!(pending(&waiter));
+        }
+
+        /// WHY (finding 2): a trusted sender offered a complete snapshot
+        /// that still waits (one record is not verified yet). Then a
+        /// marked batch with a marker this node cannot read arrives from
+        /// the same sender: its set is a newer round now. The earlier
+        /// snapshot is stale. If it stays, the late record completes it
+        /// and the carrier opens with the newer batches missing.
+        #[test]
+        fn an_invalid_marker_drops_the_senders_earlier_snapshot() {
+            let old_set = vec![short_record(1_000), short_record(1_000)];
+            let mut waiter = waiting();
+            waiter.observe_remote_carrier_batch(
+                REVOCATION_CARRIER_V1,
+                &SENDER,
+                &old_set,
+                BatchRound::Whole,
+                true,
+            );
+            assert!(pending(&waiter));
+
+            let batch = batch_with_invalid_marker(&old_set[..1]);
+            receive(&mut waiter, &batch, true);
+            assert!(waiter.contains_hash(&old_set[0].record_hash()));
+
+            // The late record of the earlier snapshot verifies now.
+            assert!(waiter
+                .verify_and_insert_at(old_set[1].clone(), None, 2_000)
+                .expect("insert"));
+            assert!(
+                pending(&waiter),
+                "a stale snapshot must not open the carrier"
+            );
+        }
+
+        /// An invalid marker from a sender that is not a trusted authority
+        /// changes nothing.
+        #[test]
+        fn an_invalid_marker_from_an_untrusted_sender_is_ignored() {
+            let set = vec![short_record(1_000), short_record(1_000)];
+            let mut waiter = waiting();
+            waiter.observe_remote_carrier_batch(
+                REVOCATION_CARRIER_V1,
+                &SENDER,
+                &set,
+                BatchRound::Whole,
+                true,
+            );
+            let (records, round) =
+                decode_revocation_batch_with_round(&batch_with_invalid_marker(&set[..1]))
+                    .expect("decode");
+            waiter.observe_remote_carrier_batch(
+                REVOCATION_CARRIER_V1,
+                &SENDER,
+                &records,
+                round,
+                false,
+            );
+            for record in set {
+                let _ = waiter.verify_and_insert_at(record, None, 2_000);
+            }
+            assert!(!pending(&waiter), "the trusted snapshot still stands");
+        }
+
+        /// A round part with a count or index out of range is the same
+        /// case on the direct path.
+        #[test]
+        fn an_out_of_range_round_part_drops_the_senders_earlier_snapshot() {
+            for marker in [
+                RoundMarker {
+                    batches: MAX_ROUND_BATCHES + 1,
+                    index: 0,
+                    set: [1u8; 32],
+                },
+                RoundMarker {
+                    batches: 2,
+                    index: 2,
+                    set: [1u8; 32],
+                },
+                RoundMarker {
+                    batches: 0,
+                    index: 0,
+                    set: [1u8; 32],
+                },
+            ] {
+                let old_set = vec![short_record(1_000), short_record(1_000)];
+                let mut waiter = waiting();
+                waiter.observe_remote_carrier_batch(
+                    REVOCATION_CARRIER_V1,
+                    &SENDER,
+                    &old_set,
+                    BatchRound::Whole,
+                    true,
+                );
+                waiter.observe_remote_carrier_batch(
+                    REVOCATION_CARRIER_V1,
+                    &SENDER,
+                    &old_set[..1],
+                    BatchRound::Part(marker),
+                    true,
+                );
+                for record in old_set {
+                    let _ = waiter.verify_and_insert_at(record, None, 2_000);
+                }
+                assert!(pending(&waiter), "{marker:?}");
+            }
+        }
+    }
+
+    /// #1863: a self-revocation of a subject this node has not seen (a
+    /// stranger) stays in force, but it is not published again.
+    mod stranger_1863 {
+        use super::super::*;
+        use crate::identity::{AgentKeypair, MachineKeypair, UserKeypair};
+
+        const SENDER: AgentId = AgentId([0xA1; 32]);
+
+        fn self_revocation(kp: &AgentKeypair) -> RevocationRecord {
+            RevocationRecord::sign(
+                RevokedSubject::Agent(kp.agent_id()),
+                kp.public_key(),
+                kp.secret_key(),
+                1_000,
+                None,
+            )
+            .expect("sign")
+        }
+
+        fn machine_self_revocation(kp: &MachineKeypair) -> RevocationRecord {
+            RevocationRecord::sign(
+                RevokedSubject::Machine(kp.machine_id()),
+                kp.public_key(),
+                kp.secret_key(),
+                1_000,
+                None,
+            )
+            .expect("sign")
+        }
+
+        fn published_hashes(set: &RevocationSet) -> HashSet<[u8; 32]> {
+            set.published_records()
+                .iter()
+                .map(RevocationRecord::record_hash)
+                .collect()
+        }
+
+        fn waiting() -> RevocationSet {
+            RevocationSet::quarantined_carrier(REVOCATION_CARRIER_V1)
+        }
+
+        fn pending(waiter: &RevocationSet) -> bool {
+            waiter.carrier_resync_pending(REVOCATION_CARRIER_V1)
+        }
+
+        /// What a waiting node does with one trusted whole-set batch.
+        fn receive_whole(waiter: &mut RevocationSet, records: &[RevocationRecord]) {
+            waiter.observe_remote_carrier_batch(
+                REVOCATION_CARRIER_V1,
+                &SENDER,
+                records,
+                BatchRound::Whole,
+                true,
+            );
+            for record in records {
+                let _ = waiter.verify_and_insert_at(record.clone(), None, 2_000);
+            }
+        }
+
+        /// WHY: a stranger's self-revocation costs the attacker one new key
+        /// and one signature, and every node would send it again for good.
+        /// It stays in force here; it is not published again.
+        #[test]
+        fn a_stranger_self_revocation_is_held_but_not_published() {
+            let agent = AgentKeypair::generate().expect("agent");
+            let machine = MachineKeypair::generate().expect("machine");
+            let mut set = RevocationSet::new();
+            let agent_record = self_revocation(&agent);
+            let machine_record = machine_self_revocation(&machine);
+            assert!(set
+                .verify_and_insert(agent_record.clone(), None)
+                .expect("insert"));
+            assert!(set
+                .verify_and_insert(machine_record.clone(), None)
+                .expect("insert"));
+            assert!(set.is_agent_revoked(&agent.agent_id()));
+            assert!(set.is_machine_revoked(&machine.machine_id()));
+            assert_eq!(set.all_records().len(), 2, "the store keeps both");
+            assert!(published_hashes(&set).is_empty());
+            assert_eq!(set.stranger_self_revocation_count(), 2);
+            let strangers: HashSet<SeenSubject> = set
+                .stranger_self_revocation_subjects()
+                .into_iter()
+                .collect();
+            assert_eq!(
+                strangers,
+                HashSet::from([
+                    SeenSubject::Agent(agent.agent_id()),
+                    SeenSubject::Machine(machine.machine_id()),
+                ])
+            );
+        }
+
+        /// WHY: the issue's rule. A held stranger record enters the
+        /// published set as soon as its subject is seen.
+        #[test]
+        fn a_stranger_record_is_published_once_its_subject_is_seen() {
+            let agent = AgentKeypair::generate().expect("agent");
+            let record = self_revocation(&agent);
+            let mut set = RevocationSet::new();
+            assert!(set.verify_and_insert(record.clone(), None).expect("insert"));
+            assert!(published_hashes(&set).is_empty());
+            let generation = set.generation();
+            assert!(
+                set.mark_seen([SeenSubject::Agent(agent.agent_id())]),
+                "marking a held stranger changes the published set"
+            );
+            assert!(
+                set.generation() > generation,
+                "a new generation makes the heartbeat publish"
+            );
+            assert_eq!(
+                published_hashes(&set),
+                HashSet::from([record.record_hash()])
+            );
+            assert_eq!(set.stranger_self_revocation_count(), 0);
+            assert!(
+                !set.mark_seen([SeenSubject::Agent(agent.agent_id())]),
+                "a second mark changes nothing"
+            );
+        }
+
+        /// A mark for a subject with no held record is not kept, so the
+        /// marks cannot grow without a held record behind each one.
+        #[test]
+        fn a_mark_without_a_held_record_is_not_kept() {
+            let agent = AgentKeypair::generate().expect("agent");
+            let mut set = RevocationSet::new();
+            assert!(!set.mark_seen([SeenSubject::Agent(agent.agent_id())]));
+            assert!(set.seen_subjects.is_empty());
+        }
+
+        /// WHY: only a self-revocation is cheap. An owner's revocation of
+        /// an agent it certified is always published.
+        #[test]
+        fn an_owner_revocation_is_always_published() {
+            let owner = UserKeypair::generate().expect("owner");
+            let agent = AgentKeypair::generate().expect("agent");
+            let cert = AgentCertificate::issue(&owner, &agent).expect("cert");
+            let record = RevocationRecord::sign(
+                RevokedSubject::Agent(agent.agent_id()),
+                owner.public_key(),
+                owner.secret_key(),
+                1_000,
+                None,
+            )
+            .expect("sign");
+            let mut set = RevocationSet::new();
+            assert!(set
+                .verify_and_insert(record.clone(), Some(&cert))
+                .expect("insert"));
+            assert_eq!(
+                published_hashes(&set),
+                HashSet::from([record.record_hash()])
+            );
+            assert_eq!(set.stranger_self_revocation_count(), 0);
+        }
+
+        /// WHY (resync rule, #1863 decision (1)): a waiting node holds a
+        /// stranger's self-revocation that it got by the one pubsub spread.
+        /// The sender leaves it out of its set. That omission must not keep
+        /// the carrier closed, and the record stays in force.
+        #[test]
+        fn a_held_omitted_self_revocation_does_not_block_opening() {
+            let stranger = AgentKeypair::generate().expect("stranger");
+            let held = self_revocation(&stranger);
+            let offered = self_revocation(&AgentKeypair::generate().expect("agent"));
+            let mut waiter = waiting();
+            assert!(waiter
+                .verify_and_insert(held.clone(), None)
+                .expect("insert"));
+            receive_whole(&mut waiter, std::slice::from_ref(&offered));
+            assert!(!pending(&waiter), "the carrier opens");
+            assert!(waiter.contains_hash(&held.record_hash()));
+            assert!(waiter.is_agent_revoked(&stranger.agent_id()));
+        }
+
+        /// The rule is for self-revocations only. A held owner revocation
+        /// that the snapshot omits still keeps the carrier closed.
+        #[test]
+        fn a_held_omitted_non_self_record_still_blocks() {
+            let owner = UserKeypair::generate().expect("owner");
+            let agent = AgentKeypair::generate().expect("agent");
+            let cert = AgentCertificate::issue(&owner, &agent).expect("cert");
+            let held = RevocationRecord::sign(
+                RevokedSubject::Agent(agent.agent_id()),
+                owner.public_key(),
+                owner.secret_key(),
+                1_000,
+                None,
+            )
+            .expect("sign");
+            let offered = self_revocation(&AgentKeypair::generate().expect("agent"));
+            let mut waiter = waiting();
+            assert!(waiter.verify_and_insert(held, Some(&cert)).expect("insert"));
+            receive_whole(&mut waiter, std::slice::from_ref(&offered));
+            assert!(pending(&waiter));
+        }
+
+        /// A held self-revocation that the snapshot has keeps the exact
+        /// rule: the carrier opens only when that record has verified.
+        #[test]
+        fn an_offered_self_revocation_must_verify_before_opening() {
+            let offered = self_revocation(&AgentKeypair::generate().expect("agent"));
+            let other = self_revocation(&AgentKeypair::generate().expect("agent"));
+            let mut waiter = waiting();
+            assert!(waiter
+                .verify_and_insert(offered.clone(), None)
+                .expect("insert"));
+            waiter.observe_remote_carrier_batch(
+                REVOCATION_CARRIER_V1,
+                &SENDER,
+                &[offered, other.clone()],
+                BatchRound::Whole,
+                true,
+            );
+            assert!(
+                pending(&waiter),
+                "the offered record `other` is not held yet"
+            );
+            assert!(waiter
+                .verify_and_insert_at(other, None, 2_000)
+                .expect("insert"));
+            assert!(!pending(&waiter));
+        }
+
+        /// WHY (#1865 review item): the design note says that an empty
+        /// batch from a trusted sender removes what it offered before. An
+        /// empty round part did not.
+        #[test]
+        fn an_empty_round_part_drops_the_senders_earlier_snapshot() {
+            let old_set = vec![
+                self_revocation(&AgentKeypair::generate().expect("agent")),
+                self_revocation(&AgentKeypair::generate().expect("agent")),
+            ];
+            let mut waiter = waiting();
+            waiter.observe_remote_carrier_batch(
+                REVOCATION_CARRIER_V1,
+                &SENDER,
+                &old_set,
+                BatchRound::Whole,
+                true,
+            );
+            waiter.observe_remote_carrier_batch(
+                REVOCATION_CARRIER_V1,
+                &SENDER,
+                &[],
+                BatchRound::Part(RoundMarker {
+                    batches: 2,
+                    index: 0,
+                    set: [1u8; 32],
+                }),
+                true,
+            );
+            for record in old_set {
+                let _ = waiter.verify_and_insert_at(record, None, 2_000);
+            }
+            assert!(
+                pending(&waiter),
+                "a stale snapshot must not open the carrier"
+            );
+        }
+    }
+
     mod share_grant_v3 {
         use super::super::*;
         use crate::identity::UserKeypair;
@@ -4264,6 +7005,9 @@ mod tests {
             let v1 = set.all_records();
             let v2 = set.binding_records();
             let v3 = set.share_grant_records();
+            // #1108: the display view holds every record; the v1 view
+            // above must stay legacy-only.
+            assert_eq!(set.all_subject_records().len(), 4);
             assert_eq!(v1.len(), 2);
             assert_eq!(v2.len(), 1);
             assert_eq!(v3.len(), 1);
@@ -4296,8 +7040,8 @@ mod tests {
         }
 
         /// WHY: a revoked grant must stay revoked across restart (v3 file)
-        /// and past the 90-day TTL while the grant could still be honoured —
-        /// a grant may be valid for longer than the TTL, and an early
+        /// for as long as the grant could still be honoured — a grant may be
+        /// valid for a long time, and an early
         /// collection would resurrect it. Once the grant itself is dead
         /// (expiry + slack) the record is collected, so the set stays
         /// bounded; every node computes that point from the SIGNED expiry.
@@ -4327,16 +7071,15 @@ mod tests {
             restored.merge_v3(RevocationSet::from_bytes_v3(&bytes).unwrap());
             assert!(restored.is_share_grant_revoked(&grant_id, &owner.user_id()));
 
-            // Far past the 90-day TTL, but before expiry + slack: kept.
-            let ttl = 90 * 24 * 3600;
+            // Long after the revocation, but before expiry + slack: kept.
             let just_before = grant_expiry + SHARE_GRANT_REVOCATION_GC_SLACK_SECS - 1;
-            assert_eq!(restored.expire_records_older_than(ttl, just_before), 0);
+            assert_eq!(restored.collect_dead_records(just_before), 0);
             assert!(restored.is_share_grant_revoked(&grant_id, &owner.user_id()));
             assert_eq!(restored.share_grant_records().len(), 1);
 
             // At expiry + slack: collected (record and index).
             let horizon = grant_expiry + SHARE_GRANT_REVOCATION_GC_SLACK_SECS;
-            assert_eq!(restored.expire_records_older_than(ttl, horizon), 1);
+            assert_eq!(restored.collect_dead_records(horizon), 1);
             assert!(!restored.is_share_grant_revoked(&grant_id, &owner.user_id()));
             assert!(restored.share_grant_records().is_empty());
 
@@ -4377,7 +7120,7 @@ mod tests {
             insert(&mut set, short);
             insert(&mut set, long);
             let now = 1_000 + SHARE_GRANT_REVOCATION_GC_SLACK_SECS;
-            assert_eq!(set.expire_records_older_than(u64::MAX, now), 1);
+            assert_eq!(set.collect_dead_records(now), 1);
             assert!(set.is_share_grant_revoked(&[0x44; 32], &UserId([0x45; 32])));
         }
 
@@ -4389,6 +7132,341 @@ mod tests {
             insert(&mut set, share_grant_fake()); // fake signature
             let tampered = set.to_bytes_v3().unwrap();
             assert!(RevocationSet::from_bytes_v3(&tampered).unwrap().is_empty());
+        }
+    }
+
+    // ---- #1867: the empty-set statement ----
+
+    const CARRIER_TOPICS_1867: [(u8, &str); 3] = [
+        (REVOCATION_CARRIER_V1, crate::REVOCATION_TOPIC),
+        (REVOCATION_CARRIER_V2, crate::REVOCATION_V2_TOPIC),
+        (REVOCATION_CARRIER_V3, crate::REVOCATION_V3_TOPIC),
+    ];
+    const AUTHORITY_1867: AgentId = AgentId([0x67; 32]);
+
+    fn waiter_1867(carriers: u8) -> std::sync::Arc<tokio::sync::RwLock<RevocationSet>> {
+        let mut set = RevocationSet::quarantined_carrier(carriers);
+        set.set_snapshot_authority(SnapshotAuthority::new(|sender, _| {
+            *sender == AUTHORITY_1867
+        }));
+        std::sync::Arc::new(tokio::sync::RwLock::new(set))
+    }
+
+    fn self_revocation_1867() -> (RevocationRecord, AgentId) {
+        let key = crate::identity::AgentKeypair::generate().unwrap();
+        let record = RevocationRecord::sign(
+            RevokedSubject::Agent(key.agent_id()),
+            key.public_key(),
+            key.secret_key(),
+            1_000,
+            None,
+        )
+        .unwrap();
+        (record, key.agent_id())
+    }
+
+    fn owner_revocation_1867() -> (RevocationRecord, AgentCertificate) {
+        let revoked = crate::identity::AgentKeypair::generate().unwrap();
+        let owner = crate::identity::UserKeypair::generate().unwrap();
+        let cert = AgentCertificate::issue(&owner, &revoked).unwrap();
+        let record = RevocationRecord::sign(
+            RevokedSubject::Agent(revoked.agent_id()),
+            owner.public_key(),
+            owner.secret_key(),
+            1_000,
+            None,
+        )
+        .unwrap();
+        (record, cert)
+    }
+
+    async fn send_1867(
+        set: &std::sync::Arc<tokio::sync::RwLock<RevocationSet>>,
+        topic: &str,
+        payload: &[u8],
+        sender: AgentId,
+    ) {
+        arm_incoming_revocation_snapshot(set, topic, payload, Some(&sender), None).await;
+    }
+
+    fn marker_only_1867(marker: RoundMarker) -> Vec<u8> {
+        encode_revocation_batch(&[round_marker_record(&marker)]).unwrap()
+    }
+
+    #[test]
+    fn empty_set_statement_is_one_marker_and_no_record_1867() {
+        let bytes = encode_empty_set_statement().unwrap();
+        let (records, round) = decode_revocation_batch_with_round(&bytes).unwrap();
+        assert!(records.is_empty());
+        assert_eq!(
+            round,
+            BatchRound::Part(RoundMarker {
+                batches: 1,
+                index: 0,
+                set: round_set_digest(&[]),
+            })
+        );
+        // An ordinary receiver strips the marker and gets no record.
+        assert!(decode_revocation_batch(&bytes).unwrap().is_empty());
+        // Other publish paths still send nothing for an empty set.
+        assert!(encode_revocation_batches(&[]).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_statement_opens_a_waiter_that_holds_nothing_1867() {
+        for (carrier, topic) in CARRIER_TOPICS_1867 {
+            let set = waiter_1867(carrier);
+            let statement = encode_empty_set_statement().unwrap();
+            send_1867(&set, topic, &statement, AgentId([0x01; 32])).await;
+            assert!(
+                set.read().await.carrier_resync_pending(carrier),
+                "{topic}: an untrusted statement keeps the carrier closed"
+            );
+            send_1867(&set, topic, &statement, AUTHORITY_1867).await;
+            let mut guard = set.write().await;
+            assert!(!guard.carrier_resync_pending(carrier), "{topic} opens");
+            assert!(
+                guard.carrier_closed(carrier),
+                "{topic} waits for the rebuild"
+            );
+            assert_eq!(guard.take_rebuild_pending(), carrier);
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_statement_opens_a_waiter_that_holds_a_strangers_self_revocation_1867() {
+        let set = waiter_1867(REVOCATION_CARRIER_V1);
+        let (record, agent) = self_revocation_1867();
+        assert!(set.write().await.verify_and_insert(record, None).unwrap());
+        let statement = encode_empty_set_statement().unwrap();
+        send_1867(&set, crate::REVOCATION_TOPIC, &statement, AUTHORITY_1867).await;
+        let guard = set.read().await;
+        assert!(!guard.carrier_resync_pending(REVOCATION_CARRIER_V1));
+        assert!(guard.is_agent_revoked(&agent), "the self-revocation stays");
+    }
+
+    #[tokio::test]
+    async fn empty_statement_does_not_open_a_waiter_that_holds_an_owner_revocation_1867() {
+        let set = waiter_1867(REVOCATION_CARRIER_V1);
+        let (record, cert) = owner_revocation_1867();
+        assert!(set
+            .write()
+            .await
+            .verify_and_insert(record, Some(&cert))
+            .unwrap());
+        let statement = encode_empty_set_statement().unwrap();
+        send_1867(&set, crate::REVOCATION_TOPIC, &statement, AUTHORITY_1867).await;
+        assert!(
+            set.read()
+                .await
+                .carrier_resync_pending(REVOCATION_CARRIER_V1),
+            "the sender is behind: the carrier stays closed"
+        );
+    }
+
+    /// An unmarked empty batch, and an empty part with any other marker,
+    /// never open and remove the sender's earlier offer.
+    #[tokio::test]
+    async fn other_empty_batches_stay_closed_and_drop_the_offer_1867() {
+        let bad = [
+            (
+                "unmarked",
+                bincode::serialize(&Vec::<RevocationRecord>::new()).unwrap(),
+            ),
+            (
+                "n=2",
+                marker_only_1867(RoundMarker {
+                    batches: 2,
+                    index: 0,
+                    set: round_set_digest(&[]),
+                }),
+            ),
+            (
+                "wrong set",
+                marker_only_1867(RoundMarker {
+                    batches: 1,
+                    index: 0,
+                    set: [0x07; 32],
+                }),
+            ),
+        ];
+        for (label, payload) in [("control", None)]
+            .into_iter()
+            .chain(bad.iter().map(|(label, bytes)| (*label, Some(bytes))))
+        {
+            let set = waiter_1867(REVOCATION_CARRIER_V1);
+            let (record, _) = self_revocation_1867();
+            let offer = bincode::serialize(&vec![record.clone()]).unwrap();
+            send_1867(&set, crate::REVOCATION_TOPIC, &offer, AUTHORITY_1867).await;
+            if let Some(payload) = payload {
+                send_1867(&set, crate::REVOCATION_TOPIC, payload, AUTHORITY_1867).await;
+                assert!(
+                    set.read()
+                        .await
+                        .carrier_resync_pending(REVOCATION_CARRIER_V1),
+                    "{label}: stays closed"
+                );
+            }
+            assert!(set.write().await.verify_and_insert(record, None).unwrap());
+            assert_eq!(
+                set.read()
+                    .await
+                    .carrier_resync_pending(REVOCATION_CARRIER_V1),
+                payload.is_some(),
+                "{label}: only the kept offer opens the carrier"
+            );
+        }
+    }
+
+    /// A statement replaces the sender's earlier whole snapshot, and a
+    /// later snapshot replaces the statement.
+    #[tokio::test]
+    async fn statement_and_snapshot_replace_each_other_1867() {
+        let (held, cert) = owner_revocation_1867();
+        let (missing, missing_cert) = owner_revocation_1867();
+        let statement = encode_empty_set_statement().unwrap();
+
+        // Whole {held, missing}, then the statement: the whole offer is
+        // stale, so the arrival of `missing` does not open.
+        let set = waiter_1867(REVOCATION_CARRIER_V1);
+        assert!(set
+            .write()
+            .await
+            .verify_and_insert(held.clone(), Some(&cert))
+            .unwrap());
+        let both = encode_revocation_batch(&[held.clone(), missing.clone()]).unwrap();
+        send_1867(&set, crate::REVOCATION_TOPIC, &both, AUTHORITY_1867).await;
+        send_1867(&set, crate::REVOCATION_TOPIC, &statement, AUTHORITY_1867).await;
+        assert!(set
+            .write()
+            .await
+            .verify_and_insert(missing, Some(&missing_cert))
+            .unwrap());
+        assert!(
+            set.read()
+                .await
+                .carrier_resync_pending(REVOCATION_CARRIER_V1),
+            "the statement replaced the whole snapshot"
+        );
+
+        // The statement, then a whole snapshot that matches: it opens.
+        let set = waiter_1867(REVOCATION_CARRIER_V1);
+        assert!(set
+            .write()
+            .await
+            .verify_and_insert(held.clone(), Some(&cert))
+            .unwrap());
+        send_1867(&set, crate::REVOCATION_TOPIC, &statement, AUTHORITY_1867).await;
+        assert!(set
+            .read()
+            .await
+            .carrier_resync_pending(REVOCATION_CARRIER_V1));
+        let one = encode_revocation_batch(&[held]).unwrap();
+        send_1867(&set, crate::REVOCATION_TOPIC, &one, AUTHORITY_1867).await;
+        assert!(!set
+            .read()
+            .await
+            .carrier_resync_pending(REVOCATION_CARRIER_V1));
+    }
+
+    /// End to end: a quarantined store opens from a trusted statement, the
+    /// rebuild writes a valid empty live file, and a reload is open.
+    #[tokio::test]
+    async fn empty_statement_rebuilds_an_open_empty_store_1867() {
+        for (carrier, topic) in CARRIER_TOPICS_1867 {
+            let dir = tempfile::tempdir().unwrap();
+            let empty = RevocationSet::new();
+            let (name, store, mut stored) = match carrier {
+                REVOCATION_CARRIER_V1 => (
+                    "revocations.bin",
+                    crate::storage::RevocationStore::V1,
+                    empty.to_bytes().unwrap(),
+                ),
+                REVOCATION_CARRIER_V2 => (
+                    "revocations-v2.bin",
+                    crate::storage::RevocationStore::V2,
+                    empty.to_bytes_v2().unwrap(),
+                ),
+                _ => (
+                    crate::SHARE_GRANT_REVOCATIONS_FILE,
+                    crate::storage::RevocationStore::V3,
+                    empty.to_bytes_v3().unwrap(),
+                ),
+            };
+            let path = dir.path().join(name);
+            stored.extend_from_slice(b"trailing");
+            tokio::fs::write(&path, &stored).await.unwrap();
+            let mut loaded = crate::storage::read_revocation_store(&path, store, false)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(loaded.carrier_resync_pending(carrier), "{name}");
+            assert!(!path.exists(), "{name}: the bad bytes are quarantined");
+            loaded.set_snapshot_authority(SnapshotAuthority::new(|sender, _| {
+                *sender == AUTHORITY_1867
+            }));
+            let set = std::sync::Arc::new(tokio::sync::RwLock::new(loaded));
+            let statement = encode_empty_set_statement().unwrap();
+            send_1867(&set, topic, &statement, AUTHORITY_1867).await;
+            assert!(set.read().await.revocation_resync_required(), "{name}");
+            crate::persist_completed_revocation_rebuild(&set, Some(dir.path())).await;
+            assert!(!set.read().await.revocation_resync_required(), "{name}");
+            assert!(path.is_file(), "{name}: the live file is written");
+            let again = crate::storage::read_revocation_store(&path, store, false)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                !again.revocation_resync_required(),
+                "{name}: reload is open"
+            );
+            assert!(again.is_empty(), "{name}");
+        }
+    }
+
+    /// A trusted statement does not open a carrier whose quarantine bytes
+    /// cannot be read: the rebuild keeps it closed, so this node sends no
+    /// statement of its own.
+    #[tokio::test]
+    async fn empty_statement_with_unreadable_quarantine_stays_closed_1867() {
+        for (carrier, topic) in CARRIER_TOPICS_1867 {
+            let dir = tempfile::tempdir().unwrap();
+            let (name, store) = match carrier {
+                REVOCATION_CARRIER_V1 => ("revocations.bin", crate::storage::RevocationStore::V1),
+                REVOCATION_CARRIER_V2 => {
+                    ("revocations-v2.bin", crate::storage::RevocationStore::V2)
+                }
+                _ => (
+                    crate::SHARE_GRANT_REVOCATIONS_FILE,
+                    crate::storage::RevocationStore::V3,
+                ),
+            };
+            let path = dir.path().join(name);
+            tokio::fs::write(&path, b"truncated-looking-but-garbage")
+                .await
+                .unwrap();
+            let mut loaded = crate::storage::read_revocation_store(&path, store, false)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(loaded.carrier_resync_pending(carrier), "{name}");
+            assert!(!path.exists(), "{name}: the bad bytes are quarantined");
+            loaded.set_snapshot_authority(SnapshotAuthority::new(|sender, _| {
+                *sender == AUTHORITY_1867
+            }));
+            let set = std::sync::Arc::new(tokio::sync::RwLock::new(loaded));
+            let statement = encode_empty_set_statement().unwrap();
+            send_1867(&set, topic, &statement, AUTHORITY_1867).await;
+            crate::persist_completed_revocation_rebuild(&set, Some(dir.path())).await;
+            assert!(
+                set.read().await.revocation_resync_required(),
+                "{name}: unreadable quarantine keeps the node closed"
+            );
+            assert!(
+                set.read().await.carrier_closed(carrier),
+                "{name}: closed carrier sends no statement"
+            );
+            assert!(!path.exists(), "{name}: no live file is written");
         }
     }
 }

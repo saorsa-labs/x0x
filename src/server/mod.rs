@@ -65,6 +65,7 @@ use routes::public_group_bootstrap_outbox::{
     load_public_group_bootstrap_outbox, public_group_bootstrap_outbox_step,
     PUBLIC_GROUP_BOOTSTRAP_DM_PREFIX,
 };
+use routes::sidecar_quarantine_diagnostics;
 use routes::{
     ack_diagnostics, acl_connect_add, acl_connect_list, acl_connect_remove, acl_exec_add,
     acl_exec_list, acl_exec_remove, acl_reload, add_contact, add_machine, add_mls_member,
@@ -86,11 +87,11 @@ use routes::{
     forward_add, forward_list, forward_remove, get_a2a_agent_card, get_agent_card,
     get_constitution, get_constitution_json, get_group_card, get_group_join_status,
     get_group_public_messages, get_group_state, get_group_state_commits, get_kv_value,
-    get_mls_group, get_named_group, get_named_group_members, get_profile, get_sync_devices,
-    gossip_diagnostics, group_membership_lock, groups_diagnostics, handle_control_blob_message,
-    handle_file_message, health, history_diagnostics, history_list, history_message,
-    history_policy, history_purge, history_retain, history_scopes, history_search, history_stats,
-    identity_revocations, identity_revoke, import_agent_card, import_group_card,
+    get_mls_group, get_named_group, get_named_group_members, get_onboard, get_profile,
+    get_sync_devices, gossip_diagnostics, group_membership_lock, groups_diagnostics,
+    handle_control_blob_message, handle_file_message, health, history_diagnostics, history_list,
+    history_message, history_policy, history_purge, history_retain, history_scopes, history_search,
+    history_stats, identity_revocations, identity_revoke, import_agent_card, import_group_card,
     ingest_public_message, introduction, join_group_via_invite, join_kv_store, leave_group,
     list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys, list_kv_stores,
     list_machines, list_mls_groups, list_named_groups, list_revocations, list_task_lists,
@@ -99,16 +100,16 @@ use routes::{
     machine_for_agent_handler, machines_by_user_handler,
     migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
     named_group_metadata_event_group_id, network_status, now_millis_u64, owner_agents,
-    owner_agents_issue, owner_agents_revoke, owner_group_recovery_mandate, owner_machines,
-    owner_riders_issue, owner_riders_list, owner_riders_revoke, peer_health_handler, peers,
-    pin_machine, presence, presence_find, presence_foaf, presence_online, presence_status,
-    probe_peer_handler, publish, publish_group_card_to_discovery, put_kv_value, quick_trust,
-    rebind_member_certificate, recover_home_suite_sidecar_journals, recover_treekem_named_journals,
-    reject_join_request, reject_unverified_direct_public_message, relay_diagnostics,
-    remove_mls_member, remove_named_group_member, replay_pending_causal_approvals,
-    requester_offer_step, restore_treekem_groups, revoke_contact, run_direct_metadata_listener,
-    run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
-    save_named_groups_checked, save_named_groups_checked_unlocked,
+    owner_agents_issue, owner_agents_revoke, owner_device_lose, owner_group_recovery_mandate,
+    owner_machines, owner_riders_issue, owner_riders_list, owner_riders_revoke,
+    peer_health_handler, peers, pin_machine, presence, presence_find, presence_foaf,
+    presence_online, presence_status, probe_peer_handler, publish, publish_group_card_to_discovery,
+    put_kv_value, quick_trust, rebind_member_certificate, recover_home_suite_sidecar_journals,
+    recover_treekem_named_journals, reject_join_request, reject_unverified_direct_public_message,
+    relay_diagnostics, remove_mls_member, remove_named_group_member,
+    replay_pending_causal_approvals, requester_offer_step, restore_treekem_groups, revoke_contact,
+    run_direct_metadata_listener, run_fallback_github_poll, run_gossip_update_listener,
+    run_startup_update_check, save_named_groups_checked, save_named_groups_checked_unlocked,
     save_predecessor_relay_outbox_unlocked, seal_group_state, secure_group_decrypt,
     secure_group_encrypt, secure_group_reseal, secure_open_envelope_adversarial,
     send_group_public_message, set_group_display_name, shutdown_handler,
@@ -477,6 +478,31 @@ pub fn record_startup_diagnostic(event: &str) {
         .as_nanos();
     eprintln!("x0xd: {event} mono_ns={mono_ns}");
     let _ = std::io::Write::flush(&mut std::io::stderr());
+}
+
+/// #1863: the group check of "seen" that `x0xd` installs on its agent. The
+/// rule is [`x0x::revocation_group_relationship`] over the named-group
+/// live roster. The check waits for the roster lock (#1867). A locked
+/// roster must not read as "not seen": the ingest and the local apply path
+/// mark just before an eviction removes the member row. The check takes
+/// the lock one time for all the agents of a call. No caller holds a
+/// `named_groups` guard when it applies a revocation. The check holds a
+/// `Weak`, so the agent does not keep `AppState` alive.
+fn revocation_group_seen_check(state: &Arc<AppState>) -> x0x::RevocationGroupSeen {
+    let roster_state = Arc::downgrade(state);
+    Arc::new(move |mut agents| {
+        let roster_state = roster_state.clone();
+        Box::pin(async move {
+            let Some(state) = roster_state.upgrade() else {
+                return std::collections::HashSet::new();
+            };
+            let local = state.agent.agent_id();
+            let groups = state.named_groups.live_read().await;
+            agents
+                .retain(|agent| x0x::revocation_group_relationship(groups.values(), &local, agent));
+            agents.into_iter().collect()
+        })
+    })
 }
 
 /// Install the check that reopens a corrupt revocation carrier (#1116).
@@ -955,6 +981,10 @@ pub async fn serve_with_options(
     // ADR 0083 slice 3: one channel, three prefixes. No validator — a
     // validator would parse the body before owner trust.
     let (gui_show_dm_tx, mut gui_show_dm_rx) = mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(256);
+    // #1003 (ADR 0080 archived, slot A03): plain typed route — the sender
+    // waits for no ACK; the record carries its own authority.
+    let (revocation_push_dm_tx, mut revocation_push_dm_rx) =
+        mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(256);
     let exec_service = x0x::exec::ExecService::spawn(Arc::clone(&agent), exec_policy, exec_dm_rx);
     // Tasks started before AppState exists still need owned cancellation on a
     // later startup rejection. They are folded into the supervisor's normal
@@ -1276,6 +1306,7 @@ pub async fn serve_with_options(
         cert_unresolvable_since: StdMutex::new(std::collections::HashMap::new()),
         pending_b8_compensation: Mutex::new(None),
         pending_listener_admission: Mutex::new(None),
+        join_sequencer: Mutex::new(Default::default()),
         group_metadata_tasks: RwLock::new(HashMap::new()),
         group_card_cache: RwLock::new(HashMap::new()),
         directory_cache: RwLock::new(x0x::groups::DirectoryShardCache::default()),
@@ -1299,6 +1330,7 @@ pub async fn serve_with_options(
         profile_path,
         mls_groups_path,
         pending_join_results: RwLock::new(HashMap::new()),
+        base_roster_fetch_slots: StdMutex::new(HashMap::new()),
         expected_join_result_inviters: StdMutex::new(HashMap::new()),
         pending_welcomes: RwLock::new(HashMap::new()),
         pending_welcome_receives: RwLock::new(HashMap::new()),
@@ -1317,6 +1349,10 @@ pub async fn serve_with_options(
         join_result_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
             crate::server::routes::named_groups::JOIN_RESULT_FETCH_PER_GROUP_CAP,
             crate::server::routes::named_groups::JOIN_RESULT_FETCH_HANDLER_CAP,
+        ),
+        base_roster_serve_admission: crate::server::routes::named_groups::FairAdmission::new(
+            crate::server::routes::named_groups::BASE_ROSTER_SERVE_PER_GROUP_CAP,
+            crate::server::routes::named_groups::BASE_ROSTER_SERVE_HANDLER_CAP,
         ),
         join_result_chunk_admission: crate::server::routes::named_groups::FairAdmission::new(
             crate::server::routes::named_groups::JOIN_RESULT_CHUNK_PER_GROUP_CAP,
@@ -1635,6 +1671,10 @@ pub async fn serve_with_options(
             health_verdict::run_delivery_probe(probe_agent, probe_snapshot, shutdown_rx).await;
         }));
     }
+
+    // #1863: a self-revocation of a group member is published again; one
+    // of a stranger is not.
+    agent.set_revocation_group_seen(revocation_group_seen_check(&state));
 
     // ADR 0089: relationship sources are installed before load verification.
     let context_state = Arc::downgrade(&state);
@@ -2064,6 +2104,7 @@ pub async fn serve_with_options(
     let dm_inbox_predecessor_relay_route_tx = predecessor_relay_dm_tx.clone();
     let dm_inbox_share_grant_route_tx = share_grant_dm_tx.clone();
     let dm_inbox_gui_show_route_tx = gui_show_dm_tx.clone();
+    let dm_inbox_revocation_push_route_tx = revocation_push_dm_tx.clone();
     bg_tasks.push(tokio::spawn(start_dm_inbox_when_gossip_ready(
         dm_inbox_agent,
         dm_inbox_kem,
@@ -2074,6 +2115,7 @@ pub async fn serve_with_options(
         dm_inbox_predecessor_relay_route_tx,
         dm_inbox_share_grant_route_tx,
         dm_inbox_gui_show_route_tx,
+        dm_inbox_revocation_push_route_tx,
     )));
 
     // Restart-amnesia fix: re-register every persisted task-list/kv-store
@@ -2817,12 +2859,35 @@ pub async fn serve_with_options(
         let offer_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
             let mut shutdown_rx = offer_state.shutdown_notify.subscribe();
+            // #1158: an offer held for an unknown capability is retried
+            // as soon as the authority's verified advert arrives.
+            let mut adverts = offer_state
+                .agent
+                .capability_store()
+                .subscribe_obligation_adverts();
             loop {
                 tokio::select! {
                     _ = shutdown_rx.changed() => break,
                     _ = tokio::time::sleep(Duration::from_millis(500)) => {
                         requester_offer_step(&offer_state).await;
                     }
+                    advert = adverts.recv() => match advert {
+                        Ok(authority) => {
+                            if crate::server::routes::named_groups::nudge_requester_offers_for(&offer_state, &authority).await {
+                                requester_offer_step(&offer_state).await;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        // The store outlives this worker; if the signal
+                        // ever closes, the 500 ms poll still retries.
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            adverts = offer_state
+                                .agent
+                                .capability_store()
+                                .subscribe_obligation_adverts();
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                    },
                 }
             }
         }));
@@ -2855,12 +2920,30 @@ pub async fn serve_with_options(
 
     // ADR-0070 §2: share-grant deliveries. The handler verifies and stores
     // the grant before completing, so the v2 ACK means "stored"; every
-    // refusal withholds it.
+    // refusal withholds it. An ADR 0079 names-carrying envelope (the
+    // `x0x-sharegrant-v2\0` prefix on the same channel) additionally puts
+    // the owner-signed names into the name store as ADR-0074 §1 defaults,
+    // gated on the owner being a Known or Trusted contact.
     {
-        let grant_agent = Arc::clone(&agent);
+        let grant_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
             while let Some(typed) = share_grant_dm_rx.recv().await {
-                let _ = grant_agent.handle_share_grant_delivery(typed).await;
+                let _ = dispatch_share_grant_typed(&grant_state, typed).await;
+            }
+        }));
+    }
+
+    // #1003: grant-revocation pushes. The handler drops before any verify
+    // (decode/subject/stale/duplicate/rate limit), then ingests through
+    // the same v3 revocation path as gossip. Best-effort: no ACK is owed.
+    {
+        let push_agent = Arc::clone(&agent);
+        bg_tasks.push(tokio::spawn(async move {
+            let limiter = tokio::sync::Mutex::new(x0x::revocation_push::PushRateLimiter::new());
+            while let Some(typed) = revocation_push_dm_rx.recv().await {
+                let _ = push_agent
+                    .handle_grant_revocation_push_delivery(&limiter, typed)
+                    .await;
             }
         }));
     }
@@ -2884,11 +2967,30 @@ pub async fn serve_with_options(
         let grant_agent = Arc::clone(&agent);
         let mut shutdown_rx = state.shutdown_notify.subscribe();
         bg_tasks.push(tokio::spawn(async move {
+            // #1158: a grant held for an unknown capability is retried as
+            // soon as the recipient's verified advert arrives.
+            let mut adverts = grant_agent
+                .capability_store()
+                .subscribe_obligation_adverts();
             loop {
                 tokio::select! {
                     _ = shutdown_rx.changed() => break,
                     _ = grant_outbox.notified() => {}
                     _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    advert = adverts.recv() => match advert {
+                        Ok(recipient) => {
+                            grant_agent.nudge_share_grant_outbox_for_agent(&recipient);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        // The store outlives this worker; if the signal
+                        // ever closes, the 5 s poll still retries.
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            adverts = grant_agent
+                                .capability_store()
+                                .subscribe_obligation_adverts();
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                        }
+                    },
                 }
                 let _ = grant_agent.share_grant_outbox_step().await;
             }
@@ -2954,6 +3056,7 @@ pub async fn serve_with_options(
         .route("/agent", get(agent_info))
         .route("/introduction", get(introduction))
         .route("/agent/card", get(get_agent_card))
+        .route("/onboard", get(get_onboard))
         .route("/sync/devices", get(get_sync_devices))
         .route("/sync/devices/enroll", post(enroll_device))
         .route(
@@ -2968,6 +3071,7 @@ pub async fn serve_with_options(
         .route("/owner/machines", get(owner_machines))
         .route("/owner/agents/issue", post(owner_agents_issue))
         .route("/owner/agents/:id", delete(owner_agents_revoke))
+        .route("/owner/devices/:machine_id/lose", post(owner_device_lose))
         .route(
             "/owner/riders",
             post(owner_riders_issue).get(owner_riders_list),
@@ -3213,6 +3317,11 @@ pub async fn serve_with_options(
         .route("/diagnostics/exec", get(exec_diagnostics))
         .route("/diagnostics/connect", get(connect_diagnostics_handler))
         .route("/diagnostics/ws", get(ws_diagnostics))
+        // D148: read-only list of ADR 0108 §5a quarantined sidecar copies.
+        .route(
+            "/diagnostics/sidecar-quarantine",
+            get(sidecar_quarantine_diagnostics),
+        )
         .route("/exec/run", post(exec_run))
         .route("/exec/cancel", post(exec_cancel))
         .route("/exec/sessions", get(exec_sessions))
@@ -3249,6 +3358,8 @@ pub async fn serve_with_options(
         .route("/names/owners/:label", delete(routes::names_owner_unbind))
         .route("/names/machines", post(routes::names_machine_label))
         .route("/names/pins/:name", delete(routes::names_unpin))
+        .route("/names/accept", post(routes::names_accept))
+        .route("/names/suggestions/:label", delete(routes::names_dismiss))
         // Peer observability (ant-quic 0.27.1/0.27.2 surface)
         .route("/peers/:peer_id/probe", post(probe_peer_handler))
         .route("/peers/:peer_id/health", get(peer_health_handler))
@@ -3860,6 +3971,38 @@ pub(crate) fn valid_predecessor_relay_typed_dm(payload: &[u8]) -> bool {
         })
 }
 
+/// Route one share-grant typed DM (ADR-0070 §2). A payload with the ADR
+/// 0079 `x0x-sharegrant-v2\0` prefix goes to the names-carrying v2 handler:
+/// the owner-signed names go into the name store as ADR-0074 §1 defaults,
+/// gated on the owner being a Known or Trusted contact and on local hosting
+/// evidence for each machine. Every other payload is a v1 delivery.
+pub(in crate::server) async fn dispatch_share_grant_typed(
+    state: &Arc<AppState>,
+    typed: x0x::dm_inbox::DmTypedPayload,
+) -> x0x::dm_inbox::DmTypedPayloadCompletionResult {
+    if !typed
+        .payload
+        .starts_with(x0x::share_grant::names::SHARE_GRANT_V2_DM_PREFIX)
+    {
+        return state.agent.handle_share_grant_delivery(typed).await;
+    }
+    let store = state.agent.share_grant_store();
+    let revocations = state.agent.revocation_set();
+    x0x::share_grant::names::handle_share_grant_v2_dm(
+        store.as_deref(),
+        Some(&revocations),
+        &state.names,
+        state.agent.user_id(),
+        |owner| routes::owner_is_known_or_trusted_contact(state, owner),
+        |grant| {
+            let agent = Arc::clone(&state.agent);
+            async move { agent.verified_grant_hosts(&grant).await }
+        },
+        typed,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn start_dm_inbox_when_gossip_ready(
     agent: Arc<x0x::Agent>,
@@ -3871,6 +4014,7 @@ async fn start_dm_inbox_when_gossip_ready(
     predecessor_relay_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     share_grant_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     gui_show_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
+    revocation_push_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
 ) {
     for attempt in 1..=DM_INBOX_START_MAX_ATTEMPTS {
         let dm_inbox_config = x0x::dm_inbox::DmInboxConfig::default()
@@ -3919,6 +4063,14 @@ async fn start_dm_inbox_when_gossip_ready(
                 x0x::share_grant::SHARE_GRANT_DM_PREFIX,
                 share_grant_route_tx.clone(),
             )
+            // ADR 0079 §1: the names-carrying v2 envelope shares the v1
+            // route channel (one consumer, two prefixes); the handler
+            // branches on the prefix. Durable for the same reason as v1:
+            // the v2 ACK must mean "grant stored and names durable".
+            .with_durable_typed_payload_route(
+                x0x::share_grant::names::SHARE_GRANT_V2_DM_PREFIX,
+                share_grant_route_tx.clone(),
+            )
             // ADR 0083 slice 3: durable, not validated. A validator would
             // parse the body before owner trust.
             .with_durable_typed_payload_route(
@@ -3932,6 +4084,17 @@ async fn start_dm_inbox_when_gossip_ready(
             .with_durable_typed_payload_route(
                 x0x::gui::remote::ACTIVITY_PREFIX,
                 gui_show_route_tx.clone(),
+            )
+            // #1003: plain (non-durable) — the push sender waits for no
+            // ACK. This route owns the prefix once the inbox runs; before
+            // that, the raw dispatcher drops a verified push (logged
+            // `not_ready`)
+            // and the static production-prefix table an unverified one, so
+            // the payload reaches DM history and generic subscribers on NO
+            // path (ADR 0080 §4).
+            .with_typed_payload_route(
+                x0x::revocation_push::GRANT_REVOCATION_PUSH_PREFIX,
+                revocation_push_route_tx.clone(),
             );
         match agent
             .start_dm_inbox(Arc::clone(&kem_keypair), dm_inbox_config)
@@ -4846,6 +5009,50 @@ async fn handle_predecessor_relay_typed_payload_inner(
             ))
             .await;
             replay_after = replay_group_id;
+            if !apply_result.accepted && apply_result.refused_without_mutation {
+                // Issue #1840: validation refused the request before any
+                // roster write, so durable state holds "neither" half and
+                // the journal has nothing to recover. Release the marker,
+                // durably, so this refusal cannot block other admissions
+                // or the next startup. The ACK stays `Err`: the refusal
+                // is judged against the current frontier only.
+                let _journal_guard = relay_state
+                    .predecessor_relay_outbox_persistence_lock
+                    .lock()
+                    .await;
+                let marker = relay_state.pending_listener_admission.lock().await.take();
+                if matches!(
+                    save_predecessor_relay_outbox_unlocked(relay_state).await,
+                    Ok(AtomicWriteOutcome::Durable)
+                ) {
+                    tracing::warn!(
+                        group_id = %group_id_str,
+                        request_id = %request_id,
+                        requester = %requester_agent_id,
+                        outcome = "refused",
+                        "ADR 0028: request refused by validation without mutation; admission journal released"
+                    );
+                    // Issue #1840: a requester that sealed over a partial
+                    // or used head waits for its turn, in arrival order.
+                    // The queue needs no journal lock.
+                    drop(_journal_guard);
+                    crate::server::routes::named_groups::join_sequence::note_refused_request(
+                        relay_state,
+                        &group_id_str,
+                        &event,
+                        now_ms,
+                    )
+                    .await;
+                } else {
+                    *relay_state.pending_listener_admission.lock().await = marker;
+                    tracing::error!(
+                        group_id = %group_id_str,
+                        request_id = %request_id,
+                        "ADR 0028: refused request's journal release is not durable; keeping admission journal"
+                    );
+                }
+                break 'admission true;
+            }
             if !apply_result.accepted {
                 tracing::error!(
                     group_id = %group_id_str,
@@ -6326,3 +6533,237 @@ targets = [\"127.0.0.1:22\"]
 // (Accepted), identity discovery authority. Test builds only.
 #[cfg(test)]
 mod identity_ingest_authority_tests;
+
+/// #1868 review round 4: the group case of #1863 through the check that
+/// `x0xd` installs and the heartbeat step, with the agent's own sources.
+#[cfg(test)]
+mod revocation_group_seen_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::revocation_group_seen_check;
+    use crate as x0x;
+    use crate::server::routes::named_groups::tests::secure_endpoint_test_state;
+
+    fn self_revocation(kp: &x0x::identity::AgentKeypair) -> x0x::revocation::RevocationRecord {
+        x0x::revocation::RevocationRecord::sign(
+            x0x::revocation::RevokedSubject::Agent(kp.agent_id()),
+            kp.public_key(),
+            kp.secret_key(),
+            1_000,
+            None,
+        )
+        .expect("sign")
+    }
+
+    #[tokio::test]
+    async fn the_roster_check_publishes_an_active_member_and_not_a_removed_one() {
+        let (state, _dir) = secure_endpoint_test_state().await.expect("state");
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let active = x0x::identity::AgentKeypair::generate().expect("keypair");
+        let removed = x0x::identity::AgentKeypair::generate().expect("keypair");
+        let removed_hex = hex::encode(removed.agent_id().as_bytes());
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "g".to_string(),
+            String::new(),
+            x0x::identity::AgentId([0x33; 32]),
+            "00112233445566778899aabbccddeeff".to_string(),
+            x0x::groups::policy::GroupPolicy {
+                admission: x0x::groups::policy::GroupAdmission::InviteOnly,
+                ..x0x::groups::policy::GroupPolicy::default()
+            },
+        );
+        for hex_id in [
+            local_hex,
+            hex::encode(active.agent_id().as_bytes()),
+            removed_hex.clone(),
+        ] {
+            info.add_member(hex_id, x0x::groups::GroupRole::Member, None, None);
+        }
+        info.remove_member(&removed_hex, Some(hex::encode([0x33u8; 32])));
+        state
+            .named_groups
+            .write()
+            .await
+            .insert("g".to_string(), info);
+        state
+            .agent
+            .set_revocation_group_seen(revocation_group_seen_check(&state));
+
+        let set = state.agent.revocation_set();
+        let active_record = self_revocation(&active);
+        {
+            let mut guard = set.write().await;
+            assert!(guard
+                .verify_and_insert(active_record.clone(), None)
+                .expect("insert"));
+            assert!(guard
+                .verify_and_insert(self_revocation(&removed), None)
+                .expect("insert"));
+            assert!(guard.published_records().is_empty());
+        }
+        assert!(
+            x0x::mark_seen_revocation_subjects(&set, &state.agent.revocation_seen_sources()).await
+        );
+        let guard = set.read().await;
+        assert_eq!(
+            guard
+                .published_records()
+                .iter()
+                .map(x0x::revocation::RevocationRecord::record_hash)
+                .collect::<Vec<_>>(),
+            vec![active_record.record_hash()],
+            "an active member is published; a removed one is not"
+        );
+        assert!(
+            guard.is_agent_revoked(&removed.agent_id()),
+            "held, unpublished"
+        );
+    }
+
+    /// #1867: the local apply path marks while another task holds the
+    /// roster for write. The check waits for the lock, so the active
+    /// member's self-revocation is published. The wrapper tells the test
+    /// when the check starts; then the test releases the roster.
+    #[tokio::test]
+    async fn a_held_roster_lock_still_publishes_an_active_member_1867() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let (state, _dir) = secure_endpoint_test_state().await.expect("state");
+        let active = x0x::identity::AgentKeypair::generate().expect("keypair");
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "g".to_string(),
+            String::new(),
+            x0x::identity::AgentId([0x33; 32]),
+            "00112233445566778899aabbccddeeff".to_string(),
+            x0x::groups::policy::GroupPolicy {
+                admission: x0x::groups::policy::GroupAdmission::InviteOnly,
+                ..x0x::groups::policy::GroupPolicy::default()
+            },
+        );
+        for agent in [state.agent.agent_id(), active.agent_id()] {
+            let hex_id = hex::encode(agent.as_bytes());
+            info.add_member(hex_id, x0x::groups::GroupRole::Member, None, None);
+        }
+        state
+            .named_groups
+            .write()
+            .await
+            .insert("g".to_string(), info);
+        let inner = revocation_group_seen_check(&state);
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let signal = Arc::clone(&reached);
+        state
+            .agent
+            .set_revocation_group_seen(Arc::new(move |agent| {
+                signal.notify_one();
+                inner(agent)
+            }));
+
+        let record = self_revocation(&active);
+        let roster = state.named_groups.write().await;
+        let task_state = Arc::clone(&state);
+        let task_record = record.clone();
+        let apply = tokio::spawn(async move {
+            task_state
+                .agent
+                .ingest_eviction_handoff_revocation(task_record, None)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(60), reached.notified())
+            .await
+            .expect("the apply path reaches the group check");
+        drop(roster);
+        let held = tokio::time::timeout(Duration::from_secs(60), apply)
+            .await
+            .expect("the apply path finishes")
+            .expect("join")
+            .expect("apply");
+        assert!(held);
+        let published = state
+            .agent
+            .revocation_set()
+            .read()
+            .await
+            .published_records()
+            .iter()
+            .map(x0x::revocation::RevocationRecord::record_hash)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            published,
+            vec![record.record_hash()],
+            "a member seen behind a held roster lock is published"
+        );
+    }
+
+    /// #1867: the heartbeat step asks the roster one time for all the held
+    /// strangers, not one time for each. A flood of strangers' records
+    /// then cannot hold the ingest behind every roster writer.
+    #[tokio::test]
+    async fn the_roster_is_read_one_time_for_all_held_strangers_1867() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let (state, _dir) = secure_endpoint_test_state().await.expect("state");
+        let members: Vec<_> = (0..3)
+            .map(|_| x0x::identity::AgentKeypair::generate().expect("keypair"))
+            .collect();
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "g".to_string(),
+            String::new(),
+            x0x::identity::AgentId([0x33; 32]),
+            "00112233445566778899aabbccddeeff".to_string(),
+            x0x::groups::policy::GroupPolicy {
+                admission: x0x::groups::policy::GroupAdmission::InviteOnly,
+                ..x0x::groups::policy::GroupPolicy::default()
+            },
+        );
+        info.add_member(
+            hex::encode(state.agent.agent_id().as_bytes()),
+            x0x::groups::GroupRole::Member,
+            None,
+            None,
+        );
+        let set = state.agent.revocation_set();
+        for member in &members {
+            let hex_id = hex::encode(member.agent_id().as_bytes());
+            info.add_member(hex_id, x0x::groups::GroupRole::Member, None, None);
+            assert!(set
+                .write()
+                .await
+                .verify_and_insert(self_revocation(member), None)
+                .expect("insert"));
+        }
+        state
+            .named_groups
+            .write()
+            .await
+            .insert("g".to_string(), info);
+        let inner = revocation_group_seen_check(&state);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&calls);
+        state
+            .agent
+            .set_revocation_group_seen(Arc::new(move |agents| {
+                count.fetch_add(1, Ordering::SeqCst);
+                inner(agents)
+            }));
+
+        assert!(
+            x0x::mark_seen_revocation_subjects(&set, &state.agent.revocation_seen_sources()).await
+        );
+        // The test home can hold strangers' records of other tests, so
+        // the proof is by record, not by count.
+        let published: Vec<_> = set
+            .read()
+            .await
+            .published_records()
+            .iter()
+            .map(x0x::revocation::RevocationRecord::record_hash)
+            .collect();
+        for member in &members {
+            assert!(published.contains(&self_revocation(member).record_hash()));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one roster read");
+    }
+}

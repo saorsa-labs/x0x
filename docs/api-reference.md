@@ -100,7 +100,7 @@ Auth-class labels used throughout this reference:
   (#1347)** below.
   Payload-conditional durable gates (body or prefix inspected, enforced
   in the handler): `POST /announce` **with
-  `include_user_identity: true`**, and `POST /direct/send` / WS
+  `include_user_identity: true` or `withdraw_consent: true`**, and `POST /direct/send` / WS
   `send_direct` carrying a reserved `x0x-exec-v1\0` exec frame.
   The same two generic send paths refuse `x0x-gui-show-v1\0`,
   `x0x-gui-show-result-v1\0`, and `x0x-gui-activity-v1\0` for every
@@ -110,7 +110,7 @@ Auth-class labels used throughout this reference:
   Rider tokens authenticate in the `Authorization` header only.
 
 **#446 resolution notes:** `POST /announce` without
-`include_user_identity` and `PATCH /groups/:id` on ordinary
+`include_user_identity` and without `withdraw_consent`, and `PATCH /groups/:id` on ordinary
  (non-Home) groups stay bearer — no credential or capability is
 involved. `DELETE /groups/:id` requires **active membership** for any
 group (self-leave is its purpose; a non-member cannot delete the local
@@ -244,9 +244,12 @@ The Home Suite campaign (ADRs 0036–0043, plus the 0044–0058 backfills) added
   `GET /diagnostics/ws`.
 
 Open issues for this release are listed in the README's *Known limitations*
-table (#446–#451). This reference documents **175 endpoints — exactly the set
+table (#446–#451). This reference documents **221 endpoints — exactly the set
 `x0x routes` prints** (two further served paths sit outside the registry:
-`/.well-known/agent-card.json` and the `/gui/` alias).
+`/.well-known/agent-card.json` and the `/gui/` alias). The registry in
+`src/api/mod.rs` is the authoritative list. `x0x routes` prints the copy of
+that registry that is compiled into the CLI. It does not send a request to a
+daemon, so it shows the routes of the CLI build, not of a running `x0xd`.
 
 ## System
 
@@ -459,27 +462,108 @@ contains the same sentence as the startup error log. See
 
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
-| GET | `/agent` | `x0x agent` | Local agent identity |
+| GET | `/agent` | `x0x agent` | Local agent identity, with the agent public key (`agent_public_key`) |
 | POST | `/announce` | `x0x announce` | Re-announce identity to the network |
 | GET | `/agent/user-id` | `x0x agent user-id` | Current user ID if configured |
 | GET | `/agent/card` | `x0x agent card [DISPLAY_NAME] [--include-groups] [--include-local-addresses]` | Generate a shareable, signed identity card (`--include-local-addresses` adds loopback/RFC1918 addresses for local testnet cards; off by default so shared cards don't leak unroutable addresses) |
 | GET | `/.well-known/agent-card.json` | — | A2A-compatible discovery card (ADR-0017) |
+| GET | `/onboard` | `x0x onboard [--inline-card] [--no-card] [--card-file <PATH>]` | Install-and-join recipe (#894): Markdown + structured steps that teach another agent to install x0x and DM this agent, with the signed card link (`?card=file\|inline\|lookup`, default `file`; `?card_file=` names the handed-over file in the recipe) |
 | POST | `/agent/card/import` | `x0x agent import` | Import a card into contacts (verifies signature; never changes existing trust: floor at existing level, Blocked is sticky) |
 | POST | `/agent/sign` | `x0x agent sign` | Detached ML-DSA-65 signature over caller-supplied bytes |
 | POST | `/agent/verify` | `x0x agent verify` | Verify a detached ML-DSA-65 signature against a caller-supplied public key |
 | GET | `/introduction` | `x0x agent introduction` | Trust-gated introduction card (`?peer=<64-hex>` scopes it to that peer's trust) |
-| POST | `/identity/revoke` | `x0x identity revoke [--agent-id <hex>] [--machine-id <hex>] [--move-epoch <n>] [--reason <text>]` | Revoke the daemon's own agent, or an owner-authorized agent–machine binding; see [Key revocation](#key-revocation) for the supported forms |
-| GET | `/identity/revocations` | `x0x identity revocations` | List signed identity revocations known to this daemon |
+| POST | `/identity/revoke` | `x0x identity revoke [--agent-id <hex>] [--machine-id <hex>] [--move-epoch <n>] [--reason <text>]` | Revoke the daemon's own agent or machine, or an owner-authorized agent–machine binding; see [Key revocation](#key-revocation) for the supported forms |
+| GET | `/identity/revocations` | `x0x identity revocations` | List every signed revocation record this daemon holds: agent, machine, binding and share-grant subjects |
+
+### Agent identity response
+
+`GET /agent` returns `agent_id`, `machine_id`, `user_id` (or `null`),
+`agent_public_key`, `kem_public_key_b64` and, when they are set, the profile
+names `human_name`, `display_name` and `machine_name`.
+
+- `agent_public_key` — the agent's ML-DSA-65 public key in hex (1952 bytes,
+  3904 hex characters). `agent_id` is the SHA-256 of the domain separator
+  `AUTONOMI_PEER_ID_V2:` followed by these key bytes. This is the value that
+  `POST /owner/agents/issue` takes as `agent_public_key`.
+- `kem_public_key_b64` — the agent's ML-KEM-768 public key in base64.
+
+### Revocation listing
+
+`GET /identity/revocations` returns `{"revocations": [...]}` with one row for
+each signed revocation record that this daemon holds. The rows are in
+`revoked_at` order, oldest first. Each row has these fields:
+
+- `subject_kind` — `agent`, `machine`, `binding` or `share_grant`.
+- `subject` — one hex id for the subject: the agent id (`agent` and
+  `binding`), the machine id (`machine`) or the grant id (`share_grant`).
+- `issuer` — hex SHA-256 of the issuer's public key bytes. This value has no
+  domain separator, so it is not an agent, machine or user id.
+- `revoked_at` — Unix seconds.
+- `reason` — text, or `null`.
+
+The other fields name each part of the subject:
+
+| `subject_kind` | More fields |
+|---|---|
+| `agent` | `agent_id` |
+| `machine` | `machine_id` |
+| `binding` | `agent_id`, `machine_id`, `move_epoch` |
+| `share_grant` | `grant_id`, `owner` (the grantor's user id), `grant_expiry` (Unix seconds) |
+
+Before [#1108](https://github.com/saorsa-labs/x0x/issues/1108) the listing
+showed `agent` and `machine` rows only. A client that reads the listing must
+ignore a `subject_kind` it does not know.
+
+The daemon holds one record for each subject and issuer of an agent, machine
+or binding revocation: the one with the earlier `revoked_at`, and for equal
+times the lower record hash (#1857). A later record for the same pair adds
+nothing, and the subject stays revoked.
+
+The answer also has `unsendable_records`: the number of held records that
+are too large for any peer to accept (only a record from an old store can
+be). While it is not 0, a peer that waits for a resync cannot open from this
+daemon; revoke that subject again with a short reason.
+
+A daemon sends its published revocation set to peers as one gossip batch when
+the set fits, and as a round of marked batches when it does not; see
+[`docs/design/revocation-batches.md`](design/revocation-batches.md). The
+marker records of a round are never in this listing. The published set is the
+held set without the self-revocation of a key that this daemon has no
+relationship with (#1863). The daemon still holds and enforces such a record,
+and this listing still shows it.
+
+A new record's `reason` is at most 1024 bytes. `POST /identity/revoke` and
+`DELETE /owner/agents/:id` answer `400` above that, and a daemon refuses
+such a record from a peer. The reason is inside the signed record and every
+peer stores it.
+
+A record does not leave the listing because of its age. Agent, machine and
+binding records stay for good. A share-grant record goes when the grant is
+past `grant_expiry` plus the clock allowance. A daemon older than this rule
+removed agent and machine records 90 days after `revoked_at`.
+
+The listing shows signed records only. A binding that a key-move activation
+bundle retired has no record of its own; `GET /agent/moves` counts it in
+`derived.retired_bindings`.
 
 ### Key revocation
 
-The one-id form of `POST /identity/revoke` signs with the daemon's agent key
-and supplies no subject certificate. It supports `agent_id` set to this
-daemon's own agent. It cannot issue machine-signed or user-authority
-revocations: revoking this daemon's machine or another agent through this
-form returns `403`. Loading an owner key or an agent certificate does not
-change the signer used by this form. This limitation is tracked in
-[#1108](https://github.com/saorsa-labs/x0x/issues/1108).
+The one-id form of `POST /identity/revoke` revokes an identity whose key this
+daemon holds:
+
+- `agent_id` set to this daemon's own agent: the daemon signs with its agent
+  key.
+- `machine_id` set to this daemon's own machine: the daemon signs with its
+  machine key. This needs the durable API token (`403` for a session token).
+  The answer has a `warning` field. The revocation cannot be undone: peers
+  refuse this machine and every agent on it for good. `x0xd` does not stop
+  itself; it keeps running and peers refuse it. A repeat call signs no new
+  record; it answers the same fields and `"already_revoked": true`. To use the computer again,
+  stop `x0xd`, delete `machine.key` and start `x0xd`.
+
+Any other agent or machine id returns `403`: the daemon has no authority
+over it. Loading an owner key or an agent certificate does not change the
+signer used by this form.
 
 To revoke a registered sub-agent, use `DELETE /owner/agents/:id` (CLI:
 `x0x owner agents revoke <AGENT_ID>`). That separate route requires the
@@ -493,18 +577,148 @@ After the selected form's token check, neither id, malformed ids, or both ids
 without `move_epoch` return `400`. The binding form rejects a session token
 with `403` before these field checks.
 
+### Lost device
+
+`POST /owner/devices/:machine_id/lose` (CLI: `x0x owner lose-device
+<MACHINE_ID> [--reason <text>] [--force]`) stops this owner's agents on a
+lost machine. Run it on another of your devices. It needs the durable API
+token and the loaded owner key. Body (all optional): `{"reason": "<text>",
+"force": false}`.
+
+The daemon does three things, with records that every released daemon
+enforces:
+
+1. For each agent that this owner certified and that has a placement record
+   here, it signs a binding revocation `(agent, machine)`. That agent can no
+   longer act from the lost machine. Agents of other owners are not touched.
+2. For each agent **pinned** to the lost machine, it also revokes the agent
+   and its rider tokens. The key of a pinned agent was on that machine.
+3. It removes the machine from the owner device set.
+
+Response:
+
+```json
+{
+  "ok": true,
+  "store_write_error": null,
+  "machine_id": "<64-hex>",
+  "agents": [
+    {"agent_id": "<64-hex>", "placement": "roaming", "pinned_to_this_machine": false,
+     "binding": "revoked", "agent": "kept", "rider_tokens_revoked": 0,
+     "rider_token_sweep_error": null}
+  ],
+  "agents_without_placement": [],
+  "placement_mint_error": null,
+  "device_enrollment": "removed",
+  "machine_key_revoked": false,
+  "owner_key_on_device": "likely",
+  "owner_key_warning": "<text>",
+  "covers_agents_certified_later": false,
+  "note": "<text>"
+}
+```
+
+- `binding` is `revoked` or `already_revoked`. `agent` is `kept`, `revoked`
+  or `already_revoked`. `device_enrollment` is `removed`, `not_enrolled` or
+  `no_device_set`. A failed step puts `failed: <cause>` or `revoked, not
+  durable: <cause>` in that field, and the answer is `500` with `ok: false`
+  and the same body.
+- `placement_mint_error` is `null`, or the cause when the daemon could not
+  bring the placement ledger up to date. The action then used the ledger
+  it held.
+- A repeat call signs no new record. Every call writes the agent/machine
+  store and the binding store again from the held records, so a repeat
+  makes a record durable that an earlier call left `revoked, not durable`
+  after a write failure. `store_write_error` is `null`, or the cause when
+  that write failed; the answer is then `500`. One cause does not go away
+  with a repeat: a store that x0xd found unreadable is quarantined and is
+  not written until it is rebuilt (`x0x identity rebuild-revocation-store`)
+  or resynced; see [troubleshooting](troubleshooting.md). The record is in
+  force in memory and is published in both cases.
+- **Your owner key is not protected.** If the lost machine held `user.key`,
+  whoever has the machine can act as you: certify agents, sign grants and
+  enroll devices. This action does not help with that, and x0x cannot
+  replace an owner key today. Treat the owner identity as compromised,
+  create a new one and tell your contacts. `owner_key_on_device` is `likely`
+  when the machine was in the owner device set, and `unknown` in all other
+  cases: the daemon holds no record of which machines hold the key.
+- **Rider tokens.** The action revokes the rider tokens of an agent pinned
+  to the lost machine. A roaming agent keeps its tokens. A rider token that
+  was on the lost machine still works on the daemon that issued it until it
+  expires: revoke it there with `DELETE /owner/riders/:id`
+  (`x0x owner riders revoke`). `rider_token_sweep_error` is `null`, or the
+  cause when the sweep for that agent did not persist.
+- **A roaming agent keeps its identity.** If its key was on the lost
+  machine, also revoke that agent with `DELETE /owner/agents/:id`.
+- **The machine key is not revoked.** No evidence that other peers can check
+  ties a machine to its owner; see
+  [`docs/design/owner-machine-revocation.md`](design/owner-machine-revocation.md).
+  A new agent with no certificate on that machine is a stranger to every
+  peer.
+- **An agent that you certify later is not covered.** Run the action again
+  after you certify it.
+- **`agents_without_placement`** lists certified agents that have no
+  placement record on this daemon (an ACP agent whose machine was never
+  confirmed). The action cannot cover them. If one ran on the lost machine,
+  revoke it with `DELETE /owner/agents/:id`.
+
+Errors: `403` without the durable token; `409` with no owner key, or when
+the machine is the one this daemon runs on (use `POST /identity/revoke`);
+`400` for a bad id; `404` when the owner has no record of the machine and
+`force` is not `true`. The owner has a record of a machine that is
+enrolled, that one of its agents is pinned to, or that already has a
+binding tombstone for one of its agents (so a repeat call is not `404`).
+The `404` check runs before the daemon writes anything.
+
 ### Announce request body
 
 ```json
 {
   "include_user_identity": false,
-  "human_consent": false
+  "human_consent": false,
+  "withdraw_consent": false
 }
 ```
 
 Notes:
 - Set `include_user_identity: true` only when the daemon has a configured user key.
 - Set `human_consent: true` when intentionally sharing human identity.
+
+**Consent is durable (#1107).** A successful announce with both
+`include_user_identity: true` and `human_consent: true` records the
+consent in `user-consent.bin` in the identity directory, next to the keys
+(mode `0600` on Unix). The daemon loads the record at each start, before
+the first announce. The startup announce and every heartbeat then carry
+the user ID and the agent certificate. You do not need to repeat the
+announce after a restart.
+
+The record names the user and the agent that consented. It applies only
+when the daemon starts with the same agent key and a certificate from the
+same user. With another user key, another agent key, or no certificate,
+the daemon announces without the user identity. A missing or damaged
+record means "not consented". It never stops the daemon.
+
+**Withdraw the consent.** Send `{"withdraw_consent": true}` (CLI:
+`x0x announce --withdraw-consent`). This needs the durable API token. The
+daemon removes the record, stops including the user identity, and then
+publishes an announce without it. The response has
+`"consent_withdrawn": true`. `withdraw_consent` together with
+`include_user_identity: true` returns `400` for the durable token; a
+session or rider token gets `403` first. A daemon older than this option
+ignores the field: it announces and returns `200` with no
+`consent_withdrawn`, and its consent stays on. Always check for
+`"consent_withdrawn": true`. The CLI does this and exits non-zero with a
+message when the field is absent; upgrade that daemon, or restart it to
+drop its in-memory consent. The record is removed before
+the announce: if the announce fails, the request returns `400` with
+`"consent_withdrawn": true`, and the consent stays withdrawn. If the daemon
+can neither remove nor empty the record (a storage error), the request
+returns `500` and no announce is sent. This run then announces without the
+identity, but the record is still on disk and the consent returns at the
+next start: correct the storage fault and send the withdrawal again.
+Withdrawal does not make peers forget an
+identity that they already saw. A peer drops the cached certificate when
+it receives a later announce without the identity.
 
 ### Agent card query params
 
@@ -642,7 +856,8 @@ authority evidence), and the response returns the certificate
 (`certificate.storage_b64`) for ACP-attached harness instances.
 
 **Rider tokens** (`{ "sub_agent_id": <hex>, "groups": [gid…], "label"?:
-string, "ttl_secs"?: ≤ 90 days, default 7, "scopes"?: ["gui:show"],
+string, "ttl_secs"?: ≤ 90 days, default 7, "scopes"?: ["gui:show",
+"scratch:read", "scratch:read_write"],
 "delegation": { "payload_b64", "signature" } }`) are stored hashed at
 rest (SHA-256),
 expire, and are revocable per-token or by revoking their sub-agent.
@@ -668,6 +883,16 @@ authenticates as a distinct principal that may reach exactly:
   checks the explicit list only)
 - `GET /history` — `group:` scopes it is granted, limit clamped to 100
 - `POST /gui/show` — only when the token's `scopes` contain `gui:show`
+- the group SCRATCH store of a granted group (issue #1094, ADR 0075
+  decisions 4–5): with `scratch:read`, `GET /stores/:id/keys` and
+  `GET /stores/:id/:key`; with `scratch:read_write`, also
+  `PUT`/`DELETE /stores/:id/:key` and `POST /groups/:id/stores` with
+  `"name": "scratch"` only. `:id` must be the percent-encoded DERIVED
+  scratch topic of a group in the token's grant list (the `topic` the
+  create route returns — `x0x/group/<gid>/kv/<store digest>`), and the
+  open store must be group-bound. No scratch scope means
+  no store access (the `scratch: none` default). A rider never reaches
+  any other store, store creation/join, or `GET /stores`.
 
 Every other route — including `/agent/sign`, `/exec/*`, `/identity/*`,
 `/shutdown`, and the rest of the `/history` family (`/history/search`,
@@ -689,10 +914,11 @@ Home encrypts record the sub-agent id as the history row's author.
 `scopes` on `POST /owner/riders` is optional. It is the rider-token
 permission list. It is not the group list inside the delegation
 capability. Omit the field, or send `[]`, and the rider has no scopes.
-The only allowed value is the exact string `gui:show`. A repeated
-`gui:show` is stored once. Any other string, including a different case
-or added whitespace, is rejected before a certificate lookup or a disk
-write. The mint response is HTTP 400 and nothing is stored:
+The allowed values are the exact strings `gui:show`, `scratch:read`
+and `scratch:read_write`. A repeated scope is stored once. Any other
+string, including a different case or added whitespace, is rejected
+before a certificate lookup or a disk write. The mint response is HTTP
+400 and nothing is stored:
 
 ```json
 {"error":"unknown rider scope: <value>","ok":false,"reason":"unknown_scope"}
@@ -935,13 +1161,17 @@ body extraction, with a matching handler-side check. The request is:
 
 The target must not be this daemon's own agent. The daemon must be owned and
 must hold the elected canonical Home locally; a losing or remote Home cannot
-mint seats into its duplicate. A successful `200` response has this shape:
+mint seats into its duplicate. The seat mints through the ordinary invite
+authority (`POST /groups/:id/invite`), so a Home with more than 20
+Active+Banned members gets a content-addressed v6 link (#646); the
+20-placement cap still applies. A successful
+`200` response has this shape:
 
 ```json
 {
   "ok": true,
   "group_id": "<canonical Home group id>",
-  "invite": "<signed addressed v4 invite link>",
+  "invite": "<signed addressed v4 or v6 invite link>",
   "intended_joiner": "<requested agent id>",
   "owner_user_id": "<Home OwnerCertified user id>",
   "join_hint": "x0x group join <invite> --home --owner <owner_user_id>",
@@ -992,7 +1222,9 @@ No multi-device convergence or roster-merge claim is made.
 **Second owner device joining (#447).** A single explicit
 `POST /announce` with body `{"include_user_identity":true,"human_consent":true}`
 on the joining device is sufficient — a bodyless announce publishes the
-anonymous certificate digest, which the owner can never resolve. A join that
+anonymous certificate digest, which the owner can never resolve. The consent
+is durable (#1107): after a restart the device announces with the certificate
+again, with no second announce. A join that
 arrives before the certificate is visible is retained in a typed `pending`
 state (`retain_pending_owner_cert_join`) and retried when the evidence lands
 (`retry_pending_owner_cert_joins`), rather than wedging. There is no
@@ -1008,8 +1240,9 @@ own `MemberAdded`, mint a fresh invite rather than replaying the link.
 | POST | `/sync/devices/enroll` | `x0x sync enroll` | durable-owner (#446) | Owner-key-sign a DeviceEnrollment for a machine |
 | DELETE | `/sync/devices/:machine_id` | `x0x sync revoke <MACHINE_ID>` | durable-owner (#446) | Remove a machine from the device set |
 | GET | `/owner/machines` | `x0x owner machines` | owner (riders denied) | M1 machine census: enrolled devices + last-sync status + this machine's version/policy digest (#1383) |
+| POST | `/owner/devices/:machine_id/lose` | `x0x owner lose-device <MACHINE_ID>` | durable-owner | Lost-device action; see [Lost device](#lost-device) |
 
-All three answer `409` when no owner identity is configured. Sync replicates
+All five answer `409` when no owner identity is configured. Sync replicates
 owner state **owner-to-owner only** — Tier 1: profile/names, the Home
 history, DMs, and exec data
 never replicate, and no third party receives the state. Inbound SyncV1 streams
@@ -1439,9 +1672,12 @@ Notable codes:
 | 400 | `require_gossip_ack_removed` | The request set the removed `require_gossip_ack` field. Drop it; use `require_durable_app_ack`. |
 | 400 | `invalid_logical_id` | `logical_id` was empty, longer than 128 characters, or contained a character outside `[a-z0-9._:-]`. |
 | 400 | `logical_id_requires_durable_ack` | `logical_id` was sent with `require_durable_app_ack: false`. Only the durable path honours the id; drop one or the other. |
+| 403 | `recipient_pairing_denied` | The local ADR-0043 B/P gate denied the `(agent, machine)` pairing that the send resolved: a tombstone retired the binding (B), or a current placement record pins the agent to another machine (P). Nothing was sent. A retry fails the same way until the binding or placement changes. Rust callers get `DmError::RecipientPairingDenied { denial }`. Before this code, this denial answered 500 `envelope_construction` (gossip path) or 500 `publish_failed` (pinned path). A denial on the raw-QUIC path still answers `publish_failed`. |
 | 404 | `recipient_key_unavailable` | The recipient has published no KEM key, or is entirely unknown to this daemon — **no capability advert and no contact card at all**. A durable send to a stranger answers this, not the 409 below. |
 | 409 | `recipient_key_invalid` | Our view of the recipient's key material has not converged. Transient — retry. |
 | 409 | `recipient_ack_semantics_unavailable` | The send required ADR 0030 durable application-ACK semantics and the recipient advertises no current v2 capability. A peer you hold **any** contact card for lands here rather than on the 404 — including one whose advert has not converged yet, since that peer is known and may simply need upgrading. Returned after one forced targeted capability refresh, so it is fast and deterministic rather than a timeout. The caller retries, surfaces "peer needs upgrade", or resends with `require_durable_app_ack: false` — the daemon never downgrades silently. |
+| 409 | `recipient_capability_pending` | The payload carries a durable obligation (a share grant, a predecessor relay or a requester offer) and the recipient has no current verified capability advert (#1158). Nothing was sent. The daemon asked the recipient for a targeted advert refresh. Retry; the send goes when the advert arrives. Ordinary DMs never get this code. Rust callers get `DmError::RecipientCapabilityPending { capability }`. |
+| 409 | `recipient_capability_unavailable` | As `recipient_capability_pending`, but no verified advert arrived within one advert period (600 s). Nothing was sent. A later advert from the recipient lets a retry go. Rust callers get `DmError::RecipientCapabilityUnavailable { capability }`. |
 | 409 | `idempotency_conflict` | The recipient already holds this `logical_id` bound to different bytes. **Retrying cannot succeed.** Either resend the original bytes under this id, or pick a new `logical_id`. |
 | 413 | `payload_too_large` | Payload exceeds the DM envelope cap. |
 | 504 | `timeout` | The overall send budget ended the send. `DmError::Timeout` can come from the raw-QUIC path, the known-recipient redial, or the relay fallback, as well as from an application ACK that does not arrive within the retry budget. Those paths are capped by the overall send budget. The error variant and the wire format are unchanged. The DM may or may not have arrived. On a durable send the body also includes `strict_gate_ms`, `publish_ms`, `ack_wait_ms`, `elapsed_ms`, and `budget_stage` so the stage that consumed the budget is named. Durable 200 and 504 also include recipient ACK-publish diagnostics `last_ack_publish_ms` and `ack_publish_route_failed` (same fields on `GET /diagnostics/dm`). These are diagnostics, not a latency SLA. |
@@ -1552,10 +1788,13 @@ token. A session token is refused before the body is read.
 | GET | `/groups/:id/members` | `x0x group members <group_id>` | List named-group members |
 | POST | `/groups/:id/members` | `x0x group add-member <group_id> <agent_id> [--display-name <n>] [--key-package <b64>]` | Admin-authored member add (propagates to subscribed peers). `--key-package` carries the base64 TreeKEM key package required for direct adds to encrypted groups |
 | DELETE | `/groups/:id/members/:agent_id` | `x0x group remove-member <group_id> <agent_id>` | Admin-authored member removal (propagates to subscribed peers) |
-| POST | `/groups/:id/invite` | `x0x group invite <group_id>` | Generate a SIGNED v4 invite link. Body `{"expiry_secs":u64,"intended_joiner":"<64-hex agent id, optional>"}`. Owner-axis (Home-capable) groups additionally require the durable owner's loaded user key (else 409 `owner_key_unavailable`). Typed 413 `invite_too_large` (per-field caps + final encoded size; roster cap 20) and 429 `invite_cap_reached` (64 live unconsumed records/group). **Invites are single-use**: the link carries a one-time secret that the issuing daemon consumes on the first validated `MemberJoined` (before it publishes the authority-signed `MemberAdded`). A replay's fate depends on where it lands: after the authority validated the original join, a replayed secret is rejected `invite_secret_consumed` and never seated; if the authority has NOT validated yet (event still in flight, or it restarted first) the secret is unburned; a replay by an already-active member is refused earlier as an idempotent no-op (and a same-node duplicate join is an idempotent local success, #188); an addressed invite replayed by the wrong joiner is refused without consuming the secret. None of these paths proves YOUR seat — mint a fresh invite instead. `expiry_secs` only bounds how long an *unconsumed* invite stays valid |
+| POST | `/groups/:id/invite` | `x0x group invite <group_id>` | Generate a SIGNED invite link — v4 with the roster inline up to 20 Active+Banned members, v6 (content-addressed) past that; version 5 is reserved for the archived ADR 0112 addressed-invite design and is refused as unsupported. Body `{"expiry_secs":u64,"intended_joiner":"<64-hex agent id, optional>"}`. Home placements keep the 20 cap (an over-20-placement Home refuses at mint). Owner-axis (Home-capable) groups additionally require the durable owner's loaded user key (else 409 `owner_key_unavailable`). Typed 413 `invite_too_large` (per-field caps + final encoded size; rosters up to 20 Active+Banned members ride the link inline as v4; larger rosters mint a v6 link that carries the roster's content address — the joiner fetches the projection from the inviter and verifies it against the signed root — up to 128 members, #646) and 429 `invite_cap_reached` (64 live unconsumed records/group). **Invites are single-use**: the link carries a one-time secret that the issuing daemon consumes on the first validated `MemberJoined` (before it publishes the authority-signed `MemberAdded`). A replay's fate depends on where it lands: after the authority validated the original join, a replayed secret is rejected `invite_secret_consumed` and never seated; if the authority has NOT validated yet (event still in flight, or it restarted first) the secret is unburned; a replay by an already-active member is refused earlier as an idempotent no-op (and a same-node duplicate join is an idempotent local success, #188); an addressed invite replayed by the wrong joiner is refused without consuming the secret. None of these paths proves YOUR seat — mint a fresh invite instead. `expiry_secs` only bounds how long an *unconsumed* invite stays valid |
 | POST | `/groups/:id/stores` | `x0x group store create <GROUP_ID> <NAME>` | Open or idempotently re-open a creator-anchored group store: signed plaintext for `SignedPublic`, encrypted for `MlsEncrypted` GSS; current group policy gates writes |
-| POST | `/groups/join` | `x0x group join <invite> [--display-name <n>] [--home --owner <hex>]` | Join via signed v4 invite. Body `{"invite":..., "display_name":..., "mode":"group"|"home", "expected_owner_user_id":"<64-hex>"}`. Typed 409 refusals: `invite_unsigned` (pre-v4), `invite_signature_invalid`, `inviter_key_mismatch|revoked`, `invite_base_inconsistent`, `invite_owner_countersignature_missing|invalid`, `reseat_invite_outside_staging` (an ADR 0109 §3a re-seat invite: owner-axis policy, no inline owner key; it is valid only in the §3 staging join), `invite_not_addressed_to_me`, and the mode matrix `use_home_mode` / `pin_requires_home_mode` / `home_mode_requires_pin` / `invite_downgraded` / `owner_mismatch`; unknown mode 400 |
-| GET | `/groups/:id/join-status` | `x0x group join-status <id>` / `x0x group join <invite> --wait <secs>` | Pending-join status (#477): `{join_state, last_join_outcome?}` where `last_join_outcome ∈ {refused(reason), timed_out}`. After a terminal finalize removed the local stub the route returns **404 with the outcome in the body**. Typed refusal reasons: `invite_secret_unknown`, `invite_secret_consumed`, `invite_role_exceeds_cap`, `invite_event_before_creation`, `invite_expired`, `invite_not_addressed`. ADR 0108 §8 (#1575): the **200** body always carries the `pending_cause` key (null unless `join_state` is `pending_authority_commit` and the joiner holds a verified `JoinPendingNotice`), holding `pending_cause {cause, raw_cause?, detail {count?, revision?, digests?}, issued_at_ms, signer_agent_id}`; the 404 body after a terminal finalize carries no `pending_cause` key; a well-formed cause this build does not know shows as `unrecognized_cause` with the raw name in `raw_cause`, never a decode failure. A later Result or Refused replaces it. A different invite while a join is pending returns 409 `join_already_pending` from `POST /groups/join` |
+| GET | `/groups/:id/stores/:app/legacy-imports` | `x0x group store legacy imports <GROUP_ID> <APP>` | List local legacy Wiki/Web snapshots with durable import and local sync-publication status (see [docs/legacy-compat.md](legacy-compat.md)) |
+| POST | `/groups/:id/stores/:app/legacy-imports/:source_id` | `x0x group store legacy import <GROUP_ID> <APP> <SOURCE_ID>` | Import a reviewed local legacy Wiki/Web snapshot and offer its retained history for shared-space sync. Body: `source_digest` (required), `idempotency_key` (required) |
+| GET | `/groups/:id/stores/:app/legacy-imports/:source_id` | `x0x group store legacy download <GROUP_ID> <APP> <SOURCE_ID>` | Download the exact reviewed legacy snapshot without changing it; `idempotency_key` query optional |
+| POST | `/groups/join` | `x0x group join <invite> [--display-name <n>] [--home --owner <hex>]` | Join via a signed v4 or v6 invite. Body `{"invite":..., "display_name":..., "mode":"group"|"home", "expected_owner_user_id":"<64-hex>"}`. A v6 (content-addressed) invite carries the base roster's root instead of the roster: after full invite authentication and before any local state, the joiner fetches the projection from the inviter and admits it only when it re-derives the signed root; while no source answers, the join refuses with a retryable 503 `base_roster_unavailable`, and when the inviter answers that the invite's root is pruned it refuses with a TERMINAL 409 `base_roster_pruned` (request a fresh invite); either way it installs or clears nothing (#646). Typed 409 refusals: `invite_unsigned` (pre-v4), `invite_signature_invalid`, `inviter_key_mismatch|revoked`, `invite_base_inconsistent`, `invite_owner_countersignature_missing|invalid`, `reseat_invite_outside_staging` (an ADR 0109 §3a re-seat invite: owner-axis policy, no inline owner key; it is valid only in the §3 staging join), `invite_not_addressed_to_me`, and the mode matrix `use_home_mode` / `pin_requires_home_mode` / `home_mode_requires_pin` / `invite_downgraded` / `owner_mismatch`; unknown mode 400 |
+| GET | `/groups/:id/join-status` | `x0x group join-status <id>` / `x0x group join <invite> --wait <secs>` | Pending-join status (#477): `{join_state, last_join_outcome?}` where `last_join_outcome ∈ {refused(reason), timed_out(reason)}`. After a terminal finalize removed the local stub the route returns **404 with the outcome in the body**. Typed refusal reasons: `invite_secret_unknown`, `invite_secret_consumed`, `invite_role_exceeds_cap`, `invite_event_before_creation`, `invite_expired`, `invite_not_addressed`. ADR 0108 §8 (#1575): the **200** body always carries the `pending_cause` key (null unless `join_state` is `pending_authority_commit` and the joiner holds a verified `JoinPendingNotice`), holding `pending_cause {cause, raw_cause?, detail {count?, revision?, digests?}, issued_at_ms, signer_agent_id}`; the 404 body after a terminal finalize carries no `pending_cause` key; a well-formed cause this build does not know shows as `unrecognized_cause` with the raw name in `raw_cause`, never a decode failure. A later Result or Refused replaces it. Timed-out reasons (ADR 0108 §8, #1640): a `timed_out` outcome always carries a `reason`. An ADR 0107 fetch-only re-arm gives `rearm_original_result_unavailable`, and this rule wins over the two rules after it. Else the reason is the cause of the verified `JoinPendingNotice` that the attempt held, in its `pending_cause.cause` form (`unrecognized_cause` for a cause this build does not know; the raw name is not kept in `reason`). Else the reason is `no_admission_result`: the attempt reached its poll deadline with no verified notice. An attempt that ADR 0109 S3 holds reports reason `adr0109_recovery_held`, not a bare `timed_out`. A different invite while a join is pending returns 409 `join_already_pending` from `POST /groups/join` |
 | PUT | `/groups/:id/display-name` | `x0x group set-name <group_id> <name>` | Set the local agent's own display name. Body `{"name":"<display name>"}`. Requires an active seat in the group, any role, on any token class. The label is local, so there is no Home durable fence. The name is not part of the signed roster |
 | PATCH | `/groups/:id` | `x0x group update <group_id>` | Update name/description (admin-authored) |
 | PATCH | `/groups/:id/policy` | `x0x group policy <group_id>` | Update group policy (admin-authored) |
@@ -1608,8 +1847,10 @@ recipient, install a group secret, or establish historical-key entitlement.
 ### `POST /groups/:id/stores` — group store
 
 This bearer-authenticated owner route accepts either the durable API token or a
-session token. Rider tokens cannot reach it: the deny-by-default middleware
-returns `403` before the handler, regardless of a rider's group grants. For
+session token. Rider tokens cannot reach it, with one exception (issue #1094,
+ADR 0075 decision 5): a rider whose token carries `scratch:read_write` may open
+the `scratch` store of a group in its grant list — any other name, scope or
+group answers `403` before any store state changes. For
 `MlsEncrypted` groups the daemon's own agent must be an active member. For
 `SignedPublic` groups, public-read policy permits nonmembers to open and read;
 members-only read policy requires an active member. Writes always follow the
@@ -1764,15 +2005,52 @@ every wait. A wait always names its cause; it does not stop silently.
     is `rank` (this node waits for its fallback time, `remaining_ms`) or
     `designated_admin_unsupported` (the designated admin's advert lacks
     `eviction_handoff_v1`).
-  - `unresolved_designated_admin` — the hand-off has not reached the
-    designated admin yet.
+  - `unresolved_designated_admin` — this node's own hand-off dispatch
+    against the designated admin completed without an exchange with it
+    and without a definitive routing or eligibility failure (ADR 0110
+    §2). The outcome is recorded per attempt when the dispatch
+    completes, and the outcome-bearing records (`unresolved`,
+    `unsupported`) survive a restart until W ends or the designation
+    changes, when the daemon drops them. The cause shows while the
+    designated window W runs — L171: it "preserves priority through W,
+    not forever" — so a rank whose fallback time is later (W + Δ and
+    on) keeps the plain `waiting_for_designated_admin` for the rest of
+    its stagger wait. The cause also stops when the designation
+    changes or the row reopens, completes or terminates; the dispatch is not
+    retried, and a later hand-off receipt does not rewrite the outcome.
+    `detail` is `rank` with `remaining_ms`, like the plain wait. A
+    definitive failure is not this cause: it keeps
+    `waiting_for_designated_admin` with the
+    `designated_admin_unsupported` detail once the row has dispatched
+    (a verified advert that lacks `eviction_handoff_v1`, or the
+    transport's refusal for that lack). A definitive policy refusal is
+    not this cause either: it keeps the plain
+    `waiting_for_designated_admin` with `detail: "rank"`. Two refusals
+    count. The first is the designated admin's trust policy that rejects
+    this node. The second is this node's pairing policy that denies the
+    designated admin's machine in the pre-send check of the direct send.
+    A pairing denial on the raw-QUIC or DM-registry path is reported as
+    a peer that is not verified, with no policy reason. That outcome is
+    `unresolved`, and it is stored, like any other failed send.
+    The manual remove/ban/seal 202 keeps its documented
+    `waiting_for_designated_admin` answer (ADR 0110 §2's ADR 0016 §6
+    amendment).
   - `local_committer_ineligible` — this admin may not seal (demoted,
     removed, revoked, left, or its own certificate expired).
   - `waiting_for_durable_intake` — the obligation is not on disk yet; the
     daemon retries. When the obligation file runs memory-only, a
     revocation waits here until the revocation store holds it on disk.
   - `waiting_for_head_sync` — a catch-up round must finish first (for
-    example after a restart).
+    example after a restart). A holder can be far behind: this node cannot
+    link its reported head through the retained commit log, and its
+    reported `responder_state_revision` is below the log's retained floor.
+    Such a holder adds no conflicting-head evidence and clears its earlier
+    evidence. It does not confirm the round. A head at or above the floor
+    that this node cannot link still counts as conflicting (#1597 item 5b).
+    `responder_state_revision` is an optional field of the peer-to-peer
+    TreeKEM catch-up answer, not a REST field. It gives the revision of
+    the saved head in `responder_state_hash`. An old peer omits it and
+    keeps the old rule.
   - `waiting_for_member_key_package` — the TreeKEM removal needs the
     member's KeyPackage; the daemon asks for it.
   - `waiting_for_fork_resolution` — a competing branch exists. A saved
@@ -1852,7 +2130,8 @@ re-sealed share of a rotated secret, so the member installs a verified
 exclusion frame without the new secret. A `signed_public` group holds no
 secret and no seat KEM key by design — its members are not keyless
 survivors. While the state lasts: the node withholds new group ciphertext
-with the 409 above; its catch-up answers omit `responder_state_hash` (a
+with the 409 above; its catch-up answers omit `responder_state_hash` and
+`responder_state_revision` (a
 node that holds no secret of an epoch cannot vouch for a head of that
 epoch; every other responder — a `signed_public` member, an
 `mls_encrypted` joiner still waiting for its welcome share, and a
@@ -1874,56 +2153,113 @@ Active seat, the encrypted GSS plane and the frame's per-seat position
 (`state_revision`, `key_sequence`) seats the key on the member's row
 (replays, stale keys, frames signed before the seat's current
 admission, and unsigned or wrong-signer frames are refused; see the
-`X0XKR1` entry below). The republication is
-automatic: the keyless install itself sends it, and a node that boots
-into the keyless state — or into the keyed state whose share never
-installed — sends it at startup. A send the carrier does not accept is
-not done: a recipient whose verified advert is missing or expired, or
-whose send failed, keeps the frame owed, and the daemon retries it
-until the advert sets the bit or rules the frame out. A send the carrier
-accepts is not proof that the peer seated the key, so the daemon sends
-the frame again to each owed Active recipient, up to 6 carrier-accepted
-sends. The sweep interval starts at 5 s and doubles to a maximum of
-80 s. A newer republication for the same group resets the count. A
-recipient that leaves the group's Active roster, or is revoked, is no
-longer owed. The receiver refuses a repeat of a seated key as
-`stale_key`, so a repeat does no harm. The startup pass keeps the seat
-selected until the share installs, so a restart sends it again. Once
-the seat is keyed — on the survivor's own copy and on the authors' copies — the next S4
-delivery round seals the current secret to it and the share installs
-through the existing path, which ends the hold and returns the served
-head. Share completion stays distinct from that head: a catch-up answer
-from a seat an author's roster leaves keyless is not share-possession
-evidence (such a seat cannot hold the epoch secret), and the frame's
-ingest owes the republisher its sealed share on the author's open S4
-rows. That debt — not the roster key — holds the row open whatever a
-restored head already reported: it ends only when the carrier accepts a
-sealed share for the member, and a share batch whose bounded retries
-fail leaves the obligation in place, re-sealed each delivery round. If
-the member republishes while the author's GSS delivery is open, the
-author resets the member's earlier convergence: the member converges
-again only after the new-key share is accepted and the member reports
-its head. A peer whose verified advert lacks
-`key_republish_v1` (bit 12) keeps the pre-#1663 behavior, so the seat
-stays keyless in that peer's view until it upgrades or the member
-re-joins. The window between the
-keyed seat and the installed share is the same superseded-intermediate
-shape the 02:09 ruling keeps as main's answer, bounded by the share
-delivery the S4 row owes. Until one of the two keys the seat again, the
-hold lasts: an installed share of the held epoch, or a later one, or
-the #1663 republication (while the node holds no secret), ends it. A
-share of the held epoch ends the hold only when its sender is a
-recorded actor of that hold and the share's secret is the one recorded
+`X0XKR1` entry below). The republication is automatic: the keyless install
+itself sends it, and a node that boots into the keyless state — or into the
+keyed state whose share never installed — sends it at startup. A send the
+carrier does not accept is not done: a recipient whose verified advert is
+missing or expired, or whose send failed, keeps the frame owed, and the
+daemon retries it until the advert sets the bit or rules the frame out. A
+send the carrier accepts is not proof that the peer seated the key, so the
+daemon sends the frame again to each owed Active recipient, up to 6
+carrier-accepted sends. The sweep interval starts at 5 s and doubles to a
+maximum of 80 s. A newer republication for the same group resets the count.
+A recipient that leaves the group's Active roster, or is revoked, is no
+longer owed. The receiver refuses a repeat of a seated key as `stale_key`,
+so a repeat does no harm. The startup pass keeps the seat selected until the
+share installs, so a restart sends it again. Once the seat is keyed — on the
+survivor's own copy and on the authors' copies — the next S4 delivery round
+seals the current secret to it and the share installs through the existing
+path, which ends the hold and returns the served head. Share completion
+stays distinct from that head: a catch-up answer from a seat an author's
+roster leaves keyless is not share-possession evidence (such a seat cannot
+hold the epoch secret), and the frame's ingest owes the republisher its
+sealed share on the author's open S4 rows. That debt — not the roster key —
+holds the row open whatever a restored head already reported: it ends only
+when the carrier accepts a sealed share for the member, and a share batch
+whose bounded retries fail leaves the obligation in place, re-sealed each
+delivery round. If the member republishes while the author's GSS delivery is
+open, the author resets the member's earlier convergence: the member
+converges again only after the new-key share is accepted and the member
+reports its head. A peer whose verified advert lacks `key_republish_v1` (bit
+12) keeps the pre-#1663 behavior, so the seat stays keyless in that peer's
+view until it upgrades or the member re-joins. The window between the keyed
+seat and the installed share is the same superseded-intermediate shape the
+02:09 ruling keeps as main's answer, bounded by the share delivery the S4
+row owes. Until one of the two keys the seat again, the hold lasts until one
+of these ends it:
+- An installed share of the held epoch, or of a later epoch that a head
+  commit pins. A sealed share that raised the local epoch past what the
+  head commits completed no verified transition (#1775).
+- A recorded actor of the hold sealing a later epoch's unpinned secret.
+- The #1663 republication, while the node holds no secret.
+- The exclusion installing with its own key. This ends every older hold.
+
+A share of the held epoch ends the hold only when its sender is a
+recorded actor of that hold, and the share's secret is the one recorded
 for that sender (#1766). A share of the same epoch from a different
-admin installs, but the hold stays. The actor's share of that epoch
-then replaces the other admin's uncommitted secret.
+admin installs, but the hold stays. While a verified transition of
+that epoch waits, a share of that epoch from any admin other than the
+installed secret's sender replaces a secret that no commit pins. The
+same rule applies to an unpinned secret of a later epoch: the early
+sealed share raised the local epoch past the head, and a share of the
+earlier epoch from any other admin displaces it. The waiting actor's
+own share is one such share, so the frame it waits for installs
+(#1775). The replace is not limited to the waiting actor. It fails
+closed: the hold stays until the actor's own share installs, so a
+third admin's replace can stall the group or lose a later key, but it
+releases no ciphertext. A hold or a parked removal replaces only for a share epoch
+above the epoch that the head commits. A keyless commit's epoch is the
+one exception, under its mark's own rule (below). A displaced later secret is not lost: it parks in the
+hold file with its sender and the displacing wait's epoch, and it
+re-delivers through the ordinary share path once a head commits that
+epoch — so the later rotation's own commit lands with its key, and an
+honest share-before-commit reordering stalls on no re-delivery. A
+promoted or superseded intermediate install parks the later key it
+drops only when the held step that raises to that epoch has the key's
+sender as its author. It drops any other later key. One exception:
+when the hold file records no sender for the displaced secret, that secret parks nowhere and is lost. A crash
+between the key write and its record write leaves the sender unknown,
+with no provenance to re-deliver, and the daemon logs a warning. The
+re-delivery also runs after an accepted share installs: a keyless
+commit can commit the displacing wait's epoch with no share of its
+own, so no later commit would carry it. The parked record goes when
+its epoch commits, when a secret of its epoch or a later one is
+already in, when its sender is revoked or the roster holds below
+Admin, or when a held removal or ban targets its sender. A replay of
+the installed frame also re-delivers it. The file keeps one parked record per group, and a live record
+keeps the slot, so a second displacement in the same window parks
+nowhere and is lost, with the same warning.
+
+The hold file is local state, not an API. It stores the parked secret
+in the clear, with its sender and epochs, written 0600 from creation.
+A file that carries a keyless mark or a parked secret is version 2;
+every other file is version 1. A binary that knows only version 1 does
+not load a version 2 file: it keeps the file and holds that group.
+
+After a #1578 keyless install, the head already commits the epoch, but
+it binds the epoch, not the secret value (#1775). The durable keyless
+mark keeps that epoch's first installed secret replaceable, and the
+group's new ciphertext held, until the exclusion's own actor seals a
+share of it. This also holds past the #1663 republication. Until then,
+any secret whose sender the record does not name stays replaceable.
+The mark claims exactly its own epoch, and the head that its keyless
+commit moved, or a commit chained on that head. A sibling commit of the
+epoch ends the mark. So does a head that commits a later epoch. A share
+of a later unpinned epoch is not the mark's actor key. When the retained
+log cannot prove the mark's head, the mark still holds its group, but
+only its own actor's share may replace — the one share that settles it.
+
+A known-empty evicted-removal hold ends at a secret of its epoch or a later
+one, committed or not. A hold whose actor list is unknown (a pre-#1771
+exclusion file) is ended by no secret that a commit does not pin.
+One that carries removed members is an evicted removal's containment.
 
 **Wire and capabilities.** The daemon advertises four more ADR 0093
 application bits: `eviction_handoff_v1` (bit 4), `crypto_exclusion_v1`
 (bit 5), `owner_recovery_v1` (bit 7) and `key_republish_v1` (bit 12,
-the #1663 republication). The new frames ride the
-direct-message carrier only. They are
-not on the metadata topic and not in a legacy-decoded container:
+the #1663 republication). The new frames ride the direct-message
+carrier only. They are not on the metadata topic and not in a
+legacy-decoded container:
 
 - `X0XEVH1` — `EvictionHandoffV1`, signed evidence from one admin to the
   others. It carries no key material.
@@ -1946,11 +2282,10 @@ not on the metadata topic and not in a legacy-decoded container:
   - `actor` — the republishing member's raw agent ID. The key seats on
     this member's own row only.
   - `agent_public_key_b64` — the actor's ML-DSA-65 agent public key
-    (base64). It verifies the
-    signature and must derive `actor`.
+    (base64). It verifies the signature and must derive `actor`.
   - `kem_public_key_b64` — the ML-KEM-768 public key (base64) to seat.
-    It must parse as an
-    ML-KEM-768 public key; a correct length alone is not sufficient.
+    It must parse as an ML-KEM-768 public key; a correct length alone
+    is not sufficient.
   - `state_revision` — the group state revision (the signed state-commit
     chain) that the actor held when it signed. This is the admission
     binding (David's 2 Nov 2026 ruling).
@@ -2807,6 +3142,20 @@ claim, or conclude the task is gone if it stays absent.
 | GET | `/stores/:id/:key` | `x0x store get <store_id> <key>` | Get a value |
 | DELETE | `/stores/:id/:key` | `x0x store rm <store_id> <key>` | Remove a value |
 
+### The group scratch store (issue #1094)
+
+Each group's SCRATCH store is the group store named `scratch`
+(`POST /groups/:id/stores` with `{"name":"scratch"}`): an ordinary sealed
+last-writer-wins KV store at the deterministic derived topic
+`x0x/group/<stable group id>/kv/<store digest>` (the digest is the
+BLAKE3 store identity of the stable group id and the name `scratch`,
+so every member computes the same topic; the create response returns
+it as `topic`), for agents' keyed working state. It is the one store
+a rider token can reach, under the `scratch:read` /
+`scratch:read_write` scopes (see the rider section); the `:id` in
+`/stores/:id/*` is the percent-encoded topic. Owners use the ordinary
+store routes above.
+
 ### Store create request body
 
 ```json
@@ -3302,6 +3651,131 @@ Run a command on **another** agent's machine. Disabled by default; every request
 
 `agent_id` is optional; when omitted the local pending-session table resolves the target.
 
+## ACL administration
+
+Manage the connect and exec ACL overlays at runtime. Each plane has a
+read-only **TOML floor** (`connect-acl.toml`, `exec-acl.toml`) plus an
+**API-managed overlay**; these routes edit the overlay only — removing a floor
+entry answers `409`. See [docs/connect-acl.md](connect-acl.md) and
+[docs/exec.md](exec.md) for entry schemas and evaluation order.
+
+Every ACL route, reads included, requires the durable API token. The auth
+middleware refuses session and rider bearers with `403` before the handler
+runs, and each handler checks again. An entry with `principal = "owner"` or
+`principal = "grant"` also needs an owner identity (user key) on the install;
+without one, `add` answers `409`.
+
+`x0x acl connect add` and `x0x acl exec add` take one required positional
+`<ENTRY_JSON>` argument: the entry as JSON, given as a literal, `@path`, or
+`-` for stdin. Example:
+`x0x acl connect add '{"principal":"owner","targets":["127.0.0.1:22"]}'`.
+`rm` is an alias of `remove`.
+
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| GET | `/acl/connect` | `x0x acl connect list` | List connect ACL entries (TOML floor + API-managed) and reload status |
+| POST | `/acl/connect` | `x0x acl connect add <ENTRY_JSON>` | Add an API-managed connect ACL entry (TOML entry schema as JSON) |
+| DELETE | `/acl/connect/:id` | `x0x acl connect rm <id>` | Remove an API-managed connect ACL entry (floor entries: `409`) |
+| GET | `/acl/exec` | `x0x acl exec list` | List exec ACL entries (TOML floor + API-managed) and reload status |
+| POST | `/acl/exec` | `x0x acl exec add <ENTRY_JSON>` | Add an API-managed exec ACL entry (TOML entry schema as JSON) |
+| DELETE | `/acl/exec/:id` | `x0x acl exec rm <id>` | Remove an API-managed exec ACL entry (floor entries: `409`) |
+| POST | `/acl/reload` | `x0x acl reload` | Re-read the connect/exec ACL floors and overlays; a rejected file keeps the last good ACL |
+
+## Share grants (ADR-0070 §2)
+
+Owner-signed capability grants that admit a named peer to a gated surface
+(e.g. an `Exec` grant counts as trust `Accept` for remote exec when the exec
+ACL has a `principal = "grant"` entry — see [docs/exec.md](exec.md)). Every
+route requires the durable API token; session and rider bearers receive
+a typed `403`.
+
+`POST /grants` body (unknown fields are refused):
+
+```json
+{
+  "grantee_user": "<64-hex user id>",
+  "agents": ["<64-hex agent id>"],
+  "caps": ["dm", {"connect": {"ports": [22]}}],
+  "ttl_secs": 86400
+}
+```
+
+- `grantee_user` or `grantee_agent` (64-hex): set exactly one, else `400`.
+- `agents` (required, non-empty): this owner's agents to share.
+- `caps` (required, non-empty): any of `"dm"`, `"exec"`, `"group_invite"`,
+  `"call"`, `{"connect":{"ports":[...]}}`,
+  `{"data":{"group":"<stable group id>","store":"<name>","access":"ro"|"rw"}}`.
+  The `data` capability (issue #1094) names ONE store of ONE group — for
+  example the group's `scratch` store — so data can be shared without
+  sharing the whole group. This release mints, stores, delivers and
+  evaluates it; the remote read/write surface that consumes it is the A4
+  sharing-completeness slice and is not yet wired.
+- `expiry` (Unix seconds) or `ttl_secs` (seconds from `not_before`): set
+  exactly one, else `400`. Grants must expire.
+- `not_before` (optional, Unix seconds): default is now.
+- `deliver_to` (optional, 64-hex agent ids): more agents to deliver the grant
+  to.
+- `include_names` (optional, default `true`): ADR 0079 — carry the owner's
+  profile `human_name` and the names of the shared machines (machines with a
+  current owner enrollment, a synced `machine_name`, and a granted agent
+  announced on them; the issuing daemon's own machine takes its name from
+  the local profile and needs no enrollment record) to capable grantees. The daemon signs the names with
+  the owner user key and sends the `x0x-sharegrant-v2\0` envelope ONLY to a
+  grantee-side recipient whose current verified advert sets ADR 0093 bit 14
+  (`share_grant_names_v1`). Shared-agent daemons, `deliver_to` recipients
+  that are not one of the grantee's agents, and grantees without the bit
+  get the unchanged v1 payload. A `deliver_to` agent that is itself one of
+  the grantee's agents is grantee-side, so it gets v2 when it sets bit 14.
+  `false` withholds both names (the CLI's `--no-names`), and every
+  recipient gets v1. The issuing daemon's own machine is always named from
+  the local profile `machine_name`, never from a synced record.
+
+An install with no owner identity (user key) answers `409`.
+
+Each `delivery` entry in the response reports `envelope`: `"v1"` or `"v2"`
+(which payload that recipient was sent, or queued with — a failed v2
+recipient is queued with its signed names, and every outbox retry resends
+the same v2 bytes).
+
+A `delivery` entry with `delivered: false` and `queued: true` gives the hold
+reason in `error`. Two reasons mean the daemon did not send the grant,
+because the recipient has no current verified capability advert (#1158):
+
+- `recipient_capability_pending: <bit>`: the daemon asked the recipient for
+  its advert and waits for it, for at most one advert period (600 s).
+- `recipient_capability_unavailable: <bit>`: no advert arrived in that time.
+
+In both cases the grant stays in the redelivery outbox. The daemon sends it
+when the recipient's verified advert arrives, and otherwise checks again on
+the outbox backoff. `recipient_upgrade_required: <bit>` is different: the
+recipient's current advert lacks the bit, so the recipient must upgrade.
+`<bit>` is `share_grant_v1` or `share_grant_names_v1`.
+
+`x0x grant issue` takes one required positional `<GRANT_JSON>` argument: this
+body as a literal, `@path`, a bare path, or `-` for stdin, plus the optional
+`--no-names` flag.
+
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| GET | `/grants` | `x0x grant list` | List share grants this install's owner issued, with status |
+| POST | `/grants` | `x0x grant issue <GRANT_JSON>` | Sign a share grant with the owner key, store it, and deliver it by durable DM |
+| DELETE | `/grants/:id` | `x0x grant revoke <id>` | Revoke a share grant (owner key; revocation gossiped on `x0x.revocation.v3` and pushed directly to capable recipients) |
+| GET | `/grants/received` | `x0x grant received` | List share grants that name this install as grantee |
+
+**Direct revocation push (#1003).** A successful `DELETE /grants/:id` also
+pushes the one signed revocation record, as a typed DM
+(`x0x-grant-revocation-push-v1`), to each recipient of the revoked grant
+whose current verified capability advert sets `grant_revocation_push_v1`.
+The push is best-effort and has no ACK; gossip stays the backstop. The
+response carries a `push` object with `recipients`, `scheduled`,
+`skipped_not_capable` and `skipped_bound` — what was scheduled at revoke
+time, not what arrived. A recipient of UNKNOWN capability also counts as
+`scheduled`: the push waits for one targeted advert refresh and is skipped
+later if no advert with the bit arrives. When this install does not hold
+the issued grant, the DELETE still revokes by id (gossip-only) and `push`
+is all zeros — the recipients are unknown here. A `503` DELETE schedules
+no push; the retry does.
+
 ## Upgrade
 
 | Method | Endpoint | CLI | Purpose |
@@ -3588,11 +4062,23 @@ structured push.
 | `GET /direct/events` | `direct_message` | flat DM row (`sender`, `machine_id`, `payload`, `received_at`, `verified`, `trust_decision?`, `observed_origin?`); `?backfill=N` attempts to replay `history_direct_message` rows then emits `live` `{}` even when history is unavailable or its query fails; 15 s keepalive is a `ping` comment |
 | `GET /peers/events` | `peer-lifecycle` | `{"peer_id","event","at_ms"}` — `event` is the Debug text of the transition (`Established`, `Replaced`, `Closing`, `Closed`, `ReaderExited`); treat as open string |
 
-## Voice (ADR-0042)
+## Voice and calls (ADR-0042, ADR-0073)
 
-Voice has **no REST endpoints** — it is not part of the endpoint registry and
-does not appear in `x0x routes`. What ships today is **point-to-point
-(two-party) calls**, feature-gated behind the `voice` cargo feature:
+Call **lifecycle** is a REST surface (ADR-0073 slice 1): ring, accept, reject,
+hang up, and inspect calls, with `call.incoming` / `call.state` events on
+`/events` and `/ws`. **Media** is not — audio ships as a library surface,
+feature-gated behind the `voice` cargo feature.
+
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| POST | `/calls` | `x0x call <agent_id> [--video]` | Ring an agent (audio, optionally video); the callee must pass trust and connect-ACL gates. Body: `{"agent_id":"<64-hex>","video":false}` |
+| GET | `/calls` | `x0x call list` | List calls with gate and lifecycle counters |
+| GET | `/calls/:id` | `x0x call show <call_id>` | Show one call's lifecycle state |
+| POST | `/calls/:id/accept` | `x0x call accept <call_id>` | Answer a ringing incoming call |
+| POST | `/calls/:id/reject` | `x0x call reject <call_id>` | Decline a ringing incoming call |
+| POST | `/calls/:id/hangup` | `x0x call hangup <call_id>` | End or cancel a call |
+
+The media plane (what the accepted call carries):
 
 - **Signaling** rides direct messages: payloads prefixed `x0x-voice-sig-v1\n`
   followed by the serialized `SignalingMessage`
@@ -3607,8 +4093,9 @@ does not appear in `x0x routes`. What ships today is **point-to-point
   trust, and ACL gates.
 - **Multi-party mesh** (ADR-0042 design-bounds it at four participants), SFU,
   and browser access are recorded **ADR follow-ups**, not shipped.
-- **Surface today:** the `x0x::voice` library module (adapters:
-  `X0xSignaling`, `X0xLinkTransport`). There is no CLI command and no GUI
+- **Media surface today:** the `x0x::voice` library module (adapters:
+  `X0xSignaling`, `X0xLinkTransport`), behind the `voice` cargo feature.
+  The REST/CLI surface above manages call lifecycle only; there is no GUI
   call button yet.
 
 ### GUI
@@ -3774,7 +4261,7 @@ All diagnostics endpoints require the normal local daemon bearer token and retur
 |---|---|---|---|
 | GET | `/diagnostics/connectivity` | `x0x diagnostics connectivity` | ant-quic NodeStatus snapshot (UPnP, NAT, relay, mDNS) |
 | GET | `/diagnostics/ack` | `x0x diagnostics ack` | ACK-v2 per-stage latency buckets and outcome counters |
-| GET | `/diagnostics/gossip` | `x0x diagnostics gossip` | PubSub drop-detection counters (publish/deliver deltas) plus Leaf/Full participation (`participation.mode`, `passthrough_refresh_runs`, C0 `relay_bytes` = non-subscribed forward, `unsubscribed_refused_frames`), plus [experimental named egress meters](504-slice1-experimental.md) (`subscribed_topics`, `outbound_by_topic_named`, `egress_budget` — including effective `egress_budget.byte_policy`, requested `byte_policy_requested`, and sg's `egress_budget.leaf_egress` snapshot with `shed_suppressed`), plus the first-class Leaf-egress summary (#945, ADR-0078 precondition) `leaf_egress` — `byte_policy` (the effective, sg-accepted policy), `applies_to_leaf`, `soft_exceeded` / `hard_exceeded` (EgressMeter exceed-sample counters), `subscribed_outbound_bytes_per_sec_60s`, `epidemic_forward_bytes` / `epidemic_forward_msgs` (the subscribed-topic epidemic-forward totals from `participation`), and `leaf_egress_snapshot` (the sg snapshot verbatim) — plus inbound attribution (`inbound_by_topic`, keys documented in [diagnostics.md](diagnostics.md#inbound-by-topic-counters-674)), plus [#1170 per-kind efficiency counters](diagnostics.md#per-kind-efficiency-counters-1170--track-e-m1) (`per_kind.current` and `per_kind.last_completed`, each with `since_ts`, `window_secs`, `kinds.<kind>.{bus_dispatched,bus_dropped,delivered,published}`, and `health.bus_pressure_kinds`; `last_completed` is null until the first rotation), plus [#288 soak instrumentation](diagnostics.md#soak-instrumentation-288): `uptime_secs`, `inner_envelope_verify.{count,failed,total_ns}`, `dispatcher.<lane>.over_100ms_count`, plus ADR 0115 `identity_authority` — `identity_announce_unauthenticated`, `activation_bundle_owner_unauthenticated`, `revocation_future_dropped` and `quarantine.{enabled,started_at,pending_records,pending_bundles,lapsed}` |
+| GET | `/diagnostics/gossip` | `x0x diagnostics gossip` | PubSub drop-detection counters (publish/deliver deltas) plus Leaf/Full participation (`participation.mode`, `passthrough_refresh_runs`, C0 `relay_bytes` = non-subscribed forward, `unsubscribed_refused_frames`), plus [experimental named egress meters](504-slice1-experimental.md) (`subscribed_topics`, `outbound_by_topic_named`, `egress_budget` — including effective `egress_budget.byte_policy`, requested `byte_policy_requested`, and sg's `egress_budget.leaf_egress` snapshot with `shed_suppressed`), plus the first-class Leaf-egress summary (#945, ADR-0078 precondition) `leaf_egress` — `byte_policy` (the effective, sg-accepted policy), `applies_to_leaf`, `soft_exceeded` / `hard_exceeded` (EgressMeter exceed-sample counters), `subscribed_outbound_bytes_per_sec_60s`, `epidemic_forward_bytes` / `epidemic_forward_msgs` (the subscribed-topic epidemic-forward totals from `participation`), and `leaf_egress_snapshot` (the sg snapshot verbatim) — plus inbound attribution (`inbound_by_topic`, keys documented in [diagnostics.md](diagnostics.md#inbound-by-topic-counters-674)), plus [#1170 per-kind efficiency counters](diagnostics.md#per-kind-efficiency-counters-1170--track-e-m1) (`per_kind.current` and `per_kind.last_completed`, each with `since_ts`, `window_secs`, `kinds.<kind>.{bus_dispatched,bus_dropped,delivered,published}`, and `health.bus_pressure_kinds`; `last_completed` is null until the first rotation), plus [#288 soak instrumentation](diagnostics.md#soak-instrumentation-288): `uptime_secs`, `inner_envelope_verify.{count,failed,total_ns}`, `dispatcher.<lane>.over_100ms_count`, plus ADR 0115 `identity_authority` — `identity_announce_unauthenticated`, `activation_bundle_owner_unauthenticated`, `revocation_future_dropped`, `revocation_stranger_self_held` (#1863: held self-revocations of strangers, not published again) and `quarantine.{enabled,started_at,pending_records,pending_bundles,lapsed}` |
 | GET | `/diagnostics/transport` | `x0x diagnostics transport` | Transport connection accounting (zombie-connection hunt, #368) |
 | GET | `/diagnostics/dm` | `x0x diagnostics dm [--agent <id>]` | Bounded local per-peer digest observations plus direct-message send/receive counters, per-peer health, last durable-send stage timers (`last_durable_send`), recipient ACK-publish diagnostics (`last_ack_publish_ms`, `stats.ack_publish_route_failed`), capability-advert freshness pre-check counter (`caps_advert_prefiltered_stale`, #674) |
 | GET | `/diagnostics/groups` | `x0x diagnostics groups` | Per-group ingest counters, listener state, and drop buckets |
@@ -3784,6 +4271,7 @@ All diagnostics endpoints require the normal local daemon bearer token and retur
 | GET | `/diagnostics/ws` | `x0x diagnostics ws` | WebSocket outbound-queue health: capacity and drop/slow-consumer-close counters |
 | GET | `/diagnostics/relay` | `x0x diagnostics relay` | ADR-0035 relay-decentralization metering: advert census + inbound-dialer evidence |
 | GET | `/diagnostics/history` | `x0x diagnostics history` | Durable-history writer/reaper counters (ADR-0023), including the ADR-0068 D1 quarantine-pin pair |
+| GET | `/diagnostics/sidecar-quarantine` | `x0x diagnostics sidecar-quarantine` | Read-only list of the ADR 0108 §5a quarantined sidecar copies, with their sizes (D148); see [below](#get-diagnosticssidecar-quarantine) |
 
 The inner-envelope verification fields are independent lock-free samples.
 Derived failure ratios and mean durations are approximate, especially over
@@ -3930,6 +4418,50 @@ Connect-ACL policy summary and allow/deny counters. Counters read `0` until the 
 
 See `docs/connect-acl.md` for full documentation including the `denial_breakdown` key reference.
 
+### `GET /diagnostics/sidecar-quarantine`
+
+Read-only. The route lists each ADR 0108 §5a quarantined sidecar copy and
+its size (D148). It looks for copies of these sidecar files:
+
+- `revocation-evictions.evs`, `revocation-evictions.evh` and
+  `revocation-evictions.rdc` in the data directory.
+- `treekem/*.evjournal` and `treekem/*.orcpend`.
+- `group-recovery/*.grecov`.
+
+```json
+{
+  "copies": [
+    {
+      "sidecar": "g1.evjournal",
+      "file": "g1.evjournal.q-<txid>-<hash>.pending",
+      "path": "treekem/g1.evjournal.q-<txid>-<hash>.pending",
+      "txid": "00112233445566778899aabbccddeeff",
+      "state": "pending",
+      "size": 17
+    }
+  ],
+  "count": 1,
+  "total_bytes": 17,
+  "scan_errors": []
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `copies[].sidecar` | The live sidecar file that the copy was moved aside from. |
+| `copies[].file` | The file name of the copy. |
+| `copies[].path` | The path of the copy, relative to the data directory. |
+| `copies[].txid` | The §5a transaction ID, as 32 hexadecimal characters. |
+| `copies[].state` | `pending` (§5a step 1) or `history` (§5a step 5). |
+| `copies[].size` | The size in bytes. `null` when the file metadata cannot be read. |
+| `count` | The number of copies. |
+| `total_bytes` | The sum of the known copy sizes. |
+| `scan_errors[]` | Each directory that could not be listed: `dir` (`.` is the data directory) and `error`. Copies found before the error stay in `copies`. |
+
+The route does not follow symbolic links and does not list them. A missing
+directory is not an error; it has no copies. The daemon never deletes these
+copies automatically (D148).
+
 
 ## Tailnet port-forwarding (#132)
 
@@ -3990,7 +4522,7 @@ At daemon start each persisted forward is re-bound. A named forward is first re-
 Restore failures are either permanent or transient:
 
 - A permanent failure (`name_changed`, invalid or reserved names, ambiguous kind, or an unsupported target kind) is never retried during this daemon run. Check the reported reason, correct the target or name if needed, then delete and re-add the forward to accept its ids and restore it. A later name change back to the saved ids does not clear this failure.
-- A transient failure (an unknown name, an unverified owner, ambiguous name candidates, a name-store failure, or `bind_failed`) gets five retries after the initial attempt. The delays are 10, 20, 40, 80 and 160 seconds. After the fifth retry, the daemon retries every 10 minutes indefinitely, until the forward listens, the owner deletes it, or a retry finds a permanent failure. A peer discovered much later can therefore recover without owner action. Every attempt still checks the saved ids; a retry never retargets the forward.
+- A transient failure (an unknown name, an unverified owner, ambiguous name candidates, a name-store failure, or `bind_failed`) gets five retries after the initial attempt. A machine name that reaches its pinned machine while that machine's agent is not rediscovered yet (usual right after a restart) is an unknown name, so it retries; only a different agent or machine id is `name_changed`. The delays are 10, 20, 40, 80 and 160 seconds. After the fifth retry, the daemon retries every 10 minutes indefinitely, until the forward listens, the owner deletes it, or a retry finds a permanent failure. A peer discovered much later can therefore recover without owner action. Every attempt still checks the saved ids; a retry never retargets the forward.
 
 The retry schedule is per forward and held only in memory. A committed owner add or delete resets it. A daemon restart starts a new schedule. The background restore task stays active while any transient forward is down, and stops when no retry remains (or the daemon shuts down).
 
@@ -4022,8 +4554,9 @@ An unreadable `forwards.json` restores nothing, is never overwritten, and is rep
 
 These are local names for agents and machines: `[agent:|machine:]<label>.<owner>`. Labels are lowercase DNS labels (`[a-z0-9-]`, 1–63 characters, no leading or trailing `-`). `me`, `agent` and `machine` are reserved. A 64-character hex agent id stays valid wherever a name is accepted.
 
-- **Owner label.** `me` is this install's owner. Any other owner label is a local petname for a `UserId`, never a network claim. A petname is bound in one of two ways:
+- **Owner label.** `me` is this install's owner. Any other owner label is a local petname for a `UserId`, never a network claim. A petname is bound in one of three ways:
   - importing a signed agent card that carries `user_id` and `owner_name`. The `owner_name` becomes a DNS label, so "Bob Smith" becomes `bob-smith`, and the import response reports `owner_label`. A signed card binds that label only when the contact is Known or Trusted and that user has no petname yet. Unknown and Blocked stay unbound: `owner_label` is null and the name store is unchanged. `POST /names/owners` still binds a label explicitly.
+  - receiving a v2 (names-carrying) `ShareGrant` (ADR 0079; see **Grant-carried name defaults** below).
   - `POST /names/owners`.
 
   A petname is frozen at first bind. Binding it to another key returns `409` `pin_mismatch` until the label is removed.
@@ -4042,6 +4575,67 @@ Resolution is local and makes no network query. It adds no trust: every identity
 | DELETE | `/names/owners/:label` | `x0x names owner rm <LABEL>` | Remove a petname and every pin under it |
 | POST | `/names/machines` | `x0x names machine label <NAME> <MACHINE_ID>` | Label a shared machine (`machine:<label>.<owner>`) |
 | DELETE | `/names/pins/:name` | `x0x names unpin <NAME>` | Drop a pin (e.g. `agent:studio.bob`) |
+| POST | `/names/accept` | `x0x names accept <LABEL>` | Apply a pending grant-names suggestion (ADR 0079) |
+| DELETE | `/names/suggestions/:label` | `x0x names dismiss <LABEL>` | Drop a pending grant-names suggestion |
+
+### Grant-carried name defaults (ADR 0079)
+
+A grant owner's daemon can wrap a `ShareGrant` in a v2 envelope
+(`x0x-sharegrant-v2\0`): the unchanged v1 grant, a names section
+(`owner_name` and the `machine_name` of each machine that hosts a granted
+agent), and a second signature by the owner **user** key over the names and
+the SHA-256 of the grant's signed bytes. The names cannot be moved to
+another grant or attributed to another user. Names are never broadcast:
+they travel only inside the end-to-end encrypted grant DM. The daemon
+advertises ADR 0093 application bit 14, `share_grant_names_v1`, for this
+route; a sender uses the v2 envelope only toward a grantee whose current
+verified advert sets bit 14, and sends the unchanged v1 payload otherwise.
+An encoded v2 envelope after the prefix is at most 48 KiB (the v1 grant
+limit is 32 KiB). The names section carries at most 64 machines, and each
+name is at most 128 bytes (the ADR-0036 profile rule). A larger or
+non-canonical envelope is refused whole.
+
+The receiver verifies the grant by the v1 rules and the names signature
+under the grant's owner key; a failure of either refuses the whole envelope
+(nothing stored, ACK withheld). The grant itself is stored exactly as a v1
+delivery, so v1 and v2 copies of one grant are an idempotent duplicate.
+The names become ADR-0074 §1 defaults in the local name store:
+
+- When the grant's owner is a **Known or Trusted** contact, an unbound
+  owner gets the petname derived from `owner_name` (source `grant`). A
+  listed machine with no label under that owner gets a machine pin only
+  when this daemon has verified hosting evidence for it: a discovered agent
+  of the grant whose certificate chains to the owner and whose
+  authenticated machine is that machine, with nothing revoked. This is the
+  evidence a manual shared-machine label needs. A machine without that
+  evidence is kept in the owner's pending suggestion and is not pinned.
+  Defaults never rebind: a label already bound to another key or machine,
+  or a later grant carrying a different name for the owner or for a
+  machine that already has a label under that owner, is reported as a
+  `default_conflict` (`conflicts` in `GET /names`: `kind` `owner` or
+  `machine`, `case` `label_taken` or `name_changed`, `label`, `held`,
+  `offered`, `offered_name`) and not applied. For `name_changed`, `label`
+  and `held` are the label in force and `offered` is the label derived
+  from the new name. Only the local owner rebinds, by removing the label
+  first.
+- A **stranger's** grant yields only a pending suggestion (`suggestions` in
+  `GET /names`). `POST /names/accept {"label": …}` applies it (and removes
+  it); `DELETE /names/suggestions/:label` drops it.
+- When a label is bound to an owner (by a grant default or
+  `POST /names/owners`), a pending suggestion that another owner left under
+  that label is dropped: it can no longer be accepted.
+- One owner holds at most one pending suggestion; a later one from the same
+  owner replaces it. One owner holds at most 16 `default_conflict` reports;
+  a further report drops that owner's oldest. The tables hold at most 256
+  entries each.
+- If `names.json` failed to load, the grant is still stored and ACKed, and
+  its names are skipped (a retry cannot succeed until the file is repaired).
+  A failed name-store write withholds the ACK, and the sender's retry
+  applies the names.
+
+A machine label recorded from a grant resolves only while the ADR-0074
+shared-machine rule holds: the machine must currently host a certified
+agent of an active, unrevoked grant from that owner.
 
 `POST /names/resolve` takes `{"name": "studio.me"}` and returns:
 

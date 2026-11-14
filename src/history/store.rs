@@ -6202,14 +6202,18 @@ mod tests {
         // current state survived the escape hatch intact.
         let (rows_after, replaceable_after): (u64, u64) = {
             let guard = lock_conn(&store.conn).unwrap();
-            guard
+            let (rows, replaceable): (i64, i64) = guard
                 .query_row(
                     "SELECT COUNT(*), COUNT(*) FILTER (WHERE replace_key IS NOT NULL) \
                      FROM history",
                     [],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
-                .unwrap()
+                .unwrap();
+            (
+                u64::try_from(rows).unwrap(),
+                u64::try_from(replaceable).unwrap(),
+            )
         };
         assert_eq!(
             replaceable_after, REPLACEABLE as u64,
@@ -9103,7 +9107,14 @@ mod tests {
                 }
             });
             let trimmer = s.spawn(|| {
-                for _ in 0..100_000 {
+                // The limit is a time, not a count of attempts (#1870). A
+                // trim that finds a reaper pass in admission returns `Busy`
+                // in a few microseconds, so a count of attempts can end
+                // before a slow runner finishes the three passes. The
+                // reaper thread is finite, so the trims complete as soon as
+                // it releases admission; the deadline only bounds a hang.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                while std::time::Instant::now() < deadline {
                     match d_trim(&store, &policy, &none, &PinnedScopes::none(), 128) {
                         Ok(report) if report.state == RetainState::Complete => return,
                         Ok(report) => assert!(
@@ -9114,7 +9125,7 @@ mod tests {
                         Err(e) => panic!("trim failed: {e}"),
                     }
                 }
-                panic!("the trims never completed");
+                panic!("the trims did not complete in 60 s");
             });
             writer.join().unwrap();
             reaper.join().unwrap();

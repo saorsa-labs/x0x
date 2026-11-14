@@ -86,6 +86,9 @@ pub const MAX_GRANT_PORTS: usize = 64;
 /// still-full store refuses new grants.
 pub const MAX_STORED_GRANTS: usize = 1024;
 
+/// Maximum byte length of a `Data` capability's `group` or `store` field.
+pub const MAX_GRANT_DATA_FIELD_BYTES: usize = 128;
+
 /// Who a grant is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -118,6 +121,29 @@ pub enum ShareCap {
     /// ADR-0073 calling: the holder may ring the granted agents (inbound
     /// call gate only, `Agent::call_gate_inbound`; opens no stream).
     Call,
+    /// Issue #1094: access to ONE named store of ONE group without group
+    /// membership — "share the data, not the group". `group` is the
+    /// STABLE group id, `store` the store name (`"scratch"` for the
+    /// scratch store). Minted and evaluated here; the remote read/write
+    /// surface that consumes it is the A4 sharing-completeness slice.
+    Data {
+        /// Stable group id the store belongs to.
+        group: String,
+        /// Store name within the group (e.g. `"scratch"`).
+        store: String,
+        /// Conferred access level.
+        access: DataAccess,
+    },
+}
+
+/// Access level a [`ShareCap::Data`] capability confers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DataAccess {
+    /// Read-only.
+    Ro,
+    /// Read and write.
+    Rw,
 }
 
 impl ShareCap {
@@ -128,6 +154,7 @@ impl ShareCap {
             Self::Connect { .. } => 3,
             Self::GroupInvite => 4,
             Self::Call => 5,
+            Self::Data { .. } => 6,
         }
     }
 }
@@ -271,11 +298,31 @@ impl ShareGrant {
         out.extend_from_slice(&(self.caps.len() as u32).to_le_bytes());
         for cap in &self.caps {
             out.push(cap.tag());
-            if let ShareCap::Connect { ports } = cap {
-                out.extend_from_slice(&(ports.len() as u32).to_le_bytes());
-                for port in ports {
-                    out.extend_from_slice(&port.to_le_bytes());
+            match cap {
+                ShareCap::Connect { ports } => {
+                    out.extend_from_slice(&(ports.len() as u32).to_le_bytes());
+                    for port in ports {
+                        out.extend_from_slice(&port.to_le_bytes());
+                    }
                 }
+                ShareCap::Data {
+                    group,
+                    store,
+                    access,
+                } => {
+                    out.extend_from_slice(&(group.len() as u32).to_le_bytes());
+                    out.extend_from_slice(group.as_bytes());
+                    out.extend_from_slice(&(store.len() as u32).to_le_bytes());
+                    out.extend_from_slice(store.as_bytes());
+                    out.push(match access {
+                        DataAccess::Ro => 1,
+                        DataAccess::Rw => 2,
+                    });
+                }
+                // Payload-free caps: the tag byte above is their whole
+                // encoding. A new variant with a payload must get its own
+                // arm, or its fields would be left out of the signed bytes.
+                ShareCap::Dm | ShareCap::Exec | ShareCap::GroupInvite | ShareCap::Call => {}
             }
         }
         out.extend_from_slice(&self.not_before.to_le_bytes());
@@ -313,6 +360,19 @@ impl ShareGrant {
                 }
                 if ports.contains(&0) || ports.windows(2).any(|w| w[0] >= w[1]) {
                     return invalid("connect ports must be sorted, unique and non-zero");
+                }
+            }
+            if let ShareCap::Data { group, store, .. } = cap {
+                if group.is_empty() || store.is_empty() {
+                    return invalid("data group and store must not be empty");
+                }
+                if group.len() > MAX_GRANT_DATA_FIELD_BYTES
+                    || store.len() > MAX_GRANT_DATA_FIELD_BYTES
+                {
+                    return invalid("data group and store must be bounded");
+                }
+                if group.contains('/') || store.contains('/') {
+                    return invalid("data group and store must not contain '/'");
                 }
             }
         }
@@ -1109,6 +1169,9 @@ pub struct GrantAccess {
     pub group_invite: bool,
     /// `Call` (ADR-0073): the inbound call gate admits the caller (#980).
     pub call: bool,
+    /// `Data` (#1094): per `(group, store)` access conferred by the grants.
+    /// `Rw` wins where grants overlap.
+    pub data: BTreeMap<(String, String), DataAccess>,
 }
 
 /// Crate-private evaluation result: public access bits plus the Connect
@@ -1139,6 +1202,19 @@ impl GrantAccess {
         self.connect_ports.contains(&port)
     }
 
+    /// Whether a `Data` capability covers reading `store` in `group`.
+    #[must_use]
+    pub fn allows_data_read(&self, group: &str, store: &str) -> bool {
+        self.data
+            .contains_key(&(group.to_string(), store.to_string()))
+    }
+
+    /// Whether a `Data` capability covers writing `store` in `group`.
+    #[must_use]
+    pub fn allows_data_write(&self, group: &str, store: &str) -> bool {
+        self.data.get(&(group.to_string(), store.to_string())) == Some(&DataAccess::Rw)
+    }
+
     fn absorb(&mut self, caps: &BTreeSet<ShareCap>) {
         for cap in caps {
             match cap {
@@ -1147,6 +1223,17 @@ impl GrantAccess {
                 ShareCap::Connect { ports } => self.connect_ports.extend(ports.iter().copied()),
                 ShareCap::GroupInvite => self.group_invite = true,
                 ShareCap::Call => self.call = true,
+                ShareCap::Data {
+                    group,
+                    store,
+                    access,
+                } => {
+                    let entry = self
+                        .data
+                        .entry((group.clone(), store.clone()))
+                        .or_insert(*access);
+                    *entry = (*entry).max(*access);
+                }
             }
         }
     }
@@ -1507,6 +1594,17 @@ pub async fn handle_share_grant_dm_checked(
 /// `Duplicate` and the retry is idempotent.
 pub const GRANT_DELIVERY_RETRIES: u8 = 3;
 
+/// One grant-delivery recipient, classified for ADR 0079: `grantee_side`
+/// recipients may get the names-carrying v2 envelope; shared-agent daemons
+/// (which enforce the grant) and extra recipients always get v1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GrantRecipient {
+    /// The recipient agent.
+    pub agent: AgentId,
+    /// Whether this recipient receives the grant AS the grantee.
+    pub grantee_side: bool,
+}
+
 /// Outcome of delivering a grant to one recipient agent.
 #[derive(Debug, Clone, Serialize)]
 pub struct GrantDelivery {
@@ -1522,6 +1620,9 @@ pub struct GrantDelivery {
     /// outbox write is not confirmed durable).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The envelope sent (or queued) for this recipient: `"v1"` (the plain
+    /// ADR-0070 grant) or `"v2"` (the ADR 0079 names-carrying envelope).
+    pub envelope: &'static str,
 }
 
 /// The exact typed-DM payload and logical request id a grant is delivered
@@ -1566,20 +1667,74 @@ where
     F: Fn(AgentId, Vec<u8>, [u8; 16]) -> Fut,
     Fut: std::future::Future<Output = Result<(), String>>,
 {
-    let (payload, request_id) = match grant_delivery_request(grant) {
-        Ok(request) => request,
-        Err(e) => {
-            return recipients
-                .iter()
-                .map(|a| GrantDelivery {
-                    agent: hex::encode(a.as_bytes()),
-                    delivered: false,
-                    queued: false,
-                    error: Some(e.to_string()),
-                })
-                .collect();
-        }
-    };
+    let classified: Vec<(AgentId, bool)> = recipients.iter().map(|a| (*a, false)).collect();
+    deliver_grant_via_classified(grant, None, &classified, outbox, revocations, now, send).await
+}
+
+/// ADR 0079 §1 "Who gets v2": `(recipient, use_v2)` for each recipient. A
+/// recipient gets the names-carrying v2 envelope only when an envelope
+/// exists, the recipient is grantee-side (never a shared-agent daemon), and
+/// `names_bit` reports a current verified advert that sets bit 14
+/// (`Some(true)`). No advert (`None`) or an advert without the bit
+/// (`Some(false)`) gets v1, so old peers never see the new prefix.
+pub fn choose_grant_envelopes(
+    recipients: &[GrantRecipient],
+    has_envelope: bool,
+    names_bit: impl Fn(&AgentId) -> Option<bool>,
+) -> Vec<(AgentId, bool)> {
+    recipients
+        .iter()
+        .map(|r| {
+            let use_v2 = has_envelope && r.grantee_side && names_bit(&r.agent) == Some(true);
+            (r.agent, use_v2)
+        })
+        .collect()
+}
+
+/// [`deliver_grant_via`] with the ADR 0079 per-recipient envelope choice:
+/// a recipient flagged `true` is sent the v2 names-carrying payload built
+/// from `envelope` (which must be present and must wrap this `grant`);
+/// every other recipient gets the plain v1 payload. A failed v2 recipient
+/// is queued WITH its names attachment, so the outbox retry resends the
+/// same bytes.
+pub async fn deliver_grant_via_classified<F, Fut>(
+    grant: &ShareGrant,
+    envelope: Option<&names::ShareGrantV2>,
+    recipients: &[(AgentId, bool)],
+    outbox: Option<&outbox::GrantRedeliveryOutbox>,
+    revocations: &RwLock<RevocationSet>,
+    now: impl Fn() -> u64,
+    send: F,
+) -> Vec<GrantDelivery>
+where
+    F: Fn(AgentId, Vec<u8>, [u8; 16]) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    /// One recipient's resolved payload: the typed DM bytes and the logical
+    /// request id, or why they could not be built.
+    type ResolvedRequest = Result<(Vec<u8>, [u8; 16]), String>;
+    let v1 = grant_delivery_request(grant);
+    let v2 = envelope.map(names::grant_delivery_request_v2);
+    let attachment = envelope.map(names::ShareGrantV2::attachment);
+    // Resolve each recipient's payload up front; a recipient whose build
+    // failed (or that was flagged v2 with no envelope) gets an error entry
+    // and no send.
+    let mut resolved: Vec<(AgentId, &'static str, ResolvedRequest)> =
+        Vec::with_capacity(recipients.len());
+    for (recipient, use_v2) in recipients {
+        let (envelope_kind, request) = if *use_v2 {
+            match &v2 {
+                Some(request) => ("v2", request.clone().map_err(|e| e.to_string())),
+                None => (
+                    "v2",
+                    Err("v2 recipient without a names envelope".to_string()),
+                ),
+            }
+        } else {
+            ("v1", v1.clone().map_err(|e| e.to_string()))
+        };
+        resolved.push((*recipient, envelope_kind, request));
+    }
     let permit = match outbox {
         Some(outbox) => Some(outbox.send_permit().await),
         None => None,
@@ -1589,35 +1744,54 @@ where
         .await
         .is_share_grant_revoked(&grant.grant_id, &grant.owner)
     {
-        return recipients
-            .iter()
-            .map(|a| GrantDelivery {
+        return resolved
+            .into_iter()
+            .map(|(a, envelope_kind, _)| GrantDelivery {
                 agent: hex::encode(a.as_bytes()),
                 delivered: false,
                 queued: false,
                 error: Some("grant is revoked; not delivered".to_string()),
+                envelope: envelope_kind,
             })
             .collect();
     }
-    let sends = recipients.iter().map(|recipient| {
-        let fut = send(*recipient, payload.clone(), request_id);
-        async move { (*recipient, outbox::bounded_send(fut).await) }
-    });
+    let sends = resolved
+        .into_iter()
+        .map(|(recipient, envelope_kind, request)| {
+            let built = request.is_ok();
+            let fut = request.map(|(payload, request_id)| send(recipient, payload, request_id));
+            async move {
+                let outcome = match fut {
+                    Ok(fut) => outbox::bounded_send(fut).await,
+                    Err(e) => Err(e),
+                };
+                (recipient, envelope_kind, built, outcome)
+            }
+        });
     let results = futures::future::join_all(sends).await;
     // Release before queueing: `enqueue` takes the gate again, and a
     // revocation queued for it in between must be allowed to run first.
     drop(permit);
     let mut out = Vec::with_capacity(recipients.len());
-    for (recipient, result) in results {
+    for (recipient, envelope_kind, built, result) in results {
         let mut delivery = GrantDelivery {
             agent: hex::encode(recipient.as_bytes()),
             delivered: result.is_ok(),
             queued: false,
             error: result.err(),
+            envelope: envelope_kind,
         };
-        if !delivery.delivered {
+        // A payload that failed to build was never sent and cannot be
+        // retried as recorded: a queued v2 row without its envelope would
+        // resend as v1. Report the error and queue nothing.
+        if !delivery.delivered && built {
             delivery.queued = queue_failed_delivery(
                 grant,
+                if envelope_kind == "v2" {
+                    attachment.as_ref()
+                } else {
+                    None
+                },
                 recipient,
                 outbox,
                 revocations,
@@ -1635,6 +1809,7 @@ where
 /// is appended to `error` so the owner sees why it will not be retried.
 async fn queue_failed_delivery(
     grant: &ShareGrant,
+    names: Option<&names::SignedGrantNames>,
     recipient: AgentId,
     outbox: Option<&outbox::GrantRedeliveryOutbox>,
     revocations: &RwLock<RevocationSet>,
@@ -1645,7 +1820,7 @@ async fn queue_failed_delivery(
         return false;
     };
     match outbox
-        .enqueue_reporting(grant, recipient, now_unix, revocations)
+        .enqueue_reporting(grant, names, recipient, now_unix, revocations)
         .await
     {
         Ok(_) => true,
@@ -1785,10 +1960,27 @@ impl crate::Agent {
         grant: &ShareGrant,
         extra: &[AgentId],
     ) -> Vec<AgentId> {
-        let mut out: BTreeSet<[u8; 32]> = BTreeSet::new();
+        self.share_grant_recipients_classified(grant, extra)
+            .await
+            .into_iter()
+            .map(|r| r.agent)
+            .collect()
+    }
+
+    /// [`Self::share_grant_recipients`], with each recipient classified for
+    /// ADR 0079: `grantee_side` recipients may get the names-carrying v2
+    /// envelope; shared-agent daemons always get v1. An `extra` recipient
+    /// is grantee-side only when it is itself one of the grantee's agents;
+    /// any other `extra` recipient gets v1.
+    pub async fn share_grant_recipients_classified(
+        &self,
+        grant: &ShareGrant,
+        extra: &[AgentId],
+    ) -> Vec<GrantRecipient> {
+        let mut grantee_side: BTreeSet<[u8; 32]> = BTreeSet::new();
         match grant.grantee {
             Grantee::Agent(agent) => {
-                out.insert(agent.0);
+                grantee_side.insert(agent.0);
             }
             Grantee::User(user) => {
                 let cache = self.identity_discovery_cache.read().await;
@@ -1799,16 +1991,26 @@ impl crate::Agent {
                         .and_then(|c| c.user_id().ok())
                         .is_some_and(|u| u == user);
                     if names_user {
-                        out.insert(agent.0);
+                        grantee_side.insert(agent.0);
                     }
                 }
             }
         }
+        let mut out: BTreeSet<[u8; 32]> = grantee_side.iter().copied().collect();
         for agent in grant.agents.iter().chain(extra) {
             out.insert(agent.0);
         }
         out.remove(&self.agent_id().0);
-        out.into_iter().map(AgentId).collect()
+        out.into_iter()
+            .map(|id| GrantRecipient {
+                agent: AgentId(id),
+                // ADR 0079 §1: "shared-agent daemons, which enforce the
+                // grant, always get v1" — a shared agent is never
+                // grantee-side, even if a certificate also names it on the
+                // grantee's side.
+                grantee_side: grantee_side.contains(&id) && !grant.agents.iter().any(|a| a.0 == id),
+            })
+            .collect()
     }
 
     /// Deliver a grant to each recipient as a durable typed DM, concurrently.
@@ -1844,6 +2046,51 @@ impl crate::Agent {
             },
         )
         .await
+    }
+
+    /// [`Self::deliver_share_grant`] with the ADR 0079 names envelope: a
+    /// grantee-side recipient whose current verified advert sets ADR 0093
+    /// bit 14 (`share_grant_names_v1`) is sent the v2 payload built from
+    /// `envelope`; every other recipient — shared-agent daemons, `extra`
+    /// recipients, grantees with no (or a bit-less) verified advert — gets
+    /// the unchanged v1 payload, so old peers never see the new prefix.
+    pub async fn deliver_share_grant_with_names(
+        &self,
+        grant: &ShareGrant,
+        recipients: &[GrantRecipient],
+        envelope: Option<&names::ShareGrantV2>,
+    ) -> Vec<GrantDelivery> {
+        let classified = self.grant_envelope_choice(recipients, envelope.is_some());
+        let outbox = self.share_grant_outbox();
+        deliver_grant_via_classified(
+            grant,
+            envelope,
+            &classified,
+            outbox.as_deref(),
+            &self.revocation_set,
+            unix_now_secs,
+            |recipient, payload, request_id| {
+                self.send_share_grant_dm(recipient, payload, request_id, GRANT_DELIVERY_RETRIES)
+            },
+        )
+        .await
+    }
+
+    /// The envelope each recipient gets ([`choose_grant_envelopes`]), with
+    /// this daemon's verified capability adverts as the bit-14 evidence.
+    #[must_use]
+    pub fn grant_envelope_choice(
+        &self,
+        recipients: &[GrantRecipient],
+        has_envelope: bool,
+    ) -> Vec<(AgentId, bool)> {
+        let capability_store = self.capability_store();
+        choose_grant_envelopes(recipients, has_envelope, |agent| {
+            capability_store.verified_registry_supports(
+                agent,
+                crate::dm::CapabilityRegistry::SHARE_GRANT_NAMES_V1,
+            )
+        })
     }
 
     /// One durable typed-DM grant send; `Ok` only on the durable v2 ACK.
@@ -1923,6 +2170,13 @@ impl crate::Agent {
         !agents.is_empty() && outbox.nudge(&agents, unix_now_secs())
     }
 
+    /// #1158: `agent`'s verified capability advert arrived. Make every
+    /// queued grant delivery to it due now.
+    pub fn nudge_share_grant_outbox_for_agent(&self, agent: &AgentId) -> bool {
+        self.share_grant_outbox()
+            .is_some_and(|outbox| outbox.nudge(&[*agent], unix_now_secs()))
+    }
+
     /// Revoke an issued grant (owner key only): sign a
     /// [`crate::revocation::RevokedSubject::ShareGrant`] record, apply it
     /// locally (effective at the next evaluation, no restart), durably
@@ -1982,19 +2236,60 @@ impl crate::Agent {
         // here and the owner's other installs should learn it. The caller
         // still gets the error (a 5xx), and a retry rewrites both files.
         if let Some(rt) = &self.gossip_runtime {
+            let publish_lock = self.revocation_set.read().await.publish_lock();
+            let _one_round = publish_lock.lock().await;
             let records = self.revocation_set.read().await.share_grant_records();
-            if let Ok(bytes) = crate::revocation::encode_revocation_batch(&records) {
-                let _ = rt
-                    .pubsub()
-                    .publish(
-                        crate::REVOCATION_V3_TOPIC.to_string(),
-                        bytes::Bytes::from(bytes),
-                    )
-                    .await;
+            if let Ok(batches) = crate::revocation::encode_revocation_batches(&records) {
+                for bytes in batches {
+                    let _ = rt
+                        .pubsub()
+                        .publish(
+                            crate::REVOCATION_V3_TOPIC.to_string(),
+                            bytes::Bytes::from(bytes),
+                        )
+                        .await;
+                }
             }
         }
         durable.map(|()| record)
     }
+}
+
+/// [`crate::Agent::revoke_share_grant`], then schedule the best-effort
+/// direct revocation push (#1003, ADR 0080 archived, slot A03) to the
+/// grant's recipients whose current verified advert sets
+/// `grant_revocation_push_v1`. The push runs in the background and is
+/// never waited for; the `x0x.revocation.v3` gossip carrier (published by
+/// the revoke) stays the backstop. No push is scheduled when the
+/// revocation was not durable (the caller's retry pushes) or when this
+/// install does not hold the issued grant (then no recipient set is
+/// computable, and gossip alone revokes it).
+///
+/// # Errors
+/// As [`crate::Agent::revoke_share_grant`].
+pub async fn revoke_share_grant_pushing(
+    agent: &std::sync::Arc<crate::Agent>,
+    grant_id: [u8; 32],
+    reason: Option<String>,
+) -> Result<
+    (
+        crate::revocation::RevocationRecord,
+        crate::revocation_push::GrantRevocationPushReport,
+    ),
+    ShareGrantError,
+> {
+    let grant = agent
+        .share_grant_store()
+        .and_then(|store| store.issued(&grant_id));
+    let record = agent.revoke_share_grant(grant_id, reason).await?;
+    let report = match &grant {
+        Some(grant) => {
+            crate::revocation_push::schedule_share_grant_revocation_push(agent, &record, grant)
+                .await
+        }
+        None => crate::revocation_push::GrantRevocationPushReport::default(),
+    };
+    Ok((record, report))
 }
 
 /// Record a LOCAL share-grant revocation (#926): under the outbox's
@@ -2059,6 +2354,7 @@ pub async fn record_local_share_grant_revocation(
     }
 }
 
+pub mod names;
 pub mod outbox;
 
 #[cfg(test)]

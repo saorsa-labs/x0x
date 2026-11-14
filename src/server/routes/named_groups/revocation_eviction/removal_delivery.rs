@@ -2105,6 +2105,7 @@ mod daemon_tests {
             std::slice::from_ref(&group_id),
             &survivor_hex,
             None,
+            None,
         )
         .await;
         assert!(
@@ -2193,6 +2194,7 @@ mod daemon_tests {
             std::slice::from_ref(&group_id),
             &survivor_hex,
             Some(&result_head),
+            None,
         )
         .await;
         assert!(
@@ -2327,6 +2329,7 @@ mod daemon_tests {
             std::slice::from_ref(&group_id),
             &survivor_hex,
             None,
+            None,
         )
         .await;
         {
@@ -2389,6 +2392,7 @@ mod daemon_tests {
             std::slice::from_ref(&group_id),
             &survivor_hex,
             Some(&result_head),
+            None,
         )
         .await;
         assert!(

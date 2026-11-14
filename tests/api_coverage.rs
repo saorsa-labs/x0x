@@ -68,6 +68,7 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Post, "/announce", daemon_api_announce),
     covered!(Get, "/agent/user-id", "GET /agent/user-id"),
     covered!(Get, "/agent/card", "GET /agent/card"),
+    covered!(Get, "/onboard", daemon_api_onboard_recipe),
     covered!(Get, "/introduction", "GET /introduction"),
     covered!(
         Post,
@@ -99,6 +100,11 @@ const COVERED: &[CoveredEndpoint] = &[
         Get,
         "/owner/machines",
         owner_machines_lists_enrolled_devices_and_local_digest
+    ),
+    covered!(
+        Post,
+        "/owner/devices/:machine_id/lose",
+        lose_device_stops_owner_agents_on_that_machine
     ),
     covered!(
         Post,
@@ -214,6 +220,11 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Get, "/diagnostics/exec", daemon_api_diagnostics_exec),
     covered!(Get, "/diagnostics/connect", daemon_api_diagnostics_connect),
     covered!(Get, "/diagnostics/ws", daemon_api_diagnostics_ws),
+    covered!(
+        Get,
+        "/diagnostics/sidecar-quarantine",
+        sidecar_quarantine_diagnostics_lists_each_copy_with_its_size
+    ),
     covered!(
         Post,
         "/peers/:peer_id/probe",
@@ -654,6 +665,12 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Delete, "/names/owners/:label", names_routes_wired),
     covered!(Post, "/names/machines", names_routes_wired),
     covered!(Delete, "/names/pins/:name", names_routes_wired),
+    covered!(Post, "/names/accept", grant_names_routes_wired),
+    covered!(
+        Delete,
+        "/names/suggestions/:label",
+        grant_names_routes_wired
+    ),
 ];
 
 const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
@@ -666,6 +683,12 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
     (
         "src/server/routes/owner.rs",
         include_str!("../src/server/routes/owner.rs"),
+    ),
+    // D148 (#1597): the sidecar-quarantine route's coverage lives in its
+    // route lib tests.
+    (
+        "src/server/routes/sidecar_quarantine.rs",
+        include_str!("../src/server/routes/sidecar_quarantine.rs"),
     ),
     (
         "tests/daemon_api_integration.rs",

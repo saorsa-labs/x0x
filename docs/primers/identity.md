@@ -192,7 +192,8 @@ Both must be true for user identity to appear in announcements.
 
 Once consent is given, it persists across heartbeats via an internal `AtomicBool`. This means:
 - You don't need to call `announce_identity()` before every heartbeat
-- Consent lasts until daemon restart
+- Consent is durable (#1107): the daemon records it in `user-consent.bin` in the identity directory and loads it at the next start
+- To withdraw it, run `x0x announce --withdraw-consent` (`POST /announce` with `{"withdraw_consent": true}`)
 - Consent is NOT automatically escalated — it must be explicitly requested
 
 ### Certificate Validation

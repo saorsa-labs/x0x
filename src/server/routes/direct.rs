@@ -484,6 +484,12 @@ pub(in crate::server) async fn direct_send(
                 x0x::dm::DmError::RecipientRejected { .. } => {
                     (StatusCode::FORBIDDEN, "recipient_rejected")
                 }
+                // ADR-0043 §9: the local B/P gate denied the resolved
+                // (agent, machine) pairing; nothing was sent. A policy
+                // refusal, not a server fault, so 403 and not 500.
+                x0x::dm::DmError::RecipientPairingDenied { .. } => {
+                    (StatusCode::FORBIDDEN, "recipient_pairing_denied")
+                }
                 x0x::dm::DmError::RecipientKeyUnavailable(_) => {
                     (StatusCode::NOT_FOUND, "recipient_key_unavailable")
                 }
@@ -507,6 +513,15 @@ pub(in crate::server) async fn direct_send(
                 }
                 x0x::dm::DmError::RecipientUpgradeRequired { .. } => {
                     (StatusCode::CONFLICT, "recipient_upgrade_required")
+                }
+                // #1158: an obligation-carrying typed payload and no
+                // current verified capability advert. Nothing was sent;
+                // retry after the recipient's advert arrives.
+                x0x::dm::DmError::RecipientCapabilityPending { .. } => {
+                    (StatusCode::CONFLICT, "recipient_capability_pending")
+                }
+                x0x::dm::DmError::RecipientCapabilityUnavailable { .. } => {
+                    (StatusCode::CONFLICT, "recipient_capability_unavailable")
                 }
                 x0x::dm::DmError::AckSemanticsUnavailable(_) => {
                     (StatusCode::CONFLICT, "recipient_ack_semantics_unavailable")
@@ -968,6 +983,88 @@ mod tests {
         assert_eq!(timeout["last_ack_publish_ms"], 7);
         assert_eq!(timeout["ack_publish_route_failed"], 1);
         assert_eq!(timeout["error"], "timeout");
+    }
+
+    /// #1815 Greptile P2: `POST /direct/send` maps a denied (agent, machine)
+    /// pairing to HTTP 403 with `ok: false` and the stable error code
+    /// `recipient_pairing_denied`. Clients use this response to tell a
+    /// policy refusal apart from a server fault. The lib test
+    /// `send_direct_reports_a_denied_pairing_as_recipient_pairing_denied`
+    /// pins the typed `DmError`; this test pins the HTTP mapping.
+    #[tokio::test]
+    async fn direct_send_denied_pairing_is_403_recipient_pairing_denied() {
+        use base64::Engine as _;
+
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let recipient = x0x::identity::AgentKeypair::generate().expect("recipient keygen");
+        let machine = x0x::identity::MachineKeypair::generate().expect("machine keygen");
+        let now = x0x::dm::now_unix_ms() / 1_000;
+        state
+            .agent
+            .insert_discovered_agent_for_testing(x0x::DiscoveredAgent {
+                self_name: None,
+                cert_digest: None,
+                agent_id: recipient.agent_id(),
+                machine_id: machine.machine_id(),
+                user_id: None,
+                addresses: Vec::new(),
+                announced_at: now,
+                last_seen: now,
+                machine_public_key: machine.public_key().as_bytes().to_vec(),
+                nat_type: None,
+                can_receive_direct: None,
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                cert_not_after: None,
+                agent_certificate: None,
+                agent_public_key: Vec::new(),
+            })
+            .await;
+        // Check B: retire the (recipient, machine) binding.
+        assert!(state
+            .agent
+            .revocation_set()
+            .write()
+            .await
+            .union_bundle_retired(&[x0x::revocation::AgentMachineBinding {
+                agent: recipient.agent_id(),
+                machine: machine.machine_id(),
+                move_epoch: 1,
+            }]));
+
+        let response = direct_send(
+            State(Arc::clone(&state)),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
+            Json(DirectSendRequest {
+                agent_id: hex::encode(recipient.agent_id().as_bytes()),
+                payload: base64::engine::general_purpose::STANDARD.encode(b"denied"),
+                prefer_raw_quic_if_connected: None,
+                raw_quic_receive_ack_ms: None,
+                stop_fallback_on_raw_error: false,
+                require_gossip: false,
+                require_gossip_ack: None,
+                require_ack_ms: None,
+                require_durable_app_ack: None,
+                logical_id: None,
+            }),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("decode response body");
+        assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+        assert_eq!(body["ok"], false, "body: {body}");
+        assert_eq!(body["error"], "recipient_pairing_denied", "body: {body}");
     }
 
     // ── ADR-0016 R2: REST pre-check (exact §3 string + status code) ─────

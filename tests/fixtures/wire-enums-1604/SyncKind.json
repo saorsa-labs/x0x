@@ -28,6 +28,13 @@
       "wire": {
         "bincode": "03000000"
       }
+    },
+    {
+      "input": "DeviceEnrollment",
+      "variant": "DeviceEnrollment",
+      "wire": {
+        "bincode": "04000000"
+      }
     }
   ],
   "type": "SyncKind"

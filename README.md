@@ -25,17 +25,16 @@ David stated this product vision on 13 Oct 2026. The marks below are against com
 | A2A and ACP as full session protocols | Target | Checked at `86a1d395`. Shipped pieces: an ACP-attached key (`CertMode::Acp` in `src/profile.rs`; the harness owns it) and an A2A discovery card (`get_a2a_agent_card` in `src/server/routes/identity.rs`, `GET /.well-known/agent-card.json`). [A04](docs/adr/consolidated/A04-r01-agent-attachment-and-inbound-events.md) says x0xd does not run the Agent Client Protocol, and A2A streaming and push stay off. |
 | Peers keep held data inside a partition | Shipped | Checked at `86a1d395`. Held data is the local snapshot a peer already stored. It is not data that state-sync has delivered (#1105). KV snapshots load through `load_snapshot` in `src/kv/sync.rs`. Task-list snapshots load through `TaskListStorage::load_task_list` in `src/crdt/persistence.rs`. [ADR 0006](docs/adr/0006-no-global-dht-for-user-and-group-data.md) is the rule. [A08](docs/adr/consolidated/A08-r01-groups-home-membership-and-repair.md) keeps liveness and repair incomplete. Availability stays with the peers who hold the data. |
 | CRDT data | Shipped | Checked at `86a1d395`. Replicated task lists (`TaskList` in `src/crdt/task_list.rs`) and key-value stores (`src/kv/mod.rs`). A last-writer value is not a text editor ([A10](docs/adr/consolidated/A10-r01-shared-data-files-and-synchronization.md)). |
-| BLE, serial and radio | Target | ant-quic 0.27.60 (tag `v0.27.60`, commit `ea64efc5`; same files on master `4c5fde07`) already has the scaffolding. Those paths are in the ant-quic crate. x0x has no `src/transport` directory. ant-quic `src/transport/addr.rs` defines `TransportAddr` for `Ble`, `LoRa` and `Serial`. ant-quic `src/transport/capabilities.rs` defines `ble`, `lora_long_range`, `lora_fast` and `serial_115200`. Feature `ble` builds `BleTransport` in ant-quic `src/transport/ble.rs`. x0x does not enable `ble` and does not call `BleTransport`. ant-quic stays the transport boundary ([T-alternate-bearers](docs/adr/transient/T-alternate-bearers.md), slot A05). |
+| BLE, serial and radio | Target | ant-quic 0.27.60 (tag `v0.27.60`, commit `ea64efc5`; same files on master `4c5fde07`) already has the scaffolding. Those paths are in the ant-quic crate. x0x has no `src/transport` directory. ant-quic `src/transport/addr.rs` defines `TransportAddr` for `Ble`, `LoRa` and `Serial`. ant-quic `src/transport/capabilities.rs` defines `ble`, `lora_long_range`, `lora_fast` and `serial_115200`. Feature `ble` builds `BleTransport` in ant-quic `src/transport/ble.rs`. x0x does not enable `ble` and does not call `BleTransport`. ant-quic stays the transport boundary ([A05](docs/adr/consolidated/A05-r01-connectivity-discovery-and-names.md), Alternate bearers). |
 | Public and private groups | Shipped | Checked at `86a1d395`. Presets `private_secure`, `public_request_secure`, `public_open` and `public_announce` (`GroupPolicyPreset` in `src/groups/policy.rs`). `SignedPublic` is a confidentiality mode. Home stays private ([A08](docs/adr/consolidated/A08-r01-groups-home-membership-and-repair.md)). |
 | Those groups challenge Slack and Discord | Target | The group kinds above are the collaboration places. Feature parity with Slack or Discord is not claimed. |
 
 ## Architecture review
 
-Read the [5 October architecture review](docs/reviews/2026-10-05-architecture/README.md)
-and the [15 ADR review set](docs/adr/consolidated/README.md). They capture the
-agreed direction, the agent delivery gap, and the controlled transfer from the
-existing decisions. The replacement ADRs remain Proposed until that transfer
-is complete.
+Read the [accepted 15 ADR set](docs/adr/consolidated/README.md) and the
+[5 October architecture review](docs/reviews/2026-10-05-architecture/README.md).
+David accepted the 15 slots on 7 November 2026; they are the live decision
+authority, and the numbered records stay archived as the historical record.
 
 ---
 
@@ -165,7 +164,7 @@ That mints an invite addressed to that one agent and prints the join command; it
 
 Sync is owner-to-owner only (Tier 1: profile, names, Home roster pointer, sub-agent issuance facts); DMs and other groups' history never replicate. As implemented today the synced Home pointer is **applied**: a device holding a Home that lost the election reports `state: "adoption_pending"` and names the winner, and a device with no Home reports `state: "elsewhere"`. Applying the pointer is not adoption — moving a device into the canonical Home is an explicit act by you (`x0x home seat <agent-id>` on the device holding it, then `x0x group join <invite> --home --owner <owner-user-id>` on the new one), and rosters are not merged. Synced sub-agent journal lines record the issuance fact (digest + time) without mode, label, or certificate bytes. The joining device needs one explicit `x0x announce` carrying its owner identity so its certificate is visible; a join that arrives first waits in a `pending` state rather than failing. Seating is not complete until that join is accepted and survives a restart on the new device — see [Known limitations](#known-limitations-v041-pre-release).
 
-**8. Voice.** Ratified in [ADR-0042](docs/adr/0042-voice-media-over-tailnet-streams.md). What is implemented today is **point-to-point (two-party) calls**: signaling over DMs (`x0x-voice-sig-v1`), audio over `WebRtcV1` streams with an opt-in unreliable-datagram lane (audio only, mutually negotiated) and reliable-stream fallback. It is a library surface behind the `voice` cargo feature (`x0x::voice`) — there is **no CLI or GUI call button yet**, and multi-party mesh (design-bounded at four participants), SFU, and browser access are recorded ADR follow-ups.
+**8. Voice.** Ratified in [ADR-0042](docs/adr/0042-voice-media-over-tailnet-streams.md). What is implemented today is **point-to-point (two-party) calls**. Call **lifecycle** is REST + CLI (ADR-0073 slice 1): `x0x call <agent_id>` / `POST /calls`, then `x0x call accept|reject|hangup`, with `call.incoming` / `call.state` events on `/events` and `/ws`. **Media** — signaling over DMs (`x0x-voice-sig-v1`), audio over `WebRtcV1` streams with an opt-in unreliable-datagram lane (audio only, mutually negotiated) and reliable-stream fallback — is a library surface behind the `voice` cargo feature (`x0x::voice`). There is **no GUI call button yet**, and multi-party mesh (design-bounded at four participants), SFU, and browser access are recorded ADR follow-ups.
 
 **9. Stay current.** The serving daemon is the only update writer. The CLI can check for a release or ask that daemon to install it:
 
@@ -310,7 +309,8 @@ curl -H "Authorization: Bearer $TOKEN" "http://$API/contacts"
 ```
 
 - **[SKILL.md](./SKILL.md)** — core agent skill (first direct message, group join, scratch KV write). Longer contracts are the topic pages in `docs/skill/`.
-- **[docs/api-reference.md](./docs/api-reference.md)** — the complete REST + WebSocket + SSE reference (all 174 endpoints, auth classes, request/response shapes, WS/SSE event tables).
+- **[docs/quickstart-two-agents.md](./docs/quickstart-two-agents.md)** — the 10-minute recipe: two local daemons, a direct message exchanged over REST, received on the event stream. CI runs it end-to-end on every PR.
+- **[docs/api-reference.md](./docs/api-reference.md)** — the complete REST + WebSocket + SSE reference (all 221 endpoints, auth classes, request/response shapes, WS/SSE event tables).
 - **[docs/local-apps.md](./docs/local-apps.md)** — integrating non-Rust applications with the daemon.
 - **[docs/adr/README.md](./docs/adr/README.md)** — the ADR index: every design decision, 0001–0058, with errata.
 - `x0x routes` — print every endpoint served by your running daemon.

@@ -1,14 +1,14 @@
 # A08 Groups Home Membership and Repair
 
-- **Status:** Proposed
+- **Status:** Accepted (David, course-correction directive, 7 Nov 2026, ruling 2)
 - **Revision:** 1
 - **Date:** 2026-10-05
 - **Decision owner:** David Irvine
 - **Direction:** Confirmed by David (D198) on 2026-10-05 for this team review.
-- **Replacement activation:** Pending the transfer and acceptance checks in A15.
-- **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
+- **Replacement activation:** Active since 7 November 2026. The 15 accepted slots are the live decision authority.
+- **Supersedes:** The archived numbered records mapped to this slot in [TRANSFER.md](TRANSFER.md). The archive stays the historical record. Existing implementation gates remain in force.
 
-These slots remain Proposed (D198, D199). David accepted the archive transfer on 10 October 2026. [docs/adr/README.md](../README.md) and [docs/adr-archive/move.json](../../adr-archive/move.json) record that acceptance. Replacement acceptance and clause-level transfer checks are still open. Use the [index and transition rules](README.md) to interpret their status.
+David accepted the 15 slots at their current revisions on 7 November 2026 (course-correction directive, ruling 2). They are the live decision authority. The numbered records stay in [docs/adr-archive](../../adr-archive/ARCHIVE.md) as the historical record. [docs/adr-archive/move.json](../../adr-archive/move.json) records the archive transfer David accepted on 10 October 2026. Use the [index](README.md) for the current rules.
 
 A group defines who can act and which shared state is valid. Home is a private group for one owner. Group operation must not depend on an unnecessary fixed device.
 
@@ -57,6 +57,16 @@ Invites must bind their group, authority, intended scope and expiry. Secrets mus
 Any-admin redemption must preserve single-use and replay rules. If a previous attempt may have committed, another admin must not create a second conflicting admission merely to avoid waiting.
 
 Fetched certificates, membership events and data images must be checked against their signed digest, authority and applicable group state. A holder supplies evidence; it does not gain authority by serving it.
+
+### SignedPublic one-revision catch-up
+
+Two accepted records govern SignedPublic catch-up after a restart skew (David, 12 Oct 2026 and D272/D280, 13–14 Oct 2026; archived as [T-signed-public-kv-revision-catchup](../../adr-archive/transient/T-signed-public-kv-revision-catchup.md) and [T-installed-catchup-admin-consent](../../adr-archive/transient/T-installed-catchup-admin-consent.md)).
+
+The KV epoch binding stays exact: a mismatched `StateRequest` stays rejected and its wire shape does not change. When a public control record matches the group and store, the author signature verifies and the signed revision is not local, the context reports the skew. If the local group is exactly one revision ahead, the local agent signed that head, and the author is an active member, the daemon sends the existing signed-public bootstrap snapshot to that author, under the per-group membership lock, throttled, withheld on fork quarantine, with no outbox obligation.
+
+The receiver applies that snapshot only when the group is already installed, SignedPublic and not fork-quarantined; the sender is the admin who signed the single retained head; the head revision is the local revision plus one and `prev_state_hash` is the local hash; the roster root, policy hash, metadata hash and recomputed state hash match the commit; the local agent stays an active member; an installed OwnerCertified owner stays unchanged; and local invite secrets, lineage, mandate observations and key material stay local. A larger gap, a non-committer sender or a hash mismatch leaves the installed group unchanged and withholds the bootstrap ACK.
+
+Consent for the installed catch-up path is the stored local roster, not the snapshot. `is_agent_revoked` runs first and a Blocked sender always fails. On an installed group, an active local admin who signed the retained head is catch-up consent for one revision. A new install keeps the existing gate: no local revocation, then a Known contact or a current `GroupInvite` grant on the authenticated machine. A stranger stays unable to install a new group, and on an OwnerCertified group a roster change or revoked newcomer is refused.
 
 Private repair and pre-member fetch must disclose only the information required by the approved admission rule. Historical access is not automatic.
 
@@ -122,6 +132,6 @@ These records are the primary sources for this draft. This mapping does not comp
 
 Decision source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Implementation checked on 12 October 2026 at commit `8cb6488331e6c1226913104ddb99ca4ec18bec37`.
 
-The public and discoverable group text was checked on 14 October 2026 at commit `86a1d395`. Preset names are `GroupPolicyPreset` in `src/groups/policy.rs` (`private_secure`, `public_request_secure`, `public_open`, `public_announce`). `SignedPublic` is `GroupConfidentiality`, a mode, not a preset name. The check records policy that is already in the tree. It does not mark liveness or repair complete. David accepted this amendment (D275, 14 Oct 2026). This slot stays Proposed. This note does not fold it into a new revision.
+The public and discoverable group text was checked on 14 October 2026 at commit `86a1d395`. Preset names are `GroupPolicyPreset` in `src/groups/policy.rs` (`private_secure`, `public_request_secure`, `public_open`, `public_announce`). `SignedPublic` is `GroupConfidentiality`, a mode, not a preset name. The check records policy that is already in the tree. It does not mark liveness or repair complete. David accepted this amendment (D275, 14 Oct 2026); it is folded into this slot as of 7 November 2026, with the SignedPublic catch-up records above.
 
 [All 15 ADRs](README.md)

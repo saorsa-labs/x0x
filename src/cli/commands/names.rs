@@ -50,6 +50,20 @@ pub async fn unpin(client: &DaemonClient, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// `x0x names accept LABEL` — apply a pending grant-names suggestion.
+pub async fn accept(client: &DaemonClient, label: &str) -> Result<()> {
+    let resp = client.post("/names/accept", &accept_body(label)).await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x names dismiss LABEL` — drop a pending grant-names suggestion.
+pub async fn dismiss(client: &DaemonClient, label: &str) -> Result<()> {
+    let resp = client.delete(&dismiss_path(label)?).await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
 /// Owner-label path. The label is checked before the path exists, so a
 /// value such as `../../contacts/<id>` never becomes a DELETE URL.
 fn owner_remove_path(label: &str) -> Result<String> {
@@ -81,6 +95,18 @@ fn owner_add_body(label: &str, user_id: &str) -> serde_json::Value {
 
 fn machine_label_body(name: &str, machine_id: &str) -> serde_json::Value {
     serde_json::json!({ "name": name, "machine_id": machine_id })
+}
+
+fn accept_body(label: &str) -> serde_json::Value {
+    serde_json::json!({ "label": label })
+}
+
+/// Suggestion path. The label is checked before the path exists, so a
+/// value such as `../../contacts/<id>` never becomes a DELETE URL.
+fn dismiss_path(label: &str) -> Result<String> {
+    crate::names::validate_label(label)
+        .map_err(|error| anyhow::anyhow!("invalid suggestion label: {error}"))?;
+    Ok(format!("/names/suggestions/{label}"))
 }
 
 #[cfg(test)]

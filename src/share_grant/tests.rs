@@ -662,6 +662,122 @@ async fn post_rename_dm_failure_is_logged_as_held_not_absent() {
     );
 }
 
+// ── ShareCap::Data (#1094) ───────────────────────────────────────────────
+
+fn data_cap(group: &str, store: &str, access: DataAccess) -> ShareCap {
+    ShareCap::Data {
+        group: group.to_string(),
+        store: store.to_string(),
+        access,
+    }
+}
+
+fn grant_with_caps(
+    owner: &UserKeypair,
+    caps: Vec<ShareCap>,
+) -> Result<ShareGrant, ShareGrantError> {
+    ShareGrant::sign(
+        owner,
+        [0x43; 32],
+        Grantee::User(UserId([9; 32])),
+        vec![agent(1)],
+        caps,
+        NOW - 60,
+        NOW + 3_600,
+    )
+}
+
+/// WHY: issue #1094 — the Data cap names exactly one store of one group;
+/// unbounded or empty names would make the grant unenforceable.
+#[test]
+fn data_cap_validation_bounds_group_and_store() {
+    let owner = UserKeypair::generate().unwrap();
+    grant_with_caps(&owner, vec![data_cap("gid", "scratch", DataAccess::Ro)])
+        .expect("a bounded data cap signs");
+    let long = "g".repeat(MAX_GRANT_DATA_FIELD_BYTES + 1);
+    for (group, store) in [
+        ("", "scratch"),
+        ("gid", ""),
+        (long.as_str(), "scratch"),
+        ("gid", long.as_str()),
+        ("x0x/group/gid", "scratch"),
+        ("gid", "kv/scratch"),
+    ] {
+        let err = grant_with_caps(&owner, vec![data_cap(group, store, DataAccess::Rw)])
+            .expect_err("invalid data cap must be refused");
+        assert!(
+            matches!(err, ShareGrantError::Invalid(_)),
+            "({group:?},{store:?}): {err}"
+        );
+    }
+}
+
+/// WHY: the signature must bind the Data cap's fields — two grants that
+/// differ only in access level (or store) must never share signed bytes.
+#[test]
+fn data_cap_signed_bytes_bind_fields() {
+    let owner = UserKeypair::generate().unwrap();
+    let ro = grant_with_caps(&owner, vec![data_cap("g", "scratch", DataAccess::Ro)]).unwrap();
+    let rw = grant_with_caps(&owner, vec![data_cap("g", "scratch", DataAccess::Rw)]).unwrap();
+    let other = grant_with_caps(&owner, vec![data_cap("g", "notes", DataAccess::Ro)]).unwrap();
+    assert_ne!(ro.signed_bytes(), rw.signed_bytes());
+    assert_ne!(ro.signed_bytes(), other.signed_bytes());
+    ro.verify().expect("ro grant verifies");
+    rw.verify().expect("rw grant verifies");
+}
+
+/// WHY: issue #1094 acceptance — an `ro` grantee must not evaluate as a
+/// writer, an absent cap confers nothing, and overlapping grants take
+/// the stronger level.
+#[test]
+fn data_cap_access_evaluation_is_level_exact() {
+    let mut access = GrantAccess::default();
+    access.absorb(
+        &[data_cap("g", "scratch", DataAccess::Ro)]
+            .into_iter()
+            .collect(),
+    );
+    assert!(access.allows_data_read("g", "scratch"));
+    assert!(
+        !access.allows_data_write("g", "scratch"),
+        "ro must not write"
+    );
+    assert!(!access.allows_data_read("g", "notes"), "store-exact");
+    assert!(!access.allows_data_read("h", "scratch"), "group-exact");
+
+    // Rw wins over Ro when grants overlap, in either absorb order.
+    access.absorb(
+        &[data_cap("g", "scratch", DataAccess::Rw)]
+            .into_iter()
+            .collect(),
+    );
+    assert!(access.allows_data_write("g", "scratch"));
+    access.absorb(
+        &[data_cap("g", "scratch", DataAccess::Ro)]
+            .into_iter()
+            .collect(),
+    );
+    assert!(
+        access.allows_data_write("g", "scratch"),
+        "a later ro grant must not downgrade rw"
+    );
+    assert!(!GrantAccess::default().allows_data_read("g", "scratch"));
+}
+
+/// WHY: the REST surface speaks serde JSON; the cap's shape is part of
+/// the API contract.
+#[test]
+fn data_cap_json_round_trips() {
+    let cap = data_cap("gid", "scratch", DataAccess::Rw);
+    let json = serde_json::to_value(&cap).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({"data":{"group":"gid","store":"scratch","access":"rw"}})
+    );
+    let back: ShareCap = serde_json::from_value(json).unwrap();
+    assert_eq!(back, cap);
+}
+
 mod enforcement;
 
 mod redelivery;

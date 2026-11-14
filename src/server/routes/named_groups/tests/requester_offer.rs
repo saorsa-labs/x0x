@@ -1410,3 +1410,134 @@ async fn d08_requester_offer_without_bit_remains_durably_queued() -> Result<()> 
     state.agent.shutdown().await;
     Ok(())
 }
+
+/// #1365: the sidecar bytes are pinned. The `Outbox<T>` move must write
+/// exactly the bytes the hand-made outbox wrote, and a restart must load
+/// them back unchanged. The golden text is the serde_json encoding of the
+/// v1 file shape (field order and integer forms are part of the format).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn issue1365_sidecar_bytes_are_pinned_across_restart() -> Result<()> {
+    let plane = format!("req-offer-1365-pin-{}", rand::random::<u32>());
+    let (state, _dir) = networked_test_state(&plane).await?;
+    let envelope = vec![1u8, 2, 3];
+    let digest: [u8; 32] = blake3::hash(&envelope).into();
+    let obligation = RequesterOfferObligation {
+        group_id: "g-pin".to_string(),
+        request_id: "r-pin".to_string(),
+        requester_agent_id: "aa".repeat(32),
+        authority_agent_id: "bb".repeat(32),
+        envelope_bytes: envelope,
+        digest,
+        byte_size: 3,
+        first_seen_ms: 1_000,
+        next_retry_at_ms: 2_000,
+        retry_count: 4,
+    };
+    insert_requester_offer_obligation(&state, obligation.clone())
+        .await
+        .expect("obligation persisted");
+    let digest_json = digest
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let golden = format!(
+        "{{\"version\":1,\"by_group\":{{\"g-pin\":[{{\"group_id\":\"g-pin\",\
+         \"request_id\":\"r-pin\",\"requester_agent_id\":\"{}\",\
+         \"authority_agent_id\":\"{}\",\"envelope_bytes\":[1,2,3],\
+         \"digest\":[{digest_json}],\"byte_size\":3,\"first_seen_ms\":1000,\
+         \"next_retry_at_ms\":2000,\"retry_count\":4}}]}}}}",
+        "aa".repeat(32),
+        "bb".repeat(32),
+    );
+    let written = tokio::fs::read(&state.requester_offer_outbox_path).await?;
+    assert_eq!(
+        String::from_utf8_lossy(&written),
+        golden,
+        "the sidecar bytes are byte-identical to the v1 format"
+    );
+
+    // Restart: empty memory, then the boot load reads the pinned bytes.
+    state.requester_offer_outbox.write().await.clear();
+    load_requester_offer_outbox(&state)
+        .await
+        .expect("pinned sidecar loads");
+    let loaded =
+        crate::server::routes::named_groups::requester_offer::requester_offer_snapshot(&state)
+            .await;
+    assert_eq!(loaded, vec![obligation], "restart restores the same entry");
+    let after_load = tokio::fs::read(&state.requester_offer_outbox_path).await?;
+    assert_eq!(
+        after_load, written,
+        "the boot load does not rewrite the file"
+    );
+    state.agent.shutdown().await;
+    Ok(())
+}
+
+/// #1365: the retry schedule and its restart are pinned. A failed send
+/// keeps the obligation, counts the attempt, and schedules the next one
+/// from the ADR 0028 offsets (0 s, then 1 s). A restart keeps the count
+/// and the schedule, so a not-yet-due obligation is not sent early.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn issue1365_retry_schedule_survives_restart() -> Result<()> {
+    let plane = format!("req-offer-1365-retry-{}", rand::random::<u32>());
+    let (state, _dir) = networked_test_state(&plane).await?;
+    let group_id = insert_local_public_group(&state, &"c5".repeat(16)).await;
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    pending_join_request(&state, &group_id, "req-1365", &local_hex).await;
+    // An unresolvable authority: every send fails.
+    let obligation = obligation_for(
+        &group_id,
+        "req-1365",
+        &local_hex,
+        &"fe".repeat(32),
+        vec![0x5A; 48],
+    );
+    insert_requester_offer_obligation(&state, obligation)
+        .await
+        .expect("obligation persisted");
+    let snapshot = || async {
+        crate::server::routes::named_groups::requester_offer::requester_offer_snapshot(&state).await
+    };
+
+    // Attempt 1 fails: offset[0] = 0 s, so it is due again at once.
+    let before = now_millis_u64();
+    requester_offer_step(&state).await;
+    let after = now_millis_u64();
+    let first = snapshot().await;
+    assert_eq!(first.len(), 1, "a failed send keeps the obligation");
+    assert_eq!(first[0].retry_count, 1);
+    assert!((before..=after).contains(&first[0].next_retry_at_ms));
+
+    // Attempt 2 fails: offset[1] = 1 s.
+    let before = now_millis_u64();
+    requester_offer_step(&state).await;
+    let after = now_millis_u64();
+    let second = snapshot().await;
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].retry_count, 2);
+    assert!((before + 1_000..=after + 1_000).contains(&second[0].next_retry_at_ms));
+    let disk_before_restart = tokio::fs::read(&state.requester_offer_outbox_path).await?;
+
+    // Restart: the boot load restores count and schedule exactly.
+    state.requester_offer_outbox.write().await.clear();
+    load_requester_offer_outbox(&state)
+        .await
+        .expect("sidecar loads");
+    assert_eq!(snapshot().await, second, "restart keeps count and schedule");
+    assert_eq!(
+        tokio::fs::read(&state.requester_offer_outbox_path).await?,
+        disk_before_restart
+    );
+    // Not due yet (1 s offset): a pass right after restart does not send.
+    if now_millis_u64() < second[0].next_retry_at_ms {
+        requester_offer_step(&state).await;
+        let held = snapshot().await;
+        if now_millis_u64() < second[0].next_retry_at_ms {
+            assert_eq!(held, second, "a not-due obligation is not attempted");
+        }
+    }
+    state.agent.shutdown().await;
+    Ok(())
+}

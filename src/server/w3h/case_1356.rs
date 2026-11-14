@@ -7,6 +7,8 @@
 //! `CAUSE_*` names (the base's behaviour) is RED; any other failure is
 //! INFRA. Controls are GREEN before and after S3, except the H-S3-d4 and
 //! H-S3-d7 controls: they call S3 routes, so they are GREEN with S3 only.
+//! The H-S3-d6 control is also GREEN with S3 only: before S3, J drops the
+//! S3 direct messages and stays marked.
 //!
 //! The ADR 0109 H-S3-a row (#818, skewed clocks) is `case_818`'s red
 //! baseline, `w3h_818_red_baseline_ownerless_skewed_joiner_is_quarantined`.
@@ -114,10 +116,13 @@ use serde_json::{json, Value};
 
 mod conflict;
 mod flood;
+mod fork_exposure;
 mod gaps;
 mod owner_axis;
+mod provisional;
 mod reseat_route;
 mod segments;
+mod segments_s;
 
 const JOIN_LABELS: &[&str] = &["A", "M1", "M2", "J"];
 const SETUP: Duration = Duration::from_secs(180);

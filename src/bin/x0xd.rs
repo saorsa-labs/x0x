@@ -17,6 +17,7 @@
 //! ```
 
 use anyhow::{Context, Result};
+use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -49,24 +50,27 @@ use x0x::server::{DaemonConfig, InstanceName, ServeOptions};
 /// First `--name value` or `--name=value` on `args`.
 ///
 /// An empty value is the same error as a missing value. `x0xd` and the CLI
-/// split check both accept these two spellings.
-fn cli_name_argument(args: &[String]) -> Result<Option<String>> {
+/// split check both accept these two spellings. argv is raw OS bytes, so a
+/// non-UTF-8 name is refused here rather than panicking at collection (#1375).
+fn cli_name_argument(args: &[OsString]) -> Result<Option<String>> {
     for (index, arg) in args.iter().enumerate() {
-        if arg == "--name" {
-            let value = args
-                .get(index + 1)
-                .context("--name requires an instance name")?;
-            if value.is_empty() {
-                anyhow::bail!("--name requires an instance name");
-            }
-            return Ok(Some(value.clone()));
+        let value = if arg == "--name" {
+            args.get(index + 1)
+                .context("--name requires an instance name")?
+                .as_os_str()
+        } else if let Some(value) = arg.as_encoded_bytes().strip_prefix(b"--name=") {
+            // Match on bytes so a non-UTF-8 `--name=` value is refused, not
+            // skipped as an unrelated argument.
+            let value = std::str::from_utf8(value).context("--name value must be valid UTF-8")?;
+            std::ffi::OsStr::new(value)
+        } else {
+            continue;
+        };
+        let value = value.to_str().context("--name value must be valid UTF-8")?;
+        if value.is_empty() {
+            anyhow::bail!("--name requires an instance name");
         }
-        if let Some(value) = arg.strip_prefix("--name=") {
-            if value.is_empty() {
-                anyhow::bail!("--name requires an instance name");
-            }
-            return Ok(Some(value.to_string()));
-        }
+        return Ok(Some(value.to_owned()));
     }
     Ok(None)
 }
@@ -118,17 +122,10 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run_daemon() -> anyhow::Result<()> {
-    // dhat heap profiler. Each daemon writes its own file so multi-daemon
-    // runs don't overwrite each other's dump. Set DHAT_OUT_DIR to override.
-    #[cfg(feature = "profile-heap")]
-    let _dhat_profiler = {
-        let dir = std::env::var("DHAT_OUT_DIR").unwrap_or_else(|_| ".".to_string());
-        let path = format!("{}/dhat-heap-{}.json", dir, std::process::id());
-        eprintln!("dhat: writing heap dump to {} on exit", path);
-        dhat::Profiler::builder().file_name(&path).build()
-    };
-
-    let args: Vec<String> = std::env::args().collect();
+    // argv is not guaranteed UTF-8; args_os() keeps the raw OS bytes, so a
+    // non-UTF-8 argument is refused by the flag that consumes it instead of
+    // panicking at collection, before logging exists (#1375).
+    let args: Vec<OsString> = std::env::args_os().collect();
 
     // Handle --version and --help before anything else
     if args.iter().any(|a| a == "--version" || a == "-V") {
@@ -216,12 +213,12 @@ async fn run_daemon() -> anyhow::Result<()> {
         x0x::connect::LoadMode::DefaultPath
     };
 
-    let check_only = args.contains(&"--check".to_string());
-    let check_updates_only = args.contains(&"--check-updates".to_string());
-    let skip_update_check = args.contains(&"--skip-update-check".to_string());
+    let check_only = args.iter().any(|a| a == "--check");
+    let check_updates_only = args.iter().any(|a| a == "--check-updates");
+    let skip_update_check = args.iter().any(|a| a == "--skip-update-check");
     let doctor_mode = args.iter().any(|arg| arg == "doctor" || arg == "--doctor");
-    let no_hard_coded_bootstrap = args.contains(&"--no-hard-coded-bootstrap".to_string());
-    let legacy_no_bootstrap = args.contains(&"--no-bootstrap".to_string());
+    let no_hard_coded_bootstrap = args.iter().any(|a| a == "--no-hard-coded-bootstrap");
+    let legacy_no_bootstrap = args.iter().any(|a| a == "--no-bootstrap");
     if legacy_no_bootstrap {
         eprintln!("warning: --no-bootstrap is deprecated; use --no-hard-coded-bootstrap");
     }
@@ -231,9 +228,9 @@ async fn run_daemon() -> anyhow::Result<()> {
     // ant-quic's best-effort UPnP IGD on networks without IGD support or
     // where operator policy forbids unsolicited router port mappings. This
     // overrides the daemon config's `port_mapping_enabled` field.
-    let cli_no_port_mapping = args.contains(&"--no-port-mapping".to_string());
-    let cli_disable_peer_cache = args.contains(&"--disable-peer-cache".to_string());
-    let cli_relay = args.contains(&"--relay".to_string());
+    let cli_no_port_mapping = args.iter().any(|a| a == "--no-port-mapping");
+    let cli_disable_peer_cache = args.iter().any(|a| a == "--disable-peer-cache");
+    let cli_relay = args.iter().any(|a| a == "--relay");
 
     // Parse --api-port for overriding the API server port
     let api_port_override = if let Some(idx) = args.iter().position(|a| a == "--api-port") {
@@ -241,6 +238,8 @@ async fn run_daemon() -> anyhow::Result<()> {
             .get(idx + 1)
             .context("--api-port requires a port number")?;
         let port: u16 = port_str
+            .to_str()
+            .context("--api-port value must be valid UTF-8")?
             .parse()
             .context("--api-port value must be a valid port number (0-65535)")?;
         Some(port)
@@ -256,10 +255,27 @@ async fn run_daemon() -> anyhow::Result<()> {
     };
 
     // Handle --list: discover running instances and exit
-    if args.contains(&"--list".to_string()) {
+    if args.iter().any(|a| a == "--list") {
         x0x::server::list_instances().await?;
         return Ok(());
     }
+
+    // dhat heap profiler. Each daemon writes its own file so multi-daemon
+    // runs don't overwrite each other's dump. Set DHAT_OUT_DIR to override.
+    // dhat's own exit path collects argv with std::env::args(), which panics
+    // on a non-UTF-8 argument. Some flags (`--config`) accept raw OS bytes,
+    // so the profiler runs only when every argument is UTF-8; otherwise that
+    // panic would hide the daemon's own exit error (#1375).
+    #[cfg(feature = "profile-heap")]
+    let _dhat_profiler = if args.iter().all(|a| a.to_str().is_some()) {
+        let dir = std::env::var("DHAT_OUT_DIR").unwrap_or_else(|_| ".".to_string());
+        let path = format!("{}/dhat-heap-{}.json", dir, std::process::id());
+        eprintln!("dhat: writing heap dump to {} on exit", path);
+        Some(dhat::Profiler::builder().file_name(&path).build())
+    } else {
+        eprintln!("dhat: heap profiler off, an argument is not UTF-8");
+        None
+    };
 
     // Whether a config file was actually loaded (explicit `--config`, or the
     // instance's default path). A named instance with a file must declare its
@@ -277,7 +293,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         x0x::gui::startup_config_path(config_path.as_deref().map(Path::new), &default_config_path);
     let config_file_loaded = loaded_config_path.is_some();
     let (mut config, mut config_findings) = match loaded_config_path.as_ref() {
-        Some(path) => load_config(path.to_str().unwrap_or("/etc/x0x/config.toml")).await?,
+        Some(path) => load_config(path).await?,
         None => (DaemonConfig::default(), Vec::new()),
     };
 
@@ -712,10 +728,13 @@ async fn run_doctor(config: &DaemonConfig) -> Result<()> {
 /// Returns the config and its non-fatal findings as warning lines, which the
 /// caller emits once logging is initialised (N7). A plane-isolation key
 /// (`network_id`, `mdns_enabled`) below the top level is fatal here.
-async fn load_config(path: &str) -> Result<(DaemonConfig, Vec<String>)> {
+/// The path is raw OS bytes end to end: an explicit `--config` value that is
+/// not UTF-8 names the file it names, never a silent fallback to the system
+/// config (#1375). Only the file *contents* must be UTF-8 TOML.
+async fn load_config(path: &Path) -> Result<(DaemonConfig, Vec<String>)> {
     let content = tokio::fs::read_to_string(path)
         .await
-        .with_context(|| format!("failed to read config file: {path}"))?;
+        .with_context(|| format!("failed to read config file: {}", path.display()))?;
     // Issue #385 / N7: name every key the schema drops (any depth) instead
     // of letting it vanish into a default. Only plane-isolation keys are
     // fatal: an ignored `network_id` joins the prod plane. Every other
@@ -723,9 +742,9 @@ async fn load_config(path: &str) -> Result<(DaemonConfig, Vec<String>)> {
     // prod configs carry stray keys and rejecting them would stop the
     // daemon after a self-update.
     let (config, findings) = x0x::server::config::analyze(&content)
-        .with_context(|| format!("failed to parse config file: {path}"))?;
+        .with_context(|| format!("failed to parse config file: {}", path.display()))?;
     if let Some(message) = findings.plane_error() {
-        anyhow::bail!("{message} (config file: {path})");
+        anyhow::bail!("{message} (config file: {})", path.display());
     }
     // ADR-0064 §1b: an out-of-range enforcement value changes security
     // behaviour (a 0-day grace would refuse every recorded-capable
@@ -1058,6 +1077,29 @@ mod tests {
         assert!(empty.to_string().contains("requires an instance name"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn name_flag_refuses_non_utf8_in_both_spellings() {
+        use std::os::unix::ffi::OsStringExt;
+        let separate = cli_name_argument(&[
+            "x0xd".into(),
+            "--name".into(),
+            OsString::from_vec(b"al\xffce".to_vec()),
+        ])
+        .unwrap_err();
+        assert!(separate.to_string().contains("valid UTF-8"));
+        let equals = cli_name_argument(&[
+            "x0xd".into(),
+            OsString::from_vec(b"--name=al\xffce".to_vec()),
+        ])
+        .unwrap_err();
+        assert!(equals.to_string().contains("valid UTF-8"));
+        // An unrelated non-UTF-8 argument is not this flag's business.
+        let other = cli_name_argument(&["x0xd".into(), OsString::from_vec(b"\xff".to_vec())])
+            .expect("unrelated argument");
+        assert!(other.is_none());
+    }
+
     #[test]
     fn cli_name_wins_over_invalid_config_loser() {
         // A CLI name is already validated; a config name is validated only when
@@ -1164,13 +1206,12 @@ mod tests {
     async fn invalid_history_rule_refuses_startup_even_with_history_disabled() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
-        let path_str = path.to_str().expect("utf-8 path").to_owned();
         std::fs::write(
             &path,
             "[history]\nenabled = false\n\n[[history.class_limits]]\nclass = \"durable\"\n",
         )
         .expect("write config");
-        let error = super::load_config(&path_str)
+        let error = super::load_config(&path)
             .await
             .expect_err("an invalid [history] rule must refuse startup");
         let message = format!("{error:#}");
@@ -1182,9 +1223,45 @@ mod tests {
 
         std::fs::write(&path, "[history]\nenabled = false\n").expect("rewrite config");
         assert!(
-            super::load_config(&path_str).await.is_ok(),
+            super::load_config(&path).await.is_ok(),
             "a config without the new rules still loads"
         );
+    }
+
+    /// #1375: the config path is raw OS bytes, so a `--config` value that is
+    /// not UTF-8 must load the file it names — never a silent fallback to
+    /// `/etc/x0x/config.toml`. APFS refuses to create a name that is not
+    /// UTF-8, so off Linux the raw path must at least reach the read error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn load_config_reads_a_file_whose_name_is_not_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let raw = std::ffi::OsString::from_vec(b"config\xff.toml".to_vec());
+        let path = dir.path().join(raw);
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::write(&path, "[history]\nenabled = false\n").expect("write config");
+            let (config, _findings) = super::load_config(&path).await.expect(
+                "the named file must load; a fallback to the system config is a silent plane change",
+            );
+            assert!(
+                !config.history.enabled,
+                "the loaded values came from the named file"
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let error = super::load_config(&path)
+                .await
+                .expect_err("the raw path must reach the read error, not a fallback");
+            let message = format!("{error:#}");
+            let lossy = path.display().to_string();
+            assert!(
+                message.contains("failed to read config file") && message.contains(lossy.as_str()),
+                "the error must name the file the flag named, losslessly: {message}"
+            );
+        }
     }
 
     /// ADR-0074 §3: a non-loopback `[socks] listen` refuses config load.
@@ -1192,9 +1269,8 @@ mod tests {
     async fn load_config_refuses_non_loopback_socks() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
-        let path_str = path.to_str().expect("utf-8 path").to_owned();
         std::fs::write(&path, "[socks]\nlisten = \"0.0.0.0:1080\"\n").expect("write config");
-        let error = super::load_config(&path_str)
+        let error = super::load_config(&path)
             .await
             .expect_err("non-loopback socks listen must refuse startup");
         let message = format!("{error:#}").to_ascii_lowercase();

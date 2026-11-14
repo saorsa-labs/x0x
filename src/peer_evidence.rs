@@ -9,6 +9,99 @@ use crate::{
     dm_capability::CapabilityAdvert,
     identity::{AgentCertificate, AgentId, MachineId, UserId},
 };
+/// A verified-shape evidence record for `agent` on `machine`, signed by
+/// both keys, for tests in other modules (#1107).
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+pub(crate) fn record_for_test(
+    agent: &crate::identity::AgentKeypair,
+    machine: &crate::identity::MachineKeypair,
+    ann_time: u64,
+    advert_time: u64,
+) -> EvidenceRecordV1 {
+    record_with_certificate_for_test(agent, machine, None, ann_time, advert_time)
+}
+
+/// [`record_for_test`] for a sender that announces an owner certificate: the
+/// announcement carries the certificate's digest, as the sender's own Hello
+/// does, so a later Hello with the same certificate keeps the stored one.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+pub(crate) fn record_with_certificate_for_test(
+    agent: &crate::identity::AgentKeypair,
+    machine: &crate::identity::MachineKeypair,
+    certificate: Option<&AgentCertificate>,
+    ann_time: u64,
+    advert_time: u64,
+) -> EvidenceRecordV1 {
+    use crate::dm::DmCapabilities;
+    use crate::dm_capability::{RegistryTrailer, REGISTRY_TRAILER_MAGIC};
+    let v2 = crate::IdentityAnnouncement {
+        self_name: Some("wire name".into()),
+        agent_id: agent.agent_id(),
+        machine_id: machine.machine_id(),
+        user_id: certificate.and_then(|c| c.user_id().ok()),
+        agent_certificate: certificate.cloned(),
+        machine_public_key: machine.public_key().as_bytes().to_vec(),
+        machine_signature: vec![],
+        addresses: vec![],
+        announced_at: ann_time / 1000,
+        nat_type: None,
+        can_receive_direct: None,
+        is_relay: None,
+        is_coordinator: None,
+        reachable_via: vec![],
+        relay_candidates: vec![],
+        agent_public_key: agent.public_key().as_bytes().to_vec(),
+    };
+    let mut ann = IdentityAnnouncementV3::build_from_v2(&v2, machine.secret_key(), 0).unwrap();
+    ann.sign_v3_1(machine.secret_key()).unwrap();
+    let mut caps = DmCapabilities::pending();
+    caps.kem_public_key = vec![42; 1184];
+    let mut advert = CapabilityAdvert {
+        protocol_version: crate::dm_capability_service::ADVERT_PROTOCOL_VERSION,
+        agent_id: *agent.agent_id().as_bytes(),
+        machine_id: *machine.machine_id().as_bytes(),
+        created_at_unix_ms: advert_time,
+        capabilities: caps,
+        signature: vec![],
+    };
+    advert.signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        agent.secret_key(),
+        &advert.signed_bytes().unwrap(),
+    )
+    .unwrap()
+    .as_bytes()
+    .to_vec();
+    let mut trailer = RegistryTrailer {
+        registry: Default::default(),
+        signature: vec![],
+    };
+    trailer.signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        agent.secret_key(),
+        &trailer.signed_bytes(&advert).unwrap(),
+    )
+    .unwrap()
+    .as_bytes()
+    .to_vec();
+    let mut bytes = postcard::to_stdvec(&advert).unwrap();
+    bytes.extend_from_slice(REGISTRY_TRAILER_MAGIC);
+    bytes.extend(postcard::to_stdvec(&trailer).unwrap());
+    EvidenceRecordV1 {
+        announcement: announce_v3::serialize_v3_1(&ann).unwrap(),
+        advert: bytes,
+        certificate: certificate.map(|c| c.to_storage_bytes().unwrap()),
+        relation: GROUP,
+        stored_at_ms: 2_000_000_000_000,
+    }
+}
+
+#[cfg(test)]
+#[path = "peer_evidence_cert_carry_tests.rs"]
+mod cert_carry_tests;
+#[cfg(test)]
+#[path = "peer_evidence_forward_opener_tests.rs"]
+mod forward_opener_tests;
 mod runtime;
 #[cfg(test)]
 pub(crate) use runtime::set_w3h_inline_lookups;
@@ -924,19 +1017,40 @@ impl PeerEvidenceStore {
             Some(view.announcement.cert_digest)
         })
     }
-    /// Exact stored certificate for a matching announcement digest, if usable.
-    pub(crate) fn certificate_for(
-        &self,
-        agent: AgentId,
-        machine: MachineId,
-        digest: [u8; 32],
-        now: u64,
-    ) -> Option<Vec<u8>> {
-        let view = self.usable(agent, machine, now)?;
-        if view.announcement.cert_digest != digest {
-            return None;
+    /// #1107: fill in the stored certificate for an announcement that names
+    /// it but carries no certificate bytes. Returns whether it did.
+    ///
+    /// A V3 announcement carries only the digest of the owner certificate;
+    /// the bytes come by a separate fetch. The stored certificate is kept if
+    /// and only if all of these hold ([`stored_certificate_for`]):
+    /// - the record has no certificate bytes;
+    /// - the announcement names a certificate (not the anonymous digest);
+    /// - the store holds a verified record for the same agent on the same
+    ///   machine, not suspended by a move;
+    /// - that record's certificate is current and its digest equals the
+    ///   announcement's signed `cert_digest`.
+    ///
+    /// The carried bytes are the stored bytes. The record is then verified
+    /// as usual, certificate included, so this grants nothing the stored
+    /// record did not hold. Revocation, expiry and owner chaining are still
+    /// checked at each use. Every ingest path that can carry calls this
+    /// before it verifies, and passes the result to
+    /// [`Self::ingest_verified_after_carry`], which decides again under the
+    /// mutation lock: a record stored in between (for example an anonymous
+    /// announcement after a consent withdrawal) wins, and the carried
+    /// record is refused.
+    pub(crate) fn carry_certificate(&self, record: &mut EvidenceRecordV1, now: u64) -> bool {
+        if record.certificate.is_some() {
+            return false;
         }
-        view.certificate.as_ref()?.to_storage_bytes().ok()
+        let Ok(ann) = announce_v3::deserialize_v3(&record.announcement) else {
+            return false;
+        };
+        let Ok(state) = self.lock() else {
+            return false;
+        };
+        record.certificate = stored_certificate_for(&state, &ann, now);
+        record.certificate.is_some()
     }
     /// Latest ingest-fresh live wire bytes, kept separately from stored bytes.
     pub fn live(&self, agent: AgentId, now: u64) -> Option<EvidenceRecordV1> {
@@ -966,15 +1080,78 @@ impl PeerEvidenceStore {
     /// new snapshot and its parent directory have been synced, unless this
     /// instance is memory-only (where the move takes effect immediately).
     pub fn ingest(&self, record: EvidenceRecordV1, source: IngestSource, now: u64) -> Result<()> {
-        let view = Arc::new(record.verify(now, W_MS)?);
-        self.ingest_verified(record, view, source, now)
+        self.ingest_with_carry(&record, source, now, |candidate, _| {
+            Ok((Arc::new(candidate.verify(now, W_MS)?), true))
+        })
+        .map(|_| ())
     }
+    /// #1107: carry, check, then store, as one decision.
+    ///
+    /// Each attempt applies [`Self::carry_certificate`] to a fresh copy of
+    /// `record`, runs `check` on it (it verifies the copy, certificate
+    /// included, and says whether to store it), and stores it with
+    /// [`Self::ingest_verified_after_carry`], which runs `allowed` and then
+    /// decides the carry again under the mutation lock. If a certificate
+    /// that the rule would keep was stored after the carry decision, the
+    /// attempt is redone from the carry, so every stored record that has a
+    /// certificate was verified and allowed with it. At most
+    /// [`CARRY_ATTEMPTS`] attempts, then the record is refused. `check`
+    /// gets the attempt index (0-based).
+    pub(crate) fn ingest_with_carry(
+        &self,
+        record: &EvidenceRecordV1,
+        source: IngestSource,
+        now: u64,
+        mut check: impl FnMut(&EvidenceRecordV1, usize) -> Result<(Arc<EvidenceView>, bool)>,
+    ) -> Result<Arc<EvidenceView>> {
+        for attempt in 0..CARRY_ATTEMPTS {
+            let mut candidate = record.clone();
+            let carried = self.carry_certificate(&mut candidate, now);
+            let (view, store) = check(&candidate, attempt)?;
+            if !store {
+                return Ok(view);
+            }
+            match self.ingest_verified_after_carry(
+                candidate,
+                Arc::clone(&view),
+                source,
+                now,
+                carried,
+            ) {
+                Err(EvidenceError::Invalid(reason)) if reason == CARRY_CHANGED => continue,
+                Err(error) => return Err(error),
+                Ok(()) => return Ok(view),
+            }
+        }
+        Err(EvidenceError::Invalid("certificate carry kept changing"))
+    }
+    /// Ingest a verified record whose certificate bytes came with it.
     pub(crate) fn ingest_verified(
+        &self,
+        record: EvidenceRecordV1,
+        view: Arc<EvidenceView>,
+        source: IngestSource,
+        now: u64,
+    ) -> Result<()> {
+        self.ingest_verified_after_carry(record, view, source, now, false)
+    }
+    /// [`Self::ingest_verified`] for a record whose certificate was carried
+    /// in by [`Self::carry_certificate`] when `carried` is true. The carry is
+    /// decided again under the mutation lock, for both outcomes:
+    /// - carried, and the rule now gives nothing (for example an anonymous
+    ///   record landed after consent was withdrawn): the record is refused.
+    ///   This fails safe; the next announcement is ingested afresh.
+    /// - not carried, and the rule now gives a certificate (a Hello stored
+    ///   it since the decision): returns [`CARRY_CHANGED`], and
+    ///   [`Self::ingest_with_carry`] redoes the attempt from the carry, so
+    ///   the record is verified and allowed with that certificate.
+    pub(crate) fn ingest_verified_after_carry(
         &self,
         mut record: EvidenceRecordV1,
         view: Arc<EvidenceView>,
         source: IngestSource,
         now: u64,
+        carried: bool,
     ) -> Result<()> {
         if !allowed(&*self.policy, &view, now) {
             return Err(EvidenceError::Invalid("not a current relationship"));
@@ -985,15 +1162,35 @@ impl PeerEvidenceStore {
         record.stored_at_ms = now;
         let _mutation = self.lock_mutation()?;
         let mut state = self.lock()?;
+        // #1107: decide the carry again under this lock, for both outcomes.
+        if carried || record.certificate.is_none() {
+            let now_carry = stored_certificate_for(&state, &view.announcement, now);
+            if carried && now_carry != record.certificate {
+                // A record stored since the decision (for example an
+                // anonymous one after consent was withdrawn) wins.
+                return Err(EvidenceError::Invalid(
+                    "carried certificate no longer stored",
+                ));
+            }
+            if !carried && now_carry.is_some() {
+                // A Hello stored the certificate this announcement names
+                // after the carry decision. Storing this record without it
+                // would lose that certificate; redo from the carry.
+                return Err(EvidenceError::Invalid(CARRY_CHANGED));
+            }
+        }
         // A gossip pairing can have been queued before a Hello completed.
-        // The same wire pair without its fetched certificate must not undo
-        // that Hello (or cause another material write).
+        // The same wire pair must not undo that Hello (or cause another
+        // material write). The whole record is compared: a certificate-less
+        // copy reaches here with the stored certificate only if the carry
+        // rule kept it (`carry_certificate`, checked again above under this
+        // lock), so it then matches the Hello exactly.
         if source == IngestSource::Gossip
             && state.live.get(&a).is_some_and(|old| {
                 old.source == IngestSource::Hello
                     && old.wire.announcement == record.announcement
                     && old.wire.advert == record.advert
-                    && (record.certificate.is_none() || old.wire.certificate == record.certificate)
+                    && old.wire.certificate == record.certificate
             })
         {
             return Ok(());
@@ -1444,6 +1641,38 @@ fn current(view: &EvidenceView, now: u64, age: u64) -> bool {
             !cert.is_expired(now / 1000) && cert.issued_at() <= now.saturating_add(SKEW_MS) / 1000
         })
 }
+/// #1107: the under-lock carry decision differs from the one made before
+/// verification; [`PeerEvidenceStore::ingest_with_carry`] redoes the attempt.
+const CARRY_CHANGED: &str = "certificate carry changed before store";
+/// #1107: attempts of [`PeerEvidenceStore::ingest_with_carry`] before the
+/// record is refused.
+const CARRY_ATTEMPTS: usize = 3;
+/// #1107: the stored certificate bytes that an announcement without
+/// certificate bytes may keep, under the rule of
+/// [`PeerEvidenceStore::carry_certificate`]. The bytes are the stored bytes
+/// on purpose, never a re-serialization: they are exactly the bytes that
+/// were verified when the record was stored.
+fn stored_certificate_for(
+    state: &State,
+    ann: &IdentityAnnouncementV3,
+    now: u64,
+) -> Option<Vec<u8>> {
+    if ann.cert_digest == announce_v3::cert_digest(&None, &None)
+        || state.suspended.contains(&ann.agent_id)
+    {
+        return None;
+    }
+    let stored = state.verified.get(&ann.agent_id)?;
+    if stored.announcement.machine_id != ann.machine_id {
+        return None;
+    }
+    let cert = stored.certificate.as_ref()?;
+    let stored_digest = announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone()));
+    if cert.is_expired(now / 1000) || stored_digest != ann.cert_digest {
+        return None;
+    }
+    state.file.records.get(&ann.agent_id)?.certificate.clone()
+}
 fn allowed(policy: &dyn EvidencePolicy, view: &EvidenceView, now: u64) -> bool {
     let a = view.announcement.agent_id;
     let m = view.announcement.machine_id;
@@ -1494,14 +1723,24 @@ impl GossipPairing {
         record: EvidenceRecordV1,
         now: u64,
     ) -> Option<Result<()>> {
-        // Hello has already verified and ingested this exact pair. Do not
-        // repeat crypto outside its wire verify budget or strip a fetched cert.
+        // Hello has already verified and ingested this exact record. Do not
+        // repeat crypto outside its wire verify budget. A record without
+        // certificate bytes matches only when the store's carry rule
+        // (`stored_certificate_for`, #1107) would give it exactly the Hello's
+        // certificate, so this skip and the store decide alike.
         if store.state.lock().is_ok_and(|state| {
             state.live.get(&agent).is_some_and(|live| {
                 live.source == IngestSource::Hello
                     && live.wire.announcement == record.announcement
                     && live.wire.advert == record.advert
-                    && (record.certificate.is_none() || live.wire.certificate == record.certificate)
+                    && (live.wire.certificate == record.certificate
+                        || (record.certificate.is_none()
+                            && announce_v3::deserialize_v3(&record.announcement).is_ok_and(
+                                |ann| {
+                                    stored_certificate_for(&state, &ann, now)
+                                        == live.wire.certificate
+                                },
+                            )))
             })
         }) {
             return None;
@@ -1645,16 +1884,12 @@ const STORE_BUSY: &str = "store_busy";
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        dm::DmCapabilities,
-        dm_capability::{RegistryTrailer, REGISTRY_TRAILER_MAGIC},
-        identity::{AgentKeypair, MachineKeypair, UserKeypair},
-    };
+    use crate::identity::{AgentKeypair, MachineKeypair, UserKeypair};
     use std::sync::atomic::{AtomicBool, Ordering};
     const NOW: u64 = 2_000_000_000_000;
     #[derive(Default)]
-    struct Policy {
-        peers: Mutex<HashMap<AgentId, u8>>,
+    pub(super) struct Policy {
+        pub(super) peers: Mutex<HashMap<AgentId, u8>>,
         revoked: AtomicBool,
         unavailable: AtomicBool,
         epoch: std::sync::atomic::AtomicU64,
@@ -1677,86 +1912,28 @@ mod tests {
             self.peers.lock().unwrap().contains_key(&a)
         }
     }
-    struct Peer {
-        agent: AgentKeypair,
-        machine: MachineKeypair,
+    pub(super) struct Peer {
+        pub(super) agent: AgentKeypair,
+        pub(super) machine: MachineKeypair,
     }
     impl Peer {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             Self {
                 agent: AgentKeypair::generate().unwrap(),
                 machine: MachineKeypair::generate().unwrap(),
             }
         }
-        fn a(&self) -> AgentId {
+        pub(super) fn a(&self) -> AgentId {
             self.agent.agent_id()
         }
-        fn m(&self) -> MachineId {
+        pub(super) fn m(&self) -> MachineId {
             self.machine.machine_id()
         }
-        fn record(&self, ann_time: u64, advert_time: u64) -> EvidenceRecordV1 {
-            let v2 = crate::IdentityAnnouncement {
-                self_name: Some("wire name".into()),
-                agent_id: self.a(),
-                machine_id: self.m(),
-                user_id: None,
-                agent_certificate: None,
-                machine_public_key: self.machine.public_key().as_bytes().to_vec(),
-                machine_signature: vec![],
-                addresses: vec![],
-                announced_at: ann_time / 1000,
-                nat_type: None,
-                can_receive_direct: None,
-                is_relay: None,
-                is_coordinator: None,
-                reachable_via: vec![],
-                relay_candidates: vec![],
-                agent_public_key: self.agent.public_key().as_bytes().to_vec(),
-            };
-            let mut ann =
-                IdentityAnnouncementV3::build_from_v2(&v2, self.machine.secret_key(), 0).unwrap();
-            ann.sign_v3_1(self.machine.secret_key()).unwrap();
-            let mut caps = DmCapabilities::pending();
-            caps.kem_public_key = vec![42; 1184];
-            let mut advert = CapabilityAdvert {
-                protocol_version: crate::dm_capability_service::ADVERT_PROTOCOL_VERSION,
-                agent_id: *self.a().as_bytes(),
-                machine_id: *self.m().as_bytes(),
-                created_at_unix_ms: advert_time,
-                capabilities: caps,
-                signature: vec![],
-            };
-            advert.signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
-                self.agent.secret_key(),
-                &advert.signed_bytes().unwrap(),
-            )
-            .unwrap()
-            .as_bytes()
-            .to_vec();
-            let mut trailer = RegistryTrailer {
-                registry: Default::default(),
-                signature: vec![],
-            };
-            trailer.signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
-                self.agent.secret_key(),
-                &trailer.signed_bytes(&advert).unwrap(),
-            )
-            .unwrap()
-            .as_bytes()
-            .to_vec();
-            let mut bytes = postcard::to_stdvec(&advert).unwrap();
-            bytes.extend_from_slice(REGISTRY_TRAILER_MAGIC);
-            bytes.extend(postcard::to_stdvec(&trailer).unwrap());
-            EvidenceRecordV1 {
-                announcement: announce_v3::serialize_v3_1(&ann).unwrap(),
-                advert: bytes,
-                certificate: None,
-                relation: GROUP,
-                stored_at_ms: NOW,
-            }
+        pub(super) fn record(&self, ann_time: u64, advert_time: u64) -> EvidenceRecordV1 {
+            super::record_for_test(&self.agent, &self.machine, ann_time, advert_time)
         }
     }
-    fn setup(peer: &Peer) -> (tempfile::TempDir, Arc<Policy>, PeerEvidenceStore) {
+    pub(super) fn setup(peer: &Peer) -> (tempfile::TempDir, Arc<Policy>, PeerEvidenceStore) {
         let dir = tempfile::tempdir().unwrap();
         let p = Arc::new(Policy::default());
         p.peers.lock().unwrap().insert(peer.a(), GROUP);

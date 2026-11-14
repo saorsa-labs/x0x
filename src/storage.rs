@@ -19,6 +19,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(test))]
 use tokio::fs;
 
+pub(crate) mod outbox;
+
 /// Test-only FS layer for W3-H (#1245): when the entropy/wall-clock shim is
 /// active, read/write/exists/remove/metadata run on the current-thread
 /// runtime instead of `tokio::fs`'s blocking pool, so same-instant task
@@ -1085,7 +1087,7 @@ fn expire_merged_v3(store: RevocationStore, merged: &mut RevocationSet) {
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0);
     if now != 0 {
-        merged.expire_records_older_than(crate::SHARE_GRANT_REVOCATIONS_TTL_SECS, now);
+        merged.collect_dead_records(now);
     }
 }
 
@@ -1931,6 +1933,171 @@ pub async fn save_agent_certificate_to<P: AsRef<Path> + Clone>(
 pub async fn load_agent_certificate_from<P: AsRef<Path>>(path: P) -> Result<AgentCertificate> {
     let bytes = fs::read(path).await.map_err(IdentityError::from)?;
     AgentCertificate::from_storage_bytes(&bytes)
+}
+
+// ── User-identity disclosure consent (#1107) ──
+
+/// File that records the user's consent to disclose their identity in
+/// this agent's announcements. It lives in the identity directory, next
+/// to the keys.
+const USER_CONSENT_FILE: &str = "user-consent.bin";
+
+/// Magic at the start of [`USER_CONSENT_FILE`].
+const USER_CONSENT_MAGIC: &[u8; 4] = b"X0UC";
+
+/// Format version inside [`USER_CONSENT_FILE`].
+const USER_CONSENT_VERSION: u8 = 1;
+
+/// The durable record of a consented user-identity disclosure
+/// (`announce_identity(true, true)`), issue #1107.
+///
+/// Consent belongs to the identity it was given for. The record names the
+/// user and the agent, and a later start applies it only when the loaded
+/// identity discloses the same user for the same agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UserDisclosureConsent {
+    /// The user whose identity the consented announce disclosed.
+    pub(crate) user_id: crate::identity::UserId,
+    /// The agent that made the consented announce.
+    pub(crate) agent_id: crate::identity::AgentId,
+    /// Unix seconds at which the consent was recorded. Informational.
+    pub(crate) consented_at: u64,
+}
+
+/// On-disk body of [`USER_CONSENT_FILE`], after the magic.
+#[derive(Serialize, Deserialize)]
+struct SerializedUserConsent {
+    version: u8,
+    user_id: [u8; 32],
+    agent_id: [u8; 32],
+    consented_at: u64,
+}
+
+/// Encode a consent record: the 4-byte magic `X0UC` followed by the bincode
+/// body (`version: u8`, `user_id: [u8; 32]`, `agent_id: [u8; 32]`,
+/// `consented_at: u64`).
+///
+/// # Errors
+/// [`IdentityError::Serialization`] when bincode fails.
+pub(crate) fn serialize_user_disclosure_consent(record: &UserDisclosureConsent) -> Result<Vec<u8>> {
+    let body = bincode::serialize(&SerializedUserConsent {
+        version: USER_CONSENT_VERSION,
+        user_id: record.user_id.0,
+        agent_id: record.agent_id.0,
+        consented_at: record.consented_at,
+    })
+    .map_err(|e| IdentityError::Serialization(e.to_string()))?;
+    let mut bytes = Vec::with_capacity(USER_CONSENT_MAGIC.len() + body.len());
+    bytes.extend_from_slice(USER_CONSENT_MAGIC);
+    bytes.extend_from_slice(&body);
+    Ok(bytes)
+}
+
+/// Decode a consent record. Wrong magic, an unknown version, a short body
+/// and trailing bytes are all errors: the caller treats them as "no
+/// consent".
+///
+/// # Errors
+/// [`IdentityError::Serialization`] when the bytes are not one exact
+/// version-1 record.
+pub(crate) fn deserialize_user_disclosure_consent(bytes: &[u8]) -> Result<UserDisclosureConsent> {
+    let body = bytes.strip_prefix(USER_CONSENT_MAGIC).ok_or_else(|| {
+        IdentityError::Serialization("user consent record has no X0UC magic".to_string())
+    })?;
+    let data: SerializedUserConsent =
+        bincode::deserialize(body).map_err(|e| IdentityError::Serialization(e.to_string()))?;
+    if data.version != USER_CONSENT_VERSION {
+        return Err(IdentityError::Serialization(format!(
+            "user consent record version {} is not supported",
+            data.version
+        )));
+    }
+    let record = UserDisclosureConsent {
+        user_id: crate::identity::UserId(data.user_id),
+        agent_id: crate::identity::AgentId(data.agent_id),
+        consented_at: data.consented_at,
+    };
+    // bincode ignores trailing bytes; one exact record is the only valid file.
+    if serialize_user_disclosure_consent(&record)?.as_slice() != bytes {
+        return Err(IdentityError::Serialization(
+            "user consent record has trailing or non-canonical bytes".to_string(),
+        ));
+    }
+    Ok(record)
+}
+
+/// Path of the consent record: `<identity_dir>/user-consent.bin`, else the
+/// default x0x home (same rule as the revocation file; honors `X0X_HOME`).
+pub(crate) fn user_consent_path(identity_dir: Option<&Path>) -> Option<std::path::PathBuf> {
+    match identity_dir {
+        Some(dir) => Some(dir.join(USER_CONSENT_FILE)),
+        None => x0x_home_dir().map(|dir| dir.join(USER_CONSENT_FILE)),
+    }
+}
+
+/// Write the consent record: temp file (0600 on Unix), file fsync, atomic
+/// rename, parent-directory fsync.
+///
+/// # Errors
+/// [`IdentityError`] when encoding or any filesystem step fails.
+pub(crate) async fn save_user_disclosure_consent(
+    path: &Path,
+    record: &UserDisclosureConsent,
+) -> Result<()> {
+    let bytes = serialize_user_disclosure_consent(record)?;
+    write_private_bytes_durable(path, bytes).await
+}
+
+/// Read the consent record. A missing file is `Ok(None)`.
+///
+/// # Errors
+/// [`IdentityError`] when the file exists but cannot be read or decoded.
+pub(crate) async fn load_user_disclosure_consent(
+    path: &Path,
+) -> Result<Option<UserDisclosureConsent>> {
+    match fs::read(path).await {
+        Ok(bytes) => deserialize_user_disclosure_consent(&bytes).map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(IdentityError::from(e)),
+    }
+}
+
+/// Remove the consent record and fsync the directory, so a withdrawal
+/// survives a power loss. A missing file is success.
+///
+/// # Errors
+/// [`IdentityError::Storage`] when the removal or the directory sync fails.
+pub(crate) async fn clear_user_disclosure_consent(path: &Path) -> Result<()> {
+    match fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(IdentityError::from(e)),
+    }
+    // Same directory sync as the durable writer, so the removal survives
+    // a power loss.
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let dir = fs::File::open(parent).await.map_err(IdentityError::from)?;
+        dir.sync_all().await.map_err(IdentityError::from)?;
+    }
+    Ok(())
+}
+
+/// Make the consent record empty and fsync it. An empty file is not a
+/// valid record, so a load reads it as "not consented". Used when the
+/// record cannot be removed.
+///
+/// # Errors
+/// [`IdentityError::Storage`] when the write or the sync fails.
+pub(crate) async fn void_user_disclosure_consent(path: &Path) -> Result<()> {
+    fs::write(path, b"").await.map_err(IdentityError::from)?;
+    // The record is 0600 already; this covers a file that some other
+    // process created with a wider mode.
+    #[cfg(unix)]
+    fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .await
+        .map_err(IdentityError::from)?;
+    let file = fs::File::open(path).await.map_err(IdentityError::from)?;
+    file.sync_all().await.map_err(IdentityError::from)
 }
 
 /// Default path for the revocation set file.

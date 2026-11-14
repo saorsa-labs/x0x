@@ -134,7 +134,11 @@ pub trait TaskDeltaProtector: Send + Sync + 'static {
     /// keeps the epoch from moving until it is dropped. The sync loop holds
     /// the permit through the publish call, so a member removal that commits
     /// between seal and publish can never let a pre-removal record out: the
-    /// loop sees [`TaskPublication::Stale`] and re-seals instead.
+    /// loop sees [`TaskPublication::Stale`] and re-seals instead. A
+    /// protector that withholds group ciphertext while verified revocations
+    /// cover every admin seat answers `Stale` for that hold too (#1581): a
+    /// revocation that lands between seal and confirm re-seals instead of
+    /// publishing.
     ///
     /// Deliberately has no default: an unconditional confirmation is
     /// fail-open for any protector that resolves a live group key, so every
@@ -152,7 +156,9 @@ pub trait TaskDeltaProtector: Send + Sync + 'static {
     /// until it is dropped, so a flip to `MlsEncrypted` cannot commit between
     /// the check and the publish. [`TaskPublication::Stale`] sends the
     /// payload back through the sealing path instead — plaintext is never
-    /// published after the group left the public plane.
+    /// published after the group left the public plane. A protector that
+    /// withholds group ciphertext for a no-eligible-admin hold answers
+    /// `Stale` here too (#1581).
     ///
     /// Unlike [`confirm_publication`](Self::confirm_publication) this hook
     /// carries a default: it post-dates every existing implementor, and the

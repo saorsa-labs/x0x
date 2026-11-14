@@ -13,6 +13,11 @@ Leaf does not subscribe to. Full / backbone nodes are unchanged.
 GRAFT is not a wire `MessageKind`. saorsa-gossip piggybacks tree repair on
 EAGER / IHAVE / IWANT. Refusing those frames **is** refusing GRAFT.
 
+Exception (#731): a Leaf lets inbound IWANT through on a topic it published
+to in the last 60 s, so it can serve its own messages. Those IWANTs are not
+counted in `unsubscribed_refused_*`. See "Leaf publishing, `observe_only`
+metering and cooling" in `docs/504-slice1-experimental.md`.
+
 ## Meter: `relay_bytes` means non-subscribed forward
 
 saorsa-gossip 0.5.74 `pubsub_stages.outbound_publish_origin.relay_bytes` is

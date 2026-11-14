@@ -558,11 +558,7 @@ async fn expired_grant_is_denied_after_its_revocation_is_collected() {
     assert!(eval(now).await.is_empty(), "revoked while live");
 
     let horizon = grant.expiry + crate::revocation::SHARE_GRANT_REVOCATION_GC_SLACK_SECS;
-    let collected = w
-        .revocations
-        .write()
-        .await
-        .expire_records_older_than(90 * 24 * 3600, horizon);
+    let collected = w.revocations.write().await.collect_dead_records(horizon);
     assert_eq!(collected, 1, "revocation collected at expiry + slack");
     assert!(!w
         .revocations

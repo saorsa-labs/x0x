@@ -60,6 +60,18 @@ pub const MAX_OWNER_LABELS: usize = 1024;
 /// Most pins the store holds.
 pub const MAX_PINS: usize = 4096;
 
+/// Most pending grant-name suggestions the store holds (ADR 0079 §2).
+pub const MAX_SUGGESTIONS: usize = 256;
+
+/// Most recorded `default_conflict` reports (ADR 0079 §2); the oldest is
+/// dropped when full.
+pub const MAX_CONFLICTS: usize = 256;
+
+/// Most `default_conflict` reports one grant owner may hold. A further
+/// report from that owner drops its own oldest, so one owner cannot push
+/// every other owner's reports out of the table.
+pub const MAX_CONFLICTS_PER_OWNER: usize = 16;
+
 const STORE_VERSION: u32 = 1;
 
 /// Which kind of target a name addresses.
@@ -686,6 +698,9 @@ pub enum BindSource {
     Manual,
     /// Pinned at the first successful resolution.
     FirstUse,
+    /// From the owner-signed names section of a received ShareGrant
+    /// (ADR 0079 §2), applied as an ADR-0074 §1 default.
+    Grant,
 }
 
 /// An owner petname.
@@ -721,6 +736,120 @@ pub enum BindOutcome {
     Unchanged,
 }
 
+/// The name defaults one received grant carries (ADR 0079 §2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantNameDefaults {
+    /// The grant's owner (verified: the names signature binds this key).
+    pub owner: UserId,
+    /// The owner's display name, if the grant carried one.
+    pub owner_name: Option<String>,
+    /// `(machine, display name)` for machines hosting granted agents.
+    pub machines: Vec<(MachineId, String)>,
+    /// Machines with verified local hosting evidence: a discovered agent of
+    /// this grant whose certificate chains to `owner` and whose
+    /// authenticated machine binding is the machine, not revoked. A trusted
+    /// owner's machine default applies only for these machines; any other
+    /// machine is kept as a pending suggestion, the same evidence a manual
+    /// `label_shared_machine` needs.
+    pub verified_hosts: BTreeSet<[u8; 32]>,
+}
+
+/// A pending grant-names suggestion (ADR 0079 §2): a stranger's grant never
+/// applies defaults directly; the local owner applies it with
+/// `x0x names accept <label>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameSuggestion {
+    /// The suggested owner.
+    pub user_id: UserId,
+    /// The owner display name the grant carried, if any.
+    pub owner_name: Option<String>,
+    /// `(machine, display name)` the grant carried.
+    pub machines: Vec<(MachineId, String)>,
+    /// Unix seconds recorded.
+    pub suggested_at: u64,
+}
+
+/// What kind of label a `default_conflict` is about (ADR 0079 §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictKind {
+    /// An owner petname.
+    Owner,
+    /// A machine label.
+    Machine,
+}
+
+impl ConflictKind {
+    /// Stable REST string.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Machine => "machine",
+        }
+    }
+}
+
+/// Why a grant-carried default was reported and not applied (ADR 0079 §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictCase {
+    /// The default's label is already bound to another key or machine.
+    LabelTaken,
+    /// A later grant carries a different name than the one in force.
+    NameChanged,
+}
+
+impl ConflictCase {
+    /// Stable REST string.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LabelTaken => "label_taken",
+            Self::NameChanged => "name_changed",
+        }
+    }
+}
+
+/// A recorded `default_conflict` (ADR 0079 §2): reported, never applied.
+/// Only the local owner rebinds, by removing the held label first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameConflict {
+    /// Owner petname or machine label.
+    pub kind: ConflictKind,
+    /// Why the default was not applied.
+    pub case: ConflictCase,
+    /// The label in question (for `NameChanged`, the label in force).
+    pub label: String,
+    /// What the label is bound to now (hex id), or the label in force.
+    pub held: String,
+    /// What the grant offered: the hex id for `LabelTaken`, the label
+    /// derived from the offered name for `NameChanged`.
+    pub offered: String,
+    /// The display name the grant carried.
+    pub offered_name: String,
+    /// Unix seconds recorded.
+    pub reported_at: u64,
+    /// The grant owner whose default was reported (the per-owner cap key).
+    /// `None` only for a report loaded from a file written before the field.
+    pub from: Option<UserId>,
+}
+
+/// What [`NameStore::apply_grant_names`] (or an accepted suggestion) did.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GrantNamesApplied {
+    /// The owner label in force after the call (bound now or earlier).
+    pub owner_label: Option<String>,
+    /// True when this call bound the owner label.
+    pub owner_bound: bool,
+    /// Machine pin keys this call inserted.
+    pub machine_pins: Vec<String>,
+    /// True when the defaults were kept as a pending suggestion.
+    pub suggested: bool,
+    /// Newly recorded `default_conflict` reports.
+    pub conflicts: usize,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OwnerRecord {
@@ -740,16 +869,55 @@ struct PinRecord {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct SuggestedMachineRecord {
+    machine_id: String,
+    machine_name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SuggestionRecord {
+    user_id: String,
+    owner_name: Option<String>,
+    machines: Vec<SuggestedMachineRecord>,
+    suggested_at: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConflictRecord {
+    kind: ConflictKind,
+    case: ConflictCase,
+    label: String,
+    held: String,
+    offered: String,
+    offered_name: String,
+    reported_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    from: Option<String>,
+}
+
+/// ADR 0079 fields are additive with defaults: a file from before this
+/// release loads unchanged. (A DOWNGRADED daemon reading a file that has
+/// them fails closed, as any unknown field does.)
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NamesFile {
     version: u32,
     owners: BTreeMap<String, OwnerRecord>,
     pins: BTreeMap<String, PinRecord>,
+    #[serde(default)]
+    suggestions: BTreeMap<String, SuggestionRecord>,
+    #[serde(default)]
+    conflicts: Vec<ConflictRecord>,
 }
 
 #[derive(Debug, Default, Clone)]
 struct NamesState {
     owners: BTreeMap<String, OwnerBinding>,
     pins: BTreeMap<String, NamePin>,
+    suggestions: BTreeMap<String, NameSuggestion>,
+    conflicts: Vec<NameConflict>,
 }
 
 fn decode32(field: &str, raw: &str) -> Result<[u8; 32], String> {
@@ -803,6 +971,71 @@ impl NamesState {
                 },
             );
         }
+        if file.suggestions.len() > MAX_SUGGESTIONS || file.conflicts.len() > MAX_CONFLICTS {
+            return Err("names.json exceeds its size bounds".into());
+        }
+        for (label, record) in file.suggestions {
+            validate_label(&label).map_err(|e| e.to_string())?;
+            if is_reserved(&label) {
+                return Err(format!("suggested label {label:?} is reserved"));
+            }
+            if record.machines.len() > crate::share_grant::MAX_GRANT_AGENTS {
+                return Err(format!("suggestion {label:?} lists too many machines"));
+            }
+            let name_bound = crate::profile::SelfProfile::MAX_NAME_LEN;
+            if record
+                .owner_name
+                .as_ref()
+                .is_some_and(|n| n.len() > name_bound)
+                || record
+                    .machines
+                    .iter()
+                    .any(|m| m.machine_name.len() > name_bound)
+            {
+                return Err(format!(
+                    "suggestion {label:?} exceeds the name length bound"
+                ));
+            }
+            let machines = record
+                .machines
+                .into_iter()
+                .map(|m| {
+                    Ok::<_, String>((
+                        MachineId(decode32("suggested machine_id", &m.machine_id)?),
+                        m.machine_name,
+                    ))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            state.suggestions.insert(
+                label,
+                NameSuggestion {
+                    user_id: UserId(decode32("suggested user_id", &record.user_id)?),
+                    owner_name: record.owner_name,
+                    machines,
+                    suggested_at: record.suggested_at,
+                },
+            );
+        }
+        state.conflicts = file
+            .conflicts
+            .into_iter()
+            .map(|record| {
+                let from = match record.from {
+                    Some(raw) => Some(UserId(decode32("conflict from", &raw)?)),
+                    None => None,
+                };
+                Ok(NameConflict {
+                    kind: record.kind,
+                    case: record.case,
+                    label: record.label,
+                    held: record.held,
+                    offered: record.offered,
+                    offered_name: record.offered_name,
+                    reported_at: record.reported_at,
+                    from,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         Ok(state)
     }
 
@@ -836,6 +1069,42 @@ impl NamesState {
                             source: p.source,
                         },
                     )
+                })
+                .collect(),
+            suggestions: self
+                .suggestions
+                .iter()
+                .map(|(label, s)| {
+                    (
+                        label.clone(),
+                        SuggestionRecord {
+                            user_id: hex::encode(s.user_id.as_bytes()),
+                            owner_name: s.owner_name.clone(),
+                            machines: s
+                                .machines
+                                .iter()
+                                .map(|(id, name)| SuggestedMachineRecord {
+                                    machine_id: hex::encode(id.as_bytes()),
+                                    machine_name: name.clone(),
+                                })
+                                .collect(),
+                            suggested_at: s.suggested_at,
+                        },
+                    )
+                })
+                .collect(),
+            conflicts: self
+                .conflicts
+                .iter()
+                .map(|c| ConflictRecord {
+                    kind: c.kind,
+                    case: c.case,
+                    label: c.label.clone(),
+                    held: c.held.clone(),
+                    offered: c.offered.clone(),
+                    offered_name: c.offered_name.clone(),
+                    reported_at: c.reported_at,
+                    from: c.from.map(|u| hex::encode(u.as_bytes())),
                 })
                 .collect(),
         }
@@ -1267,7 +1536,8 @@ impl NameStore {
         self.commit(move |state| {
             if let Some(held) = state.owners.get(&label) {
                 return if held.user_id == user {
-                    Ok((BindOutcome::Unchanged, false))
+                    let evicted = evict_foreign_suggestion(state, &label, user);
+                    Ok((BindOutcome::Unchanged, evicted))
                 } else {
                     Err(NameError::PinMismatch {
                         name: label,
@@ -1279,6 +1549,7 @@ impl NameStore {
             if state.owners.len() >= MAX_OWNER_LABELS {
                 return Err(NameError::Store("owner label table is full".into()));
             }
+            evict_foreign_suggestion(state, &label, user);
             state.owners.insert(
                 label,
                 OwnerBinding {
@@ -1399,6 +1670,101 @@ impl NameStore {
         let state = self.lock_state().await;
         Ok((state.owners.clone(), state.pins.clone()))
     }
+
+    /// Pending grant-name suggestions and recorded `default_conflict`
+    /// reports (ADR 0079 §2), for `GET /names`.
+    ///
+    /// # Errors
+    /// [`NameError::Store`].
+    pub async fn pending(
+        &self,
+    ) -> Result<(BTreeMap<String, NameSuggestion>, Vec<NameConflict>), NameError> {
+        self.usable()?;
+        let state = self.lock_state().await;
+        Ok((state.suggestions.clone(), state.conflicts.clone()))
+    }
+
+    /// Apply the name defaults a verified grant carried (ADR 0079 §2).
+    ///
+    /// `trusted` is the contact gate: Known/Trusted owners get defaults
+    /// applied (labels frozen at first bind; a differing or taken label is
+    /// reported as a `default_conflict`, never rebound); a stranger's
+    /// defaults are kept as a pending suggestion for `accept_suggestion`.
+    /// A trusted owner's machine default is pinned only for a machine in
+    /// `defaults.verified_hosts`; any other machine is kept in that owner's
+    /// pending suggestion instead. Machine names need an owner label: when
+    /// the owner has no bound label and the grant's owner name gives none
+    /// (absent, or not a valid label), a machines-only names section is
+    /// dropped and nothing is pinned, suggested or reported. One durable
+    /// commit covers everything this call changes.
+    ///
+    /// # Errors
+    /// [`NameError::Store`].
+    pub async fn apply_grant_names(
+        &self,
+        defaults: &GrantNameDefaults,
+        trusted: bool,
+        now_unix: u64,
+    ) -> Result<GrantNamesApplied, NameError> {
+        let defaults = defaults.clone();
+        self.commit(move |state| {
+            Ok(if trusted {
+                apply_defaults_trusted(state, &defaults, now_unix)
+            } else {
+                suggest_defaults(state, &defaults, now_unix)
+            })
+        })
+        .await
+    }
+
+    /// Apply the pending suggestion under `label` as if its owner were
+    /// trusted, and remove it (ADR 0079 §2: `x0x names accept <label>`).
+    ///
+    /// # Errors
+    /// [`NameError::UnknownName`] when no suggestion is pending under
+    /// `label`; [`NameError::Store`].
+    pub async fn accept_suggestion(
+        &self,
+        label: &str,
+        now_unix: u64,
+    ) -> Result<GrantNamesApplied, NameError> {
+        validate_label(label)?;
+        let label = label.to_string();
+        self.commit(move |state| {
+            let Some(suggestion) = state.suggestions.remove(&label) else {
+                return Err(NameError::UnknownName(format!(
+                    "no pending suggestion under {label:?}"
+                )));
+            };
+            // Accepting is the local owner's explicit choice, so every
+            // machine in the suggestion counts as confirmed.
+            let verified_hosts = suggestion.machines.iter().map(|(m, _)| m.0).collect();
+            let defaults = GrantNameDefaults {
+                owner: suggestion.user_id,
+                owner_name: suggestion.owner_name,
+                machines: suggestion.machines,
+                verified_hosts,
+            };
+            let (applied, _) = apply_defaults_trusted(state, &defaults, now_unix);
+            Ok((applied, true))
+        })
+        .await
+    }
+
+    /// Drop the pending suggestion under `label`. `false` when none is
+    /// pending.
+    ///
+    /// # Errors
+    /// [`NameError::Store`].
+    pub async fn dismiss_suggestion(&self, label: &str) -> Result<bool, NameError> {
+        validate_label(label)?;
+        let label = label.to_string();
+        self.commit(move |state| {
+            let removed = state.suggestions.remove(&label).is_some();
+            Ok((removed, removed))
+        })
+        .await
+    }
 }
 
 /// A resolved name.
@@ -1488,6 +1854,376 @@ fn install_pin(
         },
     );
     Ok((BindOutcome::Inserted, true))
+}
+
+/// Record a `default_conflict` (ADR 0079 §2), deduplicated on
+/// `(kind, case, label, offered, offered_name, from)`: machine labels are
+/// unique only under one owner, so two owners' reports stay apart. An owner at
+/// [`MAX_CONFLICTS_PER_OWNER`] loses its own oldest report; otherwise the
+/// oldest report is dropped when the table is full. Returns whether it was
+/// inserted.
+fn record_conflict(state: &mut NamesState, conflict: NameConflict) -> bool {
+    let duplicate = state.conflicts.iter().any(|held| {
+        held.kind == conflict.kind
+            && held.case == conflict.case
+            && held.label == conflict.label
+            && held.offered == conflict.offered
+            && held.offered_name == conflict.offered_name
+            && held.from == conflict.from
+    });
+    if duplicate {
+        return false;
+    }
+    let own: Vec<usize> = state
+        .conflicts
+        .iter()
+        .enumerate()
+        .filter(|(_, held)| conflict.from.is_some() && held.from == conflict.from)
+        .map(|(i, _)| i)
+        .collect();
+    if own.len() >= MAX_CONFLICTS_PER_OWNER {
+        if let Some(&oldest) = own.first() {
+            state.conflicts.remove(oldest);
+        }
+    } else if state.conflicts.len() >= MAX_CONFLICTS {
+        state.conflicts.remove(0);
+    }
+    state.conflicts.push(conflict);
+    true
+}
+
+/// The machine label of pin key `machine:<label>.<owner>`; `None` for an
+/// agent pin.
+fn machine_pin_label(key: &str) -> Option<String> {
+    match parse_pin_key(key) {
+        Ok((NameKind::Machine, name)) => Some(name.label),
+        _ => None,
+    }
+}
+
+/// The label bound to `user`, if any (sync, inside a commit).
+fn label_of(state: &NamesState, user: &UserId) -> Option<String> {
+    state
+        .owners
+        .iter()
+        .find(|(_, b)| b.user_id == *user)
+        .map(|(label, _)| label.clone())
+}
+
+/// Apply grant-carried defaults for a Known or Trusted owner (ADR 0079 §2).
+///
+/// Nothing silently rebinds: an owner that already has a petname keeps it
+/// (a differing grant name is reported as `name_changed`), a machine that
+/// already has a label under the owner keeps it (a differing grant name is
+/// reported as `name_changed` too), a label bound to another key or machine
+/// reports `label_taken`, and machine pins follow the TOFU rule.
+/// A full table skips the default (hex ids keep working) rather than fail.
+fn apply_defaults_trusted(
+    state: &mut NamesState,
+    defaults: &GrantNameDefaults,
+    now_unix: u64,
+) -> (GrantNamesApplied, bool) {
+    let mut applied = GrantNamesApplied::default();
+    let mut changed = false;
+    let user = defaults.owner;
+    let derived = defaults.owner_name.as_deref().and_then(label_from_display);
+    let owner_label = match label_of(state, &user) {
+        Some(held_label) => {
+            if let (Some(derived), Some(display)) = (&derived, &defaults.owner_name) {
+                if *derived != held_label
+                    && record_conflict(
+                        state,
+                        NameConflict {
+                            kind: ConflictKind::Owner,
+                            case: ConflictCase::NameChanged,
+                            label: held_label.clone(),
+                            held: held_label.clone(),
+                            offered: derived.clone(),
+                            offered_name: display.clone(),
+                            reported_at: now_unix,
+                            from: Some(user),
+                        },
+                    )
+                {
+                    applied.conflicts += 1;
+                    changed = true;
+                }
+            }
+            Some(held_label)
+        }
+        None => match (derived, &defaults.owner_name) {
+            (Some(derived), Some(display)) => {
+                if let Some(held) = state.owners.get(&derived) {
+                    if record_conflict(
+                        state,
+                        NameConflict {
+                            kind: ConflictKind::Owner,
+                            case: ConflictCase::LabelTaken,
+                            label: derived.clone(),
+                            held: hex::encode(held.user_id.as_bytes()),
+                            offered: hex::encode(user.as_bytes()),
+                            offered_name: display.clone(),
+                            reported_at: now_unix,
+                            from: Some(user),
+                        },
+                    ) {
+                        applied.conflicts += 1;
+                        changed = true;
+                    }
+                    None
+                } else if state.owners.len() >= MAX_OWNER_LABELS {
+                    None
+                } else {
+                    evict_foreign_suggestion(state, &derived, user);
+                    state.owners.insert(
+                        derived.clone(),
+                        OwnerBinding {
+                            user_id: user,
+                            bound_at: now_unix,
+                            source: BindSource::Grant,
+                        },
+                    );
+                    applied.owner_bound = true;
+                    changed = true;
+                    Some(derived)
+                }
+            }
+            _ => None,
+        },
+    };
+    applied.owner_label = owner_label.clone();
+    let Some(owner_label) = owner_label else {
+        return (applied, changed);
+    };
+    let mut deferred: Vec<(MachineId, String)> = Vec::new();
+    for (machine, display) in &defaults.machines {
+        let Some(label) = label_from_display(display) else {
+            continue;
+        };
+        // A machine that already has a label under this owner keeps it. A
+        // later grant that names it differently is a `name_changed` report
+        // (ADR 0079 §2), never a second label.
+        let held_labels: Vec<String> = state
+            .pins
+            .iter()
+            .filter(|(_, pin)| pin.owner == user && pin.id == machine.0)
+            .filter_map(|(key, _)| machine_pin_label(key))
+            .collect();
+        if let Some(held_label) = held_labels.first() {
+            if !held_labels.contains(&label)
+                && record_conflict(
+                    state,
+                    NameConflict {
+                        kind: ConflictKind::Machine,
+                        case: ConflictCase::NameChanged,
+                        label: held_label.clone(),
+                        held: held_label.clone(),
+                        offered: label,
+                        offered_name: display.clone(),
+                        reported_at: now_unix,
+                        from: Some(user),
+                    },
+                )
+            {
+                applied.conflicts += 1;
+                changed = true;
+            }
+            continue;
+        }
+        // A signed default is only a claim that the machine hosts a granted
+        // agent. Pin it only with the same verified hosting evidence a
+        // manual label needs; otherwise hold it for the local owner.
+        if !defaults.verified_hosts.contains(&machine.0) {
+            deferred.push((*machine, display.clone()));
+            continue;
+        }
+        let key = format!("machine:{label}.{owner_label}");
+        if let Some(held) = state.pins.get(&key) {
+            if (held.id != machine.0 || held.owner != user)
+                && record_conflict(
+                    state,
+                    NameConflict {
+                        kind: ConflictKind::Machine,
+                        case: ConflictCase::LabelTaken,
+                        label: label.clone(),
+                        held: hex::encode(held.id),
+                        offered: hex::encode(machine.as_bytes()),
+                        offered_name: display.clone(),
+                        reported_at: now_unix,
+                        from: Some(user),
+                    },
+                )
+            {
+                applied.conflicts += 1;
+                changed = true;
+            }
+            continue;
+        }
+        if state.pins.len() >= MAX_PINS {
+            break;
+        }
+        state.pins.insert(
+            key.clone(),
+            NamePin {
+                id: machine.0,
+                owner: user,
+                pinned_at: now_unix,
+                source: BindSource::Grant,
+            },
+        );
+        applied.machine_pins.push(key);
+        changed = true;
+    }
+    if !deferred.is_empty() {
+        changed |= evict_foreign_suggestion(state, &owner_label, user);
+        let mut machines = state
+            .suggestions
+            .get(&owner_label)
+            .filter(|held| held.user_id == user)
+            .map(|held| held.machines.clone())
+            .unwrap_or_default();
+        for (machine, display) in deferred {
+            match machines.iter_mut().find(|(m, _)| *m == machine) {
+                Some(entry) => entry.1 = display,
+                None => machines.push((machine, display)),
+            }
+        }
+        machines.sort_by_key(|(m, _)| m.0);
+        machines.truncate(crate::share_grant::MAX_GRANT_AGENTS);
+        let next = NameSuggestion {
+            user_id: user,
+            owner_name: defaults.owner_name.clone(),
+            machines,
+            suggested_at: now_unix,
+        };
+        if let Some(stored) = store_suggestion(state, &owner_label, next) {
+            applied.suggested = true;
+            changed |= stored;
+        }
+    }
+    (applied, changed)
+}
+
+/// Keep a stranger's grant-carried defaults as a pending suggestion
+/// (ADR 0079 §2 contact gate); the local owner applies it with
+/// `x0x names accept <label>`.
+fn suggest_defaults(
+    state: &mut NamesState,
+    defaults: &GrantNameDefaults,
+    now_unix: u64,
+) -> (GrantNamesApplied, bool) {
+    let mut applied = GrantNamesApplied::default();
+    let user = defaults.owner;
+    let existing = label_of(state, &user);
+    let label = existing
+        .clone()
+        .or_else(|| defaults.owner_name.as_deref().and_then(label_from_display));
+    let Some(label) = label else {
+        return (applied, false);
+    };
+    if existing.is_none() {
+        if let Some(held) = state.owners.get(&label) {
+            let inserted = record_conflict(
+                state,
+                NameConflict {
+                    kind: ConflictKind::Owner,
+                    case: ConflictCase::LabelTaken,
+                    label: label.clone(),
+                    held: hex::encode(held.user_id.as_bytes()),
+                    offered: hex::encode(user.as_bytes()),
+                    offered_name: defaults.owner_name.clone().unwrap_or_default(),
+                    reported_at: now_unix,
+                    from: Some(user),
+                },
+            );
+            applied.conflicts += usize::from(inserted);
+            return (applied, inserted);
+        }
+    }
+    if let Some(held) = state.suggestions.get(&label) {
+        if held.user_id != user {
+            let inserted = record_conflict(
+                state,
+                NameConflict {
+                    kind: ConflictKind::Owner,
+                    case: ConflictCase::LabelTaken,
+                    label: label.clone(),
+                    held: hex::encode(held.user_id.as_bytes()),
+                    offered: hex::encode(user.as_bytes()),
+                    offered_name: defaults.owner_name.clone().unwrap_or_default(),
+                    reported_at: now_unix,
+                    from: Some(user),
+                },
+            );
+            applied.conflicts += usize::from(inserted);
+            return (applied, inserted);
+        }
+    }
+    let next = NameSuggestion {
+        user_id: user,
+        owner_name: defaults.owner_name.clone(),
+        machines: defaults.machines.clone(),
+        suggested_at: now_unix,
+    };
+    let Some(changed) = store_suggestion(state, &label, next) else {
+        return (applied, false);
+    };
+    applied.owner_label = Some(label);
+    applied.suggested = true;
+    (applied, changed)
+}
+
+/// Drop a pending suggestion under `label` that another owner left. Once
+/// `label` is bound to `user`, that suggestion can never be accepted (the
+/// label is taken), and keeping it would block `user`'s own suggestion
+/// under the label. Returns whether one was removed.
+fn evict_foreign_suggestion(state: &mut NamesState, label: &str, user: UserId) -> bool {
+    let foreign = state
+        .suggestions
+        .get(label)
+        .is_some_and(|held| held.user_id != user);
+    if foreign {
+        state.suggestions.remove(label);
+    }
+    foreign
+}
+
+/// Hold `next` as the pending suggestion under `label`. One owner holds at
+/// most one suggestion: an older suggestion from the same owner under
+/// another label is replaced. A new owner is refused when the table holds
+/// [`MAX_SUGGESTIONS`]. `None` when refused (the label is held by another
+/// owner, or the table is full); otherwise whether anything changed.
+fn store_suggestion(state: &mut NamesState, label: &str, next: NameSuggestion) -> Option<bool> {
+    if let Some(held) = state.suggestions.get(label) {
+        if held.user_id != next.user_id {
+            return None;
+        }
+    }
+    let elsewhere: Vec<String> = state
+        .suggestions
+        .iter()
+        .filter(|(held_label, held)| held_label.as_str() != label && held.user_id == next.user_id)
+        .map(|(held_label, _)| held_label.clone())
+        .collect();
+    if !state.suggestions.contains_key(label)
+        && elsewhere.is_empty()
+        && state.suggestions.len() >= MAX_SUGGESTIONS
+    {
+        return None;
+    }
+    let mut changed = !elsewhere.is_empty();
+    for held_label in elsewhere {
+        state.suggestions.remove(&held_label);
+    }
+    let same = state
+        .suggestions
+        .get(label)
+        .is_some_and(|held| held.owner_name == next.owner_name && held.machines == next.machines);
+    if !same {
+        state.suggestions.insert(label.to_string(), next);
+        changed = true;
+    }
+    Some(changed)
 }
 
 /// Check both bare-name pins and insert the selected kind under one lock.
@@ -1770,6 +2506,53 @@ impl crate::Agent {
             shared_machine_candidates(owner, &labels, &received, &agents, &revoked_machines, now)
         };
         Ok(Candidates { agents, machines })
+    }
+
+    /// Machines with verified hosting evidence for `grant` (ADR 0079 §2):
+    /// each is the authenticated machine of a discovered agent listed in
+    /// `grant.agents` whose certificate chains to `grant.owner`, with
+    /// neither the agent, the machine nor the binding revoked. This is the
+    /// evidence [`Self::label_shared_machine`] needs for a manual label,
+    /// and the only machines a grant's machine-name default may pin.
+    pub async fn verified_grant_hosts(&self, grant: &ShareGrant) -> BTreeSet<[u8; 32]> {
+        let now = unix_now_secs();
+        let granted: BTreeSet<[u8; 32]> = grant.agents.iter().map(|a| a.0).collect();
+        let entries: Vec<crate::DiscoveredAgent> = {
+            let cache = self.identity_discovery_cache.read().await;
+            cache
+                .values()
+                .filter(|d| granted.contains(&d.agent_id.0))
+                .cloned()
+                .collect()
+        };
+        let mut observed = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let machine_id = self
+                .authorized_routing_machine(&entry.agent_id, Some(entry.machine_id))
+                .await;
+            observed.push(ObservedAgent {
+                agent_id: entry.agent_id,
+                announced_user: entry.user_id,
+                certificate: entry.agent_certificate,
+                self_name: None,
+                machine_id,
+                revoked: false,
+            });
+        }
+        let revoked = self.revocation_set.read().await;
+        for agent in &mut observed {
+            agent.revoked = revoked.is_agent_revoked(&agent.agent_id)
+                || agent.machine_id.is_some_and(|m| {
+                    revoked.is_machine_revoked(&m)
+                        || revoked.is_binding_revoked(&agent.agent_id, &m)
+                });
+        }
+        drop(revoked);
+        agent_candidates(&grant.owner, &observed, now)
+            .into_iter()
+            .filter(|a| a.verified)
+            .filter_map(|a| a.machine_id.map(|m| m.0))
+            .collect()
     }
 
     /// Resolve `name` locally and pin it at first use (ADR-0074 §1).

@@ -3287,7 +3287,7 @@ pub(super) async fn join_carry_attestation(
         .map(|link| link.commit.state_hash.clone())
         .chain(std::iter::once(terminal.state_hash.clone()))
         .collect();
-    sequence.truncate(s3::ATA_MAX_LINKS);
+    sequence.truncate(s3::ata_max_links());
     let segment_terminal_revision = from_revision.saturating_add(sequence.len() as u64);
     let segment_terminal_epoch = if segment_terminal_revision == terminal.revision {
         terminal_epoch
@@ -6484,6 +6484,11 @@ async fn mint_reseat_invite(
         &state.agent.agent_id(),
         expiry_secs,
     );
+    // #646 r3 (blocker 2): the re-seat invite stays INLINE-v4 —
+    // `check_reseat_invite` reads the signed base roster from the link,
+    // so a v6 content-addressed carrier could never be redeemed. Past
+    // the inline cap `sign_v4` refuses `base_roster` as oversize, so
+    // nothing is signed or stored, exactly as before #646.
     crate::server::routes::identity::populate_invite_base_state_v4(
         &mut invite,
         &info,
@@ -14831,6 +14836,7 @@ mod tests {
                 events,
                 truncated: false,
                 responder_state_hash: None,
+                responder_state_revision: None,
             },
         )
         .await;
@@ -14984,6 +14990,7 @@ mod tests {
                 events,
                 truncated: false,
                 responder_state_hash: None,
+                responder_state_revision: None,
             },
         )
         .await;

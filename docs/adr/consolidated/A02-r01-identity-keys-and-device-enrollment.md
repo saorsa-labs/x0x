@@ -1,14 +1,14 @@
 # A02 Identity Keys and Device Enrollment
 
-- **Status:** Proposed
+- **Status:** Accepted (David, course-correction directive, 7 Nov 2026, ruling 2)
 - **Revision:** 1
 - **Date:** 2026-10-05
 - **Decision owner:** David Irvine
 - **Direction:** Confirmed by David (D198) on 2026-10-05 for this team review.
-- **Replacement activation:** Pending the transfer and acceptance checks in A15.
-- **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
+- **Replacement activation:** Active since 7 November 2026. The 15 accepted slots are the live decision authority.
+- **Supersedes:** The archived numbered records mapped to this slot in [TRANSFER.md](TRANSFER.md). The archive stays the historical record. Existing implementation gates remain in force.
 
-These slots remain Proposed (D198, D199). David accepted the archive transfer on 10 October 2026. [docs/adr/README.md](../README.md) and [docs/adr-archive/move.json](../../adr-archive/move.json) record that acceptance. Replacement acceptance and clause-level transfer checks are still open. Use the [index and transition rules](README.md) to interpret their status.
+David accepted the 15 slots at their current revisions on 7 November 2026 (course-correction directive, ruling 2). They are the live decision authority. The numbered records stay in [docs/adr-archive](../../adr-archive/ARCHIVE.md) as the historical record. [docs/adr-archive/move.json](../../adr-archive/move.json) records the archive transfer David accepted on 10 October 2026. Use the [index](README.md) for the current rules.
 
 x0x uses separate identities for a human owner, an agent and a machine. This separation lets the owner grant authority to an agent without giving that agent the owner's key.
 
@@ -29,6 +29,20 @@ The current identities are derived from ML-DSA-65 public keys using SHA-256. Any
 Machine and agent keys may be created for a new installation. A user key must never be created without an explicit owner action. An AgentCertificate binds an agent key to its owner. Device enrollment establishes which machines belong to that owner's device set.
 
 Authentication must prove the relevant agent and machine binding. A transport signature alone must not turn an unverified agent name into an authenticated sender.
+
+Device enrollment is a Tier-1 owner-sync record (decided 13 Nov 2026 by Claude under David's delegation of design decisions of 10 Nov 2026; [#1107](https://github.com/saorsa-labs/x0x/issues/1107)). Before this, an `OwnerEnrollment` stayed in the local device store of the device that made it, so another device of the same owner did not learn that a machine is enrolled, and a removal stayed local. These rules apply:
+
+1. The new kind is `DeviceEnrollment` (tag 0x05). The key is the machine ID in lowercase hex. The value is `Enrolled` with the original owner-signed `OwnerEnrollment`, or `Removed` with the removal time `deleted_at_ms`. The new kind and the new value variant come last, so the encoding of the four older kinds does not change. A device keeps kind 0x05 records in their own file (`sync/enrollment_records.json`), so `sync/records.json` holds only the four older kinds and a binary built before kind 0x05 still starts after a rollback. No file that such a binary reads ever holds a kind 0x05 record: not `sync/records.json`, not `sync/journal-intent.json`, and not `sync/apply-pending.json` (which holds only name records). A commit writes its kind 0x05 records to their own file first, and the journal intent holds only the records of the four older kinds, so the all-or-none recovery of an interrupted journal commit covers that part only. In memory the two files are one register: one version vector, one session record set and one limit.
+2. The owner key signs the record, as for every Tier-1 record.
+3. The record version is `2·t + 1` for `Removed` and `2·t` for `Enrolled`, where `t` is `deleted_at_ms` or `enrolled_at_ms`. The standard Tier-1 rule (highest version wins) is not changed. Thus a later time wins, a removal wins at the same millisecond, and a re-enrollment needs a newer time than the removal. A record whose version does not follow this rule, or whose `Enrolled` value names another machine than its key, is refused.
+4. Removals sync as signed records. Without them, a machine removed on one device stays trusted on the other devices.
+5. A receiving device applies `Enrolled` through the existing enrollment path, so the tombstone and signature checks stay. It applies `Removed` through an unenroll step that only moves the tombstone forward. A device ignores records about its own machine. ADR-0018 machine revocation stays separate and still overrides enrollment. Expiry is still checked on every read.
+6. SyncV1 moves to protocol 3. A device accepts a `Hello` of version 2 or 3, and the session runs at the lower version. A protocol-2 session never sends or accepts kind 0x05, so a mixed-version fleet keeps syncing the four older kinds. A protocol-2 node refuses a `Hello` of any other version. Thus a device remembers, in memory, the version to send to each peer, and opens the next session with it. A received `Hello` lowers this version only when the peer sent a lower version than this device sent. A completed session raises it to at least the higher of the two versions, because the peer accepted the version this device sent, and never lowers it. So two sessions that run at the same time cannot leave both devices at protocol 2. After a restart of a protocol-3 device, the first session that it opens to a released protocol-2 device can fail; the next session runs at protocol 2.
+7. An enrollment learned this way admits SyncV1 from that machine, because it is owner-signed.
+8. At start, a device mints a record for each local enrollment and each local tombstone. This is safe to repeat, because the version comes from the timestamps. It does not mint a record when the register already holds a record with the same version for that machine, so a restart causes no new records. Also at start, it verifies again and applies every stored kind 0x05 record. A device that ran the first pull request stored received kind 0x05 records without applying them, and a peer does not send a record of an equal version again.
+9. `Removed` records are not pruned for now. They count toward the store limit of 4096 records.
+
+Accepted risk: a device that holds the owner key can now enroll a machine for all the owner's devices. That device can already write every other Tier-1 kind. [A10](A10-r01-shared-data-files-and-synchronization.md) already lists enrollment as owner-sync state. The work is in three pull requests: (1) the kind, the value, the version rule and the protocol-3 negotiation; (2) minting, applying, the unenroll step and the start-up migration; (3) documentation and the record source in `/sync/devices`.
 
 ## Key custody and placement
 

@@ -80,6 +80,11 @@ pub(crate) mod file_lock;
 /// gossip-fed set consulted at every trust gate.
 pub mod revocation;
 
+/// #1003 (ADR 0080, archived; slot A03): the direct, capability-gated
+/// single-record push of a share-grant revocation. Gossip stays the
+/// backstop.
+pub mod revocation_push;
+
 /// ADR-0043 agent key-move protocol: the per-agent signed move log, the
 /// total fold (custodian / retired bindings / placement / phase), the
 /// participant CAS and mesh verification rules, the ML-KEM export
@@ -145,7 +150,11 @@ pub mod mls;
 
 /// A2A (Agent2Agent) interoperability — Agent Card adapter (ADR-0017).
 pub mod a2a;
+
 pub mod delegation;
+/// Install-and-join onboarding recipe shared by `GET /onboard` and
+/// `x0x onboard` (#894, R11).
+pub mod onboard;
 
 /// Direct agent-to-agent messaging.
 ///
@@ -681,6 +690,8 @@ pub struct Agent {
     /// cleared — carrying an explicit no-name — so peers ERASE the cached
     /// name instead of displaying it forever (see the upsert clear rule).
     self_name_ever_set: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Orders this agent's own identity announces (see [`OwnAnnounceOrder`]).
+    own_announce_order: OwnAnnounceOrder,
     /// ADR-0036 owner certificate journal (sibling of `agent.cert`);
     /// `None` when no user identity is configured. Written at cert-issue
     /// time; read by `GET /owner/agents` as the authoritative base roster.
@@ -780,8 +791,36 @@ pub struct Agent {
     /// Whether the user has consented to disclosing their identity in
     /// announcements.  Set by a successful `announce_identity(true, true)`
     /// and respected by the heartbeat so it doesn't erase a consented
-    /// disclosure.
+    /// disclosure. Loaded at build from the durable record
+    /// (`user_consent_path`) when that record names this identity (#1107).
     user_identity_consented: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Where the durable consent record lives (#1107):
+    /// `<identity dir>/user-consent.bin`. `None` when there is no identity
+    /// directory and no home directory; consent is then in-memory only.
+    user_consent_path: Option<std::path::PathBuf>,
+    /// Serialises changes to the consent flag and its durable record, so a
+    /// consented announce and a withdrawal cannot leave the two in
+    /// disagreement.
+    user_consent_record_lock: tokio::sync::Mutex<()>,
+    /// Counts withdrawals. A consented announce reads it before it
+    /// publishes; if it has changed when the announce comes to record
+    /// consent, a withdrawal completed in between and the announce records
+    /// nothing. Changed only under `user_consent_record_lock`.
+    user_consent_generation: std::sync::atomic::AtomicU64,
+    /// Whether the durable record is on disk for the current consent. Off
+    /// after a failed write, so the next consented announce tries again.
+    /// Changed only under `user_consent_record_lock`.
+    user_consent_record_saved: std::sync::atomic::AtomicBool,
+    /// Test hook: a consented announce stops here after its publish and
+    /// before it records consent. It sends on the first channel, then
+    /// waits for the second.
+    #[cfg(test)]
+    consented_publish_test_gate: std::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     /// Capability store populated by the advert service and consulted by
     /// `send_direct` to choose between gossip and raw-QUIC paths.
     capability_store: std::sync::Arc<dm_capability::CapabilityStore>,
@@ -903,6 +942,9 @@ pub struct Agent {
     /// at build time; future revisions merge in gossip-announced candidates
     /// at runtime, hence the `RwLock` for mutable runtime state.
     relay_candidates: std::sync::Arc<tokio::sync::RwLock<Vec<identity::AgentId>>>,
+    /// #1863: whether a named group lists an agent as a member (any
+    /// state). Installed by `x0xd`; the revocation heartbeat reads it.
+    revocation_group_seen: RevocationGroupSeenSlot,
     /// Tailnet byte-stream accept loop state (#132 T1): a bounded channel
     /// surfacing inbound [`streams::PeerStream`]s that have cleared the
     /// identity gate, plus an idempotent started-flag for the accept loop.
@@ -3896,8 +3938,7 @@ async fn apply_legacy_revocation_records(
     revocation_set: &std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
     s4_intake: &groups::eviction::RevocationIntake,
     identity_dir: Option<std::path::PathBuf>,
-    owner_trust: &owner_trust::OwnerTrust,
-    contact_store: &std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
+    seen: &RevocationSeenSources,
     discovery_cache: &std::sync::Arc<
         tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
     >,
@@ -3905,6 +3946,8 @@ async fn apply_legacy_revocation_records(
         tokio::sync::RwLock<std::collections::HashMap<identity::MachineId, DiscoveredMachine>>,
     >,
 ) {
+    let owner_trust = &seen.owner_trust;
+    let contact_store = &seen.contact_store;
     let mut newly_inserted = Vec::new();
     {
         let _share_grant_barrier = owner_trust
@@ -3912,7 +3955,7 @@ async fn apply_legacy_revocation_records(
             .await;
         let mut set = revocation_set.write().await;
         for record in records {
-            if set.contains_hash(&record.record_hash()) {
+            if set.covers(&record) {
                 continue;
             }
             let subject_cert = match &record.subject {
@@ -3950,6 +3993,11 @@ async fn apply_legacy_revocation_records(
             s4_intake.clone(),
             identity_dir.clone(),
         );
+        // #1863: the eviction below blocks the subject as a contact, and a
+        // group admin's eviction removes its member row, so the evidence
+        // goes away. Mark the subjects first, from every source, by the
+        // same rule as the heartbeat (`SeenEvidence`).
+        SeenEvidence::gather(seen).await.mark(revocation_set).await;
         for record in newly_inserted {
             match &record.subject {
                 revocation::RevokedSubject::Agent(agent_id) => {
@@ -4017,7 +4065,7 @@ async fn apply_v2_revocation_records(
             .await;
         let mut set = revocation_set.write().await;
         for record in records {
-            if set.contains_hash(&record.record_hash()) {
+            if set.covers(&record) {
                 continue;
             }
             let subject_cert = match &record.subject {
@@ -4091,8 +4139,8 @@ struct LegacyCertRecovery {
     revocation_set: std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
     s4_intake: groups::eviction::RevocationIntake,
     identity_dir: Option<std::path::PathBuf>,
-    owner_trust: owner_trust::OwnerTrust,
-    contact_store: std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
+    /// #1863: also the owner trust and contact store that the eviction uses.
+    seen: RevocationSeenSources,
     discovery_cache: std::sync::Arc<
         tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
     >,
@@ -4632,8 +4680,7 @@ fn spawn_cert_recovery_task(
                     &batch.revocation_set,
                     &batch.s4_intake,
                     batch.identity_dir,
-                    &batch.owner_trust,
-                    &batch.contact_store,
+                    &batch.seen,
                     &batch.discovery_cache,
                     &batch.machine_cache,
                 )
@@ -4943,16 +4990,29 @@ impl AnnouncementAssistSnapshot {
 /// #398: explicit operator opt-in for announcing relay/coordinator
 /// capability without verified public reachability (manually
 /// port-forwarded hosts, hosts behind an operator-trusted edge). Checked
-/// once per process; absent by default.
+/// once per process; absent by default. argv is compared as raw OS bytes
+/// because collecting it as `String`s would panic on non-UTF-8 argv
+/// mid-daemon (#1375).
 fn relay_opt_in_explicit() -> bool {
     static OPT_IN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OPT_IN.get_or_init(|| {
-        // Command line: --relay / --relay-opt-in flag present.
-        let argv_opt_in = std::env::args().any(|arg| arg == "--relay" || arg == "--relay-opt-in");
-        // Environment: X0X_RELAY_OPT_IN=1.
-        let env_opt_in = std::env::var_os("X0X_RELAY_OPT_IN").is_some_and(|v| v == "1");
-        argv_opt_in || env_opt_in
+        relay_opt_in_from(std::env::args_os(), std::env::var_os("X0X_RELAY_OPT_IN"))
     })
+}
+
+/// Pure decision core of [`relay_opt_in_explicit`], split out so the
+/// argv/env byte handling is unit-testable without owning process argv.
+fn relay_opt_in_from<I>(argv: I, env: Option<std::ffi::OsString>) -> bool
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    // Command line: --relay / --relay-opt-in flag present.
+    let argv_opt_in = argv
+        .into_iter()
+        .any(|arg| arg == "--relay" || arg == "--relay-opt-in");
+    // Environment: X0X_RELAY_OPT_IN=1.
+    let env_opt_in = env.is_some_and(|v| v == "1");
+    argv_opt_in || env_opt_in
 }
 
 struct IdentityAnnouncementBuildOptions<'a> {
@@ -4969,6 +5029,36 @@ fn push_unique<T: Copy + PartialEq>(items: &mut Vec<T>, item: T) {
     if !items.contains(&item) {
         items.push(item);
     }
+}
+
+/// The certificate fields of an agent's OWN discovery record, written
+/// directly after it publishes `announcement`: the pair the announcement
+/// carries and the digest its V3 form commits to
+/// ([`announce_v3::cert_digest`], as in `build_from_v2`).
+///
+/// The self-write moves the entry to the announcement's `announced_at`, so
+/// it must commit to the same digest, including the anonymous digest. The
+/// digest is always `Some` on purpose. A digest-less self-write at that
+/// second keeps a stale certificate, and the #1643 equal-second rule then
+/// stops the listener's ingest of the same beat from withdrawing it.
+fn own_announcement_cert_fields(
+    announcement: &IdentityAnnouncement,
+) -> (
+    Option<u64>,
+    Option<identity::AgentCertificate>,
+    Option<[u8; 32]>,
+) {
+    (
+        announcement
+            .agent_certificate
+            .as_ref()
+            .and_then(identity::AgentCertificate::not_after),
+        announcement.agent_certificate.clone(),
+        Some(announce_v3::cert_digest(
+            &announcement.user_id,
+            &announcement.agent_certificate,
+        )),
+    )
 }
 
 fn prioritize_discovery_addresses(addresses: &mut [std::net::SocketAddr]) {
@@ -5534,8 +5624,14 @@ pub(crate) mod announced_record_barrier {
     use std::collections::HashMap;
     use std::sync::{Arc, LazyLock, Mutex};
 
+    /// The identity listener, before it records the authenticated machine
+    /// binding of an accepted announcement (#1845).
+    pub(crate) const INGEST_BEFORE_BINDING: &str = "ingest_before_binding";
     pub(crate) const INGEST_BETWEEN_WRITES: &str = "ingest_between_writes";
     pub(crate) const HYDRATION_PUBLISH: &str = "hydration_publish";
+    /// A heartbeat-style beat, after it read `announced_at` and the
+    /// self-name and before its first publish.
+    pub(crate) const HEARTBEAT_AFTER_NAME_READ: &str = "heartbeat_after_name_read";
 
     pub(crate) struct Gate {
         /// One permit each time a task parks here.
@@ -6187,6 +6283,19 @@ pub struct AgentBuilder {
     history_config: Option<history::HistoryConfig>,
 }
 
+/// Orders the builders of this agent's own identity announce: the explicit
+/// announce (`Agent::publish_identity_announcement`) and every heartbeat-style
+/// beat (`HeartbeatContext::announce`). One builder holds the lock from its
+/// `announced_at` read to its discovery self-write.
+///
+/// `upsert_discovered_agent` accepts an equal `announced_at`, so of two own
+/// announces in one clock second the later arrival wins. Without this order a
+/// beat that read the self-name before a rename could publish and self-write
+/// after the announce of that rename. The old name then stayed, locally and
+/// on peers, until the next heartbeat. With it, the announce that starts last
+/// reads the newest name and is also published and written last.
+type OwnAnnounceOrder = std::sync::Arc<tokio::sync::Mutex<()>>;
+
 struct HeartbeatContext {
     /// ADR-0043: this machine's enrolled ML-KEM public bytes (publishes
     /// on the V3 machine announce); `None` disables V3 publication.
@@ -6227,9 +6336,13 @@ struct HeartbeatContext {
     self_name: std::sync::Arc<std::sync::RwLock<Option<String>>>,
     /// Shared ever-named latch (see `Agent::self_name_ever_set`).
     self_name_ever_set: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Shared with `Agent::own_announce_order` (see [`OwnAnnounceOrder`]).
+    own_announce_order: OwnAnnounceOrder,
     /// E2d: shared verified-certificate event ring (the self-announce
     /// record carries no certificate, but the upsert signature is shared).
     verified_cert_tx: std::sync::Arc<tokio::sync::broadcast::Sender<VerifiedCertificate>>,
+    /// #1863: the sources that make a revoked subject "seen".
+    revocation_seen: RevocationSeenSources,
 }
 
 impl HeartbeatContext {
@@ -6242,6 +6355,7 @@ impl HeartbeatContext {
     }
 
     async fn announce(&self) -> error::Result<()> {
+        let own_announce_guard = self.own_announce_order.lock().await;
         let machine_public_key = self
             .identity
             .machine_keypair()
@@ -6413,6 +6527,12 @@ impl HeartbeatContext {
             relay_candidates: relay_candidates.clone(),
             agent_public_key,
         };
+        #[cfg(test)]
+        announced_record_barrier::park(
+            &announcement.agent_id,
+            announced_record_barrier::HEARTBEAT_AFTER_NAME_READ,
+        )
+        .await;
         tracing::debug!(
             target: "x0x::discovery",
             announcement_kind = "heartbeat",
@@ -6582,6 +6702,8 @@ impl HeartbeatContext {
             ),
         )
         .await;
+        let (cert_not_after, agent_certificate, cert_digest) =
+            own_announcement_cert_fields(&announcement);
         let discovered_agent = DiscoveredAgent {
             self_name: announcement.self_name.clone(),
             agent_id: announcement.agent_id,
@@ -6597,13 +6719,14 @@ impl HeartbeatContext {
             is_coordinator: announcement.is_coordinator,
             reachable_via: announcement.reachable_via.clone(),
             relay_candidates: announcement.relay_candidates.clone(),
-            cert_not_after: None,
-            agent_certificate: None,
+            cert_not_after,
+            agent_certificate,
             agent_public_key: announcement.agent_public_key.clone(),
-            cert_digest: None,
+            cert_digest,
         };
         upsert_discovered_machine_from_agent(&self.machine_cache, &discovered_agent).await;
         upsert_discovered_agent(&self.cache, &self.verified_cert_tx, discovered_agent).await;
+        drop(own_announce_guard);
 
         // ADR-0043 §2.1: publish the V3 machine announcement (enrollment
         // KEM key + placement digests + capability advert) on its own
@@ -6703,11 +6826,12 @@ impl HeartbeatContext {
         // KB/s fleet-wide (2 stale July test records × 19 KB × every node
         // × every 300 s) on a topic that should be near-silent. Now:
         //
-        // 1. TTL expiry first — records older than 90 days are dropped
-        //    (they target agents nobody has seen for months; the 2 stale
-        //    July testnet records die here).
+        // 1. Collect dead records first. Only a share-grant record whose
+        //    grant is past its signed expiry goes. Agent, machine and
+        //    binding records are never removed because of their age
+        //    (#1108): an age sweep made a revoked key valid again.
         // 2. Publish the full set only when the change_generation advanced
-        //    since our last broadcast (a record was inserted or expired).
+        //    since our last broadcast (a record was inserted or collected).
         // 3. Every 12th heartbeat (12 × 600 s = 2 h at the default
         //    IDENTITY_HEARTBEAT_INTERVAL_SECS), republish regardless
         //    — the partition-tolerance fallback for nodes that joined or
@@ -6717,22 +6841,29 @@ impl HeartbeatContext {
         // Vec<RevocationRecord> on x0x.revocation.v1; old nodes that
         // receive it process it identically.
         {
-            const REVOCATION_RECORD_TTL_SECS: u64 = 90 * 24 * 3600;
             const REVOCATION_FALLBACK_TICKS: u64 = 12;
 
-            let expired = {
+            let collected = {
                 let mut set = self.revocation_set.write().await;
-                set.expire_records_older_than(
-                    REVOCATION_RECORD_TTL_SECS,
-                    Agent::unix_timestamp_secs(),
-                )
+                set.collect_dead_records(Agent::unix_timestamp_secs())
             };
-            if expired > 0 {
+            if collected > 0 {
                 tracing::info!(
-                    expired,
-                    "revocation TTL: expired {expired} record(s) older than 90 days"
+                    collected,
+                    "revocation sweep: removed {collected} record(s) of expired share grants"
                 );
             }
+
+            // #1863: a held self-revocation of a subject this node has
+            // now seen joins the published set at once.
+            let newly_seen =
+                mark_seen_revocation_subjects(&self.revocation_set, &self.revocation_seen).await;
+            crate::identity_authority::set_revocation_stranger_self_held(
+                self.revocation_set
+                    .read()
+                    .await
+                    .stranger_self_revocation_count() as u64,
+            );
 
             let tick = self
                 .heartbeat_tick
@@ -6744,7 +6875,7 @@ impl HeartbeatContext {
             let changed = current_gen != last_gen;
             let is_fallback = tick.is_multiple_of(REVOCATION_FALLBACK_TICKS);
 
-            if !changed && !is_fallback {
+            if !changed && !is_fallback && !newly_seen {
                 return Ok(());
             }
 
@@ -6752,51 +6883,49 @@ impl HeartbeatContext {
             // topic (binding records only — the v1 batch stays
             // byte-identical for old peers). Same on-change + fallback
             // gating as the v1 arm.
-            let binding_records = self.revocation_set.read().await.binding_records();
-            if !binding_records.is_empty() {
-                if let Ok(bytes) = revocation::encode_revocation_batch(&binding_records) {
-                    let _ = self
-                        .runtime
-                        .pubsub()
-                        .publish(REVOCATION_V2_TOPIC.to_string(), bytes::Bytes::from(bytes))
-                        .await;
-                }
-            }
-            // ADR-0070: share-grant revocations ride v3 only, same gating.
-            let share_grant_records = self.revocation_set.read().await.share_grant_records();
-            if !share_grant_records.is_empty() {
-                if let Ok(bytes) = revocation::encode_revocation_batch(&share_grant_records) {
-                    let _ = self
-                        .runtime
-                        .pubsub()
-                        .publish(REVOCATION_V3_TOPIC.to_string(), bytes::Bytes::from(bytes))
-                        .await;
-                }
-            }
-
-            let records = self.revocation_set.read().await.all_records();
-            if !records.is_empty() {
-                match revocation::encode_revocation_batch(&records) {
-                    Ok(bytes) => {
-                        if let Err(e) = self
-                            .runtime
-                            .pubsub()
-                            .publish(REVOCATION_TOPIC.to_string(), bytes::Bytes::from(bytes))
-                            .await
-                        {
-                            tracing::debug!("heartbeat: revocation re-broadcast failed: {e}");
-                        } else {
-                            self.last_revocation_generation
-                                .store(current_gen, std::sync::atomic::Ordering::Relaxed);
+            // #1857: every carrier goes out as one or more batches under
+            // the size a receiver accepts (one oversized batch was ignored
+            // whole). The v1 batch stays byte-identical for old peers.
+            let publish_lock = self.revocation_set.read().await.publish_lock();
+            let _one_round = publish_lock.lock().await;
+            let carriers = {
+                let set = self.revocation_set.read().await;
+                [REVOCATION_V2_TOPIC, REVOCATION_V3_TOPIC, REVOCATION_TOPIC]
+                    .map(|topic| (topic, revocation_heartbeat_batches(&set, topic)))
+            };
+            let mut all_sent = true;
+            for (topic, encoded) in carriers {
+                match encoded {
+                    Ok(batches) => {
+                        for bytes in batches {
+                            if let Err(e) = self
+                                .runtime
+                                .pubsub()
+                                .publish(topic.to_string(), bytes::Bytes::from(bytes))
+                                .await
+                            {
+                                all_sent = false;
+                                tracing::debug!(
+                                    topic,
+                                    "heartbeat: revocation re-broadcast failed: {e}"
+                                );
+                            }
                         }
                     }
                     Err(e) => {
-                        tracing::debug!("heartbeat: failed to serialize revocation set: {e}");
+                        all_sent = false;
+                        tracing::debug!(
+                            topic,
+                            "heartbeat: failed to serialize revocation set: {e}"
+                        );
                     }
                 }
-            } else if changed {
-                // Set became empty (all records expired) — advance the
-                // generation tracker so we don't re-enter on every tick.
+            }
+            // A failed batch on ANY carrier leaves the generation behind,
+            // so the next heartbeat publishes the set again. An empty set
+            // also advances the tracker, so an emptied set does not
+            // re-enter on every tick.
+            if all_sent {
                 self.last_revocation_generation
                     .store(current_gen, std::sync::atomic::Ordering::Relaxed);
             }
@@ -6857,6 +6986,253 @@ fn raw_dm_history_record(
     })
 }
 
+/// The records that a publish sends on a revocation topic. Every publish
+/// path (the heartbeat and a local revocation) reads its records here.
+/// The v1 topic leaves out the self-revocations of strangers (#1863).
+fn revocation_publish_records(
+    set: &revocation::RevocationSet,
+    topic: &str,
+) -> Vec<revocation::RevocationRecord> {
+    match topic {
+        REVOCATION_V2_TOPIC => set.binding_records(),
+        REVOCATION_V3_TOPIC => set.share_grant_records(),
+        REVOCATION_TOPIC => set.published_records(),
+        _ => Vec::new(),
+    }
+}
+
+/// The batches that the heartbeat sends on a revocation topic. These are
+/// the batches of [`revocation_publish_records`]. When that set is empty
+/// and this node's carrier is open, it is one empty-set statement (#1867),
+/// so a peer that waits for a resync can open. A closed carrier sends
+/// nothing: this node does not know its set. Other publish paths send no
+/// statement.
+fn revocation_heartbeat_batches(
+    set: &revocation::RevocationSet,
+    topic: &str,
+) -> Result<Vec<Vec<u8>>, bincode::Error> {
+    let records = revocation_publish_records(set, topic);
+    let carrier = match topic {
+        REVOCATION_TOPIC => revocation::REVOCATION_CARRIER_V1,
+        REVOCATION_V2_TOPIC => revocation::REVOCATION_CARRIER_V2,
+        REVOCATION_V3_TOPIC => revocation::REVOCATION_CARRIER_V3,
+        _ => return Ok(Vec::new()),
+    };
+    if !records.is_empty() {
+        return revocation::encode_revocation_batches(&records);
+    }
+    if set.carrier_closed(carrier) {
+        return Ok(Vec::new());
+    }
+    Ok(vec![revocation::encode_empty_set_statement()?])
+}
+
+/// #1863: whether a named group gives an agent a relationship with this
+/// node (see [`revocation_group_relationship`]). The check gets the agents
+/// to test and returns the ones that have a relationship. It is async, so
+/// it can wait for a roster lock (#1867), and it gets all the agents in
+/// one call, so it takes that lock one time. The agent awaits it with no
+/// revocation-set lock held.
+pub type RevocationGroupSeen = std::sync::Arc<
+    dyn Fn(
+            Vec<identity::AgentId>,
+        )
+            -> futures::future::BoxFuture<'static, std::collections::HashSet<identity::AgentId>>
+        + Send
+        + Sync,
+>;
+
+/// The slot that `x0xd` fills with its [`RevocationGroupSeen`] check.
+type RevocationGroupSeenSlot = std::sync::Arc<std::sync::RwLock<Option<RevocationGroupSeen>>>;
+
+/// #1863: every source of [`SeenEvidence`]. The gossip ingest, the local
+/// apply path and the heartbeat each hold one, and
+/// [`SeenEvidence::gather`] reads all of it, so no caller can leave a
+/// source out.
+#[derive(Clone)]
+struct RevocationSeenSources {
+    own_agent: identity::AgentId,
+    own_machine: identity::MachineId,
+    /// The owner of this agent, whose issued-certificate journal counts.
+    owner: Option<identity::UserId>,
+    contact_store: std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
+    cert_journal_path: Option<std::path::PathBuf>,
+    groups: RevocationGroupSeenSlot,
+    owner_trust: owner_trust::OwnerTrust,
+}
+
+/// What makes a revoked subject "seen" (#1863), read once. The gossip
+/// ingest, the local apply path and the heartbeat use this one rule.
+///
+/// Seen means a relationship that a peer cannot create alone for a fresh
+/// key:
+/// - agent: this daemon's own agent; a contact with trust Known or
+///   Trusted (only the local user sets that); an agent in this owner's
+///   issued-certificate journal (only this owner writes it); an active
+///   member of an approval-only named group that this node is an active
+///   member of (see [`revocation_group_relationship`]).
+/// - machine: this daemon's own machine; a machine in this owner's
+///   verified device roster; a machine listed on a Known or Trusted
+///   contact (recorded from that contact's verified, agent-signed
+///   announcements).
+///
+/// Not seen: the discovery caches, an Unknown or Blocked contact, a
+/// pending, removed or banned group row, a member of an open-join group. A
+/// verified announce from a fresh key fills the discovery caches and
+/// makes an Unknown contact entry, and applying a revocation blocks its
+/// subject as a contact; none of these is a relationship.
+struct SeenEvidence {
+    own_agent: identity::AgentId,
+    own_machine: identity::MachineId,
+    related_contacts: std::collections::HashSet<identity::AgentId>,
+    contact_machines: std::collections::HashSet<identity::MachineId>,
+    owner_agents: std::collections::HashSet<String>,
+    group: Option<RevocationGroupSeen>,
+    owner_trust: owner_trust::OwnerTrust,
+}
+
+impl SeenEvidence {
+    /// Read every source of "seen" once. This is the only constructor, so
+    /// the gossip ingest, the local apply path and the heartbeat cannot
+    /// differ in what they read.
+    async fn gather(sources: &RevocationSeenSources) -> Self {
+        let mut related_contacts = std::collections::HashSet::new();
+        let mut contact_machines = std::collections::HashSet::new();
+        {
+            let contacts = sources.contact_store.read().await;
+            for contact in contacts.list() {
+                if !matches!(
+                    contact.trust_level,
+                    contacts::TrustLevel::Known | contacts::TrustLevel::Trusted
+                ) {
+                    continue;
+                }
+                related_contacts.insert(contact.agent_id);
+                contact_machines.extend(contact.machines.iter().map(|record| record.machine_id));
+            }
+        }
+        let mut owner_agents = std::collections::HashSet::new();
+        if let (Some(owner), Some(path)) = (sources.owner, sources.cert_journal_path.as_deref()) {
+            let owner_hex = hex::encode(owner.as_bytes());
+            for record in profile::IssuedCertRecord::load(path).await {
+                if record.user_id == owner_hex {
+                    owner_agents.insert(record.agent_id);
+                }
+            }
+        }
+        Self {
+            own_agent: sources.own_agent,
+            own_machine: sources.own_machine,
+            related_contacts,
+            contact_machines,
+            owner_agents,
+            group: sources
+                .groups
+                .read()
+                .ok()
+                .and_then(|slot| slot.as_ref().map(std::sync::Arc::clone)),
+            owner_trust: sources.owner_trust.clone(),
+        }
+    }
+
+    /// Every source but the group check, which [`Self::mark`] asks one
+    /// time for all the agents that are left.
+    async fn seen_without_groups(&self, subject: &revocation::SeenSubject) -> bool {
+        match subject {
+            revocation::SeenSubject::Agent(agent) => {
+                self.own_agent == *agent
+                    || self.related_contacts.contains(agent)
+                    || self.owner_agents.contains(&hex::encode(agent.as_bytes()))
+            }
+            revocation::SeenSubject::Machine(machine) => {
+                self.own_machine == *machine
+                    || self.contact_machines.contains(machine)
+                    || self.owner_trust.machine_in_owner_roster(machine).await
+            }
+        }
+    }
+
+    /// Mark the held strangers that this evidence shows as seen. Returns
+    /// `true` when the published set changed.
+    async fn mark(&self, revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>) -> bool {
+        let strangers = revocation_set
+            .read()
+            .await
+            .stranger_self_revocation_subjects();
+        let mut seen = Vec::new();
+        let mut ask_groups = Vec::new();
+        for subject in strangers {
+            if self.seen_without_groups(&subject).await {
+                seen.push(subject);
+            } else if let revocation::SeenSubject::Agent(agent) = &subject {
+                ask_groups.push(*agent);
+            }
+        }
+        // #1867: one awaited roster read for all the agents. A read for
+        // each held stranger would let a flood of strangers' records hold
+        // the ingest behind every roster writer.
+        if let (Some(related), false) = (&self.group, ask_groups.is_empty()) {
+            let related = related(ask_groups).await;
+            seen.extend(related.into_iter().map(revocation::SeenSubject::Agent));
+        }
+        !seen.is_empty() && revocation_set.write().await.mark_seen(seen)
+    }
+}
+
+/// Whether a named group gives `subject` a relationship with this node
+/// (#1863): the group is not withdrawn, admits only with approval
+/// (`InviteOnly`, `RequestAccess` or `OwnerCertified`; any other variant,
+/// also one this node does not know, does not count), lists this node as
+/// an active member, and lists `subject` as an ACTIVE member. A pending
+/// row (a join request), a removed row and a banned row do not count: a
+/// requester makes a pending row alone, and cancelling or a rejection
+/// turns it into a removed row.
+#[must_use]
+pub fn revocation_group_relationship<'a>(
+    groups: impl IntoIterator<Item = &'a groups::GroupInfo>,
+    local: &identity::AgentId,
+    subject: &identity::AgentId,
+) -> bool {
+    let local_hex = hex::encode(local.as_bytes());
+    let subject_hex = hex::encode(subject.as_bytes());
+    groups.into_iter().any(|group| {
+        !group.withdrawn
+            && matches!(
+                group.policy.admission,
+                groups::policy::GroupAdmission::InviteOnly
+                    | groups::policy::GroupAdmission::RequestAccess
+                    | groups::policy::GroupAdmission::OwnerCertified(_)
+            )
+            && group
+                .members_v2
+                .get(&local_hex)
+                .is_some_and(groups::GroupMember::is_active)
+            && group
+                .members_v2
+                .get(&subject_hex)
+                .is_some_and(groups::GroupMember::is_active)
+    })
+}
+
+/// The heartbeat step of #1863: mark each held self-revocation of a
+/// stranger whose subject this node now has a relationship with (see
+/// [`SeenEvidence`]). The marks are in memory: after a restart, a subject
+/// whose only relationship was a contact that its revocation blocked is a
+/// stranger again, and its record is no longer published. Returns `true`
+/// when the published set changed.
+async fn mark_seen_revocation_subjects(
+    revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
+    sources: &RevocationSeenSources,
+) -> bool {
+    if revocation_set.read().await.stranger_self_revocation_count() == 0 {
+        return false;
+    }
+    SeenEvidence::gather(sources)
+        .await
+        .mark(revocation_set)
+        .await
+}
+
 /// File (in the identity dir) holding ADR-0070 share-grant revocations.
 pub(crate) const SHARE_GRANT_REVOCATIONS_FILE: &str = "revocations-v3.bin";
 
@@ -6874,9 +7250,16 @@ fn s4_pending_in_set(
     set: &revocation::RevocationSet,
     s4_intake: &groups::eviction::RevocationIntake,
 ) -> std::collections::BTreeSet<[u8; 32]> {
-    let mut pending = s4_intake.not_durable_hashes();
-    pending.retain(|hash| set.contains_hash(hash));
-    pending
+    // #1857, #1864: a record that the kept record of its pair replaced
+    // counts as held. The store write holds that kept record, which is
+    // the same evidence (same subject, same issuer). The check is by
+    // pair, so it holds after any number of replacements.
+    s4_intake
+        .not_durable_pairs()
+        .into_iter()
+        .filter(|(hash, pair)| set.contains_hash(hash) || set.holds_pair(pair))
+        .map(|(hash, _)| hash)
+        .collect()
 }
 
 /// Write the v1 revocation store, which holds every Agent subject, and
@@ -7128,19 +7511,41 @@ async fn ingest_share_grant_revocations_for_s4(
     identity_dir: Option<std::path::PathBuf>,
     payload: &[u8],
 ) -> bool {
-    const MAX_V3_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
-    if payload.len() > MAX_V3_PAYLOAD_BYTES {
+    if payload.len() > revocation::MAX_REVOCATION_PAYLOAD_BYTES {
         return false;
     }
     let Ok(records) = revocation::decode_revocation_batch(payload) else {
         return false;
     };
+    let inserted = ingest_share_grant_revocation_records(
+        owner_trust,
+        revocation_set,
+        identity_dir.as_deref(),
+        records,
+    )
+    .await;
+    persist_completed_revocation_rebuild_for_s4(revocation_set, s4_intake, identity_dir.as_deref())
+        .await;
+    inserted
+}
+
+/// The shared ShareGrant-revocation ingest (#1003): every remote carrier —
+/// the `x0x.revocation.v3` gossip batch and the direct push
+/// ([`revocation_push`]) — inserts through here, so a pushed record and a
+/// gossiped record have one verify path, one revocation barrier and one
+/// store. Records of any other subject are ignored.
+pub(crate) async fn ingest_share_grant_revocation_records(
+    owner_trust: &owner_trust::OwnerTrust,
+    revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
+    identity_dir: Option<&std::path::Path>,
+    records: Vec<revocation::RevocationRecord>,
+) -> bool {
+    // 6a (ADR 0080 §4 / D139): verify and insert in memory FIRST. The only
+    // signature verify runs here, before any outbox ordering, so a forged or
+    // duplicate record never holds or waits on the #926 send gate, and a new
+    // record is in force the moment the insert returns.
     let mut inserted = false;
     {
-        // #926: ordered against in-flight grant redeliveries.
-        let _barrier = owner_trust
-            .share_grant_revocation_barrier(&records, revocation_set)
-            .await;
         let mut set = revocation_set.write().await;
         for record in records {
             if !matches!(record.subject, revocation::RevokedSubject::ShareGrant(_))
@@ -7158,11 +7563,54 @@ async fn ingest_share_grant_revocations_for_s4(
         }
     }
     if inserted {
-        persist_share_grant_revocations(revocation_set, identity_dir.as_deref()).await;
+        // 6b (D139): order the outbox. Take the #926 send gate exclusively
+        // and release it, so a redelivery pass that was in flight when the
+        // record landed finishes before this ingest counts as done — this
+        // install then never sends a grant after its revocation took effect
+        // (the local revoke keeps ADR 0077's gate-before-record order). The
+        // revocation set is NOT held here, so the lock order has no cycle.
+        if let Some(outbox) = owner_trust.share_grant_outbox() {
+            drop(outbox.revocation_barrier().await);
+        }
+        persist_share_grant_revocations(revocation_set, identity_dir).await;
     }
-    persist_completed_revocation_rebuild_for_s4(revocation_set, s4_intake, identity_dir.as_deref())
-        .await;
     inserted
+}
+
+/// #1107: whether the consent record at `path` applies to `identity`.
+///
+/// A missing, unreadable or corrupt record is "not consented"; it never
+/// stops the build. A record for another user or agent, or an identity
+/// with no certificate, is also "not consented".
+async fn load_applicable_user_consent(
+    path: Option<&std::path::Path>,
+    identity: &identity::Identity,
+) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    match storage::load_user_disclosure_consent(path).await {
+        Ok(Some(record)) => {
+            let applies = identity.agent_certificate().is_some()
+                && identity.disclosed_user_id() == Some(record.user_id)
+                && identity.agent_id() == record.agent_id;
+            if !applies {
+                tracing::info!(
+                    path = %path.display(),
+                    "the user-identity consent record names another identity; announcing without the user identity"
+                );
+            }
+            applies
+        }
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                "the user-identity consent record is unreadable; announcing without the user identity: {e}"
+            );
+            false
+        }
+    }
 }
 
 /// Best-effort write of `revocations-v3.bin` (see
@@ -7183,12 +7631,6 @@ pub(crate) async fn persist_share_grant_revocations(
 /// cross-process file lock (keeps in-process writers from spinning on it).
 static SHARE_GRANT_REVOCATIONS_WRITE_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
-
-/// Retention applied when merging `revocations-v3.bin`: the same rule the
-/// heartbeat sweep applies in memory
-/// ([`revocation::RevocationSet::expire_records_older_than`]; share-grant
-/// records ignore the TTL and are collected at their grant's GC horizon).
-const SHARE_GRANT_REVOCATIONS_TTL_SECS: u64 = 90 * 24 * 3600;
 
 /// How long a v3 writer waits for another process's lock before failing.
 const SHARE_GRANT_REVOCATIONS_LOCK_TIMEOUT: std::time::Duration =
@@ -7286,7 +7728,7 @@ where
     })?;
     merged.merge_v3(live);
     if now_unix != 0 {
-        merged.expire_records_older_than(SHARE_GRANT_REVOCATIONS_TTL_SECS, now_unix);
+        merged.collect_dead_records(now_unix);
     }
     let bytes = merged.to_bytes_v3().map_err(|e| {
         error::IdentityError::Storage(std::io::Error::other(format!("revocations-v3 encode: {e}")))
@@ -7469,6 +7911,28 @@ async fn dispatch_raw_direct_after_gates(
         }
     }
 
+    // ADR 0080 §4: ownership of the grant-revocation push prefix is
+    // UNCONDITIONAL — verified or not, before and after the inbox is ready,
+    // the payload never reaches DM history or DM subscribers. This is the
+    // catch-all for every verified push no typed route consumed: chiefly
+    // the startup window, where the raw listener dispatches with NO
+    // registered routes while a sender can hold a pre-restart capability
+    // advert for up to 900 s, but also a trust-rejected sender or a frame
+    // the route's validator refused. Drop it, logged `not_ready`: gossip
+    // still carries the record, and the next copy that reaches the shared
+    // ingest starts the live-session bound.
+    if verified && data.starts_with(revocation_push::GRANT_REVOCATION_PUSH_PREFIX) {
+        tracing::debug!(
+            target: "x0x::direct",
+            stage = "recv_push_dropped",
+            reason = "not_ready",
+            sender = %network::hex_prefix(&sender.0, 4),
+            payload_bytes = data.len(),
+            "verified grant-revocation push not consumed by a typed route; dropped"
+        );
+        return dm_inbox::TypedRouteOutcome::RejectedPrefix;
+    }
+
     // N12: an UNVERIFIED frame whose bytes claim a typed protocol route is
     // (the static production table covers the inbox-not-ready startup window)
     // not a user DM. The typed router already refuses unverified frames;
@@ -7571,6 +8035,46 @@ enum CapabilityRefreshState {
     Finished,
 }
 
+/// What a capability refresh flight waits for (#1776).
+///
+/// A strict send (ADR 0030 durable ACK, ADR 0093 application bit) waits for
+/// a specific capability. An addressability flight (the Welcome fetch and
+/// the join-result poll) waits only for any binding the gossip-inbox DM leg
+/// can use. A weaker flight must not hold back a stronger one: it can finish
+/// on a binding that does not satisfy the strict send, so a strict send
+/// never joins it and never waits out its cooldown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CapabilityRefreshPurpose {
+    /// Any gossip-usable binding is enough.
+    Addressability,
+    /// A durable-ACK or application-bit requirement.
+    Requirement,
+}
+
+impl CapabilityRefreshPurpose {
+    /// The purposes whose in-flight or recently finished flight already
+    /// answers a flight of this purpose. Every flight asks for the full
+    /// signed advert, so a requirement flight also answers addressability;
+    /// an addressability flight never answers a requirement.
+    ///
+    /// This holds for the cooldown too, including a requirement flight
+    /// that ended at its convergence deadline with no advert at all: for
+    /// [`CAPABILITY_REFRESH_COOLDOWN`] (10 s) after it, an addressability
+    /// request to the same recipient is refused (`Unavailable`) and its
+    /// caller proceeds unaided. That is deliberate. The recipient did not
+    /// answer a request moments ago, so a second request inside the window
+    /// is unlikely to change the answer, and the Welcome fetch and the
+    /// join-result poll retry well past 10 s.
+    fn answered_by(self) -> &'static [Self] {
+        match self {
+            Self::Addressability => &[Self::Addressability, Self::Requirement],
+            Self::Requirement => &[Self::Requirement],
+        }
+    }
+}
+
+type CapabilityRefreshKey = ([u8; 32], CapabilityRefreshPurpose);
+
 #[derive(Debug)]
 struct CapabilityRefreshEntry {
     flight_id: u64,
@@ -7582,11 +8086,15 @@ struct CapabilityRefreshEntry {
 struct CapabilityRefreshRegistryState {
     closed: bool,
     next_flight_id: u64,
-    inflight: std::collections::HashMap<[u8; 32], CapabilityRefreshEntry>,
-    /// Wall-clock finish time of the last flight per recipient, feeding
-    /// the requester-side cooldown. Zero-duration cooldown (tests,
+    inflight: std::collections::HashMap<CapabilityRefreshKey, CapabilityRefreshEntry>,
+    /// Finish time of the last flight per recipient and purpose, feeding the
+    /// requester-side cooldown. Kept on the tokio clock so the cooldown
+    /// lives in the same time domain as the convergence window it bounds:
+    /// under a paused test clock (W3-H) a wall-clock stamp would suppress
+    /// re-requests for whole runs of virtual seconds that elapse in
+    /// moments of real time (#1776). Zero-duration cooldown (tests,
     /// pre-cooldown behaviour) disables the check.
-    last_finished: std::collections::HashMap<[u8; 32], std::time::Instant>,
+    last_finished: std::collections::HashMap<CapabilityRefreshKey, tokio::time::Instant>,
     cooldown: std::time::Duration,
 }
 /// Bounded, recipient-keyed single-flight registry for strict capability
@@ -7637,6 +8145,7 @@ impl CapabilityRefreshRegistry {
     fn register_or_start<F, Fut>(
         self: &std::sync::Arc<Self>,
         recipient: identity::AgentId,
+        purpose: CapabilityRefreshPurpose,
         worker: F,
     ) -> CapabilityRefreshRegistration
     where
@@ -7650,7 +8159,11 @@ impl CapabilityRefreshRegistry {
             return CapabilityRefreshRegistration::Unavailable;
         };
         let recipient_key = *recipient.as_bytes();
-        if let Some(existing) = state.inflight.get(&recipient_key) {
+        let answered_by = purpose.answered_by();
+        if let Some(existing) = answered_by
+            .iter()
+            .find_map(|answer| state.inflight.get(&(recipient_key, *answer)))
+        {
             return CapabilityRefreshRegistration::Joined(existing.completion.clone());
         }
         if state.closed || state.inflight.len() >= MAX_INFLIGHT_CAPABILITY_REFRESHES {
@@ -7660,12 +8173,16 @@ impl CapabilityRefreshRegistry {
         // moments ago, so its targeted request was answered (or provably
         // could not be) within the convergence window. Fail the send
         // straight through the gate instead of re-amplifying the request
-        // on every product retry.
+        // on every product retry. Only a flight that answers this purpose
+        // counts (#1776): an addressability flight's cooldown must not
+        // refuse a strict send its own refresh.
         if state.cooldown > std::time::Duration::ZERO
-            && state
-                .last_finished
-                .get(&recipient_key)
-                .is_some_and(|finished_at| finished_at.elapsed() < state.cooldown)
+            && answered_by.iter().any(|answer| {
+                state
+                    .last_finished
+                    .get(&(recipient_key, *answer))
+                    .is_some_and(|finished_at| finished_at.elapsed() < state.cooldown)
+            })
         {
             return CapabilityRefreshRegistration::Unavailable;
         }
@@ -7673,8 +8190,9 @@ impl CapabilityRefreshRegistry {
         let flight_id = state.next_flight_id;
         let (completion_tx, completion) =
             tokio::sync::watch::channel(CapabilityRefreshState::Pending);
+        let key = (recipient_key, purpose);
         state.inflight.insert(
-            recipient_key,
+            key,
             CapabilityRefreshEntry {
                 flight_id,
                 completion: completion.clone(),
@@ -7687,11 +8205,12 @@ impl CapabilityRefreshRegistry {
         // authoritative worker handle.
         let guard = CapabilityRefreshGuard {
             registry: std::sync::Arc::clone(self),
-            recipient_key,
+            key,
             flight_id,
+            published: false,
         };
         let handle = tokio::spawn(worker(guard, completion_tx));
-        if let Some(entry) = state.inflight.get_mut(&recipient_key) {
+        if let Some(entry) = state.inflight.get_mut(&key) {
             entry.worker = Some(handle);
         }
         CapabilityRefreshRegistration::Started(completion)
@@ -7721,28 +8240,28 @@ impl CapabilityRefreshRegistry {
         let _results = futures::future::join_all(handles).await;
     }
 
-    fn remove(&self, recipient_key: &[u8; 32], flight_id: u64) {
+    fn remove(&self, key: &CapabilityRefreshKey, flight_id: u64, published: bool) {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
         if state
             .inflight
-            .get(recipient_key)
+            .get(key)
             .is_some_and(|entry| entry.flight_id == flight_id)
         {
-            state.inflight.remove(recipient_key);
+            state.inflight.remove(key);
             // Stamp the cooldown clock and, while we hold the lock, evict
             // stamps that can never gate again (bounded memory on
             // long-lived daemons with churny recipient sets). Runs before
             // the insert below, so the fresh stamp is never a candidate.
-            if state.cooldown > std::time::Duration::ZERO {
+            if published && state.cooldown > std::time::Duration::ZERO {
                 let cooldown = state.cooldown;
                 state
                     .last_finished
                     .retain(|_, finished_at| finished_at.elapsed() < cooldown);
                 state
                     .last_finished
-                    .insert(*recipient_key, std::time::Instant::now());
+                    .insert(*key, tokio::time::Instant::now());
             }
         }
     }
@@ -7758,13 +8277,19 @@ impl CapabilityRefreshRegistry {
 
 struct CapabilityRefreshGuard {
     registry: std::sync::Arc<CapabilityRefreshRegistry>,
-    recipient_key: [u8; 32],
+    key: CapabilityRefreshKey,
     flight_id: u64,
+    /// Set once the flight published its targeted request successfully.
+    /// Only such a flight starts the cooldown (#1776): a flight that was
+    /// ready at once, or whose publish failed, asked nothing, so it must
+    /// not refuse a later caller its request.
+    published: bool,
 }
 
 impl Drop for CapabilityRefreshGuard {
     fn drop(&mut self) {
-        self.registry.remove(&self.recipient_key, self.flight_id);
+        self.registry
+            .remove(&self.key, self.flight_id, self.published);
     }
 }
 
@@ -7774,6 +8299,12 @@ impl Drop for CapabilityRefreshGuard {
 /// ADR 0030 §2 specifies "one forced targeted capability refresh" — a single
 /// publish, not a retry loop. Returning early on a cache hit keeps a strict
 /// send that raced an in-flight advert from paying the full window.
+///
+/// Returns whether the targeted request was published successfully, which
+/// is what starts the requester-side cooldown. A deadline or shutdown
+/// before the publish completes returns `false` at once. A failed publish
+/// returns `false` at once for an addressability flight; a strict flight
+/// still waits out its convergence window, as before #1776.
 async fn run_strict_capability_refresh(
     recipient: identity::AgentId,
     required_application: Option<u64>,
@@ -7782,10 +8313,19 @@ async fn run_strict_capability_refresh(
     shutdown_token: tokio_util::sync::CancellationToken,
     deadline: tokio::time::Instant,
     publish: impl std::future::Future<Output = error::NetworkResult<()>> + Send,
-) {
+) -> bool {
     let ready = || {
         let binding = capability_store.lookup_binding(&recipient);
-        (!require_durable_ack || capability_binding_supports_durable_ack(binding.as_ref()))
+        // #1776: a flight with neither a durable-ack nor an application-bit
+        // requirement still has one — a binding the gossip-inbox DM leg can
+        // actually use (`binding_is_gossip_usable`). A weaker conjunct would
+        // let such a flight return before publishing anything.
+        let binding_usable_for_gossip = binding
+            .as_ref()
+            .is_some_and(dm_capability::binding_is_gossip_usable);
+        (require_durable_ack || required_application.is_some() || binding_usable_for_gossip)
+            && binding.is_some()
+            && (!require_durable_ack || capability_binding_supports_durable_ack(binding.as_ref()))
             && required_application.is_none_or(|bit| {
                 binding.as_ref().is_some_and(|binding| {
                     binding.machine_id.0 != [0; 32]
@@ -7794,7 +8334,7 @@ async fn run_strict_capability_refresh(
             })
     };
     if ready() {
-        return;
+        return false;
     }
 
     let published = tokio::select! {
@@ -7802,29 +8342,40 @@ async fn run_strict_capability_refresh(
         () = tokio::time::sleep_until(deadline) => None,
         () = shutdown_token.cancelled() => None,
     };
+    // A request that never left this node starts no cooldown (#1776
+    // review). An addressability flight also stops waiting at once, because
+    // nothing can answer it. A strict flight keeps the convergence wait it
+    // had before #1776, so the strict gate's refusal timing is unchanged.
     let Some(published) = published else {
-        return;
+        return false;
     };
-    if let Err(error) = published {
-        tracing::warn!(
-            target: "dm.trace",
-            recipient = %hex::encode(recipient.as_bytes()),
-            %error,
-            "targeted capability refresh publish failed"
-        );
+    let published = match published {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                target: "dm.trace",
+                recipient = %hex::encode(recipient.as_bytes()),
+                %error,
+                "targeted capability refresh publish failed"
+            );
+            false
+        }
+    };
+    if !published && !require_durable_ack && required_application.is_none() {
+        return false;
     }
 
     loop {
         if ready() {
-            return;
+            return published;
         }
         if tokio::time::Instant::now() >= deadline {
-            return;
+            return published;
         }
         tokio::select! {
             _ = tokio::time::sleep(CAPABILITY_REFRESH_POLL_INTERVAL) => {}
-            () = tokio::time::sleep_until(deadline) => return,
-            () = shutdown_token.cancelled() => return,
+            () = tokio::time::sleep_until(deadline) => return published,
+            () = shutdown_token.cancelled() => return published,
         }
     }
 }
@@ -10667,9 +11218,7 @@ impl Agent {
                 denial = ?denial,
                 "machine-addressed data reply withheld: the pairing was denied at the send"
             );
-            return Err(dm::DmError::EnvelopeConstruction(format!(
-                "recipient pairing denied (ADR-0043 B/P): {denial:?}"
-            )));
+            return Err(dm::DmError::RecipientPairingDenied { denial });
         }
         // #1664 r4 (Engineer ruling, 31 Oct 2026 09:00 GMT): the answer
         // rides the SAME pinned exchange a join-result chunk uses — the
@@ -11197,9 +11746,7 @@ impl Agent {
         } {
             if let Some(denial) = self.recipient_pairing_denied(to, &machine_id).await {
                 self.direct_messaging.record_outgoing_failed(*to);
-                return Err(dm::DmError::EnvelopeConstruction(format!(
-                    "recipient pairing denied (ADR-0043 B/P): {denial:?}"
-                )));
+                return Err(dm::DmError::RecipientPairingDenied { denial });
             }
         }
         if *to == self.identity.agent_id() {
@@ -11253,24 +11800,39 @@ impl Agent {
         // whose advert we simply have not heard yet must not be reported as
         // incapable, but the refusal must still be bounded — the whole point
         // of the 409 is that it is fast and deterministic, never a hang.
-        if (config.require_durable_app_ack
+        //
+        // The refresh runs only for a real requirement (durable ACK or the
+        // payload's application bit). `require_payload_capability` fails
+        // only when `required_for_payload` names a bit: a current advert
+        // lacks it, or (#1158) an obligation-carrying payload has no
+        // current verified advert at all. The last conjunct is defensive: it keeps this gate from starting an
+        // addressability flight (#1776) if those two ever diverge.
+        let required_application =
+            dm::CapabilityRegistry::required_for_payload(&payload).map(|(bit, _)| bit);
+        if ((config.require_durable_app_ack
             && stored_cap.is_none()
             && !capability_binding_supports_durable_ack(advert_binding.as_ref()))
             || self
                 .capability_store
                 .require_payload_capability(to, &payload)
-                .is_err()
+                .is_err())
+            && (config.require_durable_app_ack || required_application.is_some())
         {
             self.refresh_strict_dm_capability(
                 *to,
-                dm::CapabilityRegistry::required_for_payload(&payload).map(|(bit, _)| bit),
+                required_application,
                 config.require_durable_app_ack,
             )
             .await;
             advert_binding = self.capability_store.lookup_binding(to);
         }
-        // ADR 0093: only positive, current advert evidence of missing support
-        // holds product payloads. Unknown capabilities keep existing behaviour.
+        // ADR 0093: positive, current advert evidence of missing support
+        // holds product payloads. #1158 (ruling A, 20 Oct 2026): a share
+        // grant, predecessor relay or requester offer is also held while
+        // the recipient has NO current verified advert, even when a peer
+        // evidence view could address it. The refresh above has asked the
+        // recipient for its advert; the obligation's outbox retries. Every
+        // other payload with unknown capability is sent as before.
         if let Err(error) = self
             .capability_store
             .require_payload_capability(to, &payload)
@@ -11317,9 +11879,14 @@ impl Agent {
             if let Some(cap_machine) = cap_machine {
                 if let Some(denial) = self.recipient_pairing_denied(to, &cap_machine).await {
                     self.direct_messaging.record_outgoing_failed(*to);
-                    return Err(dm::DmError::EnvelopeConstruction(format!(
-                        "recipient pairing denied (ADR-0043 B/P, capability binding): {denial:?}"
-                    )));
+                    tracing::debug!(
+                        target: "x0x::direct",
+                        stage = "send",
+                        outcome = "drop_pairing_capability_binding",
+                        denial = ?denial,
+                        "send refused: recipient pairing denied on the capability binding (ADR-0043 B/P)"
+                    );
+                    return Err(dm::DmError::RecipientPairingDenied { denial });
                 }
             }
         }
@@ -11949,10 +12516,14 @@ impl Agent {
     /// Ask one recipient to republish its signed runtime capability and give
     /// the local subscriber a bounded window to ingest it.
     ///
-    /// Used when a strict send lacks durable ACK support (ADR 0030), or a
-    /// current advert lacks the payload's application bit (ADR 0093). The
-    /// recipient gets one chance to answer before the gate refuses.
-    /// Concurrent sends to the same recipient share a single flight.
+    /// Used when a strict send lacks durable ACK support (ADR 0030), when a
+    /// current advert lacks the payload's application bit (ADR 0093), and
+    /// when a caller holds no binding for the recipient at all and only
+    /// needs any binding to become addressable (#1776). The recipient gets
+    /// one chance to answer before the caller proceeds unaided — the strict
+    /// gate's refusal (ADR 0030 §2), or the next blind retry of a send that
+    /// cannot address it (#1776). Concurrent sends to the same recipient
+    /// share a single flight.
     async fn refresh_strict_dm_capability(
         &self,
         recipient: identity::AgentId,
@@ -11967,10 +12538,16 @@ impl Agent {
         let shutdown_token = self.shutdown_token.clone();
         let deadline = tokio::time::Instant::now() + CAPABILITY_REFRESH_CONVERGENCE_WAIT;
 
+        let purpose = if require_durable_ack || required_application.is_some() {
+            CapabilityRefreshPurpose::Requirement
+        } else {
+            CapabilityRefreshPurpose::Addressability
+        };
         let mut completion = match self.capability_refreshes.register_or_start(
             recipient,
-            move |guard, completion_tx| async move {
-                run_strict_capability_refresh(
+            purpose,
+            move |mut guard, completion_tx| async move {
+                guard.published = run_strict_capability_refresh(
                     recipient,
                     required_application,
                     require_durable_ack,
@@ -12504,9 +13081,7 @@ impl Agent {
                 reason = ?denial,
                 "pinned send refused: recipient pairing denied (ADR-0043 B/P)"
             );
-            return Err(Self::map_raw_quic_dm_error(
-                error::NetworkError::PeerNotVerified { agent_id: to.0 },
-            ));
+            return Err(dm::DmError::RecipientPairingDenied { denial });
         }
         let mut connected = transport.is_connected(&ant_peer_id).await;
         let mut repair_outcome: Option<&'static str> = None;
@@ -12557,9 +13132,7 @@ impl Agent {
                 reason = ?denial,
                 "pinned send refused after repair: recipient pairing denied (ADR-0043 B/P)"
             );
-            return Err(Self::map_raw_quic_dm_error(
-                error::NetworkError::PeerNotVerified { agent_id: to.0 },
-            ));
+            return Err(dm::DmError::RecipientPairingDenied { denial });
         }
         if connected {
             if let Some(reason) = self.direct_messaging.lifecycle_block_reason(&machine_id) {
@@ -13748,10 +14321,14 @@ impl Agent {
     ///
     /// # Security Note
     ///
-    /// This method does **not** apply trust filtering from `ContactStore`.
-    /// Messages from blocked agents will still be delivered. Use
-    /// [`recv_direct_annotated()`](Self::recv_direct_annotated) if you need
-    /// trust-based filtering.
+    /// The receive path drops a message before delivery when its trust
+    /// decision is [`TrustDecision::RejectBlocked`](trust::TrustDecision::RejectBlocked)
+    /// or [`TrustDecision::RejectMachineMismatch`](trust::TrustDecision::RejectMachineMismatch).
+    /// This method applies no other trust filter. Every other message,
+    /// including one from an unknown sender, is delivered. This method and
+    /// [`recv_direct_annotated()`](Self::recv_direct_annotated) return the
+    /// same messages. Inspect `msg.trust_decision` and `msg.verified` to
+    /// decide how to handle each message.
     ///
     /// # Returns
     ///
@@ -13770,31 +14347,6 @@ impl Agent {
         self.recv_direct_inner().await
     }
 
-    /// Receive the next direct message, filtering by trust level.
-    ///
-    /// All messages now carry pre-computed `verified` and `trust_decision`
-    /// fields from the identity discovery cache and contact store. This
-    /// method passes through all messages — applications should inspect
-    /// `msg.trust_decision` and `msg.verified` to decide how to handle
-    /// each message.
-    ///
-    /// # Returns
-    ///
-    /// The received [`DirectMessage`], or `None` if the channel closes.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// loop {
-    ///     if let Some(msg) = agent.recv_direct_annotated().await {
-    ///         match msg.trust_decision {
-    ///             Some(TrustDecision::RejectBlocked) => continue, // skip
-    ///             Some(TrustDecision::Accept) if msg.verified => { /* trusted */ }
-    ///             _ => { /* handle accordingly */ }
-    ///         }
-    ///     }
-    /// }
-    /// ```
     /// The authenticated agent→machine binding store (ADR 0115).
     pub(crate) fn authenticated_machine_bindings(&self) -> dm_inbox::AuthenticatedMachineBindings {
         std::sync::Arc::clone(&self.authenticated_machine_bindings)
@@ -13805,9 +14357,10 @@ impl Agent {
         std::sync::Arc::clone(&self.announced_machine_bindings)
     }
 
-    /// Test seam for #1088's frame-level listener tests (unit and the
-    /// connectivity integration file): the authenticated machine-binding
-    /// registry the raw delivery path consults.
+    /// Test seam for the #1088 frame-level listener unit tests: the
+    /// authenticated machine-binding registry that the raw delivery path
+    /// reads.
+    #[doc(hidden)]
     pub fn authenticated_machine_bindings_for_testing(
         &self,
     ) -> dm_inbox::AuthenticatedMachineBindings {
@@ -13826,6 +14379,7 @@ impl Agent {
     /// Test seam for #1088: record an authenticated machine binding the
     /// way the inbox records one after a verified fresh machine-key
     /// attestation.
+    #[doc(hidden)]
     pub async fn record_authenticated_binding_for_testing(
         &self,
         agent: identity::AgentId,
@@ -13861,6 +14415,7 @@ impl Agent {
     }
 
     /// Test seam: read one discovery-cache entry.
+    #[doc(hidden)]
     pub async fn discovered_agent_for_testing(
         &self,
         agent: &identity::AgentId,
@@ -13872,6 +14427,36 @@ impl Agent {
             .cloned()
     }
 
+    /// Receive the next direct message with its trust annotations.
+    ///
+    /// Each message carries `verified` and `trust_decision` fields. The
+    /// receive path sets them from the identity discovery cache and the
+    /// contact store.
+    ///
+    /// Before delivery, the receive path drops a message whose trust
+    /// decision is [`TrustDecision::RejectBlocked`](trust::TrustDecision::RejectBlocked)
+    /// or [`TrustDecision::RejectMachineMismatch`](trust::TrustDecision::RejectMachineMismatch).
+    /// This method does not filter further. It reads the same queue as
+    /// [`recv_direct()`](Self::recv_direct) and returns the same messages.
+    /// Inspect `msg.trust_decision` and `msg.verified` to decide how to
+    /// handle each message.
+    ///
+    /// # Returns
+    ///
+    /// The received [`DirectMessage`], or `None` if the channel closes.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// loop {
+    ///     if let Some(msg) = agent.recv_direct_annotated().await {
+    ///         match msg.trust_decision {
+    ///             Some(TrustDecision::Accept) if msg.verified => { /* trusted */ }
+    ///             _ => { /* handle accordingly */ }
+    ///         }
+    ///     }
+    /// }
+    /// ```
     pub async fn recv_direct_annotated(&self) -> Option<direct::DirectMessage> {
         self.recv_direct_inner().await
     }
@@ -14019,6 +14604,11 @@ impl Agent {
         include_user_identity: bool,
         human_consent: bool,
     ) -> error::Result<()> {
+        // Read before the publish: a withdrawal that completes after this
+        // point must win over this announce (#1107).
+        let consent_generation = self
+            .user_consent_generation
+            .load(std::sync::atomic::Ordering::Acquire);
         let result = self
             .publish_identity_announcement(include_user_identity, human_consent)
             .await;
@@ -14030,12 +14620,135 @@ impl Agent {
         // never escalate to identity beats on their own. There is nothing
         // to restore on failure, so concurrent disclosures need no lock:
         // the only write is this monotone `true`, and a failed call never
-        // touches the flag.
+        // touches the flag. #1107 adds one other writer, the explicit
+        // withdrawal; `user_consent_record_lock` orders the two, and the
+        // generation read above lets a completed withdrawal win over an
+        // announce that was already in flight.
         if result.is_ok() && include_user_identity && human_consent {
-            self.user_identity_consented
-                .store(true, std::sync::atomic::Ordering::Release);
+            #[cfg(test)]
+            {
+                let gate = self
+                    .consented_publish_test_gate
+                    .lock()
+                    .ok()
+                    .and_then(|mut gate| gate.take());
+                if let Some((reached, resume)) = gate {
+                    let _ = reached.send(());
+                    let _ = resume.await;
+                }
+            }
+            self.record_user_identity_consent(consent_generation).await;
         }
         result
+    }
+
+    /// Record consent after a consented disclosure published: write the
+    /// durable record (#1107), then turn the in-memory flag on.
+    ///
+    /// `generation_at_start` is the withdrawal count that the announce read
+    /// before it published. If a withdrawal completed since then, this
+    /// records nothing: the later withdrawal wins over the older grant, so
+    /// an announce that was in flight cannot bring the record back.
+    ///
+    /// The record is written when it is not on disk for the current
+    /// consent: on the change to "consented", and again after a failed
+    /// write. A write failure is logged and does not fail the announce,
+    /// which has already published: consent then lasts until the daemon
+    /// stops, and the next consented announce tries the write again.
+    async fn record_user_identity_consent(&self, generation_at_start: u64) {
+        use std::sync::atomic::Ordering;
+        let _guard = self.user_consent_record_lock.lock().await;
+        if self.user_consent_generation.load(Ordering::Acquire) != generation_at_start {
+            tracing::info!(
+                "consent was withdrawn while a consented announce was in flight; consent is not recorded"
+            );
+            return;
+        }
+        if !self.user_consent_record_saved.load(Ordering::Acquire) {
+            if let (Some(path), Some(user_id)) =
+                (&self.user_consent_path, self.identity.disclosed_user_id())
+            {
+                let record = storage::UserDisclosureConsent {
+                    user_id,
+                    agent_id: self.identity.agent_id(),
+                    consented_at: Self::unix_timestamp_secs(),
+                };
+                match storage::save_user_disclosure_consent(path, &record).await {
+                    Ok(()) => self
+                        .user_consent_record_saved
+                        .store(true, Ordering::Release),
+                    Err(e) => tracing::warn!(
+                        path = %path.display(),
+                        "could not save the user-identity consent record; consent will not survive a restart until a later consented announce saves it: {e}"
+                    ),
+                }
+            }
+        }
+        self.user_identity_consented.store(true, Ordering::Release);
+    }
+
+    /// Whether the user has consented to user-identity disclosure, so the
+    /// heartbeat and the startup announce carry the user ID and the agent
+    /// certificate.
+    #[must_use]
+    pub(crate) fn user_identity_consented(&self) -> bool {
+        self.user_identity_consented
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Withdraw the consent to user-identity disclosure (#1107).
+    ///
+    /// Removes the durable record and turns the in-memory flag off. The
+    /// announcements that follow (heartbeats, the next startup announce)
+    /// are anonymous until a new `announce_identity(true, true)`.
+    ///
+    /// This does not publish anything. Call
+    /// `announce_identity(false, false)` afterwards to send a fresh
+    /// anonymous announcement. Peers that already saw the identity are not
+    /// made to forget it; they drop the cached certificate when a fresher
+    /// anonymous announcement reaches them.
+    ///
+    /// A consented announce that is in flight when this returns does not
+    /// record consent again.
+    ///
+    /// # Errors
+    /// [`error::IdentityError::Storage`] when the record can be neither
+    /// removed nor emptied. The in-memory flag is off in that case too, so
+    /// this run announces anonymously, but the record is still on disk and
+    /// the consent comes back at the next start. A warning is logged.
+    /// Repeat the withdrawal when the cause is fixed.
+    pub async fn withdraw_user_identity_consent(&self) -> error::Result<()> {
+        use std::sync::atomic::Ordering;
+        let _guard = self.user_consent_record_lock.lock().await;
+        self.user_consent_generation.fetch_add(1, Ordering::AcqRel);
+        self.user_consent_record_saved
+            .store(false, Ordering::Release);
+        self.user_identity_consented.store(false, Ordering::Release);
+        let Some(path) = &self.user_consent_path else {
+            return Ok(());
+        };
+        let Err(remove_error) = storage::clear_user_disclosure_consent(path).await else {
+            return Ok(());
+        };
+        // The removal failed (for example, a read-only directory). An empty
+        // file is not a valid record, so the next start reads it as "not
+        // consented".
+        match storage::void_user_disclosure_consent(path).await {
+            Ok(()) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "could not remove the user-identity consent record ({remove_error}); it is now empty, which means not consented"
+                );
+                Ok(())
+            }
+            Err(void_error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "could not remove ({remove_error}) or empty ({void_error}) the user-identity consent record; the consent will come back at the next start unless the withdrawal is repeated"
+                );
+                Err(remove_error)
+            }
+        }
     }
 
     /// Build and publish the identity announcement on behalf of
@@ -14053,6 +14766,9 @@ impl Agent {
         })?;
 
         self.start_identity_listener().await?;
+        // Held to the end of this function: the `announced_at` and self-name
+        // reads, every publish and the discovery self-write.
+        let _own_announce_guard = self.own_announce_order.lock().await;
 
         let network_status = if let Some(network) = self.network.as_ref() {
             network.node_status().await
@@ -14335,6 +15051,8 @@ impl Agent {
             ),
         )
         .await;
+        let (cert_not_after, agent_certificate, cert_digest) =
+            own_announcement_cert_fields(&announcement);
         let discovered_agent = DiscoveredAgent {
             self_name: announcement.self_name.clone(),
             agent_id: announcement.agent_id,
@@ -14350,10 +15068,10 @@ impl Agent {
             is_coordinator: announcement.is_coordinator,
             reachable_via: announcement.reachable_via.clone(),
             relay_candidates: announcement.relay_candidates.clone(),
-            cert_not_after: None,
-            agent_certificate: None,
+            cert_not_after,
+            agent_certificate,
             agent_public_key: announcement.agent_public_key.clone(),
-            cert_digest: None,
+            cert_digest,
         };
         upsert_discovered_machine_from_agent(&self.machine_discovery_cache, &discovered_agent)
             .await;
@@ -14790,7 +15508,8 @@ impl Agent {
         // outbox's barrier (see `share_grant::outbox`).
         let owner_trust_for_listener = self.owner_trust.clone();
         let s4_intake_for_listener = self.s4_revocation_intake.clone();
-        let contact_store_for_evict = std::sync::Arc::clone(&self.contact_store);
+        // #1863: every source of "seen", for the ingest below.
+        let revocation_seen_for_listener = self.revocation_seen_sources();
         // L3 fetch-on-miss: the listener resolves V3 cert digests from the
         // blob cache (hit) or fires a background fetch (miss) — never
         // blocking the discovery pipeline.
@@ -15084,8 +15803,7 @@ impl Agent {
                         // Size-limit: max 2 MiB for a revocation batch (records
                         // are ~5.3 KB each; 2 MiB ≈ 380 records, far beyond
                         // any realistic fleet size in v1).
-                        const MAX_REVOCATION_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
-                        if msg.payload.len() > MAX_REVOCATION_PAYLOAD_BYTES {
+                        if msg.payload.len() > revocation::MAX_REVOCATION_PAYLOAD_BYTES {
                             tracing::debug!(
                                 "ignoring oversized revocation payload ({} bytes)",
                                 msg.payload.len()
@@ -15138,8 +15856,7 @@ impl Agent {
                                     revocation_set: revocation_set.clone(),
                                     s4_intake: s4_intake_for_listener.clone(),
                                     identity_dir: identity_dir_for_listener.clone(),
-                                    owner_trust: owner_trust_for_listener.clone(),
-                                    contact_store: contact_store_for_evict.clone(),
+                                    seen: revocation_seen_for_listener.clone(),
                                     discovery_cache: cache.clone(),
                                     machine_cache: machine_cache.clone(),
                                 })),
@@ -15151,8 +15868,7 @@ impl Agent {
                                 &revocation_set,
                                 &s4_intake_for_listener,
                                 identity_dir_for_listener.clone(),
-                                &owner_trust_for_listener,
-                                &contact_store_for_evict,
+                                &revocation_seen_for_listener,
                                 &cache,
                                 &machine_cache,
                             )
@@ -15212,8 +15928,7 @@ impl Agent {
                     // the subject cert resolved from the discovery cache
                     // (fail-closed without it, exactly the v1 rule).
                     DiscoveryMessage::RevocationV2(msg) => {
-                        const MAX_V2_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
-                        if msg.payload.len() > MAX_V2_PAYLOAD_BYTES {
+                        if msg.payload.len() > revocation::MAX_REVOCATION_PAYLOAD_BYTES {
                             continue;
                         }
                         let Ok(records) = revocation::decode_revocation_batch(&msg.payload) else {
@@ -15765,6 +16480,12 @@ impl Agent {
                         announcement.announced_at.saturating_mul(1000), now.saturating_mul(1000),
                     );
                 }
+                #[cfg(test)]
+                announced_record_barrier::park(
+                    &announcement.agent_id,
+                    announced_record_barrier::INGEST_BEFORE_BINDING,
+                )
+                .await;
                 // Probe before the bindings write lock. The contact bit is
                 // re-read if a concurrent resolve wins the epoch. The
                 // contacts lock is not held while groups and grants are scanned.
@@ -16429,7 +17150,12 @@ impl Agent {
             }
         }
 
-        if let Err(e) = self.announce_identity(false, false).await {
+        // #1107: a consent loaded from the durable record makes the
+        // startup announce an identity announce, so a restart does not
+        // publish a fresher anonymous digest that drops the certificate on
+        // every peer.
+        let consented = self.user_identity_consented();
+        if let Err(e) = self.announce_identity(consented, consented).await {
             tracing::warn!("Initial identity announcement failed: {}", e);
         }
         if let Err(e) = self.start_identity_heartbeat().await {
@@ -16464,6 +17190,8 @@ impl Agent {
                 legacy_announce: self.legacy_announce,
                 self_name: std::sync::Arc::clone(&self.self_name),
                 self_name_ever_set: std::sync::Arc::clone(&self.self_name_ever_set),
+                own_announce_order: std::sync::Arc::clone(&self.own_announce_order),
+                revocation_seen: self.revocation_seen_sources(),
             };
             // Routed through spawn_tracked (issue #116) so a shutdown racing
             // bootstrap refuses to start it once the registry is closed; it is
@@ -16630,6 +17358,16 @@ impl Agent {
                 "cannot start DM inbox: no gossip runtime configured",
             ))
         })?;
+        // ADR 0080 §1: `grant_revocation_push_v1` is route-gated. Compute
+        // the advertised registry from the routes THIS inbox registers,
+        // before `config` moves into the service: the bit goes out only
+        // when the push route is registered and ready.
+        let advertised_registry = dm::CapabilityRegistry::advertised(
+            config
+                .typed_payload_routes
+                .iter()
+                .map(|route| route.prefix.as_slice()),
+        );
         let signing = std::sync::Arc::new(gossip::SigningContext::from_keypair(
             self.identity.agent_keypair(),
         ));
@@ -16709,11 +17447,12 @@ impl Agent {
         // handle there is nothing to commit to, so the honest advert is v1:
         // a strict sender then gets a typed 409 rather than clearing its gate
         // and hanging on a waiter this daemon can never satisfy.
-        let upgraded = if self.history_handle.is_some() {
+        let mut upgraded = if self.history_handle.is_some() {
             dm::DmCapabilities::v2_durable_gossip_ready(kem_keypair.public_bytes.clone())
         } else {
             dm::DmCapabilities::v1_gossip_ready(kem_keypair.public_bytes.clone())
         };
+        upgraded.application_registry = advertised_registry;
         // send_replace stores the value even when no receiver is subscribed
         // yet; a plain send() drops the upgrade if this runs before the
         // capability advert service subscribes, leaving peers cached on
@@ -17475,10 +18214,13 @@ impl Agent {
         record: revocation::RevocationRecord,
         roster_cert: Option<&identity::AgentCertificate>,
     ) -> error::Result<bool> {
-        let hash = record.record_hash();
-        if self.revocation_set.read().await.contains_hash(&hash) {
+        // #1857: a record that the set covers (it holds the record kept
+        // for the same subject and issuer) is in force here, so the
+        // handoff's evidence is held.
+        if self.revocation_set.read().await.covers(&record) {
             return Ok(true);
         }
+        let covered_probe = record.clone();
         let certs = match record.needs_certificate_authority() {
             Some(subject) => {
                 let journal = load_journal_certs(self.cert_journal_path.as_deref()).await;
@@ -17511,7 +18253,7 @@ impl Agent {
         let subject_cert = pick_subject_cert(Some(&certs), &record).cloned();
         self.apply_and_publish_revocation(record, subject_cert.as_ref())
             .await?;
-        Ok(self.revocation_set.read().await.contains_hash(&hash))
+        Ok(self.revocation_set.read().await.covers(&covered_probe))
     }
 
     /// ADR 0110 §4 (ADR 0093): unknown or expired support for an
@@ -17524,11 +18266,62 @@ impl Agent {
             .await;
     }
 
+    /// #1776: whether the store holds a binding the gossip-inbox DM leg can
+    /// use for `recipient` — a real machine, the gossip-inbox capability,
+    /// and KEM material to seal to it. A direct send to an agent without
+    /// one cannot be addressed by any retry unaided: it either fails fast
+    /// on the raw-QUIC `AgentNotFound` path or grinds its whole absolute
+    /// send budget and ends `Timeout`, and the two variants must repair
+    /// addressability the same way.
+    pub(crate) fn holds_gossip_usable_dm_binding(&self, recipient: &identity::AgentId) -> bool {
+        self.capability_store()
+            .lookup_binding(recipient)
+            .as_ref()
+            .is_some_and(dm_capability::binding_is_gossip_usable)
+    }
+
+    /// #1776: ask `recipient` to republish its signed capability advert and
+    /// wait a bounded time for a binding the gossip-inbox DM leg can use —
+    /// no application bit, no durable-ACK support. A fresh joiner whose
+    /// only path to an authority runs over the gossip mesh joined after
+    /// that authority's last advert beat holds no binding for it (adverts
+    /// ride a 600 s cadence and are not replayed onto meshes joined
+    /// later), so every direct send dies on the raw-QUIC `AgentNotFound`
+    /// path. The targeted request travels on the same control topics the
+    /// mesh already carries, giving the gossip-inbox DM leg its KEM
+    /// material. Concurrent callers share one flight; the cooldown, kept
+    /// per recipient and per purpose, bounds repeat requests.
+    pub(crate) async fn refresh_dm_capability_binding(&self, recipient: identity::AgentId) {
+        self.refresh_strict_dm_capability(recipient, None, false)
+            .await;
+    }
+
     /// Return the shared revocation set.
     ///
     /// Callers that need to publish a new revocation record should call
     /// [`revoke`](Agent::revoke) instead; this accessor is for gate checks
     /// and diagnostics.
+    /// Install the check that says whether a named group lists an agent
+    /// (#1863). A self-revocation of a group member is published again
+    /// by the heartbeat; one of a stranger is not.
+    pub fn set_revocation_group_seen(&self, check: RevocationGroupSeen) {
+        if let Ok(mut slot) = self.revocation_group_seen.write() {
+            *slot = Some(check);
+        }
+    }
+
+    fn revocation_seen_sources(&self) -> RevocationSeenSources {
+        RevocationSeenSources {
+            own_agent: self.identity.agent_id(),
+            own_machine: self.identity.machine_id(),
+            owner: self.identity.user_id(),
+            contact_store: std::sync::Arc::clone(&self.contact_store),
+            cert_journal_path: self.cert_journal_path.clone(),
+            groups: std::sync::Arc::clone(&self.revocation_group_seen),
+            owner_trust: self.owner_trust.clone(),
+        }
+    }
+
     pub fn revocation_set(&self) -> std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>> {
         std::sync::Arc::clone(&self.revocation_set)
     }
@@ -17586,6 +18379,16 @@ impl Agent {
     /// This is a read-only snapshot; the in-memory set grows only (no un-revocation).
     pub async fn revocation_records(&self) -> Vec<revocation::RevocationRecord> {
         self.revocation_set.read().await.all_records()
+    }
+
+    /// Return a snapshot of every revocation record this agent holds:
+    /// agent, machine, binding and share-grant subjects (#1108).
+    ///
+    /// [`Self::revocation_records`] returns the agent and machine records
+    /// only. Use this method for display. Do not publish its result on the
+    /// v1 revocation topic.
+    pub async fn all_revocation_records(&self) -> Vec<revocation::RevocationRecord> {
+        self.revocation_set.read().await.all_subject_records()
     }
 
     /// Sign and publish a revocation for the given subject, then persist it
@@ -17669,6 +18472,117 @@ impl Agent {
             reason,
         )?;
         self.apply_and_publish_revocation(record.clone(), Some(subject_cert))
+            .await?;
+        Ok(record)
+    }
+
+    /// Revoke an agent that this daemon's owner certified, by agent id
+    /// (#1108 lost-device response).
+    ///
+    /// The certificate comes from the same sources as
+    /// [`Self::revoke_binding`]: the local agent certificate, the discovery
+    /// cache, then the owner's issuance journal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`error::IdentityError::Revocation`] when no certificate is
+    /// known for the agent, and the errors of [`Self::revoke_as_owner`].
+    pub async fn revoke_agent_as_owner(
+        &self,
+        agent: &identity::AgentId,
+        reason: Option<String>,
+    ) -> error::Result<revocation::RevocationRecord> {
+        let cert = self.agent_certificate_for(agent).await.ok_or_else(|| {
+            error::IdentityError::Revocation(
+                "no certificate known for the agent — owner revocation requires it".to_string(),
+            )
+        })?;
+        // The same check as `DELETE /owner/agents/:id`: refuse early, with a
+        // clear cause, a certificate that this owner did not issue for
+        // this agent.
+        let issued_here = cert.verify().is_ok()
+            && cert.agent_id().is_ok_and(|certified| certified == *agent)
+            && self
+                .user_id()
+                .is_some_and(|owner| cert.user_id().is_ok_and(|issuer| issuer == owner));
+        if !issued_here {
+            return Err(error::IdentityError::Revocation(
+                "the certificate held for the agent was not issued by this owner".to_string(),
+            ));
+        }
+        self.revoke_as_owner(&cert, reason).await
+    }
+
+    /// The held revocation record of the machine this daemon runs on, when
+    /// the machine is revoked (#1108). With several records, the one with
+    /// the earliest `revoked_at`, then the lowest record hash.
+    pub async fn own_machine_revocation(&self) -> Option<revocation::RevocationRecord> {
+        let own = revocation::RevokedSubject::Machine(self.machine_id());
+        self.revocation_set
+            .read()
+            .await
+            .all_subject_records()
+            .into_iter()
+            .filter(|record| record.subject == own)
+            .min_by_key(|record| (record.revoked_at, record.record_hash()))
+    }
+
+    /// Write the agent/machine store and the binding store again from the
+    /// records held in memory (#1108).
+    ///
+    /// A revocation can be in force but not durable when its store write
+    /// failed. A caller that repeats the action uses this to make the held
+    /// records durable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`error::IdentityError::Storage`] when a store write fails,
+    /// and [`error::IdentityError::Serialization`] on an encode failure.
+    pub async fn persist_identity_revocation_stores(&self) -> error::Result<()> {
+        persist_s4_revocations(
+            &self.revocation_set,
+            &self.s4_revocation_intake,
+            self.identity_dir.as_deref(),
+        )
+        .await?;
+        let bindings = self.revocation_set.read().await.to_bytes_v2()?;
+        if let Some(path) = self.move_file_path("revocations-v2.bin") {
+            storage::save_private_bytes_to(&path, bindings).await?;
+        }
+        Ok(())
+    }
+
+    /// Revoke the machine this daemon runs on, signed with the machine key
+    /// (#1108).
+    ///
+    /// This is a self-revocation: the issuer key hashes to the machine id,
+    /// so every peer accepts it with no other evidence. After it, peers
+    /// refuse this machine for good.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::revoke`].
+    pub async fn revoke_own_machine(
+        &self,
+        reason: Option<String>,
+    ) -> error::Result<revocation::RevocationRecord> {
+        // One call at a time in this process, so that the repeat check
+        // and the signing are one step. A repeat returns the held record
+        // and signs nothing: the set has no size limit.
+        static OWN_MACHINE_REVOKE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _one_call = OWN_MACHINE_REVOKE.lock().await;
+        if let Some(held) = self.own_machine_revocation().await {
+            return Ok(held);
+        }
+        let machine_kp = self.identity.machine_keypair();
+        let record = revocation::RevocationRecord::sign(
+            revocation::RevokedSubject::Machine(self.machine_id()),
+            machine_kp.public_key(),
+            machine_kp.secret_key(),
+            Self::unix_timestamp_secs(),
+            reason,
+        )?;
+        self.apply_and_publish_revocation(record.clone(), None)
             .await?;
         Ok(record)
     }
@@ -17764,31 +18678,36 @@ impl Agent {
             }
         }
 
+        // #1863: mark the subject by the same rule as the ingest and the
+        // heartbeat, before the eviction below removes the evidence. An
+        // operator's self-revocation of this agent or machine is always
+        // seen, so it is in the immediate publish. A stranger's record
+        // handed over by S4 stays unpublished.
+        SeenEvidence::gather(&self.revocation_seen_sources())
+            .await
+            .mark(&self.revocation_set)
+            .await;
+
         // 3. Evict from caches.
         self.evict_revoked_subject(&record.subject).await;
 
         // 4. Publish on gossip (best-effort — local enforcement happens regardless).
         if let Some(rt) = &self.gossip_runtime {
-            let (topic, records) = {
-                let set = self.revocation_set.read().await;
-                match &record.subject {
-                    revocation::RevokedSubject::AgentMachineBinding(_) => {
-                        (REVOCATION_V2_TOPIC, set.binding_records())
-                    }
-                    revocation::RevokedSubject::ShareGrant(_) => {
-                        (REVOCATION_V3_TOPIC, set.share_grant_records())
-                    }
-                    _ => (REVOCATION_TOPIC, set.all_records()),
-                }
+            let publish_lock = self.revocation_set.read().await.publish_lock();
+            let _one_round = publish_lock.lock().await;
+            let topic = match &record.subject {
+                revocation::RevokedSubject::AgentMachineBinding(_) => REVOCATION_V2_TOPIC,
+                revocation::RevokedSubject::ShareGrant(_) => REVOCATION_V3_TOPIC,
+                _ => REVOCATION_TOPIC,
             };
-            match revocation::encode_revocation_batch(&records) {
-                Ok(bytes) if !bytes.is_empty() => {
+            let records = revocation_publish_records(&*self.revocation_set.read().await, topic);
+            if let Ok(batches) = revocation::encode_revocation_batches(&records) {
+                for bytes in batches {
                     let _ = rt
                         .pubsub()
                         .publish(topic.to_string(), bytes::Bytes::from(bytes))
                         .await;
                 }
-                _ => {}
             }
         }
 
@@ -18995,11 +19914,26 @@ impl Agent {
                 return Some(cert);
             }
         }
-        if let Ok(Some(entry)) = self.discovered_agent(*agent).await {
-            if let Some(cert) = entry.agent_certificate {
-                return Some(cert);
-            }
+        // This owner's issuance journal comes before the discovery cache
+        // (#1108): the cache can hold a certificate that ANOTHER owner
+        // issued for the same agent key, and that one gives this owner no
+        // authority. `DELETE /owner/agents/:id` reads the journal too.
+        if let Some(cert) = self.owner_journal_certificate_for(agent).await {
+            return Some(cert);
         }
+        self.discovered_agent(*agent)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|entry| entry.agent_certificate)
+    }
+
+    /// The newest certificate that the loaded owner key issued for `agent`,
+    /// from this install's issuance journal.
+    async fn owner_journal_certificate_for(
+        &self,
+        agent: &identity::AgentId,
+    ) -> Option<identity::AgentCertificate> {
         let journal_path = self.cert_journal_path()?;
         let target_hex = hex::encode(agent.as_bytes());
         let user_hex = self
@@ -20527,7 +21461,9 @@ impl Agent {
 
     /// #1040: open an owner-sync (`SyncV1`) stream to an enrolled owner
     /// machine that the discovery cache does not know (no agent announced
-    /// on it yet, e.g. right after this device restarted).
+    /// on it yet, e.g. right after this device restarted), or (#1107) whose
+    /// known agents lack only trust
+    /// ([`Self::enrolled_owner_sync_over_untrusted`]; the caller checks it).
     ///
     /// Admission mirrors the inbound branch: the machine must be in this
     /// device's verified owner enrollment set
@@ -20644,6 +21580,8 @@ impl Agent {
             legacy_announce: self.legacy_announce,
             self_name: std::sync::Arc::clone(&self.self_name),
             self_name_ever_set: std::sync::Arc::clone(&self.self_name_ever_set),
+            own_announce_order: std::sync::Arc::clone(&self.own_announce_order),
+            revocation_seen: self.revocation_seen_sources(),
         };
         ctx.announce().await
     }
@@ -20954,7 +21892,7 @@ impl Agent {
             owner_trust,
             machine_id,
             None,
-            false,
+            owner_trust::InboundTrustRule::AcceptRequired,
             local_authority_only,
         )
         .await
@@ -20997,15 +21935,17 @@ impl Agent {
             owner_trust,
             machine_id,
             call_caller,
-            false,
+            owner_trust::InboundTrustRule::AcceptRequired,
             false,
         )
         .await
         .map_err(|e| e.fail_closed_admission(machine_id.0))
     }
 
-    /// Shared gate with a narrow ADR 0089 mode. Only Unknown relationship
-    /// peers gain evidence admission; every other check remains unchanged.
+    /// Shared gate with a per-agent trust rule ([`owner_trust::InboundTrustRule`]).
+    /// The narrow ADR 0089 rule admits only Unknown relationship peers for
+    /// evidence; the #1107 rule waives only missing trust for an
+    /// enrollment-only `SyncV1` handoff. Every other check is unchanged.
     ///
     /// With `local_authority_only`, confirmation and grant evaluation use
     /// non-blocking local evidence only (ADR-0074 §4 reauth); contended
@@ -21022,10 +21962,11 @@ impl Agent {
         owner_trust: &owner_trust::OwnerTrust,
         machine_id: &identity::MachineId,
         call_caller: Option<&identity::AgentId>,
-        evidence_only: bool,
+        rule: owner_trust::InboundTrustRule,
         local_authority_only: bool,
     ) -> Result<Vec<identity::AgentId>, crate::forward::PeerGateError> {
-        use crate::owner_trust::NonblockingEval;
+        use crate::owner_trust::{InboundTrustRule, NonblockingEval};
+        let evidence_only = rule == InboundTrustRule::EvidenceRelationship;
         // Identity gate — resolve ALL agents on this machine from the
         // discovery cache, then check each (revoked → trust). A single
         // non-Accept agent denies the traffic (fail-closed, #192).
@@ -21154,10 +22095,12 @@ impl Agent {
                     machine_id,
                 )
                 .await;
-            let trust_decision = Some(
-                pair.decision
-                    .with_owner_trust(has_connect_grant || has_call_grant || evidence_relationship),
-            );
+            // #1107: `with_owner_trust` lifts only Unknown/AcceptWithFlag, so
+            // the waived rule never lifts Blocked or a machine-pin mismatch.
+            let waived = rule == InboundTrustRule::EnrolledOwnerSync;
+            let trust_decision = Some(pair.decision.with_owner_trust(
+                has_connect_grant || has_call_grant || evidence_relationship || waived,
+            ));
             let (revoked_agent, revoked_machine, resync_required) = {
                 let revoked = revocation_set.read().await;
                 (
@@ -21259,7 +22202,9 @@ impl Agent {
                 confirmed.push(*agent_id);
             }
         }
-        if confirmed.is_empty() {
+        // #1107: the enrollment-only path attributes no agent, so a missing
+        // confirmation is not a deny there.
+        if confirmed.is_empty() && rule != InboundTrustRule::EnrolledOwnerSync {
             tracing::info!(
                 target: "x0x::streams",
                 machine = %hex::encode(machine_id.as_bytes()),
@@ -21272,6 +22217,9 @@ impl Agent {
             .into());
         }
 
+        // #1107: the EnrolledOwnerSync rule returns every agent it judged.
+        let judged = (rule == InboundTrustRule::EnrolledOwnerSync)
+            .then(|| agents.iter().map(|(agent, _)| *agent).collect::<Vec<_>>());
         // Connect-ACL gate input: every surviving routed agent stays listed
         // (fail-closed second layer below).
         let agents: Vec<identity::AgentId> = surviving;
@@ -21308,7 +22256,7 @@ impl Agent {
         }
         // Gate cleared — the ordered, authority-confirmed agent list for
         // the stream/lane handle.
-        Ok(confirmed)
+        Ok(judged.unwrap_or(confirmed))
     }
 
     /// Open the unreliable datagram lane to a verified, trusted peer
@@ -21485,11 +22433,17 @@ impl Agent {
     ///    ([`EnrolledOwnerSyncRoute::SharedGate`]), exactly like a stream
     ///    from a known machine. This matters because an agent can become
     ///    known during the prefix read, and it may be revoked, blocked, or
-    ///    not on the connect ACL (#1044 review round 1).
-    /// 2. Otherwise only `SyncV1` from a machine that is STILL in the
-    ///    verified owner enrollment set is admitted: `admit` runs and its
-    ///    result is returned as [`EnrolledOwnerSyncRoute::Admitted`].
-    ///    Everything else is [`EnrolledOwnerSyncRoute::Denied`].
+    ///    not on the connect ACL (#1044 review round 1). If agents that
+    ///    lack only trust are the reason the shared gate refuses, the
+    ///    caller then applies [`Self::admit_enrolled_owner_sync_over_untrusted`]
+    ///    (#1107, `SyncV1` only).
+    /// 2. Otherwise only `SyncV1` or `ForwardV2` from a machine that is
+    ///    STILL in the verified owner enrollment set is admitted: `admit`
+    ///    runs and its result is returned as
+    ///    [`EnrolledOwnerSyncRoute::Admitted`]. Everything else is
+    ///    [`EnrolledOwnerSyncRoute::Denied`]. `ForwardV2` (#1107) goes only
+    ///    to its own acceptor, whose gate needs the signed header, a usable
+    ///    evidence record for that agent on this machine, and owner trust.
     ///
     /// The enrollment (revocation set + device store) is verified first,
     /// each lock in its own scope. The discovery-cache read guard is then
@@ -21508,10 +22462,12 @@ impl Agent {
         protocol: streams::StreamProtocol,
         admit: impl FnOnce() -> T,
     ) -> EnrolledOwnerSyncRoute<T> {
-        let enrolled = protocol == streams::StreamProtocol::SyncV1
-            && owner_trust
-                .is_enrolled_owner_machine(revocation_set, machine_id)
-                .await;
+        let enrolled = matches!(
+            protocol,
+            streams::StreamProtocol::SyncV1 | streams::StreamProtocol::ForwardV2
+        ) && owner_trust
+            .is_enrolled_owner_machine(revocation_set, machine_id)
+            .await;
         let cache = discovery_cache.read().await;
         if cache.values().any(|agent| agent.machine_id == *machine_id) {
             return EnrolledOwnerSyncRoute::SharedGate;
@@ -21524,9 +22480,111 @@ impl Agent {
         EnrolledOwnerSyncRoute::Admitted(admitted)
     }
 
+    /// #1107: enrollment-only `SyncV1` handoff for an enrolled owner machine
+    /// whose KNOWN agents fail the shared gate only for missing trust (for
+    /// example a device that restarted and announced anonymously, with no
+    /// certificate). Without this, such a machine would get less than one
+    /// that had not announced at all.
+    ///
+    /// Call it only after the shared gate refused the stream with
+    /// [`error::NetworkError::PeerTrustRejected`]. A machine that the shared
+    /// gate accepts keeps the shared path and its agent list.
+    ///
+    /// Admits (runs `admit`, returns `Some`) only when all of these are true:
+    /// - `protocol` is `SyncV1`;
+    /// - the machine is in the verified owner enrollment set, checked now;
+    /// - the shared gate passes with the
+    ///   [`owner_trust::InboundTrustRule::EnrolledOwnerSync`] rule. Only
+    ///   Unknown / AcceptWithFlag trust and a missing authority confirmation
+    ///   are waived. Blocked, machine-pin mismatch, revocation, the resync
+    ///   hold, an expired certificate, dead pairings and an Enabled connect
+    ///   ACL still refuse;
+    /// - under the discovery-cache read guard, the machine's known agents are
+    ///   exactly the agents the gate judged. An agent learned meanwhile
+    ///   refuses (fail closed), so no unjudged agent rides the enrollment.
+    ///
+    /// The handoff carries no agent and writes no registry. Lock discipline
+    /// is as for [`Self::route_enrolled_owner_sync`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn admit_enrolled_owner_sync_over_untrusted<T>(
+        discovery_cache: &std::sync::Arc<
+            tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+        >,
+        contact_store: &std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
+        revocation_set: &std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+        move_state: &std::sync::Arc<tokio::sync::RwLock<key_move::MoveState>>,
+        connect_policy: &std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>>,
+        owner_trust: &owner_trust::OwnerTrust,
+        machine_id: &identity::MachineId,
+        protocol: streams::StreamProtocol,
+        admit: impl FnOnce() -> T,
+    ) -> Option<T> {
+        if protocol != streams::StreamProtocol::SyncV1
+            || !owner_trust
+                .is_enrolled_owner_machine(revocation_set, machine_id)
+                .await
+        {
+            return None;
+        }
+        let judged = Self::gate_peer_machine_inbound_for_evidence(
+            discovery_cache,
+            contact_store,
+            revocation_set,
+            move_state,
+            connect_policy,
+            owner_trust,
+            machine_id,
+            None,
+            owner_trust::InboundTrustRule::EnrolledOwnerSync,
+            false,
+        )
+        .await
+        .ok()?;
+        let cache = discovery_cache.read().await;
+        let mut known: Vec<identity::AgentId> = cache
+            .values()
+            .filter(|agent| agent.machine_id == *machine_id)
+            .map(|agent| agent.agent_id)
+            .collect();
+        known.sort_by_key(|agent| agent.0);
+        if known.is_empty() || known != judged {
+            return None;
+        }
+        let admitted = admit();
+        drop(cache);
+        Some(admitted)
+    }
+
+    /// Outbound mirror of [`Self::admit_enrolled_owner_sync_over_untrusted`]
+    /// (#1107): whether an owner-sync dial to the enrolled `machine_id` may
+    /// fall back to [`Self::open_enrolled_owner_sync_stream`] although agents
+    /// are known on it. Same rule, same gate; an explicit deny refuses.
+    pub(crate) async fn enrolled_owner_sync_over_untrusted(
+        &self,
+        machine_id: &identity::MachineId,
+    ) -> bool {
+        Self::admit_enrolled_owner_sync_over_untrusted(
+            &self.identity_discovery_cache,
+            &self.contact_store,
+            &self.revocation_set,
+            &self.move_state,
+            &self.connect_policy,
+            &self.owner_trust,
+            machine_id,
+            streams::StreamProtocol::SyncV1,
+            || (),
+        )
+        .await
+        .is_some()
+    }
+
     /// Keep the main gate-first path independent of strangers' prefix reads.
     /// Unknown relationship peers get only a bounded EvidenceV1 prefix probe.
-    /// All other denials remain on the shared gate.
+    /// An enrolled owner machine whose known agents lack only trust gets the
+    /// enrolled slot instead ([`Self::admit_enrolled_owner_sync_over_untrusted`],
+    /// #1107). All other denials remain on the shared gate. Every admission
+    /// for a machine with a known agent sets `known_machine`, so an
+    /// EvidenceV1 prefix on it is rechecked after the prefix read.
     #[allow(clippy::too_many_arguments)]
     async fn admit_stream_before_prefix(
         discovery_cache: &std::sync::Arc<
@@ -21559,6 +22617,33 @@ impl Agent {
             let agents = match agents {
                 Ok(agents) => agents,
                 Err(error::NetworkError::PeerTrustRejected { .. }) => {
+                    // #1107: lacking only trust, an enrolled owner machine
+                    // gets the enrolled slot; after the prefix only SyncV1
+                    // can use it (dispatch re-judges the machine then). The
+                    // slot keeps `known_machine`, so an EvidenceV1 prefix on
+                    // it still meets the evidence gate after the prefix read,
+                    // even if the agents' discovery entries vanish meanwhile.
+                    if Self::admit_enrolled_owner_sync_over_untrusted(
+                        discovery_cache,
+                        contact_store,
+                        revocation_set,
+                        move_state,
+                        connect_policy,
+                        owner_trust,
+                        machine_id,
+                        streams::StreamProtocol::SyncV1,
+                        || (),
+                    )
+                    .await
+                    .is_some()
+                    {
+                        return Some(streams::InboundAdmission {
+                            agents: None,
+                            prefix: None,
+                            evidence_only: false,
+                            known_machine: true,
+                        });
+                    }
                     Self::gate_peer_machine_inbound_for_evidence(
                         discovery_cache,
                         contact_store,
@@ -21568,7 +22653,7 @@ impl Agent {
                         owner_trust,
                         machine_id,
                         None,
-                        true,
+                        owner_trust::InboundTrustRule::EvidenceRelationship,
                         false,
                     )
                     .await
@@ -21577,6 +22662,7 @@ impl Agent {
                         agents: None,
                         prefix: Some(limits.admit_prefix(*machine_id)?),
                         evidence_only: true,
+                        known_machine: true,
                     });
                 }
                 Err(_) => return None,
@@ -21585,6 +22671,7 @@ impl Agent {
                 agents: Some(agents),
                 prefix: None,
                 evidence_only: false,
+                known_machine: true,
             });
         }
         if owner_trust
@@ -21595,25 +22682,77 @@ impl Agent {
                 agents: None,
                 prefix: None,
                 evidence_only: false,
+                known_machine: false,
             });
         }
         Some(streams::InboundAdmission {
             agents: None,
             prefix: Some(limits.admit_prefix(*machine_id)?),
             evidence_only: false,
+            known_machine: false,
         })
     }
 
+    /// Post-prefix recheck for an EvidenceV1 stream: `true` refuses it.
+    /// Live denials and relationships are judged again after the prefix
+    /// wait. A previously known machine cannot turn into a stranger bypass
+    /// if its discovery entries disappear during that wait: any machine with
+    /// a known agent at pre-prefix admission
+    /// ([`streams::InboundAdmission::recheck_evidence`], including the #1107
+    /// enrolled slot) meets the evidence gate, which then refuses a machine
+    /// with no known agent left.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn evidence_refused_after_prefix(
+        discovery_cache: &std::sync::Arc<
+            tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+        >,
+        contact_store: &std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
+        revocation_set: &std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+        move_state: &std::sync::Arc<tokio::sync::RwLock<key_move::MoveState>>,
+        connect_policy: &std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>>,
+        owner_trust: &owner_trust::OwnerTrust,
+        machine_id: &identity::MachineId,
+        admission: &streams::InboundAdmission,
+    ) -> bool {
+        let known = discovery_cache
+            .read()
+            .await
+            .values()
+            .any(|a| a.machine_id == *machine_id);
+        let machine_revoked = revocation_set.read().await.is_machine_revoked(machine_id);
+        machine_revoked
+            || ((known || admission.recheck_evidence())
+                && Self::gate_peer_machine_inbound_for_evidence(
+                    discovery_cache,
+                    contact_store,
+                    revocation_set,
+                    move_state,
+                    connect_policy,
+                    owner_trust,
+                    machine_id,
+                    None,
+                    owner_trust::InboundTrustRule::EvidenceRelationship,
+                    false,
+                )
+                .await
+                .is_err())
+    }
+
     /// Dispatch after gate-first admission. EvidenceV1 goes exclusively to its
-    /// evidence acceptor. Known peers retain their gate result; machines with
-    /// no known agent apply [`Self::route_enrolled_owner_sync`]:
+    /// evidence acceptor, after [`Self::evidence_refused_after_prefix`]
+    /// rechecks any machine known at pre-prefix admission. Known peers
+    /// retain their gate result; machines with no known agent apply
+    /// [`Self::route_enrolled_owner_sync`]:
     ///
     /// - An admitted `SyncV1` stream goes to the REGISTERED `SyncV1`
     ///   acceptor only, never the default channel.
-    /// - A machine whose agent became known meanwhile goes through the
+    /// - A machine with a known agent (learned meanwhile, or #1107: admitted
+    ///   pre-prefix because its agents lack only trust) goes through the
     ///   shared gate ([`Self::gate_peer_machine_inbound`]: identity, trust,
     ///   pairing and connect ACL) and is routed exactly as the normal
-    ///   accept path routes it.
+    ///   accept path routes it. If that gate refuses for trust only, a
+    ///   `SyncV1` stream gets [`Self::admit_enrolled_owner_sync_over_untrusted`],
+    ///   judged now, after the prefix read.
     /// - Anything else drops the halves (→ QUIC reset) with zero
     ///   application bytes surfaced, logged `deny_not_verified` as the
     ///   shared gate would log it.
@@ -21661,6 +22800,19 @@ impl Agent {
                 return;
             }
         };
+        // The recheck runs while `admission` still holds the prefix slot.
+        let evidence_refused = protocol == streams::StreamProtocol::EvidenceV1
+            && Self::evidence_refused_after_prefix(
+                &discovery_cache,
+                &contact_store,
+                &revocation_set,
+                &move_state,
+                &connect_policy,
+                &owner_trust,
+                &machine_id,
+                &admission,
+            )
+            .await;
         // Keep the pre-identity slot through dispatch, including asynchronous
         // relationship checks. Evidence bodies then hold a separate reservation
         // through queueing and verification.
@@ -21670,32 +22822,7 @@ impl Agent {
         // Acquire both the machine stream slot and aggregate allocation permit
         // before queueing. The lease carries the original body deadline.
         if protocol == streams::StreamProtocol::EvidenceV1 {
-            // Recheck live denials and relationships after the prefix wait.
-            // A previously known machine cannot turn into a stranger bypass
-            // if its discovery entries disappear during that wait.
-            let known = discovery_cache
-                .read()
-                .await
-                .values()
-                .any(|a| a.machine_id == machine_id);
-            let machine_revoked = revocation_set.read().await.is_machine_revoked(&machine_id);
-            if machine_revoked
-                || ((known || admission.agents.is_some() || admission.evidence_only)
-                    && Self::gate_peer_machine_inbound_for_evidence(
-                        &discovery_cache,
-                        &contact_store,
-                        &revocation_set,
-                        &move_state,
-                        &connect_policy,
-                        &owner_trust,
-                        &machine_id,
-                        None,
-                        true,
-                        false,
-                    )
-                    .await
-                    .is_err())
-            {
+            if evidence_refused {
                 return;
             }
             if let (Some(sender), Some(lease)) = (
@@ -21738,7 +22865,7 @@ impl Agent {
             &machine_id,
             protocol,
             || {
-                let sender = incoming.registered_sender(streams::StreamProtocol::SyncV1)?;
+                let sender = incoming.registered_sender(protocol)?;
                 let (send, recv) = halves.take()?;
                 let peer_stream =
                     streams::PeerStream::new(Vec::new(), machine_id, protocol, send, recv);
@@ -21752,8 +22879,9 @@ impl Agent {
                     target: "x0x::streams",
                     machine = %hex::encode(machine_id.as_bytes()),
                     outcome = "admit_enrolled_owner_sync",
+                    protocol = ?protocol,
                     delivered,
-                    "SyncV1 stream admitted on verified owner enrollment (no known agent, #1040)"
+                    "stream admitted on verified owner enrollment (no known agent, #1040/#1107)"
                 );
             }
             EnrolledOwnerSyncRoute::Admitted(None) | EnrolledOwnerSyncRoute::Denied => {
@@ -21772,7 +22900,7 @@ impl Agent {
                 let Some((send, recv)) = halves.take() else {
                     return;
                 };
-                let Ok(agents) = Self::gate_peer_machine_inbound(
+                let agents = match Self::gate_peer_machine_inbound(
                     &discovery_cache,
                     &contact_store,
                     &revocation_set,
@@ -21782,8 +22910,45 @@ impl Agent {
                     &machine_id,
                 )
                 .await
-                else {
-                    return;
+                {
+                    Ok(agents) => agents,
+                    // #1107: an enrolled machine whose agents lack only trust.
+                    Err(error::NetworkError::PeerTrustRejected { .. }) => {
+                        let delivered = Self::admit_enrolled_owner_sync_over_untrusted(
+                            &discovery_cache,
+                            &contact_store,
+                            &revocation_set,
+                            &move_state,
+                            &connect_policy,
+                            &owner_trust,
+                            &machine_id,
+                            protocol,
+                            || {
+                                let sender = incoming.registered_sender(protocol)?;
+                                let stream = streams::PeerStream::new(
+                                    Vec::new(),
+                                    machine_id,
+                                    protocol,
+                                    send,
+                                    recv,
+                                );
+                                Some(sender.try_send(stream).is_ok())
+                            },
+                        )
+                        .await;
+                        if let Some(Some(delivered)) = delivered {
+                            tracing::info!(
+                                target: "x0x::streams",
+                                machine = %hex::encode(machine_id.as_bytes()),
+                                outcome = "admit_enrolled_owner_sync_untrusted_agent",
+                                protocol = ?protocol,
+                                delivered,
+                                "stream admitted on verified owner enrollment (known agents lack only trust, #1107)"
+                            );
+                        }
+                        return;
+                    }
+                    Err(_) => return,
                 };
                 let peer_stream =
                     streams::PeerStream::new(agents, machine_id, protocol, send, recv);
@@ -21917,7 +23082,9 @@ impl Agent {
             move_state: std::sync::Arc::clone(&self.move_state),
             self_name: std::sync::Arc::clone(&self.self_name),
             self_name_ever_set: std::sync::Arc::clone(&self.self_name_ever_set),
+            own_announce_order: std::sync::Arc::clone(&self.own_announce_order),
             verified_cert_tx: std::sync::Arc::clone(&self.verified_cert_tx),
+            revocation_seen: self.revocation_seen_sources(),
         };
         let handle = tokio::task::spawn(async move {
             let mut ticker =
@@ -24234,6 +25401,11 @@ impl AgentBuilder {
         // struct — the blob responder serves this pair to fetchers.
         let own_pair_user = identity.disclosed_user_id();
         let own_pair_cert = identity.agent_certificate().cloned();
+        // #1107: load the durable consent record before the first
+        // announce. It applies only to the identity it was given for.
+        let user_consent_path = storage::user_consent_path(self.identity_dir.as_deref());
+        let user_consent_loaded =
+            load_applicable_user_consent(user_consent_path.as_deref(), &identity).await;
         Ok(Agent {
             move_state,
             move_state_load_failed,
@@ -24246,6 +25418,7 @@ impl AgentBuilder {
             history_handle,
             self_name: std::sync::Arc::new(std::sync::RwLock::new(None)),
             self_name_ever_set: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            own_announce_order: OwnAnnounceOrder::default(),
             cert_journal_path,
             agent_cert_path,
             cert_adoption_lock: tokio::sync::Mutex::new(()),
@@ -24282,7 +25455,15 @@ impl AgentBuilder {
             direct_listener_started: std::sync::atomic::AtomicBool::new(false),
             observed_prefix_enabled,
             presence,
-            user_identity_consented: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            user_identity_consented: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                user_consent_loaded,
+            )),
+            user_consent_path,
+            user_consent_record_lock: tokio::sync::Mutex::new(()),
+            user_consent_generation: std::sync::atomic::AtomicU64::new(0),
+            user_consent_record_saved: std::sync::atomic::AtomicBool::new(user_consent_loaded),
+            #[cfg(test)]
+            consented_publish_test_gate: std::sync::Mutex::new(None),
             capability_store: std::sync::Arc::new(dm_capability::CapabilityStore::new()),
             capability_refreshes: std::sync::Arc::new(CapabilityRefreshRegistry::default()),
             #[cfg(test)]
@@ -24324,6 +25505,7 @@ impl AgentBuilder {
             })),
             peer_relay,
             relay_candidates,
+            revocation_group_seen: RevocationGroupSeenSlot::default(),
             stream_accept: std::sync::Arc::new(streams::StreamAccept::new(256)),
             connect_policy: std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(
                 connect::ConnectPolicy::default(),
@@ -28788,6 +29970,7 @@ mod tests {
         for prefix in [
             crate::history::classify::KV_STORE_DELTA_DM_PREFIX,
             crate::share_grant::SHARE_GRANT_DM_PREFIX,
+            crate::share_grant::names::SHARE_GRANT_V2_DM_PREFIX,
             crate::history::classify::GROUP_PUBLIC_MESSAGE_DM_PREFIX,
             crate::exec::EXEC_DM_PREFIX,
             b"X0X-GROUP-PREDECESSOR-RELAY-V1\n".as_slice(),
@@ -28795,6 +29978,7 @@ mod tests {
             crate::gui::remote::SHOW_REQUEST_PREFIX,
             crate::gui::remote::SHOW_RESULT_PREFIX,
             crate::gui::remote::ACTIVITY_PREFIX,
+            crate::revocation_push::GRANT_REVOCATION_PUSH_PREFIX,
         ] {
             let mut payload = prefix.to_vec();
             payload.extend_from_slice(b"unverified-startup-window-frame");
@@ -28841,6 +30025,76 @@ mod tests {
             generic
                 .try_recv()
                 .expect("ordinary DMs still delivered")
+                .payload,
+            ordinary
+        );
+    }
+
+    /// ADR 0080 §4 (prefix ownership is unconditional): a VERIFIED
+    /// grant-revocation push that arrives in the startup window — the raw
+    /// listener runs before the inbox registers any typed route, and a
+    /// sender can hold a pre-restart capability advert for up to 900 s —
+    /// must be dropped (`not_ready`), never recorded in history or shown
+    /// on the generic bus as an ordinary DM. The static production table
+    /// covers only UNVERIFIED frames, so without the dedicated drop in
+    /// `dispatch_raw_direct_after_gates` this frame falls through (RED
+    /// without the fix: the generic bus shows the push bytes as a DM).
+    #[tokio::test]
+    async fn raw_path_verified_push_is_dropped_before_inbox_starts() {
+        let dm = direct::DirectMessaging::new();
+        let mut generic = dm.subscribe();
+        let sender = identity::AgentId([0x97; 32]);
+        let machine_id = identity::MachineId([0x98; 32]);
+        // The startup-window shape: no registered routes at all.
+        let no_routes: Vec<dm_inbox::DmTypedPayloadRoute> = Vec::new();
+        let mut payload = crate::revocation_push::GRANT_REVOCATION_PUSH_PREFIX.to_vec();
+        payload.extend_from_slice(b"verified-startup-window-push");
+        let outcome = dispatch_raw_direct_after_gates(
+            &dm,
+            None,
+            &no_routes,
+            RawDirectDelivery {
+                sender,
+                machine_id,
+                data: payload.clone(),
+                verified: true,
+                trust_decision: Some(trust::TrustDecision::Accept),
+                observed_origin: None,
+                digest: direct::dm_payload_digest_hex(&payload),
+            },
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            dm_inbox::TypedRouteOutcome::RejectedPrefix,
+            "a verified push with no registered route is dropped, not routed"
+        );
+        assert!(
+            generic.try_recv().is_none(),
+            "a verified push must never reach the generic bus, inbox or not"
+        );
+        // Control: a verified ORDINARY frame in the same window IS
+        // delivered — the drop is prefix ownership, not a startup blackout.
+        let ordinary = b"verified ordinary startup-window DM".to_vec();
+        dispatch_raw_direct_after_gates(
+            &dm,
+            None,
+            &no_routes,
+            RawDirectDelivery {
+                sender,
+                machine_id,
+                data: ordinary.clone(),
+                verified: true,
+                trust_decision: Some(trust::TrustDecision::Accept),
+                observed_origin: None,
+                digest: direct::dm_payload_digest_hex(&ordinary),
+            },
+        )
+        .await;
+        assert_eq!(
+            generic
+                .try_recv()
+                .expect("verified ordinary DMs still delivered")
                 .payload,
             ordinary
         );
@@ -29937,8 +31191,9 @@ mod tests {
         let make_worker =
             |publishes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
              mut release: tokio::sync::watch::Receiver<bool>| {
-                move |guard: CapabilityRefreshGuard,
+                move |mut guard: CapabilityRefreshGuard,
                   completion_tx: tokio::sync::watch::Sender<CapabilityRefreshState>| async move {
+                guard.published = true;
                 publishes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 while !*release.borrow_and_update() {
                     if release.changed().await.is_err() {
@@ -29952,11 +31207,13 @@ mod tests {
 
         let first = registry.register_or_start(
             recipient,
+            CapabilityRefreshPurpose::Requirement,
             make_worker(publishes.clone(), release_rx.clone()),
         );
         assert!(matches!(first, CapabilityRefreshRegistration::Started(_)));
         let second = registry.register_or_start(
             recipient,
+            CapabilityRefreshPurpose::Requirement,
             make_worker(publishes.clone(), release_rx.clone()),
         );
         assert!(
@@ -29965,8 +31222,11 @@ mod tests {
         );
         // A different recipient is a genuinely different question and starts
         // its own flight.
-        let third =
-            registry.register_or_start(other, make_worker(publishes.clone(), release_rx.clone()));
+        let third = registry.register_or_start(
+            other,
+            CapabilityRefreshPurpose::Requirement,
+            make_worker(publishes.clone(), release_rx.clone()),
+        );
         assert!(matches!(third, CapabilityRefreshRegistration::Started(_)));
 
         release_tx.send_replace(true);
@@ -29993,8 +31253,9 @@ mod tests {
     async fn capability_refresh_registry_cooldown_blocks_immediate_reflight() {
         let recipient = identity::AgentId([0x81_u8; 32]);
         let finish_now =
-            |guard: CapabilityRefreshGuard,
+            |mut guard: CapabilityRefreshGuard,
              completion_tx: tokio::sync::watch::Sender<CapabilityRefreshState>| async move {
+                guard.published = true;
                 completion_tx.send_replace(CapabilityRefreshState::Finished);
                 drop(guard);
             };
@@ -30003,7 +31264,11 @@ mod tests {
             std::time::Duration::from_secs(3_600),
         ));
         assert!(matches!(
-            registry.register_or_start(recipient, finish_now),
+            registry.register_or_start(
+                recipient,
+                CapabilityRefreshPurpose::Requirement,
+                finish_now
+            ),
             CapabilityRefreshRegistration::Started(_)
         ));
         for _ in 0..200 {
@@ -30015,7 +31280,11 @@ mod tests {
         assert_eq!(registry.len(), 0, "flight drained");
         assert!(
             matches!(
-                registry.register_or_start(recipient, finish_now),
+                registry.register_or_start(
+                    recipient,
+                    CapabilityRefreshPurpose::Requirement,
+                    finish_now
+                ),
                 CapabilityRefreshRegistration::Unavailable
             ),
             "an immediate reflight within the cooldown must fail fast"
@@ -30027,7 +31296,7 @@ mod tests {
             std::time::Duration::ZERO,
         ));
         assert!(matches!(
-            eager.register_or_start(recipient, finish_now),
+            eager.register_or_start(recipient, CapabilityRefreshPurpose::Requirement, finish_now),
             CapabilityRefreshRegistration::Started(_)
         ));
         for _ in 0..200 {
@@ -30037,7 +31306,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(matches!(
-            eager.register_or_start(recipient, finish_now),
+            eager.register_or_start(recipient, CapabilityRefreshPurpose::Requirement, finish_now),
             CapabilityRefreshRegistration::Started(_)
         ));
     }
@@ -30048,6 +31317,7 @@ mod tests {
         registry.close();
         let registration = registry.register_or_start(
             identity::AgentId([0x73_u8; 32]),
+            CapabilityRefreshPurpose::Requirement,
             |guard, completion_tx| async move {
                 completion_tx.send_replace(CapabilityRefreshState::Finished);
                 drop(guard);
@@ -30058,6 +31328,289 @@ mod tests {
             CapabilityRefreshRegistration::Unavailable
         ));
         assert_eq!(registry.len(), 0);
+    }
+
+    /// #1776 review (finding 3): the Welcome fetch's addressability flight
+    /// shares the recipient with strict sends. Its cooldown must not refuse
+    /// a strict (durable-ACK or application-bit) send its own refresh, and a
+    /// strict send must not join it, because it can finish on a binding
+    /// that does not satisfy the strict send. A strict flight still answers
+    /// addressability: the reverse direction joins and honours the cooldown.
+    #[tokio::test]
+    async fn capability_refresh_addressability_flight_never_holds_back_a_strict_refresh() {
+        let recipient = identity::AgentId([0x91_u8; 32]);
+        let finish_now =
+            |mut guard: CapabilityRefreshGuard,
+             completion_tx: tokio::sync::watch::Sender<CapabilityRefreshState>| async move {
+                guard.published = true;
+                completion_tx.send_replace(CapabilityRefreshState::Finished);
+                drop(guard);
+            };
+        let drain = |registry: std::sync::Arc<CapabilityRefreshRegistry>| async move {
+            for _ in 0..200 {
+                if registry.len() == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(registry.len(), 0, "flight drained");
+        };
+
+        // Cooldown: addressability first, then strict.
+        let registry = std::sync::Arc::new(CapabilityRefreshRegistry::with_cooldown(
+            std::time::Duration::from_secs(3_600),
+        ));
+        assert!(matches!(
+            registry.register_or_start(
+                recipient,
+                CapabilityRefreshPurpose::Addressability,
+                finish_now
+            ),
+            CapabilityRefreshRegistration::Started(_)
+        ));
+        drain(std::sync::Arc::clone(&registry)).await;
+        assert!(
+            matches!(
+                registry.register_or_start(
+                    recipient,
+                    CapabilityRefreshPurpose::Requirement,
+                    finish_now
+                ),
+                CapabilityRefreshRegistration::Started(_)
+            ),
+            "an addressability cooldown must not refuse a strict refresh"
+        );
+        drain(std::sync::Arc::clone(&registry)).await;
+        assert!(
+            matches!(
+                registry.register_or_start(
+                    recipient,
+                    CapabilityRefreshPurpose::Addressability,
+                    finish_now
+                ),
+                CapabilityRefreshRegistration::Unavailable
+            ),
+            "a strict flight's answer also covers addressability"
+        );
+
+        // Single flight across purposes.
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        let hold = |mut release: tokio::sync::watch::Receiver<bool>| {
+            move |mut guard: CapabilityRefreshGuard,
+                  completion_tx: tokio::sync::watch::Sender<CapabilityRefreshState>| async move {
+                guard.published = true;
+                while !*release.borrow_and_update() {
+                    if release.changed().await.is_err() {
+                        break;
+                    }
+                }
+                completion_tx.send_replace(CapabilityRefreshState::Finished);
+                drop(guard);
+            }
+        };
+        let fresh = std::sync::Arc::new(CapabilityRefreshRegistry::with_cooldown(
+            std::time::Duration::from_secs(3_600),
+        ));
+        assert!(matches!(
+            fresh.register_or_start(
+                recipient,
+                CapabilityRefreshPurpose::Addressability,
+                hold(release_rx.clone())
+            ),
+            CapabilityRefreshRegistration::Started(_)
+        ));
+        assert!(
+            matches!(
+                fresh.register_or_start(
+                    recipient,
+                    CapabilityRefreshPurpose::Requirement,
+                    hold(release_rx.clone())
+                ),
+                CapabilityRefreshRegistration::Started(_)
+            ),
+            "a strict send must not join a weaker in-flight request"
+        );
+        assert!(
+            matches!(
+                fresh.register_or_start(
+                    recipient,
+                    CapabilityRefreshPurpose::Addressability,
+                    hold(release_rx.clone())
+                ),
+                CapabilityRefreshRegistration::Joined(_)
+            ),
+            "an addressability caller joins an in-flight request"
+        );
+        assert_eq!(fresh.len(), 2);
+        release_tx.send_replace(true);
+        drain(fresh).await;
+    }
+
+    /// #1776 review round 3: only a flight that published its request starts
+    /// the cooldown. A flight that was ready at once asked nothing, so a
+    /// later caller still gets its own request. A published flight's
+    /// cooldown runs on the tokio clock and expires with virtual time.
+    #[tokio::test(start_paused = true)]
+    async fn capability_refresh_cooldown_needs_a_publish_and_expires_on_the_tokio_clock() {
+        let recipient = identity::AgentId([0x94_u8; 32]);
+        let finish = |published: bool| {
+            move |mut guard: CapabilityRefreshGuard,
+                  completion_tx: tokio::sync::watch::Sender<CapabilityRefreshState>| async move {
+                guard.published = published;
+                completion_tx.send_replace(CapabilityRefreshState::Finished);
+                drop(guard);
+            }
+        };
+        let registry = std::sync::Arc::new(CapabilityRefreshRegistry::with_cooldown(
+            CAPABILITY_REFRESH_COOLDOWN,
+        ));
+        let drain = |registry: std::sync::Arc<CapabilityRefreshRegistry>| async move {
+            for _ in 0..200 {
+                if registry.len() == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(registry.len(), 0, "flight drained");
+        };
+        let purpose = CapabilityRefreshPurpose::Addressability;
+
+        assert!(matches!(
+            registry.register_or_start(recipient, purpose, finish(false)),
+            CapabilityRefreshRegistration::Started(_)
+        ));
+        drain(std::sync::Arc::clone(&registry)).await;
+        assert!(
+            matches!(
+                registry.register_or_start(recipient, purpose, finish(true)),
+                CapabilityRefreshRegistration::Started(_)
+            ),
+            "a flight that published nothing must not start the cooldown"
+        );
+        drain(std::sync::Arc::clone(&registry)).await;
+        assert!(
+            matches!(
+                registry.register_or_start(recipient, purpose, finish(true)),
+                CapabilityRefreshRegistration::Unavailable
+            ),
+            "a published flight starts the cooldown"
+        );
+        tokio::time::advance(CAPABILITY_REFRESH_COOLDOWN + std::time::Duration::from_secs(1)).await;
+        assert!(
+            matches!(
+                registry.register_or_start(recipient, purpose, finish(true)),
+                CapabilityRefreshRegistration::Started(_)
+            ),
+            "the cooldown expires with tokio (virtual) time"
+        );
+        drain(registry).await;
+    }
+
+    /// #1776 review round 2: the strict-send gate refreshes only for a real
+    /// requirement. A payload with no application prefix can never fail
+    /// `require_payload` (even against a registry that supports nothing),
+    /// so the gate never starts an addressability flight for it.
+    #[test]
+    fn a_plain_payload_never_fails_the_application_gate() {
+        let plain = b"plain direct message".to_vec();
+        assert!(dm::CapabilityRegistry::required_for_payload(&plain).is_none());
+        assert!(dm::CapabilityRegistry::default()
+            .require_payload(&plain)
+            .is_ok());
+    }
+
+    /// #1776 review (finding 5): a refresh with no durable-ACK and no
+    /// application-bit requirement returns at once only when the store
+    /// already holds a gossip-usable binding. With no binding, or with a
+    /// stale binding the gossip-inbox leg cannot use, it must publish its
+    /// one targeted request. Before #1776 such a flight was ready at once
+    /// and published nothing.
+    #[tokio::test(start_paused = true)]
+    async fn no_requirement_refresh_publishes_unless_the_binding_is_gossip_usable() {
+        let recipient = identity::AgentId([0x92_u8; 32]);
+        let machine = identity::MachineId([0x93_u8; 32]);
+        let run = |store: std::sync::Arc<dm_capability::CapabilityStore>| async move {
+            let publishes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = std::sync::Arc::clone(&publishes);
+            run_strict_capability_refresh(
+                recipient,
+                None,
+                false,
+                store,
+                tokio_util::sync::CancellationToken::new(),
+                tokio::time::Instant::now() + CAPABILITY_REFRESH_CONVERGENCE_WAIT,
+                async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await;
+            publishes.load(std::sync::atomic::Ordering::SeqCst)
+        };
+
+        let empty = std::sync::Arc::new(dm_capability::CapabilityStore::new());
+        assert_eq!(run(empty).await, 1, "no binding: publish one request");
+
+        let stale = std::sync::Arc::new(dm_capability::CapabilityStore::new());
+        assert!(stale.insert(
+            recipient,
+            machine,
+            dm::DmCapabilities::pending(),
+            dm_capability::now_unix_ms(),
+        ));
+        assert_eq!(
+            run(stale).await,
+            1,
+            "a binding without gossip inbox or KEM key is not usable"
+        );
+
+        // A failed publish asked nothing: it returns `false` at once (no
+        // cooldown, no convergence wait).
+        let started = tokio::time::Instant::now();
+        let published = run_strict_capability_refresh(
+            recipient,
+            None,
+            false,
+            std::sync::Arc::new(dm_capability::CapabilityStore::new()),
+            tokio_util::sync::CancellationToken::new(),
+            started + CAPABILITY_REFRESH_CONVERGENCE_WAIT,
+            async { Err(error::NetworkError::BroadcastError("test".into())) },
+        )
+        .await;
+        assert!(!published, "a failed publish must not start the cooldown");
+        assert_eq!(
+            tokio::time::Instant::now(),
+            started,
+            "a failed publish must not wait for an answer"
+        );
+
+        // A strict flight keeps its pre-#1776 convergence wait after a
+        // failed publish, so the strict gate's refusal timing is unchanged.
+        let started = tokio::time::Instant::now();
+        let published = run_strict_capability_refresh(
+            recipient,
+            None,
+            true,
+            std::sync::Arc::new(dm_capability::CapabilityStore::new()),
+            tokio_util::sync::CancellationToken::new(),
+            started + CAPABILITY_REFRESH_CONVERGENCE_WAIT,
+            async { Err(error::NetworkError::BroadcastError("test".into())) },
+        )
+        .await;
+        assert!(!published, "a failed strict publish starts no cooldown");
+        assert!(
+            tokio::time::Instant::now() >= started + CAPABILITY_REFRESH_CONVERGENCE_WAIT,
+            "a strict flight still waits out its convergence window"
+        );
+
+        let usable = std::sync::Arc::new(dm_capability::CapabilityStore::new());
+        assert!(usable.insert(
+            recipient,
+            machine,
+            dm::DmCapabilities::v1_gossip_ready(vec![7_u8; 1184]),
+            dm_capability::now_unix_ms(),
+        ));
+        assert_eq!(run(usable).await, 0, "a usable binding needs no request");
     }
 
     /// #461 regression (b8a9e2a HOLD): the provenance entry used by the
@@ -37184,8 +38737,7 @@ mod tests {
                 revocation_set: std::sync::Arc::clone(&agent.revocation_set),
                 s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: identity_dir.clone(),
-                owner_trust: agent.owner_trust.clone(),
-                contact_store: std::sync::Arc::clone(&agent.contact_store),
+                seen: agent.revocation_seen_sources(),
                 discovery_cache: std::sync::Arc::clone(&agent.identity_discovery_cache),
                 machine_cache: std::sync::Arc::clone(&agent.machine_discovery_cache),
             })),
@@ -38063,11 +39615,760 @@ mod tests {
         .expect("sign")
     }
 
-    /// #1765 review finding 1: a live record that the TTL sweep takes from
-    /// the set before any write held it is not in the bytes of a later
-    /// write. It stays not durable, and no retry waits for it.
+    /// #1765 review finding 1: a live record that leaves the set before
+    /// any write held it is not in the bytes of a later write. It stays
+    /// not durable, and no retry waits for it.
+    /// #1857: a later record L and then the earlier record E for one
+    /// subject and issuer arrive before any store write. E takes the place
+    /// of L in the set. An eviction row that waits for L must not wait for
+    /// ever: the store write that holds E makes L's evidence durable.
     #[tokio::test]
-    async fn a_swept_revocation_is_not_durable_after_a_later_store_write() {
+    async fn a_replaced_revocation_is_durable_when_its_kept_record_is_written() {
+        let dir = tempfile::tempdir().expect("dir");
+        let set = tokio::sync::RwLock::new(revocation::RevocationSet::new());
+        let intake = groups::eviction::RevocationIntake::new();
+        let kp = identity::AgentKeypair::generate().expect("keypair");
+        let sign = |revoked_at: u64| {
+            revocation::RevocationRecord::sign(
+                revocation::RevokedSubject::Agent(kp.agent_id()),
+                kp.public_key(),
+                kp.secret_key(),
+                revoked_at,
+                None,
+            )
+            .expect("sign")
+        };
+        let later = sign(2_000);
+        let earlier = sign(1_000);
+        {
+            let mut guard = set.write().await;
+            assert!(guard
+                .verify_and_insert(later.clone(), None)
+                .expect("insert"));
+            intake.note_verified(&later);
+            assert!(guard
+                .verify_and_insert(earlier.clone(), None)
+                .expect("insert"));
+            intake.note_verified(&earlier);
+            assert!(!guard.contains_hash(&later.record_hash()));
+        }
+        persist_s4_revocations(&set, &intake, Some(dir.path()))
+            .await
+            .expect("store write");
+        let hashes = std::collections::BTreeSet::from([later.record_hash(), earlier.record_hash()]);
+        assert!(
+            intake.all_durable(&hashes),
+            "the replaced record's evidence is on disk as the kept record"
+        );
+        let written = std::fs::read(dir.path().join("revocations.bin")).expect("store");
+        let on_disk = revocation::RevocationSet::from_bytes(&written).expect("decode");
+        assert!(on_disk.contains_hash(&earlier.record_hash()));
+        assert!(on_disk.is_agent_revoked(&kp.agent_id()));
+    }
+
+    /// #1864 finding 3: a record that S4 waits for is replaced, and many
+    /// more replacements follow before any store write succeeds. The
+    /// first record's evidence is on disk when the kept record of its
+    /// pair is, however many replacements came between.
+    #[tokio::test]
+    async fn a_record_replaced_many_times_before_a_store_write_is_durable() {
+        // More replacements than the old replaced-record memory held (4096).
+        const REPLACEMENTS: u64 = 4_100;
+        let dir = tempfile::tempdir().expect("dir");
+        let set = tokio::sync::RwLock::new(revocation::RevocationSet::new());
+        let intake = groups::eviction::RevocationIntake::new();
+        let kp = identity::AgentKeypair::generate().expect("keypair");
+        let sign = |revoked_at: u64| {
+            revocation::RevocationRecord::sign(
+                revocation::RevokedSubject::Agent(kp.agent_id()),
+                kp.public_key(),
+                kp.secret_key(),
+                revoked_at,
+                None,
+            )
+            .expect("sign")
+        };
+        let first = sign(REPLACEMENTS + 1);
+        {
+            let mut guard = set.write().await;
+            assert!(guard
+                .verify_and_insert(first.clone(), None)
+                .expect("insert"));
+            intake.note_verified(&first);
+            // Each record is earlier than the one before, so each one
+            // takes the place of the one before. No store write runs.
+            for step in 0..REPLACEMENTS {
+                let record = sign(REPLACEMENTS - step);
+                assert!(guard
+                    .verify_and_insert(record.clone(), None)
+                    .expect("insert"));
+                intake.note_verified(&record);
+            }
+            assert_eq!(guard.len(), 1);
+        }
+        assert!(s4_store_write_pending(&set, &intake).await);
+        persist_s4_revocations(&set, &intake, Some(dir.path()))
+            .await
+            .expect("store write");
+        assert!(
+            intake.all_durable(&std::collections::BTreeSet::from([first.record_hash()])),
+            "the first record's evidence is on disk as the kept record of its pair"
+        );
+        assert!(intake.not_durable_hashes().is_empty());
+        let written = std::fs::read(dir.path().join("revocations.bin")).expect("store");
+        let on_disk = revocation::RevocationSet::from_bytes(&written).expect("decode");
+        assert!(on_disk.is_agent_revoked(&kp.agent_id()));
+    }
+
+    /// #1863 (review round 2): "seen" is a relationship. A Known contact,
+    /// an agent of this owner and a group relationship are published; an
+    /// Unknown or Blocked contact is not; a contact raised to Known later
+    /// is published at the next heartbeat.
+    #[tokio::test]
+    async fn only_a_relationship_makes_a_stranger_seen() {
+        let dir = tempfile::tempdir().expect("dir");
+        let set = tokio::sync::RwLock::new(revocation::RevocationSet::new());
+        let contacts = std::sync::Arc::new(tokio::sync::RwLock::new(contacts::ContactStore::new(
+            dir.path().join("contacts.json"),
+        )));
+        let groups: RevocationGroupSeenSlot = RevocationGroupSeenSlot::default();
+        let journal = dir.path().join("issued.jsonl");
+        let owner_kp = identity::UserKeypair::generate().expect("owner");
+        let sources = RevocationSeenSources {
+            own_agent: identity::AgentId([0x01; 32]),
+            own_machine: identity::MachineId([0x02; 32]),
+            owner: Some(owner_kp.user_id()),
+            contact_store: std::sync::Arc::clone(&contacts),
+            cert_journal_path: Some(journal.clone()),
+            groups: std::sync::Arc::clone(&groups),
+            owner_trust: owner_trust::OwnerTrust::new(
+                None,
+                std::sync::Arc::new(tokio::sync::RwLock::new(
+                    dm_inbox::AuthenticatedMachineBindingCache::default(),
+                )),
+            ),
+        };
+        let known = identity::AgentKeypair::generate().expect("keypair");
+        let unknown = identity::AgentKeypair::generate().expect("keypair");
+        let blocked = identity::AgentKeypair::generate().expect("keypair");
+        let member = identity::AgentKeypair::generate().expect("keypair");
+        let owned = identity::AgentKeypair::generate().expect("keypair");
+        let later = identity::AgentKeypair::generate().expect("keypair");
+        {
+            let mut guard = set.write().await;
+            for kp in [&known, &unknown, &blocked, &member, &owned, &later] {
+                assert!(guard
+                    .verify_and_insert(self_revocation_at(kp, 1_000), None)
+                    .expect("insert"));
+            }
+        }
+        {
+            let mut store = contacts.write().await;
+            store.set_trust(&known.agent_id(), contacts::TrustLevel::Known);
+            store.set_trust(&unknown.agent_id(), contacts::TrustLevel::Unknown);
+            store.set_trust(&blocked.agent_id(), contacts::TrustLevel::Blocked);
+            store.set_trust(&later.agent_id(), contacts::TrustLevel::Unknown);
+        }
+        let member_id = member.agent_id();
+        *groups.write().expect("slot") = Some(std::sync::Arc::new(move |mut agents| {
+            agents.retain(|agent| *agent == member_id);
+            Box::pin(std::future::ready(agents.into_iter().collect()))
+        }));
+        let cert = identity::AgentCertificate::issue(&owner_kp, &owned).expect("cert");
+        profile::IssuedCertRecord::append(
+            &journal,
+            &profile::IssuedCertRecord::from_cert(&owner_kp.user_id(), &cert).expect("record"),
+        )
+        .await
+        .expect("journal");
+
+        let published = |guard: &revocation::RevocationSet| {
+            guard
+                .published_records()
+                .iter()
+                .filter_map(|record| match record.subject {
+                    revocation::RevokedSubject::Agent(agent) => Some(agent),
+                    _ => None,
+                })
+                .collect::<std::collections::HashSet<identity::AgentId>>()
+        };
+        assert!(mark_seen_revocation_subjects(&set, &sources).await);
+        assert_eq!(
+            published(&*set.read().await),
+            std::collections::HashSet::from([
+                known.agent_id(),
+                member.agent_id(),
+                owned.agent_id()
+            ])
+        );
+        // Nothing new: the next heartbeat changes nothing.
+        assert!(!mark_seen_revocation_subjects(&set, &sources).await);
+        // The user raises a contact to Known: the next heartbeat publishes it.
+        contacts
+            .write()
+            .await
+            .set_trust(&later.agent_id(), contacts::TrustLevel::Known);
+        assert!(mark_seen_revocation_subjects(&set, &sources).await);
+        let guard = set.read().await;
+        assert!(published(&guard).contains(&later.agent_id()));
+        assert!(!published(&guard).contains(&unknown.agent_id()));
+        assert!(!published(&guard).contains(&blocked.agent_id()));
+        assert_eq!(guard.stranger_self_revocation_count(), 2);
+    }
+
+    /// #1868 review: the publish paths send what `revocation_publish_records`
+    /// gives. On the v1 topic the decoded batches hold a seen subject's
+    /// self-revocation and an owner revocation, and not a stranger's.
+    #[tokio::test]
+    async fn the_v1_publish_leaves_out_a_strangers_self_revocation() {
+        let mut set = revocation::RevocationSet::new();
+        let stranger = identity::AgentKeypair::generate().expect("keypair");
+        let seen = identity::AgentKeypair::generate().expect("keypair");
+        let stranger_record = self_revocation_at(&stranger, 1_000);
+        let seen_record = self_revocation_at(&seen, 1_000);
+        assert!(set
+            .verify_and_insert(stranger_record.clone(), None)
+            .expect("insert"));
+        assert!(set
+            .verify_and_insert(seen_record.clone(), None)
+            .expect("insert"));
+        assert!(set.mark_seen([revocation::SeenSubject::Agent(seen.agent_id())]));
+        let records = revocation_publish_records(&set, REVOCATION_TOPIC);
+        let mut sent = Vec::new();
+        for batch in revocation::encode_revocation_batches(&records).expect("encode") {
+            sent.extend(revocation::decode_revocation_batch(&batch).expect("decode"));
+        }
+        let sent: std::collections::HashSet<[u8; 32]> = sent
+            .iter()
+            .map(revocation::RevocationRecord::record_hash)
+            .collect();
+        assert_eq!(
+            sent,
+            std::collections::HashSet::from([seen_record.record_hash()])
+        );
+        assert!(!sent.contains(&stranger_record.record_hash()));
+        // The store still holds both.
+        assert_eq!(set.all_records().len(), 2);
+        assert!(revocation_publish_records(&set, "x0x.other").is_empty());
+    }
+
+    /// #1867: the heartbeat sends one empty-set statement for each topic
+    /// whose published set is empty, only while that carrier is open. A
+    /// non-empty set sends the bytes of `encode_revocation_batches`.
+    #[test]
+    fn heartbeat_states_an_empty_set_only_for_an_open_carrier_1867() {
+        let topics = [REVOCATION_TOPIC, REVOCATION_V2_TOPIC, REVOCATION_V3_TOPIC];
+        let carriers = [
+            revocation::REVOCATION_CARRIER_V1,
+            revocation::REVOCATION_CARRIER_V2,
+            revocation::REVOCATION_CARRIER_V3,
+        ];
+        let statement = revocation::encode_empty_set_statement().expect("encode");
+        let open = revocation::RevocationSet::new();
+        for topic in topics {
+            assert_eq!(
+                revocation_heartbeat_batches(&open, topic).expect("encode"),
+                vec![statement.clone()],
+                "{topic}"
+            );
+        }
+        assert!(revocation_heartbeat_batches(&open, "x0x.other")
+            .expect("encode")
+            .is_empty());
+        for (topic, carrier) in topics.into_iter().zip(carriers) {
+            // A carrier that waits for a resync states nothing; the other
+            // carriers still do.
+            let waiting = revocation::RevocationSet::quarantined_carrier(carrier);
+            // A carrier that waits for its rebuild states nothing.
+            let mut reconciling = revocation::RevocationSet::new();
+            reconciling.hold_carrier_until_reconciled(carrier);
+            for closed in [&waiting, &reconciling] {
+                assert!(closed.carrier_closed(carrier));
+                for other in topics {
+                    let sent = revocation_heartbeat_batches(closed, other).expect("encode");
+                    if other == topic {
+                        assert!(sent.is_empty(), "{topic}: a closed carrier states nothing");
+                    } else {
+                        assert_eq!(sent, vec![statement.clone()], "{other}");
+                    }
+                }
+            }
+        }
+        // A non-empty set: the same bytes as before #1867, no statement.
+        let mut held = revocation::RevocationSet::new();
+        let owner = identity::AgentKeypair::generate().expect("keypair");
+        let record = self_revocation_at(&owner, 1_000);
+        assert!(held.verify_and_insert(record, None).expect("insert"));
+        assert!(held.mark_seen([revocation::SeenSubject::Agent(owner.agent_id())]));
+        let records = revocation_publish_records(&held, REVOCATION_TOPIC);
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            revocation_heartbeat_batches(&held, REVOCATION_TOPIC).expect("encode"),
+            revocation::encode_revocation_batches(&records).expect("encode")
+        );
+    }
+
+    /// #1868 review: machine subjects. A machine on a Known contact is
+    /// seen; a machine on an Unknown contact (what an announce leaves) is
+    /// not.
+    #[tokio::test]
+    async fn a_machine_on_a_known_contact_is_seen_and_on_an_unknown_one_is_not() {
+        let dir = tempfile::tempdir().expect("dir");
+        let set = tokio::sync::RwLock::new(revocation::RevocationSet::new());
+        let contacts = std::sync::Arc::new(tokio::sync::RwLock::new(contacts::ContactStore::new(
+            dir.path().join("contacts.json"),
+        )));
+        let known_agent = identity::AgentKeypair::generate().expect("keypair");
+        let unknown_agent = identity::AgentKeypair::generate().expect("keypair");
+        let known_machine = identity::MachineKeypair::generate().expect("keypair");
+        let unknown_machine = identity::MachineKeypair::generate().expect("keypair");
+        {
+            let mut store = contacts.write().await;
+            store.add_machine(
+                &known_agent.agent_id(),
+                contacts::MachineRecord::new(known_machine.machine_id(), None),
+            );
+            store.set_trust(&known_agent.agent_id(), contacts::TrustLevel::Known);
+            store.add_machine(
+                &unknown_agent.agent_id(),
+                contacts::MachineRecord::new(unknown_machine.machine_id(), None),
+            );
+        }
+        let sign = |kp: &identity::MachineKeypair| {
+            revocation::RevocationRecord::sign(
+                revocation::RevokedSubject::Machine(kp.machine_id()),
+                kp.public_key(),
+                kp.secret_key(),
+                1_000,
+                None,
+            )
+            .expect("sign")
+        };
+        {
+            let mut guard = set.write().await;
+            for kp in [&known_machine, &unknown_machine] {
+                assert!(guard.verify_and_insert(sign(kp), None).expect("insert"));
+            }
+        }
+        assert!(
+            SeenEvidence::gather(&seen_sources_1863(&contacts, None))
+                .await
+                .mark(&set)
+                .await
+        );
+        let guard = set.read().await;
+        let published: Vec<_> = guard
+            .published_records()
+            .iter()
+            .map(|record| record.subject.clone())
+            .collect();
+        assert_eq!(
+            published,
+            vec![revocation::RevokedSubject::Machine(
+                known_machine.machine_id()
+            )]
+        );
+    }
+
+    /// The diagnostics gauge reports the value the heartbeat sets.
+    #[test]
+    fn the_stranger_gauge_is_in_the_diagnostics_counters() {
+        crate::identity_authority::set_revocation_stranger_self_held(7);
+        assert_eq!(
+            crate::identity_authority::counters_json()["revocation_stranger_self_held"],
+            7
+        );
+    }
+
+    /// #1863: the group rule. Only an active member of the group is a
+    /// relationship, and only in a group that this node is an active
+    /// member of and that needs approval to join. A pending, removed or
+    /// banned row does not count. The revocation path removes a revoked
+    /// member, so that subject is then a stranger again.
+    #[test]
+    fn the_group_relationship_rule() {
+        let local = identity::AgentId([0x11; 32]);
+        let subject = identity::AgentId([0x22; 32]);
+        let group = |admission: groups::policy::GroupAdmission,
+                     subject_state: Option<groups::member::GroupMemberState>,
+                     local_active: bool| {
+            let mut info = groups::GroupInfo::with_policy(
+                "g".to_string(),
+                String::new(),
+                identity::AgentId([0x33; 32]),
+                "00112233445566778899aabbccddeeff".to_string(),
+                groups::policy::GroupPolicy {
+                    admission,
+                    ..groups::policy::GroupPolicy::default()
+                },
+            );
+            if local_active {
+                info.add_member(
+                    hex::encode(local.as_bytes()),
+                    groups::GroupRole::Member,
+                    None,
+                    None,
+                );
+            }
+            if let Some(state) = subject_state {
+                let hex_id = hex::encode(subject.as_bytes());
+                info.add_member(hex_id.clone(), groups::GroupRole::Member, None, None);
+                if let Some(member) = info.members_v2.get_mut(&hex_id) {
+                    member.state = state;
+                }
+            }
+            info
+        };
+        use groups::member::GroupMemberState as S;
+        use groups::policy::GroupAdmission as A;
+        let check =
+            |info: groups::GroupInfo| revocation_group_relationship([&info], &local, &subject);
+        let subject_hex = hex::encode(subject.as_bytes());
+        assert!(
+            check(group(A::InviteOnly, Some(S::Active), true)),
+            "an active member"
+        );
+        assert!(check(group(A::RequestAccess, Some(S::Active), true)));
+        assert!(
+            !check(group(A::RequestAccess, Some(S::Pending), true)),
+            "a join request"
+        );
+        assert!(!check(group(A::InviteOnly, Some(S::Banned), true)));
+        assert!(
+            !check(group(A::OpenJoin, Some(S::Active), true)),
+            "anyone can join"
+        );
+        assert!(
+            !check(group(A::Unknown, Some(S::Active), true)),
+            "an unknown admission variant"
+        );
+        assert!(
+            !check(group(A::InviteOnly, Some(S::Active), false)),
+            "not this node's group"
+        );
+        assert!(!check(group(A::InviteOnly, None, true)));
+
+        // #1868 review round 3: a join request that the requester cancels
+        // leaves a Removed row that the requester made alone.
+        let mut cancelled = group(A::RequestAccess, Some(S::Pending), true);
+        assert!(cancelled.clear_pending_joiner(&subject_hex, Some(subject_hex.clone())));
+        assert!(!check(cancelled), "join request, then cancel");
+        // An admin who rejects a spam request leaves the same row.
+        let mut rejected = group(A::RequestAccess, Some(S::Pending), true);
+        assert!(rejected.clear_pending_joiner(&subject_hex, Some(hex::encode([0x33u8; 32]))));
+        assert!(!check(rejected), "a rejected join request");
+        // A removed former member is no longer a relationship.
+        let mut removed = group(A::InviteOnly, Some(S::Active), true);
+        removed.remove_member(&subject_hex, Some(hex::encode([0x33u8; 32])));
+        assert!(!check(removed), "a removed former member");
+    }
+
+    /// The gossip ingest of #1863 with empty caches and a contact store in
+    /// `dir`. Returns what the ingest needs.
+    #[allow(clippy::type_complexity)]
+    fn ingest_1863_fixture(
+        dir: &std::path::Path,
+    ) -> (
+        std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+        groups::eviction::RevocationIntake,
+        RevocationSeenSources,
+        std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
+        std::sync::Arc<
+            tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+        >,
+        std::sync::Arc<
+            tokio::sync::RwLock<std::collections::HashMap<identity::MachineId, DiscoveredMachine>>,
+        >,
+    ) {
+        let contacts = std::sync::Arc::new(tokio::sync::RwLock::new(contacts::ContactStore::new(
+            dir.join("contacts.json"),
+        )));
+        (
+            std::sync::Arc::new(tokio::sync::RwLock::new(revocation::RevocationSet::new())),
+            groups::eviction::RevocationIntake::new(),
+            seen_sources_1863(&contacts, Some(dir.join("issued.jsonl"))),
+            contacts,
+            std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        )
+    }
+
+    /// The sources of "seen" for a node with agent `[0x01; 32]`, machine
+    /// `[0x02; 32]`, no owner and no group check.
+    fn seen_sources_1863(
+        contacts: &std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
+        cert_journal_path: Option<std::path::PathBuf>,
+    ) -> RevocationSeenSources {
+        RevocationSeenSources {
+            own_agent: identity::AgentId([0x01; 32]),
+            own_machine: identity::MachineId([0x02; 32]),
+            owner: None,
+            contact_store: std::sync::Arc::clone(contacts),
+            cert_journal_path,
+            groups: RevocationGroupSeenSlot::default(),
+            owner_trust: owner_trust::OwnerTrust::new(
+                None,
+                std::sync::Arc::new(tokio::sync::RwLock::new(
+                    dm_inbox::AuthenticatedMachineBindingCache::default(),
+                )),
+            ),
+        }
+    }
+
+    /// #1868 review round 4: the gossip ingest reads the group check, like
+    /// the heartbeat. An active member of an approval-only group that this
+    /// node is in self-revokes. The ingest marks it seen. Then the admin's
+    /// eviction removes its row, so the next heartbeat no longer finds the
+    /// relationship. The record must stay in the published set.
+    #[tokio::test]
+    async fn an_evicted_group_member_stays_published_after_the_ingest() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (set, intake, seen, _contacts, discovery, machines) = ingest_1863_fixture(dir.path());
+        let member = identity::AgentKeypair::generate().expect("keypair");
+        let member_hex = hex::encode(member.agent_id().as_bytes());
+        let admin_hex = hex::encode([0x33u8; 32]);
+        let mut info = groups::GroupInfo::with_policy(
+            "g".to_string(),
+            String::new(),
+            identity::AgentId([0x33; 32]),
+            "00112233445566778899aabbccddeeff".to_string(),
+            groups::policy::GroupPolicy {
+                admission: groups::policy::GroupAdmission::InviteOnly,
+                ..groups::policy::GroupPolicy::default()
+            },
+        );
+        info.add_member(
+            hex::encode(seen.own_agent.as_bytes()),
+            groups::GroupRole::Member,
+            None,
+            None,
+        );
+        info.add_member(member_hex.clone(), groups::GroupRole::Member, None, None);
+        let roster = std::sync::Arc::new(std::sync::RwLock::new(info));
+        let local = seen.own_agent;
+        let check_roster = std::sync::Arc::clone(&roster);
+        *seen.groups.write().expect("slot") = Some(std::sync::Arc::new(move |mut agents| {
+            agents.retain(|agent| {
+                check_roster
+                    .read()
+                    .is_ok_and(|info| revocation_group_relationship([&*info], &local, agent))
+            });
+            Box::pin(std::future::ready(agents.into_iter().collect()))
+        }));
+
+        let record = self_revocation_at(&member, 1_000);
+        apply_legacy_revocation_records(
+            vec![record.clone()],
+            std::collections::HashMap::new(),
+            &set,
+            &intake,
+            Some(dir.path().to_path_buf()),
+            &seen,
+            &discovery,
+            &machines,
+        )
+        .await;
+        // The admin's eviction removes the revoked member's row.
+        roster
+            .write()
+            .expect("roster")
+            .remove_member(&member_hex, Some(admin_hex));
+        assert!(!mark_seen_revocation_subjects(&set, &seen).await);
+        let guard = set.read().await;
+        assert_eq!(
+            guard
+                .published_records()
+                .iter()
+                .map(revocation::RevocationRecord::record_hash)
+                .collect::<Vec<_>>(),
+            vec![record.record_hash()],
+            "the ingest marked the member before its eviction"
+        );
+        assert_eq!(guard.stranger_self_revocation_count(), 0);
+    }
+
+    fn self_revocation_at(
+        kp: &identity::AgentKeypair,
+        revoked_at: u64,
+    ) -> revocation::RevocationRecord {
+        revocation::RevocationRecord::sign(
+            revocation::RevokedSubject::Agent(kp.agent_id()),
+            kp.public_key(),
+            kp.secret_key(),
+            revoked_at,
+            None,
+        )
+        .expect("sign")
+    }
+
+    /// #1868 review blocker: the ingest blocks every revoked agent as a
+    /// contact, and that CREATES a contact entry. A second, better record
+    /// of the same stranger must not count that entry as "seen", or #1863
+    /// comes back for one extra signature.
+    #[tokio::test]
+    async fn a_second_self_revocation_does_not_make_a_stranger_seen() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (set, intake, seen, contacts, discovery, machines) = ingest_1863_fixture(dir.path());
+        let stranger = identity::AgentKeypair::generate().expect("keypair");
+        let first = self_revocation_at(&stranger, 2_000);
+        let second = self_revocation_at(&stranger, 1_000);
+        for record in [first, second.clone()] {
+            apply_legacy_revocation_records(
+                vec![record],
+                std::collections::HashMap::new(),
+                &set,
+                &intake,
+                Some(dir.path().to_path_buf()),
+                &seen,
+                &discovery,
+                &machines,
+            )
+            .await;
+        }
+        assert!(
+            contacts.read().await.get(&stranger.agent_id()).is_some(),
+            "the ingest made a blocked contact entry (the trap)"
+        );
+        let guard = set.read().await;
+        assert!(guard.contains_hash(&second.record_hash()), "R2 replaced R1");
+        assert!(guard.is_agent_revoked(&stranger.agent_id()));
+        assert!(
+            guard.published_records().is_empty(),
+            "a stranger stays a stranger"
+        );
+        assert_eq!(guard.stranger_self_revocation_count(), 1);
+    }
+
+    fn discovered_1863(agent: identity::AgentId, machine: identity::MachineId) -> DiscoveredAgent {
+        DiscoveredAgent {
+            self_name: None,
+            cert_digest: None,
+            agent_id: agent,
+            machine_id: machine,
+            user_id: None,
+            addresses: Vec::new(),
+            announced_at: 0,
+            last_seen: 0,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: None,
+            agent_certificate: None,
+            agent_public_key: Vec::new(),
+        }
+    }
+
+    /// #1868 review round 2: a fresh key that announces itself gets an
+    /// Unknown contact entry (with its machine) and a discovery-cache
+    /// entry, with no relationship. Its self-revocation, and the
+    /// self-revocation of its machine, must stay unpublished.
+    #[tokio::test]
+    async fn announce_then_self_revoke_stays_unpublished() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (set, intake, seen, contacts, discovery, machines) = ingest_1863_fixture(dir.path());
+        let agent = identity::AgentKeypair::generate().expect("keypair");
+        let machine = identity::MachineKeypair::generate().expect("keypair");
+        // What a verified announce leaves behind.
+        contacts.write().await.add_machine(
+            &agent.agent_id(),
+            contacts::MachineRecord::new(machine.machine_id(), None),
+        );
+        discovery.write().await.insert(
+            agent.agent_id(),
+            discovered_1863(agent.agent_id(), machine.machine_id()),
+        );
+        let machine_record = revocation::RevocationRecord::sign(
+            revocation::RevokedSubject::Machine(machine.machine_id()),
+            machine.public_key(),
+            machine.secret_key(),
+            1_000,
+            None,
+        )
+        .expect("sign");
+        apply_legacy_revocation_records(
+            vec![self_revocation_at(&agent, 1_000), machine_record],
+            std::collections::HashMap::new(),
+            &set,
+            &intake,
+            Some(dir.path().to_path_buf()),
+            &seen,
+            &discovery,
+            &machines,
+        )
+        .await;
+        let guard = set.read().await;
+        assert!(guard.is_agent_revoked(&agent.agent_id()));
+        assert!(guard.is_machine_revoked(&machine.machine_id()));
+        assert!(
+            guard.published_records().is_empty(),
+            "an announce is not a relationship"
+        );
+        assert_eq!(guard.stranger_self_revocation_count(), 2);
+    }
+
+    /// An Unknown contact is not a relationship.
+    #[tokio::test]
+    async fn an_unknown_contact_stays_unpublished() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (set, intake, seen, contacts, discovery, machines) = ingest_1863_fixture(dir.path());
+        let agent = identity::AgentKeypair::generate().expect("keypair");
+        contacts
+            .write()
+            .await
+            .set_trust(&agent.agent_id(), contacts::TrustLevel::Unknown);
+        apply_legacy_revocation_records(
+            vec![self_revocation_at(&agent, 1_000)],
+            std::collections::HashMap::new(),
+            &set,
+            &intake,
+            Some(dir.path().to_path_buf()),
+            &seen,
+            &discovery,
+            &machines,
+        )
+        .await;
+        assert!(set.read().await.published_records().is_empty());
+    }
+
+    /// The ingest marks an open contact as seen before it blocks it.
+    #[tokio::test]
+    async fn the_ingest_marks_an_open_contact_seen_before_it_blocks_it() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (set, intake, seen, contacts, discovery, machines) = ingest_1863_fixture(dir.path());
+        let contact = identity::AgentKeypair::generate().expect("keypair");
+        contacts
+            .write()
+            .await
+            .set_trust(&contact.agent_id(), contacts::TrustLevel::Known);
+        let record = self_revocation_at(&contact, 1_000);
+        apply_legacy_revocation_records(
+            vec![record.clone()],
+            std::collections::HashMap::new(),
+            &set,
+            &intake,
+            Some(dir.path().to_path_buf()),
+            &seen,
+            &discovery,
+            &machines,
+        )
+        .await;
+        let guard = set.read().await;
+        assert_eq!(
+            guard
+                .published_records()
+                .iter()
+                .map(revocation::RevocationRecord::record_hash)
+                .collect::<Vec<_>>(),
+            vec![record.record_hash()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_taken_revocation_is_not_durable_after_a_later_store_write() {
         let dir = tempfile::tempdir().expect("dir");
         let set = tokio::sync::RwLock::new(revocation::RevocationSet::new());
         let intake = groups::eviction::RevocationIntake::new();
@@ -38078,9 +40379,10 @@ mod tests {
                 .verify_and_insert(record.clone(), None)
                 .expect("insert"));
             intake.note_verified(&record);
-            let swept =
-                guard.expire_records_older_than(90 * 24 * 3600, Agent::unix_timestamp_secs());
-            assert_eq!(swept, 1);
+            // A v1 record never leaves by age (#1108); a rebuild can still
+            // take one from the set.
+            let taken = guard.take_records_where(|_, _| true);
+            assert_eq!(taken.len(), 1);
         }
         persist_s4_revocations(&set, &intake, Some(dir.path()))
             .await
@@ -39283,8 +41585,7 @@ mod tests {
                 revocation_set: std::sync::Arc::clone(&agent.revocation_set),
                 s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir,
-                owner_trust: agent.owner_trust.clone(),
-                contact_store: std::sync::Arc::clone(&agent.contact_store),
+                seen: agent.revocation_seen_sources(),
                 discovery_cache: std::sync::Arc::clone(&agent.identity_discovery_cache),
                 machine_cache: std::sync::Arc::clone(&agent.machine_discovery_cache),
             })),
@@ -39415,8 +41716,7 @@ mod tests {
                 revocation_set: std::sync::Arc::clone(&agent.revocation_set),
                 s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: identity_dir.clone(),
-                owner_trust: agent.owner_trust.clone(),
-                contact_store: std::sync::Arc::clone(&agent.contact_store),
+                seen: agent.revocation_seen_sources(),
                 discovery_cache: std::sync::Arc::clone(&agent.identity_discovery_cache),
                 machine_cache: std::sync::Arc::clone(&agent.machine_discovery_cache),
             })),
@@ -39556,8 +41856,7 @@ mod tests {
                 revocation_set: std::sync::Arc::clone(&agent.revocation_set),
                 s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: identity_dir.clone(),
-                owner_trust: agent.owner_trust.clone(),
-                contact_store: std::sync::Arc::clone(&agent.contact_store),
+                seen: agent.revocation_seen_sources(),
                 discovery_cache: std::sync::Arc::clone(&agent.identity_discovery_cache),
                 machine_cache: std::sync::Arc::clone(&agent.machine_discovery_cache),
             })),
@@ -40632,6 +42931,53 @@ fn push_unique_works_with_empty() {
     assert_eq!(items, vec![42]);
 }
 
+#[test]
+fn relay_opt_in_from_relay_flag_opts_in() {
+    let argv = ["x0xd", "--relay"]
+        .into_iter()
+        .map(std::ffi::OsString::from);
+    assert!(relay_opt_in_from(argv, None));
+}
+
+#[test]
+fn relay_opt_in_from_relay_opt_in_flag_opts_in() {
+    let argv = ["x0xd", "--relay-opt-in"]
+        .into_iter()
+        .map(std::ffi::OsString::from);
+    assert!(relay_opt_in_from(argv, None));
+}
+
+#[test]
+fn relay_opt_in_from_env_one_opts_in() {
+    assert!(relay_opt_in_from(
+        Vec::new(),
+        Some(std::ffi::OsString::from("1"))
+    ));
+}
+
+#[test]
+fn relay_opt_in_from_env_zero_does_not_opt_in() {
+    assert!(!relay_opt_in_from(
+        Vec::new(),
+        Some(std::ffi::OsString::from("0"))
+    ));
+}
+
+#[test]
+fn relay_opt_in_from_empty_is_false() {
+    assert!(!relay_opt_in_from(Vec::new(), None));
+}
+
+// #1375: argv can carry non-UTF-8 bytes; the check must neither panic
+// mid-daemon nor treat the mangled flag as opt-in.
+#[cfg(unix)]
+#[test]
+fn relay_opt_in_from_non_utf8_arg_does_not_panic_or_match() {
+    use std::os::unix::ffi::OsStringExt;
+    let argv = vec![std::ffi::OsString::from_vec(b"--relay\xff".to_vec())];
+    assert!(!relay_opt_in_from(argv, None));
+}
+
 #[cfg(test)]
 fn discovered_agent_fixture(
     tag: u8,
@@ -41300,6 +43646,51 @@ async fn revocation_discovery_eviction_preserves_authenticated_binding() {
         )
         .await,
         Some(machine.machine_id())
+    );
+}
+
+/// #1785 follow-up (David, 5 Nov 2026): a send whose resolved
+/// `(agent, machine)` pairing fails the ADR-0043 B/P gate answers the
+/// typed `DmError::RecipientPairingDenied`, not a stringly
+/// `EnvelopeConstruction`. FAIL-BEFORE: the variant did not exist, and the
+/// gate answered `EnvelopeConstruction("recipient pairing denied ...")`.
+#[tokio::test]
+async fn send_direct_reports_a_denied_pairing_as_recipient_pairing_denied() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    // No network config: an offline, inert agent.
+    let sender = Agent::builder()
+        .with_identity_dir(tempdir.path())
+        .build()
+        .await
+        .expect("sender agent");
+    let recipient = identity::AgentKeypair::generate().expect("recipient keygen");
+    let machine = identity::MachineKeypair::generate().expect("machine keygen");
+    let mut discovered = discovered_agent_fixture(0x67, 6_000, &[], None);
+    discovered.agent_id = recipient.agent_id();
+    discovered.machine_id = machine.machine_id();
+    discovered.machine_public_key = machine.public_key().as_bytes().to_vec();
+    sender.insert_discovered_agent_for_testing(discovered).await;
+    // Check B: retire the (recipient, machine) binding.
+    assert!(sender.revocation_set.write().await.union_bundle_retired(&[
+        revocation::AgentMachineBinding {
+            agent: recipient.agent_id(),
+            machine: machine.machine_id(),
+            move_epoch: 1,
+        }
+    ]));
+
+    let err = sender
+        .send_direct(&recipient.agent_id(), b"denied".to_vec())
+        .await
+        .expect_err("a denied pairing must refuse the send");
+    assert!(
+        matches!(
+            err,
+            dm::DmError::RecipientPairingDenied {
+                denial: key_move::PairingDenial::BindingRevoked
+            }
+        ),
+        "expected RecipientPairingDenied {{ BindingRevoked }}, got {err:?}"
     );
 }
 
@@ -42347,6 +44738,95 @@ async fn same_second_anonymous_announce_keeps_a_pending_fetch_digest() {
         "the entry keeps the digest the in-flight fetch will resolve"
     );
     assert!(entry.agent_certificate.is_none());
+}
+
+/// WHY (#1643 follow-up; r19_cert_carry CI flake on main 3883ddf6): an
+/// agent writes its OWN discovery record directly after it publishes an
+/// announcement. That write ran at the announcement's `announced_at` but
+/// committed to no digest. When the write landed before the listener
+/// ingested the same announcement (listener lag under CI load), the
+/// listener's anonymous V3 beat met an entry already at its second, and
+/// the #1643 equal-second exception kept the stale certificate. No later
+/// beat in the same second could withdraw it. The barrier holds the
+/// listener's ingest until `announce_identity` returns, so the bad order
+/// happens every run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn own_anonymous_announce_withdraws_a_stale_cert_when_the_self_write_lands_first() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let agent = Agent::builder()
+        .with_machine_key(dir.path().join("machine.key"))
+        .with_agent_key_path(dir.path().join("agent.key"))
+        .with_peer_cache_dir(dir.path().join("peers"))
+        .with_network_config(network::NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..network::NetworkConfig::default()
+        })
+        .build()
+        .await
+        .expect("agent");
+    let id = agent.agent_id();
+    let owner = identity::UserKeypair::generate().expect("owner kp");
+    let cert =
+        identity::AgentCertificate::issue(&owner, agent.identity().agent_keypair()).expect("cert");
+    // The stale certificate: a record older than any real announcement.
+    let mut stale = discovered_agent_fixture(9, 0, &[], Some(owner.user_id()));
+    stale.agent_id = id;
+    stale.machine_id = agent.machine_id();
+    stale.last_seen = Agent::unix_timestamp_secs();
+    stale.cert_not_after = cert.not_after();
+    stale.agent_certificate = Some(cert);
+    agent
+        .identity_discovery_cache
+        .write()
+        .await
+        .insert(id, stale);
+
+    let gate = announced_record_barrier::arm(id, announced_record_barrier::INGEST_BETWEEN_WRITES);
+    agent
+        .announce_identity(false, false)
+        .await
+        .expect("announce");
+    // The self-write has landed. Only now may the listener ingest. One
+    // permit releases one parked ingest; 64 covers every beat this
+    // announce publishes (V2, V3, V3.1) with room to spare.
+    gate.release.add_permits(64);
+    let anonymous = announce_v3::anonymous_cert_digest();
+    let withdrawn = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let reached = gate.reached.available_permits() > 0;
+            let entry = agent
+                .identity_discovery_cache
+                .read()
+                .await
+                .get(&id)
+                .cloned();
+            if reached
+                && entry.is_some_and(|e| {
+                    e.agent_certificate.is_none() && e.cert_digest == Some(anonymous)
+                })
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    announced_record_barrier::disarm(&id, announced_record_barrier::INGEST_BETWEEN_WRITES);
+    let entry = agent
+        .identity_discovery_cache
+        .read()
+        .await
+        .get(&id)
+        .cloned();
+    agent.shutdown().await;
+    assert!(
+        withdrawn.is_ok(),
+        "the agent's own anonymous announce must withdraw the stale certificate; entry: {:?}",
+        entry.map(|e| (e.announced_at, e.cert_digest, e.agent_certificate.is_some()))
+    );
 }
 
 #[test]
@@ -44072,6 +46552,12 @@ mod issue1239_tests;
 
 #[cfg(test)]
 mod issue1239_send_deadline_tests;
+
+#[cfg(test)]
+mod announce_rename_order_tests;
+#[cfg(test)]
+#[path = "identity_user_consent_persist_tests.rs"]
+mod identity_user_consent_persist_tests;
 
 #[cfg(test)]
 mod wire_golden_tests;

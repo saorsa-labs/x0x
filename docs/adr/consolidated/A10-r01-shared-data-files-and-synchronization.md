@@ -1,14 +1,14 @@
 # A10 Shared Data Files and Synchronization
 
-- **Status:** Proposed
+- **Status:** Accepted (David, course-correction directive, 7 Nov 2026, ruling 2)
 - **Revision:** 1
 - **Date:** 2026-10-05
 - **Decision owner:** David Irvine
 - **Direction:** Confirmed by David (D198) on 2026-10-05 for this team review.
-- **Replacement activation:** Pending the transfer and acceptance checks in A15.
-- **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
+- **Replacement activation:** Active since 7 November 2026. The 15 accepted slots are the live decision authority.
+- **Supersedes:** The archived numbered records mapped to this slot in [TRANSFER.md](TRANSFER.md). The archive stays the historical record. Existing implementation gates remain in force.
 
-These slots remain Proposed (D198, D199). David accepted the archive transfer on 10 October 2026. [docs/adr/README.md](../README.md) and [docs/adr-archive/move.json](../../adr-archive/move.json) record that acceptance. Replacement acceptance and clause-level transfer checks are still open. Use the [index and transition rules](README.md) to interpret their status.
+David accepted the 15 slots at their current revisions on 7 November 2026 (course-correction directive, ruling 2). They are the live decision authority. The numbered records stay in [docs/adr-archive](../../adr-archive/ARCHIVE.md) as the historical record. [docs/adr-archive/move.json](../../adr-archive/move.json) records the archive transfer David accepted on 10 October 2026. Use the [index](README.md) for the current rules.
 
 x0x stores and shares data through authorized peers. It must state who holds the data, how changes merge, and what happens when a peer is offline.
 
@@ -49,6 +49,8 @@ Rich-text notes remain parked. If that work resumes, use the accepted Loro direc
 ## File transfer and retention
 
 A file transfer must bind the declared content identity, size and recipient. Check the complete content hash before reporting verified completion.
+
+File control frames have an application acknowledgement (accepted by David, 12 Oct 2026, option (b); archived as [T-file-control-ack](../../adr-archive/transient/T-file-control-ack.md)). `FileMessage::ControlAck` (wire tag `file-control-ack`) names the transfer id and the operation: `offer`, `accept` or `reject`. Capability bit 3 is `file_control_ack_v1`; this allocation does not edit archived ADR 0093. A node waits for the acknowledgement only when the peer's current verified advert sets bit 3, and a missing acknowledgement then fails the call. A verified advert without bit 3 is a v0.47.0 peer: do not wait, do not send the frame, and a stored offer is success. With no verified advert, do not wait but still send the frame. A chunk acknowledgement whose id is `ctrl:<op>:<id>` must not complete the wait, an acknowledgement from any other agent must not complete it, and history classifies the frame as ephemeral.
 
 Bound transfer size, concurrency, temporary storage and retained content. An interrupted transfer must have a clear retry or cleanup result.
 

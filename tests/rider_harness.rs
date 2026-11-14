@@ -94,6 +94,11 @@ async fn owned_daemon() -> OwnedDaemon {
     }
 }
 
+fn b64(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
 fn client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -141,6 +146,16 @@ async fn rider_json(
 /// the daemon then verifies that capability before minting the token.
 /// Returns `(sub_agent_hex, rider_token)`.
 async fn issue_rider(d: &OwnedDaemon, label: &str, groups: Vec<String>) -> (String, String) {
+    issue_rider_scoped(d, label, groups, Vec::new()).await
+}
+
+/// [`issue_rider`] with explicit rider-token scopes (#1094 scratch rows).
+async fn issue_rider_scoped(
+    d: &OwnedDaemon,
+    label: &str,
+    groups: Vec<String>,
+    scopes: Vec<String>,
+) -> (String, String) {
     let kp = x0x::identity::AgentKeypair::generate().expect("sub-agent keypair");
     let public_hex = hex::encode(kp.public_key().as_bytes());
     let (status, body) = owner_json(
@@ -181,6 +196,7 @@ async fn issue_rider(d: &OwnedDaemon, label: &str, groups: Vec<String>) -> (Stri
         Some(json!({
             "sub_agent_id": sub_agent_id,
             "groups": groups,
+            "scopes": scopes,
             "label": label,
             "delegation": delegation,
         })),
@@ -293,6 +309,227 @@ async fn rider_scope_matrix_ungranted_verbs_forbidden() {
     )
     .await;
     assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED, "bad token 401");
+}
+
+/// Issue #1094 / ADR 0075 decisions 4–5: the group scratch store over the
+/// rider surface, end to end through the real middleware. A rider with
+/// `scratch:read` reads but cannot write; `scratch:read_write` reads,
+/// writes and deletes; no scratch scope (the `none` default), a missing
+/// group grant, and a non-scratch store are each 403 — and the sealed
+/// store's content round-trips for the owner and the granted rider.
+#[tokio::test]
+#[ignore]
+async fn rider_scratch_scope_gates_group_scratch_store() {
+    let d = owned_daemon().await;
+    let home = home_group_id(&d).await;
+    let enc = |topic: &str| topic.replace('/', "%2F");
+
+    // Owner opens the group's scratch store (deterministic topic).
+    let (status, body) = owner_json(
+        &d,
+        reqwest::Method::POST,
+        &format!("/groups/{home}/stores"),
+        Some(json!({ "name": "scratch" })),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::CREATED, "open scratch: {body}");
+    let topic = body["topic"].as_str().expect("topic").to_string();
+    assert_eq!(
+        topic,
+        x0x::kv::encrypted::group_store_identity(&home, "scratch").1,
+        "the scratch topic is derived from the stable id and store name"
+    );
+    assert_eq!(body["policy"], "encrypted", "the scratch store is sealed");
+
+    // And a second, non-scratch store riders must never reach.
+    let (status, body) = owner_json(
+        &d,
+        reqwest::Method::POST,
+        &format!("/groups/{home}/stores"),
+        Some(json!({ "name": "notes" })),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::CREATED, "open notes: {body}");
+    let notes_topic = body["topic"].as_str().expect("topic").to_string();
+
+    // Owner seeds one key.
+    let (status, body) = owner_json(
+        &d,
+        reqwest::Method::PUT,
+        &format!("/stores/{}/plan", enc(&topic)),
+        Some(json!({ "value": b64(b"draft-1"), "content_type": "text/plain" })),
+    )
+    .await;
+    assert!(
+        status == reqwest::StatusCode::OK || status == reqwest::StatusCode::ACCEPTED,
+        "owner seed write: {status} {body}"
+    );
+
+    let reader = issue_rider_scoped(
+        &d,
+        "scratch-reader",
+        vec![home.clone()],
+        vec!["scratch:read".to_string()],
+    )
+    .await
+    .1;
+    let writer = issue_rider_scoped(
+        &d,
+        "scratch-writer",
+        vec![home.clone()],
+        vec!["scratch:read_write".to_string()],
+    )
+    .await
+    .1;
+    let scopeless = issue_rider(&d, "scratch-none", vec![home.clone()]).await.1;
+    let ungranted = issue_rider_scoped(
+        &d,
+        "scratch-ungranted",
+        Vec::new(),
+        vec!["scratch:read_write".to_string()],
+    )
+    .await
+    .1;
+
+    // scratch:read — keys and values are readable…
+    let (status, body) = rider_json(
+        &reader,
+        reqwest::Method::GET,
+        d.url(&format!("/stores/{}/keys", enc(&topic))),
+        None,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "reader keys: {body}");
+    let (status, body) = rider_json(
+        &reader,
+        reqwest::Method::GET,
+        d.url(&format!("/stores/{}/plan", enc(&topic))),
+        None,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "reader get: {body}");
+    assert_eq!(body["value"].as_str(), Some(b64(b"draft-1").as_str()));
+    // …but every write is 403 (issue #1094 acceptance: `read` cannot write).
+    let (status, body) = rider_json(
+        &reader,
+        reqwest::Method::PUT,
+        d.url(&format!("/stores/{}/plan", enc(&topic))),
+        Some(json!({ "value": b64(b"evil"), "content_type": "text/plain" })),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN, "reader put: {body}");
+    let (status, body) = rider_json(
+        &reader,
+        reqwest::Method::DELETE,
+        d.url(&format!("/stores/{}/plan", enc(&topic))),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::FORBIDDEN,
+        "reader delete: {body}"
+    );
+
+    // scratch:read_write — the full LWW cycle, proven by receiver state.
+    let (status, body) = rider_json(
+        &writer,
+        reqwest::Method::PUT,
+        d.url(&format!("/stores/{}/status", enc(&topic))),
+        Some(json!({ "value": b64(b"working"), "content_type": "text/plain" })),
+    )
+    .await;
+    assert!(
+        status == reqwest::StatusCode::OK || status == reqwest::StatusCode::ACCEPTED,
+        "writer put: {status} {body}"
+    );
+    let (status, body) = rider_json(
+        &writer,
+        reqwest::Method::GET,
+        d.url(&format!("/stores/{}/status", enc(&topic))),
+        None,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "writer get: {body}");
+    assert_eq!(body["value"].as_str(), Some(b64(b"working").as_str()));
+    // The owner reads the rider's write back through its own surface.
+    let (status, body) = owner_json(
+        &d,
+        reqwest::Method::GET,
+        &format!("/stores/{}/status", enc(&topic)),
+        None,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "owner reads rider write");
+    assert_eq!(body["value"].as_str(), Some(b64(b"working").as_str()));
+    let (status, body) = rider_json(
+        &writer,
+        reqwest::Method::DELETE,
+        d.url(&format!("/stores/{}/status", enc(&topic))),
+        None,
+    )
+    .await;
+    assert!(
+        status == reqwest::StatusCode::OK || status == reqwest::StatusCode::ACCEPTED,
+        "writer delete: {status} {body}"
+    );
+
+    // Opening the scratch store through the group route is rider-reachable
+    // with read_write (idempotent re-open), and ONLY for name "scratch".
+    let (status, body) = rider_json(
+        &writer,
+        reqwest::Method::POST,
+        d.url(&format!("/groups/{home}/stores")),
+        Some(json!({ "name": "scratch" })),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "writer re-open: {body}");
+    let (status, body) = rider_json(
+        &writer,
+        reqwest::Method::POST,
+        d.url(&format!("/groups/{home}/stores")),
+        Some(json!({ "name": "wiki" })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::FORBIDDEN,
+        "non-scratch open: {body}"
+    );
+
+    // No scratch scope (the default `none`): denied even with the grant.
+    let (status, body) = rider_json(
+        &scopeless,
+        reqwest::Method::GET,
+        d.url(&format!("/stores/{}/keys", enc(&topic))),
+        None,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN, "scopeless: {body}");
+
+    // Scope without the group grant: denied.
+    let (status, body) = rider_json(
+        &ungranted,
+        reqwest::Method::GET,
+        d.url(&format!("/stores/{}/keys", enc(&topic))),
+        None,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN, "ungranted: {body}");
+
+    // A granted, scoped rider still never reaches a NON-scratch store.
+    let (status, body) = rider_json(
+        &writer,
+        reqwest::Method::GET,
+        d.url(&format!("/stores/{}/keys", enc(&notes_topic))),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::FORBIDDEN,
+        "notes store: {body}"
+    );
 }
 
 /// 2. Issuance lands in the ADR-0036 journal (mode + label + retained

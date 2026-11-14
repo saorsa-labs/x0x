@@ -85,6 +85,42 @@ metadata-plane state changes:
 - Deterministic pair-harness proof lives in `tests/named_group_d4_apply.rs`;
   report in `tests/proof-reports/PHASE_D4_REPORT.md`.
 
+### The reject link names its request (#1623)
+
+A `join_request_rejected` event carries a signed `GroupStateCommit`. That
+commit moves the revision and the hash chain, but it covers no join
+request: the state hash and the roster root do not change with the status
+of a request. So the event has a second signature, `request_binding`.
+
+- The commit signer signs `"x0x.group.join-request-reject.v1"`, then the
+  commit's `group_id`, `revision` and `state_hash`, then `request_id` and
+  `requester_agent_id` (ML-DSA-65, hex; each string has a 4-byte
+  little-endian length before it; `revision` is 8 bytes little-endian).
+- A receiver refuses a reject when `actor` is not `commit.committed_by`,
+  or when a binding is present and does not verify for the event's
+  `request_id` and `requester_agent_id`.
+- A reject with no binding comes from a signer older than #1623. On
+  gossip, on a direct message and on a catch-up page, a receiver accepts
+  it only when the authenticated sender is `actor` and `actor` is
+  `commit.committed_by`. A GSS node that holds a commit that does not
+  chain yet applies it later as its commit signer. So it holds an unbound
+  reject only when the commit signer itself delivered it; a bound reject
+  can be held from any verified peer.
+- Result of a refusal: the event is dropped. The head does not move and
+  no request changes. The node stays one link behind until it gets the
+  signer's own copy (gossip, direct message or catch-up page), as for
+  any other refused link. A refused copy does not stop a later correct
+  copy of the same link.
+- Result for a peer that is not the commit signer: it cannot change the
+  request that a reject names, with the binding or with the binding
+  removed.
+- The commit's signed bytes are unchanged. A peer older than #1623
+  ignores the field and applies the link as before. It does not check
+  the binding.
+- Limit: the commit signer itself can send an unbound copy, or sign two
+  bindings, for one commit. The state hash does not cover join requests,
+  so the chain cannot show that.
+
 **Phase F status at current working-tree HEAD:** the dedicated live suites are
 clean, and the named-groups shell runner now has repeatable clean archived runs.
 The remaining work is procedural rather than architectural: merge/commit-state
@@ -643,7 +679,7 @@ ADR-0016 defines a flat protocol ruleset:
 ### Explicit rejects
 - non-admin cannot approve requests
 - non-admin cannot remove other members
-- banned peer cannot rejoin through open-join alone
+- banned peer cannot rejoin through open-join alone, or through an invite minted before the ban
 - invite creation must follow policy and role checks
 
 ## Unifying named groups and MLS
@@ -835,13 +871,47 @@ Notes:
 - card-import stub creation so non-members can submit join requests
 - note: this phase alone is **not** sufficient for real public discovery; Phase C.2 completes that story
 
+#### Content-addressed invites past 20 members (v6, #646)
+
+An invite's inline base-roster projection is capped at 20 Active+Banned
+members (the link budget). Past the cap, `POST /groups/:id/invite` mints
+invite wire **v6**: the link carries the projection's **content address**.
+Version 5 and the `x0x.invite.v5*` domains stay reserved for archived
+ADR 0112's addressed, expiring design (David's 9 Nov 2026 renumber
+ruling); a version-5 link is refused as unsupported. The v6 link
+carries the root
+(`base_roster_root`, the same roster root `base_state_hash` commits to)
+and no inline roster. The joiner, after full invite authentication and
+before any local state, asks the INVITER for the projection over two
+`JoinResultMessage` arms (`BaseRosterFetch` / `BaseRoster`), proving
+invite possession with the BLAKE3 of the raw invite secret (compared in
+constant time). The secret hash stands in for archived ADR 0111's
+(Proposed) carry-the-invite rule: the request proves possession without
+resending the signed link. The inviter serves EXACTLY the root that
+invite signed at mint (stored on the issued-invite record), only to the
+agent an addressed invite names, and never to a Banned or Removed
+requester — archived 0111's serve rule: a pre-member gets no other kind
+and no other root. An authorized request whose root is pruned from the
+commit log gets a terminal `BaseRosterUnavailable` answer, which the
+join maps to a terminal 409 `base_roster_pruned`. The reply is admitted
+only when it is verified, comes from the join's own inviter, answers a
+waiting join, and re-derives the signed root; nothing is cached. Because the roster root does not commit
+`treekem_key_package_hash`, fetched projections are certificate-free AND
+anchor-free — the authority's signed commits carry the real anchors.
+While no source answers, the join refuses with a retryable 503
+`base_roster_unavailable` and installs or clears nothing. The fetched
+carrier caps at 128 entries (one reply fits the DM ceiling); a larger
+roster refuses at mint (`invite_too_large`). Re-seat invites (ADR 0109
+§3a) stay inline-v4: their redeem check reads the signed inline roster,
+so past the cap they refuse at mint, as before #646.
+
 #### Card-import stub and verified invite (#1161)
 
 `import_card_into_groups` inserts an inert local row: owner-only authority
 roster, no importer seat, `shared_secret = None`, `secret_epoch = 0`, no
 invite lineage / MLS group. That shape classifies as
-`InertCardImportStub` (not general `JoinFailed`). After full v4 invite
-verification, when the invite's stable group id equals the stub genesis
+`InertCardImportStub` (not general `JoinFailed`). After full v4 or v6
+invite verification, when the invite's stable group id equals the stub genesis
 `group_id`, join clears that metadata under the same write-locked path as
 `UnseatedJoinRemnant`, then runs the ordinary first join. Card
 `owner_agent_id` / genesis `creator_agent_id` are unauthenticated, so a

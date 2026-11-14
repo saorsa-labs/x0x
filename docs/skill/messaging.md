@@ -126,9 +126,10 @@ curl -X POST "http://$API/groups/join" -H "Authorization: Bearer $TOKEN" \
 > that minted it — an invite minted by a non-owner authority for a Home
 > is refused) — re-mint the invite on the owner, it is not a body error.
 > The OWNER's primary agent must ALSO have announced with
-> `{"include_user_identity":true,"human_consent":true}` (#483) — again
-> after every restart, since consent is held in memory only — before a
-> seated second device can seal/leave Home state; a pending-join state
+> `{"include_user_identity":true,"human_consent":true}` (#483) before a
+> seated second device can seal/leave Home state. The consent is durable
+> (#1107): it survives a restart, and `x0x announce --withdraw-consent`
+> withdraws it. A pending-join state
 > after a restart must be re-issued with a fresh invite. Rosters over 20
 > entries or links over 40,960 B fail typed at mint — slim the roster.
 

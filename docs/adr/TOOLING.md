@@ -1,15 +1,14 @@
 # ADR Tooling and AI Harness Setup
 
-## Use the 15 slot plan
+## Use the accepted 15 slot set
 
-Read [the consolidation rules](consolidated/README.md) and the
+The [15 accepted slots](consolidated/README.md) are the live decision
+authority (David, 7 Nov 2026). Read them and the
 [current authoring rule](transient/README.md#current-authoring-rule-19-oct-2026).
 Do not add ADR files, including transient records or folded overlays. Keep
 A01 through A15; do not allocate A16 or a second consolidated series.
 Put the rationale in the PR body and existing docs or code doc comments.
-A wire-format or public-API change needs a `FOR ENGINEER:` line for David's
-decision. Record his approval in the PR body or comment. An approved additive
-API does not need a new ADR.
+A wire-format or public-API change carries a `FOR ENGINEER:` line in the PR body that states the change; under A15 (amendment of 12 Nov 2026) it needs no separate ruling. An additive API does not need a new ADR.
 
 Existing Accepted records and frozen evidence remain unchanged. The tools
 below inspect the retained collection; their support for the earlier numbered
@@ -55,10 +54,10 @@ If the published package name differs on your machine, install from the project 
 Add this project instruction to every AI coding harness profile (`AGENTS.md`, `CLAUDE.md`, Codex/OpenCode project rules, pi harness prompts, etc.):
 
 ```text
-Before changing architecture, protocols, storage formats, crypto, network behaviour, public APIs, data models or operational invariants, inspect docs/adr/ and its status overlay.
+Before changing architecture, protocols, storage formats, crypto, network behaviour, public APIs, data models or operational invariants, read the accepted 15 ADR set in docs/adr/consolidated/.
 Keep the ADR pack at 15. Do not add ADR files, including transient T-*.md records or folded overlays (David's 19 Oct 2026 ruling).
 Put the rationale in the PR body and existing documentation or code doc comments.
-If a change touches the wire format or public API, write a FOR ENGINEER: line for David's decision. Record his approval in the PR body/comment; an approved additive API needs no new ADR.
+If a change touches the wire format or public API, write a FOR ENGINEER: line in the PR body that states the change. Under A15 (amendment of 12 Nov 2026) it needs no separate ruling; an additive API needs no new ADR.
 Preserve Accepted records and frozen evidence. Do not create a successor record or change an acceptance status as a workaround.
 Use approximately 80% ASD-STE100 style. Follow docs/documentation-style.md.
 During review, check correctness, alternatives, evidence, consequences and unchanged Accepted bytes. Existing release, security and independent-review gates still apply.
@@ -75,24 +74,30 @@ not grant approval. Preserve the existing Accepted text and frozen evidence.
 
 `python3 scripts/check-adr-consolidation.py` checks the index shape, exactly
 15 distinct slots, matching indexed titles and file revisions, regular
-record paths, required section headings, and a leading Proposed status token.
-It rejects unindexed files and early activation. Status annotations are
-allowed, as in `adr-governance.py`; Accepted annotations remain rejected.
+record paths, required section headings, and a leading Accepted status token
+(David accepted the slots on 7 Nov 2026). It rejects unindexed files, a
+second revision file, and a status or phase change away from the accepted
+state. It also compares each slot file's sha256 against the hash recorded in
+`index.json`, so a rewrite of an accepted decision fails CI unless the same
+PR records the new hash under David's ruling. Status annotations after the
+leading token are allowed, as in `adr-governance.py`.
 
 `python3 scripts/check-adr-count.py` fails when the current count exceeds
 15. The plan is `docs/adr/consolidated/README.md`. Records in the transfer
 map keep their exact paths as links and stay outside that count. The count
 excludes a path only when that path is an approved historical source and
-`docs/adr-archive/move.json` records it as that archive link. A new
-`move.json` entry outside that set is rejected. Files under
-`docs/adr/transient/` do not count (D242). The validator still understands
-the existing `T-<slug>.md` format and its lifecycle. It checks structure and
-immutability, not reviewer identity, approval scope or the current prohibition
-on new ADR files. Review must enforce that prohibition separately.
-An Accepted transient body stays frozen. Existing folded overlays refer to
-that body without changing it. A nested
-file that reuses a mapped number counts. A legal run prints the pass line
-only. It does not name an unplaced record.
+`docs/adr-archive/move.json` records it as that archive link. The approved
+set also covers the `docs/adr/transient/T-<slug>.md` records that existed at
+the trusted pre-change commit, so the 7 Nov 2026 fold moves are recorded
+moves, not invented archives. A new `move.json` entry outside that set is
+rejected. Files under `docs/adr/transient/` do not count (D242). The
+validator still understands the existing `T-<slug>.md` format and its
+lifecycle. It checks structure and immutability, not reviewer identity,
+approval scope or the current prohibition on new ADR files. Review must
+enforce that prohibition separately. An Accepted transient body stays
+frozen; the archived copy and its old-path link keep the same bytes. A
+nested file that reuses a mapped number counts. A legal run prints the pass
+line only. It does not name an unplaced record.
 
 A recorded consolidation move may replace a numbered path with a symlink
 to `docs/adr-archive/` when `docs/adr-archive/move.json` records the path,
