@@ -3730,6 +3730,16 @@ const PROBE_IO_BOUND: Duration = Duration::from_secs(5);
 struct HealthProbe {
     ok: bool,
     version: String,
+    /// M1 structured verdict (#1380). Absent on a responder that predates
+    /// it; then only `ok` and `version` decide, as before.
+    #[serde(default)]
+    verdict: Option<HealthProbeVerdict>,
+}
+
+/// The overall level of the M1 verdict object on `/health`.
+#[derive(serde::Deserialize)]
+struct HealthProbeVerdict {
+    verdict: String,
 }
 
 /// Bounded `GET /health` readiness probe: the responder must answer HTTP 200
@@ -3737,6 +3747,9 @@ struct HealthProbe {
 /// `ok == true` and `version == expected_version`. A bare 200 — from an old
 /// image still bound to the address, or a foreign listener — never commits
 /// the restart, and a truncated or malformed body fails closed.
+/// An M1 verdict of `error` (a failed local check: critical disk or missing
+/// identity) never commits either: D193 makes local checks block commit
+/// (#1377). `degraded` still commits; peer reachability is not judged here.
 /// `/health` is auth-exempt on the daemon API.
 fn http_health_ok(addr: SocketAddr, expected_version: &str) -> bool {
     let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(2)) else {
@@ -3776,7 +3789,13 @@ fn http_health_ok(addr: SocketAddr, expected_version: &str) -> bool {
         return false;
     }
     match serde_json::from_str::<HealthProbe>(body) {
-        Ok(probe) => probe.ok && probe.version == expected_version,
+        Ok(probe) => {
+            probe.ok
+                && probe.version == expected_version
+                && probe
+                    .verdict
+                    .is_none_or(|verdict| verdict.verdict != "error")
+        }
         Err(_) => false,
     }
 }
@@ -5528,6 +5547,42 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = serve_responses(listener, vec![("200 OK".to_string(), health_body("9.9.7"))]);
         assert!(!http_health_ok(addr, "9.9.9"));
+        server.join().unwrap();
+    }
+
+    /// #1377 / D193: a candidate whose own M1 verdict is `error` (a failed
+    /// local check) answers 200 ok:true with the right version, and must
+    /// still not commit. `degraded` commits; a body without a verdict (an
+    /// older responder) commits as before.
+    #[test]
+    fn http_health_ok_rejects_200_with_an_m1_error_verdict() {
+        let with_verdict = |level: &str| {
+            format!(
+                "{{\"ok\":true,\"status\":\"ok\",\"version\":\"1.2.3\",\
+                 \"verdict\":{{\"verdict\":\"{level}\",\"reasons\":[],\"inputs\":{{}}}}}}"
+            )
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_responses(
+            listener,
+            vec![
+                ("200 OK".to_string(), with_verdict("error")),
+                ("200 OK".to_string(), with_verdict("degraded")),
+                ("200 OK".to_string(), with_verdict("ok")),
+                ("200 OK".to_string(), health_body("1.2.3")),
+            ],
+        );
+        assert!(
+            !http_health_ok(addr, "1.2.3"),
+            "an M1 error verdict must not commit"
+        );
+        assert!(http_health_ok(addr, "1.2.3"), "degraded still commits");
+        assert!(http_health_ok(addr, "1.2.3"), "ok commits");
+        assert!(
+            http_health_ok(addr, "1.2.3"),
+            "a pre-M1 body commits as before"
+        );
         server.join().unwrap();
     }
 
