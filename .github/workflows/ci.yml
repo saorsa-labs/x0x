@@ -1152,6 +1152,8 @@ jobs:
           --expect w3h_1581g_control_sidecar_lifecycle_evs_damage_rebuilds=GREEN
           --require w3h_1581g_red_sidecar_lifecycle_journal_and_pending_resume
           --expect w3h_1581g_red_sidecar_lifecycle_journal_and_pending_resume=GREEN
+          --require w3h_1581g_control_sidecar_lifecycle_pending_resume_forms
+          --expect w3h_1581g_control_sidecar_lifecycle_pending_resume_forms=GREEN
           --require w3h_1581d_control_evidence_holder_resume_after_holder_returns
           --expect w3h_1581d_control_evidence_holder_resume_after_holder_returns=GREEN
           --require w3h_1581d_red_evidence_holder_all_holders_offline
