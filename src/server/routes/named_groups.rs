@@ -20913,6 +20913,7 @@ pub(in crate::server) async fn apply_listener_metadata_event(
     // post-advance state until the swap.
     let group_id = named_group_metadata_event_group_id(&event).to_string();
     let group_id_for_rearm = group_id.clone();
+    let policy_update = matches!(event, NamedGroupMetadataEvent::PolicyUpdated { .. });
     // Boxed: the apply future is large; keep it off this caller's frame.
     let applied = state
         .run_shielded(Box::pin(async move {
@@ -20940,6 +20941,11 @@ pub(in crate::server) async fn apply_listener_metadata_event(
     // apply did not move the cursor (refusals, cache updates).
     if applied.is_some() {
         maybe_rearm_stopped_treekem_pages(state, &group_id_for_rearm, None).await;
+    }
+    // #1366: a remote policy change from either transport (topic or direct
+    // lane) moves the public listener, after the apply locks are released.
+    if policy_update && applied.as_ref().is_some_and(|result| result.accepted) {
+        reconcile_public_message_listener(state, &group_id_for_rearm).await;
     }
     applied
 }
@@ -24125,6 +24131,10 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
             return;
         }
     }
+    // #1366 test hook: let a concurrent install run between the check
+    // above and the insert below, as a slow subscribe does.
+    #[cfg(test)]
+    tokio::task::yield_now().await;
     let topic = x0x::groups::public_topic_for(&group_id);
     let mut sub = match state.agent.subscribe(&topic).await {
         Ok(s) => s,
@@ -24138,6 +24148,8 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
     let topic_for_log = topic.clone();
     let mut shutdown_rx = state.shutdown_notify.subscribe();
     let handle = tokio::spawn(async move {
+        #[cfg(test)]
+        let _live = tests::issue1366_public_listener::LiveListener::start(&group_id_for_listener);
         tracing::info!(topic = %topic_for_log, "E: public-message listener subscribed");
         loop {
             tokio::select! {
@@ -24175,7 +24187,83 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
         handle.abort();
         return;
     }
+    // #1366: the checks above ran without this write lock. A concurrent
+    // call can have installed a listener since: keep that one and stop this
+    // one, so no handle is overwritten and left running. A concurrent
+    // policy change can have made the group `MlsEncrypted` or withdrawn
+    // since: read the desired state again under this lock (lock order:
+    // `public_message_tasks`, then `named_groups`; no path takes them the
+    // other way round), so a reconcile that ran in between is not undone.
+    let wanted = public_message_listener_wanted(&*state.named_groups.read().await, &group_id);
+    if tasks.contains_key(&group_id) || wanted.is_some_and(|(_, wanted)| !wanted) {
+        handle.abort();
+        return;
+    }
     tasks.insert(group_id, handle);
+}
+
+/// #1366: the stable id of `group_id` and whether its public-message
+/// listener must run: the group is not withdrawn and not `MlsEncrypted`
+/// (the rule of [`ensure_named_group_listeners`]). `None`: the group is
+/// not stored.
+fn public_message_listener_wanted(
+    groups: &HashMap<String, x0x::groups::GroupInfo>,
+    group_id: &str,
+) -> Option<(String, bool)> {
+    groups
+        .get(group_id)
+        .or_else(|| {
+            groups
+                .values()
+                .find(|info| info.stable_group_id() == group_id)
+        })
+        .map(|info| {
+            (
+                info.stable_group_id().to_string(),
+                !info.withdrawn
+                    && info.policy.confidentiality
+                        != x0x::groups::GroupConfidentiality::MlsEncrypted,
+            )
+        })
+}
+
+/// #1366: start or stop the public-message listener of `group_id` to match
+/// the stored group: it runs when the group is stored, not withdrawn and
+/// not `MlsEncrypted` (the rule of [`ensure_named_group_listeners`]), and
+/// is stopped otherwise. A policy change calls it, so a flip to
+/// `SignedPublic` does not drop the first public messages until a restart,
+/// and a flip to `MlsEncrypted` drops the subscription. The caller holds
+/// no group lock.
+pub(in crate::server) async fn reconcile_public_message_listener(
+    state: &Arc<AppState>,
+    group_id: &str,
+) {
+    let wanted = public_message_listener_wanted(&*state.named_groups.read().await, group_id);
+    let Some((stable_id, wanted)) = wanted else {
+        return;
+    };
+    if wanted {
+        // The insert reads the desired state again under the registry lock.
+        spawn_public_message_listener(Arc::clone(state), stable_id).await;
+        return;
+    }
+    // #1366 test hook: let a concurrent policy change run between the
+    // decision above and the removal below.
+    #[cfg(test)]
+    tokio::task::yield_now().await;
+    let mut tasks = state.public_message_tasks.write().await;
+    // A later policy change can have made the listener wanted again, and
+    // its reconcile can have installed it: read the desired state again
+    // under the registry lock, so this removal does not undo it.
+    let still_unwanted =
+        public_message_listener_wanted(&*state.named_groups.read().await, &stable_id)
+            .is_none_or(|(_, wanted)| !wanted);
+    if !still_unwanted {
+        return;
+    }
+    if let Some(handle) = tasks.remove(&stable_id) {
+        handle.abort();
+    }
 }
 
 /// POST /groups/:id/invite — generate an invite link (admin+; body optional).
@@ -34693,6 +34781,8 @@ pub(in crate::server) async fn update_group_policy(
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     spawn_named_group_event_delivery_to_active_members(&state, &delivery_roster, &event, &[]);
     maybe_publish_group_card_after_state_change(&state, &id).await;
+    // #1366: the confidentiality may have changed.
+    reconcile_public_message_listener(&state, &id).await;
 
     (
         StatusCode::OK,
@@ -53576,6 +53666,7 @@ pub(in crate::server) mod tests {
     pub(in crate::server) mod issue1275_listener_apply_shield;
     mod issue1288_bootstrap_outbox_shutdown;
     mod issue1347_join_request_token_class;
+    pub(in crate::server) mod issue1366_public_listener;
     pub(in crate::server) mod issue1368_crash_matrix;
     mod issue1540_roster_only_ban;
     mod issue1569_owner_certified_placeholder;
