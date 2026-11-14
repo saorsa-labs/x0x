@@ -79,13 +79,13 @@ use routes::{
     create_discovery_subscription, create_group_invite, create_group_kv_store, create_join_request,
     create_kv_store, create_mls_group, create_mls_welcome, create_named_group, create_task_list,
     daemon_shutdown_hook, delete_contact, delete_discovery_subscription, delete_kv_value,
-    delete_machine, direct_connections, direct_message_send_config, direct_send, discover_groups,
-    discover_groups_nearby, discovered_agent, discovered_agents, discovered_machine,
-    discovered_machines, dispatch_join_result_message, dispatch_welcome_blob_message,
-    dm_diagnostics, enroll_device, ensure_named_group_listeners, evaluate_trust, exec_cancel,
-    exec_diagnostics, exec_run, exec_sessions, file_accept_handler, file_reject_handler,
-    file_send_handler, file_transfer_status_handler, file_transfers_handler, find_agent,
-    forward_add, forward_list, forward_remove, get_a2a_agent_card, get_agent_card,
+    delete_machine, direct_connections, direct_message_send_config, direct_receipt, direct_send,
+    discover_groups, discover_groups_nearby, discovered_agent, discovered_agents,
+    discovered_machine, discovered_machines, dispatch_join_result_message,
+    dispatch_welcome_blob_message, dm_diagnostics, enroll_device, ensure_named_group_listeners,
+    evaluate_trust, exec_cancel, exec_diagnostics, exec_run, exec_sessions, file_accept_handler,
+    file_reject_handler, file_send_handler, file_transfer_status_handler, file_transfers_handler,
+    find_agent, forward_add, forward_list, forward_remove, get_a2a_agent_card, get_agent_card,
     get_constitution, get_constitution_json, get_group_card, get_group_join_status,
     get_group_public_messages, get_group_state, get_group_state_commits, get_kv_value,
     get_mls_group, get_named_group, get_named_group_members, get_onboard, get_profile,
@@ -1406,7 +1406,7 @@ pub async fn serve_with_options(
         reseat_stagings: Default::default(),
         treekem_groups: reseat_scope::ScopedGroupMap::new(treekem_groups),
         treekem_dir,
-        revocation_evictions: routes::named_groups::S4Runtime::default(),
+        revocation_evictions: routes::named_groups::S4Runtime::awaiting_startup_load(),
         group_recovery: routes::named_groups::S3Runtime::awaiting_restore(),
         ws_sessions: RwLock::new(HashMap::new()),
         ws_topics: RwLock::new(HashMap::new()),
@@ -1430,6 +1430,9 @@ pub async fn serve_with_options(
         upgrade_check_cache: Mutex::new(None),
         upgrade_apply_lock: Arc::new(Mutex::new(())),
         http_upgrade_wait_lock: Arc::new(Mutex::new(())),
+        self_published_release_manifests: Arc::new(Mutex::new(
+            SelfPublishedReleaseManifests::default(),
+        )),
         #[cfg(unix)]
         upgrade_staging,
         api_token,
@@ -1921,6 +1924,13 @@ pub async fn serve_with_options(
         .await);
     }
 
+    // ADR 0110 S4 (#1597 item 5c): read the obligation store and the kept
+    // expiry hand-offs before the API serves or the worker runs. The load
+    // is fail-visible (a damaged file is quarantined, a newer one runs
+    // memory-only), never fatal; until it ends no writer replaces either
+    // file.
+    routes::named_groups::load_revocation_eviction_store(&state).await;
+
     // Publish the API port only after every fallible causal-state loader has
     // completed. A rejected sidecar therefore leaves no listener task and no
     // API advertisement, and the agent/exec loops above are explicitly torn
@@ -2160,8 +2170,7 @@ pub async fn serve_with_options(
         }
     }));
 
-    let self_published_release_manifests =
-        Arc::new(Mutex::new(SelfPublishedReleaseManifests::default()));
+    let self_published_release_manifests = Arc::clone(&state.self_published_release_manifests);
 
     // Reclaim upgrade debris left by previous failed/interrupted attempts:
     // orphaned `.x0x-upgrade-*` temp dirs and `*.x0xold-*` sidelined binaries.
@@ -3261,6 +3270,7 @@ pub async fn serve_with_options(
         .route("/agents/connect", post(connect_agent))
         .route("/direct/send", post(direct_send))
         .route("/direct/connections", get(direct_connections))
+        .route("/direct/receipts/:logical_id", get(direct_receipt))
         .route("/direct/events", get(direct_events_sse))
         // MLS group encryption endpoints
         .route("/mls/groups", post(create_mls_group))
