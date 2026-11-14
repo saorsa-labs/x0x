@@ -1199,6 +1199,10 @@ pub struct OwnerSyncStore {
     /// Test injection: fail the next register write before its rename.
     #[cfg(test)]
     fail_next_register_write: std::sync::atomic::AtomicBool,
+    /// Test injection: fail the next journal intent write before it
+    /// starts, as a crash right after the kind 0x05 write would.
+    #[cfg(test)]
+    fail_next_intent_write: std::sync::atomic::AtomicBool,
     /// Test injection: fail every synced journal append.
     #[cfg(test)]
     fail_journal_append: std::sync::atomic::AtomicBool,
@@ -1499,6 +1503,8 @@ impl OwnerSyncStore {
             discharge_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             fail_next_register_write: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_intent_write: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_journal_append: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -2809,8 +2815,10 @@ impl OwnerSyncStore {
             return Ok((outcome, held)); // nothing new — no write needed
         }
         // #1542: the journal file first, then the register (see
-        // `journal_apply`). A failed append commits nothing; a later
-        // session delivers the records again.
+        // `journal_apply`). A failed append commits none of the four older
+        // kinds; a later session delivers those records again. The kind
+        // 0x05 records of the batch are durable before the journal steps
+        // (below) and stay stored whatever fails after them.
         let updates = match journal {
             Some(_) => Self::journal_updates(&records, &next, &touched),
             None => Vec::new(),
@@ -2892,6 +2900,13 @@ impl OwnerSyncStore {
         held: H,
         records: Vec<VersionedRecord>,
     ) -> Result<H, SyncError> {
+        #[cfg(test)]
+        if self
+            .fail_next_intent_write
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(SyncError::Io("injected journal intent failure".into()));
+        }
         let bytes = serde_json::to_vec(&PersistedRecords { records })
             .map_err(|e| SyncError::Io(format!("encode journal intent: {e}")))?;
         let path = self.dir.join(JOURNAL_INTENT_FILE);
@@ -9160,6 +9175,86 @@ mod issuance_journal_sync_tests {
             "the kind 0x05 record survives the stop"
         );
         assert!(!intent.exists(), "the recovery removes the intent");
+    }
+
+    /// #1107: a crash after the kind 0x05 write and before the journal
+    /// intent write. After the restart the 0x05 record is stored; no intent
+    /// and no journal line exist, and the journal record is not stored. A
+    /// later delivery of the batch commits the journal record and finds the
+    /// 0x05 record already stored.
+    #[tokio::test]
+    async fn a_crash_between_the_enrollment_write_and_the_intent_keeps_a_valid_state() {
+        use super::tests::{machine, owner_kp};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let local_dir = dir.path().join("local");
+        let (local, journal) = journal_device(&local_dir).await;
+        let d1 = journal_value("d1", 100, 5_000);
+        let r1 = remote_record(&remote, &owner, &d1).await;
+        let m = machine(9);
+        let state = DeviceEnrollmentState::Enrolled {
+            enrollment: OwnerEnrollment::sign(m, &owner, 1_000, None).expect("sign"),
+        };
+        let device = VersionedRecord::sign(
+            SyncKind::DeviceEnrollment,
+            &hex::encode(m.0),
+            &SyncValue::DeviceEnrollment {
+                state: state.clone(),
+            },
+            RecordClock {
+                version: device_enrollment_version(&state).expect("version"),
+                signed_at_ms: 1,
+                writer_machine: machine(2).0,
+            },
+            &owner,
+        )
+        .expect("sign record");
+
+        local
+            .fail_next_intent_write
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let crashed = local
+            .commit_batch(vec![r1.clone(), device.clone()], &owner.user_id())
+            .await;
+        assert!(crashed.is_err(), "the commit stops before its intent");
+        drop(local);
+
+        let (local, _) = journal_device(&local_dir).await;
+        local
+            .recover_interrupted_commit(&owner.user_id())
+            .await
+            .expect("nothing to recover");
+        let key = hex::encode(m.0);
+        assert_eq!(
+            local.stored_value(SyncKind::DeviceEnrollment, &key).await,
+            Some(SyncValue::DeviceEnrollment { state }),
+            "the kind 0x05 record is durable"
+        );
+        assert_eq!(
+            local.stored_value(SyncKind::IssuanceJournal, "bb").await,
+            None
+        );
+        assert!(!local_dir.join(SYNC_DIR).join(JOURNAL_INTENT_FILE).exists());
+        assert!(
+            crate::profile::IssuedCertRecord::load(&journal)
+                .await
+                .is_empty(),
+            "no journal line"
+        );
+
+        let outcome = local
+            .commit_batch(vec![r1, device], &owner.user_id())
+            .await
+            .expect("the batch again");
+        assert_eq!(outcome.accepted.len(), 1, "only the journal record is new");
+        assert_eq!(
+            local.stored_value(SyncKind::IssuanceJournal, "bb").await,
+            Some(d1)
+        );
     }
 
     /// Codex review of #1545 (758f62c), P2: as in
