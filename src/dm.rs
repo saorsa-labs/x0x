@@ -162,6 +162,16 @@ impl CapabilityRegistry {
     /// and [`Self::advertised`] adds it when the typed route is registered.
     pub const JOIN_REQUEST_OUTCOME_V1: u64 = 1 << 16;
 
+    /// #1540 (ADR 0110 S4; David's design approval of 21 Oct 2026 on
+    /// #1508, item c): accepts the roster-only `MemberBanned` of a TreeKEM
+    /// group, the ban of a member that holds no ratchet leaf, which carries
+    /// no TreeKEM commit and changes no epoch. Bit 17, the next free bit
+    /// after `join_request_outcome_v1` (bit 16, #1840). An admin publishes a
+    /// roster-only ban only while every other Active member's current
+    /// verified advert carries this bit; a released receiver refuses the
+    /// event (`treekem_commit_b64_absent`).
+    pub const ROSTER_ONLY_BAN_V1: u64 = 1 << 17;
+
     /// The routes supported by every receiver of this release.
     /// Route-gated bits (`grant_revocation_push_v1`,
     /// `join_request_outcome_v1`) are NOT here: they are
@@ -185,7 +195,8 @@ impl CapabilityRegistry {
                 | Self::JOIN_PENDING_NOTICE_V1
                 | Self::KEY_REPUBLISH_V1
                 | Self::TREEKEM_CATCHUP_REFUSAL_V1
-                | Self::SHARE_GRANT_NAMES_V1,
+                | Self::SHARE_GRANT_NAMES_V1
+                | Self::ROSTER_ONLY_BAN_V1,
         }
     }
 

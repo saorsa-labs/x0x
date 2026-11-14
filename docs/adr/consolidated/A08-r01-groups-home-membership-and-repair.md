@@ -101,6 +101,23 @@ D178 accepted 0108. On 20 Oct 2026 David accepted 0110 (S4, option B) and
 0109 (S3) together. Those acceptances do not waive the slice-code harness gate.
 Slices 0111–0114 continue through numbered acceptance (D199).
 
+On 14 Nov 2026 Claude built the roster-only `MemberBanned` that David
+approved as a design on 21 Oct 2026 (13:55 BST ruling on #1508, item c),
+under his delegation of design decisions of 10 Nov 2026
+([#1540](https://github.com/saorsa-labs/x0x/issues/1540)). In a TreeKEM
+group, the ban of a member that holds no seat (no row, a key-only join
+marker, or a `Removed` or `Banned` row) and no ratchet leaf carries no
+TreeKEM commit and no epoch; it is a signed roster change that closes the
+member's rejoin window. A receiver applies it only when the target holds
+no seat on its roster and its tree reports no leaf for the target; a
+target with a leaf still needs the TreeKEM removal. An admin publishes it
+only while every other Active member's current verified advert carries
+application bit 17, `roster_only_ban_v1`; otherwise the ban route answers
+409 `waiting_for_receiver_upgrade` with the members whose advert lacks the
+bit, because a released receiver refuses the event. The S4 queued ban
+uses the same route, so it no longer waits for the target to be seated
+again; it retries slowly only while that upgrade wait holds.
+
 ## Validation
 
 D16/D54 require each failure to be reproduced first in the W3-H harness
