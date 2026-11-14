@@ -27,6 +27,20 @@ pub(crate) const WARM_TARGETED_REQUEST_DOMAIN: &[u8] = b"x0x/caps/v1/targeted-re
 
 const FIRST_PUBLISH_DELAY_MS: u64 = 250;
 
+/// #504: tag of the reply-to trailer on a targeted request (see
+/// [`decode_targeted_capability_request_with_reply`]).
+pub(crate) const UNICAST_REPLY_TRAILER_TAG: u8 = 0x01;
+
+/// #504: domain prefix of a targeted capability answer sent as one direct
+/// frame to the requesting machine (bit 18 `caps_unicast_response_v1`).
+/// Frame: this prefix, the responder's agent public key length (u16 big
+/// endian), the key, then the signed advert exactly as it is published on
+/// the response topic.
+pub(crate) const UNICAST_RESPONSE_DOMAIN: &[u8] = b"x0x/caps/v1/unicast-response\0";
+
+/// #504: bound on one direct answer. A slower send falls back to the topic.
+const UNICAST_RESPONSE_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// A verified requester can make one peer republish public data, but must not
 /// be able to amplify traffic without bound. Exactly one daemon answers a
 /// targeted request, so a short global coalescing window suffices to keep a
@@ -56,8 +70,35 @@ struct TargetedCapabilityAdvertRequest {
 /// exactly, so a pre-0030 subscriber sees an undecodable advert rather than
 /// mistaking the request for one.
 pub(crate) fn decode_targeted_capability_request(topic: &str, payload: &[u8]) -> Option<AgentId> {
-    let request: TargetedCapabilityAdvertRequest = match topic {
-        DM_CAPABILITY_TARGETED_REQUEST_TOPIC => postcard::from_bytes(payload).ok()?,
+    decode_targeted_capability_request_with_reply(topic, payload).map(|(agent, _)| agent)
+}
+
+/// #504 (A06): [`decode_targeted_capability_request`] plus the optional
+/// reply-to machine a requester appends on the dedicated request topic.
+///
+/// The trailer is [`UNICAST_REPLY_TRAILER_TAG`] and the requester's 32-byte
+/// machine id, after the postcard record. A responder from before #504
+/// decodes the record with `postcard::from_bytes`, which ignores trailing
+/// bytes, so it still answers on the response topic. Any other trailer is
+/// refused. The warm carrier never carries the trailer: it must be consumed
+/// exactly, so a responder from before #504 would refuse it there.
+pub(crate) fn decode_targeted_capability_request_with_reply(
+    topic: &str,
+    payload: &[u8],
+) -> Option<(AgentId, Option<MachineId>)> {
+    let (request, reply_to): (TargetedCapabilityAdvertRequest, Option<MachineId>) = match topic {
+        DM_CAPABILITY_TARGETED_REQUEST_TOPIC => {
+            let (request, trailer) =
+                postcard::take_from_bytes::<TargetedCapabilityAdvertRequest>(payload).ok()?;
+            let reply_to = match trailer {
+                [] => None,
+                [UNICAST_REPLY_TRAILER_TAG, machine @ ..] => {
+                    Some(MachineId(<[u8; 32]>::try_from(machine).ok()?))
+                }
+                _ => return None,
+            };
+            (request, reply_to)
+        }
         DM_CAPABILITY_TOPIC => {
             let encoded = payload.strip_prefix(WARM_TARGETED_REQUEST_DOMAIN)?;
             let (request, trailing) =
@@ -65,12 +106,12 @@ pub(crate) fn decode_targeted_capability_request(topic: &str, payload: &[u8]) ->
             if !trailing.is_empty() {
                 return None;
             }
-            request
+            (request, None)
         }
         _ => return None,
     };
     (request.protocol_version == TARGETED_REQUEST_PROTOCOL_VERSION)
-        .then_some(AgentId(request.requested_agent_id))
+        .then_some((AgentId(request.requested_agent_id), reply_to))
 }
 
 fn encode_targeted_capability_request(requested_agent_id: AgentId) -> NetworkResult<Vec<u8>> {
@@ -94,15 +135,24 @@ fn encode_targeted_capability_request(requested_agent_id: AgentId) -> NetworkRes
 /// yet, while the steady advert topic's mesh is already established, and a
 /// strict send only has a three-second window to converge. Failure on one
 /// carrier is logged; only a failure on both is an error.
+///
+/// `reply_to` (#504) is this node's machine id when it can take the answer
+/// as a direct frame; it rides only the dedicated request topic.
 pub(crate) async fn publish_targeted_capability_request(
     pubsub: &PubSubManager,
     requested_agent_id: AgentId,
+    reply_to: Option<MachineId>,
 ) -> NetworkResult<()> {
-    let targeted = encode_targeted_capability_request(requested_agent_id)?;
+    let base = encode_targeted_capability_request(requested_agent_id)?;
+    let mut targeted = base.clone();
+    if let Some(machine) = reply_to {
+        targeted.push(UNICAST_REPLY_TRAILER_TAG);
+        targeted.extend_from_slice(machine.as_bytes());
+    }
     let warm = {
-        let mut warm = Vec::with_capacity(WARM_TARGETED_REQUEST_DOMAIN.len() + targeted.len());
+        let mut warm = Vec::with_capacity(WARM_TARGETED_REQUEST_DOMAIN.len() + base.len());
         warm.extend_from_slice(WARM_TARGETED_REQUEST_DOMAIN);
-        warm.extend_from_slice(&targeted);
+        warm.extend_from_slice(&base);
         warm
     };
     let (targeted_result, warm_result) = tokio::join!(
@@ -222,6 +272,156 @@ pub(crate) fn ingest_verified_capability_advert(
         );
     }
     inserted
+}
+
+/// #504: the direct frame that answers a targeted request by unicast (see
+/// [`UNICAST_RESPONSE_DOMAIN`]). `None` when the key does not fit a u16.
+pub(crate) fn encode_unicast_capability_response(
+    public_key: &[u8],
+    advert: &[u8],
+) -> Option<Vec<u8>> {
+    let key_len = u16::try_from(public_key.len()).ok()?;
+    let mut frame =
+        Vec::with_capacity(UNICAST_RESPONSE_DOMAIN.len() + 2 + public_key.len() + advert.len());
+    frame.extend_from_slice(UNICAST_RESPONSE_DOMAIN);
+    frame.extend_from_slice(&key_len.to_be_bytes());
+    frame.extend_from_slice(public_key);
+    frame.extend_from_slice(advert);
+    Some(frame)
+}
+
+/// #504: split a direct frame into the responder's public key and its
+/// advert. `None` for any other direct payload.
+pub(crate) fn decode_unicast_capability_response(data: &[u8]) -> Option<(&[u8], &[u8])> {
+    let rest = data.strip_prefix(UNICAST_RESPONSE_DOMAIN)?;
+    let (len, rest) = rest.split_first_chunk::<2>()?;
+    let key_len = usize::from(u16::from_be_bytes(*len));
+    if rest.len() < key_len {
+        return None;
+    }
+    let (public_key, advert) = rest.split_at(key_len);
+    Some((public_key, advert))
+}
+
+/// #504: verify and ingest a targeted answer that came as a direct frame.
+///
+/// The frame has no pubsub envelope, so this checks what the envelope
+/// would: the public key derives to `claimed_sender` (the agent id the
+/// direct frame names). Then the advert must name `transport_machine`, the
+/// QUIC-authenticated peer, as its machine. The rest is
+/// [`ingest_verified_capability_advert`]: the agent id, the advert
+/// signature under that key, the registry trailer and the store's freshness
+/// rule. A frame that fails any check is dropped.
+pub(crate) fn ingest_unicast_capability_response(
+    store: &CapabilityStore,
+    self_agent_id: AgentId,
+    claimed_sender: AgentId,
+    transport_machine: MachineId,
+    public_key: &[u8],
+    advert: &[u8],
+) -> bool {
+    let Ok(key) = ant_quic::MlDsaPublicKey::from_bytes(public_key) else {
+        return false;
+    };
+    if AgentId::from_public_key(&key) != claimed_sender {
+        return false;
+    }
+    match CapabilityAdvert::from_postcard(advert) {
+        Ok(decoded) if decoded.machine_id == *transport_machine.as_bytes() => {}
+        _ => return false,
+    }
+    let message = PubSubMessage {
+        topic: DM_CAPABILITY_TARGETED_RESPONSE_TOPIC.to_string(),
+        payload: Bytes::copy_from_slice(advert),
+        sender: Some(claimed_sender),
+        sender_public_key: Some(public_key.to_vec()),
+        // The key derives to the sender, as a verified envelope's would;
+        // the advert signature is checked under it below.
+        verified: true,
+        trust_level: None,
+        raw_envelope: None,
+    };
+    let ingested = ingest_verified_capability_advert(store, self_agent_id, &message);
+    #[cfg(test)]
+    if ingested {
+        UNICAST_INGESTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    ingested
+}
+
+#[cfg(test)]
+static UNICAST_INGESTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// #504 tests: adverts ingested from a direct frame in this process.
+#[cfg(test)]
+pub(crate) fn unicast_ingested_for_test() -> usize {
+    UNICAST_INGESTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// #504: the responder's direct path to a requesting machine. The answer
+/// goes direct only over an existing connection; otherwise, and on any send
+/// failure, the responder answers on the response topic.
+#[derive(Clone)]
+pub(crate) struct UnicastResponder {
+    pub(crate) network: Arc<crate::network::NetworkNode>,
+}
+
+impl std::fmt::Debug for UnicastResponder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnicastResponder").finish_non_exhaustive()
+    }
+}
+
+impl UnicastResponder {
+    async fn send(&self, self_agent_id: AgentId, machine: MachineId, frame: &[u8]) -> bool {
+        let peer = ant_quic::PeerId(machine.0);
+        if !self.network.is_connected(&peer).await {
+            return false;
+        }
+        matches!(
+            tokio::time::timeout(
+                UNICAST_RESPONSE_SEND_TIMEOUT,
+                self.network
+                    .send_direct(&peer, self_agent_id.as_bytes(), frame),
+            )
+            .await,
+            Ok(Ok(()))
+        )
+    }
+}
+
+/// #504: the targeted requests one answer covers. A requester that gave a
+/// reply-to machine gets a direct frame. A requester seen only without one
+/// gets the topic answer; its warm-carrier copy of a request that also
+/// named a machine does not.
+#[derive(Debug, Default)]
+struct PendingRequests {
+    unicast: std::collections::HashMap<AgentId, MachineId>,
+    topic: std::collections::HashSet<AgentId>,
+    topic_retry: bool,
+}
+
+impl PendingRequests {
+    fn note(&mut self, (requester, reply_to): (AgentId, Option<MachineId>), unicast_enabled: bool) {
+        match reply_to {
+            Some(machine) if unicast_enabled => {
+                self.unicast.insert(requester, machine);
+            }
+            _ => {
+                self.topic.insert(requester);
+            }
+        }
+    }
+
+    /// The machines to answer direct, and whether the topic answer is due.
+    fn drain(self) -> (Vec<[u8; 32]>, bool) {
+        let topic_due = self.topic_retry
+            || self
+                .topic
+                .iter()
+                .any(|requester| !self.unicast.contains_key(requester));
+        (self.unicast.into_values().map(|m| m.0).collect(), topic_due)
+    }
 }
 
 /// Verify and ingest one digest extension using the same authenticated
@@ -363,6 +563,7 @@ impl CapabilityAdvertService {
             store,
             publish_interval,
             periodic,
+            None,
             #[cfg(test)]
             None,
         )
@@ -379,6 +580,7 @@ impl CapabilityAdvertService {
         store: Arc<CapabilityStore>,
         publish_interval: Duration,
         periodic: bool,
+        unicast: Option<UnicastResponder>,
         #[cfg(test)] observation: Option<Arc<ConvergenceServiceObserver>>,
     ) -> NetworkResult<Self> {
         let mut subscription = pubsub.subscribe(DM_CAPABILITY_TOPIC.to_string()).await;
@@ -398,7 +600,10 @@ impl CapabilityAdvertService {
         let self_agent_for_sub = self_agent_id;
         // Depth 16 absorbs a burst; the publisher coalesces every queued
         // request into a single signed advert under the rate limit below.
-        let (reannounce_tx, mut reannounce_rx) = tokio::sync::mpsc::channel::<()>(16);
+        // #504: each request carries the requester's reply-to machine when
+        // it asked for a direct answer (Critical carrier only).
+        let (reannounce_tx, mut reannounce_rx) =
+            tokio::sync::mpsc::channel::<(AgentId, Option<MachineId>)>(16);
         let warm_reannounce_tx = reannounce_tx.clone();
 
         #[cfg(test)]
@@ -420,7 +625,10 @@ impl CapabilityAdvertService {
                         carrier = "warm",
                         requester = sender.map(|agent_id| hex::encode(agent_id.as_bytes())),
                     );
-                    let _result = warm_reannounce_tx.try_send(());
+                    let _result = match sender {
+                        Some(requester) => warm_reannounce_tx.try_send((requester, None)),
+                        None => Ok(()),
+                    };
                     #[cfg(test)]
                     if let Some(observer) = &warm_observation {
                         observer.enqueue(&message, "warm", _result.is_ok());
@@ -484,18 +692,23 @@ impl CapabilityAdvertService {
                 {
                     continue;
                 }
-                if decode_targeted_capability_request(&message.topic, &message.payload)
-                    != Some(self_agent_id)
-                {
-                    continue;
-                }
+                let reply_to = match decode_targeted_capability_request_with_reply(
+                    &message.topic,
+                    &message.payload,
+                ) {
+                    Some((requested, reply_to)) if requested == self_agent_id => reply_to,
+                    _ => continue,
+                };
                 tracing::debug!(
                     target: "dm.trace",
                     stage = "capability_refresh_request_received",
                     carrier = "critical",
                     requester = message.sender.map(|agent_id| hex::encode(agent_id.as_bytes())),
                 );
-                let _result = reannounce_tx.try_send(());
+                let _result = match message.sender {
+                    Some(requester) => reannounce_tx.try_send((requester, reply_to)),
+                    None => Ok(()),
+                };
                 #[cfg(test)]
                 if let Some(observer) = &critical_observation {
                     observer.enqueue(&message, "critical", _result.is_ok());
@@ -525,6 +738,11 @@ impl CapabilityAdvertService {
             };
             let mut last_targeted_response_at: Option<tokio::time::Instant> = None;
             let mut targeted_response_pending = false;
+            // #504: who asked since the last answer. A machine here gets
+            // the advert as a direct frame; `topic_answer_due` sends it on
+            // the response topic (a request without a reply-to, no direct
+            // path, or a failed direct send).
+            let mut requests = PendingRequests::default();
             let mut requests_open = true;
             // #656: whether the CURRENT publish cycle is a steady one (the
             // startup beat, a timer beat, or a capability upgrade) rather
@@ -539,11 +757,12 @@ impl CapabilityAdvertService {
             // listener) still gets a copy without the per-request storm.
             let mut last_steady_publish_at: Option<tokio::time::Instant> = None;
             loop {
-                while reannounce_rx.try_recv().is_ok() {
+                while let Ok(request) = reannounce_rx.try_recv() {
                     #[cfg(test)]
                     if let Some(observer) = &observation {
                         observer.record(ServiceEvent::Consumed);
                     }
+                    requests.note(request, unicast.is_some());
                     targeted_response_pending = true;
                 }
                 let caps_snapshot = publisher_caps_rx.borrow().clone();
@@ -578,9 +797,10 @@ impl CapabilityAdvertService {
                             // immediately, so there is nothing to answer with
                             // yet — just remember that someone asked.
                             match request {
-                                Some(()) => {
+                                Some(request) => {
                                     #[cfg(test)]
                                     if let Some(observer) = &observation { observer.record(ServiceEvent::Consumed); }
+                                    requests.note(request, unicast.is_some());
                                     targeted_response_pending = true;
                                 },
                                 None => requests_open = false,
@@ -634,24 +854,66 @@ impl CapabilityAdvertService {
                         // must not be spent waiting behind Bulk cooling on
                         // the steady advert topic.
                         if targeted_response_pending {
-                            match publisher_pubsub
-                                .publish(
-                                    DM_CAPABILITY_TARGETED_RESPONSE_TOPIC.to_string(),
-                                    bytes.clone(),
-                                )
-                                .await
-                            {
-                                Ok(()) => {
-                                    last_targeted_response_at = Some(tokio::time::Instant::now());
-                                    targeted_response_pending = false;
-                                    tracing::debug!(
-                                        target: "dm.trace",
-                                        stage = "capability_advert_response_published",
-                                    );
+                            // #504 (A06): answer each requester that gave a
+                            // reply-to machine with one direct frame; the
+                            // topic answer goes out only when some requester
+                            // still needs it.
+                            let (targets, mut topic_due) = std::mem::take(&mut requests).drain();
+                            if let Some(responder) = &unicast {
+                                let frame = encode_unicast_capability_response(
+                                    &publisher_signing.public_key_bytes,
+                                    &bytes,
+                                );
+                                for machine in targets {
+                                    let sent = match &frame {
+                                        Some(frame) => {
+                                            responder
+                                                .send(self_agent_id, MachineId(machine), frame)
+                                                .await
+                                        }
+                                        None => false,
+                                    };
+                                    if sent {
+                                        tracing::debug!(
+                                            target: "dm.trace",
+                                            stage = "capability_advert_response_unicast",
+                                            machine = %hex::encode(machine),
+                                        );
+                                    } else {
+                                        topic_due = true;
+                                    }
                                 }
-                                Err(e) => tracing::warn!(
-                                    "capability advert publish failed on targeted response topic: {e}"
-                                ),
+                            } else if !targets.is_empty() {
+                                topic_due = true;
+                            }
+                            if topic_due {
+                                match publisher_pubsub
+                                    .publish(
+                                        DM_CAPABILITY_TARGETED_RESPONSE_TOPIC.to_string(),
+                                        bytes.clone(),
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        last_targeted_response_at =
+                                            Some(tokio::time::Instant::now());
+                                        targeted_response_pending = false;
+                                        tracing::debug!(
+                                            target: "dm.trace",
+                                            stage = "capability_advert_response_published",
+                                        );
+                                    }
+                                    Err(e) => {
+                                        // Retry on the next cycle.
+                                        requests.topic_retry = true;
+                                        tracing::warn!(
+                                            "capability advert publish failed on targeted response topic: {e}"
+                                        )
+                                    }
+                                }
+                            } else {
+                                last_targeted_response_at = Some(tokio::time::Instant::now());
+                                targeted_response_pending = false;
                             }
                         }
                         // #656: the steady advert rides its own cadence —
@@ -737,9 +999,10 @@ impl CapabilityAdvertService {
                         request = reannounce_rx.recv(), if requests_open => {
                             match request {
                                 None => requests_open = false,
-                                Some(()) => {
+                                Some(request) => {
                                     #[cfg(test)]
                                     if let Some(observer) = &observation { observer.record(ServiceEvent::Consumed); }
+                                    requests.note(request, unicast.is_some());
                                     targeted_response_pending = true;
                                     let now = tokio::time::Instant::now();
                                     let earliest = last_targeted_response_at.map_or(now, |last| {
@@ -1571,7 +1834,7 @@ mod tests {
 
         // Let the responder's subscription register before requesting.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        publish_targeted_capability_request(&pubsub, self_agent)
+        publish_targeted_capability_request(&pubsub, self_agent, None)
             .await
             .expect("publish targeted request");
 
@@ -1622,7 +1885,7 @@ mod tests {
         .expect("spawn_default");
 
         tokio::time::sleep(Duration::from_millis(300)).await;
-        publish_targeted_capability_request(&pubsub, AgentId([0x46; 32]))
+        publish_targeted_capability_request(&pubsub, AgentId([0x46; 32]), None)
             .await
             .expect("publish targeted request");
 
@@ -1710,7 +1973,7 @@ mod tests {
         // spaced past the responder's 1 s coalescing window so each draws
         // its own response.
         for expected in 1..=3 {
-            publish_targeted_capability_request(&pubsub, self_agent)
+            publish_targeted_capability_request(&pubsub, self_agent, None)
                 .await
                 .expect("publish targeted request");
             let deadline = std::time::Instant::now() + Duration::from_secs(3);
@@ -1812,7 +2075,7 @@ mod tests {
         // the Critical topic, and no further steady advert (the fallback is
         // not due again inside the 600 s window).
         for expected in 1..=3 {
-            publish_targeted_capability_request(&pubsub, self_agent)
+            publish_targeted_capability_request(&pubsub, self_agent, None)
                 .await
                 .expect("publish targeted request");
             let deadline = std::time::Instant::now() + Duration::from_secs(3);

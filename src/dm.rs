@@ -162,6 +162,12 @@ impl CapabilityRegistry {
     /// and [`Self::advertised`] adds it when the typed route is registered.
     pub const JOIN_REQUEST_OUTCOME_V1: u64 = 1 << 16;
 
+    /// Issue #504 (A06, 14 Nov 2026): takes a targeted capability answer as
+    /// one direct frame (`x0x/caps/v1/unicast-response\0`) to the machine a
+    /// targeted request names; the response topic stays the fallback. Bit 18
+    /// (bit 17 is claimed by an open PR).
+    pub const CAPS_UNICAST_RESPONSE_V1: u64 = 1 << 18;
+
     /// The routes supported by every receiver of this release.
     /// Route-gated bits (`grant_revocation_push_v1`,
     /// `join_request_outcome_v1`) are NOT here: they are
