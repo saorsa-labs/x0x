@@ -19,7 +19,7 @@
       "revision": 1,
       "path": "A02-r01-identity-keys-and-device-enrollment.md",
       "title": "Identity Keys and Device Enrollment",
-      "sha256": "83492337567c9b0de73139f29994665b6486063eedd6392ea2153af49134f4cc"
+      "sha256": "d9b9ea12f4beca5bffe6afa97200279b39495fa4633715eca0b1225ce15438ff"
     },
     {
       "id": "A03",
@@ -47,14 +47,14 @@
       "revision": 1,
       "path": "A06-r01-gossip-relay-roles-and-resource-limits.md",
       "title": "Gossip Relay Roles and Resource Limits",
-      "sha256": "5e703e9b3cf557d1c26915753f003b856ba0b3e98fcb72f5ebd546e00f2c5d7f"
+      "sha256": "8671bd4d256b63fcfb277dc45bf8216dd8528426293248bf1d354a8c36c54683"
     },
     {
       "id": "A07",
       "revision": 1,
       "path": "A07-r01-messages-receipts-history-and-retry.md",
       "title": "Messages Receipts History and Retry",
-      "sha256": "43d4d2a4ada26358109fb326be1706ff6fed6204f72a83905232b2dda6080004"
+      "sha256": "b4511aca5387dd98b5a8faf1424935d514796e5d6995a2e38c8f14a544cbc59d"
     },
     {
       "id": "A08",

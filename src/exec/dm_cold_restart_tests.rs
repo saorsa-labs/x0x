@@ -391,6 +391,7 @@ async fn rig(revoke_first: bool) -> Rig {
                     .expect("gossip")
                     .pubsub(),
                 receiver.agent.agent_id(),
+                None,
             )
             .await;
         }
