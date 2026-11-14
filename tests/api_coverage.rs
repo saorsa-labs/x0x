@@ -320,6 +320,11 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Post, "/machines/connect", gui_api_paths_exist_in_registry),
     covered!(Post, "/direct/send", daemon_api_direct_send_not_found),
     covered!(Get, "/direct/connections", daemon_api_direct_connections),
+    covered!(
+        Get,
+        "/direct/receipts/:logical_id",
+        daemon_api_direct_receipt_unknown_and_invalid
+    ),
     covered!(Get, "/direct/events", daemon_api_direct_events_sse),
     // ── Exec ───────────────────────────────────────────────────────────
     covered!(Post, "/exec/run", daemon_api_exec_run_bad_agent_id),

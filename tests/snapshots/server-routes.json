@@ -1831,6 +1831,24 @@
   },
   {
     "method": "GET",
+    "path": "/direct/receipts/:logical_id",
+    "cli_name": "direct receipt",
+    "description": "Durable send outcome by logical_id (delivered, delivered_late, pending, unknown)",
+    "category": "direct",
+    "request": {
+      "fields": [
+        {
+          "cli": "AGENT_ID",
+          "in": "query",
+          "name": "agent_id",
+          "required": true
+        }
+      ],
+      "kind": "fields"
+    }
+  },
+  {
+    "method": "GET",
     "path": "/direct/events",
     "cli_name": "direct events",
     "description": "Stream direct messages",
