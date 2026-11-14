@@ -15,7 +15,7 @@
 //! `treekem:epoch=<n>` form can only be delivered by its signer
 //! (`catchup_may_apply_removed_as_author`).
 //!
-//! Two arms, the same scenario:
+//! Three arms, the same scenario:
 //! - plain: nodes O (owner, the signer), B, V and R, all reachable. This
 //!   is the shape the issue reports.
 //! - rotation: nodes O, P, Q, S (owner and three admins), V and R. The
@@ -24,6 +24,9 @@
 //!   off the fabric after V is back and connected to the signer, so the
 //!   first catch-up round reaches nobody. The single write gives one
 //!   observation, so that observation must move on to the signer.
+//! - silent: the plain nodes. After V is back the signer writes nothing
+//!   and V's traffic is not held: V, down past the last metadata resend,
+//!   must ask at its own start.
 //!
 //! From V's restart until the preconditions are witnessed, every
 //! application frame toward V is held (dropped). Only transport links form.
@@ -70,12 +73,15 @@ enum Arm {
     Plain,
     /// The three admins that rank before the signer are down.
     SignerAfterThreeOfflineAdmins,
+    /// The plain nodes. No later-epoch traffic is sent after V is back:
+    /// V must ask on its own.
+    Silent,
 }
 
 impl Arm {
     fn labels(self) -> &'static [&'static str] {
         match self {
-            Self::Plain => &["O", "B", "V", "R"],
+            Self::Plain | Self::Silent => &["O", "B", "V", "R"],
             Self::SignerAfterThreeOfflineAdmins => &["O", "P", "Q", "S", "V", "R"],
         }
     }
@@ -83,7 +89,7 @@ impl Arm {
     /// Labels promoted to admin by O.
     fn promoted(self) -> &'static [&'static str] {
         match self {
-            Self::Plain => &[],
+            Self::Plain | Self::Silent => &[],
             Self::SignerAfterThreeOfflineAdmins => &["P", "Q", "S"],
         }
     }
@@ -125,6 +131,44 @@ impl InboundHold {
                     | LaneClass::Stream(_)
             );
             if rule_held.load(Ordering::SeqCst) && write.lane.dst == machine && application {
+                rule_dropped.fetch_add(1, Ordering::SeqCst);
+                Fault::Drop
+            } else {
+                Fault::Pass
+            }
+        });
+        Ok(Self { held, dropped })
+    }
+
+    fn set(&self, held: bool) {
+        self.held.store(held, Ordering::SeqCst);
+    }
+
+    fn dropped(&self) -> usize {
+        self.dropped.load(Ordering::SeqCst)
+    }
+}
+
+/// Drops pubsub frames toward `target` while held, except gossip DMs, and
+/// counts them. The silent arm uses it so no later-epoch traffic (store
+/// sync, metadata) reaches the returning member while direct messages do.
+struct PubSubBlock {
+    held: Arc<AtomicBool>,
+    dropped: Arc<AtomicUsize>,
+}
+
+impl PubSubBlock {
+    fn install(sim: &Sim, target: &str) -> Result<Self> {
+        let machine = sim.peer(target)?.0;
+        let held = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (rule_held, rule_dropped) = (Arc::clone(&held), Arc::clone(&dropped));
+        sim.fabric().add_rule(move |write| {
+            if rule_held.load(Ordering::SeqCst)
+                && write.lane.dst == machine
+                && write.lane.class == LaneClass::PubSub
+                && !contains(&write.bytes, DM_TOPIC_MARKER)
+            {
                 rule_dropped.fetch_add(1, Ordering::SeqCst);
                 Fault::Drop
             } else {
@@ -358,6 +402,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         .await??;
     let metadata = TopicBlock::install(sim, "V", &topic)?;
     let hold = InboundHold::install(sim, "V")?;
+    let quiet = PubSubBlock::install(sim, "V")?;
     sim.stop("V", RestartMode::Crash).await?;
     metadata.set(true);
     let (status, removed) = sim
@@ -377,6 +422,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     })
     .await?;
     let ahead = epoch(sim, signer, &group).await?;
+    let silent = arm == Arm::Silent;
     sim.within(
         "V stays down past the metadata resends",
         OFFLINE.saturating_add(Duration::from_secs(2)),
@@ -384,8 +430,12 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     )
     .await?;
     // Hold V's application traffic until the preconditions are witnessed,
-    // so nothing can move V past e before the deliberate write.
-    hold.set(true);
+    // so nothing can move V past e before the deliberate write. The silent
+    // arm has no deliberate write: V's own start must move it.
+    hold.set(!silent);
+    // The silent arm: no later-epoch pubsub traffic reaches V until it has
+    // caught up, so only its own start can move it.
+    quiet.set(silent);
     sim.start_again("V").await?;
     let loaded = epoch(sim, "V", &group).await?;
     ensure!(
@@ -415,15 +465,16 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     }
     let restarted = epoch(sim, "V", &group).await?;
     ensure!(
-        restarted == e,
+        silent || restarted == e,
         "INFRA: V left epoch {e} for {restarted} while its traffic was held"
     );
     let reopened = open_store(sim, "V", &group).await?;
     ensure!(reopened == store, "V reopened {reopened}, expected {store}");
     let held_frames = hold.dropped();
     hold.set(false);
+    let linked_at_start = connected_to(sim, "V", signer).await;
     ensure!(
-        connected_to(sim, "V", signer).await,
+        linked_at_start,
         "INFRA: V lost its link to the signer during the hold"
     );
     let back = sim
@@ -432,7 +483,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     receipt.setup_done(at(sim));
     receipt.evidence(
         "returning_member_missed_the_removal",
-        loaded == e && restarted == e && ahead > e,
+        loaded == e && (silent || restarted == e) && ahead > e,
         format!(
             "V loaded={loaded} V before release={restarted} {signer}={ahead} e={e} \
              frames held toward V={held_frames}"
@@ -451,10 +502,12 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
 
     let served_before = served_pages(sim, signer)?;
     // One later-epoch write, then silence: no further traffic restarts a
-    // catch-up request.
-    let ticks = 1_u32;
+    // catch-up request. The silent arm writes nothing.
+    let ticks = u32::from(!silent);
     let written_at = at(sim);
-    put_value(sim, signer, &store, "w3h-1427-ahead", "e+1").await?;
+    if !silent {
+        put_value(sim, signer, &store, "w3h-1427-ahead", "e+1").await?;
+    }
     let mut seen = Observations::default();
     // The first poll at which V is past e: when, and which admins had
     // served a page by then.
@@ -492,6 +545,13 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     let served = served_pages(sim, signer)?.saturating_sub(served_before);
     let caught_up = v_epoch == signer_epoch;
     receipt.note(first_move.unwrap_or_else(|| format!("V never moved past e={e}")));
+    let quiet_dropped = quiet.dropped();
+    quiet.set(false);
+    if silent {
+        receipt.note(format!(
+            "pubsub frames toward V dropped until the catch-up check={quiet_dropped}"
+        ));
+    }
 
     let mut data_ok = false;
     if caught_up {
@@ -536,12 +596,29 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         .into_iter()
         .filter(|(write, _)| write.lane.class == LaneClass::PubSub)
         .count();
-    receipt.request_delivered(
-        "later_epoch_store_writes_reached_the_returning_member",
-        ticks > 0 && traffic > 0,
-        format!("signer writes={ticks} pubsub frames signer->V={traffic}"),
-        at(sim),
-    );
+    if silent {
+        receipt.evidence(
+            "no_later_epoch_store_write_before_the_catch_up",
+            ticks == 0,
+            format!("signer writes={ticks} pubsub frames signer->V={traffic}"),
+            at(sim),
+        );
+        // The silent arm's only stimulus is V's start with a live link to
+        // the signer, witnessed before the wait.
+        receipt.request_delivered(
+            "returning_member_started_with_a_link_to_the_signer",
+            linked_at_start,
+            format!("V connected to {signer} after its start: {linked_at_start}"),
+            at(sim),
+        );
+    } else {
+        receipt.request_delivered(
+            "later_epoch_store_writes_reached_the_returning_member",
+            ticks > 0 && traffic > 0,
+            format!("signer writes={ticks} pubsub frames signer->V={traffic}"),
+            at(sim),
+        );
+    }
     receipt.note(format!(
         "metadata-topic frames toward V dropped={}",
         metadata.dropped()
@@ -628,6 +705,23 @@ fn w3h_1427_catchup_moves_past_three_offline_admins_to_the_signer() -> Result<()
             "w3h_1427_catchup_moves_past_three_offline_admins_to_the_signer",
             0x1427_0002,
             Arm::SignerAfterThreeOfflineAdmins,
+            Verdict::Green,
+        )
+        .await
+    })
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+fn w3h_1427_silent_return_reaches_the_epoch() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1427_silent_return_reaches_the_epoch",
+            0x1427_0003,
+            Arm::Silent,
             Verdict::Green,
         )
         .await

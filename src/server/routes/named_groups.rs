@@ -15547,6 +15547,116 @@ fn epoch_ahead_catchup_peers(
         .collect()
 }
 
+/// #1427: how often a running daemon records that it is up
+/// ([`treekem_alive_path`]).
+const TREEKEM_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// #1427: the file that holds the last time (Unix ms) this daemon was up.
+/// Local state only.
+fn treekem_alive_path(state: &AppState) -> std::path::PathBuf {
+    state.data_dir.join("treekem-alive")
+}
+
+fn treekem_unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// #1427: the keys of the TreeKEM groups this node can ask a catch-up page
+/// for: stored, not withdrawn, the local agent is an active member, and
+/// the TreeKEM group is loaded.
+async fn treekem_start_catchup_groups(state: &AppState) -> Vec<String> {
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let candidates: Vec<String> = {
+        let groups = state.named_groups.read().await;
+        groups
+            .iter()
+            .filter(|(_, info)| !info.withdrawn && info.has_active_member(&local_agent_hex))
+            .map(|(key, _)| key.clone())
+            .collect()
+    };
+    let loaded = state.treekem_groups.read().await;
+    candidates
+        .into_iter()
+        .filter(|key| loaded.contains_key(key))
+        .collect()
+}
+
+/// #1427: ask the other members of one TreeKEM group for a catch-up page,
+/// with no epoch-ahead traffic needed. It runs the epoch-ahead rounds
+/// ([`request_treekem_catchup_round`]) with the next epoch as the target,
+/// so it stops when a served page moves the group past the start epoch,
+/// and asks at most [`TREEKEM_EPOCH_AHEAD_CATCHUP_PEERS`] members in each
+/// of [`TREEKEM_EPOCH_AHEAD_CATCHUP_ROUNDS`] rounds.
+async fn request_treekem_catchup_after_start(state: &Arc<AppState>, key: &str) {
+    let Some(start_epoch) = current_treekem_epoch(state, key).await else {
+        return;
+    };
+    let since = tokio::time::Instant::now();
+    let mut asked = HashSet::new();
+    for round in 0..TREEKEM_EPOCH_AHEAD_CATCHUP_ROUNDS {
+        if round > 0 {
+            tokio::time::sleep(TREEKEM_CATCHUP_THROTTLE).await;
+        }
+        let target = start_epoch.saturating_add(1);
+        if request_treekem_catchup_round(state, key, target, round, since, &mut asked)
+            .await
+            .is_none()
+        {
+            return;
+        }
+    }
+}
+
+/// #1427: the start catch-up of TreeKEM groups. A member that was down
+/// past the last metadata resend ([`GROUP_CONTROL_REDELIVERY_SCHEDULE`])
+/// can have missed a commit, and with no later traffic nothing else asks
+/// for it. So when the last recorded up time is older than that resend,
+/// the start runs [`request_treekem_catchup_after_start`] for each group.
+/// A shorter outage is left to the resends, and a first start (no record)
+/// asks nothing. While the daemon runs, it records its up time every
+/// [`TREEKEM_ALIVE_INTERVAL`].
+pub(in crate::server) async fn run_treekem_start_catchup(state: Arc<AppState>) {
+    let path = treekem_alive_path(&state);
+    let last_up = tokio::fs::read_to_string(&path)
+        .await
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok());
+    let missed_resends = GROUP_CONTROL_REDELIVERY_SCHEDULE
+        .last()
+        .copied()
+        .unwrap_or_default();
+    let down_for =
+        last_up.map(|last| Duration::from_millis(treekem_unix_now_ms().saturating_sub(last)));
+    if down_for.is_some_and(|down| down > missed_resends) {
+        for key in treekem_start_catchup_groups(&state).await {
+            tracing::info!(
+                group_id = %LogHexId::group(&key),
+                down_secs = down_for.map(|down| down.as_secs()).unwrap_or_default(),
+                "down past the last metadata resend; asking for a TreeKEM catch-up page"
+            );
+            let task_state = Arc::clone(&state);
+            let _admitted = state.spawn_detached(async move {
+                request_treekem_catchup_after_start(&task_state, &key).await;
+            });
+        }
+    }
+    let mut shutdown = state.shutdown_notify.subscribe();
+    loop {
+        if let Err(error) =
+            tokio::fs::write(&path, treekem_unix_now_ms().to_string().into_bytes()).await
+        {
+            tracing::debug!("TreeKEM up-time record was not written: {error}");
+        }
+        tokio::select! {
+            _ = shutdown.changed() => return,
+            _ = tokio::time::sleep(TREEKEM_ALIVE_INTERVAL) => {}
+        }
+    }
+}
+
 /// ADR 0110 §3: the one route for missing leaf evidence. Every S4 path
 /// that cannot decide a member's leaf because it lacks that member's
 /// committed KeyPackage calls this, then keeps its work pending: the

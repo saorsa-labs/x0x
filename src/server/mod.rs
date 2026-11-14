@@ -2665,6 +2665,13 @@ pub async fn serve_with_options(
         }));
     }
 
+    // #1427: a TreeKEM member that was down past the last metadata resend
+    // asks for the commits it missed after its start, with no later
+    // traffic needed.
+    bg_tasks.push(tokio::spawn(
+        routes::named_groups::run_treekem_start_catchup(Arc::clone(&state)),
+    ));
+
     // #1663: a member of an encrypted GSS group whose own seat carries no
     // KEM key republishes the key at boot. The keyless-install hook covers
     // the live discovery; this pass covers a node that restarted into the
