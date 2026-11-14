@@ -11,12 +11,13 @@ S3 case, and 20 reruns of them in one job do not fit the S3 test deadline.
 One rerun of H-S3-d3 takes about 16 min on a runner, so its 20 reruns
 are split across parallel parts (`PARTS`): matrix entries `s3-d3.1` to
 `s3-d3.4`, 5 reruns each. The #1661 welcome-lost row has its own shard
-too, split as `s3-1661.1` and `s3-1661.2`, 10 reruns each. The H-S3-rm4
-variants run the H-S3-c prefix and share one shard, split as `s3-rm4.1`
-and `s3-rm4.2`, 10 reruns each. H-S3-rm2 runs the H-S3-d3 five-node
-prefix with M1 seated, then the H-S3-c advance and re-seat; it has its
-own shard, split as `s3-rm2.1` and `s3-rm2.2`, 10 reruns each. H-S3-d2
-has its own shard (`s3-d2`). The summary job still counts 20 receipts.
+too, split as `s3-1661.1` and `s3-1661.2`, 10 reruns each. The five
+H-S3-rm4 variants run the H-S3-c prefix and share one shard, split as
+`s3-rm4.1` to `s3-rm4.4`, 5 reruns each. H-S3-rm2 runs the H-S3-d3
+five-node prefix with M1 seated, then the H-S3-c advance and re-seat; it
+has its own shard, split as `s3-rm2.1` and `s3-rm2.2`, 10 reruns each.
+H-S3-d2 has its own shard (`s3-d2`). The summary job still counts 20
+receipts.
 
 The S3 shard is omitted when the tree has no `w3h_1356_` test, so `main`
 does not spend a runner on an empty filter. Adding those tests makes the
@@ -63,16 +64,17 @@ RUNS = 20
 # 460 s on the runner; 20 reruns (about 153 min) leave almost no margin
 # under the 155-min S3 test deadline. 2 parts of 10 reruns take about
 # 80 min each.
-# H-S3-rm4 (1) and (2): one rerun of both is about 220 s in the 12-CPU VM,
-# so about 440 s on the runner; 20 reruns (about 147 min) leave almost no
-# margin under the 155-min S3 test deadline. 2 parts of 10 reruns take
-# about 75 min each.
+# H-S3-rm4 (1) to (5): since #1813 one variant takes 230-300 s on the
+# runner (run 42163430876), so one rerun of all five is at most about
+# 25 min even when they run one after another. 20 reruns do not fit the
+# 155-min S3 test deadline; 4 parts of 5 reruns take at most about
+# 125 min each.
 # H-S3-rm2: one rerun took about 161 s in the 12-CPU Lima VM, so about
 # 320 s on the runner (the #1780 ratio; no runner measurement yet), and
 # 20 reruns about 107 min. That estimate is not a clear margin under the
 # 155-min S3 test deadline, so split it, do not raise the budget (31 Oct
 # ruling, #1733): 2 parts of 10 reruns take about 55 min each.
-PARTS = {'s3-d3': 4, 's3-1661': 2, 's3-rm4': 2, 's3-rm2': 2}
+PARTS = {'s3-d3': 4, 's3-1661': 2, 's3-rm4': 4, 's3-rm2': 2}
 
 ROOT = Path(__file__).resolve().parents[2]
 

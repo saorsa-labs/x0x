@@ -76,6 +76,8 @@ Do not merge conflicting security membership by a generic CRDT rule. Detect an i
 
 Recovery must preserve the owner's or group's legitimate authority. It must not invent a new admin, delete a denial, or distribute keys to force progress.
 
+**Amendment, 14 Nov 2026 (Claude, under David's delegation of 10 Nov 2026; #1797).** A joiner keeps the links that its inviter serves, but not the link at its invite base. Fork evidence then had no roster at the base, so a conflicting commit that chains from that base did not authenticate. A joiner that a removed admin seated on its fork at the shared head stayed Active with no marker (ADR 0109 §10 H-S3-d2). Decision: the invite lineage keeps the signed base roster projection, local only, when the projection re-derives the signed `base_roster_root`. When the retained log has no link at `revision − 1` and the conflicting commit chains directly from the invite base, fork evidence reads the signer's role from that roster. This is the same base the joiner seeded its roster from and validated the served chain against, so it adds no new trust root. Records from before this change keep no projection and keep the old result.
+
 Persist membership, key transitions and incomplete work in a recoverable order. Keep old release-readable state where rollback requires it. [A09](A09-r01-group-encryption-and-key-changes.md) governs cryptographic exclusion.
 
 ## Consequences
