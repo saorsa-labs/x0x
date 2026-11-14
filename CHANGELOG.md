@@ -35,6 +35,13 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **A capability request whose direct answer was lost asks for the topic
+  answer next (#504 follow-up).** A responder that answers by unicast skips
+  its topic answer, so a lost direct frame left the requester without the
+  advert (the W3-H #1776 blind window). When a request that carried the
+  machine id ends with no binding, later requests to that responder omit it
+  for 10 minutes. No wire format change.
+
 - **The consent to disclose the user identity now survives a restart (#1107).**
   A successful `POST /announce` with `include_user_identity: true` and
   `human_consent: true` writes `user-consent.bin` (mode `0600`) in the
