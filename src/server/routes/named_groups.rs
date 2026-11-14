@@ -10011,14 +10011,22 @@ fn recovery_seat_may_receive_key_package(
         .is_some_and(|member| member.state == x0x::groups::GroupMemberState::Removed)
 }
 
-/// #1113 / #1567: a Removed seat may take back its KeyPackage bytes from
-/// the member's own signed `MemberJoined`, with no inviter attestation,
-/// when the bytes hash to the KeyPackage hash that the verified roster
-/// commits for the seat. A Welcome joiner needs this: its roster has no
-/// `added_by` for the members seated before it (the v4 invite roster is a
-/// projection without it), so the inviter attestation never verifies
-/// there. The leaf-removal proof of a self-leave reads these bytes.
-fn removed_seat_self_signed_key_package(
+/// #1113 / #1567 / #1583: an Active or Removed seat may take its
+/// KeyPackage bytes from the member's own signed `MemberJoined`, with no
+/// inviter attestation, when the bytes hash to the KeyPackage hash that
+/// the verified roster commits for the seat. The admin-signed roster
+/// commit already names these exact bytes, so a member cannot substitute
+/// a fresh package: a different package has a different hash.
+///
+/// A Welcome joiner needs this: its roster has no `added_by` for the
+/// members seated before it (the v4 invite roster is a projection without
+/// it), so the inviter attestation never verifies there. The leaf-removal
+/// proof of a self-leave reads these bytes. #1583: a removal of an Active
+/// seat needs them too, and the attested form reaches other members only
+/// in one direct message from the seating admin (gossip `MemberAdded`
+/// carries no `member_joined_recovery`), so catch-up accepts and serves
+/// the self-signed form.
+fn seat_self_signed_key_package(
     info: &x0x::groups::GroupInfo,
     event: &NamedGroupMetadataEvent,
 ) -> bool {
@@ -10030,14 +10038,14 @@ fn removed_seat_self_signed_key_package(
     else {
         return false;
     };
+    if !recovery_seat_may_receive_key_package(info, member_agent_id) {
+        return false;
+    }
     let seat_commits_bytes = info.members_v2.get(member_agent_id).is_some_and(|member| {
-        member.state == x0x::groups::GroupMemberState::Removed
-            && member
-                .treekem_key_package_hash
-                .as_deref()
-                .is_some_and(|expected| {
-                    blake3::hash(kp_b64.as_bytes()).to_hex().as_str() == expected
-                })
+        member
+            .treekem_key_package_hash
+            .as_deref()
+            .is_some_and(|expected| blake3::hash(kp_b64.as_bytes()).to_hex().as_str() == expected)
     });
     seat_commits_bytes && verify_member_joined_key_package_event(event)
 }
@@ -11016,7 +11024,7 @@ async fn apply_recovered_member_key_package_locked(
             return false;
         };
         if !verify_authority_attested_member_joined_recovery(info, event)
-            && !removed_seat_self_signed_key_package(info, event)
+            && !seat_self_signed_key_package(info, event)
         {
             tracing::warn!(
                 group_id = %LogHexId::group(group_id),
@@ -11182,7 +11190,10 @@ pub(in crate::server) async fn holds_member_key_package_for_removal(
         .treekem_member_key_packages
         .get(&key)
         .await
-        .is_some_and(|event| verify_authority_attested_member_joined_recovery(&info, &event))
+        .is_some_and(|event| {
+            verify_authority_attested_member_joined_recovery(&info, &event)
+                || seat_self_signed_key_package(&info, &event)
+        })
 }
 
 async fn recover_member_treekem_key_package_locked(
@@ -12747,7 +12758,10 @@ async fn member_keyed_treekem_catchup_response(
         .treekem_member_key_packages
         .find_for_member(log_keys, target_member_id)
         .await
-        .filter(|event| verify_authority_attested_member_joined_recovery(&info, event));
+        .filter(|event| {
+            verify_authority_attested_member_joined_recovery(&info, event)
+                || seat_self_signed_key_package(&info, event)
+        });
     Some(TreeKemCatchupResponse {
         message_type: "treekem_catchup_response".to_string(),
         group_id: request.group_id.clone(),
@@ -13742,7 +13756,7 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                     .map(|(_, ev)| ev)
                     .filter(|ev| {
                         verify_authority_attested_member_joined_recovery(&response_info, ev)
-                            || removed_seat_self_signed_key_package(&response_info, ev)
+                            || seat_self_signed_key_package(&response_info, ev)
                     });
                 // A survivor may relay a signed removal. The transport sender
                 // is that survivor. The author is the verified commit signer.
@@ -65295,6 +65309,7 @@ pub(in crate::server) mod tests {
         stable_group_id: String,
         member_id: AgentId,
         member_hex: String,
+        member_keypair: x0x::identity::AgentKeypair,
         event: NamedGroupMetadataEvent,
         group: Arc<Mutex<x0x::mls::TreeKemMlsGroup>>,
         initial_epoch: u64,
@@ -65458,6 +65473,7 @@ pub(in crate::server) mod tests {
             stable_group_id,
             member_id,
             member_hex,
+            member_keypair,
             event,
             group,
             initial_epoch,
@@ -71295,6 +71311,51 @@ pub(in crate::server) mod tests {
         Ok(())
     }
 
+    /// WHY (#1583): removing an Active seat needs that member's KeyPackage.
+    /// The attested form reaches other members only in one direct message
+    /// from the seating admin (gossip `MemberAdded` carries no
+    /// `member_joined_recovery`), so a member that missed it could never
+    /// remove the seat. The member's own signed `MemberJoined` now counts
+    /// for an Active seat when its bytes hash to the roster-committed
+    /// `treekem_key_package_hash`, and catch-up serves that form.
+    #[tokio::test]
+    async fn issue1583_active_seat_takes_committed_key_package_from_self_signed_member_joined(
+    ) -> Result<()> {
+        let fixture = member_joined_treekem_fixture(0x9b, 0x9c).await?;
+        let state = &fixture.state;
+        let group_id = fixture.group_id.clone();
+        let member_hex = fixture.member_hex.clone();
+        let inviter_hex = hex::encode(state.agent.agent_id().as_bytes());
+        insert_active_member_without_kp(state, &group_id, &member_hex, &inviter_hex).await;
+        let self_signed = without_recovery_attestation(fixture.event.clone());
+        let committed_kp = match &self_signed {
+            NamedGroupMetadataEvent::MemberJoined {
+                treekem_key_package_b64: Some(kp),
+                ..
+            } => kp.clone(),
+            _ => anyhow::bail!("fixture carries a KeyPackage"),
+        };
+        assert!(
+            !holds_member_key_package_for_removal(state, &group_id, &member_hex).await,
+            "control: no package is held before recovery"
+        );
+
+        assert!(
+            apply_recovered_member_key_package(state, &self_signed).await,
+            "#1583: the self-signed committed bytes install on an Active seat"
+        );
+        assert_eq!(
+            member_treekem_kp(state, &group_id, &member_hex).await,
+            Some(committed_kp),
+            "the installed bytes are the roster-committed package"
+        );
+        assert!(
+            holds_member_key_package_for_removal(state, &group_id, &member_hex).await,
+            "the removal precondition now holds"
+        );
+        Ok(())
+    }
+
     /// WP-TK1 CRITICAL — fail-closed recovery gate (issue #205): a recovered
     /// key-package install is authenticated THREE independent ways, each of
     /// which alone must refuse the install. (1) The member's ML-DSA-65 signature
@@ -71320,12 +71381,24 @@ pub(in crate::server) mod tests {
         let valid_event = fixture.event.clone();
 
         // A compromised target can self-sign a fresh package after joining.
-        // Member authentication alone is therefore insufficient: without the
-        // inviter's post-acceptance countersignature, recovery must reject it.
-        let member_only_event = without_recovery_attestation(valid_event.clone());
+        // Member authentication alone is therefore insufficient: a package
+        // whose hash the roster does not commit is refused without the
+        // inviter's post-acceptance countersignature (#1583 accepts the
+        // self-signed form only for the committed bytes).
+        let fresh_prepared =
+            x0x::mls::TreeKemMlsGroup::prepare_member(fixture.member_id, &[0xed; 32])?;
+        let member_only_event = resign_member_joined_key_package(
+            without_recovery_attestation(valid_event.clone()),
+            &fixture.member_keypair,
+            BASE64.encode(fresh_prepared.key_package_bytes()),
+        )?;
+        assert!(
+            verify_member_joined_key_package_event(&member_only_event),
+            "control: the fresh package is genuinely member-signed"
+        );
         assert!(
             !apply_recovered_member_key_package(state, &member_only_event).await,
-            "member-signed package without inviter acceptance is refused"
+            "member-signed fresh package without inviter acceptance is refused"
         );
         assert!(
             member_treekem_kp(state, &group_id, &member_hex)
@@ -72776,6 +72849,51 @@ pub(in crate::server) mod tests {
         assert_eq!(body["error"], "member_key_package_pending");
         assert_eq!(body["retry"], true);
         Ok(())
+    }
+
+    /// Re-sign a `MemberJoined` as its member with different KeyPackage
+    /// bytes (a member self-signing a fresh package after joining).
+    fn resign_member_joined_key_package(
+        mut event: NamedGroupMetadataEvent,
+        member_keypair: &x0x::identity::AgentKeypair,
+        new_key_package_b64: String,
+    ) -> Result<NamedGroupMetadataEvent> {
+        if let NamedGroupMetadataEvent::MemberJoined {
+            group_id,
+            stable_group_id,
+            member_agent_id,
+            member_public_key_b64,
+            role,
+            display_name,
+            inviter_agent_id,
+            invite_secret,
+            ts_ms,
+            treekem_key_package_b64,
+            signature_b64,
+            ..
+        } = &mut event
+        {
+            let canonical = canonical_member_joined_bytes(
+                group_id,
+                stable_group_id.as_deref(),
+                member_agent_id,
+                member_public_key_b64,
+                *role,
+                display_name.as_deref(),
+                inviter_agent_id,
+                invite_secret,
+                *ts_ms,
+                Some(&new_key_package_b64),
+            );
+            let signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+                member_keypair.secret_key(),
+                &canonical,
+            )
+            .map_err(|e| anyhow::anyhow!("re-sign MemberJoined: {e:?}"))?;
+            *treekem_key_package_b64 = Some(new_key_package_b64);
+            *signature_b64 = BASE64.encode(signature.as_bytes());
+        }
+        Ok(event)
     }
 
     fn without_recovery_attestation(mut event: NamedGroupMetadataEvent) -> NamedGroupMetadataEvent {
