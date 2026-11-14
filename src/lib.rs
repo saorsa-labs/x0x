@@ -190,6 +190,8 @@ pub mod dm_capability_service;
 pub mod dm_inbox;
 
 mod dm_evidence;
+/// #1109: durable `deliver_until` direct messages on the generic outbox.
+pub(crate) mod dm_outbox;
 /// Sender-side gossip DM path — envelope construction, publish + retry,
 /// and `InFlightAcks` wait.
 pub mod dm_send;
@@ -838,6 +840,9 @@ pub struct Agent {
         std::sync::Mutex<Option<std::sync::Arc<dm_capability_service::ConvergenceServiceObserver>>>,
     /// In-flight DM ACK waiters shared between `send_direct` and the inbox.
     dm_inflight_acks: std::sync::Arc<dm::InFlightAcks>,
+    /// #1109: the daemon's durable `deliver_until` DM outbox, installed
+    /// once at daemon start (`None` for an embedded agent with no daemon).
+    dm_obligations: std::sync::OnceLock<std::sync::Arc<dm_outbox::DmObligationStore>>,
     /// Receiver-side dedupe cache.
     recent_delivery_cache: std::sync::Arc<dm::RecentDeliveryCache>,
     /// Handle for the running capability advert service.
@@ -17353,6 +17358,20 @@ impl Agent {
         std::sync::Arc::clone(&self.dm_inflight_acks)
     }
 
+    /// #1109: install the daemon's `deliver_until` DM outbox. The first
+    /// install wins; a later one returns false and changes nothing.
+    pub(crate) fn install_dm_obligations(
+        &self,
+        store: std::sync::Arc<dm_outbox::DmObligationStore>,
+    ) -> bool {
+        self.dm_obligations.set(store).is_ok()
+    }
+
+    /// #1109: the daemon's `deliver_until` DM outbox, when installed.
+    pub(crate) fn dm_obligations(&self) -> Option<std::sync::Arc<dm_outbox::DmObligationStore>> {
+        self.dm_obligations.get().map(std::sync::Arc::clone)
+    }
+
     /// Clone the shared recent-delivery dedupe cache.
     #[must_use]
     pub fn recent_delivery_cache(&self) -> std::sync::Arc<dm::RecentDeliveryCache> {
@@ -25493,6 +25512,7 @@ impl AgentBuilder {
                 VERIFIED_CERT_EVENT_CAPACITY,
             )),
             dm_inflight_acks: std::sync::Arc::new(dm::InFlightAcks::new()),
+            dm_obligations: std::sync::OnceLock::new(),
             recent_delivery_cache: std::sync::Arc::new(dm::RecentDeliveryCache::with_defaults()),
             capability_advert_service: tokio::sync::Mutex::new(None),
             selection_skew: std::sync::Arc::new(SelectionSkew::default()),

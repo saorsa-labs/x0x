@@ -132,7 +132,7 @@ GET  /contacts/:agent_id/revocations                     contacts revocations   
 POST  /trust/evaluate                                     trust evaluate            body: agent_id,machine_id     Evaluate trust for agent+machine
 POST  /agents/connect                                     direct connect            body: agent_id                Connect to agent
 POST  /machines/connect                                   machines connect          body: machine_id              Connect to machine
-POST  /direct/send                                        direct send               body: agent_id,payload,prefer_raw_quic_if_connected,raw_quic_receive_ack_ms,stop_fallback_on_raw_error,require_gossip,require_ack_ms,require_durable_app_ack,logical_id  Send direct message
+POST  /direct/send                                        direct send               body: agent_id,payload,prefer_raw_quic_if_connected,raw_quic_receive_ack_ms,stop_fallback_on_raw_error,require_gossip,require_ack_ms,require_durable_app_ack,logical_id,deliver_until  Send direct message
 GET  /direct/connections                                 direct connections                                      List direct connections
 GET  /direct/receipts/:logical_id                        direct receipt            query: agent_id               Durable send outcome by logical_id (delivered, delivered_late, pending, unknown)
 GET  /direct/events                                      direct events             query: backfill               Stream direct messages

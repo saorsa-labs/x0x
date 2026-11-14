@@ -1105,7 +1105,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "direct send",
         description: "Send direct message",
         category: "direct",
-        request: RequestSpec::Fields(&[RequestField::body_as("agent_id", true, "AGENT_ID"), RequestField::body_as("payload", true, "MESSAGE"), RequestField::body_bool_default_true("prefer_raw_quic_if_connected"), RequestField::body("raw_quic_receive_ack_ms", false), RequestField::body("stop_fallback_on_raw_error", false), RequestField::body("require_gossip", false), RequestField::body_ignored("require_gossip_ack"), RequestField::body_as("require_ack_ms", false, "--require-ack-ms"), RequestField::body_as("require_durable_app_ack", false, "--no-durable-ack"), RequestField::body("logical_id", false)]),
+        request: RequestSpec::Fields(&[RequestField::body_as("agent_id", true, "AGENT_ID"), RequestField::body_as("payload", true, "MESSAGE"), RequestField::body_bool_default_true("prefer_raw_quic_if_connected"), RequestField::body("raw_quic_receive_ack_ms", false), RequestField::body("stop_fallback_on_raw_error", false), RequestField::body("require_gossip", false), RequestField::body_ignored("require_gossip_ack"), RequestField::body_as("require_ack_ms", false, "--require-ack-ms"), RequestField::body_as("require_durable_app_ack", false, "--no-durable-ack"), RequestField::body("logical_id", false), RequestField::body_as("deliver_until", false, "--deliver-until")]),
     },
     EndpointDef {
         method: Method::Get,

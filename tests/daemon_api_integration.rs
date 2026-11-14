@@ -1171,6 +1171,51 @@ async fn daemon_api_direct_receipt_unknown_and_invalid() {
     assert_eq!(body["error"], "invalid_logical_id", "body: {body}");
 }
 
+/// #1109: a `deliver_until` send to a recipient with no capability advert
+/// is held and answered 202 (before #1109 the daemon ignored the field and
+/// refused the send); the receipt query then reads `pending` with the
+/// obligation's schedule.
+#[tokio::test]
+#[ignore]
+async fn daemon_api_direct_send_deliver_until_holds_a_cold_recipient() {
+    let d = daemon().await;
+    let peer = "cd".repeat(32);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let resp = ca(&d)
+        .post(d.url("/direct/send"))
+        .json(&serde_json::json!({
+            "agent_id": peer,
+            "payload": "aGVsbG8=",
+            "logical_id": "cold-1",
+            "deliver_until": now_ms + 600_000,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::ACCEPTED);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], true, "body: {body}");
+    assert_eq!(body["logical_id"], "cold-1", "body: {body}");
+    assert_eq!(body["status"], "pending", "body: {body}");
+    let receipt: Value = ca(&d)
+        .get(d.url(&format!("/direct/receipts/cold-1?agent_id={peer}")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(receipt["status"], "pending", "receipt: {receipt}");
+    assert_eq!(
+        receipt["obligation"]["deliver_until"],
+        now_ms + 600_000,
+        "receipt: {receipt}"
+    );
+}
+
 #[tokio::test]
 #[ignore]
 async fn daemon_api_direct_events_sse() {
