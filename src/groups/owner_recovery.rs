@@ -193,6 +193,11 @@ pub enum OwnerRecoveryRefusal {
     RecoveryProofInvalid,
     /// The group is withdrawn or holds an ADR 0064 quarantine marker.
     RecoveryGroupQuarantined,
+    /// #1581: the parent roster has no Active admin seat at all, so no
+    /// revoked admin exists to replace. ADR 0088 §2 item 3 keeps this
+    /// state as `waiting_for_active_admin` (ADR 0110 §4), not
+    /// `recovery_not_needed`.
+    WaitingForActiveAdmin,
 }
 
 impl OwnerRecoveryRefusal {
@@ -208,6 +213,7 @@ impl OwnerRecoveryRefusal {
             Self::RecoveryMemberIneligible => "recovery_member_ineligible",
             Self::RecoveryProofInvalid => "recovery_proof_invalid",
             Self::RecoveryGroupQuarantined => "recovery_group_quarantined",
+            Self::WaitingForActiveAdmin => "waiting_for_active_admin",
         }
     }
 }
@@ -449,6 +455,19 @@ pub fn revoked_admins_when_needed(
         .collect()
 }
 
+/// The typed refusal when [`revoked_admins_when_needed`] answers `None`:
+/// `waiting_for_active_admin` for a roster with no Active admin seat
+/// (ADR 0088 §2 item 3), else `recovery_not_needed` (an eligible admin
+/// remains).
+#[must_use]
+pub fn not_needed_refusal(info: &GroupInfo) -> OwnerRecoveryRefusal {
+    if active_admins(info).is_empty() {
+        OwnerRecoveryRefusal::WaitingForActiveAdmin
+    } else {
+        OwnerRecoveryRefusal::RecoveryNotNeeded
+    }
+}
+
 /// The crypto shape this group needs (by confidentiality and plane).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryCryptoKind {
@@ -581,7 +600,7 @@ pub fn validate_mandate(
         return Err(OwnerRecoveryRefusal::RecoveryHeadMismatch);
     }
     let Some(expected) = revoked_admins_when_needed(parent, revocations) else {
-        return Err(OwnerRecoveryRefusal::RecoveryNotNeeded);
+        return Err(not_needed_refusal(parent));
     };
     let named: Vec<[u8; 32]> = body
         .revoked_admins
@@ -1288,6 +1307,29 @@ mod tests {
         assert_eq!(
             validate_mandate(&mandate, &f.info, &f.revocations, Some(&f.cert), NOW),
             Err(OwnerRecoveryRefusal::RecoveryNotNeeded)
+        );
+    }
+
+    /// #1581: a roster with no Active admin seat refuses with
+    /// `waiting_for_active_admin`, never `recovery_not_needed`.
+    #[test]
+    fn admin_empty_roster_means_waiting_for_active_admin() {
+        let mut f = treekem();
+        let mandate = mandate_for(&f);
+        let admin_hex = hex::encode(f.admin.agent_id().as_bytes());
+        f.info
+            .members_v2
+            .get_mut(&admin_hex)
+            .expect("the admin seat")
+            .role = GroupRole::Member;
+        assert!(active_admins(&f.info).is_empty(), "no admin seat is left");
+        assert_eq!(
+            validate_mandate(&mandate, &f.info, &f.revocations, Some(&f.cert), NOW),
+            Err(OwnerRecoveryRefusal::WaitingForActiveAdmin)
+        );
+        assert_eq!(
+            OwnerRecoveryRefusal::WaitingForActiveAdmin.as_str(),
+            "waiting_for_active_admin"
         );
     }
 

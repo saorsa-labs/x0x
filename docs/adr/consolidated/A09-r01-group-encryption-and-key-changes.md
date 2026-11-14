@@ -72,6 +72,21 @@ round. A sibling fork that split below the window is not detected. ADR
 0110 stays Accepted and its text is unchanged. The code and this slot
 carry the change.
 
+On 14 Nov 2026 Claude decided two ADR 0110 follow-ups under David's
+delegation of design decisions of 10 Nov 2026
+([#1581](https://github.com/saorsa-labs/x0x/issues/1581)). (1) The §2
+row budget counts host suspend. The in-boot part of a row's budget is the
+larger of the monotonic delta and the delta of the suspend-inclusive boot
+clock (`CLOCK_BOOTTIME` on Linux, `CLOCK_MONOTONIC` on Apple platforms).
+Neither clock is ever set back, so W still never renews; after a sleep
+the fallback is no longer late. Test builds, W3-H included, keep the
+virtual clock alone. (2) The owner-recovery mandate route and its
+receiver answer `waiting_for_active_admin` (HTTP 409) when the parent
+roster has no Active admin seat at all, per ADR 0088 §2 item 3 and ADR
+0110 §4. `recovery_not_needed` keeps its ADR meaning: an eligible admin
+exists. A promoted member keeps a mandate refused with either cause and
+retries it, as before. ADR 0110 stays Accepted and its text is unchanged.
+
 [A08](A08-r01-groups-home-membership-and-repair.md) defines valid group-state and fork recovery. A09 must not bypass that authority to obtain keys faster.
 
 ## Security claims

@@ -985,8 +985,10 @@ carrier, only when that member's current verified advert sets
   stays on the group's `admin_availability.owner_recovery.owner` until the
   promoted member commits.
 - `409 Conflict` — `{"ok": false, "error": "recovery_not_needed" |
-  "recovery_member_ineligible" | "recovery_group_quarantined" |
-  "recovery_head_mismatch", "group_id"}`.
+  "waiting_for_active_admin" | "recovery_member_ineligible" |
+  "recovery_group_quarantined" | "recovery_head_mismatch", "group_id"}`.
+  `waiting_for_active_admin` means the roster has no Active admin seat at
+  all, so there is no revoked admin to replace.
 - `403 Forbidden` — a session token, or `recovery_signer_not_owner` (the
   group's owner is not this node's user key).
 - `404 Not Found` — the group is not known on this node.
@@ -2350,7 +2352,8 @@ legacy-decoded container:
   seat (with its TreeKEM leaf, with one GSS rotation, or the roster seat
   alone in a `SignedPublic` group) and makes the promoted member Admin.
   Receivers accept it only under the §4b(1) rule. Typed refusals:
-  `recovery_not_needed`, `recovery_head_mismatch`,
+  `recovery_not_needed`, `waiting_for_active_admin` (no Active admin
+  seat), `recovery_head_mismatch`,
   `recovery_signer_not_owner`, `recovery_member_ineligible`,
   `recovery_proof_invalid`, `recovery_group_quarantined`. The promoted
   member holds the commit while a known Active member's current advert
