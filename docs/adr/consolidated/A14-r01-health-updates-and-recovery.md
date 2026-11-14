@@ -62,6 +62,8 @@ Ring and canary enforcement, recall and wider maintenance policy are separate fr
 
 No automatic action may widen owner policy or bypass a release hold.
 
+Local clear of a failed-release hold (amendment of 14 Nov 2026, #1376). D190 lets a failed-release hold clear on a newer release or on an authenticated, recorded local clear, and never for recovery-failed. The local clear is `POST /upgrade/clear-hold?version=<v>` (CLI `x0x upgrade --clear-hold <v>`). Under the install lock it clears only a probe `FailedHold` record for exactly `<v>`. It writes a durable receipt (`<daemon>.upgrade-probe.json.cleared`: version, cause, transaction, time) before it removes the hold, so a crash leaves the hold in place and a repeat completes the clear. Recovery-failed, a running or unresolved probe record, and a latched barrier failure stay in place (`409`). The next apply of that release starts a fresh probe at attempt 1. Additive local API; no wire change. Authority: Claude under David's delegation, 10 Nov 2026, applying David's D190 ruling of 5 Oct 2026.
+
 ## Consequences
 
 Updates can be checked and recovered under owner policy. Independent rollback and exact artifact evidence add release work. A successful publication alone cannot prove that deployed devices are healthy.
