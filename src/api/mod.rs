@@ -2005,6 +2005,18 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         request: RequestSpec::None,
     },
     EndpointDef {
+        method: Method::Post,
+        path: "/grants/:id/renew",
+        cli_name: "grant renew",
+        description: "Renew an issued share grant: sign a new grant with the same grantee, agents and caps, valid from now (at most 90 days), and deliver it",
+        category: "grants",
+        request: RequestSpec::Fields(&[
+            RequestField::body("ttl_secs", false),
+            RequestField::body("deliver_to", false),
+            RequestField::body_as("include_names", false, "--no-names"),
+        ]),
+    },
+    EndpointDef {
         method: Method::Get,
         path: "/grants/received",
         cli_name: "grant received",

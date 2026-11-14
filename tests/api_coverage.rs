@@ -658,6 +658,11 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Post, "/grants", grant_routes_wired),
     covered!(Delete, "/grants/:id", grant_routes_wired),
     covered!(Get, "/grants/received", grant_routes_wired),
+    covered!(
+        Post,
+        "/grants/:id/renew",
+        issue1350_renew_issues_a_new_grant_with_no_gap
+    ),
     // ── Names (ADR-0074 §1) ─────────────────────────────────────────────
     covered!(Get, "/names", names_routes_wired),
     covered!(Post, "/names/resolve", names_routes_wired),

@@ -19,7 +19,7 @@ PUT  /stores/:id/:key                                    store put              
 GET  /stores/:id/:key                                    store get                                               Get value from store
 DELETE  /stores/:id/:key                                    store rm                                                Remove key from store
 GET  /agent                                              agent                                                   Agent identity info
-POST  /announce                                           announce                  body: include_user_identity,human_consent  Announce identity to network
+POST  /announce                                           announce                  body: include_user_identity,human_consent,withdraw_consent  Announce identity to network
 GET  /agent/user-id                                      agent user-id                                           Current agent user ID
 GET  /agent/card                                         agent card                query: display_name,include_groups,include_local_addresses  Generate shareable identity card
 GET  /introduction                                       agent introduction        query: peer                   Introduction card with trust-scoped disclosure
@@ -212,6 +212,7 @@ POST  /acl/reload                                         acl reload            
 GET  /grants                                             grant list                                              List share grants this install's owner issued, with status
 POST  /grants                                             grant issue               body: grantee_user,grantee_agent,agents,caps,not_before,expiry,ttl_secs,deliver_to,include_names  Sign a share grant with the owner key, store it, and deliver it by durable DM
 DELETE  /grants/:id                                         grant revoke                                            Revoke a share grant (owner key; gossiped on x0x.revocation.v3 and pushed directly to capable recipients)
+POST  /grants/:id/renew                                   grant renew               body: ttl_secs,deliver_to,include_names  Renew an issued share grant: sign a new grant with the same grantee, agents and caps, valid from now (at most 90 days), and deliver it
 GET  /grants/received                                    grant received                                          List share grants that name this install as grantee
 GET  /names                                              names list                                              List owner petnames and pinned names
 POST  /names/resolve                                      names resolve             body: name                    Resolve [agent:|machine:]<label>.<owner> locally; pins the name at first use
@@ -222,4 +223,4 @@ DELETE  /names/pins/:name                                   names unpin         
 POST  /names/accept                                       names accept              body: label                   Apply a pending grant-names suggestion (ADR 0079)
 DELETE  /names/suggestions/:label                           names dismiss                                           Drop a pending grant-names suggestion
 
-221 endpoints total
+222 endpoints total

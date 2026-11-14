@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Share grants last at most 90 days; `POST /grants/:id/renew` renews one
+  (#1350, D35, A03 amendment of 14 Nov 2026).** `POST /grants` refuses a
+  window above 90 days with `400`, and a daemon does not store (or ACK) a
+  longer grant it receives. Grants already stored keep loading. Renewal signs
+  a new grant with the same grantee, agents and caps, valid from now for at
+  most 90 days (default 90), and delivers it; the old grant stays valid to its
+  own expiry, so there is no gap. CLI: `x0x grant renew <id> [--ttl-secs N]
+  [--no-names]`.
 - **Read-only `GET /diagnostics/sidecar-quarantine` (#1597, D148).** It lists
   each ADR 0108 §5a quarantined sidecar copy (pending or history) with its
   `txid` and size in bytes, plus `count` and `total_bytes`. It does not change

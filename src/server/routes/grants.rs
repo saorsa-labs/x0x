@@ -17,7 +17,9 @@ use axum::Json;
 use serde::Deserialize;
 use std::sync::Arc;
 use x0x::identity::{AgentId, UserId};
-use x0x::share_grant::{GrantRole, Grantee, ShareCap, ShareGrantError};
+use x0x::share_grant::{
+    GrantRole, Grantee, ShareCap, ShareGrantError, MAX_SHARE_GRANT_LIFETIME_SECS,
+};
 
 const DURABLE_REQUIRED: &str =
     "share-grant management requires the durable API token (not a session or rider token)";
@@ -219,14 +221,26 @@ pub(in crate::server) async fn grants_issue(
         Ok(grant) => grant,
         Err(err) => return grant_error(&err),
     };
+    deliver_new_grant(&state, grant, &deliver_to, req.include_names, None).await
+}
+
+/// Deliver a newly signed and stored grant (issue or renewal) and build the
+/// response. `renews` names the grant a renewal replaces.
+async fn deliver_new_grant(
+    state: &AppState,
+    grant: x0x::share_grant::ShareGrant,
+    deliver_to: &[AgentId],
+    include_names: bool,
+    renews: Option<[u8; 32]>,
+) -> Response {
     let recipients = state
         .agent
-        .share_grant_recipients_classified(&grant, &deliver_to)
+        .share_grant_recipients_classified(&grant, deliver_to)
         .await;
     // ADR 0079: build and sign the names section once; recipients whose
     // verified advert sets bit 14 (and only grantee-side ones) get the v2
     // envelope, everyone else the unchanged v1 payload.
-    let envelope = if req.include_names {
+    let envelope = if include_names {
         let (owner_name, own_machine_name) = {
             let profile = state.profile.read().await;
             (profile.human_name.clone(), profile.machine_name.clone())
@@ -254,15 +268,114 @@ pub(in crate::server) async fn grants_issue(
         .agent
         .deliver_share_grant_with_names(&grant, &recipients, envelope.as_ref())
         .await;
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "ok": true,
-            "grant": grant.to_view(unix_now_secs(), false),
-            "delivery": delivery,
-        })),
+    let mut body = serde_json::json!({
+        "ok": true,
+        "grant": grant.to_view(unix_now_secs(), false),
+        "delivery": delivery,
+    });
+    if let Some(old) = renews {
+        body["renews"] = serde_json::json!(hex::encode(old));
+    }
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+/// `POST /grants/:id/renew` body. Every field is optional; an empty body
+/// takes every default.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::server) struct GrantRenewRequest {
+    /// Lifetime of the renewal from now, in seconds (default and maximum:
+    /// 90 days, [`MAX_SHARE_GRANT_LIFETIME_SECS`]).
+    #[serde(default)]
+    ttl_secs: Option<u64>,
+    /// Extra agents (hex) to deliver the renewal to, as for `POST /grants`.
+    #[serde(default)]
+    deliver_to: Vec<String>,
+    /// As for `POST /grants` (default `true`).
+    #[serde(default = "default_include_names")]
+    include_names: bool,
+}
+
+impl Default for GrantRenewRequest {
+    /// The empty body: 90 days, no extra recipients, names included (the
+    /// same default as the serde default of `include_names`).
+    fn default() -> Self {
+        Self {
+            ttl_secs: None,
+            deliver_to: Vec::new(),
+            include_names: default_include_names(),
+        }
+    }
+}
+
+/// POST /grants/:id/renew — renew an issued grant (#1350): sign a new grant
+/// with the same grantee, agents and capabilities, valid from now for
+/// `ttl_secs` (default 90 days), store it and deliver it as `POST /grants`
+/// does. The old grant is not changed and stays valid to its own expiry, so
+/// a renewal delivered before then leaves no gap. `404` when this install
+/// did not issue the grant; `400` when it is revoked or `ttl_secs` is out
+/// of range.
+pub(in crate::server) async fn grants_renew(
+    State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<ActorContext>,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    if !actor.is_durable_owner() {
+        return forbidden();
+    }
+    // An empty body takes every default; a body that is not a valid
+    // request is refused, never read as the defaults.
+    let req = if body.iter().all(u8::is_ascii_whitespace) {
+        GrantRenewRequest::default()
+    } else {
+        match serde_json::from_slice::<GrantRenewRequest>(&body) {
+            Ok(req) => req,
+            Err(e) => return bad_request(format!("invalid renew body: {e}")),
+        }
+    };
+    let grant_id = match parse_id32("id", &id) {
+        Ok(id) => id,
+        Err(msg) => return bad_request(msg),
+    };
+    if state.agent.identity().user_keypair().is_none() {
+        return api_error(
+            StatusCode::CONFLICT,
+            "share grants need an owner identity (user key) on this install",
+        )
+        .into_response();
+    }
+    let mut deliver_to = Vec::with_capacity(req.deliver_to.len());
+    for raw in &req.deliver_to {
+        match parse_id32("deliver_to", raw) {
+            Ok(id) => deliver_to.push(AgentId(id)),
+            Err(msg) => return bad_request(msg),
+        }
+    }
+    let ttl = req.ttl_secs.unwrap_or(MAX_SHARE_GRANT_LIFETIME_SECS);
+    let grant = match state
+        .agent
+        .renew_share_grant(&grant_id, ttl, unix_now_secs())
+        .await
+    {
+        Ok(grant) => grant,
+        Err(ShareGrantError::NotForUs) => {
+            return api_error(
+                StatusCode::NOT_FOUND,
+                "no grant with this id was issued by this install",
+            )
+            .into_response()
+        }
+        Err(err) => return grant_error(&err),
+    };
+    deliver_new_grant(
+        &state,
+        grant,
+        &deliver_to,
+        req.include_names,
+        Some(grant_id),
     )
-        .into_response()
+    .await
 }
 
 /// DELETE /grants/:id — revoke a grant with the owner key. Effective locally
@@ -325,7 +438,8 @@ mod tests {
         let router = axum::Router::new()
             .route("/grants", get(grants_list).post(grants_issue))
             .route("/grants/received", get(grants_received))
-            .route("/grants/:id", delete(grants_revoke));
+            .route("/grants/:id", delete(grants_revoke))
+            .route("/grants/:id/renew", axum::routing::post(grants_renew));
         let router = if with_auth {
             router.layer(axum::middleware::from_fn_with_state(
                 Arc::clone(&state),
@@ -440,6 +554,11 @@ mod tests {
             (
                 "DELETE",
                 format!("/grants/{}", "cc".repeat(32)),
+                String::new(),
+            ),
+            (
+                "POST",
+                format!("/grants/{}/renew", "cc".repeat(32)),
                 String::new(),
             ),
         ];
@@ -631,7 +750,7 @@ mod tests {
             x0x::share_grant::Grantee::Agent(x0x::identity::AgentId([0xBB; 32])),
             vec![x0x::identity::AgentId([0xBC; 32])],
             vec![x0x::share_grant::ShareCap::Dm],
-            0,
+            now - 60,
             now + 3600,
         )
         .map_err(|e| anyhow::anyhow!("sign grant: {e}"))?;
@@ -708,6 +827,222 @@ mod tests {
         ] {
             assert_eq!(body["push"][field], serde_json::json!(0), "{field}: {body}");
         }
+        Ok(())
+    }
+
+    /// An install with an owner key and an in-memory grant store.
+    async fn owner_state() -> anyhow::Result<(Arc<AppState>, tempfile::TempDir)> {
+        let dir = tempfile::tempdir()?;
+        let agent = Arc::new(
+            crate::Agent::builder()
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_user_key(crate::identity::UserKeypair::from_seed(&[0x35; 32])?)
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .build()
+                .await?,
+        );
+        let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+            dir.path(),
+            agent,
+        )
+        .await?;
+        state.agent.install_share_grant_store(Arc::new(
+            x0x::share_grant::ShareGrantStore::in_memory(
+                state.agent.agent_id(),
+                state.agent.user_id(),
+            ),
+        ));
+        Ok((state, dir))
+    }
+
+    /// WHY (#1350, D35): a grant may last at most 90 days. `POST /grants`
+    /// refuses a longer window (by `ttl_secs` or by `expiry`) and stores
+    /// nothing; exactly 90 days is accepted.
+    #[tokio::test]
+    async fn issue1350_issue_refuses_a_grant_longer_than_90_days() -> anyhow::Result<()> {
+        let (state, _dir) = owner_state().await?;
+        let app = grants_router(Arc::clone(&state), false);
+        let own = hex::encode(state.agent.agent_id().as_bytes());
+        let body = |window: serde_json::Value| {
+            let mut b = serde_json::json!({
+                "grantee_agent": "c3".repeat(32),
+                "agents": [own.clone()],
+                "caps": ["dm"],
+                "include_names": false,
+            });
+            if let (Some(obj), Some(more)) = (b.as_object_mut(), window.as_object()) {
+                for (k, v) in more {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            b.to_string()
+        };
+        let max = MAX_SHARE_GRANT_LIFETIME_SECS;
+        assert_eq!(max, 7_776_000, "90 days");
+        for window in [
+            serde_json::json!({"ttl_secs": max + 1}),
+            serde_json::json!({"not_before": 1_000, "expiry": 1_000 + max + 1}),
+            serde_json::json!({"ttl_secs": 365 * 86_400}),
+        ] {
+            let (status, json) =
+                send(&app, owner_req("POST", "/grants", &body(window.clone()))?).await?;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{window}: {json}");
+            assert!(
+                json["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("90 days"),
+                "{window}: {json}"
+            );
+        }
+        let (status, json) = send(&app, owner_req("GET", "/grants", "")?).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json["grants"],
+            serde_json::json!([]),
+            "nothing stored: {json}"
+        );
+        let (status, json) = send(
+            &app,
+            owner_req(
+                "POST",
+                "/grants",
+                &body(serde_json::json!({"ttl_secs": max})),
+            )?,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "exactly 90 days: {json}");
+        Ok(())
+    }
+
+    /// WHY (#1350): `POST /grants/:id/renew` signs a NEW grant with the
+    /// same grantee, agents and caps, valid from now for at most 90 days,
+    /// and leaves the old grant active, so the grantee has no gap. An
+    /// unknown id is 404; a revoked grant, `ttl_secs` 0 or above 90 days,
+    /// and a malformed body are 400.
+    #[tokio::test]
+    async fn issue1350_renew_issues_a_new_grant_with_no_gap() -> anyhow::Result<()> {
+        let (state, _dir) = owner_state().await?;
+        let app = grants_router(Arc::clone(&state), false);
+        let own = hex::encode(state.agent.agent_id().as_bytes());
+        let issue = serde_json::json!({
+            "grantee_agent": "c4".repeat(32),
+            "agents": [own.clone()],
+            "caps": ["dm", {"connect": {"ports": [22, 80]}}],
+            "ttl_secs": 3_600,
+            "include_names": false,
+        })
+        .to_string();
+        let (status, json) = send(&app, owner_req("POST", "/grants", &issue)?).await?;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let old_id = json["grant"]["grant_id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("grant_id: {json}"))?
+            .to_string();
+        let old_raw = parse_id32("id", &old_id).map_err(|e| anyhow::anyhow!(e))?;
+        let store = state
+            .agent
+            .share_grant_store()
+            .ok_or_else(|| anyhow::anyhow!("store"))?;
+        let old = store
+            .issued(&old_raw)
+            .ok_or_else(|| anyhow::anyhow!("old held"))?;
+
+        let before = unix_now_secs();
+        let renew_path = format!("/grants/{old_id}/renew");
+        let (status, json) = send(&app, owner_req("POST", &renew_path, "")?).await?;
+        let after = unix_now_secs();
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["renews"], serde_json::json!(old_id), "{json}");
+        let new_id = json["grant"]["grant_id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("new grant_id: {json}"))?;
+        assert_ne!(new_id, old_id, "a renewal is a new grant");
+        let new = store
+            .issued(&parse_id32("id", new_id).map_err(|e| anyhow::anyhow!(e))?)
+            .ok_or_else(|| anyhow::anyhow!("renewal held"))?;
+        new.verify()?;
+        assert_eq!(new.grantee, old.grantee);
+        assert_eq!(new.agents, old.agents);
+        assert_eq!(new.caps, old.caps);
+        assert!(
+            before <= new.not_before && new.not_before <= after,
+            "{new:?}"
+        );
+        assert_eq!(
+            new.expiry - new.not_before,
+            MAX_SHARE_GRANT_LIFETIME_SECS,
+            "default renewal is 90 days"
+        );
+        // No gap: the renewal starts while the old grant is active, and
+        // both are active at the moment the renewal starts.
+        assert!(new.not_before < old.expiry);
+        assert!(old.is_active_at(new.not_before) && new.is_active_at(new.not_before));
+        assert!(
+            new.is_active_at(old.expiry),
+            "still active after the old expiry"
+        );
+        assert!(store.issued(&old_raw).is_some(), "the old grant is kept");
+
+        // An explicit shorter lifetime.
+        let (status, json) = send(
+            &app,
+            owner_req(
+                "POST",
+                &renew_path,
+                r#"{"ttl_secs":600,"include_names":false}"#,
+            )?,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(
+            json["grant"]["expiry"].as_u64().unwrap_or_default()
+                - json["grant"]["not_before"].as_u64().unwrap_or_default(),
+            600
+        );
+
+        // Refusals.
+        for (body, want) in [
+            (r#"{"ttl_secs":0}"#.to_string(), StatusCode::BAD_REQUEST),
+            (
+                format!(r#"{{"ttl_secs":{}}}"#, MAX_SHARE_GRANT_LIFETIME_SECS + 1),
+                StatusCode::BAD_REQUEST,
+            ),
+            (r#"{"ttl":60}"#.to_string(), StatusCode::BAD_REQUEST),
+            ("{not json".to_string(), StatusCode::BAD_REQUEST),
+        ] {
+            let (status, json) = send(&app, owner_req("POST", &renew_path, &body)?).await?;
+            assert_eq!(status, want, "{body}: {json}");
+        }
+        let (status, json) = send(
+            &app,
+            owner_req("POST", &format!("/grants/{}/renew", "dd".repeat(32)), "")?,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::NOT_FOUND, "unknown id: {json}");
+        let (status, _) = send(&app, owner_req("POST", "/grants/not-hex/renew", "")?).await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, json) =
+            send(&app, owner_req("DELETE", &format!("/grants/{old_id}"), "")?).await?;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let held = store.grants(GrantRole::Issued).len();
+        let (status, json) = send(&app, owner_req("POST", &renew_path, "")?).await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "revoked: {json}");
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("revoked"),
+            "{json}"
+        );
+        assert_eq!(
+            store.grants(GrantRole::Issued).len(),
+            held,
+            "no grant signed"
+        );
         Ok(())
     }
 }
