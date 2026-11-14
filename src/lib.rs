@@ -31447,11 +31447,6 @@ mod tests {
         );
     }
 
-    /// Proof-report §3 (prod caps storm): sequential strict sends to one
-    /// recipient each published their own targeted request. A completed
-    /// flight must start a cooldown during which the gate fails fast
-    /// (`Unavailable`), and a zero cooldown preserves the old behaviour.
-
     /// #504 follow-up: a request that asked for a direct reply and got no
     /// answer makes later requests to that recipient ask for the topic
     /// answer, until an answer arrives or the miss ages out.
@@ -31479,6 +31474,10 @@ mod tests {
             "a miss ages out after the TTL"
         );
     }
+    /// Proof-report §3 (prod caps storm): sequential strict sends to one
+    /// recipient each published their own targeted request. A completed
+    /// flight must start a cooldown during which the gate fails fast
+    /// (`Unavailable`), and a zero cooldown preserves the old behaviour.
     #[tokio::test]
     async fn capability_refresh_registry_cooldown_blocks_immediate_reflight() {
         let recipient = identity::AgentId([0x81_u8; 32]);
