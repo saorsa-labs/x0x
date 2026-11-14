@@ -683,6 +683,10 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
         "src/server/routes/network.rs",
         include_str!("../src/server/routes/network.rs"),
     ),
+    (
+        "src/server/routes/upgrade.rs",
+        include_str!("../src/server/routes/upgrade.rs"),
+    ),
     // #1383: the owner machine census route's coverage lives in the
     // owner route lib tests.
     (
