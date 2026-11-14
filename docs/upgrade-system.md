@@ -971,7 +971,11 @@ executable, arguments, roots and other environment; it never installs a
 default job beside a running custom one. It **refuses** a job that is not
 x0xd, and a job without `KeepAlive: true` (a one-shot or conditional job is
 not a guaranteed respawn, so declaring it supervised would leave the daemon
-down after the upgrade exit). The change takes effect on the job's next load —
+down after the upgrade exit). It also reports and refuses a job that sets
+`AbandonProcessGroup: true`, even one that already has the marker: launchd
+then leaves x0xd's process group running when the job stops, so an orphaned
+daemon can outlive its replacement (ADR 0094, #1379). Remove that key by
+hand. The change takes effect on the job's next load —
 `--repair` prints the `launchctl unload`/`load` commands rather than stopping
 a running daemon itself. The repair-time check is not the last word: every
 apply re-verifies the **loaded** job policy (#615 above), so a `KeepAlive`
