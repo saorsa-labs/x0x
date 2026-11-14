@@ -3733,26 +3733,32 @@ impl OwnerSyncStore {
         self.last_session.read().await.clone()
     }
 
-    /// #1107: for each enrolled machine whose stored kind 0x05 record is
-    /// `Enrolled` with exactly the enrollment held now, the machine that
-    /// wrote that record (for `GET /sync/devices`). A machine with no such
-    /// record (not minted yet, or a newer local enrollment) has no entry.
-    pub async fn device_enrollment_writers(&self) -> BTreeMap<[u8; 32], [u8; 32]> {
+    /// #1107: the enrolled devices, each with the machine that wrote its
+    /// stored kind 0x05 record (for `GET /sync/devices`). The writer is
+    /// `Some` only when that record is `Enrolled` with exactly the
+    /// enrollment held now; a machine with no such record (not minted yet,
+    /// or a newer local enrollment) gets `None`. Both maps are read under
+    /// one lock pair, so a re-enrollment cannot pair a stale writer with
+    /// the new enrollment.
+    pub async fn enrolled_devices_with_writers(&self) -> Vec<(OwnerEnrollment, Option<[u8; 32]>)> {
         // Lock order: records → devices.
         let records = self.records.read().await;
         let devices = self.devices.read().await;
-        records
+        devices
             .values()
-            .filter_map(|record| {
-                let SyncValue::DeviceEnrollment {
-                    state: DeviceEnrollmentState::Enrolled { enrollment },
-                } = &record.value
-                else {
-                    return None;
-                };
-                (hex::encode(enrollment.machine_id) == record.key
-                    && devices.get(&enrollment.machine_id) == Some(enrollment))
-                .then_some((enrollment.machine_id, record.clock.writer_machine))
+            .map(|enrollment| {
+                let writer = records
+                    .get(&(
+                        SyncKind::DeviceEnrollment,
+                        hex::encode(enrollment.machine_id),
+                    ))
+                    .and_then(|record| match &record.value {
+                        SyncValue::DeviceEnrollment {
+                            state: DeviceEnrollmentState::Enrolled { enrollment: stored },
+                        } if stored == enrollment => Some(record.clock.writer_machine),
+                        _ => None,
+                    });
+                (enrollment.clone(), writer)
             })
             .collect()
     }

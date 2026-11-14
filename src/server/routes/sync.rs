@@ -505,15 +505,13 @@ pub(in crate::server) async fn get_sync_devices(
     };
     let this_machine = state.agent.machine_id();
     let statuses = sync.store().session_statuses().await;
-    let writers = sync.store().device_enrollment_writers().await;
     let mut devices: Vec<SyncDeviceEntry> = sync
         .store()
-        .enrolled_devices()
+        .enrolled_devices_with_writers()
         .await
         .into_iter()
-        .map(|enrollment| {
+        .map(|(enrollment, writer)| {
             let status = statuses.get(&enrollment.machine_id);
-            let writer = writers.get(&enrollment.machine_id);
             SyncDeviceEntry {
                 machine_id: hex::encode(enrollment.machine_id),
                 enrolled_at_ms: enrollment.enrolled_at_ms,
@@ -522,7 +520,7 @@ pub(in crate::server) async fn get_sync_devices(
                 last_session_ok: status.map(|s| s.last_session_ok),
                 is_this_machine: enrollment.machine_id == this_machine.0,
                 record_source: writer.map(|w| {
-                    if *w == this_machine.0 {
+                    if w == this_machine.0 {
                         "local"
                     } else {
                         "synced"

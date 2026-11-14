@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`GET /sync/devices` names the source of each device's enrollment record
+  (#1107).** Each row has `record_source` (`"local"` when this machine wrote
+  the stored owner-device record, `"synced"` when another owner device wrote
+  it) and `record_writer_machine_id` (hex machine id of that writer). Both are
+  `null` when no stored record holds the enrollment shown, for example a new
+  enrollment that is not minted yet.
 - **`kv:changed` SSE event on `GET /events` (#1094).** A KV store this
   daemon has open sends one event per 200 ms window when it changes (local
   write or delete, merged peer record, direct delta): `store_id` and the
