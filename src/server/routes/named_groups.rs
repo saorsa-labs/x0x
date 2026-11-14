@@ -35241,18 +35241,20 @@ pub(in crate::server) const ROSTER_ONLY_BAN_UPGRADE_WAIT: &str = "waiting_for_re
 
 /// #1540: whether a TreeKEM ban of `agent_id_hex` is roster-only. The
 /// target holds no seat on `info` (no row, a key-only join marker, or a
-/// `Removed`/`Banned` row) and, by this node's tree, no ratchet leaf: the
-/// tree answers from the roster's committed KeyPackage, and a target the
-/// tree still holds a leaf for is never banned roster-only. A group with
-/// no loaded tree answers from the roster alone.
+/// `Removed`/`Banned` row) and this node's tree gives positive evidence
+/// that it holds no ratchet leaf: [`roster_treekem_leaf_presence`] answers
+/// `Some(false)` for its row (the tree checked against the committed
+/// KeyPackage, or every leaf of the tree belongs to another identified
+/// member). A row-less target needs the second rule. `None` is no
+/// evidence and is never read as "no leaf" (#1508 review P1), so a
+/// self-leaver that may still hold a leaf takes the full TreeKEM removal.
+/// A group with no loaded tree has no evidence either.
 pub(in crate::server) async fn treekem_ban_is_roster_only(
     state: &AppState,
     group_id: &str,
     info: &x0x::groups::GroupInfo,
     agent_id_hex: &str,
 ) -> bool {
-    use base64::Engine as _;
-
     let seated = info.members_v2.get(agent_id_hex).is_some_and(|member| {
         matches!(
             member.state,
@@ -35265,33 +35267,33 @@ pub(in crate::server) async fn treekem_ban_is_roster_only(
     let Ok(target) = parse_agent_id_hex(agent_id_hex) else {
         return false;
     };
-    let committed_kp = info
-        .members_v2
-        .get(agent_id_hex)
-        .and_then(current_member_treekem_key_package)
-        .and_then(|kp_b64| {
-            base64::engine::general_purpose::STANDARD
-                .decode(kp_b64)
-                .ok()
-        });
-    let group = state.treekem_groups.read().await.get(group_id).cloned();
-    match group {
-        Some(group) => {
-            group
-                .lock()
-                .await
-                .member_leaf_present(&target, committed_kp.as_deref())
-                != Some(true)
+    let Some(group) = state.treekem_groups.read().await.get(group_id).cloned() else {
+        return false;
+    };
+    let guard = group.lock().await;
+    let presence = roster_treekem_leaf_presence(&guard, info);
+    let present = match presence.get(agent_id_hex) {
+        Some(present) => *present,
+        None => {
+            let accounted = presence
+                .values()
+                .filter(|present| **present == Some(true))
+                .count();
+            match guard.member_leaf_present(&target, None) {
+                Some(true) => Some(true),
+                _ if accounted >= guard.member_count() as usize => Some(false),
+                _ => None,
+            }
         }
-        None => true,
-    }
+    };
+    present == Some(false)
 }
 
 /// #1540: the roster-only ban of a TreeKEM member that holds no seat and
 /// no leaf (David's design approval of 21 Oct 2026 on #1508, item c). The
 /// signed `MemberBanned` carries no TreeKEM commit and changes no epoch;
 /// it closes the target's rejoin window. Published only while every other
-/// Active member's current verified advert carries `roster_only_ban_v1`;
+/// Active or Pending member's current verified advert carries `roster_only_ban_v1`;
 /// otherwise 409 `waiting_for_receiver_upgrade` names the members whose
 /// advert lacks it (a released receiver refuses the event). The caller
 /// holds the group's membership lock.
@@ -35305,8 +35307,16 @@ async fn ban_treekem_member_roster_only(
     caller_hex: String,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let capabilities = state.agent.capability_store();
+    // Pending seats receive membership events too, so they count.
     let lacking: Vec<String> = next
-        .active_members()
+        .members_v2
+        .values()
+        .filter(|member| {
+            matches!(
+                member.state,
+                x0x::groups::GroupMemberState::Active | x0x::groups::GroupMemberState::Pending
+            )
+        })
         .map(|member| member.agent_id.clone())
         .filter(|member| *member != caller_hex && *member != agent_id_hex)
         .filter(|member| {

@@ -56,9 +56,10 @@ struct AdminFixture {
 }
 
 /// This node is the admin of a TreeKEM group with an Active witness W
-/// (seated in the tree) and a member R that was added and then removed:
-/// R's row is `Removed` and the tree holds no leaf for it.
-async fn admin_with_removed_member() -> Result<AdminFixture> {
+/// (seated in the tree) and a member R whose row is `Removed`. With
+/// `remove_leaf`, R's leaf was removed from the tree too; without it, R is
+/// a roster-only self-leaver that still holds its leaf.
+async fn admin_with_removed_member(remove_leaf: bool) -> Result<AdminFixture> {
     let (state, dir) = secure_endpoint_test_state().await?;
     let admin_id = state.agent.agent_id();
     let admin_hex = hex::encode(admin_id.as_bytes());
@@ -75,7 +76,9 @@ async fn admin_with_removed_member() -> Result<AdminFixture> {
         .to_vec();
     tree.add_member(witness, &witness_kp)?;
     tree.add_member(removed, &removed_kp)?;
-    tree.remove_member_verified(removed, &removed_kp)?;
+    if remove_leaf {
+        tree.remove_member_verified(removed, &removed_kp)?;
+    }
     let epoch = tree.epoch();
 
     let mut info = x0x::groups::GroupInfo::new(
@@ -124,7 +127,7 @@ async fn admin_with_removed_member() -> Result<AdminFixture> {
 /// `waiting_for_receiver_upgrade` naming W, and nothing changes.
 #[tokio::test]
 async fn a_leafless_member_is_banned_roster_only_behind_the_capability_gate() -> Result<()> {
-    let f = admin_with_removed_member().await?;
+    let f = admin_with_removed_member(true).await?;
     let witness_hex = hex::encode(f.witness.as_bytes());
     {
         let groups = f.state.named_groups.read().await;
@@ -180,6 +183,97 @@ async fn a_leafless_member_is_banned_roster_only_behind_the_capability_gate() ->
     Ok(())
 }
 
+/// #1898 review: a roster-only self-leaver that still holds its leaf is
+/// never banned roster-only. The ban takes the full TreeKEM removal: the
+/// epoch advances and the leaf is gone.
+#[tokio::test]
+async fn a_self_leaver_that_still_holds_a_leaf_gets_the_treekem_removal() -> Result<()> {
+    let f = admin_with_removed_member(false).await?;
+    {
+        let groups = f.state.named_groups.read().await;
+        let info = groups.get(GROUP).expect("group");
+        assert!(
+            !treekem_ban_is_roster_only(&f.state, GROUP, info, &f.removed_hex).await,
+            "R still holds a leaf"
+        );
+    }
+    let (status, body) = ban(&f.state, &f.removed_hex).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.get("roster_only").is_none(), "{body}");
+    let group = f.state.treekem_groups.read().await[GROUP].clone();
+    assert_eq!(
+        group.lock().await.epoch(),
+        f.epoch + 1,
+        "the TreeKEM removal ran"
+    );
+    let groups = f.state.named_groups.read().await;
+    assert!(groups[GROUP].is_banned(&f.removed_hex));
+    Ok(())
+}
+
+/// #1898 review: with no evidence the ban is not roster-only. On a
+/// joiner's tree the leaf map holds only its own leaf, so the admin's leaf
+/// is unattributed (its row has no committed KeyPackage) and a removed R
+/// with no KeyPackage reads `None`, which is never "no leaf". With R's
+/// KeyPackage the tree itself answers `Some(false)`.
+#[tokio::test]
+async fn no_leaf_evidence_is_never_read_as_no_leaf() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let local = state.agent.agent_id();
+    let local_hex = hex::encode(local.as_bytes());
+    let admin_id = AgentKeypair::generate()?.agent_id();
+    let admin_hex = hex::encode(admin_id.as_bytes());
+    let group_id_bytes = hex::decode(GROUP)?;
+    let mut admin_tree =
+        x0x::mls::TreeKemMlsGroup::create(group_id_bytes.clone(), admin_id, &[3u8; 32])?;
+    let seed = super::super::agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+    let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(local, &seed)?;
+    let local_kp = prepared.key_package_bytes().to_vec();
+    let added = admin_tree.add_member(local, &local_kp)?;
+    let local_tree = x0x::mls::TreeKemMlsGroup::join_from_welcome(prepared, &added.welcome)?;
+    state.treekem_groups.write().await.insert(
+        GROUP.to_string(),
+        Arc::new(tokio::sync::Mutex::new(local_tree)),
+    );
+    let removed_id = AgentKeypair::generate()?.agent_id();
+    let removed_hex = hex::encode(removed_id.as_bytes());
+    let mut info = x0x::groups::GroupInfo::new(
+        "ban-1540".to_string(),
+        String::new(),
+        admin_id,
+        GROUP.into(),
+    );
+    info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+    for id in [&local_hex, &removed_hex] {
+        info.add_member(
+            id.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+    }
+    info.set_member_treekem_key_package(&local_hex, BASE64.encode(&local_kp));
+    info.remove_member(&removed_hex, Some(admin_hex.clone()));
+    assert!(
+        !treekem_ban_is_roster_only(&state, GROUP, &info, &removed_hex).await,
+        "no KeyPackage and an unattributed leaf: no evidence"
+    );
+    let stranger = hex::encode(AgentKeypair::generate()?.agent_id().as_bytes());
+    assert!(
+        !treekem_ban_is_roster_only(&state, GROUP, &info, &stranger).await,
+        "a row-less target of a partly attributed tree: no evidence"
+    );
+    let removed_kp = x0x::mls::TreeKemMlsGroup::prepare_member(removed_id, &[8u8; 32])?
+        .key_package_bytes()
+        .to_vec();
+    info.set_member_treekem_key_package(&removed_hex, BASE64.encode(&removed_kp));
+    assert!(
+        treekem_ban_is_roster_only(&state, GROUP, &info, &removed_hex).await,
+        "the committed KeyPackage proves R holds no leaf"
+    );
+    Ok(())
+}
+
 /// A member applies the admin's roster-only ban of R: R holds no seat on
 /// its roster and no leaf in its tree. The same event naming a seated
 /// member is refused, so a roster-only ban never leaves a live leaf.
@@ -203,7 +297,11 @@ async fn a_member_applies_the_roster_only_ban_of_a_leafless_member() -> Result<(
     let local_tree = x0x::mls::TreeKemMlsGroup::join_from_welcome(prepared, &added.welcome)?;
     let epoch = local_tree.epoch();
 
-    let removed_hex = hex::encode(AgentKeypair::generate()?.agent_id().as_bytes());
+    let removed_id = AgentKeypair::generate()?.agent_id();
+    let removed_hex = hex::encode(removed_id.as_bytes());
+    let removed_kp = x0x::mls::TreeKemMlsGroup::prepare_member(removed_id, &[8u8; 32])?
+        .key_package_bytes()
+        .to_vec();
     let mut info = x0x::groups::GroupInfo::new(
         "ban-1540".to_string(),
         String::new(),
@@ -224,6 +322,8 @@ async fn a_member_applies_the_roster_only_ban_of_a_leafless_member() -> Result<(
         Some(admin_hex.clone()),
         None,
     );
+    // R's committed KeyPackage lets this node's tree answer `Some(false)`.
+    info.set_member_treekem_key_package(&removed_hex, BASE64.encode(&removed_kp));
     info.remove_member(&removed_hex, Some(admin_hex.clone()));
     info.secret_epoch = epoch;
     info.security_binding = Some(format!("treekem:epoch={epoch}"));
