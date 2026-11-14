@@ -175,6 +175,153 @@ async fn a_cancelled_commit_holds_the_gate_until_its_write_lands() {
     assert_reload(dir.path(), &memory).await;
 }
 
+/// The register has a record of `kind` with the key of `machine(seed)`.
+fn holds(records: &[VersionedRecord], kind: SyncKind, seed: u8) -> bool {
+    let key = hex::encode(machine(seed).0);
+    records.iter().any(|r| r.kind == kind && r.key == key)
+}
+
+/// Copy the sync directory of `from` to a new directory: the files of a
+/// process that stops now.
+fn copy_sync_dir(from: &Path) -> tempfile::TempDir {
+    let to = tempfile::tempdir().expect("tmpdir");
+    std::fs::create_dir_all(to.path().join(SYNC_DIR)).expect("sync dir");
+    let entries = std::fs::read_dir(from.join(SYNC_DIR)).expect("read sync dir");
+    for entry in entries {
+        let entry = entry.expect("entry");
+        if entry.file_type().expect("file type").is_file() {
+            let target = to.path().join(SYNC_DIR).join(entry.file_name());
+            std::fs::copy(entry.path(), target).expect("copy");
+        }
+    }
+    to
+}
+
+/// Review of #1886: `RECORDS_FILE` is renamed before
+/// `ENROLLMENT_RECORDS_FILE`. A stop between the two renames stores the
+/// older kinds only, and the kind 0x05 record is new again after it.
+#[tokio::test]
+async fn records_file_is_renamed_before_the_enrollment_file() {
+    let (dir, store, _) = seeded().await;
+    let enrollment_path = dir.path().join(SYNC_DIR).join(ENROLLMENT_RECORDS_FILE);
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    crate::profile::journal_faults::pause_next_rename(&enrollment_path, reached_tx, release_rx);
+    let committer = Arc::clone(&store);
+    let task = tokio::spawn(async move { committer.commit_batch(mixed(), &owner()).await });
+    let reached = tokio::time::timeout(std::time::Duration::from_secs(10), reached_rx).await;
+    reached
+        .expect("the enrollment rename is reached")
+        .expect("hook");
+
+    // Between the two renames.
+    let records = file(dir.path(), RECORDS_FILE);
+    assert!(
+        holds(&records, SyncKind::MachineNames, 2),
+        "records.json is renamed first"
+    );
+    let enrollment = file(dir.path(), ENROLLMENT_RECORDS_FILE);
+    assert_eq!(
+        devices(&enrollment),
+        0,
+        "enrollment file is not renamed yet"
+    );
+
+    // A process that stops here.
+    let stopped = copy_sync_dir(dir.path());
+    let restarted = OwnerSyncStore::load(stopped.path()).await.expect("load");
+    let memory = restarted.records_snapshot().await;
+    assert!(holds(&memory, SyncKind::MachineNames, 2), "older kind");
+    assert_eq!(devices(&memory), 0, "no kind 0x05 record");
+    let again = restarted
+        .commit_batch(vec![device_record()], &owner())
+        .await;
+    let again = again.expect("again");
+    assert_eq!((again.accepted.len(), again.superseded), (1, 0), "new");
+
+    release_tx.send(()).expect("release the rename");
+    let done = tokio::time::timeout(std::time::Duration::from_secs(10), task).await;
+    let outcome = done
+        .expect("the commit ends")
+        .expect("task")
+        .expect("commit");
+    assert_eq!(outcome.accepted.len(), 2, "both parts accepted");
+    let memory = store.records_snapshot().await;
+    assert_eq!(devices(&memory), 1, "the 0x05 record is stored");
+    assert!(holds(&memory, SyncKind::MachineNames, 2));
+    assert_eq!(devices(&file(dir.path(), ENROLLMENT_RECORDS_FILE)), 1);
+    assert_reload(dir.path(), &memory).await;
+}
+
+/// Review of #1886: both files are renamed and a later fsync fails.
+/// Memory takes the new register, 0x05 included, and the store is
+/// poisoned.
+#[tokio::test]
+async fn a_failed_fsync_after_both_renames_keeps_next_and_poisons() {
+    let (dir, store, _) = seeded().await;
+    store.set_fail_after_rename_for_testing(true);
+    let failed = store.commit_batch(mixed(), &owner()).await;
+    store.set_fail_after_rename_for_testing(false);
+    assert!(matches!(failed, Err(SyncError::Poisoned(_))), "{failed:?}");
+    assert!(store.poisoned_reason().is_some(), "store is poisoned");
+    let memory = store.records_snapshot().await;
+    assert_eq!(
+        memory.len(),
+        3,
+        "next: two names records and the 0x05 record"
+    );
+    assert_eq!(devices(&memory), 1, "memory holds the 0x05 record");
+    let records = file(dir.path(), RECORDS_FILE);
+    assert!(
+        holds(&records, SyncKind::MachineNames, 2),
+        "new older kinds"
+    );
+    assert_eq!(devices(&records), 0);
+    let enrollment = file(dir.path(), ENROLLMENT_RECORDS_FILE);
+    assert_eq!(
+        (enrollment.len(), devices(&enrollment)),
+        (1, 1),
+        "new 0x05 part"
+    );
+    assert_eq!(temp_files(dir.path()), 0, "no temp file is left");
+    assert_reload(dir.path(), &memory).await;
+}
+
+/// Review of #1886: when the first rename fails, neither file changes,
+/// memory stays pre-batch and no temp file is left. A directory at
+/// `RECORDS_FILE` makes the rename fail.
+#[tokio::test]
+async fn a_failed_first_rename_removes_both_temp_files() {
+    let (dir, store, before) = seeded().await;
+    let records_path = dir.path().join(SYNC_DIR).join(RECORDS_FILE);
+    std::fs::remove_file(&records_path).expect("remove records.json");
+    std::fs::create_dir(&records_path).expect("directory");
+    std::fs::write(records_path.join("keep"), b"x").expect("non-empty");
+    let failed = store.commit_batch(mixed(), &owner()).await;
+    assert!(matches!(failed, Err(SyncError::Io(_))), "{failed:?}");
+    assert!(store.poisoned_reason().is_none(), "not poisoned");
+    assert_eq!(
+        store.records_snapshot().await,
+        before,
+        "memory is pre-batch"
+    );
+    assert!(records_path.is_dir(), "records.json is not replaced");
+    assert!(file(dir.path(), ENROLLMENT_RECORDS_FILE).is_empty());
+    assert_eq!(temp_files(dir.path()), 0, "no temp file is left");
+}
+
+/// Review of #1886: a write with no enrollment change does not consume
+/// the enrollment injections.
+#[tokio::test]
+async fn enrollment_injections_stay_armed_without_an_enrollment_change() {
+    let (_dir, store, _) = seeded().await;
+    store.fail_next_enrollment_rename.store(true, Relaxed);
+    let names_only = store.commit_batch(vec![names_record(3)], &owner()).await;
+    assert_eq!(names_only.expect("names only").accepted.len(), 1);
+    let failed = store.commit_batch(mixed(), &owner()).await;
+    assert!(matches!(failed, Err(SyncError::Poisoned(_))), "{failed:?}");
+}
+
 /// A mixed batch puts each part in its own file; a reload is the
 /// register in memory.
 #[tokio::test]

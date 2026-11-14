@@ -1597,8 +1597,11 @@ impl OwnerSyncStore {
     /// #1107: write both register files (`enrollment` only when it
     /// changes). Both temp files are staged before any rename, and
     /// `RECORDS_FILE` is renamed first (see `replace_records`). The error
-    /// holds how many files were renamed before it (0, 1 or 2). The
-    /// `fail_*` flags are test injections.
+    /// holds a count of the renames: 0 = no file is renamed; 1 =
+    /// `RECORDS_FILE` is renamed, but the enrollment rename failed; 2 =
+    /// every requested rename is done (one file when `enrollment` is
+    /// `None`), and a later fsync failed. The `fail_*` flags are test
+    /// injections.
     async fn write_register_files(
         records: (&Path, &[u8]),
         enrollment: Option<(&Path, &[u8])>,
@@ -1768,9 +1771,11 @@ impl OwnerSyncStore {
     /// in one task (`run_to_completion`) that owns `records` and `held`.
     /// #1107: kind 0x05 records go to `ENROLLMENT_RECORDS_FILE`, so no
     /// file an older binary reads holds one. `RECORDS_FILE` is renamed
-    /// first: a stop between the two renames then stores no kind 0x05
-    /// record that no commit returned as accepted, and a later session
-    /// delivers those records again as new.
+    /// first. A stop between the two renames stores the older kinds only:
+    /// every kind 0x05 record on disk is one whose commit renamed both
+    /// files (it returned the record as accepted, or `Poisoned` when a
+    /// later fsync failed). A later session delivers the missing records
+    /// again as new.
     ///
     /// # Errors
     ///
@@ -1807,12 +1812,16 @@ impl OwnerSyncStore {
         {
             return Err(SyncError::Io("injected register write failure".into()));
         }
+        // The enrollment injections stay armed for a write with no
+        // enrollment change.
+        #[cfg(test)]
+        let consume = |flag: &std::sync::atomic::AtomicBool| {
+            enrollment_bytes.is_some() && flag.swap(false, std::sync::atomic::Ordering::Relaxed)
+        };
         #[cfg(test)]
         let (fail_stage, fail_second_rename, pause) = (
-            self.fail_next_enrollment_stage
-                .swap(false, std::sync::atomic::Ordering::Relaxed),
-            self.fail_next_enrollment_rename
-                .swap(false, std::sync::atomic::Ordering::Relaxed),
+            consume(&self.fail_next_enrollment_stage),
+            consume(&self.fail_next_enrollment_rename),
             self.register_write_pause
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2480,6 +2489,8 @@ impl OwnerSyncStore {
     ///
     /// [`SyncError::StoreLimit`] when the batch would exceed
     /// [`MAX_STORED_RECORDS`]; [`SyncError::Io`] when persistence fails.
+    /// [`SyncError::Poisoned`] when the register write fails after a
+    /// rename: memory takes what the disk holds (`replace_records`).
     pub async fn commit_batch(
         &self,
         batch: Vec<VersionedRecord>,
