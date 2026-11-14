@@ -18,7 +18,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 use x0x::identity::{AgentId, UserId};
 use x0x::share_grant::{
-    GrantRole, Grantee, ShareCap, ShareGrantError, MAX_SHARE_GRANT_LIFETIME_SECS,
+    GrantRole, Grantee, ShareCap, ShareGrant, ShareGrantError, MAX_SHARE_GRANT_LIFETIME_SECS,
 };
 
 const DURABLE_REQUIRED: &str =
@@ -43,6 +43,26 @@ fn parse_id32(field: &str, raw: &str) -> Result<[u8; 32], String> {
 
 fn bad_request(msg: String) -> Response {
     api_error(StatusCode::BAD_REQUEST, msg).into_response()
+}
+
+/// Parse a list of 64-hex agent ids; the error names `field` and the
+/// first bad id.
+fn parse_agent_ids(field: &str, raw: &[String]) -> Result<Vec<AgentId>, String> {
+    raw.iter()
+        .map(|id| parse_id32(field, id).map(AgentId))
+        .collect()
+}
+
+/// The `409` answer when this install has no owner key to sign grants
+/// with; `None` when it has one.
+fn missing_owner_key(state: &AppState) -> Option<Response> {
+    state.agent.identity().user_keypair().is_none().then(|| {
+        api_error(
+            StatusCode::CONFLICT,
+            "share grants need an owner identity (user key) on this install",
+        )
+        .into_response()
+    })
 }
 
 fn grant_error(err: &ShareGrantError) -> Response {
@@ -163,12 +183,8 @@ pub(in crate::server) async fn grants_issue(
     if !actor.is_durable_owner() {
         return forbidden();
     }
-    if state.agent.identity().user_keypair().is_none() {
-        return api_error(
-            StatusCode::CONFLICT,
-            "share grants need an owner identity (user key) on this install",
-        )
-        .into_response();
+    if let Some(resp) = missing_owner_key(&state) {
+        return resp;
     }
     let grantee = match (&req.grantee_user, &req.grantee_agent) {
         (Some(user), None) => match parse_id32("grantee_user", user) {
@@ -187,20 +203,14 @@ pub(in crate::server) async fn grants_issue(
             .into_response()
         }
     };
-    let mut agents = Vec::with_capacity(req.agents.len());
-    for raw in &req.agents {
-        match parse_id32("agents", raw) {
-            Ok(id) => agents.push(AgentId(id)),
-            Err(msg) => return bad_request(msg),
-        }
-    }
-    let mut deliver_to = Vec::with_capacity(req.deliver_to.len());
-    for raw in &req.deliver_to {
-        match parse_id32("deliver_to", raw) {
-            Ok(id) => deliver_to.push(AgentId(id)),
-            Err(msg) => return bad_request(msg),
-        }
-    }
+    let agents = match parse_agent_ids("agents", &req.agents) {
+        Ok(ids) => ids,
+        Err(msg) => return bad_request(msg),
+    };
+    let deliver_to = match parse_agent_ids("deliver_to", &req.deliver_to) {
+        Ok(ids) => ids,
+        Err(msg) => return bad_request(msg),
+    };
     let not_before = req.not_before.unwrap_or_else(unix_now_secs);
     let expiry = match (req.expiry, req.ttl_secs) {
         (Some(expiry), None) => expiry,
@@ -228,7 +238,7 @@ pub(in crate::server) async fn grants_issue(
 /// response. `renews` names the grant a renewal replaces.
 async fn deliver_new_grant(
     state: &AppState,
-    grant: x0x::share_grant::ShareGrant,
+    grant: ShareGrant,
     deliver_to: &[AgentId],
     include_names: bool,
     renews: Option<[u8; 32]>,
@@ -296,18 +306,6 @@ pub(in crate::server) struct GrantRenewRequest {
     include_names: bool,
 }
 
-impl Default for GrantRenewRequest {
-    /// The empty body: 90 days, no extra recipients, names included (the
-    /// same default as the serde default of `include_names`).
-    fn default() -> Self {
-        Self {
-            ttl_secs: None,
-            deliver_to: Vec::new(),
-            include_names: default_include_names(),
-        }
-    }
-}
-
 /// POST /grants/:id/renew — renew an issued grant (#1350): sign a new grant
 /// with the same grantee, agents and capabilities, valid from now for
 /// `ttl_secs` (default 90 days), store it and deliver it as `POST /grants`
@@ -326,32 +324,26 @@ pub(in crate::server) async fn grants_renew(
     }
     // An empty body takes every default; a body that is not a valid
     // request is refused, never read as the defaults.
-    let req = if body.iter().all(u8::is_ascii_whitespace) {
-        GrantRenewRequest::default()
+    let raw: &[u8] = if body.iter().all(u8::is_ascii_whitespace) {
+        b"{}"
     } else {
-        match serde_json::from_slice::<GrantRenewRequest>(&body) {
-            Ok(req) => req,
-            Err(e) => return bad_request(format!("invalid renew body: {e}")),
-        }
+        &body
+    };
+    let req = match serde_json::from_slice::<GrantRenewRequest>(raw) {
+        Ok(req) => req,
+        Err(e) => return bad_request(format!("invalid renew body: {e}")),
     };
     let grant_id = match parse_id32("id", &id) {
         Ok(id) => id,
         Err(msg) => return bad_request(msg),
     };
-    if state.agent.identity().user_keypair().is_none() {
-        return api_error(
-            StatusCode::CONFLICT,
-            "share grants need an owner identity (user key) on this install",
-        )
-        .into_response();
+    if let Some(resp) = missing_owner_key(&state) {
+        return resp;
     }
-    let mut deliver_to = Vec::with_capacity(req.deliver_to.len());
-    for raw in &req.deliver_to {
-        match parse_id32("deliver_to", raw) {
-            Ok(id) => deliver_to.push(AgentId(id)),
-            Err(msg) => return bad_request(msg),
-        }
-    }
+    let deliver_to = match parse_agent_ids("deliver_to", &req.deliver_to) {
+        Ok(ids) => ids,
+        Err(msg) => return bad_request(msg),
+    };
     let ttl = req.ttl_secs.unwrap_or(MAX_SHARE_GRANT_LIFETIME_SECS);
     let grant = match state
         .agent
