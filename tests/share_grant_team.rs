@@ -176,10 +176,20 @@ async fn admitted_within(holder: &x0x::Agent, requester: &x0x::Agent, bound: Dur
 
 /// Whether `holder` refuses `requester` within `bound`.
 async fn refused_within(holder: &x0x::Agent, requester: &x0x::Agent, bound: Duration) -> bool {
-    let deadline = std::time::Instant::now() + bound;
+    refused_by(holder, requester, std::time::Instant::now() + bound).await
+}
+
+/// Whether `holder` refuses `requester` at or before `deadline`. A refusal
+/// first seen after the deadline is a failure, even if it is seen on the
+/// first check (a revoke call that itself ran past the deadline).
+async fn refused_by(
+    holder: &x0x::Agent,
+    requester: &x0x::Agent,
+    deadline: std::time::Instant,
+) -> bool {
     loop {
         if access(holder, requester).await == (false, false) {
-            return true;
+            return std::time::Instant::now() <= deadline;
         }
         if std::time::Instant::now() >= deadline {
             return false;
@@ -275,8 +285,10 @@ async fn one_grant_shares_a_two_agent_team_with_a_human_and_revokes() {
         .await
         .expect("revoke grant");
     assert!(
-        refused_within(&a1, &bob, REVOKER_BOUND.saturating_sub(armed.elapsed())).await,
-        "the revoking agent refuses Bob within {REVOKER_BOUND:?}"
+        refused_by(&a1, &bob, armed + REVOKER_BOUND).await,
+        "the revoking agent refuses Bob within {REVOKER_BOUND:?} of the revoke call \
+         (took {:?})",
+        armed.elapsed()
     );
     assert!(
         refused_within(&a2, &bob, GOSSIP_BOUND).await,
