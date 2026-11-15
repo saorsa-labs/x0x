@@ -30,6 +30,9 @@
 //! - silent after a signer restart: as silent, and the signer crash-restarts
 //!   while V is down, so its in-memory catch-up log is gone. Only what it
 //!   saved to disk can serve the removal.
+//! - up through an outage: as silent, but V does not stop. It stays up and
+//!   off the fabric for the outage, with no connected peer, and then
+//!   connects again. Only its reconnect can move it.
 //!
 //! From V's restart until the preconditions are witnessed, every
 //! application frame toward V is held (dropped). Only transport links form.
@@ -81,12 +84,18 @@ enum Arm {
     Silent,
     /// As `Silent`, and the signer restarts while V is down.
     SilentAfterSignerRestart,
+    /// As `Silent`, but V does not stop: it stays up and is off the fabric
+    /// for the outage, then connects again.
+    StaysUpThroughOutage,
 }
 
 impl Arm {
     fn labels(self) -> &'static [&'static str] {
         match self {
-            Self::Plain | Self::Silent | Self::SilentAfterSignerRestart => &["O", "B", "V", "R"],
+            Self::Plain
+            | Self::Silent
+            | Self::SilentAfterSignerRestart
+            | Self::StaysUpThroughOutage => &["O", "B", "V", "R"],
             Self::SignerAfterThreeOfflineAdmins => &["O", "P", "Q", "S", "V", "R"],
         }
     }
@@ -94,7 +103,10 @@ impl Arm {
     /// Labels promoted to admin by O.
     fn promoted(self) -> &'static [&'static str] {
         match self {
-            Self::Plain | Self::Silent | Self::SilentAfterSignerRestart => &[],
+            Self::Plain
+            | Self::Silent
+            | Self::SilentAfterSignerRestart
+            | Self::StaysUpThroughOutage => &[],
             Self::SignerAfterThreeOfflineAdmins => &["P", "Q", "S"],
         }
     }
@@ -244,6 +256,17 @@ async fn connected_to(sim: &Sim, label: &str, other: &str) -> bool {
     match state.agent.network() {
         Some(network) => network.connected_peers().await.contains(&other),
         None => false,
+    }
+}
+
+/// How many peers `label` has a live link to (`usize::MAX` when unknown).
+async fn connected_peer_count(sim: &Sim, label: &str) -> usize {
+    let Ok(state) = sim.state(label) else {
+        return usize::MAX;
+    };
+    match state.agent.network() {
+        Some(network) => network.connected_peers().await.len(),
+        None => usize::MAX,
     }
 }
 
@@ -408,7 +431,14 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     let metadata = TopicBlock::install(sim, "V", &topic)?;
     let hold = InboundHold::install(sim, "V")?;
     let quiet = PubSubBlock::install(sim, "V")?;
-    sim.stop("V", RestartMode::Crash).await?;
+    let stays_up = arm == Arm::StaysUpThroughOutage;
+    if stays_up {
+        // V keeps running. Going off the fabric closes every link, so V has
+        // no connected peer for the whole outage.
+        sim.set_online("V", false)?;
+    } else {
+        sim.stop("V", RestartMode::Crash).await?;
+    }
     metadata.set(true);
     let (status, removed) = sim
         .api(
@@ -427,7 +457,10 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     })
     .await?;
     let ahead = epoch(sim, signer, &group).await?;
-    let silent = matches!(arm, Arm::Silent | Arm::SilentAfterSignerRestart);
+    let silent = matches!(
+        arm,
+        Arm::Silent | Arm::SilentAfterSignerRestart | Arm::StaysUpThroughOutage
+    );
     if arm == Arm::SilentAfterSignerRestart {
         // The signer's in-memory catch-up log goes with the restart. Only
         // what it saved can serve V.
@@ -451,7 +484,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     // OFFLINE old. Without it (the default nextest profile) the ten virtual
     // minutes pass in moments of real time, so write the record V would
     // hold after a real ten-minute outage.
-    let backdated = silent && !crate::w3h_inline::shim_active();
+    let backdated = silent && !stays_up && !crate::w3h_inline::shim_active();
     if backdated {
         let alive = sim.data_dir("V")?.join("treekem-alive");
         let ago_ms = u64::try_from(OFFLINE.as_millis())?;
@@ -473,11 +506,37 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     // The silent arm: no later-epoch pubsub traffic reaches V until it has
     // caught up, so only its own start can move it.
     quiet.set(silent);
-    sim.start_again("V").await?;
+    if stays_up {
+        let peers = connected_peer_count(sim, "V").await;
+        ensure!(
+            peers == 0,
+            "INFRA: V still has {peers} connected peers off the fabric"
+        );
+        sim.set_online("V", true)?;
+        // Nothing redials a peer that went off the fabric, so the signer
+        // dials V, as the network would once it is back. V sees an inbound
+        // connection: the first peer after its isolation.
+        let network = sim
+            .state(signer)?
+            .agent
+            .network()
+            .cloned()
+            .context("the signer has no network")?;
+        let addr = super::sim_addr(sim.node_index("V")?)?;
+        sim.within(
+            "the signer dials V",
+            Duration::from_secs(10),
+            network.connect_addr(addr),
+        )
+        .await?
+        .map_err(|error| anyhow::anyhow!("the signer could not dial V: {error}"))?;
+    } else {
+        sim.start_again("V").await?;
+    }
     let loaded = epoch(sim, "V", &group).await?;
     ensure!(
         loaded == e,
-        "INFRA: V loaded epoch {loaded} from disk, not the persisted epoch {e}"
+        "INFRA: V is at epoch {loaded} when it comes back, not the epoch {e} it held"
     );
     mesh(sim, labels).await?;
     sim.until("V is connected to the signer", SETUP, async |s: &Sim| {
@@ -641,8 +700,9 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
             format!("signer writes={ticks} pubsub frames signer->V={traffic}"),
             at(sim),
         );
-        // The silent arm's only stimulus is V's start with a live link to
-        // the signer, witnessed before the wait.
+        // The silent arm's only stimulus is V's start (or, when V stayed up,
+        // its reconnect) with a live link to the signer, witnessed before
+        // the wait.
         receipt.request_delivered(
             "returning_member_started_with_a_link_to_the_signer",
             linked_at_start,
@@ -777,6 +837,23 @@ fn w3h_1427_silent_return_after_signer_restart_reaches_the_epoch() -> Result<()>
             "w3h_1427_silent_return_after_signer_restart_reaches_the_epoch",
             0x1427_0004,
             Arm::SilentAfterSignerRestart,
+            Verdict::Green,
+        )
+        .await
+    })
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+fn w3h_1427_member_up_through_an_outage_reaches_the_epoch() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1427_member_up_through_an_outage_reaches_the_epoch",
+            0x1427_0005,
+            Arm::StaysUpThroughOutage,
             Verdict::Green,
         )
         .await

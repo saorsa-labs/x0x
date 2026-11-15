@@ -200,6 +200,21 @@ after its cached add is not served through that add. Not covered yet: a
 member that stays up through a network outage.
 No wire format or API changes.
 
+Second amendment of 15 Nov 2026 (#1427), made under the design delegation
+of 10 Nov 2026. It changes one rule of the amendment above and closes its
+open item. At restore, only the adds and approvals of a held target that
+come before its last held removal in the file are held back. A later add
+is a re-add after the removal, and it is served as usual. A member that
+stays up through a network outage now asks too. The daemon watches its
+connected peer count. When the first peer connects after the node had no
+connected peer for longer than the last metadata resend (60 s), it runs
+the start catch-up for each TreeKEM group and writes the outage record,
+so a restart during that pass still asks. At most one such pass runs at
+a time, and each needs a new isolation longer than the resend, so
+reconnects cannot cause a storm. A shorter isolation asks nothing. Not
+covered: a node that keeps some connected peers but loses every other
+member of a group. No wire format or API changes.
+
 [A08](A08-r01-groups-home-membership-and-repair.md) defines valid group-state and fork recovery. A09 must not bypass that authority to obtain keys faster.
 
 ## Security claims
