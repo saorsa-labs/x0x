@@ -210,6 +210,41 @@ pub(in crate::server) async fn insert_requester_offer_obligation(
     }
 }
 
+/// Issue #1840 routes 1–3: replace the offered envelope of `(group,
+/// request_id)` with `envelope`, a new seal of the same request, durably,
+/// when the stored obligation still offers `old_digest`. The new envelope is
+/// due now, with a fresh retry schedule and no refusal. `Ok(false)` when
+/// there is no such obligation or it offers another envelope.
+pub(in crate::server) async fn replace_requester_offer_envelope(
+    state: &AppState,
+    group_id: &str,
+    request_id: &str,
+    old_digest: [u8; 32],
+    envelope: Vec<u8>,
+    now_ms: u64,
+) -> Result<bool, String> {
+    let Some(mut next) = find_requester_offer(state, group_id, request_id).await else {
+        return Ok(false);
+    };
+    if next.digest != old_digest {
+        return Ok(false);
+    }
+    next.digest = blake3::hash(&envelope).into();
+    next.byte_size = envelope.len();
+    next.envelope_bytes = envelope;
+    next.next_retry_at_ms = now_ms;
+    next.retry_count = 0;
+    next.refusal = None;
+    match outbox(state)
+        .replace_if(next, |stored| stored.digest == old_digest)
+        .await
+    {
+        Ok(replaced) => Ok(replaced),
+        Err(e) if e.crossed_rename() => Ok(true),
+        Err(e) => Err(format!("failed to write requester offer outbox: {e}")),
+    }
+}
+
 /// Issue #1840: record `refusal` on the stored obligation of
 /// `(group, request_id)`, durably, when `accept` admits the stored one.
 /// `Ok(false)` when there is no such obligation or `accept` refuses it.

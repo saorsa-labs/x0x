@@ -79,6 +79,20 @@ the requester: `x0x-group-join-outcome-v1\0` followed by JSON
   and returns that copy with the head installed. A first-release requester
   cannot read a headed outcome (it is over its bound), so an authority sends
   a head only to a requester that advertises it can use one.
+- Who gets a head (A08 amendment of 15 Nov 2026). For a `stale` refusal of
+  a requester that advertises `join_request_head_v1` (bit 19): the
+  requester that holds the group's turn in the join queue gets the outcome
+  with the head; a requester that waits behind another turn gets no outcome
+  (its offer stays live and its next offer can take the turn); a requester
+  that is not queued (queue full) gets the outcome without a head. Every
+  other requester is served as in the first release.
+- The requester's handler takes the head with `adopt_join_head`, seals the
+  same request (same id, message, KEM key and TreeKEM KeyPackage) over it,
+  publishes the new envelope and replaces the offered one, so the offer
+  worker offers it at once. The request stays `pending`. A head that fails a
+  check, or a seal that fails, is recorded as the `stale` refusal. Because
+  the requester now holds the authority's roster, it can apply the approval
+  link.
 
 ### Producer and relay flow
 

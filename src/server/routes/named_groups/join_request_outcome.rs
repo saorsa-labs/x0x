@@ -40,6 +40,9 @@ use std::sync::Arc;
 
 use crate::dm_inbox::{DmTypedPayload, DmTypedPayloadCompletion, DmTypedPayloadCompletionResult};
 use crate::groups::join_outcome::{JoinRequestOutcome, JoinRequestRefusalReason};
+use crate::groups::state_commit::RetainedCommit;
+
+use super::join_sequence::JoinTurn;
 
 use super::requester_offer::{
     find_requester_offer, mark_requester_offer_refused, offer_still_live, RequesterOfferRefusal,
@@ -61,33 +64,70 @@ pub(in crate::server) const OUTCOME_SEND_PER_REQUESTER_CAP: usize = 8;
 
 /// Authority side: send the refusal of one offered envelope to its
 /// requester, subject to the capability gate and the per-digest limit.
-/// Never blocks: the send runs in a detached task.
-pub(in crate::server) fn send_join_request_refusal(
+/// The send runs in a detached task.
+///
+/// Issue #1840 routes 1–3 (A08 amendment of 15 Nov 2026), for a `stale`
+/// refusal of a requester that advertises `join_request_head_v1`:
+/// - the requester holds the group's turn (`turn`, from the join queue):
+///   the outcome carries the authority's current head
+///   ([`current_join_head`]), so the requester can sign the same request
+///   again over it. A head that does not fit the bound is left off;
+/// - the requester waits behind another turn: no outcome. It keeps its
+///   offer and offers again on its schedule; an offer after the queue
+///   moves can give it the turn. A refusal now would stop its offers;
+/// - the requester is not queued (the queue is full): the outcome without
+///   a head, as for every other requester.
+pub(in crate::server) async fn send_join_request_refusal(
     state: &Arc<AppState>,
     group_id: &str,
     request_id: &str,
     requester: AgentId,
     envelope_digest: [u8; 32],
     reason: JoinRequestRefusalReason,
+    turn: Option<&JoinTurn>,
 ) {
-    let bit = crate::dm::CapabilityRegistry::JOIN_REQUEST_OUTCOME_V1;
-    if state
-        .agent
-        .capability_store()
-        .verified_registry_supports(&requester, bit)
-        != Some(true)
-    {
+    let capabilities = state.agent.capability_store();
+    let supports = |bit| capabilities.verified_registry_supports(&requester, bit) == Some(true);
+    if !supports(crate::dm::CapabilityRegistry::JOIN_REQUEST_OUTCOME_V1) {
         return;
     }
-    let outcome = JoinRequestOutcome {
+    let mut head = None;
+    if reason == JoinRequestRefusalReason::Stale
+        && supports(crate::dm::CapabilityRegistry::JOIN_REQUEST_HEAD_V1)
+    {
+        let requester_hex = hex::encode(requester.as_bytes());
+        let holds_turn = turn.is_some_and(|t| {
+            t.request.requester_agent_id == requester_hex && t.request.request_id == request_id
+        });
+        if holds_turn {
+            head = current_join_head(state, group_id).await;
+        } else if state
+            .join_sequencer
+            .lock()
+            .await
+            .position(group_id, &requester_hex)
+            .is_some()
+        {
+            return;
+        }
+    }
+    let mut outcome = JoinRequestOutcome {
         group_id: group_id.to_string(),
         request_id: request_id.to_string(),
         envelope_digest: hex::encode(envelope_digest),
         reason,
-        head: None,
+        head,
     };
-    let Ok(payload) = outcome.encode() else {
-        return;
+    let payload = match outcome.encode() {
+        Ok(payload) => payload,
+        Err(_) if outcome.head.is_some() => {
+            outcome.head = None;
+            let Ok(payload) = outcome.encode() else {
+                return;
+            };
+            payload
+        }
+        Err(_) => return,
     };
     let now_ms = now_millis_u64();
     {
@@ -126,6 +166,28 @@ pub(in crate::server) fn send_join_request_refusal(
     });
 }
 
+/// The authority's current head on `group_key`, as a join-request outcome
+/// carries it: the newest retained link when it is the head (its
+/// `state_hash` is the record's and it carries its metadata), with the
+/// certificate bytes stripped from the roster. `None` when there is no
+/// such link.
+pub(in crate::server) async fn current_join_head(
+    state: &AppState,
+    group_key: &str,
+) -> Option<RetainedCommit> {
+    let groups = state.named_groups.read().await;
+    let info = groups.get(group_key)?;
+    let mut head = info
+        .commit_log
+        .last()
+        .filter(|link| link.commit.state_hash == info.state_hash && link.meta.is_some())?
+        .clone();
+    for snap in head.roster.values_mut() {
+        snap.certificate = None;
+    }
+    Some(head)
+}
+
 /// Requester side: apply one join-request outcome DM. Every path resolves
 /// the durable-route completion; an ignored outcome is `Duplicate` (the
 /// sender has nothing to retry).
@@ -160,6 +222,30 @@ pub(in crate::server) async fn handle_join_request_outcome_typed_payload(
         );
         return IGNORED;
     }
+    // #1840 routes 1–3: the authority's head lets this daemon sign the same
+    // request again over the authority's state. Only a head that fails a
+    // check, or a seal that fails, falls through to the refusal.
+    if let Some(head) = outcome.head.as_ref() {
+        match reseal_join_request_over_head(state, &obligation, head).await {
+            Ok(()) => {
+                tracing::info!(
+                    group_id = %crate::logging::LogHexId::group(&outcome.group_id),
+                    request_id = %outcome.request_id,
+                    head_revision = head.commit.revision,
+                    "#1840: signed the join request again over the authority's head"
+                );
+                return Ok(DmTypedPayloadCompletion::Inserted);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    group_id = %crate::logging::LogHexId::group(&outcome.group_id),
+                    request_id = %outcome.request_id,
+                    %error,
+                    "#1840: the authority's head was not used; recording the refusal"
+                );
+            }
+        }
+    }
     let refusal = RequesterOfferRefusal {
         reason: outcome.reason.as_str().to_string(),
         retryable: outcome.reason.is_retryable(),
@@ -187,6 +273,94 @@ pub(in crate::server) async fn handle_join_request_outcome_typed_payload(
         Ok(false) => IGNORED,
         Err(error) => Err(error),
     }
+}
+
+/// Requester side (#1840 routes 1–3, A08 amendment of 15 Nov 2026): install
+/// the authority's checked head on this daemon's copy of the group
+/// ([`crate::groups::join_outcome::adopt_join_head`]) and sign the SAME
+/// pending request again over it: same request id, message, KEM key and
+/// TreeKEM KeyPackage, a new commit at the head's next revision. The new
+/// envelope is published on the metadata topic as `create_join_request`
+/// does, and replaces the offered one in the offer obligation, so the offer
+/// worker offers it now. Nothing changes when a check fails.
+async fn reseal_join_request_over_head(
+    state: &AppState,
+    obligation: &super::RequesterOfferObligation,
+    head: &RetainedCommit,
+) -> Result<(), String> {
+    use base64::Engine as _;
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let key = {
+        let groups = state.named_groups.read().await;
+        groups
+            .iter()
+            .find(|(_, info)| info.stable_group_id() == obligation.group_id)
+            .map(|(key, _)| key.clone())
+            .ok_or("the group is not held")?
+    };
+    let membership_lock = super::group_membership_lock(state, &key).await;
+    let membership_guard = membership_lock.lock().await;
+    let now_ms = now_millis_u64();
+    let (next, request, metadata_topic, commit) = {
+        let groups = state.named_groups.read().await;
+        let info = groups.get(&key).ok_or("the group is not held")?;
+        let request = info
+            .join_requests
+            .get(&obligation.request_id)
+            .filter(|r| r.is_pending() && r.requester_agent_id == local_hex)
+            .cloned()
+            .ok_or("the request is no longer pending")?;
+        let mut next = crate::groups::join_outcome::adopt_join_head(info, head, &local_hex)
+            .map_err(|e| e.to_string())?;
+        next.join_requests
+            .insert(request.request_id.clone(), request.clone());
+        let commit = super::seal_commit_owner_certified(
+            state,
+            &mut next,
+            state.agent.identity().agent_keypair(),
+            now_ms,
+        )
+        .await
+        .map_err(|e| format!("seal failed: {e}"))?;
+        let metadata_topic = next.metadata_topic.clone();
+        (next, request, metadata_topic, commit)
+    };
+    if !matches!(
+        super::persist_named_group_info(state, &key, next).await,
+        Ok(crate::server::AtomicWriteOutcome::Durable)
+    ) {
+        return Err("the new seal is not directory-durable".to_string());
+    }
+    drop(membership_guard);
+    let event = super::NamedGroupMetadataEvent::JoinRequestCreated {
+        group_id: obligation.group_id.clone(),
+        request_id: request.request_id.clone(),
+        requester_agent_id: request.requester_agent_id.clone(),
+        message: request.message.clone(),
+        ts: request.created_at,
+        requester_kem_public_key_b64: Some(
+            base64::engine::general_purpose::STANDARD.encode(&state.agent_kem_keypair.public_bytes),
+        ),
+        treekem_key_package_b64: request.treekem_key_package_b64.clone(),
+        commit: Some(commit),
+    };
+    // No envelope (the publish failed): the stored offer stays. Its next
+    // offer is refused again and brings the head again.
+    if let Some(envelope) =
+        super::publish_named_group_metadata_event_with_envelope(state, &metadata_topic, &event)
+            .await
+    {
+        super::requester_offer::replace_requester_offer_envelope(
+            state,
+            &obligation.group_id,
+            &obligation.request_id,
+            obligation.digest,
+            envelope.to_vec(),
+            now_ms,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// `own_join_request` of `GET /groups/:id`: this daemon's own pending
