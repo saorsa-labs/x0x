@@ -1,4 +1,4 @@
-//! `x0x grant issue|list|revoke|received|renew` — ADR-0070 §2 share grants.
+//! `x0x grant issue|list|revoke|received|renew|data` — ADR-0070 §2 share grants.
 
 use crate::cli::{print_value, DaemonClient};
 use anyhow::Result;
@@ -30,6 +30,25 @@ pub async fn revoke(client: &DaemonClient, grant_id: &str) -> Result<()> {
 /// `x0x grant received` — grants that name this install as grantee.
 pub async fn received(client: &DaemonClient) -> Result<()> {
     let resp = client.get("/grants/received").await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x grant data AGENT GROUP STORE [KEY]` — read a store on a granted
+/// agent through a received `ShareCap::Data` grant (#1094): its keys, or
+/// one value when KEY is given.
+pub async fn data(
+    client: &DaemonClient,
+    agent: &str,
+    group: &str,
+    store: &str,
+    key: Option<&str>,
+) -> Result<()> {
+    let path = match key {
+        Some(key) => format!("/grants/data/{agent}/{group}/{store}/{key}"),
+        None => format!("/grants/data/{agent}/{group}/{store}"),
+    };
+    let resp = client.get(&path).await?;
     print_value(client.format(), &resp);
     Ok(())
 }
@@ -168,6 +187,8 @@ mod tests {
             ("grant revoke", "/grants/:id"),
             ("grant received", "/grants/received"),
             ("grant renew", "/grants/:id/renew"),
+            ("grant data keys", "/grants/data/:agent/:group/:store"),
+            ("grant data get", "/grants/data/:agent/:group/:store/:key"),
         ] {
             let ep = crate::api::find_by_cli_name(cli).expect("registered");
             assert_eq!(ep.path, path, "{cli}");

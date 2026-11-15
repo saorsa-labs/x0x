@@ -188,9 +188,17 @@ impl CapabilityRegistry {
     /// registered, because the head is handled on that route.
     pub const JOIN_REQUEST_HEAD_V1: u64 = 1 << 19;
 
+    /// Issue #1094 slice D1 (A03 amendment of 15 Nov 2026): answers a
+    /// grantee's read of a store it holds a `ShareCap::Data` grant for
+    /// (`x0x-data-read-v1`) and takes the reply (`x0x-data-reply-v1`).
+    /// Bit 20, the next free bit. A grantee sends a read only to an agent
+    /// whose current verified advert has this bit. ROUTE-GATED: advertised
+    /// only when the data-read route is registered.
+    pub const DATA_READ_V1: u64 = 1 << 20;
+
     /// The routes supported by every receiver of this release.
     /// Route-gated bits (`grant_revocation_push_v1`,
-    /// `join_request_outcome_v1`, `join_request_head_v1`) are NOT here: they are
+    /// `join_request_outcome_v1`, `join_request_head_v1`, `data_read_v1`) are NOT here: they are
     /// added per daemon by [`Self::advertised`] from the typed routes the
     /// DM inbox actually registered, so a library embedder that never wires
     /// the route never advertises the bit.
@@ -231,6 +239,8 @@ impl CapabilityRegistry {
                 registry.bits |= Self::GRANT_REVOCATION_PUSH_V1;
             } else if prefix == crate::groups::join_outcome::JOIN_REQUEST_OUTCOME_DM_PREFIX {
                 registry.bits |= Self::JOIN_REQUEST_OUTCOME_V1 | Self::JOIN_REQUEST_HEAD_V1;
+            } else if prefix == crate::share_grant::data_read::DATA_READ_REQUEST_DM_PREFIX {
+                registry.bits |= Self::DATA_READ_V1;
             }
         }
         registry
@@ -274,6 +284,10 @@ impl CapabilityRegistry {
             Some((Self::GRANT_REVOCATION_PUSH_V1, "grant_revocation_push_v1"))
         } else if payload.starts_with(crate::groups::join_outcome::JOIN_REQUEST_OUTCOME_DM_PREFIX) {
             Some((Self::JOIN_REQUEST_OUTCOME_V1, "join_request_outcome_v1"))
+        } else if payload.starts_with(crate::share_grant::data_read::DATA_READ_REQUEST_DM_PREFIX)
+            || payload.starts_with(crate::share_grant::data_read::DATA_READ_REPLY_DM_PREFIX)
+        {
+            Some((Self::DATA_READ_V1, "data_read_v1"))
         } else {
             None
         }

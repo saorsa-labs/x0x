@@ -18,6 +18,7 @@ mod auth;
 pub(crate) use auth::SESSION_TOKEN_TTL;
 pub mod config;
 mod crdt_subscriptions;
+mod data_read;
 mod delegations;
 mod delivery_gate;
 mod group_access;
@@ -987,6 +988,10 @@ pub async fn serve_with_options(
     // waits for no ACK; the record carries its own authority.
     let (revocation_push_dm_tx, mut revocation_push_dm_rx) =
         mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(256);
+    // #1094 D1: data-read requests and replies. Plain typed routes, one
+    // attempt: the grantee's HTTP call waits for the reply or times out.
+    let (data_read_dm_tx, mut data_read_dm_rx) =
+        mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(256);
     let exec_service = x0x::exec::ExecService::spawn(Arc::clone(&agent), exec_policy, exec_dm_rx);
     // Tasks started before AppState exists still need owned cancellation on a
     // later startup rejection. They are folded into the supervisor's normal
@@ -1407,6 +1412,8 @@ pub async fn serve_with_options(
         treekem_reconnect_catchup_passes: Default::default(),
         treekem_catchup_refusals: StdMutex::new(HashMap::new()),
         join_request_outcome_sends: StdMutex::new(HashMap::new()),
+        data_read_waiters: StdMutex::new(HashMap::new()),
+        data_read_serve_limits: StdMutex::new(Default::default()),
         group_membership_locks: RwLock::new(HashMap::new()),
         reseat_stagings: Default::default(),
         treekem_groups: reseat_scope::ScopedGroupMap::new(treekem_groups),
@@ -2133,6 +2140,7 @@ pub async fn serve_with_options(
     let dm_inbox_share_grant_route_tx = share_grant_dm_tx.clone();
     let dm_inbox_gui_show_route_tx = gui_show_dm_tx.clone();
     let dm_inbox_revocation_push_route_tx = revocation_push_dm_tx.clone();
+    let dm_inbox_data_read_route_tx = data_read_dm_tx.clone();
     bg_tasks.push(tokio::spawn(start_dm_inbox_when_gossip_ready(
         dm_inbox_agent,
         dm_inbox_kem,
@@ -2144,6 +2152,7 @@ pub async fn serve_with_options(
         dm_inbox_share_grant_route_tx,
         dm_inbox_gui_show_route_tx,
         dm_inbox_revocation_push_route_tx,
+        dm_inbox_data_read_route_tx,
     )));
 
     // Restart-amnesia fix: re-register every persisted task-list/kv-store
@@ -3000,6 +3009,17 @@ pub async fn serve_with_options(
         }));
     }
 
+    // #1094 D1: data reads. The grant check runs in the handler; reply
+    // sends run on detached tasks.
+    {
+        let data_read_state = Arc::clone(&state);
+        bg_tasks.push(tokio::spawn(async move {
+            while let Some(typed) = data_read_dm_rx.recv().await {
+                crate::server::data_read::handle_data_read_typed(&data_read_state, typed).await;
+            }
+        }));
+    }
+
     // ADR 0083 slice 3: remote GUI show. Trust runs in the handler, before
     // the body is decoded. Displays and reply sends run on detached tasks,
     // so one opener wait does not hold the next result or activity message.
@@ -3406,6 +3426,15 @@ pub async fn serve_with_options(
         .route("/grants/received", get(routes::grants_received))
         .route("/grants/:id", delete(routes::grants_revoke))
         .route("/grants/:id/renew", post(routes::grants_renew))
+        // #1094 D1: read a store through a received ShareCap::Data grant.
+        .route(
+            "/grants/data/:agent/:group/:store",
+            get(data_read::get_granted_store_keys),
+        )
+        .route(
+            "/grants/data/:agent/:group/:store/:key",
+            get(data_read::get_granted_store_value),
+        )
         // ADR-0074 §1: names (owner petnames, TOFU pins, resolution)
         .route("/names", get(routes::names_list))
         .route("/names/resolve", post(routes::names_resolve))
@@ -4070,6 +4099,7 @@ async fn start_dm_inbox_when_gossip_ready(
     share_grant_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     gui_show_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     revocation_push_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
+    data_read_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
 ) {
     for attempt in 1..=DM_INBOX_START_MAX_ATTEMPTS {
         let dm_inbox_config = x0x::dm_inbox::DmInboxConfig::default()
@@ -4159,6 +4189,15 @@ async fn start_dm_inbox_when_gossip_ready(
             .with_typed_payload_route(
                 x0x::revocation_push::GRANT_REVOCATION_PUSH_PREFIX,
                 revocation_push_route_tx.clone(),
+            )
+            // #1094 D1: plain routes, no ACK owed (one attempt each way).
+            .with_typed_payload_route(
+                x0x::share_grant::data_read::DATA_READ_REQUEST_DM_PREFIX,
+                data_read_route_tx.clone(),
+            )
+            .with_typed_payload_route(
+                x0x::share_grant::data_read::DATA_READ_REPLY_DM_PREFIX,
+                data_read_route_tx.clone(),
             );
         match agent
             .start_dm_inbox(Arc::clone(&kem_keypair), dm_inbox_config)
