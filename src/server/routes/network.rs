@@ -775,6 +775,35 @@ pub(in crate::server) async fn upgrade_diagnostics(
     if let (Some(body), serde_json::Value::Object(observed)) = (body.as_object_mut(), observed) {
         body.extend(observed);
     }
+    // #1381 M2 part: the upgrade records on disk. Resolve the install on this
+    // task (the executable observation is per thread in tests), then read the
+    // fixed record names off the async workers.
+    let install = crate::upgrade::apply::current_binary_path()
+        .ok()
+        .and_then(|path| path.canonicalize().ok());
+    let data_dir = state.data_dir.clone();
+    let records = tokio::task::spawn_blocking(move || {
+        super::upgrade_records::records_json(&data_dir, install.as_deref())
+    })
+    .await;
+    if let Some(body) = body.as_object_mut() {
+        match records {
+            Ok(records) => body.extend(records),
+            // Keep every field present, as the documented shape promises.
+            Err(_) => {
+                for key in ["plan", "last_attempt", "last_hold_clear"] {
+                    body.insert(key.into(), serde_json::Value::Null);
+                }
+                for key in ["backups", "holds"] {
+                    body.insert(key.into(), serde_json::json!([]));
+                }
+                body.insert(
+                    "records_error".into(),
+                    serde_json::Value::String("upgrade records read did not finish".into()),
+                );
+            }
+        }
+    }
     Json(body)
 }
 
@@ -1359,6 +1388,21 @@ mod participation_diagnostics_tests {
             !input.contains("minimum_supported_version"),
             "fleet policy must not churn the per-machine digest"
         );
+
+        // #1381 M2 part: the record fields are always present; a fresh data
+        // directory has no plan and no holds.
+        for key in [
+            "plan",
+            "last_attempt",
+            "backups",
+            "holds",
+            "last_hold_clear",
+            "records_error",
+        ] {
+            assert!(body.get(key).is_some(), "{key} must be present");
+        }
+        assert_eq!(body["plan"], serde_json::Value::Null);
+        assert_eq!(body["holds"], serde_json::json!([]));
 
         agent.shutdown().await;
     }

@@ -1404,6 +1404,7 @@ pub async fn serve_with_options(
         treekem_start_catchup_pending: Default::default(),
         treekem_network_join_ended: tokio::sync::watch::channel(false).0,
         treekem_start_catchup_passes: Default::default(),
+        treekem_reconnect_catchup_passes: Default::default(),
         treekem_catchup_refusals: StdMutex::new(HashMap::new()),
         join_request_outcome_sends: StdMutex::new(HashMap::new()),
         group_membership_locks: RwLock::new(HashMap::new()),
@@ -2707,6 +2708,12 @@ pub async fn serve_with_options(
     // traffic needed.
     bg_tasks.push(tokio::spawn(
         routes::named_groups::run_treekem_start_catchup(Arc::clone(&state)),
+    ));
+    // #1427: a TreeKEM member that stays up through a network outage past
+    // the last metadata resend asks for the commits it missed when it
+    // connects again.
+    bg_tasks.push(tokio::spawn(
+        routes::named_groups::run_treekem_reconnect_catchup(Arc::clone(&state)),
     ));
 
     // #1663: a member of an encrypted GSS group whose own seat carries no
@@ -4679,6 +4686,12 @@ async fn handle_predecessor_relay_typed_payload_inner(
         // unavailable until startup recovery (or an explicit
         // recovery loop) resolves it. Never overwrite recovery
         // evidence with a later admission.
+        //
+        // Issue #1840: a marker that can never complete (expired, or its
+        // group is gone) is released first, its evidence kept, so it does
+        // not block every later admission until a restart. A marker whose
+        // release fails, or that startup would fail closed on, stays.
+        routes::named_groups::release_unusable_listener_admission(relay_state, now_ms).await;
         let existing_admission = relay_state.pending_listener_admission.lock().await.clone();
         let marker_matches_event = existing_admission.as_ref().is_some_and(|marker| {
             marker.group_id == group_id_str
@@ -5101,20 +5114,22 @@ async fn handle_predecessor_relay_typed_payload_inner(
                     // or used head waits for its turn, in arrival order.
                     // The queue needs no journal lock.
                     drop(_journal_guard);
-                    let turn =
-                        crate::server::routes::named_groups::join_sequence::note_refused_request(
+                    // #1840 ask 4: tell the requester, once the release
+                    // is durable. Had the marker stayed, the requester's
+                    // re-offer is what retries the release, so no outcome
+                    // is sent then. The turn holder's outcome may carry
+                    // the head (A08 amendment of 15 Nov 2026). An early
+                    // gate (revoked or unverified sender, withdrawn group
+                    // and similar) has no reason: it sends nothing and
+                    // does not queue, and the requester's offer stays live.
+                    if let Some(reason) = apply_result.refusal_reason {
+                        let turn = crate::server::routes::named_groups::join_sequence::note_refused_request(
                             relay_state,
                             &group_id_str,
                             &event,
                             now_ms,
                         )
                         .await;
-                    // #1840 ask 4: tell the requester, once the release
-                    // is durable. Had the marker stayed, the requester's
-                    // re-offer is what retries the release, so no outcome
-                    // is sent then. The turn holder's outcome may carry
-                    // the head (A08 amendment of 15 Nov 2026).
-                    if let Some(reason) = apply_result.refusal_reason {
                         routes::named_groups::send_join_request_refusal(
                             relay_state,
                             &group_id_str,

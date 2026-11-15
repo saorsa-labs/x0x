@@ -348,3 +348,30 @@ async fn issue1427_start_pass_waits_for_another_epoch_ahead_task() -> Result<()>
     );
     Ok(())
 }
+
+/// #1427: a member that stays up through a network outage. The reconnect
+/// asks only after an isolation longer than the last metadata resend, at
+/// most once per isolation, and a short one asks nothing.
+#[test]
+fn issue1427_reconnect_after_a_long_isolation_asks_once() {
+    let resend = Duration::from_secs(60);
+    let t0 = tokio::time::Instant::now();
+    let at = |secs: u64| t0 + Duration::from_secs(secs);
+    let mut isolation = TreeKemIsolation::default();
+    assert!(!isolation.note(3, at(0), resend), "connected: nothing");
+    assert!(!isolation.note(0, at(1), resend), "the isolation starts");
+    assert!(!isolation.note(0, at(300), resend), "still isolated");
+    assert!(
+        isolation.note(1, at(601), resend),
+        "the first peer after 600 s asks"
+    );
+    assert!(
+        !isolation.note(2, at(602), resend),
+        "a second peer of the same reconnect asks nothing more"
+    );
+    assert!(!isolation.note(0, at(700), resend));
+    assert!(
+        !isolation.note(1, at(730), resend),
+        "an isolation within the resends asks nothing"
+    );
+}

@@ -4325,26 +4325,11 @@ async fn publish_named_group_metadata_event_with_envelope(
             named_group_metadata_event_recipient(event).map(str::to_string),
         ));
     }
-    #[cfg(test)]
-    if state
-        .named_group_test_recorders
-        .metadata_publish_envelope
-        .load(std::sync::atomic::Ordering::SeqCst)
-    {
-        return Some(Bytes::from(
-            tests::pr291_restart_marker_matrix::sign_v2_envelope(
-                state.agent.identity().agent_keypair(),
-                metadata_topic,
-                event,
-            ),
-        ));
-    }
-
     match serde_json::to_vec(event) {
         Ok(bytes) => {
             match tokio::time::timeout(
                 NAMED_GROUP_METADATA_PUBLISH_TIMEOUT,
-                state.agent.publish_and_get_envelope(metadata_topic, bytes),
+                publish_and_get_envelope(state, metadata_topic, event, bytes),
             )
             .await
             {
@@ -4364,6 +4349,50 @@ async fn publish_named_group_metadata_event_with_envelope(
         Err(e) => tracing::warn!("failed to serialize named-group metadata event: {e}"),
     }
     None
+}
+
+/// The transport step of [`publish_named_group_metadata_event_with_envelope`].
+#[cfg(not(test))]
+async fn publish_and_get_envelope(
+    state: &AppState,
+    metadata_topic: &str,
+    _event: &NamedGroupMetadataEvent,
+    bytes: Vec<u8>,
+) -> x0x::error::Result<Option<Bytes>> {
+    state
+        .agent
+        .publish_and_get_envelope(metadata_topic, bytes)
+        .await
+}
+
+/// Test build of the transport step. The unit-test agent has no gossip
+/// runtime, so the publish fails unless a test sets
+/// `metadata_publish_envelope`; then it returns the envelope the gossip
+/// layer would sign, without a transport (#1840).
+#[cfg(test)]
+async fn publish_and_get_envelope(
+    state: &AppState,
+    metadata_topic: &str,
+    event: &NamedGroupMetadataEvent,
+    bytes: Vec<u8>,
+) -> x0x::error::Result<Option<Bytes>> {
+    if state
+        .named_group_test_recorders
+        .metadata_publish_envelope
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Ok(Some(Bytes::from(
+            tests::pr291_restart_marker_matrix::sign_v2_envelope(
+                state.agent.identity().agent_keypair(),
+                metadata_topic,
+                event,
+            ),
+        )));
+    }
+    state
+        .agent
+        .publish_and_get_envelope(metadata_topic, bytes)
+        .await
 }
 
 /// Schedule best-effort delivery of a named-group metadata event directly to a
@@ -9910,7 +9939,9 @@ fn treekem_removal_target(event: &NamedGroupMetadataEvent) -> Option<&str> {
 /// goes through the rules of a live one ([`log_treekem_membership_event`]),
 /// with one more: a removal or ban whose target has an S4 row (ADR 0110),
 /// in any phase, is not served from the saved log, and neither is any add
-/// or approval of that target in the same file. S4 owns the delivery of
+/// or approval of that target that comes before its last held removal in
+/// the same file. A later add (a re-add after the removal) is served as
+/// usual. S4 owns the delivery of
 /// that commit: an open row (for example `committed_delivery_pending`)
 /// resends it only once the group's head is synced, and a closed row can
 /// hold a sibling that lost to another admin's commit.
@@ -9972,11 +10003,12 @@ pub(in crate::server) async fn restore_treekem_catchup_logs(state: &AppState) {
             continue;
         };
         // A removal or ban that S4 owns is held back, and so is every add
-        // or approval of the same target in this file: otherwise the add
-        // alone would serve the removed member pages again
-        // ([`cached_add_still_current`]).
-        let mut held_targets: HashSet<String> = HashSet::new();
-        for event in &events {
+        // or approval of the same target before its last held removal in
+        // this file: otherwise the old add alone would serve the removed
+        // member pages again ([`cached_add_still_current`]). An add after
+        // that removal is a re-add and is served.
+        let mut held_until: HashMap<String, usize> = HashMap::new();
+        for (index, event) in events.iter().enumerate() {
             let Some(target) = treekem_removal_target(event) else {
                 continue;
             };
@@ -9984,11 +10016,11 @@ pub(in crate::server) async fn restore_treekem_catchup_logs(state: &AppState) {
                 continue;
             };
             if revocation_eviction::s4_has_row_for(state, &stable, raw.0).await {
-                held_targets.insert(target.to_ascii_lowercase());
+                held_until.insert(target.to_ascii_lowercase(), index);
             }
         }
         let mut held = 0_usize;
-        for event in &events {
+        for (index, event) in events.iter().enumerate() {
             let target = match event {
                 NamedGroupMetadataEvent::MemberAdded { agent_id, .. }
                 | NamedGroupMetadataEvent::MemberRemoved { agent_id, .. }
@@ -9998,7 +10030,12 @@ pub(in crate::server) async fn restore_treekem_catchup_logs(state: &AppState) {
                 } => Some(requester_agent_id),
                 _ => None,
             };
-            if target.is_some_and(|t| held_targets.contains(&t.to_ascii_lowercase())) {
+            let before_last_held_removal = target.is_some_and(|t| {
+                held_until
+                    .get(&t.to_ascii_lowercase())
+                    .is_some_and(|last| index <= *last)
+            });
+            if before_last_held_removal {
                 held += 1;
                 continue;
             }
@@ -16187,6 +16224,133 @@ pub(in crate::server) async fn run_treekem_start_catchup(state: Arc<AppState>) {
     }
 }
 
+/// #1427: the isolation rule of the reconnect catch-up. The node is
+/// isolated while it has no connected peer. A reconnect after an
+/// isolation longer than the last metadata resend can have missed a
+/// commit that nothing redelivers, as after a restart. A shorter
+/// isolation is left to the resends.
+#[derive(Debug, Default)]
+struct TreeKemIsolation {
+    since: Option<tokio::time::Instant>,
+}
+
+impl TreeKemIsolation {
+    /// Note the connected peer count at `now`. True at most once per
+    /// isolation: when the first peer connects after an isolation longer
+    /// than `missed_resends`.
+    fn note(
+        &mut self,
+        connected: usize,
+        now: tokio::time::Instant,
+        missed_resends: Duration,
+    ) -> bool {
+        match (connected, self.since) {
+            (0, None) => {
+                self.since = Some(now);
+                false
+            }
+            (0, Some(_)) => false,
+            (_, None) => false,
+            (_, Some(since)) => {
+                self.since = None;
+                now.saturating_duration_since(since) > missed_resends
+            }
+        }
+    }
+}
+
+/// #1427: how often the reconnect catch-up reads the connected peer count
+/// besides on each connect or disconnect event. A disconnect event can
+/// arrive before the transport drops the link from its table, so the
+/// count read then can still include it.
+const TREEKEM_ISOLATION_CHECK: Duration = Duration::from_secs(5);
+
+/// #1427: the reconnect catch-up of TreeKEM groups. A member that stays
+/// up through a network outage past the last metadata resend can miss a
+/// commit just like a member that was down, and the start catch-up does
+/// not run for it. This task reads the connected peer count on each
+/// connect or disconnect event and every [`TREEKEM_ISOLATION_CHECK`]. When the
+/// first peer connects after such an isolation ([`TreeKemIsolation`]), it
+/// marks each TreeKEM group pending, writes the outage record (so a
+/// restart during the pass still asks), and runs
+/// [`request_treekem_catchup_after_start`] for each group. At most one
+/// reconnect pass runs at a time, and each needs a new isolation longer
+/// than the last resend, so reconnects cannot cause a storm.
+pub(in crate::server) async fn run_treekem_reconnect_catchup(state: Arc<AppState>) {
+    let Some(network) = state.agent.network().cloned() else {
+        return;
+    };
+    let missed_resends = GROUP_CONTROL_REDELIVERY_SCHEDULE
+        .last()
+        .copied()
+        .unwrap_or_default();
+    let mut events = network.subscribe();
+    let mut shutdown = state.shutdown_notify.subscribe();
+    let mut isolation = TreeKemIsolation::default();
+    let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut tick = tokio::time::interval(TREEKEM_ISOLATION_CHECK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => return,
+            _ = tick.tick() => {}
+            event = events.recv() => match event {
+                Ok(crate::network::NetworkEvent::PeerConnected { .. }
+                    | crate::network::NetworkEvent::PeerDisconnected { .. })
+                | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            },
+        }
+        let connected = network.connected_peers().await.len();
+        if !isolation.note(connected, tokio::time::Instant::now(), missed_resends) {
+            continue;
+        }
+        if running.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            continue;
+        }
+        let keys = treekem_start_catchup_groups(&state).await;
+        if keys.is_empty() {
+            running.store(false, std::sync::atomic::Ordering::Release);
+            continue;
+        }
+        state
+            .treekem_start_catchup_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(keys.iter().cloned());
+        let record = treekem_catchup_pending_path(&state);
+        if !tokio::fs::try_exists(&record).await.unwrap_or(false) {
+            if let Err(error) = crate::profile::write_atomically(&record, b"reconnect").await {
+                tracing::warn!("TreeKEM outage record was not written: {error}");
+            }
+        }
+        state
+            .treekem_reconnect_catchup_passes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        for key in &keys {
+            tracing::info!(
+                group_id = %LogHexId::group(key),
+                "reconnected after an isolation past the last metadata resend; \
+                 asking for a TreeKEM catch-up page"
+            );
+        }
+        let pass_state = Arc::clone(&state);
+        let pass_running = Arc::clone(&running);
+        let admitted = state.spawn_detached(async move {
+            futures::future::join_all(
+                keys.iter()
+                    .map(|key| request_treekem_catchup_after_start(&pass_state, key)),
+            )
+            .await;
+            pass_running.store(false, std::sync::atomic::Ordering::Release);
+        });
+        if !admitted {
+            running.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
 /// ADR 0110 §3: the one route for missing leaf evidence. Every S4 path
 /// that cannot decide a member's leaf because it lacks that member's
 /// committed KeyPackage calls this, then keeps its work pending: the
@@ -17411,6 +17575,16 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
     let observed_predecessor_at_ms =
         envelope_bytes.map(|_| predecessor_first_seen_ms.unwrap_or_else(now_millis_u64));
     let event_kind = named_group_metadata_event_kind(&event);
+    // Issue #1840: an early gate below writes nothing. For a
+    // `JoinRequestCreated` it says so, so the listener-admission journal
+    // releases its marker instead of blocking every later admission. It
+    // carries no reason: no outcome is sent and the requester's offer stays
+    // live. The local durability check keeps plain REJECTED.
+    let declined = if matches!(event, NamedGroupMetadataEvent::JoinRequestCreated { .. }) {
+        ApplyMetadataResult::REFUSED_WITHOUT_MUTATION
+    } else {
+        ApplyMetadataResult::REJECTED
+    };
     let sender_hex = hex::encode(sender.as_bytes());
     tracing::debug!(
         target: "treekem.trace",
@@ -17439,7 +17613,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 sender = %sender_hex,
                 "group metadata event dropped: sender is revoked"
             );
-            return ApplyMetadataResult::REJECTED;
+            return declined;
         }
         // #1116: the hold is not a revocation record. Withhold the event
         // so a previously revoked sender is not admitted, and do not purge.
@@ -17452,7 +17626,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 sender = %sender_hex,
                 "group metadata event withheld until revocation resync"
             );
-            return ApplyMetadataResult::REJECTED;
+            return declined;
         }
     }
 
@@ -17488,7 +17662,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             event = event_kind,
             sender = %sender_hex,
         );
-        return ApplyMetadataResult::REJECTED;
+        return declined;
     }
 
     let group_id = match &event {
@@ -17527,7 +17701,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 group_id = %group_id,
                 sender = %sender_hex,
             );
-            return ApplyMetadataResult::REJECTED;
+            return declined;
         }
     };
     // Serialize every membership apply for this group across the concurrent
@@ -17583,7 +17757,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
     let info = {
         let groups = state.named_groups.read().await;
         let Some(info) = groups.get(&resolved_group_key).cloned() else {
-            return ApplyMetadataResult::REJECTED;
+            return declined;
         };
         info
     };
@@ -17596,7 +17770,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             group_id = %resolved_group_key,
             sender = %sender_hex,
         );
-        return ApplyMetadataResult::REJECTED;
+        return declined;
     }
     if !info.withdrawn && !live_group_allows_metadata_withdrawal_commit(&event) {
         tracing::debug!(
@@ -17607,7 +17781,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             group_id = %resolved_group_key,
             sender = %sender_hex,
         );
-        return ApplyMetadataResult::REJECTED;
+        return declined;
     }
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
@@ -17625,7 +17799,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             group_id = %resolved_group_key,
             sender = %sender_hex,
         );
-        return ApplyMetadataResult::REJECTED;
+        return declined;
     }
 
     if allow_queue
@@ -17651,7 +17825,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             );
             queue_treekem_membership_event(state, &resolved_group_key, event, sender, &reason)
                 .await;
-            return ApplyMetadataResult::REJECTED;
+            return declined;
         }
     }
     // ADR 0109 §2 "Conflict": every route (catch-up page, DM, gossip,
@@ -17664,7 +17838,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 revision = commit.revision,
                 "ADR 0109 S3: commit past the attestation conflict's common prefix refused"
             );
-            return ApplyMetadataResult::REJECTED;
+            return declined;
         }
     }
 
@@ -36458,6 +36632,7 @@ pub(in crate::server) async fn create_join_request(
                 next_retry_at_ms: now_ms,
                 retry_count: 0,
                 refusal: None,
+                reseal_count: 0,
             };
             if let Err(error) = insert_requester_offer_obligation(&state, obligation).await {
                 // Fail-visible fallback: the pre-#908 one-shot shape, so
@@ -44825,6 +45000,122 @@ pub(in crate::server) fn refused_listener_admission_evidence_path(state: &AppSta
     state.predecessor_relay_outbox_path.with_file_name(name)
 }
 
+/// Issue #1840: why a listener-admission marker can never complete because
+/// its group is gone: the group is unknown here, or it was withdrawn. `None`
+/// while the group is live.
+fn listener_admission_group_gone(info: Option<&x0x::groups::GroupInfo>) -> Option<&'static str> {
+    match info {
+        None => Some("names an unknown group"),
+        Some(info) if info.withdrawn => Some("names a withdrawn group"),
+        Some(_) => None,
+    }
+}
+
+/// Issue #1840: why the held listener-admission marker can never complete,
+/// so it must not block later admissions until a restart. `None` when it
+/// still can complete, or when dropping it would hide an inconsistency that
+/// startup recovery fails closed on (see `load_causal_relay_state`).
+///
+/// A marker can never complete when its group is gone, or when it is past
+/// [`CAUSAL_APPROVAL_RETENTION_MS`]: an expired marker cannot refresh the
+/// predecessor retention, and startup recovery clears it without building
+/// anything. Its request, if applied, stays as it is on disk.
+fn unusable_listener_admission(
+    info: Option<&x0x::groups::GroupInfo>,
+    marker: &PendingListenerAdmission,
+    has_receipt: bool,
+    now_ms: u64,
+) -> Option<&'static str> {
+    let Some(info) = info.filter(|info| !info.withdrawn) else {
+        return listener_admission_group_gone(info);
+    };
+    if marker
+        .first_seen_ms
+        .saturating_add(CAUSAL_APPROVAL_RETENTION_MS)
+        > now_ms
+    {
+        return None;
+    }
+    match info.join_requests.get(&marker.request_id) {
+        None => Some("expired"),
+        Some(request)
+            if request.requester_agent_id == marker.requester_agent_id
+                && request.predecessor_envelope_digest == Some(marker.digest)
+                && request.predecessor_first_seen_ms == Some(marker.first_seen_ms) =>
+        {
+            // A terminal request without its receipt is fatal at startup.
+            (request.is_pending() || has_receipt).then_some("expired")
+        }
+        // A request id held by another binding is fatal at startup.
+        Some(_) => None,
+    }
+}
+
+/// Issue #1840: release the held listener-admission marker, durably, when it
+/// can never complete ([`unusable_listener_admission`]). The sidecar bytes
+/// that hold it are kept as evidence first, as startup recovery does for a
+/// refused entry. Returns `true` when the slot is free afterwards. The
+/// caller holds no persistence lock.
+pub(in crate::server) async fn release_unusable_listener_admission(
+    state: &AppState,
+    now_ms: u64,
+) -> bool {
+    let _journal_guard = state.predecessor_relay_outbox_persistence_lock.lock().await;
+    let Some(marker) = state.pending_listener_admission.lock().await.clone() else {
+        return true;
+    };
+    let same = |o_group: &str, o_request: &str, o_requester: &str, o_digest: &[u8; 32]| {
+        o_group == marker.group_id
+            && o_request == marker.request_id
+            && o_requester == marker.requester_agent_id
+            && *o_digest == marker.digest
+    };
+    let has_receipt = state
+        .predecessor_relay_outbox
+        .read()
+        .await
+        .get(&marker.group_id)
+        .is_some_and(|list| {
+            list.iter()
+                .any(|o| same(&o.group_id, &o.request_id, &o.requester_agent_id, &o.digest))
+        })
+        || state
+            .completed_relay_tombstones
+            .read()
+            .await
+            .get(&marker.group_id)
+            .is_some_and(|list| {
+                list.iter()
+                    .any(|t| same(&t.group_id, &t.request_id, &t.requester_agent_id, &t.digest))
+            });
+    let reason = {
+        let groups = state.named_groups.read().await;
+        unusable_listener_admission(groups.get(&marker.group_id), &marker, has_receipt, now_ms)
+    };
+    let Some(reason) = reason else {
+        return false;
+    };
+    preserve_refused_listener_admission_evidence(state).await;
+    *state.pending_listener_admission.lock().await = None;
+    if matches!(
+        save_predecessor_relay_outbox_unlocked(state).await,
+        Ok(AtomicWriteOutcome::Durable)
+    ) {
+        tracing::warn!(
+            group_id = %marker.group_id,
+            request_id = %marker.request_id,
+            requester = %marker.requester_agent_id,
+            first_seen_ms = marker.first_seen_ms,
+            outcome = "released",
+            "ADR 0028: listener admission journal {reason}; released it so later admissions proceed"
+        );
+        true
+    } else {
+        *state.pending_listener_admission.lock().await = Some(marker);
+        false
+    }
+}
+
 /// Issue #1840: best-effort copy of the as-loaded relay sidecar (which
 /// still holds the refused marker) to the evidence slot, before recovery
 /// re-saves the sidecar without that marker. A failed copy is logged and
@@ -45632,6 +45923,23 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
     // marker is itself authenticated evidence; if the request write did not
     // complete before the crash, apply it now, then construct the exact relay
     // obligation in the detached outbox candidate.
+    if let Some(admission) = pending_listener_admission.as_ref() {
+        // Issue #1840: a marker whose group is gone can never complete. One
+        // such entry must not stop the daemon: refuse it, keep the sidecar
+        // bytes as evidence, and carry on, as for a refused rebuild below.
+        if let Some(reason) = listener_admission_group_gone(groups_view.get(&admission.group_id)) {
+            tracing::error!(
+                group_id = %admission.group_id,
+                request_id = %admission.request_id,
+                requester = %admission.requester_agent_id,
+                first_seen_ms = admission.first_seen_ms,
+                outcome = "refused",
+                "ADR 0028 startup: listener admission journal {reason}; refusing this journal entry and continuing"
+            );
+            preserve_refused_listener_admission_evidence(state).await;
+            pending_listener_admission = None;
+        }
+    }
     if let Some(admission) = pending_listener_admission.clone() {
         let info = groups_view
             .get(&admission.group_id)
@@ -55112,6 +55420,7 @@ pub(in crate::server) mod tests {
             treekem_start_catchup_pending: Default::default(),
             treekem_network_join_ended: tokio::sync::watch::channel(false).0,
             treekem_start_catchup_passes: Default::default(),
+            treekem_reconnect_catchup_passes: Default::default(),
             treekem_catchup_refusals: StdMutex::new(HashMap::new()),
             join_request_outcome_sends: StdMutex::new(HashMap::new()),
             group_membership_locks: RwLock::new(HashMap::new()),

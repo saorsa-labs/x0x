@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`GET /diagnostics/upgrade` reports the upgrade records on disk (#1381
+  M2 part, A14 amendment of 15 Nov 2026).** New fields: `plan` (the safe-apply
+  journal's transaction, phase and versions), `last_attempt` (the pre-swap
+  probe record), `holds` (failed-release or recovery-failed, with whether
+  `x0x upgrade --clear-hold` applies), `last_hold_clear`, `backups` (backup
+  files beside the daemon and CLI) and `records_error`. Fixed record names
+  only; no recorded path is followed and no argv, environment or free-text
+  cause is returned.
 - **A join request the authority refuses as `stale` is signed again over the
   authority's head (#1840 routes 1–3, A08 amendment of 15 Nov 2026).** A
   second joiner on a group with members, a request that crosses an edit of
@@ -103,6 +111,14 @@ All notable changes to this project will be documented in this file.
   still peeks a PubSub kind only under ADR 0013 pressure.
 
 ### Changed
+
+- **A TreeKEM member that stays up through a network outage catches up
+  when it connects again (#1427, A09 second amendment of 15 Nov 2026).**
+  When the first peer connects after the node had no connected peer for
+  longer than the last metadata resend (60 s), it runs the start catch-up
+  for each TreeKEM group. One such pass runs at a time. At restore, a
+  re-add that comes after a held removal is now served; only the adds
+  before that removal are held back. No wire format or API changes.
 
 - **A node that restarted still serves the TreeKEM commits it held
   (#1427).** The TreeKEM catch-up log is saved under `treekem-catchup-log/`
@@ -239,6 +255,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **A listener-admission marker that can never complete no longer blocks join
+  requests (#1840, A08 amendment of 15 Nov 2026).** An early-gate refusal
+  (revoked or unverified sender, revocation-resync hold, withdrawn group), an
+  expired marker, and a marker whose group was deleted or withdrawn now
+  release the journal, live and at startup, with the sidecar bytes kept as
+  evidence. A requester signs one request again over the authority's head at
+  most 8 times per offer, and a re-seal no longer restarts the offer backoff.
 - **A daemon that restarts with pending S4 work no longer seals a stale
   head (#1581).** If the `.evs` file held an unsealed revocation-eviction
   row, the group needs a holder to confirm its head before S4 seals there.

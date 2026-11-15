@@ -3296,3 +3296,178 @@ async fn issue1840_live_keeps_marker_until_fork_evidence_is_durable() {
     );
     assert!(!request_is_stored(&state, &gk, &entry.request_id).await);
 }
+
+// ===========================================================================
+// Issue #1840: the #1842 leftovers
+// ===========================================================================
+
+/// A valid request on `gk`, offered by a fresh requester through the live
+/// handler. Returns `(entry, requester key)`.
+async fn offer_valid_request(
+    state: &Arc<AppState>,
+    gk: &str,
+    request_id: &str,
+) -> (RelayEntry, AgentKeypair) {
+    let kp = fresh_kp();
+    let hex_id = hex::encode(kp.agent_id().as_bytes());
+    let topic = group_topic(state, gk).await;
+    let commit = {
+        let groups = state.named_groups.read().await;
+        signed_request_join_commit(groups.get(gk).expect("group"), &kp)
+    };
+    let entry = build_relay_entry_with_commit(&kp, &topic, gk, request_id, &hex_id, 0, commit);
+    offer_via_handler(state, &local_hex(state), &entry, &kp, unix_ms()).await;
+    (entry, kp)
+}
+
+async fn request_access_groups(state: &AppState, keys: &[&str]) {
+    for gk in keys {
+        install_group_with_policy(
+            state,
+            gk,
+            2,
+            x0x::groups::GroupPolicyPreset::PublicRequestSecure,
+        )
+        .await;
+    }
+    assert_eq!(
+        save_roster(state).await.expect("roster save"),
+        AtomicWriteOutcome::Durable
+    );
+}
+
+/// An early gate (here the revocation-resync hold) refuses a journaled
+/// request before any roster write. The marker is released durably, no
+/// outcome is sent, and once the hold lifts the same offer is admitted.
+///
+/// RED on main: the gate returns plain REJECTED, so the listener keeps the
+/// marker ("request apply did not become durable; keeping admission journal
+/// and stopping") and every later admission is blocked.
+#[tokio::test]
+async fn issue1840_early_gate_refusal_frees_journal() {
+    let (state, _dir) = s_state().await;
+    let gk = format!("{:032x}", 0x1840_00e1u32);
+    request_access_groups(&state, &[&gk]).await;
+    *state.agent.revocation_set().write().await =
+        x0x::revocation::RevocationSet::quarantined_carrier(x0x::revocation::REVOCATION_CARRIER_V3);
+
+    let (entry, kp) = offer_valid_request(&state, &gk, "req-1840-gate").await;
+    assert!(!request_is_stored(&state, &gk, &entry.request_id).await);
+    assert!(
+        listener_admission_is_none(&state).await,
+        "an early-gate refusal must not hold the admission journal"
+    );
+    restart_relay(&state).await.expect("restart after the gate");
+    assert!(
+        !refused_evidence_exists(&state).await,
+        "the live release is durable"
+    );
+
+    // The hold lifts; the requester's live offer is admitted.
+    *state.agent.revocation_set().write().await = x0x::revocation::RevocationSet::new();
+    offer_via_handler(&state, &local_hex(&state), &entry, &kp, unix_ms()).await;
+    assert!(request_is_stored(&state, &gk, &entry.request_id).await);
+    assert_eq!(
+        approve_status(&state, &gk, &entry.request_id).await,
+        StatusCode::OK
+    );
+}
+
+/// A marker past the retention window can never complete. The live listener
+/// releases it (keeping the sidecar bytes as evidence) instead of blocking
+/// every admission until a restart.
+///
+/// RED on main: "expired listener-admission journal cannot refresh
+/// predecessor retention", and the other group's request is not admitted.
+#[tokio::test]
+async fn issue1840_live_expired_marker_is_released() {
+    let (state, _dir) = s_state().await;
+    let gk_a = format!("{:032x}", 0x1840_00e2u32);
+    let gk_b = format!("{:032x}", 0x1840_00e3u32);
+    request_access_groups(&state, &[&gk_a, &gk_b]).await;
+    let stale_kp = fresh_kp();
+    let stale_hex = hex::encode(stale_kp.agent_id().as_bytes());
+    let topic_a = group_topic(&state, &gk_a).await;
+    let expired = unix_ms() - CAUSAL_APPROVAL_RETENTION_MS - 1;
+    let stale = build_relay_entry(&stale_kp, &topic_a, &gk_a, "req-old", &stale_hex, expired);
+    *state.pending_listener_admission.lock().await =
+        Some(marker_admission(&gk_a, &stale_hex, &stale, expired));
+    assert_eq!(
+        save_relay(&state).await.expect("relay save"),
+        AtomicWriteOutcome::Durable
+    );
+
+    let (good, _) = offer_valid_request(&state, &gk_b, "req-1840-after-expiry").await;
+    assert!(
+        request_is_stored(&state, &gk_b, &good.request_id).await,
+        "an expired marker must not block another request"
+    );
+    assert_eq!(
+        approve_status(&state, &gk_b, &good.request_id).await,
+        StatusCode::OK
+    );
+    assert!(listener_admission_is_none(&state).await);
+    assert!(refused_evidence_exists(&state).await, "evidence kept");
+    restart_relay(&state).await.expect("restart");
+    assert!(listener_admission_is_none(&state).await);
+}
+
+/// A marker whose group is gone (deleted here, or withdrawn) can never
+/// complete: the live listener releases it, and startup refuses it and
+/// carries on instead of failing.
+///
+/// RED on main: live, "unresolved listener-admission journal blocks new
+/// admission"; at startup, "listener admission journal references an
+/// unknown group" or "local agent is not the active group authority",
+/// either of which ends startup.
+#[tokio::test]
+async fn issue1840_marker_for_a_gone_group_is_released() {
+    for withdrawn in [false, true] {
+        for live in [true, false] {
+            let (state, _dir) = s_state().await;
+            let gk_a = format!("{:032x}", 0x1840_00e4u32);
+            let gk_b = format!("{:032x}", 0x1840_00e5u32);
+            request_access_groups(&state, &[&gk_a, &gk_b]).await;
+            let kp = fresh_kp();
+            let kp_hex = hex::encode(kp.agent_id().as_bytes());
+            let topic_a = group_topic(&state, &gk_a).await;
+            let marker_time = unix_ms() - 1000; // inside the window
+            let entry = build_relay_entry(&kp, &topic_a, &gk_a, "req-gone", &kp_hex, marker_time);
+            *state.pending_listener_admission.lock().await =
+                Some(marker_admission(&gk_a, &kp_hex, &entry, marker_time));
+            {
+                let mut groups = state.named_groups.write().await;
+                if withdrawn {
+                    groups.get_mut(&gk_a).expect("group a").withdrawn = true;
+                } else {
+                    groups.remove(&gk_a);
+                }
+            }
+            assert_eq!(
+                save_roster(&state).await.expect("roster save"),
+                AtomicWriteOutcome::Durable
+            );
+            assert_eq!(
+                save_relay(&state).await.expect("relay save"),
+                AtomicWriteOutcome::Durable
+            );
+            if live {
+                let (good, _) = offer_valid_request(&state, &gk_b, "req-1840-gone-live").await;
+                assert!(
+                    request_is_stored(&state, &gk_b, &good.request_id).await,
+                    "withdrawn={withdrawn}: a gone group's marker must not block"
+                );
+            } else {
+                let result = restart_relay(&state).await;
+                assert!(
+                    result.is_ok(),
+                    "withdrawn={withdrawn}: a gone group's marker must not stop startup: {result:?}"
+                );
+            }
+            assert!(listener_admission_is_none(&state).await);
+            assert!(refused_evidence_exists(&state).await, "evidence kept");
+            restart_relay(&state).await.expect("second start is clean");
+            assert!(listener_admission_is_none(&state).await);
+        }
+    }
+}

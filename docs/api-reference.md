@@ -3897,7 +3897,7 @@ no push; the retry does.
 | GET | `/upgrade` | — (CLI does not call this) | Daemon-side check for updates (release manifests over the `x0x/release` gossip topic; GitHub first-discovery fallback). Read-only: a check that finds a newer release announces nothing and never leads to an install on this node (#1169, Engineer ruling 3 Nov 2026 17:40 GMT) |
 | POST | `/upgrade/apply` | `x0x upgrade --apply` | Daemon applies the latest verified release manifest with transactional restart; the observed release is announced on `x0x/release` before the apply work (#1169) |
 | POST | `/upgrade/clear-hold?version=<v>` | `x0x upgrade --clear-hold <v>` | Authenticated, recorded local clear of this install's failed-release probe hold for exactly `<v>` (D190, #1376). `200` `{cleared:true, version, cause, transaction_id}` after a durable receipt (`<daemon>.upgrade-probe.json.cleared`) and removal of the hold; `404` when no failed-release hold exists for `<v>`; `409` for recovery-failed or an unresolved probe record (never cleared locally) or while another upgrade runs; `400` for a missing or non-semver version; `501` off Unix. A newer release clears such a hold by itself |
-| GET | `/diagnostics/upgrade` | `x0x diagnostics upgrade` | Local version + update policy + version/policy digest for the M1 census (#1383), plus release channel, latest version seen on `x0x/release`, last release check and pending update (#1381); no update check runs, nothing is announced |
+| GET | `/diagnostics/upgrade` | `x0x diagnostics upgrade` | Local version + update policy + version/policy digest for the M1 census (#1383), plus release channel, latest version seen on `x0x/release`, last release check, pending update, and the on-disk upgrade plan, last attempt, backups and holds (#1381); no update check runs, nothing is announced |
 
 **Version/policy digest (#1383).** `GET /diagnostics/upgrade` reports the
 daemon's `current_version`, the full `update_policy` object
@@ -3929,6 +3929,20 @@ memory and reset on restart; nothing is sent on the wire.
 | `pending_update` | `{version, state, source}` or `null`. While the background apply owner holds a release, `source` is `background_owner` and `state` is `queued`, `applying`, `backoff` (failed less than 30 minutes ago) or `failed`. Otherwise the newest observed version newer than this binary, with `state` `observed` and `source` `release_topic`, `startup`, `fallback_poll` or `api` |
 
 `x0x doctor` reads `pending_update` for its upgrade line.
+
+**Upgrade records (#1381).** The same response reads the safe-apply records
+on disk. It reads fixed file names only: it never follows a path written in a
+record, never changes a record, and never returns participant arguments,
+environment or free-text causes.
+
+| Field | Value |
+|---|---|
+| `plan` | `null` when no record exists. `{record: "journal", transaction_id, phase, previous_version, candidate_version, participants, cause, boot_attempt}` for an M2 journal (`participants` is a count; `cause` is `failed`, `interrupted` or `null`). `{record: "refused"}` for an unreadable record, `{record: "legacy_handoff"}` or `{record: "handoff", boot_attempt}` for a handoff without a journal |
+| `last_attempt` | `{version, transaction_id, attempt, phase, cause, retry_remaining_ms}` from the install's pre-swap probe record, or `null`. `phase` is `running`, `passed`, `interrupted_wait`, `failed_hold` or `recovery_failed` |
+| `holds` | One entry `{version, kind, cause, clearable}` while the probe record holds a release. `kind` is `failed_release` (`clearable: true`, see `x0x upgrade --clear-hold`) or `recovery_failed` (`clearable: false`) |
+| `last_hold_clear` | `{version, cause, cleared_at_unix}` from the most recent local clear receipt, or `null` |
+| `backups` | Backup files beside the daemon and its sibling CLI: `{artifact, name, size_bytes, modified_unix}`, `artifact` `daemon` or `cli`, at most 32. Names are `<binary>.backup` (legacy) or `<binary>.backup-<version>-<transaction>` (pair apply) |
+| `records_error` | `null`, or fixed text naming a record that could not be read (`install path unavailable`, `probe record unreadable`, `hold clear receipt unreadable`) |
 
 **Minimum supported version and support window (#1384, D35).** The same
 response carries `minimum_supported_version` and `support_window`. Both ship
