@@ -11,8 +11,8 @@
 //!   once A and C hold B's machine revocation, B stays an Active member
 //!   on A's and C's rosters through one designated window plus the
 //!   completion bound plus a margin; no S4 row for B appears on A or C;
-//!   B's agent is not revoked anywhere; the group's head and TreeKEM
-//!   epoch do not move.
+//!   B's agent is not revoked anywhere; the group's state revision (r0)
+//!   and TreeKEM epoch (e0) do not move.
 //! - egress arm (`egress_machine_revoked_device_gets_no_new_key`): the
 //!   same trigger, then A rotates the group key by removing C through
 //!   the public remove route. ADR 0110 §3 (L236): a machine revocation
@@ -197,7 +197,10 @@ async fn holds_revocation(sim: &Sim, label: &str, subject_hex: &str) -> Result<b
         }))
 }
 
-/// `label`'s public S4 row for `target_hex` in `group`, if any.
+/// `label`'s public S4 row for `target_hex` in `group`, if any. A failed
+/// read or a body without the `revocation_evictions` array is an error
+/// (INFRA), never "no row": "no S4 row for B" needs a read that could
+/// have shown one (#1928 review).
 async fn s4_row(
     sim: &Sim,
     label: &str,
@@ -207,14 +210,17 @@ async fn s4_row(
     let (status, body) = sim
         .request(label, Method::GET, &format!("/groups/{group}"), None)
         .await?;
-    if !status.is_success() {
-        return Ok(None);
-    }
-    Ok(body["revocation_evictions"].as_array().and_then(|rows| {
-        rows.iter()
-            .find(|row| row["target"].as_str() == Some(target_hex))
-            .cloned()
-    }))
+    ensure!(
+        status.is_success(),
+        "INFRA: {label} GET /groups/{group}: {status} {body}"
+    );
+    let rows = body["revocation_evictions"]
+        .as_array()
+        .with_context(|| format!("INFRA: {label} GET /groups/{group}: no revocation_evictions"))?;
+    Ok(rows
+        .iter()
+        .find(|row| row["target"].as_str() == Some(target_hex))
+        .cloned())
 }
 
 /// `label` encrypts the probe; the ciphertext, or why it could not.
@@ -359,7 +365,9 @@ async fn scenario(
     while sim.fabric().now() < deadline {
         for label in ["A", "C"] {
             let view = view_now(sim, label, &group).await?;
-            if seat_lost.is_none() && (!view.lists_b || view.epoch != Some(e0)) {
+            if seat_lost.is_none()
+                && (!view.lists_b || view.epoch != Some(e0) || view.state_revision != r0)
+            {
                 seat_lost = Some(format!("{label}: {}", view.describe()));
             }
             if row_seen.is_none() {
