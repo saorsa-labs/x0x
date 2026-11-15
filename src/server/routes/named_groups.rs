@@ -16230,10 +16230,17 @@ impl TreeKemIsolation {
     }
 }
 
+/// #1427: how often the reconnect catch-up reads the connected peer count
+/// besides on each connect or disconnect event. A disconnect event can
+/// arrive before the transport drops the link from its table, so the
+/// count read then can still include it.
+const TREEKEM_ISOLATION_CHECK: Duration = Duration::from_secs(5);
+
 /// #1427: the reconnect catch-up of TreeKEM groups. A member that stays
 /// up through a network outage past the last metadata resend can miss a
 /// commit just like a member that was down, and the start catch-up does
-/// not run for it. This task watches the connected peer count. When the
+/// not run for it. This task reads the connected peer count on each
+/// connect or disconnect event and every [`TREEKEM_ISOLATION_CHECK`]. When the
 /// first peer connects after such an isolation ([`TreeKemIsolation`]), it
 /// marks each TreeKEM group pending, writes the outage record (so a
 /// restart during the pass still asks), and runs
@@ -16252,9 +16259,12 @@ pub(in crate::server) async fn run_treekem_reconnect_catchup(state: Arc<AppState
     let mut shutdown = state.shutdown_notify.subscribe();
     let mut isolation = TreeKemIsolation::default();
     let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut tick = tokio::time::interval(TREEKEM_ISOLATION_CHECK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = shutdown.changed() => return,
+            _ = tick.tick() => {}
             event = events.recv() => match event {
                 Ok(crate::network::NetworkEvent::PeerConnected { .. }
                     | crate::network::NetworkEvent::PeerDisconnected { .. })

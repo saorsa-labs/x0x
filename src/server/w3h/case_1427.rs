@@ -513,6 +513,23 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
             "INFRA: V still has {peers} connected peers off the fabric"
         );
         sim.set_online("V", true)?;
+        // Nothing redials a peer that went off the fabric, so the signer
+        // dials V, as the network would once it is back. V sees an inbound
+        // connection: the first peer after its isolation.
+        let network = sim
+            .state(signer)?
+            .agent
+            .network()
+            .cloned()
+            .context("the signer has no network")?;
+        let addr = super::sim_addr(sim.node_index("V")?)?;
+        sim.within(
+            "the signer dials V",
+            Duration::from_secs(10),
+            network.connect_addr(addr),
+        )
+        .await?
+        .map_err(|error| anyhow::anyhow!("the signer could not dial V: {error}"))?;
     } else {
         sim.start_again("V").await?;
     }
