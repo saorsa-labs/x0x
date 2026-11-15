@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`GET /diagnostics/upgrade` reports release observations (#1381, A14
+  amendment of 15 Nov 2026).** New fields: `channel` (`stable` or
+  `prerelease`), `latest_release_topic_version` (highest verified release
+  seen on `x0x/release`), `last_check` (source, time and outcome of the last
+  startup, fallback-poll or `GET /upgrade` check) and `pending_update` (the
+  background apply owner's queued, applying or failed release, else the
+  newest observed newer version). Memory only; reset on restart. `x0x doctor`
+  uses `pending_update`.
 - **`GET /sync/devices` names the source of each device's enrollment record
   (#1107).** Each row has `record_source` (`"local"` when this machine wrote
   the stored owner-device record, `"synced"` when another owner device wrote

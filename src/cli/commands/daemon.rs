@@ -290,9 +290,10 @@ async fn check_store_integrity(client: &DaemonClient) -> DoctorCheck {
 }
 
 async fn check_upgrade_state(client: &DaemonClient) -> DoctorCheck {
-    // Prefer `/diagnostics/upgrade` when #1381 ships; fall back to GET /upgrade.
-    // Until then `/upgrade` is a release *lookup*, not apply/rollback health:
-    // lookup failure and HTTP errors are `warn`; an available update stays `ok`.
+    // Prefer `/diagnostics/upgrade` (#1381: its `pending_update` names a
+    // release newer than this daemon); fall back to GET /upgrade. Neither is
+    // apply/rollback health: lookup failure and HTTP errors are `warn`; an
+    // available update stays `ok`.
     let (path, val) = match client.get("/diagnostics/upgrade").await {
         Ok(val) => ("/diagnostics/upgrade", val),
         Err(_) => match client.get("/upgrade").await {
@@ -321,11 +322,12 @@ async fn check_upgrade_state(client: &DaemonClient) -> DoctorCheck {
         );
     }
 
+    let pending_update = val.get("pending_update").filter(|v| v.is_object());
     let update_available = val
         .get("update_available")
         .or_else(|| val.get("pending"))
         .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+        .unwrap_or(pending_update.is_some());
     let current = val
         .get("current_version")
         .and_then(|v| v.as_str())
@@ -333,6 +335,7 @@ async fn check_upgrade_state(client: &DaemonClient) -> DoctorCheck {
     let latest = val
         .get("version")
         .or_else(|| val.get("latest_version"))
+        .or_else(|| pending_update.and_then(|pending| pending.get("version")))
         .and_then(|v| v.as_str());
     let detail = if update_available {
         match latest {

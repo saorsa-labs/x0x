@@ -1433,6 +1433,8 @@ pub async fn serve_with_options(
         self_published_release_manifests: Arc::new(Mutex::new(
             SelfPublishedReleaseManifests::default(),
         )),
+        upgrade_observations: Default::default(),
+        background_submit: std::sync::OnceLock::new(),
         #[cfg(unix)]
         upgrade_staging,
         api_token,
@@ -2212,6 +2214,7 @@ pub async fn serve_with_options(
         let startup_shutdown = daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx);
         let startup_apply_lock = Arc::clone(&state.upgrade_apply_lock);
         let startup_shutdown_watch = state.shutdown_notify.subscribe();
+        let startup_observations = Arc::clone(&state.upgrade_observations);
         #[cfg(unix)]
         let startup_identity_dir = identity_dir.clone();
         #[cfg(unix)]
@@ -2255,6 +2258,7 @@ pub async fn serve_with_options(
                     shutdown_watch: startup_shutdown_watch,
                     #[cfg(unix)]
                     staging,
+                    observations: Some(startup_observations),
                 }),
             )
             .await
@@ -2287,6 +2291,8 @@ pub async fn serve_with_options(
         match runtime {
             Ok(runtime) => {
                 let (submit, owner) = routes::background_channel(runtime);
+                // #1381: `/diagnostics/upgrade` reports the owner's release.
+                let _ = state.background_submit.set(submit.clone());
                 bg_tasks.push(tokio::spawn(owner.run()));
                 Some(submit)
             }
@@ -2308,6 +2314,7 @@ pub async fn serve_with_options(
         |submit| {
             let agent_for_gossip = Arc::clone(&state.agent);
             let self_published_for_gossip = Arc::clone(&self_published_release_manifests);
+            let observations_for_gossip = Arc::clone(&state.upgrade_observations);
             // Restart context stays with the shared owner; this source only
             // discovers verified releases and observes daemon shutdown.
             let gossip_shutdown_watch = state.shutdown_notify.subscribe();
@@ -2316,6 +2323,7 @@ pub async fn serve_with_options(
                     agent_for_gossip,
                     submit,
                     self_published_for_gossip,
+                    observations_for_gossip,
                     gossip_shutdown_watch,
                 )
                 .await;
@@ -2358,6 +2366,7 @@ pub async fn serve_with_options(
             let update_config = config.update.clone();
             let agent_for_poll = Arc::clone(&state.agent);
             let self_published_for_poll = Arc::clone(&self_published_release_manifests);
+            let observations_for_poll = Arc::clone(&state.upgrade_observations);
             let poll_shutdown_watch = state.shutdown_notify.subscribe();
             async move {
                 run_fallback_github_poll(
@@ -2365,6 +2374,7 @@ pub async fn serve_with_options(
                     update_config,
                     submit,
                     self_published_for_poll,
+                    observations_for_poll,
                     poll_shutdown_watch,
                 )
                 .await;

@@ -3869,7 +3869,7 @@ no push; the retry does.
 | GET | `/upgrade` | — (CLI does not call this) | Daemon-side check for updates (release manifests over the `x0x/release` gossip topic; GitHub first-discovery fallback). Read-only: a check that finds a newer release announces nothing and never leads to an install on this node (#1169, Engineer ruling 3 Nov 2026 17:40 GMT) |
 | POST | `/upgrade/apply` | `x0x upgrade --apply` | Daemon applies the latest verified release manifest with transactional restart; the observed release is announced on `x0x/release` before the apply work (#1169) |
 | POST | `/upgrade/clear-hold?version=<v>` | `x0x upgrade --clear-hold <v>` | Authenticated, recorded local clear of this install's failed-release probe hold for exactly `<v>` (D190, #1376). `200` `{cleared:true, version, cause, transaction_id}` after a durable receipt (`<daemon>.upgrade-probe.json.cleared`) and removal of the hold; `404` when no failed-release hold exists for `<v>`; `409` for recovery-failed or an unresolved probe record (never cleared locally) or while another upgrade runs; `400` for a missing or non-semver version; `501` off Unix. A newer release clears such a hold by itself |
-| GET | `/diagnostics/upgrade` | `x0x diagnostics upgrade` | Local version + update policy + version/policy digest for the M1 census (#1383; no update check runs, nothing is announced) |
+| GET | `/diagnostics/upgrade` | `x0x diagnostics upgrade` | Local version + update policy + version/policy digest for the M1 census (#1383), plus release channel, latest version seen on `x0x/release`, last release check and pending update (#1381); no update check runs, nothing is announced |
 
 **Version/policy digest (#1383).** `GET /diagnostics/upgrade` reports the
 daemon's `current_version`, the full `update_policy` object
@@ -3888,6 +3888,19 @@ ruling: no capability bit, no new field in signed machine announcements.
 Remote machines' digests reach an owner only through a later approved
 announcement change; until then the owner-side census is
 `GET /owner/machines` (see [Device sync](#device-sync-adr-0041-tier-1)).
+
+**Release observations (#1381).** The same response reports what this
+daemon has learned about releases since it started. The values are held in
+memory and reset on restart; nothing is sent on the wire.
+
+| Field | Value |
+|---|---|
+| `channel` | `"stable"`, or `"prerelease"` when `include_prereleases` is set |
+| `latest_release_topic_version` | `{version, seen_at_unix}` for the highest verified release newer than this binary received on `x0x/release`, or `null` |
+| `last_check` | `{source, at_unix, outcome, version}` for the last release check, or `null`. `source` is `startup`, `fallback_poll` or `api` (a `GET /upgrade` not answered from its cache); `outcome` is `update_available` (with `version`), `up_to_date` or `failed` |
+| `pending_update` | `{version, state, source}` or `null`. While the background apply owner holds a release, `source` is `background_owner` and `state` is `queued`, `applying`, `backoff` (failed less than 30 minutes ago) or `failed`. Otherwise the newest observed version newer than this binary, with `state` `observed` and `source` `release_topic`, `startup`, `fallback_poll` or `api` |
+
+`x0x doctor` reads `pending_update` for its upgrade line.
 
 **Minimum supported version and support window (#1384, D35).** The same
 response carries `minimum_supported_version` and `support_window`. Both ship
