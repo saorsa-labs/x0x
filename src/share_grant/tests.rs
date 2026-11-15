@@ -781,3 +781,93 @@ fn data_cap_json_round_trips() {
 mod enforcement;
 
 mod redelivery;
+
+/// A grant with the window `[NOW - 60, NOW - 60 + lifetime)`, signed over
+/// its bytes directly, as an older peer (with no lifetime rule) signs it.
+fn legacy_signed_grant(owner: &UserKeypair, lifetime: u64) -> ShareGrant {
+    let mut grant = grant_by(owner, Grantee::Agent(agent(7)), vec![agent(1)]);
+    grant.expiry = grant.not_before + lifetime;
+    let signature = sign_with_ml_dsa(owner.secret_key(), &grant.signed_bytes()).unwrap();
+    grant.signature = signature.as_bytes().to_vec();
+    grant
+        .verify()
+        .expect("structurally valid and correctly signed");
+    grant
+}
+
+/// WHY (#1350, D35): a share grant lasts at most 90 days. `sign` refuses a
+/// longer window; exactly 90 days signs.
+#[test]
+fn issue1350_sign_refuses_a_grant_longer_than_90_days() {
+    let owner = UserKeypair::generate().unwrap();
+    let sign = |lifetime: u64| {
+        ShareGrant::sign(
+            &owner,
+            [0x43; 32],
+            Grantee::Agent(agent(7)),
+            vec![agent(1)],
+            vec![ShareCap::Dm],
+            NOW,
+            NOW + lifetime,
+        )
+    };
+    assert_eq!(MAX_SHARE_GRANT_LIFETIME_SECS, 90 * 86_400);
+    let grant = sign(MAX_SHARE_GRANT_LIFETIME_SECS).expect("exactly 90 days signs");
+    grant.check_lifetime().expect("within the cap");
+    assert!(matches!(
+        sign(MAX_SHARE_GRANT_LIFETIME_SECS + 1),
+        Err(ShareGrantError::Invalid(m)) if m.contains("90 days")
+    ));
+    assert!(matches!(
+        sign(u64::MAX - NOW),
+        Err(ShareGrantError::Invalid(_))
+    ));
+}
+
+/// WHY (#1350): a longer grant from an older peer verifies (its signature
+/// is good) but is not accepted as is. The store refuses it, the typed DM
+/// completes with `Err` (no ACK), and nothing is stored. A 90-day grant
+/// from the same peer is accepted.
+#[tokio::test]
+async fn issue1350_store_refuses_a_received_grant_longer_than_90_days() {
+    let owner = UserKeypair::generate().unwrap();
+    let store = ShareGrantStore::in_memory(agent(1), Some(owner.user_id()));
+    let long = legacy_signed_grant(&owner, MAX_SHARE_GRANT_LIFETIME_SECS + 1);
+    assert!(matches!(
+        store.accept(long.clone(), NOW).await,
+        Err(ShareGrantError::Invalid(m)) if m.contains("90 days")
+    ));
+    let (t, rx) = typed(long.to_dm_payload().unwrap());
+    assert!(handle_share_grant_dm(Some(&store), t).await.is_err());
+    assert!(rx.await.unwrap().is_err(), "ACK withheld");
+    assert!(store.grants(GrantRole::Issued).is_empty());
+
+    let ok = legacy_signed_grant(&owner, MAX_SHARE_GRANT_LIFETIME_SECS);
+    store
+        .accept(ok.clone(), NOW)
+        .await
+        .expect("90 days accepted");
+    assert_eq!(store.grants(GrantRole::Issued), vec![ok]);
+}
+
+/// WHY (#1350, compatibility): a grant stored before the rule, with a
+/// longer window, still loads and still runs to its own expiry. The rule
+/// refuses NEW grants; it does not silently drop held ones on upgrade.
+#[tokio::test]
+async fn issue1350_a_stored_longer_grant_still_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(SHARE_GRANT_STORE_FILE);
+    let owner = UserKeypair::generate().unwrap();
+    let long = legacy_signed_grant(&owner, 365 * 86_400);
+    let file = StoreFile {
+        issued: vec![long.clone()],
+        received: Vec::new(),
+    };
+    let mut bytes = STORE_MAGIC.to_vec();
+    bytes.extend_from_slice(&bincode::serialize(&file).unwrap());
+    std::fs::write(&path, bytes).unwrap();
+    let store = ShareGrantStore::load(path, agent(1), Some(owner.user_id())).await;
+    assert!(store.load_error().is_none(), "{:?}", store.load_error());
+    assert_eq!(store.grants(GrantRole::Issued), vec![long.clone()]);
+    assert!(long.is_active_at(NOW + 200 * 86_400));
+}

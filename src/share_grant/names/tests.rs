@@ -24,7 +24,7 @@ fn grant_for(owner: &UserKeypair, grantee: AgentId) -> ShareGrant {
         Grantee::Agent(grantee),
         vec![AgentId([0x22; 32])],
         vec![ShareCap::Dm],
-        0,
+        now() - 60,
         now() + 3600,
     )
     .expect("sign grant")
@@ -117,7 +117,7 @@ fn names_signature_binds_the_grant_and_the_names() {
         Grantee::Agent(grantee),
         vec![AgentId([0x22; 32])],
         vec![ShareCap::Dm],
-        0,
+        now() - 60,
         now() + 3600,
     )
     .expect("sign grant");

@@ -1,4 +1,4 @@
-//! `x0x grant issue|list|revoke|received` — ADR-0070 §2 share grants.
+//! `x0x grant issue|list|revoke|received|renew` — ADR-0070 §2 share grants.
 
 use crate::cli::{print_value, DaemonClient};
 use anyhow::Result;
@@ -32,6 +32,41 @@ pub async fn received(client: &DaemonClient) -> Result<()> {
     let resp = client.get("/grants/received").await?;
     print_value(client.format(), &resp);
     Ok(())
+}
+
+/// `x0x grant renew GRANT_ID [--ttl-secs N] [--deliver-to AGENT]... [--no-names]` — renew an
+/// issued grant (#1350): a new grant, valid from now for at most 90 days.
+pub async fn renew(
+    client: &DaemonClient,
+    grant_id: &str,
+    ttl_secs: Option<u64>,
+    deliver_to: &[String],
+    no_names: bool,
+) -> Result<()> {
+    let resp = client
+        .post(
+            &format!("/grants/{grant_id}/renew"),
+            &renew_body(ttl_secs, deliver_to, no_names),
+        )
+        .await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// The `POST /grants/:id/renew` body: only the fields the user set, so the
+/// daemon's defaults apply to the rest.
+fn renew_body(ttl_secs: Option<u64>, deliver_to: &[String], no_names: bool) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    if let Some(ttl) = ttl_secs {
+        body.insert("ttl_secs".to_string(), serde_json::json!(ttl));
+    }
+    if !deliver_to.is_empty() {
+        body.insert("deliver_to".to_string(), serde_json::json!(deliver_to));
+    }
+    if no_names {
+        body.insert("include_names".to_string(), serde_json::json!(false));
+    }
+    serde_json::Value::Object(body)
 }
 
 /// The `POST /grants` body for `x0x grant issue`: GRANT_JSON as given, with
@@ -97,6 +132,17 @@ mod tests {
         assert!(issue_body("[1,2]", true).is_err());
     }
 
+    /// WHY (#1350): `grant renew` sends only the fields the user set, so
+    /// the daemon's defaults (90 days, names included) apply otherwise.
+    #[test]
+    fn renew_body_sends_only_set_fields() {
+        assert_eq!(renew_body(None, &[], false), serde_json::json!({}));
+        assert_eq!(
+            renew_body(Some(600), &["aa".to_string()], true),
+            serde_json::json!({"ttl_secs": 600, "deliver_to": ["aa"], "include_names": false})
+        );
+    }
+
     #[test]
     fn grant_json_bare_path_is_read_like_other_json_file_args() {
         // Scripts pass a file path, as for every other `*_JSON` argument;
@@ -121,6 +167,7 @@ mod tests {
             ("grant issue", "/grants"),
             ("grant revoke", "/grants/:id"),
             ("grant received", "/grants/received"),
+            ("grant renew", "/grants/:id/renew"),
         ] {
             let ep = crate::api::find_by_cli_name(cli).expect("registered");
             assert_eq!(ep.path, path, "{cli}");
