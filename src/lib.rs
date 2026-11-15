@@ -8312,7 +8312,8 @@ impl CapabilityRefreshRegistry {
 
     /// Records whether a request to `recipient` that asked for a direct
     /// reply was answered. A miss makes later requests ask for the topic
-    /// answer; an answer clears the miss.
+    /// answer. Only a met direct-ask flight or TTL expiry clears it; a topic
+    /// answer does not call this.
     fn note_unicast_answer(&self, recipient: &identity::AgentId, answered: bool) {
         let Ok(mut state) = self.state.lock() else {
             return;
@@ -31585,8 +31586,10 @@ mod tests {
             "after a miss the next request asks for the topic answer"
         );
 
-        // A topic answer brings the durable-ACK advert: the flight converges
-        // and the miss is cleared.
+        // The next flight asks for the topic answer (no reply-to machine),
+        // and the topic answer brings the durable-ACK advert. The flight
+        // converges, but the miss stays: a topic answer proves nothing about
+        // the direct path. Only TTL expiry or a met direct-ask flight clears it.
         let answering_store = std::sync::Arc::clone(&store);
         let answered = run_strict_capability_refresh_outcome(
             recipient,
@@ -31613,17 +31616,64 @@ mod tests {
                 converged: true,
             }
         );
+        note_capability_refresh_unicast_outcome(&registry, &recipient, false, answered);
+        assert!(
+            registry.unicast_answer_missed(&recipient),
+            "a converged topic flight keeps the miss for its TTL"
+        );
+
+        // After the TTL the request asks for a direct reply again, and a met
+        // direct-ask flight records the answer.
+        tokio::time::advance(CAPABILITY_UNICAST_MISS_TTL).await;
+        assert_eq!(
+            capability_refresh_reply_to(true, &registry, &recipient, local_machine),
+            Some(local_machine),
+            "after the TTL the request asks for a direct reply again"
+        );
         note_capability_refresh_unicast_outcome(&registry, &recipient, true, answered);
         assert!(!registry.unicast_answer_missed(&recipient));
+    }
 
-        // A flight that did not ask for a direct reply records nothing.
+    /// #504 follow-up (sticky miss): a flight that did not ask for a direct
+    /// reply changes nothing. A converged topic flight keeps a recorded
+    /// miss, and a lost one does not create a miss.
+    #[tokio::test(start_paused = true)]
+    async fn a_topic_flight_keeps_the_unicast_miss_record() {
+        let recipient = identity::AgentId([0x84_u8; 32]);
+        let registry = CapabilityRefreshRegistry::default();
+        let converged = StrictRefreshOutcome {
+            published: true,
+            converged: true,
+        };
+        let lost = StrictRefreshOutcome {
+            published: true,
+            converged: false,
+        };
         note_capability_refresh_unicast_outcome(&registry, &recipient, false, lost);
-        assert!(!registry.unicast_answer_missed(&recipient));
+        assert!(
+            !registry.unicast_answer_missed(&recipient),
+            "a lost topic flight records no miss"
+        );
+        note_capability_refresh_unicast_outcome(&registry, &recipient, true, lost);
+        assert!(registry.unicast_answer_missed(&recipient));
+        note_capability_refresh_unicast_outcome(&registry, &recipient, false, converged);
+        assert!(
+            registry.unicast_answer_missed(&recipient),
+            "a converged topic flight must keep the miss record"
+        );
+        note_capability_refresh_unicast_outcome(&registry, &recipient, true, converged);
+        assert!(
+            !registry.unicast_answer_missed(&recipient),
+            "a met direct-ask flight clears the miss record"
+        );
     }
 
     /// #504 follow-up: a request that asked for a direct reply and got no
     /// answer makes later requests to that recipient ask for the topic
-    /// answer, until an answer arrives or the miss ages out.
+    /// answer, until a met direct-ask flight records an answer or the miss
+    /// ages out. The registry call below is the one that
+    /// `note_capability_refresh_unicast_outcome` makes for a direct-ask
+    /// flight.
     #[tokio::test(start_paused = true)]
     async fn capability_refresh_unicast_miss_falls_back_to_the_topic_answer() {
         let recipient = identity::AgentId([0x82_u8; 32]);
@@ -31639,7 +31689,7 @@ mod tests {
         registry.note_unicast_answer(&recipient, true);
         assert!(
             !registry.unicast_answer_missed(&recipient),
-            "an answer clears the miss"
+            "a met direct-ask flight clears the miss"
         );
         registry.note_unicast_answer(&recipient, false);
         tokio::time::advance(CAPABILITY_UNICAST_MISS_TTL).await;
