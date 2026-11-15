@@ -1033,6 +1033,8 @@ jobs:
           --expect w3h_1427_silent_return_reaches_the_epoch=GREEN
           --require w3h_1427_silent_return_after_signer_restart_reaches_the_epoch
           --expect w3h_1427_silent_return_after_signer_restart_reaches_the_epoch=GREEN
+          --require w3h_1427_member_up_through_an_outage_reaches_the_epoch
+          --expect w3h_1427_member_up_through_an_outage_reaches_the_epoch=GREEN
           --require w3h_1360_red_s7_h7_1_copied_key_creates_no_duplicate
           --expect w3h_1360_red_s7_h7_1_copied_key_creates_no_duplicate=RED
           --require w3h_1161_card_import_invite

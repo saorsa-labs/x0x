@@ -9910,7 +9910,9 @@ fn treekem_removal_target(event: &NamedGroupMetadataEvent) -> Option<&str> {
 /// goes through the rules of a live one ([`log_treekem_membership_event`]),
 /// with one more: a removal or ban whose target has an S4 row (ADR 0110),
 /// in any phase, is not served from the saved log, and neither is any add
-/// or approval of that target in the same file. S4 owns the delivery of
+/// or approval of that target that comes before its last held removal in
+/// the same file. A later add (a re-add after the removal) is served as
+/// usual. S4 owns the delivery of
 /// that commit: an open row (for example `committed_delivery_pending`)
 /// resends it only once the group's head is synced, and a closed row can
 /// hold a sibling that lost to another admin's commit.
@@ -9972,11 +9974,12 @@ pub(in crate::server) async fn restore_treekem_catchup_logs(state: &AppState) {
             continue;
         };
         // A removal or ban that S4 owns is held back, and so is every add
-        // or approval of the same target in this file: otherwise the add
-        // alone would serve the removed member pages again
-        // ([`cached_add_still_current`]).
-        let mut held_targets: HashSet<String> = HashSet::new();
-        for event in &events {
+        // or approval of the same target before its last held removal in
+        // this file: otherwise the old add alone would serve the removed
+        // member pages again ([`cached_add_still_current`]). An add after
+        // that removal is a re-add and is served.
+        let mut held_until: HashMap<String, usize> = HashMap::new();
+        for (index, event) in events.iter().enumerate() {
             let Some(target) = treekem_removal_target(event) else {
                 continue;
             };
@@ -9984,11 +9987,11 @@ pub(in crate::server) async fn restore_treekem_catchup_logs(state: &AppState) {
                 continue;
             };
             if revocation_eviction::s4_has_row_for(state, &stable, raw.0).await {
-                held_targets.insert(target.to_ascii_lowercase());
+                held_until.insert(target.to_ascii_lowercase(), index);
             }
         }
         let mut held = 0_usize;
-        for event in &events {
+        for (index, event) in events.iter().enumerate() {
             let target = match event {
                 NamedGroupMetadataEvent::MemberAdded { agent_id, .. }
                 | NamedGroupMetadataEvent::MemberRemoved { agent_id, .. }
@@ -9998,7 +10001,12 @@ pub(in crate::server) async fn restore_treekem_catchup_logs(state: &AppState) {
                 } => Some(requester_agent_id),
                 _ => None,
             };
-            if target.is_some_and(|t| held_targets.contains(&t.to_ascii_lowercase())) {
+            let before_last_held_removal = target.is_some_and(|t| {
+                held_until
+                    .get(&t.to_ascii_lowercase())
+                    .is_some_and(|last| index <= *last)
+            });
+            if before_last_held_removal {
                 held += 1;
                 continue;
             }
@@ -16183,6 +16191,123 @@ pub(in crate::server) async fn run_treekem_start_catchup(state: Arc<AppState>) {
         tokio::select! {
             _ = shutdown.changed() => return,
             _ = tokio::time::sleep(TREEKEM_ALIVE_INTERVAL) => {}
+        }
+    }
+}
+
+/// #1427: the isolation rule of the reconnect catch-up. The node is
+/// isolated while it has no connected peer. A reconnect after an
+/// isolation longer than the last metadata resend can have missed a
+/// commit that nothing redelivers, as after a restart. A shorter
+/// isolation is left to the resends.
+#[derive(Debug, Default)]
+struct TreeKemIsolation {
+    since: Option<tokio::time::Instant>,
+}
+
+impl TreeKemIsolation {
+    /// Note the connected peer count at `now`. True at most once per
+    /// isolation: when the first peer connects after an isolation longer
+    /// than `missed_resends`.
+    fn note(
+        &mut self,
+        connected: usize,
+        now: tokio::time::Instant,
+        missed_resends: Duration,
+    ) -> bool {
+        match (connected, self.since) {
+            (0, None) => {
+                self.since = Some(now);
+                false
+            }
+            (0, Some(_)) => false,
+            (_, None) => false,
+            (_, Some(since)) => {
+                self.since = None;
+                now.saturating_duration_since(since) > missed_resends
+            }
+        }
+    }
+}
+
+/// #1427: the reconnect catch-up of TreeKEM groups. A member that stays
+/// up through a network outage past the last metadata resend can miss a
+/// commit just like a member that was down, and the start catch-up does
+/// not run for it. This task watches the connected peer count. When the
+/// first peer connects after such an isolation ([`TreeKemIsolation`]), it
+/// marks each TreeKEM group pending, writes the outage record (so a
+/// restart during the pass still asks), and runs
+/// [`request_treekem_catchup_after_start`] for each group. At most one
+/// reconnect pass runs at a time, and each needs a new isolation longer
+/// than the last resend, so reconnects cannot cause a storm.
+pub(in crate::server) async fn run_treekem_reconnect_catchup(state: Arc<AppState>) {
+    let Some(network) = state.agent.network().cloned() else {
+        return;
+    };
+    let missed_resends = GROUP_CONTROL_REDELIVERY_SCHEDULE
+        .last()
+        .copied()
+        .unwrap_or_default();
+    let mut events = network.subscribe();
+    let mut shutdown = state.shutdown_notify.subscribe();
+    let mut isolation = TreeKemIsolation::default();
+    let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => return,
+            event = events.recv() => match event {
+                Ok(crate::network::NetworkEvent::PeerConnected { .. }
+                    | crate::network::NetworkEvent::PeerDisconnected { .. })
+                | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            },
+        }
+        let connected = network.connected_peers().await.len();
+        if !isolation.note(connected, tokio::time::Instant::now(), missed_resends) {
+            continue;
+        }
+        if running.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            continue;
+        }
+        let keys = treekem_start_catchup_groups(&state).await;
+        if keys.is_empty() {
+            running.store(false, std::sync::atomic::Ordering::Release);
+            continue;
+        }
+        state
+            .treekem_start_catchup_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(keys.iter().cloned());
+        let record = treekem_catchup_pending_path(&state);
+        if !tokio::fs::try_exists(&record).await.unwrap_or(false) {
+            if let Err(error) = crate::profile::write_atomically(&record, b"reconnect").await {
+                tracing::warn!("TreeKEM outage record was not written: {error}");
+            }
+        }
+        state
+            .treekem_reconnect_catchup_passes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        for key in &keys {
+            tracing::info!(
+                group_id = %LogHexId::group(key),
+                "reconnected after an isolation past the last metadata resend; \
+                 asking for a TreeKEM catch-up page"
+            );
+        }
+        let pass_state = Arc::clone(&state);
+        let pass_running = Arc::clone(&running);
+        let admitted = state.spawn_detached(async move {
+            futures::future::join_all(
+                keys.iter()
+                    .map(|key| request_treekem_catchup_after_start(&pass_state, key)),
+            )
+            .await;
+            pass_running.store(false, std::sync::atomic::Ordering::Release);
+        });
+        if !admitted {
+            running.store(false, std::sync::atomic::Ordering::Release);
         }
     }
 }
@@ -55112,6 +55237,7 @@ pub(in crate::server) mod tests {
             treekem_start_catchup_pending: Default::default(),
             treekem_network_join_ended: tokio::sync::watch::channel(false).0,
             treekem_start_catchup_passes: Default::default(),
+            treekem_reconnect_catchup_passes: Default::default(),
             treekem_catchup_refusals: StdMutex::new(HashMap::new()),
             join_request_outcome_sends: StdMutex::new(HashMap::new()),
             group_membership_locks: RwLock::new(HashMap::new()),

@@ -1404,6 +1404,7 @@ pub async fn serve_with_options(
         treekem_start_catchup_pending: Default::default(),
         treekem_network_join_ended: tokio::sync::watch::channel(false).0,
         treekem_start_catchup_passes: Default::default(),
+        treekem_reconnect_catchup_passes: Default::default(),
         treekem_catchup_refusals: StdMutex::new(HashMap::new()),
         join_request_outcome_sends: StdMutex::new(HashMap::new()),
         group_membership_locks: RwLock::new(HashMap::new()),
@@ -2707,6 +2708,12 @@ pub async fn serve_with_options(
     // traffic needed.
     bg_tasks.push(tokio::spawn(
         routes::named_groups::run_treekem_start_catchup(Arc::clone(&state)),
+    ));
+    // #1427: a TreeKEM member that stays up through a network outage past
+    // the last metadata resend asks for the commits it missed when it
+    // connects again.
+    bg_tasks.push(tokio::spawn(
+        routes::named_groups::run_treekem_reconnect_catchup(Arc::clone(&state)),
     ));
 
     // #1663: a member of an encrypted GSS group whose own seat carries no

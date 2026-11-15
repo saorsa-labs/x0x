@@ -98,6 +98,14 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **A TreeKEM member that stays up through a network outage catches up
+  when it connects again (#1427, A09 second amendment of 15 Nov 2026).**
+  When the first peer connects after the node had no connected peer for
+  longer than the last metadata resend (60 s), it runs the start catch-up
+  for each TreeKEM group. One such pass runs at a time. At restore, a
+  re-add that comes after a held removal is now served; only the adds
+  before that removal are held back. No wire format or API changes.
+
 - **A node that restarted still serves the TreeKEM commits it held
   (#1427).** The TreeKEM catch-up log is saved under `treekem-catchup-log/`
   in the data directory (one file per group, local only) and loaded at
