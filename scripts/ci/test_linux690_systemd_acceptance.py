@@ -367,6 +367,11 @@ class LauncherDoneCheck(unittest.TestCase):
                 linux690_launcher_done.check(root, case)
                 self.assertEqual(linux690_launcher_done.main(["x", str(root), case]), 0)
 
+    def test_hang_clipped_by_the_total_deadline_passes(self) -> None:
+        reason = "launch attempts exhausted: total trial deadline reached"
+        root = self.fixture("hang", verdict={"class": "failed", "reason": reason})
+        linux690_launcher_done.check(root, "hang")
+
     def test_unknown_case_fails(self) -> None:
         self.rejects(self.fixture("stop"), "other")
 
@@ -406,6 +411,63 @@ class LauncherDoneCheck(unittest.TestCase):
     def test_restart_reusing_first_pid_fails(self) -> None:
         self.rejects(self.fixture("restart", pid=100), "restart")
 
+
+
+class CoordinatorDoneCheck(unittest.TestCase):
+    """The S3c coordinator cases of #1376."""
+
+    EXPECTED = {
+        case: expected for case, expected in linux690_launcher_done.COORDINATOR.items()
+    }
+
+    def fixture(self, case: str, **changes: object) -> Path:
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root)
+        resolution, previous, phase, cause = self.EXPECTED[case]
+        done: dict[str, object] = {
+            "case": case,
+            "resolution": resolution,
+            "pair_previous": previous,
+            "probe_phase": phase,
+            "probe_cause": cause,
+            "pid": 200,
+            "invocation": "inv-2",
+        }
+        first = {"pid": 100, "invocation": "inv-1"}
+        (root / "first-invocation.json").write_text(json.dumps(first), encoding="utf-8")
+        done.update(changes)
+        (root / "done.json").write_text(json.dumps(done), encoding="utf-8")
+        return root
+
+    def rejects(self, root: Path, case: str) -> None:
+        with self.assertRaises((AssertionError, ValueError)):
+            linux690_launcher_done.check(root, case)
+        self.assertNotEqual(linux690_launcher_done.main(["x", str(root), case]), 0)
+
+    def test_each_case_passes(self) -> None:
+        for case in self.EXPECTED:
+            with self.subTest(case=case):
+                root = self.fixture(case)
+                linux690_launcher_done.check(root, case)
+                self.assertEqual(linux690_launcher_done.main(["x", str(root), case]), 0)
+
+    def test_candidate_pair_left_installed_fails(self) -> None:
+        self.rejects(self.fixture("coordinator-stop", pair_previous=False), "coordinator-stop")
+        self.rejects(
+            self.fixture("coordinator-holdfail", pair_previous=True), "coordinator-holdfail"
+        )
+
+    def test_wrong_resolution_or_probe_record_fails(self) -> None:
+        self.rejects(self.fixture("coordinator-stop", resolution="retry"), "coordinator-stop")
+        self.rejects(
+            self.fixture("coordinator-handoff", probe_phase="passed"), "coordinator-handoff"
+        )
+        self.rejects(
+            self.fixture("coordinator-restart", probe_cause="apply_failed"), "coordinator-restart"
+        )
+
+    def test_restart_in_the_first_invocation_fails(self) -> None:
+        self.rejects(self.fixture("coordinator-restart", pid=100), "coordinator-restart")
 
 if __name__ == "__main__":
     unittest.main()

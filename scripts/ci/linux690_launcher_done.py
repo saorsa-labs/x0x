@@ -8,11 +8,45 @@ import sys
 VERDICTS = {
     "exec": ("failed", ("launch attempts exhausted", "exec failed")),
     "crash": ("failed", ("launch attempts exhausted", "candidate exited before commit")),
-    "hang": ("failed", ("launch attempts exhausted", "readiness deadline reached")),
+    # The last attempt's readiness window is clipped by the total trial
+    # deadline (`attempt_deadline = min(now + READY_MS, deadline_ms)`), so
+    # on a slow host the hung third attempt reports the total deadline.
+    "hang": (
+        "failed",
+        ("launch attempts exhausted", ("readiness deadline reached", "total trial deadline reached")),
+    ),
     "restart": ("interrupted", ("launcher died during exec",)),
     "restart-child": ("interrupted", ("launcher lost child custody",)),
     "stop": None,
 }
+
+# S3c coordinator cases (#1376):
+# (resolution, previous pair installed, probe phase, probe cause).
+COORDINATOR = {
+    "coordinator-stop": ("hold", True, "failed_hold", "apply_failed"),
+    "coordinator-restart": ("retry", True, "interrupted_wait", "apply_interrupted"),
+    "coordinator-handoff": ("retry", True, "interrupted_wait", "apply_interrupted"),
+    "coordinator-partial": ("retry", True, "interrupted_wait", "apply_interrupted"),
+    "coordinator-reboot": ("retry", True, "interrupted_wait", "apply_interrupted"),
+    "coordinator-holdfail": ("final", False, "passed", None),
+}
+
+
+def check_coordinator(root: Path, case: str) -> None:
+    done = json.loads((root / "done.json").read_text(encoding="utf-8"))
+    if done.get("case") != case:
+        fail(f"case is not {case}", done)
+    resolution, previous, phase, cause = COORDINATOR[case]
+    if done.get("resolution") != resolution:
+        fail(f"resolution is not {resolution}", done)
+    if done.get("pair_previous") is not previous:
+        fail(f"pair_previous is not {previous}", done)
+    if done.get("probe_phase") != phase or done.get("probe_cause") != cause:
+        fail(f"probe record is not {phase}/{cause}", done)
+    if case == "coordinator-restart":
+        first = json.loads((root / "first-invocation.json").read_text(encoding="utf-8"))
+        if first.get("pid") == done.get("pid") or first.get("invocation") == done.get("invocation"):
+            fail("successor coordinator reused the first pid or invocation", (first, done))
 
 
 def fail(message: str, value: object) -> None:
@@ -20,6 +54,9 @@ def fail(message: str, value: object) -> None:
 
 
 def check(root: Path, case: str) -> None:
+    if case in COORDINATOR:
+        check_coordinator(root, case)
+        return
     if case not in VERDICTS:
         raise ValueError(f"unknown launcher case {case!r}")
     done = json.loads((root / "done.json").read_text(encoding="utf-8"))
@@ -52,7 +89,12 @@ def check(root: Path, case: str) -> None:
     if verdict.get("class") != klass:
         fail(f"verdict class is not {klass}", done)
     reason = verdict.get("reason")
-    if not isinstance(reason, str) or not all(n in reason for n in needles):
+    def found(needle: object) -> bool:
+        if isinstance(needle, tuple):
+            return any(alternative in reason for alternative in needle)
+        return needle in reason
+
+    if not isinstance(reason, str) or not all(found(n) for n in needles):
         fail(f"verdict reason does not contain {needles}", done)
 
 

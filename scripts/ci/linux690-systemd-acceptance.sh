@@ -315,7 +315,7 @@ run_launcher_case() {
 
 if [ -n "$launcher_tests" ]; then
   sha256sum "$launcher_tests" >"$artifact_root/launcher-tests-sha256.txt"
-  for launcher_case in exec crash hang restart restart-child stop; do run_launcher_case "$launcher_case"; done
+  for launcher_case in exec crash hang restart restart-child stop coordinator-stop coordinator-restart coordinator-handoff coordinator-partial coordinator-reboot coordinator-holdfail; do run_launcher_case "$launcher_case"; done
 fi
 
 cat >"$artifact_root/oneshot-limit.txt" <<'EOF_LIMIT'
