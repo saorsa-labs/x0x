@@ -3299,6 +3299,7 @@ pub async fn serve_with_options(
         // Upgrade
         .route("/upgrade", get(check_upgrade))
         .route("/upgrade/apply", post(apply_upgrade))
+        .route("/upgrade/clear-hold", post(routes::clear_upgrade_hold))
         // Network diagnostics
         .route("/network/bootstrap-cache", get(bootstrap_cache_stats))
         .route("/diagnostics/connectivity", get(connectivity_diagnostics))
@@ -3365,6 +3366,7 @@ pub async fn serve_with_options(
         )
         .route("/grants/received", get(routes::grants_received))
         .route("/grants/:id", delete(routes::grants_revoke))
+        .route("/grants/:id/renew", post(routes::grants_renew))
         // ADR-0074 §1: names (owner petnames, TOFU pins, resolution)
         .route("/names", get(routes::names_list))
         .route("/names/resolve", post(routes::names_resolve))

@@ -1045,7 +1045,7 @@ async fn share_grant_dispatch_routes_v2_and_v1_payloads() -> anyhow::Result<()> 
         Grantee::Agent(state.agent.agent_id()),
         vec![bob_agent.agent_id()],
         vec![ShareCap::Dm],
-        0,
+        now - 60,
         now + 3600,
     )?;
     let envelope = ShareGrantV2::sign(
@@ -1167,7 +1167,7 @@ async fn share_grant_dispatch_pins_a_machine_default_with_real_hosting_evidence(
         Grantee::Agent(state.agent.agent_id()),
         granted.clone(),
         vec![ShareCap::Dm],
-        0,
+        now - 60,
         now + 3600,
     )?;
     assert_eq!(
@@ -1185,7 +1185,7 @@ async fn share_grant_dispatch_pins_a_machine_default_with_real_hosting_evidence(
         Grantee::Agent(state.agent.agent_id()),
         granted,
         vec![ShareCap::Dm],
-        0,
+        now - 60,
         now + 3600,
     )?;
     assert!(state.agent.verified_grant_hosts(&foreign).await.is_empty());

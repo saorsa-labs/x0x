@@ -1924,7 +1924,7 @@ mod owner_act_tests {
         use crate::server::routes::home::rename_home;
         use crate::server::routes::status::shutdown_handler;
         use crate::server::routes::sync::{enroll_device, unenroll_device};
-        use crate::server::routes::upgrade::apply_upgrade;
+        use crate::server::routes::upgrade::{apply_upgrade, clear_upgrade_hold};
         axum::Router::new()
             .route("/agent/sign", post(agent_sign))
             .route("/announce", post(announce_identity))
@@ -1936,6 +1936,7 @@ mod owner_act_tests {
             .route("/groups/:id/delegate", post(delegate_group_authority))
             .route("/home/rename", post(rename_home))
             .route("/upgrade/apply", post(apply_upgrade))
+            .route("/upgrade/clear-hold", post(clear_upgrade_hold))
             .route("/direct/send", post(direct_send))
             .route("/auth/session/refresh", post(refresh_session))
             .layer(axum::middleware::from_fn_with_state(
@@ -2851,6 +2852,12 @@ mod owner_act_tests {
             ),
             ("POST", "/shutdown", serde_json::json!({})),
             ("POST", "/upgrade/apply", serde_json::json!({})),
+            // #1376: a GUI session token cannot clear a release hold.
+            (
+                "POST",
+                "/upgrade/clear-hold?version=9.9.9",
+                serde_json::json!({}),
+            ),
             ("POST", "/sync/devices/enroll", serde_json::json!({})),
             (
                 "DELETE",

@@ -635,6 +635,11 @@ const COVERED: &[CoveredEndpoint] = &[
     // ── Upgrade ─────────────────────────────────────────────────────────
     covered!(Get, "/upgrade", daemon_api_upgrade_check),
     covered!(Post, "/upgrade/apply", "gui-upgrade-apply"),
+    covered!(
+        Post,
+        "/upgrade/clear-hold",
+        clear_upgrade_hold_route_records_and_removes_a_failed_hold
+    ),
     // ── WebSocket ───────────────────────────────────────────────────────
     covered!(Get, "/ws", daemon_api_ws_connect),
     covered!(Get, "/ws/direct", ws_direct_endpoint),
@@ -663,6 +668,11 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Post, "/grants", grant_routes_wired),
     covered!(Delete, "/grants/:id", grant_routes_wired),
     covered!(Get, "/grants/received", grant_routes_wired),
+    covered!(
+        Post,
+        "/grants/:id/renew",
+        issue1350_renew_issues_a_new_grant_with_no_gap
+    ),
     // ── Names (ADR-0074 §1) ─────────────────────────────────────────────
     covered!(Get, "/names", names_routes_wired),
     covered!(Post, "/names/resolve", names_routes_wired),
@@ -682,6 +692,10 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
     (
         "src/server/routes/network.rs",
         include_str!("../src/server/routes/network.rs"),
+    ),
+    (
+        "src/server/routes/upgrade.rs",
+        include_str!("../src/server/routes/upgrade.rs"),
     ),
     // #1383: the owner machine census route's coverage lives in the
     // owner route lib tests.

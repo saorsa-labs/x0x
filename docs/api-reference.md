@@ -993,8 +993,10 @@ carrier, only when that member's current verified advert sets
   stays on the group's `admin_availability.owner_recovery.owner` until the
   promoted member commits.
 - `409 Conflict` — `{"ok": false, "error": "recovery_not_needed" |
-  "recovery_member_ineligible" | "recovery_group_quarantined" |
-  "recovery_head_mismatch", "group_id"}`.
+  "waiting_for_active_admin" | "recovery_member_ineligible" |
+  "recovery_group_quarantined" | "recovery_head_mismatch", "group_id"}`.
+  `waiting_for_active_admin` means the roster has no Active admin seat at
+  all, so there is no revoked admin to replace.
 - `403 Forbidden` — a session token, or `recovery_signer_not_owner` (the
   group's owner is not this node's user key).
 - `404 Not Found` — the group is not known on this node.
@@ -2145,6 +2147,7 @@ every wait. A wait always names its cause; it does not stop silently.
 |---|---|---|
 | `DELETE /groups/:id/members/:agent_id`, `POST /groups/:id/ban/:agent_id`, `POST /groups/:id/state/seal` | `202 Accepted` | `{"ok": true, "queued": true, "status": "waiting_for_designated_admin", "group_id", "target", "request": "remove" \| "ban" \| "seal", "waiting": {"cause", "designated_admin", "detail": "rank", "local_rank", "remaining_ms", "fallback_at_unix_ms"}}`. The target has an open obligation and this admin's fallback time has not come. The request is queued. It does not rekey early. |
 | `DELETE /groups/:id/members/:agent_id`, `POST /groups/:id/ban/:agent_id`, `POST /groups/:id/state/seal` | `202 Accepted` | `{"ok": true, "queued": true, "status": <cause>, "group_id", "target", "request", "waiting": {"cause"}}` with cause `waiting_for_head_sync`, `waiting_for_durable_intake` or `local_committer_ineligible`. This admin is designated or past its fallback time, but the S4 evaluation does not let it seal yet. The daemon checks again under the group's membership lock, just before any change. The request is queued. Nothing is sealed from a stale head. |
+| `POST /groups/:id/ban/:agent_id` (TreeKEM group, target with no seat and no leaf) | `200 OK` / `409 Conflict` | #1540: the ban is roster-only — no TreeKEM commit, no epoch change — and answers `{"ok": true, "revision", "roster_only": true}`. While another Active member's current verified advert lacks application bit 17 (`roster_only_ban_v1`) it answers 409 `{"ok": false, "error": "waiting_for_receiver_upgrade", "capability": "roster_only_ban_v1", "members": [<agent hex>...]}` and changes nothing. |
 | Group sends, invites, member adds, seals, `POST /groups/:id/secure/encrypt` | `409 Conflict` | `{"ok": false, "error": "waiting_for_eligible_admin_revocation", "reason": ..., "state", "revoked_admins", "exit": "owner_recovery" \| "group_admin_revoked", "group_id"}`. No eligible admin remains, so no new message, admission or key can reach a revoked admin key. |
 | Same routes | `410 Gone` | `{"ok": false, "error": "group_admin_revoked", "reason": ..., "state", "revoked_admins", "exit", "recreate_offer", "group_id"}`. A group without `OwnerCertified` admission whose admins are all revoked. This is final for the group. |
 | `POST /groups/:id/secure/encrypt` (GSS plane) | `424 Failed Dependency` | `{"ok": false, "error": "no shared secret available — await welcome or ask admin to re-share"}`. The caller is an active member that holds no group secret and no verified-removal hold: an encrypted-group joiner still waiting for its welcome share. The keyless survivor of the 409 row below is not this state — its hold is what separates the two answers.
@@ -2386,7 +2389,8 @@ legacy-decoded container:
   seat (with its TreeKEM leaf, with one GSS rotation, or the roster seat
   alone in a `SignedPublic` group) and makes the promoted member Admin.
   Receivers accept it only under the §4b(1) rule. Typed refusals:
-  `recovery_not_needed`, `recovery_head_mismatch`,
+  `recovery_not_needed`, `waiting_for_active_admin` (no Active admin
+  seat), `recovery_head_mismatch`,
   `recovery_signer_not_owner`, `recovery_member_ineligible`,
   `recovery_proof_invalid`, `recovery_group_quarantined`. The promoted
   member holds the commit while a known Active member's current advert
@@ -3747,7 +3751,10 @@ a typed `403`.
   evaluates it; the remote read/write surface that consumes it is the A4
   sharing-completeness slice and is not yet wired.
 - `expiry` (Unix seconds) or `ttl_secs` (seconds from `not_before`): set
-  exactly one, else `400`. Grants must expire.
+  exactly one, else `400`. Grants must expire. The window
+  `expiry - not_before` is at most 90 days (7776000 s); a longer grant is
+  refused with `400` and nothing is stored (#1350). To keep access going,
+  renew the grant (below).
 - `not_before` (optional, Unix seconds): default is now.
 - `deliver_to` (optional, 64-hex agent ids): more agents to deliver the grant
   to.
@@ -3797,6 +3804,34 @@ body as a literal, `@path`, a bare path, or `-` for stdin, plus the optional
 | POST | `/grants` | `x0x grant issue <GRANT_JSON>` | Sign a share grant with the owner key, store it, and deliver it by durable DM |
 | DELETE | `/grants/:id` | `x0x grant revoke <id>` | Revoke a share grant (owner key; revocation gossiped on `x0x.revocation.v3` and pushed directly to capable recipients) |
 | GET | `/grants/received` | `x0x grant received` | List share grants that name this install as grantee |
+| POST | `/grants/:id/renew` | `x0x grant renew <id> [--ttl-secs N] [--deliver-to <agent>]... [--no-names]` | Renew an issued share grant: sign a new grant with the same grantee, agents and caps, valid from now (at most 90 days), and deliver it |
+
+**Lifetime and renewal (#1350).** A share grant lasts at most 90 days
+(`expiry - not_before` ≤ 7776000 s). The daemon refuses a longer grant when
+it signs one (`POST /grants` answers `400`) and when it receives one: a
+longer grant from an older peer is not stored and its DM is not ACKed. A
+grant stored before this rule keeps loading and runs to its own expiry.
+
+`POST /grants/:id/renew` takes an optional body (an empty body takes every
+default; unknown fields are refused):
+
+```json
+{ "ttl_secs": 7776000, "deliver_to": ["<64-hex agent id>"], "include_names": true }
+```
+
+- `ttl_secs` (optional): the renewal's lifetime from now, 1 to 7776000;
+  default 7776000 (90 days). Out of range is `400`.
+- `deliver_to`, `include_names`: as for `POST /grants`.
+
+The renewal is a NEW grant (new `grant_id`) with the same grantee, agents
+and caps, valid from now. The response is the `POST /grants` response plus
+`renews` (the old grant id). The old grant is not changed and stays valid to
+its own expiry, so a renewal that is delivered before that expiry leaves the
+grantee no gap. On the wire a renewal is an ordinary grant, so older peers
+accept it. `404` when this install did not issue the grant; `400` when the
+grant is revoked. A renewal after the old expiry also works, but the grantee
+has no grant between the two windows. Revoking access after a renewal needs
+`DELETE` of each grant that is still active.
 
 **Direct revocation push (#1003).** A successful `DELETE /grants/:id` also
 pushes the one signed revocation record, as a typed DM
@@ -3818,6 +3853,7 @@ no push; the retry does.
 |---|---|---|---|
 | GET | `/upgrade` | — (CLI does not call this) | Daemon-side check for updates (release manifests over the `x0x/release` gossip topic; GitHub first-discovery fallback). Read-only: a check that finds a newer release announces nothing and never leads to an install on this node (#1169, Engineer ruling 3 Nov 2026 17:40 GMT) |
 | POST | `/upgrade/apply` | `x0x upgrade --apply` | Daemon applies the latest verified release manifest with transactional restart; the observed release is announced on `x0x/release` before the apply work (#1169) |
+| POST | `/upgrade/clear-hold?version=<v>` | `x0x upgrade --clear-hold <v>` | Authenticated, recorded local clear of this install's failed-release probe hold for exactly `<v>` (D190, #1376). `200` `{cleared:true, version, cause, transaction_id}` after a durable receipt (`<daemon>.upgrade-probe.json.cleared`) and removal of the hold; `404` when no failed-release hold exists for `<v>`; `409` for recovery-failed or an unresolved probe record (never cleared locally) or while another upgrade runs; `400` for a missing or non-semver version; `501` off Unix. A newer release clears such a hold by itself |
 | GET | `/diagnostics/upgrade` | `x0x diagnostics upgrade` | Local version + update policy + version/policy digest for the M1 census (#1383; no update check runs, nothing is announced) |
 
 **Version/policy digest (#1383).** `GET /diagnostics/upgrade` reports the
