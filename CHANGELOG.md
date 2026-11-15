@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`GET /diagnostics/upgrade` reports the upgrade records on disk (#1381
+  M2 part, A14 amendment of 15 Nov 2026).** New fields: `plan` (the safe-apply
+  journal's transaction, phase and versions), `last_attempt` (the pre-swap
+  probe record), `holds` (failed-release or recovery-failed, with whether
+  `x0x upgrade --clear-hold` applies), `last_hold_clear`, `backups` (backup
+  files beside the daemon and CLI) and `records_error`. Fixed record names
+  only; no recorded path is followed and no argv, environment or free-text
+  cause is returned.
 - **A join request the authority refuses as `stale` is signed again over the
   authority's head (#1840 routes 1–3, A08 amendment of 15 Nov 2026).** A
   second joiner on a group with members, a request that crosses an edit of

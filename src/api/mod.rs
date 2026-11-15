@@ -704,7 +704,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Get,
         path: "/diagnostics/upgrade",
         cli_name: "diagnostics upgrade",
-        description: "Local version, update policy and digest (#1383), plus channel, latest release-topic version, last check and pending update (#1381); local only, no wire change",
+        description: "Local version, update policy and digest (#1383), plus channel, latest release-topic version, last check, pending update, upgrade plan, last attempt, backups and holds (#1381); local only, no wire change",
         category: "network",
         request: RequestSpec::None,
     },
