@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **A `stale` join-request outcome can carry the authority's head (#1840,
+  A08 amendment of 15 Nov 2026).** New optional `head` field on
+  `groups::join_outcome::JoinRequestOutcome` (signed head commit, roster
+  projection, public metadata) and `groups::join_outcome::adopt_join_head`,
+  which checks a head against a requester's copy and installs it. Wire and
+  library only: nothing sends or uses a head yet.
 - **`GET /diagnostics/upgrade` reports release observations (#1381, A14
   amendment of 15 Nov 2026).** New fields: `channel` (`stable` or
   `prerelease`), `latest_release_topic_version` (highest verified release
@@ -131,6 +137,11 @@ All notable changes to this project will be documented in this file.
 
 ### Tests and tooling
 
+- **Release propagation over real gossip (#1169).** A two-node loopback test
+  runs node A's fallback driver, which observes a signed release and
+  publishes it on `x0x/release`, and node B's gossip driver, which verifies
+  it and queues it with its background apply owner. It passes in about 4 s
+  against the issue's bar of 2 × the 600 s heartbeat.
 - **The forward gate after a true restart of the receiver (#1107).** A new
   real-path test shuts the receiving daemon down, builds it again from its
   files, and opens a `ForwardV2` stream from an owner device it knows only
@@ -171,6 +182,20 @@ All notable changes to this project will be documented in this file.
   registered=0`. Fixtures log at `warn`, where dial and join activity is
   not recorded. A daemon that does not answer keeps unknown counts; it is
   never reported as zero connections.
+
+### Fixed
+
+- **A daemon that restarts with pending S4 work no longer seals a stale
+  head (#1581).** If the `.evs` file held an unsealed revocation-eviction
+  row, the group needs a holder to confirm its head before S4 seals there.
+  Until then the row shows `waiting_for_head_sync`, also past the 13 s
+  restart sync wait. Before, the wait alone counted as a synced head, and a
+  restarted admin could seal its stale head with a divergent key.
+- **A demoted S4 worker shows `local_committer_ineligible` (#1581).** An
+  admin that is demoted to member while it holds an open revocation-eviction
+  row now marks the row `local_committer_ineligible` naming the next
+  admin, as ADR 0110 §4 wants. Before, the row showed
+  `waiting_for_designated_admin`.
 
 ## [v0.48.1] - 2026-10-17
 

@@ -61,14 +61,14 @@
       "revision": 1,
       "path": "A08-r01-groups-home-membership-and-repair.md",
       "title": "Groups Home Membership and Repair",
-      "sha256": "2958f3d8b70e2408ccaba8256180a7d96c96d9e18bdb49a2fd9e237a3a6aaf86"
+      "sha256": "c4d05d2fe9cf124bdc761ba9dd7fb7a36df82f7f431e49edd9fcc57b58a5f094"
     },
     {
       "id": "A09",
       "revision": 1,
       "path": "A09-r01-group-encryption-and-key-changes.md",
       "title": "Group Encryption and Key Changes",
-      "sha256": "68a664f85a6db929c9569855f9a6ef899a66dee4a84acbe3ff3161355a90acbf"
+      "sha256": "4f88aab361756a152fecffd4d06586def9414f0a98cce0a19647f2a226e465bc"
     },
     {
       "id": "A10",

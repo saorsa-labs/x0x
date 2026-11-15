@@ -46,12 +46,14 @@
 //! the restart sync wait, A keeps the typed `waiting_for_head_sync`,
 //! seals nothing (inside the wait and past it), and the later release
 //! still converges on D's single exclusion with no second rotation and
-//! a coherent data plane. `main` violates the claim — the same
-//! `HeadRound::synced` wait branch treats 13 s of silence from holders
-//! it asked as a usable local head, so A seals its stale head at about
-//! the sync wait with a divergent key — so the arm is wired as an
-//! expected RED with `CAUSE_STALE_SEAL`; it turns GREEN when the
-//! production fix (which follows fenced #1627 under #1581) lands.
+//! a coherent data plane. Before #1581's fix the `HeadRound::synced`
+//! wait branch treated 13 s of silence from holders it asked as a usable
+//! local head, so A sealed its stale head at about the sync wait with a
+//! divergent key (`CAUSE_STALE_SEAL`, pinned RED). Now a group whose
+//! unsealed row this boot loaded from the previous boot's `.evs` is in
+//! `S4Inner::restart_unconfirmed` until a holder confirms its head, and
+//! the wait alone does not sync it while a holder exists, so the arm
+//! expects GREEN.
 //!
 //! Before t = 0 the ordinary `private_secure` (TreeKEM) group is
 //! settled (every node at A's state revision r0 and epoch e0, four
@@ -78,9 +80,9 @@
 //!   hold through a fixed read past the wait), A's epoch stays e0 at
 //!   the stale revision, D's and C's revisions stay at D's commit, and
 //!   after the release A converges on D's exclusion with no second
-//!   rotation and a coherent data plane. RED on `main` (the stale-head
-//!   seal, [`CAUSE_STALE_SEAL`]); GREEN with the ADR 0110 §2 fix. A
-//!   missing typed state fails with [`CAUSE_NO_TYPED_STATE`].
+//!   rotation and a coherent data plane. GREEN with the #1581 fix; a
+//!   stale-head seal fails with [`CAUSE_STALE_SEAL`], and a missing
+//!   typed state with [`CAUSE_NO_TYPED_STATE`].
 
 #![cfg(test)]
 
@@ -1450,9 +1452,9 @@ fn w3h_1581c_red_restart_stale_head_no_sync_past_wait() -> Result<()> {
             0x1581_0005,
             LABELS,
             true,
-            // RED on main (CAUSE_STALE_SEAL, the stale-head seal at the
-            // sync wait); GREEN with the ADR 0110 §2 fix.
-            Verdict::Red,
+            // RED before #1581's restart_unconfirmed fix (CAUSE_STALE_SEAL,
+            // the stale-head seal at the sync wait); GREEN with it.
+            Verdict::Green,
         )
         .await
     })
