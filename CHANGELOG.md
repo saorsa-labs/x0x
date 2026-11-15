@@ -65,8 +65,8 @@ All notable changes to this project will be documented in this file.
   (#1427).** The TreeKEM catch-up log is saved under `treekem-catchup-log/`
   in the data directory (one file per group, local only) and loaded at
   start. A member that was offline when a commit was made can catch up
-  from a signer that restarted since. A removal or ban that S4 still
-  delivers (an open ADR 0110 row) is not loaded from the saved file. A
+  from a signer that restarted since. A removal or ban that has an ADR
+  0110 (S4) row, in any phase, is not loaded from the saved file. A
   start catch-up cycle now waits for another running catch-up task of the
   same group to end before it judges the cycle. No wire format or API
   changes.

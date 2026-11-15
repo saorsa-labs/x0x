@@ -9848,10 +9848,11 @@ fn treekem_removal_target(event: &NamedGroupMetadataEvent) -> Option<&str> {
 /// commits it held before the restart. It runs after the S4 store loads.
 /// A file of a group this node no longer stores is removed. Each event
 /// goes through the rules of a live one ([`log_treekem_membership_event`]),
-/// with one more: a removal or ban whose target has an open S4 row
-/// (ADR 0110, for example `committed_delivery_pending`) is not served from
-/// the saved log. S4 owns the delivery of that commit, and after a restart
-/// it resends only once the group's head is synced.
+/// with one more: a removal or ban whose target has an S4 row (ADR 0110),
+/// in any phase, is not served from the saved log. S4 owns the delivery of
+/// that commit: an open row (for example `committed_delivery_pending`)
+/// resends it only once the group's head is synced, and a closed row can
+/// hold a sibling that lost to another admin's commit.
 pub(in crate::server) async fn restore_treekem_catchup_logs(state: &AppState) {
     let dir = state.data_dir.join("treekem-catchup-log");
     let Ok(mut listed) = tokio::fs::read_dir(&dir).await else {
@@ -9907,7 +9908,7 @@ pub(in crate::server) async fn restore_treekem_catchup_logs(state: &AppState) {
             if let Some(target) =
                 treekem_removal_target(event).and_then(|t| parse_agent_id_hex(t).ok())
             {
-                if revocation_eviction::s4_row_open_for(state, &stable, target.0).await {
+                if revocation_eviction::s4_has_row_for(state, &stable, target.0).await {
                     held += 1;
                     continue;
                 }

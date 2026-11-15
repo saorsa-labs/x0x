@@ -116,10 +116,10 @@ loads it at start, after the S4 store. So a node that restarted after it
 signed or applied a commit still serves it to a member that was offline at
 the time. The saved log of a group the node no longer stores is removed,
 and deleting a group removes its files. One rule protects S4: a removal or
-ban whose target still has an open S4 row (ADR 0110, for example
-`committed_delivery_pending`) is not loaded from the saved log, because S4
-owns the delivery of that commit and resends it only after the group's
-head is synced. A start catch-up cycle that hands its target to another
+ban whose target has an S4 row (ADR 0110), in any phase, is not loaded
+from the saved log. S4 owns the delivery of that commit: an open row
+resends it only after the group's head is synced, and a closed row can
+hold a sibling that lost to another admin's commit (the W3-H 1581e fork). A start catch-up cycle that hands its target to another
 running catch-up task waits for that task to end before it judges the
 cycle. Not covered yet: a member that stays up through a network outage.
 No wire format or API changes.
