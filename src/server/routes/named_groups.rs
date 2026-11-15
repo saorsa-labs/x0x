@@ -14107,6 +14107,7 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
             reported_head.as_deref(),
         )
         .await;
+        treekem_start_catchup_note_head(state, &response_key, reported_head.as_deref()).await;
         let peer_open = self_leave_rekey_fence_peer_open(&fence_ids, &sender_hex);
         let any_open = self_leave_rekey_fence_any_open(&fence_ids);
         if peer_open {
@@ -15610,6 +15611,308 @@ fn epoch_ahead_catchup_peers(
         .take(TREEKEM_EPOCH_AHEAD_CATCHUP_PEERS)
         .map(|(_, peer)| peer)
         .collect()
+}
+
+/// #1427: how often a running daemon records that it is up
+/// ([`treekem_alive_path`]).
+const TREEKEM_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// #1427: the file that holds the last time (Unix ms) this daemon was up.
+/// Local state only.
+fn treekem_alive_path(state: &AppState) -> std::path::PathBuf {
+    state.data_dir.join("treekem-alive")
+}
+
+fn treekem_unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// #1427: the keys of the TreeKEM groups this node can ask a catch-up page
+/// for: stored, not withdrawn, the local agent is an active member, and
+/// the TreeKEM group is loaded.
+async fn treekem_start_catchup_groups(state: &AppState) -> Vec<String> {
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let candidates: Vec<String> = {
+        let groups = state.named_groups.read().await;
+        groups
+            .iter()
+            .filter(|(_, info)| !info.withdrawn && info.has_active_member(&local_agent_hex))
+            .map(|(key, _)| key.clone())
+            .collect()
+    };
+    let loaded = state.treekem_groups.read().await;
+    candidates
+        .into_iter()
+        .filter(|key| loaded.contains_key(key))
+        .collect()
+}
+
+/// #1427: the outage record. It is written when a start finds the daemon
+/// was down past the last metadata resend, and removed when the start
+/// catch-up of every TreeKEM group succeeds. The up-time record is
+/// overwritten at once, so a start whose catch-up could not reach a peer
+/// (a slow bootstrap) still asks on the next start. Local state only.
+fn treekem_catchup_pending_path(state: &AppState) -> std::path::PathBuf {
+    state.data_dir.join("treekem-catchup-pending")
+}
+
+/// #1427: the start catch-up of `key` succeeded, or the group no longer
+/// needs it. When no group is left, the outage record is removed.
+async fn treekem_start_catchup_done(state: &AppState, key: &str) {
+    let none_left = {
+        let mut pending = state
+            .treekem_start_catchup_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !pending.remove(key) {
+            return;
+        }
+        pending.is_empty()
+    };
+    if !none_left {
+        return;
+    }
+    match tokio::fs::remove_file(treekem_catchup_pending_path(state)).await {
+        Ok(()) => tracing::info!("TreeKEM start catch-up done; outage record removed"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!("TreeKEM outage record was not removed: {error}"),
+    }
+}
+
+/// #1427: a verified last catch-up page from a member whose saved head
+/// equals the local saved head after the page applied. This member is as
+/// current as that member, so its start catch-up succeeded even though no
+/// commit was missed.
+async fn treekem_start_catchup_note_head(state: &AppState, key: &str, reported: Option<&str>) {
+    let Some(reported) = reported.filter(|head| !head.is_empty()) else {
+        return;
+    };
+    let pending = state
+        .treekem_start_catchup_pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(key);
+    if !pending {
+        return;
+    }
+    let current = state
+        .named_groups
+        .read()
+        .await
+        .get(key)
+        .is_some_and(|info| info.state_hash == reported);
+    if current {
+        treekem_start_catchup_done(state, key).await;
+    }
+}
+
+/// #1427: the most catch-up cycles one start pass runs for one group. A
+/// served page can move the group by one epoch, so a member that missed
+/// several commits needs a cycle for each.
+const TREEKEM_START_CATCHUP_CYCLES: usize = 16;
+
+/// #1427: how a start pass for one group ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TreeKemStartCatchupEnd {
+    /// The group moved and a later cycle brought no newer epoch, a member
+    /// reported the local head, or the group is gone.
+    Done,
+    /// No cycle moved the group, or the cycles ran out while it still
+    /// moved. The group stays pending.
+    KeepPending,
+}
+
+/// #1427: the cycle rule of one start pass. `cycle(target)` runs one
+/// catch-up cycle toward `target`. While a cycle moves the group, the
+/// next cycle asks for the epoch after the new one, so a member that is
+/// several commits behind keeps asking. The pass is done when a cycle
+/// after a move brings no newer epoch, or when `pending()` turns false
+/// (a member reported the local head). The cycles are bounded by
+/// [`TREEKEM_START_CATCHUP_CYCLES`].
+async fn drive_treekem_start_catchup<E, C>(
+    mut epoch_now: impl FnMut() -> E,
+    mut cycle: impl FnMut(u64) -> C,
+    pending: impl Fn() -> bool,
+) -> TreeKemStartCatchupEnd
+where
+    E: std::future::Future<Output = Option<u64>>,
+    C: std::future::Future<Output = ()>,
+{
+    let Some(mut from) = epoch_now().await else {
+        return TreeKemStartCatchupEnd::Done;
+    };
+    let mut moved = false;
+    for _ in 0..TREEKEM_START_CATCHUP_CYCLES {
+        cycle(from.saturating_add(1)).await;
+        if !pending() {
+            return TreeKemStartCatchupEnd::Done;
+        }
+        match epoch_now().await {
+            None => return TreeKemStartCatchupEnd::Done,
+            Some(now) if now > from => {
+                from = now;
+                moved = true;
+            }
+            Some(_) if moved => return TreeKemStartCatchupEnd::Done,
+            Some(_) => return TreeKemStartCatchupEnd::KeepPending,
+        }
+    }
+    TreeKemStartCatchupEnd::KeepPending
+}
+
+/// #1427: ask the other members of one TreeKEM group for catch-up pages,
+/// with no epoch-ahead traffic needed. Each cycle runs as the group's
+/// epoch-ahead task ([`request_treekem_catchup_for_epoch_ahead`]) with the
+/// next epoch as the target, so it never runs beside another catch-up
+/// task for the group; when an epoch-ahead task already runs, that task
+/// takes the target. [`drive_treekem_start_catchup`] repeats the cycle
+/// while the group moves. The group stays pending until the pass is done,
+/// a member reports the local head, or this member leaves the group.
+async fn request_treekem_catchup_after_start(state: &Arc<AppState>, key: &str) {
+    state
+        .treekem_start_catchup_passes
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let end = drive_treekem_start_catchup(
+        || {
+            let state = Arc::clone(state);
+            let key = key.to_string();
+            async move { current_treekem_epoch(&state, &key).await }
+        },
+        |target| {
+            let state = Arc::clone(state);
+            let key = key.to_string();
+            async move { request_treekem_catchup_for_epoch_ahead(&state, &key, target).await }
+        },
+        || {
+            state
+                .treekem_start_catchup_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(key)
+        },
+    )
+    .await;
+    if end == TreeKemStartCatchupEnd::Done
+        || !treekem_start_catchup_groups(state)
+            .await
+            .iter()
+            .any(|k| k == key)
+    {
+        treekem_start_catchup_done(state, key).await;
+    }
+}
+
+/// #1427: run [`request_treekem_catchup_after_start`] for each pending
+/// group, each on its own task. After the first pass, the task waits for
+/// the end of the network join (at once when it has already ended) and,
+/// when the group is still pending, runs one more pass. So the order of
+/// the join and of this registration does not matter: a start pass that
+/// ran during a slow bootstrap always gets a pass after the join.
+fn spawn_treekem_start_catchup(state: &Arc<AppState>, keys: Vec<String>) {
+    for key in keys {
+        let task_state = Arc::clone(state);
+        let mut join_ended = state.treekem_network_join_ended.subscribe();
+        let _admitted = state.spawn_detached(async move {
+            request_treekem_catchup_after_start(&task_state, &key).await;
+            if join_ended.wait_for(|ended| *ended).await.is_err() {
+                return;
+            }
+            let still_pending = task_state
+                .treekem_start_catchup_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&key);
+            if still_pending {
+                tracing::info!(
+                    group_id = %LogHexId::group(&key),
+                    "network join ended; asking again for TreeKEM catch-up pages"
+                );
+                request_treekem_catchup_after_start(&task_state, &key).await;
+            }
+        });
+    }
+}
+
+/// #1427: the network join has ended (Ok or Err). Each start catch-up
+/// task that is still pending, or that registers later, then asks again
+/// ([`spawn_treekem_start_catchup`]).
+pub(in crate::server) fn retry_treekem_start_catchup(state: &AppState) {
+    state.treekem_network_join_ended.send_replace(true);
+}
+
+/// #1427: the start catch-up of TreeKEM groups. A member that was down
+/// past the last metadata resend ([`GROUP_CONTROL_REDELIVERY_SCHEDULE`])
+/// can have missed a commit, and with no later traffic nothing else asks
+/// for it. So when the last recorded up time is older than that resend, or
+/// an earlier start left the outage record
+/// ([`treekem_catchup_pending_path`]), the start runs
+/// [`request_treekem_catchup_after_start`] for each group, and each group
+/// that is still pending asks again after the network join
+/// ([`spawn_treekem_start_catchup`]). A
+/// shorter outage is left to the resends, and a first start (no record)
+/// asks nothing. While the daemon runs, it records its up time every
+/// [`TREEKEM_ALIVE_INTERVAL`]. Both records are written atomically.
+pub(in crate::server) async fn run_treekem_start_catchup(state: Arc<AppState>) {
+    let path = treekem_alive_path(&state);
+    let record = treekem_catchup_pending_path(&state);
+    let last_up = tokio::fs::read_to_string(&path)
+        .await
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok());
+    let missed_resends = GROUP_CONTROL_REDELIVERY_SCHEDULE
+        .last()
+        .copied()
+        .unwrap_or_default();
+    let down_for =
+        last_up.map(|last| Duration::from_millis(treekem_unix_now_ms().saturating_sub(last)));
+    let outage = down_for.is_some_and(|down| down > missed_resends);
+    let recorded = tokio::fs::try_exists(&record).await.unwrap_or(false);
+    if outage || recorded {
+        let keys = treekem_start_catchup_groups(&state).await;
+        state
+            .treekem_start_catchup_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(keys.iter().cloned());
+        if keys.is_empty() {
+            if recorded {
+                let _ = tokio::fs::remove_file(&record).await;
+            }
+        } else if !recorded {
+            // Before the first up-time write below replaces the outage.
+            let down_ms = down_for.map(|down| down.as_millis()).unwrap_or_default();
+            if let Err(error) =
+                crate::profile::write_atomically(&record, down_ms.to_string().as_bytes()).await
+            {
+                tracing::warn!("TreeKEM outage record was not written: {error}");
+            }
+        }
+        for key in &keys {
+            tracing::info!(
+                group_id = %LogHexId::group(key),
+                down_secs = down_for.map(|down| down.as_secs()).unwrap_or_default(),
+                recorded,
+                "down past the last metadata resend; asking for a TreeKEM catch-up page"
+            );
+        }
+        spawn_treekem_start_catchup(&state, keys);
+    }
+    let mut shutdown = state.shutdown_notify.subscribe();
+    loop {
+        if let Err(error) =
+            crate::profile::write_atomically(&path, treekem_unix_now_ms().to_string().as_bytes())
+                .await
+        {
+            tracing::debug!("TreeKEM up-time record was not written: {error}");
+        }
+        tokio::select! {
+            _ = shutdown.changed() => return,
+            _ = tokio::time::sleep(TREEKEM_ALIVE_INTERVAL) => {}
+        }
+    }
 }
 
 /// ADR 0110 §3: the one route for missing leaf evidence. Every S4 path
@@ -53668,6 +53971,7 @@ pub(in crate::server) mod tests {
     mod issue1347_join_request_token_class;
     pub(in crate::server) mod issue1366_public_listener;
     pub(in crate::server) mod issue1368_crash_matrix;
+    mod issue1427_start_catchup;
     mod issue1540_roster_only_ban;
     mod issue1569_owner_certified_placeholder;
     mod issue1570_held_back_cards;
@@ -54532,6 +54836,9 @@ pub(in crate::server) mod tests {
                 TREEKEM_CATCHUP_SERVE_SLOTS,
             )),
             treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
+            treekem_start_catchup_pending: Default::default(),
+            treekem_network_join_ended: tokio::sync::watch::channel(false).0,
+            treekem_start_catchup_passes: Default::default(),
             treekem_catchup_refusals: StdMutex::new(HashMap::new()),
             join_request_outcome_sends: StdMutex::new(HashMap::new()),
             group_membership_locks: RwLock::new(HashMap::new()),

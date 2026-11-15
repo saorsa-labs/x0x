@@ -36,6 +36,7 @@ mod rider_auth;
 mod routes;
 mod sse;
 mod state;
+mod system_events;
 mod update_check;
 #[cfg(any(unix, windows))]
 mod upgrade_flush;
@@ -1400,6 +1401,9 @@ pub async fn serve_with_options(
             routes::named_groups::TREEKEM_CATCHUP_SERVE_SLOTS,
         )),
         treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
+        treekem_start_catchup_pending: Default::default(),
+        treekem_network_join_ended: tokio::sync::watch::channel(false).0,
+        treekem_start_catchup_passes: Default::default(),
         treekem_catchup_refusals: StdMutex::new(HashMap::new()),
         join_request_outcome_sends: StdMutex::new(HashMap::new()),
         group_membership_locks: RwLock::new(HashMap::new()),
@@ -1615,6 +1619,8 @@ pub async fn serve_with_options(
         // here rather than reaching back into the config from the task.
         let resolved_plane = config.resolved_network_id();
         let mut verdict_windows = health_verdict::VerdictWindows::default();
+        // #1351: verdict and upgrade-input changes become `system.*` events.
+        let mut system_events = system_events::SystemEventTracker::default();
         bg_tasks.push(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
                 routes::status::HEALTH_SNAPSHOT_REFRESH_SECS,
@@ -1660,6 +1666,7 @@ pub async fn serve_with_options(
                 )
                 .await;
                 snapshot_state.health_snapshot.store_verdict_sample(sample);
+                system_events::emit_changes(&snapshot_state, &mut system_events);
             }
         }));
     }
@@ -2170,6 +2177,10 @@ pub async fn serve_with_options(
                 tracing::error!("Failed to join network: {e}");
             }
         }
+        // #1427: a start catch-up that ran during a slow bootstrap asks
+        // again now that the join has ended, whether it registered before
+        // or after this point.
+        routes::named_groups::retry_treekem_start_catchup(&join_rekey_state);
     }));
 
     let self_published_release_manifests = Arc::clone(&state.self_published_release_manifests);
@@ -2687,6 +2698,13 @@ pub async fn serve_with_options(
                 .await;
         }));
     }
+
+    // #1427: a TreeKEM member that was down past the last metadata resend
+    // asks for the commits it missed after its start, with no later
+    // traffic needed.
+    bg_tasks.push(tokio::spawn(
+        routes::named_groups::run_treekem_start_catchup(Arc::clone(&state)),
+    ));
 
     // #1663: a member of an encrypted GSS group whose own seat carries no
     // KEM key republishes the key at boot. The keyless-install hook covers
