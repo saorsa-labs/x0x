@@ -116,6 +116,12 @@ All notable changes to this project will be documented in this file.
   same group to end before it judges the cycle. No wire format or API
   changes.
 
+- **Docs: what a machine revocation protects (#1929).** A machine revocation
+  denies delivery, transport and requests to that device. It does not cut a
+  device that still holds the agent key off TreeKEM group content, because
+  the leaf keys derive from the agent key. To cut off a lost or stolen
+  device, revoke the agent or remove the member. See
+  `docs/trust-and-connectivity.md`, `docs/api-reference.md` and A09.
 - **Documented the exit for a forked head behind an armed gap record
   (#871).** The anchored-gap gate has no expiry and no local clear. With no
   progress (10 minutes for an owner-armed gap, 30 minutes for an
