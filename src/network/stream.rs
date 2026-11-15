@@ -60,6 +60,16 @@ mod test_halves {
     }
 
     impl StreamSend {
+        /// The connection generation this stream was opened or accepted on
+        /// (ant-quic `SendStream::connection_generation`; the simulated half
+        /// carries its link generation).
+        pub fn connection_generation(&self) -> u64 {
+            match self {
+                Self::Quic(send) => send.connection_generation(),
+                Self::Sim(send) => send.generation(),
+            }
+        }
+
         /// Write all of `buf` (ant-quic `SendStream::write_all`).
         pub async fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
             match self {

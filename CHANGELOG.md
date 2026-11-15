@@ -286,6 +286,14 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **An evidence Hello on a followed older connection gets a reply again
+  (#1346, A05 amendment of 15 Nov 2026).** The Hello reply gate charged a
+  high-water mark of connection generations, so after ant-quic made an older
+  connection the winner again (ADR-017 follow) a Hello on it got only an ACK.
+  The gate now charges the accepted stream's own connection generation
+  (ant-quic 0.27.62), and each generation gets one attempt in a bounded
+  record; the 60-second machine gate is unchanged. A local race no longer
+  charges the peer a reset. No wire-format change.
 - **A listener-admission marker that can never complete no longer blocks join
   requests (#1840, A08 amendment of 15 Nov 2026).** An early-gate refusal
   (revoked or unverified sender, revocation-resync hold, withdrawn group), an
@@ -314,6 +322,15 @@ pub/sub constructors now take `Arc<SigningContext>` instead of
 
 ### Dependencies
 
+- **ant-quic `=0.27.62`** (was `=0.27.61`). It adds
+  `SendStream`/`RecvStream::connection_generation()` only (ant-quic#327).
+- **saorsa-gossip `=0.5.91`** for all eleven `saorsa-gossip-*` crates (was
+  `=0.5.90`; A06 amendment of 15 Nov 2026). Critical Data sends are no
+  longer held back by peer cooling at claim time; V3 control retries keep
+  one recovery intent; per-kind verify counters and `msg_id` subscriptions
+  are added. The #501 controlled-load producer allowlist now accepts only the
+  crates.io saorsa-gossip-pubsub 0.5.91 package (checksum `f69989fc…`);
+  0.5.90 is refused as superseded.
 - **ant-quic `=0.27.61`** (was `=0.27.60`).
 - **saorsa-gossip `=0.5.90`** for all eleven `saorsa-gossip-*` crates (was
   `=0.5.89`). saorsa-gossip 0.5.90 changes only its ant-quic pin to

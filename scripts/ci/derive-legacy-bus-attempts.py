@@ -27,15 +27,21 @@ KEY_CACHE_CONTROL_TOPIC = "saorsa-gossip/key-cache-control/v1"
 CONTROL = "87f4025bf2b9a4ad"
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 HEX16 = re.compile(r"[0-9a-f]{16}\Z")
-# crates.io 0.5.90: pubsub sources are byte-identical to 0.5.89 (0.5.90 only
-# moves the ant-quic pin to =0.27.61). Compared with 0.5.88, 0.5.89 changed
-# only payload replay refusal state/handling and tests. Outbound meters,
+# crates.io 0.5.91: against 0.5.90 it adds per-kind verify counters,
+# msg_id-carrying subscriptions, the Critical Data cooling exemption at claim
+# time, V3 recovery-intent keying, no send attempts for a stale eager-reply
+# claim (pruned or token mismatch), no IWANT re-admission while
+# retry_pending, and refusal of a local publish whose signing returns an
+# empty signature (msg_id_after_local_sign); none changes an outbound meter
+# definition.
+# 0.5.90's pubsub sources were byte-identical to 0.5.89, which changed only
+# payload replay refusal relative to 0.5.88. Outbound meters,
 # wire_bytes_for_peer and key_cache CONTROL_DOMAIN retain the reviewed
-# accounting semantics. Refused replays can change attempt counts without
-# changing the meter.
-REGISTRY_PUBSUB_VERSION = "0.5.90"
+# accounting semantics. Refused replays and claim changes can move attempt
+# counts without changing the meter.
+REGISTRY_PUBSUB_VERSION = "0.5.91"
 REGISTRY_PUBSUB_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
-REGISTRY_PUBSUB_SHA = "ae450e28dd005cd606e006815fde51e515c6c0dc671a94e5fc044e35228320b0"
+REGISTRY_PUBSUB_SHA = "f69989fc3f21060f6294a359eb1ca15e0ccede5065bb8f92d75ed8fa703867e6"
 GIT_PUBSUB_VERSION = "0.5.85"
 GIT_PUBSUB_URL = "https://github.com/saorsa-labs/saorsa-gossip.git"
 # SG 997abc75: per-peer wire-byte accounting via wire_bytes_for_peer;
@@ -91,7 +97,7 @@ def validate_source_premise(cargo_bytes, rust_bytes):
     manifest = tomllib.loads(cargo_bytes.decode())
     pin = manifest.get("dependencies", {}).get("saorsa-gossip-pubsub")
     patch = manifest.get("patch", {}).get("crates-io", {}).get("saorsa-gossip-pubsub")
-    # Registry 0.5.90 is the current package; the historical git producers
+    # Registry 0.5.91 is the current package; the historical git producers
     # remain at 0.5.85 and require an exact reviewed patch revision.
     if patch is None:
         require(pin == f"={REGISTRY_PUBSUB_VERSION}", "WORKSPACE_PUBSUB_PIN_MISMATCH")
