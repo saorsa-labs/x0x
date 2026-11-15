@@ -177,6 +177,13 @@ All notable changes to this project will be documented in this file.
 
 ### Tests and tooling
 
+- **Launcher host coordinator recovery (#1376, S3c; A14 amendment of 15 Nov
+  2026).** A dormant coordinator pass (`src/upgrade/launcher/coordinator.rs`)
+  reconciles the host after a missing handoff, one healthy and one failed
+  participant, a coordinator death, a partial restore, a hold-write failure
+  and a reboot. It stops and reaps every live participant before a pair
+  restore, keeps `RecoveryFailed` final across restarts, and applies the
+  D189 retry rule. No production caller yet.
 - **Release propagation over real gossip (#1169).** A two-node loopback test
   runs node A's fallback driver, which observes a signed release and
   publishes it on `x0x/release`, and node B's gossip driver, which verifies

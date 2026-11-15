@@ -29,7 +29,7 @@ const OUTPUT_LIMIT: usize = 8192;
 const MAX_CANDIDATE_BYTES: u64 = 200 * 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const REAP_TIMEOUT: Duration = Duration::from_secs(2);
-const RETRY_DELAYS_MS: [u64; 3] = [30 * 60_000, 60 * 60_000, 120 * 60_000];
+pub(crate) const RETRY_DELAYS_MS: [u64; 3] = [30 * 60_000, 60 * 60_000, 120 * 60_000];
 
 /// Captured with the carried restart plan, before any await or mutation.
 /// The child inherits the old process's effective account and groups.

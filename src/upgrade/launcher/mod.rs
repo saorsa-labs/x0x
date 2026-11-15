@@ -9,6 +9,7 @@
 
 mod child;
 mod control;
+mod coordinator;
 mod filesystem;
 pub(crate) mod forward;
 #[path = "../journal.rs"]
