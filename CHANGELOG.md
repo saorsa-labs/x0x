@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`GET /sync/devices` names the source of each device's enrollment record
+  (#1107).** Each row has `record_source` (`"local"` when this machine wrote
+  the stored owner-device record, `"synced"` when another owner device wrote
+  it) and `record_writer_machine_id` (hex machine id of that writer). Both are
+  `null` when no stored record holds the enrollment shown, for example a new
+  enrollment that is not minted yet.
 - **Share grants last at most 90 days; `POST /grants/:id/renew` renews one
   (#1350, D35, A03 amendment of 14 Nov 2026).** `POST /grants` refuses a
   window above 90 days with `400`, and a daemon does not store (or ACK) a
