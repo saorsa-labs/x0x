@@ -1337,6 +1337,10 @@ pub(super) struct AppState {
     /// total.
     pub(super) join_request_outcome_sends:
         StdMutex<HashMap<[u8; 32], (u64, crate::identity::AgentId)>>,
+    /// Issue #1094 D1: grantee-side reads waiting for their reply.
+    pub(super) data_read_waiters: StdMutex<crate::server::data_read::DataReadWaiters>,
+    /// Issue #1094 D1: granted-agent side, per-sender serve counters.
+    pub(super) data_read_serve_limits: StdMutex<crate::server::data_read::DataReadServeLimits>,
     /// Per-group serialization for authoritative membership mutations. The
     /// owner-side `MemberJoined`→`MemberAdded` add (and every other membership
     /// apply) is a read-modify-write that loads `info`, mutates a clone, mutates

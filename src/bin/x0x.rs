@@ -548,6 +548,12 @@ enum GrantSub {
     },
     /// List grants that name this install as grantee.
     Received,
+    /// Read a store on a granted agent through a received data grant
+    /// (#1094): its keys, or one value when KEY is given.
+    Data {
+        #[command(subcommand)]
+        sub: GrantDataSub,
+    },
     /// Renew an issued grant: sign a new grant with the same grantee,
     /// agents and caps, valid from now (default and maximum 90 days), and
     /// deliver it. The old grant stays valid to its own expiry.
@@ -564,6 +570,31 @@ enum GrantSub {
         /// ADR 0079: withhold the owner and machine names from the renewal.
         #[arg(long)]
         no_names: bool,
+    },
+}
+
+/// `x0x grant data` sub-actions (#1094).
+#[derive(Subcommand)]
+enum GrantDataSub {
+    /// List the keys of the store.
+    Keys {
+        /// The granted agent (64 hex chars).
+        agent: String,
+        /// Stable group id, as in the grant.
+        group: String,
+        /// Store name, as in the grant (e.g. scratch).
+        store: String,
+    },
+    /// Read one value of the store.
+    Get {
+        /// The granted agent (64 hex chars).
+        agent: String,
+        /// Stable group id, as in the grant.
+        group: String,
+        /// Store name, as in the grant (e.g. scratch).
+        store: String,
+        /// The key.
+        key: String,
     },
 }
 
@@ -3563,6 +3594,19 @@ async fn run(
             GrantSub::List => commands::grant::list(&client).await,
             GrantSub::Revoke { id } => commands::grant::revoke(&client, &id).await,
             GrantSub::Received => commands::grant::received(&client).await,
+            GrantSub::Data { sub } => match sub {
+                GrantDataSub::Keys {
+                    agent,
+                    group,
+                    store,
+                } => commands::grant::data(&client, &agent, &group, &store, None).await,
+                GrantDataSub::Get {
+                    agent,
+                    group,
+                    store,
+                    key,
+                } => commands::grant::data(&client, &agent, &group, &store, Some(&key)).await,
+            },
             GrantSub::Renew {
                 id,
                 ttl_secs,
