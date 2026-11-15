@@ -647,6 +647,24 @@ impl Store {
     /// initialization, before any version is committed (controller decision
     /// C-0116-F1).
     pub fn open_with_busy_timeout(path: &Path, busy: std::time::Duration) -> HistoryResult<Self> {
+        Self::open_inner(path, busy, true)?
+            .ok_or_else(|| HistoryError::Database("history migration deferred".into()))
+    }
+
+    /// Open unless the database needs a schema migration (ADR 0094 §4, §6;
+    /// #1377). Inside an uncommitted upgrade trial a format-upgrade write
+    /// must wait for host commit, so an older schema returns `Ok(None)`
+    /// with every file byte-identical, as the newer-schema refusal leaves
+    /// it. A new database or one at this schema opens as usual.
+    pub(crate) fn open_unless_migration_needed(path: &Path) -> HistoryResult<Option<Self>> {
+        Self::open_inner(path, std::time::Duration::from_millis(5000), false)
+    }
+
+    fn open_inner(
+        path: &Path,
+        busy: std::time::Duration,
+        migrate_allowed: bool,
+    ) -> HistoryResult<Option<Self>> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 // Surface the resolved db path (the operator's `<data_dir>`
@@ -715,6 +733,11 @@ impl Store {
         if let Some(version) = stored.filter(|version| *version > SCHEMA_VERSION) {
             return Err(newer_schema_error(version));
         }
+        // #1377: an older schema waits for host commit. Like the refusal
+        // above, this returns before any setup write.
+        if !migrate_allowed && stored.is_some_and(|version| version < SCHEMA_VERSION) {
+            return Ok(None);
+        }
         // Compatible (or new): the ordinary close from here on.
         if wal_present {
             no_checkpoint_on_close(false).map_err(pragma_error)?;
@@ -745,7 +768,7 @@ impl Store {
         backfill_canonical_ids(&conn)?;
         let text_encoding: String = conn.query_row("PRAGMA encoding", [], |r| r.get(0))?;
         let (before_close, after_close) = close_watch::signals();
-        Ok(Self {
+        Ok(Some(Self {
             _before_close: before_close,
             conn: Mutex::new(conn),
             retention: Mutex::new(()),
@@ -791,7 +814,7 @@ impl Store {
             test_slow_after: Mutex::new(None),
             trim_cursor: Mutex::new(None),
             _after_close: after_close,
-        })
+        }))
     }
 
     /// Insert a record. Dedupe on `msg_id`; replaceable slots supersede.

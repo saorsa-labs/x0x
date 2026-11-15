@@ -217,6 +217,13 @@ All notable changes to this project will be documented in this file.
   candidate's probe record (new causes `apply_failed` and
   `apply_interrupted`) before any restored start, and the record's attempt
   count carries D189 across fresh transactions.
+- **Upgrade host commit gate (#1377, S3d part 1; A14 amendment of 15 Nov
+  2026).** A versioned per-candidate health commit (`upgrade-health.json`)
+  binds transaction, child identity, version, roots and executable hash;
+  the dormant launcher commits the host only for a healthy full set with
+  the candidate CLI installed, and applies D193 peer continuity. The S4
+  host-commit gate is shared, and an uncommitted trial no longer migrates
+  an older `history.db` schema (history is off for that start).
 - **Launcher host coordinator recovery (#1376, S3c; A14 amendment of 15 Nov
   2026).** A dormant coordinator pass (`src/upgrade/launcher/coordinator.rs`)
   reconciles the host after a missing handoff, one healthy and one failed

@@ -112,6 +112,40 @@ impl Host {
         })
     }
 
+    /// Write the host commit (ADR 0094 §3 `host-committed`). Under the host
+    /// lock: the transaction must be uncommitted and not rolling back, both
+    /// installed files must hash to the candidate pair, and `check` (the
+    /// full-set health check) must pass. A refusal returns its cause and
+    /// changes nothing.
+    pub(super) fn commit(
+        &self,
+        check: impl FnOnce() -> io::Result<Option<journal::Cause>>,
+    ) -> io::Result<Option<journal::Cause>> {
+        self.locked(|record| {
+            if !matches!(
+                record.phase,
+                journal::Phase::SwappedCli
+                    | journal::Phase::HandoffArmed
+                    | journal::Phase::Booting
+                    | journal::Phase::HealthCommitted
+            ) {
+                return Err(invalid("host is not in a committable phase"));
+            }
+            if self.verify_candidate().is_err() {
+                return Ok(Some(cause(
+                    journal::CauseClass::Failed,
+                    "installed pair is not the candidate pair",
+                )));
+            }
+            if let Some(refusal) = check()? {
+                return Ok(Some(refusal));
+            }
+            record.phase = journal::Phase::HostCommitted;
+            self.save(record)?;
+            Ok(None)
+        })
+    }
+
     pub(super) fn verify_candidate(&self) -> io::Result<()> {
         for a in [&self.plan().daemon, &self.plan().cli] {
             if hash(&a.target_path)? != a.candidate_sha256 {
