@@ -3761,7 +3761,10 @@ a typed `403`.
   evaluates it; the remote read/write surface that consumes it is the A4
   sharing-completeness slice and is not yet wired.
 - `expiry` (Unix seconds) or `ttl_secs` (seconds from `not_before`): set
-  exactly one, else `400`. Grants must expire.
+  exactly one, else `400`. Grants must expire. The window
+  `expiry - not_before` is at most 90 days (7776000 s); a longer grant is
+  refused with `400` and nothing is stored (#1350). To keep access going,
+  renew the grant (below).
 - `not_before` (optional, Unix seconds): default is now.
 - `deliver_to` (optional, 64-hex agent ids): more agents to deliver the grant
   to.
@@ -3811,6 +3814,34 @@ body as a literal, `@path`, a bare path, or `-` for stdin, plus the optional
 | POST | `/grants` | `x0x grant issue <GRANT_JSON>` | Sign a share grant with the owner key, store it, and deliver it by durable DM |
 | DELETE | `/grants/:id` | `x0x grant revoke <id>` | Revoke a share grant (owner key; revocation gossiped on `x0x.revocation.v3` and pushed directly to capable recipients) |
 | GET | `/grants/received` | `x0x grant received` | List share grants that name this install as grantee |
+| POST | `/grants/:id/renew` | `x0x grant renew <id> [--ttl-secs N] [--deliver-to <agent>]... [--no-names]` | Renew an issued share grant: sign a new grant with the same grantee, agents and caps, valid from now (at most 90 days), and deliver it |
+
+**Lifetime and renewal (#1350).** A share grant lasts at most 90 days
+(`expiry - not_before` ≤ 7776000 s). The daemon refuses a longer grant when
+it signs one (`POST /grants` answers `400`) and when it receives one: a
+longer grant from an older peer is not stored and its DM is not ACKed. A
+grant stored before this rule keeps loading and runs to its own expiry.
+
+`POST /grants/:id/renew` takes an optional body (an empty body takes every
+default; unknown fields are refused):
+
+```json
+{ "ttl_secs": 7776000, "deliver_to": ["<64-hex agent id>"], "include_names": true }
+```
+
+- `ttl_secs` (optional): the renewal's lifetime from now, 1 to 7776000;
+  default 7776000 (90 days). Out of range is `400`.
+- `deliver_to`, `include_names`: as for `POST /grants`.
+
+The renewal is a NEW grant (new `grant_id`) with the same grantee, agents
+and caps, valid from now. The response is the `POST /grants` response plus
+`renews` (the old grant id). The old grant is not changed and stays valid to
+its own expiry, so a renewal that is delivered before that expiry leaves the
+grantee no gap. On the wire a renewal is an ordinary grant, so older peers
+accept it. `404` when this install did not issue the grant; `400` when the
+grant is revoked. A renewal after the old expiry also works, but the grantee
+has no grant between the two windows. Revoking access after a renewal needs
+`DELETE` of each grant that is still active.
 
 **Direct revocation push (#1003).** A successful `DELETE /grants/:id` also
 pushes the one signed revocation record, as a typed DM
@@ -4110,6 +4141,7 @@ structured push.
 | `GET /events` | `message` | outer `{"type":"message","data":{subscription_id, topic, payload, sender?, verified, trust_level?}}` — only for active REST `/subscribe` subscriptions |
 | `GET /events` | `file:offer` / `file:complete` | outer `{"type":"file:offer"\|"file:complete","data":{...}}`; offer data has `transfer_id`, `filename`, `size`, `sender`, while complete data has `transfer_id`, `filename`, `sha256`, `path` |
 | `GET /events` | `kv:changed` | (#1094) `{"type":"kv:changed","data":{"store_id":"<topic>","origins":["local"\|"remote"]}}` — a KV store this daemon has open changed: a local write or delete, or a merged peer record or direct delta. Notices within 200 ms are merged into one event per store. No keys or values: read the store through `/stores/:id/*`. `{"store_id":null,"lagged":true}` means notices were lost; re-read every store you show |
+| `GET /events` | `task:changed` | (#1094) `{"type":"task:changed","data":{"list_id":"<topic>","origins":["local"\|"remote"]}}` — a task list this daemon has open changed: a local add, claim, complete, reorder or board migration, or a merged peer delta. Merged per 200 ms window like `kv:changed`; no task content: read the list through `/task-lists/:id/*`. `{"list_id":null,"lagged":true}` means notices were lost |
 | `GET /presence/events` | `presence` | `{"event":"online","agent_id","reachable"}` / `{"event":"offline","agent_id"}` |
 | `GET /direct/events` | `direct_message` | flat DM row (`sender`, `machine_id`, `payload`, `received_at`, `verified`, `trust_decision?`, `observed_origin?`); `?backfill=N` attempts to replay `history_direct_message` rows then emits `live` `{}` even when history is unavailable or its query fails; 15 s keepalive is a `ping` comment |
 | `GET /peers/events` | `peer-lifecycle` | `{"peer_id","event","at_ms"}` — `event` is the Debug text of the transition (`Established`, `Replaced`, `Closing`, `Closed`, `ReaderExited`); treat as open string |
@@ -4193,7 +4225,7 @@ David approved rider `scopes` on 22 Oct 2026 at 22:22 BST. That ruling narrows t
 
 A rider show is attributed to that token's `sub_agent_id`. The origin banner, the block check, the rate limit, and the `gui.show` `agent_id` use that id. Stop on a rider id adds that agent to the block list. It does not write `gui_show_local_disabled`. The rider banner tells the human to remove that agent's id from `gui_show_blocked.json` and restart the daemon. The button on this machine reads "Stop shows from this rider". Other riders on this machine and this daemon's own shows continue. Stop on the daemon's own agent still turns local show off. The local banner still names `gui_show_local_disabled`.
 
-View grammar (Rust `gui::view_route::parse`, mirrors `applyHashRoute` in the GUI): `dm/<hex>`, `groups/<hex>[/<app>]` with `<app>` in `chat|board|files|swarm|feed|wiki|web`, or a singleton in `home|homespace|discover|people|network|presence|mls|admin|settings|constitution|about`.
+View grammar (Rust `gui::view_route::parse`, mirrors `applyHashRoute` in the GUI): `dm/<hex>`, `groups/<hex>[/<app>]` with `<app>` in `chat|board|files|swarm|feed|wiki|web|scratch`, `scratch/<hex>` (#1094; the same view as `groups/<hex>/scratch`), or a singleton in `home|homespace|discover|people|network|presence|mls|admin|settings|constitution|about`.
 
 `target_machine` chooses the machine that displays the view. Omit the field, or send `null` or an empty string, and this daemon shows it. Send a 64-character hex `MachineId` to show on that machine. This daemon must have an owner, and `OwnerSyncStore::is_enrolled` must be true for that machine. Otherwise the outcome is `refused` and no direct message is sent. Send `active` to choose the enrolled owner machine whose GUI reported visible activity most recently. This machine is a candidate. The daemon asks each other enrolled machine that has an authenticated agent binding and a verified `gui_show_v1` capability. An announce-only discovery entry is not a target. Gossip delivery is enough for that query. The queries run in parallel and share one 10 second budget with their replies. A reply that has already arrived counts when its gossip ACK times out. A GUI tab that is still visible counts as active even when its stored stamp is older than 15 minutes, when that socket holds a live session token. A hidden tab keeps that stamp. A session refresh does not set the stamp. Clock skew beyond 120 seconds is outcome `stale_request`. This daemon also applies its own Stop and block list before it sends: `local_enabled = false` answers `disabled`, and a blocked requesting agent answers `refused`. A rider request carries that sub-agent id as `subject`. The target names that id on the banner, using a local contact label when it has one and the short id otherwise. The envelope stays signed by the originating daemon. David approved `GuiShowRequest.subject`, the daemon-signed envelope, and the limit that an owner-trusted originator can set any `subject` within the per-machine 30-per-hour cap, on 23 Oct 2026 14:27 BST. The originating daemon appends the selected machine id to that signed payload as `target`. The receiving daemon compares `target` with its own `MachineId` before it displays. A different id is outcome `wrong_machine`, and no view opens. A change to `target` after the ADR 0050 signature fails that signature. David approved this field on 24 Oct 2026 03:07 BST. `GuiShowOutcome` and `GuiActivityBody` are `#[non_exhaustive]`. An unknown variant index fails decode and does not open a view. David approved that rule on 24 Oct 2026 03:34 BST. An expired GUI session does not refresh `last_gui_visible_at`, including a reveal that waited for a queue slot. The target refuses the show when the envelope signer is in `gui_show_blocked`, including when `via_rider` is set. A rider show spends one rate-limit token for the envelope signer and one for `subject`, and one slot of the hourly cap. Stop on a remote rider show blocks shows from that machine. It writes the envelope signer, the originating daemon, to `gui_show_blocked`. Later shows from that daemon are refused, including other riders and that daemon's own shows. The receiver cannot verify `subject`, so Stop does not block only that subject. It records the `(signer, subject)` pair and does not add `subject`. That agent's direct shows from another machine continue. The banner says "Stop blocks shows from that machine." The button reads "Stop shows from this machine". `no_active_machine` means no machine qualifies. The response then includes `candidates`, an array of hex machine ids, and the daemon sends no show. A show sent to another machine waits up to 10 seconds for that machine's result. The outcome is `unconfirmed` when that wait ends with no result, or when the send fails before a result arrives. A result that has already arrived is kept when the gossip ACK times out. There is no automatic retry. A target with no verified `gui_show_v1` capability returns outcome `refused` and `reason` `target_needs_upgrade`, and the daemon sends nothing. `[gui_show] remote_enabled` defaults to true. The daemon reads it at startup and again on `POST /acl/reload`. `false` makes that machine answer `disabled` and answer an activity query with no timestamp. A remote response carries no URL and no session token. The local rate-limit bucket is spent only when this machine displays the view. David approved this wire and API surface on 22 Oct 2026 18:31 BST.
 
