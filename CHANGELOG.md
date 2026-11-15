@@ -27,6 +27,12 @@ All notable changes to this project will be documented in this file.
   `latest_version`, `handoff_pending`, `failed_artifact`). The first check
   after start is the baseline and emits nothing. `/ws` sessions get typed
   frames `{"type":"system.…","data":{…}}`.
+- **`POST /direct/send` names a revoked recipient machine (#1597 item 4,
+  ADR 0110 D70).** A send whose resolved recipient machine is revoked answers
+  `403 recipient_machine_revoked` (Rust: `DmError::RecipientMachineRevoked
+  { machine }`) instead of a generic transport error. Nothing is sent; the
+  agent keeps its group seats. A revoked binding still answers
+  `recipient_pairing_denied`.
 - **`GET /sync/devices` names the source of each device's enrollment record
   (#1107).** Each row has `record_source` (`"local"` when this machine wrote
   the stored owner-device record, `"synced"` when another owner device wrote

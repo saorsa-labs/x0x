@@ -1052,6 +1052,17 @@ pub enum DmError {
         denial: crate::key_move::PairingDenial,
     },
 
+    /// ADR 0110 §3 (D70; #1597 item 4): the machine the send resolved for
+    /// the recipient is revoked, so nothing was sent. A machine revocation
+    /// denies that device only; the recipient agent keeps its seat until
+    /// the agent itself is revoked. A retry fails the same way until the
+    /// recipient announces from another machine.
+    #[error("recipient machine revoked: {machine:?}")]
+    RecipientMachineRevoked {
+        /// The revoked machine the send resolved.
+        machine: crate::identity::MachineId,
+    },
+
     /// Local gossip publish failed — typically because the mesh is not
     /// joined yet or the inbox topic has no active peers. Distinct from
     /// `Timeout`, which is "remote didn't respond".
