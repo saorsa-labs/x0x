@@ -2902,7 +2902,8 @@ mod tests {
     /// node B's real gossip driver, fed by its own topic subscription and
     /// the listener's verifier, queues it with its background apply owner.
     /// The issue's bar is under 2 × the heartbeat (2 × 600 s); the test
-    /// allows 10 s. `announced_release_propagates_to_a_subscribed_peer_immediately`
+    /// waits for the topic mesh with unique probes, then allows 10 s.
+    /// `announced_release_propagates_to_a_subscribed_peer_immediately`
     /// proves the same flow with a channel in place of the network.
     #[tokio::test]
     async fn observed_release_propagates_over_real_gossip_to_a_peer_owner() {
@@ -2941,6 +2942,34 @@ mod tests {
             .await
             .expect("a connects to b");
 
+        // Wait until the release topic carries A's messages to B, so the one
+        // real publish below cannot race the mesh. Each probe is unique and
+        // fails B's signature check, so B's driver drops it.
+        let mut b_probe = b
+            .subscribe(RELEASE_TOPIC)
+            .await
+            .expect("b probe subscribes");
+        let mut probe_seq = 0u32;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                probe_seq += 1;
+                let probe = format!("mesh-probe-{probe_seq}").into_bytes();
+                a.publish(RELEASE_TOPIC, probe)
+                    .await
+                    .expect("a publishes probe");
+                if let Ok(Some(message)) =
+                    tokio::time::timeout(Duration::from_millis(250), b_probe.recv()).await
+                {
+                    if message.payload.starts_with(b"mesh-probe-") {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the release topic did not carry A's probes to B within 10 s");
+        drop(b_probe);
+
         // Peer B: subscription -> verifier -> real driver -> owner intake.
         let (queued_tx, mut queued_rx) = mpsc::unbounded_channel();
         let b_submit = BackgroundSubmit {
@@ -2970,7 +2999,6 @@ mod tests {
         ));
 
         // Node A: one real fallback tick observes the release and publishes.
-        let started = tokio::time::Instant::now();
         let (_a_running, a_shutdown) = watch::channel(false);
         let a_publish = Arc::clone(&a);
         let a_driver = tokio::spawn(run_fallback_update_driver(
@@ -3001,7 +3029,6 @@ mod tests {
             Some((expected_version, SubmitOutcome::Accepted)),
             "the peer's owner accepted the announced release"
         );
-        assert!(started.elapsed() < Duration::from_secs(2 * 600));
         a_driver.abort();
         b_driver.abort();
         a.shutdown().await;

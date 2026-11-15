@@ -113,6 +113,12 @@ All notable changes to this project will be documented in this file.
   publishes it on `x0x/release`, and node B's gossip driver, which verifies
   it and queues it with its background apply owner. It passes in about 4 s
   against the issue's bar of 2 × the 600 s heartbeat.
+- **The forward gate after a true restart of the receiver (#1107).** A new
+  real-path test shuts the receiving daemon down, builds it again from its
+  files, and opens a `ForwardV2` stream from an owner device it knows only
+  from the stored evidence; bytes reach the target with no consent or
+  announce re-issued. The test-only certificate-recovery hold is now a drop
+  guard, so a failing test cannot leave it set.
 - **The `delegation_spaces` binary joined the `quic-localhost` nextest group
   (#1283).** The groups job's issue #321 acceptance selector runs three
   daemon-mesh tests from that binary in one nextest invocation; nextest runs
