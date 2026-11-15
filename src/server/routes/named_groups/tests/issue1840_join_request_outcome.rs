@@ -116,6 +116,7 @@ async fn requester_holds_offer(pair: &Pair, entry: &RelayEntry) {
             next_retry_at_ms: now_ms + 3_600_000,
             retry_count: 0,
             refusal: None,
+            reseal_count: 0,
         },
     )
     .await
