@@ -148,6 +148,13 @@ All notable changes to this project will be documented in this file.
   publishes it on `x0x/release`, and node B's gossip driver, which verifies
   it and queues it with its background apply owner. It passes in about 4 s
   against the issue's bar of 2 × the 600 s heartbeat.
+- **The W3-H row H-S3-d2 uses the ADR setup: the removed admin's invite is
+  minted at the shared head r (#1797).** With the invite-base roster fix,
+  the joiner on the fork holds a marker naming the owner's removal and shows
+  `reseat_required {not_a_member}`. The #1797 unit test's tampered-roster
+  control now forges an extra seat, so it proves the root check. A policy
+  change inside a served chain still fails closed (A08 amendment of 15 Nov
+  2026).
 - **The forward gate after a true restart of the receiver (#1107).** A new
   real-path test shuts the receiving daemon down, builds it again from its
   files, and opens a `ForwardV2` stream from an owner device it knows only
