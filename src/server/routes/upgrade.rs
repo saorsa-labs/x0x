@@ -2897,6 +2897,144 @@ mod tests {
         )
     }
 
+    /// #1169 acceptance over real loopback gossip: node A's real fallback
+    /// driver observes a signed release and publishes it on `x0x/release`;
+    /// node B's real gossip driver, fed by its own topic subscription and
+    /// the listener's verifier, queues it with its background apply owner.
+    /// The issue's bar is under 2 × the heartbeat (2 × 600 s); the test
+    /// waits for the topic mesh with unique probes, then allows 10 s.
+    /// `announced_release_propagates_to_a_subscribed_peer_immediately`
+    /// proves the same flow with a channel in place of the network.
+    #[tokio::test]
+    async fn observed_release_propagates_over_real_gossip_to_a_peer_owner() {
+        use x0x::upgrade::signature::sign_with_context;
+        let (pk, sk) = saorsa_pqc::api::sig::ml_dsa_65()
+            .generate_keypair()
+            .expect("test release key");
+        let mut manifest = manifest_with_version(&version_newer_than_current());
+        manifest.assets[0].target = x0x::upgrade::manifest::current_platform_target()
+            .expect("tests run on a supported platform")
+            .to_string();
+        let expected_version = manifest.version.clone();
+        let manifest_json = serde_json::to_vec(&manifest).expect("manifest json");
+        let signature = sign_with_context(&sk.to_bytes(), &manifest_json).expect("sign");
+        let payload = x0x::upgrade::manifest::encode_signed_manifest(&manifest_json, &signature);
+        let verified = VerifiedRelease {
+            manifest,
+            manifest_json,
+            signature,
+            gossip_payload: payload,
+        };
+
+        let dir_a = tempfile::tempdir().expect("tmpdir a");
+        let dir_b = tempfile::tempdir().expect("tmpdir b");
+        let a = loopback_gossip_agent(dir_a.path()).await;
+        let b = loopback_gossip_agent(dir_b.path()).await;
+        a.join_network().await.expect("a joins");
+        b.join_network().await.expect("b joins");
+        let _a_topic = a.subscribe(RELEASE_TOPIC).await.expect("a subscribes");
+        let b_topic = b.subscribe(RELEASE_TOPIC).await.expect("b subscribes");
+        let b_addr = b.bound_addr().await.expect("b bound");
+        let b_addr = SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), b_addr.port());
+        a.network()
+            .expect("a network")
+            .connect_addr(b_addr)
+            .await
+            .expect("a connects to b");
+
+        // Wait until the release topic carries A's messages to B, so the one
+        // real publish below cannot race the mesh. Each probe is unique and
+        // fails B's signature check, so B's driver drops it.
+        let mut b_probe = b
+            .subscribe(RELEASE_TOPIC)
+            .await
+            .expect("b probe subscribes");
+        let mut probe_seq = 0u32;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                probe_seq += 1;
+                let probe = format!("mesh-probe-{probe_seq}").into_bytes();
+                a.publish(RELEASE_TOPIC, probe)
+                    .await
+                    .expect("a publishes probe");
+                if let Ok(Some(message)) =
+                    tokio::time::timeout(Duration::from_millis(250), b_probe.recv()).await
+                {
+                    if message.payload.starts_with(b"mesh-probe-") {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the release topic did not carry A's probes to B within 10 s");
+        drop(b_probe);
+
+        // Peer B: subscription -> verifier -> real driver -> owner intake.
+        let (queued_tx, mut queued_rx) = mpsc::unbounded_channel();
+        let b_submit = BackgroundSubmit {
+            processed: Some(Arc::new(move |version, outcome| {
+                let _ = queued_tx.send((version, outcome));
+            })),
+            ..Default::default()
+        };
+        let releases = futures::stream::unfold(
+            (b_topic, pk.to_bytes()),
+            |(mut subscription, key)| async move {
+                loop {
+                    let message = subscription.recv().await?;
+                    if let Some(verified) = verify_gossip_release_with_key(&message.payload, &key) {
+                        return Some((verified, (subscription, key)));
+                    }
+                }
+            },
+        );
+        let (_b_running, b_shutdown) = watch::channel(false);
+        let b_driver = tokio::spawn(run_gossip_update_driver(
+            releases,
+            Some(b_submit),
+            Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
+            |_| async { Ok(()) },
+            b_shutdown,
+        ));
+
+        // Node A: one real fallback tick observes the release and publishes.
+        let (_a_running, a_shutdown) = watch::channel(false);
+        let a_publish = Arc::clone(&a);
+        let a_driver = tokio::spawn(run_fallback_update_driver(
+            futures::stream::iter([()]),
+            move || {
+                let verified = verified.clone();
+                async move { Ok(Some(verified)) }
+            },
+            None::<BackgroundSubmit>,
+            Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
+            move |payload| {
+                let agent = Arc::clone(&a_publish);
+                async move {
+                    agent
+                        .publish(RELEASE_TOPIC, payload)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+            },
+            a_shutdown,
+        ));
+
+        let queued = tokio::time::timeout(Duration::from_secs(10), queued_rx.recv())
+            .await
+            .expect("the peer did not queue the release within 10 s");
+        assert_eq!(
+            queued,
+            Some((expected_version, SubmitOutcome::Accepted)),
+            "the peer's owner accepted the announced release"
+        );
+        a_driver.abort();
+        b_driver.abort();
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
     async fn upgrade_route_state(agent: Arc<Agent>, data_dir: &std::path::Path) -> Arc<AppState> {
         super::super::named_groups::tests::secure_endpoint_test_state_at_with_self_update(
             data_dir, agent, true,
