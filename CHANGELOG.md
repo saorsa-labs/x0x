@@ -61,6 +61,19 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **A TreeKEM member that was down past the last metadata resend asks for
+  the commits it missed after it starts (#1427).** With no later traffic,
+  such a member stayed at its old epoch. When its last recorded up time is
+  more than 60 s old, the daemon asks the other members of each TreeKEM
+  group for catch-up pages at start, and again after the network join ends
+  (in either order), so a slow bootstrap does not end the catch-up. While a
+  page moves the group, it asks for the next epoch (at most 16 cycles), so a
+  member several commits behind reaches the tip. Two new local files are in
+  the data directory: `treekem-alive` (the last up time, written every 15 s)
+  and `treekem-catchup-pending` (the outage record, kept until each group's
+  catch-up succeeds, so the next start asks again). A first start and a
+  shorter outage ask nothing. No wire format or API changes.
+
 - **A capability request whose direct answer was lost asks for the topic
   answer next (#504 follow-up).** A responder that answers by unicast skips
   its topic answer, so a lost direct frame left the requester without the
