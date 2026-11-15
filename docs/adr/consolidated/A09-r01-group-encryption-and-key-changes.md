@@ -121,7 +121,13 @@ from the saved log. S4 owns the delivery of that commit: an open row
 resends it only after the group's head is synced, and a closed row can
 hold a sibling that lost to another admin's commit (the W3-H 1581e fork). A start catch-up cycle that hands its target to another
 running catch-up task waits for that task to end before it judges the
-cycle. Not covered yet: a member that stays up through a network outage.
+cycle. The saved file is written by rename without fsync, so a crash can
+lose the latest copy; the node then falls back to the behaviour before
+this change (the commit is not served after its restart). The file carries
+a format version, and a file of another version, or a damaged one, is
+skipped with a warning. A requester that the log shows removed or banned
+after its cached add is not served through that add. Not covered yet: a
+member that stays up through a network outage.
 No wire format or API changes.
 
 [A08](A08-r01-groups-home-membership-and-repair.md) defines valid group-state and fork recovery. A09 must not bypass that authority to obtain keys faster.

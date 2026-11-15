@@ -2707,3 +2707,141 @@ async fn issue1427_saved_log_of_a_gone_group_is_dropped() -> anyhow::Result<()> 
     );
     Ok(())
 }
+
+fn issue1427_added(target: &str) -> NamedGroupMetadataEvent {
+    NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
+        group_id: "1427".repeat(8),
+        revision: 2,
+        actor: agent("01"),
+        agent_id: target.to_string(),
+        display_name: None,
+        treekem_commit_b64: None,
+        treekem_welcome_b64: None,
+        welcome_ref: None,
+        treekem_epoch: None,
+        treekem_key_package_hash: None,
+        member_joined_recovery: None,
+        member_recovery_history: Vec::new(),
+        certificate_b64: None,
+        owner_mandate: None,
+        commit: None,
+        reseat_mandate: None,
+    }
+}
+
+fn issue1427_removed(target: &str) -> NamedGroupMetadataEvent {
+    NamedGroupMetadataEvent::MemberRemoved {
+        group_id: "1427".repeat(8),
+        revision: 3,
+        actor: agent("01"),
+        agent_id: target.to_string(),
+        treekem_commit_b64: None,
+        treekem_epoch: None,
+        secret_epoch: None,
+        commit: None,
+    }
+}
+
+fn issue1427_banned(target: &str) -> NamedGroupMetadataEvent {
+    NamedGroupMetadataEvent::MemberBanned {
+        group_id: "1427".repeat(8),
+        revision: 3,
+        actor: agent("01"),
+        agent_id: target.to_string(),
+        secret_epoch: None,
+        treekem_commit_b64: None,
+        treekem_epoch: None,
+        commit: None,
+        target_key_package_b64: None,
+    }
+}
+
+/// #1926 review: a cached add admits a requester that is not yet Active,
+/// but a later removal or ban of it in the log refuses it. The saved log
+/// keeps that add across restarts, so the latest event must decide.
+#[test]
+fn issue1427_removed_or_banned_requester_is_not_served_by_its_cached_add() {
+    let j = agent(REQUESTER);
+    let other = agent(REMOVED);
+    let added = issue1427_added(&j);
+    assert!(cached_add_still_current([&added], &j));
+    assert!(!cached_add_still_current([&added], &other));
+    let removed = issue1427_removed(&j);
+    assert!(
+        !cached_add_still_current([&added, &removed], &j),
+        "#1427: a removal after the add must refuse the requester"
+    );
+    let banned = issue1427_banned(&j);
+    assert!(
+        !cached_add_still_current([&added, &banned], &j),
+        "#1427: a ban after the add must refuse the requester"
+    );
+    assert!(
+        cached_add_still_current([&added, &removed, &added], &j),
+        "#1427: a later add admits the requester again"
+    );
+    let other_removed = issue1427_removed(&other);
+    assert!(cached_add_still_current([&added, &other_removed], &j));
+}
+
+/// #1926 review: a saved log file that is truncated, corrupt or of an
+/// unknown version is skipped with a warning; it loads nothing.
+#[tokio::test]
+async fn issue1427_corrupt_or_unknown_saved_log_loads_nothing() -> anyhow::Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let owner = state.agent.identity().agent_keypair();
+    let owner_hex = hex::encode(owner.agent_id().as_bytes());
+    let mut ahead = base_group(owner, None)?;
+    let base = ahead.clone();
+    let removal = seal_link(&mut ahead, owner, 2_000, |next| {
+        next.remove_member(&agent(REMOVED), Some(owner_hex.clone()));
+        take_treekem_epoch(next);
+    })?;
+    let removal = removal_event(&base, &owner_hex, &removal);
+    let group_id = named_group_metadata_event_group_id(&removal).to_string();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), ahead);
+    remember_treekem_membership_event(&state, &removal).await;
+    let path = treekem_catchup_log_path(&state, &group_id);
+    let good = std::fs::read(&path)?;
+    let saved: serde_json::Value = serde_json::from_slice(&good)?;
+    assert_eq!(
+        saved["version"], 1,
+        "#1427: the saved log carries its version"
+    );
+
+    let mut newer = saved.clone();
+    newer["version"] = serde_json::json!(2);
+    let truncated = good[..good.len() / 2].to_vec();
+    for (what, bytes) in [
+        ("truncated", truncated),
+        ("corrupt", b"{not json".to_vec()),
+        ("unknown version", serde_json::to_vec(&newer)?),
+        ("bare event list", serde_json::to_vec(&saved["events"])?),
+    ] {
+        std::fs::write(&path, &bytes)?;
+        state.treekem_event_log.write().await.clear();
+        restore_treekem_catchup_logs(&state).await;
+        assert!(
+            state.treekem_event_log.read().await.is_empty(),
+            "#1427: a {what} saved log must load nothing"
+        );
+    }
+    // The good file still loads.
+    std::fs::write(&path, &good)?;
+    restore_treekem_catchup_logs(&state).await;
+    assert_eq!(
+        state
+            .treekem_event_log
+            .read()
+            .await
+            .get(&group_id)
+            .map(|log| log.len()),
+        Some(1)
+    );
+    Ok(())
+}

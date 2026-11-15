@@ -66,7 +66,9 @@ All notable changes to this project will be documented in this file.
   in the data directory (one file per group, local only) and loaded at
   start. A member that was offline when a commit was made can catch up
   from a signer that restarted since. A removal or ban that has an ADR
-  0110 (S4) row, in any phase, is not loaded from the saved file. A
+  0110 (S4) row, in any phase, is not loaded from the saved file. The file
+  is versioned; a damaged or unknown-version file is skipped. A requester
+  removed or banned after its cached add is no longer served pages. A
   start catch-up cycle now waits for another running catch-up task of the
   same group to end before it judges the cycle. No wire format or API
   changes.

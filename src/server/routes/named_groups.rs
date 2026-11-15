@@ -9767,6 +9767,37 @@ async fn log_treekem_membership_event(state: &AppState, event: &NamedGroupMetada
     true
 }
 
+/// #1427 (#1926 review): whether the latest logged event that names
+/// `sender_hex` as a member target admits it: a `MemberAdded` or a
+/// `JoinRequestApproved` for it, with no later `MemberRemoved` or
+/// `MemberBanned` of it. A joiner that is not yet Active may pull pages
+/// through its cached add; a member removed or banned after that add may
+/// not, and the saved log keeps that add across restarts.
+fn cached_add_still_current<'a>(
+    events: impl IntoIterator<Item = &'a NamedGroupMetadataEvent>,
+    sender_hex: &str,
+) -> bool {
+    let mut admitted = false;
+    for event in events {
+        match event {
+            NamedGroupMetadataEvent::MemberAdded { agent_id, .. } if agent_id == sender_hex => {
+                admitted = true;
+            }
+            NamedGroupMetadataEvent::JoinRequestApproved {
+                requester_agent_id, ..
+            } if requester_agent_id == sender_hex => admitted = true,
+            NamedGroupMetadataEvent::MemberRemoved { agent_id, .. }
+            | NamedGroupMetadataEvent::MemberBanned { agent_id, .. }
+                if agent_id == sender_hex =>
+            {
+                admitted = false;
+            }
+            _ => {}
+        }
+    }
+    admitted
+}
+
 /// #1427: the file that keeps the catch-up log of `group_id` across a
 /// restart. Local state only; it is never sent.
 fn treekem_catchup_log_path(state: &AppState, group_id: &str) -> std::path::PathBuf {
@@ -9775,6 +9806,17 @@ fn treekem_catchup_log_path(state: &AppState, group_id: &str) -> std::path::Path
         .data_dir
         .join("treekem-catchup-log")
         .join(format!("{name}.json"))
+}
+
+/// #1427: the format version of a saved catch-up log file. A file with
+/// another version is skipped with a warning (a newer release wrote it).
+const TREEKEM_CATCHUP_LOG_VERSION: u32 = 1;
+
+/// #1427: one saved catch-up log file.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedTreeKemCatchupLog {
+    version: u32,
+    events: Vec<NamedGroupMetadataEvent>,
 }
 
 /// Serializes the catch-up log file writes, so an older copy of a log
@@ -9804,7 +9846,11 @@ async fn persist_treekem_catchup_log(state: &AppState, group_id: &str) {
             _ => Ok(()),
         }
     } else {
-        match serde_json::to_vec(&events) {
+        let saved = SavedTreeKemCatchupLog {
+            version: TREEKEM_CATCHUP_LOG_VERSION,
+            events,
+        };
+        match serde_json::to_vec(&saved) {
             Ok(bytes) => crate::storage::save_private_bytes_to(&path, bytes)
                 .await
                 .map_err(|error| error.to_string()),
@@ -9867,10 +9913,17 @@ pub(in crate::server) async fn restore_treekem_catchup_logs(state: &AppState) {
             .await
             .map_err(|e| e.to_string())
             .and_then(|bytes| {
-                serde_json::from_slice::<Vec<NamedGroupMetadataEvent>>(&bytes)
-                    .map_err(|e| e.to_string())
+                serde_json::from_slice::<SavedTreeKemCatchupLog>(&bytes).map_err(|e| e.to_string())
             }) {
-            Ok(events) => events,
+            Ok(saved) if saved.version == TREEKEM_CATCHUP_LOG_VERSION => saved.events,
+            Ok(saved) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    version = saved.version,
+                    "saved TreeKEM catch-up log has an unknown version; skipped"
+                );
+                continue;
+            }
             Err(error) => {
                 tracing::warn!(
                     path = %path.display(),
@@ -13418,17 +13471,8 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     let target_of_cached_add = {
         let logs = state.treekem_event_log.read().await;
         log_keys.iter().any(|key| {
-            logs.get(key).is_some_and(|events| {
-                events.iter().any(|event| match event {
-                    NamedGroupMetadataEvent::MemberAdded { agent_id, .. } => {
-                        agent_id == &sender_hex
-                    }
-                    NamedGroupMetadataEvent::JoinRequestApproved {
-                        requester_agent_id, ..
-                    } => requester_agent_id == &sender_hex,
-                    _ => false,
-                })
-            })
+            logs.get(key)
+                .is_some_and(|events| cached_add_still_current(events, &sender_hex))
         })
     };
     if !authorized && !target_of_cached_add {
@@ -15885,6 +15929,11 @@ async fn treekem_start_catchup_note_head(state: &AppState, key: &str, reported: 
 /// several commits needs a cycle for each.
 const TREEKEM_START_CATCHUP_CYCLES: usize = 16;
 
+/// #1427: the longest a start cycle waits for another epoch-ahead task of
+/// the same group to end. That task renews while new observations arrive,
+/// so the wait is bounded; after it the cycle is judged as it stands.
+const TREEKEM_START_CATCHUP_HANDOFF_WAIT: Duration = Duration::from_secs(600);
+
 /// #1427: how a start pass for one group ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TreeKemStartCatchupEnd {
@@ -15961,11 +16010,13 @@ async fn request_treekem_catchup_after_start(state: &Arc<AppState>, key: &str) {
                 // call above only hands it the target and returns at once.
                 // Judge the cycle only after that task ends, or a cycle that
                 // asked nobody would look like "no newer epoch".
-                while state
-                    .treekem_epoch_ahead_targets
-                    .lock()
-                    .await
-                    .contains_key(&key)
+                let deadline = tokio::time::Instant::now() + TREEKEM_START_CATCHUP_HANDOFF_WAIT;
+                while tokio::time::Instant::now() < deadline
+                    && state
+                        .treekem_epoch_ahead_targets
+                        .lock()
+                        .await
+                        .contains_key(&key)
                 {
                     tokio::time::sleep(TREEKEM_CATCHUP_THROTTLE).await;
                 }
