@@ -33,8 +33,8 @@
 use super::super::gaps::recovery_route;
 use super::*;
 use crate::groups::recovery::{
-    decode_sidecar, encode_message, AttestAnswer, GroupAttestResponseV1, GroupRecoveryMessageV1,
-    IssuedReseatV1, GROUP_RECOVERY_DIR, GROUP_RECOVERY_EXTENSION,
+    decode_message, decode_sidecar, encode_message, AttestAnswer, GroupAttestResponseV1,
+    GroupRecoveryMessageV1, IssuedReseatV1, GROUP_RECOVERY_DIR, GROUP_RECOVERY_EXTENSION,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -81,9 +81,33 @@ fn hold_o_to_j(sim: &Sim) -> Result<Arc<AtomicBool>> {
     Ok(held)
 }
 
+/// Whether `rx` holds O's re-seat answer for J: a `group_attest_response`
+/// from O whose answer is `Reseat` with `digest`'s authorisation.
+fn reseat_received(
+    rx: &mut crate::direct::DirectMessageReceiver,
+    o: &crate::identity::AgentId,
+    digest: &[u8],
+) -> bool {
+    let mut seen = false;
+    while let Some(msg) = rx.try_recv() {
+        if msg.sender != *o {
+            continue;
+        }
+        if let Ok(GroupRecoveryMessageV1::Response(response)) = decode_message(&msg.payload) {
+            if let AttestAnswer::Reseat { authorisation, .. } = &response.answer {
+                seen |= authorisation.digest().as_slice() == digest;
+            }
+        }
+    }
+    seen
+}
+
 /// O sends J `issued` as a `group_attest_response`, as O's push would.
-async fn send_reseat(sim: &Sim, group: &str, issued: &IssuedReseatV1) -> Result<usize> {
+/// Returns whether J received it, read on J's own direct-message stream
+/// (not from wire frames: O's reconnect traffic reaches J too).
+async fn send_reseat(sim: &Sim, group: &str, issued: &IssuedReseatV1) -> Result<bool> {
     let (j, _) = sim.ids("J")?;
+    let o = sim.ids("O")?.0;
     let payload = encode_message(&GroupRecoveryMessageV1::Response(GroupAttestResponseV1 {
         group: group.to_string(),
         subject: j.0,
@@ -93,27 +117,34 @@ async fn send_reseat(sim: &Sim, group: &str, issued: &IssuedReseatV1) -> Result<
             invite: issued.invite.clone(),
         },
     }))?;
-    let cut = sim
-        .fabric()
-        .mark_indexed("case: O sends J the authorisation issued before its stop".to_string());
+    let digest = issued.authorisation.digest();
+    let mut rx = sim.state("J")?.agent.subscribe_direct();
+    sim.fabric()
+        .mark("case: O sends J the authorisation issued before its stop");
     let agent = sim.state("O")?.agent.clone();
     // Right after its restart O can have no link to J yet, so a send can
-    // fail before any frame leaves: send again until a frame reaches J.
+    // fail before anything leaves: send again until J has received it.
     for _ in 0..SEND_ATTEMPTS {
         sim.within("O sends the lost authorisation", SEND_BOUND, async {
             let _ = agent.send_direct(&j, payload.clone()).await;
         })
         .await?;
-        let delivered = delivered_after(sim, "O", "J", cut)?;
-        if delivered > 0 {
-            return Ok(delivered);
+        let mut received = false;
+        let _ = sim
+            .until(
+                "J receives the lost authorisation",
+                secs(10),
+                async |_s: &Sim| {
+                    received |= reseat_received(&mut rx, &o, digest.as_slice());
+                    received
+                },
+            )
+            .await;
+        if received {
+            return Ok(true);
         }
-        sim.within("O waits before sending again", secs(12), async {
-            tokio::time::sleep(secs(10)).await;
-        })
-        .await?;
     }
-    delivered_after(sim, "O", "J", cut)
+    Ok(false)
 }
 
 /// O's sidecar directory and its file names (O is stopped).
@@ -251,7 +282,7 @@ async fn issuer_rebuild(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     o_to_j.store(false, Ordering::SeqCst);
     p.j_out_held.store(false, Ordering::SeqCst);
     sim.fabric().mark("fault: O->J and J's writes released");
-    let delivered = send_reseat(sim, &group, &issued).await?;
+    let received = send_reseat(sim, &group, &issued).await?;
     let mut st = None;
     let waited = sim
         .until(
@@ -289,12 +320,12 @@ async fn issuer_rebuild(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         .as_ref()
         .map_or_else(|| "404".to_string(), Status::describe);
     receipt.note(format!(
-        "frames O->J with the lost authorisation {delivered}; J then {j_text}"
+        "J received the lost authorisation {received}; J then {j_text}"
     ));
     receipt.request_delivered(
         "o_reached_j_with_the_lost_authorisation",
-        delivered > 0,
-        format!("frames O->J {delivered}"),
+        received,
+        format!("J's direct-message stream holds O's re-seat answer: {received}"),
         at(sim),
     );
 
@@ -371,7 +402,7 @@ async fn issuer_rebuild(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         base.describe(),
         head.describe()
     );
-    let red = delivered > 0 && !after_ok;
+    let red = received && !after_ok;
     let pinned = kept
         && lost
         && admitted
