@@ -481,9 +481,7 @@ impl Rig {
 /// certificate the evidence store kept across that announcement.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exec_over_dm_is_admitted_after_the_receiver_restarts() {
-    use std::sync::atomic::Ordering;
-    let hold = &crate::announce_blob::HOLD_CERTIFICATE_RECOVERY;
-    hold.store(true, Ordering::SeqCst);
+    let hold = crate::announce_blob::CertificateRecoveryHold::hold();
     let rig = rig(false).await;
     let sender = rig.senders[0].agent.identity();
     let digest = crate::announce_v3::cert_digest(
@@ -535,7 +533,7 @@ async fn exec_over_dm_is_admitted_after_the_receiver_restarts() {
         .agent
         .discovered_agent_for_testing(&sender.agent_id())
         .await;
-    hold.store(false, Ordering::SeqCst);
+    drop(hold);
     let diagnostics = rig.receiver.service.diagnostics_snapshot().await.totals;
     let result = result.unwrap_or_else(|why| panic!("no result: {why}; receiver {diagnostics:?}"));
     assert_eq!(
