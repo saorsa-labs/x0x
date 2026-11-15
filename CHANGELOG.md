@@ -108,6 +108,11 @@ All notable changes to this project will be documented in this file.
 
 ### Tests and tooling
 
+- **Release propagation over real gossip (#1169).** A two-node loopback test
+  runs node A's fallback driver, which observes a signed release and
+  publishes it on `x0x/release`, and node B's gossip driver, which verifies
+  it and queues it with its background apply owner. It passes in about 4 s
+  against the issue's bar of 2 × the 600 s heartbeat.
 - **The `delegation_spaces` binary joined the `quic-localhost` nextest group
   (#1283).** The groups job's issue #321 acceptance selector runs three
   daemon-mesh tests from that binary in one nextest invocation; nextest runs
