@@ -36,6 +36,7 @@ mod rider_auth;
 mod routes;
 mod sse;
 mod state;
+mod system_events;
 mod update_check;
 #[cfg(any(unix, windows))]
 mod upgrade_flush;
@@ -1616,6 +1617,8 @@ pub async fn serve_with_options(
         // here rather than reaching back into the config from the task.
         let resolved_plane = config.resolved_network_id();
         let mut verdict_windows = health_verdict::VerdictWindows::default();
+        // #1351: verdict and upgrade-input changes become `system.*` events.
+        let mut system_events = system_events::SystemEventTracker::default();
         bg_tasks.push(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
                 routes::status::HEALTH_SNAPSHOT_REFRESH_SECS,
@@ -1661,6 +1664,7 @@ pub async fn serve_with_options(
                 )
                 .await;
                 snapshot_state.health_snapshot.store_verdict_sample(sample);
+                system_events::emit_changes(&snapshot_state, &mut system_events);
             }
         }));
     }
