@@ -1322,6 +1322,11 @@ pub(super) struct AppState {
     /// the node had no connected peer for longer than the last metadata
     /// resend. Diagnostics only.
     pub(super) treekem_reconnect_catchup_passes: std::sync::atomic::AtomicU64,
+    /// #1427: orders the writes and the removal of the outage record. A
+    /// pass marks its groups pending and keeps the record under this
+    /// lock, and the last finished group removes the record under it only
+    /// when no group is pending, so a removal never follows a new mark.
+    pub(super) treekem_catchup_record_lock: tokio::sync::Mutex<()>,
     /// #1657 (ADR 0110 §3): the latest typed TreeKEM catch-up refusal
     /// this daemon received, per group, keyed by the group id its own
     /// request used. Surfaced in the operator log at receive time and

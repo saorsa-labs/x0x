@@ -375,3 +375,391 @@ fn issue1427_reconnect_after_a_long_isolation_asks_once() {
         "an isolation within the resends asks nothing"
     );
 }
+
+#[test]
+fn issue1427_reconnect_during_a_pass_runs_one_more_pass() {
+    let gate = TreeKemReconnectGate::default();
+    assert!(gate.request(), "the first reconnect starts a pass");
+    assert!(!gate.request(), "a reconnect during the pass waits");
+    assert!(
+        !gate.request(),
+        "a second one during the same pass adds nothing"
+    );
+    assert!(gate.finish(), "the pass ends: one more pass runs");
+    assert!(!gate.finish(), "that pass ends: no reconnect came, done");
+    assert!(gate.request(), "a later reconnect starts a pass again");
+    assert!(!gate.finish());
+}
+
+type TaskFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+/// The test spawner: a plain tokio task.
+fn tokio_spawn(task: TaskFuture) -> bool {
+    tokio::spawn(task);
+    true
+}
+
+/// Asks recorded by key, with their virtual start times.
+type Asks = Arc<std::sync::Mutex<Vec<(String, tokio::time::Instant)>>>;
+
+fn asks_of(asks: &Asks, key: &str) -> usize {
+    asks.lock()
+        .unwrap()
+        .iter()
+        .filter(|(k, _)| k == key)
+        .count()
+}
+
+#[tokio::test(start_paused = true)]
+async fn issue1427_reconnect_pass_retries_a_group_left_pending() {
+    use std::sync::Mutex as StdMutex;
+    // Group "a" is done after its first ask; "b" stays pending, as after
+    // a reconnect to peers that were not members. Four more keys show the
+    // concurrency cap.
+    let calls: Arc<StdMutex<Vec<(String, tokio::time::Instant)>>> = Arc::default();
+    let pending: Arc<StdMutex<std::collections::HashSet<String>>> = Arc::new(StdMutex::new(
+        ["a", "b", "c", "d", "e", "f"]
+            .iter()
+            .map(|k| k.to_string())
+            .collect(),
+    ));
+    let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let most = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = Arc::new(TreeKemReconnectGate::default());
+    assert!(gate.request());
+    let t0 = tokio::time::Instant::now();
+    let retry = [Duration::from_secs(60), Duration::from_secs(300)];
+    drive_treekem_reconnect_pass(
+        ["a", "b", "c", "d", "e", "f"]
+            .iter()
+            .map(|k| k.to_string())
+            .collect(),
+        (2, Duration::from_secs(120)),
+        || Duration::from_secs(1),
+        {
+            let (calls, pending) = (Arc::clone(&calls), Arc::clone(&pending));
+            let (in_flight, most) = (Arc::clone(&in_flight), Arc::clone(&most));
+            move |key: String| {
+                let calls = Arc::clone(&calls);
+                let pending = Arc::clone(&pending);
+                let in_flight = Arc::clone(&in_flight);
+                let most = Arc::clone(&most);
+                async move {
+                    let now = in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    most.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    calls
+                        .lock()
+                        .unwrap()
+                        .push((key.clone(), tokio::time::Instant::now()));
+                    if key != "b" {
+                        pending.lock().unwrap().remove(&key);
+                    }
+                }
+            }
+        },
+        &tokio_spawn,
+        |key| pending.lock().unwrap().contains(key),
+        &retry,
+        &gate,
+    )
+    .await;
+    let calls = calls.lock().unwrap().clone();
+    let asks = |k: &str| calls.iter().filter(|(key, _)| key == k).count();
+    assert_eq!(asks("a"), 1, "a done group is asked once");
+    assert_eq!(
+        asks("b"),
+        3,
+        "a pending group is asked again after each wait"
+    );
+    assert_eq!(
+        most.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the cap holds"
+    );
+    let b_times: Vec<Duration> = calls
+        .iter()
+        .filter(|(key, _)| key == "b")
+        .map(|(_, at)| at.saturating_duration_since(t0))
+        .collect();
+    assert!(b_times[1] - b_times[0] >= Duration::from_secs(60));
+    assert!(b_times[2] - b_times[1] >= Duration::from_secs(300));
+    assert!(!gate.finish());
+}
+
+#[tokio::test(start_paused = true)]
+async fn issue1427_reconnect_during_a_retry_wait_ends_the_pass() {
+    let gate = Arc::new(TreeKemReconnectGate::default());
+    assert!(gate.request());
+    let asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let driver_gate = Arc::clone(&gate);
+    let driver_asks = Arc::clone(&asks);
+    let driver = tokio::spawn(async move {
+        drive_treekem_reconnect_pass(
+            vec!["b".to_string()],
+            (4, Duration::from_secs(120)),
+            || Duration::ZERO,
+            move |_key: String| {
+                let asks = Arc::clone(&driver_asks);
+                async move {
+                    asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
+            &tokio_spawn,
+            |_key| true,
+            &[Duration::from_secs(900)],
+            &driver_gate,
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert!(!gate.request(), "a reconnect during the retry wait");
+    tokio::time::timeout(Duration::from_secs(1), driver)
+        .await
+        .expect("the wait ends early")
+        .expect("driver task");
+    assert_eq!(asks.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(gate.finish(), "the next pass runs for the reconnect");
+}
+
+/// #1936 review: a group whose catch-up never ends (it renews while
+/// epoch-ahead traffic for an unservable commit arrives) holds its slot
+/// for one turn only, so the groups behind it are still asked.
+#[tokio::test(start_paused = true)]
+async fn issue1427_a_catchup_that_never_ends_holds_its_slot_for_one_turn() {
+    let asks: Asks = Arc::default();
+    let gate = Arc::new(TreeKemReconnectGate::default());
+    assert!(gate.request());
+    let (driver_asks, driver_gate) = (Arc::clone(&asks), Arc::clone(&gate));
+    let turn = Duration::from_secs(120);
+    let t0 = tokio::time::Instant::now();
+    let driver = tokio::spawn(async move {
+        drive_treekem_reconnect_pass(
+            ["stuck1", "stuck2", "late"]
+                .iter()
+                .map(|k| k.to_string())
+                .collect(),
+            (2, turn),
+            || Duration::ZERO,
+            move |key: String| {
+                let asks = Arc::clone(&driver_asks);
+                async move {
+                    asks.lock()
+                        .unwrap()
+                        .push((key.clone(), tokio::time::Instant::now()));
+                    if key.starts_with("stuck") {
+                        std::future::pending::<()>().await;
+                    }
+                }
+            },
+            &tokio_spawn,
+            |key| key.starts_with("stuck"),
+            &[Duration::from_secs(60)],
+            &driver_gate,
+        )
+        .await;
+    });
+    tokio::time::sleep(turn + Duration::from_secs(5)).await;
+    assert_eq!(
+        asks_of(&asks, "late"),
+        1,
+        "the group behind the stuck ones is asked"
+    );
+    let late_at = asks
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(k, _)| k == "late")
+        .map(|(_, at)| *at);
+    assert!(late_at.is_some_and(|at| at.saturating_duration_since(t0) >= turn));
+    // The retry round skips the stuck groups whose catch-up still runs.
+    tokio::time::timeout(Duration::from_secs(600), driver)
+        .await
+        .expect("the pass ends")
+        .expect("driver task");
+    assert_eq!(
+        asks_of(&asks, "stuck1"),
+        1,
+        "no second catch-up beside a running one"
+    );
+    assert_eq!(asks_of(&asks, "stuck2"), 1);
+}
+
+/// #1936 review: a reconnect that waits ends the current turns and starts
+/// no further group; the next pass asks for every group.
+#[tokio::test(start_paused = true)]
+async fn issue1427_a_waiting_reconnect_cuts_the_round_short() {
+    let asks: Asks = Arc::default();
+    let gate = Arc::new(TreeKemReconnectGate::default());
+    assert!(gate.request());
+    let (driver_asks, driver_gate) = (Arc::clone(&asks), Arc::clone(&gate));
+    let driver = tokio::spawn(async move {
+        drive_treekem_reconnect_pass(
+            ["stuck", "b", "c"].iter().map(|k| k.to_string()).collect(),
+            (1, Duration::from_secs(3600)),
+            || Duration::ZERO,
+            move |key: String| {
+                let asks = Arc::clone(&driver_asks);
+                async move {
+                    asks.lock()
+                        .unwrap()
+                        .push((key.clone(), tokio::time::Instant::now()));
+                    std::future::pending::<()>().await;
+                }
+            },
+            &tokio_spawn,
+            |_key| true,
+            &[Duration::from_secs(60)],
+            &driver_gate,
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert!(
+        !gate.request(),
+        "a reconnect while the stuck group holds the slot"
+    );
+    tokio::time::timeout(Duration::from_secs(1), driver)
+        .await
+        .expect("the round ends at once")
+        .expect("driver task");
+    assert_eq!(asks_of(&asks, "stuck"), 1);
+    assert_eq!(
+        asks_of(&asks, "b") + asks_of(&asks, "c"),
+        0,
+        "no group starts after it"
+    );
+    assert!(gate.finish(), "the next pass runs for the reconnect");
+}
+
+/// #1936 review: the record lock orders the removal of the outage record
+/// against a new mark. While a pass holds the lock, the last finished
+/// group does not remove the record; once the pass has marked a new group
+/// under the lock, the record stays.
+#[tokio::test]
+async fn issue1427_record_removal_waits_for_the_record_lock() -> Result<()> {
+    let (state, _dir, key) = treekem_member_state().await?;
+    let record = treekem_catchup_pending_path(&state);
+    crate::profile::write_atomically(&record, b"outage").await?;
+    state
+        .treekem_start_catchup_pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key.clone());
+    // A reconnect pass holds the lock, as it does while it marks.
+    let held = state.treekem_catchup_record_lock.lock().await;
+    let done_state = Arc::clone(&state);
+    let done_key = key.clone();
+    let mut done = tokio::spawn(async move {
+        treekem_start_catchup_done(&done_state, &done_key).await;
+    });
+    let waited = tokio::time::timeout(Duration::from_millis(300), &mut done).await;
+    assert!(waited.is_err(), "the removal waits for the record lock");
+    assert!(
+        tokio::fs::try_exists(&record).await?,
+        "the record stays meanwhile"
+    );
+    // The pass marks a new group under the lock and sees the record.
+    state
+        .treekem_start_catchup_pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert("another-group".to_string());
+    drop(held);
+    done.await?;
+    assert!(
+        tokio::fs::try_exists(&record).await?,
+        "a group is pending again, so the record stays"
+    );
+    Ok(())
+}
+
+/// #1936 delta review: a pass that finds a group's catch-up from an earlier
+/// pass still running does not start a second one, but that catch-up asks
+/// once more when it ends, so a pending mark the later pass set is served
+/// after the mark (the old catch-up's `Done` could clear it).
+#[tokio::test(start_paused = true)]
+async fn issue1427_a_busy_group_is_asked_again_when_its_catchup_ends() {
+    let asks: Asks = Arc::default();
+    let first = Arc::new(tokio::sync::Notify::new());
+    let gate = Arc::new(TreeKemReconnectGate::default());
+    let run = {
+        let (asks, first) = (Arc::clone(&asks), Arc::clone(&first));
+        move |key: String| {
+            let (asks, first) = (Arc::clone(&asks), Arc::clone(&first));
+            async move {
+                let n = {
+                    let mut asks = asks.lock().unwrap();
+                    asks.push((key, tokio::time::Instant::now()));
+                    asks.len()
+                };
+                if n == 1 {
+                    // The first catch-up outlives its turn.
+                    first.notified().await;
+                }
+            }
+        }
+    };
+    // Pass 1: G's catch-up outlives its turn.
+    assert!(gate.request());
+    drive_treekem_reconnect_pass(
+        vec!["g".to_string()],
+        (4, Duration::from_secs(120)),
+        || Duration::ZERO,
+        run.clone(),
+        &tokio_spawn,
+        |_key| false,
+        &[],
+        &gate,
+    )
+    .await;
+    assert!(!gate.finish());
+    // Pass 2, after another isolation: G is marked again but still busy.
+    assert!(gate.request());
+    drive_treekem_reconnect_pass(
+        vec!["g".to_string()],
+        (4, Duration::from_secs(120)),
+        || Duration::ZERO,
+        run,
+        &tokio_spawn,
+        |_key| false,
+        &[],
+        &gate,
+    )
+    .await;
+    assert_eq!(
+        asks_of(&asks, "g"),
+        1,
+        "no second catch-up beside the running one"
+    );
+    // The first catch-up ends: it asks once more for pass 2.
+    first.notify_one();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        asks_of(&asks, "g"),
+        2,
+        "the busy group is asked again after its catch-up"
+    );
+    assert!(gate.claim("g"), "and is released after that");
+}
+
+/// #1936 delta review: a catch-up task that panics releases its group.
+#[tokio::test(start_paused = true)]
+async fn issue1427_a_panicking_catchup_releases_its_group() {
+    let gate = Arc::new(TreeKemReconnectGate::default());
+    assert!(gate.request());
+    drive_treekem_reconnect_pass(
+        vec!["g".to_string()],
+        (4, Duration::from_secs(120)),
+        || Duration::ZERO,
+        |_key: String| async move { panic!("catch-up task panics") },
+        &tokio_spawn,
+        |_key| false,
+        &[],
+        &gate,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(gate.claim("g"), "the panicked task's group is free again");
+}

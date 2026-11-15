@@ -61,6 +61,10 @@ GROUPS = (
     # 80-90 virtual seconds. `rest` is close to its deadline, so the row
     # has its own shard; the budget is not raised (31 Oct ruling, #1733).
     ('1581i', 'w3h_1581i_'),
+    # #1427: five catch-up rows, each about 25 s per rerun in the 12-CPU
+    # Lima VM. `rest` takes about 108 of its 120 minutes, so the rows have
+    # their own shard; the budget is not raised (31 Oct ruling, #1733).
+    ('1427', 'w3h_1427_'),
 )
 
 # The gate's reruns per case (D196). A group in `PARTS` runs them as that
