@@ -2,17 +2,17 @@
 //! expected GREEN with S3.
 //!
 //! Setup: S0. A (creator) seats M1, M2 and X, promotes X to admin and
-//! makes the four policy changes. X mints invite I_X at r−1; A renames
-//! (r). Then every message between {X, J} and {A, M1, M2} is held. A
-//! removes X (r+1), X renames (r+1′), J redeems I_X and X seals J (r+2′).
-//! The case advances [`CATCHUP`].
+//! makes the four policy changes. A renames (r), and X mints invite I_X
+//! at r, the ADR text. Then every message between {X, J} and {A, M1, M2}
+//! is held. A removes X (r+1), X renames (r+1′), J redeems I_X and X
+//! seals J (r+2′). The case advances [`CATCHUP`].
 //!
-//! **Engineer ruling (b), 4 Nov 2026 (test-only).** With I_X at r (the
-//! ADR text) J never holds a marker (VM runs d2-3, d2-4): a joiner keeps
-//! its served links, not its base, so `fork_candidate_authenticated`
-//! cannot read A's role at r. With I_X at r−1, X serves r and r+1′, J
-//! keeps r, and A's r+1 authenticates. The link at r is a rename, because
-//! a policy change in a served chain stops `validate_alternate_chain`.
+//! **#1797 (A08 amendment of 14 Nov 2026).** J keeps the links X serves
+//! (r+1′, r+2′), not the link at its invite base r. A's r+1 chains from
+//! r, so J reads A's role at r from the signed base roster projection in
+//! its invite lineage. Before that fix this setup left J Active with no
+//! marker (VM runs d2-3, d2-4), and the row used Engineer ruling (b), 4 Nov
+//! 2026 (I_X at r−1), which this setup replaces.
 //!
 //! Release: J and {A, M1, M2} pass; X stays cut. The fabric drops a held
 //! write, so A publishes its recorded r+1 bytes again until J holds a
@@ -224,10 +224,10 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         ensure!(code.is_success(), "policy {write_access}: {code} {answer}");
     }
     settled(sim, &["M1", "M2", "X"], &group, "every member holds r−1").await?;
-    let minted = view(sim, "X", &group).await?;
-    let link = invite(sim, "X", &group).await?;
     rename(sim, "A", &group, "w3h d2 A r").await?;
     settled(sim, &["M1", "M2", "X"], &group, "every member holds r").await?;
+    let minted = view(sim, "X", &group).await?;
+    let link = invite(sim, "X", &group).await?;
     let base = view(sim, "X", &group).await?;
     // §5: the hold blocks advert refreshes (15 min lifetime).
     for label in ["X", "A", "M1", "M2"] {
@@ -266,10 +266,11 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     let sealed = view(sim, "X", &group).await?;
     receipt.setup_done(at(sim));
     receipt.evidence(
-        "ownerless_group_x_admin_mints_i_x_at_r_minus_1_and_holds_r",
+        "ownerless_group_x_admin_mints_i_x_at_r",
         !minted.owner_axis
             && minted.marker.is_none()
-            && base.state_revision == minted.state_revision + 1,
+            && base.state_revision == minted.state_revision
+            && base.state_hash == minted.state_hash,
         format!(
             "X at the mint {}; X at r {}",
             minted.describe(),

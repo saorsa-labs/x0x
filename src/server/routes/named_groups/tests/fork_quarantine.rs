@@ -5555,8 +5555,11 @@ async fn issue1797_joiner_after_base_admin_removal(
         Issue1797Base::Signed => base_roster.clone(),
         Issue1797Base::Missing => BTreeMap::new(),
         Issue1797Base::Tampered => {
+            // A stays an active admin; only an extra seat is forged, so
+            // the root check alone must refuse this roster.
             let mut forged = base_roster.clone();
-            forged.remove(&a_hex);
+            let a_entry = forged.get(&a_hex).cloned().context("A in base roster")?;
+            forged.insert("00".repeat(32), a_entry);
             forged
         }
     };
