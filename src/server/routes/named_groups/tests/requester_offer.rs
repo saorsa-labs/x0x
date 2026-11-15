@@ -38,6 +38,8 @@ fn obligation_for(
         first_seen_ms: now_ms,
         next_retry_at_ms: now_ms,
         retry_count: 0,
+        refusal: None,
+        reseal_count: 0,
     }
 }
 
@@ -1432,6 +1434,8 @@ async fn issue1365_sidecar_bytes_are_pinned_across_restart() -> Result<()> {
         first_seen_ms: 1_000,
         next_retry_at_ms: 2_000,
         retry_count: 4,
+        refusal: None,
+        reseal_count: 0,
     };
     insert_requester_offer_obligation(&state, obligation.clone())
         .await

@@ -100,6 +100,18 @@ impl Host {
         journal::write_record(&self.root.join(journal::JOURNAL_FILE_NAME), record)
     }
 
+    /// Record that no safe automatic step remains. A committed host is
+    /// never changed.
+    pub(super) fn mark_recovery_failed(&self) -> io::Result<()> {
+        self.locked(|record| {
+            if record.phase == journal::Phase::HostCommitted {
+                return Err(invalid("a committed host is never marked failed"));
+            }
+            record.phase = journal::Phase::RecoveryFailed;
+            self.save(record)
+        })
+    }
+
     pub(super) fn verify_candidate(&self) -> io::Result<()> {
         for a in [&self.plan().daemon, &self.plan().cli] {
             if hash(&a.target_path)? != a.candidate_sha256 {

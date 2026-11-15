@@ -704,7 +704,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Get,
         path: "/diagnostics/upgrade",
         cli_name: "diagnostics upgrade",
-        description: "Local version + update-policy digest for the M1 census (#1383; local only, no wire change)",
+        description: "Local version, update policy and digest (#1383), plus channel, latest release-topic version, last check, pending update, upgrade plan, last attempt, backups and holds (#1381); local only, no wire change",
         category: "network",
         request: RequestSpec::None,
     },
@@ -1114,6 +1114,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         description: "List direct connections",
         category: "direct",
         request: RequestSpec::None,
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/direct/receipts/:logical_id",
+        cli_name: "direct receipt",
+        description: "Durable send outcome by logical_id (delivered, delivered_late, pending, unknown)",
+        category: "direct",
+        request: RequestSpec::Fields(&[RequestField::query_as("agent_id", true, "AGENT_ID")]),
     },
     EndpointDef {
         method: Method::Get,
@@ -1835,6 +1843,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         category: "upgrade",
         request: RequestSpec::Fields(&[RequestField::query("now", false)]),
     },
+    EndpointDef {
+        method: Method::Post,
+        path: "/upgrade/clear-hold",
+        cli_name: "upgrade --clear-hold",
+        description: "Authenticated, recorded local clear of this install's failed-release probe hold for one version (D190); never clears recovery-failed",
+        category: "upgrade",
+        request: RequestSpec::Fields(&[RequestField::query("version", false)]),
+    },
     // ── WebSocket ───────────────────────────────────────────────────────
     EndpointDef {
         method: Method::Get,
@@ -2003,6 +2019,18 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         description: "Revoke a share grant (owner key; gossiped on x0x.revocation.v3 and pushed directly to capable recipients)",
         category: "grants",
         request: RequestSpec::None,
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/grants/:id/renew",
+        cli_name: "grant renew",
+        description: "Renew an issued share grant: sign a new grant with the same grantee, agents and caps, valid from now (at most 90 days), and deliver it",
+        category: "grants",
+        request: RequestSpec::Fields(&[
+            RequestField::body("ttl_secs", false),
+            RequestField::body("deliver_to", false),
+            RequestField::body_as("include_names", false, "--no-names"),
+        ]),
     },
     EndpointDef {
         method: Method::Get,

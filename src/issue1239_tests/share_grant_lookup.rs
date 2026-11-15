@@ -48,7 +48,7 @@ async fn install_dm_grant(agent: &Agent, requester: identity::AgentId) {
         share_grant::Grantee::Agent(requester),
         vec![agent.agent_id()],
         vec![share_grant::ShareCap::Dm],
-        0,
+        now_unix - 60,
         now_unix + 3600,
     )
     .unwrap();

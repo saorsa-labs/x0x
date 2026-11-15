@@ -26,6 +26,16 @@
 //!   pending copy beside a damaged `.evs` writes one replacement listing
 //!   both transaction ids.
 //!
+//! - `control_sidecar_lifecycle_pending_resume_forms`: the §5a resume
+//!   forms the other arms leave out. A verified pending copy with the
+//!   `.evs` missing resumes into one replacement that lists its txid. A
+//!   pending copy that fails verify with the `.evs` missing writes no
+//!   replacement and shows `sidecar_quarantine_failed` with `step verify`.
+//!   Three pending copies, one of which fails verify: the replacement
+//!   lists the two that pass and the failed one stays pending. Once its
+//!   bytes verify, the next load finalizes it as history beside the valid
+//!   `.evs`, which keeps its `rebuilt_from`.
+//!
 //! Harness honesty: fsync-failure injection has no seam, so the §5a cut
 //! points are modelled as the on-disk states they leave. The journal stem
 //! is arbitrary: §5a classification is keyed on the extension, and a
@@ -34,9 +44,9 @@
 //! journal) also plants a damaged `.evs` in the same load: the store
 //! state publishes only after the whole load, journal scan included, so
 //! the untouched read happens after it, not after a guessed settle
-//! window. Not covered: the fsync failures at §5a steps 2, 4 and 5
-//! themselves, a resume with the `.evs` missing and only the pending
-//! copy, a scan with three pendings of which one fails verification,
+//! window. A pending copy that "fails verify" holds bytes whose BLAKE3 is
+//! not the `h` in its name, which is what a failed step 3 read leaves.
+//! Not covered: the fsync failures at §5a steps 2, 4 and 5 themselves,
 //! retention (D148), and the ADR 0094 trial-gate forms, which stay with
 //! the upgrade paths.
 
@@ -73,6 +83,11 @@ const CAUSE_NOT_QUARANTINED: &str = "a damaged S4 file stayed in place: no quara
                                      transaction, no history copy, no replacement";
 const CAUSE_NEWER_TOUCHED: &str = "a newer-layout S4 file was rewritten, quarantined or \
                                    removed";
+const FINAL_PENDING: &str = "pending_resume_forms_meet_adr_0108_5a";
+const CAUSE_PENDING_FORMS: &str = "a 5a resume form went wrong: a verified pending copy was \
+                                   not covered or finalized, a failed copy was covered, \
+                                   finalized or removed, or a replacement was written with no \
+                                   verified copy";
 const CAUSE_RESUME_LOST: &str = "the 5a resume dropped pending evidence: the replacement \
                                  does not list every verified txid, or a pending copy or the \
                                  damaged file was left behind";
@@ -557,6 +572,226 @@ async fn red_arm(sim: &mut Sim, receipt: &mut Receipt, group: &str) -> Result<()
     Ok(())
 }
 
+/// Plant a pending copy named for `named` that holds `bytes`: it verifies
+/// only when `bytes == named`.
+fn write_pending_as(dir: &Path, txid: &[u8; 16], named: &[u8], bytes: &[u8]) -> Result<PathBuf> {
+    let path = dir.join(quarantine_pending_name(EVS_FILE, txid, named));
+    std::fs::write(&path, bytes)?;
+    Ok(path)
+}
+
+/// The pending-resume forms (ADR 0108 §5a "Resume at startup" and its
+/// test list).
+async fn pending_arm(sim: &mut Sim, receipt: &mut Receipt, group: &str) -> Result<()> {
+    let at = |sim: &Sim| sim.fabric().now().as_micros();
+    let mut passed = true;
+    let mut fail = |receipt: &mut Receipt, sim: &Sim, ok: bool, detail: String| {
+        if !ok {
+            receipt.cause(CAUSE_PENDING_FORMS, Some(detail), true, at(sim));
+        }
+        passed &= ok;
+    };
+
+    // (1) The `.evs` missing, one verified pending copy: one replacement
+    // that lists its txid; the copy becomes history.
+    sim.stop("A", RestartMode::Crash).await?;
+    // The harness reads a node's files only while it is stopped.
+    let dir = sim.data_dir("A")?;
+    let evs = dir.join(EVS_FILE);
+    let one = b"X0XEVICU1\0missing-file".as_slice();
+    if evs.exists() {
+        std::fs::remove_file(&evs)?;
+    }
+    let copy = write_pending(&dir, &[0x16; 16], one)?;
+    sim.fabric()
+        .mark("case: .evs missing, one verified pending copy");
+    receipt.evidence(
+        "missing: no .evs and one verified pending copy",
+        !evs.exists() && copy.exists(),
+        "planted",
+        at(sim),
+    );
+    let (history_before, _) = quarantine_names(&dir, EVS_FILE);
+    sim.start_again("A").await?;
+    let (state, detail, rebuilt_from) = boot_read(
+        sim,
+        receipt,
+        group,
+        "rebuilt",
+        "missing: the restarted daemon serves the group and its S4 store view",
+    )
+    .await?;
+    let (history, pendings) = quarantine_names(&dir, EVS_FILE);
+    let (replaced, replaced_detail) = replacement_check(&dir, &rebuilt_from);
+    let new_history = new_names(&history, &history_before);
+    let named = history_named(
+        &dir,
+        EVS_FILE,
+        &new_history,
+        one,
+        Some(&[hex::encode([0x16; 16])][..]),
+    );
+    let ok = state == "rebuilt"
+        && rebuilt_from == [hex::encode([0x16; 16])]
+        && pendings.is_empty()
+        && new_history.len() == 1
+        && named
+        && replaced;
+    fail(
+        receipt,
+        sim,
+        ok,
+        format!(
+            "missing: state={state} detail={detail:?} rebuilt_from={rebuilt_from:?} \
+             new_history={new_history:?} pending={pendings:?} named={named} \
+             replacement: {replaced_detail}"
+        ),
+    );
+
+    // (2) The `.evs` missing and the only pending copy fails verify: no
+    // replacement, `sidecar_quarantine_failed {step verify}`, the copy
+    // kept.
+    sim.stop("A", RestartMode::Crash).await?;
+    std::fs::remove_file(&evs)?;
+    let good = b"X0XEVICU1\0verify-later".as_slice();
+    let bad = write_pending_as(&dir, &[0x17; 16], good, b"X0XEVICU1\0bit-flipped!")?;
+    sim.fabric()
+        .mark("case: .evs missing, the only pending copy fails verify");
+    receipt.evidence(
+        "verify: no .evs and one pending copy whose bytes do not verify",
+        !evs.exists() && bad.exists(),
+        "planted",
+        at(sim),
+    );
+    sim.start_again("A").await?;
+    let (state, detail, rebuilt_from) = boot_read(
+        sim,
+        receipt,
+        group,
+        "sidecar_quarantine_failed",
+        "verify: the restarted daemon serves the group and its S4 store view",
+    )
+    .await?;
+    let ok = state == "sidecar_quarantine_failed"
+        && detail.as_deref() == Some("step verify")
+        && !evs.exists()
+        && bad.exists();
+    fail(
+        receipt,
+        sim,
+        ok,
+        format!(
+            "verify: state={state} detail={detail:?} rebuilt_from={rebuilt_from:?} \
+             evs_exists={} failed_copy_kept={}",
+            evs.exists(),
+            bad.exists()
+        ),
+    );
+
+    // (3) Three pending copies, one of which fails verify (the copy from
+    // (2)): the replacement lists the two that pass; the failed one stays
+    // pending.
+    sim.stop("A", RestartMode::Crash).await?;
+    let two = b"X0XEVICU1\0second".as_slice();
+    let three = b"X0XEVICU1\0third".as_slice();
+    // The failing copy from (2) stays pending and no `.evs` exists. A
+    // regression in (2) can change both; the step restores its own
+    // premise so such a regression shows as RED here too.
+    if evs.exists() {
+        std::fs::remove_file(&evs)?;
+    }
+    if !bad.exists() {
+        write_pending_as(&dir, &[0x17; 16], good, b"X0XEVICU1\0bit-flipped!")?;
+    }
+    write_pending(&dir, &[0x18; 16], two)?;
+    write_pending(&dir, &[0x19; 16], three)?;
+    sim.fabric()
+        .mark("case: three pending copies, one fails verify");
+    let (history_before, pending_before) = quarantine_names(&dir, EVS_FILE);
+    receipt.evidence(
+        "three: no .evs and three pending copies",
+        !evs.exists() && pending_before.len() == 3,
+        format!("pending {pending_before:?}"),
+        at(sim),
+    );
+    sim.start_again("A").await?;
+    let (state, detail, rebuilt_from) = boot_read(
+        sim,
+        receipt,
+        group,
+        "rebuilt",
+        "three: the restarted daemon serves the group and its S4 store view",
+    )
+    .await?;
+    let passing = [hex::encode([0x18; 16]), hex::encode([0x19; 16])];
+    let (history, pendings) = quarantine_names(&dir, EVS_FILE);
+    let (replaced, replaced_detail) = replacement_check(&dir, &rebuilt_from);
+    let new_history = new_names(&history, &history_before);
+    let ok = state == "rebuilt"
+        && rebuilt_from == passing
+        && pendings.len() == 1
+        && bad.exists()
+        && new_history.len() == 2
+        && replaced;
+    fail(
+        receipt,
+        sim,
+        ok,
+        format!(
+            "three: state={state} detail={detail:?} rebuilt_from={rebuilt_from:?} \
+             new_history={new_history:?} pending={pendings:?} replacement: {replaced_detail}"
+        ),
+    );
+
+    // (4) The failed copy's bytes now verify: the next load finalizes it
+    // as history beside the valid `.evs`, which keeps its `rebuilt_from`.
+    sim.stop("A", RestartMode::Crash).await?;
+    std::fs::write(&bad, good)?;
+    sim.fabric()
+        .mark("case: the failed pending copy now verifies");
+    let (history_before, _) = quarantine_names(&dir, EVS_FILE);
+    sim.start_again("A").await?;
+    let _ = sim
+        .until("the repaired copy is finalized", BOOT, async |_: &Sim| {
+            !bad.exists()
+        })
+        .await;
+    let (state, detail, rebuilt_from) = store_view(sim, group)
+        .await?
+        .context("the group status carries no revocation_eviction_store")?;
+    receipt.request_delivered(
+        "finalize: the restarted daemon serves the group and its S4 store view",
+        true,
+        format!("store state {state}"),
+        at(sim),
+    );
+    let (history, pendings) = quarantine_names(&dir, EVS_FILE);
+    let (kept, kept_detail) = replacement_check(&dir, &passing);
+    let new_history = new_names(&history, &history_before);
+    let named = history_named(
+        &dir,
+        EVS_FILE,
+        &new_history,
+        good,
+        Some(&[hex::encode([0x17; 16])][..]),
+    );
+    let ok =
+        pendings.is_empty() && new_history.len() == 1 && named && kept && rebuilt_from == passing;
+    fail(
+        receipt,
+        sim,
+        ok,
+        format!(
+            "finalize: state={state} detail={detail:?} rebuilt_from={rebuilt_from:?} \
+             new_history={new_history:?} pending={pendings:?} named={named} \
+             .evs: {kept_detail}"
+        ),
+    );
+
+    receipt.finish(FINAL_PENDING, passed, at(sim));
+    Ok(())
+}
+
 /// Start the one node and create the group the store view hangs off.
 async fn setup(sim: &mut Sim, receipt: &mut Receipt) -> Result<String> {
     let at = |sim: &Sim| sim.fabric().now().as_micros();
@@ -587,6 +822,8 @@ enum Arm {
     Control,
     /// The journal faults and the pending-copy resume.
     Resume,
+    /// The pending-resume forms.
+    Pending,
 }
 
 async fn run(case: &str, seed: u64, arm: Arm) -> Receipt {
@@ -602,6 +839,7 @@ async fn run(case: &str, seed: u64, arm: Arm) -> Receipt {
                 Ok(group) => match arm {
                     Arm::Control => control_arm(&mut sim, &mut receipt, &group).await,
                     Arm::Resume => red_arm(&mut sim, &mut receipt, &group).await,
+                    Arm::Pending => pending_arm(&mut sim, &mut receipt, &group).await,
                 },
                 Err(error) => Err(error),
             };
@@ -617,6 +855,7 @@ async fn run(case: &str, seed: u64, arm: Arm) -> Receipt {
     let final_name = match arm {
         Arm::Control => FINAL_CONTROL,
         Arm::Resume => FINAL_RESUME,
+        Arm::Pending => FINAL_PENDING,
     };
     if receipt.verdict().is_none() || receipt.has_infra() {
         receipt.reclassify(final_name);
@@ -681,6 +920,31 @@ fn w3h_1581g_red_sidecar_lifecycle_journal_and_pending_resume() -> Result<()> {
             "w3h_1581g_red_sidecar_lifecycle_journal_and_pending_resume",
             0x1581_000d,
             Arm::Resume,
+        )
+        .await
+    })
+}
+
+/// ADR 0110 `s4_sidecar_lifecycle`, control: the §5a resume forms with the
+/// `.evs` missing, a pending copy that fails verify, and three pending
+/// copies of which one fails verify and is finalized at the next load.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "#1559: needs the W3-H entropy shim (nextest profile w3h / w3h-gate \
+              --run-ignored all); plain suites run unseeded entropy, which is not an \
+              observation"
+)]
+fn w3h_1581g_control_sidecar_lifecycle_pending_resume_forms() -> Result<()> {
+    super::block_on_paused(async move {
+        expect_green(
+            "w3h_1581g_control_sidecar_lifecycle_pending_resume_forms",
+            0x1581_000e,
+            Arm::Pending,
         )
         .await
     })

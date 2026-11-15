@@ -311,6 +311,14 @@ enum Commands {
         /// Does not bypass the daemon's apply checks.
         #[arg(long)]
         force: bool,
+        /// Clear this install's failed-release hold for VERSION (recorded by
+        /// the daemon). A newer release clears such a hold by itself. Never
+        /// clears a recovery-failed state.
+        #[arg(long, requires = "version", conflicts_with_all = ["check", "apply", "force"])]
+        clear_hold: bool,
+        /// Release version for --clear-hold.
+        #[arg(requires = "clear_hold")]
+        version: Option<String>,
     },
     /// WebSocket session info. [dev]
     #[command(hide = true)]
@@ -540,6 +548,23 @@ enum GrantSub {
     },
     /// List grants that name this install as grantee.
     Received,
+    /// Renew an issued grant: sign a new grant with the same grantee,
+    /// agents and caps, valid from now (default and maximum 90 days), and
+    /// deliver it. The old grant stays valid to its own expiry.
+    Renew {
+        /// Grant id (64 hex chars) from `list`.
+        id: String,
+        /// Lifetime of the renewal in seconds (default and maximum 7776000,
+        /// 90 days).
+        #[arg(long)]
+        ttl_secs: Option<u64>,
+        /// More agents (64 hex chars) to deliver the renewal to; repeatable.
+        #[arg(long = "deliver-to", value_name = "AGENT_ID")]
+        deliver_to: Vec<String>,
+        /// ADR 0079: withhold the owner and machine names from the renewal.
+        #[arg(long)]
+        no_names: bool,
+    },
 }
 
 /// `x0x acl` sub-actions.
@@ -1141,7 +1166,9 @@ enum IdentitySub {
     /// sub-agent, use `x0x owner agents revoke <AGENT_ID>`. For a lost
     /// device, use `x0x owner lose-device <MACHINE_ID>`. Both ids plus
     /// --move-epoch select an owner-signed binding revocation and require
-    /// the durable API token.
+    /// the durable API token. A machine revocation does not cut a device
+    /// that still holds the agent key off TreeKEM group content; revoke
+    /// the agent or remove the member for that (#1929).
     Revoke {
         /// Agent ID to revoke (hex, 64 chars).
         #[arg(long)]
@@ -1515,6 +1542,15 @@ enum DirectSub {
     },
     /// List established direct connections.
     Connections,
+    /// Show the outcome of a durable send by its logical id (#1109):
+    /// delivered, delivered_late, pending or unknown. Use it after a 504
+    /// (`outcome: "ack_unknown"`) to learn whether a late ACK arrived.
+    Receipt {
+        /// The `--logical-id` the send used.
+        logical_id: String,
+        /// Recipient agent ID (hex).
+        agent_id: String,
+    },
     /// Stream incoming direct messages.
     Events {
         /// Replay the N most recent stored DM rows before the `live`
@@ -2305,6 +2341,7 @@ async fn run(
             check,
             apply,
             force,
+            clear_hold: false,
             ..
         } if *check || !*apply => {
             return commands::upgrade::run(*check, *force, name, api).await;
@@ -2959,6 +2996,10 @@ async fn run(
                 .await
             }
             DirectSub::Connections => commands::direct::connections(&client).await,
+            DirectSub::Receipt {
+                logical_id,
+                agent_id,
+            } => commands::direct::receipt(&client, &logical_id, &agent_id).await,
             DirectSub::Events { backfill } => commands::direct::events(&client, backfill).await,
         },
         Commands::Groups { sub } => match sub {
@@ -3391,6 +3432,26 @@ async fn run(
                 .await
             }
         },
+        Commands::Upgrade {
+            clear_hold: true,
+            version: Some(version),
+            ..
+        } => {
+            // D190: the daemon validates the version and records the clear
+            // under its install lock. Only semver characters reach the query.
+            if version.is_empty()
+                || !version
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+            {
+                anyhow::bail!("--clear-hold needs a release version such as 0.48.2");
+            }
+            let response = client
+                .post_empty(&format!("/upgrade/clear-hold?version={version}"))
+                .await?;
+            x0x::cli::print_value(client.format(), &response);
+            Ok(())
+        }
         Commands::Upgrade { now, .. } => {
             // The serving daemon owns installation and its writer lock. The
             // existing client carries the selected instance and bearer token.
@@ -3502,6 +3563,12 @@ async fn run(
             GrantSub::List => commands::grant::list(&client).await,
             GrantSub::Revoke { id } => commands::grant::revoke(&client, &id).await,
             GrantSub::Received => commands::grant::received(&client).await,
+            GrantSub::Renew {
+                id,
+                ttl_secs,
+                deliver_to,
+                no_names,
+            } => commands::grant::renew(&client, &id, ttl_secs, &deliver_to, no_names).await,
         },
         Commands::Names { sub } => match sub {
             NamesSub::List => commands::names::list(&client).await,

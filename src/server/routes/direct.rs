@@ -343,6 +343,7 @@ pub(in crate::server) async fn direct_send(
         Ok(config) => config,
         Err(rejection) => return rejection.into_response(),
     };
+    let durable = send_config.require_durable_app_ack;
 
     // Check trust level before sending — reject blocked agents
     {
@@ -490,6 +491,12 @@ pub(in crate::server) async fn direct_send(
                 x0x::dm::DmError::RecipientPairingDenied { .. } => {
                     (StatusCode::FORBIDDEN, "recipient_pairing_denied")
                 }
+                // ADR 0110 §3 (D70; #1597 item 4): the recipient's resolved
+                // machine is revoked; that device is denied, nothing was
+                // sent, and the agent keeps its seat. A policy refusal.
+                x0x::dm::DmError::RecipientMachineRevoked { .. } => {
+                    (StatusCode::FORBIDDEN, "recipient_machine_revoked")
+                }
                 x0x::dm::DmError::RecipientKeyUnavailable(_) => {
                     (StatusCode::NOT_FOUND, "recipient_key_unavailable")
                 }
@@ -581,6 +588,9 @@ pub(in crate::server) async fn direct_send(
                     snap.last_ack_publish_ms,
                     snap.stats.ack_publish_route_failed,
                 );
+                if durable {
+                    attach_ack_unknown(&mut body, req.logical_id.as_deref());
+                }
             }
             (status, Json(body))
         }
@@ -626,6 +636,69 @@ pub(in crate::server) async fn direct_connections(
 /// Build the `/direct/send` error JSON. Timeout 504s also export the #336
 /// phase-1 stage timers so a slow send names which of the three stages
 /// consumed the budget. Status and `error`/`detail` stay unchanged.
+/// #1109: a durable send that ran out of budget did not learn the outcome.
+/// The recipient may hold the message; `outcome: "ack_unknown"` says so, and
+/// `logical_id` (when the caller supplied one) is the key for
+/// `GET /direct/receipts/{logical_id}`, which reports a late ACK.
+fn attach_ack_unknown(body: &mut serde_json::Value, logical_id: Option<&str>) {
+    body["outcome"] = serde_json::json!("ack_unknown");
+    body["logical_id"] = serde_json::json!(logical_id);
+}
+
+/// Query string of `GET /direct/receipts/{logical_id}`.
+#[derive(Debug, Deserialize)]
+pub(in crate::server) struct DirectReceiptQuery {
+    /// Recipient agent id (64 hex). A logical id is scoped to one directed
+    /// pair, so the recipient is part of the key.
+    pub(in crate::server) agent_id: String,
+}
+
+/// #1109: the response body for one receipt lookup, or the refusal.
+fn direct_receipt_body(
+    raw_logical_id: &str,
+    raw_agent_id: &str,
+    self_agent_id: x0x::identity::AgentId,
+    acks: &x0x::dm::InFlightAcks,
+) -> Result<serde_json::Value, DirectSendRequestRejection> {
+    let logical_id = x0x::dm::DmLogicalId::parse(raw_logical_id).map_err(|detail| {
+        DirectSendRequestRejection {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_logical_id",
+            detail,
+        }
+    })?;
+    let recipient =
+        parse_agent_id_hex(raw_agent_id).map_err(|detail| DirectSendRequestRejection {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_agent_id",
+            detail,
+        })?;
+    let request_id = logical_id.request_id(self_agent_id, recipient);
+    Ok(serde_json::json!({
+        "ok": true,
+        "logical_id": logical_id.as_str(),
+        "agent_id": hex::encode(recipient.as_bytes()),
+        "request_id": hex::encode(request_id),
+        "status": acks.receipt_status(&request_id).as_str(),
+    }))
+}
+
+/// GET /direct/receipts/{logical_id}?agent_id=<hex> — #1109: what this daemon
+/// knows about a durable send it made under `logical_id` to `agent_id`:
+/// `delivered`, `delivered_late`, `pending` or `unknown`. Records live for
+/// ten minutes after the send resolved or gave up.
+pub(in crate::server) async fn direct_receipt(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(logical_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<DirectReceiptQuery>,
+) -> impl IntoResponse {
+    let acks = state.agent.dm_inflight_acks();
+    match direct_receipt_body(&logical_id, &query.agent_id, state.agent.agent_id(), &acks) {
+        Ok(body) => (StatusCode::OK, Json(body)),
+        Err(rejection) => rejection.into_response(),
+    }
+}
+
 fn dm_error_body(
     err_kind: &str,
     e: &x0x::dm::DmError,
@@ -1067,5 +1140,175 @@ mod tests {
         assert_eq!(body["error"], "recipient_pairing_denied", "body: {body}");
     }
 
+    /// #1597 item 4 (ADR 0110 §3, D70): `POST /direct/send` to an agent
+    /// whose machine is revoked answers HTTP 403 with the stable error code
+    /// `recipient_machine_revoked`, which names the machine revocation
+    /// (a binding revocation keeps `recipient_pairing_denied`). The lib
+    /// test `send_direct_reports_a_revoked_machine_as_recipient_machine_revoked`
+    /// pins the typed `DmError` through the real revocation path (eviction
+    /// included); this test pins only the HTTP mapping, so it inserts the
+    /// record into the set directly and keeps the discovery entry.
+    #[tokio::test]
+    async fn direct_send_to_a_revoked_machine_is_403_recipient_machine_revoked() {
+        use base64::Engine as _;
+
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let recipient = x0x::identity::AgentKeypair::generate().expect("recipient keygen");
+        let machine = x0x::identity::MachineKeypair::generate().expect("machine keygen");
+        let now = x0x::dm::now_unix_ms() / 1_000;
+        state
+            .agent
+            .insert_discovered_agent_for_testing(x0x::DiscoveredAgent {
+                self_name: None,
+                cert_digest: None,
+                agent_id: recipient.agent_id(),
+                machine_id: machine.machine_id(),
+                user_id: None,
+                addresses: Vec::new(),
+                announced_at: now,
+                last_seen: now,
+                machine_public_key: machine.public_key().as_bytes().to_vec(),
+                nat_type: None,
+                can_receive_direct: None,
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                cert_not_after: None,
+                agent_certificate: None,
+                agent_public_key: Vec::new(),
+            })
+            .await;
+        let record = x0x::revocation::RevocationRecord::sign(
+            x0x::revocation::RevokedSubject::Machine(machine.machine_id()),
+            machine.public_key(),
+            machine.secret_key(),
+            1_000,
+            None,
+        )
+        .expect("sign");
+        assert!(state
+            .agent
+            .revocation_set()
+            .write()
+            .await
+            .verify_and_insert(record, None)
+            .expect("a machine self-revocation verifies"));
+
+        let response = direct_send(
+            State(Arc::clone(&state)),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
+            Json(DirectSendRequest {
+                agent_id: hex::encode(recipient.agent_id().as_bytes()),
+                payload: base64::engine::general_purpose::STANDARD.encode(b"revoked"),
+                prefer_raw_quic_if_connected: None,
+                raw_quic_receive_ack_ms: None,
+                stop_fallback_on_raw_error: false,
+                require_gossip: false,
+                require_gossip_ack: None,
+                require_ack_ms: None,
+                require_durable_app_ack: None,
+                logical_id: None,
+            }),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("decode response body");
+        assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+        assert_eq!(body["ok"], false, "body: {body}");
+        assert_eq!(body["error"], "recipient_machine_revoked", "body: {body}");
+    }
+
     // ── ADR-0016 R2: REST pre-check (exact §3 string + status code) ─────
+
+    /// #1109: a durable 504 says the outcome is unknown and carries the
+    /// caller's logical id, the key for the receipt query.
+    #[test]
+    fn issue1109_durable_timeout_body_says_ack_unknown() {
+        let err = x0x::dm::DmError::Timeout {
+            retries: 1,
+            elapsed: Duration::from_secs(16),
+        };
+        let mut body = dm_error_body("timeout", &err, None);
+        attach_ack_unknown(&mut body, Some("order-42"));
+        assert_eq!(body["error"], "timeout");
+        assert_eq!(body["outcome"], "ack_unknown");
+        assert_eq!(body["logical_id"], "order-42");
+        let mut anonymous = dm_error_body("timeout", &err, None);
+        attach_ack_unknown(&mut anonymous, None);
+        assert!(anonymous["logical_id"].is_null());
+    }
+
+    /// #1109: the receipt query derives the same request id as the send
+    /// (logical id bound to this sender and the named recipient) and reports
+    /// a late ACK recorded after the send gave up.
+    #[test]
+    fn issue1109_receipt_query_reports_a_late_ack_by_logical_id() {
+        let me = test_agent_id(1);
+        let peer = test_agent_id(2);
+        let peer_hex = hex::encode(peer.as_bytes());
+        let config = direct_send_config_for_request(
+            &parse_request(serde_json::json!({
+                "agent_id": peer_hex,
+                "payload": "aGk=",
+                "logical_id": "order-42",
+            })),
+            me,
+            peer,
+        )
+        .expect("valid request");
+        let rid = config
+            .logical_request_id
+            .expect("logical id derives a request id");
+        let acks = x0x::dm::InFlightAcks::new();
+        let query = |acks: &x0x::dm::InFlightAcks| {
+            direct_receipt_body("order-42", &peer_hex, me, acks).expect("valid query")
+        };
+        assert_eq!(query(&acks)["status"], "unknown");
+        let machine = x0x::identity::MachineId([9; 32]);
+        let _rx =
+            acks.register_for_protocol(rid, x0x::dm::DM_PROTOCOL_DURABLE_ACK, peer, Some(machine));
+        assert_eq!(query(&acks)["status"], "pending");
+        acks.abandon(&rid);
+        assert_eq!(query(&acks)["status"], "pending");
+        assert!(!acks.resolve_for_protocol(
+            &rid,
+            x0x::dm::DM_PROTOCOL_DURABLE_ACK,
+            peer,
+            machine,
+            x0x::dm::DmAckOutcome::Accepted,
+        ));
+        let body = query(&acks);
+        assert_eq!(body["status"], "delivered_late");
+        assert_eq!(body["request_id"], hex::encode(rid));
+        assert_eq!(body["logical_id"], "order-42");
+        // The same token to another recipient is another request.
+        let other = hex::encode(test_agent_id(3).as_bytes());
+        let elsewhere = direct_receipt_body("order-42", &other, me, &acks).expect("valid");
+        assert_eq!(elsewhere["status"], "unknown");
+    }
+
+    /// #1109: malformed keys are refused, not answered `unknown`.
+    #[test]
+    fn issue1109_receipt_query_refuses_bad_keys() {
+        let acks = x0x::dm::InFlightAcks::new();
+        let peer_hex = hex::encode(test_agent_id(2).as_bytes());
+        let bad_id = direct_receipt_body("Order 42", &peer_hex, test_agent_id(1), &acks)
+            .expect_err("uppercase and space are not a logical id");
+        assert_eq!(bad_id.status, StatusCode::BAD_REQUEST);
+        assert_eq!(bad_id.code, "invalid_logical_id");
+        let bad_agent = direct_receipt_body("order-42", "zz", test_agent_id(1), &acks)
+            .expect_err("not an agent id");
+        assert_eq!(bad_agent.status, StatusCode::BAD_REQUEST);
+        assert_eq!(bad_agent.code, "invalid_agent_id");
+    }
 }

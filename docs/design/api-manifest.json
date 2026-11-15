@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 221,
+  "endpoint_count": 224,
   "endpoints": [
     {
       "category": "status",
@@ -966,7 +966,7 @@
     {
       "category": "network",
       "cli_name": "diagnostics upgrade",
-      "description": "Local version + update-policy digest for the M1 census (#1383; local only, no wire change)",
+      "description": "Local version, update policy and digest (#1383), plus channel, latest release-topic version, last check, pending update, upgrade plan, last attempt, backups and holds (#1381); local only, no wire change",
       "method": "GET",
       "path": "/diagnostics/upgrade",
       "request": {
@@ -1829,6 +1829,24 @@
       "path": "/direct/connections",
       "request": {
         "kind": "none"
+      }
+    },
+    {
+      "category": "direct",
+      "cli_name": "direct receipt",
+      "description": "Durable send outcome by logical_id (delivered, delivered_late, pending, unknown)",
+      "method": "GET",
+      "path": "/direct/receipts/:logical_id",
+      "request": {
+        "fields": [
+          {
+            "cli": "AGENT_ID",
+            "in": "query",
+            "name": "agent_id",
+            "required": true
+          }
+        ],
+        "kind": "fields"
       }
     },
     {
@@ -3330,6 +3348,24 @@
       }
     },
     {
+      "category": "upgrade",
+      "cli_name": "upgrade --clear-hold",
+      "description": "Authenticated, recorded local clear of this install's failed-release probe hold for one version (D190); never clears recovery-failed",
+      "method": "POST",
+      "path": "/upgrade/clear-hold",
+      "request": {
+        "fields": [
+          {
+            "cli": "default",
+            "in": "query",
+            "name": "version",
+            "required": false
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
       "category": "websocket",
       "cli_name": "ws",
       "description": "General-purpose WebSocket session",
@@ -3627,6 +3663,36 @@
       "path": "/grants/:id",
       "request": {
         "kind": "none"
+      }
+    },
+    {
+      "category": "grants",
+      "cli_name": "grant renew",
+      "description": "Renew an issued share grant: sign a new grant with the same grantee, agents and caps, valid from now (at most 90 days), and deliver it",
+      "method": "POST",
+      "path": "/grants/:id/renew",
+      "request": {
+        "fields": [
+          {
+            "cli": "default",
+            "in": "body",
+            "name": "ttl_secs",
+            "required": false
+          },
+          {
+            "cli": "default",
+            "in": "body",
+            "name": "deliver_to",
+            "required": false
+          },
+          {
+            "cli": "--no-names",
+            "in": "body",
+            "name": "include_names",
+            "required": false
+          }
+        ],
+        "kind": "fields"
       }
     },
     {

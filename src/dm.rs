@@ -151,8 +151,46 @@ impl CapabilityRegistry {
     /// junk DM and release a durable ACK).
     pub const SHARE_GRANT_NAMES_V1: u64 = 1 << 14;
 
+    /// Issue #1840 (David's ruling, 10 Nov 2026 08:10 GMT: "typed DM"):
+    /// accepts the join-request outcome (`x0x-group-join-outcome-v1\0`)
+    /// that an authority sends when its validation refuses a
+    /// `JoinRequestCreated` offer. Bit 16, the next free bit. The sender
+    /// needs POSITIVE evidence: an authority sends the outcome only to a
+    /// requester whose current verified advert has this bit, because an
+    /// old receiver would show the payload as an ordinary DM. ROUTE-GATED
+    /// like `grant_revocation_push_v1`: [`Self::current`] leaves it out
+    /// and [`Self::advertised`] adds it when the typed route is registered.
+    pub const JOIN_REQUEST_OUTCOME_V1: u64 = 1 << 16;
+
+    /// #1540 (ADR 0110 S4; David's design approval of 21 Oct 2026 on
+    /// #1508, item c): accepts the roster-only `MemberBanned` of a TreeKEM
+    /// group, the ban of a member that holds no ratchet leaf, which carries
+    /// no TreeKEM commit and changes no epoch. Bit 17, the next free bit
+    /// after `join_request_outcome_v1` (bit 16, #1840). An admin publishes a
+    /// roster-only ban only while every other Active member's current
+    /// verified advert carries this bit; a released receiver refuses the
+    /// event (`treekem_commit_b64_absent`).
+    pub const ROSTER_ONLY_BAN_V1: u64 = 1 << 17;
+
+    /// Issue #504 (A06, 14 Nov 2026): takes a targeted capability answer as
+    /// one direct frame (`x0x/caps/v1/unicast-response\0`) to the machine a
+    /// targeted request names; the response topic stays the fallback. Bit 18
+    /// (bit 17 is `roster_only_ban_v1`, #1540).
+    pub const CAPS_UNICAST_RESPONSE_V1: u64 = 1 << 18;
+
+    /// Issue #1840 routes 1–3 (A08 amendment of 15 Nov 2026): reads the
+    /// optional `head` of a `stale` join-request outcome and signs the same
+    /// request again over it. Bit 19, the next free bit. An authority puts
+    /// a head on an outcome only for a requester whose current verified
+    /// advert has this bit: a requester without it cannot read a headed
+    /// outcome (it is over the first release's bound). ROUTE-GATED with
+    /// `join_request_outcome_v1`: advertised only when the outcome route is
+    /// registered, because the head is handled on that route.
+    pub const JOIN_REQUEST_HEAD_V1: u64 = 1 << 19;
+
     /// The routes supported by every receiver of this release.
-    /// Route-gated bits (`grant_revocation_push_v1`) are NOT here: they are
+    /// Route-gated bits (`grant_revocation_push_v1`,
+    /// `join_request_outcome_v1`, `join_request_head_v1`) are NOT here: they are
     /// added per daemon by [`Self::advertised`] from the typed routes the
     /// DM inbox actually registered, so a library embedder that never wires
     /// the route never advertises the bit.
@@ -173,23 +211,27 @@ impl CapabilityRegistry {
                 | Self::JOIN_PENDING_NOTICE_V1
                 | Self::KEY_REPUBLISH_V1
                 | Self::TREEKEM_CATCHUP_REFUSAL_V1
-                | Self::SHARE_GRANT_NAMES_V1,
+                | Self::SHARE_GRANT_NAMES_V1
+                | Self::ROSTER_ONLY_BAN_V1,
         }
     }
 
     /// The registry a READY receiver advertises, given the prefixes of the
     /// typed routes its DM inbox registered. ADR 0080 §1:
     /// `grant_revocation_push_v1` is route-gated — the bit is advertised
-    /// only when the push route is registered and ready; everything in
-    /// [`Self::current`] is unconditional.
+    /// only when the push route is registered and ready. #1840:
+    /// `join_request_outcome_v1` is route-gated in the same way. Everything
+    /// in [`Self::current`] is unconditional.
     #[must_use]
     pub fn advertised<P: AsRef<[u8]>>(route_prefixes: impl IntoIterator<Item = P>) -> Self {
         let mut registry = Self::current();
-        if route_prefixes
-            .into_iter()
-            .any(|p| p.as_ref() == crate::revocation_push::GRANT_REVOCATION_PUSH_PREFIX)
-        {
-            registry.bits |= Self::GRANT_REVOCATION_PUSH_V1;
+        for prefix in route_prefixes {
+            let prefix = prefix.as_ref();
+            if prefix == crate::revocation_push::GRANT_REVOCATION_PUSH_PREFIX {
+                registry.bits |= Self::GRANT_REVOCATION_PUSH_V1;
+            } else if prefix == crate::groups::join_outcome::JOIN_REQUEST_OUTCOME_DM_PREFIX {
+                registry.bits |= Self::JOIN_REQUEST_OUTCOME_V1 | Self::JOIN_REQUEST_HEAD_V1;
+            }
         }
         registry
     }
@@ -230,6 +272,8 @@ impl CapabilityRegistry {
             Some((Self::KEY_REPUBLISH_V1, "key_republish_v1"))
         } else if payload.starts_with(crate::revocation_push::GRANT_REVOCATION_PUSH_PREFIX) {
             Some((Self::GRANT_REVOCATION_PUSH_V1, "grant_revocation_push_v1"))
+        } else if payload.starts_with(crate::groups::join_outcome::JOIN_REQUEST_OUTCOME_DM_PREFIX) {
+            Some((Self::JOIN_REQUEST_OUTCOME_V1, "join_request_outcome_v1"))
         } else {
             None
         }
@@ -1016,6 +1060,17 @@ pub enum DmError {
     RecipientPairingDenied {
         /// Which check denied the pairing.
         denial: crate::key_move::PairingDenial,
+    },
+
+    /// ADR 0110 §3 (D70; #1597 item 4): the machine the send resolved for
+    /// the recipient is revoked, so nothing was sent. A machine revocation
+    /// denies that device only; the recipient agent keeps its seat until
+    /// the agent itself is revoked. A retry fails the same way until the
+    /// recipient announces from another machine.
+    #[error("recipient machine revoked: {machine:?}")]
+    RecipientMachineRevoked {
+        /// The revoked machine the send resolved.
+        machine: crate::identity::MachineId,
     },
 
     /// Local gossip publish failed — typically because the mesh is not
@@ -2128,6 +2183,134 @@ impl EnvelopeBuilder {
 #[derive(Default)]
 pub struct InFlightAcks {
     inner: Arc<dashmap::DashMap<[u8; 16], InFlightAck>>,
+    /// #1109: what became of durable (v2) requests after their waiter
+    /// resolved or was abandoned. Bounded by [`RECEIPT_LEDGER_CAP`] and
+    /// [`RECEIPT_LEDGER_TTL`].
+    receipts: Arc<std::sync::Mutex<ReceiptLedger>>,
+}
+
+/// #1109: how long the sender remembers a durable request's outcome after
+/// its waiter resolved or gave up.
+pub const RECEIPT_LEDGER_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// #1109: the most durable request outcomes the sender remembers. The
+/// oldest entry is dropped first.
+pub const RECEIPT_LEDGER_CAP: usize = 4_096;
+
+/// #1109: the sender-side state of one durable request, as
+/// `GET /direct/receipts/{logical_id}` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DmReceiptStatus {
+    /// The recipient's v2 ACK resolved the waiter inside the send budget.
+    Delivered,
+    /// The recipient's v2 ACK arrived after the send returned (for example
+    /// after a 504). The recipient holds the message; do not resend.
+    DeliveredLate,
+    /// A send is waiting for the ACK, or gave up and the ACK has not
+    /// arrived yet. The outcome is unknown.
+    Pending,
+    /// This daemon holds no record: no durable send with this id, or the
+    /// record expired or was evicted.
+    Unknown,
+}
+
+impl DmReceiptStatus {
+    /// Stable wire name for the REST API and CLI.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Delivered => "delivered",
+            Self::DeliveredLate => "delivered_late",
+            Self::Pending => "pending",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// The ACK binding a tombstone keeps, so only the exact recipient, machine
+/// and protocol can turn it into `delivered_late`.
+#[derive(Debug, Clone, Copy)]
+struct ReceiptBinding {
+    expected_recipient: AgentId,
+    expected_machine: Option<MachineId>,
+    protocol_version: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReceiptEntry {
+    status: DmReceiptStatus,
+    binding: ReceiptBinding,
+    expires: Instant,
+    seq: u64,
+}
+
+#[derive(Debug, Default)]
+struct ReceiptLedger {
+    entries: std::collections::HashMap<[u8; 16], ReceiptEntry>,
+    /// Insertion order as `(request_id, seq)`; a stale pair (the entry was
+    /// rewritten since) is skipped on eviction.
+    order: std::collections::VecDeque<([u8; 16], u64)>,
+    next_seq: u64,
+}
+
+impl ReceiptLedger {
+    fn prune(&mut self, now: Instant) {
+        // `order` is in seq order and every entry has the same TTL, so the
+        // first current pair that has not expired ends the sweep.
+        while let Some(&(id, seq)) = self.order.front() {
+            // A pair whose entry was rewritten since, or is gone, is stale.
+            let current = self.entries.get(&id).filter(|entry| entry.seq == seq);
+            if let Some(entry) = current {
+                if entry.expires > now {
+                    break;
+                }
+                self.entries.remove(&id);
+            }
+            self.order.pop_front();
+        }
+    }
+
+    fn record(
+        &mut self,
+        request_id: [u8; 16],
+        status: DmReceiptStatus,
+        binding: ReceiptBinding,
+        now: Instant,
+    ) {
+        self.prune(now);
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        self.entries.insert(
+            request_id,
+            ReceiptEntry {
+                status,
+                binding,
+                expires: now + RECEIPT_LEDGER_TTL,
+                seq,
+            },
+        );
+        self.order.push_back((request_id, seq));
+        while self.entries.len() > RECEIPT_LEDGER_CAP {
+            let Some((id, old_seq)) = self.order.pop_front() else {
+                break;
+            };
+            if self
+                .entries
+                .get(&id)
+                .is_some_and(|entry| entry.seq == old_seq)
+            {
+                self.entries.remove(&id);
+            }
+        }
+    }
+
+    fn status(&mut self, request_id: &[u8; 16], now: Instant) -> Option<DmReceiptStatus> {
+        self.prune(now);
+        self.entries
+            .get(request_id)
+            .filter(|entry| entry.expires > now)
+            .map(|entry| entry.status)
+    }
 }
 
 /// A registered waiter plus the binding an ACK must satisfy to resolve it.
@@ -2150,6 +2333,32 @@ struct InFlightAck {
     ingress_cell: ProvenanceCell,
 }
 
+impl InFlightAck {
+    fn binding(&self) -> ReceiptBinding {
+        ReceiptBinding {
+            expected_recipient: self.expected_recipient,
+            expected_machine: self.expected_machine,
+            protocol_version: self.protocol_version,
+        }
+    }
+}
+
+/// The one ACK binding rule, shared by live waiters and #1109 tombstones:
+/// exact protocol, exact sender agent, and the pinned machine when one was
+/// supplied.
+fn binding_matches(
+    binding: &ReceiptBinding,
+    protocol_version: u16,
+    ack_sender: AgentId,
+    ack_machine: MachineId,
+) -> bool {
+    binding.protocol_version == protocol_version
+        && binding.expected_recipient == ack_sender
+        && binding
+            .expected_machine
+            .is_none_or(|expected| expected == ack_machine)
+}
+
 /// Shared ingress-stamp cell handed back alongside the waiter receiver
 /// (`register_for_protocol_with_provenance`).
 pub type ProvenanceCell = std::sync::Arc<std::sync::Mutex<Option<DmAckIngress>>>;
@@ -2170,6 +2379,7 @@ impl Clone for InFlightAcks {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            receipts: Arc::clone(&self.receipts),
         }
     }
 }
@@ -2266,7 +2476,9 @@ impl InFlightAcks {
     /// machine, and the ACK's protocol version all match the registered
     /// binding. Returns true if a waiter was resolved, false otherwise (a late
     /// ACK after the sender gave up, or a receipt weaker than the one the
-    /// caller is waiting for).
+    /// caller is waiting for). A late v2 `Accepted` ACK that matches an
+    /// abandoned waiter's tombstone still returns false, but is recorded as
+    /// `delivered_late` (#1109; see [`Self::receipt_status`]).
     ///
     /// The match on `protocol_version` is exact, not `>=`: a v1 ACK asserts
     /// level-2 enqueue and must never satisfy a waiter that was promised the
@@ -2347,12 +2559,156 @@ impl InFlightAcks {
                         *cell = Some(ingress);
                     }
                 }
+                if waiter.protocol_version >= DM_PROTOCOL_DURABLE_ACK
+                    && matches!(outcome, DmAckOutcome::Accepted)
+                {
+                    self.record_receipt(
+                        *request_id,
+                        DmReceiptStatus::Delivered,
+                        waiter.binding(),
+                        Instant::now(),
+                    );
+                }
                 // Stamp BEFORE send so the receiver observes it after recv.
                 let _ = waiter.reply.send(outcome);
                 true
             }
-            Entry::Occupied(_) | Entry::Vacant(_) => false,
+            Entry::Occupied(_) => false,
+            Entry::Vacant(vacant) => {
+                // Release the map shard before taking the ledger lock.
+                drop(vacant);
+                // #1109: no waiter. A late v2 ACK for a request whose send
+                // gave up is still proof of delivery; record it. The return
+                // stays `false`: no waiter was resolved, and callers key
+                // origin attribution on a resolved waiter.
+                self.resolve_late(
+                    request_id,
+                    protocol_version,
+                    ack_sender,
+                    ack_machine,
+                    &outcome,
+                    Instant::now(),
+                );
+                false
+            }
         }
+    }
+
+    /// #1109: turn a pending tombstone into `delivered_late` when a late ACK
+    /// carries the exact binding the abandoned waiter held. Anything else
+    /// (no tombstone, a mismatched sender, machine or protocol, a refusal
+    /// outcome) changes nothing.
+    fn resolve_late(
+        &self,
+        request_id: &[u8; 16],
+        protocol_version: u16,
+        ack_sender: AgentId,
+        ack_machine: MachineId,
+        outcome: &DmAckOutcome,
+        now: Instant,
+    ) {
+        if !matches!(outcome, DmAckOutcome::Accepted) {
+            return;
+        }
+        let Ok(mut ledger) = self.receipts.lock() else {
+            return;
+        };
+        let binding = match ledger.entries.get(request_id) {
+            Some(entry)
+                if entry.status == DmReceiptStatus::Pending
+                    && entry.expires > now
+                    && binding_matches(
+                        &entry.binding,
+                        protocol_version,
+                        ack_sender,
+                        ack_machine,
+                    ) =>
+            {
+                entry.binding
+            }
+            _ => return,
+        };
+        ledger.record(*request_id, DmReceiptStatus::DeliveredLate, binding, now);
+    }
+
+    fn record_receipt(
+        &self,
+        request_id: [u8; 16],
+        status: DmReceiptStatus,
+        binding: ReceiptBinding,
+        now: Instant,
+    ) {
+        if let Ok(mut ledger) = self.receipts.lock() {
+            ledger.record(request_id, status, binding, now);
+        }
+    }
+
+    /// #1109: the sender gave up on `request_id` (budget spent, or the send
+    /// future was dropped). The waiter is removed as [`Self::cancel`] does;
+    /// a durable (v2) waiter also leaves a `pending` tombstone so a late ACK
+    /// with the same binding is recorded as `delivered_late`.
+    pub fn abandon(&self, request_id: &[u8; 16]) {
+        self.abandon_at(request_id, Instant::now());
+    }
+
+    fn abandon_at(&self, request_id: &[u8; 16], now: Instant) {
+        let Some((_, waiter)) = self.inner.remove(request_id) else {
+            return;
+        };
+        if waiter.protocol_version < DM_PROTOCOL_DURABLE_ACK {
+            return;
+        }
+        let Ok(mut ledger) = self.receipts.lock() else {
+            return;
+        };
+        // A retry under the same logical id must not hide an earlier
+        // proof of delivery behind a fresh `pending`.
+        if ledger.status(request_id, now).is_some_and(|status| {
+            matches!(
+                status,
+                DmReceiptStatus::Delivered | DmReceiptStatus::DeliveredLate
+            )
+        }) {
+            return;
+        }
+        ledger.record(*request_id, DmReceiptStatus::Pending, waiter.binding(), now);
+    }
+
+    /// #1109: what this daemon knows about the durable request `request_id`.
+    /// A recorded delivery wins over a waiter that is still open (a resend
+    /// under the same logical id), then an open waiter or tombstone reads
+    /// `pending`, and no record reads `unknown`.
+    #[must_use]
+    pub fn receipt_status(&self, request_id: &[u8; 16]) -> DmReceiptStatus {
+        self.receipt_status_at(request_id, Instant::now())
+    }
+
+    fn receipt_status_at(&self, request_id: &[u8; 16], now: Instant) -> DmReceiptStatus {
+        let recorded = self
+            .receipts
+            .lock()
+            .ok()
+            .and_then(|mut ledger| ledger.status(request_id, now));
+        match recorded {
+            Some(status @ (DmReceiptStatus::Delivered | DmReceiptStatus::DeliveredLate)) => status,
+            _ if self
+                .inner
+                .get(request_id)
+                .is_some_and(|waiter| waiter.protocol_version >= DM_PROTOCOL_DURABLE_ACK) =>
+            {
+                DmReceiptStatus::Pending
+            }
+            Some(status) => status,
+            None => DmReceiptStatus::Unknown,
+        }
+    }
+
+    /// Diagnostic count of remembered durable request outcomes.
+    pub fn receipts_remembered(&self) -> usize {
+        self.receipts
+            .lock()
+            .map(|ledger| ledger.entries.len())
+            .unwrap_or_default()
     }
 
     fn ack_binding_matches(
@@ -2361,11 +2717,12 @@ impl InFlightAcks {
         ack_sender: AgentId,
         ack_machine: MachineId,
     ) -> bool {
-        pending.protocol_version == protocol_version
-            && pending.expected_recipient == ack_sender
-            && pending
-                .expected_machine
-                .is_none_or(|expected| expected == ack_machine)
+        binding_matches(
+            &pending.binding(),
+            protocol_version,
+            ack_sender,
+            ack_machine,
+        )
     }
 
     /// Cancel a waiter (sender gave up / retry-attempt abandoned).
@@ -3329,5 +3686,196 @@ mod tests {
             elapsed: Duration::from_secs(16),
         };
         assert_eq!(err.to_string(), "timed out after 1 retries over 16s");
+    }
+
+    /// #1109 ledger fixture: a durable (v2) waiter bound to one agent and
+    /// machine.
+    fn issue1109_v2_waiter(
+        acks: &super::InFlightAcks,
+        rid: [u8; 16],
+    ) -> tokio::sync::oneshot::Receiver<DmAckOutcome> {
+        acks.register_for_protocol(
+            rid,
+            DM_PROTOCOL_DURABLE_ACK,
+            AgentId([0x31; 32]),
+            Some(MachineId([0x32; 32])),
+        )
+    }
+
+    /// #1109: a v2 ACK that arrives after the send gave up (the 504 case)
+    /// is recorded as `delivered_late` instead of being discarded. The
+    /// resolve call still returns false: no waiter was resolved.
+    #[test]
+    fn issue1109_late_v2_ack_after_give_up_reads_delivered_late() {
+        let acks = super::InFlightAcks::new();
+        let rid = [0x11; 16];
+        let _rx = issue1109_v2_waiter(&acks, rid);
+        assert_eq!(acks.receipt_status(&rid), super::DmReceiptStatus::Pending);
+        acks.abandon(&rid);
+        assert_eq!(acks.outstanding(), 0, "the waiter itself is gone");
+        assert_eq!(acks.receipt_status(&rid), super::DmReceiptStatus::Pending);
+        assert!(!acks.resolve_for_ingress(
+            &rid,
+            DM_PROTOCOL_DURABLE_ACK,
+            AgentId([0x31; 32]),
+            MachineId([0x32; 32]),
+            DmAckOutcome::Accepted,
+            super::DmAckIngress::Subscription,
+        ));
+        assert_eq!(
+            acks.receipt_status(&rid),
+            super::DmReceiptStatus::DeliveredLate
+        );
+    }
+
+    /// #1109 risk: a tombstone keeps the exact ACK binding. A late ACK from
+    /// another agent, another machine, or under v1 semantics never turns it
+    /// into a delivery; nor does a late refusal.
+    #[test]
+    fn issue1109_tombstone_refuses_a_mismatched_late_ack() {
+        let acks = super::InFlightAcks::new();
+        let rid = [0x12; 16];
+        let _rx = issue1109_v2_waiter(&acks, rid);
+        acks.abandon(&rid);
+        for (protocol, sender, machine, outcome) in [
+            (
+                DM_PROTOCOL_DURABLE_ACK,
+                AgentId([0x99; 32]),
+                MachineId([0x32; 32]),
+                DmAckOutcome::Accepted,
+            ),
+            (
+                DM_PROTOCOL_DURABLE_ACK,
+                AgentId([0x31; 32]),
+                MachineId([0x99; 32]),
+                DmAckOutcome::Accepted,
+            ),
+            (
+                DM_PROTOCOL_V1,
+                AgentId([0x31; 32]),
+                MachineId([0x32; 32]),
+                DmAckOutcome::Accepted,
+            ),
+            (
+                DM_PROTOCOL_DURABLE_ACK,
+                AgentId([0x31; 32]),
+                MachineId([0x32; 32]),
+                DmAckOutcome::RejectedByPolicy {
+                    reason: "late refusal".to_string(),
+                },
+            ),
+        ] {
+            assert!(!acks.resolve_for_protocol(&rid, protocol, sender, machine, outcome));
+            assert_eq!(acks.receipt_status(&rid), super::DmReceiptStatus::Pending);
+        }
+    }
+
+    /// #1109: an ACK inside the budget reads `delivered`; a later resend under
+    /// the same logical id that gives up does not hide that proof behind a
+    /// fresh `pending`.
+    #[test]
+    fn issue1109_in_budget_delivery_survives_a_resend_give_up() {
+        let acks = super::InFlightAcks::new();
+        let rid = [0x13; 16];
+        let _rx = issue1109_v2_waiter(&acks, rid);
+        assert!(acks.resolve_for_protocol(
+            &rid,
+            DM_PROTOCOL_DURABLE_ACK,
+            AgentId([0x31; 32]),
+            MachineId([0x32; 32]),
+            DmAckOutcome::Accepted,
+        ));
+        assert_eq!(acks.receipt_status(&rid), super::DmReceiptStatus::Delivered);
+        let _rx2 = issue1109_v2_waiter(&acks, rid);
+        assert_eq!(
+            acks.receipt_status(&rid),
+            super::DmReceiptStatus::Delivered,
+            "a recorded delivery wins over an open resend waiter"
+        );
+        acks.abandon(&rid);
+        assert_eq!(acks.receipt_status(&rid), super::DmReceiptStatus::Delivered);
+    }
+
+    /// #1109: v1 sends carry no durable receipt, so giving up leaves no
+    /// record and a late v1 ACK records nothing.
+    #[test]
+    fn issue1109_v1_give_up_leaves_no_record() {
+        let acks = super::InFlightAcks::new();
+        let rid = [0x14; 16];
+        let _rx = acks.register(rid, AgentId([0x31; 32]), None);
+        acks.abandon(&rid);
+        assert!(!acks.resolve(
+            &rid,
+            AgentId([0x31; 32]),
+            MachineId([0x32; 32]),
+            DmAckOutcome::Accepted
+        ));
+        assert_eq!(acks.receipt_status(&rid), super::DmReceiptStatus::Unknown);
+        assert_eq!(acks.receipts_remembered(), 0);
+    }
+
+    /// #1109: a tombstone expires after the TTL; a late ACK after that is
+    /// not recorded and the request reads `unknown`.
+    #[test]
+    fn issue1109_tombstone_expires_after_the_ttl() {
+        let acks = super::InFlightAcks::new();
+        let rid = [0x15; 16];
+        let start = Instant::now();
+        let _rx = issue1109_v2_waiter(&acks, rid);
+        acks.abandon_at(&rid, start);
+        let just_before = start + super::RECEIPT_LEDGER_TTL - Duration::from_secs(1);
+        assert_eq!(
+            acks.receipt_status_at(&rid, just_before),
+            super::DmReceiptStatus::Pending
+        );
+        let after = start + super::RECEIPT_LEDGER_TTL + Duration::from_secs(1);
+        acks.resolve_late(
+            &rid,
+            DM_PROTOCOL_DURABLE_ACK,
+            AgentId([0x31; 32]),
+            MachineId([0x32; 32]),
+            &DmAckOutcome::Accepted,
+            after,
+        );
+        assert_eq!(
+            acks.receipt_status_at(&rid, after),
+            super::DmReceiptStatus::Unknown
+        );
+        assert_eq!(acks.receipts_remembered(), 0, "expired entries are pruned");
+    }
+
+    /// #1109: the ledger is bounded; past the cap the oldest record goes
+    /// first.
+    #[test]
+    fn issue1109_ledger_is_capped_oldest_first() {
+        let acks = super::InFlightAcks::new();
+        let now = Instant::now();
+        let total = super::RECEIPT_LEDGER_CAP + 3;
+        for n in 0..total {
+            let mut rid = [0_u8; 16];
+            rid[..8].copy_from_slice(&(n as u64).to_be_bytes());
+            let _rx = issue1109_v2_waiter(&acks, rid);
+            acks.abandon_at(&rid, now);
+        }
+        assert_eq!(acks.receipts_remembered(), super::RECEIPT_LEDGER_CAP);
+        let id = |n: u64| {
+            let mut rid = [0_u8; 16];
+            rid[..8].copy_from_slice(&n.to_be_bytes());
+            rid
+        };
+        for evicted in 0..3 {
+            assert_eq!(
+                acks.receipt_status_at(&id(evicted), now),
+                super::DmReceiptStatus::Unknown
+            );
+        }
+        assert_eq!(
+            acks.receipt_status_at(&id(3), now),
+            super::DmReceiptStatus::Pending
+        );
+        assert_eq!(
+            acks.receipt_status_at(&id(total as u64 - 1), now),
+            super::DmReceiptStatus::Pending
+        );
     }
 }

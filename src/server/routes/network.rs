@@ -724,6 +724,12 @@ pub(in crate::server) fn version_policy_digest(
 /// change, no capability bit). Read-only view of what `GET /upgrade` would
 /// act on; no network check is performed here.
 ///
+/// #1381 (A14 amendment of 15 Nov 2026): it also reports the release
+/// `channel`, the highest verified version seen on `x0x/release`, the last
+/// release check, and the `pending_update`. These come from the in-memory
+/// [`UpgradeObservations`](crate::server::routes::UpgradeObservations) and
+/// reset when the daemon restarts.
+///
 /// #1384 (D35): `minimum_supported_version` and `support_window` ship as
 /// explicit nulls — fleet-level policy David sets later; a null IS the
 /// published state ("no fleet minimum published yet"), not a missing field.
@@ -736,7 +742,19 @@ pub(in crate::server) async fn upgrade_diagnostics(
     let version = env!("CARGO_PKG_VERSION");
     let cfg = &state.update_config;
     let input = version_policy_digest_input(version, cfg);
-    Json(serde_json::json!({
+    // #1381: what this daemon has seen and checked since it started.
+    let background = state
+        .background_submit
+        .get()
+        .and_then(|submit| submit.status());
+    let observed = {
+        let record = state
+            .upgrade_observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        record.diagnostics_json(version, background)
+    };
+    let mut body = serde_json::json!({
         "ok": true,
         "current_version": version,
         "update_policy": {
@@ -752,7 +770,41 @@ pub(in crate::server) async fn upgrade_diagnostics(
         "support_window": serde_json::Value::Null,
         "version_policy_digest": version_policy_digest(version, cfg),
         "digest_input": input,
-    }))
+        "channel": if cfg.include_prereleases { "prerelease" } else { "stable" },
+    });
+    if let (Some(body), serde_json::Value::Object(observed)) = (body.as_object_mut(), observed) {
+        body.extend(observed);
+    }
+    // #1381 M2 part: the upgrade records on disk. Resolve the install on this
+    // task (the executable observation is per thread in tests), then read the
+    // fixed record names off the async workers.
+    let install = crate::upgrade::apply::current_binary_path()
+        .ok()
+        .and_then(|path| path.canonicalize().ok());
+    let data_dir = state.data_dir.clone();
+    let records = tokio::task::spawn_blocking(move || {
+        super::upgrade_records::records_json(&data_dir, install.as_deref())
+    })
+    .await;
+    if let Some(body) = body.as_object_mut() {
+        match records {
+            Ok(records) => body.extend(records),
+            // Keep every field present, as the documented shape promises.
+            Err(_) => {
+                for key in ["plan", "last_attempt", "last_hold_clear"] {
+                    body.insert(key.into(), serde_json::Value::Null);
+                }
+                for key in ["backups", "holds"] {
+                    body.insert(key.into(), serde_json::json!([]));
+                }
+                body.insert(
+                    "records_error".into(),
+                    serde_json::Value::String("upgrade records read did not finish".into()),
+                );
+            }
+        }
+    }
+    Json(body)
 }
 
 #[cfg(test)]
@@ -1336,6 +1388,21 @@ mod participation_diagnostics_tests {
             !input.contains("minimum_supported_version"),
             "fleet policy must not churn the per-machine digest"
         );
+
+        // #1381 M2 part: the record fields are always present; a fresh data
+        // directory has no plan and no holds.
+        for key in [
+            "plan",
+            "last_attempt",
+            "backups",
+            "holds",
+            "last_hold_clear",
+            "records_error",
+        ] {
+            assert!(body.get(key).is_some(), "{key} must be present");
+        }
+        assert_eq!(body["plan"], serde_json::Value::Null);
+        assert_eq!(body["holds"], serde_json::json!([]));
 
         agent.shutdown().await;
     }

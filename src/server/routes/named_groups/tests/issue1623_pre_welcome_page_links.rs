@@ -347,6 +347,7 @@ async fn pre_welcome_page_applies_ban_state_only() -> anyhow::Result<()> {
         treekem_commit_b64: treekem_commit_b64(),
         treekem_epoch: Some(TREEKEM_EPOCH),
         commit: Some(ban.clone()),
+        target_key_package_b64: None,
     };
     let mut stub = base.clone();
     arm(&mut stub, vec![ban.state_hash.clone()], &owner);
@@ -504,6 +505,7 @@ async fn pre_welcome_ban_without_armed_sequence_is_refused() -> anyhow::Result<(
         treekem_commit_b64: treekem_commit_b64(),
         treekem_epoch: Some(TREEKEM_EPOCH),
         commit: Some(ban),
+        target_key_package_b64: None,
     };
     let key = install_stub(&state, base.clone()).await?;
     let trace = refusal_trace(&state, &key, &owner, event).await;
@@ -2595,5 +2597,406 @@ fn reject_step_refuses_a_request_that_the_signer_did_not_name() -> anyhow::Resul
         !step(REQUEST_ID, &admin, &admin, Some(&binding)),
         "another admin cannot present the signer's commit with its binding"
     );
+    Ok(())
+}
+
+/// #1427: a removal this node signed, saved to its catch-up log and, after
+/// a restart, loaded back. `s4_open` opens an S4 row for the removed
+/// member before the load. Returns the logged event keys after the load,
+/// the expected key, and whether the saved file existed.
+async fn issue1427_restart_with_saved_removal(
+    s4_open: bool,
+) -> anyhow::Result<(Vec<Option<String>>, Option<String>, bool)> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let owner = state.agent.identity().agent_keypair();
+    let owner_hex = hex::encode(owner.agent_id().as_bytes());
+    let mut ahead = base_group(owner, None)?;
+    let base = ahead.clone();
+    let removal = seal_link(&mut ahead, owner, 2_000, |next| {
+        next.remove_member(&agent(REMOVED), Some(owner_hex.clone()));
+        take_treekem_epoch(next);
+    })?;
+    let removal = removal_event(&base, &owner_hex, &removal);
+    let group_id = named_group_metadata_event_group_id(&removal).to_string();
+    let stable = ahead.stable_group_id().to_string();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), ahead);
+    remember_treekem_membership_event(&state, &removal).await;
+    let saved = treekem_catchup_log_path(&state, &group_id).exists();
+
+    // A restart starts with an empty in-memory log; the S4 store loads
+    // first.
+    state.treekem_event_log.write().await.clear();
+    if s4_open {
+        let target: [u8; 32] = hex::decode(agent(REMOVED))?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("agent id length"))?;
+        revocation_eviction::open_fallback_row_for_test(&state, &stable, target, &group_id).await;
+    }
+    restore_treekem_catchup_logs(&state).await;
+    let restored = state
+        .treekem_event_log
+        .read()
+        .await
+        .get(&group_id)
+        .map(|log| log.iter().map(treekem_membership_event_key).collect())
+        .unwrap_or_default();
+    Ok((restored, treekem_membership_event_key(&removal), saved))
+}
+
+/// #1427: the catch-up log is kept on disk. After a restart the node
+/// serves the removal it signed before the restart.
+#[tokio::test]
+async fn issue1427_catchup_log_is_restored_after_a_restart() -> anyhow::Result<()> {
+    let (restored, key, saved) = issue1427_restart_with_saved_removal(false).await?;
+    assert!(saved, "#1427: the catch-up log is saved");
+    assert_eq!(
+        restored,
+        vec![key],
+        "#1427: the restarted node serves the removal it signed"
+    );
+    Ok(())
+}
+
+/// #1427 (the 1581e rule): a removal whose S4 row is still open after the
+/// restart is not served from the saved log. S4 owns its delivery.
+#[tokio::test]
+async fn issue1427_restore_holds_a_removal_s4_still_delivers() -> anyhow::Result<()> {
+    let (restored, _, saved) = issue1427_restart_with_saved_removal(true).await?;
+    assert!(saved, "#1427: the catch-up log is saved");
+    assert!(
+        restored.is_empty(),
+        "#1427: a removal with an open S4 row must not be served from the saved log"
+    );
+    Ok(())
+}
+
+/// #1427: a saved log of a group this node no longer stores is removed at
+/// the next start.
+#[tokio::test]
+async fn issue1427_saved_log_of_a_gone_group_is_dropped() -> anyhow::Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let owner = state.agent.identity().agent_keypair();
+    let owner_hex = hex::encode(owner.agent_id().as_bytes());
+    let mut ahead = base_group(owner, None)?;
+    let base = ahead.clone();
+    let removal = seal_link(&mut ahead, owner, 2_000, |next| {
+        next.remove_member(&agent(REMOVED), Some(owner_hex.clone()));
+        take_treekem_epoch(next);
+    })?;
+    let removal = removal_event(&base, &owner_hex, &removal);
+    let group_id = named_group_metadata_event_group_id(&removal).to_string();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), ahead);
+    remember_treekem_membership_event(&state, &removal).await;
+    let saved = treekem_catchup_log_path(&state, &group_id);
+    assert!(saved.exists());
+    state.named_groups.write().await.clear();
+    state.treekem_event_log.write().await.clear();
+    restore_treekem_catchup_logs(&state).await;
+    assert!(state.treekem_event_log.read().await.is_empty());
+    assert!(
+        !saved.exists(),
+        "#1427: a log of a removed group is dropped"
+    );
+    Ok(())
+}
+
+fn issue1427_added(target: &str) -> NamedGroupMetadataEvent {
+    NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
+        group_id: "1427".repeat(8),
+        revision: 2,
+        actor: agent("01"),
+        agent_id: target.to_string(),
+        display_name: None,
+        treekem_commit_b64: None,
+        treekem_welcome_b64: None,
+        welcome_ref: None,
+        treekem_epoch: None,
+        treekem_key_package_hash: None,
+        member_joined_recovery: None,
+        member_recovery_history: Vec::new(),
+        certificate_b64: None,
+        owner_mandate: None,
+        commit: None,
+        reseat_mandate: None,
+    }
+}
+
+fn issue1427_removed(target: &str) -> NamedGroupMetadataEvent {
+    NamedGroupMetadataEvent::MemberRemoved {
+        group_id: "1427".repeat(8),
+        revision: 3,
+        actor: agent("01"),
+        agent_id: target.to_string(),
+        treekem_commit_b64: None,
+        treekem_epoch: None,
+        secret_epoch: None,
+        commit: None,
+    }
+}
+
+fn issue1427_banned(target: &str) -> NamedGroupMetadataEvent {
+    NamedGroupMetadataEvent::MemberBanned {
+        group_id: "1427".repeat(8),
+        revision: 3,
+        actor: agent("01"),
+        agent_id: target.to_string(),
+        secret_epoch: None,
+        treekem_commit_b64: None,
+        treekem_epoch: None,
+        commit: None,
+        target_key_package_b64: None,
+    }
+}
+
+/// #1926 review: a cached add admits a requester that is not yet Active,
+/// but a later removal or ban of it in the log refuses it. The saved log
+/// keeps that add across restarts, so the latest event must decide.
+#[test]
+fn issue1427_removed_or_banned_requester_is_not_served_by_its_cached_add() {
+    let j = agent(REQUESTER);
+    let other = agent(REMOVED);
+    let added = issue1427_added(&j);
+    assert!(cached_add_still_current([&added], &j));
+    assert!(!cached_add_still_current([&added], &other));
+    let removed = issue1427_removed(&j);
+    assert!(
+        !cached_add_still_current([&added, &removed], &j),
+        "#1427: a removal after the add must refuse the requester"
+    );
+    let banned = issue1427_banned(&j);
+    assert!(
+        !cached_add_still_current([&added, &banned], &j),
+        "#1427: a ban after the add must refuse the requester"
+    );
+    assert!(
+        cached_add_still_current([&added, &removed, &added], &j),
+        "#1427: a later add admits the requester again"
+    );
+    let other_removed = issue1427_removed(&other);
+    assert!(cached_add_still_current([&added, &other_removed], &j));
+}
+
+/// #1926 review: a saved log file that is truncated, corrupt or of an
+/// unknown version is skipped with a warning; it loads nothing.
+#[tokio::test]
+async fn issue1427_corrupt_or_unknown_saved_log_loads_nothing() -> anyhow::Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let owner = state.agent.identity().agent_keypair();
+    let owner_hex = hex::encode(owner.agent_id().as_bytes());
+    let mut ahead = base_group(owner, None)?;
+    let base = ahead.clone();
+    let removal = seal_link(&mut ahead, owner, 2_000, |next| {
+        next.remove_member(&agent(REMOVED), Some(owner_hex.clone()));
+        take_treekem_epoch(next);
+    })?;
+    let removal = removal_event(&base, &owner_hex, &removal);
+    let group_id = named_group_metadata_event_group_id(&removal).to_string();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), ahead);
+    remember_treekem_membership_event(&state, &removal).await;
+    let path = treekem_catchup_log_path(&state, &group_id);
+    let good = std::fs::read(&path)?;
+    let saved: serde_json::Value = serde_json::from_slice(&good)?;
+    assert_eq!(
+        saved["version"], 1,
+        "#1427: the saved log carries its version"
+    );
+
+    let mut newer = saved.clone();
+    newer["version"] = serde_json::json!(2);
+    let truncated = good[..good.len() / 2].to_vec();
+    for (what, bytes) in [
+        ("truncated", truncated),
+        ("corrupt", b"{not json".to_vec()),
+        ("unknown version", serde_json::to_vec(&newer)?),
+        ("bare event list", serde_json::to_vec(&saved["events"])?),
+    ] {
+        std::fs::write(&path, &bytes)?;
+        state.treekem_event_log.write().await.clear();
+        restore_treekem_catchup_logs(&state).await;
+        assert!(
+            state.treekem_event_log.read().await.is_empty(),
+            "#1427: a {what} saved log must load nothing"
+        );
+    }
+    // The good file still loads.
+    std::fs::write(&path, &good)?;
+    restore_treekem_catchup_logs(&state).await;
+    assert_eq!(
+        state
+            .treekem_event_log
+            .read()
+            .await
+            .get(&group_id)
+            .map(|log| log.len()),
+        Some(1)
+    );
+    Ok(())
+}
+
+/// #1926 review (blocker): through a real save and restore. J is added and
+/// then removed; S4 owns the removal (a row exists, in any phase), so the
+/// restore holds it back. It must hold back J's add too, or the add alone
+/// would serve the removed J pages after the restart.
+#[tokio::test]
+async fn issue1427_restore_holds_the_add_of_a_held_removal_target() -> anyhow::Result<()> {
+    restore_with_held_removal(false).await
+}
+
+/// #1926 review follow-up: J is added, removed (S4 owns the removal) and
+/// then added again. Only the add before the last held removal is held
+/// back. The re-add is a later, legitimate membership and must still serve
+/// J pages after the restart.
+#[tokio::test]
+async fn issue1427_restore_serves_a_readd_after_a_held_removal() -> anyhow::Result<()> {
+    restore_with_held_removal(true).await
+}
+
+/// The saved catch-up log of `group_id`, read with the lock taken.
+async fn logged_events(state: &AppState, group_id: &str) -> Vec<NamedGroupMetadataEvent> {
+    state
+        .treekem_event_log
+        .read()
+        .await
+        .get(group_id)
+        .map(|log| log.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+async fn restore_with_held_removal(readd: bool) -> anyhow::Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let owner = state.agent.identity().agent_keypair();
+    let owner_hex = hex::encode(owner.agent_id().as_bytes());
+    let j = agent(REQUESTER);
+    let mut ahead = base_group(owner, None)?;
+    let before_add = ahead.clone();
+    let add = seal_link(&mut ahead, owner, 2_000, |next| {
+        next.add_member(
+            j.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(owner_hex.clone()),
+            None,
+        );
+        take_treekem_epoch(next);
+    })?;
+    let added = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
+        group_id: before_add.stable_group_id().to_string(),
+        revision: add.revision,
+        actor: owner_hex.clone(),
+        agent_id: j.clone(),
+        display_name: None,
+        treekem_commit_b64: treekem_commit_b64(),
+        treekem_welcome_b64: None,
+        welcome_ref: None,
+        treekem_epoch: Some(TREEKEM_EPOCH),
+        treekem_key_package_hash: None,
+        member_joined_recovery: None,
+        member_recovery_history: Vec::new(),
+        certificate_b64: None,
+        owner_mandate: None,
+        commit: Some(add.clone()),
+        reseat_mandate: None,
+    };
+    let removal = seal_link(&mut ahead, owner, 3_000, |next| {
+        next.remove_member(&j, Some(owner_hex.clone()));
+        take_treekem_epoch(next);
+    })?;
+    let removed = NamedGroupMetadataEvent::MemberRemoved {
+        group_id: before_add.stable_group_id().to_string(),
+        revision: removal.revision,
+        actor: owner_hex.clone(),
+        agent_id: j.clone(),
+        treekem_commit_b64: treekem_commit_b64(),
+        treekem_epoch: Some(TREEKEM_EPOCH + 1),
+        secret_epoch: None,
+        commit: Some(removal.clone()),
+    };
+    let readded = if readd {
+        let again = seal_link(&mut ahead, owner, 4_000, |next| {
+            next.add_member(
+                j.clone(),
+                x0x::groups::GroupRole::Member,
+                Some(owner_hex.clone()),
+                None,
+            );
+            take_treekem_epoch(next);
+        })?;
+        let mut event = added.clone();
+        if let NamedGroupMetadataEvent::MemberAdded {
+            revision,
+            treekem_epoch,
+            commit,
+            ..
+        } = &mut event
+        {
+            *revision = again.revision;
+            *treekem_epoch = Some(TREEKEM_EPOCH + 2);
+            *commit = Some(again);
+        }
+        Some(event)
+    } else {
+        None
+    };
+    let group_id = named_group_metadata_event_group_id(&added).to_string();
+    let stable = ahead.stable_group_id().to_string();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), ahead);
+    remember_treekem_membership_event(&state, &added).await;
+    remember_treekem_membership_event(&state, &removed).await;
+    if let Some(event) = &readded {
+        remember_treekem_membership_event(&state, event).await;
+    }
+    let before = logged_events(&state, &group_id).await;
+    assert_eq!(
+        before.len(),
+        2 + usize::from(readd),
+        "#1427: every link is logged"
+    );
+    assert_eq!(cached_add_still_current(before.iter(), &j), readd);
+
+    // Restart: the S4 store holds a row for J, then the saved log loads.
+    state.treekem_event_log.write().await.clear();
+    let target: [u8; 32] = hex::decode(&j)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("agent id length"))?;
+    revocation_eviction::open_fallback_row_for_test(&state, &stable, target, &group_id).await;
+    restore_treekem_catchup_logs(&state).await;
+    let restored = logged_events(&state, &group_id).await;
+    if readd {
+        assert!(
+            cached_add_still_current(restored.iter(), &j),
+            "#1427: the re-add after the held removal still serves J"
+        );
+        assert_eq!(
+            restored.len(),
+            1,
+            "#1427: only the re-add is restored; the first add and the removal stay out"
+        );
+    } else {
+        assert!(
+            !cached_add_still_current(restored.iter(), &j),
+            "#1427: after the restart a held removal must not leave J served through its add"
+        );
+        assert!(
+            restored.is_empty(),
+            "#1427: the add and the removal of a held target both stay out"
+        );
+    }
     Ok(())
 }

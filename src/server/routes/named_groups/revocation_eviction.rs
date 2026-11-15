@@ -67,8 +67,10 @@ const S4_WORKER_TICK: Duration = Duration::from_secs(1);
 /// After a failed commit attempt the worker retries no sooner than this.
 const S4_COMMIT_RETRY: Duration = Duration::from_secs(5);
 
-/// Retry interval of a queued ban whose target holds no seat.
-const S4_UNSEATED_BAN_RETRY: Duration = Duration::from_secs(60);
+/// Retry interval of a queued ban held by `waiting_for_receiver_upgrade`:
+/// the roster-only ban of a leafless target waits for every other Active
+/// member's advert to carry `roster_only_ban_v1` (#1540).
+const S4_RECEIVER_UPGRADE_BAN_RETRY: Duration = Duration::from_secs(60);
 
 /// A manual request that §2 queued instead of rekeying early.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +141,17 @@ pub(in crate::server) struct S4Runtime {
     inner: tokio::sync::Mutex<S4Inner>,
     /// ADR 0108 §5a writer lock for `revocation-evictions.evs`.
     evs_writer: tokio::sync::Mutex<()>,
+    /// #1597 item 5c: the daemon has not read the `.evs` and `.evh` files
+    /// of this boot yet. No writer replaces either file while this is set,
+    /// so a change made before the load (a gossip receipt, an early API
+    /// call) can never overwrite the obligations of the previous boot.
+    /// [`S4Runtime::awaiting_startup_load`] sets it; the startup load
+    /// clears it.
+    awaiting_load: std::sync::atomic::AtomicBool,
+    /// Test builds: whether `api.port` already existed when the last S4
+    /// load began (#1597 item 5c ordering test).
+    #[cfg(test)]
+    port_published_at_load: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -176,6 +189,14 @@ struct S4Inner {
     not_durable: BTreeMap<EvictionKey, u64>,
     /// §2: per stable group ID, the current head catch-up round.
     head_rounds: HashMap<String, HeadRound>,
+    /// #1581 (`s4_restart_stale_head`; David's rulings of 29 Oct 2026
+    /// 00:15/00:40 GMT): the groups that had an unsealed (pending or
+    /// prepared) row in the `.evs` this boot loaded, until a holder
+    /// confirms a head of the group. For
+    /// such a group the bounded restart sync wait does not end discovery
+    /// while a holder exists: a node that restarted with pending work on
+    /// a head loaded from disk seals nothing until a holder confirms it.
+    restart_unconfirmed: BTreeSet<String>,
     /// §2: the last ask of each peer in the current round.
     head_round_asks: HeadRoundAsks,
     /// #1660 (Engineer ruling, 29 Oct 17:12 GMT): how many head asks
@@ -267,7 +288,26 @@ impl S4Runtime {
             boot_instant: Instant::now(),
             inner: tokio::sync::Mutex::new(S4Inner::default()),
             evs_writer: tokio::sync::Mutex::new(()),
+            awaiting_load: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            port_published_at_load: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// The daemon runtime: no `.evs` or `.evh` write until
+    /// [`load_revocation_eviction_store`] has read both files (#1597 item
+    /// 5c). [`Self::new`] and [`Default`] start with nothing to read.
+    pub(in crate::server) fn awaiting_startup_load() -> Self {
+        let runtime = Self::default();
+        runtime
+            .awaiting_load
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        runtime
+    }
+
+    /// The startup load of this boot has not run yet.
+    fn load_pending(&self) -> bool {
+        self.awaiting_load.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// §2 restart rule, the minimum part only: the bounded restart sync
@@ -310,7 +350,10 @@ const HEAD_ROUND_REASK: Duration = Duration::from_secs(2);
 /// holder answers a catch-up page, after that page is applied, with
 /// exactly the local head (any holder; no quorum). If no holder answers,
 /// the bounded restart sync wait from the round start ends discovery
-/// (D73). A holder that reports a different head is unresolved head
+/// (D73), except for a group whose open row this boot loaded from the
+/// previous boot's `.evs`: there, while any holder exists, only a
+/// holder's confirmation syncs, also past the wait (#1581,
+/// `S4Inner::restart_unconfirmed`). A holder that reports a different head is unresolved head
 /// evidence: the round cannot complete, and it restarts (asks again) after
 /// the wait. A new local head starts a new round.
 ///
@@ -362,12 +405,17 @@ impl HeadRound {
     /// The §2 seal condition for this round. `holders` is the number of
     /// other members that could hold a later head; `unresolved` is the
     /// higher-head evidence from [`unresolved_head_evidence`].
+    /// `wait_ends_discovery` is false for a group in
+    /// `S4Inner::restart_unconfirmed` (#1581): then the elapsed wait
+    /// alone never syncs while a holder exists.
+    #[allow(clippy::too_many_arguments)]
     fn synced(
         &self,
         current_head: &str,
         holders: usize,
         unresolved: bool,
         restart_wait_elapsed: bool,
+        wait_ends_discovery: bool,
         now: Instant,
         wait: Duration,
     ) -> bool {
@@ -377,7 +425,7 @@ impl HeadRound {
             && self.conflicting.is_empty()
             && (self.confirmed
                 || holders == 0
-                || now.saturating_duration_since(self.started) >= wait)
+                || (wait_ends_discovery && now.saturating_duration_since(self.started) >= wait))
     }
 }
 
@@ -891,6 +939,7 @@ async fn group_head_synced_at(state: &AppState, group_key: &str, tree_epoch: Opt
         )
         .collect();
     let holders = head_holders(&info, &local, &excluded).len();
+    let wait_ends_discovery = !inner.restart_unconfirmed.contains(info.stable_group_id());
     inner
         .head_rounds
         .get(info.stable_group_id())
@@ -900,6 +949,7 @@ async fn group_head_synced_at(state: &AppState, group_key: &str, tree_epoch: Opt
                 holders,
                 unresolved,
                 true,
+                wait_ends_discovery,
                 now,
                 runtime.timing.restart_sync_wait,
             )
@@ -1193,6 +1243,10 @@ pub(in crate::server) async fn note_catchup_head(
         report,
         Instant::now(),
     );
+    // #1581: a holder confirmed this group's head since the boot.
+    if report == HeadReport::OnLocalChain {
+        state_inner.restart_unconfirmed.remove(&stable);
+    }
 }
 
 /// ADR 0094 host-commit gate (§5). S4 creates or materially writes its
@@ -1232,7 +1286,11 @@ pub(in crate::server) async fn run_revocation_eviction_worker(state: Arc<AppStat
         restart_sync_wait_ms = s4::duration_ms(timing.restart_sync_wait),
         "ADR 0110 S4 timing values"
     );
-    load_persisted_obligations(&state).await;
+    // The daemon loads the store before it serves (#1597 item 5c); this
+    // load only runs for a runtime that started without it.
+    if state.revocation_evictions.load_pending() {
+        load_persisted_obligations(&state).await;
+    }
     let notify = state.agent.s4_revocation_intake().notified();
     loop {
         // §5: re-scan on host commit; the load then does what the trial
@@ -1479,12 +1537,14 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
                 .map(|peer| ((*group_key).clone(), x0x::identity::AgentId(peer))),
         );
         let unresolved = head_evidence.get(stable).copied().unwrap_or(true);
+        let wait_ends_discovery = !inner.restart_unconfirmed.contains(stable);
         let synced = inner.head_rounds.get(stable).is_some_and(|round| {
             round.synced(
                 &info.state_hash,
                 holders.len(),
                 unresolved,
                 restart_wait_elapsed,
+                wait_ends_discovery,
                 now,
                 runtime.timing.restart_sync_wait,
             )
@@ -2585,6 +2645,20 @@ pub(super) async fn s4_seal_recheck_locked(
     Some(cause)
 }
 
+/// #1427: whether S4 holds a row, in any phase, for `target` in the group
+/// with `stable_group_id`. S4 owns the delivery of that exclusion: an open
+/// row still delivers it, and a closed row may hold a sibling that lost to
+/// another admin's commit (the 1581e fork).
+pub(in crate::server) async fn s4_has_row_for(
+    state: &AppState,
+    stable_group_id: &str,
+    target: [u8; 32],
+) -> bool {
+    let key = EvictionKey::new(stable_group_id.to_string(), target);
+    let inner = state.revocation_evictions.inner.lock().await;
+    inner.store.get(&key).is_some()
+}
+
 /// Whether `key` has an open S4 row.
 pub(super) async fn s4_row_open(state: &AppState, key: &EvictionKey) -> bool {
     let inner = state.revocation_evictions.inner.lock().await;
@@ -3098,9 +3172,11 @@ async fn send_one_handoff(
 /// advert (ADR 0093: unknown support never implies support) sends nothing
 /// from the dispatch loop itself; its detached task awaits the bounded
 /// single-flight advert refresh (ADR 0110 §4, about 3 s), re-reads the
-/// advert and sends the hand-off only on `Some(true)` — a `Some(false)`
-/// or still-unknown advert sends nothing, and the dispatch is not
-/// retried (one attempt per row). The
+/// advert and sends the hand-off only on `Some(true)`. A `Some(false)`
+/// after the refresh records the same unsupported attempt as the
+/// synchronous read; a still-unknown advert sends nothing and is logged
+/// ([`refreshed_handoff_dispatch`]). The dispatch is not retried (one
+/// attempt per row). The
 /// designated admin's own dispatch outcome is recorded against its
 /// attempt (L174), and the outcome-bearing records persist (§2
 /// L170–L173, §5 v3), so `unresolved_designated_admin` and the §4
@@ -3174,14 +3250,16 @@ async fn dispatch_handoffs(state: &Arc<AppState>) {
                     // which makes this detached task the hand-off's last
                     // chance: it awaits the bounded single-flight refresh
                     // (about 3 s, no lock held across the await), re-reads
-                    // the advert and sends only on `Some(true)`. A
-                    // `Some(false)` or still-unknown advert sends nothing;
-                    // the dispatch is not retried.
+                    // the advert and sends only on `Some(true)`; a
+                    // `Some(false)` records the unsupported attempt and a
+                    // still-unknown advert sends nothing. The dispatch is
+                    // not retried.
                     let designated_attempt = attempt
                         .filter(|_| Some(recipient) == designated)
                         .map(|attempt| (key.clone(), attempt));
                     let send_state = Arc::clone(state);
                     let bytes = payload.clone();
+                    let row_key = key.clone();
                     let _spawned = state.spawn_detached(async move {
                         send_state
                             .agent
@@ -3190,18 +3268,22 @@ async fn dispatch_handoffs(state: &Arc<AppState>) {
                                 x0x::dm::CapabilityRegistry::EVICTION_HANDOFF_V1,
                             )
                             .await;
-                        if send_state
+                        let support = send_state
                             .agent
                             .capability_store()
                             .verified_registry_supports(
                                 &agent,
                                 x0x::dm::CapabilityRegistry::EVICTION_HANDOFF_V1,
-                            )
-                            != Some(true)
-                        {
-                            return;
-                        }
-                        send_one_handoff(send_state, recipient, bytes, designated_attempt).await;
+                            );
+                        refreshed_handoff_dispatch(
+                            send_state,
+                            row_key,
+                            recipient,
+                            support,
+                            bytes,
+                            designated_attempt,
+                        )
+                        .await;
                     });
                 }
             }
@@ -3230,6 +3312,57 @@ async fn dispatch_handoffs(state: &Arc<AppState>) {
     }
 }
 
+/// #1581 (#1881 review): the dispatch of one hand-off after its advert
+/// refresh. `Some(true)` sends it. `Some(false)` is the same definitive
+/// lack the synchronous arm of [`dispatch_handoffs`] records: the
+/// recipient joins the row's `unsupported_handoff` set and, for the
+/// designated admin, its attempt records `Unsupported` (ADR 0110 §4).
+/// `None` (the refresh brought no current advert) sends nothing and is
+/// logged; the dispatch is not retried.
+async fn refreshed_handoff_dispatch(
+    state: Arc<AppState>,
+    key: EvictionKey,
+    recipient: [u8; 32],
+    support: Option<bool>,
+    payload: Vec<u8>,
+    designated_attempt: Option<(EvictionKey, u64)>,
+) {
+    match support {
+        Some(true) => {
+            send_one_handoff(state, recipient, payload, designated_attempt).await;
+        }
+        Some(false) => {
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .unsupported_handoff
+                .entry(key)
+                .or_default()
+                .insert(recipient);
+            if let Some((key, attempt)) = designated_attempt {
+                record_designated_handoff(
+                    &state,
+                    &key,
+                    attempt,
+                    recipient,
+                    s4::DesignatedHandoffOutcome::Unsupported,
+                )
+                .await;
+            }
+        }
+        None => {
+            tracing::info!(
+                group_id = %super::LogHexId::group(&key.stable_group_id),
+                recipient = %x0x::logging::LogAgentId::from(&x0x::identity::AgentId(recipient)),
+                designated = designated_attempt.is_some(),
+                "ADR 0110 S4: the advert refresh brought no current eviction_handoff_v1 advert; the hand-off is not sent"
+            );
+        }
+    }
+}
+
 /// Map one `send_direct` result of a designated-admin hand-off to its
 /// §2 (L170–L173) outcome. Every `DmError` variant is matched by name,
 /// so a new variant must be classified here before the code builds.
@@ -3241,7 +3374,7 @@ async fn dispatch_handoffs(state: &Arc<AppState>) {
 ///   `Some(false)` read — so it is `Unsupported`.
 /// - `RecipientRejected` (the designated admin's own acknowledgement that
 ///   its trust policy refused this sender) and the ADR-0043 pairing
-///   denial (`RecipientPairingDenied`, or the legacy
+///   denial (`RecipientPairingDenied`, `RecipientMachineRevoked`, or the legacy
 ///   `EnvelopeConstruction` with the `RECIPIENT_PAIRING_DENIED` prefix:
 ///   this node's policy refused the designated admin's machine) are
 ///   definitive policy refusals under
@@ -3266,6 +3399,9 @@ fn designated_send_outcome(
         DmError::RecipientUpgradeRequired { .. } => Outcome::Unsupported,
         DmError::RecipientRejected { .. } => Outcome::PolicyRefused,
         DmError::RecipientPairingDenied { .. } => Outcome::PolicyRefused,
+        // #1597 item 4 (D70): this node's revocation set denies the
+        // designated admin's machine, the same local policy refusal.
+        DmError::RecipientMachineRevoked { .. } => Outcome::PolicyRefused,
         DmError::EnvelopeConstruction(message)
             if message.starts_with(x0x::dm::RECIPIENT_PAIRING_DENIED) =>
         {
@@ -4223,14 +4359,16 @@ async fn drive_queued_bans(state: &Arc<AppState>) {
                 error = body.get("error").and_then(serde_json::Value::as_str).unwrap_or_default(),
                 "ADR 0110 S4: a queued manual ban could not be applied yet; retrying"
             );
-            // A TreeKEM ban of a target with no leaf cannot run through
-            // the existing route; it applies once the target is seated
-            // again (a rejoin), so retry slowly while it is not.
-            let seated = seat_target(info, &target_hex);
-            let retry = if seated {
-                S4_COMMIT_RETRY
+            // #1540: a TreeKEM ban of a target with no leaf is roster-only
+            // and runs through the same route. It waits only while an
+            // Active member's advert lacks `roster_only_ban_v1`, which an
+            // upgrade ends, so that refusal retries slowly.
+            let upgrade_wait = body.get("error").and_then(serde_json::Value::as_str)
+                == Some(super::ROSTER_ONLY_BAN_UPGRADE_WAIT);
+            let retry = if upgrade_wait {
+                S4_RECEIVER_UPGRADE_BAN_RETRY
             } else {
-                S4_UNSEATED_BAN_RETRY
+                S4_COMMIT_RETRY
             };
             inner
                 .ban_next_attempt
@@ -4609,6 +4747,16 @@ fn evjournal_path(state: &AppState, stable_group_id: &str) -> PathBuf {
 async fn persist_obligations(state: &AppState) -> bool {
     let runtime = &state.revocation_evictions;
     let _writer = runtime.evs_writer.lock().await;
+    // #1597 item 5c: before the startup load the file still holds the
+    // previous boot's rows, which memory does not, so nothing is written
+    // and the answer is "not durable". The load then replaces the store
+    // (rows and queued bans) with the file: a change made before it is not
+    // carried. The daemon awaits the load before it serves the API, so no
+    // request can make one; a trigger re-derives from its durable source
+    // on the next pass. Only the `.evh` load merges memory with the file.
+    if runtime.load_pending() {
+        return false;
+    }
     let snapshot = {
         let mut inner = runtime.inner.lock().await;
         match begin_persist(&mut inner, host_commit_gate_open(state)) {
@@ -4912,6 +5060,11 @@ pub(super) async fn verified_pending_copies(path: &FsPath) -> (Vec<([u8; 16], Pa
 async fn load_persisted_obligations(state: &AppState) {
     let runtime = &state.revocation_evictions;
     let _writer = runtime.evs_writer.lock().await;
+    #[cfg(test)]
+    runtime.port_published_at_load.store(
+        state.data_dir.join("api.port").exists(),
+        std::sync::atomic::Ordering::SeqCst,
+    );
     let path = evs_path(state);
     // §5 and "ADR 0094 trial": inside an uncommitted trial the load only
     // reads. It starts no quarantine transaction, writes no replacement
@@ -5053,6 +5206,13 @@ async fn load_persisted_obligations(state: &AppState) {
         }
     }
     let mut inner = runtime.inner.lock().await;
+    // Only unsealed work: a committed row's delivery resends its saved
+    // event and seals nothing new.
+    inner.restart_unconfirmed = store
+        .rows()
+        .filter(|row| matches!(row.phase, Phase::Pending | Phase::Prepared))
+        .map(|row| row.stable_group_id.clone())
+        .collect();
     inner.store = store;
     inner.sidecar = sidecar;
     inner.rebuilt_from = rebuilt_from;
@@ -5096,6 +5256,18 @@ async fn load_persisted_obligations(state: &AppState) {
         }
     }
     handoff_log::load(state, gate_open).await;
+    // Both files are read; writers may replace them from now on. This load
+    // holds the writer lock, so no writer runs between the read and here.
+    runtime
+        .awaiting_load
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// #1597 item 5c: the daemon's startup load of the S4 store, awaited
+/// before the API port is published, so no request, worker pass or
+/// receipt write can replace the `.evs` or `.evh` before they are read.
+pub(in crate::server) async fn load_revocation_eviction_store(state: &AppState) {
+    load_persisted_obligations(state).await;
 }
 
 /// Read every `.evjournal` in the TreeKEM directory and classify it (§5).
@@ -5453,6 +5625,40 @@ pub(super) mod tests {
 
     // ─── Codex round 1, item 3: head sync is not elapsed time ──────────
 
+    /// #1581 (`s4_restart_stale_head`, David's rulings of 29 Oct 2026
+    /// 00:15/00:40 GMT): for a group whose open row this boot loaded from
+    /// the previous boot's `.evs`, the elapsed wait alone never syncs while
+    /// a holder exists, inside the wait or past it. A holder's
+    /// confirmation does, and with no holder nothing can hold a later
+    /// head. FAIL-BEFORE: `synced` took the elapsed wait as a usable head,
+    /// so the restarted node sealed its stale head at about the wait
+    /// (`ci.yml` pinned `w3h_1581c_red_restart_stale_head_no_sync_past_wait=RED`).
+    #[test]
+    fn a_restarted_group_needs_a_holder_confirmation_past_the_wait() {
+        let wait = Duration::from_secs(13);
+        let start = Instant::now();
+        let mut rounds = HashMap::new();
+        let mut asks = HeadRoundAsks::new();
+        let holders = [[9; 32]];
+        refresh_head_round(&mut rounds, &mut asks, "g", "h1", &holders, start, wait);
+        let later = start + wait * 10;
+        let round = rounds.get("g").expect("round");
+        assert!(!round.synced("h1", 1, false, true, false, start, wait));
+        assert!(!round.synced("h1", 1, false, true, false, later, wait));
+        assert!(round.synced("h1", 0, false, true, false, later, wait));
+        note_head_report(
+            &mut rounds,
+            &mut asks,
+            "g",
+            "h1",
+            [9; 32],
+            HeadReport::OnLocalChain,
+            later,
+        );
+        let round = rounds.get("g").expect("round");
+        assert!(round.synced("h1", 1, false, true, false, later, wait));
+    }
+
     #[test]
     fn elapsed_time_alone_does_not_sync_a_head_with_unresolved_evidence() {
         let wait = Duration::from_secs(13);
@@ -5465,14 +5671,14 @@ pub(super) mod tests {
         let later = start + wait * 10;
         let round = rounds.get("g").expect("round");
         // A stale replica: queued higher-head evidence is still open.
-        assert!(!round.synced("h1", 1, true, true, later, wait));
+        assert!(!round.synced("h1", 1, true, true, true, later, wait));
         // The restart minimum is necessary.
-        assert!(!round.synced("h1", 1, false, false, later, wait));
+        assert!(!round.synced("h1", 1, false, false, true, later, wait));
         // No evidence and no answer: the bounded wait ends discovery (D73).
-        assert!(!round.synced("h1", 1, false, true, start, wait));
-        assert!(round.synced("h1", 1, false, true, later, wait));
+        assert!(!round.synced("h1", 1, false, true, true, start, wait));
+        assert!(round.synced("h1", 1, false, true, true, later, wait));
         // The round confirms one head only.
-        assert!(!round.synced("h2", 1, false, true, later, wait));
+        assert!(!round.synced("h2", 1, false, true, true, later, wait));
     }
 
     /// CI DIAG #1546 W3-H `s4_designated_late_observation` (iteration 11):
@@ -5541,7 +5747,7 @@ pub(super) mod tests {
         assert!(!rounds
             .get("g")
             .expect("round")
-            .synced("h1", 2, false, true, later, wait));
+            .synced("h1", 2, false, true, true, later, wait));
         // After the wait the round asks every holder again, A included.
         let again = refresh_head_round(&mut rounds, &mut asks, "g", "h1", &holders, later, wait);
         assert_eq!(again, holders.to_vec());
@@ -5559,7 +5765,7 @@ pub(super) mod tests {
             !rounds
                 .get("g")
                 .expect("round")
-                .synced("h1", 2, false, true, later, wait),
+                .synced("h1", 2, false, true, true, later, wait),
             "the retry kept A's unknown-head report"
         );
         // A itself now reports a head on the local chain: resolved.
@@ -5575,13 +5781,13 @@ pub(super) mod tests {
         assert!(rounds
             .get("g")
             .expect("round")
-            .synced("h1", 2, false, true, later, wait));
+            .synced("h1", 2, false, true, true, later, wait));
         // A new local head needs a new round.
         refresh_head_round(&mut rounds, &mut asks, "g", "h2", &holders, later, wait);
         assert!(!rounds
             .get("g")
             .expect("round")
-            .synced("h2", 2, false, true, later, wait));
+            .synced("h2", 2, false, true, true, later, wait));
     }
 
     /// #1578 rc4 (Engineer ruling, 28 Oct 09:35 GMT; Codex P1): a
@@ -5644,7 +5850,7 @@ pub(super) mod tests {
             !rounds
                 .get("g")
                 .expect("round")
-                .synced("h1", 2, false, true, settled, wait),
+                .synced("h1", 2, false, true, true, settled, wait),
             "another confirmation plus the elapsed wait must not seal from the stale head"
         );
         // The liveness path the ruling names: the seat is keyed again
@@ -5664,7 +5870,7 @@ pub(super) mod tests {
             rounds
                 .get("g")
                 .expect("round")
-                .synced("h1", 2, false, true, settled, wait),
+                .synced("h1", 2, false, true, true, settled, wait),
             "the holder's own on-chain report resolves its entry"
         );
     }
@@ -5749,7 +5955,7 @@ pub(super) mod tests {
             next,
         );
         let round = rounds.get("g").expect("round");
-        assert!(!round.synced("h2", 2, false, true, next, wait));
+        assert!(!round.synced("h2", 2, false, true, true, next, wait));
         note_head_report(
             &mut rounds,
             &mut asks,
@@ -5760,7 +5966,7 @@ pub(super) mod tests {
             next,
         );
         let round = rounds.get("g").expect("round");
-        assert!(round.synced("h2", 2, false, true, next, wait));
+        assert!(round.synced("h2", 2, false, true, true, next, wait));
         // A report arrives first for the new head.
         let mut rounds = HashMap::new();
         let mut asks = HeadRoundAsks::new();
@@ -5785,14 +5991,14 @@ pub(super) mod tests {
         );
         let round = rounds.get("g").expect("round");
         assert!(
-            !round.synced("h2", 2, false, true, start, wait),
+            !round.synced("h2", 2, false, true, true, start, wait),
             "the head change in the report path kept A's report"
         );
         // A holder that is no longer a holder (it left, or it is now an
         // open target) no longer blocks.
         refresh_head_round(&mut rounds, &mut asks, "g", "h2", &[b], start, wait);
         let round = rounds.get("g").expect("round");
-        assert!(round.synced("h2", 1, false, true, start, wait));
+        assert!(round.synced("h2", 1, false, true, true, start, wait));
     }
 
     /// CI W3-H `w3h_1357_red_s4_restart_intake_prepare`: the committer is
@@ -5842,7 +6048,7 @@ pub(super) mod tests {
             note_head_report(&mut rounds, &mut asks, "g", &head, holder, report, now);
             rounds
                 .get("g")
-                .is_some_and(|round| round.synced(&head, 1, false, true, now, wait))
+                .is_some_and(|round| round.synced(&head, 1, false, true, true, now, wait))
         };
         // Behind at r (our parent): synced at once.
         assert!(synced_after(&parent));
@@ -5863,7 +6069,7 @@ pub(super) mod tests {
         assert!(!rounds
             .get("g")
             .expect("round")
-            .synced("h1", 1, false, true, now, wait));
+            .synced("h1", 1, false, true, true, now, wait));
         note_head_report(
             &mut rounds,
             &mut asks,
@@ -5876,10 +6082,10 @@ pub(super) mod tests {
         assert!(rounds
             .get("g")
             .expect("round")
-            .synced("h1", 1, false, true, now, wait));
+            .synced("h1", 1, false, true, true, now, wait));
         let alone = HeadRound::new("h1", now);
-        assert!(alone.synced("h1", 0, false, true, now, wait));
-        assert!(!alone.synced("h1", 0, true, true, now, wait));
+        assert!(alone.synced("h1", 0, false, true, true, now, wait));
+        assert!(!alone.synced("h1", 0, true, true, true, now, wait));
     }
 
     // ─── Codex round 1, item 1: several revoked OwnerCertified seats ───
@@ -8386,6 +8592,69 @@ pub(super) mod tests {
         Ok(())
     }
 
+    /// #1581 (#1881 review items 1 and 3): after the advert refresh, a
+    /// `Some(false)` read is the same definitive lack as the synchronous
+    /// arm — the designated admin joins `unsupported_handoff` and its
+    /// attempt records `Unsupported` — while a still-unknown read records
+    /// nothing. Red on main, where the post-refresh read only returned.
+    #[tokio::test]
+    async fn a_lacking_advert_after_the_refresh_records_the_unsupported_outcome(
+    ) -> anyhow::Result<()> {
+        let (state, _group_id, key, designated, _bytes, _dir) =
+            uda_state_after_restart(None).await?;
+        revocation_eviction_pass(&state).await;
+        let attempt = {
+            let inner = state.revocation_evictions.inner.lock().await;
+            let row = inner.store.get(&key).expect("the row");
+            assert_eq!(row.designated, Some(designated));
+            row.first_dispatch_unix_ms.expect("the row has dispatched")
+        };
+
+        // Still unknown after the refresh: nothing is recorded.
+        refreshed_handoff_dispatch(
+            Arc::clone(&state),
+            key.clone(),
+            designated,
+            None,
+            Vec::new(),
+            Some((key.clone(), attempt)),
+        )
+        .await;
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            assert_eq!(
+                inner.store.get(&key).expect("the row").designated_handoff,
+                None,
+                "an unknown advert is not an outcome"
+            );
+            assert!(!inner.unsupported_handoff.contains_key(&key));
+        }
+
+        // A lacking advert after the refresh: the unsupported attempt.
+        refreshed_handoff_dispatch(
+            Arc::clone(&state),
+            key.clone(),
+            designated,
+            Some(false),
+            Vec::new(),
+            Some((key.clone(), attempt)),
+        )
+        .await;
+        let inner = state.revocation_evictions.inner.lock().await;
+        assert_eq!(
+            inner.store.get(&key).expect("the row").designated_handoff,
+            Some(s4::DesignatedHandoffRecord {
+                designated,
+                outcome: s4::DesignatedHandoffOutcome::Unsupported,
+            })
+        );
+        assert!(inner
+            .unsupported_handoff
+            .get(&key)
+            .is_some_and(|ids| ids.contains(&designated)));
+        Ok(())
+    }
+
     /// #1581: the dispatch's `None` arm for an unknown or expired
     /// advert (a card-only binding, which carries no verified advert,
     /// reads the same) sends no hand-off and asks exactly once per
@@ -8468,8 +8737,14 @@ pub(super) mod tests {
             );
             info.recompute_state_hash();
         }
+        // Real KEM keys, so the inbox check below can unseal anything sent
+        // to these two recipients and tell a hand-off from other traffic.
+        let expired_kem = crate::groups::kem_envelope::AgentKemKeypair::generate()
+            .expect("a KEM keypair for the expired advert");
+        let card_only_kem = crate::groups::kem_envelope::AgentKemKeypair::generate()
+            .expect("a KEM keypair for the card");
         let nearly_stale = now_unix_ms() - (x0x::dm_capability::ADVERT_CACHE_TTL_SECS * 1000 - 500);
-        let mut caps = x0x::dm::DmCapabilities::v1_gossip_ready(vec![42; 1184]);
+        let mut caps = x0x::dm::DmCapabilities::v1_gossip_ready(expired_kem.public_bytes.to_vec());
         caps.application_registry = x0x::dm::CapabilityRegistry {
             version: 1,
             bits: u64::MAX,
@@ -8487,7 +8762,7 @@ pub(super) mod tests {
             state.agent.capability_store().insert_from_card(
                 x0x::identity::AgentId(card_only),
                 x0x::identity::MachineId([7; 32]),
-                x0x::dm::DmCapabilities::v1_gossip_ready(vec![42; 1184]),
+                x0x::dm::DmCapabilities::v1_gossip_ready(card_only_kem.public_bytes.to_vec()),
                 now_unix_ms(),
             ),
             "the card-only binding is seeded"
@@ -8513,6 +8788,29 @@ pub(super) mod tests {
             .agent
             .subscribe(crate::dm_capability::DM_CAPABILITY_TARGETED_REQUEST_TOPIC)
             .await?;
+        // #1881 review item 2: every recipient's DM inbox topic, subscribed
+        // the way the inbox service does, so "sends nothing" is checked
+        // per recipient on the wire and not only by the designated
+        // admin's recorded outcome. The designated admin has no advert,
+        // so nothing can be sealed to it; the other two hold real keys.
+        let mut inboxes = Vec::new();
+        for (id, kem) in [
+            (designated, None),
+            (expired, Some(&expired_kem)),
+            (card_only, Some(&card_only_kem)),
+        ] {
+            let recipient_id = x0x::identity::AgentId(id);
+            let inbox = state
+                .agent
+                .pubsub()
+                .expect("the hermetic plane runs a gossip runtime")
+                .subscribe_topic_id(
+                    crate::dm_inbox::DmInboxService::inbox_topic_name(&recipient_id),
+                    x0x::dm::dm_inbox_topic(&recipient_id),
+                )
+                .await;
+            inboxes.push((id, kem, inbox));
+        }
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // One pass derives the designation onto the row; the row has
@@ -8571,6 +8869,37 @@ pub(super) mod tests {
         // a gossip-inbox publish) — these assertions hold only because
         // no send ran.
         tokio::time::sleep(Duration::from_millis(2_000)).await;
+        for (id, kem, inbox) in &mut inboxes {
+            // Drain what the topic holds. Other DM traffic (the head-sync
+            // catch-up asks) may ride it; no frame may unseal to an
+            // `X0XEVH1` hand-off body.
+            while let Ok(Some(message)) =
+                tokio::time::timeout(Duration::from_millis(200), inbox.recv()).await
+            {
+                let Some(envelope) = x0x::dm::DmEnvelope::from_wire_bytes(&message.payload).ok()
+                else {
+                    continue;
+                };
+                let x0x::dm::DmBody::Payload(sealed) = &envelope.body else {
+                    continue;
+                };
+                let Some(kem) = kem else {
+                    panic!(
+                        "nothing can be sealed to {} (no advert)",
+                        hex::encode(&id[..4])
+                    );
+                };
+                let Ok(plaintext) = x0x::dm::decrypt_payload(kem, sealed, &envelope.aead_aad())
+                else {
+                    continue;
+                };
+                assert!(
+                    s4::decode_handoff(&plaintext.payload).is_err(),
+                    "no hand-off reaches the inbox of {}",
+                    hex::encode(&id[..4])
+                );
+            }
+        }
         let inner = state.revocation_evictions.inner.lock().await;
         assert_eq!(
             inner.store.get(&key).expect("the row").designated_handoff,
@@ -8880,6 +9209,12 @@ pub(super) mod tests {
         assert_eq!(
             designated_send_outcome(&Err(x0x::dm::DmError::RecipientPairingDenied {
                 denial: x0x::key_move::PairingDenial::BindingRevoked,
+            })),
+            s4::DesignatedHandoffOutcome::PolicyRefused
+        );
+        assert_eq!(
+            designated_send_outcome(&Err(x0x::dm::DmError::RecipientMachineRevoked {
+                machine: x0x::identity::MachineId([7; 32]),
             })),
             s4::DesignatedHandoffOutcome::PolicyRefused
         );
@@ -11006,5 +11341,169 @@ pub(super) mod tests {
             "a group outside the open set keeps its share-seal generation"
         );
         state.agent.shutdown().await;
+    }
+
+    /// #1597 item 5c: a write asked for before the startup load (an early
+    /// manual ban, a verified expiry hand-off receipt) never replaces the
+    /// previous boot's `.evs` or `.evh`. The load reads both files, keeps
+    /// the receipt, and the first write after it carries the receipt with
+    /// the kept hand-off.
+    #[tokio::test]
+    async fn a_write_before_the_startup_load_keeps_the_previous_boot_files() -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let kept = EvictionKey::new("1597".to_string(), [1; 32]);
+        let early = EvictionKey::new("1597".to_string(), [2; 32]);
+        let handoff = |received_unix_ms| ExpiryHandoff {
+            certificate_digest: "ab".repeat(32),
+            received_unix_ms,
+        };
+        let boot_id = state.revocation_evictions.boot_id;
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.store.intake(
+                &kept,
+                s4::EvictionTrigger::AgentRevocation {
+                    record_hash: [7; 32],
+                    record_bytes: vec![7],
+                },
+                None,
+                now_unix_ms(),
+                boot_id,
+            );
+            inner.dirty = true;
+            inner.expiry_handoffs.insert(kept.clone(), handoff(42));
+            inner.expiry_handoffs_dirty = true;
+        }
+        assert!(persist_obligations(&state).await, "the row is durable");
+        handoff_log::persist(&state).await;
+        let evs_before = std::fs::read(evs_path(&state))?;
+        let evh_before = std::fs::read(handoff_log::path(&state))?;
+
+        // Restart: memory is empty and the files are not read yet.
+        *state.revocation_evictions.inner.lock().await = S4Inner::default();
+        state
+            .revocation_evictions
+            .awaiting_load
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.queued_bans.insert(early.clone(), now_unix_ms());
+            inner.dirty = true;
+            inner.expiry_handoffs.insert(early.clone(), handoff(43));
+            inner.expiry_handoffs_dirty = true;
+        }
+        assert!(
+            !persist_obligations(&state).await,
+            "a change before the load is not durable"
+        );
+        handoff_log::persist(&state).await;
+        assert_eq!(
+            std::fs::read(evs_path(&state))?,
+            evs_before,
+            "the .evs of the previous boot is not replaced before the load"
+        );
+        assert_eq!(
+            std::fs::read(handoff_log::path(&state))?,
+            evh_before,
+            "the .evh of the previous boot is not replaced before the load"
+        );
+
+        load_revocation_eviction_store(&state).await;
+        assert!(!state.revocation_evictions.load_pending());
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            assert!(inner.store.get(&kept).is_some(), "the kept row is loaded");
+            assert!(inner.expiry_handoffs.contains_key(&kept));
+            assert!(
+                inner.expiry_handoffs.contains_key(&early),
+                "the receipt made before the load is kept"
+            );
+        }
+        handoff_log::persist(&state).await;
+        let written = handoff_log::decode(&std::fs::read(handoff_log::path(&state))?)
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        assert!(written.contains_key(&kept) && written.contains_key(&early));
+        state.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1597 item 5c: the daemon reads the S4 store before it publishes
+    /// `api.port`, so no API request can run before the load. A real
+    /// daemon starts on a data dir that holds an `.evs` row; when `serve`
+    /// returns, the startup load has run, it began while `api.port` did
+    /// not exist yet, and it read the file. Red with the `mod.rs` load
+    /// removed: the worker loads after the port is published.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_daemon_loads_the_s4_store_before_it_publishes_the_api_port() -> anyhow::Result<()>
+    {
+        let root = tempfile::tempdir()?;
+        let data = root.path().join("data");
+        std::fs::create_dir_all(&data)?;
+        let mut store = ObligationStore::new();
+        store.intake(
+            &EvictionKey::new("1597".to_string(), [5; 32]),
+            s4::EvictionTrigger::AgentRevocation {
+                record_hash: [7; 32],
+                record_bytes: vec![7],
+            },
+            None,
+            now_unix_ms(),
+            [0; 16],
+        );
+        let bytes = s4::encode_evs(&s4::EvsBodyV1 {
+            rebuilt_from: Vec::new(),
+            rows: store.to_rows(),
+        })?;
+        std::fs::write(data.join(s4::EVS_FILE_NAME), bytes)?;
+        let config: crate::server::DaemonConfig = serde_json::from_value(serde_json::json!({
+            "bind_address": "127.0.0.1:0",
+            "api_address": "127.0.0.1:0",
+            "data_dir": data,
+            "identity_dir": root.path().join("identity"),
+            "bootstrap_peers": [],
+            "mdns_enabled": false,
+            "port_mapping_enabled": false,
+            "network_id": format!(
+                "x0x.test.1597.s4load.{}.{:08x}",
+                std::process::id(),
+                rand::random::<u32>()
+            )
+        }))?;
+        let options = crate::server::ServeOptions {
+            skip_update_check: true,
+            cli_no_port_mapping: true,
+            cli_disable_peer_cache: true,
+            self_update_enabled: false,
+            ..crate::server::ServeOptions::default()
+        };
+        let handle = tokio::time::timeout(
+            Duration::from_secs(60),
+            crate::server::serve_with_options(config, options),
+        )
+        .await??;
+        let state = handle
+            .test_state
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("live daemon state"))?;
+        assert!(data.join("api.port").exists(), "the port is published");
+        assert!(
+            !state.revocation_evictions.load_pending(),
+            "the startup load ran before serve returned"
+        );
+        assert!(
+            !state
+                .revocation_evictions
+                .port_published_at_load
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the load began before api.port was written"
+        );
+        assert!(
+            state.revocation_evictions.inner.lock().await.file_exists,
+            "the load read the previous boot's .evs"
+        );
+        drop(state);
+        tokio::time::timeout(Duration::from_secs(60), handle.shutdown_and_wait()).await??;
+        Ok(())
     }
 }

@@ -29,12 +29,14 @@ mod gui_show_remote;
 /// registry — the ERROR-event count is the verdict's log input.
 pub mod health_verdict;
 mod instance_lock;
+mod kv_change_events;
 mod legacy_store_migration;
 pub(crate) mod reseat_scope;
 mod rider_auth;
 mod routes;
 mod sse;
 mod state;
+mod system_events;
 mod update_check;
 #[cfg(any(unix, windows))]
 mod upgrade_flush;
@@ -78,13 +80,13 @@ use routes::{
     create_discovery_subscription, create_group_invite, create_group_kv_store, create_join_request,
     create_kv_store, create_mls_group, create_mls_welcome, create_named_group, create_task_list,
     daemon_shutdown_hook, delete_contact, delete_discovery_subscription, delete_kv_value,
-    delete_machine, direct_connections, direct_message_send_config, direct_send, discover_groups,
-    discover_groups_nearby, discovered_agent, discovered_agents, discovered_machine,
-    discovered_machines, dispatch_join_result_message, dispatch_welcome_blob_message,
-    dm_diagnostics, enroll_device, ensure_named_group_listeners, evaluate_trust, exec_cancel,
-    exec_diagnostics, exec_run, exec_sessions, file_accept_handler, file_reject_handler,
-    file_send_handler, file_transfer_status_handler, file_transfers_handler, find_agent,
-    forward_add, forward_list, forward_remove, get_a2a_agent_card, get_agent_card,
+    delete_machine, direct_connections, direct_message_send_config, direct_receipt, direct_send,
+    discover_groups, discover_groups_nearby, discovered_agent, discovered_agents,
+    discovered_machine, discovered_machines, dispatch_join_result_message,
+    dispatch_welcome_blob_message, dm_diagnostics, enroll_device, ensure_named_group_listeners,
+    evaluate_trust, exec_cancel, exec_diagnostics, exec_run, exec_sessions, file_accept_handler,
+    file_reject_handler, file_send_handler, file_transfer_status_handler, file_transfers_handler,
+    find_agent, forward_add, forward_list, forward_remove, get_a2a_agent_card, get_agent_card,
     get_constitution, get_constitution_json, get_group_card, get_group_join_status,
     get_group_public_messages, get_group_state, get_group_state_commits, get_kv_value,
     get_mls_group, get_named_group, get_named_group_members, get_onboard, get_profile,
@@ -1399,12 +1401,17 @@ pub async fn serve_with_options(
             routes::named_groups::TREEKEM_CATCHUP_SERVE_SLOTS,
         )),
         treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
+        treekem_start_catchup_pending: Default::default(),
+        treekem_network_join_ended: tokio::sync::watch::channel(false).0,
+        treekem_start_catchup_passes: Default::default(),
+        treekem_reconnect_catchup_passes: Default::default(),
         treekem_catchup_refusals: StdMutex::new(HashMap::new()),
+        join_request_outcome_sends: StdMutex::new(HashMap::new()),
         group_membership_locks: RwLock::new(HashMap::new()),
         reseat_stagings: Default::default(),
         treekem_groups: reseat_scope::ScopedGroupMap::new(treekem_groups),
         treekem_dir,
-        revocation_evictions: routes::named_groups::S4Runtime::default(),
+        revocation_evictions: routes::named_groups::S4Runtime::awaiting_startup_load(),
         group_recovery: routes::named_groups::S3Runtime::awaiting_restore(),
         ws_sessions: RwLock::new(HashMap::new()),
         ws_topics: RwLock::new(HashMap::new()),
@@ -1428,6 +1435,11 @@ pub async fn serve_with_options(
         upgrade_check_cache: Mutex::new(None),
         upgrade_apply_lock: Arc::new(Mutex::new(())),
         http_upgrade_wait_lock: Arc::new(Mutex::new(())),
+        self_published_release_manifests: Arc::new(Mutex::new(
+            SelfPublishedReleaseManifests::default(),
+        )),
+        upgrade_observations: Default::default(),
+        background_submit: std::sync::OnceLock::new(),
         #[cfg(unix)]
         upgrade_staging,
         api_token,
@@ -1608,6 +1620,8 @@ pub async fn serve_with_options(
         // here rather than reaching back into the config from the task.
         let resolved_plane = config.resolved_network_id();
         let mut verdict_windows = health_verdict::VerdictWindows::default();
+        // #1351: verdict and upgrade-input changes become `system.*` events.
+        let mut system_events = system_events::SystemEventTracker::default();
         bg_tasks.push(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
                 routes::status::HEALTH_SNAPSHOT_REFRESH_SECS,
@@ -1653,6 +1667,7 @@ pub async fn serve_with_options(
                 )
                 .await;
                 snapshot_state.health_snapshot.store_verdict_sample(sample);
+                system_events::emit_changes(&snapshot_state, &mut system_events);
             }
         }));
     }
@@ -1919,6 +1934,16 @@ pub async fn serve_with_options(
         .await);
     }
 
+    // ADR 0110 S4 (#1597 item 5c): read the obligation store and the kept
+    // expiry hand-offs before the API serves or the worker runs. The load
+    // is fail-visible (a damaged file is quarantined, a newer one runs
+    // memory-only), never fatal; until it ends no writer replaces either
+    // file.
+    routes::named_groups::load_revocation_eviction_store(&state).await;
+    // #1427: the catch-up commits this node held before the restart. After
+    // the S4 store, so a commit S4 still delivers is not served from it.
+    routes::named_groups::restore_treekem_catchup_logs(&state).await;
+
     // Publish the API port only after every fallible causal-state loader has
     // completed. A rejected sidecar therefore leaves no listener task and no
     // API advertisement, and the agent/exec loops above are explicitly torn
@@ -2022,6 +2047,9 @@ pub async fn serve_with_options(
     // Phase E: subscribe to a stable global SignedPublic message fallback so
     // first messages are not dependent on a brand-new per-group topic tree.
     bg_tasks.extend(spawn_global_public_message_listener(Arc::clone(&state)).await);
+    // #1094: `kv:changed` / `task:changed` SSE events from the agent's
+    // KV and task-list change notices.
+    bg_tasks.extend(kv_change_events::spawn(Arc::clone(&state)));
 
     // Invite-auth #468/#469 (design v6 E2d / v7 F1): the member-certificate
     // bridge. `cert_events_rx` was subscribed before the AppState groups
@@ -2153,10 +2181,13 @@ pub async fn serve_with_options(
                 tracing::error!("Failed to join network: {e}");
             }
         }
+        // #1427: a start catch-up that ran during a slow bootstrap asks
+        // again now that the join has ended, whether it registered before
+        // or after this point.
+        routes::named_groups::retry_treekem_start_catchup(&join_rekey_state);
     }));
 
-    let self_published_release_manifests =
-        Arc::new(Mutex::new(SelfPublishedReleaseManifests::default()));
+    let self_published_release_manifests = Arc::clone(&state.self_published_release_manifests);
 
     // Reclaim upgrade debris left by previous failed/interrupted attempts:
     // orphaned `.x0x-upgrade-*` temp dirs and `*.x0xold-*` sidelined binaries.
@@ -2198,6 +2229,7 @@ pub async fn serve_with_options(
         let startup_shutdown = daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx);
         let startup_apply_lock = Arc::clone(&state.upgrade_apply_lock);
         let startup_shutdown_watch = state.shutdown_notify.subscribe();
+        let startup_observations = Arc::clone(&state.upgrade_observations);
         #[cfg(unix)]
         let startup_identity_dir = identity_dir.clone();
         #[cfg(unix)]
@@ -2241,6 +2273,7 @@ pub async fn serve_with_options(
                     shutdown_watch: startup_shutdown_watch,
                     #[cfg(unix)]
                     staging,
+                    observations: Some(startup_observations),
                 }),
             )
             .await
@@ -2273,6 +2306,8 @@ pub async fn serve_with_options(
         match runtime {
             Ok(runtime) => {
                 let (submit, owner) = routes::background_channel(runtime);
+                // #1381: `/diagnostics/upgrade` reports the owner's release.
+                let _ = state.background_submit.set(submit.clone());
                 bg_tasks.push(tokio::spawn(owner.run()));
                 Some(submit)
             }
@@ -2294,6 +2329,7 @@ pub async fn serve_with_options(
         |submit| {
             let agent_for_gossip = Arc::clone(&state.agent);
             let self_published_for_gossip = Arc::clone(&self_published_release_manifests);
+            let observations_for_gossip = Arc::clone(&state.upgrade_observations);
             // Restart context stays with the shared owner; this source only
             // discovers verified releases and observes daemon shutdown.
             let gossip_shutdown_watch = state.shutdown_notify.subscribe();
@@ -2302,6 +2338,7 @@ pub async fn serve_with_options(
                     agent_for_gossip,
                     submit,
                     self_published_for_gossip,
+                    observations_for_gossip,
                     gossip_shutdown_watch,
                 )
                 .await;
@@ -2344,6 +2381,7 @@ pub async fn serve_with_options(
             let update_config = config.update.clone();
             let agent_for_poll = Arc::clone(&state.agent);
             let self_published_for_poll = Arc::clone(&self_published_release_manifests);
+            let observations_for_poll = Arc::clone(&state.upgrade_observations);
             let poll_shutdown_watch = state.shutdown_notify.subscribe();
             async move {
                 run_fallback_github_poll(
@@ -2351,6 +2389,7 @@ pub async fn serve_with_options(
                     update_config,
                     submit,
                     self_published_for_poll,
+                    observations_for_poll,
                     poll_shutdown_watch,
                 )
                 .await;
@@ -2663,6 +2702,19 @@ pub async fn serve_with_options(
                 .await;
         }));
     }
+
+    // #1427: a TreeKEM member that was down past the last metadata resend
+    // asks for the commits it missed after its start, with no later
+    // traffic needed.
+    bg_tasks.push(tokio::spawn(
+        routes::named_groups::run_treekem_start_catchup(Arc::clone(&state)),
+    ));
+    // #1427: a TreeKEM member that stays up through a network outage past
+    // the last metadata resend asks for the commits it missed when it
+    // connects again.
+    bg_tasks.push(tokio::spawn(
+        routes::named_groups::run_treekem_reconnect_catchup(Arc::clone(&state)),
+    ));
 
     // #1663: a member of an encrypted GSS group whose own seat carries no
     // KEM key republishes the key at boot. The keyless-install hook covers
@@ -3256,6 +3308,7 @@ pub async fn serve_with_options(
         .route("/agents/connect", post(connect_agent))
         .route("/direct/send", post(direct_send))
         .route("/direct/connections", get(direct_connections))
+        .route("/direct/receipts/:logical_id", get(direct_receipt))
         .route("/direct/events", get(direct_events_sse))
         // MLS group encryption endpoints
         .route("/mls/groups", post(create_mls_group))
@@ -3285,6 +3338,7 @@ pub async fn serve_with_options(
         // Upgrade
         .route("/upgrade", get(check_upgrade))
         .route("/upgrade/apply", post(apply_upgrade))
+        .route("/upgrade/clear-hold", post(routes::clear_upgrade_hold))
         // Network diagnostics
         .route("/network/bootstrap-cache", get(bootstrap_cache_stats))
         .route("/diagnostics/connectivity", get(connectivity_diagnostics))
@@ -3351,6 +3405,7 @@ pub async fn serve_with_options(
         )
         .route("/grants/received", get(routes::grants_received))
         .route("/grants/:id", delete(routes::grants_revoke))
+        .route("/grants/:id/renew", post(routes::grants_renew))
         // ADR-0074 §1: names (owner petnames, TOFU pins, resolution)
         .route("/names", get(routes::names_list))
         .route("/names/resolve", post(routes::names_resolve))
@@ -4054,6 +4109,15 @@ async fn start_dm_inbox_when_gossip_ready(
                 GROUP_PREDECESSOR_RELAY_DM_PREFIX,
                 predecessor_relay_route_tx.clone(),
                 valid_predecessor_relay_typed_dm,
+            )
+            // #1840: the join-request outcome (the authority's typed
+            // refusal of an offer) shares the predecessor channel: one
+            // consumer, two prefixes, and the handler branches on the
+            // prefix. Not validated: a malformed outcome must end in the
+            // handler, never be shown as a generic DM.
+            .with_durable_typed_payload_route(
+                x0x::groups::join_outcome::JOIN_REQUEST_OUTCOME_DM_PREFIX,
+                predecessor_relay_route_tx.clone(),
             );
         // ADR-0070 §2: durable, never validated-and-fallthrough — a
         // malformed grant must fail the handler (ACK withheld), never be
@@ -4319,8 +4383,16 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
     // unavailable on purpose (indurable journal transitions) — the
     // sender's retry schedule re-offers.
     let completion = typed.completion.take();
-    let outcome =
-        handle_predecessor_relay_typed_payload_inner(relay_state, local_agent_hex, typed).await;
+    // #1840: the requester-side outcome of a refused offer arrives on the
+    // same channel under its own prefix.
+    let outcome = if typed
+        .payload
+        .starts_with(x0x::groups::join_outcome::JOIN_REQUEST_OUTCOME_DM_PREFIX)
+    {
+        routes::named_groups::handle_join_request_outcome_typed_payload(relay_state, &typed).await
+    } else {
+        handle_predecessor_relay_typed_payload_inner(relay_state, local_agent_hex, typed).await
+    };
     if let Some(tx) = completion {
         let _ = tx.send(outcome);
     }
@@ -4614,6 +4686,12 @@ async fn handle_predecessor_relay_typed_payload_inner(
         // unavailable until startup recovery (or an explicit
         // recovery loop) resolves it. Never overwrite recovery
         // evidence with a later admission.
+        //
+        // Issue #1840: a marker that can never complete (expired, or its
+        // group is gone) is released first, its evidence kept, so it does
+        // not block every later admission until a restart. A marker whose
+        // release fails, or that startup would fail closed on, stays.
+        routes::named_groups::release_unusable_listener_admission(relay_state, now_ms).await;
         let existing_admission = relay_state.pending_listener_admission.lock().await.clone();
         let marker_matches_event = existing_admission.as_ref().is_some_and(|marker| {
             marker.group_id == group_id_str
@@ -5036,13 +5114,33 @@ async fn handle_predecessor_relay_typed_payload_inner(
                     // or used head waits for its turn, in arrival order.
                     // The queue needs no journal lock.
                     drop(_journal_guard);
-                    crate::server::routes::named_groups::join_sequence::note_refused_request(
-                        relay_state,
-                        &group_id_str,
-                        &event,
-                        now_ms,
-                    )
-                    .await;
+                    // #1840 ask 4: tell the requester, once the release
+                    // is durable. Had the marker stayed, the requester's
+                    // re-offer is what retries the release, so no outcome
+                    // is sent then. The turn holder's outcome may carry
+                    // the head (A08 amendment of 15 Nov 2026). An early
+                    // gate (revoked or unverified sender, withdrawn group
+                    // and similar) has no reason: it sends nothing and
+                    // does not queue, and the requester's offer stays live.
+                    if let Some(reason) = apply_result.refusal_reason {
+                        let turn = crate::server::routes::named_groups::join_sequence::note_refused_request(
+                            relay_state,
+                            &group_id_str,
+                            &event,
+                            now_ms,
+                        )
+                        .await;
+                        routes::named_groups::send_join_request_refusal(
+                            relay_state,
+                            &group_id_str,
+                            &request_id,
+                            typed.sender,
+                            digest_bytes,
+                            reason,
+                            turn.as_ref(),
+                        )
+                        .await;
+                    }
                 } else {
                     *relay_state.pending_listener_admission.lock().await = marker;
                     tracing::error!(

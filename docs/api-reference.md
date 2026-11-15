@@ -561,6 +561,13 @@ daemon holds:
   record; it answers the same fields and `"already_revoked": true`. To use the computer again,
   stop `x0xd`, delete `machine.key` and start `x0xd`.
 
+A machine revocation denies delivery, transport and requests to that
+device. The agent keeps its group seats (ADR 0110 D70). It does **not**
+protect TreeKEM group content against a device that still holds the agent
+key: the agent's TreeKEM leaf keys derive from the agent key, so such a
+device can follow later epochs. To cut a lost or stolen device off group
+content, revoke the agent or remove the member from the group (#1929).
+
 Any other agent or machine id returns `403`: the daemon has no authority
 over it. Loading an owner key or an agent certificate does not change the
 signer used by this form.
@@ -846,6 +853,14 @@ All six are owner-only: every `/owner/*` route rejects a rider token with
 `403` in the auth middleware before any handler runs. `409` when the
 daemon has no owner user key.
 
+**Certificate-only device (#1860).** `certificate.storage_b64` in the
+issuance answer is the `agent.cert` file format. A daemon with no user key
+loads `agent.cert` at start when the certificate binds its agent and its
+owner signature verifies, and then announces the issuer as its user. It can
+adopt a renewal from the owner, but it cannot issue one; an expired
+certificate leaves it unreachable for pinned messages. See
+[Owner, Home, and riders](skill/owner.md).
+
 **Issuance** takes `{ "agent_public_key": <hex ML-DSA-65 public key>,
 "mode": "acp"|"rider", "label"?: string, "not_after"?: unix-seconds }`.
 The harness generates and custodies the keypair; the daemon never sees
@@ -985,8 +1000,10 @@ carrier, only when that member's current verified advert sets
   stays on the group's `admin_availability.owner_recovery.owner` until the
   promoted member commits.
 - `409 Conflict` — `{"ok": false, "error": "recovery_not_needed" |
-  "recovery_member_ineligible" | "recovery_group_quarantined" |
-  "recovery_head_mismatch", "group_id"}`.
+  "waiting_for_active_admin" | "recovery_member_ineligible" |
+  "recovery_group_quarantined" | "recovery_head_mismatch", "group_id"}`.
+  `waiting_for_active_admin` means the roster has no Active admin seat at
+  all, so there is no revoked admin to replace.
 - `403 Forbidden` — a session token, or `recovery_signer_not_owner` (the
   group's owner is not this node's user key).
 - `404 Not Found` — the group is not known on this node.
@@ -1244,8 +1261,8 @@ own `MemberAdded`, mint a fresh invite rather than replaying the link.
 
 All five answer `409` when no owner identity is configured. Sync replicates
 owner state **owner-to-owner only** — Tier 1: profile/names, the Home
-history, DMs, and exec data
-never replicate, and no third party receives the state. Inbound SyncV1 streams
+pointer, the issuance journal and the owner device set (#1107). Group
+history, DMs, and exec data never replicate, and no third party receives the state. Inbound SyncV1 streams
 are refused at the enrollment gate unless the enrollment signature and
 currency (expiry) verify — corrupt, foreign-key, or stale enrollments never
 open the sync gate; non-enrolled machines are refused at stream accept.
@@ -1260,10 +1277,17 @@ open the sync gate; non-enrolled machines are refused at stream accept.
   "devices": [
     {"machine_id":"e55130…","enrolled_at_ms":1788090728080,
      "expires_at_ms":null,"last_session_ms":null,"last_session_ok":null,
-     "is_this_machine":true}
+     "is_this_machine":true,"record_source":"local",
+     "record_writer_machine_id":"e55130…"}
   ]
 }
 ```
+
+`record_source` (#1107) says where the device's synced enrollment record
+(Tier-1 kind 0x05) came from: `"local"` when this machine wrote it,
+`"synced"` when another owner device wrote it (`record_writer_machine_id`
+names that device), and `null` when no record holds this enrollment yet (the
+next sync pass writes it).
 
 **POST /sync/devices/enroll** request — `machine_id` optional (64-hex;
 omitted = enroll THIS machine), `ttl_secs` optional (bounds the enrollment's
@@ -1301,12 +1325,15 @@ ruling).
 }
 ```
 
-**Enrollment is per-machine and must be bilateral.** A daemon dials sync only
+**The first session needs a bilateral enrollment.** A daemon dials sync only
 to machines in *its own* enrolled set (minus itself), and the receiving side
 accepts a stream only from a machine *it* has enrolled. Two machines sync
 when each holds the other's enrollment — run `enroll` on **both** machines,
 each naming the other's machine id (plus itself), or no session is ever
-established.
+established. After that, enrollments and removals sync (Tier-1 kind 0x05,
+SyncV1 protocol 3, #1107): a machine enrolled or removed on one device is
+enrolled or removed on every owner device that syncs with it. A peer on
+protocol 2 does not receive them.
 
 **Trust prerequisite:** SyncV1 rides ADR-0022 byte streams through the same
 stream gate as every other protocol — each side's peer-trust decision for the
@@ -1560,6 +1587,7 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 | POST | `/machines/connect` | `x0x machines connect <machine_id>` | Establish a machine-id transport connection |
 | POST | `/direct/send` | `x0x direct send <agent_id> <message> [--require-ack-ms <ms>] [--prefer-raw-quic-if-connected <BOOL>] [--raw-quic-receive-ack-ms <ms>] [--stop-fallback-on-raw-error] [--require-gossip] [--no-durable-ack] [--logical-id <token>]` | Send a direct base64 payload. Durable-by-default since v0.38.0 |
 | GET | `/direct/connections` | `x0x direct connections` | List active direct connections |
+| GET | `/direct/receipts/:logical_id?agent_id=<hex>` | `x0x direct receipt <logical_id> <agent_id>` | Outcome of a durable send made under `logical_id` to `agent_id`: `delivered`, `delivered_late`, `pending` or `unknown` (#1109). See [Durable send receipts](#durable-send-receipts-1109) |
 | GET | `/history/message/:msg_id` | `x0x history message` | Point lookup of one durable history row by exposed `msg_id` (64 hex; canonical group ids need `?scope=`); 404 when absent, 400 on malformed id. Same record shape as `/history` (issue #319) |
 | GET | `/direct/events` | `x0x direct events` | SSE stream of direct messages; `?backfill=N` requests up to N stored `dm:` rows as `history_direct_message` events before a `live` marker and live frames (ADR-0023 §7). The attempt is best-effort; reconcile through [`/history`](#durable-history-adr-0023) |
 
@@ -1673,6 +1701,7 @@ Notable codes:
 | 400 | `invalid_logical_id` | `logical_id` was empty, longer than 128 characters, or contained a character outside `[a-z0-9._:-]`. |
 | 400 | `logical_id_requires_durable_ack` | `logical_id` was sent with `require_durable_app_ack: false`. Only the durable path honours the id; drop one or the other. |
 | 403 | `recipient_pairing_denied` | The local ADR-0043 B/P gate denied the `(agent, machine)` pairing that the send resolved: a tombstone retired the binding (B), or a current placement record pins the agent to another machine (P). Nothing was sent. A retry fails the same way until the binding or placement changes. Rust callers get `DmError::RecipientPairingDenied { denial }`. Before this code, this denial answered 500 `envelope_construction` (gossip path) or 500 `publish_failed` (pinned path). A denial on the raw-QUIC path still answers `publish_failed`. |
+| 403 | `recipient_machine_revoked` | The machine the send resolved for the recipient is revoked (ADR 0110 §3, D70). That device is denied and nothing was sent; the recipient agent keeps its group seats until the agent itself is revoked. A retry fails the same way until the recipient announces from another machine. Rust callers get `DmError::RecipientMachineRevoked { machine }`. A revoked binding answers `recipient_pairing_denied`. |
 | 404 | `recipient_key_unavailable` | The recipient has published no KEM key, or is entirely unknown to this daemon — **no capability advert and no contact card at all**. A durable send to a stranger answers this, not the 409 below. |
 | 409 | `recipient_key_invalid` | Our view of the recipient's key material has not converged. Transient — retry. |
 | 409 | `recipient_ack_semantics_unavailable` | The send required ADR 0030 durable application-ACK semantics and the recipient advertises no current v2 capability. A peer you hold **any** contact card for lands here rather than on the 404 — including one whose advert has not converged yet, since that peer is known and may simply need upgrading. Returned after one forced targeted capability refresh, so it is fast and deterministic rather than a timeout. The caller retries, surfaces "peer needs upgrade", or resends with `require_durable_app_ack: false` — the daemon never downgrades silently. |
@@ -1680,7 +1709,7 @@ Notable codes:
 | 409 | `recipient_capability_unavailable` | As `recipient_capability_pending`, but no verified advert arrived within one advert period (600 s). Nothing was sent. A later advert from the recipient lets a retry go. Rust callers get `DmError::RecipientCapabilityUnavailable { capability }`. |
 | 409 | `idempotency_conflict` | The recipient already holds this `logical_id` bound to different bytes. **Retrying cannot succeed.** Either resend the original bytes under this id, or pick a new `logical_id`. |
 | 413 | `payload_too_large` | Payload exceeds the DM envelope cap. |
-| 504 | `timeout` | The overall send budget ended the send. `DmError::Timeout` can come from the raw-QUIC path, the known-recipient redial, or the relay fallback, as well as from an application ACK that does not arrive within the retry budget. Those paths are capped by the overall send budget. The error variant and the wire format are unchanged. The DM may or may not have arrived. On a durable send the body also includes `strict_gate_ms`, `publish_ms`, `ack_wait_ms`, `elapsed_ms`, and `budget_stage` so the stage that consumed the budget is named. Durable 200 and 504 also include recipient ACK-publish diagnostics `last_ack_publish_ms` and `ack_publish_route_failed` (same fields on `GET /diagnostics/dm`). These are diagnostics, not a latency SLA. |
+| 504 | `timeout` | The overall send budget ended the send. `DmError::Timeout` can come from the raw-QUIC path, the known-recipient redial, or the relay fallback, as well as from an application ACK that does not arrive within the retry budget. Those paths are capped by the overall send budget. The error variant and the wire format are unchanged. The DM may or may not have arrived. On a durable send the body also includes `strict_gate_ms`, `publish_ms`, `ack_wait_ms`, `elapsed_ms`, and `budget_stage` so the stage that consumed the budget is named. Durable 200 and 504 also include recipient ACK-publish diagnostics `last_ack_publish_ms` and `ack_publish_route_failed` (same fields on `GET /diagnostics/dm`). These are diagnostics, not a latency SLA. A durable 504 also has `outcome: "ack_unknown"` and `logical_id` (the caller's token, or null); query [`GET /direct/receipts/:logical_id`](#durable-send-receipts-1109) to learn whether the ACK arrived late (#1109). |
 
 The two 409s prescribe opposite repairs and must not be conflated in client
 code: `recipient_ack_semantics_unavailable` means *retry later or tell the user
@@ -1715,6 +1744,33 @@ true` advert after re-serialization and drops it (self-healing once both sides
 upgrade); old→new *strict* durable DMs answer `409
 recipient_ack_semantics_unavailable` until the old side upgrades. Plan
 upgrades as a coordinated roll-forward.
+
+### Durable send receipts (#1109)
+
+A durable send that answers 504 (`outcome: "ack_unknown"`) did not learn the outcome. The recipient may hold the message. Do not resend a second copy to find out. Ask the daemon:
+
+```
+GET /direct/receipts/order-42?agent_id=8a3f...
+```
+
+```json
+{
+  "ok": true,
+  "logical_id": "order-42",
+  "agent_id": "8a3f...",
+  "request_id": "5c1e...",
+  "status": "delivered_late"
+}
+```
+
+| `status` | Meaning |
+|---|---|
+| `delivered` | The recipient's v2 ACK arrived inside the send budget |
+| `delivered_late` | The v2 ACK arrived after the send returned. The recipient holds the message |
+| `pending` | A send is waiting, or gave up and no ACK has arrived yet |
+| `unknown` | No record: no durable send under this id to this agent, or the record expired |
+
+The key is the pair (`logical_id`, `agent_id`), because a logical id is scoped to one recipient. Only sends that supplied `logical_id` can be queried. Records are kept in memory for 10 minutes after the send resolved or gave up, at most 4,096, oldest dropped first; a restart forgets them. Only an `Accepted` v2 ACK from the exact recipient agent and machine counts. A malformed `logical_id` or `agent_id` answers 400 `invalid_logical_id` or `invalid_agent_id`. Decision: [A07](adr/consolidated/A07-r01-messages-receipts-history-and-retry.md) (amendment of 14 Nov 2026).
 
 ### `/direct/events` SSE message shape
 
@@ -1784,7 +1840,7 @@ token. A session token is refused before the body is read.
 |---|---|---|---|
 | POST | `/groups` | `x0x group create <name>` | Create a named group |
 | GET | `/groups` | `x0x group list` | List named groups |
-| GET | `/groups/:id` | `x0x group info <group_id>` | Get group info |
+| GET | `/groups/:id` | `x0x group info <group_id>` | Get group info. `own_join_request` is this daemon's own pending join request on the group, or `null`: `request_id`, `created_at` and `status` (`pending` or `refused`). When the group's authority refused the request (#1840), `refusal` gives `reason` (`stale`, `already_member`, `banned`, `pending_exists`, `invalid` or `unknown`), `retryable` and `refused_at` (Unix ms; the time this daemon received the refusal, not the time the authority refused). A refused request is not sent again. Cancel it before you file a new one. `retryable` is `true` only for `stale`: this daemon's copy of the group is not current, and a new request made from a current group card can succeed. When both daemons advertise `join_request_head_v1`, a `stale` refusal normally does not show here: the authority sends its current group state with it, this daemon signs the same request again over that state and offers it, and `status` stays `pending` (A08 amendment of 15 Nov 2026). If this daemon loses the stored refusal (its offer store is over its limit), `status` reads `pending` again |
 | GET | `/groups/:id/members` | `x0x group members <group_id>` | List named-group members |
 | POST | `/groups/:id/members` | `x0x group add-member <group_id> <agent_id> [--display-name <n>] [--key-package <b64>]` | Admin-authored member add (propagates to subscribed peers). `--key-package` carries the base64 TreeKEM key package required for direct adds to encrypted groups |
 | DELETE | `/groups/:id/members/:agent_id` | `x0x group remove-member <group_id> <agent_id>` | Admin-authored member removal (propagates to subscribed peers) |
@@ -1805,7 +1861,7 @@ token. A session token is refused before the body is read.
 | POST | `/groups/:id/members/:agent_id/reseat` | `x0x group reseat <group_id> <agent_id> --reason <text> --basis <json>` | **ADR 0109 §3**: re-seat a forked or removed node by hand. See [Ownerless attestation and re-seat](#ownerless-attestation-and-re-seat-adr-0109-s3) |
 | GET | `/groups/:id/recovery` | `x0x group recovery <group_id>` | **ADR 0109 §8**: this node's `recovery` object, the sidecar file, and on an admin the pending requesters and issued re-seats |
 | GET | `/groups/:id/requests` | `x0x group requests <group_id>` | List join requests. Requires a local admin seat. Token class: [join-request admin](#authentication-and-token-classes) (#1347). A session token is accepted, except on a Home or an `OwnerCertified` group, which needs the durable API token |
-| POST | `/groups/:id/requests` | `x0x group request-access <group_id>` | Submit a join request |
+| POST | `/groups/:id/requests` | `x0x group request-access <group_id>` | Submit a join request. `201` means the request is stored locally and will be offered to the group's authority; it does not mean the authority took it. Read `own_join_request` on `GET /groups/:id` for a later refusal (#1840) |
 | POST | `/groups/:id/requests/:request_id/approve` | `x0x group approve-request <group_id> <request_id>` | Approve a join request (admin-authored). Same token class as the list (#1347) |
 | POST | `/groups/:id/requests/:request_id/reject` | `x0x group reject-request <group_id> <request_id>` | Reject a join request (admin-authored). Same token class as the list (#1347) |
 | DELETE | `/groups/:id/requests/:request_id` | `x0x group cancel-request <group_id> <request_id>` | Cancel your own pending request. An owner credential (session or durable) is enough; the request must belong to this daemon |
@@ -2109,6 +2165,7 @@ every wait. A wait always names its cause; it does not stop silently.
 |---|---|---|
 | `DELETE /groups/:id/members/:agent_id`, `POST /groups/:id/ban/:agent_id`, `POST /groups/:id/state/seal` | `202 Accepted` | `{"ok": true, "queued": true, "status": "waiting_for_designated_admin", "group_id", "target", "request": "remove" \| "ban" \| "seal", "waiting": {"cause", "designated_admin", "detail": "rank", "local_rank", "remaining_ms", "fallback_at_unix_ms"}}`. The target has an open obligation and this admin's fallback time has not come. The request is queued. It does not rekey early. |
 | `DELETE /groups/:id/members/:agent_id`, `POST /groups/:id/ban/:agent_id`, `POST /groups/:id/state/seal` | `202 Accepted` | `{"ok": true, "queued": true, "status": <cause>, "group_id", "target", "request", "waiting": {"cause"}}` with cause `waiting_for_head_sync`, `waiting_for_durable_intake` or `local_committer_ineligible`. This admin is designated or past its fallback time, but the S4 evaluation does not let it seal yet. The daemon checks again under the group's membership lock, just before any change. The request is queued. Nothing is sealed from a stale head. |
+| `POST /groups/:id/ban/:agent_id` (TreeKEM group, target with no seat and no leaf) | `200 OK` / `409 Conflict` | #1540: the ban is roster-only — no TreeKEM commit, no epoch change — and answers `{"ok": true, "revision", "roster_only": true}`. While another Active member's current verified advert lacks application bit 17 (`roster_only_ban_v1`) it answers 409 `{"ok": false, "error": "waiting_for_receiver_upgrade", "capability": "roster_only_ban_v1", "members": [<agent hex>...]}` and changes nothing. |
 | Group sends, invites, member adds, seals, `POST /groups/:id/secure/encrypt` | `409 Conflict` | `{"ok": false, "error": "waiting_for_eligible_admin_revocation", "reason": ..., "state", "revoked_admins", "exit": "owner_recovery" \| "group_admin_revoked", "group_id"}`. No eligible admin remains, so no new message, admission or key can reach a revoked admin key. |
 | Same routes | `410 Gone` | `{"ok": false, "error": "group_admin_revoked", "reason": ..., "state", "revoked_admins", "exit", "recreate_offer", "group_id"}`. A group without `OwnerCertified` admission whose admins are all revoked. This is final for the group. |
 | `POST /groups/:id/secure/encrypt` (GSS plane) | `424 Failed Dependency` | `{"ok": false, "error": "no shared secret available — await welcome or ask admin to re-share"}`. The caller is an active member that holds no group secret and no verified-removal hold: an encrypted-group joiner still waiting for its welcome share. The keyless survivor of the 409 row below is not this state — its hold is what separates the two answers.
@@ -2350,7 +2407,8 @@ legacy-decoded container:
   seat (with its TreeKEM leaf, with one GSS rotation, or the roster seat
   alone in a `SignedPublic` group) and makes the promoted member Admin.
   Receivers accept it only under the §4b(1) rule. Typed refusals:
-  `recovery_not_needed`, `recovery_head_mismatch`,
+  `recovery_not_needed`, `waiting_for_active_admin` (no Active admin
+  seat), `recovery_head_mismatch`,
   `recovery_signer_not_owner`, `recovery_member_ineligible`,
   `recovery_proof_invalid`, `recovery_group_quarantined`. The promoted
   member holds the commit while a known Active member's current advert
@@ -2375,11 +2433,31 @@ the fields shown:
 | `awaiting_attestation` | `reason`, `asked`, `next_retry_at_ms` | The node asks capable admins, then members. `reason` is `no_capable_peer`, `no_reply`, `segment_exhausted`, `renewal_due`, `provisional_unverified`, or the last refusal reason. |
 | `readmission_required` | `cause`, `asked`, `exit` | `cause` is `base_beyond_retention` or `local_state_lost`. `exit` is `manual_remove_and_reinvite` until ADR 0114's repair is in effect. A readmitted joiner whose own admission commit (`MemberAdded` or `JoinRequestApproved` with a Welcome reference) cannot fetch its staged Welcome (the admitting admin restarted, or the Welcome's 10-minute lifetime passed) comes back to this state and stops asking. Its join attempt ends with `last_join_outcome` `timed_out`, reason `rearm_original_result_unavailable` (ADR 0107), and it applies no later attestation for that attempt. A node that holds its keys never ends this way. A new verified invite starts a new attempt. |
 | `manual_clear_required` | `ref` | The head is on the admin's chain, but the marker names a sibling. Use `POST /groups/:id/quarantine/clear`. |
-| `reseat_required` | `cause`, `ref`, `last_refusal`, `asked` | `cause` is `not_on_chain`, `attestation_conflict`, `not_a_member` or `reseat_failed`. An admin must re-seat this node by hand. When this node refuses a re-seat authorisation, `last_refusal` is `authorisation_refused:<cause>`, where `<cause>` is `signature`, `signer`, `subject`, `basis`, `base_seats_subject` or `expired` (ADR 0109 §3); other failed checks, for example `group_mismatch` or `reseat_invite_unpaired`, show their own name. |
+| `reseat_required` | `cause`, `ref`, `last_refusal`, `asked` | `cause` is `not_on_chain`, `attestation_conflict`, `not_a_member` or `reseat_failed`. An admin must re-seat this node by hand. When this node refuses a re-seat authorisation, `last_refusal` is `authorisation_refused:<cause>`, where `<cause>` is `signature`, `signer`, `subject`, `basis`, `base_seats_subject` or `expired` (ADR 0109 §3); other failed checks, for example `group_mismatch` or `reseat_invite_unpaired`, show their own name. When the join route refuses the staged join with 409, `last_refusal` is that refusal's reason, for example `owner_mismatch` or `invite_downgraded` (another status shows `join_<status>`). Each re-seat invite refusal is also counted in `invites_refused {reason}`. |
 | `reseat_in_progress` | `authorised_by`, `phase`, `expires_at_ms` | A valid authorisation arrived. The staged join runs. |
 | `recovery_deferred` | `cause`, and `file` for a damaged sidecar | `home_gate_closed` (Home activation is off) or `host_commit_pending`. Inside an uncommitted ADR 0094 upgrade trial S3 creates no sidecar and writes no placeholder, and a damaged sidecar stays in place; after host commit S3 continues (a damaged file is then quarantined and rebuilt). |
 | `recovery_refused` | `reason` | `banned_or_revoked`. Final. |
 | `sidecar_unavailable`, `sidecar_newer_format`, `sidecar_quarantine_failed` | `file` and `cause`, `version` or `step` | ADR 0108 §5a. S3 makes no transition for the group. |
+
+**A forked head behind an armed gap record (#871).** A joiner whose
+served chain crossed a gap under an owner's or an admin's terminal
+attestation keeps a durable gap record (`invite_lineage.anchored_gap_refusal`).
+While it is armed, a catch-up page applies only when it links from the
+current head and matches the attested sequence. A head on a fork can never
+link, so every page is refused. The gate does not expire, and there is no
+local clear for it: an expiry would let unattested pages apply, and
+overwriting the revision or the hash would break the next attested commit.
+With no progress the node asks capable admins for an attestation: after
+10 minutes (`GATE_STALL`) for a gap armed by an owner's attestation, and
+after 30 minutes (`ATA_ARMED_LIFETIME`) for a gap armed by an admin's
+attestation. An admin that finds the head on no chain of its
+own answers `not_on_chain`, and the node shows
+`reseat_required {cause: not_on_chain, ref: {"kind": "gap", ...}}`. The
+exit is an admin's manual re-seat with that `gap` ref (or the removal) as
+its basis. The swap replaces the whole group record and retires the gap
+record; the refusal stays in the sidecar as a retired record. A node that
+cannot reach a capable admin keeps the gate and shows
+`awaiting_attestation`.
 
 After an ADR 0108 §5a rebuild the object also has
 `recovery_sidecar_rebuilt: {file, txid, lost}`. A `ref` is
@@ -3711,8 +3789,13 @@ a typed `403`.
   evaluates it; the remote read/write surface that consumes it is the A4
   sharing-completeness slice and is not yet wired.
 - `expiry` (Unix seconds) or `ttl_secs` (seconds from `not_before`): set
-  exactly one, else `400`. Grants must expire.
-- `not_before` (optional, Unix seconds): default is now.
+  exactly one, else `400`. Grants must expire. The window
+  `expiry - not_before` is at most 90 days (7776000 s); a longer grant is
+  refused with `400` and nothing is stored (#1350). To keep access going,
+  renew the grant (below).
+- `not_before` (optional, Unix seconds): default is now. It may be at most
+  600 s in the future (clock skew); a later start is refused with `400`.
+  Issue a grant when it should start, and renew it to extend it.
 - `deliver_to` (optional, 64-hex agent ids): more agents to deliver the grant
   to.
 - `include_names` (optional, default `true`): ADR 0079 — carry the owner's
@@ -3761,6 +3844,37 @@ body as a literal, `@path`, a bare path, or `-` for stdin, plus the optional
 | POST | `/grants` | `x0x grant issue <GRANT_JSON>` | Sign a share grant with the owner key, store it, and deliver it by durable DM |
 | DELETE | `/grants/:id` | `x0x grant revoke <id>` | Revoke a share grant (owner key; revocation gossiped on `x0x.revocation.v3` and pushed directly to capable recipients) |
 | GET | `/grants/received` | `x0x grant received` | List share grants that name this install as grantee |
+| POST | `/grants/:id/renew` | `x0x grant renew <id> [--ttl-secs N] [--deliver-to <agent>]... [--no-names]` | Renew an issued share grant: sign a new grant with the same grantee, agents and caps, valid from now (at most 90 days), and deliver it |
+
+**Lifetime and renewal (#1350).** A share grant lasts at most 90 days
+(`expiry - not_before` ≤ 7776000 s). The daemon refuses a longer grant when
+it signs one (`POST /grants` answers `400`) and when it receives one: a
+longer grant from an older peer is not stored and its DM is not ACKed. A
+grant stored before this rule keeps loading and runs to its own expiry.
+A daemon also refuses a grant whose `not_before` is more than 600 s ahead of
+its own clock, so a chain of pre-signed future grants cannot extend access
+past 90 days; each renewal must be signed when it is due.
+
+`POST /grants/:id/renew` takes an optional body (an empty body takes every
+default; unknown fields are refused):
+
+```json
+{ "ttl_secs": 7776000, "deliver_to": ["<64-hex agent id>"], "include_names": true }
+```
+
+- `ttl_secs` (optional): the renewal's lifetime from now, 1 to 7776000;
+  default 7776000 (90 days). Out of range is `400`.
+- `deliver_to`, `include_names`: as for `POST /grants`.
+
+The renewal is a NEW grant (new `grant_id`) with the same grantee, agents
+and caps, valid from now. The response is the `POST /grants` response plus
+`renews` (the old grant id). The old grant is not changed and stays valid to
+its own expiry, so a renewal that is delivered before that expiry leaves the
+grantee no gap. On the wire a renewal is an ordinary grant, so older peers
+accept it. `404` when this install did not issue the grant; `400` when the
+grant is revoked. A renewal after the old expiry also works, but the grantee
+has no grant between the two windows. Revoking access after a renewal needs
+`DELETE` of each grant that is still active.
 
 **Direct revocation push (#1003).** A successful `DELETE /grants/:id` also
 pushes the one signed revocation record, as a typed DM
@@ -3782,7 +3896,8 @@ no push; the retry does.
 |---|---|---|---|
 | GET | `/upgrade` | — (CLI does not call this) | Daemon-side check for updates (release manifests over the `x0x/release` gossip topic; GitHub first-discovery fallback). Read-only: a check that finds a newer release announces nothing and never leads to an install on this node (#1169, Engineer ruling 3 Nov 2026 17:40 GMT) |
 | POST | `/upgrade/apply` | `x0x upgrade --apply` | Daemon applies the latest verified release manifest with transactional restart; the observed release is announced on `x0x/release` before the apply work (#1169) |
-| GET | `/diagnostics/upgrade` | `x0x diagnostics upgrade` | Local version + update policy + version/policy digest for the M1 census (#1383; no update check runs, nothing is announced) |
+| POST | `/upgrade/clear-hold?version=<v>` | `x0x upgrade --clear-hold <v>` | Authenticated, recorded local clear of this install's failed-release probe hold for exactly `<v>` (D190, #1376). `200` `{cleared:true, version, cause, transaction_id}` after a durable receipt (`<daemon>.upgrade-probe.json.cleared`) and removal of the hold; `404` when no failed-release hold exists for `<v>`; `409` for recovery-failed or an unresolved probe record (never cleared locally) or while another upgrade runs; `400` for a missing or non-semver version; `501` off Unix. A newer release clears such a hold by itself |
+| GET | `/diagnostics/upgrade` | `x0x diagnostics upgrade` | Local version + update policy + version/policy digest for the M1 census (#1383), plus release channel, latest version seen on `x0x/release`, last release check, pending update, and the on-disk upgrade plan, last attempt, backups and holds (#1381); no update check runs, nothing is announced |
 
 **Version/policy digest (#1383).** `GET /diagnostics/upgrade` reports the
 daemon's `current_version`, the full `update_policy` object
@@ -3801,6 +3916,33 @@ ruling: no capability bit, no new field in signed machine announcements.
 Remote machines' digests reach an owner only through a later approved
 announcement change; until then the owner-side census is
 `GET /owner/machines` (see [Device sync](#device-sync-adr-0041-tier-1)).
+
+**Release observations (#1381).** The same response reports what this
+daemon has learned about releases since it started. The values are held in
+memory and reset on restart; nothing is sent on the wire.
+
+| Field | Value |
+|---|---|
+| `channel` | `"stable"`, or `"prerelease"` when `include_prereleases` is set |
+| `latest_release_topic_version` | `{version, seen_at_unix}` for the highest verified release newer than this binary received on `x0x/release`, or `null` |
+| `last_check` | `{source, at_unix, outcome, version}` for the last release check, or `null`. `source` is `startup`, `fallback_poll` or `api` (a `GET /upgrade` not answered from its cache); `outcome` is `update_available` (with `version`), `up_to_date` or `failed` |
+| `pending_update` | `{version, state, source}` or `null`. While the background apply owner holds a release, `source` is `background_owner` and `state` is `queued`, `applying`, `backoff` (failed less than 30 minutes ago) or `failed`. Otherwise the newest observed version newer than this binary, with `state` `observed` and `source` `release_topic`, `startup`, `fallback_poll` or `api` |
+
+`x0x doctor` reads `pending_update` for its upgrade line.
+
+**Upgrade records (#1381).** The same response reads the safe-apply records
+on disk. It reads fixed file names only: it never follows a path written in a
+record, never changes a record, and never returns participant arguments,
+environment or free-text causes.
+
+| Field | Value |
+|---|---|
+| `plan` | `null` when no record exists. `{record: "journal", transaction_id, phase, previous_version, candidate_version, participants, cause, boot_attempt}` for an M2 journal (`participants` is a count; `cause` is `failed`, `interrupted` or `null`). `{record: "refused"}` for an unreadable record, `{record: "legacy_handoff"}` or `{record: "handoff", boot_attempt}` for a handoff without a journal |
+| `last_attempt` | `{version, transaction_id, attempt, phase, cause, retry_remaining_ms}` from the install's pre-swap probe record, or `null`. `phase` is `running`, `passed`, `interrupted_wait`, `failed_hold` or `recovery_failed` |
+| `holds` | One entry `{version, kind, cause, clearable}` while the probe record holds a release. `kind` is `failed_release` (`clearable: true`, see `x0x upgrade --clear-hold`) or `recovery_failed` (`clearable: false`) |
+| `last_hold_clear` | `{version, cause, cleared_at_unix}` from the most recent local clear receipt, or `null` |
+| `backups` | Backup files beside the daemon and its sibling CLI: `{artifact, name, size_bytes, modified_unix}`, `artifact` `daemon` or `cli`, at most 32. Names are `<binary>.backup` (legacy) or `<binary>.backup-<version>-<transaction>` (pair apply) |
+| `records_error` | `null`, or fixed text naming a record that could not be read (`install path unavailable`, `probe record unreadable`, `hold clear receipt unreadable`) |
 
 **Minimum supported version and support window (#1384, D35).** The same
 response carries `minimum_supported_version` and `support_window`. Both ship
@@ -3915,6 +4057,7 @@ Server → client (complete outbound frame set):
 | `mention` | `topic`, `group_id`, `msg_id`, `author_agent_id`, `reason` (`"mention"` \| `"delegation"`), `mentions[]` (omitted when empty), `timestamp` | An ingested, validated group message names the local agent (ADR-0040). **Emitted only on the group's shared topic channel — the session must be subscribed to the group's topic; an unsubscribed `/ws` session gets nothing (routing still happens daemon-side).** A delegation carrier directed at the local agent produces the same frame with `reason: "delegation"` — there is no separate `delegation` event type |
 | `pong` | — | Reply to `ping`; also the 30 s keepalive |
 | `error` | `message` | Malformed command, invalid base64, publish/send failure |
+| `system.health_verdict` / `system.upgrade_state` | `data` (same object as on `GET /events`) | (#1351) The M1 health verdict or its upgrade input changed; every `/ws` and `/ws/direct` session. See the SSE table |
 
 **Live `message` delivery is best-effort.** After a subscriber restart,
 subscribe-time anti-entropy can re-serve messages from the sender's roughly
@@ -4058,6 +4201,10 @@ structured push.
 |---|---|---|
 | `GET /events` | `message` | outer `{"type":"message","data":{subscription_id, topic, payload, sender?, verified, trust_level?}}` — only for active REST `/subscribe` subscriptions |
 | `GET /events` | `file:offer` / `file:complete` | outer `{"type":"file:offer"\|"file:complete","data":{...}}`; offer data has `transfer_id`, `filename`, `size`, `sender`, while complete data has `transfer_id`, `filename`, `sha256`, `path` |
+| `GET /events` | `kv:changed` | (#1094) `{"type":"kv:changed","data":{"store_id":"<topic>","origins":["local"\|"remote"]}}` — a KV store this daemon has open changed: a local write or delete, or a merged peer record or direct delta. Notices within 200 ms are merged into one event per store. No keys or values: read the store through `/stores/:id/*`. `{"store_id":null,"lagged":true}` means notices were lost; re-read every store you show |
+| `GET /events` | `task:changed` | (#1094) `{"type":"task:changed","data":{"list_id":"<topic>","origins":["local"\|"remote"]}}` — a task list this daemon has open changed: a local add, claim, complete, reorder or board migration, or a merged peer delta. Merged per 200 ms window like `kv:changed`; no task content: read the list through `/task-lists/:id/*`. `{"list_id":null,"lagged":true}` means notices were lost |
+| `GET /events` | `system.health_verdict` | (#1351) `{"type":"system.health_verdict","data":{"verdict":"ok"\|"degraded"\|"error","previous":"<verdict>","reasons":["..."],"at_unix":<secs>}}` — the M1 `/health` verdict changed. Checked every 5 s by the health refresher; the first check after start is the baseline and emits nothing, so read `GET /health` for the current value. `reasons` use the redacted wording (no measured values) |
+| `GET /events` | `system.upgrade_state` | (#1351) `{"type":"system.upgrade_state","data":{"state":"ok"\|"degraded"\|"error","previous_state":"<state>","update_available":<bool\|null>,"latest_version":"<v>"\|null,"handoff_pending":<bool>,"failed_artifact":<bool>,"at_unix":<secs>}}` — the M1 upgrade input of `/health` changed (its state, `update_available`, `latest_version`, `handoff_pending` or `failed_artifact`; the check age alone is not a change). Same cadence and baseline rule as `system.health_verdict` |
 | `GET /presence/events` | `presence` | `{"event":"online","agent_id","reachable"}` / `{"event":"offline","agent_id"}` |
 | `GET /direct/events` | `direct_message` | flat DM row (`sender`, `machine_id`, `payload`, `received_at`, `verified`, `trust_decision?`, `observed_origin?`); `?backfill=N` attempts to replay `history_direct_message` rows then emits `live` `{}` even when history is unavailable or its query fails; 15 s keepalive is a `ping` comment |
 | `GET /peers/events` | `peer-lifecycle` | `{"peer_id","event","at_ms"}` — `event` is the Debug text of the transition (`Established`, `Replaced`, `Closing`, `Closed`, `ReaderExited`); treat as open string |
@@ -4141,7 +4288,7 @@ David approved rider `scopes` on 22 Oct 2026 at 22:22 BST. That ruling narrows t
 
 A rider show is attributed to that token's `sub_agent_id`. The origin banner, the block check, the rate limit, and the `gui.show` `agent_id` use that id. Stop on a rider id adds that agent to the block list. It does not write `gui_show_local_disabled`. The rider banner tells the human to remove that agent's id from `gui_show_blocked.json` and restart the daemon. The button on this machine reads "Stop shows from this rider". Other riders on this machine and this daemon's own shows continue. Stop on the daemon's own agent still turns local show off. The local banner still names `gui_show_local_disabled`.
 
-View grammar (Rust `gui::view_route::parse`, mirrors `applyHashRoute` in the GUI): `dm/<hex>`, `groups/<hex>[/<app>]` with `<app>` in `chat|board|files|swarm|feed|wiki|web`, or a singleton in `home|homespace|discover|people|network|presence|mls|admin|settings|constitution|about`.
+View grammar (Rust `gui::view_route::parse`, mirrors `applyHashRoute` in the GUI): `dm/<hex>`, `groups/<hex>[/<app>]` with `<app>` in `chat|board|files|swarm|feed|wiki|web|scratch`, `scratch/<hex>` (#1094; the same view as `groups/<hex>/scratch`), or a singleton in `home|homespace|discover|people|network|presence|mls|admin|settings|constitution|about`.
 
 `target_machine` chooses the machine that displays the view. Omit the field, or send `null` or an empty string, and this daemon shows it. Send a 64-character hex `MachineId` to show on that machine. This daemon must have an owner, and `OwnerSyncStore::is_enrolled` must be true for that machine. Otherwise the outcome is `refused` and no direct message is sent. Send `active` to choose the enrolled owner machine whose GUI reported visible activity most recently. This machine is a candidate. The daemon asks each other enrolled machine that has an authenticated agent binding and a verified `gui_show_v1` capability. An announce-only discovery entry is not a target. Gossip delivery is enough for that query. The queries run in parallel and share one 10 second budget with their replies. A reply that has already arrived counts when its gossip ACK times out. A GUI tab that is still visible counts as active even when its stored stamp is older than 15 minutes, when that socket holds a live session token. A hidden tab keeps that stamp. A session refresh does not set the stamp. Clock skew beyond 120 seconds is outcome `stale_request`. This daemon also applies its own Stop and block list before it sends: `local_enabled = false` answers `disabled`, and a blocked requesting agent answers `refused`. A rider request carries that sub-agent id as `subject`. The target names that id on the banner, using a local contact label when it has one and the short id otherwise. The envelope stays signed by the originating daemon. David approved `GuiShowRequest.subject`, the daemon-signed envelope, and the limit that an owner-trusted originator can set any `subject` within the per-machine 30-per-hour cap, on 23 Oct 2026 14:27 BST. The originating daemon appends the selected machine id to that signed payload as `target`. The receiving daemon compares `target` with its own `MachineId` before it displays. A different id is outcome `wrong_machine`, and no view opens. A change to `target` after the ADR 0050 signature fails that signature. David approved this field on 24 Oct 2026 03:07 BST. `GuiShowOutcome` and `GuiActivityBody` are `#[non_exhaustive]`. An unknown variant index fails decode and does not open a view. David approved that rule on 24 Oct 2026 03:34 BST. An expired GUI session does not refresh `last_gui_visible_at`, including a reveal that waited for a queue slot. The target refuses the show when the envelope signer is in `gui_show_blocked`, including when `via_rider` is set. A rider show spends one rate-limit token for the envelope signer and one for `subject`, and one slot of the hourly cap. Stop on a remote rider show blocks shows from that machine. It writes the envelope signer, the originating daemon, to `gui_show_blocked`. Later shows from that daemon are refused, including other riders and that daemon's own shows. The receiver cannot verify `subject`, so Stop does not block only that subject. It records the `(signer, subject)` pair and does not add `subject`. That agent's direct shows from another machine continue. The banner says "Stop blocks shows from that machine." The button reads "Stop shows from this machine". `no_active_machine` means no machine qualifies. The response then includes `candidates`, an array of hex machine ids, and the daemon sends no show. A show sent to another machine waits up to 10 seconds for that machine's result. The outcome is `unconfirmed` when that wait ends with no result, or when the send fails before a result arrives. A result that has already arrived is kept when the gossip ACK times out. There is no automatic retry. A target with no verified `gui_show_v1` capability returns outcome `refused` and `reason` `target_needs_upgrade`, and the daemon sends nothing. `[gui_show] remote_enabled` defaults to true. The daemon reads it at startup and again on `POST /acl/reload`. `false` makes that machine answer `disabled` and answer an activity query with no timestamp. A remote response carries no URL and no session token. The local rate-limit bucket is spent only when this machine displays the view. David approved this wire and API surface on 22 Oct 2026 18:31 BST.
 

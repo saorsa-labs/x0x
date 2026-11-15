@@ -319,7 +319,7 @@ async fn pushed_revoke_parks_at_the_outbox_gate_until_the_in_flight_send_ends() 
         crate::share_grant::Grantee::Agent(grantee),
         vec![shared],
         vec![crate::share_grant::ShareCap::Dm],
-        0,
+        now - 60,
         now + 3_600,
     )
     .expect("sign grant");
@@ -473,7 +473,7 @@ async fn schedule_counts_capable_not_capable_and_unknown() {
         crate::share_grant::Grantee::Agent(capable),
         vec![not_capable, unknown],
         vec![crate::share_grant::ShareCap::Dm],
-        0,
+        now_unix() - 60,
         now_unix() + 86_400,
     )
     .expect("sign grant");

@@ -366,6 +366,10 @@ impl PinnedMachineSource {
 /// the verified sources of its recipient's machine.
 const PINNED_RESOLUTION_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Buffer of each agent-wide change channel, KV and task list (#1094). A subscriber that
+/// falls further behind than this loses the oldest notices.
+const CHANGE_CHANNEL_CAPACITY: usize = 1024;
+
 /// x0x #1150 (r7b): the transport operations raw-QUIC target resolution
 /// uses (connection state, send-readiness repair, discovery redial).
 /// Production always uses the network; test builds can script them, so the
@@ -824,6 +828,12 @@ pub struct Agent {
     /// Capability store populated by the advert service and consulted by
     /// `send_direct` to choose between gossip and raw-QUIC paths.
     capability_store: std::sync::Arc<dm_capability::CapabilityStore>,
+    /// #1094: change notices of every KV store this agent opens
+    /// ([`Agent::subscribe_kv_changes`]).
+    kv_changes: tokio::sync::broadcast::Sender<kv::KvStoreChanged>,
+    /// #1094: change notices of every task list this agent opens
+    /// ([`Agent::subscribe_task_changes`]).
+    task_changes: tokio::sync::broadcast::Sender<crdt::TaskListChanged>,
     /// Single-flight registry for ADR 0030 strict capability refreshes, so
     /// concurrent strict sends to one recipient publish a single targeted
     /// request between them.
@@ -7933,6 +7943,23 @@ async fn dispatch_raw_direct_after_gates(
         return dm_inbox::TypedRouteOutcome::RejectedPrefix;
     }
 
+    // #1840: the same catch-all for a verified join-request outcome that
+    // no typed route consumed (the startup window, a trust-rejected
+    // sender). It is not a user DM. Dropping it loses nothing: the
+    // requester's offer obligation is kept, and its next offer gets a
+    // new outcome once the authority's 30 s send limit has passed.
+    if verified && data.starts_with(groups::join_outcome::JOIN_REQUEST_OUTCOME_DM_PREFIX) {
+        tracing::debug!(
+            target: "x0x::direct",
+            stage = "recv_join_outcome_dropped",
+            reason = "not_ready",
+            sender = %network::hex_prefix(&sender.0, 4),
+            payload_bytes = data.len(),
+            "verified join-request outcome not consumed by a typed route; dropped"
+        );
+        return dm_inbox::TypedRouteOutcome::RejectedPrefix;
+    }
+
     // N12: an UNVERIFIED frame whose bytes claim a typed protocol route is
     // (the static production table covers the inbox-not-ready startup window)
     // not a user DM. The typed router already refuses unverified frames;
@@ -8096,6 +8123,15 @@ struct CapabilityRefreshRegistryState {
     /// pre-cooldown behaviour) disables the check.
     last_finished: std::collections::HashMap<CapabilityRefreshKey, tokio::time::Instant>,
     cooldown: std::time::Duration,
+    /// #504 follow-up: recipients that did not answer a request that asked
+    /// for a direct reply, with the time of that miss (tokio clock, like
+    /// `last_finished`). While an entry is younger than
+    /// [`CAPABILITY_UNICAST_MISS_TTL`], requests to that recipient omit the
+    /// reply-to machine, so the recipient answers on the topic. A direct
+    /// frame can be lost where the topic still delivers (a path that only
+    /// relays reach), and the responder skips its topic answer once it has
+    /// sent the direct one.
+    unicast_missed: std::collections::HashMap<[u8; 32], tokio::time::Instant>,
 }
 /// Bounded, recipient-keyed single-flight registry for strict capability
 /// discovery.
@@ -8266,6 +8302,39 @@ impl CapabilityRefreshRegistry {
         }
     }
 
+    /// Whether the last request to `recipient` that asked for a direct
+    /// reply got no answer within [`CAPABILITY_UNICAST_MISS_TTL`].
+    fn unicast_answer_missed(&self, recipient: &identity::AgentId) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            state
+                .unicast_missed
+                .get(&recipient.0)
+                .is_some_and(|missed_at| missed_at.elapsed() < CAPABILITY_UNICAST_MISS_TTL)
+        })
+    }
+
+    /// Records whether a request to `recipient` that asked for a direct
+    /// reply was answered. A miss makes later requests ask for the topic
+    /// answer. Only a met direct-ask flight or TTL expiry clears it; a topic
+    /// answer does not call this.
+    fn note_unicast_answer(&self, recipient: &identity::AgentId, answered: bool) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if answered {
+            state.unicast_missed.remove(&recipient.0);
+            return;
+        }
+        state
+            .unicast_missed
+            .retain(|_, missed_at| missed_at.elapsed() < CAPABILITY_UNICAST_MISS_TTL);
+        if state.unicast_missed.len() < CAPABILITY_UNICAST_MISS_LIMIT {
+            state
+                .unicast_missed
+                .insert(recipient.0, tokio::time::Instant::now());
+        }
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.state
@@ -8274,6 +8343,15 @@ impl CapabilityRefreshRegistry {
             .unwrap_or_default()
     }
 }
+
+/// #504 follow-up: how long a missed direct answer makes requests to that
+/// recipient ask for the topic answer instead.
+const CAPABILITY_UNICAST_MISS_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// #504 follow-up: the most recipients with a recorded missed direct
+/// answer. A full table records no new miss; those requests keep asking
+/// for a direct reply, as before.
+const CAPABILITY_UNICAST_MISS_LIMIT: usize = 1024;
 
 struct CapabilityRefreshGuard {
     registry: std::sync::Arc<CapabilityRefreshRegistry>,
@@ -8293,18 +8371,9 @@ impl Drop for CapabilityRefreshGuard {
     }
 }
 
-/// Publish exactly one targeted capability request for `recipient`, then wait
-/// (bounded) for the signed response to be ingested.
-///
-/// ADR 0030 §2 specifies "one forced targeted capability refresh" — a single
-/// publish, not a retry loop. Returning early on a cache hit keeps a strict
-/// send that raced an in-flight advert from paying the full window.
-///
-/// Returns whether the targeted request was published successfully, which
-/// is what starts the requester-side cooldown. A deadline or shutdown
-/// before the publish completes returns `false` at once. A failed publish
-/// returns `false` at once for an addressability flight; a strict flight
-/// still waits out its convergence window, as before #1776.
+/// The published flag of [`run_strict_capability_refresh_outcome`], for
+/// the tests written against it.
+#[cfg(test)]
 async fn run_strict_capability_refresh(
     recipient: identity::AgentId,
     required_application: Option<u64>,
@@ -8314,6 +8383,79 @@ async fn run_strict_capability_refresh(
     deadline: tokio::time::Instant,
     publish: impl std::future::Future<Output = error::NetworkResult<()>> + Send,
 ) -> bool {
+    run_strict_capability_refresh_outcome(
+        recipient,
+        required_application,
+        require_durable_ack,
+        capability_store,
+        shutdown_token,
+        deadline,
+        publish,
+    )
+    .await
+    .published
+}
+
+/// What one strict capability refresh flight did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StrictRefreshOutcome {
+    /// The flight published its targeted request (starts the cooldown).
+    published: bool,
+    /// The flight's own requirement held when it ended: a durable-ACK
+    /// binding, the application bit, or a gossip-usable binding. A stale
+    /// binding that was already stored does not count.
+    converged: bool,
+}
+
+/// #504 follow-up: record whether a flight that asked for a direct reply
+/// got its answer, judged by the flight's own requirement. A durable-ACK
+/// (ADR 0030) or application-bit (ADR 0093) flight starts with a stale
+/// binding already stored, so "any binding" would always count as answered.
+fn note_capability_refresh_unicast_outcome(
+    registry: &CapabilityRefreshRegistry,
+    recipient: &identity::AgentId,
+    asked_for_direct_reply: bool,
+    outcome: StrictRefreshOutcome,
+) {
+    if asked_for_direct_reply && outcome.published {
+        registry.note_unicast_answer(recipient, outcome.converged);
+    }
+}
+
+/// #504 follow-up: the machine a targeted request names for a direct
+/// reply. None while the direct listener is not running, or while the
+/// recipient's last direct answer was missed (it then answers on the topic).
+fn capability_refresh_reply_to(
+    direct_listener_started: bool,
+    registry: &CapabilityRefreshRegistry,
+    recipient: &identity::AgentId,
+    local_machine: identity::MachineId,
+) -> Option<identity::MachineId> {
+    (direct_listener_started && !registry.unicast_answer_missed(recipient)).then_some(local_machine)
+}
+
+/// Publish exactly one targeted capability request for `recipient`, then wait
+/// (bounded) for the signed response to be ingested.
+///
+/// ADR 0030 §2 specifies "one forced targeted capability refresh" — a single
+/// publish, not a retry loop. Returning early on a cache hit keeps a strict
+/// send that raced an in-flight advert from paying the full window.
+///
+/// Returns whether the targeted request was published successfully, which
+/// is what starts the requester-side cooldown, and whether the flight's
+/// requirement held when it ended. A deadline or shutdown
+/// before the publish completes returns `false` at once. A failed publish
+/// returns `false` at once for an addressability flight; a strict flight
+/// still waits out its convergence window, as before #1776.
+async fn run_strict_capability_refresh_outcome(
+    recipient: identity::AgentId,
+    required_application: Option<u64>,
+    require_durable_ack: bool,
+    capability_store: std::sync::Arc<dm_capability::CapabilityStore>,
+    shutdown_token: tokio_util::sync::CancellationToken,
+    deadline: tokio::time::Instant,
+    publish: impl std::future::Future<Output = error::NetworkResult<()>> + Send,
+) -> StrictRefreshOutcome {
     let ready = || {
         let binding = capability_store.lookup_binding(&recipient);
         // #1776: a flight with neither a durable-ack nor an application-bit
@@ -8334,7 +8476,10 @@ async fn run_strict_capability_refresh(
             })
     };
     if ready() {
-        return false;
+        return StrictRefreshOutcome {
+            published: false,
+            converged: true,
+        };
     }
 
     let published = tokio::select! {
@@ -8347,7 +8492,10 @@ async fn run_strict_capability_refresh(
     // nothing can answer it. A strict flight keeps the convergence wait it
     // had before #1776, so the strict gate's refusal timing is unchanged.
     let Some(published) = published else {
-        return false;
+        return StrictRefreshOutcome {
+            published: false,
+            converged: ready(),
+        };
     };
     let published = match published {
         Ok(()) => true,
@@ -8362,20 +8510,27 @@ async fn run_strict_capability_refresh(
         }
     };
     if !published && !require_durable_ack && required_application.is_none() {
-        return false;
+        return StrictRefreshOutcome {
+            published: false,
+            converged: ready(),
+        };
     }
 
+    let outcome = |converged| StrictRefreshOutcome {
+        published,
+        converged,
+    };
     loop {
         if ready() {
-            return published;
+            return outcome(true);
         }
         if tokio::time::Instant::now() >= deadline {
-            return published;
+            return outcome(false);
         }
         tokio::select! {
             _ = tokio::time::sleep(CAPABILITY_REFRESH_POLL_INTERVAL) => {}
-            () = tokio::time::sleep_until(deadline) => return published,
-            () = shutdown_token.cancelled() => return published,
+            () = tokio::time::sleep_until(deadline) => return outcome(ready()),
+            () = shutdown_token.cancelled() => return outcome(ready()),
         }
     }
 }
@@ -8540,7 +8695,7 @@ impl Agent {
         &self,
         renewal: &identity::AgentCertificate,
     ) -> error::Result<CertificateRenewalAdoption> {
-        // No path means no user identity, so no certificate to renew.
+        // No path means no certificate in use, so none to renew.
         let Some(path) = self.agent_cert_path.as_deref() else {
             return Ok(CertificateRenewalAdoption::Refused(
                 identity::CertificateRenewalRefusal::NoCurrentCertificate,
@@ -10916,6 +11071,42 @@ impl Agent {
         (peer.stats.avg_rtt_ms > 0).then_some(peer.stats.avg_rtt_ms)
     }
 
+    /// ADR 0110 §3 (D70; #1597 item 4): whether an outbound send's
+    /// resolved recipient machine is revoked. A machine revocation denies
+    /// that device only: the send answers the typed
+    /// [`dm::DmError::RecipientMachineRevoked`], and the agent's seat is
+    /// not touched.
+    async fn recipient_machine_revoked(&self, machine: &identity::MachineId) -> bool {
+        self.revocation_set.read().await.is_machine_revoked(machine)
+    }
+
+    /// ADR 0110 §3 (D70; #1597 item 4, #1918 review): the recipient's
+    /// newest retained machine binding, when that machine is revoked. A
+    /// machine revocation evicts the recipient from the discovery caches
+    /// ([`Self::evict_revoked_subject`]), so the discovery preflight finds
+    /// no machine to check. The authenticated and announced binding stores
+    /// outlive that eviction; the newer of their two records names the
+    /// machine the agent last announced from. A later announcement from
+    /// a clean machine replaces it, so a moved agent is not refused.
+    async fn recipient_retained_machine_revoked(
+        &self,
+        to: &identity::AgentId,
+    ) -> Option<identity::MachineId> {
+        let attested = self.authenticated_machine_bindings.read().await.peek(to);
+        let announced = self.announced_machine_bindings.read().await.peek(to);
+        let newest = match (attested, announced) {
+            (Some(a), Some(b)) => Some(if b.announced_at > a.announced_at {
+                b
+            } else {
+                a
+            }),
+            (a, b) => a.or(b),
+        }?;
+        self.recipient_machine_revoked(&newest.machine_id)
+            .await
+            .then_some(newest.machine_id)
+    }
+
     /// ADR-0043 §9 outbound B/P (review r4 H5): evaluate the pairing for
     /// a RESOLVED recipient machine — whichever source resolved it
     /// (discovery cache, capability-advert binding, or the DM connection
@@ -11744,10 +11935,22 @@ impl Agent {
                 .await?;
             cache.get(to).map(|entry| entry.machine_id)
         } {
+            if self.recipient_machine_revoked(&machine_id).await {
+                self.direct_messaging.record_outgoing_failed(*to);
+                return Err(dm::DmError::RecipientMachineRevoked {
+                    machine: machine_id,
+                });
+            }
             if let Some(denial) = self.recipient_pairing_denied(to, &machine_id).await {
                 self.direct_messaging.record_outgoing_failed(*to);
                 return Err(dm::DmError::RecipientPairingDenied { denial });
             }
+        } else if let Some(machine) = self.recipient_retained_machine_revoked(to).await {
+            // #1918 review: the machine revocation already evicted the
+            // recipient's discovery entry; its retained binding still
+            // names the revoked machine.
+            self.direct_messaging.record_outgoing_failed(*to);
+            return Err(dm::DmError::RecipientMachineRevoked { machine });
         }
         if *to == self.identity.agent_id() {
             self.direct_messaging.record_outgoing_started(*to, None);
@@ -11877,6 +12080,12 @@ impl Agent {
         // path will use it, evaluate B+P for that pairing too.
         if gossip_ok {
             if let Some(cap_machine) = cap_machine {
+                if self.recipient_machine_revoked(&cap_machine).await {
+                    self.direct_messaging.record_outgoing_failed(*to);
+                    return Err(dm::DmError::RecipientMachineRevoked {
+                        machine: cap_machine,
+                    });
+                }
                 if let Some(denial) = self.recipient_pairing_denied(to, &cap_machine).await {
                     self.direct_messaging.record_outgoing_failed(*to);
                     tracing::debug!(
@@ -12537,6 +12746,18 @@ impl Agent {
         let capability_store = std::sync::Arc::clone(&self.capability_store);
         let shutdown_token = self.shutdown_token.clone();
         let deadline = tokio::time::Instant::now() + CAPABILITY_REFRESH_CONVERGENCE_WAIT;
+        // #504 (A06): ask for the answer as a direct frame when the direct
+        // listener that ingests it is running; the topic stays the fallback.
+        // A recipient whose direct answer did not arrive last time answers
+        // on the topic instead (the topic answer reaches relay-only paths).
+        let reply_to = capability_refresh_reply_to(
+            self.direct_listener_started
+                .load(std::sync::atomic::Ordering::Acquire),
+            &self.capability_refreshes,
+            &recipient,
+            self.identity.machine_id(),
+        );
+        let registry = std::sync::Arc::clone(&self.capability_refreshes);
 
         let purpose = if require_durable_ack || required_application.is_some() {
             CapabilityRefreshPurpose::Requirement
@@ -12547,16 +12768,25 @@ impl Agent {
             recipient,
             purpose,
             move |mut guard, completion_tx| async move {
-                guard.published = run_strict_capability_refresh(
+                let outcome = run_strict_capability_refresh_outcome(
                     recipient,
                     required_application,
                     require_durable_ack,
                     capability_store,
                     shutdown_token,
                     deadline,
-                    dm_capability_service::publish_targeted_capability_request(&pubsub, recipient),
+                    dm_capability_service::publish_targeted_capability_request(
+                        &pubsub, recipient, reply_to,
+                    ),
                 )
                 .await;
+                guard.published = outcome.published;
+                note_capability_refresh_unicast_outcome(
+                    &registry,
+                    &recipient,
+                    reply_to.is_some(),
+                    outcome,
+                );
                 completion_tx.send_replace(CapabilityRefreshState::Finished);
                 drop(guard);
             },
@@ -17215,6 +17445,28 @@ impl Agent {
         Ok(())
     }
 
+    /// Subscribe to change notices of every KV store this agent opens
+    /// (#1094): one notice per local write or delete and per merged remote
+    /// record or delta. A notice names the store topic and the origin; it
+    /// carries no keys or values. A slow subscriber loses old notices
+    /// (`RecvError::Lagged`), not new ones.
+    #[must_use]
+    pub fn subscribe_kv_changes(&self) -> tokio::sync::broadcast::Receiver<kv::KvStoreChanged> {
+        self.kv_changes.subscribe()
+    }
+
+    /// Subscribe to change notices of every task list this agent opens
+    /// (#1094): one notice per local mutation (add, claim, complete,
+    /// reorder, board migration) and per merged remote delta. As
+    /// [`Self::subscribe_kv_changes`], a notice names the topic and the
+    /// origin only.
+    #[must_use]
+    pub fn subscribe_task_changes(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crdt::TaskListChanged> {
+        self.task_changes.subscribe()
+    }
+
     /// Clone the shared capability store.
     #[must_use]
     pub fn capability_store(&self) -> std::sync::Arc<dm_capability::CapabilityStore> {
@@ -17263,6 +17515,12 @@ impl Agent {
             std::sync::Arc::clone(&self.capability_store),
             std::time::Duration::from_secs(dm_capability::ADVERT_PUBLISH_INTERVAL_SECS),
             self.legacy_announce,
+            // #504: a targeted answer goes direct to a connected requester.
+            self.network
+                .as_ref()
+                .map(|network| dm_capability_service::UnicastResponder {
+                    network: std::sync::Arc::clone(network),
+                }),
             #[cfg(test)]
             convergence_observer,
         )
@@ -17362,12 +17620,15 @@ impl Agent {
         // the advertised registry from the routes THIS inbox registers,
         // before `config` moves into the service: the bit goes out only
         // when the push route is registered and ready.
-        let advertised_registry = dm::CapabilityRegistry::advertised(
+        let mut advertised_registry = dm::CapabilityRegistry::advertised(
             config
                 .typed_payload_routes
                 .iter()
                 .map(|route| route.prefix.as_slice()),
         );
+        // #504 (A06): this agent takes a targeted capability answer as a
+        // direct frame (its direct listener ingests it).
+        advertised_registry.bits |= dm::CapabilityRegistry::CAPS_UNICAST_RESPONSE_V1;
         let signing = std::sync::Arc::new(gossip::SigningContext::from_keypair(
             self.identity.agent_keypair(),
         ));
@@ -20994,6 +21255,8 @@ impl Agent {
         // catch-up refusal so the requester knows who refused. AgentId is
         // Copy, so the capture needs no clone.
         let local_agent_id = self.identity.agent_id();
+        // #504: the store a direct targeted capability answer lands in.
+        let unicast_caps_store = std::sync::Arc::clone(&self.capability_store);
 
         self.spawn_tracked(async move {
             tracing::info!(target: "x0x::direct", stage = "listener", "direct message listener started");
@@ -21258,6 +21521,30 @@ impl Agent {
                             }
                         }
                     }
+                    continue;
+                }
+
+                // #504 (A06): a targeted capability answer sent by unicast.
+                // It carries its own proof (key, advert signature, machine)
+                // and is ingested as the response topic would; it never
+                // reaches the DM paths below.
+                if let Some((public_key, advert)) =
+                    dm_capability_service::decode_unicast_capability_response(&data)
+                {
+                    let ingested = dm_capability_service::ingest_unicast_capability_response(
+                        &unicast_caps_store,
+                        local_agent_id,
+                        sender,
+                        machine_id,
+                        public_key,
+                        advert,
+                    );
+                    tracing::debug!(
+                        target: "dm.trace",
+                        stage = "capability_advert_unicast_received",
+                        sender = %hex::encode(sender.as_bytes()),
+                        ingested,
+                    );
                     continue;
                 }
 
@@ -23661,6 +23948,7 @@ impl Agent {
                 e
             )))
         })?;
+        sync.set_change_sink(self.task_changes.clone());
 
         // Arm persistence BEFORE start so no merged delta can land
         // unpersisted, and write an initial snapshot so the file exists from
@@ -24360,25 +24648,18 @@ fn schedule_reconnect(
 }
 
 /// The owner-issued certificate a certificate-only device (no user key)
-/// loads from `path`: test builds only (W3-H, #1572), and only when it
-/// verifies and binds `agent`. Production keeps loading `agent.cert` only
-/// beside the user key, so this is always `None` there.
-#[cfg(test)]
+/// loads from `path` (#1860, A02): only when it binds `agent` and its owner
+/// signature verifies. Any other file (another agent's certificate, a bad
+/// signature, unreadable bytes) is ignored, and the device runs with no
+/// user identity. An expired certificate still loads, so that a renewal
+/// from the owner can replace it ([`Agent::adopt_own_certificate_renewal`]).
 async fn certificate_only_cert(
-    path: Option<&std::path::Path>,
+    path: &std::path::Path,
     agent: &identity::AgentKeypair,
 ) -> Option<identity::AgentCertificate> {
-    let cert = storage::load_agent_certificate_from(path?).await.ok()?;
+    let cert = storage::load_agent_certificate_from(path).await.ok()?;
     let binds_agent = cert.agent_id().is_ok_and(|id| id == agent.agent_id());
     (binds_agent && cert.verify().is_ok()).then_some(cert)
-}
-
-#[cfg(not(test))]
-async fn certificate_only_cert(
-    _path: Option<&std::path::Path>,
-    _agent: &identity::AgentKeypair,
-) -> Option<identity::AgentCertificate> {
-    None
 }
 
 impl AgentBuilder {
@@ -24862,10 +25143,19 @@ impl AgentBuilder {
             cert_journal_path = journal_path;
             identity::Identity::new_with_user(machine_keypair, agent_keypair, user_kp, cert)
         } else {
-            let certificate_only =
-                certificate_only_cert(self.agent_cert_path.as_deref(), &agent_keypair).await;
+            // #1860: a device without the user key runs on an owner-issued
+            // certificate when one binds this agent. Only an explicit
+            // certificate path is read (x0xd always sets one): a library
+            // agent on default paths never picks up a host-wide file.
+            let cert_path = self.agent_cert_path.clone();
+            let certificate_only = match cert_path.as_deref() {
+                Some(p) => certificate_only_cert(p, &agent_keypair).await,
+                None => None,
+            };
             match certificate_only {
                 Some(cert) => {
+                    // The path lets a renewal from the owner replace it.
+                    agent_cert_path = cert_path;
                     identity::Identity::new_with_certificate(machine_keypair, agent_keypair, cert)
                 }
                 None => identity::Identity::new(machine_keypair, agent_keypair),
@@ -25465,6 +25755,8 @@ impl AgentBuilder {
             #[cfg(test)]
             consented_publish_test_gate: std::sync::Mutex::new(None),
             capability_store: std::sync::Arc::new(dm_capability::CapabilityStore::new()),
+            kv_changes: tokio::sync::broadcast::channel(CHANGE_CHANNEL_CAPACITY).0,
+            task_changes: tokio::sync::broadcast::channel(CHANGE_CHANNEL_CAPACITY).0,
             capability_refreshes: std::sync::Arc::new(CapabilityRefreshRegistry::default()),
             #[cfg(test)]
             capability_convergence_observer: std::sync::Mutex::new(None),
@@ -25886,6 +26178,7 @@ impl TaskListHandle {
             let delta = crdt::TaskListDelta::for_add(task_id, task, tag, version);
             (task_id, version, delta)
         };
+        self.sync.note_change(kv::KvChangeOrigin::Local);
         // Durability before announcement (#557, mirrors the kv put path):
         // persist the committed mutation and DO NOT publish if the snapshot
         // fails — announcing state the disk never saw loses it on restart.
@@ -25969,6 +26262,7 @@ impl TaskListHandle {
             delta
         };
         let count = delta.added_tasks.len();
+        self.sync.note_change(kv::KvChangeOrigin::Local);
         self.sync.persist().await.map_err(|e| {
             error::IdentityError::Storage(std::io::Error::other(format!(
                 "board migration applied locally but snapshot persistence FAILED ({e}); \
@@ -26086,6 +26380,7 @@ impl TaskListHandle {
                 advisory,
             )
         };
+        self.sync.note_change(kv::KvChangeOrigin::Local);
         // Durability before announcement (#557): see add_task_versioned.
         self.sync.persist().await.map_err(|e| {
             error::IdentityError::Storage(std::io::Error::other(format!(
@@ -26185,6 +26480,7 @@ impl TaskListHandle {
                 advisory,
             )
         };
+        self.sync.note_change(kv::KvChangeOrigin::Local);
         // Durability before announcement (#557): see add_task_versioned.
         self.sync.persist().await.map_err(|e| {
             error::IdentityError::Storage(std::io::Error::other(format!(
@@ -26289,6 +26585,7 @@ impl TaskListHandle {
                 list.current_version(),
             )
         };
+        self.sync.note_change(kv::KvChangeOrigin::Local);
         // Durability before announcement (#557): see add_task_versioned.
         self.sync.persist().await.map_err(|e| {
             error::IdentityError::Storage(std::io::Error::other(format!(
@@ -26547,6 +26844,7 @@ impl Agent {
             Some(self.agent_id()),
         )
         .map_err(|e| kv_storage_err(format!("kv store sync creation failed: {e}")))?;
+        sync.set_change_sink(self.kv_changes.clone());
         if let Some(secure) = secure {
             sync.set_secure_context(secure, secure_refresh);
             let signing =
@@ -28154,6 +28452,7 @@ impl KvStoreHandle {
             }
             (delta, evicted_keys)
         };
+        self.sync.note_change(kv::KvChangeOrigin::Local);
         // Durability before announcement: persist the committed mutation and
         // DO NOT publish if the snapshot fails — announcing state the disk
         // never saw is how an owner ends up re-signing rewritten history
@@ -28271,6 +28570,8 @@ impl KvStoreHandle {
             }
             d
         };
+        // #1094: the content changed here, whatever persist and publish do.
+        self.sync.note_change(kv::KvChangeOrigin::Local);
         // Durability before announcement — see put_with_delta.
         self.sync.persist().await.map_err(|e| {
             error::IdentityError::Storage(std::io::Error::other(format!(
@@ -28334,6 +28635,7 @@ impl KvStoreHandle {
                     )))
                 })?;
         }
+        self.sync.note_change(kv::KvChangeOrigin::Remote);
         // Direct-delivery deltas mutate state just like the gossip receive
         // loop — persist with the same semantics (an attacker who can steer
         // deltas onto this side channel must not gain an unpersisted-merge
@@ -29347,21 +29649,33 @@ mod tests {
         agent.shutdown().await;
     }
 
-    /// W3-H (#1572): a test build loads an owner-issued `agent.cert` with
-    /// no user key only when it binds this agent; the announce then names
-    /// the certificate's issuer.
+    /// #1860 (W3-H #1572): a device with no user key loads an
+    /// owner-issued `agent.cert` only when it binds this agent and its
+    /// signature verifies; the announce then names the certificate's
+    /// issuer, and the path is kept so a renewal can replace it. A
+    /// certificate for another agent, or one with a bad signature, is
+    /// ignored.
     #[tokio::test]
     async fn certificate_only_device_loads_its_own_certificate() {
         let owner = identity::UserKeypair::generate().expect("owner user key");
         let agent_kp = identity::AgentKeypair::generate().expect("agent key");
         let other = identity::AgentKeypair::generate().expect("other agent key");
-        for (issued_to, loads) in [(&agent_kp, true), (&other, false)] {
+        for (issued_to, bad_signature, loads) in [
+            (&agent_kp, false, true),
+            (&other, false, false),
+            (&agent_kp, true, false),
+        ] {
             let dir = tempfile::tempdir().expect("tempdir");
             let cert_path = dir.path().join("agent.cert");
             let cert = identity::AgentCertificate::issue(&owner, issued_to).expect("issue");
-            storage::save_agent_certificate_to(&cert, cert_path.clone())
-                .await
-                .expect("save cert");
+            let mut bytes = cert.to_storage_bytes().expect("encode cert");
+            if bad_signature {
+                // The last signature byte (a v1 certificate ends with its
+                // signature, then the 8-byte issue time).
+                let at = bytes.len() - 9;
+                bytes[at] ^= 0x01;
+            }
+            std::fs::write(&cert_path, &bytes).expect("save cert");
             storage::save_agent_keypair_to(&agent_kp, dir.path().join("agent.key"))
                 .await
                 .expect("save agent key");
@@ -29377,6 +29691,11 @@ mod tests {
             let identity = agent.identity();
             assert_eq!(identity.user_id(), None, "no user key: not the owner");
             assert_eq!(identity.agent_certificate().is_some(), loads);
+            assert_eq!(
+                agent.agent_cert_path.is_some(),
+                loads,
+                "a renewal can replace only a loaded certificate"
+            );
             let disclosed = loads.then(|| owner.user_id());
             assert_eq!(identity.disclosed_user_id(), disclosed);
             // The blob responder serves the pair the announce advertises
@@ -30097,6 +30416,46 @@ mod tests {
                 .expect("verified ordinary DMs still delivered")
                 .payload,
             ordinary
+        );
+    }
+
+    /// #1840 (PR #1850 review r1): a VERIFIED join-request outcome that
+    /// arrives in the startup window (no registered typed route) is
+    /// dropped. RED without the drop in `dispatch_raw_direct_after_gates`:
+    /// the generic bus shows the outcome bytes as an ordinary DM.
+    #[tokio::test]
+    async fn raw_path_verified_join_outcome_is_dropped_before_inbox_starts() {
+        let dm = direct::DirectMessaging::new();
+        let mut generic = dm.subscribe();
+        let no_routes: Vec<dm_inbox::DmTypedPayloadRoute> = Vec::new();
+        let payload = groups::join_outcome::JoinRequestOutcome {
+            group_id: "g".to_string(),
+            request_id: "r".to_string(),
+            envelope_digest: "ab".repeat(32),
+            reason: groups::join_outcome::JoinRequestRefusalReason::Stale,
+            head: None,
+        }
+        .encode()
+        .expect("encode");
+        let outcome = dispatch_raw_direct_after_gates(
+            &dm,
+            None,
+            &no_routes,
+            RawDirectDelivery {
+                sender: identity::AgentId([0x99; 32]),
+                machine_id: identity::MachineId([0x9a; 32]),
+                data: payload.clone(),
+                verified: true,
+                trust_decision: Some(trust::TrustDecision::Accept),
+                observed_origin: None,
+                digest: direct::dm_payload_digest_hex(&payload),
+            },
+        )
+        .await;
+        assert_eq!(outcome, dm_inbox::TypedRouteOutcome::RejectedPrefix);
+        assert!(
+            generic.try_recv().is_none(),
+            "a verified join-request outcome must never reach the generic bus"
         );
     }
 
@@ -31245,6 +31604,177 @@ mod tests {
         );
     }
 
+    /// #504 follow-up review: a durable-ACK flight (ADR 0030) starts with a
+    /// stale binding already stored. When its direct answer is lost, the
+    /// flight's own requirement still fails, so it counts as a miss, and the
+    /// next request omits the reply-to machine. "Any binding" would have
+    /// counted it as answered and kept it on the lost direct path.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_binding_flight_records_a_missed_direct_answer() {
+        let recipient = identity::AgentId([0x94_u8; 32]);
+        let peer_machine = identity::MachineId([0x95_u8; 32]);
+        let local_machine = identity::MachineId([0x96_u8; 32]);
+        let store = std::sync::Arc::new(dm_capability::CapabilityStore::new());
+        assert!(store.insert(
+            recipient,
+            peer_machine,
+            dm::DmCapabilities::v1_gossip_ready(vec![7_u8; 1184]),
+            dm_capability::now_unix_ms(),
+        ));
+        let registry = CapabilityRefreshRegistry::default();
+        assert_eq!(
+            capability_refresh_reply_to(true, &registry, &recipient, local_machine),
+            Some(local_machine),
+            "with no miss the request asks for a direct reply"
+        );
+        assert_eq!(
+            capability_refresh_reply_to(false, &registry, &recipient, local_machine),
+            None,
+            "no direct listener, no direct reply"
+        );
+
+        // The direct answer is lost: nothing new reaches the store.
+        let lost = run_strict_capability_refresh_outcome(
+            recipient,
+            None,
+            true,
+            std::sync::Arc::clone(&store),
+            tokio_util::sync::CancellationToken::new(),
+            tokio::time::Instant::now() + CAPABILITY_REFRESH_CONVERGENCE_WAIT,
+            async { Ok(()) },
+        )
+        .await;
+        assert_eq!(
+            lost,
+            StrictRefreshOutcome {
+                published: true,
+                converged: false,
+            }
+        );
+        assert!(
+            store.lookup_binding(&recipient).is_some(),
+            "the stale binding is still stored"
+        );
+        note_capability_refresh_unicast_outcome(&registry, &recipient, true, lost);
+        assert!(registry.unicast_answer_missed(&recipient));
+        assert_eq!(
+            capability_refresh_reply_to(true, &registry, &recipient, local_machine),
+            None,
+            "after a miss the next request asks for the topic answer"
+        );
+
+        // The next flight asks for the topic answer (no reply-to machine),
+        // and the topic answer brings the durable-ACK advert. The flight
+        // converges, but the miss stays: a topic answer proves nothing about
+        // the direct path. Only TTL expiry or a met direct-ask flight clears it.
+        let answering_store = std::sync::Arc::clone(&store);
+        let answered = run_strict_capability_refresh_outcome(
+            recipient,
+            None,
+            true,
+            std::sync::Arc::clone(&store),
+            tokio_util::sync::CancellationToken::new(),
+            tokio::time::Instant::now() + CAPABILITY_REFRESH_CONVERGENCE_WAIT,
+            async move {
+                assert!(answering_store.insert(
+                    recipient,
+                    peer_machine,
+                    dm::DmCapabilities::v2_durable_gossip_ready(vec![7_u8; 1184]),
+                    dm_capability::now_unix_ms().saturating_add(1),
+                ));
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(
+            answered,
+            StrictRefreshOutcome {
+                published: true,
+                converged: true,
+            }
+        );
+        note_capability_refresh_unicast_outcome(&registry, &recipient, false, answered);
+        assert!(
+            registry.unicast_answer_missed(&recipient),
+            "a converged topic flight keeps the miss for its TTL"
+        );
+
+        // After the TTL the request asks for a direct reply again, and a met
+        // direct-ask flight records the answer.
+        tokio::time::advance(CAPABILITY_UNICAST_MISS_TTL).await;
+        assert_eq!(
+            capability_refresh_reply_to(true, &registry, &recipient, local_machine),
+            Some(local_machine),
+            "after the TTL the request asks for a direct reply again"
+        );
+        note_capability_refresh_unicast_outcome(&registry, &recipient, true, answered);
+        assert!(!registry.unicast_answer_missed(&recipient));
+    }
+
+    /// #504 follow-up (sticky miss): a flight that did not ask for a direct
+    /// reply changes nothing. A converged topic flight keeps a recorded
+    /// miss, and a lost one does not create a miss.
+    #[tokio::test(start_paused = true)]
+    async fn a_topic_flight_keeps_the_unicast_miss_record() {
+        let recipient = identity::AgentId([0x84_u8; 32]);
+        let registry = CapabilityRefreshRegistry::default();
+        let converged = StrictRefreshOutcome {
+            published: true,
+            converged: true,
+        };
+        let lost = StrictRefreshOutcome {
+            published: true,
+            converged: false,
+        };
+        note_capability_refresh_unicast_outcome(&registry, &recipient, false, lost);
+        assert!(
+            !registry.unicast_answer_missed(&recipient),
+            "a lost topic flight records no miss"
+        );
+        note_capability_refresh_unicast_outcome(&registry, &recipient, true, lost);
+        assert!(registry.unicast_answer_missed(&recipient));
+        note_capability_refresh_unicast_outcome(&registry, &recipient, false, converged);
+        assert!(
+            registry.unicast_answer_missed(&recipient),
+            "a converged topic flight must keep the miss record"
+        );
+        note_capability_refresh_unicast_outcome(&registry, &recipient, true, converged);
+        assert!(
+            !registry.unicast_answer_missed(&recipient),
+            "a met direct-ask flight clears the miss record"
+        );
+    }
+
+    /// #504 follow-up: a request that asked for a direct reply and got no
+    /// answer makes later requests to that recipient ask for the topic
+    /// answer, until a met direct-ask flight records an answer or the miss
+    /// ages out. The registry call below is the one that
+    /// `note_capability_refresh_unicast_outcome` makes for a direct-ask
+    /// flight.
+    #[tokio::test(start_paused = true)]
+    async fn capability_refresh_unicast_miss_falls_back_to_the_topic_answer() {
+        let recipient = identity::AgentId([0x82_u8; 32]);
+        let other = identity::AgentId([0x83_u8; 32]);
+        let registry = CapabilityRefreshRegistry::default();
+        assert!(!registry.unicast_answer_missed(&recipient));
+        registry.note_unicast_answer(&recipient, false);
+        assert!(
+            registry.unicast_answer_missed(&recipient),
+            "a missed direct answer must make the next request ask for the topic answer"
+        );
+        assert!(!registry.unicast_answer_missed(&other));
+        registry.note_unicast_answer(&recipient, true);
+        assert!(
+            !registry.unicast_answer_missed(&recipient),
+            "a met direct-ask flight clears the miss"
+        );
+        registry.note_unicast_answer(&recipient, false);
+        tokio::time::advance(CAPABILITY_UNICAST_MISS_TTL).await;
+        assert!(
+            !registry.unicast_answer_missed(&recipient),
+            "a miss ages out after the TTL"
+        );
+    }
     /// Proof-report §3 (prod caps storm): sequential strict sends to one
     /// recipient each published their own targeted request. A completed
     /// flight must start a cooldown during which the gate fails fast
@@ -43649,6 +44179,93 @@ async fn revocation_discovery_eviction_preserves_authenticated_binding() {
     );
 }
 
+/// #1597 item 4 (ADR 0110 §3, D70): a send to a recipient whose machine
+/// is revoked answers the typed `DmError::RecipientMachineRevoked` naming
+/// that machine, and nothing is sent. The agent itself is not revoked (its
+/// seat stays). The revocation goes through the real apply path, so the
+/// eviction runs and drops the recipient's discovery entry (#1918 review):
+/// the retained authenticated binding is what still names the machine.
+/// FAIL-BEFORE: the send went on to the generic transport outcome.
+#[tokio::test]
+async fn send_direct_reports_a_revoked_machine_as_recipient_machine_revoked() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let sender = Agent::builder()
+        .with_identity_dir(tempdir.path())
+        .build()
+        .await
+        .expect("sender agent");
+    let recipient = identity::AgentKeypair::generate().expect("recipient keygen");
+    let machine = identity::MachineKeypair::generate().expect("machine keygen");
+    let mut discovered = discovered_agent_fixture(0x68, 6_000, &[], None);
+    discovered.agent_id = recipient.agent_id();
+    discovered.machine_id = machine.machine_id();
+    discovered.machine_public_key = machine.public_key().as_bytes().to_vec();
+    sender.insert_discovered_agent_for_testing(discovered).await;
+    // What a verified announcement leaves behind besides the cache entry.
+    dm_inbox::record_authenticated_machine_binding(
+        &sender.authenticated_machine_bindings,
+        recipient.agent_id(),
+        machine.machine_id(),
+        6_000,
+    )
+    .await;
+    let record = revocation::RevocationRecord::sign(
+        revocation::RevokedSubject::Machine(machine.machine_id()),
+        machine.public_key(),
+        machine.secret_key(),
+        1_000,
+        None,
+    )
+    .expect("sign");
+    sender
+        .apply_and_publish_revocation(record, None)
+        .await
+        .expect("the machine revocation applies");
+    assert!(
+        sender
+            .identity_discovery_cache
+            .read()
+            .await
+            .get(&recipient.agent_id())
+            .is_none(),
+        "the eviction dropped the recipient's discovery entry"
+    );
+    assert!(!sender
+        .revocation_set
+        .read()
+        .await
+        .is_agent_revoked(&recipient.agent_id()));
+
+    let err = sender
+        .send_direct(&recipient.agent_id(), b"revoked".to_vec())
+        .await
+        .expect_err("a revoked machine must refuse the send");
+    assert!(
+        matches!(
+            err,
+            dm::DmError::RecipientMachineRevoked { machine: m } if m == machine.machine_id()
+        ),
+        "expected RecipientMachineRevoked naming the machine, got {err:?}"
+    );
+
+    // A later announcement from a clean machine moves the agent: no
+    // machine-revocation refusal.
+    let moved = identity::MachineKeypair::generate().expect("machine keygen");
+    dm_inbox::record_authenticated_machine_binding(
+        &sender.authenticated_machine_bindings,
+        recipient.agent_id(),
+        moved.machine_id(),
+        7_000,
+    )
+    .await;
+    assert_eq!(
+        sender
+            .recipient_retained_machine_revoked(&recipient.agent_id())
+            .await,
+        None
+    );
+}
+
 /// #1785 follow-up (David, 5 Nov 2026): a send whose resolved
 /// `(agent, machine)` pairing fails the ADR-0043 B/P gate answers the
 /// typed `DmError::RecipientPairingDenied`, not a stringly
@@ -46537,6 +47154,9 @@ mod peer_connected_handler_integration_tests {
 
 #[cfg(test)]
 mod asymmetric_capability_convergence_tests;
+
+#[cfg(test)]
+mod caps_unicast_504_tests;
 
 #[cfg(test)]
 mod legacy_bus_interop_tests;

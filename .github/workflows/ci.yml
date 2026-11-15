@@ -768,9 +768,10 @@ jobs:
     # runs as four parallel parts (`s3-d3.1` to `s3-d3.4`, 5 reruns each;
     # `PARTS` in w3h-shards.py). The #1661 welcome-lost row has its own
     # group too (`s3-1661.1` and `s3-1661.2`, 10 reruns each), the
-    # H-S3-rm4 variants share `s3-rm4.1` and `s3-rm4.2`, H-S3-rm2 has its
-    # own group (`s3-rm2.1` and `s3-rm2.2`, 10 reruns each), and H-S3-d2 has
-    # `s3-d2`. A group is omitted when the tree has no matching test.
+    # H-S3-rm4 variants share `s3-rm4.1` to `s3-rm4.4`, H-S3-rm2 has its
+    # own group (`s3-rm2.1` and `s3-rm2.2`, 10 reruns each), H-S3-d2 has
+    # `s3-d2`, and H-S3-q has `s3-q`. A group is omitted when the tree has
+    # no matching test.
     name: W3-H shard plan
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -1028,6 +1029,12 @@ jobs:
           --expect w3h_1427_offline_member_reaches_the_epoch_it_missed=GREEN
           --require w3h_1427_catchup_moves_past_three_offline_admins_to_the_signer
           --expect w3h_1427_catchup_moves_past_three_offline_admins_to_the_signer=GREEN
+          --require w3h_1427_silent_return_reaches_the_epoch
+          --expect w3h_1427_silent_return_reaches_the_epoch=GREEN
+          --require w3h_1427_silent_return_after_signer_restart_reaches_the_epoch
+          --expect w3h_1427_silent_return_after_signer_restart_reaches_the_epoch=GREEN
+          --require w3h_1427_member_up_through_an_outage_reaches_the_epoch
+          --expect w3h_1427_member_up_through_an_outage_reaches_the_epoch=GREEN
           --require w3h_1360_red_s7_h7_1_copied_key_creates_no_duplicate
           --expect w3h_1360_red_s7_h7_1_copied_key_creates_no_duplicate=RED
           --require w3h_1161_card_import_invite
@@ -1096,6 +1103,8 @@ jobs:
           --expect w3h_1356_control_s3_s_two_link_segments_across_a_restart=GREEN
           --require w3h_1356_control_s3_x_attestation_conflict_stops_at_common_prefix
           --expect w3h_1356_control_s3_x_attestation_conflict_stops_at_common_prefix=GREEN
+          --require w3h_1356_red_s3_q_joiner_unreadable_sidecar
+          --expect w3h_1356_red_s3_q_joiner_unreadable_sidecar=RED
           --require w3h_1356_red_s3_forked_node_shows_reseat_required
           --expect w3h_1356_red_s3_forked_node_shows_reseat_required=GREEN
           --require w3h_1356_control_s3_forked_node_not_auto_recovered
@@ -1139,7 +1148,7 @@ jobs:
           --require w3h_1581c_control_restart_stale_head_resume
           --expect w3h_1581c_control_restart_stale_head_resume=GREEN
           --require w3h_1581c_red_restart_stale_head_no_sync_past_wait
-          --expect w3h_1581c_red_restart_stale_head_no_sync_past_wait=RED
+          --expect w3h_1581c_red_restart_stale_head_no_sync_past_wait=GREEN
           --require w3h_1581e_red_crash_commit_fork_contained
           --expect w3h_1581e_red_crash_commit_fork_contained=RED
           --require w3h_1581e_control_crash_commit_same_chain_resume
@@ -1147,11 +1156,13 @@ jobs:
           --require w3h_1581f_control_local_authority_exit_revoked_committer
           --expect w3h_1581f_control_local_authority_exit_revoked_committer=GREEN
           --require w3h_1581f_red_local_authority_exit_demoted_form
-          --expect w3h_1581f_red_local_authority_exit_demoted_form=RED
+          --expect w3h_1581f_red_local_authority_exit_demoted_form=GREEN
           --require w3h_1581g_control_sidecar_lifecycle_evs_damage_rebuilds
           --expect w3h_1581g_control_sidecar_lifecycle_evs_damage_rebuilds=GREEN
           --require w3h_1581g_red_sidecar_lifecycle_journal_and_pending_resume
           --expect w3h_1581g_red_sidecar_lifecycle_journal_and_pending_resume=GREEN
+          --require w3h_1581g_control_sidecar_lifecycle_pending_resume_forms
+          --expect w3h_1581g_control_sidecar_lifecycle_pending_resume_forms=GREEN
           --require w3h_1581d_control_evidence_holder_resume_after_holder_returns
           --expect w3h_1581d_control_evidence_holder_resume_after_holder_returns=GREEN
           --require w3h_1581d_red_evidence_holder_all_holders_offline
@@ -1164,10 +1175,18 @@ jobs:
           --expect w3h_1581h_control_sidecar_rebuild_body_damage_rederives=GREEN
           --require w3h_1581h_control_sidecar_rebuild_newer_file_memory_only
           --expect w3h_1581h_control_sidecar_rebuild_newer_file_memory_only=GREEN
+          --require w3h_1581i_control_machine_revoked_device_keeps_its_seat
+          --expect w3h_1581i_control_machine_revoked_device_keeps_its_seat=GREEN
+          --require w3h_1581i_egress_machine_revoked_device_gets_no_new_key
+          --expect w3h_1581i_egress_machine_revoked_device_gets_no_new_key=RED
           --require w3h_1765_red_newer_file_revocation_waits_for_store_write
           --expect w3h_1765_red_newer_file_revocation_waits_for_store_write=GREEN
           --require w3h_1776_delayed_fresh_joiner_fetches_the_welcome
           --expect w3h_1776_delayed_fresh_joiner_fetches_the_welcome=GREEN
+          --require w3h_1776_delayed_fresh_joiner_fetches_the_welcome_seed2
+          --expect w3h_1776_delayed_fresh_joiner_fetches_the_welcome_seed2=GREEN
+          --require w3h_1776_delayed_fresh_joiner_fetches_the_welcome_seed4
+          --expect w3h_1776_delayed_fresh_joiner_fetches_the_welcome_seed4=GREEN
           --require w3h_1623_red_pre_welcome_joiner_applies_removal_and_ban_links
           --expect w3h_1623_red_pre_welcome_joiner_applies_removal_and_ban_links=GREEN
 

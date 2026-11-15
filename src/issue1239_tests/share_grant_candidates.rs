@@ -66,7 +66,7 @@ async fn grant_fixture() -> (
         share_grant::Grantee::Agent(requester),
         vec![local],
         vec![share_grant::ShareCap::Dm],
-        0,
+        now_unix - 60,
         now_unix + 3600,
     )
     .unwrap();

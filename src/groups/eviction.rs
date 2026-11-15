@@ -1250,7 +1250,29 @@ pub fn evaluate_row(row: &ObligationRow, ctx: &RowContext<'_>, timing: &S4Timing
     };
     let (waiting, action) = match &permission {
         CommitPermission::NotEligible => {
-            let local_is_admin = ctx.active_admins.contains(&ctx.local);
+            // §4 L274-L275 (D72; #1581): a worker that loses its committer
+            // authority while the row is open marks
+            // `local_committer_ineligible`, whatever the exit: revoked
+            // (still an Active admin seat), demoted to member, or removed.
+            // A local node that is no longer an Active admin was this
+            // row's worker when the row's last derivation named it
+            // designated or a fallback rank. A stored mark also keeps it
+            // after the derivation moves to the next admin, and across a
+            // restart while `waiting` holds it. It is shown only while no
+            // override replaces the stored `waiting` (rebuilding, the
+            // host-commit gate, the fork wait, `waiting_for_receiver_upgrade`,
+            // rebind): once one has, and the derivation no longer names the
+            // local node, the row falls back to the plain designated wait.
+            // A member that was never a committer for the row keeps the
+            // plain designated wait.
+            let local = ctx.local;
+            let local_was_worker = row.designated == Some(local)
+                || row.ranks.contains(&local)
+                || row
+                    .waiting
+                    .as_ref()
+                    .is_some_and(|waiting| waiting.cause == WaitingCause::LocalCommitterIneligible);
+            let local_is_admin = ctx.active_admins.contains(&local) || local_was_worker;
             let cause = if local_is_admin {
                 WaitingCause::LocalCommitterIneligible
             } else {
@@ -1350,12 +1372,21 @@ pub fn evaluate_row(row: &ObligationRow, ctx: &RowContext<'_>, timing: &S4Timing
 /// in-boot part runs on the monotonic clock (`tokio::time::Instant`, so a
 /// paused test clock drives it too), so a wall-clock change or a rollback
 /// never renews W.
+///
+/// #1581: the monotonic clock stops while the host is suspended
+/// (`CLOCK_MONOTONIC` on Linux), so W alone would run late after a sleep.
+/// The in-boot part is the larger of the monotonic delta and the delta of
+/// the suspend-inclusive boot clock ([`boot_clock_now`]), which is never
+/// set back either. Under `cfg(test)` (unit and W3-H runs) the boot clock
+/// is off and the virtual clock alone drives the budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowBudget {
     /// Budget consumed by earlier boots.
     pub consumed_before_boot: Duration,
     /// The monotonic instant at which this boot started counting.
     pub counting_since: tokio::time::Instant,
+    /// The boot clock at `counting_since`, when the platform has one.
+    pub counting_since_boot: Option<Duration>,
 }
 
 impl RowBudget {
@@ -1365,14 +1396,27 @@ impl RowBudget {
         Self {
             consumed_before_boot,
             counting_since: now,
+            counting_since_boot: boot_clock_now(),
         }
     }
 
     /// The elapsed budget at `now`.
     #[must_use]
     pub fn elapsed(&self, now: tokio::time::Instant) -> Duration {
+        self.elapsed_at(now, boot_clock_now())
+    }
+
+    /// The elapsed budget at `now`, with `boot_now` the boot clock read at
+    /// the same moment.
+    #[must_use]
+    pub fn elapsed_at(&self, now: tokio::time::Instant, boot_now: Option<Duration>) -> Duration {
+        let monotonic = now.saturating_duration_since(self.counting_since);
+        let suspend_inclusive = match (boot_now, self.counting_since_boot) {
+            (Some(boot_now), Some(since)) => boot_now.saturating_sub(since),
+            _ => Duration::ZERO,
+        };
         self.consumed_before_boot
-            .saturating_add(now.saturating_duration_since(self.counting_since))
+            .saturating_add(monotonic.max(suspend_inclusive))
     }
 
     /// An earlier verified hand-off may shorten a budget: move T_obs back
@@ -1380,6 +1424,46 @@ impl RowBudget {
     pub fn shorten(&mut self, earlier_by: Duration) {
         self.consumed_before_boot = self.consumed_before_boot.saturating_add(earlier_by);
     }
+}
+
+/// #1581: the suspend-inclusive boot clock that [`RowBudget`] reads, or
+/// `None` under `cfg(test)`, where the paused virtual clock alone drives
+/// the budget.
+#[must_use]
+pub fn boot_clock_now() -> Option<Duration> {
+    if cfg!(test) {
+        None
+    } else {
+        read_boot_clock()
+    }
+}
+
+/// The time since boot including suspend: `CLOCK_BOOTTIME` on Linux and
+/// Android, `CLOCK_MONOTONIC` on Apple platforms (it counts sleep there).
+/// `None` on other platforms or when the read fails.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn read_boot_clock() -> Option<Duration> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const CLOCK: libc::clockid_t = libc::CLOCK_BOOTTIME;
+    #[cfg(target_vendor = "apple")]
+    const CLOCK: libc::clockid_t = libc::CLOCK_MONOTONIC;
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `now` is a valid, writable `timespec` for the call.
+    let result = unsafe { libc::clock_gettime(CLOCK, &mut now) };
+    if result != 0 {
+        return None;
+    }
+    let secs = u64::try_from(now.tv_sec).ok()?;
+    let nanos = u32::try_from(now.tv_nsec).ok()?;
+    Some(Duration::new(secs, nanos))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn read_boot_clock() -> Option<Duration> {
+    None
 }
 
 /// Convert a duration to whole milliseconds, saturating.
@@ -2311,6 +2395,58 @@ mod tests {
         assert!(raw_expiry_passed(100, 101));
     }
 
+    /// #1581: a host suspend stops the monotonic clock but not the boot
+    /// clock, so the budget counts the suspended time and the fallback
+    /// is not late. A boot clock behind the monotonic one never lowers
+    /// the budget, and with no boot clock the monotonic delta alone runs.
+    #[test]
+    fn budget_counts_a_host_suspend() {
+        let now = tokio::time::Instant::now();
+        let budget = RowBudget {
+            consumed_before_boot: Duration::from_secs(1),
+            counting_since: now,
+            counting_since_boot: Some(Duration::from_secs(100)),
+        };
+        // 2 s monotonic, 30 s on the boot clock (28 s suspended).
+        assert_eq!(
+            budget.elapsed_at(now + Duration::from_secs(2), Some(Duration::from_secs(130))),
+            Duration::from_secs(31)
+        );
+        // The boot clock behind: the monotonic delta stands.
+        assert_eq!(
+            budget.elapsed_at(now + Duration::from_secs(5), Some(Duration::from_secs(101))),
+            Duration::from_secs(6)
+        );
+        assert_eq!(
+            budget.elapsed_at(now + Duration::from_secs(5), None),
+            Duration::from_secs(6)
+        );
+        let no_clock = RowBudget {
+            counting_since_boot: None,
+            ..budget
+        };
+        assert_eq!(
+            no_clock.elapsed_at(now + Duration::from_secs(5), Some(Duration::from_secs(900))),
+            Duration::from_secs(6)
+        );
+        // The test build keeps the virtual clock alone.
+        assert_eq!(boot_clock_now(), None);
+        assert_eq!(
+            RowBudget::resume(Duration::ZERO, now).counting_since_boot,
+            None
+        );
+    }
+
+    /// #1581: the platform boot clock reads and never goes back.
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn the_boot_clock_reads_and_never_goes_back() {
+        let first = read_boot_clock().expect("the boot clock reads");
+        let second = read_boot_clock().expect("the boot clock reads");
+        assert!(second >= first);
+        assert!(first > Duration::ZERO);
+    }
+
     #[test]
     fn budget_survives_restart_and_shortens_only() {
         let now = tokio::time::Instant::now();
@@ -2564,6 +2700,78 @@ mod tests {
             now_unix: 1_000,
             local_certificate_expired: false,
         }
+    }
+
+    /// §4 L274 (#1581, `s4_local_authority_exit` demoted form): the
+    /// designated admin A is demoted to member while its row is open. A
+    /// is no longer an Active admin, but the row's last derivation named
+    /// it designated, so it marks `local_committer_ineligible` naming the
+    /// new designated admin, and the mark stays once the stored
+    /// derivation moved to D. A member that never was a committer for the
+    /// row keeps the plain designated wait. FAIL-BEFORE: the demoted A
+    /// showed `waiting_for_designated_admin` (`ci.yml` pinned
+    /// `w3h_1581f_red_local_authority_exit_demoted_form=RED`).
+    #[test]
+    fn evaluate_row_marks_a_demoted_worker_local_committer_ineligible() {
+        let timing = S4Timing::default();
+        let mut row = sample_row();
+        row.designated = Some(id(1));
+        row.ranks = vec![id(2)];
+        let none = BTreeSet::new();
+        // A (id 1) is demoted: D (id 2) is the only Active admin.
+        let admins = [id(2)];
+        let demoted = evaluate_row(&row, &ctx(1, &admins, &none, Duration::ZERO), &timing);
+        assert_eq!(demoted.action, RowAction::None);
+        assert_eq!(
+            demoted.waiting.clone().map(|w| (w.cause, w.named)),
+            Some((WaitingCause::LocalCommitterIneligible, vec![id(2)]))
+        );
+        // The worker stores the new derivation and the mark.
+        row.designated = Some(id(2));
+        row.ranks = Vec::new();
+        row.waiting = demoted.waiting;
+        let later = evaluate_row(&row, &ctx(1, &admins, &none, Duration::ZERO), &timing);
+        assert_eq!(
+            later.waiting.map(|w| w.cause),
+            Some(WaitingCause::LocalCommitterIneligible)
+        );
+        // A fallback rank that is demoted marks too.
+        let mut ranked = sample_row();
+        ranked.designated = Some(id(2));
+        ranked.ranks = vec![id(3)];
+        let rank_demoted = evaluate_row(&ranked, &ctx(3, &admins, &none, Duration::ZERO), &timing);
+        assert_eq!(
+            rank_demoted.waiting.map(|w| w.cause),
+            Some(WaitingCause::LocalCommitterIneligible)
+        );
+        // A member that never was a committer for the row.
+        let member = evaluate_row(&ranked, &ctx(8, &admins, &none, Duration::ZERO), &timing);
+        assert_eq!(
+            member.waiting.map(|w| (w.cause, w.named)),
+            Some((WaitingCause::WaitingForDesignatedAdmin, vec![id(2)]))
+        );
+    }
+
+    /// #1921 review: the mark lives only in the row's stored derivation
+    /// and its stored `waiting`. When an override (here the host-commit
+    /// gate) replaced the stored `waiting` between two evaluations, and
+    /// the derivation already moved to the next admin, the demoted node
+    /// falls back to `waiting_for_designated_admin`. This pins the
+    /// documented limit; there is no separate worker-history state.
+    #[test]
+    fn an_override_between_evaluations_drops_the_demoted_worker_mark() {
+        let timing = S4Timing::default();
+        let mut row = sample_row();
+        row.designated = Some(id(2));
+        row.ranks = Vec::new();
+        row.waiting = Some(WaitingState::cause(WaitingCause::WaitingForHostCommit));
+        let none = BTreeSet::new();
+        let admins = [id(2)];
+        let evaluation = evaluate_row(&row, &ctx(1, &admins, &none, Duration::ZERO), &timing);
+        assert_eq!(
+            evaluation.waiting.map(|w| (w.cause, w.named)),
+            Some((WaitingCause::WaitingForDesignatedAdmin, vec![id(2)]))
+        );
     }
 
     #[test]

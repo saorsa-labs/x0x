@@ -290,9 +290,10 @@ async fn check_store_integrity(client: &DaemonClient) -> DoctorCheck {
 }
 
 async fn check_upgrade_state(client: &DaemonClient) -> DoctorCheck {
-    // Prefer `/diagnostics/upgrade` when #1381 ships; fall back to GET /upgrade.
-    // Until then `/upgrade` is a release *lookup*, not apply/rollback health:
-    // lookup failure and HTTP errors are `warn`; an available update stays `ok`.
+    // Prefer `/diagnostics/upgrade` (#1381: its `pending_update` names a
+    // release newer than this daemon); fall back to GET /upgrade. Neither is
+    // apply/rollback health: lookup failure and HTTP errors are `warn`; an
+    // available update stays `ok`.
     let (path, val) = match client.get("/diagnostics/upgrade").await {
         Ok(val) => ("/diagnostics/upgrade", val),
         Err(_) => match client.get("/upgrade").await {
@@ -321,11 +322,12 @@ async fn check_upgrade_state(client: &DaemonClient) -> DoctorCheck {
         );
     }
 
+    let pending_update = val.get("pending_update").filter(|v| v.is_object());
     let update_available = val
         .get("update_available")
         .or_else(|| val.get("pending"))
         .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+        .unwrap_or(pending_update.is_some());
     let current = val
         .get("current_version")
         .and_then(|v| v.as_str())
@@ -333,6 +335,7 @@ async fn check_upgrade_state(client: &DaemonClient) -> DoctorCheck {
     let latest = val
         .get("version")
         .or_else(|| val.get("latest_version"))
+        .or_else(|| pending_update.and_then(|pending| pending.get("version")))
         .and_then(|v| v.as_str());
     let detail = if update_available {
         match latest {
@@ -976,6 +979,20 @@ pub(crate) fn classify_launchd_job(plist: &serde_json::Value) -> RepairVerdict {
                     .to_string(),
             );
         }
+    }
+
+    // ADR 0094 (#1379): launchd's process-group cleanup is what removes a
+    // surviving child when the job stops or its supervisor dies. A job that
+    // sets `AbandonProcessGroup` keeps orphans alive across a restart, so an
+    // old and a new daemon could share the data roots. Report it, whether or
+    // not the job already carries the marker; the repair never edits it.
+    if plist.get("AbandonProcessGroup") == Some(&serde_json::Value::Bool(true)) {
+        return RepairVerdict::Refused(
+            "job sets `AbandonProcessGroup`, so launchd does not remove x0xd's process \
+             group when the job stops and an orphaned daemon can outlive its \
+             replacement; remove that key by hand"
+                .to_string(),
+        );
     }
 
     let env = plist.get("EnvironmentVariables");
@@ -1633,6 +1650,31 @@ mod tests {
             )),
             RepairVerdict::Refused(_)
         ));
+    }
+
+    /// #1379: `AbandonProcessGroup` defeats launchd's process-group cleanup,
+    /// so the repair refuses it, even on a job that already has the marker.
+    /// `AbandonProcessGroup: false` is launchd's default and is accepted.
+    #[test]
+    fn repair_refuses_jobs_that_abandon_their_process_group() {
+        let mut job = serde_json::json!({
+            "Label": "com.example.x0xd",
+            "ProgramArguments": ["/usr/local/bin/x0xd"],
+            "KeepAlive": true,
+            "AbandonProcessGroup": true,
+        });
+        assert!(matches!(
+            classify_launchd_job(&job),
+            RepairVerdict::Refused(reason) if reason.contains("AbandonProcessGroup")
+        ));
+        job["EnvironmentVariables"] =
+            serde_json::json!({ crate::upgrade::restart::SUPERVISED_ENV_VAR: "1" });
+        assert!(matches!(
+            classify_launchd_job(&job),
+            RepairVerdict::Refused(reason) if reason.contains("AbandonProcessGroup")
+        ));
+        job["AbandonProcessGroup"] = serde_json::Value::Bool(false);
+        assert_eq!(classify_launchd_job(&job), RepairVerdict::AlreadySupervised);
     }
 
     #[test]

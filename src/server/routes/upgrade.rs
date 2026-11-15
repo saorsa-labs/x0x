@@ -39,14 +39,42 @@ const SELF_PUBLISHED_RELEASE_TTL: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Default)]
 pub(in crate::server) struct SelfPublishedReleaseManifests {
-    published_at: HashMap<[u8; 32], Instant>,
+    published_at: HashMap<[u8; 32], SelfPublished>,
+}
+
+/// One self-published payload: when it was first recorded, and whether
+/// `/upgrade/apply` recorded it (#1169). Only a route-recorded payload is
+/// already owned by an apply in progress; driver rebroadcasts, fallback
+/// publishes and the start-up broadcast still let their echo reach the
+/// background owner, whose version dedup absorbs repeats.
+#[derive(Debug, Clone, Copy)]
+struct SelfPublished {
+    first_seen: Instant,
+    apply_route: bool,
 }
 
 impl SelfPublishedReleaseManifests {
     fn record_payload(&mut self, payload: &[u8], now: Instant) {
+        self.record(payload, now, false);
+    }
+
+    /// Record a payload that `/upgrade/apply` announces for the release it
+    /// is applying itself.
+    fn record_apply_route_payload(&mut self, payload: &[u8], now: Instant) {
+        self.record(payload, now, true);
+    }
+
+    fn record(&mut self, payload: &[u8], now: Instant, apply_route: bool) {
         self.prune(now);
-        self.published_at
-            .insert(release_manifest_payload_digest(payload), now);
+        let entry = self
+            .published_at
+            .entry(release_manifest_payload_digest(payload))
+            .or_insert(SelfPublished {
+                first_seen: now,
+                apply_route,
+            });
+        entry.first_seen = now;
+        entry.apply_route |= apply_route;
     }
 
     fn contains_recent_digest(&mut self, digest: &[u8; 32], now: Instant) -> bool {
@@ -54,9 +82,17 @@ impl SelfPublishedReleaseManifests {
         self.published_at.contains_key(digest)
     }
 
+    /// Whether `/upgrade/apply` recorded this payload within the TTL.
+    fn recorded_by_apply_route(&mut self, digest: &[u8; 32], now: Instant) -> bool {
+        self.prune(now);
+        self.published_at
+            .get(digest)
+            .is_some_and(|entry| entry.apply_route)
+    }
+
     fn prune(&mut self, now: Instant) {
-        self.published_at.retain(|_, first_seen| {
-            now.saturating_duration_since(*first_seen) < SELF_PUBLISHED_RELEASE_TTL
+        self.published_at.retain(|_, entry| {
+            now.saturating_duration_since(entry.first_seen) < SELF_PUBLISHED_RELEASE_TTL
         });
     }
 }
@@ -108,6 +144,205 @@ fn decide_release_manifest_rebroadcast(
 }
 
 // ---------------------------------------------------------------------------
+// Upgrade observations (#1381): what `GET /diagnostics/upgrade` reports
+// ---------------------------------------------------------------------------
+
+/// Where a release check ran (#1381).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::server) enum ReleaseCheckSource {
+    /// The check that runs once after the API listener binds.
+    Startup,
+    /// The periodic GitHub fallback poll.
+    FallbackPoll,
+    /// A `GET /upgrade` request that was not answered from the cache.
+    Api,
+}
+
+impl ReleaseCheckSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::FallbackPoll => "fallback_poll",
+            Self::Api => "api",
+        }
+    }
+}
+
+/// What a release check found (#1381).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::server) enum ReleaseCheckOutcome {
+    /// A verified release newer than this binary.
+    UpdateAvailable(String),
+    /// No newer release.
+    UpToDate,
+    /// The check did not complete.
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+struct ReleaseSighting {
+    version: String,
+    seen_at_unix: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ReleaseCheckRecord {
+    source: ReleaseCheckSource,
+    at_unix: u64,
+    outcome: ReleaseCheckOutcome,
+}
+
+/// What this daemon has learned about releases since it started (#1381).
+/// Memory only: a restart starts empty. `GET /diagnostics/upgrade` reports
+/// it; nothing here is sent on the wire.
+#[derive(Debug, Default)]
+pub(in crate::server) struct UpgradeObservations {
+    latest_on_topic: Option<ReleaseSighting>,
+    last_check: Option<ReleaseCheckRecord>,
+}
+
+impl UpgradeObservations {
+    /// Record a verified release received on `x0x/release`. Only the
+    /// highest version is kept; a repeat of it refreshes the time.
+    pub(in crate::server) fn record_topic_release(&mut self, version: &str, now_unix: u64) {
+        let Ok(seen) = semver::Version::parse(version) else {
+            return;
+        };
+        let keep = match &self.latest_on_topic {
+            Some(prior) => semver::Version::parse(&prior.version)
+                .map(|prior| seen.cmp_precedence(&prior) != std::cmp::Ordering::Less)
+                .unwrap_or(true),
+            None => true,
+        };
+        if keep {
+            self.latest_on_topic = Some(ReleaseSighting {
+                version: version.to_string(),
+                seen_at_unix: now_unix,
+            });
+        }
+    }
+
+    /// Record the result of a release check.
+    pub(in crate::server) fn record_check(
+        &mut self,
+        source: ReleaseCheckSource,
+        outcome: ReleaseCheckOutcome,
+        now_unix: u64,
+    ) {
+        self.last_check = Some(ReleaseCheckRecord {
+            source,
+            at_unix: now_unix,
+            outcome,
+        });
+    }
+
+    /// The newest observed version that is newer than `current`.
+    fn newest_observed(&self, current: &str) -> Option<(String, &'static str)> {
+        let topic = self
+            .latest_on_topic
+            .as_ref()
+            .map(|seen| (seen.version.clone(), "release_topic"));
+        let check = self
+            .last_check
+            .as_ref()
+            .and_then(|check| match &check.outcome {
+                ReleaseCheckOutcome::UpdateAvailable(version) => {
+                    Some((version.clone(), check.source.as_str()))
+                }
+                _ => None,
+            });
+        [topic, check]
+            .into_iter()
+            .flatten()
+            .filter(|(version, _)| is_newer(version, current))
+            .max_by(
+                |(a, _), (b, _)| match (semver::Version::parse(a), semver::Version::parse(b)) {
+                    (Ok(a), Ok(b)) => a.cmp_precedence(&b),
+                    _ => std::cmp::Ordering::Equal,
+                },
+            )
+    }
+
+    /// The `/diagnostics/upgrade` fields this record owns.
+    pub(in crate::server) fn diagnostics_json(
+        &self,
+        current: &str,
+        background: Option<BackgroundStatus>,
+    ) -> serde_json::Value {
+        let latest_on_topic = self.latest_on_topic.as_ref().map(|seen| {
+            serde_json::json!({ "version": seen.version, "seen_at_unix": seen.seen_at_unix })
+        });
+        let last_check = self.last_check.as_ref().map(|check| {
+            let (outcome, version) = match &check.outcome {
+                ReleaseCheckOutcome::UpdateAvailable(version) => {
+                    ("update_available", Some(version.clone()))
+                }
+                ReleaseCheckOutcome::UpToDate => ("up_to_date", None),
+                ReleaseCheckOutcome::Failed => ("failed", None),
+            };
+            serde_json::json!({
+                "source": check.source.as_str(),
+                "at_unix": check.at_unix,
+                "outcome": outcome,
+                "version": version,
+            })
+        });
+        let pending_update = match background {
+            Some(status) => Some(serde_json::json!({
+                "version": status.version,
+                "state": status.state,
+                "source": "background_owner",
+            })),
+            None => self.newest_observed(current).map(|(version, source)| {
+                serde_json::json!({ "version": version, "state": "observed", "source": source })
+            }),
+        };
+        serde_json::json!({
+            "latest_release_topic_version": latest_on_topic,
+            "last_check": last_check,
+            "pending_update": pending_update,
+        })
+    }
+}
+
+/// Seconds since the Unix epoch; 0 if the clock is before it.
+pub(in crate::server) fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// Apply `update` to the shared observations. A poisoned lock still records:
+/// the data is diagnostic only.
+pub(in crate::server) fn observe_upgrade(
+    observations: &std::sync::Mutex<UpgradeObservations>,
+    update: impl FnOnce(&mut UpgradeObservations),
+) {
+    let mut guard = observations
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    update(&mut guard);
+}
+
+/// The [`ReleaseCheckOutcome`] of a monitor answer.
+fn check_outcome<E>(checked: &Result<Option<VerifiedRelease>, E>) -> ReleaseCheckOutcome {
+    match checked {
+        Ok(Some(release)) => ReleaseCheckOutcome::UpdateAvailable(release.manifest.version.clone()),
+        Ok(None) => ReleaseCheckOutcome::UpToDate,
+        Err(_) => ReleaseCheckOutcome::Failed,
+    }
+}
+
+/// The release the background apply owner holds, if it still has work or a
+/// recent failure for it (#1381).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::server) struct BackgroundStatus {
+    version: String,
+    state: &'static str,
+}
+
+// ---------------------------------------------------------------------------
 // Restart plumbing (#261): every apply caller builds the same planner context
 // ---------------------------------------------------------------------------
 
@@ -143,6 +378,9 @@ pub(in crate::server) struct StartupUpdateCheckRuntime {
     pub shutdown_watch: watch::Receiver<bool>,
     #[cfg(unix)]
     pub staging: StartupStagingContext,
+    /// Where the check records its result for `GET /diagnostics/upgrade`
+    /// (#1381); `None` records nothing.
+    pub observations: Option<Arc<std::sync::Mutex<UpgradeObservations>>>,
 }
 
 #[cfg(unix)]
@@ -427,21 +665,28 @@ pub(in crate::server) async fn run_startup_update_check(
         #[cfg(test)]
         {
             match startup_release_seam::take() {
-                Some(injected) => Some(injected),
-                None => monitor
-                    .check_for_updates()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+                Some(injected) => Ok(Some(injected)),
+                None => monitor.check_for_updates().await,
             }
         }
         #[cfg(not(test))]
         {
-            monitor
-                .check_for_updates()
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?
+            monitor.check_for_updates().await
         }
     };
+    if let Some(observations) = runtime
+        .as_ref()
+        .and_then(|runtime| runtime.observations.as_ref())
+    {
+        observe_upgrade(observations, |record| {
+            record.record_check(
+                ReleaseCheckSource::Startup,
+                check_outcome(&checked),
+                unix_now(),
+            )
+        });
+    }
+    let checked = checked.map_err(|e| anyhow::anyhow!("{e}"))?;
     let Some(verified) = checked else {
         return Ok(None);
     };
@@ -820,6 +1065,30 @@ impl BackgroundSubmit {
                 .is_some_and(|failed| failed.elapsed() < Duration::from_secs(30 * 60))
     }
 
+    /// The selected release while it is queued, applying, or failed
+    /// (#1381). `None` once the owner has nothing left for it.
+    pub(in crate::server) fn status(&self) -> Option<BackgroundStatus> {
+        let slot = self.slot.lock().ok()?;
+        let latest = slot.latest.as_ref()?;
+        let state = if slot.active.is_some() {
+            "applying"
+        } else if slot.pending {
+            "queued"
+        } else if let Some(failed) = slot.failed_at {
+            if failed.elapsed() < Duration::from_secs(30 * 60) {
+                "backoff"
+            } else {
+                "failed"
+            }
+        } else {
+            return None;
+        };
+        Some(BackgroundStatus {
+            version: latest.manifest.version.clone(),
+            state,
+        })
+    }
+
     fn close(&self) {
         let mut slot = self
             .slot
@@ -1043,6 +1312,7 @@ pub(in crate::server) async fn run_gossip_update_listener(
     agent: Arc<Agent>,
     submit: Option<BackgroundSubmit>,
     self_published: Arc<Mutex<SelfPublishedReleaseManifests>>,
+    observations: Arc<std::sync::Mutex<UpgradeObservations>>,
     shutdown: watch::Receiver<bool>,
 ) {
     let subscription = match agent.subscribe(RELEASE_TOPIC).await {
@@ -1060,6 +1330,7 @@ pub(in crate::server) async fn run_gossip_update_listener(
             }
         }
     });
+    let releases = observe_topic_releases(releases, observations);
     run_gossip_update_driver(
         releases,
         submit,
@@ -1076,6 +1347,19 @@ pub(in crate::server) async fn run_gossip_update_listener(
         shutdown,
     )
     .await;
+}
+
+/// Record each verified release from `x0x/release` for
+/// `GET /diagnostics/upgrade` (#1381) before the driver sees it.
+fn observe_topic_releases(
+    releases: impl Stream<Item = VerifiedRelease>,
+    observations: Arc<std::sync::Mutex<UpgradeObservations>>,
+) -> impl Stream<Item = VerifiedRelease> {
+    releases.inspect(move |release| {
+        observe_upgrade(&observations, |record| {
+            record.record_topic_release(&release.manifest.version, unix_now())
+        });
+    })
 }
 
 fn verify_gossip_release(payload: &[u8]) -> Option<VerifiedRelease> {
@@ -1166,18 +1450,31 @@ async fn run_gossip_update_driver<S, Publish, PublishFuture>(
         if x0x::upgrade::monitor::validate_manifest_timestamp(&verified.manifest).is_err() {
             continue;
         }
-        let decision = {
+        let (decision, apply_route_echo) = {
             let mut published = self_published.lock().await;
-            decide_release_manifest_rebroadcast(
+            let digest = release_manifest_payload_digest(&verified.gossip_payload);
+            let decision = decide_release_manifest_rebroadcast(
                 &verified.manifest.version,
                 x0x::VERSION,
-                release_manifest_payload_digest(&verified.gossip_payload),
+                digest,
                 &mut rebroadcasted,
                 &mut published,
                 Instant::now(),
+            );
+            (
+                decision,
+                published.recorded_by_apply_route(&digest, Instant::now()),
             )
         };
         if decision == ReleaseRebroadcastDecision::SkipNotNewer {
+            continue;
+        }
+        // #1169: the echo of an `/upgrade/apply` announcement is not
+        // submitted. That route applies the release itself; a submit would
+        // start a second apply of the operator-requested release. Echoes of
+        // driver rebroadcasts, fallback publishes and the start-up broadcast
+        // still reach the owner, whose version dedup absorbs them.
+        if decision == ReleaseRebroadcastDecision::SkipSelfPublished && apply_route_echo {
             continue;
         }
         if decision == ReleaseRebroadcastDecision::Rebroadcast {
@@ -1205,6 +1502,7 @@ pub(in crate::server) async fn run_fallback_github_poll(
     config: DaemonUpdateConfig,
     submit: Option<BackgroundSubmit>,
     self_published: Arc<Mutex<SelfPublishedReleaseManifests>>,
+    observations: Arc<std::sync::Mutex<UpgradeObservations>>,
     shutdown: watch::Receiver<bool>,
 ) {
     let interval = Duration::from_secs(config.fallback_check_interval_minutes.saturating_mul(60));
@@ -1225,11 +1523,24 @@ pub(in crate::server) async fn run_fallback_github_poll(
         ticks,
         move || {
             let config = config.clone();
+            let observations = Arc::clone(&observations);
             async move {
-                let monitor = UpgradeMonitor::new(&config.repo, "x0xd", x0x::VERSION)
-                    .map_err(x0x::upgrade::UpgradeError::Other)?
-                    .with_include_prereleases(config.include_prereleases);
-                monitor.check_for_updates().await
+                let checked = async {
+                    UpgradeMonitor::new(&config.repo, "x0xd", x0x::VERSION)
+                        .map_err(x0x::upgrade::UpgradeError::Other)?
+                        .with_include_prereleases(config.include_prereleases)
+                        .check_for_updates()
+                        .await
+                }
+                .await;
+                observe_upgrade(&observations, |record| {
+                    record.record_check(
+                        ReleaseCheckSource::FallbackPoll,
+                        check_outcome(&checked),
+                        unix_now(),
+                    )
+                });
+                checked
             }
         },
         submit,
@@ -1739,7 +2050,11 @@ pub(in crate::server) async fn check_upgrade(State(state): State<Arc<AppState>>)
     // background install from a read. It answers and caches only; peers
     // learn the release from an applying node, the fallback poll or
     // relay. `monitor_check` carries the cfg(test) feed seam.
-    match monitor_check(&monitor).await {
+    let checked = monitor_check(&monitor).await;
+    observe_upgrade(&state.upgrade_observations, |record| {
+        record.record_check(ReleaseCheckSource::Api, check_outcome(&checked), unix_now())
+    });
+    match checked {
         Ok(Some(release)) => {
             store_upgrade_response(
                 state.as_ref(),
@@ -1922,15 +2237,17 @@ pub(in crate::server) async fn apply_upgrade(
     // After the lock drop: a bounded-but-slow publish must not hold the
     // shared replacement lock away from background and startup applies.
     // The only announcing route: an explicit owner action on a release
-    // this node is already installing. Self-delivery does return the
-    // announcement to this node's own gossip listener, so with gossip
-    // updates on the same version also enters the background apply owner
-    // — a duplicate attempt of an operator-requested release, serialized
-    // by the shared apply lock and version dedup, not a new install
-    // decision. Recording the payload as self-published (so the driver
-    // skips the rebroadcast and the submit) needs the shared tracker on
-    // AppState (src/server/mod.rs, held by #1774).
+    // this node is already installing. Self-delivery returns the
+    // announcement to this node's own gossip listener. The payload is
+    // recorded as published by this route first, so the gossip driver skips
+    // both the rebroadcast and the submit for that echo: this route already
+    // owns the apply.
     {
+        state
+            .self_published_release_manifests
+            .lock()
+            .await
+            .record_apply_route_payload(&release.gossip_payload, Instant::now());
         let agent = Arc::clone(&state.agent);
         announce_observed_release(&release, move |payload| async move {
             agent
@@ -1997,6 +2314,116 @@ pub(in crate::server) async fn apply_upgrade(
                     "error": e.to_string()
                 })),
             )
+        }
+    }
+}
+
+/// `POST /upgrade/clear-hold?version=<v>` (D190, #1376).
+#[derive(serde::Deserialize)]
+pub(in crate::server) struct UpgradeClearHoldQuery {
+    #[serde(default)]
+    version: Option<String>,
+}
+
+/// D190: an authenticated, recorded local clear of this install's
+/// failed-release probe hold for exactly `version`. A newer release already
+/// clears such a hold by itself; this route lets an operator retry the held
+/// release. It never clears recovery-failed or an unresolved record, and it
+/// refuses while another upgrade operation holds the in-process apply lock.
+pub(in crate::server) async fn clear_upgrade_hold(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<UpgradeClearHoldQuery>,
+) -> Response {
+    let refuse = |status: StatusCode, error: String| {
+        (
+            status,
+            Json(serde_json::json!({ "ok": false, "cleared": false, "error": error })),
+        )
+            .into_response()
+    };
+    if !state.self_update_enabled {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "cleared": false,
+                "reason": "self-update disabled for this process"
+            })),
+        )
+            .into_response();
+    }
+    let Some(version) = query
+        .version
+        .filter(|version| semver::Version::parse(version).is_ok())
+    else {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "query parameter version must be a semantic version".into(),
+        );
+    };
+    #[cfg(not(unix))]
+    {
+        let _ = (&state, version);
+        refuse(
+            StatusCode::NOT_IMPLEMENTED,
+            "release probe holds exist only on Unix installs".into(),
+        )
+    }
+    #[cfg(unix)]
+    {
+        let Ok(_apply_guard) = state.upgrade_apply_lock.try_lock() else {
+            return refuse(StatusCode::CONFLICT, "upgrade already in progress".into());
+        };
+        // Resolve the install on this task: the executable observation is
+        // per thread in tests and must not move to the blocking pool.
+        let install = match crate::upgrade::apply::current_binary_path().and_then(|path| {
+            path.canonicalize()
+                .map_err(|error| x0x::upgrade::UpgradeError::Other(error.to_string()))
+        }) {
+            Ok(install) => install,
+            Err(error) => {
+                return refuse(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("install path unavailable: {error}"),
+                )
+            }
+        };
+        let requested = version.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let _host_lock = crate::upgrade::acquire_host_upgrade_lock(&install)
+                .map_err(|error| error.to_string())?;
+            crate::upgrade::probe::clear_failed_hold(&install, &requested)
+                .map_err(|error| error.to_string())
+        })
+        .await;
+        match outcome {
+            Ok(Ok(crate::upgrade::probe::HoldClear::Cleared(receipt))) => {
+                tracing::info!(
+                    version = %receipt.version,
+                    cause = ?receipt.cause,
+                    "Failed-release hold cleared by an authenticated local request"
+                );
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "ok": true,
+                        "cleared": true,
+                        "version": receipt.version,
+                        "cause": receipt.cause,
+                        "transaction_id": receipt.transaction_id,
+                    })),
+                )
+                    .into_response()
+            }
+            Ok(Ok(crate::upgrade::probe::HoldClear::NotHeld)) => refuse(
+                StatusCode::NOT_FOUND,
+                format!("no failed-release hold for {version}"),
+            ),
+            Ok(Err(error)) => refuse(StatusCode::CONFLICT, error),
+            Err(error) => refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("hold clear worker failed: {error}"),
+            ),
         }
     }
 }
@@ -2454,6 +2881,123 @@ mod tests {
         }
     }
 
+    /// A release this node can apply here: the shared fixture's only asset
+    /// targets Linux x64, and the background owner refuses a manifest
+    /// without this platform's asset before it records anything.
+    fn submittable_release(version: &str) -> VerifiedRelease {
+        let mut manifest = manifest_with_version(version);
+        manifest.assets[0].target = x0x::upgrade::manifest::current_platform_target()
+            .expect("tests run on a supported platform")
+            .to_string();
+        let manifest_json = serde_json::to_vec(&manifest).expect("serialize manifest fixture");
+        let payload = x0x::upgrade::manifest::encode_signed_manifest(&manifest_json, b"announce");
+        VerifiedRelease {
+            manifest,
+            manifest_json,
+            signature: b"announce".to_vec(),
+            gossip_payload: payload,
+        }
+    }
+
+    /// Run the real gossip driver over one release and report how many
+    /// rebroadcasts it published and which version the background slot
+    /// selected.
+    async fn drive_one_gossip_release(
+        verified: VerifiedRelease,
+        self_published: Arc<Mutex<SelfPublishedReleaseManifests>>,
+    ) -> (usize, Option<String>) {
+        let submit = BackgroundSubmit::default();
+        let (_keep_running, shutdown) = watch::channel(false);
+        let published = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&published);
+        run_gossip_update_driver(
+            futures::stream::iter([verified]),
+            submit.clone(),
+            self_published,
+            move |_| {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Ok(()) }
+            },
+            shutdown,
+        )
+        .await;
+        let selected = submit
+            .slot
+            .lock()
+            .unwrap()
+            .latest
+            .as_ref()
+            .map(|release| release.manifest.version.clone());
+        (
+            published.load(std::sync::atomic::Ordering::SeqCst),
+            selected,
+        )
+    }
+
+    // #1169: `/upgrade/apply` announces and then applies itself. The
+    // announcement self-delivers to this node's gossip listener; before the
+    // fix the driver skipped only the rebroadcast and still queued the same
+    // release on the background owner — a second apply of an
+    // operator-requested release.
+    #[tokio::test]
+    async fn self_published_release_is_not_resubmitted_to_the_background_owner() {
+        let version = version_newer_than_current();
+        let verified = submittable_release(&version);
+        let self_published = Arc::new(Mutex::new(SelfPublishedReleaseManifests::default()));
+        self_published
+            .lock()
+            .await
+            .record_apply_route_payload(&verified.gossip_payload, Instant::now());
+
+        let (rebroadcasts, selected) = drive_one_gossip_release(verified, self_published).await;
+
+        assert_eq!(
+            rebroadcasts, 0,
+            "a self-published payload is not rebroadcast"
+        );
+        assert_eq!(
+            selected, None,
+            "a self-delivered announcement must not queue a second apply"
+        );
+    }
+
+    /// Echoes of this node's own driver rebroadcast, fallback publish or
+    /// start-up broadcast are not route-owned: they are not rebroadcast
+    /// again but still reach the background owner, which dedups them.
+    #[tokio::test]
+    async fn non_route_self_published_echo_is_still_submitted() {
+        let version = version_newer_than_current();
+        let verified = submittable_release(&version);
+        let self_published = Arc::new(Mutex::new(SelfPublishedReleaseManifests::default()));
+        self_published
+            .lock()
+            .await
+            .record_payload(&verified.gossip_payload, Instant::now());
+
+        let (rebroadcasts, selected) = drive_one_gossip_release(verified, self_published).await;
+
+        assert_eq!(
+            rebroadcasts, 0,
+            "a self-published payload is not rebroadcast"
+        );
+        assert_eq!(selected, Some(version), "the echo still reaches the owner");
+    }
+
+    /// Control for the test above: the same release from a peer is
+    /// rebroadcast once and queued, so the fixture is one the background
+    /// owner accepts.
+    #[tokio::test]
+    async fn peer_published_release_is_rebroadcast_and_submitted() {
+        let version = version_newer_than_current();
+        let verified = submittable_release(&version);
+        let self_published = Arc::new(Mutex::new(SelfPublishedReleaseManifests::default()));
+
+        let (rebroadcasts, selected) = drive_one_gossip_release(verified, self_published).await;
+
+        assert_eq!(rebroadcasts, 1);
+        assert_eq!(selected, Some(version));
+    }
+
     #[tokio::test]
     async fn observed_release_announcement_publishes_the_signed_payload() {
         let verified = verified_release_with_version(&version_newer_than_current());
@@ -2619,6 +3163,144 @@ mod tests {
         )
     }
 
+    /// #1169 acceptance over real loopback gossip: node A's real fallback
+    /// driver observes a signed release and publishes it on `x0x/release`;
+    /// node B's real gossip driver, fed by its own topic subscription and
+    /// the listener's verifier, queues it with its background apply owner.
+    /// The issue's bar is under 2 × the heartbeat (2 × 600 s); the test
+    /// waits for the topic mesh with unique probes, then allows 10 s.
+    /// `announced_release_propagates_to_a_subscribed_peer_immediately`
+    /// proves the same flow with a channel in place of the network.
+    #[tokio::test]
+    async fn observed_release_propagates_over_real_gossip_to_a_peer_owner() {
+        use x0x::upgrade::signature::sign_with_context;
+        let (pk, sk) = saorsa_pqc::api::sig::ml_dsa_65()
+            .generate_keypair()
+            .expect("test release key");
+        let mut manifest = manifest_with_version(&version_newer_than_current());
+        manifest.assets[0].target = x0x::upgrade::manifest::current_platform_target()
+            .expect("tests run on a supported platform")
+            .to_string();
+        let expected_version = manifest.version.clone();
+        let manifest_json = serde_json::to_vec(&manifest).expect("manifest json");
+        let signature = sign_with_context(&sk.to_bytes(), &manifest_json).expect("sign");
+        let payload = x0x::upgrade::manifest::encode_signed_manifest(&manifest_json, &signature);
+        let verified = VerifiedRelease {
+            manifest,
+            manifest_json,
+            signature,
+            gossip_payload: payload,
+        };
+
+        let dir_a = tempfile::tempdir().expect("tmpdir a");
+        let dir_b = tempfile::tempdir().expect("tmpdir b");
+        let a = loopback_gossip_agent(dir_a.path()).await;
+        let b = loopback_gossip_agent(dir_b.path()).await;
+        a.join_network().await.expect("a joins");
+        b.join_network().await.expect("b joins");
+        let _a_topic = a.subscribe(RELEASE_TOPIC).await.expect("a subscribes");
+        let b_topic = b.subscribe(RELEASE_TOPIC).await.expect("b subscribes");
+        let b_addr = b.bound_addr().await.expect("b bound");
+        let b_addr = SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), b_addr.port());
+        a.network()
+            .expect("a network")
+            .connect_addr(b_addr)
+            .await
+            .expect("a connects to b");
+
+        // Wait until the release topic carries A's messages to B, so the one
+        // real publish below cannot race the mesh. Each probe is unique and
+        // fails B's signature check, so B's driver drops it.
+        let mut b_probe = b
+            .subscribe(RELEASE_TOPIC)
+            .await
+            .expect("b probe subscribes");
+        let mut probe_seq = 0u32;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                probe_seq += 1;
+                let probe = format!("mesh-probe-{probe_seq}").into_bytes();
+                a.publish(RELEASE_TOPIC, probe)
+                    .await
+                    .expect("a publishes probe");
+                if let Ok(Some(message)) =
+                    tokio::time::timeout(Duration::from_millis(250), b_probe.recv()).await
+                {
+                    if message.payload.starts_with(b"mesh-probe-") {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the release topic did not carry A's probes to B within 10 s");
+        drop(b_probe);
+
+        // Peer B: subscription -> verifier -> real driver -> owner intake.
+        let (queued_tx, mut queued_rx) = mpsc::unbounded_channel();
+        let b_submit = BackgroundSubmit {
+            processed: Some(Arc::new(move |version, outcome| {
+                let _ = queued_tx.send((version, outcome));
+            })),
+            ..Default::default()
+        };
+        let releases = futures::stream::unfold(
+            (b_topic, pk.to_bytes()),
+            |(mut subscription, key)| async move {
+                loop {
+                    let message = subscription.recv().await?;
+                    if let Some(verified) = verify_gossip_release_with_key(&message.payload, &key) {
+                        return Some((verified, (subscription, key)));
+                    }
+                }
+            },
+        );
+        let (_b_running, b_shutdown) = watch::channel(false);
+        let b_driver = tokio::spawn(run_gossip_update_driver(
+            releases,
+            Some(b_submit),
+            Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
+            |_| async { Ok(()) },
+            b_shutdown,
+        ));
+
+        // Node A: one real fallback tick observes the release and publishes.
+        let (_a_running, a_shutdown) = watch::channel(false);
+        let a_publish = Arc::clone(&a);
+        let a_driver = tokio::spawn(run_fallback_update_driver(
+            futures::stream::iter([()]),
+            move || {
+                let verified = verified.clone();
+                async move { Ok(Some(verified)) }
+            },
+            None::<BackgroundSubmit>,
+            Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
+            move |payload| {
+                let agent = Arc::clone(&a_publish);
+                async move {
+                    agent
+                        .publish(RELEASE_TOPIC, payload)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+            },
+            a_shutdown,
+        ));
+
+        let queued = tokio::time::timeout(Duration::from_secs(10), queued_rx.recv())
+            .await
+            .expect("the peer did not queue the release within 10 s");
+        assert_eq!(
+            queued,
+            Some((expected_version, SubmitOutcome::Accepted)),
+            "the peer's owner accepted the announced release"
+        );
+        a_driver.abort();
+        b_driver.abort();
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
     async fn upgrade_route_state(agent: Arc<Agent>, data_dir: &std::path::Path) -> Arc<AppState> {
         super::super::named_groups::tests::secure_endpoint_test_state_at_with_self_update(
             data_dir, agent, true,
@@ -2638,6 +3320,160 @@ mod tests {
             parts.status,
             serde_json::from_slice(&bytes).expect("response json"),
         )
+    }
+
+    async fn diagnostics_json(state: &Arc<AppState>) -> serde_json::Value {
+        let response = super::super::network::upgrade_diagnostics(State(Arc::clone(state)))
+            .await
+            .into_response();
+        let (status, body) = route_response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    }
+
+    /// #1381: `GET /diagnostics/upgrade` reports the channel, the highest
+    /// verified version seen on the release topic, the last check and the
+    /// pending update. Before anything is observed the fields are present
+    /// and null; the background owner's selected release wins over a
+    /// sighting.
+    #[tokio::test]
+    async fn upgrade_diagnostics_reports_topic_check_and_pending_update() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = loopback_gossip_agent(dir.path()).await;
+        let state = upgrade_route_state(Arc::clone(&agent), dir.path()).await;
+
+        let body = diagnostics_json(&state).await;
+        assert_eq!(body["channel"], "stable", "{body}");
+        for field in [
+            "latest_release_topic_version",
+            "last_check",
+            "pending_update",
+        ] {
+            assert_eq!(
+                body.get(field),
+                Some(&serde_json::Value::Null),
+                "{field} is present and null before anything is observed: {body}"
+            );
+        }
+
+        let newer = version_newer_than_current();
+        observe_upgrade(&state.upgrade_observations, |record| {
+            record.record_topic_release(&newer, 1_700_000_000);
+            record.record_check(
+                ReleaseCheckSource::FallbackPoll,
+                ReleaseCheckOutcome::UpToDate,
+                1_700_000_100,
+            );
+        });
+        let body = diagnostics_json(&state).await;
+        assert_eq!(
+            body["latest_release_topic_version"],
+            serde_json::json!({ "version": newer, "seen_at_unix": 1_700_000_000u64 })
+        );
+        assert_eq!(
+            body["last_check"],
+            serde_json::json!({
+                "source": "fallback_poll",
+                "at_unix": 1_700_000_100u64,
+                "outcome": "up_to_date",
+                "version": null,
+            })
+        );
+        assert_eq!(
+            body["pending_update"],
+            serde_json::json!({ "version": newer, "state": "observed", "source": "release_topic" })
+        );
+
+        let submit = BackgroundSubmit::default();
+        let queued = submittable_release(&newer);
+        assert_eq!(
+            submit.submit(queued).expect("queued"),
+            SubmitOutcome::Accepted
+        );
+        assert!(state.background_submit.set(submit).is_ok());
+        let body = diagnostics_json(&state).await;
+        assert_eq!(
+            body["pending_update"],
+            serde_json::json!({ "version": newer, "state": "queued", "source": "background_owner" })
+        );
+
+        agent.shutdown().await;
+    }
+
+    /// #1381: the topic record keeps the highest verified version; an
+    /// older release seen later does not replace it.
+    #[tokio::test]
+    async fn topic_observation_keeps_the_highest_verified_version() {
+        let mut higher = semver::Version::parse(x0x::VERSION).expect("semver");
+        higher.minor += 1;
+        let higher = higher.to_string();
+        let lower = version_newer_than_current();
+        let observations = Arc::new(std::sync::Mutex::new(UpgradeObservations::default()));
+        let seen: Vec<_> = observe_topic_releases(
+            futures::stream::iter([
+                verified_release_with_version(&higher),
+                verified_release_with_version(&lower),
+            ]),
+            Arc::clone(&observations),
+        )
+        .collect()
+        .await;
+        assert_eq!(seen.len(), 2, "observation passes every release on");
+        let json = observations
+            .lock()
+            .expect("observations")
+            .diagnostics_json(x0x::VERSION, None);
+        assert_eq!(json["latest_release_topic_version"]["version"], higher);
+        assert_eq!(json["pending_update"]["version"], higher);
+    }
+
+    /// #1381: a `GET /upgrade` check that reaches the monitor records its
+    /// result; the cached answer that follows records nothing new.
+    #[tokio::test]
+    async fn upgrade_check_records_the_last_check() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = loopback_gossip_agent(dir.path()).await;
+        let state = upgrade_route_state(Arc::clone(&agent), dir.path()).await;
+        let expected = version_newer_than_current();
+        let _feed =
+            upgrade_check_feed_seam::install(Some(verified_release_with_version(&expected)));
+        let (status, _) = route_response_json(check_upgrade(State(Arc::clone(&state))).await).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let body = diagnostics_json(&state).await;
+        assert_eq!(body["last_check"]["source"], "api", "{body}");
+        assert_eq!(body["last_check"]["outcome"], "update_available");
+        assert_eq!(body["last_check"]["version"], serde_json::json!(expected));
+        assert_eq!(body["pending_update"]["source"], "api");
+        assert!(
+            body["latest_release_topic_version"].is_null(),
+            "a check is not a topic sighting: {body}"
+        );
+        agent.shutdown().await;
+    }
+
+    /// #1381: the background owner reports its release while it has work
+    /// for it and nothing once it has none.
+    #[test]
+    fn background_status_follows_the_slot() {
+        let submit = BackgroundSubmit::default();
+        assert_eq!(submit.status(), None);
+        let version = version_newer_than_current();
+        submit
+            .submit(submittable_release(&version))
+            .expect("queued");
+        assert_eq!(
+            submit.status().map(|status| (status.version, status.state)),
+            Some((version.clone(), "queued"))
+        );
+        {
+            let mut slot = submit.slot.lock().expect("slot");
+            slot.pending = false;
+            slot.failed_at = Some(Instant::now());
+        }
+        assert_eq!(submit.status().map(|status| status.state), Some("backoff"));
+        submit.slot.lock().expect("slot").failed_at = None;
+        assert_eq!(submit.status(), None, "nothing left for the release");
     }
 
     /// Engineer ruling 3 Nov 2026 17:40 GMT: GET /upgrade is a read-only
@@ -2688,6 +3524,154 @@ mod tests {
                 .is_err(),
             "nothing may self-deliver on the release topic from a check"
         );
+    }
+
+    /// A fake install with one probe record in `phase` for `version`.
+    #[cfg(unix)]
+    fn install_with_probe_record(
+        dir: &std::path::Path,
+        version: &str,
+        phase: crate::upgrade::probe::ProbePhase,
+        cause: crate::upgrade::probe::ProbeCause,
+    ) -> PathBuf {
+        let install = dir.join("x0xd");
+        std::fs::write(&install, b"installed daemon").expect("install fixture");
+        let install = install.canonicalize().expect("canonical install");
+        let state = crate::upgrade::probe::ProbeState {
+            schema_version: 1,
+            record_kind: "probe".into(),
+            install: install.clone(),
+            version: version.into(),
+            platform: "test-platform".into(),
+            archive_sha256: [7; 32],
+            transaction_id: uuid::Uuid::new_v4().to_string(),
+            attempt: 1,
+            phase,
+            cause: Some(cause),
+            last_pid: None,
+            boot_id: "test-boot".into(),
+            retry_remaining_ms: 0,
+            retry_deadline_ms: 0,
+            daemon_sha256: None,
+            cli_sha256: None,
+        };
+        crate::upgrade::journal::write_auxiliary_record(
+            &crate::upgrade::probe::state_path(&install).expect("state path"),
+            &state,
+            |_| Ok(()),
+        )
+        .expect("probe record fixture");
+        install
+    }
+
+    // #1376 / D190: an authenticated local clear removes a failed-release
+    // hold for exactly that version, records a durable receipt, and the
+    // held release is admitted again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clear_upgrade_hold_route_records_and_removes_a_failed_hold() {
+        use crate::upgrade::probe::{self, Admission, ProbeCause, ProbePhase};
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = loopback_gossip_agent(dir.path()).await;
+        let state = upgrade_route_state(Arc::clone(&agent), dir.path()).await;
+        let install = install_with_probe_record(
+            dir.path(),
+            "9.9.9",
+            ProbePhase::FailedHold,
+            ProbeCause::VersionMismatch,
+        );
+        let _install = crate::upgrade::apply::current_binary_path_seam::install(install.clone());
+        assert!(
+            matches!(
+                probe::inspect_admission(&install, "9.9.9"),
+                Err(probe::ProbeRefusal::Held { .. })
+            ),
+            "fixture: the release starts held"
+        );
+
+        let clear = |version: &str| {
+            clear_upgrade_hold(
+                State(Arc::clone(&state)),
+                Query(UpgradeClearHoldQuery {
+                    version: Some(version.into()),
+                }),
+            )
+        };
+        let (status, body) = route_response_json(clear("9.9.8").await).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "another version: {body}");
+        assert!(probe::read_state(&install).expect("read").is_some());
+
+        let (status, body) = route_response_json(clear("9.9.9").await).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["cleared"], serde_json::json!(true));
+        assert_eq!(body["cause"], serde_json::json!("version_mismatch"));
+        assert!(
+            probe::read_state(&install).expect("read").is_none(),
+            "the hold record is removed"
+        );
+        let receipt: probe::HoldClearReceipt = serde_json::from_slice(
+            &crate::upgrade::journal::read_auxiliary_record(
+                &probe::clear_receipt_path(&install).expect("receipt path"),
+            )
+            .expect("durable receipt"),
+        )
+        .expect("receipt decodes");
+        assert_eq!(receipt.version, "9.9.9");
+        assert_eq!(receipt.cause, ProbeCause::VersionMismatch);
+        assert_eq!(
+            probe::inspect_admission(&install, "9.9.9").expect("admitted"),
+            Admission::Ready
+        );
+
+        let (status, body) = route_response_json(clear("9.9.9").await).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a repeat finds no hold: {body}"
+        );
+        let (status, _) = route_response_json(clear("not-a-version").await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // D190: recovery-failed is never cleared by the local route; the record
+    // stays and admission still refuses.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clear_upgrade_hold_route_never_clears_recovery_failed() {
+        use crate::upgrade::probe::{self, ProbeCause, ProbePhase};
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = loopback_gossip_agent(dir.path()).await;
+        let state = upgrade_route_state(Arc::clone(&agent), dir.path()).await;
+        let install = install_with_probe_record(
+            dir.path(),
+            "9.9.9",
+            ProbePhase::RecoveryFailed,
+            ProbeCause::HoldWriteFailed,
+        );
+        let _install = crate::upgrade::apply::current_binary_path_seam::install(install.clone());
+
+        let (status, body) = route_response_json(
+            clear_upgrade_hold(
+                State(Arc::clone(&state)),
+                Query(UpgradeClearHoldQuery {
+                    version: Some("9.9.9".into()),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["cleared"], serde_json::json!(false));
+        let kept = probe::read_state(&install)
+            .expect("read")
+            .expect("record kept");
+        assert_eq!(kept.phase, ProbePhase::RecoveryFailed);
+        assert!(!probe::clear_receipt_path(&install).expect("path").exists());
+        assert!(matches!(
+            probe::inspect_admission(&install, "9.9.9"),
+            Err(probe::ProbeRefusal::RecoveryFailed { .. })
+        ));
     }
 
     /// The apply path is the one announcing route: an explicit owner
@@ -2750,6 +3734,17 @@ mod tests {
             &received.payload[..],
             expected_payload.as_slice(),
             "the announced payload is the verified gossip payload"
+        );
+        assert!(
+            state
+                .self_published_release_manifests
+                .lock()
+                .await
+                .recorded_by_apply_route(
+                    &release_manifest_payload_digest(&expected_payload),
+                    Instant::now()
+                ),
+            "the route records its announcement so the gossip driver skips its self-delivery"
         );
     }
 
@@ -3029,6 +4024,7 @@ mod tests {
                 shutdown_watch,
                 #[cfg(unix)]
                 staging,
+                observations: None,
             },
             shutdown_tx,
         )

@@ -6,6 +6,94 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`GET /diagnostics/upgrade` reports the upgrade records on disk (#1381
+  M2 part, A14 amendment of 15 Nov 2026).** New fields: `plan` (the safe-apply
+  journal's transaction, phase and versions), `last_attempt` (the pre-swap
+  probe record), `holds` (failed-release or recovery-failed, with whether
+  `x0x upgrade --clear-hold` applies), `last_hold_clear`, `backups` (backup
+  files beside the daemon and CLI) and `records_error`. Fixed record names
+  only; no recorded path is followed and no argv, environment or free-text
+  cause is returned.
+- **A join request the authority refuses as `stale` is signed again over the
+  authority's head (#1840 routes 1–3, A08 amendment of 15 Nov 2026).** A
+  second joiner on a group with members, a request that crosses an edit of
+  the group, and a removed member asking again are now listed and can be
+  approved. The authority sends its head (signed head commit, roster, public
+  metadata) to the requester whose turn it is in the join queue; the
+  requester checks it, signs the same request again over it and offers it,
+  and after approval it can apply the approval link. A requester that waits
+  behind another turn gets no outcome until its turn. New capability bit 19,
+  `join_request_head_v1`; a peer without it keeps the earlier behaviour.
+- **W3-H row `s4_intake_and_egress`, machine-revocation part (#1581, D70).**
+  A control arm checks that a machine-only revocation keeps the agent's
+  group seat and opens no S4 row. An egress arm, pinned RED, records a
+  known gap: after a later rotation a TreeKEM member's revoked device still
+  reaches the new epoch through its kept leaf. The row has its own W3-H
+  shard (`1581i`).
+- **A `stale` join-request outcome can carry the authority's head (#1840,
+  A08 amendment of 15 Nov 2026).** New optional `head` field on
+  `groups::join_outcome::JoinRequestOutcome` (signed head commit, roster
+  projection, public metadata) and `groups::join_outcome::adopt_join_head`,
+  which checks a head against a requester's copy and installs it. Wire and
+  library only: nothing sends or uses a head yet.
+- **`GET /diagnostics/upgrade` reports release observations (#1381, A14
+  amendment of 15 Nov 2026).** New fields: `channel` (`stable` or
+  `prerelease`), `latest_release_topic_version` (highest verified release
+  seen on `x0x/release`), `last_check` (source, time and outcome of the last
+  startup, fallback-poll or `GET /upgrade` check) and `pending_update` (the
+  background apply owner's queued, applying or failed release, else the
+  newest observed newer version). Memory only; reset on restart. `x0x doctor`
+  uses `pending_update`.
+- **`system.health_verdict` and `system.upgrade_state` events on
+  `GET /events` and `/ws` (#1351, A14 amendment of 15 Nov 2026).** The 5 s
+  health refresher emits one event when the M1 `/health` verdict changes and
+  one when its upgrade input changes (state, `update_available`,
+  `latest_version`, `handoff_pending`, `failed_artifact`). The first check
+  after start is the baseline and emits nothing. `/ws` sessions get typed
+  frames `{"type":"system.…","data":{…}}`.
+- **`POST /direct/send` names a revoked recipient machine (#1597 item 4,
+  ADR 0110 D70).** A send whose resolved recipient machine is revoked answers
+  `403 recipient_machine_revoked` (Rust: `DmError::RecipientMachineRevoked
+  { machine }`) instead of a generic transport error. Nothing is sent; the
+  agent keeps its group seats. A revoked binding still answers
+  `recipient_pairing_denied`.
+- **`GET /sync/devices` names the source of each device's enrollment record
+  (#1107).** Each row has `record_source` (`"local"` when this machine wrote
+  the stored owner-device record, `"synced"` when another owner device wrote
+  it) and `record_writer_machine_id` (hex machine id of that writer). Both are
+  `null` when no stored record holds the enrollment shown, for example a new
+  enrollment that is not minted yet.
+- **Share grants last at most 90 days; `POST /grants/:id/renew` renews one
+  (#1350, D35, A03 amendment of 14 Nov 2026).** `POST /grants` refuses a
+  window above 90 days with `400`, and a daemon does not store (or ACK) a
+  longer grant it receives. Grants already stored keep loading. Renewal signs
+  a new grant with the same grantee, agents and caps, valid from now for at
+  most 90 days (default 90), and delivers it; the old grant stays valid to its
+  own expiry, so there is no gap. CLI: `x0x grant renew <id> [--ttl-secs N]
+  [--no-names]`.
+- **GUI scratch app and deep link (#1094).** Each space has a Scratch tab
+  for the group's sealed `scratch` store: list keys, view, edit, save and
+  delete short text values. `#/groups/<id>/scratch` and the short form
+  `#/scratch/<id>` open it, in the GUI and through `POST /gui/show`.
+- **`task:changed` SSE event on `GET /events` (#1094).** The task-list
+  sibling of `kv:changed`: one event per list per 200 ms window on a local
+  mutation or a merged peer delta, with `list_id` and `origins`, no task
+  content. Library: `Agent::subscribe_task_changes`.
+- **`kv:changed` SSE event on `GET /events` (#1094).** A KV store this
+  daemon has open sends one event per 200 ms window when it changes (local
+  write or delete, merged peer record, direct delta): `store_id` and the
+  set of `origins`, no keys or values. A `lagged` event says notices were
+  lost. Library: `Agent::subscribe_kv_changes`.
+- **A join request that the group owner refuses gets a typed outcome (#1840).**
+  The owner's daemon sends the requester a direct message with a reason:
+  `stale`, `already_member`, `banned`, `pending_exists` or `invalid`. Only
+  `stale` is retryable. `GET /groups/:id` shows it as
+  `own_join_request.status = "refused"` with a `refusal` object. Both daemons
+  must advertise capability bit 16; an older daemon keeps the old behaviour.
+- **A share grant may start at most 600 s in the future (#1350 follow-up).**
+  A daemon refuses (`POST /grants` 400; no store and no ACK on receipt) a
+  grant whose `not_before` is more than 600 s ahead of its clock, so a
+  chain of pre-signed grants cannot extend access past 90 days.
 - **Read-only `GET /diagnostics/sidecar-quarantine` (#1597, D148).** It lists
   each ADR 0108 §5a quarantined sidecar copy (pending or history) with its
   `txid` and size in bytes, plus `count` and `total_bytes`. It does not change
@@ -23,6 +111,64 @@ All notable changes to this project will be documented in this file.
   still peeks a PubSub kind only under ADR 0013 pressure.
 
 ### Changed
+
+- **A TreeKEM member that stays up through a network outage catches up
+  when it connects again (#1427, A09 second amendment of 15 Nov 2026).**
+  When the first peer connects after the node had no connected peer for
+  longer than the last metadata resend (60 s), it runs the start catch-up
+  for each TreeKEM group. One such pass runs at a time. At restore, a
+  re-add that comes after a held removal is now served; only the adds
+  before that removal are held back. No wire format or API changes.
+
+- **A node that restarted still serves the TreeKEM commits it held
+  (#1427).** The TreeKEM catch-up log is saved under `treekem-catchup-log/`
+  in the data directory (one file per group, local only) and loaded at
+  start. A member that was offline when a commit was made can catch up
+  from a signer that restarted since. A removal or ban that has an ADR
+  0110 (S4) row, in any phase, is not loaded from the saved file. The file
+  is versioned; a damaged or unknown-version file is skipped. A requester
+  removed or banned after its cached add is no longer served pages. A
+  start catch-up cycle now waits for another running catch-up task of the
+  same group to end before it judges the cycle. No wire format or API
+  changes.
+
+- **Docs: what a machine revocation protects (#1929).** A machine revocation
+  denies delivery, transport and requests to that device. It does not cut a
+  device that still holds the agent key off TreeKEM group content, because
+  the leaf keys derive from the agent key. To cut off a lost or stolen
+  device, revoke the agent or remove the member. See
+  `docs/trust-and-connectivity.md`, `docs/api-reference.md` and A09.
+- **Documented the exit for a forked head behind an armed gap record
+  (#871).** The anchored-gap gate has no expiry and no local clear. With no
+  progress (10 minutes for an owner-armed gap, 30 minutes for an
+  admin-armed gap) the node asks for an attestation, shows
+  `reseat_required {not_on_chain}` with a `gap` ref, and an admin's manual
+  re-seat (ADR 0109 §3) retires the record. A08 amendment of 15 Nov 2026.
+  No code change.
+
+- **A TreeKEM member that was down past the last metadata resend asks for
+  the commits it missed after it starts (#1427).** With no later traffic,
+  such a member stayed at its old epoch. When its last recorded up time is
+  more than 60 s old, the daemon asks the other members of each TreeKEM
+  group for catch-up pages at start, and again after the network join ends
+  (in either order), so a slow bootstrap does not end the catch-up. While a
+  page moves the group, it asks for the next epoch (at most 16 cycles), so a
+  member several commits behind reaches the tip. Two new local files are in
+  the data directory: `treekem-alive` (the last up time, written every 15 s)
+  and `treekem-catchup-pending` (the outage record, kept until each group's
+  catch-up succeeds, so the next start asks again). A first start and a
+  shorter outage ask nothing. No wire format or API changes.
+
+- **A capability request whose direct answer was lost asks for the topic
+  answer next (#504 follow-up).** A responder that answers by unicast skips
+  its topic answer, so a lost direct frame left the requester without the
+  advert (the W3-H #1776 blind window). When a request that carried the
+  machine id ends without the flight's own requirement met (a usable
+  binding, the durable-ACK capability or the application bit; a stale
+  stored binding does not count), later requests to that responder omit it
+  for 10 minutes. A topic answer does not clear this record; only expiry or
+  a later met request that carried the machine id does. No wire format
+  change.
 
 - **The consent to disclose the user identity now survives a restart (#1107).**
   A successful `POST /announce` with `include_user_identity: true` and
@@ -47,6 +193,31 @@ All notable changes to this project will be documented in this file.
 
 ### Tests and tooling
 
+- **Launcher host coordinator recovery (#1376, S3c; A14 amendment of 15 Nov
+  2026).** A dormant coordinator pass (`src/upgrade/launcher/coordinator.rs`)
+  reconciles the host after a missing handoff, one healthy and one failed
+  participant, a coordinator death, a partial restore, a hold-write failure
+  and a reboot. It stops and reaps every live participant before a pair
+  restore, keeps `RecoveryFailed` final across restarts, and applies the
+  D189 retry rule. No production caller yet.
+- **Release propagation over real gossip (#1169).** A two-node loopback test
+  runs node A's fallback driver, which observes a signed release and
+  publishes it on `x0x/release`, and node B's gossip driver, which verifies
+  it and queues it with its background apply owner. It passes in about 4 s
+  against the issue's bar of 2 × the 600 s heartbeat.
+- **The W3-H row H-S3-d2 uses the ADR setup: the removed admin's invite is
+  minted at the shared head r (#1797).** With the invite-base roster fix,
+  the joiner on the fork holds a marker naming the owner's removal and shows
+  `reseat_required {not_a_member}`. The #1797 unit test's tampered-roster
+  control now forges an extra seat, so it proves the root check. A policy
+  change inside a served chain still fails closed (A08 amendment of 15 Nov
+  2026).
+- **The forward gate after a true restart of the receiver (#1107).** A new
+  real-path test shuts the receiving daemon down, builds it again from its
+  files, and opens a `ForwardV2` stream from an owner device it knows only
+  from the stored evidence; bytes reach the target with no consent or
+  announce re-issued. The test-only certificate-recovery hold is now a drop
+  guard, so a failing test cannot leave it set.
 - **The `delegation_spaces` binary joined the `quic-localhost` nextest group
   (#1283).** The groups job's issue #321 acceptance selector runs three
   daemon-mesh tests from that binary in one nextest invocation; nextest runs
@@ -81,6 +252,27 @@ All notable changes to this project will be documented in this file.
   registered=0`. Fixtures log at `warn`, where dial and join activity is
   not recorded. A daemon that does not answer keeps unknown counts; it is
   never reported as zero connections.
+
+### Fixed
+
+- **A listener-admission marker that can never complete no longer blocks join
+  requests (#1840, A08 amendment of 15 Nov 2026).** An early-gate refusal
+  (revoked or unverified sender, revocation-resync hold, withdrawn group), an
+  expired marker, and a marker whose group was deleted or withdrawn now
+  release the journal, live and at startup, with the sidecar bytes kept as
+  evidence. A requester signs one request again over the authority's head at
+  most 8 times per offer, and a re-seal no longer restarts the offer backoff.
+- **A daemon that restarts with pending S4 work no longer seals a stale
+  head (#1581).** If the `.evs` file held an unsealed revocation-eviction
+  row, the group needs a holder to confirm its head before S4 seals there.
+  Until then the row shows `waiting_for_head_sync`, also past the 13 s
+  restart sync wait. Before, the wait alone counted as a synced head, and a
+  restarted admin could seal its stale head with a divergent key.
+- **A demoted S4 worker shows `local_committer_ineligible` (#1581).** An
+  admin that is demoted to member while it holds an open revocation-eviction
+  row now marks the row `local_committer_ineligible` naming the next
+  admin, as ADR 0110 §4 wants. Before, the row showed
+  `waiting_for_designated_admin`.
 
 ## [v0.48.1] - 2026-10-17
 

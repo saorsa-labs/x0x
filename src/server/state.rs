@@ -32,7 +32,7 @@ use super::routes::{
     ListenerRegistration, NamedGroupMetadataEvent, ParkedRoleUpdate, PendingCausalApproval,
     PendingJoinAttempt, PendingJoinRefusal, PendingJoinResult, PendingTreeKemMetadataEvent,
     PendingWelcome, PendingWelcomeReceive, PredecessorRelayObligation, RestSubscription,
-    WelcomeFetchWaiter,
+    SelfPublishedReleaseManifests, WelcomeFetchWaiter,
 };
 use super::sse::SseEvent;
 use super::ws::{SharedTopicState, WsOutboundStats, WsSession};
@@ -1304,6 +1304,24 @@ pub(super) struct AppState {
     /// task runs; each later observation updates the entry.
     pub(super) treekem_epoch_ahead_targets:
         Mutex<HashMap<String, crate::server::routes::named_groups::EpochAheadTarget>>,
+    /// #1427: the keys of the TreeKEM groups whose start catch-up has not
+    /// succeeded since an outage past the last metadata resend. The
+    /// outage record on disk stays until this set is empty.
+    pub(super) treekem_start_catchup_pending: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// #1427: true once the network join task has ended (Ok or Err). A
+    /// start catch-up waits for it, in any order, and then asks again for
+    /// each group that is still pending.
+    pub(super) treekem_network_join_ended: tokio::sync::watch::Sender<bool>,
+    /// #1427: how many start catch-up passes this daemon began. A pass is
+    /// one run of the start catch-up for one group, which runs up to 16
+    /// catch-up cycles; a group gets a first pass at start and at most one
+    /// more after the network join. Diagnostics only.
+    pub(super) treekem_start_catchup_passes: std::sync::atomic::AtomicU64,
+    /// #1427: how many reconnect catch-up passes this daemon began. A
+    /// reconnect pass runs the start catch-up for every TreeKEM group after
+    /// the node had no connected peer for longer than the last metadata
+    /// resend. Diagnostics only.
+    pub(super) treekem_reconnect_catchup_passes: std::sync::atomic::AtomicU64,
     /// #1657 (ADR 0110 §3): the latest typed TreeKEM catch-up refusal
     /// this daemon received, per group, keyed by the group id its own
     /// request used. Surfaced in the operator log at receive time and
@@ -1312,6 +1330,13 @@ pub(super) struct AppState {
     /// refusal for a group this node does not hold records nothing
     /// (review finding 2), so the map is bounded by the local groups.
     pub(super) treekem_catchup_refusals: StdMutex<HashMap<String, TreeKemCatchupRefusalNote>>,
+    /// Issue #1840: when (Unix millis) and to which requester this
+    /// authority last sent a join-request outcome, per refused envelope
+    /// digest. It limits the outcome to one per digest per interval;
+    /// `join_request_outcome` prunes it and caps it per requester and in
+    /// total.
+    pub(super) join_request_outcome_sends:
+        StdMutex<HashMap<[u8; 32], (u64, crate::identity::AgentId)>>,
     /// Per-group serialization for authoritative membership mutations. The
     /// owner-side `MemberJoined`→`MemberAdded` add (and every other membership
     /// apply) is a read-modify-write that loads `info`, mutates a clone, mutates
@@ -1395,6 +1420,17 @@ pub(super) struct AppState {
     pub(super) upgrade_apply_lock: Arc<Mutex<()>>,
     /// Bounds HTTP staging waits without holding the shared replacement lock.
     pub(super) http_upgrade_wait_lock: Arc<Mutex<()>>,
+    /// Release-topic payloads this daemon published itself. Shared by
+    /// `/upgrade/apply` and the gossip/fallback/startup publishers so the
+    /// gossip driver neither rebroadcasts nor re-submits its own
+    /// self-delivered announcement (#1169).
+    pub(super) self_published_release_manifests: Arc<Mutex<SelfPublishedReleaseManifests>>,
+    /// Releases seen on the topic and the last release check (#1381),
+    /// reported by `GET /diagnostics/upgrade`. Memory only.
+    pub(super) upgrade_observations: Arc<std::sync::Mutex<super::routes::UpgradeObservations>>,
+    /// The background apply owner's intake, once the daemon has started it
+    /// (#1381: `pending_update` reads its selected release).
+    pub(super) background_submit: std::sync::OnceLock<super::routes::BackgroundSubmit>,
     /// Actual boot identity; unavailable identity refuses HTTP update only.
     #[cfg(unix)]
     pub(super) upgrade_staging: Option<super::routes::StartupStagingContext>,
@@ -1651,6 +1687,11 @@ pub(super) struct NamedGroupTestRecorders {
     /// returns an error. Tests that want the success arm set this. Production
     /// leaves it false and uses the transport result.
     pub(super) metadata_publish_force_ok: std::sync::atomic::AtomicBool,
+    /// #1840: the unit-test agent has no gossip runtime, so a publish that
+    /// must return its signed V2 envelope returns none. Tests that need the
+    /// envelope set this; the publish then returns the envelope the gossip
+    /// layer would sign (`sign_v2_envelope`), without a transport.
+    pub(super) metadata_publish_envelope: std::sync::atomic::AtomicBool,
     /// #1113 startup catch-up: tests that want a page send to count as
     /// delivered set this. Production builds omit the recorders.
     pub(super) catchup_page_force_ok: std::sync::atomic::AtomicBool,

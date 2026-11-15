@@ -85,6 +85,38 @@ pub(in crate::server) struct RequesterOfferObligation {
     pub(in crate::server) next_retry_at_ms: u64,
     /// Offer attempts completed so far.
     pub(in crate::server) retry_count: u32,
+    /// Issue #1840: set when the authority refused this exact envelope
+    /// (see `join_request_outcome`). A refused obligation is never offered
+    /// again; it stays until the local request stops being pending, so the
+    /// API can show the refusal. Absent from the sidecar bytes when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::server) refusal: Option<RequesterOfferRefusal>,
+    /// Issue #1840: how many times this request was signed again over an
+    /// authority's head ([`JOIN_REQUEST_RESEAL_CAP`] bounds it). Absent from
+    /// the sidecar bytes when zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(in crate::server) reseal_count: u32,
+}
+
+/// Issue #1840: the most times one request is signed again over a head the
+/// authority sent. A head that would pass this cap becomes the stale
+/// refusal, so an authority whose state keeps moving cannot hold the
+/// requester in a sign-and-offer loop.
+pub(in crate::server) const JOIN_REQUEST_RESEAL_CAP: u32 = 8;
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// Issue #1840: the authority's typed refusal of one offered envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(in crate::server) struct RequesterOfferRefusal {
+    /// `JoinRequestRefusalReason::as_str` of the received reason.
+    pub(in crate::server) reason: String,
+    /// `true` when a new envelope sealed over a fresh head can succeed.
+    pub(in crate::server) retryable: bool,
+    /// Unix-epoch millis when this daemon recorded the refusal.
+    pub(in crate::server) refused_at_ms: u64,
 }
 
 /// Sidecar shape: version + obligations grouped by group id.
@@ -193,6 +225,88 @@ pub(in crate::server) async fn insert_requester_offer_obligation(
     }
 }
 
+/// Issue #1840 routes 1–3: replace the offered envelope of `(group,
+/// request_id)` with `envelope`, a new seal of the same request, durably,
+/// when the stored obligation still offers `old_digest`. The new envelope is
+/// due now, with no refusal, and counts one more re-seal. The retry count
+/// is kept, so the backoff does not start again at each re-seal. `Ok(false)`
+/// when there is no such obligation or it offers another envelope.
+pub(in crate::server) async fn replace_requester_offer_envelope(
+    state: &AppState,
+    group_id: &str,
+    request_id: &str,
+    old_digest: [u8; 32],
+    envelope: Vec<u8>,
+    now_ms: u64,
+) -> Result<bool, String> {
+    let Some(mut next) = find_requester_offer(state, group_id, request_id).await else {
+        return Ok(false);
+    };
+    if next.digest != old_digest {
+        return Ok(false);
+    }
+    next.digest = blake3::hash(&envelope).into();
+    next.byte_size = envelope.len();
+    next.envelope_bytes = envelope;
+    next.next_retry_at_ms = now_ms;
+    next.refusal = None;
+    next.reseal_count = next.reseal_count.saturating_add(1);
+    match outbox(state)
+        .replace_if(next, |stored| stored.digest == old_digest)
+        .await
+    {
+        Ok(replaced) => Ok(replaced),
+        Err(e) if e.crossed_rename() => Ok(true),
+        Err(e) => Err(format!("failed to write requester offer outbox: {e}")),
+    }
+}
+
+/// Issue #1840: record `refusal` on the stored obligation of
+/// `(group, request_id)`, durably, when `accept` admits the stored one.
+/// `Ok(false)` when there is no such obligation or `accept` refuses it.
+pub(in crate::server) async fn mark_requester_offer_refused(
+    state: &AppState,
+    group_id: &str,
+    request_id: &str,
+    refusal: RequesterOfferRefusal,
+    accept: impl Fn(&RequesterOfferObligation) -> bool,
+) -> Result<bool, String> {
+    let Some(mut refused) = find_requester_offer(state, group_id, request_id).await else {
+        return Ok(false);
+    };
+    if !accept(&refused) {
+        return Ok(false);
+    }
+    refused.refusal = Some(refusal);
+    // `accept` runs again on the entry stored under the persistence lock.
+    match outbox(state)
+        .replace_if(refused, |stored| accept(stored))
+        .await
+    {
+        Ok(replaced) => Ok(replaced),
+        // After the rename the disk and memory hold the refusal (#1101), so
+        // it is in effect; only the directory fsync is unconfirmed.
+        Err(e) if e.crossed_rename() => Ok(true),
+        Err(e) => Err(format!("failed to write requester offer outbox: {e}")),
+    }
+}
+
+/// The stored obligation of `(group, request_id)`, if any.
+pub(in crate::server) async fn find_requester_offer(
+    state: &AppState,
+    group_id: &str,
+    request_id: &str,
+) -> Option<RequesterOfferObligation> {
+    state
+        .requester_offer_outbox
+        .read()
+        .await
+        .get(group_id)?
+        .iter()
+        .find(|o| o.request_id == request_id)
+        .cloned()
+}
+
 /// Load the outbox at boot. Missing ⇒ empty. Malformed, wrong version, or
 /// over the daemon caps ⇒ empty + an error, and the file is moved aside
 /// (#942 M2) so the operator keeps the evidence and the next insert
@@ -217,7 +331,10 @@ pub(in crate::server) async fn nudge_requester_offers_for(
 /// Is the obligation's join still live — pending, in a live group? When
 /// this is false the offer can never matter again (an authority may only
 /// act on a pending request), so the worker drops it.
-async fn offer_still_live(state: &AppState, obligation: &RequesterOfferObligation) -> bool {
+pub(in crate::server) async fn offer_still_live(
+    state: &AppState,
+    obligation: &RequesterOfferObligation,
+) -> bool {
     let groups = state.named_groups.read().await;
     let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, &obligation.group_id)
     else {
@@ -247,11 +364,16 @@ pub(in crate::server) async fn requester_offer_step(state: &std::sync::Arc<AppSt
     let mut resolved: Vec<RequesterOfferObligation> = Vec::new();
     let mut to_send: Vec<RequesterOfferObligation> = Vec::new();
     for obligation in due {
-        if offer_still_live(state, &obligation).await {
-            to_send.push(obligation);
-        } else {
+        if !offer_still_live(state, &obligation).await {
             resolved.push(obligation);
+        } else if obligation.refusal.is_none() {
+            to_send.push(obligation);
         }
+        // Issue #1840: a refused envelope of a still-pending request is
+        // kept and never offered again.
+    }
+    if resolved.is_empty() && to_send.is_empty() {
+        return;
     }
     // #942 r4 (bounded pass): a per-pass SEND budget — a hundred slow
     // strict sends can no longer starve a brand-new obligation behind
@@ -269,6 +391,8 @@ pub(in crate::server) async fn requester_offer_step(state: &std::sync::Arc<AppSt
         );
         dm_payload.extend_from_slice(GROUP_PREDECESSOR_RELAY_DM_PREFIX);
         dm_payload.extend_from_slice(&obligation.envelope_bytes);
+        #[cfg(test)]
+        offer_send_seam::record(state, authority, dm_payload.clone());
         // #942 r3 (B4): dual-wire delivery, the bootstrap-outbox pattern.
         // A v2-capable authority gets the STRICT config (send Ok = the
         // handler's durable disposition, logical_request_id makes retries
@@ -365,6 +489,8 @@ mod tests {
             first_seen_ms,
             next_retry_at_ms: 0,
             retry_count: 0,
+            refusal: None,
+            reseal_count: 0,
         }
     }
 
@@ -407,5 +533,36 @@ mod tests {
         // seen earliest) is gone, the newest survives.
         assert!(!by_group.contains_key("g0"));
         assert!(by_group.contains_key(&format!("g{}", CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP + 7)));
+    }
+}
+
+/// Test-only record of the offer payloads the worker handed to the send,
+/// per requester daemon.
+#[cfg(test)]
+pub(in crate::server) mod offer_send_seam {
+    use crate::identity::AgentId;
+    use crate::server::state::AppState;
+    use std::sync::Mutex;
+
+    type Sent = (String, AgentId, Vec<u8>);
+    static SENT: Mutex<Vec<Sent>> = Mutex::new(Vec::new());
+
+    pub(super) fn record(state: &AppState, to: AgentId, payload: Vec<u8>) {
+        let from = hex::encode(state.agent.agent_id().as_bytes());
+        SENT.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((from, to, payload));
+    }
+
+    /// The offer payloads the requester `state` handed to the send, oldest
+    /// first.
+    pub(in crate::server) fn sent_by(state: &AppState) -> Vec<(AgentId, Vec<u8>)> {
+        let from = hex::encode(state.agent.agent_id().as_bytes());
+        SENT.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(sender, _, _)| *sender == from)
+            .map(|(_, to, payload)| (*to, payload.clone()))
+            .collect()
     }
 }

@@ -19,14 +19,14 @@
       "revision": 1,
       "path": "A02-r01-identity-keys-and-device-enrollment.md",
       "title": "Identity Keys and Device Enrollment",
-      "sha256": "6908b1754ff4ce9a368410ddce51bc1a107356fb011d26a5040c305d81ec46dc"
+      "sha256": "201936384200895db0aa07c689354f99b20e69a205eef3f19c1a761399b4a349"
     },
     {
       "id": "A03",
       "revision": 1,
       "path": "A03-r01-trust-permissions-sharing-and-revocation.md",
       "title": "Trust Permissions Sharing and Revocation",
-      "sha256": "de70dd2ea0cfb7d12405da38be3c25be3e9c1add7ba74a611e4dfea3f75d7a7f"
+      "sha256": "1e57eab2a5d235db45940083499262dc507b6fc326e2bca7cb0201928ad1d513"
     },
     {
       "id": "A04",
@@ -47,28 +47,28 @@
       "revision": 1,
       "path": "A06-r01-gossip-relay-roles-and-resource-limits.md",
       "title": "Gossip Relay Roles and Resource Limits",
-      "sha256": "5e703e9b3cf557d1c26915753f003b856ba0b3e98fcb72f5ebd546e00f2c5d7f"
+      "sha256": "edd85761668b3c55bbf10b396e93fc53b972c91ce724ca8bc4591d402c6f09da"
     },
     {
       "id": "A07",
       "revision": 1,
       "path": "A07-r01-messages-receipts-history-and-retry.md",
       "title": "Messages Receipts History and Retry",
-      "sha256": "43d4d2a4ada26358109fb326be1706ff6fed6204f72a83905232b2dda6080004"
+      "sha256": "b4511aca5387dd98b5a8faf1424935d514796e5d6995a2e38c8f14a544cbc59d"
     },
     {
       "id": "A08",
       "revision": 1,
       "path": "A08-r01-groups-home-membership-and-repair.md",
       "title": "Groups Home Membership and Repair",
-      "sha256": "58a96da4d869b867e16c7ff97bc1c2d995968eea4e3d36d03ecb76a8e1b424cf"
+      "sha256": "ee6044c2f975954d1862e622056fd9da18a6816361b9739d01e94dc0366e9b52"
     },
     {
       "id": "A09",
       "revision": 1,
       "path": "A09-r01-group-encryption-and-key-changes.md",
       "title": "Group Encryption and Key Changes",
-      "sha256": "272609cbcfda7febcf052a16b7a653606918c0eb773a100e353342a585816a10"
+      "sha256": "01f3a5537d585b77430d54e0a64294fc3e256ab8336488c1203879dcc27b03c1"
     },
     {
       "id": "A10",
@@ -103,7 +103,7 @@
       "revision": 1,
       "path": "A14-r01-health-updates-and-recovery.md",
       "title": "Health Updates and Recovery",
-      "sha256": "bb476e6351af665138a2d15cc194372b99f9c14e89a3edd1ac2a18b7bc843e2d"
+      "sha256": "fba444a326bc3960ee2949c74e942ffc3b51fa7a3b4bbf1326e0b497ace7d779"
     },
     {
       "id": "A15",
