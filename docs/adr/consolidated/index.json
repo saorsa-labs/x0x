@@ -40,14 +40,14 @@
       "revision": 1,
       "path": "A05-r01-connectivity-discovery-and-names.md",
       "title": "Connectivity Discovery and Names",
-      "sha256": "e482a68683e3d2f059820a307716bb1163be9ef3be9dd8f59298c756391d9d98"
+      "sha256": "cdcf81fb4633fbab5b1414de5616f1dd663ef91f52f8fc754d546dae2ef69a47"
     },
     {
       "id": "A06",
       "revision": 1,
       "path": "A06-r01-gossip-relay-roles-and-resource-limits.md",
       "title": "Gossip Relay Roles and Resource Limits",
-      "sha256": "edd85761668b3c55bbf10b396e93fc53b972c91ce724ca8bc4591d402c6f09da"
+      "sha256": "3042fd52fbea77cf3b49374d7d8f2beebfc06cdd55d38fc1f27f16d8443beebb"
     },
     {
       "id": "A07",
@@ -68,7 +68,7 @@
       "revision": 1,
       "path": "A09-r01-group-encryption-and-key-changes.md",
       "title": "Group Encryption and Key Changes",
-      "sha256": "01f3a5537d585b77430d54e0a64294fc3e256ab8336488c1203879dcc27b03c1"
+      "sha256": "2d2f6c9c3cbbcb010652dd6ea72c03fa56a49eb3dfd8c08f83f7c36684f7b4b9"
     },
     {
       "id": "A10",
@@ -103,7 +103,7 @@
       "revision": 1,
       "path": "A14-r01-health-updates-and-recovery.md",
       "title": "Health Updates and Recovery",
-      "sha256": "cfee5110ecfd38837a40500442d301229ee35bc409f986cec9c47d2d103f6174"
+      "sha256": "f59c451d82bb936b0c9acd0c00e10d010a0fc77445a056be6cc9b657565173d2"
     },
     {
       "id": "A15",

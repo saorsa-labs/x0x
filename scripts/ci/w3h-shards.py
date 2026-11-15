@@ -49,6 +49,9 @@ GROUPS = (
     # H-S3-q (#1572): the `s3` shard already takes about 90 min (run
     # 43366324030), so the H-S3-q variants have their own shard.
     ('s3-q', 'w3h_1356_red_s3_q_'),
+    # H-S3-q (3) (#1572) runs the H-S3-c3 prefix with O's restart, so it
+    # has its own shard like the other owner-axis rows.
+    ('s3-q3', 'w3h_1356_red_s3_q3_issuer_unreadable_sidecar$'),
     # H-S3-q2 (#1572): about 60 s per rerun in the 12-CPU VM, so about
     # 40 min for 20 reruns on a runner; its own shard, as H-S3-q.
     ('s3-q2', 'w3h_1356_control_s3_q2_sidecar_fault_cases$'),
@@ -61,6 +64,10 @@ GROUPS = (
     # 80-90 virtual seconds. `rest` is close to its deadline, so the row
     # has its own shard; the budget is not raised (31 Oct ruling, #1733).
     ('1581i', 'w3h_1581i_'),
+    # #1427: five catch-up rows, each about 25 s per rerun in the 12-CPU
+    # Lima VM. `rest` takes about 108 of its 120 minutes, so the rows have
+    # their own shard; the budget is not raised (31 Oct ruling, #1733).
+    ('1427', 'w3h_1427_'),
 )
 
 # The gate's reruns per case (D196). A group in `PARTS` runs them as that
@@ -84,7 +91,10 @@ RUNS = 20
 # 20 reruns about 107 min. That estimate is not a clear margin under the
 # 155-min S3 test deadline, so split it, do not raise the budget (31 Oct
 # ruling, #1733): 2 parts of 10 reruns take about 55 min each.
-PARTS = {'s3-d3': 4, 's3-1661': 2, 's3-rm4': 4, 's3-rm2': 2}
+# H-S3-q (3): one rerun is 172-203 s in the 12-CPU VM, so about 400 s on
+# the runner and about 135 min for 20 reruns, too close to the 155-min S3
+# test deadline: 2 parts of 10 reruns take about 70 min each.
+PARTS = {'s3-d3': 4, 's3-1661': 2, 's3-rm4': 4, 's3-rm2': 2, 's3-q3': 2}
 
 ROOT = Path(__file__).resolve().parents[2]
 

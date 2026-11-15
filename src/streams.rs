@@ -576,6 +576,14 @@ impl PeerStream {
         self.peer
     }
 
+    /// The lifecycle generation of the connection that carries this stream
+    /// (ant-quic#327). Fixed at open/accept time, so it stays the provenance
+    /// of the carrying connection even after a follow replaces the live
+    /// winner; the `u64::MAX` sentinel marks an unstamped stream.
+    pub(crate) fn connection_generation(&self) -> u64 {
+        self.send.connection_generation()
+    }
+
     /// The negotiated application protocol.
     #[must_use]
     pub fn protocol(&self) -> StreamProtocol {

@@ -1,4 +1,7 @@
-//! Only this owner starts, signals and waits for its candidate.
+//! Only this owner starts, signals and waits for its candidate. The one
+//! exception is `stop_foreign`: the S3c host coordinator stops a live
+//! process of another launcher before a pair restore, and that launcher
+//! (or init) still reaps it.
 use super::*;
 use std::ffi::OsString;
 use std::io::{Read, Write};
@@ -458,6 +461,122 @@ pub(super) fn identity(_pid: u32) -> io::Result<Identity> {
         io::ErrorKind::Unsupported,
         "launcher process custody requires Linux",
     ))
+}
+
+/// Stop a live process this launcher does not own: another participant's
+/// candidate or OLD daemon (S3c, #1376). The process is pinned by a pidfd
+/// and its identity is checked again after the pidfd opens, so a reused PID
+/// is never signalled. SIGTERM comes first, then SIGKILL, each followed by
+/// a bounded wait for the identity to be absent. The process's own parent
+/// reaps it; a process that is still present after SIGKILL and its wait is
+/// an error, which the coordinator turns into RecoveryFailed. A zombie
+/// still counts as present (`absent` reads `/proc/<pid>/stat`), so the
+/// target must not be a child of this process: `coordinator::recover`
+/// refuses one, and its caller reaps its own child first.
+#[cfg(target_os = "linux")]
+pub(super) fn stop_foreign(expected: &Identity) -> io::Result<()> {
+    use std::os::fd::OwnedFd;
+    if absent(expected)? {
+        return Ok(());
+    }
+    let pid = libc::pid_t::try_from(expected.pid).map_err(invalid)?;
+    // SAFETY: pidfd_open takes a pid and zero flags and returns a new
+    // descriptor or -1; it reads no caller memory.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if raw < 0 {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(error)
+        };
+    }
+    let raw = i32::try_from(raw).map_err(invalid)?;
+    // SAFETY: `raw` is the new descriptor that pidfd_open returned; this is
+    // its only owner.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw) };
+    // The pidfd now names one process. If that process is not the expected
+    // identity, the PID was reused: signal nothing.
+    if absent(expected)? {
+        return Ok(());
+    }
+    for signal in [libc::SIGTERM, libc::SIGKILL] {
+        // SAFETY: the pidfd is open and owned here; a null siginfo and zero
+        // flags ask the kernel for a plain kill-style signal.
+        let sent = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if sent < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(());
+            }
+            return Err(error);
+        }
+        if wait_absent(expected)? {
+            return Ok(());
+        }
+    }
+    Err(invalid(
+        "recovery-failed: participant of another launcher survived SIGKILL",
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn stop_foreign(_expected: &Identity) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "launcher process custody requires Linux",
+    ))
+}
+
+/// Whether the live process with this identity is a child of this
+/// process. Only its parent can reap a child, so the coordinator refuses
+/// to treat one as another launcher's process.
+#[cfg(target_os = "linux")]
+pub(super) fn is_own_child(expected: &Identity) -> io::Result<bool> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", expected.pid))?;
+    let parent: u32 = stat
+        .rsplit_once(')')
+        .ok_or_else(|| invalid("bad process stat"))?
+        .1
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| invalid("missing parent pid"))?
+        .parse()
+        .map_err(invalid)?;
+    Ok(parent == std::process::id())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn is_own_child(_expected: &Identity) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "launcher process custody requires Linux",
+    ))
+}
+
+/// Wait up to `REAP_MS` for the identity to be absent.
+#[cfg(target_os = "linux")]
+fn wait_absent(expected: &Identity) -> io::Result<bool> {
+    let start = Clock::now()?;
+    let until = start.ms.saturating_add(REAP_MS);
+    loop {
+        if absent(expected)? {
+            return Ok(true);
+        }
+        let now = Clock::now()?;
+        if now.boot != start.boot || now.ms >= until {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 pub(super) fn absent(expected: &Identity) -> io::Result<bool> {
@@ -1045,5 +1164,30 @@ mod boot_guards {
             <[u8; 32]>::from(Sha256::digest(b"candidate-bytes"))
         );
         assert!(filesystem::hash(&linked_executable).is_err());
+    }
+
+    /// A live process of another owner is stopped and its own parent
+    /// reaps it; a PID whose identity changed is never signalled.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_foreign_stops_a_live_process_and_skips_a_reused_pid() {
+        let mut live = Command::new("sleep").arg("30").spawn().unwrap();
+        let identity = identity(live.id()).unwrap();
+        // The other launcher's reaper.
+        let reaper = std::thread::spawn(move || live.wait().unwrap());
+        stop_foreign(&identity).unwrap();
+        assert!(absent(&identity).unwrap());
+        assert!(!reaper.join().unwrap().success());
+
+        let mut other = Command::new("sleep").arg("30").spawn().unwrap();
+        let mut stale = super::identity(other.id()).unwrap();
+        stale.start += 1;
+        stop_foreign(&stale).unwrap();
+        assert!(
+            other.try_wait().unwrap().is_none(),
+            "reused pid was signalled"
+        );
+        other.kill().unwrap();
+        other.wait().unwrap();
     }
 }

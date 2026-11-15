@@ -53,6 +53,10 @@ impl Host {
         Ok(Self { root, expected })
     }
 
+    /// The directory that holds the host journal and handoff records.
+    pub(super) fn root(&self) -> &Path {
+        &self.root
+    }
     pub(super) fn plan(&self) -> &journal::FrozenPlan {
         &self.expected.plan
     }

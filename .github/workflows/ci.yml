@@ -661,7 +661,7 @@ jobs:
   linux-systemd-policy:
     name: Linux systemd policy acceptance
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
 
@@ -695,7 +695,23 @@ jobs:
       - name: Build only the systemd acceptance probe
         env:
           CARGO_BUILD_JOBS: 4
-        run: cargo build --locked --example linux690_systemd_probe
+        # The launcher hashes the probe as a candidate binary, which it
+        # bounds at 200 MiB; debug info makes the debug probe larger.
+        run: |
+          cargo build --locked --example linux690_systemd_probe
+          strip --strip-debug target/debug/examples/linux690_systemd_probe
+
+      # The launcher lifecycle cases (#690 exec/crash/hang/restart/stop and
+      # the S3c coordinator cases of #1376) run from this test binary under
+      # a real systemd job.
+      - name: Build the launcher lifecycle tests
+        env:
+          CARGO_BUILD_JOBS: 4
+        run: |
+          cargo test --locked --no-run --features m2-launcher --bin x0x-launcher --message-format=json \
+            | jq -r 'select(.profile.test == true and .target.name == "x0x-launcher") | .executable' \
+            | tail -n 1 >"${RUNNER_TEMP}/launcher-tests-path"
+          test -x "$(cat "${RUNNER_TEMP}/launcher-tests-path")"
 
       - name: Exercise inert runner controls
         run: python3 -B scripts/ci/test_linux690_systemd_acceptance.py -v
@@ -722,7 +738,8 @@ jobs:
           sudo scripts/ci/linux690-systemd-acceptance.sh \
             --probe "${GITHUB_WORKSPACE}/target/debug/examples/linux690_systemd_probe" \
             --manager system \
-            --artifact-root "${artifact}"
+            --artifact-root "${artifact}" \
+            --launcher-tests "$(cat "${RUNNER_TEMP}/launcher-tests-path")"
           acceptance_status=$?
           set -e
           if ! sudo test -d "${artifact}"; then
@@ -770,8 +787,9 @@ jobs:
     # group too (`s3-1661.1` and `s3-1661.2`, 10 reruns each), the
     # H-S3-rm4 variants share `s3-rm4.1` to `s3-rm4.4`, H-S3-rm2 has its
     # own group (`s3-rm2.1` and `s3-rm2.2`, 10 reruns each), H-S3-d2 has
-    # `s3-d2`, H-S3-q has `s3-q`, and H-S3-q2 has `s3-q2`. A group is
-    # omitted when the tree has no matching test.
+    # `s3-d2`, H-S3-q (1) has `s3-q`, H-S3-q2 has `s3-q2`, and H-S3-q (3)
+    # has `s3-q3.1` and `s3-q3.2` (10 reruns each). A group is omitted
+    # when the tree has no matching test.
     name: W3-H shard plan
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -1105,6 +1123,8 @@ jobs:
           --expect w3h_1356_control_s3_x_attestation_conflict_stops_at_common_prefix=GREEN
           --require w3h_1356_red_s3_q_joiner_unreadable_sidecar
           --expect w3h_1356_red_s3_q_joiner_unreadable_sidecar=RED
+          --require w3h_1356_red_s3_q3_issuer_unreadable_sidecar
+          --expect w3h_1356_red_s3_q3_issuer_unreadable_sidecar=RED
           --require w3h_1356_control_s3_q2_sidecar_fault_cases
           --expect w3h_1356_control_s3_q2_sidecar_fault_cases=GREEN
           --require w3h_1356_red_s3_forked_node_shows_reseat_required

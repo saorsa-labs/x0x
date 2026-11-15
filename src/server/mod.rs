@@ -1410,6 +1410,7 @@ pub async fn serve_with_options(
         treekem_network_join_ended: tokio::sync::watch::channel(false).0,
         treekem_start_catchup_passes: Default::default(),
         treekem_reconnect_catchup_passes: Default::default(),
+        treekem_catchup_record_lock: Default::default(),
         treekem_catchup_refusals: StdMutex::new(HashMap::new()),
         join_request_outcome_sends: StdMutex::new(HashMap::new()),
         data_read_waiters: StdMutex::new(HashMap::new()),
