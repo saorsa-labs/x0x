@@ -208,6 +208,13 @@ All notable changes to this project will be documented in this file.
 
 ### Tests and tooling
 
+- **Host commit outcome classes and the latched-barrier hold (#1943 and
+  #1939 review; A14 amendment of 15 Nov 2026).** The launcher's host
+  commit returns a typed committed / not-yet / roll-back decision; a
+  transient hash read error is retried instead of holding the release; a
+  corrupt health record waits for the trial deadline. The API reference
+  names the latched barrier failure as a source of the
+  `unresolved_probe_record` hold, with a test.
 - **Coordinator recovery records its outcome (#1376, S3c follow-up; A14
   amendment of 15 Nov 2026).** A host with no trial records no longer
   repeats a refused restore on every pass: the coordinator arms a trial for

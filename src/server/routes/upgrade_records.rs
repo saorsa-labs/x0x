@@ -440,4 +440,33 @@ mod tests {
             Err(probe::ProbeRefusal::RecoveryFailed { .. })
         ));
     }
+
+    // #1939 review: a probe record barrier failure latched in this daemon
+    // process also blocks every local clear, so it is listed as an
+    // `unresolved_probe_record` hold and the failed hold is not clearable.
+    #[cfg(unix)]
+    #[test]
+    fn a_latched_barrier_makes_the_failed_hold_not_clearable() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let install = dir.path().join("x0xd");
+        std::fs::write(&install, b"daemon").expect("install");
+        let install = install.canonicalize().expect("canonical");
+        write_probe_record(
+            &install,
+            ProbePhase::FailedHold,
+            probe::ProbeCause::RetriesExhausted,
+        );
+        probe::latch_for_test(&install).expect("latch");
+
+        let body = records_json(dir.path(), Some(&install));
+        let holds = body["holds"].as_array().expect("holds");
+        assert_eq!(holds.len(), 2, "{holds:?}");
+        assert_eq!(holds[0]["kind"], "unresolved_probe_record");
+        assert_eq!(holds[1]["kind"], "failed_release");
+        assert_eq!(holds[1]["clearable"], false);
+        assert!(matches!(
+            probe::clear_failed_hold(&install, "9.9.9"),
+            Err(probe::ProbeRefusal::RecoveryFailed { .. })
+        ));
+    }
 }
