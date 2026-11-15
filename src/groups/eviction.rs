@@ -1256,10 +1256,15 @@ pub fn evaluate_row(row: &ObligationRow, ctx: &RowContext<'_>, timing: &S4Timing
             // (still an Active admin seat), demoted to member, or removed.
             // A local node that is no longer an Active admin was this
             // row's worker when the row's last derivation named it
-            // designated or a fallback rank. The mark is sticky: once
-            // stored, a later pass (whose derivation no longer names the
-            // local node) and a restart keep it. A member that was never
-            // a committer for the row keeps the plain designated wait.
+            // designated or a fallback rank. A stored mark also keeps it
+            // after the derivation moves to the next admin, and across a
+            // restart while `waiting` holds it. It is shown only while no
+            // override replaces the stored `waiting` (rebuilding, the
+            // host-commit gate, the fork wait, `waiting_for_receiver_upgrade`,
+            // rebind): once one has, and the derivation no longer names the
+            // local node, the row falls back to the plain designated wait.
+            // A member that was never a committer for the row keeps the
+            // plain designated wait.
             let local = ctx.local;
             let local_was_worker = row.designated == Some(local)
                 || row.ranks.contains(&local)
@@ -2743,6 +2748,28 @@ mod tests {
         let member = evaluate_row(&ranked, &ctx(8, &admins, &none, Duration::ZERO), &timing);
         assert_eq!(
             member.waiting.map(|w| (w.cause, w.named)),
+            Some((WaitingCause::WaitingForDesignatedAdmin, vec![id(2)]))
+        );
+    }
+
+    /// #1921 review: the mark lives only in the row's stored derivation
+    /// and its stored `waiting`. When an override (here the host-commit
+    /// gate) replaced the stored `waiting` between two evaluations, and
+    /// the derivation already moved to the next admin, the demoted node
+    /// falls back to `waiting_for_designated_admin`. This pins the
+    /// documented limit; there is no separate worker-history state.
+    #[test]
+    fn an_override_between_evaluations_drops_the_demoted_worker_mark() {
+        let timing = S4Timing::default();
+        let mut row = sample_row();
+        row.designated = Some(id(2));
+        row.ranks = Vec::new();
+        row.waiting = Some(WaitingState::cause(WaitingCause::WaitingForHostCommit));
+        let none = BTreeSet::new();
+        let admins = [id(2)];
+        let evaluation = evaluate_row(&row, &ctx(1, &admins, &none, Duration::ZERO), &timing);
+        assert_eq!(
+            evaluation.waiting.map(|w| (w.cause, w.named)),
             Some((WaitingCause::WaitingForDesignatedAdmin, vec![id(2)]))
         );
     }

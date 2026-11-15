@@ -96,10 +96,14 @@ Nov 2026 ([#1581](https://github.com/saorsa-labs/x0x/issues/1581),
 that is no longer an Active admin was the row's worker when the row's
 last stored derivation named it the designated admin or a fallback rank.
 Such a node marks `local_committer_ineligible` naming the designated
-admin, the same as a revoked worker. The mark is sticky: it stays once
-stored, also after the stored derivation moves to another admin and
-across a restart. A member that never was a committer for the row keeps
-`waiting_for_designated_admin`. The leave form is not covered: a leave
+admin, the same as a revoked worker. A stored mark keeps it after the
+stored derivation moves to another admin, and across a restart, while no
+override replaces the row's stored waiting cause (rebuilding, the
+host-commit gate, the fork wait, `waiting_for_receiver_upgrade`, rebind).
+After such an override, once the derivation no longer names the node, the
+row shows `waiting_for_designated_admin` again; there is no separate
+worker-history state. A member that never was a committer for the row
+keeps `waiting_for_designated_admin`. The leave form is not covered: a leave
 drops the local group record, so no row is left to mark. ADR 0110 stays
 Accepted and its text is unchanged.
 
