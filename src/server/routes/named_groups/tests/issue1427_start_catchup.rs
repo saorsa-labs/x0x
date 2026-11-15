@@ -436,22 +436,26 @@ async fn issue1427_reconnect_pass_retries_a_group_left_pending() {
             .collect(),
         (2, Duration::from_secs(120)),
         || Duration::from_secs(1),
-        |key| {
-            let calls = Arc::clone(&calls);
-            let pending = Arc::clone(&pending);
-            let in_flight = Arc::clone(&in_flight);
-            let most = Arc::clone(&most);
-            async move {
-                let now = in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                most.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                calls
-                    .lock()
-                    .unwrap()
-                    .push((key.clone(), tokio::time::Instant::now()));
-                if key != "b" {
-                    pending.lock().unwrap().remove(&key);
+        {
+            let (calls, pending) = (Arc::clone(&calls), Arc::clone(&pending));
+            let (in_flight, most) = (Arc::clone(&in_flight), Arc::clone(&most));
+            move |key: String| {
+                let calls = Arc::clone(&calls);
+                let pending = Arc::clone(&pending);
+                let in_flight = Arc::clone(&in_flight);
+                let most = Arc::clone(&most);
+                async move {
+                    let now = in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    most.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    calls
+                        .lock()
+                        .unwrap()
+                        .push((key.clone(), tokio::time::Instant::now()));
+                    if key != "b" {
+                        pending.lock().unwrap().remove(&key);
+                    }
                 }
             }
         },
@@ -496,7 +500,7 @@ async fn issue1427_reconnect_during_a_retry_wait_ends_the_pass() {
             vec!["b".to_string()],
             (4, Duration::from_secs(120)),
             || Duration::ZERO,
-            |_key| {
+            move |_key: String| {
                 let asks = Arc::clone(&driver_asks);
                 async move {
                     asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -538,7 +542,7 @@ async fn issue1427_a_catchup_that_never_ends_holds_its_slot_for_one_turn() {
                 .collect(),
             (2, turn),
             || Duration::ZERO,
-            |key| {
+            move |key: String| {
                 let asks = Arc::clone(&driver_asks);
                 async move {
                     asks.lock()
@@ -595,7 +599,7 @@ async fn issue1427_a_waiting_reconnect_cuts_the_round_short() {
             ["stuck", "b", "c"].iter().map(|k| k.to_string()).collect(),
             (1, Duration::from_secs(3600)),
             || Duration::ZERO,
-            |key| {
+            move |key: String| {
                 let asks = Arc::clone(&driver_asks);
                 async move {
                     asks.lock()
@@ -669,4 +673,93 @@ async fn issue1427_record_removal_waits_for_the_record_lock() -> Result<()> {
         "a group is pending again, so the record stays"
     );
     Ok(())
+}
+
+/// #1936 delta review: a pass that finds a group's catch-up from an earlier
+/// pass still running does not start a second one, but that catch-up asks
+/// once more when it ends, so a pending mark the later pass set is served
+/// after the mark (the old catch-up's `Done` could clear it).
+#[tokio::test(start_paused = true)]
+async fn issue1427_a_busy_group_is_asked_again_when_its_catchup_ends() {
+    let asks: Asks = Arc::default();
+    let first = Arc::new(tokio::sync::Notify::new());
+    let gate = Arc::new(TreeKemReconnectGate::default());
+    let run = {
+        let (asks, first) = (Arc::clone(&asks), Arc::clone(&first));
+        move |key: String| {
+            let (asks, first) = (Arc::clone(&asks), Arc::clone(&first));
+            async move {
+                let n = {
+                    let mut asks = asks.lock().unwrap();
+                    asks.push((key, tokio::time::Instant::now()));
+                    asks.len()
+                };
+                if n == 1 {
+                    // The first catch-up outlives its turn.
+                    first.notified().await;
+                }
+            }
+        }
+    };
+    // Pass 1: G's catch-up outlives its turn.
+    assert!(gate.request());
+    drive_treekem_reconnect_pass(
+        vec!["g".to_string()],
+        (4, Duration::from_secs(120)),
+        || Duration::ZERO,
+        run.clone(),
+        &tokio_spawn,
+        |_key| false,
+        &[],
+        &gate,
+    )
+    .await;
+    assert!(!gate.finish());
+    // Pass 2, after another isolation: G is marked again but still busy.
+    assert!(gate.request());
+    drive_treekem_reconnect_pass(
+        vec!["g".to_string()],
+        (4, Duration::from_secs(120)),
+        || Duration::ZERO,
+        run,
+        &tokio_spawn,
+        |_key| false,
+        &[],
+        &gate,
+    )
+    .await;
+    assert_eq!(
+        asks_of(&asks, "g"),
+        1,
+        "no second catch-up beside the running one"
+    );
+    // The first catch-up ends: it asks once more for pass 2.
+    first.notify_one();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        asks_of(&asks, "g"),
+        2,
+        "the busy group is asked again after its catch-up"
+    );
+    assert!(gate.claim("g"), "and is released after that");
+}
+
+/// #1936 delta review: a catch-up task that panics releases its group.
+#[tokio::test(start_paused = true)]
+async fn issue1427_a_panicking_catchup_releases_its_group() {
+    let gate = Arc::new(TreeKemReconnectGate::default());
+    assert!(gate.request());
+    drive_treekem_reconnect_pass(
+        vec!["g".to_string()],
+        (4, Duration::from_secs(120)),
+        || Duration::ZERO,
+        |_key: String| async move { panic!("catch-up task panics") },
+        &tokio_spawn,
+        |_key| false,
+        &[],
+        &gate,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(gate.claim("g"), "the panicked task's group is free again");
 }

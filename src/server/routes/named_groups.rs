@@ -16306,13 +16306,15 @@ const TREEKEM_RECONNECT_TURN: Duration = Duration::from_secs(120);
 /// pass runs is not lost: the running pass ends its current turns, starts
 /// no more groups, stops its retry wait, and one more pass runs when it
 /// ends. `busy` holds the groups whose catch-up from an earlier turn still
-/// runs, so a later turn does not start a second one.
+/// runs, so a later turn does not start a second one; the value says that
+/// a later turn wanted the group meanwhile, so the running catch-up asks
+/// once more when it ends.
 #[derive(Debug, Default)]
 struct TreeKemReconnectGate {
     running: std::sync::atomic::AtomicBool,
     rerun: std::sync::atomic::AtomicBool,
     wake: tokio::sync::Notify,
-    busy: std::sync::Mutex<HashSet<String>>,
+    busy: std::sync::Mutex<HashMap<String, bool>>,
 }
 
 impl TreeKemReconnectGate {
@@ -16356,12 +16358,42 @@ impl TreeKemReconnectGate {
         self.rerun.swap(false, SeqCst) && !self.running.swap(true, SeqCst)
     }
 
-    /// Mark `key`'s catch-up as running. False when one already runs.
+    /// Mark `key`'s catch-up as running. False when one already runs:
+    /// that catch-up then asks once more when it ends
+    /// ([`Self::ask_again`]), since this turn's pass marked the group
+    /// pending after the running catch-up started.
     fn claim(&self, key: &str) -> bool {
-        self.busy
+        let mut busy = self
+            .busy
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(key.to_string())
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match busy.get_mut(key) {
+            Some(again) => {
+                *again = true;
+                false
+            }
+            None => {
+                busy.insert(key.to_string(), false);
+                true
+            }
+        }
+    }
+
+    /// `key`'s catch-up ended. True: a later turn wanted it meanwhile, so
+    /// the caller runs it once more (the key stays claimed). False: the key
+    /// is released.
+    fn ask_again(&self, key: &str) -> bool {
+        let mut busy = self
+            .busy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(again) = busy.get_mut(key) {
+            if std::mem::take(again) {
+                return true;
+            }
+        }
+        busy.remove(key);
+        false
     }
 
     fn release(&self, key: &str) {
@@ -16369,6 +16401,22 @@ impl TreeKemReconnectGate {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(key);
+    }
+}
+
+/// Releases a claimed key if its catch-up task ends without
+/// [`TreeKemReconnectGate::ask_again`] releasing it (a panic).
+struct TreeKemClaimGuard {
+    gate: Arc<TreeKemReconnectGate>,
+    key: String,
+    armed: bool,
+}
+
+impl Drop for TreeKemClaimGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.gate.release(&self.key);
+        }
     }
 }
 
@@ -16383,7 +16431,9 @@ type TreeKemReconnectSpawn<'a> = &'a (dyn Fn(std::pin::Pin<Box<dyn std::future::
 /// A turn starts `run` for the key on a detached task (`spawn`) and holds
 /// its slot until that task ends, for at most `turn`, or until a
 /// reconnect waits on `gate`; the task itself keeps running. A key whose
-/// task from an earlier turn still runs is skipped. Once a reconnect
+/// task from an earlier turn still runs is not started again: that task
+/// runs `run` once more when it ends, so a group this pass marked pending
+/// is asked after the mark. Once a reconnect
 /// waits, no further turn starts and the pass ends after the round: the
 /// next pass asks for every group. The keys for which `still_pending` is
 /// true after a round get another round after the next wait of `retry`;
@@ -16399,7 +16449,7 @@ async fn drive_treekem_reconnect_pass<F, Fut>(
     retry: &[Duration],
     gate: &Arc<TreeKemReconnectGate>,
 ) where
-    F: Fn(String) -> Fut,
+    F: Fn(String) -> Fut + Clone + Send + Sync + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
     use futures::StreamExt;
@@ -16409,21 +16459,31 @@ async fn drive_treekem_reconnect_pass<F, Fut>(
             let wait = jitter();
             let run = &run;
             async move {
+                let run = run.clone();
                 tokio::time::sleep(wait).await;
                 if gate.rerun_pending() || !gate.claim(&key) {
                     return;
                 }
                 let (done, ended) = tokio::sync::oneshot::channel::<()>();
-                let task_gate = Arc::clone(gate);
-                let task_key = key.clone();
-                let ask = run(key.clone());
+                let mut guard = TreeKemClaimGuard {
+                    gate: Arc::clone(gate),
+                    key: key.clone(),
+                    armed: true,
+                };
+                let task_run = run.clone();
                 let admitted = spawn(Box::pin(async move {
-                    ask.await;
-                    task_gate.release(&task_key);
+                    loop {
+                        task_run(guard.key.clone()).await;
+                        if !guard.gate.ask_again(&guard.key) {
+                            guard.armed = false;
+                            break;
+                        }
+                    }
+                    drop(guard);
                     let _ = done.send(());
                 }));
                 if !admitted {
-                    gate.release(&key);
+                    // The dropped task's guard released the key.
                     return;
                 }
                 tokio::select! {
@@ -16557,9 +16617,12 @@ async fn run_treekem_reconnect_pass(state: &Arc<AppState>, gate: &Arc<TreeKemRec
             let max_ms = u64::try_from(TREEKEM_RECONNECT_JITTER.as_millis()).unwrap_or(u64::MAX);
             Duration::from_millis(rand::thread_rng().gen_range(0..=max_ms))
         },
-        |key| {
-            let state = Arc::clone(state);
-            async move { request_treekem_catchup_after_start(&state, &key).await }
+        {
+            let run_state = Arc::clone(state);
+            move |key: String| {
+                let state = Arc::clone(&run_state);
+                async move { request_treekem_catchup_after_start(&state, &key).await }
+            }
         },
         &spawn,
         |key| {

@@ -222,7 +222,9 @@ the current pass ends. A pass asks for at most 4 groups at a time, and
 it waits a random time of up to 10 s before it asks for each group, so
 a member set that heals at once spreads its requests. One group holds a
 slot for at most 120 s: its catch-up keeps running after its turn, and a
-later turn does not start a second catch-up for it while it runs. A
+later turn does not start a second catch-up for it while it runs; that
+catch-up then asks once more when it ends, so a group the later pass
+marked pending is asked after the mark. A
 reconnect that waits ends the current turns and starts no further
 group, since the next pass asks for every group. A group that is
 still pending after a pass is asked for again after 60 s, 300 s and
