@@ -38,7 +38,6 @@ use tokio::time::Instant;
 
 use crate as x0x;
 use crate::server::state::AppState;
-use crate::upgrade::journal::{read_boot_records, Phase as UpgradePhase, RecordRead};
 use x0x::groups::crypto_exclusion as ce;
 use x0x::groups::eviction::{
     self as s4, CommitPermission, EvJournalV1, EvictionKey, EvictionTrigger, EvsBodyV1,
@@ -1258,20 +1257,11 @@ pub(super) fn host_commit_gate_open(state: &AppState) -> bool {
     host_commit_gate_open_at(&state.data_dir)
 }
 
-/// The gate reads the ADR 0094 upgrade journal (`upgrade-journal.json`)
-/// read-only. With no journal record, this boot runs outside a trial and
-/// the gate is open. A record in `host_committed` opens it. A record in
-/// any other phase is an uncommitted trial, and an unreadable, corrupt or
-/// unknown record fails closed.
+/// The shared ADR 0094 gate (`journal::host_commit_gate_open`, #1377):
+/// no journal record or `host_committed` opens it; any other phase, or an
+/// unreadable record, keeps it closed.
 fn host_commit_gate_open_at(data_dir: &FsPath) -> bool {
-    match read_boot_records(data_dir).journal {
-        RecordRead::Missing => true,
-        RecordRead::Journal(record) => record.phase == UpgradePhase::HostCommitted,
-        RecordRead::Refused(_)
-        | RecordRead::Handoff(_)
-        | RecordRead::Boot(_)
-        | RecordRead::LegacyHandoff(_) => false,
-    }
+    crate::upgrade::journal::host_commit_gate_open(data_dir)
 }
 
 // ─── Worker ────────────────────────────────────────────────────────────────

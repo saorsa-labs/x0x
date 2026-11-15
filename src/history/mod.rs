@@ -632,6 +632,28 @@ impl HistoryService {
         config: &HistoryConfig,
         data_dir: &std::path::Path,
     ) -> HistoryResult<OpenedHistory> {
+        Self::open_inner(config, data_dir, true)?
+            .ok_or_else(|| HistoryError::Database("history migration deferred".into()))
+    }
+
+    /// As [`Self::open`], but inside an uncommitted ADR 0094 upgrade trial
+    /// (`journal::host_commit_gate_open` closed for `data_dir`) a database
+    /// that needs a schema migration is not opened: `Ok(None)`, every file
+    /// unchanged (#1377). The daemon then runs without history until a
+    /// start after host commit migrates it.
+    pub(crate) fn open_unless_trial_needs_migration(
+        config: &HistoryConfig,
+        data_dir: &std::path::Path,
+    ) -> HistoryResult<Option<OpenedHistory>> {
+        let migrate_allowed = crate::upgrade::journal::host_commit_gate_open(data_dir);
+        Self::open_inner(config, data_dir, migrate_allowed)
+    }
+
+    fn open_inner(
+        config: &HistoryConfig,
+        data_dir: &std::path::Path,
+        migrate_allowed: bool,
+    ) -> HistoryResult<Option<OpenedHistory>> {
         // ADR 0116 §1: refuse a bad rule before history opens: no database
         // file is created or migrated for a config that will not run.
         let rules = Arc::new(config.validate()?);
@@ -639,7 +661,14 @@ impl HistoryService {
             .db_path
             .clone()
             .unwrap_or_else(|| data_dir.join("history.db"));
-        let store = Store::open(&db_path)?;
+        let store = if migrate_allowed {
+            Store::open(&db_path)?
+        } else {
+            match Store::open_unless_migration_needed(&db_path)? {
+                Some(store) => store,
+                None => return Ok(None),
+            }
+        };
         // Codex review of slice B, round 2 (controller decision): topic-rule
         // limits match topic names in SQL as UTF-8 bytes, so they need a
         // UTF-8 database. On a database created with another text encoding
@@ -654,12 +683,12 @@ impl HistoryService {
                 store.text_encoding()
             )));
         }
-        Ok(OpenedHistory {
+        Ok(Some(OpenedHistory {
             store: Arc::new(store),
             policy: config.retention_policy(),
             quarantine_pins: Arc::new(QuarantinePinSlot::default()),
             rules,
-        })
+        }))
     }
 
     /// Spawn the writer thread + retention reaper over an [`Self::open`]ed

@@ -494,6 +494,8 @@ fn is_acl_admin_path(path: &str) -> bool {
 /// `/grants/<nonempty-segment>` (including `/grants/received`).
 fn is_grants_path(path: &str) -> bool {
     path == "/grants"
+        // #1094 D1: reading a store through this install's received grants.
+        || path.starts_with("/grants/data/")
         || path
             .strip_prefix("/grants/")
             .is_some_and(|id| !id.is_empty() && !id.contains('/'))
@@ -1578,6 +1580,14 @@ mod tests {
         // agents; issuing/revoking changes it. Durable-owner only.
         for method in [Method::GET, Method::POST, Method::DELETE] {
             for path in ["/grants", "/grants/received", "/grants/00ff"] {
+                assert!(
+                    requires_durable_owner(&method, path),
+                    "{method} {path} must be durable-owner"
+                );
+            }
+        }
+        for method in [Method::GET] {
+            for path in ["/grants/data/aa/bb/scratch", "/grants/data/aa/bb/scratch/k"] {
                 assert!(
                     requires_durable_owner(&method, path),
                     "{method} {path} must be durable-owner"
