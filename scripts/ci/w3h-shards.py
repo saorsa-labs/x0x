@@ -54,6 +54,10 @@ GROUPS = (
     # takes about 104 of its 120 minutes (run 41624339394), so the row
     # has its own shard.
     ('1623', 'w3h_1623_'),
+    # #1581 `s4_intake_and_egress` (D70): two three-node arms, each about
+    # 80-90 virtual seconds. `rest` is close to its deadline, so the row
+    # has its own shard; the budget is not raised (31 Oct ruling, #1733).
+    ('1581i', 'w3h_1581i_'),
 )
 
 # The gate's reruns per case (D196). A group in `PARTS` runs them as that

@@ -37,6 +37,7 @@ mod sync;
 pub(in crate::server) mod tasks;
 mod trust;
 mod upgrade;
+mod upgrade_records;
 #[cfg(test)]
 mod wire_golden_tests;
 

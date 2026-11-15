@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`GET /diagnostics/upgrade` reports the upgrade records on disk (#1381
+  M2 part, A14 amendment of 15 Nov 2026).** New fields: `plan` (the safe-apply
+  journal's transaction, phase and versions), `last_attempt` (the pre-swap
+  probe record), `holds` (failed-release or recovery-failed, with whether
+  `x0x upgrade --clear-hold` applies), `last_hold_clear`, `backups` (backup
+  files beside the daemon and CLI) and `records_error`. Fixed record names
+  only; no recorded path is followed and no argv, environment or free-text
+  cause is returned.
 - **A join request the authority refuses as `stale` is signed again over the
   authority's head (#1840 routes 1–3, A08 amendment of 15 Nov 2026).** A
   second joiner on a group with members, a request that crosses an edit of
@@ -16,6 +24,12 @@ All notable changes to this project will be documented in this file.
   and after approval it can apply the approval link. A requester that waits
   behind another turn gets no outcome until its turn. New capability bit 19,
   `join_request_head_v1`; a peer without it keeps the earlier behaviour.
+- **W3-H row `s4_intake_and_egress`, machine-revocation part (#1581, D70).**
+  A control arm checks that a machine-only revocation keeps the agent's
+  group seat and opens no S4 row. An egress arm, pinned RED, records a
+  known gap: after a later rotation a TreeKEM member's revoked device still
+  reaches the new epoch through its kept leaf. The row has its own W3-H
+  shard (`1581i`).
 - **A `stale` join-request outcome can carry the authority's head (#1840,
   A08 amendment of 15 Nov 2026).** New optional `head` field on
   `groups::join_outcome::JoinRequestOutcome` (signed head commit, roster
@@ -118,6 +132,12 @@ All notable changes to this project will be documented in this file.
   same group to end before it judges the cycle. No wire format or API
   changes.
 
+- **Docs: what a machine revocation protects (#1929).** A machine revocation
+  denies delivery, transport and requests to that device. It does not cut a
+  device that still holds the agent key off TreeKEM group content, because
+  the leaf keys derive from the agent key. To cut off a lost or stolen
+  device, revoke the agent or remove the member. See
+  `docs/trust-and-connectivity.md`, `docs/api-reference.md` and A09.
 - **Documented the exit for a forked head behind an armed gap record
   (#871).** The anchored-gap gate has no expiry and no local clear. With no
   progress (10 minutes for an owner-armed gap, 30 minutes for an
@@ -228,6 +248,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **A listener-admission marker that can never complete no longer blocks join
+  requests (#1840, A08 amendment of 15 Nov 2026).** An early-gate refusal
+  (revoked or unverified sender, revocation-resync hold, withdrawn group), an
+  expired marker, and a marker whose group was deleted or withdrawn now
+  release the journal, live and at startup, with the sidecar bytes kept as
+  evidence. A requester signs one request again over the authority's head at
+  most 8 times per offer, and a re-seal no longer restarts the offer backoff.
 - **A daemon that restarts with pending S4 work no longer seals a stale
   head (#1581).** If the `.evs` file held an unsealed revocation-eviction
   row, the group needs a holder to confirm its head before S4 seals there.

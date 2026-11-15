@@ -1175,6 +1175,10 @@ jobs:
           --expect w3h_1581h_control_sidecar_rebuild_body_damage_rederives=GREEN
           --require w3h_1581h_control_sidecar_rebuild_newer_file_memory_only
           --expect w3h_1581h_control_sidecar_rebuild_newer_file_memory_only=GREEN
+          --require w3h_1581i_control_machine_revoked_device_keeps_its_seat
+          --expect w3h_1581i_control_machine_revoked_device_keeps_its_seat=GREEN
+          --require w3h_1581i_egress_machine_revoked_device_gets_no_new_key
+          --expect w3h_1581i_egress_machine_revoked_device_gets_no_new_key=RED
           --require w3h_1765_red_newer_file_revocation_waits_for_store_write
           --expect w3h_1765_red_newer_file_revocation_waits_for_store_write=GREEN
           --require w3h_1776_delayed_fresh_joiner_fetches_the_welcome
