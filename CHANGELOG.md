@@ -6,6 +6,22 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Share grants last at most 90 days; `POST /grants/:id/renew` renews one
+  (#1350, D35, A03 amendment of 14 Nov 2026).** `POST /grants` refuses a
+  window above 90 days with `400`, and a daemon does not store (or ACK) a
+  longer grant it receives. Grants already stored keep loading. Renewal signs
+  a new grant with the same grantee, agents and caps, valid from now for at
+  most 90 days (default 90), and delivers it; the old grant stays valid to its
+  own expiry, so there is no gap. CLI: `x0x grant renew <id> [--ttl-secs N]
+  [--no-names]`.
+- **GUI scratch app and deep link (#1094).** Each space has a Scratch tab
+  for the group's sealed `scratch` store: list keys, view, edit, save and
+  delete short text values. `#/groups/<id>/scratch` and the short form
+  `#/scratch/<id>` open it, in the GUI and through `POST /gui/show`.
+- **`task:changed` SSE event on `GET /events` (#1094).** The task-list
+  sibling of `kv:changed`: one event per list per 200 ms window on a local
+  mutation or a merged peer delta, with `list_id` and `origins`, no task
+  content. Library: `Agent::subscribe_task_changes`.
 - **`kv:changed` SSE event on `GET /events` (#1094).** A KV store this
   daemon has open sends one event per 200 ms window when it changes (local
   write or delete, merged peer record, direct delta): `store_id` and the
