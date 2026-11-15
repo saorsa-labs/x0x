@@ -12,6 +12,14 @@ All notable changes to this project will be documented in this file.
   projection, public metadata) and `groups::join_outcome::adopt_join_head`,
   which checks a head against a requester's copy and installs it. Wire and
   library only: nothing sends or uses a head yet.
+- **`GET /diagnostics/upgrade` reports release observations (#1381, A14
+  amendment of 15 Nov 2026).** New fields: `channel` (`stable` or
+  `prerelease`), `latest_release_topic_version` (highest verified release
+  seen on `x0x/release`), `last_check` (source, time and outcome of the last
+  startup, fallback-poll or `GET /upgrade` check) and `pending_update` (the
+  background apply owner's queued, applying or failed release, else the
+  newest observed newer version). Memory only; reset on restart. `x0x doctor`
+  uses `pending_update`.
 - **`system.health_verdict` and `system.upgrade_state` events on
   `GET /events` and `/ws` (#1351, A14 amendment of 15 Nov 2026).** The 5 s
   health refresher emits one event when the M1 `/health` verdict changes and
