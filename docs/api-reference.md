@@ -2439,15 +2439,17 @@ current head and matches the attested sequence. A head on a fork can never
 link, so every page is refused. The gate does not expire, and there is no
 local clear for it: an expiry would let unattested pages apply, and
 overwriting the revision or the hash would break the next attested commit.
-After 10 minutes with no progress (`GATE_STALL`) the node asks capable
-admins for an attestation. An admin that finds the head on no chain of its
+With no progress the node asks capable admins for an attestation: after
+10 minutes (`GATE_STALL`) for a gap armed by an owner's attestation, and
+after 30 minutes (`ATA_ARMED_LIFETIME`) for a gap armed by an admin's
+attestation. An admin that finds the head on no chain of its
 own answers `not_on_chain`, and the node shows
 `reseat_required {cause: not_on_chain, ref: {"kind": "gap", ...}}`. The
 exit is an admin's manual re-seat with that `gap` ref (or the removal) as
 its basis. The swap replaces the whole group record and retires the gap
 record; the refusal stays in the sidecar as a retired record. A node that
 cannot reach a capable admin keeps the gate and shows
-`awaiting_attestation`. Leaving and joining again also works.
+`awaiting_attestation`.
 
 After an ADR 0108 §5a rebuild the object also has
 `recovery_sidecar_rebuilt: {file, txid, lost}`. A `ref` is
