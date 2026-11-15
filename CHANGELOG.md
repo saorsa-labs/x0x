@@ -232,6 +232,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **A listener-admission marker that can never complete no longer blocks join
+  requests (#1840, A08 amendment of 15 Nov 2026).** An early-gate refusal
+  (revoked or unverified sender, revocation-resync hold, withdrawn group), an
+  expired marker, and a marker whose group was deleted or withdrawn now
+  release the journal, live and at startup, with the sidecar bytes kept as
+  evidence. A requester signs one request again over the authority's head at
+  most 8 times per offer, and a re-seal no longer restarts the offer backoff.
 - **A daemon that restarts with pending S4 work no longer seals a stale
   head (#1581).** If the `.evs` file held an unsealed revocation-eviction
   row, the group needs a holder to confirm its head before S4 seals there.
