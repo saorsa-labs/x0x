@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`GET /sync/devices` names the source of each device's enrollment record
+  (#1107).** Each row has `record_source` (`"local"` when this machine wrote
+  the stored owner-device record, `"synced"` when another owner device wrote
+  it) and `record_writer_machine_id` (hex machine id of that writer). Both are
+  `null` when no stored record holds the enrollment shown, for example a new
+  enrollment that is not minted yet.
 - **Share grants last at most 90 days; `POST /grants/:id/renew` renews one
   (#1350, D35, A03 amendment of 14 Nov 2026).** `POST /grants` refuses a
   window above 90 days with `400`, and a daemon does not store (or ACK) a
@@ -67,6 +73,17 @@ All notable changes to this project will be documented in this file.
   and `treekem-catchup-pending` (the outage record, kept until each group's
   catch-up succeeds, so the next start asks again). A first start and a
   shorter outage ask nothing. No wire format or API changes.
+
+- **A capability request whose direct answer was lost asks for the topic
+  answer next (#504 follow-up).** A responder that answers by unicast skips
+  its topic answer, so a lost direct frame left the requester without the
+  advert (the W3-H #1776 blind window). When a request that carried the
+  machine id ends without the flight's own requirement met (a usable
+  binding, the durable-ACK capability or the application bit; a stale
+  stored binding does not count), later requests to that responder omit it
+  for 10 minutes. A topic answer does not clear this record; only expiry or
+  a later met request that carried the machine id does. No wire format
+  change.
 
 - **The consent to disclose the user identity now survives a restart (#1107).**
   A successful `POST /announce` with `include_user_identity: true` and

@@ -93,7 +93,7 @@ principal = "owner"
 argv = ["systemctl", "status", "x0xd"]
 ```
 
-It matches any **owner-trusted** requester: the agent presents a valid, unexpired `AgentCertificate` signed by this install's owner (`user.key`), its machine holds a current owner enrollment (`/sync/devices`, ADR-0041), and neither the agent, the machine nor their binding is revoked. A `Blocked` contact is never owner-trusted, and an install with no owner key never matches an owner entry.
+It matches any **owner-trusted** requester: the agent presents a valid, unexpired `AgentCertificate` signed by this install's owner (`user.key`), its machine holds a current owner enrollment (`/sync/devices`, ADR-0041; an enrollment made on another owner device counts once it has synced, #1107), and neither the agent, the machine nor their binding is revoked. A `Blocked` contact is never owner-trusted, and an install with no owner key never matches an owner entry.
 
 - Owner trust **does not open exec by itself.** With no `principal = "owner"` entry an owner-trusted requester is denied (`agent_machine_not_in_acl`). The shipped defaults contain no owner entry.
 - Argv stays an exact allowlist; caps and `max_duration_secs` apply as for pair entries.

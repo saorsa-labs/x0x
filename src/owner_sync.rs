@@ -1,9 +1,10 @@
 //! ADR-0041 Tier-1 cross-machine owner-state sync.
 //!
-//! Tier 1 replicates exactly four kinds of small owner-signed state between
+//! Tier 1 replicates exactly five kinds of small owner-signed state between
 //! the owner's machines over ADR-0022 byte streams ([`crate::streams`]):
 //! the owner profile, per-machine agent/machine names, the Home roster +
-//! policy pointer, and the sub-agent issuance journal. Tier 2 (history
+//! policy pointer, the sub-agent issuance journal, and the owner device set
+//! (kind 0x05, #1107; protocol 3 only). Tier 2 (history
 //! backfill) and Tier 3 (never-replicates state) are out of scope here.
 //!
 //! # Trust model — same-owner, enrolled machines, key possession
@@ -68,9 +69,9 @@
 //!
 //! # Tier-3 boundary (gapcheck blocker 32 scope note)
 //!
-//! The sync surface serializes ONLY the four Tier-1 kinds: [`crate::owner_sync::SyncKind`] and
+//! The sync surface serializes ONLY the five Tier-1 kinds: [`crate::owner_sync::SyncKind`] and
 //! [`crate::owner_sync::SyncValue`] are closed enums with no catch-all. A record whose kind tag
-//! is not one of the four fails to decode, and a record whose kind does not
+//! is not one of the five fails to decode, and a record whose kind does not
 //! match its value variant is rejected whole.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -3730,6 +3731,36 @@ impl OwnerSyncStore {
     /// Last-session status per device (for `GET /sync/devices`).
     pub async fn session_statuses(&self) -> BTreeMap<[u8; 32], DeviceSyncStatus> {
         self.last_session.read().await.clone()
+    }
+
+    /// #1107: the enrolled devices, each with the machine that wrote its
+    /// stored kind 0x05 record (for `GET /sync/devices`). The writer is
+    /// `Some` only when that record is `Enrolled` with exactly the
+    /// enrollment held now; a machine with no such record (not minted yet,
+    /// or a newer local enrollment) gets `None`. Both maps are read under
+    /// one lock pair, so a re-enrollment cannot pair a stale writer with
+    /// the new enrollment.
+    pub async fn enrolled_devices_with_writers(&self) -> Vec<(OwnerEnrollment, Option<[u8; 32]>)> {
+        // Lock order: records → devices.
+        let records = self.records.read().await;
+        let devices = self.devices.read().await;
+        devices
+            .values()
+            .map(|enrollment| {
+                let writer = records
+                    .get(&(
+                        SyncKind::DeviceEnrollment,
+                        hex::encode(enrollment.machine_id),
+                    ))
+                    .and_then(|record| match &record.value {
+                        SyncValue::DeviceEnrollment {
+                            state: DeviceEnrollmentState::Enrolled { enrollment: stored },
+                        } if stored == enrollment => Some(record.clock.writer_machine),
+                        _ => None,
+                    });
+                (enrollment.clone(), writer)
+            })
+            .collect()
     }
 
     /// Test-only: insert a pre-built record WITHOUT verification, so

@@ -1405,3 +1405,71 @@ async fn the_store_limit_counts_both_files() {
     assert_eq!(outcome.accepted.len(), 1);
     assert_eq!(s.records_snapshot().await.len(), MAX_STORED_RECORDS);
 }
+
+fn writer_of(rows: &[(OwnerEnrollment, Option<[u8; 32]>)], m: MachineId) -> Option<[u8; 32]> {
+    rows.iter()
+        .find(|(e, _)| e.machine_id == m.0)
+        .and_then(|(_, w)| *w)
+}
+
+/// `enrolled_devices_with_writers` names a writer only for the enrollment
+/// its stored 0x05 record holds: a newer local re-enrollment has no writer
+/// until it is minted.
+#[tokio::test]
+async fn a_re_enrollment_has_no_writer_until_it_is_minted() {
+    let (_dir, a, _b) = pair().await;
+    let m = machine(9);
+    let at = now_ms() - 10_000;
+    a.enroll(signed(m, at, None)).await.expect("enroll m");
+    mint(&a, machine(1)).await;
+    let rows = a.enrolled_devices_with_writers().await;
+    assert_eq!(writer_of(&rows, m), Some(machine(1).0));
+
+    a.enroll(signed(m, at + 1, None))
+        .await
+        .expect("re-enroll m");
+    let rows = a.enrolled_devices_with_writers().await;
+    let (enrollment, writer) = rows
+        .iter()
+        .find(|(e, _)| e.machine_id == m.0)
+        .expect("m is listed");
+    assert_eq!(enrollment.enrolled_at_ms, at + 1, "the new enrollment");
+    assert_eq!(*writer, None, "no stale writer for the new enrollment");
+
+    mint(&a, machine(1)).await;
+    let rows = a.enrolled_devices_with_writers().await;
+    assert_eq!(writer_of(&rows, m), Some(machine(1).0));
+}
+
+/// Re-enrollments running while `GET /sync/devices` reads the device set
+/// never pair the writer of the minted record with a newer enrollment:
+/// both maps are read under one lock pair.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_re_enrollment_never_pairs_a_stale_writer() {
+    let (_dir, a, _b) = pair().await;
+    let m = machine(9);
+    let at = now_ms() - 100_000;
+    a.enroll(signed(m, at, None)).await.expect("enroll m");
+    mint(&a, machine(1)).await;
+    let enroller = {
+        let a = Arc::clone(&a);
+        tokio::spawn(async move {
+            for i in 1..=200u64 {
+                a.enroll(signed(m, at + i, None)).await.expect("re-enroll");
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+    while !enroller.is_finished() {
+        for (enrollment, writer) in a.enrolled_devices_with_writers().await {
+            if enrollment.machine_id == m.0 && writer.is_some() {
+                assert_eq!(
+                    enrollment.enrolled_at_ms, at,
+                    "writer pairs only the minted one"
+                );
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+    enroller.await.expect("enroller");
+}
