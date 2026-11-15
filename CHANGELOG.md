@@ -33,6 +33,10 @@ All notable changes to this project will be documented in this file.
   `stale` is retryable. `GET /groups/:id` shows it as
   `own_join_request.status = "refused"` with a `refusal` object. Both daemons
   must advertise capability bit 16; an older daemon keeps the old behaviour.
+- **A share grant may start at most 600 s in the future (#1350 follow-up).**
+  A daemon refuses (`POST /grants` 400; no store and no ACK on receipt) a
+  grant whose `not_before` is more than 600 s ahead of its clock, so a
+  chain of pre-signed grants cannot extend access past 90 days.
 - **Read-only `GET /diagnostics/sidecar-quarantine` (#1597, D148).** It lists
   each ADR 0108 §5a quarantined sidecar copy (pending or history) with its
   `txid` and size in bytes, plus `count` and `total_bytes`. It does not change

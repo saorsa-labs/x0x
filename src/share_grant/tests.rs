@@ -25,6 +25,19 @@ fn grant_by(owner: &UserKeypair, grantee: Grantee, agents: Vec<AgentId>) -> Shar
     .expect("sign grant")
 }
 
+/// As [`grant_by`], valid around the REAL clock: for tests that go through
+/// the typed DM handler, which accepts at the real time. A grant around the
+/// fixed [`NOW`] (2027) would start too far ahead (#1350 follow-up).
+fn live_grant_by(owner: &UserKeypair, grantee: Grantee, agents: Vec<AgentId>) -> ShareGrant {
+    let now = unix_now_secs();
+    let mut grant = grant_by(owner, grantee, agents);
+    grant.not_before = now - 60;
+    grant.expiry = now + 3_600;
+    let signature = sign_with_ml_dsa(owner.secret_key(), &grant.signed_bytes()).unwrap();
+    grant.signature = signature.as_bytes().to_vec();
+    grant
+}
+
 fn typed(
     payload: Vec<u8>,
 ) -> (
@@ -219,7 +232,7 @@ async fn malformed_grant_withholds_ack_and_is_not_stored() {
 async fn valid_grant_is_stored_then_acked_and_replays_are_duplicates() {
     let owner = UserKeypair::generate().unwrap();
     let grantee_owner = UserKeypair::generate().unwrap();
-    let grant = grant_by(
+    let grant = live_grant_by(
         &owner,
         Grantee::User(grantee_owner.user_id()),
         vec![agent(1)],
@@ -603,7 +616,7 @@ async fn post_rename_dm_failure_is_logged_as_held_not_absent() {
     let path = dir.path().join(SHARE_GRANT_STORE_FILE);
     let owner = UserKeypair::generate().unwrap();
     let store = ShareGrantStore::load(path.clone(), agent(1), Some(owner.user_id())).await;
-    let grant = grant_by(&owner, Grantee::Agent(agent(7)), vec![agent(1)]);
+    let grant = live_grant_by(&owner, Grantee::Agent(agent(7)), vec![agent(1)]);
     let (logs, _subscriber) = capture_info_logs();
 
     let _seam = crate::storage::arm_fail_parent_dir_fsync_for_testing(&path);
@@ -639,8 +652,8 @@ async fn post_rename_dm_failure_is_logged_as_held_not_absent() {
         Grantee::Agent(agent(8)),
         vec![agent(1)],
         vec![ShareCap::Dm],
-        NOW - 60,
-        NOW + 3_600,
+        unix_now_secs() - 60,
+        unix_now_secs() + 3_600,
     )
     .unwrap();
     let (t, rx) = typed(other.to_dm_payload().unwrap());
@@ -870,4 +883,50 @@ async fn issue1350_a_stored_longer_grant_still_loads() {
     assert!(store.load_error().is_none(), "{:?}", store.load_error());
     assert_eq!(store.grants(GrantRole::Issued), vec![long.clone()]);
     assert!(long.is_active_at(NOW + 200 * 86_400));
+}
+
+/// WHY (#1350 follow-up): a chain of pre-signed future grants, each within
+/// the 90-day cap, must not hand out access for years. A store refuses a
+/// grant that starts more than 600 s after its clock, and accepts one that
+/// starts exactly at the allowance.
+#[tokio::test]
+async fn issue1350_store_refuses_a_grant_that_starts_far_in_the_future() {
+    let owner = UserKeypair::generate().unwrap();
+    let store = ShareGrantStore::in_memory(agent(1), Some(owner.user_id()));
+    let sign = |id: u8, not_before: u64| {
+        ShareGrant::sign(
+            &owner,
+            [id; 32],
+            Grantee::Agent(agent(7)),
+            vec![agent(1)],
+            vec![ShareCap::Dm],
+            not_before,
+            not_before + MAX_SHARE_GRANT_LIFETIME_SECS,
+        )
+        .expect("each grant is within the cap")
+    };
+    // The second link of a pre-signed chain: valid only after the first.
+    let next = sign(0x51, NOW + MAX_SHARE_GRANT_LIFETIME_SECS);
+    assert!(matches!(
+        store.accept(next.clone(), NOW).await,
+        Err(ShareGrantError::Invalid(m)) if m.contains("in the future")
+    ));
+    let (t, rx) = typed(next.to_dm_payload().unwrap());
+    assert!(handle_share_grant_dm(Some(&store), t).await.is_err());
+    assert!(rx.await.unwrap().is_err(), "ACK withheld");
+    let just_over = sign(0x52, NOW + MAX_SHARE_GRANT_START_LEAD_SECS + 1);
+    assert!(store.accept(just_over, NOW).await.is_err());
+    assert!(store.grants(GrantRole::Issued).is_empty());
+
+    let at_allowance = sign(0x53, NOW + MAX_SHARE_GRANT_START_LEAD_SECS);
+    store
+        .accept(at_allowance.clone(), NOW)
+        .await
+        .expect("clock skew is allowed");
+    // The same far-future grant is accepted once its start is near.
+    store
+        .accept(next.clone(), next.not_before)
+        .await
+        .expect("accepted when it is due");
+    assert_eq!(store.grants(GrantRole::Issued).len(), 2);
 }
