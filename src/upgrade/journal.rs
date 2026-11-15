@@ -21,6 +21,8 @@ use serde_json::Value;
 pub(crate) const JOURNAL_FILE_NAME: &str = "upgrade-journal.json";
 pub(crate) const HANDOFF_FILE_NAME: &str = "upgrade-handoff.json";
 pub(crate) const BOOT_FILE_NAME: &str = "upgrade-boot.json";
+/// A candidate's per-instance health commit (#1377), beside its data root.
+pub(crate) const HEALTH_FILE_NAME: &str = "upgrade-health.json";
 pub(crate) const SCHEMA_VERSION: u32 = 1;
 const MAX_RECORD_BYTES: u64 = 1024 * 1024;
 
@@ -229,6 +231,102 @@ pub(crate) struct BootRecord {
     /// Suspend-inclusive monotonic times in nanoseconds, in this boot.
     pub started_at_ns: u64,
     pub deadline_ns: u64,
+}
+
+/// ADR 0094 host-commit gate (§4, §6; #1377). Persisted-format upgrade
+/// writes, lazy rewrites included, and other work that must not survive a
+/// binary rollback wait for host commit. Instance health alone never opens
+/// it.
+///
+/// The gate reads the upgrade journal in `data_dir` read-only, on every
+/// call, so it opens on the first pass after the commit. With no journal
+/// record this boot runs outside a trial and the gate is open. A record in
+/// `host_committed` opens it. A record in any other phase is an
+/// uncommitted trial, and an unreadable, corrupt or unknown record fails
+/// closed.
+pub(crate) fn host_commit_gate_open(data_dir: &Path) -> bool {
+    match read_boot_records(data_dir).journal {
+        RecordRead::Missing => true,
+        RecordRead::Journal(record) => record.phase == Phase::HostCommitted,
+        RecordRead::Refused(_)
+        | RecordRead::Handoff(_)
+        | RecordRead::Boot(_)
+        | RecordRead::LegacyHandoff(_) => false,
+    }
+}
+
+/// The M1 verdict over the local inputs a candidate checked before its
+/// health commit (D193: local checks block commit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LocalVerdict {
+    Ok,
+    Degraded,
+    Error,
+}
+
+/// A candidate's per-instance health commit (ADR 0094 §3
+/// `health-committed`, §4; #1377). It stays provisional until the host
+/// coordinator verifies the full set and writes the host commit. HTTP 200
+/// alone is never health: the record binds the transaction, the child
+/// identity and attempt, the version, the roots and the executable hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HealthRecord {
+    pub schema_version: u32,
+    pub record_kind: String,
+    pub transaction_id: String,
+    pub generation: u64,
+    pub instance_id: String,
+    pub attempt: u32,
+    pub pid: u32,
+    pub process_start: u64,
+    pub boot_id: String,
+    pub version: String,
+    pub data_root: PathBuf,
+    pub identity_root: PathBuf,
+    pub executable_sha256: [u8; 32],
+    /// Every store initialized (ADR 0094 §4: commit only after stores
+    /// initialize).
+    pub stores_initialized: bool,
+    /// The M1 verdict over local inputs, held for the stable interval.
+    pub local_verdict: LocalVerdict,
+    /// The OLD instance had a send-ready peer before the update (D193).
+    pub previously_connected: bool,
+    /// A send-ready peer was reached and kept through the stable interval.
+    pub peer_continuity: bool,
+}
+
+pub(crate) fn validate_health(bytes: &[u8]) -> io::Result<()> {
+    decode_health(bytes).map(|_| ())
+}
+
+fn decode_health(bytes: &[u8]) -> io::Result<HealthRecord> {
+    let record: HealthRecord =
+        serde_json::from_slice(bytes).map_err(|error| io::Error::other(error.to_string()))?;
+    if record.schema_version != SCHEMA_VERSION
+        || record.record_kind != "health"
+        || record.transaction_id.is_empty()
+        || record.instance_id.is_empty()
+        || record.attempt == 0
+        || record.pid == 0
+        || record.boot_id.is_empty()
+        || record.version.is_empty()
+        || !record.data_root.is_absolute()
+        || !record.identity_root.is_absolute()
+    {
+        return Err(io::Error::other("invalid health record"));
+    }
+    Ok(record)
+}
+
+/// The health commit beside `data_root`, if one exists.
+pub(crate) fn read_health(data_root: &Path) -> io::Result<Option<HealthRecord>> {
+    match read_auxiliary_record(&data_root.join(HEALTH_FILE_NAME)) {
+        Ok(bytes) => decode_health(&bytes).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 pub(crate) enum RecordRead {

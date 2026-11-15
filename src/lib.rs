@@ -25669,18 +25669,35 @@ impl AgentBuilder {
                 // paused runtime idle, so virtual time auto-advances by
                 // however long SQLite takes. Open on the caller instead.
                 let opened = if w3h_inline::shim_active() {
-                    history::HistoryService::open(&start_cfg, &data_dir)
+                    history::HistoryService::open_unless_trial_needs_migration(
+                        &start_cfg, &data_dir,
+                    )
                 } else {
                     tokio::task::spawn_blocking(move || {
-                        history::HistoryService::open(&start_cfg, &data_dir)
+                        history::HistoryService::open_unless_trial_needs_migration(
+                            &start_cfg, &data_dir,
+                        )
                     })
                     .await
                     .map_err(|e| error::IdentityError::HistoryInit(e.to_string()))?
                 }
                 .map_err(|e| error::IdentityError::HistoryInit(e.to_string()))?;
-                let service = history::HistoryService::start_tasks(opened);
-                let handle = service.handle();
-                (Some(service), Some(handle))
+                match opened {
+                    Some(opened) => {
+                        let service = history::HistoryService::start_tasks(opened);
+                        let handle = service.handle();
+                        (Some(service), Some(handle))
+                    }
+                    // ADR 0094 §4 (#1377): no format-upgrade write before
+                    // host commit. History stays off for this start.
+                    None => {
+                        tracing::warn!(
+                            "history schema migration deferred until upgrade host commit; \
+                             history is off for this start"
+                        );
+                        (None, None)
+                    }
+                }
             }
             _ => (None, None),
         };
