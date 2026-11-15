@@ -3941,10 +3941,10 @@ environment or free-text causes.
 |---|---|
 | `plan` | `null` when no record exists. `{record: "journal", transaction_id, phase, previous_version, candidate_version, participants, cause, boot_attempt}` for an M2 journal (`participants` is a count; `cause` is `failed`, `interrupted` or `null`). `{record: "refused"}` for an unreadable record, `{record: "legacy_handoff"}` or `{record: "handoff", boot_attempt}` for a handoff without a journal |
 | `last_attempt` | `{version, transaction_id, attempt, phase, cause, retry_remaining_ms}` from the install's pre-swap probe record, or `null`. `phase` is `running`, `passed`, `interrupted_wait`, `failed_hold` or `recovery_failed` |
-| `holds` | One entry `{version, kind, cause, clearable}` while the probe record holds a release. `kind` is `failed_release` (`clearable: true`, see `x0x upgrade --clear-hold`) or `recovery_failed` (`clearable: false`) |
+| `holds` | Entries `{version, kind, cause, clearable}`. `kind` is `failed_release` (see `x0x upgrade --clear-hold`), `recovery_failed` (never clearable) or `unresolved_probe_record` (an unresolved `.pending` terminalization marker beside the probe record; never clearable, `cause` is `null`). `clearable` is `true` only when `x0x upgrade --clear-hold` would clear the hold: a `.pending` marker or a probe barrier failure in this daemon process makes every hold not clearable |
 | `last_hold_clear` | `{version, cause, cleared_at_unix}` from the most recent local clear receipt, or `null` |
 | `backups` | Backup files beside the daemon and its sibling CLI: `{artifact, name, size_bytes, modified_unix}`, `artifact` `daemon` or `cli`, at most 32. Names are `<binary>.backup` (legacy) or `<binary>.backup-<version>-<transaction>` (pair apply) |
-| `records_error` | `null`, or fixed text naming a record that could not be read (`install path unavailable`, `probe record unreadable`, `hold clear receipt unreadable`) |
+| `records_error` | `null`, or fixed text naming a record that could not be read (`install path unavailable`, `probe record unreadable`, `probe terminalization record unreadable`, `hold clear receipt unreadable`, `journal record unreadable`, `handoff record unreadable`, `boot record unreadable`); several are joined with `; ` |
 
 **Minimum supported version and support window (#1384, D35).** The same
 response carries `minimum_supported_version` and `support_window`. Both ship

@@ -726,6 +726,26 @@ fn parse_clear_receipt(bytes: &[u8]) -> io::Result<HoldClearReceipt> {
     Ok(receipt)
 }
 
+/// Why no local hold clear can run on this install, before the record's
+/// own phase is checked: an unresolved terminalization marker (`.pending`)
+/// or a barrier failure latched in this process. `clear_failed_hold` and the
+/// diagnostics `clearable` flag both use this, so they cannot disagree.
+pub(crate) fn clear_blocker(install: &Path) -> io::Result<Option<&'static str>> {
+    match journal::read_auxiliary_record(&uncertainty_path(install)?) {
+        Ok(_) => {
+            return Ok(Some(
+                "probe terminalization is unresolved; records preserved",
+            ))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    if is_latched(&state_path(install)?) {
+        return Ok(Some("a probe record barrier failed in this process"));
+    }
+    Ok(None)
+}
+
 /// D190: an authenticated, recorded local clear of a failed-release hold.
 ///
 /// The caller holds the install lock and has authenticated the request. Only
@@ -737,18 +757,9 @@ fn parse_clear_receipt(bytes: &[u8]) -> io::Result<HoldClearReceipt> {
 /// request then completes the clear.
 pub(crate) fn clear_failed_hold(install: &Path, version: &str) -> Result<HoldClear, ProbeRefusal> {
     let path = state_path(install).map_err(recovery_error)?;
-    match journal::read_auxiliary_record(&uncertainty_path(install).map_err(recovery_error)?) {
-        Ok(_) => {
-            return Err(ProbeRefusal::RecoveryFailed {
-                reason: "probe terminalization is unresolved; records preserved".into(),
-            });
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(recovery_error(error)),
-    }
-    if is_latched(&path) {
+    if let Some(reason) = clear_blocker(install).map_err(recovery_error)? {
         return Err(ProbeRefusal::RecoveryFailed {
-            reason: "a probe record barrier failed in this process".into(),
+            reason: reason.into(),
         });
     }
     let Some(state) = read_state(install).map_err(recovery_error)? else {
