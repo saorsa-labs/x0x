@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Upgrade records: `clearable` matches the local clear (#1932 review; A14
+  amendment of 15 Nov 2026).** A hold reports `clearable: true` only when
+  `x0x upgrade --clear-hold` would clear it; an unresolved `.pending` probe
+  marker is listed as an `unresolved_probe_record` hold. An unreadable
+  journal, handoff or boot record now sets `records_error`.
 - **`GET /diagnostics/upgrade` reports the upgrade records on disk (#1381
   M2 part, A14 amendment of 15 Nov 2026).** New fields: `plan` (the safe-apply
   journal's transaction, phase and versions), `last_attempt` (the pre-swap
