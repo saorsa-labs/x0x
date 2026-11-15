@@ -68,6 +68,14 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Documented the exit for a forked head behind an armed gap record
+  (#871).** The anchored-gap gate has no expiry and no local clear. With no
+  progress (10 minutes for an owner-armed gap, 30 minutes for an
+  admin-armed gap) the node asks for an attestation, shows
+  `reseat_required {not_on_chain}` with a `gap` ref, and an admin's manual
+  re-seat (ADR 0109 §3) retires the record. A08 amendment of 15 Nov 2026.
+  No code change.
+
 - **A TreeKEM member that was down past the last metadata resend asks for
   the commits it missed after it starts (#1427).** With no later traffic,
   such a member stayed at its old epoch. When its last recorded up time is
