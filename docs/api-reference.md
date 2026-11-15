@@ -3844,6 +3844,8 @@ body as a literal, `@path`, a bare path, or `-` for stdin, plus the optional
 | POST | `/grants` | `x0x grant issue <GRANT_JSON>` | Sign a share grant with the owner key, store it, and deliver it by durable DM |
 | DELETE | `/grants/:id` | `x0x grant revoke <id>` | Revoke a share grant (owner key; revocation gossiped on `x0x.revocation.v3` and pushed directly to capable recipients) |
 | GET | `/grants/received` | `x0x grant received` | List share grants that name this install as grantee |
+| GET | `/grants/data/:agent/:group/:store` | `x0x grant data keys <agent> <group> <store>` | List the keys of a store on a granted agent, read through a received `ShareCap::Data` grant (#1094). `:group` is the stable group id and `:store` the store name, as in the grant. Returns `keys` (`key`, `content_type`, `size`, `updated_at`) and `truncated`. 403 when the granted agent holds no grant that covers the read; 503 when it does not hold the store open; 424 when the agent does not advertise `data_read_v1`; 504 when no reply comes within 15 s. Durable owner token |
+| GET | `/grants/data/:agent/:group/:store/:key` | `x0x grant data get <agent> <group> <store> <key>` | Read one value of a store on a granted agent the same way. Returns `key`, `value` (base64), `content_type` and `updated_at`; 404 when the key is not in the store; 413 when the value is over 30 720 bytes, the read limit (a store value can be up to 64 KiB, but a read reply must fit one 48 KiB DM), or its content type is over 128 bytes; other statuses as above |
 | POST | `/grants/:id/renew` | `x0x grant renew <id> [--ttl-secs N] [--deliver-to <agent>]... [--no-names]` | Renew an issued share grant: sign a new grant with the same grantee, agents and caps, valid from now (at most 90 days), and deliver it |
 
 **Lifetime and renewal (#1350).** A share grant lasts at most 90 days
@@ -3939,10 +3941,10 @@ environment or free-text causes.
 |---|---|
 | `plan` | `null` when no record exists. `{record: "journal", transaction_id, phase, previous_version, candidate_version, participants, cause, boot_attempt}` for an M2 journal (`participants` is a count; `cause` is `failed`, `interrupted` or `null`). `{record: "refused"}` for an unreadable record, `{record: "legacy_handoff"}` or `{record: "handoff", boot_attempt}` for a handoff without a journal |
 | `last_attempt` | `{version, transaction_id, attempt, phase, cause, retry_remaining_ms}` from the install's pre-swap probe record, or `null`. `phase` is `running`, `passed`, `interrupted_wait`, `failed_hold` or `recovery_failed` |
-| `holds` | One entry `{version, kind, cause, clearable}` while the probe record holds a release. `kind` is `failed_release` (`clearable: true`, see `x0x upgrade --clear-hold`) or `recovery_failed` (`clearable: false`) |
+| `holds` | Entries `{version, kind, cause, clearable}`. `kind` is `failed_release` (see `x0x upgrade --clear-hold`), `recovery_failed` (never clearable) or `unresolved_probe_record` (an unresolved `.pending` terminalization marker beside the probe record; never clearable, `cause` is `null`). `clearable` is `true` only when `x0x upgrade --clear-hold` would clear the hold: a `.pending` marker or a probe barrier failure in this daemon process makes every hold not clearable |
 | `last_hold_clear` | `{version, cause, cleared_at_unix}` from the most recent local clear receipt, or `null` |
 | `backups` | Backup files beside the daemon and its sibling CLI: `{artifact, name, size_bytes, modified_unix}`, `artifact` `daemon` or `cli`, at most 32. Names are `<binary>.backup` (legacy) or `<binary>.backup-<version>-<transaction>` (pair apply) |
-| `records_error` | `null`, or fixed text naming a record that could not be read (`install path unavailable`, `probe record unreadable`, `hold clear receipt unreadable`) |
+| `records_error` | `null`, or fixed text naming a record that could not be read (`install path unavailable`, `probe record unreadable`, `probe terminalization record unreadable`, `hold clear receipt unreadable`, `journal record unreadable`, `handoff record unreadable`, `boot record unreadable`); several are joined with `; ` |
 
 **Minimum supported version and support window (#1384, D35).** The same
 response carries `minimum_supported_version` and `support_window`. Both ship

@@ -22,7 +22,7 @@ const MAX_BACKUPS: usize = 32;
 pub(super) fn records_json(data_dir: &Path, install: Option<&Path>) -> Map<String, Value> {
     let mut errors = Vec::new();
     let mut body = Map::new();
-    body.insert("plan".into(), plan_json(data_dir));
+    body.insert("plan".into(), plan_json(data_dir, &mut errors));
 
     let probe_state = match install {
         Some(install) => match probe::read_state(install) {
@@ -50,10 +50,29 @@ pub(super) fn records_json(data_dir: &Path, install: Option<&Path>) -> Map<Strin
             })
         }),
     );
+    // `clearable` must match `probe::clear_failed_hold`: an unresolved
+    // `.pending` terminalization marker or a latched barrier failure blocks
+    // every local clear, and the marker is itself a hold.
+    let blocker = match install.map(probe::clear_blocker) {
+        Some(Ok(blocker)) => blocker,
+        Some(Err(_)) => {
+            errors.push("probe terminalization record unreadable");
+            Some("unreadable")
+        }
+        None => None,
+    };
     let mut holds = Vec::new();
+    if blocker.is_some() {
+        holds.push(json!({
+            "version": probe_state.as_ref().map(|state| state.version.clone()),
+            "kind": "unresolved_probe_record",
+            "cause": Value::Null,
+            "clearable": false,
+        }));
+    }
     if let Some(state) = &probe_state {
         let held = match state.phase {
-            ProbePhase::FailedHold => Some(("failed_release", true)),
+            ProbePhase::FailedHold => Some(("failed_release", blocker.is_none())),
             // D190: only a failed-release hold has a local clear.
             ProbePhase::RecoveryFailed => Some(("recovery_failed", false)),
             _ => None,
@@ -98,8 +117,19 @@ pub(super) fn records_json(data_dir: &Path, install: Option<&Path>) -> Map<Strin
 }
 
 /// The frozen plan of the M2 journal, if a record exists.
-fn plan_json(data_dir: &Path) -> Value {
+fn plan_json(data_dir: &Path, errors: &mut Vec<&'static str>) -> Value {
     let records = journal::read_boot_records(data_dir);
+    // Each refused record is named by fixed text: parser errors can quote
+    // a malformed record. A refused boot record alone must still show.
+    for (read, name) in [
+        (&records.journal, "journal record unreadable"),
+        (&records.handoff, "handoff record unreadable"),
+        (&records.boot, "boot record unreadable"),
+    ] {
+        if matches!(read, RecordRead::Refused(_)) {
+            errors.push(name);
+        }
+    }
     let boot_attempt = match &records.boot {
         RecordRead::Boot(boot) => Some(boot.attempt),
         _ => None,
@@ -348,8 +378,66 @@ mod tests {
         .expect("journal");
         let body = records_json(dir.path(), None);
         assert_eq!(body["plan"], json!({ "record": "refused" }));
+        assert!(body["records_error"]
+            .as_str()
+            .expect("records error")
+            .contains("journal record unreadable"));
         assert!(!serde_json::to_string(&body)
             .expect("json")
             .contains("token-123"));
+    }
+
+    // #1932 review: an unreadable boot record alone names a records error,
+    // without its contents.
+    #[test]
+    fn an_unreadable_boot_record_alone_is_a_records_error() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        std::fs::write(
+            dir.path().join(journal::BOOT_FILE_NAME),
+            b"{\"secret\":\"token-456\"",
+        )
+        .expect("boot");
+        let body = records_json(dir.path(), None);
+        assert!(body["records_error"]
+            .as_str()
+            .expect("records error")
+            .contains("boot record unreadable"));
+        assert!(!serde_json::to_string(&body)
+            .expect("json")
+            .contains("token-456"));
+    }
+
+    // #1932 review: with the `.pending` terminalization marker present,
+    // `clear_failed_hold` refuses, so the hold is not clearable and the
+    // marker is listed as its own hold.
+    #[cfg(unix)]
+    #[test]
+    fn a_pending_marker_makes_the_failed_hold_not_clearable() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let install = dir.path().join("x0xd");
+        std::fs::write(&install, b"daemon").expect("install");
+        let install = install.canonicalize().expect("canonical");
+        write_probe_record(
+            &install,
+            ProbePhase::FailedHold,
+            probe::ProbeCause::RetriesExhausted,
+        );
+        std::fs::write(
+            probe::uncertainty_path(&install).expect("marker path"),
+            b"{}",
+        )
+        .expect("marker");
+
+        let body = records_json(dir.path(), Some(&install));
+        let holds = body["holds"].as_array().expect("holds");
+        assert_eq!(holds.len(), 2, "{holds:?}");
+        assert_eq!(holds[0]["kind"], "unresolved_probe_record");
+        assert_eq!(holds[0]["clearable"], false);
+        assert_eq!(holds[1]["kind"], "failed_release");
+        assert_eq!(holds[1]["clearable"], false);
+        assert!(matches!(
+            probe::clear_failed_hold(&install, "9.9.9"),
+            Err(probe::ProbeRefusal::RecoveryFailed { .. })
+        ));
     }
 }

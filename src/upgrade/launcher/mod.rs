@@ -8,6 +8,7 @@
 #![allow(dead_code)]
 
 mod child;
+mod commit;
 mod control;
 mod coordinator;
 mod filesystem;

@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Upgrade records: `clearable` matches the local clear (#1932 review; A14
+  amendment of 15 Nov 2026).** A hold reports `clearable: true` only when
+  `x0x upgrade --clear-hold` would clear it; an unresolved `.pending` probe
+  marker is listed as an `unresolved_probe_record` hold. An unreadable
+  journal, handoff or boot record now sets `records_error`.
 - **`GET /diagnostics/upgrade` reports the upgrade records on disk (#1381
   M2 part, A14 amendment of 15 Nov 2026).** New fields: `plan` (the safe-apply
   journal's transaction, phase and versions), `last_attempt` (the pre-swap
@@ -14,6 +19,16 @@ All notable changes to this project will be documented in this file.
   files beside the daemon and CLI) and `records_error`. Fixed record names
   only; no recorded path is followed and no argv, environment or free-text
   cause is returned.
+- **A grantee reads a store through a `ShareCap::Data` grant (#1094 slice D1,
+  A03 amendment of 15 Nov 2026).** `GET /grants/data/:agent/:group/:store`
+  lists a granted store's keys and `GET /grants/data/:agent/:group/:store/:key`
+  reads one value (`x0x grant data keys|get`). The granted agent checks the
+  grant and serves the read from its own copy over two new typed DMs,
+  `x0x-data-read-v1` and `x0x-data-reply-v1`. New capability bit 20,
+  `data_read_v1`; a peer without it is not sent a read. A read reply must fit
+  one 48 KiB DM, so a value over 30 720 bytes (or with a content type over
+  128 bytes) is answered 413; the store itself takes values up to 64 KiB.
+  Writes come later.
 - **A join request the authority refuses as `stale` is signed again over the
   authority's head (#1840 routes 1–3, A08 amendment of 15 Nov 2026).** A
   second joiner on a group with members, a request that crosses an edit of
@@ -193,6 +208,22 @@ All notable changes to this project will be documented in this file.
 
 ### Tests and tooling
 
+- **Coordinator recovery records its outcome (#1376, S3c follow-up; A14
+  amendment of 15 Nov 2026).** A host with no trial records no longer
+  repeats a refused restore on every pass: the coordinator arms a trial for
+  each participant that has none, then restores. Any failure after it
+  decides to restore marks the host and every trial `RecoveryFailed`. The
+  D189 retry wait or the D190 failed-release hold is written into the
+  candidate's probe record (new causes `apply_failed` and
+  `apply_interrupted`) before any restored start, and the record's attempt
+  count carries D189 across fresh transactions.
+- **Upgrade host commit gate (#1377, S3d part 1; A14 amendment of 15 Nov
+  2026).** A versioned per-candidate health commit (`upgrade-health.json`)
+  binds transaction, child identity, version, roots and executable hash;
+  the dormant launcher commits the host only for a healthy full set with
+  the candidate CLI installed, and applies D193 peer continuity. The S4
+  host-commit gate is shared, and an uncommitted trial no longer migrates
+  an older `history.db` schema (history is off for that start).
 - **Launcher host coordinator recovery (#1376, S3c; A14 amendment of 15 Nov
   2026).** A dormant coordinator pass (`src/upgrade/launcher/coordinator.rs`)
   reconciles the host after a missing handoff, one healthy and one failed

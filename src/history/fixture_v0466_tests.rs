@@ -786,3 +786,104 @@ fn an_undecodable_version_leaves_a_crash_wal_untouched() {
     );
     assert!(error.contains("schema check"), "{error}");
 }
+
+/// ADR 0094 §4, §6 (#1377): inside an uncommitted upgrade trial an older
+/// schema is not migrated. The service returns no store and the file's
+/// bytes stay unchanged; with the gate open (host committed) it migrates.
+#[test]
+fn an_older_schema_is_not_migrated_before_host_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = copy_fixture(dir.path());
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("UPDATE schema_version SET version = 3", [])
+            .unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+    }
+    let before = sha256_file(&path);
+    // An uncommitted trial: a journal in `booting`.
+    let journal = dir.path().join(crate::upgrade::journal::JOURNAL_FILE_NAME);
+    write_trial_journal(&journal, "booting");
+    let listing = dir_listing(dir.path());
+    let config = HistoryConfig {
+        enabled: true,
+        db_path: Some(path.clone()),
+        ..HistoryConfig::default()
+    };
+    assert!(
+        HistoryService::open_unless_trial_needs_migration(&config, dir.path())
+            .unwrap()
+            .is_none(),
+        "a trial defers the migration"
+    );
+    assert_eq!(sha256_file(&path), before, "no byte changed");
+    assert_eq!(dir_listing(dir.path()), listing, "and no side file");
+
+    // After host commit the same open runs the migration.
+    write_trial_journal(&journal, "host_committed");
+    // This copy only claims schema 3 and still has the v4 columns, so the
+    // v3 -> v4 migration's ALTER fails: that failure proves it ran.
+    match HistoryService::open_unless_trial_needs_migration(&config, dir.path()) {
+        Ok(None) => panic!("host commit must open the gate"),
+        Ok(Some(_)) => {}
+        Err(error) => assert!(
+            error.to_string().contains("duplicate column"),
+            "the migration ran: {error}"
+        ),
+    }
+}
+
+/// A schema-valid M2 journal record in `phase`, as the S4 gate test writes.
+fn write_trial_journal(path: &Path, phase: &str) {
+    let dir = path.parent().unwrap();
+    let artifact = |name: &str| {
+        serde_json::json!({
+            "target_path": dir.join(name),
+            "staged_path": dir.join(format!("{name}.staged")),
+            "backup_path": dir.join(format!("{name}.backup")),
+            "previous_sha256": vec![1_u8; 32],
+            "candidate_sha256": vec![2_u8; 32],
+        })
+    };
+    let record = serde_json::json!({
+        "schema_version": 1,
+        "record_kind": "journal",
+        "transaction_id": "transaction-a",
+        "sequence": 1,
+        "generation": 1,
+        "plan": {
+            "previous_version": "0.48.1",
+            "candidate_version": "0.48.2",
+            "manifest_sha256": vec![3_u8; 32],
+            "daemon": artifact("x0xd"),
+            "cli": artifact("x0x"),
+            "participants": [{
+                "instance_id": "alice",
+                "executable": dir.join("x0xd"),
+                "data_root": dir,
+                "identity_root": dir,
+                "argv": ["x0xd"],
+                "cwd": dir,
+                "env": {},
+                "restart": {
+                    "mode": "TransactionalHandoff",
+                    "supervised_exit_code": null,
+                    "supervision_signal": null,
+                    "launchd_verified": null,
+                    "systemd_verified": null,
+                    "launcher": null
+                },
+                "old_pid": 1234,
+                "process_start": 100,
+                "boot_id": "boot-a",
+                "was_running": true
+            }]
+        },
+        "phase": phase,
+        "cause": null,
+        "daemon_progress": {"swapped": true, "restored": false, "observed_sha256": null},
+        "cli_progress": {"swapped": true, "restored": false, "observed_sha256": null}
+    });
+    std::fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
+}

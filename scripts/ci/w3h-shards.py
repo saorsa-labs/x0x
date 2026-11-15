@@ -52,6 +52,9 @@ GROUPS = (
     # H-S3-q (3) (#1572) runs the H-S3-c3 prefix with O's restart, so it
     # has its own shard like the other owner-axis rows.
     ('s3-q3', 'w3h_1356_red_s3_q3_issuer_unreadable_sidecar$'),
+    # H-S3-q2 (#1572): about 60 s per rerun in the 12-CPU VM, so about
+    # 40 min for 20 reruns on a runner; its own shard, as H-S3-q.
+    ('s3-q2', 'w3h_1356_control_s3_q2_sidecar_fault_cases$'),
     ('s3', 'w3h_1356_'),
     # #1623 (refs #1356): about 11 s per rerun on macOS; `rest` already
     # takes about 104 of its 120 minutes (run 41624339394), so the row
