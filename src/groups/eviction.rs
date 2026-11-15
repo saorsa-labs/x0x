@@ -1250,7 +1250,29 @@ pub fn evaluate_row(row: &ObligationRow, ctx: &RowContext<'_>, timing: &S4Timing
     };
     let (waiting, action) = match &permission {
         CommitPermission::NotEligible => {
-            let local_is_admin = ctx.active_admins.contains(&ctx.local);
+            // §4 L274-L275 (D72; #1581): a worker that loses its committer
+            // authority while the row is open marks
+            // `local_committer_ineligible`, whatever the exit: revoked
+            // (still an Active admin seat), demoted to member, or removed.
+            // A local node that is no longer an Active admin was this
+            // row's worker when the row's last derivation named it
+            // designated or a fallback rank. A stored mark also keeps it
+            // after the derivation moves to the next admin, and across a
+            // restart while `waiting` holds it. It is shown only while no
+            // override replaces the stored `waiting` (rebuilding, the
+            // host-commit gate, the fork wait, `waiting_for_receiver_upgrade`,
+            // rebind): once one has, and the derivation no longer names the
+            // local node, the row falls back to the plain designated wait.
+            // A member that was never a committer for the row keeps the
+            // plain designated wait.
+            let local = ctx.local;
+            let local_was_worker = row.designated == Some(local)
+                || row.ranks.contains(&local)
+                || row
+                    .waiting
+                    .as_ref()
+                    .is_some_and(|waiting| waiting.cause == WaitingCause::LocalCommitterIneligible);
+            let local_is_admin = ctx.active_admins.contains(&local) || local_was_worker;
             let cause = if local_is_admin {
                 WaitingCause::LocalCommitterIneligible
             } else {
@@ -2678,6 +2700,78 @@ mod tests {
             now_unix: 1_000,
             local_certificate_expired: false,
         }
+    }
+
+    /// §4 L274 (#1581, `s4_local_authority_exit` demoted form): the
+    /// designated admin A is demoted to member while its row is open. A
+    /// is no longer an Active admin, but the row's last derivation named
+    /// it designated, so it marks `local_committer_ineligible` naming the
+    /// new designated admin, and the mark stays once the stored
+    /// derivation moved to D. A member that never was a committer for the
+    /// row keeps the plain designated wait. FAIL-BEFORE: the demoted A
+    /// showed `waiting_for_designated_admin` (`ci.yml` pinned
+    /// `w3h_1581f_red_local_authority_exit_demoted_form=RED`).
+    #[test]
+    fn evaluate_row_marks_a_demoted_worker_local_committer_ineligible() {
+        let timing = S4Timing::default();
+        let mut row = sample_row();
+        row.designated = Some(id(1));
+        row.ranks = vec![id(2)];
+        let none = BTreeSet::new();
+        // A (id 1) is demoted: D (id 2) is the only Active admin.
+        let admins = [id(2)];
+        let demoted = evaluate_row(&row, &ctx(1, &admins, &none, Duration::ZERO), &timing);
+        assert_eq!(demoted.action, RowAction::None);
+        assert_eq!(
+            demoted.waiting.clone().map(|w| (w.cause, w.named)),
+            Some((WaitingCause::LocalCommitterIneligible, vec![id(2)]))
+        );
+        // The worker stores the new derivation and the mark.
+        row.designated = Some(id(2));
+        row.ranks = Vec::new();
+        row.waiting = demoted.waiting;
+        let later = evaluate_row(&row, &ctx(1, &admins, &none, Duration::ZERO), &timing);
+        assert_eq!(
+            later.waiting.map(|w| w.cause),
+            Some(WaitingCause::LocalCommitterIneligible)
+        );
+        // A fallback rank that is demoted marks too.
+        let mut ranked = sample_row();
+        ranked.designated = Some(id(2));
+        ranked.ranks = vec![id(3)];
+        let rank_demoted = evaluate_row(&ranked, &ctx(3, &admins, &none, Duration::ZERO), &timing);
+        assert_eq!(
+            rank_demoted.waiting.map(|w| w.cause),
+            Some(WaitingCause::LocalCommitterIneligible)
+        );
+        // A member that never was a committer for the row.
+        let member = evaluate_row(&ranked, &ctx(8, &admins, &none, Duration::ZERO), &timing);
+        assert_eq!(
+            member.waiting.map(|w| (w.cause, w.named)),
+            Some((WaitingCause::WaitingForDesignatedAdmin, vec![id(2)]))
+        );
+    }
+
+    /// #1921 review: the mark lives only in the row's stored derivation
+    /// and its stored `waiting`. When an override (here the host-commit
+    /// gate) replaced the stored `waiting` between two evaluations, and
+    /// the derivation already moved to the next admin, the demoted node
+    /// falls back to `waiting_for_designated_admin`. This pins the
+    /// documented limit; there is no separate worker-history state.
+    #[test]
+    fn an_override_between_evaluations_drops_the_demoted_worker_mark() {
+        let timing = S4Timing::default();
+        let mut row = sample_row();
+        row.designated = Some(id(2));
+        row.ranks = Vec::new();
+        row.waiting = Some(WaitingState::cause(WaitingCause::WaitingForHostCommit));
+        let none = BTreeSet::new();
+        let admins = [id(2)];
+        let evaluation = evaluate_row(&row, &ctx(1, &admins, &none, Duration::ZERO), &timing);
+        assert_eq!(
+            evaluation.waiting.map(|w| (w.cause, w.named)),
+            Some((WaitingCause::WaitingForDesignatedAdmin, vec![id(2)]))
+        );
     }
 
     #[test]

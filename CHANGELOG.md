@@ -183,6 +183,11 @@ All notable changes to this project will be documented in this file.
   Until then the row shows `waiting_for_head_sync`, also past the 13 s
   restart sync wait. Before, the wait alone counted as a synced head, and a
   restarted admin could seal its stale head with a divergent key.
+- **A demoted S4 worker shows `local_committer_ineligible` (#1581).** An
+  admin that is demoted to member while it holds an open revocation-eviction
+  row now marks the row `local_committer_ineligible` naming the next
+  admin, as ADR 0110 §4 wants. Before, the row showed
+  `waiting_for_designated_admin`.
 
 ## [v0.48.1] - 2026-10-17
 

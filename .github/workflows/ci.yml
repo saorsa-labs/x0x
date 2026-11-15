@@ -1150,7 +1150,7 @@ jobs:
           --require w3h_1581f_control_local_authority_exit_revoked_committer
           --expect w3h_1581f_control_local_authority_exit_revoked_committer=GREEN
           --require w3h_1581f_red_local_authority_exit_demoted_form
-          --expect w3h_1581f_red_local_authority_exit_demoted_form=RED
+          --expect w3h_1581f_red_local_authority_exit_demoted_form=GREEN
           --require w3h_1581g_control_sidecar_lifecycle_evs_damage_rebuilds
           --expect w3h_1581g_control_sidecar_lifecycle_evs_damage_rebuilds=GREEN
           --require w3h_1581g_red_sidecar_lifecycle_journal_and_pending_resume
