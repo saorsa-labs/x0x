@@ -6,6 +6,16 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **A join request the authority refuses as `stale` is signed again over the
+  authority's head (#1840 routes 1–3, A08 amendment of 15 Nov 2026).** A
+  second joiner on a group with members, a request that crosses an edit of
+  the group, and a removed member asking again are now listed and can be
+  approved. The authority sends its head (signed head commit, roster, public
+  metadata) to the requester whose turn it is in the join queue; the
+  requester checks it, signs the same request again over it and offers it,
+  and after approval it can apply the approval link. A requester that waits
+  behind another turn gets no outcome until its turn. New capability bit 19,
+  `join_request_head_v1`; a peer without it keeps the earlier behaviour.
 - **A `stale` join-request outcome can carry the authority's head (#1840,
   A08 amendment of 15 Nov 2026).** New optional `head` field on
   `groups::join_outcome::JoinRequestOutcome` (signed head commit, roster

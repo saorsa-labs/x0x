@@ -1682,6 +1682,11 @@ pub(super) struct NamedGroupTestRecorders {
     /// returns an error. Tests that want the success arm set this. Production
     /// leaves it false and uses the transport result.
     pub(super) metadata_publish_force_ok: std::sync::atomic::AtomicBool,
+    /// #1840: the unit-test agent has no gossip runtime, so a publish that
+    /// must return its signed V2 envelope returns none. Tests that need the
+    /// envelope set this; the publish then returns the envelope the gossip
+    /// layer would sign (`sign_v2_envelope`), without a transport.
+    pub(super) metadata_publish_envelope: std::sync::atomic::AtomicBool,
     /// #1113 startup catch-up: tests that want a page send to count as
     /// delivered set this. Production builds omit the recorders.
     pub(super) catchup_page_force_ok: std::sync::atomic::AtomicBool,

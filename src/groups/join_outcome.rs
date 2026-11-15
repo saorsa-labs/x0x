@@ -191,10 +191,6 @@ pub enum JoinHeadError {
     /// The head commit's hash or signature does not verify.
     #[error("the head commit does not verify: {0}")]
     Unverified(String),
-    /// The head commit is signed by neither the authority nor an Active
-    /// admin of the head roster.
-    #[error("the head is not signed by the authority or an active admin")]
-    Signer,
     /// The roster projection does not hash to the signed `roster_root`.
     #[error("the head roster does not hash to the signed roster root")]
     Roster,
@@ -205,10 +201,15 @@ pub enum JoinHeadError {
     /// signed `policy_hash`: the requester's copy has another policy.
     #[error("the head policy is not this copy's request-access policy")]
     Policy,
-    /// The head is behind this copy by more than the requester's own
-    /// request link.
-    #[error("the head is behind this copy")]
-    Behind,
+    /// The head does not move this copy forward: it is at an older
+    /// revision than the copy's base, or at the same revision with another
+    /// state hash.
+    #[error("the head is not ahead of this copy")]
+    NotAhead,
+    /// The group's creator is not an Active admin or owner in the head
+    /// roster.
+    #[error("the head roster drops the group's owner")]
+    OwnerMissing,
     /// The head or this copy is withdrawn.
     #[error("the group is withdrawn")]
     Withdrawn,
@@ -226,21 +227,40 @@ pub enum JoinHeadError {
 /// the head link. The caller signs its request again over the result. The
 /// local copy is not changed.
 ///
-/// `authority_agent_id` is the authenticated sender of the outcome, the
-/// authority the request was offered to; `requester_agent_id` is this
-/// daemon's agent.
+/// Trust: the only trust anchor is the authority. The caller has matched
+/// the outcome to its own pending offer and its authenticated sender to the
+/// authority that offer went to, the same authority whose card the
+/// requester imported. The checks below prove the head is intact and fits
+/// this group; they do not prove who may have written it. In particular
+/// the commit's signer is not checked against the head roster, because
+/// that roster comes from the same head (a key could list itself as an
+/// admin), and the newest link is often another requester's request link,
+/// which that requester signed.
+///
+/// Chain: the requester is not a member, so its copy is a card stub, a copy
+/// from before an edit, or the copy it kept as a removed member. It holds
+/// none of the links between that copy and the head, so it cannot check
+/// ancestry. The rule is forward-only instead: the head must be at a
+/// higher revision than the copy's base, or at the same revision with the
+/// same state hash (a card stub holds the authority's real hash with a
+/// partial roster). The base is the copy's head, or the link before it when
+/// the newest link is the requester's own request link. So a head can
+/// never move the copy back. Clearing the copy's log is allowed for the
+/// same reason: a non-member's log holds no link that a later check reads,
+/// and the installed copy keeps the head link, which is what the next seal
+/// chains to.
+///
+/// `requester_agent_id` is this daemon's agent.
 ///
 /// Checks, each a [`JoinHeadError`]:
-/// - the head commit is for this group, its hash and ML-DSA-65 signature
-///   verify, and its signer is the authority or an Active admin (or owner)
-///   of the head roster;
+/// - the head commit is for this group, and its hash and ML-DSA-65
+///   signature verify (the commit is intact);
+/// - the group's creator is an Active admin or owner in the head roster;
 /// - the roster projection re-derives the signed `roster_root`, and the
 ///   metadata re-derives the signed `public_meta_hash`;
 /// - the local policy is request access and re-derives the signed
 ///   `policy_hash`;
-/// - the head is at most one revision behind the local copy (the local copy
-///   may hold the requester's own refused request link on top of an older
-///   head);
+/// - the head is ahead of the copy's base, as above;
 /// - neither is withdrawn, and the requester is not Active or Banned in the
 ///   head roster;
 /// - the installed copy re-derives the head's full `state_hash`.
@@ -250,7 +270,6 @@ pub enum JoinHeadError {
 pub fn adopt_join_head(
     local: &GroupInfo,
     head: &RetainedCommit,
-    authority_agent_id: &str,
     requester_agent_id: &str,
 ) -> Result<GroupInfo, JoinHeadError> {
     let commit = &head.commit;
@@ -260,12 +279,6 @@ pub fn adopt_join_head(
     commit
         .verify_structure()
         .map_err(|e| JoinHeadError::Unverified(e.to_string()))?;
-    let signer_is_admin = head.roster.get(&commit.committed_by).is_some_and(|snap| {
-        snap.state == GroupMemberState::Active && snap.role.at_least(GroupRole::Admin)
-    });
-    if commit.committed_by != authority_agent_id && !signer_is_admin {
-        return Err(JoinHeadError::Signer);
-    }
     if roster_root_of_projection(&head.roster) != commit.roster_root {
         return Err(JoinHeadError::Roster);
     }
@@ -279,8 +292,29 @@ pub fn adopt_join_head(
     {
         return Err(JoinHeadError::Policy);
     }
-    if commit.revision.saturating_add(1) < local.state_revision {
-        return Err(JoinHeadError::Behind);
+    let creator_hex = hex::encode(local.creator.as_bytes());
+    if !head.roster.get(&creator_hex).is_some_and(|snap| {
+        snap.state == GroupMemberState::Active && snap.role.at_least(GroupRole::Admin)
+    }) {
+        return Err(JoinHeadError::OwnerMissing);
+    }
+    let own_link_on_top = local.commit_log.last().is_some_and(|link| {
+        link.commit.committed_by == requester_agent_id
+            && link.commit.revision == local.state_revision
+    });
+    let (base_revision, base_hash) = if own_link_on_top {
+        (
+            local.state_revision.saturating_sub(1),
+            local.prev_state_hash.clone(),
+        )
+    } else {
+        (local.state_revision, Some(local.state_hash.clone()))
+    };
+    let ahead = commit.revision > base_revision
+        || (commit.revision == base_revision
+            && base_hash.as_deref() == Some(commit.state_hash.as_str()));
+    if !ahead {
+        return Err(JoinHeadError::NotAhead);
     }
     if commit.withdrawn || local.withdrawn {
         return Err(JoinHeadError::Withdrawn);
@@ -392,9 +426,8 @@ mod tests {
     /// metadata, so a request link it signs next chains to the head.
     #[test]
     fn issue1840_a_stale_copy_adopts_the_checked_head() {
-        let (owner, authority, stale) = authority_and_stale_copy(2);
-        let owner_hex = hex::encode(owner.agent_id().as_bytes());
-        let adopted = adopt_join_head(&stale, &head_of(&authority), &owner_hex, &requester())
+        let (_owner, authority, stale) = authority_and_stale_copy(2);
+        let adopted = adopt_join_head(&stale, &head_of(&authority), &requester())
             .expect("a valid head is adopted");
         assert_eq!(adopted.state_hash, authority.state_hash);
         assert_eq!(adopted.state_revision, authority.state_revision);
@@ -410,6 +443,40 @@ mod tests {
         );
     }
 
+    /// WHY (#1840, review of #1927): the head carries certificate digests
+    /// only, and a fresh joiner holds none of the members' certificates.
+    /// The requester's plain seal over the adopted copy still works: a
+    /// request link changes no roster row and verifies no certificate, and
+    /// the link chains to the authority's head.
+    #[test]
+    fn issue1840_requester_seals_over_a_digest_only_head() {
+        let (owner, mut authority, stale) = authority_and_stale_copy(2);
+        for member in authority.members_v2.values_mut() {
+            member.certificate = None;
+            member.certificate_digest = Some("cd".repeat(32));
+        }
+        authority
+            .seal_commit(&owner, now_ms())
+            .expect("head over digest seats");
+        let joiner = AgentKeypair::generate().expect("joiner");
+        let joiner_hex = hex::encode(joiner.agent_id().as_bytes());
+        let mut adopted =
+            adopt_join_head(&stale, &head_of(&authority), &joiner_hex).expect("adopted");
+        assert!(adopted
+            .members_v2
+            .values()
+            .all(|m| m.certificate.is_none() && m.certificate_digest.is_some()));
+        let link = adopted
+            .seal_commit(&joiner, now_ms())
+            .expect("plain requester seal");
+        assert_eq!(link.revision, authority.state_revision + 1);
+        assert_eq!(
+            link.prev_state_hash.as_deref(),
+            Some(authority.state_hash.as_str())
+        );
+        assert_eq!(link.roster_root, head_of(&authority).commit.roster_root);
+    }
+
     /// WHY (#1840): every check refuses on its own, and a refused head
     /// changes nothing.
     #[test]
@@ -417,9 +484,7 @@ mod tests {
         let (owner, authority, stale) = authority_and_stale_copy(1);
         let owner_hex = hex::encode(owner.agent_id().as_bytes());
         let me = requester();
-        let adopt = |head: &RetainedCommit, local: &GroupInfo| {
-            adopt_join_head(local, head, &owner_hex, &me)
-        };
+        let adopt = |head: &RetainedCommit, local: &GroupInfo| adopt_join_head(local, head, &me);
 
         let mut other = head_of(&authority);
         other.commit.group_id = "00".repeat(32);
@@ -432,14 +497,14 @@ mod tests {
             Err(JoinHeadError::Unverified(_))
         ));
 
-        // Signed by an agent that is neither the authority nor an admin.
-        let stranger = AgentKeypair::generate().expect("stranger");
-        let mut by_stranger = authority.clone();
-        by_stranger.seal_commit(&stranger, now_ms()).expect("seal");
-        assert_eq!(
-            adopt(&head_of(&by_stranger), &stale),
-            Err(JoinHeadError::Signer)
-        );
+        // The newest link may be another requester's request link, signed
+        // by that requester: an intact commit is adopted whoever signed it.
+        let other_requester = AgentKeypair::generate().expect("requester");
+        let mut by_requester = authority.clone();
+        by_requester
+            .seal_commit(&other_requester, now_ms())
+            .expect("seal");
+        assert!(adopt(&head_of(&by_requester), &stale).is_ok());
 
         let mut roster = head_of(&authority);
         roster.roster.pop_first();
@@ -461,11 +526,56 @@ mod tests {
             Err(JoinHeadError::Policy)
         );
 
+        // Not ahead: the copy is past the head; the head is older than the
+        // copy; a head at the copy's revision with another hash (a fork).
         let mut ahead = stale.clone();
         ahead.state_revision = authority.state_revision + 2;
         assert_eq!(
             adopt(&head_of(&authority), &ahead),
-            Err(JoinHeadError::Behind)
+            Err(JoinHeadError::NotAhead)
+        );
+        assert_eq!(
+            adopt(&head_of(&stale), &authority),
+            Err(JoinHeadError::NotAhead)
+        );
+        let mut fork = stale.clone();
+        fork.state_revision -= 1;
+        fork.name = "a fork at the same revision".to_string();
+        fork.seal_commit(&owner, now_ms()).expect("fork seal");
+        assert_eq!(fork.state_revision, stale.state_revision);
+        assert_eq!(adopt(&head_of(&fork), &stale), Err(JoinHeadError::NotAhead));
+
+        // A copy whose newest link is the requester's own request link at
+        // the head's revision: its base is the link before, so the head
+        // (route 3: an edit crossed the request) is ahead.
+        let me_key = AgentKeypair::generate().expect("requester key");
+        let me_hex = hex::encode(me_key.agent_id().as_bytes());
+        let mut asked = stale.clone();
+        asked
+            .seal_commit(&me_key, now_ms())
+            .expect("own request link");
+        assert_eq!(asked.state_revision, authority.state_revision);
+        assert!(adopt_join_head(&asked, &head_of(&authority), &me_hex).is_ok());
+
+        // A head whose roster drops the owner.
+        let mut ownerless = authority.clone();
+        let admin = ownerless
+            .members_v2
+            .keys()
+            .find(|id| **id != owner_hex)
+            .expect("member")
+            .clone();
+        if let Some(member) = ownerless.members_v2.get_mut(&admin) {
+            member.role = GroupRole::Admin;
+        }
+        ownerless.members_v2.remove(&owner_hex);
+        let stranger = AgentKeypair::generate().expect("stranger");
+        ownerless
+            .seal_commit(&stranger, now_ms())
+            .expect("seal without the owner");
+        assert_eq!(
+            adopt(&head_of(&ownerless), &stale),
+            Err(JoinHeadError::OwnerMissing)
         );
 
         let mut withdrawn = stale.clone();
@@ -482,7 +592,7 @@ mod tests {
             .expect("member")
             .clone();
         assert_eq!(
-            adopt_join_head(&stale, &head_of(&authority), &owner_hex, &seated),
+            adopt_join_head(&stale, &head_of(&authority), &seated),
             Err(JoinHeadError::Seated)
         );
     }

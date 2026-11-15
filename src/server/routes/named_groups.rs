@@ -4325,6 +4325,20 @@ async fn publish_named_group_metadata_event_with_envelope(
             named_group_metadata_event_recipient(event).map(str::to_string),
         ));
     }
+    #[cfg(test)]
+    if state
+        .named_group_test_recorders
+        .metadata_publish_envelope
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Some(Bytes::from(
+            tests::pr291_restart_marker_matrix::sign_v2_envelope(
+                state.agent.identity().agent_keypair(),
+                metadata_topic,
+                event,
+            ),
+        ));
+    }
 
     match serde_json::to_vec(event) {
         Ok(bytes) => {
@@ -54260,7 +54274,7 @@ pub(in crate::server) mod tests {
     mod join_pending_notice_limiter_1575;
     mod join_pending_notice_wire_1575;
     mod owner_mandate;
-    mod pr291_restart_marker_matrix;
+    pub(in crate::server) mod pr291_restart_marker_matrix;
     #[path = "issue1105_public_revision_catchup.rs"]
     mod public_revision_catchup_1105;
     mod r17_cert_hydrate;
