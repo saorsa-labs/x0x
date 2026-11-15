@@ -87,7 +87,7 @@ async fn approve_status(state: &Arc<AppState>, group_key: &str, request_id: &str
 
 /// Real requester-signed V2 pub/sub envelope (same construction as
 /// `pubsub::encode_v2` using only public ML-DSA-65 primitives).
-pub(super) fn sign_v2_envelope(
+pub(in crate::server) fn sign_v2_envelope(
     kp: &AgentKeypair,
     topic: &str,
     event: &NamedGroupMetadataEvent,

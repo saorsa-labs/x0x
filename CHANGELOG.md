@@ -6,6 +6,16 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **A join request the authority refuses as `stale` is signed again over the
+  authority's head (#1840 routes 1–3, A08 amendment of 15 Nov 2026).** A
+  second joiner on a group with members, a request that crosses an edit of
+  the group, and a removed member asking again are now listed and can be
+  approved. The authority sends its head (signed head commit, roster, public
+  metadata) to the requester whose turn it is in the join queue; the
+  requester checks it, signs the same request again over it and offers it,
+  and after approval it can apply the approval link. A requester that waits
+  behind another turn gets no outcome until its turn. New capability bit 19,
+  `join_request_head_v1`; a peer without it keeps the earlier behaviour.
 - **W3-H row `s4_intake_and_egress`, machine-revocation part (#1581, D70).**
   A control arm checks that a machine-only revocation keeps the agent's
   group seat and opens no S4 row. An egress arm, pinned RED, records a
@@ -18,6 +28,14 @@ All notable changes to this project will be documented in this file.
   projection, public metadata) and `groups::join_outcome::adopt_join_head`,
   which checks a head against a requester's copy and installs it. Wire and
   library only: nothing sends or uses a head yet.
+- **`GET /diagnostics/upgrade` reports release observations (#1381, A14
+  amendment of 15 Nov 2026).** New fields: `channel` (`stable` or
+  `prerelease`), `latest_release_topic_version` (highest verified release
+  seen on `x0x/release`), `last_check` (source, time and outcome of the last
+  startup, fallback-poll or `GET /upgrade` check) and `pending_update` (the
+  background apply owner's queued, applying or failed release, else the
+  newest observed newer version). Memory only; reset on restart. `x0x doctor`
+  uses `pending_update`.
 - **`system.health_verdict` and `system.upgrade_state` events on
   `GET /events` and `/ws` (#1351, A14 amendment of 15 Nov 2026).** The 5 s
   health refresher emits one event when the M1 `/health` verdict changes and
@@ -25,6 +43,12 @@ All notable changes to this project will be documented in this file.
   `latest_version`, `handoff_pending`, `failed_artifact`). The first check
   after start is the baseline and emits nothing. `/ws` sessions get typed
   frames `{"type":"system.…","data":{…}}`.
+- **`POST /direct/send` names a revoked recipient machine (#1597 item 4,
+  ADR 0110 D70).** A send whose resolved recipient machine is revoked answers
+  `403 recipient_machine_revoked` (Rust: `DmError::RecipientMachineRevoked
+  { machine }`) instead of a generic transport error. Nothing is sent; the
+  agent keeps its group seats. A revoked binding still answers
+  `recipient_pairing_denied`.
 - **`GET /sync/devices` names the source of each device's enrollment record
   (#1107).** Each row has `record_source` (`"local"` when this machine wrote
   the stored owner-device record, `"synced"` when another owner device wrote
@@ -79,6 +103,18 @@ All notable changes to this project will be documented in this file.
   still peeks a PubSub kind only under ADR 0013 pressure.
 
 ### Changed
+
+- **A node that restarted still serves the TreeKEM commits it held
+  (#1427).** The TreeKEM catch-up log is saved under `treekem-catchup-log/`
+  in the data directory (one file per group, local only) and loaded at
+  start. A member that was offline when a commit was made can catch up
+  from a signer that restarted since. A removal or ban that has an ADR
+  0110 (S4) row, in any phase, is not loaded from the saved file. The file
+  is versioned; a damaged or unknown-version file is skipped. A requester
+  removed or banned after its cached add is no longer served pages. A
+  start catch-up cycle now waits for another running catch-up task of the
+  same group to end before it judges the cycle. No wire format or API
+  changes.
 
 - **Documented the exit for a forked head behind an armed gap record
   (#871).** The anchored-gap gate has no expiry and no local clear. With no
@@ -140,6 +176,13 @@ All notable changes to this project will be documented in this file.
   publishes it on `x0x/release`, and node B's gossip driver, which verifies
   it and queues it with its background apply owner. It passes in about 4 s
   against the issue's bar of 2 × the 600 s heartbeat.
+- **The W3-H row H-S3-d2 uses the ADR setup: the removed admin's invite is
+  minted at the shared head r (#1797).** With the invite-base roster fix,
+  the joiner on the fork holds a marker naming the owner's removal and shows
+  `reseat_required {not_a_member}`. The #1797 unit test's tampered-roster
+  control now forges an extra seat, so it proves the root check. A policy
+  change inside a served chain still fails closed (A08 amendment of 15 Nov
+  2026).
 - **The forward gate after a true restart of the receiver (#1107).** A new
   real-path test shuts the receiving daemon down, builds it again from its
   files, and opens a `ForwardV2` stream from an owner device it knows only
@@ -189,6 +232,11 @@ All notable changes to this project will be documented in this file.
   Until then the row shows `waiting_for_head_sync`, also past the 13 s
   restart sync wait. Before, the wait alone counted as a synced head, and a
   restarted admin could seal its stale head with a divergent key.
+- **A demoted S4 worker shows `local_committer_ineligible` (#1581).** An
+  admin that is demoted to member while it holds an open revocation-eviction
+  row now marks the row `local_committer_ineligible` naming the next
+  admin, as ADR 0110 §4 wants. Before, the row showed
+  `waiting_for_designated_admin`.
 
 ## [v0.48.1] - 2026-10-17
 

@@ -651,3 +651,545 @@ async fn issue1840_only_head_refusals_are_queued() {
         assert_eq!(sequencer::refused(&owner, &key, &event).await, 0, "{case}");
     }
 }
+
+/// Issue #1840 routes 1–3 (A08 amendment of 15 Nov 2026): the production
+/// hand-off. The authority's `stale` outcome to the turn holder carries the
+/// head; the requester's real outcome handler installs it and signs the
+/// same request again; the next offer is listed, approved, and the
+/// requester applies the approval link.
+mod head_handshake {
+    use super::*;
+    use crate::dm::CapabilityRegistry;
+    use crate::groups::join_outcome::{JoinRequestOutcome, JoinRequestRefusalReason};
+    use crate::server::routes::named_groups::join_request_outcome::handle_join_request_outcome_typed_payload;
+    use crate::server::routes::named_groups::join_request_outcome::test_seam::sent_by;
+    use crate::server::routes::named_groups::requester_offer::find_requester_offer;
+
+    const HEADED: u64 =
+        CapabilityRegistry::JOIN_REQUEST_OUTCOME_V1 | CapabilityRegistry::JOIN_REQUEST_HEAD_V1;
+
+    /// `owner` holds a current verified advert of `requester` with `bits`.
+    fn advertise(owner: &AppState, requester: &AppState, bits: u64) {
+        let mut caps = crate::dm::DmCapabilities::v2_durable_gossip_ready(
+            requester.agent_kem_keypair.public_bytes.clone(),
+        );
+        caps.application_registry = CapabilityRegistry { version: 1, bits };
+        assert!(owner.agent.capability_store().insert(
+            requester.agent.agent_id(),
+            requester.agent.machine_id(),
+            caps,
+            crate::dm_capability::now_unix_ms(),
+        ));
+    }
+
+    /// What `create_join_request` files when its publish returns the
+    /// envelope (the test agent has no gossip runtime, so it returns none).
+    async fn file_offer(owner: &AppState, asked: &Asked) {
+        let key = {
+            let groups = asked.0.named_groups.read().await;
+            groups
+                .values()
+                .find(|info| info.join_requests.contains_key(&asked.2))
+                .expect("request")
+                .stable_group_id()
+                .to_string()
+        };
+        let now_ms = now_millis_u64();
+        insert_requester_offer_obligation(
+            &asked.0,
+            RequesterOfferObligation {
+                group_id: key,
+                request_id: asked.2.clone(),
+                requester_agent_id: agent_hex(&asked.0),
+                authority_agent_id: agent_hex(owner),
+                envelope_bytes: asked.3.clone(),
+                digest: blake3::hash(&asked.3).into(),
+                byte_size: asked.3.len(),
+                first_seen_ms: now_ms,
+                next_retry_at_ms: now_ms + 3_600_000,
+                retry_count: 0,
+                refusal: None,
+            },
+        )
+        .await
+        .expect("offer obligation");
+    }
+
+    /// The outcomes `owner` sent to `requester`, oldest first.
+    fn outcomes_to(owner: &AppState, requester: &AppState) -> Vec<Vec<u8>> {
+        sent_by(owner)
+            .into_iter()
+            .filter(|(to, _)| *to == requester.agent.agent_id())
+            .map(|(_, payload)| payload)
+            .collect()
+    }
+
+    async fn deliver(owner: &AppState, requester: &AppState, payload: Vec<u8>) {
+        deliver_from(owner.agent.agent_id(), requester, payload).await;
+    }
+
+    async fn deliver_from(
+        sender: crate::identity::AgentId,
+        requester: &AppState,
+        payload: Vec<u8>,
+    ) {
+        let dm = DmTypedPayload {
+            sender,
+            machine_id: MachineId([0u8; 32]),
+            payload,
+            verified: true,
+            trust_decision: None,
+            received_at_unix_ms: now_millis_u64(),
+            request_id: [0u8; 16],
+            completion: None,
+        };
+        let _ = handle_join_request_outcome_typed_payload(requester, &dm).await;
+    }
+
+    /// The requester offers; while the authority refuses it with a head,
+    /// the requester's real handler takes the head, signs the request
+    /// again, publishes it (the publish returns its signed envelope through
+    /// the test seam) and swaps it into the offer obligation; the real
+    /// offer worker then sends the stored envelope. Returns the number of
+    /// headed outcomes used.
+    async fn offer_until_listed(owner: &Arc<AppState>, asked: &Asked, key: &str) -> usize {
+        asked
+            .0
+            .named_group_test_recorders
+            .metadata_publish_envelope
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut envelope = asked.3.clone();
+        for heads in 0..3 {
+            offer(owner, &asked.0, &envelope).await;
+            if pending_request_ids(owner, key).await.contains(&asked.2) {
+                return heads;
+            }
+            let payload = outcomes_to(owner, &asked.0)
+                .pop()
+                .expect("the turn holder gets an outcome");
+            let outcome = JoinRequestOutcome::decode(&payload).expect("outcome");
+            assert_eq!(outcome.reason, JoinRequestRefusalReason::Stale);
+            assert!(
+                outcome.head.is_some(),
+                "the turn holder's outcome has the head"
+            );
+            let before = find_requester_offer(&asked.0, key, &asked.2)
+                .await
+                .expect("obligation");
+            deliver(owner, &asked.0, payload).await;
+            let after = find_requester_offer(&asked.0, key, &asked.2)
+                .await
+                .expect("obligation kept");
+            assert!(after.refusal.is_none(), "a used head is not a refusal");
+            assert_ne!(
+                after.digest, before.digest,
+                "the new seal replaced the offered envelope"
+            );
+            assert_eq!(
+                after.digest,
+                <[u8; 32]>::from(blake3::hash(&after.envelope_bytes))
+            );
+            assert_eq!(after.retry_count, 0);
+            assert!(after.next_retry_at_ms <= now_millis_u64(), "due now");
+
+            // The real offer worker sends exactly the stored envelope.
+            crate::server::routes::named_groups::requester_offer::requester_offer_step(&asked.0)
+                .await;
+            let (to, sent) =
+                crate::server::routes::named_groups::requester_offer::offer_send_seam::sent_by(
+                    &asked.0,
+                )
+                .pop()
+                .expect("the worker offered the new envelope");
+            assert_eq!(to, owner.agent.agent_id());
+            let sent = sent
+                .strip_prefix(GROUP_PREDECESSOR_RELAY_DM_PREFIX)
+                .expect("offer prefix");
+            assert_eq!(sent, after.envelope_bytes.as_slice());
+            envelope = sent.to_vec();
+        }
+        panic!("the request was not listed after three offers");
+    }
+
+    /// The requester applies the authority's approval link on its own copy.
+    async fn requester_applies_approval(owner: &AppState, asked: &Asked, key: &str) {
+        let (commit, revision) = {
+            let groups = owner.named_groups.read().await;
+            let info = groups.get(key).expect("group");
+            (
+                info.commit_log.last().expect("approval").commit.clone(),
+                info.roster_revision,
+            )
+        };
+        let copy = asked
+            .0
+            .named_groups
+            .read()
+            .await
+            .get(key)
+            .expect("copy")
+            .clone();
+        let applied = apply_stateful_event_to_group(
+            &copy,
+            &commit,
+            x0x::groups::ActionKind::AdminOrHigher,
+            |next| {
+                set_join_request_approved(
+                    next,
+                    &asked.2,
+                    &agent_hex(owner),
+                    &agent_hex(&asked.0),
+                    revision,
+                    commit.committed_at,
+                )
+            },
+        );
+        assert!(
+            applied.is_ok(),
+            "the approved requester applies the approval link: {:?}",
+            applied.err()
+        );
+    }
+
+    async fn admit(owner: &Arc<AppState>, asked: &Asked, key: &str) -> usize {
+        advertise(owner, &asked.0, HEADED);
+        file_offer(owner, asked).await;
+        let heads = offer_until_listed(owner, asked, key).await;
+        assert!(listener_journal_is_free(owner).await);
+        assert_eq!(approve(owner, key, &asked.2).await, StatusCode::OK);
+        assert!(owner
+            .named_groups
+            .read()
+            .await
+            .get(key)
+            .expect("group")
+            .has_active_member(&agent_hex(&asked.0)));
+        requester_applies_approval(owner, asked, key).await;
+        heads
+    }
+
+    /// Route 2: a second joiner on a group that already has a member.
+    ///
+    /// RED before this change: the request is refused for ever (the
+    /// outcome has no head), and the R1 trace shows a partial stub cannot
+    /// apply the approval.
+    #[tokio::test]
+    async fn issue1840_route2_second_joiner_is_admitted_through_the_head() {
+        let (owner, _o) = secure_endpoint_test_state().await.expect("owner state");
+        let key = install_authority_group(&owner, b"1840-head-route2", 1).await;
+        let asked = requester_asks(&authority_card(&owner, &key).await).await;
+        assert_eq!(admit(&owner, &asked, &key).await, 1, "one head round");
+    }
+
+    /// Route 3: the request crosses an edit of the group. The requester
+    /// sealed over the card; the owner then renames the group.
+    #[tokio::test]
+    async fn issue1840_route3_request_across_an_edit_is_admitted_through_the_head() {
+        let (owner, _o) = secure_endpoint_test_state().await.expect("owner state");
+        let key = install_authority_group(&owner, b"1840-head-route3", 0).await;
+        let asked = requester_asks(&authority_card(&owner, &key).await).await;
+        let (status, body) = response_json(
+            update_named_group(
+                State(Arc::clone(&owner)),
+                axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                    durable: true,
+                }),
+                Path(key.clone()),
+                Json(UpdateGroupRequest {
+                    name: Some("renamed while a request was in flight".to_string()),
+                    description: None,
+                }),
+            )
+            .await
+            .into_response(),
+        )
+        .await
+        .expect("response");
+        assert_eq!(status, StatusCode::OK, "edit: {body}");
+        assert_eq!(admit(&owner, &asked, &key).await, 1, "one head round");
+        let groups = asked.0.named_groups.read().await;
+        assert_eq!(
+            groups.get(&key).expect("copy").name,
+            "renamed while a request was in flight",
+            "the requester holds the edited metadata"
+        );
+    }
+
+    /// Route 1: a removed member asks again on the same group. Its daemon
+    /// dropped the group on removal and imports the card again; the group
+    /// has another member, so the card stub is partial.
+    #[tokio::test]
+    async fn issue1840_route1_removed_member_asks_again_and_is_admitted() {
+        let (owner, _o) = secure_endpoint_test_state().await.expect("owner state");
+        let key = install_authority_group(&owner, b"1840-head-route1", 1).await;
+        // The removal rotates the group secret to the survivors, so the
+        // fixture member needs a roster KEM key.
+        {
+            use base64::Engine as _;
+            let kem = BASE64.encode(&owner.agent_kem_keypair.public_bytes);
+            let mut groups = owner.named_groups.write().await;
+            let info = groups.get_mut(&key).expect("group");
+            let owner_hex = agent_hex(&owner);
+            for member in info.members_v2.values_mut() {
+                if member.agent_id != owner_hex {
+                    member.kem_public_key_b64 = Some(kem.clone());
+                }
+            }
+        }
+        let first = requester_asks(&authority_card(&owner, &key).await).await;
+        admit(&owner, &first, &key).await;
+        let member = agent_hex(&first.0);
+        let response = remove_named_group_member(
+            State(Arc::clone(&owner)),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
+            Path((key.clone(), member.clone())),
+        )
+        .await
+        .into_response();
+        let (status, body) = response_json(response).await.expect("response");
+        assert_eq!(status, StatusCode::OK, "removal: {body}");
+        first.0.named_groups.write().await.remove(&key);
+        assert!(!owner
+            .named_groups
+            .read()
+            .await
+            .get(&key)
+            .expect("group")
+            .has_active_member(&member));
+
+        // The same daemon asks again from a fresh card.
+        let card = authority_card(&owner, &key).await;
+        let response = import_group_card(State(Arc::clone(&first.0)), Json(card.clone()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK, "card import");
+        let (status, body) = response_json(
+            create_join_request(
+                State(Arc::clone(&first.0)),
+                Path(card.group_id.clone()),
+                None,
+            )
+            .await
+            .into_response(),
+        )
+        .await
+        .expect("response");
+        assert_eq!(status, StatusCode::CREATED, "request again: {body}");
+        let request_id = body["request_id"].as_str().expect("id").to_string();
+        let envelope = offered_envelope(&first.0, &request_id, None).await;
+        let again: Asked = (
+            Arc::clone(&first.0),
+            tempfile::tempdir().expect("dir"),
+            request_id,
+            envelope,
+        );
+        admit(&owner, &again, &key).await;
+    }
+
+    /// A headed outcome from any sender other than the authority the offer
+    /// went to is ignored: the copy, the offer and its envelope stay as
+    /// they were. The authority is the head's only trust anchor.
+    #[tokio::test]
+    async fn issue1840_head_from_a_non_authority_is_ignored() {
+        let (owner, _o) = secure_endpoint_test_state().await.expect("owner state");
+        let key = install_authority_group(&owner, b"1840-head-not-authority", 1).await;
+        let asked = requester_asks(&authority_card(&owner, &key).await).await;
+        advertise(&owner, &asked.0, HEADED);
+        file_offer(&owner, &asked).await;
+        offer(&owner, &asked.0, &asked.3).await;
+        let payload = outcomes_to(&owner, &asked.0).pop().expect("headed outcome");
+        assert!(JoinRequestOutcome::decode(&payload)
+            .expect("outcome")
+            .head
+            .is_some());
+        let before = asked
+            .0
+            .named_groups
+            .read()
+            .await
+            .get(&key)
+            .expect("copy")
+            .state_hash
+            .clone();
+        let (impostor, _i) = secure_endpoint_test_state().await.expect("impostor");
+        deliver_from(impostor.agent.agent_id(), &asked.0, payload).await;
+        let obligation = find_requester_offer(&asked.0, &key, &asked.2)
+            .await
+            .expect("obligation");
+        assert!(obligation.refusal.is_none(), "nothing recorded");
+        assert_eq!(obligation.digest, <[u8; 32]>::from(blake3::hash(&asked.3)));
+        assert_eq!(
+            asked
+                .0
+                .named_groups
+                .read()
+                .await
+                .get(&key)
+                .expect("copy")
+                .state_hash,
+            before,
+            "the copy is unchanged"
+        );
+    }
+
+    /// Review of #1927 (B1): a local failure while signing again is not
+    /// the authority's verdict. Here the publish returns no envelope; the
+    /// offer stays live (no refusal, same envelope), and the worker offers
+    /// it again.
+    #[tokio::test]
+    async fn issue1840_local_reseal_failure_keeps_the_offer_live() {
+        let (owner, _o) = secure_endpoint_test_state().await.expect("owner state");
+        let key = install_authority_group(&owner, b"1840-head-local-fail", 1).await;
+        let asked = requester_asks(&authority_card(&owner, &key).await).await;
+        advertise(&owner, &asked.0, HEADED);
+        file_offer(&owner, &asked).await;
+        offer(&owner, &asked.0, &asked.3).await;
+        let payload = outcomes_to(&owner, &asked.0).pop().expect("headed outcome");
+        // The envelope seam is off: the publish fails like a dead transport.
+        deliver(&owner, &asked.0, payload).await;
+        let obligation = find_requester_offer(&asked.0, &key, &asked.2)
+            .await
+            .expect("obligation kept");
+        assert!(
+            obligation.refusal.is_none(),
+            "a local failure is not a refusal"
+        );
+        assert_eq!(obligation.digest, <[u8; 32]>::from(blake3::hash(&asked.3)));
+        assert!(
+            crate::server::routes::named_groups::requester_offer::offer_still_live(
+                &asked.0,
+                &obligation
+            )
+            .await
+        );
+    }
+
+    /// Review of #1927: a late outcome whose head is older than the
+    /// requester's copy (`NotAhead`) is ignored, not recorded as a refusal.
+    #[tokio::test]
+    async fn issue1840_late_older_head_is_not_a_refusal() {
+        let (owner, _o) = secure_endpoint_test_state().await.expect("owner state");
+        let key = install_authority_group(&owner, b"1840-head-late", 1).await;
+        // One more authority link, so an older head with metadata exists.
+        {
+            let mut groups = owner.named_groups.write().await;
+            let info = groups.get_mut(&key).expect("group");
+            info.name = "second head".to_string();
+            info.seal_commit(owner.agent.identity().agent_keypair(), now_millis_u64())
+                .expect("seal");
+        }
+        let asked = requester_asks(&authority_card(&owner, &key).await).await;
+        advertise(&owner, &asked.0, HEADED);
+        file_offer(&owner, &asked).await;
+        asked
+            .0
+            .named_group_test_recorders
+            .metadata_publish_envelope
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        offer(&owner, &asked.0, &asked.3).await;
+        let payload = outcomes_to(&owner, &asked.0).pop().expect("headed outcome");
+        deliver(&owner, &asked.0, payload).await;
+        let resealed = find_requester_offer(&asked.0, &key, &asked.2)
+            .await
+            .expect("obligation");
+        assert!(resealed.refusal.is_none());
+
+        let older = {
+            let groups = owner.named_groups.read().await;
+            let log = &groups.get(&key).expect("group").commit_log;
+            let mut older = log[log.len() - 2].clone();
+            for snap in older.roster.values_mut() {
+                snap.certificate = None;
+            }
+            older
+        };
+        assert!(older.meta.is_some());
+        let late = JoinRequestOutcome {
+            group_id: key.clone(),
+            request_id: asked.2.clone(),
+            envelope_digest: hex::encode(resealed.digest),
+            reason: JoinRequestRefusalReason::Stale,
+            head: Some(older),
+        }
+        .encode()
+        .expect("encode");
+        deliver(&owner, &asked.0, late).await;
+        let after = find_requester_offer(&asked.0, &key, &asked.2)
+            .await
+            .expect("obligation");
+        assert!(after.refusal.is_none(), "a late older head is ignored");
+        assert_eq!(after.digest, resealed.digest, "the offer is unchanged");
+    }
+
+    /// Mixed versions: a requester without `join_request_head_v1` gets the
+    /// first-release outcome (no head, within 1024 bytes) and records the
+    /// refusal, as before this change.
+    #[tokio::test]
+    async fn issue1840_requester_without_the_head_bit_keeps_the_old_outcome() {
+        let (owner, _o) = secure_endpoint_test_state().await.expect("owner state");
+        let key = install_authority_group(&owner, b"1840-head-old-peer", 1).await;
+        let asked = requester_asks(&authority_card(&owner, &key).await).await;
+        advertise(
+            &owner,
+            &asked.0,
+            CapabilityRegistry::JOIN_REQUEST_OUTCOME_V1,
+        );
+        file_offer(&owner, &asked).await;
+        offer(&owner, &asked.0, &asked.3).await;
+        let payload = outcomes_to(&owner, &asked.0).pop().expect("outcome");
+        assert!(
+            payload.len() <= crate::groups::join_outcome::MAX_JOIN_REQUEST_OUTCOME_BYTES,
+            "a first-release requester can read it"
+        );
+        let outcome = JoinRequestOutcome::decode(&payload).expect("outcome");
+        assert!(outcome.head.is_none());
+        deliver(&owner, &asked.0, payload).await;
+        let obligation = find_requester_offer(&asked.0, &key, &asked.2)
+            .await
+            .expect("obligation");
+        assert_eq!(
+            obligation.refusal.map(|r| r.reason),
+            Some("stale".to_string()),
+            "the refusal is recorded as before"
+        );
+        assert!(pending_request_ids(&owner, &key).await.is_empty());
+    }
+
+    /// Two head-capable requesters on one group. The second waits behind
+    /// the first's turn: it gets no outcome, so its offer stays live. Once
+    /// the first is listed, the second's next offer gets the turn and the
+    /// head, and it is listed too.
+    #[tokio::test]
+    async fn issue1840_waiting_requester_gets_no_outcome_until_its_turn() {
+        let (owner, _o) = secure_endpoint_test_state().await.expect("owner state");
+        let key = install_authority_group(&owner, b"1840-head-two", 1).await;
+        let card = authority_card(&owner, &key).await;
+        let a = requester_asks(&card).await;
+        let b = requester_asks(&card).await;
+        for asked in [&a, &b] {
+            advertise(&owner, &asked.0, HEADED);
+            file_offer(&owner, asked).await;
+        }
+        offer(&owner, &a.0, &a.3).await;
+        offer(&owner, &b.0, &b.3).await;
+        assert!(
+            outcomes_to(&owner, &b.0).is_empty(),
+            "a requester behind another turn gets no outcome"
+        );
+        assert!(find_requester_offer(&b.0, &key, &b.2)
+            .await
+            .expect("obligation")
+            .refusal
+            .is_none());
+
+        offer_until_listed(&owner, &a, &key).await;
+        offer_until_listed(&owner, &b, &key).await;
+        assert_eq!(
+            last_link_signers(&owner, &key, 2).await,
+            vec![agent_hex(&a.0), agent_hex(&b.0)],
+            "listed one at a time, in arrival order"
+        );
+    }
+}

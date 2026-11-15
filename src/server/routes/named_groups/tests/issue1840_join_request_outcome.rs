@@ -692,23 +692,33 @@ async fn issue1840_outcome_send_limits() {
     advertise_requester(&pair, CapabilityRegistry::JOIN_REQUEST_OUTCOME_V1);
     let requester = pair.requester.agent.agent_id();
     let send = |to: AgentId, digest: [u8; 32]| {
-        send_join_request_refusal(
-            &pair.owner,
-            &pair.gk,
-            REQUEST_ID,
-            to,
-            digest,
-            JoinRequestRefusalReason::Stale,
-        );
-        sent_by(&pair.owner).len()
+        let owner = Arc::clone(&pair.owner);
+        let gk = pair.gk.clone();
+        async move {
+            send_join_request_refusal(
+                &owner,
+                &gk,
+                REQUEST_ID,
+                to,
+                digest,
+                JoinRequestRefusalReason::Stale,
+                None,
+            )
+            .await;
+            sent_by(&owner).len()
+        }
     };
-    assert_eq!(send(requester, [1; 32]), 1);
-    assert_eq!(send(requester, [1; 32]), 1, "one per digest per interval");
+    assert_eq!(send(requester, [1; 32]).await, 1);
+    assert_eq!(
+        send(requester, [1; 32]).await,
+        1,
+        "one per digest per interval"
+    );
     for i in 2..=OUTCOME_SEND_PER_REQUESTER_CAP {
-        assert_eq!(send(requester, [i as u8; 32]), i);
+        assert_eq!(send(requester, [i as u8; 32]).await, i);
     }
     assert_eq!(
-        send(requester, [0xee; 32]),
+        send(requester, [0xee; 32]).await,
         OUTCOME_SEND_PER_REQUESTER_CAP,
         "the per-requester cap stops one agent"
     );
@@ -729,7 +739,7 @@ async fn issue1840_outcome_send_limits() {
         crate::dm_capability::now_unix_ms(),
     ));
     let count = OUTCOME_SEND_PER_REQUESTER_CAP + 1;
-    assert_eq!(send(other, [0xa0; 32]), count);
+    assert_eq!(send(other, [0xa0; 32]).await, count);
 
     // Total cap: with the memory full, no outcome is sent.
     let now_ms = unix_ms();
@@ -743,7 +753,7 @@ async fn issue1840_outcome_send_limits() {
             sent.insert(key, (now_ms, AgentId(agent)));
         }
     }
-    assert_eq!(send(other, [0xa1; 32]), count, "memory full: no send");
+    assert_eq!(send(other, [0xa1; 32]).await, count, "memory full: no send");
 
     // After the interval the memory is pruned and the same digest is sent
     // again (a lost outcome is repeated on a later offer).
@@ -754,7 +764,7 @@ async fn issue1840_outcome_send_limits() {
         }
     }
     assert_eq!(
-        send(requester, [1; 32]),
+        send(requester, [1; 32]).await,
         count + 1,
         "resend after the interval"
     );

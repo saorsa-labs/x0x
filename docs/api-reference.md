@@ -1694,6 +1694,7 @@ Notable codes:
 | 400 | `invalid_logical_id` | `logical_id` was empty, longer than 128 characters, or contained a character outside `[a-z0-9._:-]`. |
 | 400 | `logical_id_requires_durable_ack` | `logical_id` was sent with `require_durable_app_ack: false`. Only the durable path honours the id; drop one or the other. |
 | 403 | `recipient_pairing_denied` | The local ADR-0043 B/P gate denied the `(agent, machine)` pairing that the send resolved: a tombstone retired the binding (B), or a current placement record pins the agent to another machine (P). Nothing was sent. A retry fails the same way until the binding or placement changes. Rust callers get `DmError::RecipientPairingDenied { denial }`. Before this code, this denial answered 500 `envelope_construction` (gossip path) or 500 `publish_failed` (pinned path). A denial on the raw-QUIC path still answers `publish_failed`. |
+| 403 | `recipient_machine_revoked` | The machine the send resolved for the recipient is revoked (ADR 0110 §3, D70). That device is denied and nothing was sent; the recipient agent keeps its group seats until the agent itself is revoked. A retry fails the same way until the recipient announces from another machine. Rust callers get `DmError::RecipientMachineRevoked { machine }`. A revoked binding answers `recipient_pairing_denied`. |
 | 404 | `recipient_key_unavailable` | The recipient has published no KEM key, or is entirely unknown to this daemon — **no capability advert and no contact card at all**. A durable send to a stranger answers this, not the 409 below. |
 | 409 | `recipient_key_invalid` | Our view of the recipient's key material has not converged. Transient — retry. |
 | 409 | `recipient_ack_semantics_unavailable` | The send required ADR 0030 durable application-ACK semantics and the recipient advertises no current v2 capability. A peer you hold **any** contact card for lands here rather than on the 404 — including one whose advert has not converged yet, since that peer is known and may simply need upgrading. Returned after one forced targeted capability refresh, so it is fast and deterministic rather than a timeout. The caller retries, surfaces "peer needs upgrade", or resends with `require_durable_app_ack: false` — the daemon never downgrades silently. |
@@ -1832,7 +1833,7 @@ token. A session token is refused before the body is read.
 |---|---|---|---|
 | POST | `/groups` | `x0x group create <name>` | Create a named group |
 | GET | `/groups` | `x0x group list` | List named groups |
-| GET | `/groups/:id` | `x0x group info <group_id>` | Get group info. `own_join_request` is this daemon's own pending join request on the group, or `null`: `request_id`, `created_at` and `status` (`pending` or `refused`). When the group's authority refused the request (#1840), `refusal` gives `reason` (`stale`, `already_member`, `banned`, `pending_exists`, `invalid` or `unknown`), `retryable` and `refused_at` (Unix ms; the time this daemon received the refusal, not the time the authority refused). A refused request is not sent again. Cancel it before you file a new one. `retryable` is `true` only for `stale`: this daemon's copy of the group is not current, and a new request made from a current group card can succeed. If this daemon loses the stored refusal (its offer store is over its limit), `status` reads `pending` again |
+| GET | `/groups/:id` | `x0x group info <group_id>` | Get group info. `own_join_request` is this daemon's own pending join request on the group, or `null`: `request_id`, `created_at` and `status` (`pending` or `refused`). When the group's authority refused the request (#1840), `refusal` gives `reason` (`stale`, `already_member`, `banned`, `pending_exists`, `invalid` or `unknown`), `retryable` and `refused_at` (Unix ms; the time this daemon received the refusal, not the time the authority refused). A refused request is not sent again. Cancel it before you file a new one. `retryable` is `true` only for `stale`: this daemon's copy of the group is not current, and a new request made from a current group card can succeed. When both daemons advertise `join_request_head_v1`, a `stale` refusal normally does not show here: the authority sends its current group state with it, this daemon signs the same request again over that state and offers it, and `status` stays `pending` (A08 amendment of 15 Nov 2026). If this daemon loses the stored refusal (its offer store is over its limit), `status` reads `pending` again |
 | GET | `/groups/:id/members` | `x0x group members <group_id>` | List named-group members |
 | POST | `/groups/:id/members` | `x0x group add-member <group_id> <agent_id> [--display-name <n>] [--key-package <b64>]` | Admin-authored member add (propagates to subscribed peers). `--key-package` carries the base64 TreeKEM key package required for direct adds to encrypted groups |
 | DELETE | `/groups/:id/members/:agent_id` | `x0x group remove-member <group_id> <agent_id>` | Admin-authored member removal (propagates to subscribed peers) |
@@ -3889,7 +3890,7 @@ no push; the retry does.
 | GET | `/upgrade` | — (CLI does not call this) | Daemon-side check for updates (release manifests over the `x0x/release` gossip topic; GitHub first-discovery fallback). Read-only: a check that finds a newer release announces nothing and never leads to an install on this node (#1169, Engineer ruling 3 Nov 2026 17:40 GMT) |
 | POST | `/upgrade/apply` | `x0x upgrade --apply` | Daemon applies the latest verified release manifest with transactional restart; the observed release is announced on `x0x/release` before the apply work (#1169) |
 | POST | `/upgrade/clear-hold?version=<v>` | `x0x upgrade --clear-hold <v>` | Authenticated, recorded local clear of this install's failed-release probe hold for exactly `<v>` (D190, #1376). `200` `{cleared:true, version, cause, transaction_id}` after a durable receipt (`<daemon>.upgrade-probe.json.cleared`) and removal of the hold; `404` when no failed-release hold exists for `<v>`; `409` for recovery-failed or an unresolved probe record (never cleared locally) or while another upgrade runs; `400` for a missing or non-semver version; `501` off Unix. A newer release clears such a hold by itself |
-| GET | `/diagnostics/upgrade` | `x0x diagnostics upgrade` | Local version + update policy + version/policy digest for the M1 census (#1383; no update check runs, nothing is announced) |
+| GET | `/diagnostics/upgrade` | `x0x diagnostics upgrade` | Local version + update policy + version/policy digest for the M1 census (#1383), plus release channel, latest version seen on `x0x/release`, last release check and pending update (#1381); no update check runs, nothing is announced |
 
 **Version/policy digest (#1383).** `GET /diagnostics/upgrade` reports the
 daemon's `current_version`, the full `update_policy` object
@@ -3908,6 +3909,19 @@ ruling: no capability bit, no new field in signed machine announcements.
 Remote machines' digests reach an owner only through a later approved
 announcement change; until then the owner-side census is
 `GET /owner/machines` (see [Device sync](#device-sync-adr-0041-tier-1)).
+
+**Release observations (#1381).** The same response reports what this
+daemon has learned about releases since it started. The values are held in
+memory and reset on restart; nothing is sent on the wire.
+
+| Field | Value |
+|---|---|
+| `channel` | `"stable"`, or `"prerelease"` when `include_prereleases` is set |
+| `latest_release_topic_version` | `{version, seen_at_unix}` for the highest verified release newer than this binary received on `x0x/release`, or `null` |
+| `last_check` | `{source, at_unix, outcome, version}` for the last release check, or `null`. `source` is `startup`, `fallback_poll` or `api` (a `GET /upgrade` not answered from its cache); `outcome` is `update_available` (with `version`), `up_to_date` or `failed` |
+| `pending_update` | `{version, state, source}` or `null`. While the background apply owner holds a release, `source` is `background_owner` and `state` is `queued`, `applying`, `backoff` (failed less than 30 minutes ago) or `failed`. Otherwise the newest observed version newer than this binary, with `state` `observed` and `source` `release_topic`, `startup`, `fallback_poll` or `api` |
+
+`x0x doctor` reads `pending_update` for its upgrade line.
 
 **Minimum supported version and support window (#1384, D35).** The same
 response carries `minimum_supported_version` and `support_window`. Both ship
