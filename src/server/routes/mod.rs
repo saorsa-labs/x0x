@@ -66,7 +66,7 @@ pub(super) use files::{
     decode_file_message, file_accept_handler, file_reject_handler, file_send_handler,
     file_transfer_status_handler, file_transfers_handler, handle_file_message, FileChunkAckSlot,
 };
-pub(super) use grants::{grants_issue, grants_list, grants_received, grants_revoke};
+pub(super) use grants::{grants_issue, grants_list, grants_received, grants_renew, grants_revoke};
 pub(super) use groups::{
     add_mls_member, create_mls_group, create_mls_welcome, get_mls_group, list_mls_groups,
     mls_decrypt, mls_encrypt, remove_mls_member,
@@ -166,7 +166,7 @@ pub(super) use trust::evaluate_trust;
 pub(super) use upgrade::StartupStagingContext;
 pub(super) use upgrade::{
     apply_upgrade, background_channel, broadcast_current_manifest, check_upgrade,
-    daemon_shutdown_hook, listener_restart_context, run_fallback_github_poll,
+    clear_upgrade_hold, daemon_shutdown_hook, listener_restart_context, run_fallback_github_poll,
     run_gossip_update_listener, run_startup_update_check, BackgroundRuntime,
     SelfPublishedReleaseManifests, StartupUpdateCheckRuntime,
 };

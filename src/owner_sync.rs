@@ -349,6 +349,20 @@ pub fn device_enrollment_version(state: &DeviceEnrollmentState) -> Option<u64> {
     t.checked_mul(2).map(|double| double + removed)
 }
 
+/// The time of a [`SyncKind::DeviceEnrollment`] value (`enrolled_at_ms`
+/// or `deleted_at_ms`); `None` for the other kinds.
+fn device_enrollment_time(value: &SyncValue) -> Option<u64> {
+    match value {
+        SyncValue::DeviceEnrollment {
+            state: DeviceEnrollmentState::Enrolled { enrollment },
+        } => Some(enrollment.enrolled_at_ms),
+        SyncValue::DeviceEnrollment {
+            state: DeviceEnrollmentState::Removed { deleted_at_ms },
+        } => Some(*deleted_at_ms),
+        _ => None,
+    }
+}
+
 /// Structural checks of a [`SyncKind::DeviceEnrollment`] record (#1107):
 /// the key is a lowercase machine id hex, an `Enrolled` value names the
 /// machine of its key, and the clock version is
@@ -1185,6 +1199,10 @@ pub struct OwnerSyncStore {
     /// Test injection: fail the next register write before its rename.
     #[cfg(test)]
     fail_next_register_write: std::sync::atomic::AtomicBool,
+    /// Test injection: fail the next journal intent write before it
+    /// starts, as a crash right after the kind 0x05 write would.
+    #[cfg(test)]
+    fail_next_intent_write: std::sync::atomic::AtomicBool,
     /// Test injections: fail the staging, or the rename, of the next
     /// enrollment file write.
     #[cfg(test)]
@@ -1405,13 +1423,9 @@ impl OwnerSyncStore {
                 ))
             })?;
         }
-        let mut persisted_records: PersistedRecords =
-            Self::load_json(&dir.join(RECORDS_FILE)).await?;
+        let persisted_records: PersistedRecords = Self::load_json(&dir.join(RECORDS_FILE)).await?;
         let persisted_enrollment_records: PersistedRecords =
             Self::load_json(&dir.join(ENROLLMENT_RECORDS_FILE)).await?;
-        persisted_records
-            .records
-            .extend(persisted_enrollment_records.records);
         let persisted_devices: PersistedDevices = Self::load_json(&dir.join(DEVICES_FILE)).await?;
         let pending_apply: PersistedPendingApplies =
             Self::load_json(&dir.join(APPLY_PENDING_FILE)).await?;
@@ -1425,11 +1439,22 @@ impl OwnerSyncStore {
                 persisted_tombstones.version
             )));
         }
-        let records = persisted_records
+        // #1107: one register from the two files. A key in both files
+        // keeps the record that wins under the merge rule (`classify`).
+        let mut records = RecordMap::new();
+        for record in persisted_records
             .records
             .into_iter()
-            .map(|r| ((r.kind, r.key.clone()), r))
-            .collect::<BTreeMap<_, _>>();
+            .chain(persisted_enrollment_records.records)
+        {
+            let key = (record.kind, record.key.clone());
+            let wins = records
+                .get(&key)
+                .is_none_or(|stored| Self::classify(&record, stored) == MergeOutcome::Accepted);
+            if wins {
+                records.insert(key, record);
+            }
+        }
         let devices = persisted_devices
             .devices
             .into_iter()
@@ -1487,6 +1512,8 @@ impl OwnerSyncStore {
             discharge_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             fail_next_register_write: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_intent_write: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_next_enrollment_stage: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -2372,6 +2399,30 @@ impl OwnerSyncStore {
     /// semantics match [`Self::enroll`]. Returns `Ok(false)` when not
     /// enrolled.
     pub async fn unenroll(&self, machine: &MachineId) -> Result<bool, SyncError> {
+        self.remove_device(machine, None).await
+    }
+
+    /// #1107: apply a synced `Removed` record. The tombstone of `machine`
+    /// moves forward to `deleted_at_ms` and never back, and the device row
+    /// is removed only when its enrollment is not newer than
+    /// `deleted_at_ms`, so an older removal cannot undo a newer
+    /// enrollment. Locks and write order are those of [`Self::unenroll`].
+    /// Returns `Ok(true)` when a device row was removed.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::unenroll`].
+    pub(crate) async fn unenroll_at(
+        &self,
+        machine: &MachineId,
+        deleted_at_ms: u64,
+    ) -> Result<bool, SyncError> {
+        self.remove_device(machine, Some(deleted_at_ms)).await
+    }
+
+    /// [`Self::unenroll`] (`at` is `None`: the deletion time is now, and at
+    /// least the enrollment time) and [`Self::unenroll_at`].
+    async fn remove_device(&self, machine: &MachineId, at: Option<u64>) -> Result<bool, SyncError> {
         if let Some(err) = self.poison_refusal() {
             return Err(err);
         }
@@ -2399,7 +2450,7 @@ impl OwnerSyncStore {
             .await
             .get(&machine.0)
             .map_or(0, |enrollment| enrollment.enrolled_at_ms);
-        let deleted_at = now_unix_ms().max(enrollment_at);
+        let deleted_at = at.unwrap_or_else(|| now_unix_ms().max(enrollment_at));
         // #1545: each write and its memory update run to their end in a
         // task that owns the lock of the state it writes
         // (`replace_state`), so a cancelled unenroll cannot land after a
@@ -2417,7 +2468,10 @@ impl OwnerSyncStore {
             (tombstones, removal_gate)
         };
         let devices = Arc::clone(&self.devices).write_owned().await;
-        if !devices.contains_key(&machine.0) {
+        if devices
+            .get(&machine.0)
+            .is_none_or(|enrollment| enrollment.enrolled_at_ms > deleted_at)
+        {
             return Ok(false);
         }
         let mut next = devices.clone();
@@ -2430,6 +2484,211 @@ impl OwnerSyncStore {
     /// Enrolled machines (raw records, for surfaces).
     pub async fn enrolled_devices(&self) -> Vec<OwnerEnrollment> {
         self.devices.read().await.values().cloned().collect()
+    }
+
+    /// #1107: the local device set as [`DeviceEnrollmentState`]s, one per
+    /// machine. A tombstone gives `Removed`; an enrollment newer than the
+    /// machine's tombstone gives `Enrolled`, if `owner` signed it (the
+    /// verified index, so no signature check runs here).
+    fn local_enrollment_states(
+        devices: &BTreeMap<[u8; 32], OwnerEnrollment>,
+        tombstones: &BTreeMap<[u8; 32], u64>,
+        verified: &VerifiedEnrollmentOwners,
+        owner: &UserId,
+    ) -> BTreeMap<[u8; 32], DeviceEnrollmentState> {
+        let mut states: BTreeMap<[u8; 32], DeviceEnrollmentState> = tombstones
+            .iter()
+            .map(|(machine, deleted_at_ms)| {
+                (
+                    *machine,
+                    DeviceEnrollmentState::Removed {
+                        deleted_at_ms: *deleted_at_ms,
+                    },
+                )
+            })
+            .collect();
+        for (machine, enrollment) in devices {
+            let newer = tombstones
+                .get(machine)
+                .is_none_or(|deleted_at| enrollment.enrolled_at_ms > *deleted_at);
+            let signed_by_owner = verified
+                .get(machine)
+                .is_some_and(|(signer, record)| signer == owner && record == enrollment);
+            if newer && signed_by_owner {
+                states.insert(
+                    *machine,
+                    DeviceEnrollmentState::Enrolled {
+                        enrollment: enrollment.clone(),
+                    },
+                );
+            }
+        }
+        states
+    }
+
+    /// #1107 (A02 rule 8): sign a [`SyncKind::DeviceEnrollment`] record for
+    /// each local enrollment and each local tombstone that the register
+    /// does not hold yet. The version comes from the timestamps
+    /// ([`device_enrollment_version`]), so a repeat is safe: no record is
+    /// minted when the register holds a record of the same or a higher
+    /// version for that machine, and a restart or a second call mints
+    /// nothing. Returns the number of records minted.
+    ///
+    /// Lock order: `records` → `unenroll_tombstones` → `devices`, as in
+    /// the admission check of a session commit.
+    ///
+    /// # Errors
+    ///
+    /// [`SyncError::StoreLimit`] when the register is full;
+    /// [`SyncError::BadSignature`] when signing fails; the errors of
+    /// [`Self::replace_records`].
+    pub(crate) async fn mint_device_enrollments(
+        &self,
+        owner: &UserKeypair,
+        writer_machine: MachineId,
+    ) -> Result<usize, SyncError> {
+        if let Some(err) = self.poison_refusal() {
+            return Err(err);
+        }
+        let owner_id = owner.user_id();
+        let records = Arc::clone(&self.records).write_owned().await;
+        let states = {
+            let tombstones = self.unenroll_tombstones.read().await;
+            let devices = self.devices.read().await;
+            let verified = self
+                .evidence_owners
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Self::local_enrollment_states(&devices, &tombstones, &verified, &owner_id)
+        };
+        let wanted: Vec<(String, DeviceEnrollmentState, u64)> = states
+            .into_iter()
+            .filter_map(|(machine, state)| {
+                let version = device_enrollment_version(&state)?;
+                let key = hex::encode(machine);
+                let stored = records.get(&(SyncKind::DeviceEnrollment, key.clone()));
+                stored
+                    .is_none_or(|r| r.clock.version < version)
+                    .then_some((key, state, version))
+            })
+            .collect();
+        if wanted.is_empty() {
+            return Ok(0);
+        }
+        let minted = wanted.len();
+        let signed_at_ms = now_unix_ms();
+        let mut next = records.clone();
+        for (key, state, version) in wanted {
+            let slot = (SyncKind::DeviceEnrollment, key);
+            if next.len() >= MAX_STORED_RECORDS && !next.contains_key(&slot) {
+                return Err(SyncError::StoreLimit(format!(
+                    "store at capacity ({MAX_STORED_RECORDS} records)"
+                )));
+            }
+            let clock = RecordClock {
+                version,
+                signed_at_ms,
+                writer_machine: writer_machine.0,
+            };
+            let value = SyncValue::DeviceEnrollment { state };
+            let record =
+                VersionedRecord::sign(SyncKind::DeviceEnrollment, &slot.1, &value, clock, owner)
+                    .map_err(|e| SyncError::BadSignature(format!("mint: {e}")))?;
+            next.insert(slot, record);
+        }
+        self.replace_records(records, next, ()).await?;
+        Ok(minted)
+    }
+
+    /// #1107 (A02 rule 5): apply kind 0x05 records to the device set. Each
+    /// record is verified again (owner signature and shape). A record
+    /// about `local_machine` is ignored. `Enrolled` goes through
+    /// [`Self::enroll`] (so the tombstone check holds) when its inner
+    /// enrollment is signed by `owner`, names the record's machine and is
+    /// not expired; `Removed` goes through [`Self::unenroll_at`], which
+    /// only moves the tombstone forward. A failure is logged and the next
+    /// record is applied: the record stays in the register, and the next
+    /// start applies it again ([`Self::reconcile_device_enrollments`]).
+    pub(crate) async fn apply_device_enrollments(
+        &self,
+        records: &[VersionedRecord],
+        owner: &UserId,
+        local_machine: &MachineId,
+    ) {
+        let now_ms = now_unix_ms();
+        for record in records
+            .iter()
+            .filter(|r| r.kind == SyncKind::DeviceEnrollment)
+        {
+            if let Err(e) = record.verify_owner(owner) {
+                tracing::warn!(target: "x0x::owner_sync", key = %record.key, error = %e,
+                    "device enrollment record not applied: verification failed");
+                continue;
+            }
+            let SyncValue::DeviceEnrollment { state } = &record.value else {
+                continue;
+            };
+            let mut machine = [0u8; 32];
+            if hex::decode_to_slice(&record.key, &mut machine).is_err()
+                || machine == local_machine.0
+            {
+                continue;
+            }
+            let applied = match state {
+                DeviceEnrollmentState::Enrolled { enrollment } => {
+                    if enrollment.machine_id != machine
+                        || enrollment.verify_owner(owner).is_err()
+                        || !enrollment.is_current_at(now_ms)
+                    {
+                        tracing::debug!(target: "x0x::owner_sync", key = %record.key,
+                            "device enrollment record not applied: enrollment invalid or expired");
+                        continue;
+                    }
+                    if self.devices.read().await.get(&machine) == Some(enrollment) {
+                        continue;
+                    }
+                    match self.enroll(enrollment.clone()).await {
+                        Err(SyncError::EnrollmentTombstoned { .. }) => Ok(()),
+                        other => other,
+                    }
+                }
+                DeviceEnrollmentState::Removed { deleted_at_ms } => self
+                    .unenroll_at(&MachineId(machine), *deleted_at_ms)
+                    .await
+                    .map(drop),
+            };
+            if let Err(e) = applied {
+                tracing::warn!(target: "x0x::owner_sync", key = %record.key, error = %e,
+                    "device enrollment record not applied");
+            }
+        }
+    }
+
+    /// #1107 (A02 rule 8), at start: verify again and apply every stored
+    /// kind 0x05 record, and then mint records for the local device set
+    /// ([`Self::mint_device_enrollments`]). A device that ran PR 1 of #1107
+    /// stored received records without applying them, and a peer does not
+    /// send a record of an equal version again.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::mint_device_enrollments`].
+    pub(crate) async fn reconcile_device_enrollments(
+        &self,
+        owner: &UserKeypair,
+        local_machine: MachineId,
+    ) -> Result<usize, SyncError> {
+        let stored: Vec<VersionedRecord> = self
+            .records
+            .read()
+            .await
+            .values()
+            .filter(|r| r.kind == SyncKind::DeviceEnrollment)
+            .cloned()
+            .collect();
+        self.apply_device_enrollments(&stored, &owner.user_id(), &local_machine)
+            .await;
+        self.mint_device_enrollments(owner, local_machine).await
     }
 
     /// On-change trigger: bump the generation the periodic task waits on.
@@ -2595,10 +2854,27 @@ impl OwnerSyncStore {
         // the batch until `replace_records`.
         let mut touched: BTreeSet<(SyncKind, String)> = BTreeSet::new();
         let mut outcome = CommitOutcome::default();
+        let now_ms = now_unix_ms();
         for record in batch {
             // Re-verify inside the lock: the caller's verification and
             // the commit must not be separated by a store mutation.
             record.verify_owner(owner)?;
+            // #1107: a kind 0x05 record whose time is more than the
+            // enrollment clock skew (`ENROLL_EXPIRY_SKEW_MS`) in the future
+            // is not stored. Its version comes from that time, so it would
+            // otherwise outrank every honest record for the machine until
+            // then. It is not an error: the other records of the batch
+            // commit, and the record is accepted once its time is near.
+            if device_enrollment_time(&record.value)
+                .is_some_and(|t| t > now_ms.saturating_add(ENROLL_EXPIRY_SKEW_MS))
+            {
+                tracing::warn!(
+                    target: "x0x::owner_sync",
+                    key = %record.key,
+                    "device enrollment record from the future not stored"
+                );
+                continue;
+            }
             if next.len() >= MAX_STORED_RECORDS
                 && !next.contains_key(&(record.kind, record.key.clone()))
             {
@@ -2721,6 +2997,13 @@ impl OwnerSyncStore {
         held: H,
         records: Vec<VersionedRecord>,
     ) -> Result<H, SyncError> {
+        #[cfg(test)]
+        if self
+            .fail_next_intent_write
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(SyncError::Io("injected journal intent failure".into()));
+        }
         let bytes = serde_json::to_vec(&PersistedRecords { records })
             .map_err(|e| SyncError::Io(format!("encode journal intent: {e}")))?;
         let path = self.dir.join(JOURNAL_INTENT_FILE);
@@ -3645,6 +3928,15 @@ where
         }
     }
     let outcome = outcome?;
+    // #1107: only a durably committed session raises the Hello version
+    // remembered for this peer.
+    store.note_session_completed(peer_machine, pending.version_after_success);
+    // #1107 (A02 rule 5): the device set follows the committed kind 0x05
+    // records. A failure here leaves them in the register; the next start
+    // applies them again.
+    store
+        .apply_device_enrollments(&outcome.accepted, &owner_id, local_machine)
+        .await;
     let mut summary = pending.summary;
     summary.accepted = outcome.accepted.len();
     summary.superseded = outcome.superseded;
@@ -3661,6 +3953,9 @@ where
 struct PendingCommit {
     summary: SessionSummary,
     verified: Vec<VersionedRecord>,
+    /// The `Hello` version to remember for the peer once the commit is
+    /// durable (`OwnerSyncStore::note_session_completed`).
+    version_after_success: u32,
 }
 
 /// The network protocol body (no timeout wrapper, no commit — the caller
@@ -3837,8 +4132,11 @@ where
         record.verify_owner(&owner_id)?;
         verified.push(record);
     }
-    store.note_session_completed(peer_machine, version_after_success);
-    Ok(PendingCommit { summary, verified })
+    Ok(PendingCommit {
+        summary,
+        verified,
+        version_after_success,
+    })
 }
 
 /// Write the version table as bounded pages (always at least one page, so
@@ -4394,6 +4692,17 @@ impl OwnerSyncService {
         if let Some(path) = journal_path.as_ref() {
             store.set_journal_path(path.clone());
         }
+        // #1107 (A02 rule 8): before any session, apply the stored kind
+        // 0x05 records and mint the local device set.
+        if let Some(owner) = agent.identity().user_keypair() {
+            if let Err(e) = store
+                .reconcile_device_enrollments(owner, agent.machine_id())
+                .await
+            {
+                tracing::warn!(target: "x0x::owner_sync", error = %e,
+                    "device enrollment start-up reconcile failed");
+            }
+        }
         let service = Arc::new(Self {
             agent,
             store: Arc::new(store),
@@ -4425,6 +4734,17 @@ impl OwnerSyncService {
             .map_err(|e| crate::error::NetworkError::CacheError(format!("sync store: {e}")))?;
         if let Some(path) = journal_path.as_ref() {
             store.set_journal_path(path.clone());
+        }
+        // #1107 (A02 rule 8): before any session, apply the stored kind
+        // 0x05 records and mint the local device set.
+        if let Some(owner) = agent.identity().user_keypair() {
+            if let Err(e) = store
+                .reconcile_device_enrollments(owner, agent.machine_id())
+                .await
+            {
+                tracing::warn!(target: "x0x::owner_sync", error = %e,
+                    "device enrollment start-up reconcile failed");
+            }
         }
         let service = Arc::new(Self {
             agent,
@@ -5035,6 +5355,16 @@ impl OwnerSyncService {
             mint_journal_lines(&self.store, path, owner_kp, local_machine).await;
             // Its recovery can commit names too.
             self.apply_pending().await;
+        }
+
+        // Kind 5 (#1107): the local device set. An enroll or unenroll
+        // kicks a pass, so its record is minted before the next sessions.
+        if let Err(e) = self
+            .store
+            .mint_device_enrollments(owner_kp, local_machine)
+            .await
+        {
+            tracing::warn!(target: "x0x::owner_sync", error = %e, "device enrollment mint failed");
         }
         Ok(())
     }
@@ -8951,6 +9281,90 @@ mod issuance_journal_sync_tests {
             Some(SyncValue::DeviceEnrollment { state })
         );
         assert!(!intent.exists(), "the recovery removes the intent");
+    }
+
+    /// #1107: a crash before the journal intent write of a batch that holds
+    /// a kind 0x05 record. Since #1886 a commit writes both record files in
+    /// one register write after the journal steps, so after the restart
+    /// nothing of the batch is stored: no 0x05 record, no intent, no journal
+    /// line, no journal record. A later delivery of the batch commits both.
+    #[tokio::test]
+    async fn a_crash_between_the_enrollment_write_and_the_intent_keeps_a_valid_state() {
+        use super::tests::{machine, owner_kp};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let local_dir = dir.path().join("local");
+        let (local, journal) = journal_device(&local_dir).await;
+        let d1 = journal_value("d1", 100, 5_000);
+        let r1 = remote_record(&remote, &owner, &d1).await;
+        let m = machine(9);
+        let state = DeviceEnrollmentState::Enrolled {
+            enrollment: OwnerEnrollment::sign(m, &owner, 1_000, None).expect("sign"),
+        };
+        let device = VersionedRecord::sign(
+            SyncKind::DeviceEnrollment,
+            &hex::encode(m.0),
+            &SyncValue::DeviceEnrollment {
+                state: state.clone(),
+            },
+            RecordClock {
+                version: device_enrollment_version(&state).expect("version"),
+                signed_at_ms: 1,
+                writer_machine: machine(2).0,
+            },
+            &owner,
+        )
+        .expect("sign record");
+
+        local
+            .fail_next_intent_write
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let crashed = local
+            .commit_batch(vec![r1.clone(), device.clone()], &owner.user_id())
+            .await;
+        assert!(crashed.is_err(), "the commit stops before its intent");
+        drop(local);
+
+        let (local, _) = journal_device(&local_dir).await;
+        local
+            .recover_interrupted_commit(&owner.user_id())
+            .await
+            .expect("nothing to recover");
+        let key = hex::encode(m.0);
+        assert_eq!(
+            local.stored_value(SyncKind::DeviceEnrollment, &key).await,
+            None,
+            "the kind 0x05 record is not stored before the register write"
+        );
+        assert_eq!(
+            local.stored_value(SyncKind::IssuanceJournal, "bb").await,
+            None
+        );
+        assert!(!local_dir.join(SYNC_DIR).join(JOURNAL_INTENT_FILE).exists());
+        assert!(
+            crate::profile::IssuedCertRecord::load(&journal)
+                .await
+                .is_empty(),
+            "no journal line"
+        );
+
+        let outcome = local
+            .commit_batch(vec![r1, device], &owner.user_id())
+            .await
+            .expect("the batch again");
+        assert_eq!(outcome.accepted.len(), 2, "both records are new");
+        assert_eq!(
+            local.stored_value(SyncKind::DeviceEnrollment, &key).await,
+            Some(SyncValue::DeviceEnrollment { state })
+        );
+        assert_eq!(
+            local.stored_value(SyncKind::IssuanceJournal, "bb").await,
+            Some(d1)
+        );
     }
 
     /// Codex review of #1545 (758f62c), P2: as in

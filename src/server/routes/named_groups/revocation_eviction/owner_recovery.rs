@@ -715,7 +715,7 @@ pub(in crate::server) async fn sign_recovery_mandate(
     }
     let revocations = verified_agent_revocations(state).await;
     let Some(revoked_admins) = orc::revoked_admins_when_needed(&info, &revocations) else {
-        return refusal_response(orc::OwnerRecoveryRefusal::RecoveryNotNeeded, &stable);
+        return refusal_response(orc::not_needed_refusal(&info), &stable);
     };
     let member = info.members_v2.get(&hex::encode(promoted.as_bytes()));
     let Some(digest) = member.and_then(|member| member.certificate_digest.clone()) else {
@@ -1117,7 +1117,10 @@ async fn try_commit(state: &Arc<AppState>, stable: &str) {
         match refusal {
             // The revocation records may still be arriving, or this node
             // is behind the mandate's head: keep it.
-            orc::OwnerRecoveryRefusal::RecoveryNotNeeded => {
+            // #1581: an admin-empty roster keeps the mandate the same way,
+            // now under its own typed cause.
+            orc::OwnerRecoveryRefusal::RecoveryNotNeeded
+            | orc::OwnerRecoveryRefusal::WaitingForActiveAdmin => {
                 set_wait(state, stable, Some((refusal.as_str(), Vec::new()))).await;
             }
             orc::OwnerRecoveryRefusal::RecoveryHeadMismatch
@@ -3393,7 +3396,11 @@ async fn receive_commit(
             drop(guard);
             contain_sibling(state, &group_key, &info, &body, &revocations).await;
         }
-        return if refusal == orc::OwnerRecoveryRefusal::RecoveryNotNeeded {
+        return if matches!(
+            refusal,
+            orc::OwnerRecoveryRefusal::RecoveryNotNeeded
+                | orc::OwnerRecoveryRefusal::WaitingForActiveAdmin
+        ) {
             // The named revocation records may still be on their way.
             ReceiveOutcome::Retained {
                 verified: orc::check_ahead(&body, &info, &revocations, now_unix()).is_ok(),
