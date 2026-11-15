@@ -14,10 +14,14 @@ All notable changes to this project will be documented in this file.
   most 90 days (default 90), and delivers it; the old grant stays valid to its
   own expiry, so there is no gap. CLI: `x0x grant renew <id> [--ttl-secs N]
   [--no-names]`.
-- **A share grant may start at most 600 s in the future (#1350 follow-up).**
-  A daemon refuses (`POST /grants` 400; no store and no ACK on receipt) a
-  grant whose `not_before` is more than 600 s ahead of its clock, so a
-  chain of pre-signed grants cannot extend access past 90 days.
+- **GUI scratch app and deep link (#1094).** Each space has a Scratch tab
+  for the group's sealed `scratch` store: list keys, view, edit, save and
+  delete short text values. `#/groups/<id>/scratch` and the short form
+  `#/scratch/<id>` open it, in the GUI and through `POST /gui/show`.
+- **`task:changed` SSE event on `GET /events` (#1094).** The task-list
+  sibling of `kv:changed`: one event per list per 200 ms window on a local
+  mutation or a merged peer delta, with `list_id` and `origins`, no task
+  content. Library: `Agent::subscribe_task_changes`.
 - **`kv:changed` SSE event on `GET /events` (#1094).** A KV store this
   daemon has open sends one event per 200 ms window when it changes (local
   write or delete, merged peer record, direct delta): `store_id` and the
@@ -29,6 +33,10 @@ All notable changes to this project will be documented in this file.
   `stale` is retryable. `GET /groups/:id` shows it as
   `own_join_request.status = "refused"` with a `refusal` object. Both daemons
   must advertise capability bit 16; an older daemon keeps the old behaviour.
+- **A share grant may start at most 600 s in the future (#1350 follow-up).**
+  A daemon refuses (`POST /grants` 400; no store and no ACK on receipt) a
+  grant whose `not_before` is more than 600 s ahead of its clock, so a
+  chain of pre-signed grants cannot extend access past 90 days.
 - **Read-only `GET /diagnostics/sidecar-quarantine` (#1597, D148).** It lists
   each ADR 0108 §5a quarantined sidecar copy (pending or history) with its
   `txid` and size in bytes, plus `count` and `total_bytes`. It does not change

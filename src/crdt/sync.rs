@@ -362,6 +362,45 @@ pub type StateServeGate = Arc<
         + Sync,
 >;
 
+/// One change notice for an open task list (#1094 `task:changed`). It
+/// carries no task content: a subscriber reads the list through its own
+/// authorised path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskListChanged {
+    /// The list's topic (the id the REST API uses).
+    pub topic: String,
+    /// Where the change came from.
+    pub origin: crate::kv::KvChangeOrigin,
+}
+
+/// Where a list sends its change notices; set once before the loops start.
+#[derive(Debug, Clone)]
+struct TaskChangeSink {
+    tx: tokio::sync::broadcast::Sender<TaskListChanged>,
+    topic: String,
+}
+
+/// The shared, set-once slot for a list's change sink.
+#[derive(Debug, Default)]
+struct TaskChangeSlot(std::sync::OnceLock<TaskChangeSink>);
+
+impl TaskChangeSlot {
+    /// Attach the sink once; a second call is ignored.
+    fn set(&self, tx: tokio::sync::broadcast::Sender<TaskListChanged>, topic: String) {
+        let _ = self.0.set(TaskChangeSink { tx, topic });
+    }
+
+    /// Send a notice if a sink is attached; no subscriber is not an error.
+    fn note(&self, origin: crate::kv::KvChangeOrigin) {
+        if let Some(sink) = self.0.get() {
+            let _ = sink.tx.send(TaskListChanged {
+                topic: sink.topic.clone(),
+                origin,
+            });
+        }
+    }
+}
+
 /// Synchronization wrapper for a TaskList.
 ///
 /// Manages automatic background synchronization of a TaskList using gossip
@@ -384,6 +423,9 @@ pub struct TaskListSync {
     /// coming back as an empty replica (issue #557). Mirrors
     /// `KvStoreSync::persist`.
     persist: std::sync::Mutex<Option<Arc<TaskPersistCtx>>>,
+
+    /// #1094: where change notices go ([`Self::set_change_sink`]).
+    change_sink: Arc<TaskChangeSlot>,
 
     /// This node's gossip peer id — identifies our deltas and state
     /// requests on the wire.
@@ -1376,12 +1418,14 @@ async fn drain_and_persist(
     buffer: &std::sync::Mutex<QuarantineDeltaBuffer>,
     task_list: &RwLock<TaskList>,
     persist: Option<&Arc<TaskPersistCtx>>,
+    changes: &TaskChangeSlot,
 ) -> usize {
     // #895: sealed deltas held during the quarantine are opened first (no
     // list guard held), so the pinned drain below merges them in order.
     open_held_sealed(gate.gate(), protector, buffer, task_list).await;
     let applied = drain_quarantine_buffer(gate.gate(), buffer, task_list).await;
     if applied > 0 {
+        changes.note(crate::kv::KvChangeOrigin::Remote);
         if let Some(ctx) = persist {
             if let Err(e) = persist_snapshot(task_list, ctx).await {
                 tracing::warn!("failed to persist drained fork-quarantine task deltas: {e}");
@@ -1435,6 +1479,7 @@ impl TaskListSync {
             topic,
             local_peer_id,
             persist: std::sync::Mutex::new(None),
+            change_sink: Arc::new(TaskChangeSlot::default()),
             stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancel: tokio_util::sync::CancellationToken::new(),
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
@@ -1506,6 +1551,7 @@ impl TaskListSync {
             &self.quarantine_buffer,
             &self.task_list,
             self.persist_ctx().as_ref(),
+            &self.change_sink,
         )
         .await
     }
@@ -1615,6 +1661,7 @@ impl TaskListSync {
         // Best-effort by design — a failing disk must never wedge
         // replication (the degraded flag refuses LOCAL mutations instead).
         let listener_persist = self.persist_ctx();
+        let listener_changes = Arc::clone(&self.change_sink);
         // ADR-0068 D2: read through the slot on every delta — the daemon
         // installs the gate after this loop is already running.
         let listener_gate = Arc::clone(&self.ingest_gate);
@@ -1689,6 +1736,7 @@ impl TaskListSync {
                         &listener_buffer,
                         &task_list,
                         listener_persist.as_ref(),
+                        &listener_changes,
                     )
                     .await;
                     continue;
@@ -1758,6 +1806,7 @@ impl TaskListSync {
                                         &listener_buffer,
                                         &task_list,
                                         listener_persist.as_ref(),
+                                        &listener_changes,
                                     )
                                     .await;
                                 }
@@ -1806,6 +1855,7 @@ impl TaskListSync {
                                 &listener_buffer,
                                 &task_list,
                                 listener_persist.as_ref(),
+                                &listener_changes,
                             )
                             .await;
                         }
@@ -1889,6 +1939,7 @@ impl TaskListSync {
                             }
                         } // write guard released before persisting
                         if merged_ok {
+                            listener_changes.note(crate::kv::KvChangeOrigin::Remote);
                             if let Some(ctx) = &listener_persist {
                                 if let Err(e) = persist_snapshot(&task_list, ctx).await {
                                     tracing::warn!("failed to persist merged task-list delta: {e}");
@@ -2310,9 +2361,26 @@ impl TaskListSync {
         delta: TaskListDelta,
         writer: Option<&AgentId>,
     ) -> Result<()> {
-        let mut task_list = self.task_list.write().await;
-        task_list.merge_delta(&delta, peer_id, writer)?;
+        {
+            let mut task_list = self.task_list.write().await;
+            task_list.merge_delta(&delta, peer_id, writer)?;
+        }
+        self.change_sink.note(crate::kv::KvChangeOrigin::Remote);
         Ok(())
+    }
+
+    /// Send this list's change notices (#1094 `task:changed`) to `tx`. Set
+    /// once, before [`Self::start`]; a second call is ignored. Without a
+    /// sink the list sends nothing.
+    pub fn set_change_sink(&self, tx: tokio::sync::broadcast::Sender<TaskListChanged>) {
+        self.change_sink.set(tx, self.topic.clone());
+    }
+
+    /// Send a change notice for a change made outside the sync loops (a
+    /// local mutation). Call it once the content has changed, whatever
+    /// persist and publish then do.
+    pub fn note_change(&self, origin: crate::kv::KvChangeOrigin) {
+        self.change_sink.note(origin);
     }
 
     /// Publish a local delta to the gossip network.
@@ -3368,6 +3436,62 @@ mod tests {
     // ------------------------------------------------------------------
     // start(): default spawner merges a remotely-published delta
     // ------------------------------------------------------------------
+
+    /// WHY (#1094 `task:changed`): a remote delta that the listener merges
+    /// sends exactly one change notice with the list topic and origin
+    /// `Remote`; a direct `apply_remote_delta` sends one; `note_change`
+    /// sends a `Local` one.
+    #[tokio::test]
+    async fn issue1094_a_merged_remote_task_delta_sends_one_change_notice() {
+        let (pubsub, publisher) = signed_pubsub_with_signer().await;
+        let (sync, _pubsub) = sync_on_pubsub("tasks/1094", pubsub);
+        sync.write()
+            .await
+            .set_authorized_agents(std::collections::HashSet::from([publisher]));
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        sync.set_change_sink(tx);
+        sync.start().await.expect("start");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let remote = peer(2);
+        let task = make_task(7, remote);
+        let task_id = *task.id();
+        let mut delta = TaskListDelta::new(1);
+        delta.added_tasks.insert(task_id, (task, (remote, 1)));
+        sync.publish_delta(remote, delta).await.expect("publish");
+        let change = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a merged delta sends a notice")
+            .expect("notice");
+        assert_eq!(
+            change,
+            TaskListChanged {
+                topic: "tasks/1094".to_string(),
+                origin: crate::kv::KvChangeOrigin::Remote,
+            }
+        );
+        assert!(sync.read().await.get_task(&task_id).is_some());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        let other = make_task(8, remote);
+        let mut direct = TaskListDelta::new(2);
+        direct.added_tasks.insert(*other.id(), (other, (remote, 2)));
+        sync.apply_remote_delta(remote, direct, Some(&publisher))
+            .await
+            .expect("direct delta");
+        assert_eq!(
+            rx.try_recv().expect("direct notice").origin,
+            crate::kv::KvChangeOrigin::Remote
+        );
+        sync.note_change(crate::kv::KvChangeOrigin::Local);
+        assert_eq!(
+            rx.try_recv().expect("local notice").origin,
+            crate::kv::KvChangeOrigin::Local
+        );
+    }
 
     #[tokio::test]
     async fn start_default_spawner_merges_remote_delta() {
