@@ -124,6 +124,7 @@ mod reseat_route;
 mod segments;
 mod segments_s;
 mod sidecar_q;
+mod sidecar_q2;
 
 const JOIN_LABELS: &[&str] = &["A", "M1", "M2", "J"];
 const SETUP: Duration = Duration::from_secs(180);
