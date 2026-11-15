@@ -264,6 +264,14 @@ fn latch(path: &Path) {
         .insert(path.to_path_buf());
 }
 
+/// Latch a barrier failure for this install, as a failed record write
+/// does (tests only).
+#[cfg(test)]
+pub(crate) fn latch_for_test(install: &Path) -> io::Result<()> {
+    latch(&state_path(install)?);
+    Ok(())
+}
+
 fn is_latched(path: &Path) -> bool {
     recovery_latches()
         .lock()

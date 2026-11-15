@@ -119,12 +119,15 @@ impl Host {
     /// Write the host commit (ADR 0094 §3 `host-committed`). Under the host
     /// lock: the transaction must be uncommitted and not rolling back, both
     /// installed files must hash to the candidate pair, and `check` (the
-    /// full-set health check) must pass. A refusal returns its cause and
-    /// changes nothing.
+    /// full-set health check) must pass. A refusal changes nothing.
+    ///
+    /// A file that hashes to other bytes rolls back as Failed. A hash that
+    /// cannot be read (an I/O error) is returned as `Err` for the caller to
+    /// retry: a transient read error must not hold the release (D189).
     pub(super) fn commit(
         &self,
-        check: impl FnOnce() -> io::Result<Option<journal::Cause>>,
-    ) -> io::Result<Option<journal::Cause>> {
+        check: impl FnOnce() -> io::Result<commit::Commit>,
+    ) -> io::Result<commit::Commit> {
         self.locked(|record| {
             if !matches!(
                 record.phase,
@@ -135,18 +138,20 @@ impl Host {
             ) {
                 return Err(invalid("host is not in a committable phase"));
             }
-            if self.verify_candidate().is_err() {
-                return Ok(Some(cause(
-                    journal::CauseClass::Failed,
-                    "installed pair is not the candidate pair",
-                )));
+            for a in [&self.plan().daemon, &self.plan().cli] {
+                if hash(&a.target_path)? != a.candidate_sha256 {
+                    return Ok(commit::Commit::RollBack(cause(
+                        journal::CauseClass::Failed,
+                        "installed pair is not the candidate pair",
+                    )));
+                }
             }
-            if let Some(refusal) = check()? {
-                return Ok(Some(refusal));
+            let decision = check()?;
+            if decision == commit::Commit::Committed {
+                record.phase = journal::Phase::HostCommitted;
+                self.save(record)?;
             }
-            record.phase = journal::Phase::HostCommitted;
-            self.save(record)?;
-            Ok(None)
+            Ok(decision)
         })
     }
 
