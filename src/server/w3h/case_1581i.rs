@@ -557,12 +557,12 @@ fn w3h_1581i_control_machine_revoked_device_keeps_its_seat() -> Result<()> {
 
 /// ADR 0110 `s4_intake_and_egress`, D70 guarded egress: after a later
 /// rotation the machine-revoked device must get no key of the new epoch.
-/// RED on `main` with [`CAUSE_KEY_DELIVERED`]: a TreeKEM rotation
-/// encrypts its path secrets to every leaf in the tree, and B's leaf (its
-/// device's KeyPackage) stays while B keeps its seat, so B's revoked
-/// device reaches the new epoch through the published commit. Closing it
-/// needs a design choice (the leaf belongs to the revoked device while
-/// the seat belongs to the agent) that is tracked on #1581.
+/// RED on `main` with [`CAUSE_KEY_DELIVERED`], the gap tracked as #1929:
+/// a TreeKEM rotation encrypts its path secrets to every leaf, B keeps
+/// its seat and its leaf, and the leaf key derives from B's portable
+/// agent key, which the revoked device still holds. A09 (15 Nov 2026)
+/// records the limit; closing it needs per-device leaves (#1929,
+/// option 1).
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -580,7 +580,7 @@ fn w3h_1581i_egress_machine_revoked_device_gets_no_new_key() -> Result<()> {
             "w3h_1581i_egress_machine_revoked_device_gets_no_new_key",
             0x1581_0021,
             true,
-            // RED on main (CAUSE_KEY_DELIVERED); see the doc above.
+            // RED on main (CAUSE_KEY_DELIVERED, #1929); see the doc above.
             Verdict::Red,
         )
         .await
