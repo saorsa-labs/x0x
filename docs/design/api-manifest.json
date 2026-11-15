@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 224,
+  "endpoint_count": 226,
   "endpoints": [
     {
       "category": "status",
@@ -3701,6 +3701,26 @@
       "description": "List share grants that name this install as grantee",
       "method": "GET",
       "path": "/grants/received",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "grants",
+      "cli_name": "grant data keys",
+      "description": "List the keys of a store on a granted agent, read through a received ShareCap::Data grant (#1094)",
+      "method": "GET",
+      "path": "/grants/data/:agent/:group/:store",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "grants",
+      "cli_name": "grant data get",
+      "description": "Read one value of a store on a granted agent, through a received ShareCap::Data grant (#1094)",
+      "method": "GET",
+      "path": "/grants/data/:agent/:group/:store/:key",
       "request": {
         "kind": "none"
       }

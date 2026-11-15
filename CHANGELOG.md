@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **A grantee reads a store through a `ShareCap::Data` grant (#1094 slice D1,
+  A03 amendment of 15 Nov 2026).** `GET /grants/data/:agent/:group/:store`
+  lists a granted store's keys and `GET /grants/data/:agent/:group/:store/:key`
+  reads one value (`x0x grant data keys|get`). The granted agent checks the
+  grant and serves the read from its own copy over two new typed DMs,
+  `x0x-data-read-v1` and `x0x-data-reply-v1`. New capability bit 20,
+  `data_read_v1`; a peer without it is not sent a read. Writes come later.
 - **A join request the authority refuses as `stale` is signed again over the
   authority's head (#1840 routes 1–3, A08 amendment of 15 Nov 2026).** A
   second joiner on a group with members, a request that crosses an edit of

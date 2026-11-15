@@ -2040,6 +2040,22 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         category: "grants",
         request: RequestSpec::None,
     },
+    EndpointDef {
+        method: Method::Get,
+        path: "/grants/data/:agent/:group/:store",
+        cli_name: "grant data keys",
+        description: "List the keys of a store on a granted agent, read through a received ShareCap::Data grant (#1094)",
+        category: "grants",
+        request: RequestSpec::None,
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/grants/data/:agent/:group/:store/:key",
+        cli_name: "grant data get",
+        description: "Read one value of a store on a granted agent, through a received ShareCap::Data grant (#1094)",
+        category: "grants",
+        request: RequestSpec::None,
+    },
     // ── Names (ADR-0074 §1; durable owner token only) ───────────────────
     EndpointDef {
         method: Method::Get,

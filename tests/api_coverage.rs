@@ -673,6 +673,16 @@ const COVERED: &[CoveredEndpoint] = &[
         "/grants/:id/renew",
         issue1350_renew_issues_a_new_grant_with_no_gap
     ),
+    covered!(
+        Get,
+        "/grants/data/:agent/:group/:store",
+        issue1094_grantee_route_waits_for_the_granted_agents_reply
+    ),
+    covered!(
+        Get,
+        "/grants/data/:agent/:group/:store/:key",
+        issue1094_data_grantee_reads_keys_and_values
+    ),
     // ── Names (ADR-0074 §1) ─────────────────────────────────────────────
     covered!(Get, "/names", names_routes_wired),
     covered!(Post, "/names/resolve", names_routes_wired),
@@ -689,6 +699,12 @@ const COVERED: &[CoveredEndpoint] = &[
 ];
 
 const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
+    // #1094 D1: the granted-store read routes' coverage lives in the
+    // data-read lib tests.
+    (
+        "src/server/data_read_tests.rs",
+        include_str!("../src/server/data_read_tests.rs"),
+    ),
     (
         "src/server/routes/network.rs",
         include_str!("../src/server/routes/network.rs"),
