@@ -149,6 +149,15 @@ All notable changes to this project will be documented in this file.
   not recorded. A daemon that does not answer keeps unknown counts; it is
   never reported as zero connections.
 
+### Fixed
+
+- **A daemon that restarts with pending S4 work no longer seals a stale
+  head (#1581).** If the `.evs` file held an unsealed revocation-eviction
+  row, the group needs a holder to confirm its head before S4 seals there.
+  Until then the row shows `waiting_for_head_sync`, also past the 13 s
+  restart sync wait. Before, the wait alone counted as a synced head, and a
+  restarted admin could seal its stale head with a divergent key.
+
 ## [v0.48.1] - 2026-10-17
 
 A patch release. It pins ant-quic 0.27.61 and saorsa-gossip 0.5.90, and

@@ -89,6 +89,23 @@ roster has no Active admin seat at all, per ADR 0088 §2 item 3 and ADR
 exists. A promoted member keeps a mandate refused with either cause and
 retries it, as before. ADR 0110 stays Accepted and its text is unchanged.
 
+On 15 Nov 2026 Claude decided when the §2 restart sync wait ends head
+discovery, under David's delegation of design decisions of 10 Nov 2026
+([#1581](https://github.com/saorsa-labs/x0x/issues/1581),
+`s4_restart_stale_head`), to carry out David's rulings of 29 Oct 2026
+00:15/00:40 GMT. A group that had an unsealed (pending or prepared) row
+in the `.evs` file this boot loaded needs a holder's confirmation of its
+head before S4 seals in it, while any holder exists. The elapsed restart
+sync wait alone does not end discovery for that group, inside the wait or
+past it, and the row keeps `waiting_for_head_sync`. The first
+confirmation of the group's head since the boot lifts the rule. Every
+other group keeps D73: the bounded wait ends discovery when no holder
+answers. A committed row's delivery is not gated, because it resends its
+saved event and seals nothing new. A node that restarted with pending
+work on a head loaded from disk thus never seals that stale head, and
+another admin's fallback still covers the row. ADR 0110 stays Accepted
+and its text is unchanged.
+
 Amendment of 14 Nov 2026 (#1427), made under the design delegation of
 10 Nov 2026. A TreeKEM member that was down longer than the last
 metadata resend (60 s) can have missed a commit, and with no later
