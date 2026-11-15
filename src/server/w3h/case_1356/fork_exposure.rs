@@ -394,7 +394,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     .unwrap_or((false, false));
     receipt.evidence(
         "j_keeps_the_signed_base_roster_at_r",
-        base_roster.1,
+        !base_roster.0 && base_roster.1,
         format!(
             "r {} on J: link kept {}, signed base roster {}",
             short(&base.state_hash),

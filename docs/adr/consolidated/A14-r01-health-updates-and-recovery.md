@@ -40,6 +40,8 @@ Use typed degraded and blocked states. Do not report healthy merely because one 
 
 Diagnostic data for the owner should identify the failed condition and the permitted recovery action. Reports to maintainers are opt-in and must remove secrets and unrelated private data.
 
+`system.*` events for the M1 verdict (amendment of 15 Nov 2026, #1351). The daemon emits `system.health_verdict` when the overall `/health` verdict changes and `system.upgrade_state` when its upgrade input changes (state, `update_available`, `latest_version`, `handoff_pending`, `failed_artifact`; the check age alone is not a change). Both go on the daemon broadcast that feeds `GET /events` and every `/ws` session. The 5 s health refresher classifies the same merge `GET /health` serves; the first classification after start is the baseline and emits nothing. Reasons use the redacted wording, because a GUI session token can read both streams. These names sit beside `system.update_behind` of the Proposed signalling section below and do not replace it. Additive local API; no wire change. Authority: Claude under David's delegation, 10 Nov 2026.
+
 ## Safe apply
 
 Resolve who owns process restart before changing installed files. The old daemon records the intended executables, paths, arguments, data roots and supervisor behavior.
