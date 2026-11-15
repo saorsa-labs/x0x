@@ -1933,6 +1933,9 @@ pub async fn serve_with_options(
     // memory-only), never fatal; until it ends no writer replaces either
     // file.
     routes::named_groups::load_revocation_eviction_store(&state).await;
+    // #1427: the catch-up commits this node held before the restart. After
+    // the S4 store, so a commit S4 still delivers is not served from it.
+    routes::named_groups::restore_treekem_catchup_logs(&state).await;
 
     // Publish the API port only after every fallible causal-state loader has
     // completed. A rejected sidecar therefore leaves no listener task and no

@@ -307,3 +307,44 @@ async fn issue1427_start_pass_follows_a_multi_epoch_gap() {
     assert_eq!(end, TreeKemStartCatchupEnd::KeepPending);
     assert_eq!(epoch.get(), TREEKEM_START_CATCHUP_CYCLES as u64);
 }
+
+/// #1913 review follow-up: when another epoch-ahead task holds the group,
+/// a start cycle only hands it the target. The start pass must wait for
+/// that task to end before it judges the cycle.
+#[tokio::test(start_paused = true)]
+async fn issue1427_start_pass_waits_for_another_epoch_ahead_task() -> Result<()> {
+    let (state, _dir, key) = treekem_member_state().await?;
+    state
+        .treekem_start_catchup_pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key.clone());
+    // Another task holds the group.
+    state.treekem_epoch_ahead_targets.lock().await.insert(
+        key.clone(),
+        EpochAheadTarget {
+            epoch: 99,
+            observations: 0,
+        },
+    );
+    let pass = tokio::spawn({
+        let state = Arc::clone(&state);
+        let key = key.clone();
+        async move { request_treekem_catchup_after_start(&state, &key).await }
+    });
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert!(
+        !pass.is_finished(),
+        "#1427: the start pass must not end while another task holds the group"
+    );
+    state.treekem_epoch_ahead_targets.lock().await.remove(&key);
+    settle("the start pass after the other task ends", async || {
+        pass.is_finished()
+    })
+    .await?;
+    assert!(
+        pending(&state, &key),
+        "#1427: no move keeps the group pending"
+    );
+    Ok(())
+}

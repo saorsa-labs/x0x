@@ -27,6 +27,9 @@
 //! - silent: the plain nodes. After V is back the signer writes nothing
 //!   and V's traffic is not held: V, down past the last metadata resend,
 //!   must ask at its own start.
+//! - silent after a signer restart: as silent, and the signer crash-restarts
+//!   while V is down, so its in-memory catch-up log is gone. Only what it
+//!   saved to disk can serve the removal.
 //!
 //! From V's restart until the preconditions are witnessed, every
 //! application frame toward V is held (dropped). Only transport links form.
@@ -76,12 +79,14 @@ enum Arm {
     /// The plain nodes. No later-epoch traffic is sent after V is back:
     /// V must ask on its own.
     Silent,
+    /// As `Silent`, and the signer restarts while V is down.
+    SilentAfterSignerRestart,
 }
 
 impl Arm {
     fn labels(self) -> &'static [&'static str] {
         match self {
-            Self::Plain | Self::Silent => &["O", "B", "V", "R"],
+            Self::Plain | Self::Silent | Self::SilentAfterSignerRestart => &["O", "B", "V", "R"],
             Self::SignerAfterThreeOfflineAdmins => &["O", "P", "Q", "S", "V", "R"],
         }
     }
@@ -89,7 +94,7 @@ impl Arm {
     /// Labels promoted to admin by O.
     fn promoted(self) -> &'static [&'static str] {
         match self {
-            Self::Plain | Self::Silent => &[],
+            Self::Plain | Self::Silent | Self::SilentAfterSignerRestart => &[],
             Self::SignerAfterThreeOfflineAdmins => &["P", "Q", "S"],
         }
     }
@@ -422,7 +427,19 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     })
     .await?;
     let ahead = epoch(sim, signer, &group).await?;
-    let silent = arm == Arm::Silent;
+    let silent = matches!(arm, Arm::Silent | Arm::SilentAfterSignerRestart);
+    if arm == Arm::SilentAfterSignerRestart {
+        // The signer's in-memory catch-up log goes with the restart. Only
+        // what it saved can serve V.
+        sim.stop(signer, RestartMode::Crash).await?;
+        sim.start_again(signer).await?;
+        let reloaded = epoch(sim, signer, &group).await?;
+        ensure!(
+            reloaded == ahead,
+            "INFRA: {signer} reloaded epoch {reloaded}, not {ahead}"
+        );
+        mesh(sim, &["O", "B"]).await?;
+    }
     sim.within(
         "V stays down past the metadata resends",
         OFFLINE.saturating_add(Duration::from_secs(2)),
@@ -743,6 +760,23 @@ fn w3h_1427_silent_return_reaches_the_epoch() -> Result<()> {
             "w3h_1427_silent_return_reaches_the_epoch",
             0x1427_0003,
             Arm::Silent,
+            Verdict::Green,
+        )
+        .await
+    })
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+fn w3h_1427_silent_return_after_signer_restart_reaches_the_epoch() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1427_silent_return_after_signer_restart_reaches_the_epoch",
+            0x1427_0004,
+            Arm::SilentAfterSignerRestart,
             Verdict::Green,
         )
         .await

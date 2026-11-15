@@ -2599,3 +2599,111 @@ fn reject_step_refuses_a_request_that_the_signer_did_not_name() -> anyhow::Resul
     );
     Ok(())
 }
+
+/// #1427: a removal this node signed, saved to its catch-up log and, after
+/// a restart, loaded back. `s4_open` opens an S4 row for the removed
+/// member before the load. Returns the logged event keys after the load,
+/// the expected key, and whether the saved file existed.
+async fn issue1427_restart_with_saved_removal(
+    s4_open: bool,
+) -> anyhow::Result<(Vec<Option<String>>, Option<String>, bool)> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let owner = state.agent.identity().agent_keypair();
+    let owner_hex = hex::encode(owner.agent_id().as_bytes());
+    let mut ahead = base_group(owner, None)?;
+    let base = ahead.clone();
+    let removal = seal_link(&mut ahead, owner, 2_000, |next| {
+        next.remove_member(&agent(REMOVED), Some(owner_hex.clone()));
+        take_treekem_epoch(next);
+    })?;
+    let removal = removal_event(&base, &owner_hex, &removal);
+    let group_id = named_group_metadata_event_group_id(&removal).to_string();
+    let stable = ahead.stable_group_id().to_string();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), ahead);
+    remember_treekem_membership_event(&state, &removal).await;
+    let saved = treekem_catchup_log_path(&state, &group_id).exists();
+
+    // A restart starts with an empty in-memory log; the S4 store loads
+    // first.
+    state.treekem_event_log.write().await.clear();
+    if s4_open {
+        let target: [u8; 32] = hex::decode(agent(REMOVED))?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("agent id length"))?;
+        revocation_eviction::open_fallback_row_for_test(&state, &stable, target, &group_id).await;
+    }
+    restore_treekem_catchup_logs(&state).await;
+    let restored = state
+        .treekem_event_log
+        .read()
+        .await
+        .get(&group_id)
+        .map(|log| log.iter().map(treekem_membership_event_key).collect())
+        .unwrap_or_default();
+    Ok((restored, treekem_membership_event_key(&removal), saved))
+}
+
+/// #1427: the catch-up log is kept on disk. After a restart the node
+/// serves the removal it signed before the restart.
+#[tokio::test]
+async fn issue1427_catchup_log_is_restored_after_a_restart() -> anyhow::Result<()> {
+    let (restored, key, saved) = issue1427_restart_with_saved_removal(false).await?;
+    assert!(saved, "#1427: the catch-up log is saved");
+    assert_eq!(
+        restored,
+        vec![key],
+        "#1427: the restarted node serves the removal it signed"
+    );
+    Ok(())
+}
+
+/// #1427 (the 1581e rule): a removal whose S4 row is still open after the
+/// restart is not served from the saved log. S4 owns its delivery.
+#[tokio::test]
+async fn issue1427_restore_holds_a_removal_s4_still_delivers() -> anyhow::Result<()> {
+    let (restored, _, saved) = issue1427_restart_with_saved_removal(true).await?;
+    assert!(saved, "#1427: the catch-up log is saved");
+    assert!(
+        restored.is_empty(),
+        "#1427: a removal with an open S4 row must not be served from the saved log"
+    );
+    Ok(())
+}
+
+/// #1427: a saved log of a group this node no longer stores is removed at
+/// the next start.
+#[tokio::test]
+async fn issue1427_saved_log_of_a_gone_group_is_dropped() -> anyhow::Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let owner = state.agent.identity().agent_keypair();
+    let owner_hex = hex::encode(owner.agent_id().as_bytes());
+    let mut ahead = base_group(owner, None)?;
+    let base = ahead.clone();
+    let removal = seal_link(&mut ahead, owner, 2_000, |next| {
+        next.remove_member(&agent(REMOVED), Some(owner_hex.clone()));
+        take_treekem_epoch(next);
+    })?;
+    let removal = removal_event(&base, &owner_hex, &removal);
+    let group_id = named_group_metadata_event_group_id(&removal).to_string();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), ahead);
+    remember_treekem_membership_event(&state, &removal).await;
+    let saved = treekem_catchup_log_path(&state, &group_id);
+    assert!(saved.exists());
+    state.named_groups.write().await.clear();
+    state.treekem_event_log.write().await.clear();
+    restore_treekem_catchup_logs(&state).await;
+    assert!(state.treekem_event_log.read().await.is_empty());
+    assert!(
+        !saved.exists(),
+        "#1427: a log of a removed group is dropped"
+    );
+    Ok(())
+}

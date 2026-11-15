@@ -2621,6 +2621,20 @@ pub(super) async fn s4_seal_recheck_locked(
     Some(cause)
 }
 
+/// #1427: whether the S4 row of `target` in the group with
+/// `stable_group_id` is open (its commit's delivery is not done).
+pub(in crate::server) async fn s4_row_open_for(
+    state: &AppState,
+    stable_group_id: &str,
+    target: [u8; 32],
+) -> bool {
+    s4_row_open(
+        state,
+        &EvictionKey::new(stable_group_id.to_string(), target),
+    )
+    .await
+}
+
 /// Whether `key` has an open S4 row.
 pub(super) async fn s4_row_open(state: &AppState, key: &EvictionKey) -> bool {
     let inner = state.revocation_evictions.inner.lock().await;
