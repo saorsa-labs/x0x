@@ -23,6 +23,9 @@ pub(crate) const HANDOFF_FILE_NAME: &str = "upgrade-handoff.json";
 pub(crate) const BOOT_FILE_NAME: &str = "upgrade-boot.json";
 /// A candidate's per-instance health commit (#1377), beside its data root.
 pub(crate) const HEALTH_FILE_NAME: &str = "upgrade-health.json";
+/// Legacy-map key in an M2 handoff: the OLD instance's send-ready peer
+/// count when it armed the handoff (D193 `previously_connected`, #1377).
+pub(crate) const HANDOFF_SEND_READY_PEERS: &str = "send_ready_peers";
 pub(crate) const SCHEMA_VERSION: u32 = 1;
 const MAX_RECORD_BYTES: u64 = 1024 * 1024;
 

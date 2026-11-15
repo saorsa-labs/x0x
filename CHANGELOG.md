@@ -217,6 +217,13 @@ All notable changes to this project will be documented in this file.
 
 ### Tests and tooling
 
+- **Upgrade candidate health commit and D194 staging reserve (#1377, S3d
+  part 2; A14 amendment of 15 Nov 2026).** A launcher trial candidate
+  writes `upgrade-health.json` once its local M1 inputs stay `ok` for the
+  stable interval, with D193 peer continuity when the OLD instance had a
+  send-ready peer (recorded in the handoff). Staging refuses a download
+  that would leave less than 1 GiB free. A missing or symlinked installed
+  file rolls the host commit back as Failed at once.
 - **Coordinator production pass and systemd recovery cases (#1376, S3c;
   A14 amendment of 15 Nov 2026).** `coordinator::recover` keeps trials at
   `<data_root>/upgrade-trial.json`, counts only a handoff that binds this

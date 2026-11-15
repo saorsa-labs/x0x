@@ -139,7 +139,16 @@ impl Host {
                 return Err(invalid("host is not in a committable phase"));
             }
             for a in [&self.plan().daemon, &self.plan().cli] {
-                if hash(&a.target_path)? != a.candidate_sha256 {
+                // A missing, symlinked, non-regular or oversized installed
+                // file will fail every retry: roll back now as Failed. Only
+                // a true I/O error is returned for the caller to retry; if
+                // it keeps happening, the trial's total deadline rolls back.
+                let installed = match hash(&a.target_path) {
+                    Ok(installed) => Some(installed),
+                    Err(error) if super::filesystem::persistent_hash_error(&error) => None,
+                    Err(error) => return Err(error),
+                };
+                if installed != Some(a.candidate_sha256) {
                     return Ok(commit::Commit::RollBack(cause(
                         journal::CauseClass::Failed,
                         "installed pair is not the candidate pair",

@@ -41,6 +41,7 @@ mod system_events;
 mod update_check;
 #[cfg(any(unix, windows))]
 mod upgrade_flush;
+mod upgrade_health_commit;
 pub use update_check::run_update_check_and_report;
 // W3-H (#1164): deterministic simulation harness (test builds only:
 // `#![cfg(test)]` inside the module).
@@ -1630,6 +1631,13 @@ pub async fn serve_with_options(
         let mut verdict_windows = health_verdict::VerdictWindows::default();
         // #1351: verdict and upgrade-input changes become `system.*` events.
         let mut system_events = system_events::SystemEventTracker::default();
+        // #1377: a launcher trial candidate writes its health commit. Read
+        // once; an ordinary daemon is `None` and does nothing per tick.
+        let health_candidate = upgrade_health_commit::detect(
+            &state.data_dir,
+            identity_dir.clone().or_else(crate::storage::x0x_home_dir),
+        );
+        let mut health_tracker = upgrade_health_commit::Tracker::default();
         bg_tasks.push(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
                 routes::status::HEALTH_SNAPSHOT_REFRESH_SECS,
@@ -1674,6 +1682,26 @@ pub async fn serve_with_options(
                     &mut verdict_windows,
                 )
                 .await;
+                if let Some(candidate) = &health_candidate {
+                    let (_, send_ready, _) = snapshot_state.health_snapshot.load();
+                    let local =
+                        health_verdict::local_verdict(&health_verdict::classify_with_detail(
+                            &sample,
+                            health_verdict::DetailAccess::Full,
+                        ));
+                    let observation = upgrade_health_commit::Observation {
+                        stores_initialized: true,
+                        local_verdict: local,
+                        send_ready_peers: send_ready,
+                    };
+                    if let Some(record) =
+                        health_tracker.observe(candidate, observation, std::time::Instant::now())
+                    {
+                        if let Err(error) = upgrade_health_commit::write(candidate, &record) {
+                            tracing::warn!("upgrade health commit not written: {error}");
+                        }
+                    }
+                }
                 snapshot_state.health_snapshot.store_verdict_sample(sample);
                 system_events::emit_changes(&snapshot_state, &mut system_events);
             }

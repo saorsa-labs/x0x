@@ -146,6 +146,7 @@ impl FlushOwner {
             api_token: state.api_token.clone(),
             api_address: state.api_address,
             identity_root,
+            health_snapshot: Arc::clone(&state.health_snapshot),
         });
         let flush_failed = Arc::new(tokio::sync::Notify::new());
         let failure_signal = Arc::clone(&flush_failed);
@@ -278,6 +279,9 @@ struct ControlContext {
     api_token: String,
     api_address: std::net::SocketAddr,
     identity_root: PathBuf,
+    /// The live peer counts; the handoff records the send-ready count
+    /// (D193, #1377).
+    health_snapshot: Arc<super::routes::status::HealthSnapshot>,
 }
 
 #[derive(Deserialize)]
@@ -430,6 +434,9 @@ fn admit(state: &ControlContext, root: &Path, bytes: &[u8]) -> io::Result<Admitt
         "old_pid": participant.old_pid, "api_addr": state.api_address.to_string(), "started_at": started_at,
         "mode": participant.restart.mode, "launchd_verified": participant.restart.launchd_verified,
         "systemd_verified": participant.restart.systemd_verified,
+        // D193 (#1377): the candidate needs peer continuity only when this
+        // OLD instance had a send-ready peer.
+        journal::HANDOFF_SEND_READY_PEERS: state.health_snapshot.load().1,
     });
     let handoff = journal::M2HandoffRecord {
         schema_version: journal::SCHEMA_VERSION,
@@ -1425,6 +1432,7 @@ mod windows_exec_regressions {
             api_token: "owned fixture credential".into(),
             api_address: std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
             identity_root: root.clone(),
+            health_snapshot: Arc::default(),
         });
         let artifact = serde_json::json!({
             "target_path": root.join("x0xd.exe"), "staged_path": root.join("x0xd.staged"),
