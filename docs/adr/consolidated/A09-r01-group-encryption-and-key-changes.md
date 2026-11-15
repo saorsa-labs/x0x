@@ -96,7 +96,10 @@ direct send whose resolved recipient machine is revoked answers the typed
 `DmError::RecipientMachineRevoked { machine }`, and `POST /direct/send`
 maps it to HTTP 403 `recipient_machine_revoked`. The check runs before the
 ADR-0043 pairing check, on the discovery-cached machine and on the
-capability-advert binding. A revoked binding keeps its existing typed
+capability-advert binding. A machine revocation evicts the recipient from
+the discovery caches, so when no discovery entry is left the check reads
+the newest retained authenticated or announced binding, which outlives
+that eviction; a later announcement from a clean machine replaces it. A revoked binding keeps its existing typed
 answer, `recipient_pairing_denied` (`PairingDenial::BindingRevoked`). The
 S4 designated hand-off reads the new error as a policy refusal, like the
 pairing denial. A request from a revoked device keeps the #1657 typed

@@ -1145,7 +1145,9 @@ mod tests {
     /// `recipient_machine_revoked`, which names the machine revocation
     /// (a binding revocation keeps `recipient_pairing_denied`). The lib
     /// test `send_direct_reports_a_revoked_machine_as_recipient_machine_revoked`
-    /// pins the typed `DmError`; this test pins the HTTP mapping.
+    /// pins the typed `DmError` through the real revocation path (eviction
+    /// included); this test pins only the HTTP mapping, so it inserts the
+    /// record into the set directly and keeps the discovery entry.
     #[tokio::test]
     async fn direct_send_to_a_revoked_machine_is_403_recipient_machine_revoked() {
         use base64::Engine as _;

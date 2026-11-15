@@ -11071,11 +11071,6 @@ impl Agent {
         (peer.stats.avg_rtt_ms > 0).then_some(peer.stats.avg_rtt_ms)
     }
 
-    /// ADR-0043 §9 outbound B/P (review r4 H5): evaluate the pairing for
-    /// a RESOLVED recipient machine — whichever source resolved it
-    /// (discovery cache, capability-advert binding, or the DM connection
-    /// registry). Present evidence fails closed; absent evidence fails
-    /// open (§9.3).
     /// ADR 0110 §3 (D70; #1597 item 4): whether an outbound send's
     /// resolved recipient machine is revoked. A machine revocation denies
     /// that device only: the send answers the typed
@@ -11085,6 +11080,38 @@ impl Agent {
         self.revocation_set.read().await.is_machine_revoked(machine)
     }
 
+    /// ADR 0110 §3 (D70; #1597 item 4, #1918 review): the recipient's
+    /// newest retained machine binding, when that machine is revoked. A
+    /// machine revocation evicts the recipient from the discovery caches
+    /// ([`Self::evict_revoked_subject`]), so the discovery preflight finds
+    /// no machine to check. The authenticated and announced binding stores
+    /// outlive that eviction; the newer of their two records names the
+    /// machine the agent last announced from. A later announcement from
+    /// a clean machine replaces it, so a moved agent is not refused.
+    async fn recipient_retained_machine_revoked(
+        &self,
+        to: &identity::AgentId,
+    ) -> Option<identity::MachineId> {
+        let attested = self.authenticated_machine_bindings.read().await.peek(to);
+        let announced = self.announced_machine_bindings.read().await.peek(to);
+        let newest = match (attested, announced) {
+            (Some(a), Some(b)) => Some(if b.announced_at > a.announced_at {
+                b
+            } else {
+                a
+            }),
+            (a, b) => a.or(b),
+        }?;
+        self.recipient_machine_revoked(&newest.machine_id)
+            .await
+            .then_some(newest.machine_id)
+    }
+
+    /// ADR-0043 §9 outbound B/P (review r4 H5): evaluate the pairing for
+    /// a RESOLVED recipient machine — whichever source resolved it
+    /// (discovery cache, capability-advert binding, or the DM connection
+    /// registry). Present evidence fails closed; absent evidence fails
+    /// open (§9.3).
     async fn recipient_pairing_denied(
         &self,
         to: &identity::AgentId,
@@ -11918,6 +11945,12 @@ impl Agent {
                 self.direct_messaging.record_outgoing_failed(*to);
                 return Err(dm::DmError::RecipientPairingDenied { denial });
             }
+        } else if let Some(machine) = self.recipient_retained_machine_revoked(to).await {
+            // #1918 review: the machine revocation already evicted the
+            // recipient's discovery entry; its retained binding still
+            // names the revoked machine.
+            self.direct_messaging.record_outgoing_failed(*to);
+            return Err(dm::DmError::RecipientMachineRevoked { machine });
         }
         if *to == self.identity.agent_id() {
             self.direct_messaging.record_outgoing_started(*to, None);
@@ -44145,11 +44178,13 @@ async fn revocation_discovery_eviction_preserves_authenticated_binding() {
     );
 }
 
-/// #1597 item 4 (ADR 0110 §3, D70): a send to a recipient whose resolved
-/// machine is revoked answers the typed `DmError::RecipientMachineRevoked`
-/// naming that machine, and nothing is sent. The agent itself is not
-/// revoked (its seat stays). FAIL-BEFORE: the preflight checked only the
-/// ADR-0043 pairing, so the send went on to the generic transport outcome.
+/// #1597 item 4 (ADR 0110 §3, D70): a send to a recipient whose machine
+/// is revoked answers the typed `DmError::RecipientMachineRevoked` naming
+/// that machine, and nothing is sent. The agent itself is not revoked (its
+/// seat stays). The revocation goes through the real apply path, so the
+/// eviction runs and drops the recipient's discovery entry (#1918 review):
+/// the retained authenticated binding is what still names the machine.
+/// FAIL-BEFORE: the send went on to the generic transport outcome.
 #[tokio::test]
 async fn send_direct_reports_a_revoked_machine_as_recipient_machine_revoked() {
     let tempdir = tempfile::tempdir().expect("tempdir");
@@ -44165,6 +44200,14 @@ async fn send_direct_reports_a_revoked_machine_as_recipient_machine_revoked() {
     discovered.machine_id = machine.machine_id();
     discovered.machine_public_key = machine.public_key().as_bytes().to_vec();
     sender.insert_discovered_agent_for_testing(discovered).await;
+    // What a verified announcement leaves behind besides the cache entry.
+    dm_inbox::record_authenticated_machine_binding(
+        &sender.authenticated_machine_bindings,
+        recipient.agent_id(),
+        machine.machine_id(),
+        6_000,
+    )
+    .await;
     let record = revocation::RevocationRecord::sign(
         revocation::RevokedSubject::Machine(machine.machine_id()),
         machine.public_key(),
@@ -44173,12 +44216,19 @@ async fn send_direct_reports_a_revoked_machine_as_recipient_machine_revoked() {
         None,
     )
     .expect("sign");
-    assert!(sender
-        .revocation_set
-        .write()
+    sender
+        .apply_and_publish_revocation(record, None)
         .await
-        .verify_and_insert(record, None)
-        .expect("a machine self-revocation verifies"));
+        .expect("the machine revocation applies");
+    assert!(
+        sender
+            .identity_discovery_cache
+            .read()
+            .await
+            .get(&recipient.agent_id())
+            .is_none(),
+        "the eviction dropped the recipient's discovery entry"
+    );
     assert!(!sender
         .revocation_set
         .read()
@@ -44195,6 +44245,23 @@ async fn send_direct_reports_a_revoked_machine_as_recipient_machine_revoked() {
             dm::DmError::RecipientMachineRevoked { machine: m } if m == machine.machine_id()
         ),
         "expected RecipientMachineRevoked naming the machine, got {err:?}"
+    );
+
+    // A later announcement from a clean machine moves the agent: no
+    // machine-revocation refusal.
+    let moved = identity::MachineKeypair::generate().expect("machine keygen");
+    dm_inbox::record_authenticated_machine_binding(
+        &sender.authenticated_machine_bindings,
+        recipient.agent_id(),
+        moved.machine_id(),
+        7_000,
+    )
+    .await;
+    assert_eq!(
+        sender
+            .recipient_retained_machine_revoked(&recipient.agent_id())
+            .await,
+        None
     );
 }
 
