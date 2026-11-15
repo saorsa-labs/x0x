@@ -17,7 +17,8 @@ use crate::dm_inbox::{DmTypedPayload, DmTypedPayloadCompletion};
 use crate::identity::AgentId;
 use crate::share_grant::data_read::{
     DataReadEntry, DataReadKey, DataReadOp, DataReadReply, DataReadRequest, DataReadStatus,
-    DATA_READ_REPLY_DM_PREFIX, DATA_READ_REQUEST_DM_PREFIX, MAX_DATA_READ_VALUE_BYTES,
+    DATA_READ_REPLY_DM_PREFIX, DATA_READ_REQUEST_DM_PREFIX, MAX_DATA_READ_CONTENT_TYPE_BYTES,
+    MAX_DATA_READ_VALUE_BYTES,
 };
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -156,6 +157,10 @@ async fn read_local_store(state: &AppState, request: &DataReadRequest) -> Option
             DataReadReply::keys_fitting(&request.request_id, keys)
         }
         DataReadOp::Get { key } => match handle.get(key).await {
+            Ok(Some(entry)) if entry.content_type.len() > MAX_DATA_READ_CONTENT_TYPE_BYTES => {
+                DataReadReply::status(&request.request_id, DataReadStatus::ContentTypeTooLong)
+                    .encode()
+            }
             Ok(Some(entry)) if entry.value.len() > MAX_DATA_READ_VALUE_BYTES => {
                 DataReadReply::status(&request.request_id, DataReadStatus::TooLarge).encode()
             }
@@ -171,10 +176,9 @@ async fn read_local_store(state: &AppState, request: &DataReadRequest) -> Option
                     updated_at: entry.updated_at,
                 }),
             }
-            .encode()
-            .or_else(|| {
-                DataReadReply::status(&request.request_id, DataReadStatus::TooLarge).encode()
-            }),
+            // Within the bounds above the reply always fits (const-checked
+            // in `share_grant::data_read`); `None` would answer unavailable.
+            .encode(),
             Ok(None) => {
                 DataReadReply::status(&request.request_id, DataReadStatus::NotFound).encode()
             }
@@ -256,6 +260,12 @@ fn reply_response(reply: DataReadReply) -> (StatusCode, Json<serde_json::Value>)
             StatusCode::PAYLOAD_TOO_LARGE,
             format!(
                 "the value is over the {MAX_DATA_READ_VALUE_BYTES}-byte limit of a granted read"
+            ),
+        ),
+        DataReadStatus::ContentTypeTooLong => api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "the value's content type is over the {MAX_DATA_READ_CONTENT_TYPE_BYTES}-byte limit of a granted read"
             ),
         ),
         DataReadStatus::Unavailable => api_error(

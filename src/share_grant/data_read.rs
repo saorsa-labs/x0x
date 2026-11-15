@@ -19,8 +19,10 @@ pub const DATA_READ_REQUEST_DM_PREFIX: &[u8] = b"x0x-data-read-v1\0";
 /// Typed-DM prefix of a read reply (granted agent → grantee).
 pub const DATA_READ_REPLY_DM_PREFIX: &[u8] = b"x0x-data-reply-v1\0";
 
-/// Largest request, prefix included.
-pub const MAX_DATA_READ_REQUEST_BYTES: usize = 1024;
+/// Largest request, prefix included: four fields (request id, group,
+/// store, key) at [`MAX_DATA_READ_FIELD_BYTES`], each escaped in the worst
+/// case, fit with room to spare.
+pub const MAX_DATA_READ_REQUEST_BYTES: usize = 8192;
 
 /// Largest reply, prefix included: inside the 48 KiB DM payload limit
 /// ([`crate::dm::MAX_PAYLOAD_BYTES`]) with room for the DM framing.
@@ -29,12 +31,45 @@ pub const MAX_DATA_READ_REPLY_BYTES: usize = 45_056;
 /// Longest group id, store name or key a request may carry.
 pub const MAX_DATA_READ_FIELD_BYTES: usize = 256;
 
-/// Largest value a `get` reply carries: 32 KiB. Its base64 (43 692 bytes)
-/// fits [`MAX_DATA_READ_REPLY_BYTES`] with the bounded key and request id.
-/// A store value can be larger (up to 64 KiB inline); a larger value is
-/// answered [`DataReadStatus::TooLarge`]. The DM payload limit
-/// ([`crate::dm::MAX_PAYLOAD_BYTES`], 48 KiB) does not allow more.
-pub const MAX_DATA_READ_VALUE_BYTES: usize = 32 * 1024;
+/// Longest content type a `get` reply carries. A longer one is answered
+/// [`DataReadStatus::ContentTypeTooLong`].
+pub const MAX_DATA_READ_CONTENT_TYPE_BYTES: usize = 128;
+
+/// JSON escapes a control character as `\u00XX`: at most 6 bytes per input
+/// byte. Every other character is written as its own UTF-8 bytes.
+const JSON_ESCAPE_WORST: usize = 6;
+
+/// Fixed bytes of a `get` reply besides its strings: prefix, field names,
+/// quotes, braces, the status and a 20-digit `updated_at` (under 140 bytes;
+/// the test `worst_case_get_reply_fits` checks it).
+const GET_REPLY_FIXED_BYTES: usize = 256;
+
+/// Base64 bytes left for the value in a worst-case `get` reply: the reply
+/// bound less the fixed bytes and the escaped request id, key and content
+/// type at their bounds.
+const VALUE_B64_BUDGET: usize = MAX_DATA_READ_REPLY_BYTES
+    - GET_REPLY_FIXED_BYTES
+    - JSON_ESCAPE_WORST * (2 * MAX_DATA_READ_FIELD_BYTES + MAX_DATA_READ_CONTENT_TYPE_BYTES);
+
+/// Largest value a `get` reply carries, derived from the reply bound
+/// ([`MAX_DATA_READ_REPLY_BYTES`]) so a value at this size always fits,
+/// whatever its key, request id and content type within their bounds:
+/// 30 720 bytes. A store value can be larger (up to 64 KiB inline); a
+/// larger value is answered [`DataReadStatus::TooLarge`]. The DM payload
+/// limit ([`crate::dm::MAX_PAYLOAD_BYTES`], 48 KiB) does not allow more.
+pub const MAX_DATA_READ_VALUE_BYTES: usize = VALUE_B64_BUDGET / 4 * 3;
+
+const _: () = assert!(
+    GET_REPLY_FIXED_BYTES
+        + JSON_ESCAPE_WORST * (2 * MAX_DATA_READ_FIELD_BYTES + MAX_DATA_READ_CONTENT_TYPE_BYTES)
+        + MAX_DATA_READ_VALUE_BYTES.div_ceil(3) * 4
+        <= MAX_DATA_READ_REPLY_BYTES
+);
+const _: () = assert!(MAX_DATA_READ_VALUE_BYTES == 30_720);
+const _: () = assert!(
+    GET_REPLY_FIXED_BYTES + JSON_ESCAPE_WORST * 4 * MAX_DATA_READ_FIELD_BYTES
+        <= MAX_DATA_READ_REQUEST_BYTES
+);
 
 /// What a request reads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,9 +108,10 @@ pub enum DataReadStatus {
     Forbidden,
     /// The key is not in the store.
     NotFound,
-    /// The value is over [`MAX_DATA_READ_VALUE_BYTES`], or with its key and
-    /// content type it does not fit in one reply.
+    /// The value is over [`MAX_DATA_READ_VALUE_BYTES`].
     TooLarge,
+    /// The value's content type is over [`MAX_DATA_READ_CONTENT_TYPE_BYTES`].
+    ContentTypeTooLong,
     /// This daemon does not hold the store open, or the read failed, or the
     /// result does not fit in one reply.
     Unavailable,
@@ -282,6 +318,54 @@ mod tests {
         assert!(empty.encode().is_none());
         assert!(DataReadRequest::decode(b"x0x-data-read-v1\0{}").is_none());
         assert!(DataReadRequest::decode(b"not a request").is_none());
+    }
+
+    /// The derived value limit fits the reply bound in the worst case:
+    /// request id, key and content type at their bounds and made only of
+    /// control characters (6 bytes each once escaped).
+    #[test]
+    fn worst_case_request_fits() {
+        let control = |n: usize| "\u{1}".repeat(n);
+        let request = DataReadRequest {
+            request_id: control(MAX_DATA_READ_FIELD_BYTES),
+            group: control(MAX_DATA_READ_FIELD_BYTES),
+            store: control(MAX_DATA_READ_FIELD_BYTES),
+            op: DataReadOp::Get {
+                key: control(MAX_DATA_READ_FIELD_BYTES),
+            },
+        };
+        let bytes = request.encode().expect("the worst case fits");
+        assert_eq!(DataReadRequest::decode(&bytes), Some(request));
+    }
+
+    #[test]
+    fn worst_case_get_reply_fits() {
+        let control = |n: usize| "\u{1}".repeat(n);
+        let reply = DataReadReply {
+            request_id: control(MAX_DATA_READ_FIELD_BYTES),
+            status: DataReadStatus::Ok,
+            keys: None,
+            truncated: false,
+            entry: Some(DataReadEntry {
+                key: control(MAX_DATA_READ_FIELD_BYTES),
+                value_b64: base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    vec![0xff; MAX_DATA_READ_VALUE_BYTES],
+                ),
+                content_type: control(MAX_DATA_READ_CONTENT_TYPE_BYTES),
+                updated_at: u64::MAX,
+            }),
+        };
+        let bytes = reply.encode().expect("the worst case fits");
+        assert!(bytes.len() <= MAX_DATA_READ_REPLY_BYTES);
+        let strings = JSON_ESCAPE_WORST
+            * (2 * MAX_DATA_READ_FIELD_BYTES + MAX_DATA_READ_CONTENT_TYPE_BYTES)
+            + MAX_DATA_READ_VALUE_BYTES.div_ceil(3) * 4;
+        assert!(
+            bytes.len() - strings <= GET_REPLY_FIXED_BYTES,
+            "fixed bytes {} exceed the allowance",
+            bytes.len() - strings
+        );
     }
 
     #[test]

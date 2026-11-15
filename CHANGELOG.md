@@ -12,7 +12,10 @@ All notable changes to this project will be documented in this file.
   reads one value (`x0x grant data keys|get`). The granted agent checks the
   grant and serves the read from its own copy over two new typed DMs,
   `x0x-data-read-v1` and `x0x-data-reply-v1`. New capability bit 20,
-  `data_read_v1`; a peer without it is not sent a read. Writes come later.
+  `data_read_v1`; a peer without it is not sent a read. A read reply must fit
+  one 48 KiB DM, so a value over 30 720 bytes (or with a content type over
+  128 bytes) is answered 413; the store itself takes values up to 64 KiB.
+  Writes come later.
 - **A join request the authority refuses as `stale` is signed again over the
   authority's head (#1840 routes 1–3, A08 amendment of 15 Nov 2026).** A
   second joiner on a group with members, a request that crosses an edit of

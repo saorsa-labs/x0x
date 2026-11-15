@@ -441,6 +441,26 @@ async fn issue1094_value_size_limit_is_typed() {
             .await
             .expect("put");
     }
+    // Review of #1935: the worst-case key (256 control characters, 6 bytes
+    // each once escaped) with a value at the limit still fits one reply,
+    // and a content type over its bound has its own status.
+    let worst_key = "\u{1}".repeat(crate::share_grant::data_read::MAX_DATA_READ_FIELD_BYTES);
+    handle
+        .put_with_delta(
+            worst_key.clone(),
+            vec![b'v'; MAX_DATA_READ_VALUE_BYTES],
+            "\u{1}".repeat(MAX_DATA_READ_CONTENT_TYPE_BYTES),
+        )
+        .await
+        .expect("put");
+    handle
+        .put_with_delta(
+            "long-type".to_string(),
+            b"small".to_vec(),
+            "t".repeat(MAX_DATA_READ_CONTENT_TYPE_BYTES + 1),
+        )
+        .await
+        .expect("put");
     let (agent, machine) = bound_sender(&state).await;
     install_grant(&state, agent, vec![data_cap(DataAccess::Ro)]).await;
 
@@ -456,6 +476,13 @@ async fn issue1094_value_size_limit_is_typed() {
             .len(),
         MAX_DATA_READ_VALUE_BYTES
     );
+    let worst = serve(&state, agent, machine, get(&worst_key)).await;
+    assert_eq!(worst.status, DataReadStatus::Ok, "the worst case fits");
+    let long_type = serve(&state, agent, machine, get("long-type")).await;
+    assert_eq!(long_type.status, DataReadStatus::ContentTypeTooLong);
+    let (code, body) = reply_response(long_type);
+    assert_eq!(code, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(body.0.to_string().contains("content type"));
     for key in ["over-limit", "forty-kb"] {
         let reply = serve(&state, agent, machine, get(key)).await;
         assert_eq!(reply.status, DataReadStatus::TooLarge, "{key}");
