@@ -2431,6 +2431,26 @@ the fields shown:
 | `recovery_refused` | `reason` | `banned_or_revoked`. Final. |
 | `sidecar_unavailable`, `sidecar_newer_format`, `sidecar_quarantine_failed` | `file` and `cause`, `version` or `step` | ADR 0108 §5a. S3 makes no transition for the group. |
 
+**A forked head behind an armed gap record (#871).** A joiner whose
+served chain crossed a gap under an owner's or an admin's terminal
+attestation keeps a durable gap record (`invite_lineage.anchored_gap_refusal`).
+While it is armed, a catch-up page applies only when it links from the
+current head and matches the attested sequence. A head on a fork can never
+link, so every page is refused. The gate does not expire, and there is no
+local clear for it: an expiry would let unattested pages apply, and
+overwriting the revision or the hash would break the next attested commit.
+With no progress the node asks capable admins for an attestation: after
+10 minutes (`GATE_STALL`) for a gap armed by an owner's attestation, and
+after 30 minutes (`ATA_ARMED_LIFETIME`) for a gap armed by an admin's
+attestation. An admin that finds the head on no chain of its
+own answers `not_on_chain`, and the node shows
+`reseat_required {cause: not_on_chain, ref: {"kind": "gap", ...}}`. The
+exit is an admin's manual re-seat with that `gap` ref (or the removal) as
+its basis. The swap replaces the whole group record and retires the gap
+record; the refusal stays in the sidecar as a retired record. A node that
+cannot reach a capable admin keeps the gate and shows
+`awaiting_attestation`.
+
 After an ADR 0108 §5a rebuild the object also has
 `recovery_sidecar_rebuilt: {file, txid, lost}`. A `ref` is
 `{"kind": "marker", "revision", "state_hash", "committed_by", "observed_at_ms", "no_anchor"}`
@@ -4002,6 +4022,7 @@ Server → client (complete outbound frame set):
 | `mention` | `topic`, `group_id`, `msg_id`, `author_agent_id`, `reason` (`"mention"` \| `"delegation"`), `mentions[]` (omitted when empty), `timestamp` | An ingested, validated group message names the local agent (ADR-0040). **Emitted only on the group's shared topic channel — the session must be subscribed to the group's topic; an unsubscribed `/ws` session gets nothing (routing still happens daemon-side).** A delegation carrier directed at the local agent produces the same frame with `reason: "delegation"` — there is no separate `delegation` event type |
 | `pong` | — | Reply to `ping`; also the 30 s keepalive |
 | `error` | `message` | Malformed command, invalid base64, publish/send failure |
+| `system.health_verdict` / `system.upgrade_state` | `data` (same object as on `GET /events`) | (#1351) The M1 health verdict or its upgrade input changed; every `/ws` and `/ws/direct` session. See the SSE table |
 
 **Live `message` delivery is best-effort.** After a subscriber restart,
 subscribe-time anti-entropy can re-serve messages from the sender's roughly
@@ -4147,6 +4168,8 @@ structured push.
 | `GET /events` | `file:offer` / `file:complete` | outer `{"type":"file:offer"\|"file:complete","data":{...}}`; offer data has `transfer_id`, `filename`, `size`, `sender`, while complete data has `transfer_id`, `filename`, `sha256`, `path` |
 | `GET /events` | `kv:changed` | (#1094) `{"type":"kv:changed","data":{"store_id":"<topic>","origins":["local"\|"remote"]}}` — a KV store this daemon has open changed: a local write or delete, or a merged peer record or direct delta. Notices within 200 ms are merged into one event per store. No keys or values: read the store through `/stores/:id/*`. `{"store_id":null,"lagged":true}` means notices were lost; re-read every store you show |
 | `GET /events` | `task:changed` | (#1094) `{"type":"task:changed","data":{"list_id":"<topic>","origins":["local"\|"remote"]}}` — a task list this daemon has open changed: a local add, claim, complete, reorder or board migration, or a merged peer delta. Merged per 200 ms window like `kv:changed`; no task content: read the list through `/task-lists/:id/*`. `{"list_id":null,"lagged":true}` means notices were lost |
+| `GET /events` | `system.health_verdict` | (#1351) `{"type":"system.health_verdict","data":{"verdict":"ok"\|"degraded"\|"error","previous":"<verdict>","reasons":["..."],"at_unix":<secs>}}` — the M1 `/health` verdict changed. Checked every 5 s by the health refresher; the first check after start is the baseline and emits nothing, so read `GET /health` for the current value. `reasons` use the redacted wording (no measured values) |
+| `GET /events` | `system.upgrade_state` | (#1351) `{"type":"system.upgrade_state","data":{"state":"ok"\|"degraded"\|"error","previous_state":"<state>","update_available":<bool\|null>,"latest_version":"<v>"\|null,"handoff_pending":<bool>,"failed_artifact":<bool>,"at_unix":<secs>}}` — the M1 upgrade input of `/health` changed (its state, `update_available`, `latest_version`, `handoff_pending` or `failed_artifact`; the check age alone is not a change). Same cadence and baseline rule as `system.health_verdict` |
 | `GET /presence/events` | `presence` | `{"event":"online","agent_id","reachable"}` / `{"event":"offline","agent_id"}` |
 | `GET /direct/events` | `direct_message` | flat DM row (`sender`, `machine_id`, `payload`, `received_at`, `verified`, `trust_decision?`, `observed_origin?`); `?backfill=N` attempts to replay `history_direct_message` rows then emits `live` `{}` even when history is unavailable or its query fails; 15 s keepalive is a `ping` comment |
 | `GET /peers/events` | `peer-lifecycle` | `{"peer_id","event","at_ms"}` — `event` is the Debug text of the transition (`Established`, `Replaced`, `Closing`, `Closed`, `ReaderExited`); treat as open string |
