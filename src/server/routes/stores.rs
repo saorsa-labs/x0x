@@ -7311,6 +7311,86 @@ mod tests {
         );
     }
 
+    /// WHY (#1094 acceptance, "only ciphertext on the wire for a
+    /// private-group scratch store"): the scratch store is an ordinary
+    /// group store, so it must take the sealed publish path of its group.
+    /// A raw subscription on its topic, with no group context, is what any
+    /// peer on the mesh sees. For a private (TreeKEM) group and for a GSS
+    /// group, a scratch write puts on that topic a sealed record that
+    /// carries neither the key nor the value in clear, and that is not a
+    /// plaintext delta.
+    #[tokio::test]
+    async fn issue1094_scratch_store_puts_only_ciphertext_on_the_wire() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let treekem_key = "56".repeat(16);
+        seed_treekem_group(&state, &treekem_key).await;
+        let gss_key = "78".repeat(16);
+        seed_group(&state, &gss_key, state.agent.agent_id()).await;
+
+        for (group_key, plane) in [(treekem_key, "treekem"), (gss_key, "gss")] {
+            let (code, resp) = create_group_kv_store(
+                State(Arc::clone(&state)),
+                Path(group_key.clone()),
+                Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+                Json(CreateGroupStoreRequest {
+                    name: crate::server::rider_auth::SCRATCH_STORE_NAME.to_string(),
+                }),
+            )
+            .await;
+            assert_eq!(code, StatusCode::CREATED, "{plane}: {resp:?}");
+            assert_eq!(resp.0["policy"], "encrypted", "{plane}");
+            let topic = resp.0["topic"].as_str().expect("topic").to_string();
+            let handle = state
+                .kv_stores
+                .read()
+                .await
+                .get(&topic)
+                .cloned()
+                .expect("scratch handle registered");
+            let mut raw = state
+                .agent
+                .subscribe(&topic)
+                .await
+                .expect("raw subscription");
+
+            let key = format!("issue1094-scratch-key-{plane}");
+            let value = format!("issue1094-scratch-value-{plane}-hush");
+            handle
+                .put_with_delta(key.clone(), value.clone().into_bytes(), "text/plain".into())
+                .await
+                .expect("owner write on the scratch store");
+
+            let msg = tokio::time::timeout(Duration::from_secs(5), raw.recv())
+                .await
+                .expect("the scratch write reaches the topic")
+                .expect("subscription open");
+            let wire = &msg.payload[..];
+            for (what, needle) in [("key", key.as_bytes()), ("value", value.as_bytes())] {
+                assert!(
+                    !wire.windows(needle.len()).any(|w| w == needle),
+                    "{plane}: the scratch {what} must not appear in clear on the wire"
+                );
+            }
+            let sealed = match plane {
+                "treekem" => {
+                    crate::gossip::wire::decode_delta::<x0x::kv::TreeKemKvStoreRecordV1>(wire)
+                        .is_ok()
+                }
+                _ => crate::gossip::wire::decode_delta::<x0x::kv::EncryptedKvStoreRecordV1>(wire)
+                    .is_ok(),
+            };
+            assert!(sealed, "{plane}: the payload is the group's sealed record");
+            assert!(
+                crate::gossip::wire::decode_delta::<x0x::kv::KvStoreDelta>(wire).map_or(
+                    true,
+                    |(_, delta)| !delta.added.contains_key(&key)
+                        && !delta.updated.contains_key(&key)
+                ),
+                "{plane}: the payload is not a plaintext delta"
+            );
+        }
+    }
+
     /// Codex P2 (#1508 r6), same class as the task-list write: ADR 0110
     /// §4b(3) refuses every member operation while verified revocations
     /// cover every admin seat. A put or delete on a `SignedPublic` group's
