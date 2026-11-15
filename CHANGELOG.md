@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **A `stale` join-request outcome can carry the authority's head (#1840,
+  A08 amendment of 15 Nov 2026).** New optional `head` field on
+  `groups::join_outcome::JoinRequestOutcome` (signed head commit, roster
+  projection, public metadata) and `groups::join_outcome::adopt_join_head`,
+  which checks a head against a requester's copy and installs it. Wire and
+  library only: nothing sends or uses a head yet.
 - **`GET /sync/devices` names the source of each device's enrollment record
   (#1107).** Each row has `record_source` (`"local"` when this machine wrote
   the stored owner-device record, `"synced"` when another owner device wrote
