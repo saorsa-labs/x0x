@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **A `stale` join-request outcome can carry the authority's head (#1840,
+  A08 amendment of 15 Nov 2026).** New optional `head` field on
+  `groups::join_outcome::JoinRequestOutcome` (signed head commit, roster
+  projection, public metadata) and `groups::join_outcome::adopt_join_head`,
+  which checks a head against a requester's copy and installs it. Wire and
+  library only: nothing sends or uses a head yet.
 - **`system.health_verdict` and `system.upgrade_state` events on
   `GET /events` and `/ws` (#1351, A14 amendment of 15 Nov 2026).** The 5 s
   health refresher emits one event when the M1 `/health` verdict changes and
