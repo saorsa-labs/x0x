@@ -225,7 +225,19 @@ pub(in crate::server) async fn handle_join_request_outcome_typed_payload(
     // #1840 routes 1–3: the authority's head lets this daemon sign the same
     // request again over the authority's state. Only a head that fails a
     // check, or a seal that fails, falls through to the refusal.
-    if let Some(head) = outcome.head.as_ref() {
+    let head = match outcome.head.as_ref() {
+        Some(_) if obligation.reseal_count >= super::requester_offer::JOIN_REQUEST_RESEAL_CAP => {
+            tracing::warn!(
+                group_id = %crate::logging::LogHexId::group(&outcome.group_id),
+                request_id = %outcome.request_id,
+                reseals = obligation.reseal_count,
+                "#1840: the join request was signed again too many times; recording the refusal"
+            );
+            None
+        }
+        other => other,
+    };
+    if let Some(head) = head {
         match reseal_join_request_over_head(state, &obligation, head).await {
             Ok(()) => {
                 tracing::info!(

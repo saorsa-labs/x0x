@@ -454,6 +454,19 @@ provenance confirms their issuer, and they lapse after 7 days. `GET
 /diagnostics/gossip` reports the counters and the quarantine under
 `identity_authority`.
 
+## What a machine revocation protects (#1929)
+
+A machine revocation denies that device only (ADR 0110 D70). Peers refuse
+delivery to it, transport from it and requests from it, and the agent
+keeps its group seats. It does not protect TreeKEM group content against a
+device that still holds the agent key. The agent's TreeKEM leaf keys
+derive from the agent key and the group id, not from the machine key, so
+such a device can still follow later epochs, and a rejoin from another
+device restores the same leaf key. To cut a lost or stolen device off
+group content, revoke the agent (and use a new agent key) or remove the
+member from the group. Per-device TreeKEM leaves, which would close this,
+are tracked on #1929.
+
 ## Peer Relay (`peer_relay.rs`, X0X-0070b + #193)
 
 When a direct DM to peer `P` fails `fail_threshold` times within `fail_window`,

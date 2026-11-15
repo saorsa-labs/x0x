@@ -709,6 +709,7 @@ mod head_handshake {
                 next_retry_at_ms: now_ms + 3_600_000,
                 retry_count: 0,
                 refusal: None,
+                reseal_count: 0,
             },
         )
         .await
@@ -789,7 +790,11 @@ mod head_handshake {
                 after.digest,
                 <[u8; 32]>::from(blake3::hash(&after.envelope_bytes))
             );
-            assert_eq!(after.retry_count, 0);
+            assert_eq!(
+                after.retry_count, before.retry_count,
+                "a re-seal does not start the backoff again"
+            );
+            assert_eq!(after.reseal_count, before.reseal_count + 1);
             assert!(after.next_retry_at_ms <= now_millis_u64(), "due now");
 
             // The real offer worker sends exactly the stored envelope.
@@ -1121,6 +1126,116 @@ mod head_handshake {
             .expect("obligation");
         assert!(after.refusal.is_none(), "a late older head is ignored");
         assert_eq!(after.digest, resealed.digest, "the offer is unchanged");
+    }
+
+    /// Review of #1927: the re-seal is durable on the requester's copy but
+    /// its publish fails. The offer keeps the old envelope; the authority
+    /// refuses it again with its head, and the second re-seal (over a copy
+    /// whose newest link is its own request) is offered and admitted.
+    #[tokio::test]
+    async fn issue1840_publish_failure_then_second_head_is_admitted() {
+        let (owner, _o) = secure_endpoint_test_state().await.expect("owner state");
+        let key = install_authority_group(&owner, b"1840-head-publish-fail", 1).await;
+        let asked = requester_asks(&authority_card(&owner, &key).await).await;
+        advertise(&owner, &asked.0, HEADED);
+        file_offer(&owner, &asked).await;
+        offer(&owner, &asked.0, &asked.3).await;
+        let payload = outcomes_to(&owner, &asked.0).pop().expect("headed outcome");
+        // The envelope seam is off: the publish fails after the persist.
+        deliver(&owner, &asked.0, payload).await;
+        let owner_revision = owner
+            .named_groups
+            .read()
+            .await
+            .get(&key)
+            .expect("group")
+            .state_revision;
+        {
+            let groups = asked.0.named_groups.read().await;
+            let copy = groups.get(&key).expect("copy");
+            assert_eq!(
+                copy.state_revision,
+                owner_revision + 1,
+                "the re-seal over the head is durable on the requester's copy"
+            );
+            assert!(copy.join_requests.contains_key(&asked.2));
+        }
+        let kept = find_requester_offer(&asked.0, &key, &asked.2)
+            .await
+            .expect("obligation kept");
+        assert!(kept.refusal.is_none());
+        assert_eq!(kept.digest, <[u8; 32]>::from(blake3::hash(&asked.3)));
+        assert_eq!(kept.reseal_count, 0, "an unpublished seal is not counted");
+
+        // The old envelope is offered again; its second headed outcome
+        // re-seals over the persisted copy, and that envelope is admitted.
+        assert_eq!(offer_until_listed(&owner, &asked, &key).await, 1);
+        assert!(listener_journal_is_free(&owner).await);
+        assert_eq!(approve(&owner, &key, &asked.2).await, StatusCode::OK);
+        assert!(owner
+            .named_groups
+            .read()
+            .await
+            .get(&key)
+            .expect("group")
+            .has_active_member(&agent_hex(&asked.0)));
+        requester_applies_approval(&owner, &asked, &key).await;
+    }
+
+    /// Review of #1927: re-seals per offer are capped. At the cap, a headed
+    /// outcome is recorded as the stale refusal and the offer stops.
+    #[tokio::test]
+    async fn issue1840_reseals_are_capped_per_offer() {
+        use crate::server::routes::named_groups::requester_offer::JOIN_REQUEST_RESEAL_CAP;
+        let (owner, _o) = secure_endpoint_test_state().await.expect("owner state");
+        let key = install_authority_group(&owner, b"1840-head-cap", 1).await;
+        let asked = requester_asks(&authority_card(&owner, &key).await).await;
+        advertise(&owner, &asked.0, HEADED);
+        file_offer(&owner, &asked).await;
+        // Count the cap's worth of re-seals (same bytes, so the offer still
+        // matches the authority's view).
+        let digest: [u8; 32] = blake3::hash(&asked.3).into();
+        for _ in 0..JOIN_REQUEST_RESEAL_CAP {
+            assert_eq!(
+                crate::server::routes::named_groups::requester_offer::replace_requester_offer_envelope(
+                    &asked.0,
+                    &key,
+                    &asked.2,
+                    digest,
+                    asked.3.clone(),
+                    now_millis_u64(),
+                )
+                .await,
+                Ok(true)
+            );
+        }
+        asked
+            .0
+            .named_group_test_recorders
+            .metadata_publish_envelope
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        offer(&owner, &asked.0, &asked.3).await;
+        let payload = outcomes_to(&owner, &asked.0).pop().expect("headed outcome");
+        assert!(JoinRequestOutcome::decode(&payload)
+            .expect("outcome")
+            .head
+            .is_some());
+        deliver(&owner, &asked.0, payload).await;
+        let after = find_requester_offer(&asked.0, &key, &asked.2)
+            .await
+            .expect("obligation kept for the API");
+        assert_eq!(after.digest, <[u8; 32]>::from(blake3::hash(&asked.3)));
+        let refusal = after.refusal.expect("the capped head is the refusal");
+        assert_eq!(refusal.reason, JoinRequestRefusalReason::Stale.as_str());
+        assert_eq!(after.reseal_count, JOIN_REQUEST_RESEAL_CAP, "no re-seal");
+        // The refused offer is not offered again.
+        crate::server::routes::named_groups::requester_offer::requester_offer_step(&asked.0).await;
+        assert!(
+            crate::server::routes::named_groups::requester_offer::offer_send_seam::sent_by(
+                &asked.0
+            )
+            .is_empty()
+        );
     }
 
     /// Mixed versions: a requester without `join_request_head_v1` gets the

@@ -1166,7 +1166,9 @@ enum IdentitySub {
     /// sub-agent, use `x0x owner agents revoke <AGENT_ID>`. For a lost
     /// device, use `x0x owner lose-device <MACHINE_ID>`. Both ids plus
     /// --move-epoch select an owner-signed binding revocation and require
-    /// the durable API token.
+    /// the durable API token. A machine revocation does not cut a device
+    /// that still holds the agent key off TreeKEM group content; revoke
+    /// the agent or remove the member for that (#1929).
     Revoke {
         /// Agent ID to revoke (hex, 64 chars).
         #[arg(long)]
