@@ -375,6 +375,8 @@ pub(in crate::server) async fn requester_offer_step(state: &std::sync::Arc<AppSt
         );
         dm_payload.extend_from_slice(GROUP_PREDECESSOR_RELAY_DM_PREFIX);
         dm_payload.extend_from_slice(&obligation.envelope_bytes);
+        #[cfg(test)]
+        offer_send_seam::record(state, authority, dm_payload.clone());
         // #942 r3 (B4): dual-wire delivery, the bootstrap-outbox pattern.
         // A v2-capable authority gets the STRICT config (send Ok = the
         // handler's durable disposition, logical_request_id makes retries
@@ -514,5 +516,36 @@ mod tests {
         // seen earliest) is gone, the newest survives.
         assert!(!by_group.contains_key("g0"));
         assert!(by_group.contains_key(&format!("g{}", CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP + 7)));
+    }
+}
+
+/// Test-only record of the offer payloads the worker handed to the send,
+/// per requester daemon.
+#[cfg(test)]
+pub(in crate::server) mod offer_send_seam {
+    use crate::identity::AgentId;
+    use crate::server::state::AppState;
+    use std::sync::Mutex;
+
+    type Sent = (String, AgentId, Vec<u8>);
+    static SENT: Mutex<Vec<Sent>> = Mutex::new(Vec::new());
+
+    pub(super) fn record(state: &AppState, to: AgentId, payload: Vec<u8>) {
+        let from = hex::encode(state.agent.agent_id().as_bytes());
+        SENT.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((from, to, payload));
+    }
+
+    /// The offer payloads the requester `state` handed to the send, oldest
+    /// first.
+    pub(in crate::server) fn sent_by(state: &AppState) -> Vec<(AgentId, Vec<u8>)> {
+        let from = hex::encode(state.agent.agent_id().as_bytes());
+        SENT.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(sender, _, _)| *sender == from)
+            .map(|(_, to, payload)| (*to, payload.clone()))
+            .collect()
     }
 }

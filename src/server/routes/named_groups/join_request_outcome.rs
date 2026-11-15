@@ -39,7 +39,7 @@
 use std::sync::Arc;
 
 use crate::dm_inbox::{DmTypedPayload, DmTypedPayloadCompletion, DmTypedPayloadCompletionResult};
-use crate::groups::join_outcome::{JoinRequestOutcome, JoinRequestRefusalReason};
+use crate::groups::join_outcome::{JoinHeadError, JoinRequestOutcome, JoinRequestRefusalReason};
 use crate::groups::state_commit::RetainedCommit;
 
 use super::join_sequence::JoinTurn;
@@ -236,12 +236,29 @@ pub(in crate::server) async fn handle_join_request_outcome_typed_payload(
                 );
                 return Ok(DmTypedPayloadCompletion::Inserted);
             }
-            Err(error) => {
+            // A head that is not ahead of this copy is a late or duplicate
+            // outcome: this daemon already holds a newer state. Nothing to
+            // record; the offer stays live.
+            Err(ResealError::Head(JoinHeadError::NotAhead)) => return IGNORED,
+            // A local failure is not the authority's verdict. The offer
+            // stays live: its next offer is refused again and brings the
+            // head again, so a temporary failure does not end the join.
+            Err(ResealError::Local(error)) => {
                 tracing::warn!(
                     group_id = %crate::logging::LogHexId::group(&outcome.group_id),
                     request_id = %outcome.request_id,
                     %error,
-                    "#1840: the authority's head was not used; recording the refusal"
+                    "#1840: could not sign the join request again over the head; the offer stays live"
+                );
+                return IGNORED;
+            }
+            // Only a head that fails a check becomes the stale refusal.
+            Err(ResealError::Head(error)) => {
+                tracing::warn!(
+                    group_id = %crate::logging::LogHexId::group(&outcome.group_id),
+                    request_id = %outcome.request_id,
+                    %error,
+                    "#1840: the authority's head failed a check; recording the refusal"
                 );
             }
         }
@@ -275,6 +292,16 @@ pub(in crate::server) async fn handle_join_request_outcome_typed_payload(
     }
 }
 
+/// Why a re-seal over a head did not happen.
+#[derive(Debug)]
+enum ResealError {
+    /// The head failed a check: the authority's state is not usable.
+    Head(JoinHeadError),
+    /// A local condition (the group or the request is gone, the seal or a
+    /// write failed). Not the authority's verdict, so never a refusal.
+    Local(String),
+}
+
 /// Requester side (#1840 routes 1–3, A08 amendment of 15 Nov 2026): install
 /// the authority's checked head on this daemon's copy of the group
 /// ([`crate::groups::join_outcome::adopt_join_head`]) and sign the SAME
@@ -283,12 +310,20 @@ pub(in crate::server) async fn handle_join_request_outcome_typed_payload(
 /// envelope is published on the metadata topic as `create_join_request`
 /// does, and replaces the offered one in the offer obligation, so the offer
 /// worker offers it now. Nothing changes when a check fails.
+///
+/// The link is sealed with the plain requester seal
+/// ([`crate::groups::GroupInfo::seal_commit`]), not the member seal path:
+/// a request link changes no roster row, and the requester does not hold
+/// the members' certificates (the head carries digests only), so it neither
+/// can nor needs to verify or evict them. `adopt_join_head` admits only a
+/// request-access group, which the plain seal accepts.
 async fn reseal_join_request_over_head(
     state: &AppState,
     obligation: &super::RequesterOfferObligation,
     head: &RetainedCommit,
-) -> Result<(), String> {
+) -> Result<(), ResealError> {
     use base64::Engine as _;
+    let local = |e: &str| ResealError::Local(e.to_string());
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     let key = {
         let groups = state.named_groups.read().await;
@@ -296,40 +331,37 @@ async fn reseal_join_request_over_head(
             .iter()
             .find(|(_, info)| info.stable_group_id() == obligation.group_id)
             .map(|(key, _)| key.clone())
-            .ok_or("the group is not held")?
+            .ok_or_else(|| local("the group is not held"))?
     };
     let membership_lock = super::group_membership_lock(state, &key).await;
     let membership_guard = membership_lock.lock().await;
     let now_ms = now_millis_u64();
-    let (next, request, metadata_topic, commit) = {
-        let groups = state.named_groups.read().await;
-        let info = groups.get(&key).ok_or("the group is not held")?;
-        let request = info
-            .join_requests
-            .get(&obligation.request_id)
-            .filter(|r| r.is_pending() && r.requester_agent_id == local_hex)
-            .cloned()
-            .ok_or("the request is no longer pending")?;
-        let mut next = crate::groups::join_outcome::adopt_join_head(info, head, &local_hex)
-            .map_err(|e| e.to_string())?;
-        next.join_requests
-            .insert(request.request_id.clone(), request.clone());
-        let commit = super::seal_commit_owner_certified(
-            state,
-            &mut next,
-            state.agent.identity().agent_keypair(),
-            now_ms,
-        )
+    let current = state
+        .named_groups
+        .read()
         .await
-        .map_err(|e| format!("seal failed: {e}"))?;
-        let metadata_topic = next.metadata_topic.clone();
-        (next, request, metadata_topic, commit)
-    };
+        .get(&key)
+        .cloned()
+        .ok_or_else(|| local("the group is not held"))?;
+    let request = current
+        .join_requests
+        .get(&obligation.request_id)
+        .filter(|r| r.is_pending() && r.requester_agent_id == local_hex)
+        .cloned()
+        .ok_or_else(|| local("the request is no longer pending"))?;
+    let mut next = crate::groups::join_outcome::adopt_join_head(&current, head, &local_hex)
+        .map_err(ResealError::Head)?;
+    next.join_requests
+        .insert(request.request_id.clone(), request.clone());
+    let commit = next
+        .seal_commit(state.agent.identity().agent_keypair(), now_ms)
+        .map_err(|e| ResealError::Local(format!("seal failed: {e}")))?;
+    let metadata_topic = next.metadata_topic.clone();
     if !matches!(
         super::persist_named_group_info(state, &key, next).await,
         Ok(crate::server::AtomicWriteOutcome::Durable)
     ) {
-        return Err("the new seal is not directory-durable".to_string());
+        return Err(local("the new seal is not directory-durable"));
     }
     drop(membership_guard);
     let event = super::NamedGroupMetadataEvent::JoinRequestCreated {
@@ -346,20 +378,20 @@ async fn reseal_join_request_over_head(
     };
     // No envelope (the publish failed): the stored offer stays. Its next
     // offer is refused again and brings the head again.
-    if let Some(envelope) =
+    let envelope =
         super::publish_named_group_metadata_event_with_envelope(state, &metadata_topic, &event)
             .await
-    {
-        super::requester_offer::replace_requester_offer_envelope(
-            state,
-            &obligation.group_id,
-            &obligation.request_id,
-            obligation.digest,
-            envelope.to_vec(),
-            now_ms,
-        )
-        .await?;
-    }
+            .ok_or_else(|| local("the new seal was not published"))?;
+    super::requester_offer::replace_requester_offer_envelope(
+        state,
+        &obligation.group_id,
+        &obligation.request_id,
+        obligation.digest,
+        envelope.to_vec(),
+        now_ms,
+    )
+    .await
+    .map_err(ResealError::Local)?;
     Ok(())
 }
 

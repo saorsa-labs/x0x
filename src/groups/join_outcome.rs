@@ -443,6 +443,40 @@ mod tests {
         );
     }
 
+    /// WHY (#1840, review of #1927): the head carries certificate digests
+    /// only, and a fresh joiner holds none of the members' certificates.
+    /// The requester's plain seal over the adopted copy still works: a
+    /// request link changes no roster row and verifies no certificate, and
+    /// the link chains to the authority's head.
+    #[test]
+    fn issue1840_requester_seals_over_a_digest_only_head() {
+        let (owner, mut authority, stale) = authority_and_stale_copy(2);
+        for member in authority.members_v2.values_mut() {
+            member.certificate = None;
+            member.certificate_digest = Some("cd".repeat(32));
+        }
+        authority
+            .seal_commit(&owner, now_ms())
+            .expect("head over digest seats");
+        let joiner = AgentKeypair::generate().expect("joiner");
+        let joiner_hex = hex::encode(joiner.agent_id().as_bytes());
+        let mut adopted =
+            adopt_join_head(&stale, &head_of(&authority), &joiner_hex).expect("adopted");
+        assert!(adopted
+            .members_v2
+            .values()
+            .all(|m| m.certificate.is_none() && m.certificate_digest.is_some()));
+        let link = adopted
+            .seal_commit(&joiner, now_ms())
+            .expect("plain requester seal");
+        assert_eq!(link.revision, authority.state_revision + 1);
+        assert_eq!(
+            link.prev_state_hash.as_deref(),
+            Some(authority.state_hash.as_str())
+        );
+        assert_eq!(link.roster_root, head_of(&authority).commit.roster_root);
+    }
+
     /// WHY (#1840): every check refuses on its own, and a refused head
     /// changes nothing.
     #[test]
