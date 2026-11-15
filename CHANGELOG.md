@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`GET /diagnostics/upgrade` reports the upgrade records on disk (#1381
+  M2 part, A14 amendment of 15 Nov 2026).** New fields: `plan` (the safe-apply
+  journal's transaction, phase and versions), `last_attempt` (the pre-swap
+  probe record), `holds` (failed-release or recovery-failed, with whether
+  `x0x upgrade --clear-hold` applies), `last_hold_clear`, `backups` (backup
+  files beside the daemon and CLI) and `records_error`. Fixed record names
+  only; no recorded path is followed and no argv, environment or free-text
+  cause is returned.
 - **A grantee reads a store through a `ShareCap::Data` grant (#1094 slice D1,
   A03 amendment of 15 Nov 2026).** `GET /grants/data/:agent/:group/:store`
   lists a granted store's keys and `GET /grants/data/:agent/:group/:store/:key`
@@ -114,6 +122,14 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **A TreeKEM member that stays up through a network outage catches up
+  when it connects again (#1427, A09 second amendment of 15 Nov 2026).**
+  When the first peer connects after the node had no connected peer for
+  longer than the last metadata resend (60 s), it runs the start catch-up
+  for each TreeKEM group. One such pass runs at a time. At restore, a
+  re-add that comes after a held removal is now served; only the adds
+  before that removal are held back. No wire format or API changes.
+
 - **A node that restarted still serves the TreeKEM commits it held
   (#1427).** The TreeKEM catch-up log is saved under `treekem-catchup-log/`
   in the data directory (one file per group, local only) and loaded at
@@ -187,6 +203,13 @@ All notable changes to this project will be documented in this file.
 
 ### Tests and tooling
 
+- **Launcher host coordinator recovery (#1376, S3c; A14 amendment of 15 Nov
+  2026).** A dormant coordinator pass (`src/upgrade/launcher/coordinator.rs`)
+  reconciles the host after a missing handoff, one healthy and one failed
+  participant, a coordinator death, a partial restore, a hold-write failure
+  and a reboot. It stops and reaps every live participant before a pair
+  restore, keeps `RecoveryFailed` final across restarts, and applies the
+  D189 retry rule. No production caller yet.
 - **Release propagation over real gossip (#1169).** A two-node loopback test
   runs node A's fallback driver, which observes a signed release and
   publishes it on `x0x/release`, and node B's gossip driver, which verifies
@@ -242,6 +265,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **A listener-admission marker that can never complete no longer blocks join
+  requests (#1840, A08 amendment of 15 Nov 2026).** An early-gate refusal
+  (revoked or unverified sender, revocation-resync hold, withdrawn group), an
+  expired marker, and a marker whose group was deleted or withdrawn now
+  release the journal, live and at startup, with the sidecar bytes kept as
+  evidence. A requester signs one request again over the authority's head at
+  most 8 times per offer, and a re-seal no longer restarts the offer backoff.
 - **A daemon that restarts with pending S4 work no longer seals a stale
   head (#1581).** If the `.evs` file held an unsealed revocation-eviction
   row, the group needs a holder to confirm its head before S4 seals there.

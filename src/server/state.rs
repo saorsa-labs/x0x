@@ -1317,6 +1317,11 @@ pub(super) struct AppState {
     /// catch-up cycles; a group gets a first pass at start and at most one
     /// more after the network join. Diagnostics only.
     pub(super) treekem_start_catchup_passes: std::sync::atomic::AtomicU64,
+    /// #1427: how many reconnect catch-up passes this daemon began. A
+    /// reconnect pass runs the start catch-up for every TreeKEM group after
+    /// the node had no connected peer for longer than the last metadata
+    /// resend. Diagnostics only.
+    pub(super) treekem_reconnect_catchup_passes: std::sync::atomic::AtomicU64,
     /// #1657 (ADR 0110 §3): the latest typed TreeKEM catch-up refusal
     /// this daemon received, per group, keyed by the group id its own
     /// request used. Surfaced in the operator log at receive time and

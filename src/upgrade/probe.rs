@@ -29,7 +29,7 @@ const OUTPUT_LIMIT: usize = 8192;
 const MAX_CANDIDATE_BYTES: u64 = 200 * 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const REAP_TIMEOUT: Duration = Duration::from_secs(2);
-const RETRY_DELAYS_MS: [u64; 3] = [30 * 60_000, 60 * 60_000, 120 * 60_000];
+pub(crate) const RETRY_DELAYS_MS: [u64; 3] = [30 * 60_000, 60 * 60_000, 120 * 60_000];
 
 /// Captured with the carried restart plan, before any await or mutation.
 /// The child inherits the old process's effective account and groups.
@@ -682,7 +682,28 @@ pub(crate) fn clear_receipt_path(install: &Path) -> io::Result<PathBuf> {
     Ok(state.with_file_name(name))
 }
 
+/// The most recent D190 clear receipt for this install, if one exists.
+pub(crate) fn read_clear_receipt(install: &Path) -> io::Result<Option<HoldClearReceipt>> {
+    let canonical = std::fs::canonicalize(install)?;
+    let path = clear_receipt_path(&canonical)?;
+    match journal::read_auxiliary_record(&path) {
+        Ok(bytes) => {
+            let receipt = parse_clear_receipt(&bytes)?;
+            if receipt.install != canonical {
+                return Err(invalid("hold clear receipt belongs to another install"));
+            }
+            Ok(Some(receipt))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn validate_clear_receipt(bytes: &[u8]) -> io::Result<()> {
+    parse_clear_receipt(bytes).map(|_| ())
+}
+
+fn parse_clear_receipt(bytes: &[u8]) -> io::Result<HoldClearReceipt> {
     let receipt: HoldClearReceipt = serde_json::from_slice(bytes).map_err(invalid)?;
     if receipt.schema_version != 1
         || receipt.record_kind != "probe_hold_cleared"
@@ -690,7 +711,7 @@ fn validate_clear_receipt(bytes: &[u8]) -> io::Result<()> {
     {
         return Err(invalid("invalid probe hold clear receipt"));
     }
-    Ok(())
+    Ok(receipt)
 }
 
 /// D190: an authenticated, recorded local clear of a failed-release hold.

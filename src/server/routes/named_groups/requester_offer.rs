@@ -91,6 +91,21 @@ pub(in crate::server) struct RequesterOfferObligation {
     /// API can show the refusal. Absent from the sidecar bytes when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::server) refusal: Option<RequesterOfferRefusal>,
+    /// Issue #1840: how many times this request was signed again over an
+    /// authority's head ([`JOIN_REQUEST_RESEAL_CAP`] bounds it). Absent from
+    /// the sidecar bytes when zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(in crate::server) reseal_count: u32,
+}
+
+/// Issue #1840: the most times one request is signed again over a head the
+/// authority sent. A head that would pass this cap becomes the stale
+/// refusal, so an authority whose state keeps moving cannot hold the
+/// requester in a sign-and-offer loop.
+pub(in crate::server) const JOIN_REQUEST_RESEAL_CAP: u32 = 8;
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// Issue #1840: the authority's typed refusal of one offered envelope.
@@ -213,8 +228,9 @@ pub(in crate::server) async fn insert_requester_offer_obligation(
 /// Issue #1840 routes 1–3: replace the offered envelope of `(group,
 /// request_id)` with `envelope`, a new seal of the same request, durably,
 /// when the stored obligation still offers `old_digest`. The new envelope is
-/// due now, with a fresh retry schedule and no refusal. `Ok(false)` when
-/// there is no such obligation or it offers another envelope.
+/// due now, with no refusal, and counts one more re-seal. The retry count
+/// is kept, so the backoff does not start again at each re-seal. `Ok(false)`
+/// when there is no such obligation or it offers another envelope.
 pub(in crate::server) async fn replace_requester_offer_envelope(
     state: &AppState,
     group_id: &str,
@@ -233,8 +249,8 @@ pub(in crate::server) async fn replace_requester_offer_envelope(
     next.byte_size = envelope.len();
     next.envelope_bytes = envelope;
     next.next_retry_at_ms = now_ms;
-    next.retry_count = 0;
     next.refusal = None;
+    next.reseal_count = next.reseal_count.saturating_add(1);
     match outbox(state)
         .replace_if(next, |stored| stored.digest == old_digest)
         .await
@@ -474,6 +490,7 @@ mod tests {
             next_retry_at_ms: 0,
             retry_count: 0,
             refusal: None,
+            reseal_count: 0,
         }
     }
 

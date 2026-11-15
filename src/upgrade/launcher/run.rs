@@ -204,7 +204,7 @@ pub(super) fn run_trial(
 /// any: every attempt used and failed, or the total budget run out on this
 /// boot. Do not call it while an attempt runs: that attempt is counted but
 /// has not failed.
-fn failed_verdict(trial: &Trial, clock: &Clock) -> Option<journal::Cause> {
+pub(super) fn failed_verdict(trial: &Trial, clock: &Clock) -> Option<journal::Cause> {
     if trial.attempts >= MAX_ATTEMPTS {
         let reason = format!(
             "launch attempts exhausted: {}",

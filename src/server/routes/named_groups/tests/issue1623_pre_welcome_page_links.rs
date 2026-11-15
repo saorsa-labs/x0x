@@ -2852,6 +2852,30 @@ async fn issue1427_corrupt_or_unknown_saved_log_loads_nothing() -> anyhow::Resul
 /// would serve the removed J pages after the restart.
 #[tokio::test]
 async fn issue1427_restore_holds_the_add_of_a_held_removal_target() -> anyhow::Result<()> {
+    restore_with_held_removal(false).await
+}
+
+/// #1926 review follow-up: J is added, removed (S4 owns the removal) and
+/// then added again. Only the add before the last held removal is held
+/// back. The re-add is a later, legitimate membership and must still serve
+/// J pages after the restart.
+#[tokio::test]
+async fn issue1427_restore_serves_a_readd_after_a_held_removal() -> anyhow::Result<()> {
+    restore_with_held_removal(true).await
+}
+
+/// The saved catch-up log of `group_id`, read with the lock taken.
+async fn logged_events(state: &AppState, group_id: &str) -> Vec<NamedGroupMetadataEvent> {
+    state
+        .treekem_event_log
+        .read()
+        .await
+        .get(group_id)
+        .map(|log| log.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+async fn restore_with_held_removal(readd: bool) -> anyhow::Result<()> {
     let (state, _dir) = secure_endpoint_test_state().await?;
     let owner = state.agent.identity().agent_keypair();
     let owner_hex = hex::encode(owner.agent_id().as_bytes());
@@ -2900,6 +2924,32 @@ async fn issue1427_restore_holds_the_add_of_a_held_removal_target() -> anyhow::R
         secret_epoch: None,
         commit: Some(removal.clone()),
     };
+    let readded = if readd {
+        let again = seal_link(&mut ahead, owner, 4_000, |next| {
+            next.add_member(
+                j.clone(),
+                x0x::groups::GroupRole::Member,
+                Some(owner_hex.clone()),
+                None,
+            );
+            take_treekem_epoch(next);
+        })?;
+        let mut event = added.clone();
+        if let NamedGroupMetadataEvent::MemberAdded {
+            revision,
+            treekem_epoch,
+            commit,
+            ..
+        } = &mut event
+        {
+            *revision = again.revision;
+            *treekem_epoch = Some(TREEKEM_EPOCH + 2);
+            *commit = Some(again);
+        }
+        Some(event)
+    } else {
+        None
+    };
     let group_id = named_group_metadata_event_group_id(&added).to_string();
     let stable = ahead.stable_group_id().to_string();
     state
@@ -2909,16 +2959,16 @@ async fn issue1427_restore_holds_the_add_of_a_held_removal_target() -> anyhow::R
         .insert(group_id.clone(), ahead);
     remember_treekem_membership_event(&state, &added).await;
     remember_treekem_membership_event(&state, &removed).await;
-    let logged = |state: &AppState| {
-        let state = state.treekem_event_log.try_read().ok().map(|logs| {
-            logs.get(&group_id)
-                .map(|log| log.iter().cloned().collect::<Vec<_>>())
-                .unwrap_or_default()
-        });
-        state.unwrap_or_default()
-    };
-    assert_eq!(logged(&state).len(), 2, "#1427: both links are logged");
-    assert!(!cached_add_still_current(logged(&state).iter(), &j));
+    if let Some(event) = &readded {
+        remember_treekem_membership_event(&state, event).await;
+    }
+    let before = logged_events(&state, &group_id).await;
+    assert_eq!(
+        before.len(),
+        2 + usize::from(readd),
+        "#1427: every link is logged"
+    );
+    assert_eq!(cached_add_still_current(before.iter(), &j), readd);
 
     // Restart: the S4 store holds a row for J, then the saved log loads.
     state.treekem_event_log.write().await.clear();
@@ -2927,14 +2977,26 @@ async fn issue1427_restore_holds_the_add_of_a_held_removal_target() -> anyhow::R
         .map_err(|_| anyhow::anyhow!("agent id length"))?;
     revocation_eviction::open_fallback_row_for_test(&state, &stable, target, &group_id).await;
     restore_treekem_catchup_logs(&state).await;
-    let restored = logged(&state);
-    assert!(
-        !cached_add_still_current(restored.iter(), &j),
-        "#1427: after the restart a held removal must not leave J served through its add"
-    );
-    assert!(
-        restored.is_empty(),
-        "#1427: the add and the removal of a held target both stay out"
-    );
+    let restored = logged_events(&state, &group_id).await;
+    if readd {
+        assert!(
+            cached_add_still_current(restored.iter(), &j),
+            "#1427: the re-add after the held removal still serves J"
+        );
+        assert_eq!(
+            restored.len(),
+            1,
+            "#1427: only the re-add is restored; the first add and the removal stay out"
+        );
+    } else {
+        assert!(
+            !cached_add_still_current(restored.iter(), &j),
+            "#1427: after the restart a held removal must not leave J served through its add"
+        );
+        assert!(
+            restored.is_empty(),
+            "#1427: the add and the removal of a held target both stay out"
+        );
+    }
     Ok(())
 }
