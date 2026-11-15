@@ -40,14 +40,14 @@
       "revision": 1,
       "path": "A05-r01-connectivity-discovery-and-names.md",
       "title": "Connectivity Discovery and Names",
-      "sha256": "e482a68683e3d2f059820a307716bb1163be9ef3be9dd8f59298c756391d9d98"
+      "sha256": "30fa99f2d11fd234cce443f54c180bac02769af9199bccb88fce71cfe7671547"
     },
     {
       "id": "A06",
       "revision": 1,
       "path": "A06-r01-gossip-relay-roles-and-resource-limits.md",
       "title": "Gossip Relay Roles and Resource Limits",
-      "sha256": "edd85761668b3c55bbf10b396e93fc53b972c91ce724ca8bc4591d402c6f09da"
+      "sha256": "e04203cf136b82b80d32d4ec31fe6ff9eb82175eef8f0fce00da2643f23453af"
     },
     {
       "id": "A07",
