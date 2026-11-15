@@ -11076,6 +11076,15 @@ impl Agent {
     /// (discovery cache, capability-advert binding, or the DM connection
     /// registry). Present evidence fails closed; absent evidence fails
     /// open (§9.3).
+    /// ADR 0110 §3 (D70; #1597 item 4): whether an outbound send's
+    /// resolved recipient machine is revoked. A machine revocation denies
+    /// that device only: the send answers the typed
+    /// [`dm::DmError::RecipientMachineRevoked`], and the agent's seat is
+    /// not touched.
+    async fn recipient_machine_revoked(&self, machine: &identity::MachineId) -> bool {
+        self.revocation_set.read().await.is_machine_revoked(machine)
+    }
+
     async fn recipient_pairing_denied(
         &self,
         to: &identity::AgentId,
@@ -11899,6 +11908,12 @@ impl Agent {
                 .await?;
             cache.get(to).map(|entry| entry.machine_id)
         } {
+            if self.recipient_machine_revoked(&machine_id).await {
+                self.direct_messaging.record_outgoing_failed(*to);
+                return Err(dm::DmError::RecipientMachineRevoked {
+                    machine: machine_id,
+                });
+            }
             if let Some(denial) = self.recipient_pairing_denied(to, &machine_id).await {
                 self.direct_messaging.record_outgoing_failed(*to);
                 return Err(dm::DmError::RecipientPairingDenied { denial });
@@ -12032,6 +12047,12 @@ impl Agent {
         // path will use it, evaluate B+P for that pairing too.
         if gossip_ok {
             if let Some(cap_machine) = cap_machine {
+                if self.recipient_machine_revoked(&cap_machine).await {
+                    self.direct_messaging.record_outgoing_failed(*to);
+                    return Err(dm::DmError::RecipientMachineRevoked {
+                        machine: cap_machine,
+                    });
+                }
                 if let Some(denial) = self.recipient_pairing_denied(to, &cap_machine).await {
                     self.direct_messaging.record_outgoing_failed(*to);
                     tracing::debug!(
@@ -44121,6 +44142,59 @@ async fn revocation_discovery_eviction_preserves_authenticated_binding() {
         )
         .await,
         Some(machine.machine_id())
+    );
+}
+
+/// #1597 item 4 (ADR 0110 §3, D70): a send to a recipient whose resolved
+/// machine is revoked answers the typed `DmError::RecipientMachineRevoked`
+/// naming that machine, and nothing is sent. The agent itself is not
+/// revoked (its seat stays). FAIL-BEFORE: the preflight checked only the
+/// ADR-0043 pairing, so the send went on to the generic transport outcome.
+#[tokio::test]
+async fn send_direct_reports_a_revoked_machine_as_recipient_machine_revoked() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let sender = Agent::builder()
+        .with_identity_dir(tempdir.path())
+        .build()
+        .await
+        .expect("sender agent");
+    let recipient = identity::AgentKeypair::generate().expect("recipient keygen");
+    let machine = identity::MachineKeypair::generate().expect("machine keygen");
+    let mut discovered = discovered_agent_fixture(0x68, 6_000, &[], None);
+    discovered.agent_id = recipient.agent_id();
+    discovered.machine_id = machine.machine_id();
+    discovered.machine_public_key = machine.public_key().as_bytes().to_vec();
+    sender.insert_discovered_agent_for_testing(discovered).await;
+    let record = revocation::RevocationRecord::sign(
+        revocation::RevokedSubject::Machine(machine.machine_id()),
+        machine.public_key(),
+        machine.secret_key(),
+        1_000,
+        None,
+    )
+    .expect("sign");
+    assert!(sender
+        .revocation_set
+        .write()
+        .await
+        .verify_and_insert(record, None)
+        .expect("a machine self-revocation verifies"));
+    assert!(!sender
+        .revocation_set
+        .read()
+        .await
+        .is_agent_revoked(&recipient.agent_id()));
+
+    let err = sender
+        .send_direct(&recipient.agent_id(), b"revoked".to_vec())
+        .await
+        .expect_err("a revoked machine must refuse the send");
+    assert!(
+        matches!(
+            err,
+            dm::DmError::RecipientMachineRevoked { machine: m } if m == machine.machine_id()
+        ),
+        "expected RecipientMachineRevoked naming the machine, got {err:?}"
     );
 }
 

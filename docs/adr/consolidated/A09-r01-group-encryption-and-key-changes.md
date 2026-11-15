@@ -89,6 +89,21 @@ roster has no Active admin seat at all, per ADR 0088 §2 item 3 and ADR
 exists. A promoted member keeps a mandate refused with either cause and
 retries it, as before. ADR 0110 stays Accepted and its text is unchanged.
 
+On 15 Nov 2026 Claude decided the D70 caller refusal under David's
+delegation of design decisions of 10 Nov 2026
+([#1597](https://github.com/saorsa-labs/x0x/issues/1597) item 4). A
+direct send whose resolved recipient machine is revoked answers the typed
+`DmError::RecipientMachineRevoked { machine }`, and `POST /direct/send`
+maps it to HTTP 403 `recipient_machine_revoked`. The check runs before the
+ADR-0043 pairing check, on the discovery-cached machine and on the
+capability-advert binding. A revoked binding keeps its existing typed
+answer, `recipient_pairing_denied` (`PairingDenial::BindingRevoked`). The
+S4 designated hand-off reads the new error as a policy refusal, like the
+pairing denial. A request from a revoked device keeps the #1657 typed
+catch-up refusal. The internal guarded S4 sends keep their withhold-and-retry
+path; they report to no caller. ADR 0110 stays Accepted and its text is
+unchanged.
+
 [A08](A08-r01-groups-home-membership-and-repair.md) defines valid group-state and fork recovery. A09 must not bypass that authority to obtain keys faster.
 
 ## Security claims

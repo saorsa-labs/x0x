@@ -3336,7 +3336,7 @@ async fn refreshed_handoff_dispatch(
 ///   `Some(false)` read — so it is `Unsupported`.
 /// - `RecipientRejected` (the designated admin's own acknowledgement that
 ///   its trust policy refused this sender) and the ADR-0043 pairing
-///   denial (`RecipientPairingDenied`, or the legacy
+///   denial (`RecipientPairingDenied`, `RecipientMachineRevoked`, or the legacy
 ///   `EnvelopeConstruction` with the `RECIPIENT_PAIRING_DENIED` prefix:
 ///   this node's policy refused the designated admin's machine) are
 ///   definitive policy refusals under
@@ -3361,6 +3361,9 @@ fn designated_send_outcome(
         DmError::RecipientUpgradeRequired { .. } => Outcome::Unsupported,
         DmError::RecipientRejected { .. } => Outcome::PolicyRefused,
         DmError::RecipientPairingDenied { .. } => Outcome::PolicyRefused,
+        // #1597 item 4 (D70): this node's revocation set denies the
+        // designated admin's machine, the same local policy refusal.
+        DmError::RecipientMachineRevoked { .. } => Outcome::PolicyRefused,
         DmError::EnvelopeConstruction(message)
             if message.starts_with(x0x::dm::RECIPIENT_PAIRING_DENIED) =>
         {
@@ -9127,6 +9130,12 @@ pub(super) mod tests {
         assert_eq!(
             designated_send_outcome(&Err(x0x::dm::DmError::RecipientPairingDenied {
                 denial: x0x::key_move::PairingDenial::BindingRevoked,
+            })),
+            s4::DesignatedHandoffOutcome::PolicyRefused
+        );
+        assert_eq!(
+            designated_send_outcome(&Err(x0x::dm::DmError::RecipientMachineRevoked {
+                machine: x0x::identity::MachineId([7; 32]),
             })),
             s4::DesignatedHandoffOutcome::PolicyRefused
         );
