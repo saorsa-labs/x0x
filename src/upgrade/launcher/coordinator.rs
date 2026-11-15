@@ -1,14 +1,16 @@
 //! S3c host coordinator recovery (ADR 0094 §3, §4; #1376). Dormant like the
 //! rest of this module: no production caller yet. The caller holds the
-//! independent frozen plan (`Host`), every participant's trial record, and a
-//! way to stop and reap a live child of another launcher.
+//! independent frozen plan (`Host`), the trial path of every participant,
+//! and a way to stop and reap a live child of another launcher.
 //!
 //! One pass reconciles the host after a crash, a stop or a reboot. It never
 //! starts a child. It stops and reaps every live participant before a pair
-//! restore, restores the pair once for all participants, and leaves each
-//! trial `Restored` so each launcher starts only its missing restored child
+//! restore, restores the pair once for all participants, records the D189 or
+//! D190 outcome in the release's probe record, and only then leaves each
+//! trial `Restored`, so each launcher starts only its missing restored child
 //! (`run::run_trial`). A `RecoveryFailed` host or trial is final and stays so
-//! across restarts.
+//! across restarts. Every failure after the pass decides to restore marks
+//! the host and every trial `RecoveryFailed`, so no later pass repeats it.
 use super::*;
 
 /// What the host must do after one coordinator pass.
@@ -16,102 +18,171 @@ use super::*;
 pub(super) enum Resolution {
     /// No recovery is needed: the transaction continues as planned.
     Proceed,
-    /// The previous pair is installed and every trial is `Restored`. Each
-    /// launcher may start its missing restored child. `After` is the D189
-    /// decision for the release.
+    /// The previous pair is installed, the outcome is durable in the probe
+    /// record and every trial is `Restored`. Each launcher may start its
+    /// missing restored child.
     Restored(After),
     /// No automatic action is allowed (`RecoveryFailed` or `HostCommitted`).
     Final(journal::Phase),
 }
 
-/// The D189 decision after a restore.
+/// The D189 or D190 outcome after a restore, as the probe record holds it.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum After {
-    /// A Failed cause, or interrupted retries exhausted: hold the release.
+    /// A Failed cause, or interrupted retries exhausted: the release is
+    /// held (D190).
     Hold(journal::Cause),
-    /// An Interrupted cause with retries left: stage a fresh transaction
-    /// after this delay.
+    /// An Interrupted cause with retries left: a fresh transaction for the
+    /// release may stage after this delay (D189).
     RetryAfterMs(u64),
-}
-
-/// D189: an interrupted attempt retries as a fresh transaction at 30, 60 and
-/// 120 minutes (N = 3), then holds with `retries_exhausted`. A Failed cause
-/// holds at once. `prior_retries` is the count of fresh retry transactions
-/// already staged for this release.
-pub(super) fn after_restore(cause: &journal::Cause, prior_retries: u32) -> After {
-    if cause.class == journal::CauseClass::Failed {
-        return After::Hold(cause.clone());
-    }
-    match probe::RETRY_DELAYS_MS.get(prior_retries as usize) {
-        Some(delay) => After::RetryAfterMs(*delay),
-        None => After::Hold(super::cause(
-            journal::CauseClass::Failed,
-            "retries_exhausted",
-        )),
-    }
+    /// The hold was already cleared, or a newer release owns the probe
+    /// record.
+    Resolved,
 }
 
 /// Reconcile the host once.
 ///
-/// `handoff_present` says whether the transaction's handoff record exists.
-/// `stop` must stop and reap the live process with that identity; the pass
-/// checks absence itself afterwards and never trusts the callback alone.
+/// `trial_path` names each participant's trial record. A missing record
+/// means that participant's launcher never armed a trial, so it never asked
+/// OLD to stop and never started a candidate. `handoff_present` says whether
+/// the transaction's handoff record exists. `stop` must stop and reap the
+/// live process with that identity; the pass checks absence itself
+/// afterwards and never trusts the callback alone.
 pub(super) fn reconcile(
     host: &recovery::Host,
-    trials: &mut [(PathBuf, Trial)],
+    trial_path: impl Fn(&journal::Participant) -> PathBuf,
     handoff_present: bool,
     clock: &Clock,
-    prior_retries: u32,
     mut stop: impl FnMut(&Identity) -> io::Result<()>,
 ) -> io::Result<Resolution> {
     let (phase, journal_cause) = host.locked(|record| Ok((record.phase, record.cause.clone())))?;
+    if phase == journal::Phase::RecoveryFailed {
+        return Ok(Resolution::Final(phase));
+    }
+    let binding = host.binding()?;
+    let mut trials = Vec::new();
+    let mut unarmed = Vec::new();
+    for p in &host.plan().participants {
+        let path = trial_path(p);
+        match Trial::load(&path, &binding, &p.instance_id) {
+            Ok(trial) => trials.push((path, trial)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                unarmed.push((path, p.instance_id.clone()));
+            }
+            Err(error) => return Err(error),
+        }
+    }
     // A RecoveryFailed trial or host survives restart and blocks every
     // automatic step (ADR 0094 §4).
-    if phase == journal::Phase::RecoveryFailed
-        || trials
-            .iter()
-            .any(|(_, trial)| trial.phase == Phase::RecoveryFailed)
+    if trials
+        .iter()
+        .any(|(_, trial)| trial.phase == Phase::RecoveryFailed)
     {
         return Ok(Resolution::Final(journal::Phase::RecoveryFailed));
     }
     if phase == journal::Phase::HostCommitted {
         return Ok(Resolution::Final(phase));
     }
-    let binding = host.binding()?;
-    if trials.iter().any(|(_, trial)| trial.binding != binding) {
-        return Err(invalid("trial binding mismatch"));
-    }
-    // Partial restore: the pair is back. Keep the cause and mark every
-    // trial Restored, so each launcher starts only a missing child.
+    // Partial restore: the pair is back. Keep the cause, make the outcome
+    // durable, and mark every trial Restored.
     if phase == journal::Phase::Restored {
         let cause = journal_cause.ok_or_else(|| invalid("restored host has no cause"))?;
-        mark_restored(trials, &cause)?;
-        return Ok(Resolution::Restored(after_restore(&cause, prior_retries)));
+        arm(&mut trials, unarmed, &binding, clock)
+            .map_err(|error| fail(host, &mut trials, error))?;
+        return finish(host, &mut trials, &cause, clock);
     }
-    let Some(cause) = recovery_cause(host, trials, phase, journal_cause, handoff_present, clock)?
+    let Some(cause) = recovery_cause(host, &trials, phase, journal_cause, handoff_present, clock)?
     else {
         return Ok(Resolution::Proceed);
     };
     // Stop and reap every participant before the pair restore. A
     // provisional commit by a healthy participant is invalidated here.
-    if let Err(error) = stop_all(host, trials, &mut stop) {
-        // Nothing moved, but no safe automatic step remains: record it on
-        // the host as well, so the block does not live in trials alone.
-        let _ = host.mark_recovery_failed();
-        return Err(fail_all(trials, error));
+    if let Err(error) = stop_all(host, &trials, &mut stop) {
+        return Err(fail(host, &mut trials, error));
+    }
+    // A participant with no trial record gets an Armed one now, so the
+    // restore has custody of every participant and the outcome is durable
+    // for each launcher. Without it the restore refuses with "participant
+    // trial missing" and every later pass repeats that refusal.
+    if let Err(error) = arm(&mut trials, unarmed, &binding, clock) {
+        return Err(fail(host, &mut trials, error));
     }
     for (path, trial) in trials.iter_mut() {
-        begin_rollback(path, trial, &cause)?;
+        if let Err(error) = begin_rollback(path, trial, &cause) {
+            return Err(fail(host, &mut trials, error));
+        }
     }
-    if let Err(error) = host.restore(trials, cause) {
-        return Err(fail_all(trials, error));
+    if let Err(error) = host.restore(&trials, cause) {
+        return Err(fail(host, &mut trials, error));
     }
     // `restore` keeps an earlier Failed cause: read back the durable one.
     let kept = host
         .locked(|record| Ok(record.cause.clone()))?
         .ok_or_else(|| invalid("restored host has no cause"))?;
-    mark_restored(trials, &kept)?;
-    Ok(Resolution::Restored(after_restore(&kept, prior_retries)))
+    finish(host, &mut trials, &kept, clock)
+}
+
+/// Save an Armed trial for each participant that has none.
+fn arm(
+    trials: &mut Vec<(PathBuf, Trial)>,
+    unarmed: Vec<(PathBuf, String)>,
+    binding: &Binding,
+    clock: &Clock,
+) -> io::Result<()> {
+    for (path, instance) in unarmed {
+        let trial = Trial::new(binding.clone(), instance, clock)?;
+        trial.save(&path)?;
+        trials.push((path, trial));
+    }
+    Ok(())
+}
+
+/// With the pair restored: record the D189 or D190 outcome in the probe
+/// record (the hold barrier before any restored start), then mark every
+/// trial Restored.
+fn finish(
+    host: &recovery::Host,
+    trials: &mut [(PathBuf, Trial)],
+    cause: &journal::Cause,
+    clock: &Clock,
+) -> io::Result<Resolution> {
+    let after = record_outcome(host, cause, clock).map_err(|error| fail(host, trials, error))?;
+    mark_restored(trials, cause).map_err(|error| fail(host, trials, error))?;
+    Ok(Resolution::Restored(after))
+}
+
+fn record_outcome(
+    host: &recovery::Host,
+    cause: &journal::Cause,
+    clock: &Clock,
+) -> io::Result<After> {
+    let plan = host.plan();
+    let outcome = probe::record_apply_outcome(
+        &plan.daemon.target_path,
+        &plan.candidate_version,
+        (plan.daemon.candidate_sha256, plan.cli.candidate_sha256),
+        cause.class == journal::CauseClass::Failed,
+        &probe::ProbeClock {
+            boot_id: clock.boot.clone(),
+            monotonic_ms: clock.ms,
+        },
+    )?;
+    Ok(match outcome {
+        probe::ApplyOutcome::Held(probe::ProbeCause::RetriesExhausted) => After::Hold(
+            super::cause(journal::CauseClass::Failed, "retries_exhausted"),
+        ),
+        probe::ApplyOutcome::Held(_) => After::Hold(cause.clone()),
+        probe::ApplyOutcome::Waiting { retry_after_ms } => After::RetryAfterMs(retry_after_ms),
+        probe::ApplyOutcome::Resolved => After::Resolved,
+    })
+}
+
+/// No safe automatic step remains: the host and every trial record
+/// RecoveryFailed, so no later pass repeats the step. A committed host is
+/// never changed.
+fn fail(host: &recovery::Host, trials: &mut [(PathBuf, Trial)], error: io::Error) -> io::Error {
+    let _ = host.mark_recovery_failed();
+    fail_all(trials, error)
 }
 
 /// The cause that requires a pair restore, or `None` to proceed.
@@ -259,11 +330,67 @@ fn fail_all(trials: &mut [(PathBuf, Trial)], error: io::Error) -> io::Error {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::super::testkit::{fixture, fixture_with};
+    use super::super::testkit;
     use super::*;
 
     fn now() -> Clock {
         Clock::now().unwrap()
+    }
+
+    /// The shared fixture plus a Passed probe record for the candidate, as
+    /// the probe leaves it before the swap.
+    fn fixture(
+        phase: journal::Phase,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        recovery::Host,
+        journal::JournalRecord,
+    ) {
+        fixture_with(phase, |_| {})
+    }
+
+    fn fixture_with(
+        phase: journal::Phase,
+        edit: impl FnOnce(&mut journal::JournalRecord),
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        recovery::Host,
+        journal::JournalRecord,
+    ) {
+        let fixture = testkit::fixture_with(phase, edit);
+        write_probe(&fixture.2, 1, probe::ProbePhase::Passed);
+        fixture
+    }
+
+    fn write_probe(host: &recovery::Host, attempt: u32, phase: probe::ProbePhase) {
+        let plan = host.plan();
+        let install = plan.daemon.target_path.clone();
+        let state = probe::ProbeState {
+            schema_version: 1,
+            record_kind: "probe".into(),
+            install: install.clone(),
+            version: plan.candidate_version.clone(),
+            platform: "fixture-platform".into(),
+            archive_sha256: [1; 32],
+            transaction_id: "00000000-0000-4000-8000-000000000001".into(),
+            attempt,
+            phase,
+            cause: None,
+            last_pid: None,
+            boot_id: "fixture-boot".into(),
+            retry_remaining_ms: 0,
+            retry_deadline_ms: 0,
+            daemon_sha256: Some(plan.daemon.candidate_sha256),
+            cli_sha256: Some(plan.cli.candidate_sha256),
+        };
+        journal::write_auxiliary_record(&probe::state_path(&install).unwrap(), &state, |_| Ok(()))
+            .unwrap();
+    }
+
+    fn probe_state(host: &recovery::Host) -> Option<probe::ProbeState> {
+        probe::read_state(&host.plan().daemon.target_path).unwrap()
     }
 
     fn journal_record(root: &Path) -> journal::JournalRecord {
@@ -288,6 +415,10 @@ mod tests {
         }
     }
 
+    fn path_in(dir: &Path) -> impl Fn(&journal::Participant) -> PathBuf + '_ {
+        move |p| dir.join(format!("{}.trial.json", p.instance_id))
+    }
+
     /// One saved trial per participant, in `dir`, at `phase`.
     fn make_trials(
         host: &recovery::Host,
@@ -299,7 +430,7 @@ mod tests {
             .participants
             .iter()
             .map(|p| {
-                let path = dir.join(format!("{}.trial.json", p.instance_id));
+                let path = path_in(dir)(p);
                 let mut trial =
                     Trial::new(host.binding().unwrap(), p.instance_id.clone(), clock).unwrap();
                 trial.save(&path).unwrap();
@@ -327,25 +458,29 @@ mod tests {
         record.plan.participants.push(bob);
     }
 
-    fn reload(trials: &[(PathBuf, Trial)], host: &recovery::Host) -> Vec<Trial> {
-        trials
+    /// Every participant's trial as saved on disk.
+    fn reload(host: &recovery::Host, dir: &Path) -> Vec<Trial> {
+        host.plan()
+            .participants
             .iter()
-            .map(|(path, trial)| {
-                Trial::load(path, &host.binding().unwrap(), &trial.instance).unwrap()
+            .map(|p| {
+                Trial::load(&path_in(dir)(p), &host.binding().unwrap(), &p.instance_id).unwrap()
             })
             .collect()
     }
 
     /// Case 1: both swaps done, no handoff written, OLD process gone. The
-    /// unarmed NEW bytes are not started; the pair is restored.
+    /// unarmed NEW bytes are not started; the pair is restored and the
+    /// first D189 wait is durable in the probe record.
     #[test]
     fn missing_handoff_restores_the_unarmed_pair() {
         let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
         let trial_dir = tempfile::tempdir().unwrap();
         let clock = now();
-        let mut trials = make_trials(&host, trial_dir.path(), &clock, Phase::Armed);
+        make_trials(&host, trial_dir.path(), &clock, Phase::Armed);
 
-        let resolution = reconcile(&host, &mut trials, false, &clock, 0, no_stop).unwrap();
+        let resolution =
+            reconcile(&host, path_in(trial_dir.path()), false, &clock, no_stop).unwrap();
         assert_eq!(
             resolution,
             Resolution::Restored(After::RetryAfterMs(30 * 60_000))
@@ -354,9 +489,86 @@ mod tests {
         let record = journal_record(&root);
         assert_eq!(record.phase, journal::Phase::Restored);
         assert_eq!(record.cause.unwrap().reason, "handoff missing after swap");
-        for trial in reload(&trials, &host) {
+        for trial in reload(&host, trial_dir.path()) {
             assert_eq!(trial.phase, Phase::Restored);
         }
+        let state = probe_state(&host).unwrap();
+        assert_eq!(state.phase, probe::ProbePhase::InterruptedWait);
+        assert_eq!(state.cause, Some(probe::ProbeCause::ApplyInterrupted));
+    }
+
+    /// Review fix for #1934: with no trial record yet, the pass arms one per
+    /// participant and restores. Before the fix `Host::restore` refused with
+    /// "participant trial missing" before any mark, so every pass repeated
+    /// with no RecoveryFailed and the node stayed down on the unarmed pair.
+    #[test]
+    fn missing_trial_records_are_armed_and_the_pair_restored() {
+        let (_dir, root, host, _record) =
+            fixture_with(journal::Phase::SwappedCli, two_participants);
+        let trial_dir = tempfile::tempdir().unwrap();
+        let clock = now();
+
+        let resolution =
+            reconcile(&host, path_in(trial_dir.path()), false, &clock, no_stop).unwrap();
+        assert_eq!(
+            resolution,
+            Resolution::Restored(After::RetryAfterMs(30 * 60_000))
+        );
+        assert_previous_pair(&host);
+        assert_eq!(journal_record(&root).phase, journal::Phase::Restored);
+        let trials = reload(&host, trial_dir.path());
+        assert_eq!(trials.len(), 2);
+        for trial in trials {
+            assert_eq!(trial.phase, Phase::Restored);
+            assert_eq!(trial.attempts, 0);
+            assert_eq!(trial.verdict.unwrap().reason, "handoff missing after swap");
+        }
+        // A second pass finds the restored host and moves nothing.
+        let again = reconcile(&host, path_in(trial_dir.path()), false, &clock, no_stop).unwrap();
+        assert_eq!(
+            again,
+            Resolution::Restored(After::RetryAfterMs(30 * 60_000))
+        );
+    }
+
+    /// One trial present and one missing: the missing one is armed too.
+    #[test]
+    fn a_partly_armed_host_restores_with_custody_of_every_participant() {
+        let (_dir, _root, host, _record) =
+            fixture_with(journal::Phase::SwappedCli, two_participants);
+        let trial_dir = tempfile::tempdir().unwrap();
+        let clock = now();
+        let mut trials = make_trials(&host, trial_dir.path(), &clock, Phase::Armed);
+        std::fs::remove_file(&trials.pop().unwrap().0).unwrap();
+
+        let resolution =
+            reconcile(&host, path_in(trial_dir.path()), false, &clock, no_stop).unwrap();
+        assert!(matches!(resolution, Resolution::Restored(_)));
+        assert_previous_pair(&host);
+        for trial in reload(&host, trial_dir.path()) {
+            assert_eq!(trial.phase, Phase::Restored);
+        }
+    }
+
+    /// A restore that fails after the pass decided to restore marks the host
+    /// RecoveryFailed, so a later pass does not repeat it.
+    #[test]
+    fn a_refused_restore_marks_the_host_recovery_failed() {
+        let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
+        // Unrelated bytes in the daemon target: restore must refuse.
+        std::fs::write(&host.plan().daemon.target_path, b"unrelated").unwrap();
+        let trial_dir = tempfile::tempdir().unwrap();
+        let clock = now();
+
+        let error =
+            reconcile(&host, path_in(trial_dir.path()), false, &clock, no_stop).unwrap_err();
+        assert!(error.to_string().contains("unrelated"), "{error}");
+        assert_eq!(journal_record(&root).phase, journal::Phase::RecoveryFailed);
+        for trial in reload(&host, trial_dir.path()) {
+            assert_eq!(trial.phase, Phase::RecoveryFailed);
+        }
+        let again = reconcile(&host, path_in(trial_dir.path()), false, &clock, no_stop).unwrap();
+        assert_eq!(again, Resolution::Final(journal::Phase::RecoveryFailed));
     }
 
     /// With the handoff present, an unstarted transaction proceeds.
@@ -365,15 +577,17 @@ mod tests {
         let (_dir, _root, host, _record) = fixture(journal::Phase::SwappedCli);
         let trial_dir = tempfile::tempdir().unwrap();
         let clock = now();
-        let mut trials = make_trials(&host, trial_dir.path(), &clock, Phase::Armed);
-        let resolution = reconcile(&host, &mut trials, true, &clock, 0, no_stop).unwrap();
+        make_trials(&host, trial_dir.path(), &clock, Phase::Armed);
+        let resolution =
+            reconcile(&host, path_in(trial_dir.path()), true, &clock, no_stop).unwrap();
         assert_eq!(resolution, Resolution::Proceed);
         assert_candidate_pair(&host);
+        assert_eq!(probe_state(&host).unwrap().phase, probe::ProbePhase::Passed);
     }
 
-    /// Case 2: A is healthy (Provisional), B failed before host commit.
-    /// A's provisional commit is invalidated, both are reaped, the pair is
-    /// restored once, and the Failed cause holds the release.
+    /// Case 2: A is still booting, B failed before host commit. Both trials
+    /// roll back, the pair is restored once, and the Failed cause holds the
+    /// release (D190) until a local clear.
     #[test]
     fn one_healthy_and_one_failed_participant_restore_together_and_hold() {
         let (_dir, root, host, _record) =
@@ -381,21 +595,13 @@ mod tests {
         let trial_dir = tempfile::tempdir().unwrap();
         let clock = now();
         let mut trials = make_trials(&host, trial_dir.path(), &clock, Phase::Authorized);
-        // A: provisional with a child from another boot (already gone).
+        // A: booting with no child yet. The live provisional case runs on
+        // Linux (`a_live_healthy_candidate_is_stopped_and_reaped_before_restore`).
         {
             let (path, a) = &mut trials[0];
             a.attempts = 1;
             a.phase = Phase::Booting;
             a.save(path).unwrap();
-            a.child = Some(Identity {
-                pid: 4300,
-                start: 1,
-                boot: a.boot.clone(),
-            });
-            a.ready_since_ms = Some(clock.ms);
-            a.phase = Phase::Provisional;
-            a.save(path).unwrap();
-            a.child.as_mut().unwrap().boot = "earlier-boot".into();
         }
         // B: its launcher began rollback with a Failed verdict.
         {
@@ -408,17 +614,34 @@ mod tests {
             b.save(path).unwrap();
         }
 
-        let resolution = reconcile(&host, &mut trials, true, &clock, 0, no_stop).unwrap();
+        let resolution =
+            reconcile(&host, path_in(trial_dir.path()), true, &clock, no_stop).unwrap();
         let held = cause(journal::CauseClass::Failed, "launch attempts exhausted");
         assert_eq!(resolution, Resolution::Restored(After::Hold(held)));
         assert_previous_pair(&host);
         let record = journal_record(&root);
         assert_eq!(record.phase, journal::Phase::Restored);
         assert_eq!(record.cause.unwrap().class, journal::CauseClass::Failed);
-        for trial in reload(&trials, &host) {
+        for trial in reload(&host, trial_dir.path()) {
             assert_eq!(trial.phase, Phase::Restored, "{}", trial.instance);
             assert!(trial.child.is_none());
         }
+        let state = probe_state(&host).unwrap();
+        assert_eq!(state.phase, probe::ProbePhase::FailedHold);
+        assert_eq!(state.cause, Some(probe::ProbeCause::ApplyFailed));
+        // The hold is the D190 failed-release hold: admission refuses the
+        // release and a local clear lifts it.
+        assert!(matches!(
+            probe::inspect_admission(&host.plan().daemon.target_path, "9.9.9"),
+            Err(probe::ProbeRefusal::Held { .. })
+        ));
+        assert!(matches!(
+            probe::clear_failed_hold(&host.plan().daemon.target_path, "9.9.9"),
+            Ok(probe::HoldClear::Cleared(_))
+        ));
+        // After the clear, a later pass finds the hold resolved.
+        let again = reconcile(&host, path_in(trial_dir.path()), true, &clock, no_stop).unwrap();
+        assert_eq!(again, Resolution::Restored(After::Resolved));
     }
 
     /// Case 2 with live processes: the coordinator stops and reaps the
@@ -453,7 +676,7 @@ mod tests {
             b.save(path).unwrap();
         }
         let mut stopped = Vec::new();
-        let resolution = reconcile(&host, &mut trials, true, &clock, 0, |target| {
+        let resolution = reconcile(&host, path_in(trial_dir.path()), true, &clock, |target| {
             stopped.push(target.clone());
             live.kill()?;
             live.wait().map(|_| ())
@@ -465,7 +688,7 @@ mod tests {
     }
 
     /// A participant that survives its stop leaves no safe restore: no byte
-    /// moves and every trial is RecoveryFailed.
+    /// moves and the host and every trial are RecoveryFailed.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_participant_that_survives_its_stop_fails_recovery_without_restore() {
@@ -483,10 +706,14 @@ mod tests {
             a.verdict = Some(cause(journal::CauseClass::Failed, "stable health lost"));
             a.save(path).unwrap();
         }
-        let error = reconcile(&host, &mut trials, true, &clock, 0, |_| Ok(())).unwrap_err();
+        let error =
+            reconcile(&host, path_in(trial_dir.path()), true, &clock, |_| Ok(())).unwrap_err();
         assert!(error.to_string().contains("survived"), "{error}");
         assert_candidate_pair(&host);
-        assert_eq!(trials[0].1.phase, Phase::RecoveryFailed);
+        assert_eq!(
+            reload(&host, trial_dir.path())[0].phase,
+            Phase::RecoveryFailed
+        );
         assert_eq!(journal_record(&root).phase, journal::Phase::RecoveryFailed);
         live.kill().unwrap();
         live.wait().unwrap();
@@ -494,20 +721,24 @@ mod tests {
 
     /// Case 3: a coordinator that died during a restore left the host
     /// RollingBack. The successor resumes the restore and keeps the cause.
+    /// The probe record's attempt 2 means one retry was already staged, so
+    /// the wait is 60 minutes (D189 count persisted across transactions).
     #[test]
     fn a_successor_coordinator_resumes_an_interrupted_restore() {
         let (_dir, root, _host, mut record) = fixture(journal::Phase::RollingBack);
         record.cause = Some(cause(journal::CauseClass::Interrupted, "first coordinator"));
         journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &record).unwrap();
         let host = recovery::Host::new(root.clone(), record).unwrap();
+        write_probe(&host, 2, probe::ProbePhase::Passed);
         // The first coordinator restored the daemon only.
         let daemon = host.plan().daemon.clone();
         filesystem::restore_one(&daemon).unwrap();
         let trial_dir = tempfile::tempdir().unwrap();
         let clock = now();
-        let mut trials = make_trials(&host, trial_dir.path(), &clock, Phase::Authorized);
+        make_trials(&host, trial_dir.path(), &clock, Phase::Authorized);
 
-        let resolution = reconcile(&host, &mut trials, true, &clock, 1, no_stop).unwrap();
+        let resolution =
+            reconcile(&host, path_in(trial_dir.path()), true, &clock, no_stop).unwrap();
         assert_eq!(
             resolution,
             Resolution::Restored(After::RetryAfterMs(60 * 60_000))
@@ -519,32 +750,37 @@ mod tests {
 
     /// Case 4: the pair was restored but the coordinator died before every
     /// trial was marked. The next pass marks them Restored and moves no byte.
+    /// Attempt 4 means three retries were used: the release is held.
     #[test]
     fn a_partial_restore_marks_every_trial_restored_without_moving_bytes() {
         let (_dir, root, _host, mut record) = fixture(journal::Phase::Restored);
         record.cause = Some(cause(journal::CauseClass::Interrupted, "earlier pass"));
         journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &record).unwrap();
         let host = recovery::Host::new(root.clone(), record).unwrap();
+        write_probe(&host, 4, probe::ProbePhase::Passed);
         for a in [&host.plan().daemon, &host.plan().cli] {
             filesystem::restore_one(a).unwrap();
         }
         let trial_dir = tempfile::tempdir().unwrap();
         let clock = now();
-        let mut trials = make_trials(&host, trial_dir.path(), &clock, Phase::Authorized);
+        make_trials(&host, trial_dir.path(), &clock, Phase::Authorized);
 
-        let resolution = reconcile(&host, &mut trials, true, &clock, 3, no_stop).unwrap();
-        // Interrupted with three retries already used: hold (D189).
+        let resolution =
+            reconcile(&host, path_in(trial_dir.path()), true, &clock, no_stop).unwrap();
         let exhausted = cause(journal::CauseClass::Failed, "retries_exhausted");
         assert_eq!(resolution, Resolution::Restored(After::Hold(exhausted)));
         assert_previous_pair(&host);
-        for trial in reload(&trials, &host) {
+        for trial in reload(&host, trial_dir.path()) {
             assert_eq!(trial.phase, Phase::Restored);
             assert_eq!(trial.verdict.unwrap().reason, "earlier pass");
         }
+        let state = probe_state(&host).unwrap();
+        assert_eq!(state.phase, probe::ProbePhase::FailedHold);
+        assert_eq!(state.cause, Some(probe::ProbeCause::RetriesExhausted));
     }
 
-    /// Case 5: the hold record cannot be made durable. No byte moves, no
-    /// restored start is possible, and every trial is RecoveryFailed.
+    /// Case 5: the journal cannot be written. No byte moves, no restored
+    /// start is possible, and every trial is RecoveryFailed.
     #[test]
     fn a_hold_write_failure_moves_no_bytes_and_fails_recovery() {
         use std::os::unix::fs::PermissionsExt;
@@ -558,14 +794,35 @@ mod tests {
         let clock = now();
         let mut trials = make_trials(&host, trial_dir.path(), &clock, Phase::Authorized);
         trials[0].1.verdict = Some(cause(journal::CauseClass::Failed, "stable health lost"));
+        trials[0].1.save(&trials[0].0).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).unwrap();
 
-        let result = reconcile(&host, &mut trials, true, &clock, 0, no_stop);
+        let result = reconcile(&host, path_in(trial_dir.path()), true, &clock, no_stop);
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(result.is_err());
         assert_candidate_pair(&host);
         assert_ne!(journal_record(&root).phase, journal::Phase::Restored);
-        for trial in reload(&trials, &host) {
+        for trial in reload(&host, trial_dir.path()) {
+            assert_eq!(trial.phase, Phase::RecoveryFailed);
+        }
+    }
+
+    /// Case 5b: the pair is restored but the outcome cannot be recorded (no
+    /// probe record names the candidate). No restored start is allowed: the
+    /// host and every trial are RecoveryFailed, and no trial is Restored.
+    #[test]
+    fn an_unrecordable_outcome_blocks_every_restored_start() {
+        let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
+        std::fs::remove_file(probe::state_path(&host.plan().daemon.target_path).unwrap()).unwrap();
+        let trial_dir = tempfile::tempdir().unwrap();
+        let clock = now();
+        make_trials(&host, trial_dir.path(), &clock, Phase::Armed);
+
+        let error =
+            reconcile(&host, path_in(trial_dir.path()), false, &clock, no_stop).unwrap_err();
+        assert!(error.to_string().contains("no probe record"), "{error}");
+        assert_eq!(journal_record(&root).phase, journal::Phase::RecoveryFailed);
+        for trial in reload(&host, trial_dir.path()) {
             assert_eq!(trial.phase, Phase::RecoveryFailed);
         }
     }
@@ -580,10 +837,11 @@ mod tests {
             boot: "earlier-boot".into(),
             ms: 1_000,
         };
-        let mut trials = make_trials(&host, trial_dir.path(), &earlier, Phase::Booting);
+        make_trials(&host, trial_dir.path(), &earlier, Phase::Booting);
         let clock = now();
 
-        let resolution = reconcile(&host, &mut trials, true, &clock, 0, no_stop).unwrap();
+        let resolution =
+            reconcile(&host, path_in(trial_dir.path()), true, &clock, no_stop).unwrap();
         assert_eq!(
             resolution,
             Resolution::Restored(After::RetryAfterMs(30 * 60_000))
@@ -591,7 +849,7 @@ mod tests {
         assert_previous_pair(&host);
         let kept = journal_record(&root).cause.unwrap();
         assert_eq!(kept.class, journal::CauseClass::Interrupted);
-        for trial in reload(&trials, &host) {
+        for trial in reload(&host, trial_dir.path()) {
             assert_eq!(trial.phase, Phase::Restored);
             assert_eq!(trial.attempts, 1, "counters never reset");
             assert_eq!(trial.boot, "earlier-boot");
@@ -617,7 +875,8 @@ mod tests {
             a.child = Some(child::identity(live.id()).unwrap());
             a.save(path).unwrap();
         }
-        let resolution = reconcile(&host, &mut trials, true, &clock, 0, no_stop).unwrap();
+        let resolution =
+            reconcile(&host, path_in(trial_dir.path()), true, &clock, no_stop).unwrap();
         assert_eq!(resolution, Resolution::Proceed);
         assert_candidate_pair(&host);
         live.kill().unwrap();
@@ -625,16 +884,18 @@ mod tests {
     }
 
     /// Nothing is swapped yet in `Prepared`: a missing handoff restores
-    /// nothing and charges no retry.
+    /// nothing, arms no trial and charges no retry.
     #[test]
     fn a_prepared_host_without_handoff_proceeds() {
         let (_dir, root, host, _record) = fixture(journal::Phase::Prepared);
         let trial_dir = tempfile::tempdir().unwrap();
         let clock = now();
-        let mut trials = make_trials(&host, trial_dir.path(), &clock, Phase::Armed);
-        let resolution = reconcile(&host, &mut trials, false, &clock, 0, no_stop).unwrap();
+        let resolution =
+            reconcile(&host, path_in(trial_dir.path()), false, &clock, no_stop).unwrap();
         assert_eq!(resolution, Resolution::Proceed);
         assert_eq!(journal_record(&root).phase, journal::Phase::Prepared);
+        assert_eq!(std::fs::read_dir(trial_dir.path()).unwrap().count(), 0);
+        assert_eq!(probe_state(&host).unwrap().phase, probe::ProbePhase::Passed);
     }
 
     /// RecoveryFailed survives a restart: a later pass takes no action.
@@ -646,13 +907,8 @@ mod tests {
         let mut trials = make_trials(&host, trial_dir.path(), &clock, Phase::Authorized);
         let (path, trial) = &mut trials[0];
         let _ = trial.recovery_failed(path, invalid("fixture failure"));
-        // A restarted coordinator reloads the durable trial.
-        let mut reloaded: Vec<_> = reload(&trials, &host)
-            .into_iter()
-            .zip(trials.iter().map(|(path, _)| path.clone()))
-            .map(|(trial, path)| (path, trial))
-            .collect();
-        let resolution = reconcile(&host, &mut reloaded, false, &clock, 0, no_stop).unwrap();
+        let resolution =
+            reconcile(&host, path_in(trial_dir.path()), false, &clock, no_stop).unwrap();
         assert_eq!(
             resolution,
             Resolution::Final(journal::Phase::RecoveryFailed)
@@ -661,33 +917,34 @@ mod tests {
 
         let (_dir, _root, host, _record) = fixture(journal::Phase::RecoveryFailed);
         let other_dir = tempfile::tempdir().unwrap();
-        let mut trials = make_trials(&host, other_dir.path(), &clock, Phase::Armed);
-        let resolution = reconcile(&host, &mut trials, false, &clock, 0, no_stop).unwrap();
+        make_trials(&host, other_dir.path(), &clock, Phase::Armed);
+        let resolution =
+            reconcile(&host, path_in(other_dir.path()), false, &clock, no_stop).unwrap();
         assert_eq!(
             resolution,
             Resolution::Final(journal::Phase::RecoveryFailed)
         );
     }
 
+    /// D189 across transactions: the probe record's attempt carries the
+    /// count. Attempts 1..=3 wait 30, 60 and 120 minutes; attempt 4 holds
+    /// with `retries_exhausted`.
     #[test]
     fn d189_retries_three_times_then_holds() {
-        let interrupted = cause(journal::CauseClass::Interrupted, "x");
-        assert_eq!(
-            after_restore(&interrupted, 0),
-            After::RetryAfterMs(30 * 60_000)
-        );
-        assert_eq!(
-            after_restore(&interrupted, 1),
-            After::RetryAfterMs(60 * 60_000)
-        );
-        assert_eq!(
-            after_restore(&interrupted, 2),
-            After::RetryAfterMs(120 * 60_000)
-        );
-        assert!(
-            matches!(after_restore(&interrupted, 3), After::Hold(c) if c.reason == "retries_exhausted")
-        );
-        let failed = cause(journal::CauseClass::Failed, "y");
-        assert_eq!(after_restore(&failed, 0), After::Hold(failed.clone()));
+        let expected = [
+            After::RetryAfterMs(30 * 60_000),
+            After::RetryAfterMs(60 * 60_000),
+            After::RetryAfterMs(120 * 60_000),
+            After::Hold(cause(journal::CauseClass::Failed, "retries_exhausted")),
+        ];
+        for (attempt, after) in (1..=4).zip(expected) {
+            let (_dir, _root, host, _record) = fixture(journal::Phase::SwappedCli);
+            write_probe(&host, attempt, probe::ProbePhase::Passed);
+            let trial_dir = tempfile::tempdir().unwrap();
+            let clock = now();
+            let resolution =
+                reconcile(&host, path_in(trial_dir.path()), false, &clock, no_stop).unwrap();
+            assert_eq!(resolution, Resolution::Restored(after), "attempt {attempt}");
+        }
     }
 }

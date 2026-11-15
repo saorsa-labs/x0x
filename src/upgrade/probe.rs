@@ -113,6 +113,12 @@ pub(crate) enum ProbeCause {
     HoldWriteFailed,
     StateWriteFailed,
     CleanupFailed,
+    /// The launcher coordinator restored the previous pair after a Failed
+    /// trial cause (#1376, D190 hold).
+    ApplyFailed,
+    /// The launcher coordinator restored the previous pair after an
+    /// Interrupted trial cause (#1376, D189 retry wait).
+    ApplyInterrupted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -370,7 +376,12 @@ fn decode_state(bytes: &[u8]) -> io::Result<ProbeState> {
     if state.phase == ProbePhase::InterruptedWait {
         if !matches!(
             state.cause,
-            Some(ProbeCause::Timeout | ProbeCause::HostIo | ProbeCause::Cancelled)
+            Some(
+                ProbeCause::Timeout
+                    | ProbeCause::HostIo
+                    | ProbeCause::Cancelled
+                    | ProbeCause::ApplyInterrupted
+            )
         ) || state.retry_remaining_ms == 0
             || state.retry_deadline_ms == 0
             || state.attempt > 3
@@ -396,6 +407,7 @@ fn decode_state(bytes: &[u8]) -> io::Result<ProbeState> {
                         | ProbeCause::OutputLimit
                         | ProbeCause::CandidateChanged
                         | ProbeCause::RetriesExhausted
+                        | ProbeCause::ApplyFailed
                 )
             ) =>
         {
@@ -780,6 +792,104 @@ pub(crate) fn clear_failed_hold(install: &Path, version: &str) -> Result<HoldCle
             .map_err(|error| recovery_error(format!("hold removal not durable: {error}")))?;
     }
     Ok(HoldClear::Cleared(receipt))
+}
+
+/// What the launcher coordinator recorded for a restored candidate release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum ApplyOutcome {
+    /// The release is held (D190). Only a local clear or a newer release
+    /// lifts it.
+    Held(ProbeCause),
+    /// A fresh transaction for the same release may stage after this wait
+    /// (D189).
+    Waiting { retry_after_ms: u64 },
+    /// The hold for this release was cleared, or a newer release owns the
+    /// probe record. Nothing remains to record.
+    Resolved,
+}
+
+/// S3c (#1376): after the launcher coordinator restores the previous pair,
+/// record the D189/D190 outcome for the candidate release in this install's
+/// probe record. The caller must make this durable before any restored
+/// child starts.
+///
+/// The probe record's `attempt` is the persistent D189 count: attempt `n`
+/// is the `n - 1`th fresh retry transaction for the release. A Failed cause
+/// holds at once; an Interrupted cause waits 30, 60 or 120 minutes, then
+/// holds with `retries_exhausted`. A record already moved to a hold or a
+/// wait for the same candidate is returned unchanged, so a successor pass
+/// cannot charge a second retry. The record must name exactly the
+/// candidate bytes; any other record is an error.
+#[allow(dead_code)]
+pub(crate) fn record_apply_outcome(
+    install: &Path,
+    version: &str,
+    candidate: ([u8; 32], [u8; 32]),
+    failed: bool,
+    clock: &ProbeClock,
+) -> io::Result<ApplyOutcome> {
+    let path = state_path(install)?;
+    match journal::read_auxiliary_record(&uncertainty_path(install)?) {
+        Ok(_) => return Err(invalid("probe terminalization is unresolved")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    if is_latched(&path) {
+        return Err(invalid("a probe record barrier failed in this process"));
+    }
+    let requested = semver::Version::parse(version).map_err(invalid)?;
+    let Some(mut state) = read_state(install)? else {
+        return match read_clear_receipt(install)? {
+            Some(receipt) if receipt.version == version => Ok(ApplyOutcome::Resolved),
+            _ => Err(invalid("no probe record for the candidate release")),
+        };
+    };
+    let recorded = semver::Version::parse(&state.version).map_err(invalid)?;
+    if recorded > requested {
+        return Ok(ApplyOutcome::Resolved);
+    }
+    if recorded < requested
+        || state.daemon_sha256 != Some(candidate.0)
+        || state.cli_sha256 != Some(candidate.1)
+    {
+        return Err(invalid("probe record names other candidate bytes"));
+    }
+    match state.phase {
+        ProbePhase::Passed => {}
+        ProbePhase::FailedHold => {
+            return state
+                .cause
+                .map(ApplyOutcome::Held)
+                .ok_or_else(|| invalid("failed probe hold has no cause"));
+        }
+        ProbePhase::InterruptedWait => {
+            return Ok(ApplyOutcome::Waiting {
+                retry_after_ms: state.retry_remaining_ms,
+            });
+        }
+        ProbePhase::Running | ProbePhase::RecoveryFailed => {
+            return Err(invalid("probe record is unresolved"));
+        }
+    }
+    if failed {
+        state.phase = ProbePhase::FailedHold;
+        state.cause = Some(ProbeCause::ApplyFailed);
+    } else {
+        interrupt_state(&mut state, ProbeCause::ApplyInterrupted, clock);
+    }
+    let write = if state.phase == ProbePhase::FailedHold {
+        RecordWrite::Hold
+    } else {
+        RecordWrite::Outcome
+    };
+    write_state(&path, &state, write, None).map_err(invalid)?;
+    Ok(match state.phase {
+        ProbePhase::InterruptedWait => ApplyOutcome::Waiting {
+            retry_after_ms: state.retry_remaining_ms,
+        },
+        _ => ApplyOutcome::Held(state.cause.unwrap_or(ProbeCause::ApplyFailed)),
+    })
 }
 
 fn interrupt_state(state: &mut ProbeState, cause: ProbeCause, clock: &ProbeClock) {
