@@ -392,6 +392,13 @@ enum WsOutbound {
     /// ADR-0073: a call lifecycle transition.
     #[serde(rename = "call.state")]
     CallState { call: serde_json::Value },
+    /// #1351: the M1 health verdict changed (`GET /events` carries the same
+    /// `data`).
+    #[serde(rename = "system.health_verdict")]
+    SystemHealthVerdict { data: serde_json::Value },
+    /// #1351: the M1 upgrade input changed.
+    #[serde(rename = "system.upgrade_state")]
+    SystemUpgradeState { data: serde_json::Value },
     /// ADR 0083: navigate an open GUI tab to a validated view.
     #[serde(rename = "gui.show")]
     GuiShow {
@@ -1186,7 +1193,7 @@ async fn feed_direct_backfill_rows(
     hashes
 }
 
-/// Subscribe to navigation broadcasts (`call.*` and `gui.show`).
+/// Subscribe to navigation broadcasts (`call.*`, `gui.show`, `system.*`).
 ///
 /// `handle_ws_connection` calls this before it inserts the session.
 /// Broadcast does not replay. A `gui.show` sent once the session is visible
@@ -1195,7 +1202,8 @@ fn subscribe_navigation(state: &AppState) -> broadcast::Receiver<super::sse::Sse
     state.broadcast_tx.subscribe()
 }
 
-/// ADR-0073: forward `call.*` and `gui.show` onto one session queue.
+/// ADR-0073: forward `call.*`, `gui.show` and (#1351) `system.*` onto one
+/// session queue.
 ///
 /// A hidden tab skips `gui.show`. Call events still forward. `None` means
 /// shutdown has closed admission and the task was not started.
@@ -1218,6 +1226,12 @@ fn spawn_navigation_forwarder(
             let out = match event.event_type.as_str() {
                 "call.incoming" => WsOutbound::CallIncoming { call: event.data },
                 "call.state" => WsOutbound::CallState { call: event.data },
+                super::system_events::HEALTH_VERDICT_EVENT => {
+                    WsOutbound::SystemHealthVerdict { data: event.data }
+                }
+                super::system_events::UPGRADE_STATE_EVENT => {
+                    WsOutbound::SystemUpgradeState { data: event.data }
+                }
                 "gui.show" => {
                     // `POST /gui/show` does not use this broadcast. It
                     // confirms a slot on the session queue first. A full
@@ -5773,6 +5787,75 @@ mod tests {
         assert_eq!(view, "people");
         armed.forwarder.abort();
         watcher.abort();
+    }
+
+    /// #1351: a `system.*` event on the daemon broadcast reaches every
+    /// `/ws` session as a typed frame with the same `data`.
+    #[tokio::test]
+    async fn system_events_reach_ws_sessions() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<WsOutbound>(8);
+        let stats = Arc::new(WsOutboundStats::default());
+        let slow_close = tokio_util::sync::CancellationToken::new();
+        let slow_close_counted = Arc::new(AtomicBool::new(false));
+        let armed = arm_navigation_and_advertise_session(
+            &state,
+            test_gui_ws_session("system-events"),
+            &outbound_tx,
+            &stats,
+            &slow_close,
+            &slow_close_counted,
+        )
+        .await
+        .expect("navigation forwarder admitted");
+
+        for (event_type, data) in [
+            (
+                super::super::system_events::HEALTH_VERDICT_EVENT,
+                serde_json::json!({ "verdict": "error", "previous": "ok" }),
+            ),
+            (
+                super::super::system_events::UPGRADE_STATE_EVENT,
+                serde_json::json!({ "state": "degraded", "previous_state": "ok" }),
+            ),
+        ] {
+            state
+                .broadcast_tx
+                .send(crate::server::sse::SseEvent {
+                    event_type: event_type.to_string(),
+                    data,
+                })
+                .expect("a receiver is subscribed");
+        }
+
+        let mut frames = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while frames.len() < 2 {
+                match outbound_rx.recv().await {
+                    Some(frame @ WsOutbound::SystemHealthVerdict { .. })
+                    | Some(frame @ WsOutbound::SystemUpgradeState { .. }) => {
+                        frames.push(serde_json::to_value(&frame).expect("frame json"))
+                    }
+                    Some(_) => continue,
+                    None => panic!("outbound queue closed before the system events"),
+                }
+            }
+        })
+        .await
+        .expect("system events missed on /ws");
+        assert_eq!(
+            frames[0],
+            serde_json::json!({
+                "type": "system.health_verdict",
+                "data": { "verdict": "error", "previous": "ok" },
+            })
+        );
+        assert_eq!(frames[1]["type"], "system.upgrade_state");
+        assert_eq!(frames[1]["data"]["state"], "degraded");
+        armed.forwarder.abort();
     }
 
     #[tokio::test]

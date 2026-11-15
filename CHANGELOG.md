@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`system.health_verdict` and `system.upgrade_state` events on
+  `GET /events` and `/ws` (#1351, A14 amendment of 15 Nov 2026).** The 5 s
+  health refresher emits one event when the M1 `/health` verdict changes and
+  one when its upgrade input changes (state, `update_available`,
+  `latest_version`, `handoff_pending`, `failed_artifact`). The first check
+  after start is the baseline and emits nothing. `/ws` sessions get typed
+  frames `{"type":"system.…","data":{…}}`.
 - **`POST /direct/send` names a revoked recipient machine (#1597 item 4,
   ADR 0110 D70).** A send whose resolved recipient machine is revoked answers
   `403 recipient_machine_revoked` (Rust: `DmError::RecipientMachineRevoked
@@ -66,6 +73,14 @@ All notable changes to this project will be documented in this file.
   still peeks a PubSub kind only under ADR 0013 pressure.
 
 ### Changed
+
+- **Documented the exit for a forked head behind an armed gap record
+  (#871).** The anchored-gap gate has no expiry and no local clear. With no
+  progress (10 minutes for an owner-armed gap, 30 minutes for an
+  admin-armed gap) the node asks for an attestation, shows
+  `reseat_required {not_on_chain}` with a `gap` ref, and an admin's manual
+  re-seat (ADR 0109 §3) retires the record. A08 amendment of 15 Nov 2026.
+  No code change.
 
 - **A TreeKEM member that was down past the last metadata resend asks for
   the commits it missed after it starts (#1427).** With no later traffic,
