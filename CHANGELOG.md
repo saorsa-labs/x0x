@@ -193,6 +193,15 @@ All notable changes to this project will be documented in this file.
 
 ### Tests and tooling
 
+- **Coordinator recovery records its outcome (#1376, S3c follow-up; A14
+  amendment of 15 Nov 2026).** A host with no trial records no longer
+  repeats a refused restore on every pass: the coordinator arms a trial for
+  each participant that has none, then restores. Any failure after it
+  decides to restore marks the host and every trial `RecoveryFailed`. The
+  D189 retry wait or the D190 failed-release hold is written into the
+  candidate's probe record (new causes `apply_failed` and
+  `apply_interrupted`) before any restored start, and the record's attempt
+  count carries D189 across fresh transactions.
 - **Launcher host coordinator recovery (#1376, S3c; A14 amendment of 15 Nov
   2026).** A dormant coordinator pass (`src/upgrade/launcher/coordinator.rs`)
   reconciles the host after a missing handoff, one healthy and one failed
