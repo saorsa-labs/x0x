@@ -89,6 +89,20 @@ roster has no Active admin seat at all, per ADR 0088 §2 item 3 and ADR
 exists. A promoted member keeps a mandate refused with either cause and
 retries it, as before. ADR 0110 stays Accepted and its text is unchanged.
 
+On 15 Nov 2026 Claude recorded the limit of a machine revocation for
+TreeKEM group content, under David's delegation of design decisions of 10
+Nov 2026 ([#1929](https://github.com/saorsa-labs/x0x/issues/1929),
+option 3; the #1928 W3-H row found it). A machine revocation denies
+delivery, transport and requests to that device, and the agent keeps its
+seat (D70). It does not protect TreeKEM group content against a device
+that still holds the agent key. The leaf keys derive from the agent key
+and the group id (`derive_identity_seed`), so the device can open every
+later UpdatePath sealed to the agent's leaf, and removing the leaf and
+rejoining from another device restores the same key. To cut a lost or
+stolen device off group content, revoke the agent or remove the member.
+Per-device TreeKEM leaves (#1929 option 1) would close the gap and are a
+separate project. ADR 0110 stays Accepted and its text is unchanged.
+
 On 15 Nov 2026 Claude decided when the §2 restart sync wait ends head
 discovery, under David's delegation of design decisions of 10 Nov 2026
 ([#1581](https://github.com/saorsa-labs/x0x/issues/1581),
