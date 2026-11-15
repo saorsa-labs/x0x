@@ -178,9 +178,19 @@ impl CapabilityRegistry {
     /// (bit 17 is `roster_only_ban_v1`, #1540).
     pub const CAPS_UNICAST_RESPONSE_V1: u64 = 1 << 18;
 
+    /// Issue #1840 routes 1–3 (A08 amendment of 15 Nov 2026): reads the
+    /// optional `head` of a `stale` join-request outcome and signs the same
+    /// request again over it. Bit 19, the next free bit. An authority puts
+    /// a head on an outcome only for a requester whose current verified
+    /// advert has this bit: a requester without it cannot read a headed
+    /// outcome (it is over the first release's bound). ROUTE-GATED with
+    /// `join_request_outcome_v1`: advertised only when the outcome route is
+    /// registered, because the head is handled on that route.
+    pub const JOIN_REQUEST_HEAD_V1: u64 = 1 << 19;
+
     /// The routes supported by every receiver of this release.
     /// Route-gated bits (`grant_revocation_push_v1`,
-    /// `join_request_outcome_v1`) are NOT here: they are
+    /// `join_request_outcome_v1`, `join_request_head_v1`) are NOT here: they are
     /// added per daemon by [`Self::advertised`] from the typed routes the
     /// DM inbox actually registered, so a library embedder that never wires
     /// the route never advertises the bit.
@@ -220,7 +230,7 @@ impl CapabilityRegistry {
             if prefix == crate::revocation_push::GRANT_REVOCATION_PUSH_PREFIX {
                 registry.bits |= Self::GRANT_REVOCATION_PUSH_V1;
             } else if prefix == crate::groups::join_outcome::JOIN_REQUEST_OUTCOME_DM_PREFIX {
-                registry.bits |= Self::JOIN_REQUEST_OUTCOME_V1;
+                registry.bits |= Self::JOIN_REQUEST_OUTCOME_V1 | Self::JOIN_REQUEST_HEAD_V1;
             }
         }
         registry

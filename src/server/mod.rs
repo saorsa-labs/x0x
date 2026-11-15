@@ -1939,6 +1939,9 @@ pub async fn serve_with_options(
     // memory-only), never fatal; until it ends no writer replaces either
     // file.
     routes::named_groups::load_revocation_eviction_store(&state).await;
+    // #1427: the catch-up commits this node held before the restart. After
+    // the S4 store, so a commit S4 still delivers is not served from it.
+    routes::named_groups::restore_treekem_catchup_logs(&state).await;
 
     // Publish the API port only after every fallible causal-state loader has
     // completed. A rejected sidecar therefore leaves no listener task and no
@@ -5094,10 +5097,23 @@ async fn handle_predecessor_relay_typed_payload_inner(
                         outcome = "refused",
                         "ADR 0028: request refused by validation without mutation; admission journal released"
                     );
+                    // Issue #1840: a requester that sealed over a partial
+                    // or used head waits for its turn, in arrival order.
+                    // The queue needs no journal lock.
+                    drop(_journal_guard);
+                    let turn =
+                        crate::server::routes::named_groups::join_sequence::note_refused_request(
+                            relay_state,
+                            &group_id_str,
+                            &event,
+                            now_ms,
+                        )
+                        .await;
                     // #1840 ask 4: tell the requester, once the release
                     // is durable. Had the marker stayed, the requester's
                     // re-offer is what retries the release, so no outcome
-                    // is sent then.
+                    // is sent then. The turn holder's outcome may carry
+                    // the head (A08 amendment of 15 Nov 2026).
                     if let Some(reason) = apply_result.refusal_reason {
                         routes::named_groups::send_join_request_refusal(
                             relay_state,
@@ -5106,19 +5122,10 @@ async fn handle_predecessor_relay_typed_payload_inner(
                             typed.sender,
                             digest_bytes,
                             reason,
-                        );
+                            turn.as_ref(),
+                        )
+                        .await;
                     }
-                    // Issue #1840: a requester that sealed over a partial
-                    // or used head waits for its turn, in arrival order.
-                    // The queue needs no journal lock.
-                    drop(_journal_guard);
-                    crate::server::routes::named_groups::join_sequence::note_refused_request(
-                        relay_state,
-                        &group_id_str,
-                        &event,
-                        now_ms,
-                    )
-                    .await;
                 } else {
                     *relay_state.pending_listener_admission.lock().await = marker;
                     tracing::error!(

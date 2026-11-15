@@ -1312,8 +1312,10 @@ pub(super) struct AppState {
     /// start catch-up waits for it, in any order, and then asks again for
     /// each group that is still pending.
     pub(super) treekem_network_join_ended: tokio::sync::watch::Sender<bool>,
-    /// #1427: how many start catch-up passes this daemon began (a pass is
-    /// one catch-up cycle for one group). Diagnostics only.
+    /// #1427: how many start catch-up passes this daemon began. A pass is
+    /// one run of the start catch-up for one group, which runs up to 16
+    /// catch-up cycles; a group gets a first pass at start and at most one
+    /// more after the network join. Diagnostics only.
     pub(super) treekem_start_catchup_passes: std::sync::atomic::AtomicU64,
     /// #1657 (ADR 0110 §3): the latest typed TreeKEM catch-up refusal
     /// this daemon received, per group, keyed by the group id its own
@@ -1680,6 +1682,11 @@ pub(super) struct NamedGroupTestRecorders {
     /// returns an error. Tests that want the success arm set this. Production
     /// leaves it false and uses the transport result.
     pub(super) metadata_publish_force_ok: std::sync::atomic::AtomicBool,
+    /// #1840: the unit-test agent has no gossip runtime, so a publish that
+    /// must return its signed V2 envelope returns none. Tests that need the
+    /// envelope set this; the publish then returns the envelope the gossip
+    /// layer would sign (`sign_v2_envelope`), without a transport.
+    pub(super) metadata_publish_envelope: std::sync::atomic::AtomicBool,
     /// #1113 startup catch-up: tests that want a page send to count as
     /// delivered set this. Production builds omit the recorders.
     pub(super) catchup_page_force_ok: std::sync::atomic::AtomicBool,

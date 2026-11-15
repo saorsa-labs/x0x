@@ -6,6 +6,22 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **A join request the authority refuses as `stale` is signed again over the
+  authority's head (#1840 routes 1–3, A08 amendment of 15 Nov 2026).** A
+  second joiner on a group with members, a request that crosses an edit of
+  the group, and a removed member asking again are now listed and can be
+  approved. The authority sends its head (signed head commit, roster, public
+  metadata) to the requester whose turn it is in the join queue; the
+  requester checks it, signs the same request again over it and offers it,
+  and after approval it can apply the approval link. A requester that waits
+  behind another turn gets no outcome until its turn. New capability bit 19,
+  `join_request_head_v1`; a peer without it keeps the earlier behaviour.
+- **W3-H row `s4_intake_and_egress`, machine-revocation part (#1581, D70).**
+  A control arm checks that a machine-only revocation keeps the agent's
+  group seat and opens no S4 row. An egress arm, pinned RED, records a
+  known gap: after a later rotation a TreeKEM member's revoked device still
+  reaches the new epoch through its kept leaf. The row has its own W3-H
+  shard (`1581i`).
 - **A `stale` join-request outcome can carry the authority's head (#1840,
   A08 amendment of 15 Nov 2026).** New optional `head` field on
   `groups::join_outcome::JoinRequestOutcome` (signed head commit, roster
@@ -87,6 +103,18 @@ All notable changes to this project will be documented in this file.
   still peeks a PubSub kind only under ADR 0013 pressure.
 
 ### Changed
+
+- **A node that restarted still serves the TreeKEM commits it held
+  (#1427).** The TreeKEM catch-up log is saved under `treekem-catchup-log/`
+  in the data directory (one file per group, local only) and loaded at
+  start. A member that was offline when a commit was made can catch up
+  from a signer that restarted since. A removal or ban that has an ADR
+  0110 (S4) row, in any phase, is not loaded from the saved file. The file
+  is versioned; a damaged or unknown-version file is skipped. A requester
+  removed or banned after its cached add is no longer served pages. A
+  start catch-up cycle now waits for another running catch-up task of the
+  same group to end before it judges the cycle. No wire format or API
+  changes.
 
 - **Docs: what a machine revocation protects (#1929).** A machine revocation
   denies delivery, transport and requests to that device. It does not cut a
