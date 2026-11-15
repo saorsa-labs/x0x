@@ -16,14 +16,15 @@
 //!   route while A's row for B is open. §4 L274 wants the same
 //!   `local_committer_ineligible` mark for a demoted worker, and
 //!   §4 L275 (D72) keeps a demoted worker a member that retains its
-//!   pending rows. `main` mislabels it — the demoted local seat is
-//!   no longer an Active admin, so `evaluate_row` falls to
-//!   `waiting_for_designated_admin` instead (the divergence #1751
-//!   recorded on #1581, diverging from §4 L274 and
-//!   `docs/api-reference.md`). Expected RED on `main` with
-//!   [`CAUSE_NO_MARK`]; GREEN when the `evaluate_row` fix lands. The
-//!   RED is eligible only with the mislabel itself observed — a row
-//!   that never evaluated the exit is not the named divergence.
+//!   pending rows. Before #1581's fix `evaluate_row` mislabelled it
+//!   — the demoted local seat is no longer an Active admin, so it fell
+//!   to `waiting_for_designated_admin` (the divergence #1751 recorded
+//!   on #1581). Now a local node whose row derivation named it
+//!   designated or a fallback rank marks `local_committer_ineligible`
+//!   (sticky), so the arm expects GREEN. A RED names
+//!   [`CAUSE_NO_MARK`], and is eligible only with the mislabel itself
+//!   observed — a row that never evaluated the exit is not the named
+//!   divergence.
 //!
 //! Harness honesty, three departures the row needs stated plainly:
 //!
@@ -1559,9 +1560,10 @@ fn w3h_1581f_control_local_authority_exit_revoked_committer() -> Result<()> {
 /// ADR 0110 `s4_local_authority_exit`, the demoted form: §4 L274 wants
 /// the same `local_committer_ineligible` mark from a worker demoted
 /// mid-window, which stays a member and keeps its rows (L275, D72).
-/// RED on `main`, which mislabels the demoted worker's row
-/// `waiting_for_designated_admin` (the #1751 finding on #1581); GREEN
-/// once the `evaluate_row` fix lands.
+/// GREEN: `evaluate_row` marks the demoted worker (the row's last
+/// derivation named it designated) `local_committer_ineligible`. It was
+/// RED before that fix, which mislabelled the row
+/// `waiting_for_designated_admin` (the #1751 finding on #1581).
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -1580,9 +1582,9 @@ fn w3h_1581f_red_local_authority_exit_demoted_form() -> Result<()> {
             0x1581_000b,
             LABELS,
             true,
-            // RED on main (CAUSE_NO_MARK, the mislabelled exit); GREEN
-            // with the ADR 0110 §4 L274 fix in evaluate_row.
-            Verdict::Red,
+            // RED before #1581's evaluate_row fix (CAUSE_NO_MARK, the
+            // mislabelled exit); GREEN with the ADR 0110 §4 L274 fix.
+            Verdict::Green,
         )
         .await
     })

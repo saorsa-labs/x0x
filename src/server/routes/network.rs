@@ -724,6 +724,12 @@ pub(in crate::server) fn version_policy_digest(
 /// change, no capability bit). Read-only view of what `GET /upgrade` would
 /// act on; no network check is performed here.
 ///
+/// #1381 (A14 amendment of 15 Nov 2026): it also reports the release
+/// `channel`, the highest verified version seen on `x0x/release`, the last
+/// release check, and the `pending_update`. These come from the in-memory
+/// [`UpgradeObservations`](crate::server::routes::UpgradeObservations) and
+/// reset when the daemon restarts.
+///
 /// #1384 (D35): `minimum_supported_version` and `support_window` ship as
 /// explicit nulls — fleet-level policy David sets later; a null IS the
 /// published state ("no fleet minimum published yet"), not a missing field.
@@ -736,7 +742,19 @@ pub(in crate::server) async fn upgrade_diagnostics(
     let version = env!("CARGO_PKG_VERSION");
     let cfg = &state.update_config;
     let input = version_policy_digest_input(version, cfg);
-    Json(serde_json::json!({
+    // #1381: what this daemon has seen and checked since it started.
+    let background = state
+        .background_submit
+        .get()
+        .and_then(|submit| submit.status());
+    let observed = {
+        let record = state
+            .upgrade_observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        record.diagnostics_json(version, background)
+    };
+    let mut body = serde_json::json!({
         "ok": true,
         "current_version": version,
         "update_policy": {
@@ -752,7 +770,12 @@ pub(in crate::server) async fn upgrade_diagnostics(
         "support_window": serde_json::Value::Null,
         "version_policy_digest": version_policy_digest(version, cfg),
         "digest_input": input,
-    }))
+        "channel": if cfg.include_prereleases { "prerelease" } else { "stable" },
+    });
+    if let (Some(body), serde_json::Value::Object(observed)) = (body.as_object_mut(), observed) {
+        body.extend(observed);
+    }
+    Json(body)
 }
 
 #[cfg(test)]

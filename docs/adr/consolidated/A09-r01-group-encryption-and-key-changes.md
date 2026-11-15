@@ -106,6 +106,24 @@ work on a head loaded from disk thus never seals that stale head, and
 another admin's fallback still covers the row. ADR 0110 stays Accepted
 and its text is unchanged.
 
+On 15 Nov 2026 Claude decided how S4 knows that a local worker lost its
+committer authority, under David's delegation of design decisions of 10
+Nov 2026 ([#1581](https://github.com/saorsa-labs/x0x/issues/1581),
+`s4_local_authority_exit`, ADR 0110 §4 L274 and L275, D72). A local node
+that is no longer an Active admin was the row's worker when the row's
+last stored derivation named it the designated admin or a fallback rank.
+Such a node marks `local_committer_ineligible` naming the designated
+admin, the same as a revoked worker. A stored mark keeps it after the
+stored derivation moves to another admin, and across a restart, while no
+override replaces the row's stored waiting cause (rebuilding, the
+host-commit gate, the fork wait, `waiting_for_receiver_upgrade`, rebind).
+After such an override, once the derivation no longer names the node, the
+row shows `waiting_for_designated_admin` again; there is no separate
+worker-history state. A member that never was a committer for the row
+keeps `waiting_for_designated_admin`. The leave form is not covered: a leave
+drops the local group record, so no row is left to mark. ADR 0110 stays
+Accepted and its text is unchanged.
+
 Amendment of 14 Nov 2026 (#1427), made under the design delegation of
 10 Nov 2026. A TreeKEM member that was down longer than the last
 metadata resend (60 s) can have missed a commit, and with no later
@@ -125,6 +143,48 @@ checks. Not covered yet: a member that stays up through a network
 outage, and a serving node that restarted since the commit (its catch-up
 log is in memory). A saved log must not serve a commit that S4 still
 holds as delivery-pending after a restart. No wire format or API changes.
+
+On 15 Nov 2026 Claude decided the D70 caller refusal under David's
+delegation of design decisions of 10 Nov 2026
+([#1597](https://github.com/saorsa-labs/x0x/issues/1597) item 4). A
+direct send whose resolved recipient machine is revoked answers the typed
+`DmError::RecipientMachineRevoked { machine }`, and `POST /direct/send`
+maps it to HTTP 403 `recipient_machine_revoked`. The check runs before the
+ADR-0043 pairing check, on the discovery-cached machine and on the
+capability-advert binding. A machine revocation evicts the recipient from
+the discovery caches, so when no discovery entry is left the check reads
+the newest retained authenticated or announced binding, which outlives
+that eviction; a later announcement from a clean machine replaces it. A revoked binding keeps its existing typed
+answer, `recipient_pairing_denied` (`PairingDenial::BindingRevoked`). The
+S4 designated hand-off reads the new error as a policy refusal, like the
+pairing denial. A request from a revoked device keeps the #1657 typed
+catch-up refusal. The internal guarded S4 sends keep their withhold-and-retry
+path; they report to no caller. ADR 0110 stays Accepted and its text is
+unchanged.
+
+Amendment of 15 Nov 2026 (#1427), made under the design delegation of
+10 Nov 2026. A node keeps its TreeKEM catch-up log on disk
+(`treekem-catchup-log/`, one file per group, local state, never sent) and
+loads it at start, after the S4 store. So a node that restarted after it
+signed or applied a commit still serves it to a member that was offline at
+the time. The saved log of a group the node no longer stores is removed,
+and deleting a group removes its files. One rule protects S4: a removal or
+ban whose target has an S4 row (ADR 0110), in any phase, is not loaded
+from the saved log. S4 owns the delivery of that commit: an open row
+resends it only after the group's head is synced, and a closed row can
+hold a sibling that lost to another admin's commit (the W3-H 1581e fork).
+The adds and approvals of that target in the same file are held back too,
+so a held removal cannot leave its member served through an old add. A start catch-up cycle that hands its target to another
+running catch-up task waits for that task to end before it judges the
+cycle. The saved file is written by rename without fsync, so a crash can
+lose the latest copy; the node then falls back to the behaviour before
+this change (the commit is not served after its restart). The file is
+JSON and carries a format version. A file of another version, a damaged
+one, or one written before the version field existed is skipped with a
+warning and overwritten by the next save. A requester that the log shows removed or banned
+after its cached add is not served through that add. Not covered yet: a
+member that stays up through a network outage.
+No wire format or API changes.
 
 [A08](A08-r01-groups-home-membership-and-repair.md) defines valid group-state and fork recovery. A09 must not bypass that authority to obtain keys faster.
 

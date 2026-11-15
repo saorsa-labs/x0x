@@ -37,6 +37,7 @@ macro_rules! staging_supersession_regression_tests {
                 upgrade_apply_lock: Arc::clone(&older_runtime.upgrade_apply_lock),
                 shutdown_watch: older_runtime.shutdown_watch.clone(),
                 staging: older_runtime.staging.clone(),
+                observations: None,
             };
             let (older_tx, mut older_rx) = tokio::sync::mpsc::unbounded_channel();
             older_runtime.staging.observed = Some(Arc::new(move |decision| {

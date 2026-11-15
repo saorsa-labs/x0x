@@ -70,7 +70,7 @@ GET  /diagnostics/connectivity                           diagnostics connectivit
 GET  /diagnostics/ack                                    diagnostics ack                                         ACK-v2 per-stage latency buckets and outcome counters
 GET  /diagnostics/gossip                                 diagnostics gossip                                      PubSub drop-detection counters (publish/deliver deltas)
 GET  /diagnostics/transport                              diagnostics transport                                   Transport connection accounting (zombie-connection hunt, #368)
-GET  /diagnostics/upgrade                                diagnostics upgrade                                     Local version + update-policy digest for the M1 census (#1383; local only, no wire change)
+GET  /diagnostics/upgrade                                diagnostics upgrade                                     Local version, update policy and digest (#1383), plus channel, latest release-topic version, last check and pending update (#1381); local only, no wire change
 GET  /diagnostics/relay                                  diagnostics relay                                       ADR-0035 relay-decentralization metering: advert census + inbound-dialer evidence
 GET  /diagnostics/dm                                     diagnostics dm            query: agent                  Direct-message send/receive counters and per-peer health
 GET  /diagnostics/groups                                 diagnostics groups                                      Per-group ingest counters, listener state, and drop buckets

@@ -1312,8 +1312,10 @@ pub(super) struct AppState {
     /// start catch-up waits for it, in any order, and then asks again for
     /// each group that is still pending.
     pub(super) treekem_network_join_ended: tokio::sync::watch::Sender<bool>,
-    /// #1427: how many start catch-up passes this daemon began (a pass is
-    /// one catch-up cycle for one group). Diagnostics only.
+    /// #1427: how many start catch-up passes this daemon began. A pass is
+    /// one run of the start catch-up for one group, which runs up to 16
+    /// catch-up cycles; a group gets a first pass at start and at most one
+    /// more after the network join. Diagnostics only.
     pub(super) treekem_start_catchup_passes: std::sync::atomic::AtomicU64,
     /// #1657 (ADR 0110 §3): the latest typed TreeKEM catch-up refusal
     /// this daemon received, per group, keyed by the group id its own
@@ -1418,6 +1420,12 @@ pub(super) struct AppState {
     /// gossip driver neither rebroadcasts nor re-submits its own
     /// self-delivered announcement (#1169).
     pub(super) self_published_release_manifests: Arc<Mutex<SelfPublishedReleaseManifests>>,
+    /// Releases seen on the topic and the last release check (#1381),
+    /// reported by `GET /diagnostics/upgrade`. Memory only.
+    pub(super) upgrade_observations: Arc<std::sync::Mutex<super::routes::UpgradeObservations>>,
+    /// The background apply owner's intake, once the daemon has started it
+    /// (#1381: `pending_update` reads its selected release).
+    pub(super) background_submit: std::sync::OnceLock<super::routes::BackgroundSubmit>,
     /// Actual boot identity; unavailable identity refuses HTTP update only.
     #[cfg(unix)]
     pub(super) upgrade_staging: Option<super::routes::StartupStagingContext>,

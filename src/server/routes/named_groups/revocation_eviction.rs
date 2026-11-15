@@ -2645,6 +2645,20 @@ pub(super) async fn s4_seal_recheck_locked(
     Some(cause)
 }
 
+/// #1427: whether S4 holds a row, in any phase, for `target` in the group
+/// with `stable_group_id`. S4 owns the delivery of that exclusion: an open
+/// row still delivers it, and a closed row may hold a sibling that lost to
+/// another admin's commit (the 1581e fork).
+pub(in crate::server) async fn s4_has_row_for(
+    state: &AppState,
+    stable_group_id: &str,
+    target: [u8; 32],
+) -> bool {
+    let key = EvictionKey::new(stable_group_id.to_string(), target);
+    let inner = state.revocation_evictions.inner.lock().await;
+    inner.store.get(&key).is_some()
+}
+
 /// Whether `key` has an open S4 row.
 pub(super) async fn s4_row_open(state: &AppState, key: &EvictionKey) -> bool {
     let inner = state.revocation_evictions.inner.lock().await;
@@ -3360,7 +3374,7 @@ async fn refreshed_handoff_dispatch(
 ///   `Some(false)` read — so it is `Unsupported`.
 /// - `RecipientRejected` (the designated admin's own acknowledgement that
 ///   its trust policy refused this sender) and the ADR-0043 pairing
-///   denial (`RecipientPairingDenied`, or the legacy
+///   denial (`RecipientPairingDenied`, `RecipientMachineRevoked`, or the legacy
 ///   `EnvelopeConstruction` with the `RECIPIENT_PAIRING_DENIED` prefix:
 ///   this node's policy refused the designated admin's machine) are
 ///   definitive policy refusals under
@@ -3385,6 +3399,9 @@ fn designated_send_outcome(
         DmError::RecipientUpgradeRequired { .. } => Outcome::Unsupported,
         DmError::RecipientRejected { .. } => Outcome::PolicyRefused,
         DmError::RecipientPairingDenied { .. } => Outcome::PolicyRefused,
+        // #1597 item 4 (D70): this node's revocation set denies the
+        // designated admin's machine, the same local policy refusal.
+        DmError::RecipientMachineRevoked { .. } => Outcome::PolicyRefused,
         DmError::EnvelopeConstruction(message)
             if message.starts_with(x0x::dm::RECIPIENT_PAIRING_DENIED) =>
         {
@@ -9192,6 +9209,12 @@ pub(super) mod tests {
         assert_eq!(
             designated_send_outcome(&Err(x0x::dm::DmError::RecipientPairingDenied {
                 denial: x0x::key_move::PairingDenial::BindingRevoked,
+            })),
+            s4::DesignatedHandoffOutcome::PolicyRefused
+        );
+        assert_eq!(
+            designated_send_outcome(&Err(x0x::dm::DmError::RecipientMachineRevoked {
+                machine: x0x::identity::MachineId([7; 32]),
             })),
             s4::DesignatedHandoffOutcome::PolicyRefused
         );

@@ -9722,7 +9722,20 @@ async fn should_queue_treekem_membership_event(
 /// for the same page again. Each class has its own
 /// [`TREEKEM_EVENT_LOG_PER_GROUP_CAP`], oldest out first, so state-only
 /// links never evict a membership link that key catch-up needs.
+///
+/// #1427: the log is also kept on disk ([`persist_treekem_catchup_log`]),
+/// so a node that restarts after it signed or applied a commit can still
+/// serve that commit to a member that was offline at the time.
 async fn remember_treekem_membership_event(state: &AppState, event: &NamedGroupMetadataEvent) {
+    if log_treekem_membership_event(state, event).await {
+        persist_treekem_catchup_log(state, named_group_metadata_event_group_id(event)).await;
+    }
+}
+
+/// Adds `event` to the in-memory catch-up log under the rules of
+/// [`remember_treekem_membership_event`]. Returns `true` when the log
+/// changed.
+async fn log_treekem_membership_event(state: &AppState, event: &NamedGroupMetadataEvent) -> bool {
     let state_only = match (
         treekem_membership_event_frontier(event),
         treekem_state_only_link(event),
@@ -9731,17 +9744,17 @@ async fn remember_treekem_membership_event(state: &AppState, event: &NamedGroupM
         (None, Some((commit, actor))) => {
             let local_hex = hex::encode(state.agent.agent_id().as_bytes());
             if actor != local_hex || commit.committed_by != local_hex {
-                return;
+                return false;
             }
             true
         }
-        (None, None) => return,
+        (None, None) => return false,
     };
     let group_id = named_group_metadata_event_group_id(event);
     {
         let groups = state.named_groups.read().await;
         if has_withdrawn_group_record(&groups, group_id) {
-            return;
+            return false;
         }
     }
     let mut logs = state.treekem_event_log.write().await;
@@ -9752,7 +9765,7 @@ async fn remember_treekem_membership_event(state: &AppState, event: &NamedGroupM
             .filter_map(treekem_membership_event_key)
             .any(|existing| existing == key)
         {
-            return;
+            return false;
         }
     }
     log.push_back(event.clone());
@@ -9764,6 +9777,239 @@ async fn remember_treekem_membership_event(state: &AppState, event: &NamedGroupM
             break;
         };
         log.remove(oldest);
+    }
+    true
+}
+
+/// #1427 (#1926 review): whether the latest logged event that names
+/// `sender_hex` as a member target admits it: a `MemberAdded` or a
+/// `JoinRequestApproved` for it, with no later `MemberRemoved` or
+/// `MemberBanned` of it. A joiner that is not yet Active may pull pages
+/// through its cached add; a member removed or banned after that add may
+/// not, and the saved log keeps that add across restarts.
+fn cached_add_still_current<'a>(
+    events: impl IntoIterator<Item = &'a NamedGroupMetadataEvent>,
+    sender_hex: &str,
+) -> bool {
+    let mut admitted = false;
+    for event in events {
+        match event {
+            NamedGroupMetadataEvent::MemberAdded { agent_id, .. } if agent_id == sender_hex => {
+                admitted = true;
+            }
+            NamedGroupMetadataEvent::JoinRequestApproved {
+                requester_agent_id, ..
+            } if requester_agent_id == sender_hex => admitted = true,
+            NamedGroupMetadataEvent::MemberRemoved { agent_id, .. }
+            | NamedGroupMetadataEvent::MemberBanned { agent_id, .. }
+                if agent_id == sender_hex =>
+            {
+                admitted = false;
+            }
+            _ => {}
+        }
+    }
+    admitted
+}
+
+/// #1427: the file that keeps the catch-up log of `group_id` across a
+/// restart. Local state only; it is never sent.
+fn treekem_catchup_log_path(state: &AppState, group_id: &str) -> std::path::PathBuf {
+    let name = blake3::hash(group_id.as_bytes()).to_hex().to_string();
+    state
+        .data_dir
+        .join("treekem-catchup-log")
+        .join(format!("{name}.json"))
+}
+
+/// #1427: the format version of a saved catch-up log file. A file with
+/// another version is skipped with a warning (a newer release wrote it).
+const TREEKEM_CATCHUP_LOG_VERSION: u32 = 1;
+
+/// #1427: one saved catch-up log file.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedTreeKemCatchupLog {
+    version: u32,
+    events: Vec<NamedGroupMetadataEvent>,
+}
+
+/// Serializes the catch-up log file writes, so an older copy of a log
+/// cannot replace a newer one.
+fn treekem_catchup_log_file_lock() -> &'static Mutex<()> {
+    use std::sync::OnceLock;
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// #1427: write the catch-up log of `group_id` to disk. The copy is taken
+/// under the file lock, so the last write holds the latest log. A failure
+/// is logged: the in-memory log still serves until the next restart.
+async fn persist_treekem_catchup_log(state: &AppState, group_id: &str) {
+    let path = treekem_catchup_log_path(state, group_id);
+    let _file_guard = treekem_catchup_log_file_lock().lock().await;
+    let events: Vec<NamedGroupMetadataEvent> = state
+        .treekem_event_log
+        .read()
+        .await
+        .get(group_id)
+        .map(|log| log.iter().cloned().collect())
+        .unwrap_or_default();
+    let written = if events.is_empty() {
+        match tokio::fs::remove_file(&path).await {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.to_string()),
+            _ => Ok(()),
+        }
+    } else {
+        let saved = SavedTreeKemCatchupLog {
+            version: TREEKEM_CATCHUP_LOG_VERSION,
+            events,
+        };
+        match serde_json::to_vec(&saved) {
+            Ok(bytes) => crate::storage::save_private_bytes_to(&path, bytes)
+                .await
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
+        }
+    };
+    if let Err(error) = written {
+        tracing::warn!(
+            group_id = %LogHexId::group(group_id),
+            "TreeKEM catch-up log was not saved; a restart loses it: {error}"
+        );
+    }
+}
+
+/// #1427: drop the saved catch-up log of each alias of a deleted group.
+async fn remove_treekem_catchup_logs(state: &AppState, aliases: &HashSet<String>) {
+    let _file_guard = treekem_catchup_log_file_lock().lock().await;
+    for alias in aliases {
+        let path = treekem_catchup_log_path(state, alias);
+        if let Err(error) = tokio::fs::remove_file(&path).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    group_id = %LogHexId::group(alias),
+                    "saved TreeKEM catch-up log was not removed: {error}"
+                );
+            }
+        }
+    }
+}
+
+/// #1427: the removal or ban target of `event`, when it has one.
+fn treekem_removal_target(event: &NamedGroupMetadataEvent) -> Option<&str> {
+    match event {
+        NamedGroupMetadataEvent::MemberRemoved { agent_id, .. }
+        | NamedGroupMetadataEvent::MemberBanned { agent_id, .. } => Some(agent_id),
+        _ => None,
+    }
+}
+
+/// #1427: load the saved catch-up logs at start, so this node serves the
+/// commits it held before the restart. It runs after the S4 store loads.
+/// A file of a group this node no longer stores is removed. Each event
+/// goes through the rules of a live one ([`log_treekem_membership_event`]),
+/// with one more: a removal or ban whose target has an S4 row (ADR 0110),
+/// in any phase, is not served from the saved log, and neither is any add
+/// or approval of that target in the same file. S4 owns the delivery of
+/// that commit: an open row (for example `committed_delivery_pending`)
+/// resends it only once the group's head is synced, and a closed row can
+/// hold a sibling that lost to another admin's commit.
+pub(in crate::server) async fn restore_treekem_catchup_logs(state: &AppState) {
+    let dir = state.data_dir.join("treekem-catchup-log");
+    let Ok(mut listed) = tokio::fs::read_dir(&dir).await else {
+        return;
+    };
+    let mut paths = Vec::new();
+    while let Ok(Some(entry)) = listed.next_entry().await {
+        paths.push(entry.path());
+    }
+    for path in paths {
+        let events = match tokio::fs::read(&path)
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| {
+                serde_json::from_slice::<SavedTreeKemCatchupLog>(&bytes).map_err(|e| e.to_string())
+            }) {
+            Ok(saved) if saved.version == TREEKEM_CATCHUP_LOG_VERSION => saved.events,
+            Ok(saved) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    version = saved.version,
+                    "saved TreeKEM catch-up log has an unknown version; skipped"
+                );
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "saved TreeKEM catch-up log was not loaded: {error}"
+                );
+                continue;
+            }
+        };
+        let Some(group_id) = events
+            .first()
+            .map(|event| named_group_metadata_event_group_id(event).to_string())
+        else {
+            continue;
+        };
+        let stable = {
+            let groups = state.named_groups.read().await;
+            groups
+                .iter()
+                .find(|(key, info)| {
+                    !info.withdrawn
+                        && (key.as_str() == group_id
+                            || info.stable_group_id() == group_id
+                            || info.mls_group_id == group_id)
+                })
+                .map(|(_, info)| info.stable_group_id().to_string())
+        };
+        let Some(stable) = stable.filter(|_| treekem_catchup_log_path(state, &group_id) == path)
+        else {
+            let _file_guard = treekem_catchup_log_file_lock().lock().await;
+            let _ = tokio::fs::remove_file(&path).await;
+            continue;
+        };
+        // A removal or ban that S4 owns is held back, and so is every add
+        // or approval of the same target in this file: otherwise the add
+        // alone would serve the removed member pages again
+        // ([`cached_add_still_current`]).
+        let mut held_targets: HashSet<String> = HashSet::new();
+        for event in &events {
+            let Some(target) = treekem_removal_target(event) else {
+                continue;
+            };
+            let Ok(raw) = parse_agent_id_hex(target) else {
+                continue;
+            };
+            if revocation_eviction::s4_has_row_for(state, &stable, raw.0).await {
+                held_targets.insert(target.to_ascii_lowercase());
+            }
+        }
+        let mut held = 0_usize;
+        for event in &events {
+            let target = match event {
+                NamedGroupMetadataEvent::MemberAdded { agent_id, .. }
+                | NamedGroupMetadataEvent::MemberRemoved { agent_id, .. }
+                | NamedGroupMetadataEvent::MemberBanned { agent_id, .. } => Some(agent_id),
+                NamedGroupMetadataEvent::JoinRequestApproved {
+                    requester_agent_id, ..
+                } => Some(requester_agent_id),
+                _ => None,
+            };
+            if target.is_some_and(|t| held_targets.contains(&t.to_ascii_lowercase())) {
+                held += 1;
+                continue;
+            }
+            log_treekem_membership_event(state, event).await;
+        }
+        tracing::info!(
+            group_id = %LogHexId::group(&group_id),
+            loaded = events.len().saturating_sub(held),
+            held_by_s4 = held,
+            "TreeKEM catch-up log restored"
+        );
     }
 }
 
@@ -13261,17 +13507,8 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     let target_of_cached_add = {
         let logs = state.treekem_event_log.read().await;
         log_keys.iter().any(|key| {
-            logs.get(key).is_some_and(|events| {
-                events.iter().any(|event| match event {
-                    NamedGroupMetadataEvent::MemberAdded { agent_id, .. } => {
-                        agent_id == &sender_hex
-                    }
-                    NamedGroupMetadataEvent::JoinRequestApproved {
-                        requester_agent_id, ..
-                    } => requester_agent_id == &sender_hex,
-                    _ => false,
-                })
-            })
+            logs.get(key)
+                .is_some_and(|events| cached_add_still_current(events, &sender_hex))
         })
     };
     if !authorized && !target_of_cached_add {
@@ -15728,6 +15965,11 @@ async fn treekem_start_catchup_note_head(state: &AppState, key: &str, reported: 
 /// several commits needs a cycle for each.
 const TREEKEM_START_CATCHUP_CYCLES: usize = 16;
 
+/// #1427: the longest a start cycle waits for another epoch-ahead task of
+/// the same group to end. That task renews while new observations arrive,
+/// so the wait is bounded; after it the cycle is judged as it stands.
+const TREEKEM_START_CATCHUP_HANDOFF_WAIT: Duration = Duration::from_secs(600);
+
 /// #1427: how a start pass for one group ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TreeKemStartCatchupEnd {
@@ -15798,7 +16040,23 @@ async fn request_treekem_catchup_after_start(state: &Arc<AppState>, key: &str) {
         |target| {
             let state = Arc::clone(state);
             let key = key.to_string();
-            async move { request_treekem_catchup_for_epoch_ahead(&state, &key, target).await }
+            async move {
+                request_treekem_catchup_for_epoch_ahead(&state, &key, target).await;
+                // When another epoch-ahead task already holds the group, the
+                // call above only hands it the target and returns at once.
+                // Judge the cycle only after that task ends, or a cycle that
+                // asked nobody would look like "no newer epoch".
+                let deadline = tokio::time::Instant::now() + TREEKEM_START_CATCHUP_HANDOFF_WAIT;
+                while tokio::time::Instant::now() < deadline
+                    && state
+                        .treekem_epoch_ahead_targets
+                        .lock()
+                        .await
+                        .contains_key(&key)
+                {
+                    tokio::time::sleep(TREEKEM_CATCHUP_THROTTLE).await;
+                }
+            }
         },
         || {
             state
@@ -28732,6 +28990,7 @@ async fn wipe_local_group_crypto_material(
             event_log.remove(alias);
         }
     }
+    remove_treekem_catchup_logs(state, &aliases).await;
     {
         let mut catchup = state.treekem_catchup_throttle.write().await;
         for alias in &aliases {
@@ -54884,6 +55143,8 @@ pub(in crate::server) mod tests {
             upgrade_apply_lock: Arc::new(Mutex::new(())),
             http_upgrade_wait_lock: Arc::new(Mutex::new(())),
             self_published_release_manifests: Default::default(),
+            upgrade_observations: Default::default(),
+            background_submit: std::sync::OnceLock::new(),
             #[cfg(unix)]
             upgrade_staging: None,
             api_token: "test-token".to_string(),
