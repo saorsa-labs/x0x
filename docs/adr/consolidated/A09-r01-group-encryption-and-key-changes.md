@@ -119,13 +119,16 @@ and deleting a group removes its files. One rule protects S4: a removal or
 ban whose target has an S4 row (ADR 0110), in any phase, is not loaded
 from the saved log. S4 owns the delivery of that commit: an open row
 resends it only after the group's head is synced, and a closed row can
-hold a sibling that lost to another admin's commit (the W3-H 1581e fork). A start catch-up cycle that hands its target to another
+hold a sibling that lost to another admin's commit (the W3-H 1581e fork).
+The adds and approvals of that target in the same file are held back too,
+so a held removal cannot leave its member served through an old add. A start catch-up cycle that hands its target to another
 running catch-up task waits for that task to end before it judges the
 cycle. The saved file is written by rename without fsync, so a crash can
 lose the latest copy; the node then falls back to the behaviour before
-this change (the commit is not served after its restart). The file carries
-a format version, and a file of another version, or a damaged one, is
-skipped with a warning. A requester that the log shows removed or banned
+this change (the commit is not served after its restart). The file is
+JSON and carries a format version. A file of another version, a damaged
+one, or one written before the version field existed is skipped with a
+warning and overwritten by the next save. A requester that the log shows removed or banned
 after its cached add is not served through that add. Not covered yet: a
 member that stays up through a network outage.
 No wire format or API changes.

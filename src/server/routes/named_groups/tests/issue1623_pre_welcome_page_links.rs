@@ -2845,3 +2845,96 @@ async fn issue1427_corrupt_or_unknown_saved_log_loads_nothing() -> anyhow::Resul
     );
     Ok(())
 }
+
+/// #1926 review (blocker): through a real save and restore. J is added and
+/// then removed; S4 owns the removal (a row exists, in any phase), so the
+/// restore holds it back. It must hold back J's add too, or the add alone
+/// would serve the removed J pages after the restart.
+#[tokio::test]
+async fn issue1427_restore_holds_the_add_of_a_held_removal_target() -> anyhow::Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let owner = state.agent.identity().agent_keypair();
+    let owner_hex = hex::encode(owner.agent_id().as_bytes());
+    let j = agent(REQUESTER);
+    let mut ahead = base_group(owner, None)?;
+    let before_add = ahead.clone();
+    let add = seal_link(&mut ahead, owner, 2_000, |next| {
+        next.add_member(
+            j.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(owner_hex.clone()),
+            None,
+        );
+        take_treekem_epoch(next);
+    })?;
+    let added = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
+        group_id: before_add.stable_group_id().to_string(),
+        revision: add.revision,
+        actor: owner_hex.clone(),
+        agent_id: j.clone(),
+        display_name: None,
+        treekem_commit_b64: treekem_commit_b64(),
+        treekem_welcome_b64: None,
+        welcome_ref: None,
+        treekem_epoch: Some(TREEKEM_EPOCH),
+        treekem_key_package_hash: None,
+        member_joined_recovery: None,
+        member_recovery_history: Vec::new(),
+        certificate_b64: None,
+        owner_mandate: None,
+        commit: Some(add.clone()),
+        reseat_mandate: None,
+    };
+    let removal = seal_link(&mut ahead, owner, 3_000, |next| {
+        next.remove_member(&j, Some(owner_hex.clone()));
+        take_treekem_epoch(next);
+    })?;
+    let removed = NamedGroupMetadataEvent::MemberRemoved {
+        group_id: before_add.stable_group_id().to_string(),
+        revision: removal.revision,
+        actor: owner_hex.clone(),
+        agent_id: j.clone(),
+        treekem_commit_b64: treekem_commit_b64(),
+        treekem_epoch: Some(TREEKEM_EPOCH + 1),
+        secret_epoch: None,
+        commit: Some(removal.clone()),
+    };
+    let group_id = named_group_metadata_event_group_id(&added).to_string();
+    let stable = ahead.stable_group_id().to_string();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), ahead);
+    remember_treekem_membership_event(&state, &added).await;
+    remember_treekem_membership_event(&state, &removed).await;
+    let logged = |state: &AppState| {
+        let state = state.treekem_event_log.try_read().ok().map(|logs| {
+            logs.get(&group_id)
+                .map(|log| log.iter().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        });
+        state.unwrap_or_default()
+    };
+    assert_eq!(logged(&state).len(), 2, "#1427: both links are logged");
+    assert!(!cached_add_still_current(logged(&state).iter(), &j));
+
+    // Restart: the S4 store holds a row for J, then the saved log loads.
+    state.treekem_event_log.write().await.clear();
+    let target: [u8; 32] = hex::decode(&j)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("agent id length"))?;
+    revocation_eviction::open_fallback_row_for_test(&state, &stable, target, &group_id).await;
+    restore_treekem_catchup_logs(&state).await;
+    let restored = logged(&state);
+    assert!(
+        !cached_add_still_current(restored.iter(), &j),
+        "#1427: after the restart a held removal must not leave J served through its add"
+    );
+    assert!(
+        restored.is_empty(),
+        "#1427: the add and the removal of a held target both stay out"
+    );
+    Ok(())
+}

@@ -9895,7 +9895,8 @@ fn treekem_removal_target(event: &NamedGroupMetadataEvent) -> Option<&str> {
 /// A file of a group this node no longer stores is removed. Each event
 /// goes through the rules of a live one ([`log_treekem_membership_event`]),
 /// with one more: a removal or ban whose target has an S4 row (ADR 0110),
-/// in any phase, is not served from the saved log. S4 owns the delivery of
+/// in any phase, is not served from the saved log, and neither is any add
+/// or approval of that target in the same file. S4 owns the delivery of
 /// that commit: an open row (for example `committed_delivery_pending`)
 /// resends it only once the group's head is synced, and a closed row can
 /// hold a sibling that lost to another admin's commit.
@@ -9956,15 +9957,36 @@ pub(in crate::server) async fn restore_treekem_catchup_logs(state: &AppState) {
             let _ = tokio::fs::remove_file(&path).await;
             continue;
         };
+        // A removal or ban that S4 owns is held back, and so is every add
+        // or approval of the same target in this file: otherwise the add
+        // alone would serve the removed member pages again
+        // ([`cached_add_still_current`]).
+        let mut held_targets: HashSet<String> = HashSet::new();
+        for event in &events {
+            let Some(target) = treekem_removal_target(event) else {
+                continue;
+            };
+            let Ok(raw) = parse_agent_id_hex(target) else {
+                continue;
+            };
+            if revocation_eviction::s4_has_row_for(state, &stable, raw.0).await {
+                held_targets.insert(target.to_ascii_lowercase());
+            }
+        }
         let mut held = 0_usize;
         for event in &events {
-            if let Some(target) =
-                treekem_removal_target(event).and_then(|t| parse_agent_id_hex(t).ok())
-            {
-                if revocation_eviction::s4_has_row_for(state, &stable, target.0).await {
-                    held += 1;
-                    continue;
-                }
+            let target = match event {
+                NamedGroupMetadataEvent::MemberAdded { agent_id, .. }
+                | NamedGroupMetadataEvent::MemberRemoved { agent_id, .. }
+                | NamedGroupMetadataEvent::MemberBanned { agent_id, .. } => Some(agent_id),
+                NamedGroupMetadataEvent::JoinRequestApproved {
+                    requester_agent_id, ..
+                } => Some(requester_agent_id),
+                _ => None,
+            };
+            if target.is_some_and(|t| held_targets.contains(&t.to_ascii_lowercase())) {
+                held += 1;
+                continue;
             }
             log_treekem_membership_event(state, event).await;
         }
