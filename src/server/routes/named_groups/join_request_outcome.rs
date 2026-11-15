@@ -84,6 +84,7 @@ pub(in crate::server) fn send_join_request_refusal(
         request_id: request_id.to_string(),
         envelope_digest: hex::encode(envelope_digest),
         reason,
+        head: None,
     };
     let Ok(payload) = outcome.encode() else {
         return;

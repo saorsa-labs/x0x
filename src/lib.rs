@@ -30433,6 +30433,7 @@ mod tests {
             request_id: "r".to_string(),
             envelope_digest: "ab".repeat(32),
             reason: groups::join_outcome::JoinRequestRefusalReason::Stale,
+            head: None,
         }
         .encode()
         .expect("encode");

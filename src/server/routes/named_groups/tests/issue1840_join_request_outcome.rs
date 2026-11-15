@@ -254,6 +254,7 @@ async fn issue1840_refused_offer_reaches_requester_as_typed_outcome() {
                 request_id: REQUEST_ID.to_string(),
                 envelope_digest: hex::encode(entry.digest),
                 reason,
+                head: None,
             },
             "{kind:?}"
         );
