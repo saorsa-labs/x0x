@@ -32,14 +32,18 @@
 //!   after the replacement write) becomes history and `F` is kept.
 //! - History with `F` present: both stay byte-identical. History with `F`
 //!   absent: no replacement is written and the history stays.
-//! - A healthy restart: `F`'s bytes and `generation` do not change.
+//! - A healthy restart (J's writes held): `F`'s bytes and `generation` do
+//!   not change, read after J stops.
+//! - Each verified pending copy becomes history under its own name, byte
+//!   for byte.
 //!
 //! In addition, for S3: while a §5a fault state holds (newer, unavailable,
-//! quarantine failed) J sends no request and arms nothing, and no marker
-//! or gate is cleared. A request is any direct write from J to A, counted
-//! when J hands it to the transport (J's writes are dropped after that).
-//! The healthy restart is the control: there J does ask A, so the count
-//! can see a request.
+//! quarantine failed) J's writes pass, yet J sends no request and arms
+//! nothing, and no marker or gate is cleared. A request is a requester
+//! row for J on A with a newer `at_ms` than before the case, or an answer
+//! from A on J's direct-message stream. The last case, a healthy restart
+//! with J's writes passing, is the control: there A does record J's
+//! request, so the check can see one.
 //!
 //! Not covered, by name: the fsync failures at §5a steps 2, 4 and 5 (no
 //! fsync seam, as for S4's files in `case_1581g`), and a clock rollback
@@ -83,10 +87,15 @@ enum Case {
     PendingBesideValidF,
     HistoryFPresent,
     HistoryFAbsent,
+    /// A healthy restart with J's writes held: `F` must not change.
     Healthy,
+    /// A healthy restart with J's writes passing: the control that the
+    /// request check sees J ask A.
+    HealthyAsks,
 }
 
-/// In order. The healthy restart is last.
+/// In order. The healthy restarts are last; the asking one lets J move,
+/// so it is the very last.
 const CASES: &[Case] = &[
     Case::MissingPrefix,
     Case::Truncated,
@@ -101,6 +110,7 @@ const CASES: &[Case] = &[
     Case::HistoryFPresent,
     Case::HistoryFAbsent,
     Case::Healthy,
+    Case::HealthyAsks,
 ];
 
 impl Case {
@@ -175,8 +185,9 @@ fn plant_pending(dir: &Path, file: &str, n: u8, named: &[u8], bytes: &[u8]) -> R
 struct Planted {
     /// The bytes at `F`, when `F` is a file.
     f: Option<Vec<u8>>,
-    /// The pending copies that verify, and the ones that fail.
-    good: Vec<String>,
+    /// The pending copies that verify (with their bytes), and the ones
+    /// that fail.
+    good: Vec<(String, Vec<u8>)>,
     bad: Vec<String>,
     /// History copies planted, with their bytes.
     history: Vec<(String, Vec<u8>)>,
@@ -203,9 +214,8 @@ fn plant(dir: &Path, file: &str, healthy: &[u8], case: Case) -> Result<Planted> 
             std::fs::remove_file(&path)?;
             planted.f = None;
             let bytes = copy_bytes(1);
-            planted
-                .good
-                .push(plant_pending(dir, file, 1, &bytes, &bytes)?);
+            let name = plant_pending(dir, file, 1, &bytes, &bytes)?;
+            planted.good.push((name, bytes));
         }
         Case::PendingFailsVerify => {
             std::fs::remove_file(&path)?;
@@ -220,9 +230,8 @@ fn plant(dir: &Path, file: &str, healthy: &[u8], case: Case) -> Result<Planted> 
             planted.f = None;
             for n in [3u8, 4] {
                 let bytes = copy_bytes(n);
-                planted
-                    .good
-                    .push(plant_pending(dir, file, n, &bytes, &bytes)?);
+                let name = plant_pending(dir, file, n, &bytes, &bytes)?;
+                planted.good.push((name, bytes));
             }
             let bytes = copy_bytes(5);
             planted
@@ -231,9 +240,8 @@ fn plant(dir: &Path, file: &str, healthy: &[u8], case: Case) -> Result<Planted> 
         }
         Case::PendingBesideValidF => {
             let bytes = copy_bytes(6);
-            planted
-                .good
-                .push(plant_pending(dir, file, 6, &bytes, &bytes)?);
+            let name = plant_pending(dir, file, 6, &bytes, &bytes)?;
+            planted.good.push((name, bytes));
         }
         Case::HistoryFPresent | Case::HistoryFAbsent => {
             if case == Case::HistoryFAbsent {
@@ -309,6 +317,11 @@ impl Disk {
     }
 }
 
+/// The `generation` of a sidecar's bytes, when they decode.
+fn generation_of(bytes: &[u8]) -> Option<u64> {
+    decode_sidecar(bytes).ok().map(|body| body.generation)
+}
+
 /// The `txid` (hex) in a quarantined copy's name.
 fn txid_of(name: &str, file: &str) -> Option<String> {
     name.strip_prefix(&format!("{file}.q-"))
@@ -343,6 +356,13 @@ fn judge(
         ids.sort();
         ids
     };
+    // Each verified pending copy is now history under its own name
+    // (without `.pending`), byte for byte.
+    let finalized = planted.good.iter().all(|(name, bytes)| {
+        quarantine_history_name(name)
+            .is_some_and(|history| disk.history.iter().any(|(n, b)| n == history && b == bytes))
+    });
+    let good_names: Vec<String> = planted.good.iter().map(|(n, _)| n.clone()).collect();
     let mut rebuilt = disk.rebuilt_from.clone();
     rebuilt.sort();
     match case {
@@ -367,8 +387,9 @@ fn judge(
                 && state == case.fault()
         }
         Case::PendingFMissing | Case::ThreePendingOneFails => {
-            rebuilt == txids(&planted.good)
+            rebuilt == txids(&good_names)
                 && new_history.len() == planted.good.len()
+                && finalized
                 && disk.pending == planted.bad
         }
         Case::PendingFailsVerify => {
@@ -379,7 +400,10 @@ fn judge(
                 && state == case.fault()
         }
         Case::PendingBesideValidF => {
-            disk.f.as_deref() == Some(healthy) && new_history.len() == 1 && disk.pending.is_empty()
+            disk.f.as_deref() == Some(healthy)
+                && new_history.len() == 1
+                && finalized
+                && disk.pending.is_empty()
         }
         Case::HistoryFPresent => {
             disk.f.as_deref() == Some(healthy)
@@ -390,9 +414,16 @@ fn judge(
         Case::HistoryFAbsent => {
             disk.f.is_none() && history_kept && new_history.is_empty() && disk.pending.is_empty()
         }
-        // J's writes pass in this case, so J can move on and rewrite `F`
-        // later; the restart itself is checked on `F` at the start.
-        Case::Healthy => disk.history.is_empty() && disk.pending.is_empty(),
+        // J's writes are held, so nothing but the restart can touch `F`.
+        Case::Healthy => {
+            disk.f.as_deref() == Some(healthy)
+                && disk.generation == generation_of(healthy)
+                && disk.history.is_empty()
+                && disk.pending.is_empty()
+        }
+        // J's writes pass, so J can move on and rewrite `F`; this case is
+        // the request control only.
+        Case::HealthyAsks => disk.history.is_empty() && disk.pending.is_empty(),
     }
 }
 
@@ -454,9 +485,9 @@ async fn one_case(
     restore(&dir, copy)?;
     let planted = plant(&dir, file, healthy, case)?;
     // J's writes pass in a fault case (to see that J sends nothing) and in
-    // the healthy restart (to see that it does). Elsewhere they stay held,
-    // so J never moves.
-    let open = case.fault().is_some() || case == Case::Healthy;
+    // the asking healthy restart (to see that it does). Elsewhere they stay
+    // held, so J never moves.
+    let open = case.fault().is_some() || case == Case::HealthyAsks;
     j_out.store(!open, Ordering::SeqCst);
     let row_before = a_row_for_j(sim, group).await?;
     sim.fabric().mark(format!("case: H-S3-q2 {case:?}"));
@@ -465,8 +496,6 @@ async fn one_case(
     let mut rx = sim.state("J")?.agent.subscribe_direct();
     let a_id = sim.ids("A")?.0;
     let mut answered: Vec<(u64, usize)> = Vec::new();
-    // The healthy restart: F before J does anything (a passive read).
-    let at_start = std::fs::read(dir.join(file)).ok();
     let mut heads: Vec<u64> = Vec::new();
     let mut markers: Vec<Option<String>> = Vec::new();
     let mut gates: Vec<Option<String>> = Vec::new();
@@ -498,7 +527,15 @@ async fn one_case(
         .await;
     drain_answers(&mut rx, &a_id, &mut answered);
     let row_after = a_row_for_j(sim, group).await?;
-    let asked = row_after != row_before || !answered.is_empty();
+    // A request is a row with a newer `at_ms` than before (a pruned or
+    // otherwise changed row is not one), or an answer from A.
+    let at_ms = |row: &Value| row["at_ms"].as_u64();
+    let newer_row = match (at_ms(&row_before), at_ms(&row_after)) {
+        (Some(before), Some(after)) => after > before,
+        (None, Some(_)) => true,
+        _ => false,
+    };
+    let asked = newer_row || !answered.is_empty();
     sim.stop("J", RestartMode::Graceful).await?;
     j_out.store(true, Ordering::SeqCst);
     let disk = Disk::read(&dir, file)?;
@@ -510,22 +547,13 @@ async fn one_case(
     if case.fault().is_some() {
         ok = ok && !asked && still;
     }
-    if case == Case::Healthy {
-        let generation = |bytes: Option<&[u8]>| {
-            bytes
-                .and_then(|b| decode_sidecar(b).ok())
-                .map(|b| b.generation)
-        };
-        ok = ok
-            && at_start.as_deref() == Some(healthy)
-            && generation(at_start.as_deref()) == generation(Some(healthy));
-    }
-    let note = format!(
+    let note =
+        format!(
         "{case:?}: ok={ok}; state {state:?}; asked {asked} (answers {answered:?}, A's row before \
          {row_before} after {row_after}); heads {heads:?}; markers \
          {markers:?}; gates {gates:?}; planted good {:?} bad {:?} history {:?}; disk f {:?} \
          dir {} generation {:?} rebuilt_from {:?} history {:?} pending {:?}",
-        planted.good,
+        planted.good.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
         planted.bad,
         planted
             .history
@@ -635,7 +663,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         )
         .await?;
         receipt.note(outcome.note.clone());
-        if *case == Case::Healthy {
+        if *case == Case::HealthyAsks {
             healthy_requests = outcome.asked;
         }
         if !outcome.ok {
