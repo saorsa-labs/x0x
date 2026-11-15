@@ -109,6 +109,21 @@ outage, and a serving node that restarted since the commit (its catch-up
 log is in memory). A saved log must not serve a commit that S4 still
 holds as delivery-pending after a restart. No wire format or API changes.
 
+Amendment of 15 Nov 2026 (#1427), made under the design delegation of
+10 Nov 2026. A node keeps its TreeKEM catch-up log on disk
+(`treekem-catchup-log/`, one file per group, local state, never sent) and
+loads it at start, after the S4 store. So a node that restarted after it
+signed or applied a commit still serves it to a member that was offline at
+the time. The saved log of a group the node no longer stores is removed,
+and deleting a group removes its files. One rule protects S4: a removal or
+ban whose target still has an open S4 row (ADR 0110, for example
+`committed_delivery_pending`) is not loaded from the saved log, because S4
+owns the delivery of that commit and resends it only after the group's
+head is synced. A start catch-up cycle that hands its target to another
+running catch-up task waits for that task to end before it judges the
+cycle. Not covered yet: a member that stays up through a network outage.
+No wire format or API changes.
+
 [A08](A08-r01-groups-home-membership-and-repair.md) defines valid group-state and fork recovery. A09 must not bypass that authority to obtain keys faster.
 
 ## Security claims

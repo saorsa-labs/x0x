@@ -61,6 +61,16 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **A node that restarted still serves the TreeKEM commits it held
+  (#1427).** The TreeKEM catch-up log is saved under `treekem-catchup-log/`
+  in the data directory (one file per group, local only) and loaded at
+  start. A member that was offline when a commit was made can catch up
+  from a signer that restarted since. A removal or ban that S4 still
+  delivers (an open ADR 0110 row) is not loaded from the saved file. A
+  start catch-up cycle now waits for another running catch-up task of the
+  same group to end before it judges the cycle. No wire format or API
+  changes.
+
 - **A TreeKEM member that was down past the last metadata resend asks for
   the commits it missed after it starts (#1427).** With no later traffic,
   such a member stayed at its old epoch. When its last recorded up time is
