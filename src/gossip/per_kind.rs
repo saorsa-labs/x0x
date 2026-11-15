@@ -9,8 +9,9 @@
 //!
 //! `delivered` and `published` are Eager PlumTree traffic only. Same-daemon
 //! `local:` hand-offs never enter PlumTree and are not counted. Per-kind
-//! verify CPU is not in this slice: the pinned saorsa-gossip 0.5.90 crate
-//! has no per-kind verify meter, and x0x does not sample `stage_stats()`.
+//! verify CPU is not in this slice: the pinned saorsa-gossip 0.5.91 crate
+//! exposes a per-kind verify meter (`verify_by_kind_stats()`), but x0x does
+//! not read it yet (#1397) and does not sample `stage_stats()`.
 //!
 //! The reporting clock starts when the meter is created, with a zero
 //! baseline taken at that same moment. `window_secs` is the elapsed seconds

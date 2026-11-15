@@ -29,7 +29,11 @@ HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 HEX16 = re.compile(r"[0-9a-f]{16}\Z")
 # crates.io 0.5.91: against 0.5.90 it adds per-kind verify counters,
 # msg_id-carrying subscriptions, the Critical Data cooling exemption at claim
-# time and V3 recovery-intent keying; no outbound meter definition changes.
+# time, V3 recovery-intent keying, no send attempts for a stale eager-reply
+# claim (pruned or token mismatch), no IWANT re-admission while
+# retry_pending, and refusal of a local publish whose signing returns an
+# empty signature (msg_id_after_local_sign); none changes an outbound meter
+# definition.
 # 0.5.90's pubsub sources were byte-identical to 0.5.89, which changed only
 # payload replay refusal relative to 0.5.88. Outbound meters,
 # wire_bytes_for_peer and key_cache CONTROL_DOMAIN retain the reviewed
