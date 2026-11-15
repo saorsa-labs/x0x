@@ -207,7 +207,7 @@ fn a_below_window_report_clears_evidence_but_does_not_confirm() -> anyhow::Resul
     note_head_report(&mut rounds, &mut asks, "g", &head, holder, first, now);
     let round = rounds.get("g").expect("round");
     assert!(round.conflicting.contains(&holder));
-    assert!(!round.synced(&head, 1, false, true, later, wait));
+    assert!(!round.synced(&head, 1, false, true, true, later, wait));
 
     let second = classify_head_report(&info, &unlinkable(), Some(floor - 1));
     assert_eq!(second, HeadReport::BelowRetainedWindow);
@@ -219,10 +219,10 @@ fn a_below_window_report_clears_evidence_but_does_not_confirm() -> anyhow::Resul
         asks.get("g").expect("asks").answered.contains(&holder),
         "the holder answered this round"
     );
-    assert!(!round.synced(&head, 1, false, true, now, wait));
-    assert!(round.synced(&head, 1, false, true, later, wait));
+    assert!(!round.synced(&head, 1, false, true, true, now, wait));
+    assert!(round.synced(&head, 1, false, true, true, later, wait));
     // Higher-head evidence from elsewhere still blocks.
-    assert!(!round.synced(&head, 1, true, true, later, wait));
+    assert!(!round.synced(&head, 1, true, true, true, later, wait));
     Ok(())
 }
 
@@ -250,8 +250,8 @@ fn a_below_window_holder_never_becomes_conflicting() -> anyhow::Result<()> {
     let ask = refresh_head_round(&mut rounds, &mut asks, "g", &head, &[holder], now, wait);
     assert!(ask.is_empty(), "the holder answered: it is not asked again");
     let round = rounds.get("g").expect("round");
-    assert!(!round.synced(&head, 1, false, true, now, wait));
-    assert!(round.synced(&head, 1, false, true, now + wait, wait));
+    assert!(!round.synced(&head, 1, false, true, true, now, wait));
+    assert!(round.synced(&head, 1, false, true, true, now + wait, wait));
     Ok(())
 }
 
