@@ -69,6 +69,16 @@ the requester: `x0x-group-join-outcome-v1\0` followed by JSON
   the offer of that envelope, and shows it as `own_join_request` on
   `GET /groups/:id`. The roster is not changed.
 - A durability failure on the authority is not a refusal and sends nothing.
+- A `stale` outcome may carry an optional `head` (A08 amendment of 15 Nov
+  2026): the authority's signed head commit, the roster projection that its
+  `roster_root` hashes (certificate bytes stripped) and its public metadata,
+  in the `RetainedCommit` shape. A headed outcome can be up to 45 056 bytes
+  (`MAX_JOIN_REQUEST_HEAD_OUTCOME_BYTES`); one without a head keeps the
+  1024-byte bound, and a head on any other reason makes the outcome
+  unreadable. `adopt_join_head` checks a head against the requester's copy
+  and returns that copy with the head installed. A first-release requester
+  cannot read a headed outcome (it is over its bound), so an authority sends
+  a head only to a requester that advertises it can use one.
 
 ### Producer and relay flow
 

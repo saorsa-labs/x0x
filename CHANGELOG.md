@@ -6,6 +6,20 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **A `stale` join-request outcome can carry the authority's head (#1840,
+  A08 amendment of 15 Nov 2026).** New optional `head` field on
+  `groups::join_outcome::JoinRequestOutcome` (signed head commit, roster
+  projection, public metadata) and `groups::join_outcome::adopt_join_head`,
+  which checks a head against a requester's copy and installs it. Wire and
+  library only: nothing sends or uses a head yet.
+- **`GET /diagnostics/upgrade` reports release observations (#1381, A14
+  amendment of 15 Nov 2026).** New fields: `channel` (`stable` or
+  `prerelease`), `latest_release_topic_version` (highest verified release
+  seen on `x0x/release`), `last_check` (source, time and outcome of the last
+  startup, fallback-poll or `GET /upgrade` check) and `pending_update` (the
+  background apply owner's queued, applying or failed release, else the
+  newest observed newer version). Memory only; reset on restart. `x0x doctor`
+  uses `pending_update`.
 - **`system.health_verdict` and `system.upgrade_state` events on
   `GET /events` and `/ws` (#1351, A14 amendment of 15 Nov 2026).** The 5 s
   health refresher emits one event when the M1 `/health` verdict changes and
@@ -13,6 +27,12 @@ All notable changes to this project will be documented in this file.
   `latest_version`, `handoff_pending`, `failed_artifact`). The first check
   after start is the baseline and emits nothing. `/ws` sessions get typed
   frames `{"type":"system.…","data":{…}}`.
+- **`POST /direct/send` names a revoked recipient machine (#1597 item 4,
+  ADR 0110 D70).** A send whose resolved recipient machine is revoked answers
+  `403 recipient_machine_revoked` (Rust: `DmError::RecipientMachineRevoked
+  { machine }`) instead of a generic transport error. Nothing is sent; the
+  agent keeps its group seats. A revoked binding still answers
+  `recipient_pairing_denied`.
 - **`GET /sync/devices` names the source of each device's enrollment record
   (#1107).** Each row has `record_source` (`"local"` when this machine wrote
   the stored owner-device record, `"synced"` when another owner device wrote
@@ -135,6 +155,18 @@ All notable changes to this project will be documented in this file.
 
 ### Tests and tooling
 
+- **Release propagation over real gossip (#1169).** A two-node loopback test
+  runs node A's fallback driver, which observes a signed release and
+  publishes it on `x0x/release`, and node B's gossip driver, which verifies
+  it and queues it with its background apply owner. It passes in about 4 s
+  against the issue's bar of 2 × the 600 s heartbeat.
+- **The W3-H row H-S3-d2 uses the ADR setup: the removed admin's invite is
+  minted at the shared head r (#1797).** With the invite-base roster fix,
+  the joiner on the fork holds a marker naming the owner's removal and shows
+  `reseat_required {not_a_member}`. The #1797 unit test's tampered-roster
+  control now forges an extra seat, so it proves the root check. A policy
+  change inside a served chain still fails closed (A08 amendment of 15 Nov
+  2026).
 - **The forward gate after a true restart of the receiver (#1107).** A new
   real-path test shuts the receiving daemon down, builds it again from its
   files, and opens a `ForwardV2` stream from an owner device it knows only
@@ -175,6 +207,20 @@ All notable changes to this project will be documented in this file.
   registered=0`. Fixtures log at `warn`, where dial and join activity is
   not recorded. A daemon that does not answer keeps unknown counts; it is
   never reported as zero connections.
+
+### Fixed
+
+- **A daemon that restarts with pending S4 work no longer seals a stale
+  head (#1581).** If the `.evs` file held an unsealed revocation-eviction
+  row, the group needs a holder to confirm its head before S4 seals there.
+  Until then the row shows `waiting_for_head_sync`, also past the 13 s
+  restart sync wait. Before, the wait alone counted as a synced head, and a
+  restarted admin could seal its stale head with a divergent key.
+- **A demoted S4 worker shows `local_committer_ineligible` (#1581).** An
+  admin that is demoted to member while it holds an open revocation-eviction
+  row now marks the row `local_committer_ineligible` naming the next
+  admin, as ADR 0110 §4 wants. Before, the row showed
+  `waiting_for_designated_admin`.
 
 ## [v0.48.1] - 2026-10-17
 

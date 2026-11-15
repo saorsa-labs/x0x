@@ -1420,6 +1420,12 @@ pub(super) struct AppState {
     /// gossip driver neither rebroadcasts nor re-submits its own
     /// self-delivered announcement (#1169).
     pub(super) self_published_release_manifests: Arc<Mutex<SelfPublishedReleaseManifests>>,
+    /// Releases seen on the topic and the last release check (#1381),
+    /// reported by `GET /diagnostics/upgrade`. Memory only.
+    pub(super) upgrade_observations: Arc<std::sync::Mutex<super::routes::UpgradeObservations>>,
+    /// The background apply owner's intake, once the daemon has started it
+    /// (#1381: `pending_update` reads its selected release).
+    pub(super) background_submit: std::sync::OnceLock<super::routes::BackgroundSubmit>,
     /// Actual boot identity; unavailable identity refuses HTTP update only.
     #[cfg(unix)]
     pub(super) upgrade_staging: Option<super::routes::StartupStagingContext>,

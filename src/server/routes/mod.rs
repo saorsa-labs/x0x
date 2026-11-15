@@ -170,3 +170,4 @@ pub(super) use upgrade::{
     run_gossip_update_listener, run_startup_update_check, BackgroundRuntime,
     SelfPublishedReleaseManifests, StartupUpdateCheckRuntime,
 };
+pub(super) use upgrade::{BackgroundSubmit, UpgradeObservations};

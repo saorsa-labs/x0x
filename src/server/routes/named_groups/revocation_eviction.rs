@@ -189,6 +189,14 @@ struct S4Inner {
     not_durable: BTreeMap<EvictionKey, u64>,
     /// §2: per stable group ID, the current head catch-up round.
     head_rounds: HashMap<String, HeadRound>,
+    /// #1581 (`s4_restart_stale_head`; David's rulings of 29 Oct 2026
+    /// 00:15/00:40 GMT): the groups that had an unsealed (pending or
+    /// prepared) row in the `.evs` this boot loaded, until a holder
+    /// confirms a head of the group. For
+    /// such a group the bounded restart sync wait does not end discovery
+    /// while a holder exists: a node that restarted with pending work on
+    /// a head loaded from disk seals nothing until a holder confirms it.
+    restart_unconfirmed: BTreeSet<String>,
     /// §2: the last ask of each peer in the current round.
     head_round_asks: HeadRoundAsks,
     /// #1660 (Engineer ruling, 29 Oct 17:12 GMT): how many head asks
@@ -342,7 +350,10 @@ const HEAD_ROUND_REASK: Duration = Duration::from_secs(2);
 /// holder answers a catch-up page, after that page is applied, with
 /// exactly the local head (any holder; no quorum). If no holder answers,
 /// the bounded restart sync wait from the round start ends discovery
-/// (D73). A holder that reports a different head is unresolved head
+/// (D73), except for a group whose open row this boot loaded from the
+/// previous boot's `.evs`: there, while any holder exists, only a
+/// holder's confirmation syncs, also past the wait (#1581,
+/// `S4Inner::restart_unconfirmed`). A holder that reports a different head is unresolved head
 /// evidence: the round cannot complete, and it restarts (asks again) after
 /// the wait. A new local head starts a new round.
 ///
@@ -394,12 +405,17 @@ impl HeadRound {
     /// The §2 seal condition for this round. `holders` is the number of
     /// other members that could hold a later head; `unresolved` is the
     /// higher-head evidence from [`unresolved_head_evidence`].
+    /// `wait_ends_discovery` is false for a group in
+    /// `S4Inner::restart_unconfirmed` (#1581): then the elapsed wait
+    /// alone never syncs while a holder exists.
+    #[allow(clippy::too_many_arguments)]
     fn synced(
         &self,
         current_head: &str,
         holders: usize,
         unresolved: bool,
         restart_wait_elapsed: bool,
+        wait_ends_discovery: bool,
         now: Instant,
         wait: Duration,
     ) -> bool {
@@ -409,7 +425,7 @@ impl HeadRound {
             && self.conflicting.is_empty()
             && (self.confirmed
                 || holders == 0
-                || now.saturating_duration_since(self.started) >= wait)
+                || (wait_ends_discovery && now.saturating_duration_since(self.started) >= wait))
     }
 }
 
@@ -923,6 +939,7 @@ async fn group_head_synced_at(state: &AppState, group_key: &str, tree_epoch: Opt
         )
         .collect();
     let holders = head_holders(&info, &local, &excluded).len();
+    let wait_ends_discovery = !inner.restart_unconfirmed.contains(info.stable_group_id());
     inner
         .head_rounds
         .get(info.stable_group_id())
@@ -932,6 +949,7 @@ async fn group_head_synced_at(state: &AppState, group_key: &str, tree_epoch: Opt
                 holders,
                 unresolved,
                 true,
+                wait_ends_discovery,
                 now,
                 runtime.timing.restart_sync_wait,
             )
@@ -1225,6 +1243,10 @@ pub(in crate::server) async fn note_catchup_head(
         report,
         Instant::now(),
     );
+    // #1581: a holder confirmed this group's head since the boot.
+    if report == HeadReport::OnLocalChain {
+        state_inner.restart_unconfirmed.remove(&stable);
+    }
 }
 
 /// ADR 0094 host-commit gate (§5). S4 creates or materially writes its
@@ -1515,12 +1537,14 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
                 .map(|peer| ((*group_key).clone(), x0x::identity::AgentId(peer))),
         );
         let unresolved = head_evidence.get(stable).copied().unwrap_or(true);
+        let wait_ends_discovery = !inner.restart_unconfirmed.contains(stable);
         let synced = inner.head_rounds.get(stable).is_some_and(|round| {
             round.synced(
                 &info.state_hash,
                 holders.len(),
                 unresolved,
                 restart_wait_elapsed,
+                wait_ends_discovery,
                 now,
                 runtime.timing.restart_sync_wait,
             )
@@ -3350,7 +3374,7 @@ async fn refreshed_handoff_dispatch(
 ///   `Some(false)` read — so it is `Unsupported`.
 /// - `RecipientRejected` (the designated admin's own acknowledgement that
 ///   its trust policy refused this sender) and the ADR-0043 pairing
-///   denial (`RecipientPairingDenied`, or the legacy
+///   denial (`RecipientPairingDenied`, `RecipientMachineRevoked`, or the legacy
 ///   `EnvelopeConstruction` with the `RECIPIENT_PAIRING_DENIED` prefix:
 ///   this node's policy refused the designated admin's machine) are
 ///   definitive policy refusals under
@@ -3375,6 +3399,9 @@ fn designated_send_outcome(
         DmError::RecipientUpgradeRequired { .. } => Outcome::Unsupported,
         DmError::RecipientRejected { .. } => Outcome::PolicyRefused,
         DmError::RecipientPairingDenied { .. } => Outcome::PolicyRefused,
+        // #1597 item 4 (D70): this node's revocation set denies the
+        // designated admin's machine, the same local policy refusal.
+        DmError::RecipientMachineRevoked { .. } => Outcome::PolicyRefused,
         DmError::EnvelopeConstruction(message)
             if message.starts_with(x0x::dm::RECIPIENT_PAIRING_DENIED) =>
         {
@@ -5179,6 +5206,13 @@ async fn load_persisted_obligations(state: &AppState) {
         }
     }
     let mut inner = runtime.inner.lock().await;
+    // Only unsealed work: a committed row's delivery resends its saved
+    // event and seals nothing new.
+    inner.restart_unconfirmed = store
+        .rows()
+        .filter(|row| matches!(row.phase, Phase::Pending | Phase::Prepared))
+        .map(|row| row.stable_group_id.clone())
+        .collect();
     inner.store = store;
     inner.sidecar = sidecar;
     inner.rebuilt_from = rebuilt_from;
@@ -5591,6 +5625,40 @@ pub(super) mod tests {
 
     // ─── Codex round 1, item 3: head sync is not elapsed time ──────────
 
+    /// #1581 (`s4_restart_stale_head`, David's rulings of 29 Oct 2026
+    /// 00:15/00:40 GMT): for a group whose open row this boot loaded from
+    /// the previous boot's `.evs`, the elapsed wait alone never syncs while
+    /// a holder exists, inside the wait or past it. A holder's
+    /// confirmation does, and with no holder nothing can hold a later
+    /// head. FAIL-BEFORE: `synced` took the elapsed wait as a usable head,
+    /// so the restarted node sealed its stale head at about the wait
+    /// (`ci.yml` pinned `w3h_1581c_red_restart_stale_head_no_sync_past_wait=RED`).
+    #[test]
+    fn a_restarted_group_needs_a_holder_confirmation_past_the_wait() {
+        let wait = Duration::from_secs(13);
+        let start = Instant::now();
+        let mut rounds = HashMap::new();
+        let mut asks = HeadRoundAsks::new();
+        let holders = [[9; 32]];
+        refresh_head_round(&mut rounds, &mut asks, "g", "h1", &holders, start, wait);
+        let later = start + wait * 10;
+        let round = rounds.get("g").expect("round");
+        assert!(!round.synced("h1", 1, false, true, false, start, wait));
+        assert!(!round.synced("h1", 1, false, true, false, later, wait));
+        assert!(round.synced("h1", 0, false, true, false, later, wait));
+        note_head_report(
+            &mut rounds,
+            &mut asks,
+            "g",
+            "h1",
+            [9; 32],
+            HeadReport::OnLocalChain,
+            later,
+        );
+        let round = rounds.get("g").expect("round");
+        assert!(round.synced("h1", 1, false, true, false, later, wait));
+    }
+
     #[test]
     fn elapsed_time_alone_does_not_sync_a_head_with_unresolved_evidence() {
         let wait = Duration::from_secs(13);
@@ -5603,14 +5671,14 @@ pub(super) mod tests {
         let later = start + wait * 10;
         let round = rounds.get("g").expect("round");
         // A stale replica: queued higher-head evidence is still open.
-        assert!(!round.synced("h1", 1, true, true, later, wait));
+        assert!(!round.synced("h1", 1, true, true, true, later, wait));
         // The restart minimum is necessary.
-        assert!(!round.synced("h1", 1, false, false, later, wait));
+        assert!(!round.synced("h1", 1, false, false, true, later, wait));
         // No evidence and no answer: the bounded wait ends discovery (D73).
-        assert!(!round.synced("h1", 1, false, true, start, wait));
-        assert!(round.synced("h1", 1, false, true, later, wait));
+        assert!(!round.synced("h1", 1, false, true, true, start, wait));
+        assert!(round.synced("h1", 1, false, true, true, later, wait));
         // The round confirms one head only.
-        assert!(!round.synced("h2", 1, false, true, later, wait));
+        assert!(!round.synced("h2", 1, false, true, true, later, wait));
     }
 
     /// CI DIAG #1546 W3-H `s4_designated_late_observation` (iteration 11):
@@ -5679,7 +5747,7 @@ pub(super) mod tests {
         assert!(!rounds
             .get("g")
             .expect("round")
-            .synced("h1", 2, false, true, later, wait));
+            .synced("h1", 2, false, true, true, later, wait));
         // After the wait the round asks every holder again, A included.
         let again = refresh_head_round(&mut rounds, &mut asks, "g", "h1", &holders, later, wait);
         assert_eq!(again, holders.to_vec());
@@ -5697,7 +5765,7 @@ pub(super) mod tests {
             !rounds
                 .get("g")
                 .expect("round")
-                .synced("h1", 2, false, true, later, wait),
+                .synced("h1", 2, false, true, true, later, wait),
             "the retry kept A's unknown-head report"
         );
         // A itself now reports a head on the local chain: resolved.
@@ -5713,13 +5781,13 @@ pub(super) mod tests {
         assert!(rounds
             .get("g")
             .expect("round")
-            .synced("h1", 2, false, true, later, wait));
+            .synced("h1", 2, false, true, true, later, wait));
         // A new local head needs a new round.
         refresh_head_round(&mut rounds, &mut asks, "g", "h2", &holders, later, wait);
         assert!(!rounds
             .get("g")
             .expect("round")
-            .synced("h2", 2, false, true, later, wait));
+            .synced("h2", 2, false, true, true, later, wait));
     }
 
     /// #1578 rc4 (Engineer ruling, 28 Oct 09:35 GMT; Codex P1): a
@@ -5782,7 +5850,7 @@ pub(super) mod tests {
             !rounds
                 .get("g")
                 .expect("round")
-                .synced("h1", 2, false, true, settled, wait),
+                .synced("h1", 2, false, true, true, settled, wait),
             "another confirmation plus the elapsed wait must not seal from the stale head"
         );
         // The liveness path the ruling names: the seat is keyed again
@@ -5802,7 +5870,7 @@ pub(super) mod tests {
             rounds
                 .get("g")
                 .expect("round")
-                .synced("h1", 2, false, true, settled, wait),
+                .synced("h1", 2, false, true, true, settled, wait),
             "the holder's own on-chain report resolves its entry"
         );
     }
@@ -5887,7 +5955,7 @@ pub(super) mod tests {
             next,
         );
         let round = rounds.get("g").expect("round");
-        assert!(!round.synced("h2", 2, false, true, next, wait));
+        assert!(!round.synced("h2", 2, false, true, true, next, wait));
         note_head_report(
             &mut rounds,
             &mut asks,
@@ -5898,7 +5966,7 @@ pub(super) mod tests {
             next,
         );
         let round = rounds.get("g").expect("round");
-        assert!(round.synced("h2", 2, false, true, next, wait));
+        assert!(round.synced("h2", 2, false, true, true, next, wait));
         // A report arrives first for the new head.
         let mut rounds = HashMap::new();
         let mut asks = HeadRoundAsks::new();
@@ -5923,14 +5991,14 @@ pub(super) mod tests {
         );
         let round = rounds.get("g").expect("round");
         assert!(
-            !round.synced("h2", 2, false, true, start, wait),
+            !round.synced("h2", 2, false, true, true, start, wait),
             "the head change in the report path kept A's report"
         );
         // A holder that is no longer a holder (it left, or it is now an
         // open target) no longer blocks.
         refresh_head_round(&mut rounds, &mut asks, "g", "h2", &[b], start, wait);
         let round = rounds.get("g").expect("round");
-        assert!(round.synced("h2", 1, false, true, start, wait));
+        assert!(round.synced("h2", 1, false, true, true, start, wait));
     }
 
     /// CI W3-H `w3h_1357_red_s4_restart_intake_prepare`: the committer is
@@ -5980,7 +6048,7 @@ pub(super) mod tests {
             note_head_report(&mut rounds, &mut asks, "g", &head, holder, report, now);
             rounds
                 .get("g")
-                .is_some_and(|round| round.synced(&head, 1, false, true, now, wait))
+                .is_some_and(|round| round.synced(&head, 1, false, true, true, now, wait))
         };
         // Behind at r (our parent): synced at once.
         assert!(synced_after(&parent));
@@ -6001,7 +6069,7 @@ pub(super) mod tests {
         assert!(!rounds
             .get("g")
             .expect("round")
-            .synced("h1", 1, false, true, now, wait));
+            .synced("h1", 1, false, true, true, now, wait));
         note_head_report(
             &mut rounds,
             &mut asks,
@@ -6014,10 +6082,10 @@ pub(super) mod tests {
         assert!(rounds
             .get("g")
             .expect("round")
-            .synced("h1", 1, false, true, now, wait));
+            .synced("h1", 1, false, true, true, now, wait));
         let alone = HeadRound::new("h1", now);
-        assert!(alone.synced("h1", 0, false, true, now, wait));
-        assert!(!alone.synced("h1", 0, true, true, now, wait));
+        assert!(alone.synced("h1", 0, false, true, true, now, wait));
+        assert!(!alone.synced("h1", 0, true, true, true, now, wait));
     }
 
     // ─── Codex round 1, item 1: several revoked OwnerCertified seats ───
@@ -9141,6 +9209,12 @@ pub(super) mod tests {
         assert_eq!(
             designated_send_outcome(&Err(x0x::dm::DmError::RecipientPairingDenied {
                 denial: x0x::key_move::PairingDenial::BindingRevoked,
+            })),
+            s4::DesignatedHandoffOutcome::PolicyRefused
+        );
+        assert_eq!(
+            designated_send_outcome(&Err(x0x::dm::DmError::RecipientMachineRevoked {
+                machine: x0x::identity::MachineId([7; 32]),
             })),
             s4::DesignatedHandoffOutcome::PolicyRefused
         );
