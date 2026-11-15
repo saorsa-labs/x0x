@@ -6810,6 +6810,13 @@ mod tests {
     }
 
     async fn evidence_forward_rig() -> Option<EvidenceForwardRig> {
+        evidence_forward_rig_with(false).await
+    }
+
+    /// The rig; with `restart_bob`, Bob is shut down after the past
+    /// session's files are written and built again from them: a true
+    /// restart of the receiver, with empty in-memory caches.
+    async fn evidence_forward_rig_with(restart_bob: bool) -> Option<EvidenceForwardRig> {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let owner = crate::identity::UserKeypair::generate().expect("owner");
         let bob_home = dir.path().join("bob");
@@ -6823,7 +6830,7 @@ mod tests {
             return None;
         };
         let alice = Arc::new(alice);
-        let bob = Arc::new(bob);
+        let mut bob = Arc::new(bob);
         let now_ms = crate::dm_capability::now_unix_ms();
 
         // Bob's owner enrolls Alice's machine.
@@ -6869,6 +6876,48 @@ mod tests {
             .expect("bob store")
             .ingest(record, crate::peer_evidence::IngestSource::Hello, now_ms)
             .expect("ingest alice's record");
+
+        if restart_bob {
+            bob.peer_evidence()
+                .store()
+                .expect("bob store")
+                .flush(now_ms, true)
+                .expect("flush bob's evidence");
+            bob.shutdown().await;
+            drop(bob);
+            let Some(restarted) = build_loopback_agent(dir.path(), "bob").await else {
+                alice.shutdown().await;
+                return None;
+            };
+            bob = Arc::new(restarted);
+            let devices = Arc::new(
+                crate::owner_sync::OwnerSyncStore::load(&bob_home)
+                    .await
+                    .expect("device store after restart"),
+            );
+            assert!(
+                devices
+                    .is_enrolled(&alice.machine_id(), &owner.user_id())
+                    .await,
+                "the enrollment is read back from disk"
+            );
+            bob.owner_trust.install_device_store(devices);
+            bob.start_peer_evidence(
+                bob_home.join("evidence"),
+                crate::peer_evidence::EvidenceConfig::default(),
+                Arc::new(|_| Some(false)),
+            )
+            .expect("bob evidence after restart");
+            assert!(bob.peer_evidence().wait(0).await, "bob evidence loads");
+            assert!(
+                bob.peer_evidence()
+                    .store()
+                    .expect("bob store")
+                    .usable_agent(alice.agent_id(), crate::dm_capability::now_unix_ms())
+                    .is_some_and(|view| view.certificate.is_some()),
+                "alice's record and certificate are read back from disk"
+            );
+        }
 
         // Link the pair. Only Bob joins (his stream accept loop starts
         // there); Alice never announces, so Bob never learns her agent.
@@ -6997,6 +7046,34 @@ mod tests {
         assert!(
             revoked_torn,
             "revoking the opener tears the evidence-admitted stream down"
+        );
+    }
+
+    /// #1107 acceptance: the forward gate after a true restart of the
+    /// receiver. Bob is shut down and built again from his files (keys,
+    /// owner device store, ADR 0089 evidence store); his discovery cache and
+    /// binding registry start empty, and Alice never announces. Alice's
+    /// `ForwardV2` stream passes the stream gate and the forward gate from
+    /// the stored evidence alone, with no consent or announce re-issued.
+    /// RED when, after the load checks, the restarted Bob's device store
+    /// (the enrollment read back from disk) is swapped for an empty one: no
+    /// bytes reach the target.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn forward_is_admitted_after_a_true_restart_of_the_receiver() {
+        use tokio::io::AsyncWriteExt;
+        let Some(rig) = evidence_forward_rig_with(true).await else {
+            return;
+        };
+        let mut client = TcpStream::connect(rig.local).await.expect("client");
+        client.write_all(b"after-restart").await.expect("write");
+        let carried = rig.target_reaches(13, 15).await;
+        let still_unknown = !alice_known_to_bob(&rig.alice, &rig.bob).await;
+        drop(client);
+        rig.shutdown().await;
+        assert!(carried, "the forward carries bytes after bob restarts");
+        assert!(
+            still_unknown,
+            "bob's discovery cache still has no agent for alice"
         );
     }
 
