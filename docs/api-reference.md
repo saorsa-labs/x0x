@@ -561,6 +561,13 @@ daemon holds:
   record; it answers the same fields and `"already_revoked": true`. To use the computer again,
   stop `x0xd`, delete `machine.key` and start `x0xd`.
 
+A machine revocation denies delivery, transport and requests to that
+device. The agent keeps its group seats (ADR 0110 D70). It does **not**
+protect TreeKEM group content against a device that still holds the agent
+key: the agent's TreeKEM leaf keys derive from the agent key, so such a
+device can follow later epochs. To cut a lost or stolen device off group
+content, revoke the agent or remove the member from the group (#1929).
+
 Any other agent or machine id returns `403`: the daemon has no authority
 over it. Loading an owner key or an agent certificate does not change the
 signer used by this form.

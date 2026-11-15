@@ -16,6 +16,12 @@ All notable changes to this project will be documented in this file.
   and after approval it can apply the approval link. A requester that waits
   behind another turn gets no outcome until its turn. New capability bit 19,
   `join_request_head_v1`; a peer without it keeps the earlier behaviour.
+- **W3-H row `s4_intake_and_egress`, machine-revocation part (#1581, D70).**
+  A control arm checks that a machine-only revocation keeps the agent's
+  group seat and opens no S4 row. An egress arm, pinned RED, records a
+  known gap: after a later rotation a TreeKEM member's revoked device still
+  reaches the new epoch through its kept leaf. The row has its own W3-H
+  shard (`1581i`).
 - **A `stale` join-request outcome can carry the authority's head (#1840,
   A08 amendment of 15 Nov 2026).** New optional `head` field on
   `groups::join_outcome::JoinRequestOutcome` (signed head commit, roster
@@ -110,6 +116,12 @@ All notable changes to this project will be documented in this file.
   same group to end before it judges the cycle. No wire format or API
   changes.
 
+- **Docs: what a machine revocation protects (#1929).** A machine revocation
+  denies delivery, transport and requests to that device. It does not cut a
+  device that still holds the agent key off TreeKEM group content, because
+  the leaf keys derive from the agent key. To cut off a lost or stolen
+  device, revoke the agent or remove the member. See
+  `docs/trust-and-connectivity.md`, `docs/api-reference.md` and A09.
 - **Documented the exit for a forked head behind an armed gap record
   (#871).** The anchored-gap gate has no expiry and no local clear. With no
   progress (10 minutes for an owner-armed gap, 30 minutes for an
