@@ -321,9 +321,10 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     receipt.evidence(
         "x_seals_j_at_r_plus_2_prime_with_a_join_carry_ata",
         sealed.state_revision == base.state_revision + 2
-            && carry
-                .as_ref()
-                .is_some_and(|a| a.fields.sequence.contains(&base.state_hash)),
+            && carry.as_ref().is_some_and(|a| {
+                a.fields.from_revision == base.state_revision
+                    && a.fields.sequence.contains(&fork.state_hash)
+            }),
         format!(
             "X {}; carry {:?}",
             sealed.describe(),
@@ -373,17 +374,33 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         failing.push("a_m1_m2_unchanged_in_the_first_advance");
     }
     let before = heads(sim, &group).await?;
-    let holds_r = record(sim, "J", &group, |info| {
-        info.commit_log
+    // #1797: J keeps the served links, not the link at r; its invite
+    // lineage keeps the signed base roster at r instead.
+    let base_roster = record(sim, "J", &group, |info| {
+        let holds_r = info
+            .commit_log
             .iter()
-            .any(|e| e.commit.state_hash == base.state_hash)
+            .any(|e| e.commit.state_hash == base.state_hash);
+        let signed = info.invite_lineage.as_ref().is_some_and(|lineage| {
+            lineage.base_revision == base.state_revision
+                && lineage.base_hash == base.state_hash
+                && !lineage.base_roster.is_empty()
+                && crate::groups::state_commit::roster_root_of_projection(&lineage.base_roster)
+                    == lineage.base_roster_root
+        });
+        (holds_r, signed)
     })
     .await?
-    .unwrap_or(false);
+    .unwrap_or((false, false));
     receipt.evidence(
-        "j_retains_the_commit_at_r",
-        holds_r,
-        format!("r {} on J: {holds_r}", short(&base.state_hash)),
+        "j_keeps_the_signed_base_roster_at_r",
+        base_roster.1,
+        format!(
+            "r {} on J: link kept {}, signed base roster {}",
+            short(&base.state_hash),
+            base_roster.0,
+            base_roster.1
+        ),
         at(sim),
     );
 
