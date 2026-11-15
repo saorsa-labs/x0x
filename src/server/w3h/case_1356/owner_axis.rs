@@ -22,6 +22,7 @@ mod invites;
 mod mandates;
 mod refusals;
 mod released;
+mod sidecar_issuer;
 
 const LABELS: &[&str] = &["O", "A"];
 const FINAL: &str = "certificate_only_admin_seals_an_owner_certified_group";
