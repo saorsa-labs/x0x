@@ -112,6 +112,13 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **The TreeKEM reconnect catch-up pass is bounded (#1427, A09 third
+  amendment of 15 Nov 2026).** A reconnect during a pass runs one more
+  pass after it. A pass asks for at most 4 groups at a time, each after a
+  random wait of up to 10 s, and asks again for a group still pending
+  after 60 s, 300 s and 900 s. The outage record is written and removed
+  under one lock. The #1427 W3-H rows have their own CI shard (`1427`).
+
 - **A TreeKEM member that stays up through a network outage catches up
   when it connects again (#1427, A09 second amendment of 15 Nov 2026).**
   When the first peer connects after the node had no connected peer for

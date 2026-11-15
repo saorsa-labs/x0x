@@ -15963,6 +15963,17 @@ async fn treekem_start_catchup_done(state: &AppState, key: &str) {
     if !none_left {
         return;
     }
+    // A reconnect pass can mark groups pending and keep the record between
+    // the check above and the removal; the record lock orders the two.
+    let _record = state.treekem_catchup_record_lock.lock().await;
+    if !state
+        .treekem_start_catchup_pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_empty()
+    {
+        return;
+    }
     match tokio::fs::remove_file(treekem_catchup_pending_path(state)).await {
         Ok(()) => tracing::info!("TreeKEM start catch-up done; outage record removed"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -16181,6 +16192,7 @@ pub(in crate::server) async fn run_treekem_start_catchup(state: Arc<AppState>) {
     let recorded = tokio::fs::try_exists(&record).await.unwrap_or(false);
     if outage || recorded {
         let keys = treekem_start_catchup_groups(&state).await;
+        let _record = state.treekem_catchup_record_lock.lock().await;
         state
             .treekem_start_catchup_pending
             .lock()
@@ -16199,6 +16211,7 @@ pub(in crate::server) async fn run_treekem_start_catchup(state: Arc<AppState>) {
                 tracing::warn!("TreeKEM outage record was not written: {error}");
             }
         }
+        drop(_record);
         for key in &keys {
             tracing::info!(
                 group_id = %LogHexId::group(key),
@@ -16265,16 +16278,123 @@ impl TreeKemIsolation {
 /// count read then can still include it.
 const TREEKEM_ISOLATION_CHECK: Duration = Duration::from_secs(5);
 
+/// #1427: the most groups one reconnect pass asks for at the same time.
+/// When a whole member set heals, each member runs a pass; the cap and the
+/// jitter ([`TREEKEM_RECONNECT_JITTER`]) spread those requests.
+const TREEKEM_RECONNECT_CONCURRENCY: usize = 4;
+
+/// #1427: the longest random wait before a reconnect pass asks for one
+/// group.
+const TREEKEM_RECONNECT_JITTER: Duration = Duration::from_secs(10);
+
+/// #1427: the waits before a reconnect pass asks again for the groups
+/// that are still pending after the previous round (no member served a
+/// page, for example because the peers that came back were not members).
+const TREEKEM_RECONNECT_RETRY: [Duration; 3] = [
+    Duration::from_secs(60),
+    Duration::from_secs(300),
+    Duration::from_secs(900),
+];
+
+/// #1427: one reconnect pass at a time. A reconnect that comes while a
+/// pass runs is not lost: the running pass stops its retry wait and one
+/// more pass runs when it ends.
+#[derive(Debug, Default)]
+struct TreeKemReconnectGate {
+    running: std::sync::atomic::AtomicBool,
+    rerun: std::sync::atomic::AtomicBool,
+    wake: tokio::sync::Notify,
+}
+
+impl TreeKemReconnectGate {
+    /// A reconnect asks for a pass. True: the caller starts the pass now.
+    /// False: a pass runs, and it runs once more when it ends.
+    fn request(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.rerun.store(true, SeqCst);
+        if self.running.swap(true, SeqCst) {
+            self.wake.notify_one();
+            return false;
+        }
+        self.rerun.store(false, SeqCst);
+        true
+    }
+
+    /// True while a reconnect waits for the running pass to end.
+    fn rerun_pending(&self) -> bool {
+        self.rerun.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A pass ended, or was not started. True: the caller runs one more
+    /// pass now, for a reconnect that came during the pass.
+    fn finish(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.running.store(false, SeqCst);
+        self.rerun.swap(false, SeqCst) && !self.running.swap(true, SeqCst)
+    }
+}
+
+/// #1427: the round rule of one reconnect pass. Each round runs `run` for
+/// each key, at most `concurrency` at a time, each after a `jitter()`
+/// wait. The keys for which `still_pending` is true after a round get
+/// another round after the next wait of `retry`. A wait ends early, and
+/// the pass ends, when `gate` has a reconnect waiting: the next pass
+/// asks for every group.
+async fn drive_treekem_reconnect_pass<F, Fut>(
+    mut keys: Vec<String>,
+    concurrency: usize,
+    jitter: impl Fn() -> Duration,
+    run: F,
+    still_pending: impl Fn(&str) -> bool,
+    retry: &[Duration],
+    gate: &TreeKemReconnectGate,
+) where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    use futures::StreamExt;
+    let mut waits = retry.iter();
+    loop {
+        futures::stream::iter(keys.iter().cloned().map(|key| {
+            let wait = jitter();
+            let ask = run(key);
+            async move {
+                tokio::time::sleep(wait).await;
+                ask.await;
+            }
+        }))
+        .buffer_unordered(concurrency.max(1))
+        .collect::<Vec<()>>()
+        .await;
+        keys.retain(|key| still_pending(key));
+        let Some(wait) = waits.next() else {
+            return;
+        };
+        if keys.is_empty() || gate.rerun_pending() {
+            return;
+        }
+        let until = tokio::time::Instant::now() + *wait;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(until) => break,
+                _ = gate.wake.notified() => {
+                    if gate.rerun_pending() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// #1427: the reconnect catch-up of TreeKEM groups. A member that stays
 /// up through a network outage past the last metadata resend can miss a
 /// commit just like a member that was down, and the start catch-up does
 /// not run for it. This task reads the connected peer count on each
 /// connect or disconnect event and every [`TREEKEM_ISOLATION_CHECK`]. When the
 /// first peer connects after such an isolation ([`TreeKemIsolation`]), it
-/// marks each TreeKEM group pending, writes the outage record (so a
-/// restart during the pass still asks), and runs
-/// [`request_treekem_catchup_after_start`] for each group. At most one
-/// reconnect pass runs at a time, and each needs a new isolation longer
+/// runs a reconnect pass ([`run_treekem_reconnect_pass`]). One pass runs at
+/// a time ([`TreeKemReconnectGate`]), and each needs a new isolation longer
 /// than the last resend, so reconnects cannot cause a storm.
 pub(in crate::server) async fn run_treekem_reconnect_catchup(state: Arc<AppState>) {
     let Some(network) = state.agent.network().cloned() else {
@@ -16287,7 +16407,7 @@ pub(in crate::server) async fn run_treekem_reconnect_catchup(state: Arc<AppState
     let mut events = network.subscribe();
     let mut shutdown = state.shutdown_notify.subscribe();
     let mut isolation = TreeKemIsolation::default();
-    let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let gate = Arc::new(TreeKemReconnectGate::default());
     let mut tick = tokio::time::interval(TREEKEM_ISOLATION_CHECK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -16306,49 +16426,84 @@ pub(in crate::server) async fn run_treekem_reconnect_catchup(state: Arc<AppState
         if !isolation.note(connected, tokio::time::Instant::now(), missed_resends) {
             continue;
         }
-        if running.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        if !gate.request() {
             continue;
         }
-        let keys = treekem_start_catchup_groups(&state).await;
-        if keys.is_empty() {
-            running.store(false, std::sync::atomic::Ordering::Release);
-            continue;
+        let pass_state = Arc::clone(&state);
+        let pass_gate = Arc::clone(&gate);
+        let admitted = state.spawn_detached(async move {
+            loop {
+                run_treekem_reconnect_pass(&pass_state, &pass_gate).await;
+                if !pass_gate.finish() {
+                    return;
+                }
+            }
+        });
+        if !admitted {
+            let _ = gate.finish();
         }
+    }
+}
+
+/// #1427: one reconnect pass. It marks each TreeKEM group pending and
+/// keeps the outage record (so a restart during the pass still asks),
+/// then runs [`request_treekem_catchup_after_start`] for each group under
+/// [`drive_treekem_reconnect_pass`]: at most
+/// [`TREEKEM_RECONNECT_CONCURRENCY`] groups at a time, each after a random
+/// wait up to [`TREEKEM_RECONNECT_JITTER`], and the groups that stay
+/// pending again after each wait of [`TREEKEM_RECONNECT_RETRY`].
+async fn run_treekem_reconnect_pass(state: &Arc<AppState>, gate: &TreeKemReconnectGate) {
+    let keys = treekem_start_catchup_groups(state).await;
+    if keys.is_empty() {
+        return;
+    }
+    {
+        let _record = state.treekem_catchup_record_lock.lock().await;
         state
             .treekem_start_catchup_pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .extend(keys.iter().cloned());
-        let record = treekem_catchup_pending_path(&state);
+        let record = treekem_catchup_pending_path(state);
         if !tokio::fs::try_exists(&record).await.unwrap_or(false) {
             if let Err(error) = crate::profile::write_atomically(&record, b"reconnect").await {
                 tracing::warn!("TreeKEM outage record was not written: {error}");
             }
         }
-        state
-            .treekem_reconnect_catchup_passes
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        for key in &keys {
-            tracing::info!(
-                group_id = %LogHexId::group(key),
-                "reconnected after an isolation past the last metadata resend; \
-                 asking for a TreeKEM catch-up page"
-            );
-        }
-        let pass_state = Arc::clone(&state);
-        let pass_running = Arc::clone(&running);
-        let admitted = state.spawn_detached(async move {
-            futures::future::join_all(
-                keys.iter()
-                    .map(|key| request_treekem_catchup_after_start(&pass_state, key)),
-            )
-            .await;
-            pass_running.store(false, std::sync::atomic::Ordering::Release);
-        });
-        if !admitted {
-            running.store(false, std::sync::atomic::Ordering::Release);
-        }
     }
+    state
+        .treekem_reconnect_catchup_passes
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    for key in &keys {
+        tracing::info!(
+            group_id = %LogHexId::group(key),
+            "reconnected after an isolation past the last metadata resend; \
+             asking for a TreeKEM catch-up page"
+        );
+    }
+    drive_treekem_reconnect_pass(
+        keys,
+        TREEKEM_RECONNECT_CONCURRENCY,
+        || {
+            use rand::Rng;
+            let max_ms = u64::try_from(TREEKEM_RECONNECT_JITTER.as_millis()).unwrap_or(u64::MAX);
+            Duration::from_millis(rand::thread_rng().gen_range(0..=max_ms))
+        },
+        |key| {
+            let state = Arc::clone(state);
+            async move { request_treekem_catchup_after_start(&state, &key).await }
+        },
+        |key| {
+            state
+                .treekem_start_catchup_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(key)
+        },
+        &TREEKEM_RECONNECT_RETRY,
+        gate,
+    )
+    .await;
 }
 
 /// ADR 0110 §3: the one route for missing leaf evidence. Every S4 path
@@ -55421,6 +55576,7 @@ pub(in crate::server) mod tests {
             treekem_network_join_ended: tokio::sync::watch::channel(false).0,
             treekem_start_catchup_passes: Default::default(),
             treekem_reconnect_catchup_passes: Default::default(),
+            treekem_catchup_record_lock: Default::default(),
             treekem_catchup_refusals: StdMutex::new(HashMap::new()),
             join_request_outcome_sends: StdMutex::new(HashMap::new()),
             group_membership_locks: RwLock::new(HashMap::new()),

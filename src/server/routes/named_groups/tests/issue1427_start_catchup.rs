@@ -375,3 +375,125 @@ fn issue1427_reconnect_after_a_long_isolation_asks_once() {
         "an isolation within the resends asks nothing"
     );
 }
+
+#[test]
+fn issue1427_reconnect_during_a_pass_runs_one_more_pass() {
+    let gate = TreeKemReconnectGate::default();
+    assert!(gate.request(), "the first reconnect starts a pass");
+    assert!(!gate.request(), "a reconnect during the pass waits");
+    assert!(
+        !gate.request(),
+        "a second one during the same pass adds nothing"
+    );
+    assert!(gate.finish(), "the pass ends: one more pass runs");
+    assert!(!gate.finish(), "that pass ends: no reconnect came, done");
+    assert!(gate.request(), "a later reconnect starts a pass again");
+    assert!(!gate.finish());
+}
+
+#[tokio::test(start_paused = true)]
+async fn issue1427_reconnect_pass_retries_a_group_left_pending() {
+    use std::sync::Mutex as StdMutex;
+    // Group "a" is done after its first ask; "b" stays pending, as after
+    // a reconnect to peers that were not members. Four more keys show the
+    // concurrency cap.
+    let calls: Arc<StdMutex<Vec<(String, tokio::time::Instant)>>> = Arc::default();
+    let pending: Arc<StdMutex<std::collections::HashSet<String>>> = Arc::new(StdMutex::new(
+        ["a", "b", "c", "d", "e", "f"]
+            .iter()
+            .map(|k| k.to_string())
+            .collect(),
+    ));
+    let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let most = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = TreeKemReconnectGate::default();
+    assert!(gate.request());
+    let t0 = tokio::time::Instant::now();
+    let retry = [Duration::from_secs(60), Duration::from_secs(300)];
+    drive_treekem_reconnect_pass(
+        ["a", "b", "c", "d", "e", "f"]
+            .iter()
+            .map(|k| k.to_string())
+            .collect(),
+        2,
+        || Duration::from_secs(1),
+        |key| {
+            let calls = Arc::clone(&calls);
+            let pending = Arc::clone(&pending);
+            let in_flight = Arc::clone(&in_flight);
+            let most = Arc::clone(&most);
+            async move {
+                let now = in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                most.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                calls
+                    .lock()
+                    .unwrap()
+                    .push((key.clone(), tokio::time::Instant::now()));
+                if key != "b" {
+                    pending.lock().unwrap().remove(&key);
+                }
+            }
+        },
+        |key| pending.lock().unwrap().contains(key),
+        &retry,
+        &gate,
+    )
+    .await;
+    let calls = calls.lock().unwrap().clone();
+    let asks = |k: &str| calls.iter().filter(|(key, _)| key == k).count();
+    assert_eq!(asks("a"), 1, "a done group is asked once");
+    assert_eq!(
+        asks("b"),
+        3,
+        "a pending group is asked again after each wait"
+    );
+    assert_eq!(
+        most.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the cap holds"
+    );
+    let b_times: Vec<Duration> = calls
+        .iter()
+        .filter(|(key, _)| key == "b")
+        .map(|(_, at)| at.saturating_duration_since(t0))
+        .collect();
+    assert!(b_times[1] - b_times[0] >= Duration::from_secs(60));
+    assert!(b_times[2] - b_times[1] >= Duration::from_secs(300));
+    assert!(!gate.finish());
+}
+
+#[tokio::test(start_paused = true)]
+async fn issue1427_reconnect_during_a_retry_wait_ends_the_pass() {
+    let gate = Arc::new(TreeKemReconnectGate::default());
+    assert!(gate.request());
+    let asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let driver_gate = Arc::clone(&gate);
+    let driver_asks = Arc::clone(&asks);
+    let driver = tokio::spawn(async move {
+        drive_treekem_reconnect_pass(
+            vec!["b".to_string()],
+            4,
+            || Duration::ZERO,
+            |_key| {
+                let asks = Arc::clone(&driver_asks);
+                async move {
+                    asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
+            |_key| true,
+            &[Duration::from_secs(900)],
+            &driver_gate,
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert!(!gate.request(), "a reconnect during the retry wait");
+    tokio::time::timeout(Duration::from_secs(1), driver)
+        .await
+        .expect("the wait ends early")
+        .expect("driver task");
+    assert_eq!(asks.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(gate.finish(), "the next pass runs for the reconnect");
+}
