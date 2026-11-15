@@ -89,6 +89,20 @@ roster has no Active admin seat at all, per ADR 0088 §2 item 3 and ADR
 exists. A promoted member keeps a mandate refused with either cause and
 retries it, as before. ADR 0110 stays Accepted and its text is unchanged.
 
+On 15 Nov 2026 Claude decided how S4 knows that a local worker lost its
+committer authority, under David's delegation of design decisions of 10
+Nov 2026 ([#1581](https://github.com/saorsa-labs/x0x/issues/1581),
+`s4_local_authority_exit`, ADR 0110 §4 L274 and L275, D72). A local node
+that is no longer an Active admin was the row's worker when the row's
+last stored derivation named it the designated admin or a fallback rank.
+Such a node marks `local_committer_ineligible` naming the designated
+admin, the same as a revoked worker. The mark is sticky: it stays once
+stored, also after the stored derivation moves to another admin and
+across a restart. A member that never was a committer for the row keeps
+`waiting_for_designated_admin`. The leave form is not covered: a leave
+drops the local group record, so no row is left to mark. ADR 0110 stays
+Accepted and its text is unchanged.
+
 Amendment of 14 Nov 2026 (#1427), made under the design delegation of
 10 Nov 2026. A TreeKEM member that was down longer than the last
 metadata resend (60 s) can have missed a commit, and with no later

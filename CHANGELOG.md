@@ -143,6 +143,14 @@ All notable changes to this project will be documented in this file.
   not recorded. A daemon that does not answer keeps unknown counts; it is
   never reported as zero connections.
 
+### Fixed
+
+- **A demoted S4 worker shows `local_committer_ineligible` (#1581).** An
+  admin that is demoted to member while it holds an open revocation-eviction
+  row now marks the row `local_committer_ineligible` naming the next
+  admin, as ADR 0110 §4 wants. Before, the row showed
+  `waiting_for_designated_admin`.
+
 ## [v0.48.1] - 2026-10-17
 
 A patch release. It pins ant-quic 0.27.61 and saorsa-gossip 0.5.90, and
