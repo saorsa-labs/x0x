@@ -1546,11 +1546,14 @@ async fn b8_final_expiry_check_linearizes_with_journal_installation() {
     offer_predecessor_obligation_via_real_path(&state, &group_key, &request_id, &requester_kp)
         .await;
 
-    // Leave enough time for the first authenticated proof read to finish, but
-    // little enough that the deterministic barrier crosses the retention edge.
+    // Leave enough time for the setup and the first authenticated proof read
+    // to finish on a loaded runner. The barrier below then waits on the wall
+    // clock, the clock the handler's expiry check reads, until the proof has
+    // expired.
     let first_seen_ms = unix_ms()
         .saturating_sub(CAUSAL_APPROVAL_RETENTION_MS)
-        .saturating_add(1_500);
+        .saturating_add(3_000);
+    let expires_at_ms = first_seen_ms.saturating_add(CAUSAL_APPROVAL_RETENTION_MS);
     {
         let mut groups = state.named_groups.write().await;
         let request = groups
@@ -1594,7 +1597,24 @@ async fn b8_final_expiry_check_linearizes_with_journal_installation() {
     timeout(Duration::from_secs(5), entered.notified())
         .await
         .expect("B8 reached the final authorization barrier within 5s");
-    sleep(Duration::from_millis(1_600)).await;
+    // The mutant that samples the clock before the barrier passes only
+    // when the proof is still live at the barrier. A setup slower than the
+    // margin would let it pass, so require that here.
+    assert!(
+        unix_ms() < expires_at_ms,
+        "the setup must reach the barrier before the proof expires"
+    );
+    // A fixed monotonic sleep is not enough: the handler's check reads the
+    // wall clock, and a wall clock that lags the monotonic one by more than
+    // the margin let the approval through (200) on a loaded VM. Wait until
+    // the wall clock itself is past the expiry.
+    timeout(Duration::from_secs(10), async {
+        while unix_ms() <= expires_at_ms.saturating_add(100) {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the wall clock passed the proof expiry within 10s");
     release.notify_one();
 
     let status = timeout(Duration::from_secs(5), approval)

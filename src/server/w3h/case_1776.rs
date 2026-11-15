@@ -115,19 +115,57 @@ fn is_dm(write: &Write) -> bool {
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
 fn w3h_1776_delayed_fresh_joiner_fetches_the_welcome() -> Result<()> {
+    super::block_on_paused(async move { expect_green(CASE, SEED).await })
+}
+
+/// #504 follow-up: the same scenario on two more fabric seeds. With the
+/// #1912 direct capability answer, B's request named its machine, A answered
+/// with one direct frame (dropped in the blind window) and skipped the topic
+/// answer, so B never learned A. Whether a seed hit that depended on the
+/// interleaving: these two were RED on main 0007c9b5a, as were 6 of 9 seeds
+/// in all (the original seed among them on some runs).
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+fn w3h_1776_delayed_fresh_joiner_fetches_the_welcome_seed2() -> Result<()> {
     super::block_on_paused(async move {
-        let receipt = run().await;
-        ensure!(
-            receipt.verdict() == Some(Verdict::Green),
-            "{CASE} verdict {:?}, expected GREEN",
-            receipt.verdict()
-        );
-        Ok(())
+        expect_green(
+            "w3h_1776_delayed_fresh_joiner_fetches_the_welcome_seed2",
+            0x1776_0002,
+        )
+        .await
     })
 }
 
-async fn run() -> Receipt {
-    let mut receipt = Receipt::new(CASE, SEED);
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+fn w3h_1776_delayed_fresh_joiner_fetches_the_welcome_seed4() -> Result<()> {
+    super::block_on_paused(async move {
+        expect_green(
+            "w3h_1776_delayed_fresh_joiner_fetches_the_welcome_seed4",
+            0x1776_0004,
+        )
+        .await
+    })
+}
+
+async fn expect_green(case: &str, seed: u64) -> Result<()> {
+    let receipt = run(case, seed).await;
+    ensure!(
+        receipt.verdict() == Some(Verdict::Green),
+        "{case} verdict {:?}, expected GREEN",
+        receipt.verdict()
+    );
+    Ok(())
+}
+
+async fn run(case: &str, seed: u64) -> Receipt {
+    let mut receipt = Receipt::new(case, seed);
     receipt.note(
         "The fabric drops every pubsub frame to B except the group's own \
          metadata topic and the targeted capability control topics, and every \
@@ -136,7 +174,7 @@ async fn run() -> Receipt {
          membership plus B opening the group store, which needs the group \
          key the Welcome carries.",
     );
-    match Sim::empty(CASE, SEED, &["O", "A", "B"]) {
+    match Sim::empty(case, seed, &["O", "A", "B"]) {
         Ok(mut sim) => {
             if let Err(error) = scenario(&mut sim, &mut receipt).await {
                 receipt.infra(format!("{error:#}"), sim.fabric().now().as_micros());
