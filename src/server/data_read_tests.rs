@@ -416,3 +416,83 @@ async fn issue1094_grantee_route_needs_the_peer_capability() {
         .iter()
         .all(|(to, _)| *to != old_peer));
 }
+
+/// Review of #1935: a value at the 32 KiB read limit is served; one byte
+/// over it, and a 40 KB value (a store takes up to 64 KiB inline), is
+/// `too_large`, which the grantee route answers with 413.
+#[tokio::test]
+async fn issue1094_value_size_limit_is_typed() {
+    let (state, _dir) = state_with_store().await;
+    let (_, topic) = crate::kv::encrypted::group_store_identity(GROUP, STORE);
+    let handle = state
+        .kv_stores
+        .read()
+        .await
+        .get(&topic)
+        .cloned()
+        .expect("store");
+    for (key, len) in [
+        ("at-limit", MAX_DATA_READ_VALUE_BYTES),
+        ("over-limit", MAX_DATA_READ_VALUE_BYTES + 1),
+        ("forty-kb", 40_000),
+    ] {
+        handle
+            .put_with_delta(key.to_string(), vec![b'v'; len], "text/plain".into())
+            .await
+            .expect("put");
+    }
+    let (agent, machine) = bound_sender(&state).await;
+    install_grant(&state, agent, vec![data_cap(DataAccess::Ro)]).await;
+
+    let get = |key: &str| DataReadOp::Get {
+        key: key.to_string(),
+    };
+    let at = serve(&state, agent, machine, get("at-limit")).await;
+    assert_eq!(at.status, DataReadStatus::Ok);
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(at.entry.expect("entry").value_b64)
+            .expect("b64")
+            .len(),
+        MAX_DATA_READ_VALUE_BYTES
+    );
+    for key in ["over-limit", "forty-kb"] {
+        let reply = serve(&state, agent, machine, get(key)).await;
+        assert_eq!(reply.status, DataReadStatus::TooLarge, "{key}");
+        let (code, _) = reply_response(reply);
+        assert_eq!(code, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+}
+
+/// Review of #1935: senders without a data grant have their own small
+/// bucket, so a crowd of strangers cannot take the grantees' slots.
+#[tokio::test]
+async fn issue1094_strangers_cannot_crowd_out_grantees() {
+    let (state, _dir) = state_with_store().await;
+    let (grantee, grantee_machine) = bound_sender(&state).await;
+    install_grant(&state, grantee, vec![data_cap(DataAccess::Ro)]).await;
+    for _ in 0..DATA_READ_SERVE_STRANGERS_CAP {
+        let (stranger, machine) = bound_sender(&state).await;
+        assert!(
+            serve_data_read(&state, &typed(stranger, machine, request(DataReadOp::Keys)))
+                .await
+                .is_some()
+        );
+    }
+    let (late, late_machine) = bound_sender(&state).await;
+    assert!(
+        serve_data_read(
+            &state,
+            &typed(late, late_machine, request(DataReadOp::Keys))
+        )
+        .await
+        .is_none(),
+        "the strangers' bucket is full"
+    );
+    let reply = serve(&state, grantee, grantee_machine, DataReadOp::Keys).await;
+    assert_eq!(
+        reply.status,
+        DataReadStatus::Ok,
+        "the grantee is still served"
+    );
+}

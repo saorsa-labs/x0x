@@ -1412,7 +1412,7 @@ pub async fn serve_with_options(
         treekem_catchup_refusals: StdMutex::new(HashMap::new()),
         join_request_outcome_sends: StdMutex::new(HashMap::new()),
         data_read_waiters: StdMutex::new(HashMap::new()),
-        data_read_serve_limits: StdMutex::new(HashMap::new()),
+        data_read_serve_limits: StdMutex::new(Default::default()),
         group_membership_locks: RwLock::new(HashMap::new()),
         reseat_stagings: Default::default(),
         treekem_groups: reseat_scope::ScopedGroupMap::new(treekem_groups),

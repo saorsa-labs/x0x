@@ -17,7 +17,7 @@ use crate::dm_inbox::{DmTypedPayload, DmTypedPayloadCompletion};
 use crate::identity::AgentId;
 use crate::share_grant::data_read::{
     DataReadEntry, DataReadKey, DataReadOp, DataReadReply, DataReadRequest, DataReadStatus,
-    DATA_READ_REPLY_DM_PREFIX, DATA_READ_REQUEST_DM_PREFIX,
+    DATA_READ_REPLY_DM_PREFIX, DATA_READ_REQUEST_DM_PREFIX, MAX_DATA_READ_VALUE_BYTES,
 };
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -37,15 +37,25 @@ const DATA_READ_WAITER_CAP: usize = 64;
 /// Per-sender serve limit: at most this many requests per window.
 const DATA_READ_SERVE_PER_WINDOW: u32 = 30;
 const DATA_READ_SERVE_WINDOW_MS: u64 = 10_000;
-/// Senders the serve limiter remembers.
+/// Grantees the serve limiter remembers.
 const DATA_READ_SERVE_SENDERS_CAP: usize = 256;
+/// Senders with no data grant here share a smaller, separate bucket, so
+/// strangers cannot fill the grantees' slots.
+const DATA_READ_SERVE_STRANGERS_CAP: usize = 32;
 
 /// Grantee-side waiters, by request id: the agent the request went to, and
 /// where its reply goes.
 pub(super) type DataReadWaiters = HashMap<String, (AgentId, oneshot::Sender<DataReadReply>)>;
 
 /// Per-sender serve counters: window start (Unix ms) and count.
-pub(super) type DataReadServeLimits = HashMap<AgentId, (u64, u32)>;
+pub(super) type DataReadServeCounts = HashMap<AgentId, (u64, u32)>;
+
+/// Serve counters: senders that hold a data grant here, and the rest.
+#[derive(Debug, Default)]
+pub(super) struct DataReadServeLimits {
+    grantees: DataReadServeCounts,
+    strangers: DataReadServeCounts,
+}
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -74,14 +84,20 @@ pub(super) async fn handle_data_read_typed(state: &Arc<AppState>, typed: DmTyped
     finish(typed);
 }
 
-/// Whether `sender` is under the serve limit; counts this request.
-fn admit_sender(state: &AppState, sender: &AgentId, now: u64) -> bool {
-    let mut limits = state
+/// Whether `sender` is under the serve limit; counts this request. A
+/// sender with a data grant here counts in the grantees' bucket.
+fn admit_sender(state: &AppState, sender: &AgentId, grantee: bool, now: u64) -> bool {
+    let mut all = state
         .data_read_serve_limits
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (limits, cap) = if grantee {
+        (&mut all.grantees, DATA_READ_SERVE_SENDERS_CAP)
+    } else {
+        (&mut all.strangers, DATA_READ_SERVE_STRANGERS_CAP)
+    };
     limits.retain(|_, (start, _)| now.saturating_sub(*start) < DATA_READ_SERVE_WINDOW_MS);
-    if !limits.contains_key(sender) && limits.len() >= DATA_READ_SERVE_SENDERS_CAP {
+    if !limits.contains_key(sender) && limits.len() >= cap {
         return false;
     }
     let (_, count) = limits.entry(*sender).or_insert((now, 0));
@@ -98,7 +114,7 @@ pub(super) async fn serve_data_read(
     state: &AppState,
     typed: &DmTypedPayload,
 ) -> Option<(AgentId, Vec<u8>)> {
-    if !typed.verified || !admit_sender(state, &typed.sender, now_ms()) {
+    if !typed.verified {
         return None;
     }
     let request = DataReadRequest::decode(&typed.payload)?;
@@ -106,6 +122,9 @@ pub(super) async fn serve_data_read(
         .agent
         .share_grant_access(&typed.sender, &typed.machine_id)
         .await;
+    if !admit_sender(state, &typed.sender, !access.data.is_empty(), now_ms()) {
+        return None;
+    }
     let reply = if !access.allows_data_read(&request.group, &request.store) {
         DataReadReply::status(&request.request_id, DataReadStatus::Forbidden).encode()
     } else {
@@ -137,6 +156,9 @@ async fn read_local_store(state: &AppState, request: &DataReadRequest) -> Option
             DataReadReply::keys_fitting(&request.request_id, keys)
         }
         DataReadOp::Get { key } => match handle.get(key).await {
+            Ok(Some(entry)) if entry.value.len() > MAX_DATA_READ_VALUE_BYTES => {
+                DataReadReply::status(&request.request_id, DataReadStatus::TooLarge).encode()
+            }
             Ok(Some(entry)) => DataReadReply {
                 request_id: request.request_id.clone(),
                 status: DataReadStatus::Ok,
@@ -149,7 +171,10 @@ async fn read_local_store(state: &AppState, request: &DataReadRequest) -> Option
                     updated_at: entry.updated_at,
                 }),
             }
-            .encode(),
+            .encode()
+            .or_else(|| {
+                DataReadReply::status(&request.request_id, DataReadStatus::TooLarge).encode()
+            }),
             Ok(None) => {
                 DataReadReply::status(&request.request_id, DataReadStatus::NotFound).encode()
             }
@@ -227,6 +252,12 @@ fn reply_response(reply: DataReadReply) -> (StatusCode, Json<serde_json::Value>)
             "the granted agent holds no grant that lets this agent read the store",
         ),
         DataReadStatus::NotFound => api_error(StatusCode::NOT_FOUND, "key not found"),
+        DataReadStatus::TooLarge => api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "the value is over the {MAX_DATA_READ_VALUE_BYTES}-byte limit of a granted read"
+            ),
+        ),
         DataReadStatus::Unavailable => api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "the granted agent cannot serve this store now",

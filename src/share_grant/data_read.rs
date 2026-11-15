@@ -29,6 +29,13 @@ pub const MAX_DATA_READ_REPLY_BYTES: usize = 45_056;
 /// Longest group id, store name or key a request may carry.
 pub const MAX_DATA_READ_FIELD_BYTES: usize = 256;
 
+/// Largest value a `get` reply carries: 32 KiB. Its base64 (43 692 bytes)
+/// fits [`MAX_DATA_READ_REPLY_BYTES`] with the bounded key and request id.
+/// A store value can be larger (up to 64 KiB inline); a larger value is
+/// answered [`DataReadStatus::TooLarge`]. The DM payload limit
+/// ([`crate::dm::MAX_PAYLOAD_BYTES`], 48 KiB) does not allow more.
+pub const MAX_DATA_READ_VALUE_BYTES: usize = 32 * 1024;
+
 /// What a request reads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -66,6 +73,9 @@ pub enum DataReadStatus {
     Forbidden,
     /// The key is not in the store.
     NotFound,
+    /// The value is over [`MAX_DATA_READ_VALUE_BYTES`], or with its key and
+    /// content type it does not fit in one reply.
+    TooLarge,
     /// This daemon does not hold the store open, or the read failed, or the
     /// result does not fit in one reply.
     Unavailable,
@@ -290,6 +300,10 @@ mod tests {
         };
         let bytes = reply.encode().expect("encode");
         assert_eq!(DataReadReply::decode(&bytes), Some(reply));
+        let too_large = DataReadReply::status("x", DataReadStatus::TooLarge);
+        assert!(
+            String::from_utf8_lossy(&too_large.encode().expect("encode")).contains("too_large")
+        );
         let forbidden = DataReadReply::status("x", DataReadStatus::Forbidden);
         assert_eq!(
             DataReadReply::decode(&forbidden.encode().expect("encode")),
