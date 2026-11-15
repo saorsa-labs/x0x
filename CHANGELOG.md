@@ -16,6 +16,12 @@ All notable changes to this project will be documented in this file.
   and after approval it can apply the approval link. A requester that waits
   behind another turn gets no outcome until its turn. New capability bit 19,
   `join_request_head_v1`; a peer without it keeps the earlier behaviour.
+- **W3-H row `s4_intake_and_egress`, machine-revocation part (#1581, D70).**
+  A control arm checks that a machine-only revocation keeps the agent's
+  group seat and opens no S4 row. An egress arm, pinned RED, records a
+  known gap: after a later rotation a TreeKEM member's revoked device still
+  reaches the new epoch through its kept leaf. The row has its own W3-H
+  shard (`1581i`).
 - **A `stale` join-request outcome can carry the authority's head (#1840,
   A08 amendment of 15 Nov 2026).** New optional `head` field on
   `groups::join_outcome::JoinRequestOutcome` (signed head commit, roster
