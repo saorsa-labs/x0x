@@ -49,6 +49,9 @@ GROUPS = (
     # H-S3-q (#1572): the `s3` shard already takes about 90 min (run
     # 43366324030), so the H-S3-q variants have their own shard.
     ('s3-q', 'w3h_1356_red_s3_q_'),
+    # H-S3-q2 (#1572): about 60 s per rerun in the 12-CPU VM, so about
+    # 40 min for 20 reruns on a runner; its own shard, as H-S3-q.
+    ('s3-q2', 'w3h_1356_control_s3_q2_sidecar_fault_cases$'),
     ('s3', 'w3h_1356_'),
     # #1623 (refs #1356): about 11 s per rerun on macOS; `rest` already
     # takes about 104 of its 120 minutes (run 41624339394), so the row
