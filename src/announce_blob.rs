@@ -99,6 +99,29 @@ pub fn fetch_warranted(cert_digest: &[u8; 32]) -> bool {
 pub(crate) static HOLD_CERTIFICATE_RECOVERY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Test-only guard: holds certificate recovery
+/// ([`HOLD_CERTIFICATE_RECOVERY`]) until dropped, also when the test
+/// panics.
+#[cfg(test)]
+#[must_use = "recovery is released when the guard drops"]
+pub(crate) struct CertificateRecoveryHold(());
+
+#[cfg(test)]
+impl CertificateRecoveryHold {
+    /// Hold certificate recovery until the guard drops.
+    pub(crate) fn hold() -> Self {
+        HOLD_CERTIFICATE_RECOVERY.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self(())
+    }
+}
+
+#[cfg(test)]
+impl Drop for CertificateRecoveryHold {
+    fn drop(&mut self) {
+        HOLD_CERTIFICATE_RECOVERY.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Whether certificate recovery is held ([`HOLD_CERTIFICATE_RECOVERY`]).
 /// Always `false` outside tests.
 #[inline]
