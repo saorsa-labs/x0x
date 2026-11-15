@@ -193,6 +193,16 @@ All notable changes to this project will be documented in this file.
 
 ### Tests and tooling
 
+- **Coordinator production pass and systemd recovery cases (#1376, S3c;
+  A14 amendment of 15 Nov 2026).** `coordinator::recover` keeps trials at
+  `<data_root>/upgrade-trial.json`, reads the handoff from the host root and
+  stops another launcher's live process through `child::stop_foreign`
+  (pidfd, identity re-checked, SIGTERM then SIGKILL, bounded waits). It
+  stays uncalled until the inventory issuer (#1378) exists. The Linux
+  systemd CI job now builds the launcher test binary and runs the launcher
+  lifecycle cases: the six #690 cases and six coordinator cases (cross-
+  launcher stop, coordinator restart, missing handoff, partial restore,
+  reboot, unwritable journal).
 - **Coordinator recovery records its outcome (#1376, S3c follow-up; A14
   amendment of 15 Nov 2026).** A host with no trial records no longer
   repeats a refused restore on every pass: the coordinator arms a trial for

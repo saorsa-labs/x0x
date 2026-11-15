@@ -1,7 +1,6 @@
 //! S3c host coordinator recovery (ADR 0094 §3, §4; #1376). Dormant like the
-//! rest of this module: no production caller yet. The caller holds the
-//! independent frozen plan (`Host`), the trial path of every participant,
-//! and a way to stop and reap a live child of another launcher.
+//! rest of this module. `recover` is the production pass; it needs a `Host`
+//! from the complete inventory issuer (#1378), so nothing calls it yet.
 //!
 //! One pass reconciles the host after a crash, a stop or a reboot. It never
 //! starts a child. It stops and reaps every live participant before a pair
@@ -38,6 +37,34 @@ pub(super) enum After {
     /// The hold was already cleared, or a newer release owns the probe
     /// record.
     Resolved,
+}
+
+/// Each participant's trial record, beside its data root.
+pub(super) const TRIAL_FILE_NAME: &str = "upgrade-trial.json";
+
+pub(super) fn trial_path(participant: &journal::Participant) -> PathBuf {
+    participant.data_root.join(TRIAL_FILE_NAME)
+}
+
+/// The production pass: trial records at `trial_path`, the handoff record
+/// read from the host root, the live clock, and `child::stop_foreign` for
+/// every live participant. `host` must come from the complete inventory
+/// issuer (#1378). There is none yet, so the launcher does not call this
+/// while `ENABLED` is false. A handoff record that cannot be read refuses
+/// the pass: it can be neither trusted as present nor treated as missing.
+pub(super) fn recover(host: &recovery::Host) -> io::Result<Resolution> {
+    let handoff_present = match journal::read_boot_records(host.root()).handoff {
+        journal::RecordRead::Missing => false,
+        journal::RecordRead::Refused(_) => return Err(invalid("handoff record refused")),
+        _ => true,
+    };
+    reconcile(
+        host,
+        trial_path,
+        handoff_present,
+        &Clock::now()?,
+        child::stop_foreign,
+    )
 }
 
 /// Reconcile the host once.
@@ -946,5 +973,73 @@ mod tests {
                 reconcile(&host, path_in(trial_dir.path()), false, &clock, no_stop).unwrap();
             assert_eq!(resolution, Resolution::Restored(after), "attempt {attempt}");
         }
+    }
+
+    /// The production pass reads the handoff from the host root and keeps
+    /// trials at `trial_path`. With no handoff and no trial it arms one
+    /// there and restores.
+    #[test]
+    fn recover_uses_the_root_handoff_and_the_fixed_trial_path() {
+        let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
+        let resolution = recover(&host).unwrap();
+        assert_eq!(
+            resolution,
+            Resolution::Restored(After::RetryAfterMs(30 * 60_000))
+        );
+        assert_previous_pair(&host);
+        let trial = Trial::load(
+            &root.join(TRIAL_FILE_NAME),
+            &host.binding().unwrap(),
+            "alice",
+        )
+        .unwrap();
+        assert_eq!(trial.phase, Phase::Restored);
+    }
+
+    /// A handoff record that cannot be read refuses the pass and moves
+    /// nothing.
+    #[test]
+    fn recover_refuses_an_unreadable_handoff() {
+        let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
+        std::fs::write(root.join(journal::HANDOFF_FILE_NAME), b"{broken").unwrap();
+        let error = recover(&host).unwrap_err();
+        assert!(error.to_string().contains("handoff"), "{error}");
+        assert_candidate_pair(&host);
+        assert_eq!(journal_record(&root).phase, journal::Phase::SwappedCli);
+    }
+
+    /// A live candidate of another launcher is stopped through
+    /// `child::stop_foreign`; that launcher's reaper collects it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_live_candidate_of_another_launcher_is_stopped_before_restore() {
+        let (_dir, _root, host, _record) = fixture(journal::Phase::SwappedCli);
+        let trial_dir = tempfile::tempdir().unwrap();
+        let clock = now();
+        let mut trials = make_trials(&host, trial_dir.path(), &clock, Phase::Booting);
+        let mut live = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let identity = child::identity(live.id()).unwrap();
+        let reaper = std::thread::spawn(move || live.wait().unwrap());
+        {
+            let (path, a) = &mut trials[0];
+            a.child = Some(identity.clone());
+            a.verdict = Some(cause(journal::CauseClass::Failed, "peer failed"));
+            a.save(path).unwrap();
+        }
+        let resolution = reconcile(
+            &host,
+            path_in(trial_dir.path()),
+            true,
+            &clock,
+            child::stop_foreign,
+        )
+        .unwrap();
+        assert!(matches!(resolution, Resolution::Restored(After::Hold(_))));
+        assert!(child::absent(&identity).unwrap());
+        assert!(!reaper.join().unwrap().success());
+        assert_previous_pair(&host);
     }
 }

@@ -209,6 +209,10 @@ fn systemd() {
         )
         .unwrap();
     }
+    if case.starts_with("coordinator") {
+        coordinator_case(&root, &case);
+        return;
+    }
     let (host, mut trial) = if case.starts_with("restart") && path.exists() {
         let record =
             serde_json::from_slice(&fs::read(root.join("independent-plan.json")).unwrap()).unwrap();
@@ -326,6 +330,247 @@ fn systemd() {
         "attempts": trial.attempts, "deadline_ms": trial.deadline_ms, "cause": trial.cause,
         "verdict": trial.verdict,
         "pid": std::process::id(), "invocation": std::env::var("INVOCATION_ID").unwrap()}))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+/// A Passed pre-swap probe record for the fixture candidate, as the probe
+/// leaves it before the swap. The coordinator records its outcome here.
+fn passed_probe(host: &recovery::Host) {
+    let plan = host.plan();
+    let install = plan.daemon.target_path.clone();
+    let state = probe::ProbeState {
+        schema_version: 1,
+        record_kind: "probe".into(),
+        install: install.clone(),
+        version: plan.candidate_version.clone(),
+        platform: "linux-fixture".into(),
+        archive_sha256: [1; 32],
+        transaction_id: "00000000-0000-4000-8000-000000000001".into(),
+        attempt: 1,
+        phase: probe::ProbePhase::Passed,
+        cause: None,
+        last_pid: None,
+        boot_id: Clock::now().unwrap().boot,
+        retry_remaining_ms: 0,
+        retry_deadline_ms: 0,
+        daemon_sha256: Some(plan.daemon.candidate_sha256),
+        cli_sha256: Some(plan.cli.candidate_sha256),
+    };
+    journal::write_auxiliary_record(&probe::state_path(&install).unwrap(), &state, |_| Ok(()))
+        .unwrap();
+}
+
+fn host_from_plan(root: &Path) -> recovery::Host {
+    let record =
+        serde_json::from_slice(&fs::read(root.join("independent-plan.json")).unwrap()).unwrap();
+    recovery::Host::new(root.into(), record).unwrap()
+}
+
+/// S3c coordinator cases (#1376) under a real systemd job:
+/// - `coordinator-stop`: a live healthy candidate, owned by another
+///   launcher thread, is stopped through `child::stop_foreign` before the
+///   pair restore; the Failed verdict becomes the D190 hold.
+/// - `coordinator-restart`: the coordinator dies with the host RollingBack
+///   and only the daemon restored; systemd restarts the job and the
+///   successor finishes the restore (Interrupted: D189 wait).
+/// - `coordinator-handoff`: OLD is gone, no handoff and no trial exist; the
+///   production `recover` pass arms a trial and restores.
+/// - `coordinator-partial`: the pair is restored but no trial is marked;
+///   the pass marks it Restored and moves no byte.
+/// - `coordinator-reboot`: the trial was charged on an earlier boot; the
+///   pass restores as Interrupted and keeps the counters.
+/// - `coordinator-holdfail`: the journal directory is read-only; no byte
+///   moves and the trial is RecoveryFailed.
+fn coordinator_case(root: &Path, case: &str) {
+    let died = root.join("coordinator-died");
+    let (host, resolution) = if case == "coordinator-restart" && died.exists() {
+        let host = host_from_plan(root);
+        let resolution = coordinator::recover(&host).unwrap();
+        (host, resolution)
+    } else {
+        let (host, mut trial) = prepare(root, case);
+        passed_probe(&host);
+        let path = root.join("trial.json");
+        match case {
+            "coordinator-stop" => {
+                trial.reserve(&path, &Clock::now().unwrap()).unwrap();
+                let mut owned = child::Owned::spawn(
+                    &mut trial,
+                    &path,
+                    &host.plan().participants[0],
+                    &host.plan().candidate_version,
+                    host.plan().daemon.candidate_sha256,
+                )
+                .unwrap()
+                .expect("candidate starts");
+                let bound = Instant::now() + Duration::from_secs(10);
+                while !owned.poll_boot().unwrap() {
+                    assert!(Instant::now() < bound, "candidate boot timed out");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let identity = owned.identity().clone();
+                // The other launcher keeps custody and reaps its child.
+                let reaper = std::thread::spawn(move || loop {
+                    if let Some(status) = owned.exited().unwrap() {
+                        return status;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                });
+                let mut trial = Trial::load(&path, &host.binding().unwrap(), "alice").unwrap();
+                trial.verdict = Some(cause(journal::CauseClass::Failed, "peer failed"));
+                trial.save(&path).unwrap();
+                let resolution = coordinator::reconcile(
+                    &host,
+                    |_| path.clone(),
+                    true,
+                    &Clock::now().unwrap(),
+                    child::stop_foreign,
+                )
+                .unwrap();
+                assert!(child::absent(&identity).unwrap());
+                assert!(!reaper.join().unwrap().success());
+                (host, resolution)
+            }
+            "coordinator-restart" => {
+                // The first coordinator recorded rollback and restored the
+                // daemon only, then died.
+                let mut record = match journal::read_boot_records(root).journal {
+                    journal::RecordRead::Journal(record) => *record,
+                    _ => panic!("journal missing"),
+                };
+                record.sequence += 1;
+                record.phase = journal::Phase::RollingBack;
+                record.cause = Some(cause(
+                    journal::CauseClass::Interrupted,
+                    "coordinator died during rollback",
+                ));
+                journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &record).unwrap();
+                filesystem::restore_one(&host.plan().daemon).unwrap();
+                fs::remove_file(&path).unwrap();
+                fs::write(&died, b"yes").unwrap();
+                std::process::exit(75);
+            }
+            "coordinator-handoff" => {
+                // OLD is reaped by `prepare`; drop its trial so no launcher
+                // has armed one, and no handoff record exists.
+                fs::remove_file(&path).unwrap();
+                assert!(!root.join(journal::HANDOFF_FILE_NAME).exists());
+                let resolution = coordinator::recover(&host).unwrap();
+                (host, resolution)
+            }
+            "coordinator-partial" => {
+                // The pair was restored, then the coordinator died before
+                // any trial was marked.
+                let mut record = match journal::read_boot_records(root).journal {
+                    journal::RecordRead::Journal(record) => *record,
+                    _ => panic!("journal missing"),
+                };
+                record.sequence += 1;
+                record.phase = journal::Phase::Restored;
+                record.cause = Some(cause(journal::CauseClass::Interrupted, "earlier pass"));
+                journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &record).unwrap();
+                for a in [&host.plan().daemon, &host.plan().cli] {
+                    filesystem::restore_one(a).unwrap();
+                }
+                let resolution = coordinator::reconcile(
+                    &host,
+                    |_| path.clone(),
+                    true,
+                    &Clock::now().unwrap(),
+                    child::stop_foreign,
+                )
+                .unwrap();
+                let trial = Trial::load(&path, &host.binding().unwrap(), "alice").unwrap();
+                assert_eq!(trial.phase, Phase::Restored);
+                (host, resolution)
+            }
+            "coordinator-reboot" => {
+                // The trial was armed and charged on an earlier boot.
+                fs::remove_file(&path).unwrap();
+                let earlier = Clock {
+                    boot: "earlier-boot".into(),
+                    ms: 1_000,
+                };
+                let mut trial =
+                    Trial::new(host.binding().unwrap(), "alice".into(), &earlier).unwrap();
+                trial.save(&path).unwrap();
+                trial.phase = Phase::Authorized;
+                trial.save(&path).unwrap();
+                trial.reserve(&path, &earlier).unwrap();
+                let resolution = coordinator::reconcile(
+                    &host,
+                    |_| path.clone(),
+                    true,
+                    &Clock::now().unwrap(),
+                    child::stop_foreign,
+                )
+                .unwrap();
+                let trial = Trial::load(&path, &host.binding().unwrap(), "alice").unwrap();
+                assert_eq!(trial.attempts, 1, "counters never reset");
+                (host, resolution)
+            }
+            "coordinator-holdfail" => {
+                // The journal directory is read-only: the rollback record
+                // cannot be made durable. The trial lives elsewhere.
+                let trials = root.join("trials");
+                fs::create_dir(&trials).unwrap();
+                let moved = trials.join("trial.json");
+                fs::rename(&path, &moved).unwrap();
+                let mut trial = Trial::load(&moved, &host.binding().unwrap(), "alice").unwrap();
+                trial.verdict = Some(cause(journal::CauseClass::Failed, "stable health lost"));
+                trial.save(&moved).unwrap();
+                host.locked(|_| Ok(())).unwrap();
+                fs::set_permissions(root, fs::Permissions::from_mode(0o500)).unwrap();
+                let result = coordinator::reconcile(
+                    &host,
+                    |_| moved.clone(),
+                    true,
+                    &Clock::now().unwrap(),
+                    child::stop_foreign,
+                );
+                fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
+                assert!(result.is_err());
+                let trial = Trial::load(&moved, &host.binding().unwrap(), "alice").unwrap();
+                assert_eq!(trial.phase, Phase::RecoveryFailed);
+                let phase = match journal::read_boot_records(root).journal {
+                    journal::RecordRead::Journal(record) => record.phase,
+                    _ => panic!("journal missing"),
+                };
+                assert_ne!(phase, journal::Phase::Restored);
+                (
+                    host,
+                    coordinator::Resolution::Final(journal::Phase::RecoveryFailed),
+                )
+            }
+            other => panic!("unknown coordinator case {other}"),
+        }
+    };
+    let pair_previous = [&host.plan().daemon, &host.plan().cli]
+        .iter()
+        .all(|a| filesystem::hash(&a.target_path).unwrap() == a.previous_sha256);
+    let state = probe::read_state(&host.plan().daemon.target_path)
+        .unwrap()
+        .expect("probe record");
+    let resolution = match resolution {
+        coordinator::Resolution::Restored(coordinator::After::Hold(_)) => "hold",
+        coordinator::Resolution::Restored(coordinator::After::RetryAfterMs(_)) => "retry",
+        coordinator::Resolution::Restored(coordinator::After::Resolved) => "resolved",
+        coordinator::Resolution::Proceed => "proceed",
+        coordinator::Resolution::Final(_) => "final",
+    };
+    fs::write(
+        root.join("done.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "case": case,
+            "resolution": resolution,
+            "pair_previous": pair_previous,
+            "probe_phase": state.phase,
+            "probe_cause": state.cause,
+            "pid": std::process::id(),
+            "invocation": std::env::var("INVOCATION_ID").unwrap(),
+        }))
         .unwrap(),
     )
     .unwrap();
