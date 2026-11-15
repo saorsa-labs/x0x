@@ -46,25 +46,65 @@ pub(super) fn trial_path(participant: &journal::Participant) -> PathBuf {
     participant.data_root.join(TRIAL_FILE_NAME)
 }
 
-/// The production pass: trial records at `trial_path`, the handoff record
-/// read from the host root, the live clock, and `child::stop_foreign` for
-/// every live participant. `host` must come from the complete inventory
-/// issuer (#1378). There is none yet, so the launcher does not call this
-/// while `ENABLED` is false. A handoff record that cannot be read refuses
-/// the pass: it can be neither trusted as present nor treated as missing.
+/// The production pass: trial records at `trial_path`, each running
+/// participant's handoff record read from its data root, the live clock,
+/// and `child::stop_foreign` for every live participant. `host` must come
+/// from the complete inventory issuer (#1378). There is none yet, so the
+/// launcher does not call this while `ENABLED` is false.
+///
+/// Contract for the caller: it stops and reaps its own child
+/// (`child::Owned::reap`) first. `stop_foreign` only signals; a child of
+/// this process would stay a zombie that only this process can reap, so
+/// the pass refuses one before it acts.
 pub(super) fn recover(host: &recovery::Host) -> io::Result<Resolution> {
-    let handoff_present = match journal::read_boot_records(host.root()).handoff {
-        journal::RecordRead::Missing => false,
-        journal::RecordRead::Refused(_) => return Err(invalid("handoff record refused")),
-        _ => true,
-    };
+    let binding = host.binding()?;
+    for p in &host.plan().participants {
+        let path = trial_path(p);
+        match Trial::load(&path, &binding, &p.instance_id) {
+            Ok(trial) => {
+                if let Some(identity) = &trial.child {
+                    if !child::absent(identity)? && child::is_own_child(identity)? {
+                        return Err(invalid("own child must be reaped before recover"));
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
     reconcile(
         host,
         trial_path,
-        handoff_present,
+        handoff_present(host)?,
         &Clock::now()?,
         child::stop_foreign,
     )
+}
+
+/// Whether every running participant's handoff for this transaction is
+/// durable. Only an M2 handoff whose transaction, generation and instance
+/// equal the binding counts. A missing record means not armed. Any other
+/// record (a legacy handoff, another transaction or generation, another
+/// instance, or an unreadable one) refuses the pass: counting it as present
+/// would skip the missing-handoff restore and start unarmed NEW bytes.
+fn handoff_present(host: &recovery::Host) -> io::Result<bool> {
+    let binding = host.binding()?;
+    let mut all = true;
+    for p in host.plan().participants.iter().filter(|p| p.was_running) {
+        match journal::read_boot_records(&p.data_root).handoff {
+            journal::RecordRead::Missing => all = false,
+            journal::RecordRead::Handoff(record)
+                if record.transaction_id == binding.transaction
+                    && record.generation == binding.generation
+                    && record.instance_id == p.instance_id => {}
+            _ => {
+                return Err(invalid(
+                    "handoff record does not belong to this transaction",
+                ))
+            }
+        }
+    }
+    Ok(all)
 }
 
 /// Reconcile the host once.
@@ -122,16 +162,17 @@ pub(super) fn reconcile(
     else {
         return Ok(Resolution::Proceed);
     };
+    // A participant with no trial record gets an Armed one first, so the
+    // restore has custody of every participant and any later failure is
+    // durable in a trial even when the host record cannot be written.
+    // Without it the restore refuses with "participant trial missing" and
+    // every later pass repeats that refusal.
+    if let Err(error) = arm(&mut trials, unarmed, &binding, clock) {
+        return Err(fail(host, &mut trials, error));
+    }
     // Stop and reap every participant before the pair restore. A
     // provisional commit by a healthy participant is invalidated here.
     if let Err(error) = stop_all(host, &trials, &mut stop) {
-        return Err(fail(host, &mut trials, error));
-    }
-    // A participant with no trial record gets an Armed one now, so the
-    // restore has custody of every participant and the outcome is durable
-    // for each launcher. Without it the restore refuses with "participant
-    // trial missing" and every later pass repeats that refusal.
-    if let Err(error) = arm(&mut trials, unarmed, &binding, clock) {
         return Err(fail(host, &mut trials, error));
     }
     for (path, trial) in trials.iter_mut() {
@@ -208,7 +249,11 @@ fn record_outcome(
 /// RecoveryFailed, so no later pass repeats the step. A committed host is
 /// never changed.
 fn fail(host: &recovery::Host, trials: &mut [(PathBuf, Trial)], error: io::Error) -> io::Error {
-    let _ = host.mark_recovery_failed();
+    let error = match host.mark_recovery_failed() {
+        Ok(()) => error,
+        // The trials still carry the marker; report both failures.
+        Err(mark) => invalid(format!("{error}; host not marked recovery-failed: {mark}")),
+    };
     fail_all(trials, error)
 }
 
@@ -996,16 +1041,114 @@ mod tests {
         assert_eq!(trial.phase, Phase::Restored);
     }
 
-    /// A handoff record that cannot be read refuses the pass and moves
-    /// nothing.
+    fn legacy_handoff() -> serde_json::Value {
+        serde_json::json!({
+            "from_version": "0.0.1", "to_version": "9.9.9",
+            "target_path": "/owned/bin/x0xd", "backup_path": "/owned/bin/x0xd.backup",
+            "argv": ["x0xd"], "cwd": "/owned", "env": {}, "old_pid": 24,
+            "api_addr": "127.0.0.1:12700", "started_at": 1_792_500_000u64,
+            "mode": "TransactionalHandoff", "launchd_verified": null,
+            "systemd_verified": null
+        })
+    }
+
+    fn m2_handoff(transaction: &str, generation: u64, instance: &str) -> serde_json::Value {
+        let mut value = legacy_handoff();
+        let object = value.as_object_mut().unwrap();
+        object.insert("schema_version".into(), 1.into());
+        object.insert("record_kind".into(), "handoff".into());
+        object.insert("transaction_id".into(), transaction.into());
+        object.insert("generation".into(), generation.into());
+        object.insert("instance_id".into(), instance.into());
+        value
+    }
+
+    /// Review of #1940: only an M2 handoff of this transaction, generation
+    /// and instance counts as present. Every other record refuses the pass,
+    /// moves no byte and leaves the journal as it was; it never makes an
+    /// unarmed swapped host proceed.
     #[test]
-    fn recover_refuses_an_unreadable_handoff() {
+    fn recover_refuses_every_handoff_that_does_not_bind_the_transaction() {
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("unreadable", b"{broken".to_vec()),
+            ("legacy", serde_json::to_vec(&legacy_handoff()).unwrap()),
+            (
+                "other transaction",
+                serde_json::to_vec(&m2_handoff("other-transaction", 1, "alice")).unwrap(),
+            ),
+            (
+                "other generation",
+                serde_json::to_vec(&m2_handoff("refusal-fixture", 2, "alice")).unwrap(),
+            ),
+            (
+                "other instance",
+                serde_json::to_vec(&m2_handoff("refusal-fixture", 1, "bob")).unwrap(),
+            ),
+        ];
+        for (name, bytes) in cases {
+            let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
+            std::fs::write(root.join(journal::HANDOFF_FILE_NAME), bytes).unwrap();
+            // Each fixture is the record kind it names, not a parse error.
+            let read = journal::read_boot_records(&root).handoff;
+            match name {
+                "unreadable" => assert!(matches!(read, journal::RecordRead::Refused(_))),
+                "legacy" => assert!(matches!(read, journal::RecordRead::LegacyHandoff(_))),
+                _ => assert!(matches!(read, journal::RecordRead::Handoff(_)), "{name}"),
+            }
+            let error = recover(&host).unwrap_err();
+            assert!(error.to_string().contains("handoff"), "{name}: {error}");
+            assert_candidate_pair(&host);
+            assert_eq!(
+                journal_record(&root).phase,
+                journal::Phase::SwappedCli,
+                "{name}"
+            );
+        }
+    }
+
+    /// The binding handoff counts as present: the armed transaction
+    /// proceeds.
+    #[test]
+    fn recover_counts_the_binding_handoff_as_present() {
         let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
-        std::fs::write(root.join(journal::HANDOFF_FILE_NAME), b"{broken").unwrap();
-        let error = recover(&host).unwrap_err();
-        assert!(error.to_string().contains("handoff"), "{error}");
+        std::fs::write(
+            root.join(journal::HANDOFF_FILE_NAME),
+            serde_json::to_vec(&m2_handoff("refusal-fixture", 1, "alice")).unwrap(),
+        )
+        .unwrap();
+        match journal::read_boot_records(&root).handoff {
+            journal::RecordRead::Handoff(_) => {}
+            journal::RecordRead::Refused(reason) => panic!("fixture refused: {reason}"),
+            _ => panic!("fixture is not an M2 handoff"),
+        }
+        assert_eq!(recover(&host).unwrap(), Resolution::Proceed);
         assert_candidate_pair(&host);
-        assert_eq!(journal_record(&root).phase, journal::Phase::SwappedCli);
+    }
+
+    /// The caller must reap its own child first: a live child of this
+    /// process refuses the pass before any action.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recover_refuses_a_live_child_of_this_process() {
+        let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
+        let mut live = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let clock = now();
+        let path = root.join(TRIAL_FILE_NAME);
+        let mut trial = Trial::new(host.binding().unwrap(), "alice".into(), &clock).unwrap();
+        trial.save(&path).unwrap();
+        trial.phase = Phase::Authorized;
+        trial.save(&path).unwrap();
+        trial.reserve(&path, &clock).unwrap();
+        trial.child = Some(child::identity(live.id()).unwrap());
+        trial.save(&path).unwrap();
+        let error = recover(&host).unwrap_err();
+        assert!(error.to_string().contains("own child"), "{error}");
+        assert_candidate_pair(&host);
+        live.kill().unwrap();
+        live.wait().unwrap();
     }
 
     /// A live candidate of another launcher is stopped through

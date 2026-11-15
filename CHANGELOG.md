@@ -195,7 +195,8 @@ All notable changes to this project will be documented in this file.
 
 - **Coordinator production pass and systemd recovery cases (#1376, S3c;
   A14 amendment of 15 Nov 2026).** `coordinator::recover` keeps trials at
-  `<data_root>/upgrade-trial.json`, reads the handoff from the host root and
+  `<data_root>/upgrade-trial.json`, counts only a handoff that binds this
+  transaction, generation and instance (any other record refuses), and
   stops another launcher's live process through `child::stop_foreign`
   (pidfd, identity re-checked, SIGTERM then SIGKILL, bounded waits). It
   stays uncalled until the inventory issuer (#1378) exists. The Linux

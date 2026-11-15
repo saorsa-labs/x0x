@@ -469,7 +469,10 @@ pub(super) fn identity(_pid: u32) -> io::Result<Identity> {
 /// is never signalled. SIGTERM comes first, then SIGKILL, each followed by
 /// a bounded wait for the identity to be absent. The process's own parent
 /// reaps it; a process that is still present after SIGKILL and its wait is
-/// an error, which the coordinator turns into RecoveryFailed.
+/// an error, which the coordinator turns into RecoveryFailed. A zombie
+/// still counts as present (`absent` reads `/proc/<pid>/stat`), so the
+/// target must not be a child of this process: `coordinator::recover`
+/// refuses one, and its caller reaps its own child first.
 #[cfg(target_os = "linux")]
 pub(super) fn stop_foreign(expected: &Identity) -> io::Result<()> {
     use std::os::fd::OwnedFd;
@@ -527,6 +530,32 @@ pub(super) fn stop_foreign(expected: &Identity) -> io::Result<()> {
 
 #[cfg(not(target_os = "linux"))]
 pub(super) fn stop_foreign(_expected: &Identity) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "launcher process custody requires Linux",
+    ))
+}
+
+/// Whether the live process with this identity is a child of this
+/// process. Only its parent can reap a child, so the coordinator refuses
+/// to treat one as another launcher's process.
+#[cfg(target_os = "linux")]
+pub(super) fn is_own_child(expected: &Identity) -> io::Result<bool> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", expected.pid))?;
+    let parent: u32 = stat
+        .rsplit_once(')')
+        .ok_or_else(|| invalid("bad process stat"))?
+        .1
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| invalid("missing parent pid"))?
+        .parse()
+        .map_err(invalid)?;
+    Ok(parent == std::process::id())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn is_own_child(_expected: &Identity) -> io::Result<bool> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "launcher process custody requires Linux",
