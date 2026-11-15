@@ -88,6 +88,18 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **A node that restarted still serves the TreeKEM commits it held
+  (#1427).** The TreeKEM catch-up log is saved under `treekem-catchup-log/`
+  in the data directory (one file per group, local only) and loaded at
+  start. A member that was offline when a commit was made can catch up
+  from a signer that restarted since. A removal or ban that has an ADR
+  0110 (S4) row, in any phase, is not loaded from the saved file. The file
+  is versioned; a damaged or unknown-version file is skipped. A requester
+  removed or banned after its cached add is no longer served pages. A
+  start catch-up cycle now waits for another running catch-up task of the
+  same group to end before it judges the cycle. No wire format or API
+  changes.
+
 - **Documented the exit for a forked head behind an armed gap record
   (#871).** The anchored-gap gate has no expiry and no local clear. With no
   progress (10 minutes for an owner-armed gap, 30 minutes for an
