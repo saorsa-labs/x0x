@@ -55,8 +55,10 @@ All notable changes to this project will be documented in this file.
   the commits it missed after it starts (#1427).** With no later traffic,
   such a member stayed at its old epoch. When its last recorded up time is
   more than 60 s old, the daemon asks the other members of each TreeKEM
-  group for a catch-up page at start, and again when the network join ends,
-  so a slow bootstrap does not end the catch-up. Two new local files are in
+  group for catch-up pages at start, and again after the network join ends
+  (in either order), so a slow bootstrap does not end the catch-up. While a
+  page moves the group, it asks for the next epoch (at most 16 cycles), so a
+  member several commits behind reaches the tip. Two new local files are in
   the data directory: `treekem-alive` (the last up time, written every 15 s)
   and `treekem-catchup-pending` (the outage record, kept until each group's
   catch-up succeeds, so the next start asks again). A first start and a

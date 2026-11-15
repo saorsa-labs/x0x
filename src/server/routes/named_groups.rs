@@ -15709,24 +15709,93 @@ async fn treekem_start_catchup_note_head(state: &AppState, key: &str, reported: 
     }
 }
 
-/// #1427: ask the other members of one TreeKEM group for a catch-up page,
-/// with no epoch-ahead traffic needed. It runs as the group's epoch-ahead
-/// task ([`request_treekem_catchup_for_epoch_ahead`]) with the next epoch
-/// as the target, so it never runs beside another catch-up task for the
-/// group, and stops when a served page moves the group past the start
-/// epoch. When an epoch-ahead task already runs, that task takes the
-/// target. The group stays pending until its epoch moves, a member reports
-/// the local head, or this member leaves the group.
-async fn request_treekem_catchup_after_start(state: &Arc<AppState>, key: &str) {
-    let Some(start_epoch) = current_treekem_epoch(state, key).await else {
-        treekem_start_catchup_done(state, key).await;
-        return;
+/// #1427: the most catch-up cycles one start pass runs for one group. A
+/// served page can move the group by one epoch, so a member that missed
+/// several commits needs a cycle for each.
+const TREEKEM_START_CATCHUP_CYCLES: usize = 16;
+
+/// #1427: how a start pass for one group ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TreeKemStartCatchupEnd {
+    /// The group moved and a later cycle brought no newer epoch, a member
+    /// reported the local head, or the group is gone.
+    Done,
+    /// No cycle moved the group, or the cycles ran out while it still
+    /// moved. The group stays pending.
+    KeepPending,
+}
+
+/// #1427: the cycle rule of one start pass. `cycle(target)` runs one
+/// catch-up cycle toward `target`. While a cycle moves the group, the
+/// next cycle asks for the epoch after the new one, so a member that is
+/// several commits behind keeps asking. The pass is done when a cycle
+/// after a move brings no newer epoch, or when `pending()` turns false
+/// (a member reported the local head). The cycles are bounded by
+/// [`TREEKEM_START_CATCHUP_CYCLES`].
+async fn drive_treekem_start_catchup<E, C>(
+    mut epoch_now: impl FnMut() -> E,
+    mut cycle: impl FnMut(u64) -> C,
+    pending: impl Fn() -> bool,
+) -> TreeKemStartCatchupEnd
+where
+    E: std::future::Future<Output = Option<u64>>,
+    C: std::future::Future<Output = ()>,
+{
+    let Some(mut from) = epoch_now().await else {
+        return TreeKemStartCatchupEnd::Done;
     };
-    request_treekem_catchup_for_epoch_ahead(state, key, start_epoch.saturating_add(1)).await;
-    let moved = current_treekem_epoch(state, key)
-        .await
-        .is_none_or(|now| now > start_epoch);
-    if moved
+    let mut moved = false;
+    for _ in 0..TREEKEM_START_CATCHUP_CYCLES {
+        cycle(from.saturating_add(1)).await;
+        if !pending() {
+            return TreeKemStartCatchupEnd::Done;
+        }
+        match epoch_now().await {
+            None => return TreeKemStartCatchupEnd::Done,
+            Some(now) if now > from => {
+                from = now;
+                moved = true;
+            }
+            Some(_) if moved => return TreeKemStartCatchupEnd::Done,
+            Some(_) => return TreeKemStartCatchupEnd::KeepPending,
+        }
+    }
+    TreeKemStartCatchupEnd::KeepPending
+}
+
+/// #1427: ask the other members of one TreeKEM group for catch-up pages,
+/// with no epoch-ahead traffic needed. Each cycle runs as the group's
+/// epoch-ahead task ([`request_treekem_catchup_for_epoch_ahead`]) with the
+/// next epoch as the target, so it never runs beside another catch-up
+/// task for the group; when an epoch-ahead task already runs, that task
+/// takes the target. [`drive_treekem_start_catchup`] repeats the cycle
+/// while the group moves. The group stays pending until the pass is done,
+/// a member reports the local head, or this member leaves the group.
+async fn request_treekem_catchup_after_start(state: &Arc<AppState>, key: &str) {
+    state
+        .treekem_start_catchup_passes
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let end = drive_treekem_start_catchup(
+        || {
+            let state = Arc::clone(state);
+            let key = key.to_string();
+            async move { current_treekem_epoch(&state, &key).await }
+        },
+        |target| {
+            let state = Arc::clone(state);
+            let key = key.to_string();
+            async move { request_treekem_catchup_for_epoch_ahead(&state, &key, target).await }
+        },
+        || {
+            state
+                .treekem_start_catchup_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(key)
+        },
+    )
+    .await;
+    if end == TreeKemStartCatchupEnd::Done
         || !treekem_start_catchup_groups(state)
             .await
             .iter()
@@ -15737,34 +15806,41 @@ async fn request_treekem_catchup_after_start(state: &Arc<AppState>, key: &str) {
 }
 
 /// #1427: run [`request_treekem_catchup_after_start`] for each pending
-/// group, each on its own task.
+/// group, each on its own task. After the first pass, the task waits for
+/// the end of the network join (at once when it has already ended) and,
+/// when the group is still pending, runs one more pass. So the order of
+/// the join and of this registration does not matter: a start pass that
+/// ran during a slow bootstrap always gets a pass after the join.
 fn spawn_treekem_start_catchup(state: &Arc<AppState>, keys: Vec<String>) {
     for key in keys {
         let task_state = Arc::clone(state);
+        let mut join_ended = state.treekem_network_join_ended.subscribe();
         let _admitted = state.spawn_detached(async move {
             request_treekem_catchup_after_start(&task_state, &key).await;
+            if join_ended.wait_for(|ended| *ended).await.is_err() {
+                return;
+            }
+            let still_pending = task_state
+                .treekem_start_catchup_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&key);
+            if still_pending {
+                tracing::info!(
+                    group_id = %LogHexId::group(&key),
+                    "network join ended; asking again for TreeKEM catch-up pages"
+                );
+                request_treekem_catchup_after_start(&task_state, &key).await;
+            }
         });
     }
 }
 
-/// #1427: the network join has ended. A start catch-up that ran during a
-/// slow bootstrap can have ended before any member was reachable, so ask
-/// again for each group that is still pending.
-pub(in crate::server) fn retry_treekem_start_catchup(state: &Arc<AppState>) {
-    let keys: Vec<String> = state
-        .treekem_start_catchup_pending
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-        .cloned()
-        .collect();
-    if !keys.is_empty() {
-        tracing::info!(
-            groups = keys.len(),
-            "network join ended; asking again for TreeKEM catch-up pages"
-        );
-    }
-    spawn_treekem_start_catchup(state, keys);
+/// #1427: the network join has ended (Ok or Err). Each start catch-up
+/// task that is still pending, or that registers later, then asks again
+/// ([`spawn_treekem_start_catchup`]).
+pub(in crate::server) fn retry_treekem_start_catchup(state: &AppState) {
+    state.treekem_network_join_ended.send_replace(true);
 }
 
 /// #1427: the start catch-up of TreeKEM groups. A member that was down
@@ -15773,8 +15849,9 @@ pub(in crate::server) fn retry_treekem_start_catchup(state: &Arc<AppState>) {
 /// for it. So when the last recorded up time is older than that resend, or
 /// an earlier start left the outage record
 /// ([`treekem_catchup_pending_path`]), the start runs
-/// [`request_treekem_catchup_after_start`] for each group, and
-/// [`retry_treekem_start_catchup`] asks again after the network join. A
+/// [`request_treekem_catchup_after_start`] for each group, and each group
+/// that is still pending asks again after the network join
+/// ([`spawn_treekem_start_catchup`]). A
 /// shorter outage is left to the resends, and a first start (no record)
 /// asks nothing. While the daemon runs, it records its up time every
 /// [`TREEKEM_ALIVE_INTERVAL`]. Both records are written atomically.
@@ -54760,6 +54837,8 @@ pub(in crate::server) mod tests {
             )),
             treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
             treekem_start_catchup_pending: Default::default(),
+            treekem_network_join_ended: tokio::sync::watch::channel(false).0,
+            treekem_start_catchup_passes: Default::default(),
             treekem_catchup_refusals: StdMutex::new(HashMap::new()),
             join_request_outcome_sends: StdMutex::new(HashMap::new()),
             group_membership_locks: RwLock::new(HashMap::new()),

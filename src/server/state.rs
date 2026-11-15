@@ -1308,6 +1308,13 @@ pub(super) struct AppState {
     /// succeeded since an outage past the last metadata resend. The
     /// outage record on disk stays until this set is empty.
     pub(super) treekem_start_catchup_pending: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// #1427: true once the network join task has ended (Ok or Err). A
+    /// start catch-up waits for it, in any order, and then asks again for
+    /// each group that is still pending.
+    pub(super) treekem_network_join_ended: tokio::sync::watch::Sender<bool>,
+    /// #1427: how many start catch-up passes this daemon began (a pass is
+    /// one catch-up cycle for one group). Diagnostics only.
+    pub(super) treekem_start_catchup_passes: std::sync::atomic::AtomicU64,
     /// #1657 (ADR 0110 §3): the latest typed TreeKEM catch-up refusal
     /// this daemon received, per group, keyed by the group id its own
     /// request used. Surfaced in the operator log at receive time and

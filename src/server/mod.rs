@@ -1401,6 +1401,8 @@ pub async fn serve_with_options(
         )),
         treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
         treekem_start_catchup_pending: Default::default(),
+        treekem_network_join_ended: tokio::sync::watch::channel(false).0,
+        treekem_start_catchup_passes: Default::default(),
         treekem_catchup_refusals: StdMutex::new(HashMap::new()),
         join_request_outcome_sends: StdMutex::new(HashMap::new()),
         group_membership_locks: RwLock::new(HashMap::new()),
@@ -2170,7 +2172,8 @@ pub async fn serve_with_options(
             }
         }
         // #1427: a start catch-up that ran during a slow bootstrap asks
-        // again now that the join has ended.
+        // again now that the join has ended, whether it registered before
+        // or after this point.
         routes::named_groups::retry_treekem_start_catchup(&join_rekey_state);
     }));
 

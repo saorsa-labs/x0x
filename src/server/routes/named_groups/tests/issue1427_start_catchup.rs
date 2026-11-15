@@ -211,3 +211,99 @@ async fn issue1427_short_outage_asks_nothing() -> Result<()> {
     start.abort();
     Ok(())
 }
+
+fn passes(state: &AppState) -> u64 {
+    state
+        .treekem_start_catchup_passes
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Review round 2: the join task can end before the start registers its
+/// pending groups. The retry must still come after the registration.
+#[tokio::test(start_paused = true)]
+async fn issue1427_join_ended_before_registration_still_asks_again() -> Result<()> {
+    let (state, _dir, key) = treekem_member_state().await?;
+    write_last_up(&state, Duration::from_secs(600)).await?;
+    // The join ends first, while nothing is pending yet.
+    retry_treekem_start_catchup(&state);
+    assert_eq!(passes(&state), 0);
+    let start = tokio::spawn(run_treekem_start_catchup(Arc::clone(&state)));
+    settle("a second start pass after the join", async || {
+        passes(&state) >= 2
+    })
+    .await?;
+    assert!(
+        pending(&state, &key),
+        "#1427: passes that reached no member keep the group pending"
+    );
+    start.abort();
+    Ok(())
+}
+
+/// Review round 2: a member several commits behind keeps asking while
+/// each cycle moves it one epoch, and stops when a cycle brings no newer
+/// epoch.
+#[tokio::test(start_paused = true)]
+async fn issue1427_start_pass_follows_a_multi_epoch_gap() {
+    // The member is at epoch 3; the group is at 6. Each served page moves
+    // it one epoch.
+    let epoch = std::cell::Cell::new(3_u64);
+    let targets = std::cell::RefCell::new(Vec::new());
+    let end = drive_treekem_start_catchup(
+        || std::future::ready(Some(epoch.get())),
+        |target| {
+            targets.borrow_mut().push(target);
+            if epoch.get() < 6 {
+                epoch.set(epoch.get() + 1);
+            }
+            std::future::ready(())
+        },
+        || true,
+    )
+    .await;
+    assert_eq!(end, TreeKemStartCatchupEnd::Done);
+    assert_eq!(epoch.get(), 6, "#1427: the pass must reach the group epoch");
+    assert_eq!(*targets.borrow(), vec![4, 5, 6, 7]);
+
+    // No cycle moves the group: it stays pending after one cycle.
+    let cycles = std::cell::Cell::new(0);
+    let end = drive_treekem_start_catchup(
+        || std::future::ready(Some(3)),
+        |_| {
+            cycles.set(cycles.get() + 1);
+            std::future::ready(())
+        },
+        || true,
+    )
+    .await;
+    assert_eq!(end, TreeKemStartCatchupEnd::KeepPending);
+    assert_eq!(cycles.get(), 1);
+
+    // A member reports the local head: the pass ends at once.
+    let cycles = std::cell::Cell::new(0);
+    let end = drive_treekem_start_catchup(
+        || std::future::ready(Some(3)),
+        |_| {
+            cycles.set(cycles.get() + 1);
+            std::future::ready(())
+        },
+        || false,
+    )
+    .await;
+    assert_eq!(end, TreeKemStartCatchupEnd::Done);
+    assert_eq!(cycles.get(), 1);
+
+    // A group that keeps moving is bounded and stays pending.
+    let epoch = std::cell::Cell::new(0_u64);
+    let end = drive_treekem_start_catchup(
+        || std::future::ready(Some(epoch.get())),
+        |_| {
+            epoch.set(epoch.get() + 1);
+            std::future::ready(())
+        },
+        || true,
+    )
+    .await;
+    assert_eq!(end, TreeKemStartCatchupEnd::KeepPending);
+    assert_eq!(epoch.get(), TREEKEM_START_CATCHUP_CYCLES as u64);
+}
