@@ -19,12 +19,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::dm_inbox::{DmTypedPayload, DmTypedPayloadCompletion};
+use crate::groups::eviction::WaitingCause;
 use crate::identity::AgentId;
 use crate::share_grant::data_read::{
-    truncate_utf8, DataReadEntry, DataReadKey, DataReadOp, DataReadReply, DataReadRequest,
-    DataReadStatus, DataWriteOp, DataWriteRequest, DATA_READ_REPLY_DM_PREFIX,
+    DataReadEntry, DataReadKey, DataReadOp, DataReadReply, DataReadRequest, DataReadStatus,
+    DataWriteOp, DataWriteRefusal, DataWriteRequest, DATA_READ_REPLY_DM_PREFIX,
     DATA_READ_REQUEST_DM_PREFIX, DATA_WRITE_REQUEST_DM_PREFIX, MAX_DATA_READ_CONTENT_TYPE_BYTES,
-    MAX_DATA_READ_VALUE_BYTES, MAX_DATA_WRITE_ERROR_BYTES, MAX_DATA_WRITE_VALUE_BYTES,
+    MAX_DATA_READ_VALUE_BYTES, MAX_DATA_WRITE_VALUE_BYTES,
 };
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -268,16 +269,28 @@ fn write_reply(request_id: &str, code: StatusCode, body: &serde_json::Value) -> 
     match status {
         DataReadStatus::Ok => reply.published = Some(code == StatusCode::OK),
         DataReadStatus::Refused => {
-            reply.error = Some(truncate_utf8(
-                body["error"]
-                    .as_str()
-                    .unwrap_or("the store refused the write"),
-                MAX_DATA_WRITE_ERROR_BYTES,
-            ));
+            reply.error = Some(refusal_for(code, body).as_str().to_string());
         }
         _ => {}
     }
     reply
+}
+
+/// The fixed refusal code for a store handler's refusal. The handler's own
+/// error text stays on this daemon (review of #1953).
+fn refusal_for(code: StatusCode, body: &serde_json::Value) -> DataWriteRefusal {
+    match code {
+        StatusCode::FORBIDDEN => DataWriteRefusal::StorePolicy,
+        StatusCode::GONE => DataWriteRefusal::GroupAdminRevoked,
+        StatusCode::CONFLICT
+            if body["reason"].as_str()
+                == Some(WaitingCause::WaitingForEligibleAdminRevocation.as_str()) =>
+        {
+            DataWriteRefusal::WaitingForEligibleAdminRevocation
+        }
+        StatusCode::CONFLICT => DataWriteRefusal::ImmutableKey,
+        _ => DataWriteRefusal::Other,
+    }
 }
 
 /// Send one data-read DM, one attempt, off the caller's task.
@@ -351,7 +364,7 @@ fn reply_response(reply: DataReadReply) -> (StatusCode, Json<serde_json::Value>)
             StatusCode::CONFLICT,
             format!(
                 "the granted agent's store refused the write: {}",
-                reply.error.unwrap_or_default()
+                DataWriteRefusal::from_wire(reply.error.as_deref().unwrap_or_default()).describe()
             ),
         ),
         DataReadStatus::Forbidden => api_error(

@@ -51,11 +51,11 @@ GROUPS = (
     # H-S3-q (2) (#1572): about 60 s per rerun in the 12-CPU VM (it
     # watches J past GATE_STALL), so about 40 min for 20 reruns on a
     # runner; its own shard, so the `s3-q` shard does not grow.
-    ('s3-qm', 'w3h_1356_red_s3_q_member_unreadable_sidecar$'),
-    ('s3-q', 'w3h_1356_red_s3_q_'),
+    ('s3-qm', 'w3h_1356_control_s3_q_member_unreadable_sidecar$'),
+    ('s3-q', 'w3h_1356_(red|control)_s3_q_joiner_'),
     # H-S3-q (3) (#1572) runs the H-S3-c3 prefix with O's restart, so it
     # has its own shard like the other owner-axis rows.
-    ('s3-q3', 'w3h_1356_red_s3_q3_issuer_unreadable_sidecar$'),
+    ('s3-q3', 'w3h_1356_control_s3_q3_issuer_unreadable_sidecar$'),
     # H-S3-q2 (#1572): about 60 s per rerun in the 12-CPU VM, so about
     # 40 min for 20 reruns on a runner; its own shard, as H-S3-q.
     ('s3-q2', 'w3h_1356_control_s3_q2_sidecar_fault_cases$'),
@@ -76,6 +76,11 @@ GROUPS = (
     # Lima VM. `rest` takes about 108 of its 120 minutes, so the rows have
     # their own shard; the budget is not raised (31 Oct ruling, #1733).
     ('1427', 'w3h_1427_'),
+    # #1581 `s4_certificate_expiry_skew` runs (1), (5a), (8): three
+    # five-node arms of about 700 virtual seconds each (B's certificate
+    # expires 600 s after issue, then N + τ + the bound), so the row has
+    # its own shard rather than a raised budget (31 Oct ruling, #1733).
+    ('1581j', 'w3h_1581j_'),
 )
 
 # The gate's reruns per case (D196). A group in `PARTS` runs them as that
@@ -102,7 +107,11 @@ RUNS = 20
 # H-S3-q (3): one rerun is 172-203 s in the 12-CPU VM, so about 400 s on
 # the runner and about 135 min for 20 reruns, too close to the 155-min S3
 # test deadline: 2 parts of 10 reruns take about 70 min each.
-PARTS = {'s3-d3': 4, 's3-1661': 2, 's3-rm4': 4, 's3-rm2': 2, 's3-q3': 2}
+# 1581j (#1581 `s4_certificate_expiry_skew`): one rerun of the three arms
+# is about 125 s in the 12-CPU VM, so about 250 s on the runner and
+# about 85 min for 20 reruns, too close to the 110-min test deadline of a
+# non-S3 group: 2 parts of 10 reruns take about 45 min each.
+PARTS = {'s3-d3': 4, 's3-1661': 2, 's3-rm4': 4, 's3-rm2': 2, 's3-q3': 2, '1581j': 2}
 
 ROOT = Path(__file__).resolve().parents[2]
 
