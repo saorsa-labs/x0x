@@ -108,10 +108,7 @@ pub(super) fn run_trial(
         }
         let spawned = host.locked(|record| {
             // Each attempt re-checks the host phase, not only the first.
-            if !matches!(
-                record.phase,
-                journal::Phase::SwappedCli | journal::Phase::HandoffArmed
-            ) {
+            if !protected_start_allowed(record.phase) {
                 return Err(invalid("host is not ready for protected start"));
             }
             host.verify_candidate()?;
@@ -198,6 +195,15 @@ pub(super) fn run_trial(
         trial.next_launch_ms = now()?.ms.saturating_add(GAP_MS);
         trial.save(path)?;
     }
+}
+
+/// Whether the host phase allows a candidate spawn. Checked under the host
+/// lock; the coordinator's RollingBack fence makes it false.
+pub(super) fn protected_start_allowed(phase: journal::Phase) -> bool {
+    matches!(
+        phase,
+        journal::Phase::SwappedCli | journal::Phase::HandoffArmed
+    )
 }
 
 /// The Failed verdict a trial has already reached between attempts, if

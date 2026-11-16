@@ -26,7 +26,7 @@
       "revision": 1,
       "path": "A03-r01-trust-permissions-sharing-and-revocation.md",
       "title": "Trust Permissions Sharing and Revocation",
-      "sha256": "30dfc2e3634c909f526e2c2319819c2a6f3c733ddec8dde358def6754f267fb9"
+      "sha256": "6346e7fbdf40d36d15533776de7a12a693528017438f311136333cbb62fa46eb"
     },
     {
       "id": "A04",
@@ -103,7 +103,7 @@
       "revision": 1,
       "path": "A14-r01-health-updates-and-recovery.md",
       "title": "Health Updates and Recovery",
-      "sha256": "e6544b8df3c981c0c03527e1457b5766d485d29ea8e6f1ad150e31798b83c3d3"
+      "sha256": "6de42e62bf7dfd198435bd8c9bc62288aa700d084ef691ad2265dcb96052025a"
     },
     {
       "id": "A15",

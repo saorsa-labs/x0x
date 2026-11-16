@@ -11,6 +11,7 @@ use std::path::Path;
 use serde_json::{json, Map, Value};
 
 use crate::upgrade::journal::{self, RecordRead};
+#[cfg(unix)]
 use crate::upgrade::probe::{self, ProbePhase};
 
 /// The most backup files the inventory lists.
@@ -24,18 +25,40 @@ pub(super) fn records_json(data_dir: &Path, install: Option<&Path>) -> Map<Strin
     let mut body = Map::new();
     body.insert("plan".into(), plan_json(data_dir, &mut errors));
 
-    let probe_state = match install {
-        Some(install) => match probe::read_state(install) {
-            Ok(state) => state,
-            Err(_) => {
-                errors.push("probe record unreadable");
-                None
-            }
+    if install.is_none() {
+        errors.push("install path unavailable");
+    }
+    probe_records_json(install, &mut body, &mut errors);
+    body.insert(
+        "backups".into(),
+        Value::Array(install.map(backups_json).unwrap_or_default()),
+    );
+    body.insert(
+        "records_error".into(),
+        if errors.is_empty() {
+            Value::Null
+        } else {
+            Value::String(errors.join("; "))
         },
-        None => {
-            errors.push("install path unavailable");
+    );
+    body
+}
+
+/// The `last_attempt`, `holds` and `last_hold_clear` fields, from the
+/// install's pre-swap probe records.
+#[cfg(unix)]
+fn probe_records_json(
+    install: Option<&Path>,
+    body: &mut Map<String, Value>,
+    errors: &mut Vec<&'static str>,
+) {
+    let probe_state = match install.map(probe::read_state) {
+        Some(Ok(state)) => state,
+        Some(Err(_)) => {
+            errors.push("probe record unreadable");
             None
         }
+        None => None,
     };
     body.insert(
         "last_attempt".into(),
@@ -101,19 +124,19 @@ pub(super) fn records_json(data_dir: &Path, install: Option<&Path>) -> Map<Strin
         _ => Value::Null,
     };
     body.insert("last_hold_clear".into(), last_clear);
-    body.insert(
-        "backups".into(),
-        Value::Array(install.map(backups_json).unwrap_or_default()),
-    );
-    body.insert(
-        "records_error".into(),
-        if errors.is_empty() {
-            Value::Null
-        } else {
-            Value::String(errors.join("; "))
-        },
-    );
-    body
+}
+
+/// Probe records and holds exist only on Unix installs (`upgrade::probe`), so
+/// the fields keep their documented shape with the "no record" values.
+#[cfg(not(unix))]
+fn probe_records_json(
+    _install: Option<&Path>,
+    body: &mut Map<String, Value>,
+    _errors: &mut Vec<&'static str>,
+) {
+    body.insert("last_attempt".into(), Value::Null);
+    body.insert("holds".into(), Value::Array(Vec::new()));
+    body.insert("last_hold_clear".into(), Value::Null);
 }
 
 /// The frozen plan of the M2 journal, if a record exists.

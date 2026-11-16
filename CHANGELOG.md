@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **An `rw` grantee writes a store through a `ShareCap::Data` grant (#1094
+  slice D2, A03 amendment of 16 Nov 2026).** `PUT` and
+  `DELETE /grants/data/:agent/:group/:store/:key` (`x0x grant data put|rm`)
+  set or remove one key. The granted agent checks that the grant is `rw` and
+  applies the write as its own write to the store, so the store's policy and
+  write refusals apply unchanged. New typed DM `x0x-data-write-v1` (the reply
+  uses `x0x-data-reply-v1`, with a new `refused` status, 409 on the grantee)
+  and capability bit 21, `data_write_v1`; a peer without it is not sent a
+  write (424). A value over 28 416 bytes is answered 413 and not sent.
 - **Upgrade records: `clearable` matches the local clear (#1932 review; A14
   amendment of 15 Nov 2026).** A hold reports `clearable: true` only when
   `x0x upgrade --clear-hold` would clear it; an unresolved `.pending` probe
@@ -39,6 +48,10 @@ All notable changes to this project will be documented in this file.
   and after approval it can apply the approval link. A requester that waits
   behind another turn gets no outcome until its turn. New capability bit 19,
   `join_request_head_v1`; a peer without it keeps the earlier behaviour.
+- **W3-H row `s4_certificate_rebind` run (7) (#1581).** After B revokes
+  its own agent and A and C hold the record, B's self-rebind of a later
+  renewal is refused with `rebind_signer_ineligible`, and no node binds
+  it. The step runs at the end of the existing pre-cutoff arm.
 - **W3-H row `s4_intake_and_egress`, machine-revocation part (#1581, D70).**
   A control arm checks that a machine-only revocation keeps the agent's
   group seat and opens no S4 row. An egress arm, pinned RED, records a
@@ -242,7 +255,14 @@ All notable changes to this project will be documented in this file.
   systemd CI job now builds the launcher test binary and runs the launcher
   lifecycle cases: the six #690 cases and six coordinator cases (cross-
   launcher stop, coordinator restart, missing handoff, partial restore,
-  reboot, unwritable journal).
+  reboot, unwritable journal). Before it stops any participant, the pass
+  now fences the host to `RollingBack` under the host lock and loads every
+  trial again, so no launcher starts a candidate past the restore; a host
+  that a peer restored or committed in the meantime is left as it is. The
+  host lock is free during the stop, so the pass reads the phase again,
+  restores, records the outcome and marks the trials in one lock: it never
+  stops a restored child or demotes a host that a peer restored (#1940 and #1950 review follow-ups, A14 amendment
+  of 16 Nov 2026).
 - **Host commit outcome classes and the latched-barrier hold (#1943 and
   #1939 review; A14 amendment of 15 Nov 2026).** The launcher's host
   commit returns a typed committed / not-yet / roll-back decision; a
