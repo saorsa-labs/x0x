@@ -991,8 +991,7 @@ pub async fn serve_with_options(
         mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(256);
     // #1094 D1: data-read requests and replies. Plain typed routes, one
     // attempt: the grantee's HTTP call waits for the reply or times out.
-    let (data_read_dm_tx, mut data_read_dm_rx) =
-        mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(256);
+    let (data_read_dm_tx, data_read_dm_rx) = mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(256);
     let exec_service = x0x::exec::ExecService::spawn(Arc::clone(&agent), exec_policy, exec_dm_rx);
     // Tasks started before AppState exists still need owned cancellation on a
     // later startup rejection. They are folded into the supervisor's normal
@@ -3035,16 +3034,12 @@ pub async fn serve_with_options(
         }));
     }
 
-    // #1094 D1: data reads. The grant check runs in the handler; reply
-    // sends run on detached tasks.
-    {
-        let data_read_state = Arc::clone(&state);
-        bg_tasks.push(tokio::spawn(async move {
-            while let Some(typed) = data_read_dm_rx.recv().await {
-                crate::server::data_read::handle_data_read_typed(&data_read_state, typed).await;
-            }
-        }));
-    }
+    // #1094 D1/D2: data reads and writes. Replies complete their waiter in
+    // the consumer; request serves and reply sends run on detached tasks,
+    // so a slow write does not hold the next reply (#1953 review).
+    bg_tasks.push(tokio::spawn(
+        crate::server::data_read::run_data_read_consumer(Arc::clone(&state), data_read_dm_rx),
+    ));
 
     // ADR 0083 slice 3: remote GUI show. Trust runs in the handler, before
     // the body is decoded. Displays and reply sends run on detached tasks,

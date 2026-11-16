@@ -100,6 +100,10 @@ async fn bound_sender(state: &AppState) -> (AgentId, MachineId) {
     (agent, machine)
 }
 
+fn serve_slots() -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(DATA_SERVE_SLOTS))
+}
+
 fn typed(sender: AgentId, machine: MachineId, payload: Vec<u8>) -> DmTypedPayload {
     DmTypedPayload {
         sender,
@@ -370,6 +374,7 @@ async fn issue1094_grantee_route_waits_for_the_granted_agents_reply() {
         let imposter = AgentKeypair::generate().expect("imposter").agent_id();
         handle_data_read_typed(
             &grantee,
+            &serve_slots(),
             typed(
                 imposter,
                 MachineId([0; 32]),
@@ -377,14 +382,13 @@ async fn issue1094_grantee_route_waits_for_the_granted_agents_reply() {
                     .encode()
                     .expect("encode"),
             ),
-        )
-        .await;
+        );
         assert!(!call.is_finished());
         handle_data_read_typed(
             &grantee,
+            &serve_slots(),
             typed(granted, MachineId([0; 32]), reply.encode().expect("encode")),
-        )
-        .await;
+        );
         let (got, _) = call.await.expect("route");
         assert_eq!(got, code);
     }
@@ -900,9 +904,9 @@ async fn issue1094_d2_grantee_write_routes() {
         }
         handle_data_read_typed(
             &grantee,
+            &serve_slots(),
             typed(granted, MachineId([0; 32]), reply.encode().expect("encode")),
-        )
-        .await;
+        );
         let (got, body) = call.await.expect("route");
         assert_eq!(got, code);
         if status == DataReadStatus::Ok {
@@ -912,4 +916,130 @@ async fn issue1094_d2_grantee_write_routes() {
     assert!(test_seam::sent_by(&grantee)
         .iter()
         .all(|(to, _)| *to != read_only_peer));
+}
+
+// ── #1953 review: request serves do not hold replies ────────────────────
+
+/// Insert a waiter on `state` for `request_id`, sent to `to`.
+fn waiter(state: &AppState, request_id: &str, to: AgentId) -> oneshot::Receiver<DataReadReply> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .data_read_waiters
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(request_id.to_string(), (to, tx));
+    rx
+}
+
+/// The `Ok` reply bytes for `request_id`.
+fn ok_reply(request_id: &str) -> Vec<u8> {
+    let mut reply = DataReadReply::status(request_id, DataReadStatus::Ok);
+    reply.keys = Some(Vec::new());
+    reply.encode().expect("encode")
+}
+
+/// The replies `state` sent to `to`, oldest first.
+fn replies_to(state: &AppState, to: AgentId) -> Vec<DataReadReply> {
+    test_seam::sent_by(state)
+        .into_iter()
+        .filter(|(sent_to, _)| *sent_to == to)
+        .filter_map(|(_, payload)| DataReadReply::decode(&payload))
+        .collect()
+}
+
+/// WHY (#1953 review): requests and replies share one consumer. A write
+/// can take up to the GSS publish deadline (30 s); the grantee's waiter
+/// gives up at 15 s. A held write must not hold a reply for another
+/// waiter: the reply completes its waiter at once, and the write still
+/// finishes, and is answered, when it is released.
+#[tokio::test]
+async fn issue1953_a_held_write_does_not_hold_another_waiters_reply() {
+    let (state, _dir) = state_with_store().await;
+    let (writer, machine) = bound_sender(&state).await;
+    install_grant(&state, writer, vec![data_cap(DataAccess::Rw)]).await;
+    // This daemon is also a grantee: it waits on its own request to `peer`.
+    let peer = AgentKeypair::generate().expect("peer").agent_id();
+    let reply_rx = waiter(&state, "r1", peer);
+
+    let gate = test_seam::hold_serves(&state);
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let consumer = tokio::spawn(run_data_read_consumer(Arc::clone(&state), rx));
+    tx.send(typed(writer, machine, write_request(put_op("held", b"v"))))
+        .await
+        .expect("send write");
+    tx.send(typed(peer, MachineId([0; 32]), ok_reply("r1")))
+        .await
+        .expect("send reply");
+
+    let got = tokio::time::timeout(Duration::from_secs(5), reply_rx)
+        .await
+        .expect("the reply completes its waiter while the write is held")
+        .expect("reply");
+    assert_eq!(got.status, DataReadStatus::Ok);
+    assert_eq!(stored(&state, "held").await, None, "the write is held");
+
+    gate.close();
+    let served = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(reply) = replies_to(&state, writer).pop() {
+                break reply;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the released write is answered");
+    assert_eq!(served.status, DataReadStatus::Ok);
+    assert_eq!(stored(&state, "held").await.as_deref(), Some(&b"v"[..]));
+    drop(tx);
+    consumer.await.expect("consumer");
+}
+
+/// WHY (#1953 review): detached serves are bounded. With
+/// [`DATA_SERVE_SLOTS`] serves held, one more request is dropped unserved
+/// (no reply, as over the serve limit), and a reply still completes its
+/// waiter. Released, the held serves are all answered.
+#[tokio::test]
+async fn issue1953_serves_in_flight_are_bounded() {
+    let (state, _dir) = state_with_store().await;
+    let (reader, machine) = bound_sender(&state).await;
+    install_grant(&state, reader, vec![data_cap(DataAccess::Ro)]).await;
+    let peer = AgentKeypair::generate().expect("peer").agent_id();
+    let reply_rx = waiter(&state, "r1", peer);
+
+    let gate = test_seam::hold_serves(&state);
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let consumer = tokio::spawn(run_data_read_consumer(Arc::clone(&state), rx));
+    for _ in 0..=DATA_SERVE_SLOTS {
+        tx.send(typed(reader, machine, request(DataReadOp::Keys)))
+            .await
+            .expect("send request");
+    }
+    tx.send(typed(peer, MachineId([0; 32]), ok_reply("r1")))
+        .await
+        .expect("send reply");
+    // The consumer handles DMs in order: once the reply is in, every
+    // request before it was admitted or dropped.
+    tokio::time::timeout(Duration::from_secs(5), reply_rx)
+        .await
+        .expect("the reply completes its waiter while the slots are full")
+        .expect("reply");
+    assert!(replies_to(&state, reader).is_empty(), "the serves are held");
+
+    gate.close();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while replies_to(&state, reader).len() < DATA_SERVE_SLOTS {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the held serves are answered");
+    drop(tx);
+    consumer.await.expect("consumer");
+    // The consumer has ended, so no task can still be admitted; give any
+    // admitted serve time to send before the count is final.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let replies = replies_to(&state, reader);
+    assert_eq!(replies.len(), DATA_SERVE_SLOTS, "one request was dropped");
+    assert!(replies.iter().all(|r| r.status == DataReadStatus::Ok));
 }

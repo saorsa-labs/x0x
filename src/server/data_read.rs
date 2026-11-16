@@ -30,7 +30,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use base64::Engine as _;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Semaphore};
 
 use super::state::AppState;
 use super::{api_error, parse_agent_id_hex};
@@ -40,6 +40,13 @@ const DATA_READ_REPLY_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Most reads a grantee may have in flight at once on this daemon.
 const DATA_READ_WAITER_CAP: usize = 64;
+
+/// Request serves (reads and writes) in flight at once on this daemon. The
+/// same bound as the TreeKEM catch-up serves. Each serve holds one request
+/// of at most `MAX_DATA_WRITE_VALUE_BYTES` and, for a write, one store
+/// publish; 16 lets several grantees write at once without a burst of slow
+/// publishes taking unbounded tasks and memory.
+const DATA_SERVE_SLOTS: usize = 16;
 
 /// Per-sender serve limit: at most this many requests per window.
 const DATA_READ_SERVE_PER_WINDOW: u32 = 30;
@@ -71,28 +78,61 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn finish(mut typed: DmTypedPayload) {
-    if let Some(tx) = typed.completion.take() {
-        let _ = tx.send(Ok(DmTypedPayloadCompletion::Inserted));
+/// The data-read DM consumer: every typed DM of the data-read routes.
+/// Replies complete their waiter here; request serves run on detached
+/// tasks, at most [`DATA_SERVE_SLOTS`] at once.
+pub(super) async fn run_data_read_consumer(
+    state: Arc<AppState>,
+    mut rx: tokio::sync::mpsc::Receiver<DmTypedPayload>,
+) {
+    let slots = Arc::new(Semaphore::new(DATA_SERVE_SLOTS));
+    while let Some(typed) = rx.recv().await {
+        handle_data_read_typed(&state, &slots, typed);
     }
 }
 
-/// Handle one data-read typed DM (either prefix).
-pub(super) async fn handle_data_read_typed(state: &Arc<AppState>, typed: DmTypedPayload) {
-    if typed.payload.starts_with(DATA_READ_REQUEST_DM_PREFIX) {
-        if let Some((to, reply)) = serve_data_read(state, &typed).await {
-            send_payload(state, to, reply);
-        }
-    } else if typed.payload.starts_with(DATA_WRITE_REQUEST_DM_PREFIX) {
-        if let Some((to, reply)) = serve_data_write(state, &typed).await {
-            send_payload(state, to, reply);
+/// Handle one data-read typed DM (any of the three prefixes).
+///
+/// A write waits on the store's disk write and gossip publish (up to the
+/// 30 s GSS publish deadline), and a read on the store; a grantee's waiter
+/// gives up after [`DATA_READ_REPLY_TIMEOUT`]. So a serve runs on a
+/// detached task, and the consumer stays free for the next reply. With no
+/// free slot the request is dropped unserved, as over the serve limit: the
+/// grantee's call times out.
+pub(super) fn handle_data_read_typed(
+    state: &Arc<AppState>,
+    slots: &Arc<Semaphore>,
+    mut typed: DmTypedPayload,
+) {
+    // The inbox needs only the hand-off, not the serve.
+    if let Some(tx) = typed.completion.take() {
+        let _ = tx.send(Ok(DmTypedPayloadCompletion::Inserted));
+    }
+    let write = typed.payload.starts_with(DATA_WRITE_REQUEST_DM_PREFIX);
+    if write || typed.payload.starts_with(DATA_READ_REQUEST_DM_PREFIX) {
+        let Ok(permit) = Arc::clone(slots).try_acquire_owned() else {
+            tracing::debug!("#1094: data-read serve slots full; request dropped");
+            return;
+        };
+        let task_state = Arc::clone(state);
+        if !state.spawn_detached(async move {
+            let _permit = permit;
+            let reply = if write {
+                serve_data_write(&task_state, &typed).await
+            } else {
+                serve_data_read(&task_state, &typed).await
+            };
+            if let Some((to, reply)) = reply {
+                send_payload(&task_state, to, reply);
+            }
+        }) {
+            tracing::debug!("#1094: data-read serve skipped: shutdown closed task admission");
         }
     } else if typed.payload.starts_with(DATA_READ_REPLY_DM_PREFIX) && typed.verified {
         if let Some(reply) = DataReadReply::decode(&typed.payload) {
             complete_waiter(state, &typed.sender, reply);
         }
     }
-    finish(typed);
 }
 
 /// Whether `sender` is under the serve limit; counts this request. A
@@ -125,6 +165,8 @@ pub(super) async fn serve_data_read(
     state: &AppState,
     typed: &DmTypedPayload,
 ) -> Option<(AgentId, Vec<u8>)> {
+    #[cfg(test)]
+    test_seam::wait_hold(state).await;
     if !typed.verified {
         return None;
     }
@@ -201,6 +243,8 @@ pub(super) async fn serve_data_write(
     state: &Arc<AppState>,
     typed: &DmTypedPayload,
 ) -> Option<(AgentId, Vec<u8>)> {
+    #[cfg(test)]
+    test_seam::wait_hold(state).await;
     if !typed.verified {
         return None;
     }
@@ -561,10 +605,41 @@ pub(super) async fn delete_granted_store_value(
 pub(super) mod test_seam {
     use crate::identity::AgentId;
     use crate::server::state::AppState;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     type Sent = (String, AgentId, Vec<u8>);
     static SENT: Mutex<Vec<Sent>> = Mutex::new(Vec::new());
+    type Hold = (String, Arc<tokio::sync::Semaphore>);
+    static HOLDS: Mutex<Vec<Hold>> = Mutex::new(Vec::new());
+
+    /// Hold every request serve on `state` until the returned gate is
+    /// closed.
+    pub(in crate::server) fn hold_serves(state: &AppState) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        HOLDS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((
+                hex::encode(state.agent.agent_id().as_bytes()),
+                Arc::clone(&gate),
+            ));
+        gate
+    }
+
+    /// Wait while a hold on `state` is open.
+    pub(super) async fn wait_hold(state: &AppState) {
+        let me = hex::encode(state.agent.agent_id().as_bytes());
+        let gate = HOLDS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|(agent, _)| *agent == me)
+            .map(|(_, gate)| Arc::clone(gate));
+        if let Some(gate) = gate {
+            // A closed gate is an error here: the hold is released.
+            let _ = gate.acquire().await;
+        }
+    }
 
     pub(super) fn record(state: &AppState, to: AgentId, payload: Vec<u8>) {
         let from = hex::encode(state.agent.agent_id().as_bytes());

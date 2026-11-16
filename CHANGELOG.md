@@ -347,6 +347,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Granted-store CLI paths and serves (#1953 review).** `x0x grant data`
+  (and `grant revoke|renew`) percent-encode each path segment, so a key with
+  `#`, `?` or `/` reaches the exact key. A slow granted read or write now
+  runs on a detached task (at most 16 at once), so it does not hold the
+  replies to other waiting requests.
 - **An evidence Hello on a followed older connection gets a reply again
   (#1346, A05 amendment of 15 Nov 2026).** The Hello reply gate charged a
   high-water mark of connection generations, so after ant-quic made an older
