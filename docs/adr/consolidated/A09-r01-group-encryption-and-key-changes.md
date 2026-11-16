@@ -239,8 +239,11 @@ group pending while the group's catch-up from an earlier turn still
 runs, the end of that older catch-up does not remove the mark, so it
 does not remove the outage record either. The mark carries the group through
 the second ask and the later rounds of that pass. The record carries it
-through a restart. The second ask removes the mark as usual when the
-group is current. No wire format or API changes.
+through a restart. This holds for every end of the older catch-up,
+including a member that reports the local head: that page can answer a
+request from before the later isolation. The daemon has one gate, and
+every removal of a mark goes through it. The second ask removes the mark
+as usual when the group is current. No wire format or API changes.
 
 Fifth amendment of 16 Nov 2026 (#1427), recorded by Claude under the
 design delegation of 10 Nov 2026. A start or reconnect catch-up cycle
