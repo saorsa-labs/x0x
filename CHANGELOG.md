@@ -11,6 +11,9 @@ All notable changes to this project will be documented in this file.
   for x0xd's shutdown before SIGKILL. The retire after a host commit retries
   only a failed host lock, ends its retries on a stop, and hands its result to
   the caller. A start that finds a committed trial honours a stop.
+- **A KV merge keeps the earliest `created_at` (#1094, review of #1974).**
+  Every merge path now keeps the earlier `created_at` of the two entries
+  whichever wins, so replicas converge on it regardless of arrival order.
 - **`GET /stores/:id/:key` shows the verified writer (#1094 slice P2, A10
   amendment of 16 Nov 2026).** New `writer` field: the agent (and rider
   sub-agent) whose mark verifies for the returned value, or
