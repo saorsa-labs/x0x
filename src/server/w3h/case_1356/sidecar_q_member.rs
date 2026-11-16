@@ -232,6 +232,10 @@ struct Run {
     /// restart.
     answered_before: Vec<(u64, usize)>,
     answered_after: Vec<(u64, usize)>,
+    /// B's agent ID, and the `(agent, answer)` rows of `asked` in J's
+    /// last `recovery`.
+    b_hex: String,
+    asked: Vec<(String, String)>,
 }
 
 impl Run {
@@ -239,7 +243,7 @@ impl Run {
         format!(
             "sealed r+1={} active {}; terminal {} fork {}; before: states {:?} answered {:?} \
              marker by B {}; restart heads {:?}; after: heads {:?} states {:?} answered {:?}; \
-             markers {:?}; A at end {}; B at end {}; rebuilt {}; exit {:?}; disk {:?}",
+             markers {:?}; A at end {}; B at end {}; rebuilt {}; exit {:?}; asked {:?}; disk {:?}",
             self.sealed,
             self.active,
             self.terminal,
@@ -256,6 +260,7 @@ impl Run {
             self.b_end,
             self.rebuilt,
             self.exit,
+            self.asked,
             disk
         )
     }
@@ -299,9 +304,15 @@ impl Run {
     }
 
     /// The gap the expected-RED arm pins: J never shows `local_state_lost`,
-    /// ends in `awaiting_attestation` and names no exit.
+    /// ends in `awaiting_attestation`, still asks (its last `recovery`
+    /// lists B as `pending`) and names no exit. `awaiting_attestation`
+    /// alone is not the pin: a node with no recovery subject reports it
+    /// with an empty `asked`.
     fn asking(&self) -> bool {
         !self.states_after.is_empty()
+            && self.asked.iter().any(|(agent, answer)| {
+                agent.eq_ignore_ascii_case(&self.b_hex) && answer == "pending"
+            })
             && !self.states_after.iter().any(|state| state == LOST)
             && self
                 .states_after
@@ -536,6 +547,18 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         .unwrap_or(Value::Null);
     run.rebuilt = recovery["recovery_sidecar_rebuilt"].clone();
     run.exit = recovery["exit"].as_str().map(str::to_string);
+    run.b_hex = hex::encode(sim.ids("B")?.0.as_bytes());
+    run.asked = recovery["asked"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            Some((
+                row["agent"].as_str()?.to_string(),
+                row["answer"].as_str()?.to_string(),
+            ))
+        })
+        .collect();
     run.a_end = view(sim, "A", &group).await?.state_revision;
     run.b_end = view(sim, "B", &group).await?.state_revision;
     let route = sim
@@ -665,6 +688,13 @@ fn w3h_1356_q_member_shapes() {
     ];
     run.exit = None;
     assert!(!run.inert_lost());
+    assert!(!run.asking(), "an empty asked list is not asking");
+    run.b_hex = "0b".repeat(32);
+    run.asked = vec![("0a".repeat(32), "pending".to_string())];
+    assert!(!run.asking(), "B is not asked");
+    run.asked = vec![("0b".repeat(32), "no_reply".to_string())];
+    assert!(!run.asking(), "B is not pending");
+    run.asked.push(("0B".repeat(32), "pending".to_string()));
     assert!(run.asking());
     run.exit = Some("x".to_string());
     assert!(!run.asking(), "an exit is named");
