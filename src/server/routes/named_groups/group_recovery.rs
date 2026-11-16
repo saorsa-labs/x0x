@@ -1368,7 +1368,7 @@ async fn revoke_pending_invites(state: &AppState) {
                 durable
             }
         };
-        if !durable {
+        if !durable || !roster_durability_confirmed(state).await {
             continue;
         }
         let path = revoke_marker_path(&dir, &sidecar_stem(&stable));
@@ -1380,6 +1380,12 @@ async fn revoke_pending_invites(state: &AppState) {
                 continue;
             }
         }
+        // The removal is durable only once the directory is synced; until
+        // then the group stays pending and the next tick retries.
+        if let Err(error) = super::revocation_eviction::sync_dir_of(&path).await {
+            tracing::warn!(%error, "ADR 0109 S3: revocation marker removal not synced; retried");
+            continue;
+        }
         state
             .group_recovery
             .inner
@@ -1387,6 +1393,30 @@ async fn revoke_pending_invites(state: &AppState) {
             .await
             .revoke_pending
             .remove(&stable);
+    }
+}
+
+/// #1941 review: an earlier roster save that replaced the file but did not
+/// sync its directory (`named_groups_requires_durability_confirmation`)
+/// leaves a revocation in memory only. "Nothing left to revoke" then proves
+/// nothing, so the roster is saved again and must be `Durable` before the
+/// marker may go.
+async fn roster_durability_confirmed(state: &AppState) -> bool {
+    use std::sync::atomic::Ordering;
+    if !state
+        .named_groups_requires_durability_confirmation
+        .load(Ordering::Acquire)
+    {
+        return true;
+    }
+    match super::save_named_groups_checked(state).await {
+        Ok(super::AtomicWriteOutcome::Durable) => {
+            state
+                .named_groups_requires_durability_confirmation
+                .store(false, Ordering::Release);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -10847,6 +10877,83 @@ mod tests {
             .await
             .revoke_pending
             .contains(&stable));
+        Ok(())
+    }
+
+    /// #1941 re-review (a): a revocation whose roster save replaced the
+    /// file but did not sync its directory leaves the invite gone from
+    /// memory only. The next tick finds nothing to revoke; it must still
+    /// keep the marker until a confirming save is `Durable`. Inert.
+    #[tokio::test]
+    async fn a_revocation_without_a_synced_roster_keeps_its_marker() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, stable, _info) = targeted_invites_fixture(&state).await?;
+        let dir = sidecar_dir(&state);
+        tokio::fs::create_dir_all(&dir).await?;
+        assert!(mark_revoke_pending(&dir, &sidecar_stem(&stable)).await);
+        // The revocation's save replaces the file; its directory fsync
+        // fails, as `ReplacedNotDurable` does.
+        state.named_groups_save_fault.store(3, Ordering::SeqCst);
+        load_sidecars(&state).await;
+        state
+            .named_groups_requires_durability_confirmation
+            .store(true, Ordering::Release);
+        assert!(marker_exists(&state, &stable), "not durable: kept");
+        // A tick with nothing left to revoke, while the confirming save
+        // still fails: the marker stays.
+        revoke_pending_invites(&state).await;
+        assert!(marker_exists(&state, &stable), "unconfirmed roster: kept");
+        // Once the confirming save is durable, the marker goes.
+        state.named_groups_save_fault.store(0, Ordering::SeqCst);
+        revoke_pending_invites(&state).await;
+        assert!(!marker_exists(&state, &stable));
+        assert!(!state
+            .named_groups_requires_durability_confirmation
+            .load(Ordering::Acquire));
+        assert_eq!(held_secrets(&state, &key).await, AFTER_REVOKE);
+        Ok(())
+    }
+
+    /// #1941 re-review: the switch-over at host commit. The deferred
+    /// quarantine clears the fault and publishes the rebuilt sidecar; the
+    /// group is pending under the same lock, so a targeted invite's join is
+    /// held even when the revocation write then fails. Inert.
+    #[tokio::test]
+    async fn the_deferred_switch_over_keeps_targeted_joins_held() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, stable, _info) = targeted_invites_fixture(&state).await?;
+        let path = sidecar_path(&state, &stable);
+        tokio::fs::create_dir_all(sidecar_dir(&state)).await?;
+        tokio::fs::write(&path, [b"JUNKJUNK".as_slice(), &[0u8; 56]].concat()).await?;
+        super::super::revocation_eviction::tests::write_upgrade_journal(
+            &state.data_dir,
+            "health_committed",
+        )?;
+        load_sidecars(&state).await;
+        super::super::revocation_eviction::tests::write_upgrade_journal(
+            &state.data_dir,
+            "host_committed",
+        )?;
+        state.named_groups_save_fault.store(1, Ordering::SeqCst);
+        resume_deferred_quarantine(&state).await;
+        state.named_groups_save_fault.store(0, Ordering::SeqCst);
+        let inner = state.group_recovery.inner.lock().await;
+        assert!(!inner.sidecar_status.contains_key(&stable), "fault cleared");
+        assert!(
+            inner.sidecars.contains_key(&stable),
+            "rebuilt sidecar published"
+        );
+        drop(inner);
+        let live = live_record(&state, &key).await?;
+        assert!(live.issued_invites.contains_key("reseat-secret"));
+        assert!(
+            unpaired_join_held(&state, &live, "reseat-secret").await,
+            "held across the switch-over"
+        );
+        revoke_pending_invites(&state).await;
+        assert_eq!(held_secrets(&state, &key).await, AFTER_REVOKE);
         Ok(())
     }
 
