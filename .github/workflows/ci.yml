@@ -201,6 +201,13 @@ jobs:
         id: prepare_convergence
         run: python3 scripts/ci/issue442-convergence-custody.py prepare
 
+      # nextest drains a test group's queue only when a test of that group
+      # finishes, so mixed `threads-required` values in one group can end
+      # the run with tests "not run" and no failure (scripts/ci/
+      # check-nextest-groups.py, .config/nextest.toml quic-localhost).
+      - name: Check nextest test-group weights
+        run: python3 -B scripts/ci/check-nextest-groups.py
+
       - name: Record disk before Run tests
         run: |
           echo "=== disk before Run tests ==="
@@ -568,8 +575,10 @@ jobs:
   # ADR 0109 §10 H-S3-rm released-binary rows (#1572): rm1 (capability
   # floor) and rm3 (i) and (ii) (older receiver after the seal), and
   # H-S3-m (v0.46.1 on J's data dir between the H-S3-s segments; about
-  # 100 s in the VM, with two 45 s real-time waits). The filter also
-  # selects later rows in the same module. In rm1 and rm3, phase 1
+  # 100 s in the VM, with two 45 s real-time waits), and its OwnerCertified
+  # variant (v0.46.1 on J's copy after the H-S3-c phase 1, then rm1's
+  # re-seat on real sockets). The filter also selects later rows in the
+  # same module. In rm1 and rm3, phase 1
   # runs on the paused W3-H sim and phase 2 runs candidate daemons on
   # real loopback sockets, with member M on the published v0.46.1
   # daemon. H-S3-m stays on the paused sim: the published v0.46.1 runs
@@ -790,7 +799,7 @@ jobs:
     # runs as four parallel parts (`s3-d3.1` to `s3-d3.4`, 5 reruns each;
     # `PARTS` in w3h-shards.py). The #1661 welcome-lost row has its own
     # group too (`s3-1661.1` and `s3-1661.2`, 10 reruns each), the
-    # H-S3-rm4 variants share `s3-rm4.1` to `s3-rm4.4`, H-S3-rm2 has its
+    # H-S3-rm4 variants share `s3-rm4.1` to `s3-rm4.5`, H-S3-rm2 has its
     # own group (`s3-rm2.1` and `s3-rm2.2`, 10 reruns each), H-S3-d2 has
     # `s3-d2`, H-S3-q (1) has `s3-q`, H-S3-q2 has `s3-q2`, and H-S3-q (3)
     # has `s3-q3.1` and `s3-q3.2` (10 reruns each). A group is omitted
@@ -1214,6 +1223,12 @@ jobs:
           --expect w3h_1581j_expiry_skew_run5a_announced_renewal_rebinds_at_expiry=GREEN
           --require w3h_1581j_expiry_skew_run8_signed_public
           --expect w3h_1581j_expiry_skew_run8_signed_public=GREEN
+          --require w3h_1581k_staged_join_machine_revoked_device_gets_no_key
+          --expect w3h_1581k_staged_join_machine_revoked_device_gets_no_key=GREEN
+          --require w3h_1581k_staged_join_agent_revoked_gets_no_key
+          --expect w3h_1581k_staged_join_agent_revoked_gets_no_key=GREEN
+          --require w3h_1581k_control_staged_join_unrevoked_gets_its_key
+          --expect w3h_1581k_control_staged_join_unrevoked_gets_its_key=GREEN
           --require w3h_1765_red_newer_file_revocation_waits_for_store_write
           --expect w3h_1765_red_newer_file_revocation_waits_for_store_write=GREEN
           --require w3h_1776_delayed_fresh_joiner_fetches_the_welcome

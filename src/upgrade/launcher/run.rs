@@ -6,6 +6,10 @@ pub(super) enum Outcome {
     // Ownership remains with this launcher. The S3c host coordinator must
     // still verify all participants before it can commit the host.
     Provisional(child::Owned),
+    /// The host is committed and this trial is retired. No child of this
+    /// launcher runs: the caller starts the installed (committed) daemon as
+    /// an ordinary start.
+    Committed,
 }
 
 /// `health` must be the candidate's version/root/ownership-bound M1 evidence,
@@ -30,6 +34,10 @@ pub(super) fn run_trial(
     if trial.phase == Phase::RecoveryFailed {
         return Err(invalid("automatic start is forbidden"));
     }
+    if trial.phase == Phase::Committed {
+        prior_child_absent(trial)?;
+        return Ok(Outcome::Committed);
+    }
     if trial.phase == Phase::Restored {
         // An intentional stop starts no restored child; the trial stays
         // Restored, so the next start starts it (#1968 review).
@@ -51,6 +59,13 @@ pub(super) fn run_trial(
     if let Some(identity) = &trial.child {
         if !child::absent(identity)? {
             return Err(invalid("prior child still exists"));
+        }
+        // The launcher died after the host commit and before it retired
+        // the trial: the committed host keeps the candidate. Without this a
+        // lost child would roll back, the restore would refuse the
+        // committed host, and the trial would end RecoveryFailed.
+        if retire(host, path, trial)? {
+            return Ok(Outcome::Committed);
         }
         return rollback(
             host,
@@ -200,6 +215,44 @@ pub(super) fn run_trial(
         trial.next_launch_ms = now()?.ms.saturating_add(GAP_MS);
         trial.save(path)?;
     }
+}
+
+/// Retire a provisional trial whose host is committed: under the host lock,
+/// a fresh read, saved `Committed`. Returns false, and writes nothing, when
+/// the host is not committed. `*trial` is the saved trial on true.
+pub(super) fn retire(host: &recovery::Host, path: &Path, trial: &mut Trial) -> io::Result<bool> {
+    let (binding, instance) = (trial.binding.clone(), trial.instance.clone());
+    let retired = host.locked(|record| {
+        if record.phase != journal::Phase::HostCommitted {
+            return Ok(None);
+        }
+        let mut current = Trial::load(path, &binding, &instance)?;
+        match current.phase {
+            Phase::Provisional => {
+                current.phase = Phase::Committed;
+                current.save(path)?;
+            }
+            Phase::Committed => {}
+            // `host_commit` refuses a trial that is not provisional.
+            _ => return Err(invalid("committed host has an uncommitted trial")),
+        }
+        Ok(Some(current))
+    })?;
+    if let Some(current) = retired {
+        *trial = current;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// ADR 0094 S4: never overlap a surviving process of an earlier start.
+fn prior_child_absent(trial: &Trial) -> io::Result<()> {
+    if let Some(identity) = &trial.child {
+        if !child::absent(identity)? {
+            return Err(invalid("prior child still exists"));
+        }
+    }
+    Ok(())
 }
 
 /// Whether the host phase allows a candidate spawn. Checked under the host

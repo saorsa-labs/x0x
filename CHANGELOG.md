@@ -6,6 +6,21 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`GET /stores/:id/:key` shows the verified writer (#1094 slice P2, A10
+  amendment of 16 Nov 2026).** New `writer` field: the agent (and rider
+  sub-agent) whose mark verifies for the returned value, or
+  `{"verified": false}`, writer unknown. The raw `x0x.writer.*` keys are no
+  longer in `metadata`. A rider's write names the rider. The Scratch app
+  shows the writer. Every KV merge path now refuses an entry whose content
+  hash does not match its value.
+- **The dormant launcher retires a committed trial (#1378 slice 3; A14
+  amendment of 16 Nov 2026).** When the host commits, the supervise driver
+  saves the trial `Committed` and hands the candidate to the caller, which
+  keeps or stops it as an ordinary committed daemon. A launcher that dies
+  between the host commit and the retire now retires the trial at its next
+  start and starts the installed daemon, instead of rolling back and ending
+  RecoveryFailed. The stop path's first host-lock pass is retried like the
+  rollback path's. The launcher is still dormant (`ENABLED` is false).
 - **A refused granted write names a fixed reason (#1094, review of #1953;
   A03 amendment of 16 Nov 2026).** The granted agent no longer forwards its
   store's error text to a remote grantee; the reply carries one of
@@ -114,6 +129,14 @@ All notable changes to this project will be documented in this file.
   A09 (16 Nov 2026) records that reading of the row. Run (8) repeats run
   (1) in an owner-certified `SignedPublic` group. The row has its own W3-H
   shard (`1581j`).
+- **W3-H row `s4_intake_and_egress`, staged-join part (#1581).** A
+  staged its artifacts for B's join, and B got none of them before the
+  trigger. B then revokes its own machine or agent, and after the release
+  B gets no key; with only a machine revocation A keeps B's agent seated
+  (D70). A revoked B stops asking A, so these arms do not reach A's egress
+  guards; a fetch from a device that keeps asking stays open. A control arm does the same hold and
+  release with no revocation, and B gets its key. The row has its own W3-H
+  shard (`1581k`).
 - **A `stale` join-request outcome can carry the authority's head (#1840,
   A08 amendment of 15 Nov 2026).** New optional `head` field on
   `groups::join_outcome::JoinRequestOutcome` (signed head commit, roster
@@ -438,6 +461,16 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Granted-store CLI paths and serves (#1953 review).** `x0x grant data`
+  (and `grant revoke|renew`) percent-encode each path segment, so a key with
+  `#`, `?` or `/` reaches the exact key. A slow granted read or write now
+  runs on a detached task (at most 16 at once), so it does not hold the
+  replies to other waiting requests.
+- **The dormant launcher reads a process that exits during its `/proc` read
+  as gone.** `child::absent` treated only NotFound as gone; a process reaped
+  between the open and the read of `/proc/<pid>/stat` fails with ESRCH, which
+  flaked `a_peer_recovery_failure_during_the_stop_is_final` on studio1 and
+  could make `stop_foreign` report a stopped process as an error.
 - **A #1427 catch-up probe no longer holds S4 seals (A09 fifth amendment
   of 16 Nov 2026).** A start or reconnect catch-up cycle asks for the next
   TreeKEM epoch without having seen it. Its target was read as ADR 0110 §2
