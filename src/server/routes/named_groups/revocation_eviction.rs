@@ -4923,7 +4923,7 @@ pub(super) async fn write_bytes_durably(
     sync_dir_of(path).await
 }
 
-async fn sync_dir_of(path: &FsPath) -> std::io::Result<()> {
+pub(super) async fn sync_dir_of(path: &FsPath) -> std::io::Result<()> {
     let path = path.to_path_buf();
     if crate::w3h_inline::shim_active() {
         return super::sync_parent_dir_for_path(&path);

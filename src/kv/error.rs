@@ -21,6 +21,17 @@ pub enum KvError {
         max: usize,
     },
 
+    /// #1094 P1 (review of #1963): the put would take the store's complete
+    /// image over the retained-image limit, so new and lagging members
+    /// could no longer get its history. The store is full.
+    #[error("store full: the store image would be {image} bytes, above the {max}-byte retained-image limit")]
+    StoreFull {
+        /// The image size the put would reach (an upper estimate).
+        image: u64,
+        /// The limit.
+        max: usize,
+    },
+
     /// Serialization error.
     #[error("serialization error: {0}")]
     Serialization(#[from] bincode::Error),

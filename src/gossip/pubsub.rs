@@ -4941,6 +4941,11 @@ fn verify_signature(
     )
     .is_ok();
     verify_stats.record(started.elapsed(), verified);
+    if verified {
+        // #1094 P1: a verified sender proves its agent key; KV writer marks
+        // carry only the agent id and are checked against these keys.
+        crate::kv::provenance::note_agent_key(&public_key);
+    }
     verified
 }
 

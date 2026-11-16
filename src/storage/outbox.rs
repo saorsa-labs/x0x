@@ -59,6 +59,13 @@ pub(crate) trait OutboxRecord: Clone {
     fn partition(&self) -> &str;
     /// The entry identity inside its partition.
     fn id(&self) -> &str;
+    /// Is `other` this exact entry? [`Outbox::settle`] only touches the
+    /// entry an attempt was made for. The default is the id; a record whose
+    /// id can be reused for other content also compares that content
+    /// (#1109).
+    fn same_entry(&self, other: &Self) -> bool {
+        self.id() == other.id()
+    }
     /// When the entry was first created (eviction order).
     fn first_seen_ms(&self) -> u64;
     /// Accounted size for the byte caps.
@@ -69,6 +76,11 @@ pub(crate) trait OutboxRecord: Clone {
     fn retry_count(&self) -> u32;
     /// Set the attempt count and the next due time.
     fn set_schedule(&mut self, retry_count: u32, next_retry_at_ms: u64);
+    /// Copy what one attempt learned from `attempted` (the copy the
+    /// worker sent) onto the stored entry, before [`Outbox::settle`]
+    /// reschedules it. The default keeps nothing (#1109 keeps the last
+    /// error code).
+    fn record_attempt(&mut self, _attempted: &Self) {}
     /// Load-time consistency check of one entry. `Err` is the reason.
     fn check(&self) -> Result<(), String>;
     /// Encode the whole store as sidecar bytes.
@@ -150,7 +162,7 @@ fn remove_entry<T: OutboxRecord>(map: &mut OutboxMap<T>, entry: &T) -> bool {
         return false;
     };
     let before = list.len();
-    list.retain(|o| o.id() != entry.id());
+    list.retain(|o| !o.same_entry(entry));
     let after = list.len();
     if after == 0 {
         map.remove(entry.partition());
@@ -286,10 +298,11 @@ impl<'a, T: OutboxRecord> Outbox<'a, T> {
         for (entry, ok) in attempts {
             let Some(live) = next
                 .get_mut(entry.partition())
-                .and_then(|list| list.iter_mut().find(|o| o.id() == entry.id()))
+                .and_then(|list| list.iter_mut().find(|o| o.same_entry(entry)))
             else {
                 continue;
             };
+            live.record_attempt(entry);
             let retry_count = live.retry_count().saturating_add(1);
             if *ok {
                 delivered.push(entry.partition().to_string());
@@ -306,7 +319,7 @@ impl<'a, T: OutboxRecord> Outbox<'a, T> {
         for (entry, ok) in attempts {
             if *ok {
                 if let Some(list) = next.get_mut(entry.partition()) {
-                    list.retain(|o| o.id() != entry.id());
+                    list.retain(|o| !o.same_entry(entry));
                 }
             }
         }

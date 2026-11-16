@@ -1239,6 +1239,9 @@ pub(super) struct AppState {
     /// #908: serializes snapshot-and-write of the requester offer outbox
     /// sidecar (the relay outbox's discipline).
     pub(super) requester_offer_outbox_persistence_lock: Mutex<()>,
+    /// #1109: durable `POST /direct/send` obligations (`deliver_until_ms`),
+    /// keyed by recipient. See `routes::direct_outbox`.
+    pub(super) direct_send_outbox: crate::server::routes::direct_outbox::DirectSendOutbox,
     /// Serializes bootstrap outbox mutation and durable replacement. The retry
     /// worker never holds this while awaiting network delivery.
     pub(super) public_group_bootstrap_outbox_persistence_lock: Mutex<()>,
@@ -1308,6 +1311,10 @@ pub(super) struct AppState {
     /// succeeded since an outage past the last metadata resend. The
     /// outage record on disk stays until this set is empty.
     pub(super) treekem_start_catchup_pending: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// #1427: the daemon's one reconnect gate. Every removal of a pending
+    /// mark goes through it, so a later pass's mark is not lost.
+    pub(super) treekem_reconnect_gate:
+        Arc<crate::server::routes::named_groups::TreeKemReconnectGate>,
     /// #1427: true once the network join task has ended (Ok or Err). A
     /// start catch-up waits for it, in any order, and then asks again for
     /// each group that is still pending.

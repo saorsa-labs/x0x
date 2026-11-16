@@ -1105,7 +1105,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "direct send",
         description: "Send direct message",
         category: "direct",
-        request: RequestSpec::Fields(&[RequestField::body_as("agent_id", true, "AGENT_ID"), RequestField::body_as("payload", true, "MESSAGE"), RequestField::body_bool_default_true("prefer_raw_quic_if_connected"), RequestField::body("raw_quic_receive_ack_ms", false), RequestField::body("stop_fallback_on_raw_error", false), RequestField::body("require_gossip", false), RequestField::body_ignored("require_gossip_ack"), RequestField::body_as("require_ack_ms", false, "--require-ack-ms"), RequestField::body_as("require_durable_app_ack", false, "--no-durable-ack"), RequestField::body("logical_id", false)]),
+        request: RequestSpec::Fields(&[RequestField::body_as("agent_id", true, "AGENT_ID"), RequestField::body_as("payload", true, "MESSAGE"), RequestField::body_bool_default_true("prefer_raw_quic_if_connected"), RequestField::body("raw_quic_receive_ack_ms", false), RequestField::body("stop_fallback_on_raw_error", false), RequestField::body("require_gossip", false), RequestField::body_ignored("require_gossip_ack"), RequestField::body_as("require_ack_ms", false, "--require-ack-ms"), RequestField::body_as("require_durable_app_ack", false, "--no-durable-ack"), RequestField::body("logical_id", false), RequestField::body("deliver_until_ms", false)]),
     },
     EndpointDef {
         method: Method::Get,
@@ -1120,6 +1120,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         path: "/direct/receipts/:logical_id",
         cli_name: "direct receipt",
         description: "Durable send outcome by logical_id (delivered, delivered_late, pending, unknown)",
+        category: "direct",
+        request: RequestSpec::Fields(&[RequestField::query_as("agent_id", true, "AGENT_ID")]),
+    },
+    EndpointDef {
+        method: Method::Delete,
+        path: "/direct/receipts/:logical_id",
+        cli_name: "direct cancel",
+        description: "Cancel a queued durable send by logical_id (#1109)",
         category: "direct",
         request: RequestSpec::Fields(&[RequestField::query_as("agent_id", true, "AGENT_ID")]),
     },
