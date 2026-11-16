@@ -17,6 +17,10 @@ struct Inner {
     in_flight: HashSet<String>,
     per_group: HashMap<String, usize>,
     total: usize,
+    /// Every request that reached [`FairAdmission::try_admit`], by key,
+    /// admitted or not (W3-H receiver-side evidence, #1581).
+    #[cfg(test)]
+    asked: HashMap<String, usize>,
 }
 
 /// Why a fetch handler was not admitted. Every refusal is retryable: the
@@ -68,6 +72,10 @@ impl FairAdmission {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        #[cfg(test)]
+        {
+            *inner.asked.entry(key.to_string()).or_insert(0) += 1;
+        }
         if inner.in_flight.contains(key) {
             return Err(AdmissionRefusal::Duplicate);
         }
@@ -85,6 +93,21 @@ impl FairAdmission {
             key: key.to_string(),
             group: group.to_string(),
         })
+    }
+
+    /// How many requests for keys ending in `:{member}` reached
+    /// [`Self::try_admit`], admitted or not (tests).
+    #[cfg(test)]
+    pub(in crate::server) fn asked_for_member(&self, member: &str) -> usize {
+        let suffix = format!(":{member}");
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .asked
+            .iter()
+            .filter(|(key, _)| key.ends_with(&suffix))
+            .map(|(_, count)| *count)
+            .sum()
     }
 
     /// In-flight handlers (diagnostics and tests).

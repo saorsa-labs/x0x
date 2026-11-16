@@ -303,6 +303,13 @@ async fn release_and_watch(
 ) -> Result<()> {
     let at = |sim: &Sim| sim.fabric().now().as_micros();
     // Release B's poll; watch B for SETTLE.
+    // Receiver-side evidence (#1956 review): A's join-result fetch
+    // admission logs each `FetchRequest` that reaches it; a raw B->A frame
+    // count would also count membership and `MemberJoined` retries.
+    let fetches_before = sim
+        .state("A")?
+        .join_result_fetch_admission
+        .asked_for_member(b_hex);
     let dropped = hold.release(sim);
     let released = sim
         .fabric()
@@ -328,10 +335,18 @@ async fn release_and_watch(
         .fabric()
         .delivered_writes_after(&sim.peer("B")?, &sim.peer("A")?, released)
         .len();
+    let fetches_after = sim
+        .state("A")?
+        .join_result_fetch_admission
+        .asked_for_member(b_hex);
+    let fetched = fetches_after.saturating_sub(fetches_before);
     receipt.request_delivered(
-        "b_reached_a_after_the_release",
-        dropped > 0 && b_to_a > 0,
-        format!("dropped A/C->B frames {dropped}; B->A frames since release {b_to_a}"),
+        "a_received_b_join_result_fetches_after_the_release",
+        dropped > 0 && fetched > 0,
+        format!(
+            "dropped A/C->B frames {dropped}; B's join-result fetches at A: {fetches_before} \
+             before the release, {fetched} after; B->A frames since release {b_to_a}"
+        ),
         at(sim),
     );
     let a_lists_b = lists(sim, "A", group, b_hex).await;
