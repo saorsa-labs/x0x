@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **A rebuilt issuer refuses a lost re-seat (#1941, A08 amendment of 16 Nov
+  2026).** When a damaged S3 sidecar is rebuilt, the node revokes the group's
+  unconsumed invites that name a joiner who is not Active, so a re-seat
+  authorisation sent before the damage can no longer seat its subject through
+  the old invite. A durable marker carries the revocation across a crash, and
+  until it is done (or while the sidecar is not loaded) such a join is
+  refused. The subject shows `reseat_required {reseat_failed}`; the
+  admin calls the re-seat route again.
+
 - **An `rw` grantee writes a store through a `ShareCap::Data` grant (#1094
   slice D2, A03 amendment of 16 Nov 2026).** `PUT` and
   `DELETE /grants/data/:agent/:group/:store/:key` (`x0x grant data put|rm`)

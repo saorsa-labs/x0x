@@ -409,6 +409,9 @@ struct S3Inner {
     join_carry: HashMap<(String, u64), AdminTerminalAttestation>,
     /// The §11 responder limits.
     responder: ResponderBudget,
+    /// #1941: groups (stable ID) whose revocation marker is on disk; their
+    /// targeted invites are revoked by [`revoke_pending_invites`].
+    revoke_pending: HashSet<String>,
     /// Groups (stable ID) whose staged join runs in this process. A journal
     /// with no live record and no entry here was interrupted by a restart.
     staging_live: HashSet<String>,
@@ -1087,7 +1090,8 @@ async fn sidecar_snapshot(state: &AppState, stable_group_id: &str) -> Option<Gro
 /// `quarantine_open` is false (inside an uncommitted ADR 0094 trial), a
 /// damaged file also stays in place, as `QuarantineDeferred` (§4 "Before
 /// host commit"). Returns the loaded bodies and the faults, keyed by file
-/// stem.
+/// stem. Before a damaged file is quarantined, its group's revocation
+/// marker is written ([`mark_revoke_pending`], #1941).
 async fn scan_sidecar_dir(
     dir: &FsPath,
     quarantine_open: bool,
@@ -1161,6 +1165,19 @@ async fn scan_sidecar_dir(
             }
             Err(GroupRecoveryDecodeError::Damaged(cause)) => {
                 tracing::warn!(file = %name, cause, "ADR 0109 S3: damaged sidecar; quarantining (D120)");
+                // #1941: the rebuild loses `issued_reseats`. The durable
+                // marker comes first, so a crash at any later step still
+                // revokes the group's targeted invites on the next load.
+                if !mark_revoke_pending(dir, stem).await {
+                    faults.insert(
+                        stem.to_string(),
+                        SidecarFault::QuarantineFailed {
+                            file: name.clone(),
+                            step: "revoke_marker".to_string(),
+                        },
+                    );
+                    continue;
+                }
                 match super::revocation_eviction::quarantine_file(&path, &bytes).await {
                     Ok((txid, pending)) => {
                         let rebuilt = GroupRecoveryV1 {
@@ -1206,6 +1223,7 @@ async fn load_sidecars(state: &AppState) {
         let _writer = state.group_recovery.writer.lock().await;
         scan_sidecar_dir(&dir, quarantine_open).await
     };
+    let marked = revoke_marked_stems(&dir).await;
     // Files are named by the sanitised stable ID; map them back through
     // the live groups so the in-memory key is the stable ID itself. The
     // roster is read before the S3 lock (the roster encoder takes the S3
@@ -1227,6 +1245,9 @@ async fn load_sidecars(state: &AppState) {
         if let Some(fault) = faults.remove(&stem) {
             inner.sidecar_status.insert(stable.to_string(), fault);
         }
+        if marked.contains(&stem) {
+            inner.revoke_pending.insert(stable.to_string());
+        }
     }
     // A sidecar whose group is not in the live map holds a re-seat journal
     // (an older binary moved the live record aside before its staged join;
@@ -1240,6 +1261,181 @@ async fn load_sidecars(state: &AppState) {
     for (stable, body) in &inner.sidecars {
         state.group_recovery.refresh_staging(stable, Some(body));
     }
+    drop(inner);
+    revoke_pending_invites(state).await;
+}
+
+/// #1941: the extension of a group's durable revocation marker, beside
+/// its `.grecov` in the sidecar directory. Its presence is the whole
+/// record; the bytes are a label only.
+const REVOKE_MARKER_EXTENSION: &str = "grevoke";
+
+fn revoke_marker_path(dir: &FsPath, stem: &str) -> PathBuf {
+    dir.join(format!("{stem}.{REVOKE_MARKER_EXTENSION}"))
+}
+
+/// Write `stem`'s revocation marker durably. True once it is on disk.
+pub(super) async fn mark_revoke_pending(dir: &FsPath, stem: &str) -> bool {
+    let path = revoke_marker_path(dir, stem);
+    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        return true;
+    }
+    super::revocation_eviction::write_bytes_durably(&path, b"x0x issued-reseats-lost\n", None)
+        .await
+        .is_ok()
+}
+
+/// The stems whose revocation marker is on disk.
+async fn revoke_marked_stems(dir: &FsPath) -> HashSet<String> {
+    let mut stems = HashSet::new();
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return stems;
+    };
+    let suffix = format!(".{REVOKE_MARKER_EXTENSION}");
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if let Some(stem) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.strip_suffix(&suffix))
+        {
+            stems.insert(stem.to_string());
+        }
+    }
+    stems
+}
+
+/// #1941 (§4, D120): a rebuild empties `issued_reseats`, so this node can
+/// no longer tell which of its unconsumed invites pair with a re-seat
+/// authorisation it issued before the damage. Such an authorisation may
+/// still be in flight, and its subject's staged join would consume the
+/// invite as an ordinary add. So, for each group with a revocation
+/// marker, revoke every unconsumed issued invite that names an intended
+/// joiner who is not Active in the live roster: a re-seat invite always
+/// names its subject, and the subject is never Active (its basis is its
+/// removal). An ordinary targeted invite to such an agent is revoked too,
+/// which is the safe outcome for a field no holder has; the issuer mints a
+/// new one, or calls the re-seat route again.
+///
+/// The marker is written durably before the quarantine starts and is
+/// removed only after the revocation is durable, so a crash at any step
+/// revokes on the next load. Until then [`unpaired_join_held`] refuses
+/// those joins (fail closed), and the worker tick retries. Local records
+/// only: no commit, no wire change.
+async fn revoke_pending_invites(state: &AppState) {
+    let pending: Vec<String> = state
+        .group_recovery
+        .inner
+        .lock()
+        .await
+        .revoke_pending
+        .iter()
+        .cloned()
+        .collect();
+    let dir = sidecar_dir(state);
+    for stable in pending {
+        let key = {
+            let groups = state.named_groups.read().await;
+            groups
+                .iter()
+                .find(|(_, info)| info.stable_group_id() == stable.as_str())
+                .map(|(key, _)| key.clone())
+        };
+        let durable = match key {
+            // The group is gone: nothing can consume its invites.
+            None => true,
+            Some(key) => {
+                let Some(lock) = super::group_membership_lock_for_known_group(state, &key).await
+                else {
+                    continue;
+                };
+                let _membership = lock.lock().await;
+                let secrets = state
+                    .named_groups
+                    .read()
+                    .await
+                    .get(&key)
+                    .map(unpaired_targeted_invites)
+                    .unwrap_or_default();
+                let durable = revoke_replaced_reseat_invite(state, &key, &secrets).await;
+                if !secrets.is_empty() {
+                    tracing::warn!(
+                        group_id = %LogHexId::group(&stable),
+                        revoked = secrets.len(),
+                        durable,
+                        "ADR 0109 S3: sidecar rebuilt; unconsumed targeted invites revoked (issued re-seats lost, #1941)"
+                    );
+                }
+                durable
+            }
+        };
+        if !durable {
+            continue;
+        }
+        let path = revoke_marker_path(&dir, &sidecar_stem(&stable));
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(%error, "ADR 0109 S3: revocation marker not removed; retried");
+                continue;
+            }
+        }
+        state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .revoke_pending
+            .remove(&stable);
+    }
+}
+
+/// #1941: at the seal of a `MemberJoined`, refuse the redemption of an
+/// unconsumed invite that names an intended joiner who is not Active while
+/// this node cannot tell whether it pairs with a lost re-seat
+/// authorisation: its revocation is pending, or the group's sidecar is not
+/// loaded (a fault, such as a damaged file kept in place before host
+/// commit). Fail closed; the caller refuses as for an unknown invite.
+pub(super) async fn unpaired_join_held(
+    state: &AppState,
+    info: &GroupInfo,
+    invite_secret: &str,
+) -> bool {
+    let targeted = info
+        .issued_invites
+        .get(invite_secret)
+        .is_some_and(|record| {
+            record.consumed_by.is_none()
+                && record
+                    .intended_joiner
+                    .as_deref()
+                    .is_some_and(|joiner| !info.has_active_member(joiner))
+        });
+    if !targeted {
+        return false;
+    }
+    let stable = info.stable_group_id();
+    let inner = state.group_recovery.inner.lock().await;
+    inner.revoke_pending.contains(stable) || inner.sidecar_status.contains_key(stable)
+}
+
+/// The unconsumed issued invites of `info` that name an intended joiner
+/// who is not Active ([`revoke_pending_invites`]).
+fn unpaired_targeted_invites(info: &GroupInfo) -> Vec<String> {
+    let mut secrets: Vec<String> = info
+        .issued_invites
+        .iter()
+        .filter(|(_, record)| record.consumed_by.is_none())
+        .filter(|(_, record)| {
+            record
+                .intended_joiner
+                .as_deref()
+                .is_some_and(|joiner| !info.has_active_member(joiner))
+        })
+        .map(|(secret, _)| secret.clone())
+        .collect();
+    secrets.sort();
+    secrets
 }
 
 /// §4 "Before host commit": a damaged sidecar found inside an ADR 0094
@@ -1261,13 +1457,20 @@ async fn resume_deferred_quarantine(state: &AppState) {
     if deferred.is_empty() {
         return;
     }
+    let dir = sidecar_dir(state);
     let (mut loaded, mut faults) = {
         let _writer = state.group_recovery.writer.lock().await;
-        scan_sidecar_dir(&sidecar_dir(state), true).await
+        scan_sidecar_dir(&dir, true).await
     };
+    let marked = revoke_marked_stems(&dir).await;
     let mut inner = state.group_recovery.inner.lock().await;
     for stable in deferred {
         let stem = sidecar_stem(&stable);
+        // #1941: the revocation is pending before the rebuilt sidecar is
+        // published under this same lock, so no join slips in between.
+        if marked.contains(&stem) {
+            inner.revoke_pending.insert(stable.clone());
+        }
         inner.sidecar_status.remove(&stable);
         if let Some(body) = loaded.remove(&stem) {
             state.group_recovery.refresh_staging(&stable, Some(&body));
@@ -1277,6 +1480,8 @@ async fn resume_deferred_quarantine(state: &AppState) {
             inner.sidecar_status.insert(stable, fault);
         }
     }
+    drop(inner);
+    revoke_pending_invites(state).await;
 }
 
 /// §4 "Crash reconciliation at load": a crash between the sidecar write
@@ -4198,6 +4403,7 @@ pub(in crate::server) async fn run_group_recovery_worker(state: Arc<AppState>) {
             _ = interval.tick() => {}
         }
         resume_deferred_quarantine(&state).await;
+        revoke_pending_invites(&state).await;
         reseat_progress(&state).await;
         subject_tick(&state).await;
         ensure_placeholders(&state).await;
@@ -10430,6 +10636,248 @@ mod tests {
             live.set_member_role(&local_hex(&state), x0x::groups::GroupRole::Member);
         }
         assert_eq!(recovery().await?["issued_reseats_lost"], false);
+        Ok(())
+    }
+
+    /// #1941 fixture: a group whose subject was removed, with four issued
+    /// invites: `reseat-secret` (names the removed subject), `open-secret`
+    /// (names no one), `active-secret` (names this Active node) and
+    /// `consumed-secret` (names the subject, consumed).
+    async fn targeted_invites_fixture(
+        state: &Arc<AppState>,
+    ) -> anyhow::Result<(String, String, GroupInfo)> {
+        let subject = "ab".repeat(32);
+        let (key, info, _basis) = removed_subject_group(state, &subject, None).await?;
+        let stable = info.stable_group_id().to_string();
+        let local = local_hex(state);
+        let mut groups = state.named_groups.write().await;
+        let live = groups
+            .get_mut(&key)
+            .ok_or_else(|| anyhow::anyhow!("live record"))?;
+        for (secret, joiner) in [
+            ("reseat-secret", Some(subject.as_str())),
+            ("open-secret", None),
+            ("active-secret", Some(local.as_str())),
+            ("consumed-secret", Some(subject.as_str())),
+        ] {
+            live.record_issued_invite_v2(
+                secret.to_string(),
+                1,
+                u64::MAX / 4,
+                x0x::groups::GroupRole::Member,
+                joiner.map(str::to_string),
+                x0x::groups::InviteOrigin::Explicit,
+                None,
+            );
+        }
+        if let Some(consumed) = live.issued_invites.get_mut("consumed-secret") {
+            consumed.consumed_by = Some(subject.clone());
+        }
+        let info = live.clone();
+        Ok((key, stable, info))
+    }
+
+    async fn held_secrets(state: &AppState, key: &str) -> Vec<String> {
+        let groups = state.named_groups.read().await;
+        let mut held: Vec<String> = groups
+            .get(key)
+            .map(|info| info.issued_invites.keys().cloned().collect())
+            .unwrap_or_default();
+        held.sort();
+        held
+    }
+
+    async fn live_record(state: &AppState, key: &str) -> anyhow::Result<GroupInfo> {
+        state
+            .named_groups
+            .read()
+            .await
+            .get(key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("live record"))
+    }
+
+    fn marker_exists(state: &AppState, stable: &str) -> bool {
+        revoke_marker_path(&sidecar_dir(state), &sidecar_stem(stable)).exists()
+    }
+
+    const AFTER_REVOKE: [&str; 3] = ["active-secret", "consumed-secret", "open-secret"];
+
+    /// #1941 (§4, D120): a rebuild empties `issued_reseats`, so the load
+    /// that rebuilds a sidecar revokes every unconsumed issued invite that
+    /// names an intended joiner who is not Active; a re-seat authorisation
+    /// still in flight then pairs with no invite. Controls: an untargeted
+    /// invite, one that names an Active member and a consumed one stay; a
+    /// later load that rebuilds nothing revokes nothing. Inert.
+    #[tokio::test]
+    async fn a_rebuilt_sidecar_revokes_unconsumed_targeted_invites() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, stable, _info) = targeted_invites_fixture(&state).await?;
+
+        // Control: a load that rebuilds nothing revokes nothing.
+        load_sidecars(&state).await;
+        assert_eq!(held_secrets(&state, &key).await.len(), 4);
+
+        let path = sidecar_path(&state, &stable);
+        tokio::fs::create_dir_all(sidecar_dir(&state)).await?;
+        tokio::fs::write(&path, [b"JUNKJUNK".as_slice(), &[0u8; 56]].concat()).await?;
+        load_sidecars(&state).await;
+        assert_eq!(
+            sidecar_on_disk(&state, &stable).await?.rebuilt_from.len(),
+            1
+        );
+        assert_eq!(held_secrets(&state, &key).await, AFTER_REVOKE);
+        assert!(!live_record(&state, &key)
+            .await?
+            .issued_invite_secrets
+            .contains("reseat-secret"));
+        assert!(!marker_exists(&state, &stable), "removed once durable");
+
+        // Control: a targeted invite minted after the rebuild survives the
+        // next load, which rebuilds nothing.
+        {
+            let mut groups = state.named_groups.write().await;
+            if let Some(live) = groups.get_mut(&key) {
+                live.record_issued_invite_v2(
+                    "later-secret".to_string(),
+                    1,
+                    u64::MAX / 4,
+                    x0x::groups::GroupRole::Member,
+                    Some("ab".repeat(32)),
+                    x0x::groups::InviteOrigin::Explicit,
+                    None,
+                );
+            }
+        }
+        load_sidecars(&state).await;
+        let live = live_record(&state, &key).await?;
+        assert!(live.issued_invites.contains_key("later-secret"));
+        assert!(!unpaired_join_held(&state, &live, "later-secret").await);
+        Ok(())
+    }
+
+    /// #1941 review (MAJOR 1 (A)): a crash after the rebuild, before the
+    /// revocation was durable, leaves a valid sidecar and the marker. The
+    /// next load revokes from the marker, then removes it. Inert.
+    #[tokio::test]
+    async fn a_revocation_marker_left_by_a_crash_revokes_on_the_next_load() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, stable, _info) = targeted_invites_fixture(&state).await?;
+        let dir = sidecar_dir(&state);
+        tokio::fs::create_dir_all(&dir).await?;
+        assert!(mark_revoke_pending(&dir, &sidecar_stem(&stable)).await);
+        load_sidecars(&state).await;
+        assert_eq!(held_secrets(&state, &key).await, AFTER_REVOKE);
+        assert!(!marker_exists(&state, &stable));
+        Ok(())
+    }
+
+    /// #1941 review (MAJOR 1 (B)): a crash between the quarantine rename
+    /// and the replacement write. The resume writes the marker before it
+    /// writes the empty replacement (a quarantine begun by an older binary
+    /// has none), and the load revokes. Inert.
+    #[tokio::test]
+    async fn a_resumed_quarantine_marks_and_revokes() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, stable, _info) = targeted_invites_fixture(&state).await?;
+        let path = sidecar_path(&state, &stable);
+        tokio::fs::create_dir_all(sidecar_dir(&state)).await?;
+        let junk = [b"JUNKJUNK".as_slice(), &[0u8; 56]].concat();
+        tokio::fs::write(&path, &junk).await?;
+        super::super::revocation_eviction::quarantine_file(&path, &junk)
+            .await
+            .map_err(|step| anyhow::anyhow!("quarantine {step}"))?;
+        assert!(
+            !tokio::fs::try_exists(&path).await?,
+            "crash before the replacement"
+        );
+        assert!(
+            !marker_exists(&state, &stable),
+            "an older binary wrote no marker"
+        );
+        load_sidecars(&state).await;
+        assert_eq!(
+            sidecar_on_disk(&state, &stable).await?.rebuilt_from.len(),
+            1
+        );
+        assert_eq!(held_secrets(&state, &key).await, AFTER_REVOKE);
+        assert!(!marker_exists(&state, &stable));
+        Ok(())
+    }
+
+    /// #1941 review (MAJOR 1 (C)): a revocation write that is not durable
+    /// keeps the marker and fails closed: the targeted invite's join is
+    /// held. The worker's retry revokes it and removes the marker. Inert.
+    #[tokio::test]
+    async fn a_non_durable_revocation_holds_the_join_and_retries() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, stable, _info) = targeted_invites_fixture(&state).await?;
+        let path = sidecar_path(&state, &stable);
+        tokio::fs::create_dir_all(sidecar_dir(&state)).await?;
+        tokio::fs::write(&path, [b"JUNKJUNK".as_slice(), &[0u8; 56]].concat()).await?;
+        state.named_groups_save_fault.store(1, Ordering::SeqCst);
+        load_sidecars(&state).await;
+        state.named_groups_save_fault.store(0, Ordering::SeqCst);
+        assert!(marker_exists(&state, &stable), "kept until durable");
+        let live = live_record(&state, &key).await?;
+        assert!(
+            live.issued_invites.contains_key("reseat-secret"),
+            "rolled back"
+        );
+        assert!(unpaired_join_held(&state, &live, "reseat-secret").await);
+        assert!(!unpaired_join_held(&state, &live, "open-secret").await);
+        assert!(!unpaired_join_held(&state, &live, "active-secret").await);
+
+        revoke_pending_invites(&state).await;
+        assert_eq!(held_secrets(&state, &key).await, AFTER_REVOKE);
+        assert!(!marker_exists(&state, &stable));
+        assert!(!state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .revoke_pending
+            .contains(&stable));
+        Ok(())
+    }
+
+    /// #1941 review (MAJOR 2): inside an ADR 0094 trial the damaged sidecar
+    /// stays in place and is not loaded, so a targeted invite's join is
+    /// held. At host commit the deferred quarantine marks the group before
+    /// it publishes the rebuilt sidecar, and revokes. Inert.
+    #[tokio::test]
+    async fn a_deferred_quarantine_holds_targeted_joins_until_revoked() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, stable, _info) = targeted_invites_fixture(&state).await?;
+        let path = sidecar_path(&state, &stable);
+        tokio::fs::create_dir_all(sidecar_dir(&state)).await?;
+        tokio::fs::write(&path, [b"JUNKJUNK".as_slice(), &[0u8; 56]].concat()).await?;
+        super::super::revocation_eviction::tests::write_upgrade_journal(
+            &state.data_dir,
+            "health_committed",
+        )?;
+        load_sidecars(&state).await;
+        let live = live_record(&state, &key).await?;
+        assert_eq!(
+            held_secrets(&state, &key).await.len(),
+            4,
+            "nothing revoked yet"
+        );
+        assert!(unpaired_join_held(&state, &live, "reseat-secret").await);
+        assert!(!unpaired_join_held(&state, &live, "open-secret").await);
+
+        super::super::revocation_eviction::tests::write_upgrade_journal(
+            &state.data_dir,
+            "host_committed",
+        )?;
+        resume_deferred_quarantine(&state).await;
+        assert_eq!(
+            sidecar_on_disk(&state, &stable).await?.rebuilt_from.len(),
+            1
+        );
+        assert_eq!(held_secrets(&state, &key).await, AFTER_REVOKE);
+        assert!(!marker_exists(&state, &stable));
         Ok(())
     }
 

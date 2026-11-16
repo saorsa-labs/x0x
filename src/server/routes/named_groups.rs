@@ -21239,6 +21239,35 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 }
             }
 
+            // #1941 (ADR 0109 §4, D120): while this node cannot tell whether
+            // a targeted invite pairs with a re-seat authorisation it lost
+            // in a sidecar rebuild (the revocation is pending, or the
+            // sidecar is not loaded), its redemption is refused as for an
+            // unknown invite. The pending revocation then removes it.
+            if group_recovery::unpaired_join_held(state, &info, &invite_secret).await {
+                tracing::info!(
+                    group_id = %resolved_group_key,
+                    member = %member_agent_id,
+                    "MemberJoined: targeted invite held while issued re-seats are lost (#1941); not consumed"
+                );
+                state
+                    .groups_diagnostics
+                    .record_member_joined_rejected_invite_secret_unknown(&resolved_group_key);
+                state.groups_diagnostics.record_invite_refusal(
+                    &resolved_group_key,
+                    JoinRefusalReason::InviteSecretUnknown.as_str(),
+                );
+                stage_join_refusal(
+                    state,
+                    &resolved_group_key,
+                    &member_agent_id,
+                    &event_for_log,
+                    JoinRefusalReason::InviteSecretUnknown,
+                )
+                .await;
+                return ApplyMetadataResult::REJECTED;
+            }
+
             // 8. Build the authoritative committed add on a clone first. If
             //    validation/signing fails, the live group remains unchanged.
             let signing_kp = state.agent.identity().agent_keypair();
