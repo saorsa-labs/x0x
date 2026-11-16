@@ -345,13 +345,30 @@ async fn skew_scenario(sim: &mut Sim, run: SkewRun, receipt: &mut Receipt) -> Re
             (n - RENEWAL_BEFORE_N) * 1000,
         )
         .await?;
+        // The pause above returns at once when the wall clock is already
+        // past N − 5 s, so the timing is proved here: A, D and E must hold
+        // the renewal before raw N, or the run shows nothing about a
+        // renewal that arrives before the expiry (INFRA, #1951 review).
+        let announce_from_ms = wall_ms();
         let (renewal, d1, _) = issue_for(sim, "A", "B", n + RENEWAL_EXTRA).await?;
         let (held, detail) = announce_renewal(sim, &renewal, &d1).await?;
+        let held_ms = wall_ms();
+        let before_n = held_ms < n * 1000;
         receipt.evidence(
-            "a_d_e_hold_b_s_renewal_by_announce_only",
-            held,
-            format!("renewal digest {d1}; discovery entries: {detail}"),
+            "a_d_e_hold_b_s_renewal_by_announce_only_before_raw_not_after",
+            held && before_n,
+            format!(
+                "renewal digest {d1}; announce from wall {announce_from_ms} ms, held at wall \
+                 {held_ms} ms, raw N {} ms; discovery entries: {detail}",
+                n * 1000
+            ),
             at(sim),
+        );
+        ensure!(
+            held && before_n,
+            "INFRA: A, D and E did not hold B's renewal before raw not_after (held {held}, at \
+             wall {held_ms} ms, N {} ms)",
+            n * 1000
         );
         renewal_digest = Some(d1);
     }
