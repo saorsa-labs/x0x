@@ -68,6 +68,11 @@ GROUPS = (
     # Lima VM. `rest` takes about 108 of its 120 minutes, so the rows have
     # their own shard; the budget is not raised (31 Oct ruling, #1733).
     ('1427', 'w3h_1427_'),
+    # #1581 `s4_certificate_expiry_skew` runs (1), (5a), (8): three
+    # five-node arms of about 700 virtual seconds each (B's certificate
+    # expires 600 s after issue, then N + τ + the bound), so the row has
+    # its own shard rather than a raised budget (31 Oct ruling, #1733).
+    ('1581j', 'w3h_1581j_'),
 )
 
 # The gate's reruns per case (D196). A group in `PARTS` runs them as that

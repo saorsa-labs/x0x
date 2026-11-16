@@ -232,6 +232,23 @@ still pending after a pass is asked for again after 60 s, 300 s and
 outage record is written and removed under one lock, so a removal never
 follows a new pass's mark. No wire format or API changes.
 
+On 16 Nov 2026 Claude recorded how run (5a) of the ADR 0110 row
+`s4_certificate_expiry_skew` is read, under David's delegation of design
+decisions of 10 Nov 2026
+([#1581](https://github.com/saorsa-labs/x0x/issues/1581)). The row says
+that a renewal reaching the admins only by announce cancels nothing and
+that B is evicted. That text predates §4a. §4a (L289) and
+`s4_certificate_rebind` run (2) have the designated expiry worker commit
+the rebind instead of `MemberRemoved` when it holds a verified renewal
+from any source, an announce cache included. The two agree on D135: the
+announce alone cancels nothing, and only a rebinding commit keeps the
+seat. Run (5a) therefore passes when nothing moves before raw
+`not_after`, and the designated admin then commits the rebind within the
+completion bound from its trigger, with no epoch change. When the
+mixed-version rule forbids a rebind, the seat is evicted, as run (3) of
+`s4_certificate_rebind` states. No code, wire format or API changes. ADR
+0110 stays Accepted and its text is unchanged.
+
 [A08](A08-r01-groups-home-membership-and-repair.md) defines valid group-state and fork recovery. A09 must not bypass that authority to obtain keys faster.
 
 ## Security claims

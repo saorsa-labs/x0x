@@ -45,6 +45,15 @@ All notable changes to this project will be documented in this file.
   known gap: after a later rotation a TreeKEM member's revoked device still
   reaches the new epoch through its kept leaf. The row has its own W3-H
   shard (`1581i`).
+- **W3-H row `s4_certificate_expiry_skew`, runs (1), (5a) and (8) (#1581).**
+  In a Home with admins A < D < E, B's device certificate expires and the
+  survivors exclude B once: after B's raw `not_after`, signed by A, within
+  the completion bound from A's trigger. In run (5a), B's renewal reaches
+  the admins only by announce; at expiry A commits the rebind instead of
+  the removal (ADR 0110 §4a), so B keeps its seat with no epoch change.
+  A09 (16 Nov 2026) records that reading of the row. Run (8) repeats run
+  (1) in an owner-certified `SignedPublic` group. The row has its own W3-H
+  shard (`1581j`).
 - **A `stale` join-request outcome can carry the authority's head (#1840,
   A08 amendment of 15 Nov 2026).** New optional `head` field on
   `groups::join_outcome::JoinRequestOutcome` (signed head commit, roster

@@ -88,6 +88,10 @@
 //! offline until t = 10 s; a 0.46.1 member L; O silent for 24 virtual
 //! hours; and the joiner J's `JoinPendingNotice`.
 
+// #1581: ADR 0110 `s4_certificate_expiry_skew`, sim-feasible runs. A child
+// module, so that it uses this file's Home, seat and certificate helpers.
+mod expiry_skew;
+
 use super::*;
 use crate::groups::cert_rebind as cr;
 use crate::groups::eviction::EXPIRY_TOLERANCE_SECS as TAU;
