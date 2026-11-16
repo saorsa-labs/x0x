@@ -422,6 +422,25 @@ fn reply_response(reply: DataReadReply) -> (StatusCode, Json<serde_json::Value>)
     }
 }
 
+/// Review of #1966: a group, store or key that is empty, `.` or `..` is
+/// refused (400). A URL client resolves dot segments, so such a part never
+/// names what the caller meant, and the CLI refuses it too.
+fn dot_segment_refusal(
+    parts: [&str; 2],
+    key: Option<&str>,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    parts
+        .into_iter()
+        .chain(key)
+        .any(|part| matches!(part, "" | "." | ".."))
+        .then(|| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "group, store and key cannot be empty, `.` or `..`",
+            )
+        })
+}
+
 /// Grantee side: read `op` of `(group, store)` from `agent`.
 pub(super) async fn read_granted_store(
     state: &AppState,
@@ -430,6 +449,9 @@ pub(super) async fn read_granted_store(
     store: String,
     op: DataReadOp,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if let Some(refusal) = dot_segment_refusal([group.as_str(), store.as_str()], op.key()) {
+        return refusal;
+    }
     let encode = |request_id| {
         DataReadRequest {
             request_id,
@@ -451,6 +473,9 @@ pub(super) async fn write_granted_store(
     store: String,
     op: DataWriteOp,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if let Some(refusal) = dot_segment_refusal([group.as_str(), store.as_str()], Some(op.key())) {
+        return refusal;
+    }
     let encode = |request_id| {
         DataWriteRequest {
             request_id,

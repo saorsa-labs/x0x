@@ -1043,3 +1043,60 @@ async fn issue1953_serves_in_flight_are_bounded() {
     assert_eq!(replies.len(), DATA_SERVE_SLOTS, "one request was dropped");
     assert!(replies.iter().all(|r| r.status == DataReadStatus::Ok));
 }
+
+/// Review of #1966: a raw client can send `%2E%2E`, which the route
+/// decodes to `..`. The grantee routes refuse an empty, `.` or `..` group,
+/// store or key with 400 and send nothing, for reads and writes.
+#[tokio::test]
+async fn issue1094_grantee_routes_refuse_dot_segments() {
+    let (grantee, _dir) = crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+        .await
+        .expect("state");
+    let peer = AgentKeypair::generate().expect("peer").agent_id();
+    for bad in ["", ".", ".."] {
+        for (group, store, key) in [(bad, STORE, "k"), (GROUP, bad, "k"), (GROUP, STORE, bad)] {
+            let (code, _) = read_granted_store(
+                &grantee,
+                peer,
+                group.to_string(),
+                store.to_string(),
+                DataReadOp::Get {
+                    key: key.to_string(),
+                },
+            )
+            .await;
+            assert_eq!(
+                code,
+                StatusCode::BAD_REQUEST,
+                "read {group:?}/{store:?}/{key:?}"
+            );
+            let (code, _) = write_granted_store(
+                &grantee,
+                peer,
+                group.to_string(),
+                store.to_string(),
+                DataWriteOp::Delete {
+                    key: key.to_string(),
+                },
+            )
+            .await;
+            assert_eq!(
+                code,
+                StatusCode::BAD_REQUEST,
+                "write {group:?}/{store:?}/{key:?}"
+            );
+        }
+    }
+    let (code, _) = read_granted_store(
+        &grantee,
+        peer,
+        "..".to_string(),
+        STORE.to_string(),
+        DataReadOp::Keys,
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    assert!(test_seam::sent_by(&grantee)
+        .iter()
+        .all(|(to, _)| *to != peer));
+}
