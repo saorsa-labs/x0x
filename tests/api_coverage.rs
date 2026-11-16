@@ -683,6 +683,16 @@ const COVERED: &[CoveredEndpoint] = &[
         "/grants/data/:agent/:group/:store/:key",
         issue1094_data_grantee_reads_keys_and_values
     ),
+    covered!(
+        Put,
+        "/grants/data/:agent/:group/:store/:key",
+        issue1094_d2_grantee_write_routes
+    ),
+    covered!(
+        Delete,
+        "/grants/data/:agent/:group/:store/:key",
+        issue1094_d2_grantee_write_routes
+    ),
     // ── Names (ADR-0074 §1) ─────────────────────────────────────────────
     covered!(Get, "/names", names_routes_wired),
     covered!(Post, "/names/resolve", names_routes_wired),
@@ -699,8 +709,8 @@ const COVERED: &[CoveredEndpoint] = &[
 ];
 
 const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
-    // #1094 D1: the granted-store read routes' coverage lives in the
-    // data-read lib tests.
+    // #1094 D1/D2: the granted-store read and write routes' coverage lives
+    // in the data-read lib tests.
     (
         "src/server/data_read_tests.rs",
         include_str!("../src/server/data_read_tests.rs"),

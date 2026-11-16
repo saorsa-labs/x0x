@@ -548,8 +548,8 @@ enum GrantSub {
     },
     /// List grants that name this install as grantee.
     Received,
-    /// Read a store on a granted agent through a received data grant
-    /// (#1094): its keys, or one value when KEY is given.
+    /// Read or write a store on a granted agent through a received data
+    /// grant (#1094).
     Data {
         #[command(subcommand)]
         sub: GrantDataSub,
@@ -587,6 +587,33 @@ enum GrantDataSub {
     },
     /// Read one value of the store.
     Get {
+        /// The granted agent (64 hex chars).
+        agent: String,
+        /// Stable group id, as in the grant.
+        group: String,
+        /// Store name, as in the grant (e.g. scratch).
+        store: String,
+        /// The key.
+        key: String,
+    },
+    /// Set one value of the store (the grant must be `rw`).
+    Put {
+        /// The granted agent (64 hex chars).
+        agent: String,
+        /// Stable group id, as in the grant.
+        group: String,
+        /// Store name, as in the grant (e.g. scratch).
+        store: String,
+        /// The key.
+        key: String,
+        /// The value (text; sent base64-encoded).
+        value: String,
+        /// Content type (default application/octet-stream).
+        #[arg(long)]
+        content_type: Option<String>,
+    },
+    /// Remove one key of the store (the grant must be `rw`).
+    Rm {
         /// The granted agent (64 hex chars).
         agent: String,
         /// Stable group id, as in the grant.
@@ -3606,6 +3633,31 @@ async fn run(
                     store,
                     key,
                 } => commands::grant::data(&client, &agent, &group, &store, Some(&key)).await,
+                GrantDataSub::Put {
+                    agent,
+                    group,
+                    store,
+                    key,
+                    value,
+                    content_type,
+                } => {
+                    commands::grant::data_put(
+                        &client,
+                        &agent,
+                        &group,
+                        &store,
+                        &key,
+                        &value,
+                        content_type.as_deref(),
+                    )
+                    .await
+                }
+                GrantDataSub::Rm {
+                    agent,
+                    group,
+                    store,
+                    key,
+                } => commands::grant::data_rm(&client, &agent, &group, &store, &key).await,
             },
             GrantSub::Renew {
                 id,

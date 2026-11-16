@@ -41,6 +41,7 @@ mod system_events;
 mod update_check;
 #[cfg(any(unix, windows))]
 mod upgrade_flush;
+mod upgrade_health_commit;
 pub use update_check::run_update_check_and_report;
 // W3-H (#1164): deterministic simulation harness (test builds only:
 // `#![cfg(test)]` inside the module).
@@ -1630,6 +1631,13 @@ pub async fn serve_with_options(
         let mut verdict_windows = health_verdict::VerdictWindows::default();
         // #1351: verdict and upgrade-input changes become `system.*` events.
         let mut system_events = system_events::SystemEventTracker::default();
+        // #1377: a launcher trial candidate writes its health commit. Read
+        // once; an ordinary daemon is `None` and does nothing per tick.
+        let health_candidate = upgrade_health_commit::detect(
+            &state.data_dir,
+            identity_dir.clone().or_else(crate::storage::x0x_home_dir),
+        );
+        let mut health_tracker = upgrade_health_commit::Tracker::default();
         bg_tasks.push(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
                 routes::status::HEALTH_SNAPSHOT_REFRESH_SECS,
@@ -1674,6 +1682,23 @@ pub async fn serve_with_options(
                     &mut verdict_windows,
                 )
                 .await;
+                if let Some(candidate) = &health_candidate {
+                    let (_, send_ready, _) = snapshot_state.health_snapshot.load();
+                    let observation = upgrade_health_commit::Observation {
+                        stores_initialized: true,
+                        local_verdict: upgrade_health_commit::candidate_local_verdict(
+                            &snapshot_state.health_snapshot,
+                            &sample,
+                        ),
+                        send_ready_peers: send_ready,
+                    };
+                    // A failed write is retried at the next tick.
+                    if let Err(error) =
+                        health_tracker.commit(candidate, observation, std::time::Instant::now())
+                    {
+                        tracing::warn!("upgrade health commit not written: {error}");
+                    }
+                }
                 snapshot_state.health_snapshot.store_verdict_sample(sample);
                 system_events::emit_changes(&snapshot_state, &mut system_events);
             }
@@ -3436,6 +3461,15 @@ pub async fn serve_with_options(
             "/grants/data/:agent/:group/:store/:key",
             get(data_read::get_granted_store_value),
         )
+        // #1094 D2: write a store through a received `rw` ShareCap::Data grant.
+        .route(
+            "/grants/data/:agent/:group/:store/:key",
+            put(data_read::put_granted_store_value),
+        )
+        .route(
+            "/grants/data/:agent/:group/:store/:key",
+            delete(data_read::delete_granted_store_value),
+        )
         // ADR-0074 §1: names (owner petnames, TOFU pins, resolution)
         .route("/names", get(routes::names_list))
         .route("/names/resolve", post(routes::names_resolve))
@@ -4198,6 +4232,11 @@ async fn start_dm_inbox_when_gossip_ready(
             )
             .with_typed_payload_route(
                 x0x::share_grant::data_read::DATA_READ_REPLY_DM_PREFIX,
+                data_read_route_tx.clone(),
+            )
+            // #1094 D2: a grantee's write; the reply uses the read reply route.
+            .with_typed_payload_route(
+                x0x::share_grant::data_read::DATA_WRITE_REQUEST_DM_PREFIX,
                 data_read_route_tx.clone(),
             );
         match agent

@@ -48,6 +48,10 @@ GROUPS = (
     ('s3-d2', 'w3h_1356_control_s3_d2_fork_exposure_contained$'),
     # H-S3-q (#1572): the `s3` shard already takes about 90 min (run
     # 43366324030), so the H-S3-q variants have their own shard.
+    # H-S3-q (2) (#1572): about 60 s per rerun in the 12-CPU VM (it
+    # watches J past GATE_STALL), so about 40 min for 20 reruns on a
+    # runner; its own shard, so the `s3-q` shard does not grow.
+    ('s3-qm', 'w3h_1356_red_s3_q_member_unreadable_sidecar$'),
     ('s3-q', 'w3h_1356_red_s3_q_'),
     # H-S3-q (3) (#1572) runs the H-S3-c3 prefix with O's restart, so it
     # has its own shard like the other owner-axis rows.
