@@ -6883,7 +6883,15 @@ mod tests {
                 .expect("bob store")
                 .flush(now_ms, true)
                 .expect("flush bob's evidence");
-            bob.shutdown().await;
+            bob.try_shutdown().await.expect("bob shuts down");
+            assert!(
+                bob.network()
+                    .expect("bob network")
+                    .node_status()
+                    .await
+                    .is_none(),
+                "the old endpoint must be gone before the restart"
+            );
             drop(bob);
             let Some(restarted) = build_loopback_agent(dir.path(), "bob").await else {
                 alice.shutdown().await;

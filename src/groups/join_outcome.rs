@@ -482,6 +482,7 @@ mod tests {
     #[test]
     fn issue1840_a_head_that_fails_a_check_is_not_adopted() {
         let (owner, authority, stale) = authority_and_stale_copy(1);
+        let stale_before = stale.clone();
         let owner_hex = hex::encode(owner.agent_id().as_bytes());
         let me = requester();
         let adopt = |head: &RetainedCommit, local: &GroupInfo| adopt_join_head(local, head, &me);
@@ -595,6 +596,39 @@ mod tests {
             adopt_join_head(&stale, &head_of(&authority), &seated),
             Err(JoinHeadError::Seated)
         );
+
+        // A withdrawn head refuses on its own (the copy is live).
+        let mut head_withdrawn = authority.clone();
+        head_withdrawn
+            .seal_withdrawal(&owner, now_ms())
+            .expect("withdrawal seal");
+        assert_eq!(
+            adopt(&head_of(&head_withdrawn), &stale),
+            Err(JoinHeadError::Withdrawn)
+        );
+
+        // A requester that is Banned in the head counts as seated.
+        let mut banned = authority.clone();
+        banned.ban_member(&me, Some(owner_hex.clone()));
+        banned.seal_commit(&owner, now_ms()).expect("ban seal");
+        assert_eq!(adopt(&head_of(&banned), &stale), Err(JoinHeadError::Seated));
+
+        // The refused heads left the input copy as it was.
+        assert_eq!(stale, stale_before);
+    }
+
+    /// WHY (#1840): a copy whose own request link sits on the head itself
+    /// (local revision = head revision + 1) has the head as its base. The
+    /// same revision with the same hash is allowed, not `NotAhead`.
+    #[test]
+    fn issue1840_own_link_on_the_head_itself_is_not_behind() {
+        let (_owner, authority, _stale) = authority_and_stale_copy(1);
+        let me = AgentKeypair::generate().expect("requester key");
+        let me_hex = hex::encode(me.agent_id().as_bytes());
+        let mut asked = authority.clone();
+        asked.seal_commit(&me, now_ms()).expect("own request link");
+        assert_eq!(asked.state_revision, authority.state_revision + 1);
+        assert!(adopt_join_head(&asked, &head_of(&authority), &me_hex).is_ok());
     }
 
     /// WHY (#1840, mixed versions): a head rides only on `stale`, a headed
