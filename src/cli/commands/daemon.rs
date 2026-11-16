@@ -422,18 +422,143 @@ pub(crate) fn finish_doctor_write(
 
 /// `x0x doctor` when named-instance discovery fails before any HTTP client
 /// exists. Still emits the JSON/text summary; does not fall back to default.
-pub fn doctor_unreachable(format: OutputFormat, err: &anyhow::Error) -> Result<()> {
-    let report = unreachable_doctor_report(format!("daemon not reachable: {err:#}"));
+/// With `bundle`, also writes the diagnostic bundle (#1354) — its `health`
+/// section records the discovery failure, its `doctor` section is the
+/// four-fail unreachable report.
+pub fn doctor_unreachable(
+    format: OutputFormat,
+    err: &anyhow::Error,
+    bundle: Option<&Path>,
+) -> Result<()> {
+    let detail = format!("daemon not reachable: {err:#}");
+    let report = unreachable_doctor_report(detail.clone());
+    if let Some(path) = bundle {
+        let health = serde_json::json!({ "error": detail });
+        let value = doctor_bundle_value(health, &report)?;
+        write_doctor_bundle_value(value, path)?;
+    }
     finish_doctor(format, &report)
 }
 
 /// `x0x doctor` — run diagnostics against the daemon.
 ///
 /// With `--json`, prints one summary object (connectivity, key health, store
-/// integrity, upgrade). Exits non-zero when any check is `fail`.
-pub async fn doctor(client: &DaemonClient) -> Result<()> {
+/// integrity, upgrade). Exits non-zero when any check is `fail`. With
+/// `--bundle` (#1354), writes the redacted diagnostic bundle before the
+/// summary; a bundle write failure is an error.
+pub async fn doctor(client: &DaemonClient, bundle: Option<&Path>) -> Result<()> {
     let report = collect_doctor_report(client).await;
+    if let Some(path) = bundle {
+        write_doctor_bundle(client, &report, path).await?;
+    }
     finish_doctor(client.format(), &report)
+}
+
+// ---------------------------------------------------------------------------
+// Doctor bundle (#1354)
+// ---------------------------------------------------------------------------
+
+/// Seconds since the Unix epoch, with the pre-epoch clock failure as an
+/// error instead of a panic (production paths avoid `unwrap`).
+fn unix_secs_now() -> Result<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .context("system clock is before the Unix epoch")
+}
+
+/// File name a bare `--bundle` writes (#1354):
+/// `x0x-doctor-bundle-<unix-secs>.json` in the current directory.
+pub(crate) fn doctor_bundle_default_filename(secs: u64) -> String {
+    format!("x0x-doctor-bundle-{secs}.json")
+}
+
+/// Default bundle path for a bare `--bundle`: a fresh seconds-stamped
+/// name in the current directory.
+pub(crate) fn doctor_bundle_default_path() -> Result<std::path::PathBuf> {
+    Ok(std::path::PathBuf::from(doctor_bundle_default_filename(
+        unix_secs_now()?,
+    )))
+}
+
+/// Resolve the raw `--bundle` flag value (#1354) into the path to write.
+/// `None` (flag absent) stays `None`; a bare flag (`Some(None)`, plus the
+/// defensively-treated empty value) becomes the default seconds-stamped
+/// name in the current directory; any other explicit path passes through
+/// unchanged. The bin forwards the result as `Option<&Path>`.
+pub fn resolve_doctor_bundle_path(
+    bundle: Option<Option<&Path>>,
+) -> Result<Option<std::path::PathBuf>> {
+    match bundle {
+        None => Ok(None),
+        Some(None) => Ok(Some(doctor_bundle_default_path()?)),
+        Some(Some(path)) if path.as_os_str().is_empty() => Ok(Some(doctor_bundle_default_path()?)),
+        Some(Some(path)) => Ok(Some(path.to_path_buf())),
+    }
+}
+
+/// The `health` section of a bundle (#1354): a fresh `/health` fetch with
+/// the gated detail redacted, or `{"error": ...}` when the fetch fails.
+async fn doctor_bundle_health(client: &DaemonClient) -> serde_json::Value {
+    match client
+        .get_with_timeout("/health", DOCTOR_HEALTH_TIMEOUT)
+        .await
+    {
+        Ok(mut body) => {
+            // The bundle may be attached to an issue, so the loopback body
+            // gets the same #1480 Finding 3 gate as the non-loopback one.
+            crate::server::health_verdict::redact_health_detail(&mut body);
+            body
+        }
+        Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
+    }
+}
+
+/// Assemble the #1354 doctor-bundle JSON value from a resolved `health`
+/// section and the doctor report.
+fn doctor_bundle_value(
+    health: serde_json::Value,
+    report: &DoctorReport,
+) -> Result<serde_json::Value> {
+    Ok(serde_json::json!({
+        "schema": "x0x-doctor-bundle",
+        "version": 1,
+        "created_unix": unix_secs_now()?,
+        "generator": { "name": "x0x", "version": crate::VERSION },
+        "health": health,
+        "doctor": report.to_json_value()?,
+    }))
+}
+
+/// Write one assembled doctor bundle (#1354): pretty JSON, `fs::write`,
+/// then a read-back parse — the write-verify discipline the Windows
+/// autostart wrapper uses — so a truncated write surfaces as an error
+/// instead of a silently broken file. The one-line notice goes to stderr,
+/// keeping `--json` stdout to exactly one JSON value.
+fn write_doctor_bundle_value(value: serde_json::Value, path: &Path) -> Result<()> {
+    let text = serde_json::to_string_pretty(&value).context("serialize doctor bundle")?;
+    std::fs::write(path, &text)
+        .with_context(|| format!("failed to write doctor bundle {}", path.display()))?;
+    let written = std::fs::read(path)
+        .with_context(|| format!("failed to read back doctor bundle {}", path.display()))?;
+    serde_json::from_slice::<serde_json::Value>(&written).with_context(|| {
+        format!(
+            "doctor bundle {} did not parse back as JSON",
+            path.display()
+        )
+    })?;
+    eprintln!("doctor bundle written to {}", path.display());
+    Ok(())
+}
+
+/// Fetch `/health` (redacted), build and write the #1354 doctor bundle.
+pub(crate) async fn write_doctor_bundle(
+    client: &DaemonClient,
+    report: &DoctorReport,
+    path: &Path,
+) -> Result<()> {
+    let health = doctor_bundle_health(client).await;
+    write_doctor_bundle_value(doctor_bundle_value(health, report)?, path)
 }
 
 /// `x0x instances` — list running daemon instances.
@@ -1389,7 +1514,7 @@ mod tests {
         });
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
-        let result = doctor(&client).await;
+        let result = doctor(&client, None).await;
         assert!(result.is_ok(), "doctor should succeed: {:?}", result);
     }
 
@@ -1573,6 +1698,193 @@ mod tests {
         let report = collect_doctor_report(&client).await;
         let parsed = assert_doctor_json_stdout(&report, true);
         assert_eq!(parsed["connectivity"]["status"], "warn");
+    }
+
+    // ===================================================================
+    // #1354: `x0x doctor --bundle` redacted diagnostic bundle
+    // ===================================================================
+
+    /// One body satisfying every doctor fetch at once (the mock server
+    /// answers any path with it), with canaries planted in the #1480
+    /// gated fields of `verdict.inputs`.
+    fn doctor_bundle_mock_body() -> serde_json::Value {
+        serde_json::json!({
+            "ok": true,
+            "status": "healthy",
+            "peers": 5,
+            "agent_id": "abc123",
+            "machine_id": "def456",
+            "stores": [],
+            "update_available": false,
+            "current_version": "0.1.0",
+            "verdict": {
+                "overall": "ok",
+                "inputs": {
+                    "disk": { "state": "ok", "free_bytes": 999888777666u64, "total_bytes": 999888777999u64 },
+                    "upgrade": {
+                        "state": "ok",
+                        "checks_enabled": true,
+                        "latest_version": "canary-version-DO-NOT-SHIP"
+                    },
+                    "identity": { "state": "ok", "agent": true, "machine": true, "user_present": true },
+                    "log": { "state": "ok", "window_secs": 60, "errors": 424242 },
+                    "send_failure_rate": { "state": "ok", "attempts": 999111, "failed": 999222, "rate": 0.9993 }
+                }
+            }
+        })
+    }
+
+    /// The bundle round-trips the #1354 schema (envelope, redacted health
+    /// body, four-check doctor report), the gated #1480 detail planted in
+    /// the mock `/health` body is absent from the written bytes, and
+    /// non-gated fields survive. Removing the `redact_health_detail` call
+    /// turns this red.
+    #[tokio::test]
+    async fn doctor_bundle_writes_redacted_file() {
+        let (url, _shutdown) = start_mock_server(doctor_bundle_mock_body()).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let report = collect_doctor_report(&client).await;
+        assert!(report.ok, "mock daemon must pass every check");
+
+        let dir = tempfile::tempdir().expect("bundle dir");
+        let path = dir.path().join("doctor-bundle.json");
+        write_doctor_bundle(&client, &report, &path)
+            .await
+            .expect("write doctor bundle");
+
+        let text = String::from_utf8(std::fs::read(&path).expect("read bundle back"))
+            .expect("bundle bytes utf-8");
+        for canary in [
+            "999888777666",               // disk.free_bytes
+            "999888777999",               // disk.total_bytes
+            "canary-version-DO-NOT-SHIP", // upgrade.latest_version
+            "user_present",               // identity.user_present (key removed)
+            "424242",                     // log.errors
+            "999111",                     // send_failure_rate.attempts
+            "999222",                     // send_failure_rate.failed
+            "0.9993",                     // send_failure_rate.rate
+        ] {
+            assert!(
+                !text.contains(canary),
+                "gated canary {canary} leaked into the bundle"
+            );
+        }
+
+        // Non-gated fields survive, and the envelope carries the contract
+        // shape (schema, version, created_unix, generator, health, doctor).
+        let parsed: serde_json::Value =
+            serde_json::from_str(&text).expect("bundle must parse as JSON");
+        assert_eq!(parsed["schema"], "x0x-doctor-bundle");
+        assert_eq!(parsed["version"], 1);
+        assert!(
+            parsed["created_unix"].as_u64().unwrap_or(0) > 0,
+            "created_unix must be a positive u64: {parsed}"
+        );
+        assert_eq!(parsed["generator"]["name"], "x0x");
+        assert_eq!(parsed["generator"]["version"], crate::VERSION);
+        let health = &parsed["health"];
+        assert_eq!(health["status"], "healthy");
+        assert_eq!(health["peers"], 5);
+        assert_eq!(health["verdict"]["overall"], "ok");
+        let inputs = &health["verdict"]["inputs"];
+        assert!(inputs["disk"].is_object(), "disk input survives: {health}");
+        for gated in [
+            ("disk", "free_bytes"),
+            ("disk", "total_bytes"),
+            ("upgrade", "latest_version"),
+            ("identity", "user_present"),
+            ("log", "errors"),
+            ("send_failure_rate", "attempts"),
+            ("send_failure_rate", "failed"),
+            ("send_failure_rate", "rate"),
+        ] {
+            assert!(
+                inputs[gated.0].get(gated.1).is_none(),
+                "gated field {gated:?} must be withheld"
+            );
+        }
+        assert_eq!(parsed["doctor"]["ok"], true);
+        for check in ["connectivity", "key_health", "store_integrity", "upgrade"] {
+            assert!(
+                parsed["doctor"][check].is_object(),
+                "doctor.{check} must be an object: {parsed}"
+            );
+        }
+    }
+
+    /// Named instance with no api.port plus `--bundle`: the bundle carries
+    /// the four-fail unreachable report and `health` = discovery error.
+    #[test]
+    fn doctor_unreachable_bundle_writes_four_fail_report() {
+        let err = match DaemonClient::new(
+            Some("absent-instance-doctor-1354-xyz"),
+            None,
+            crate::cli::OutputFormat::Json,
+        ) {
+            Ok(_) => panic!("named instance without api.port must fail discovery"),
+            Err(e) => e,
+        };
+
+        let dir = tempfile::tempdir().expect("bundle dir");
+        let path = dir.path().join("doctor-bundle.json");
+        let result = doctor_unreachable(crate::cli::OutputFormat::Json, &err, Some(&path));
+        assert!(result.is_err(), "unreachable doctor must exit non-zero");
+
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read doctor bundle back"))
+                .expect("bundle must parse as JSON");
+        let health_error = parsed["health"]["error"]
+            .as_str()
+            .expect("health must carry the error string");
+        assert!(
+            health_error.contains("daemon not reachable")
+                && health_error.contains("absent-instance-doctor-1354-xyz"),
+            "health error must name the failure and the instance: {health_error}"
+        );
+        assert_eq!(parsed["doctor"]["ok"], false);
+        for check in ["connectivity", "key_health", "store_integrity", "upgrade"] {
+            assert_eq!(parsed["doctor"][check]["status"], "fail");
+        }
+    }
+
+    /// The three `--bundle` flag states resolve as specified (#1354):
+    /// absent → `None`; bare (or empty) → the seconds-stamped default name
+    /// in the current directory; explicit → the given path.
+    #[test]
+    fn doctor_bundle_flag_resolution() {
+        assert!(
+            resolve_doctor_bundle_path(None)
+                .expect("absent flag resolves")
+                .is_none(),
+            "absent flag stays None"
+        );
+
+        for bare in [None, Some(Path::new(""))] {
+            let resolved = resolve_doctor_bundle_path(Some(bare))
+                .expect("bare flag resolves")
+                .expect("bare flag generates a path");
+            assert!(
+                !resolved.is_absolute(),
+                "default bundle path must be cwd-relative: {}",
+                resolved.display()
+            );
+            let name = resolved.to_string_lossy();
+            let secs: u64 = name
+                .trim_start_matches("x0x-doctor-bundle-")
+                .trim_end_matches(".json")
+                .parse()
+                .expect("default name carries unix secs");
+            assert_eq!(
+                resolved,
+                std::path::PathBuf::from(doctor_bundle_default_filename(secs)),
+                "bare flag must generate the seconds-stamped default name"
+            );
+        }
+
+        let explicit = resolve_doctor_bundle_path(Some(Some(Path::new("/tmp/diag.json"))))
+            .expect("explicit path resolves")
+            .expect("explicit path is Some");
+        assert_eq!(explicit, std::path::PathBuf::from("/tmp/diag.json"));
     }
 
     #[tokio::test]

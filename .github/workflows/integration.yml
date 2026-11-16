@@ -154,6 +154,10 @@ jobs:
         run: bash scripts/ci/nextest-isolated.sh --all-features --test daemon_api_integration -- -- --ignored
       - name: Run named group D4 signed commit integration tests
         run: bash scripts/ci/nextest-isolated.sh --all-features --test named_group_d4_apply -- -- --ignored
+      # #1354 redaction proof: a daemon seeded with keys, tokens and a KV
+      # value must yield a `x0x doctor --bundle` file free of all of them.
+      - name: Run doctor bundle redaction proof
+        run: bash scripts/ci/nextest-isolated.sh --all-features --test doctor_bundle -- -- --ignored
       - name: Run bound-port forwarding regression
         run: bash scripts/ci/nextest-isolated.sh --all-features --lib -- --run-ignored ignored-only --no-tests=fail -E 'test(=forward::tests::port_zero_forwards_are_listed_and_removed_by_bound_address)'
 

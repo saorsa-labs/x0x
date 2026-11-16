@@ -1048,7 +1048,11 @@ pub(in crate::server) fn classify_with_detail(
 ///
 /// The publish-failure `rate` goes with its `attempts`/`failed` counts:
 /// it is the same windowed measurement in ratio form.
-pub(in crate::server) fn redact_health_detail(payload: &mut serde_json::Value) {
+///
+/// The `x0x doctor --bundle` writer applies the same function to the
+/// loopback `/health` body before embedding it in the owner-local
+/// diagnostic bundle (#1354).
+pub(crate) fn redact_health_detail(payload: &mut serde_json::Value) {
     let Some(inputs) = payload
         .get_mut("verdict")
         .and_then(|verdict| verdict.get_mut("inputs"))

@@ -422,6 +422,21 @@ particular, a dual-stack `[::]` bind receives local IPv4 probes as
 v4-mapped addresses, so they get the redacted payload; bind `127.0.0.1`
 (the default) or probe over IPv6 when the full detail is wanted.
 
+`x0x doctor --bundle [PATH]` (#1354) writes the owner-local diagnostic
+bundle: one JSON file with this redacted `/health` body — the CLI
+connects over loopback, so it applies the same withheld-fields redaction
+itself before the body goes into a file an owner may attach to a report —
+plus the four doctor checks (`connectivity`, `key_health`,
+`store_integrity`, `upgrade`) and a small envelope (`schema`, `version`,
+`created_unix`, `generator`). The bundle holds no keys, tokens or
+message content: the writer embeds only the redacted `/health` body and
+the check summaries, never route bodies that carry store values,
+history or auth material (a daemon-seeded test checks this). A bare
+`--bundle` writes `x0x-doctor-bundle-<unix-secs>.json` in the current
+directory. The file stays on the owner's machine: this slice adds no
+sending (`POST /report` and opt-in maintainer delivery are later slices
+of #1354).
+
 ### Example: status
 
 ```bash
