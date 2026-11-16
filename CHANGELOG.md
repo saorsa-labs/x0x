@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **A joiner whose S3 sidecar is rebuilt under its placeholder shows
+  `readmission_required {local_state_lost}` (#1937).** The rebuild drops the
+  authoritative record behind the placeholder, which no holder has; the group
+  now stays inert and placeheld with D43's exit and
+  `recovery_sidecar_rebuilt`, as ADR 0109 §4's rebuild table says. Before, the
+  node showed no recovery object.
+
 - **Upgrade records: `clearable` matches the local clear (#1932 review; A14
   amendment of 15 Nov 2026).** A hold reports `clearable: true` only when
   `x0x upgrade --clear-hold` would clear it; an unresolved `.pending` probe
