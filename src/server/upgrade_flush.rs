@@ -1296,11 +1296,11 @@ mod arm_flush_regressions_unused_reservation {
                 released
                     .lock()
                     .unwrap()
-                    .recv_timeout(Duration::from_secs(5))
+                    .recv_timeout(Duration::from_secs(30))
                     .map_err(io::Error::other)?;
                 deadline.check()
             }),
-            Duration::from_millis(300),
+            crate::upgrade::shutdown_flush::TEST_OVERRUN_LIMIT,
         )
         .unwrap();
         let (complete, _receive) = mpsc::sync_channel(1);

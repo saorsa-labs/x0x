@@ -605,6 +605,24 @@ mod tests {
         assert!(candidate.previously_connected);
         assert_eq!(candidate.boot.pid, pid);
 
+        // #1961 review: a data dir reached through a symlink, or given
+        // relative, is recorded in canonical form, so the record names the
+        // planned root and passes `validate_health`.
+        let link = dir.path().join("data-link");
+        std::os::unix::fs::symlink(&root, &link).expect("symlink");
+        let via_link = detect_with(&link, Some(link.clone()), &executable).expect("candidate");
+        assert_eq!(via_link.data_root, root);
+        assert_eq!(via_link.identity_root, root);
+        let cwd = std::env::current_dir().expect("cwd");
+        let relative: PathBuf = std::iter::repeat_n("..", cwd.components().count())
+            .collect::<PathBuf>()
+            .join(root.strip_prefix("/").expect("absolute root"));
+        let via_relative =
+            detect_with(&relative, Some(root.clone()), &executable).expect("candidate");
+        assert_eq!(via_relative.data_root, root);
+        let health = super::record(&via_link, healthy(1), true);
+        journal::validate_health(&serde_json::to_vec(&health).expect("encode")).expect("valid");
+
         write_journal(&root, "host_committed");
         assert!(detect_with(&root, Some(root.clone()), &executable).is_none());
     }

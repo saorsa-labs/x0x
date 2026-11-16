@@ -482,7 +482,7 @@ fn entry_commitment_bytes(outer_key: &str, entry: &KvEntry) -> Vec<u8> {
 }
 
 /// Write a length-prefixed byte slice (64-bit LE length + data).
-fn lp_bytes(buf: &mut Vec<u8>, data: &[u8]) {
+pub(super) fn lp_bytes(buf: &mut Vec<u8>, data: &[u8]) {
     buf.extend_from_slice(&(data.len() as u64).to_le_bytes());
     buf.extend_from_slice(data);
 }
@@ -662,6 +662,32 @@ pub(crate) enum MergeRejection {
     UnauthorizedWriter,
     AnonymousWriter,
     AmbiguousDelta,
+    /// #1094 P1: an entry under another key than its own.
+    MisplacedEntry,
+}
+
+/// Encoded bytes of a writer mark (#1094 P1): agent id, signature, version
+/// tag and their names, with length prefixes, rider label at its bound. The
+/// test `writer_mark_bytes_bound_the_mark` checks it.
+pub(crate) const WRITER_MARK_BYTES: usize = 4_800;
+
+/// Encoded bytes of an entry besides its key (twice: map key and inner
+/// key), value and content type: lengths, hash, metadata count, times.
+const ENTRY_FIXED_BYTES: usize = 128;
+
+/// Encoded length prefix of an entry's map key.
+const MAP_KEY_PREFIX_BYTES: usize = 8;
+
+/// Encoded bytes of one OR-Set tag for a key, besides the key.
+const KEY_TAG_BYTES: usize = 128;
+
+/// Whether any entry of `delta` sits under a map key other than its own.
+fn delta_has_misplaced_entry(delta: &KvStoreDelta) -> bool {
+    delta
+        .added
+        .iter()
+        .any(|(key, (entry, _))| *key != entry.key)
+        || delta.updated.iter().any(|(key, entry)| *key != entry.key)
 }
 
 /// A replicated key-value store using CRDTs with access control.
@@ -1956,6 +1982,65 @@ impl KvStore {
         Ok(evicted)
     }
 
+    /// #1094 P1 (review of #1963): refuse a put of `key` that would take
+    /// this store's complete image (what a retained image serializes) over
+    /// the retained-image limit. `marked` adds a writer mark's bytes. The
+    /// growth is an upper estimate: the new entry, its map key and a new
+    /// key tag, less the entry it replaces.
+    ///
+    /// # Errors
+    ///
+    /// [`KvError::StoreFull`] when the image would pass the limit.
+    pub fn check_image_room(
+        &self,
+        key: &str,
+        value_len: usize,
+        content_type_len: usize,
+        marked: bool,
+    ) -> Result<()> {
+        let max = crate::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES;
+        let now = bincode::serialized_size(self)?;
+        let mark = if marked { WRITER_MARK_BYTES } else { 0 };
+        let entry = ENTRY_FIXED_BYTES + 2 * key.len() + value_len + content_type_len + mark;
+        let tag = KEY_TAG_BYTES + key.len();
+        let replaced = match self.entries.get(key) {
+            Some(old) => bincode::serialized_size(old)?
+                .saturating_add((MAP_KEY_PREFIX_BYTES + key.len()) as u64),
+            None => 0,
+        };
+        let image = now
+            .saturating_add((entry + tag) as u64)
+            .saturating_sub(replaced);
+        if image > max as u64 {
+            return Err(KvError::StoreFull { image, max });
+        }
+        Ok(())
+    }
+
+    /// #1094 P1: mark `key`'s current entry as written by the holder of
+    /// `public_key`, with `rider` when a rider wrote through it. The store
+    /// version does not move: call it in the same write lock as the put, so
+    /// the mark is part of what that put publishes and commits.
+    ///
+    /// # Errors
+    ///
+    /// [`KvError::Merge`] when the key has no entry or signing fails.
+    pub fn mark_entry_writer(
+        &mut self,
+        key: &str,
+        public_key: &ant_quic::MlDsaPublicKey,
+        secret_key: &ant_quic::MlDsaSecretKey,
+        rider: Option<&str>,
+    ) -> Result<()> {
+        let id = *self.id();
+        let entry = self
+            .entries
+            .get_mut(key)
+            .ok_or_else(|| KvError::Merge(format!("no entry to mark for key {key:?}")))?;
+        crate::kv::provenance::mark(entry, &id, public_key, secret_key, rider)
+            .map_err(KvError::Merge)
+    }
+
     /// Get an entry by key.
     ///
     /// Gated on active-key membership so a tombstoned key never reads back.
@@ -2171,6 +2256,13 @@ impl KvStore {
             tracing::warn!("rejected anonymous self_keyed delta for store {}", self.id);
             return Ok(()); // silent whole-delta reject — applies nothing
         };
+        if delta_has_misplaced_entry(delta) {
+            tracing::warn!(
+                "rejected self_keyed delta for store {}: an entry is not under its own key",
+                self.id
+            );
+            return Ok(());
+        }
         // Ambiguity gate (mirrors the sender-auth path): a delta carrying the
         // same key in both `added` and `updated` is ambiguous by
         // construction — drop the whole delta.
@@ -2409,6 +2501,16 @@ impl KvStore {
                 );
                 return Ok(MergeOutcome::Rejected(MergeRejection::AmbiguousDelta));
             }
+        }
+        // Slot gate, ALL policies (#1094 P1, review of #1963): an entry must
+        // sit under its own key. Otherwise one key's value and writer mark
+        // could be shown under another key. No legitimate producer emits it.
+        if delta_has_misplaced_entry(delta) {
+            tracing::warn!(
+                "rejected delta for store {}: an entry is not under its own key",
+                self.id
+            );
+            return Ok(MergeOutcome::Rejected(MergeRejection::MisplacedEntry));
         }
 
         // Apply allowlist changes from the delta (owner-only)

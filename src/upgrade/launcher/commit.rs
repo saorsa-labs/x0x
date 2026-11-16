@@ -120,25 +120,36 @@ fn check_record(
 /// Write the host commit when the full set is healthy. A refusal changes
 /// nothing. An `Err` is an I/O failure (for example a transient hash read
 /// error): the caller retries, and it is never a rollback cause.
+///
+/// Every trial is read under the host lock (#1968 review): a launcher that
+/// saved a rollback verdict, or whose trial ran past its total deadline, is
+/// never committed by a peer from an older copy. Such a trial rolls the
+/// host back with its cause.
 pub(super) fn host_commit(
     host: &recovery::Host,
-    trials: &[(PathBuf, Trial)],
+    trial_path: impl Fn(&journal::Participant) -> PathBuf,
+    clock: &Clock,
 ) -> io::Result<Commit> {
     host.commit(|| {
+        let binding = host.binding()?;
         for p in &host.plan().participants {
             if !p.was_running {
                 continue;
             }
-            let Some((_, trial)) = trials.iter().find(|(_, t)| t.instance == p.instance_id) else {
-                return Ok(Commit::NotYet("participant trial missing".into()));
+            let trial = match Trial::load(&trial_path(p), &binding, &p.instance_id) {
+                Ok(trial) => trial,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(Commit::NotYet("participant trial missing".into()));
+                }
+                Err(error) => return Err(error),
             };
-            if trial.binding != host.binding()? {
-                return Err(invalid("trial binding mismatch"));
+            if let Some(verdict) = trial.verdict.clone().or_else(|| trial.expired(clock)) {
+                return Ok(Commit::RollBack(verdict));
             }
             if trial.phase != Phase::Provisional {
                 return Ok(Commit::NotYet("participant is not provisional".into()));
             }
-            match instance_health(host, p, trial) {
+            match instance_health(host, p, &trial) {
                 Health::Committed => {}
                 Health::NotYet(reason) => return Ok(Commit::NotYet(reason.into())),
                 Health::RollBack(cause) => return Ok(Commit::RollBack(cause)),
@@ -185,6 +196,55 @@ mod tests {
         trial.phase = Phase::Provisional;
         trial.save(&path).unwrap();
         (path, trial)
+    }
+
+    /// The host commit over `trials` as saved on disk, at 2 s on the trial
+    /// boot.
+    fn commit_now(host: &recovery::Host, trials: &[(PathBuf, Trial)]) -> io::Result<Commit> {
+        let clock = Clock {
+            boot: trials[0].1.boot.clone(),
+            ms: 2_000,
+        };
+        host_commit(
+            host,
+            |p| {
+                trials
+                    .iter()
+                    .find(|(_, t)| t.instance == p.instance_id)
+                    .map(|(path, _)| path.clone())
+                    .unwrap_or_else(|| PathBuf::from("/nonexistent/trial.json"))
+            },
+            &clock,
+        )
+    }
+
+    /// #1968 review: a trial that saved a rollback verdict, or ran past its
+    /// total deadline, rolls the host back with that cause; a peer never
+    /// commits it from an older copy.
+    #[test]
+    fn a_trial_with_a_verdict_or_past_its_deadline_is_never_committed() {
+        let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
+        let (path, mut trial) = provisional(&host, &root, gone_child());
+        write_health(&root, &healthy_record(&host, &trial));
+        trial.verdict = Some(cause(journal::CauseClass::Failed, "deadline"));
+        trial.save(&path).unwrap();
+        let trials = vec![(path.clone(), trial.clone())];
+        assert!(matches!(
+            commit_now(&host, &trials).unwrap(),
+            Commit::RollBack(c) if c.reason == "deadline"
+        ));
+        let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
+        let (path, trial) = provisional(&host, &root, gone_child());
+        write_health(&root, &healthy_record(&host, &trial));
+        let late = Clock {
+            boot: trial.boot.clone(),
+            ms: trial.deadline_ms,
+        };
+        assert!(matches!(
+            host_commit(&host, |_| path.clone(), &late).unwrap(),
+            Commit::RollBack(c) if c.reason == "total trial deadline reached"
+        ));
+        assert_eq!(journal_phase(&root), journal::Phase::SwappedCli);
     }
 
     fn healthy_record(host: &recovery::Host, trial: &Trial) -> journal::HealthRecord {
@@ -317,13 +377,13 @@ mod tests {
         let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
         let trials = vec![provisional(&host, &root, gone_child())];
         assert_eq!(
-            host_commit(&host, &trials).unwrap(),
+            commit_now(&host, &trials).unwrap(),
             Commit::NotYet("no health commit".into())
         );
 
         std::fs::write(root.join(journal::HEALTH_FILE_NAME), b"{corrupt").unwrap();
         assert_eq!(
-            host_commit(&host, &trials).unwrap(),
+            commit_now(&host, &trials).unwrap(),
             Commit::NotYet("health commit unreadable".into())
         );
         // The record writer refuses to replace bytes it cannot validate.
@@ -333,7 +393,7 @@ mod tests {
         record.local_verdict = journal::LocalVerdict::Error;
         write_health(&root, &record);
         assert!(matches!(
-            host_commit(&host, &trials).unwrap(),
+            commit_now(&host, &trials).unwrap(),
             Commit::NotYet(reason) if reason.contains("M1")
         ));
 
@@ -341,7 +401,7 @@ mod tests {
         record.identity_root = PathBuf::from("/var/lib/elsewhere");
         write_health(&root, &record);
         assert!(matches!(
-            host_commit(&host, &trials).unwrap(),
+            commit_now(&host, &trials).unwrap(),
             Commit::RollBack(c) if c.class == journal::CauseClass::Failed
         ));
         assert_eq!(journal_phase(&root), journal::Phase::SwappedCli);
@@ -357,7 +417,7 @@ mod tests {
         record.peer_continuity = false;
         write_health(&root, &record);
         assert!(matches!(
-            host_commit(&host, &trials).unwrap(),
+            commit_now(&host, &trials).unwrap(),
             Commit::RollBack(c) if c.class == journal::CauseClass::Interrupted
         ));
         assert_eq!(journal_phase(&root), journal::Phase::SwappedCli);
@@ -371,7 +431,7 @@ mod tests {
         write_health(&root, &healthy_record(&host, &trials[0].1));
         std::fs::write(&host.plan().cli.target_path, b"other cli").unwrap();
         assert!(matches!(
-            host_commit(&host, &trials).unwrap(),
+            commit_now(&host, &trials).unwrap(),
             Commit::RollBack(c) if c.class == journal::CauseClass::Failed
                 && c.reason.contains("candidate pair")
         ));
@@ -393,7 +453,7 @@ mod tests {
             }
             assert!(
                 matches!(
-                    host_commit(&host, &trials).unwrap(),
+                    commit_now(&host, &trials).unwrap(),
                     Commit::RollBack(c) if c.class == journal::CauseClass::Failed
                 ),
                 "symlink = {symlink}"
@@ -415,7 +475,7 @@ mod tests {
         write_health(&root, &healthy_record(&host, &trials[0].1));
         let cli = host.plan().cli.target_path.clone();
         std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let result = host_commit(&host, &trials);
+        let result = commit_now(&host, &trials);
         std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(result.is_err(), "{result:?}");
         assert_eq!(journal_phase(&root), journal::Phase::SwappedCli);
@@ -433,7 +493,7 @@ mod tests {
         let identity = child::identity(live.id()).unwrap();
         let trials = vec![provisional(&host, &root, identity)];
         write_health(&root, &healthy_record(&host, &trials[0].1));
-        assert_eq!(host_commit(&host, &trials).unwrap(), Commit::Committed);
+        assert_eq!(commit_now(&host, &trials).unwrap(), Commit::Committed);
         assert_eq!(journal_phase(&root), journal::Phase::HostCommitted);
         assert!(journal::host_commit_gate_open(&root));
         live.kill().unwrap();

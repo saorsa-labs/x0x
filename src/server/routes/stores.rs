@@ -740,6 +740,10 @@ pub(in crate::server) async fn put_kv_value(
                 StatusCode::FORBIDDEN
             } else if format!("{e}").contains("value too large") {
                 StatusCode::PAYLOAD_TOO_LARGE
+            } else if format!("{e}").contains("store full") {
+                // #1094 P1: the store's image would pass the retained-image
+                // limit.
+                StatusCode::INSUFFICIENT_STORAGE
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             };
