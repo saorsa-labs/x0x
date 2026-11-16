@@ -14,6 +14,12 @@
 # committed, so the cost is negligible.
 experimental = ["wrapper-scripts"]
 
+# cargo-nextest 0.9.151 is the first release with future-queue 0.4.1
+# (nextest-rs/future-queue#603): before it, a test queued behind a full
+# test group could end the run "not run" with no failure. CI pins 0.9.151;
+# an older local nextest warns.
+nextest-version = { recommended = "0.9.151" }
+
 [scripts.wrapper.x0x-test-home]
 command = 'env RUST_MIN_STACK=16777216 X0X_HOME=/tmp/x0x-nextest-home HOME=/tmp/x0x-nextest-home'
 
@@ -268,20 +274,39 @@ priority = 60
 # concurrently on macOS — ant-quic's dual-stack socket handling causes
 # intermittent connection failures and hangs when many endpoints share
 # the loopback interface. Serialise them via a shared test group.
+#
+# Every override that puts a test in this group sets the SAME
+# `threads-required` (4); `scripts/ci/check-nextest-groups.py` checks it.
+# nextest schedules with `future_queue_grouped` (future-queue 0.4.0): a
+# test queued behind the full group is retried only when a test of the
+# same group finishes, and starts only if the global limit has room for
+# its own weight then. The finisher frees only its own weight, and a
+# finishing test outside the group never retries the group queue. So a
+# weight-4 head behind a weight-1 finisher stayed queued while long W3-H
+# rows held the global threads, and the run ended with the group
+# undrained: "45/N tests were not run", "error: test run failed", no
+# failure (studio1 trains 18, 26, 42). With one weight in the group the
+# finisher always frees enough. 4 keeps the reservations that #316,
+# #1614 and ADR 0030 slice 3 added below. Upstream fixed the scheduler in
+# future-queue 0.4.1 (nextest-rs/future-queue#603), first used by
+# cargo-nextest 0.9.151; CI pins 0.9.144.
 [test-groups.quic-localhost]
 max-threads = 1
 
 [[profile.default.overrides]]
 filter = "test(mesh_connections) | test(/^test_local_/)"
 test-group = "quic-localhost"
+threads-required = 4
 
 [[profile.default.overrides]]
 filter = "test(/^d4_/) | test(/^c2_/) | test(/^e_/)"
 test-group = "quic-localhost"
+threads-required = 4
 
 [[profile.default.overrides]]
 filter = "binary(named_group_join_metadata_event) | binary(named_group_integration)"
 test-group = "quic-localhost"
+threads-required = 4
 
 # Issue #1283: the groups job's issue #321 acceptance selector runs three
 # daemon-mesh tests from this binary in one nextest invocation, and nextest
@@ -296,14 +321,17 @@ test-group = "quic-localhost"
 [[profile.default.overrides]]
 filter = "binary(delegation_spaces)"
 test-group = "quic-localhost"
+threads-required = 4
 
 [[profile.default.overrides]]
 filter = "binary(threading_integration)"
 test-group = "quic-localhost"
+threads-required = 4
 
 [[profile.default.overrides]]
 filter = "binary(f2_public_group_bootstrap_wiring) | binary(history_point_lookup_wiring)"
 test-group = "quic-localhost"
+threads-required = 4
 
 # Issue #316: these two loopback tests failed a full parallel run and
 # passed in isolation. Serial-group placement alone was not enough, so
@@ -355,6 +383,7 @@ threads-required = 4
 [[profile.default.overrides]]
 filter = "test(discovered_but_disconnected_peer_is_dialed_by_same_send) | test(identity_epoch_converges_with_linear_application_publishes) | test(non_treekem_self_leave_directly_delivers_member_removed_to_retained_owner) | binary(gossip_plane_isolation)"
 test-group = "quic-localhost"
+threads-required = 4
 
 # Issue #510: cap concurrent execution of the deadline-carrying membership
 # cluster tests at two. This bounds their overlap with one another while
@@ -373,12 +402,14 @@ test-group = "membership-cluster"
 [[profile.default.overrides]]
 filter = "test(legacy_bus_interop_tests::)"
 test-group = "quic-localhost"
+threads-required = 4
 
 # Pinned v0.47.0 file interop builds that daemon on a cache miss, then
 # runs two loopback daemons. The first match wins, so this stays specific.
 [[profile.default.overrides]]
 filter = "test(=v047_pinned_peer_stores_accepts_and_rejects_both_ways)"
 test-group = "quic-localhost"
+threads-required = 4
 slow-timeout = { period = "120s", terminate-after = 8 }
 
 # ADR 0109 H-S3-home released-binary gate (#1571). The tests are
