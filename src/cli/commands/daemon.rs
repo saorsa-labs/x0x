@@ -11,6 +11,15 @@ use crate::cli::{DaemonClient, OutputFormat};
 /// Bounded timeout for doctor's first `/health` probe (matches `ensure_running`).
 const DOCTOR_HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Doctor's single `/health` fetch, shared by the connectivity check and
+/// the #1354 bundle's `health` section (#1997 review). `?detail=redacted`
+/// asks the daemon for the redacted-audience body — reason sentences that
+/// name the crossed bound, not the measurement — so the bundle embeds
+/// exactly what a non-loopback unauthenticated caller gets. The
+/// connectivity check only reads fields identical under redaction
+/// (`status`, `peers`, `degraded_reason`).
+const DOCTOR_HEALTH_PATH: &str = "/health?detail=redacted";
+
 /// The status `x0x start --foreground` exits with after x0xd stops where the
 /// Unix exec is not available. It keeps x0xd's exact status for a
 /// supervisor, as the Unix exec does: 100 asks for a restart on new bytes,
@@ -189,8 +198,15 @@ impl DoctorReport {
 }
 
 /// Collect the four doctor checks against a live (or mock) daemon.
-pub(crate) async fn collect_doctor_report(client: &DaemonClient) -> DoctorReport {
-    let connectivity = check_connectivity(client).await;
+///
+/// `health` is doctor's single `/health` fetch (shared with the #1354
+/// bundle): `Ok` body feeds the connectivity check, `Err` is the
+/// unreachable report.
+pub(crate) async fn collect_doctor_report(
+    client: &DaemonClient,
+    health: &Result<serde_json::Value>,
+) -> DoctorReport {
+    let connectivity = check_connectivity(health);
     let daemon_up = connectivity.status != DoctorCheckStatus::Fail;
 
     let key_health = if daemon_up {
@@ -212,11 +228,8 @@ pub(crate) async fn collect_doctor_report(client: &DaemonClient) -> DoctorReport
     DoctorReport::from_checks(connectivity, key_health, store_integrity, upgrade)
 }
 
-async fn check_connectivity(client: &DaemonClient) -> DoctorCheck {
-    match client
-        .get_with_timeout("/health", DOCTOR_HEALTH_TIMEOUT)
-        .await
-    {
+fn check_connectivity(health: &Result<serde_json::Value>) -> DoctorCheck {
+    match health {
         Ok(val) => {
             let status = val
                 .get("status")
@@ -392,12 +405,8 @@ pub(crate) fn unreachable_doctor_report(detail: impl Into<String>) -> DoctorRepo
     )
 }
 
-/// Print the report and return `Err` when any check failed (#1382).
-pub(crate) fn finish_doctor(format: OutputFormat, report: &DoctorReport) -> Result<()> {
-    finish_doctor_write(format, report, &mut std::io::stdout())
-}
-
-/// Write the report to `out` and return `Err` when any check failed.
+/// Write the report to `out` and return `Err` when any check failed
+/// (#1382).
 ///
 /// Tests capture `out` so they assert the exact JSON stdout contract.
 pub(crate) fn finish_doctor_write(
@@ -422,22 +431,36 @@ pub(crate) fn finish_doctor_write(
 
 /// `x0x doctor` when named-instance discovery fails before any HTTP client
 /// exists. Still emits the JSON/text summary; does not fall back to default.
-/// With `bundle`, also writes the diagnostic bundle (#1354) — its `health`
-/// section records the discovery failure, its `doctor` section is the
-/// four-fail unreachable report.
+/// With `bundle` (the raw `--bundle` flag value), also writes the diagnostic
+/// bundle (#1354) — its `health` section records the discovery failure, its
+/// `doctor` section is the four-fail unreachable report.
 pub fn doctor_unreachable(
     format: OutputFormat,
     err: &anyhow::Error,
-    bundle: Option<&Path>,
+    bundle: Option<Option<&Path>>,
+) -> Result<()> {
+    doctor_unreachable_with_output(format, err, bundle, &mut std::io::stdout())
+}
+
+/// [`doctor_unreachable`] with the summary stream injected: tests assert the
+/// stdout contract — the summary is emitted even when the bundle write
+/// fails, and that error then wins (#1997 review finding 2).
+pub(crate) fn doctor_unreachable_with_output(
+    format: OutputFormat,
+    err: &anyhow::Error,
+    bundle: Option<Option<&Path>>,
+    out: &mut dyn Write,
 ) -> Result<()> {
     let detail = format!("daemon not reachable: {err:#}");
     let report = unreachable_doctor_report(detail.clone());
-    if let Some(path) = bundle {
-        let health = serde_json::json!({ "error": detail });
-        let value = doctor_bundle_value(health, &report)?;
-        write_doctor_bundle_value(value, path)?;
-    }
-    finish_doctor(format, &report)
+    let bundle_err = (|| -> Result<()> {
+        if let Some(target) = resolve_doctor_bundle_path(bundle)? {
+            write_doctor_bundle(serde_json::json!({ "error": detail }), &report, &target)?;
+        }
+        Ok(())
+    })()
+    .err();
+    finish_doctor_after_bundle(format, &report, out, bundle_err)
 }
 
 /// `x0x doctor` — run diagnostics against the daemon.
@@ -445,13 +468,61 @@ pub fn doctor_unreachable(
 /// With `--json`, prints one summary object (connectivity, key health, store
 /// integrity, upgrade). Exits non-zero when any check is `fail`. With
 /// `--bundle` (#1354), writes the redacted diagnostic bundle before the
-/// summary; a bundle write failure is an error.
-pub async fn doctor(client: &DaemonClient, bundle: Option<&Path>) -> Result<()> {
-    let report = collect_doctor_report(client).await;
-    if let Some(path) = bundle {
-        write_doctor_bundle(client, &report, path).await?;
+/// summary; a bundle write failure is an error but never empties stdout.
+pub async fn doctor(client: &DaemonClient, bundle: Option<Option<&Path>>) -> Result<()> {
+    doctor_with_output(client, bundle, &mut std::io::stdout()).await
+}
+
+/// [`doctor`] with the summary stream injected: tests assert the stdout
+/// contract under a failed bundle write (#1997 review finding 2).
+pub(crate) async fn doctor_with_output(
+    client: &DaemonClient,
+    bundle: Option<Option<&Path>>,
+    out: &mut dyn Write,
+) -> Result<()> {
+    // One fetch feeds both the connectivity check and the bundle's
+    // `health` section, so the two can never disagree (#1997 review).
+    let health = client
+        .get_with_timeout(DOCTOR_HEALTH_PATH, DOCTOR_HEALTH_TIMEOUT)
+        .await;
+    let report = collect_doctor_report(client, &health).await;
+
+    // `--dump-request` never contacts the daemon — every fetch answers
+    // with the synthetic `{"ok":true}` — so there is nothing to diagnose
+    // and no bundle to write (#1997 review).
+    if client.dumping_requests() {
+        if bundle.is_some() {
+            eprintln!("--dump-request: no daemon was contacted, skipping the --bundle write");
+        }
+        return finish_doctor_write(client.format(), &report, out);
     }
-    finish_doctor(client.format(), &report)
+
+    let bundle_err = (|| -> Result<()> {
+        if let Some(target) = resolve_doctor_bundle_path(bundle)? {
+            write_doctor_bundle(doctor_bundle_health_section(&health), &report, &target)?;
+        }
+        Ok(())
+    })()
+    .err();
+    finish_doctor_after_bundle(client.format(), &report, out, bundle_err)
+}
+
+/// Emit the summary, then surface the bundle error: `--json` stdout keeps
+/// exactly one JSON value even when the bundle write failed, and that
+/// failure still exits non-zero (#1997 review finding 2). The bundle error
+/// is the more specific one, so it wins over a failed-check exit.
+fn finish_doctor_after_bundle(
+    format: OutputFormat,
+    report: &DoctorReport,
+    out: &mut dyn Write,
+    bundle_err: Option<anyhow::Error>,
+) -> Result<()> {
+    let finish = finish_doctor_write(format, report, out);
+    match (bundle_err, finish) {
+        (Some(e), _) => Err(e),
+        (None, Err(e)) => Err(e),
+        (None, Ok(())) => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -481,36 +552,88 @@ pub(crate) fn doctor_bundle_default_path() -> Result<std::path::PathBuf> {
     )))
 }
 
-/// Resolve the raw `--bundle` flag value (#1354) into the path to write.
+/// Where a `--bundle` write goes (#1354): the resolved path plus whether
+/// the name was generated (bare flag). A generated name is written with
+/// `create_new`, so a second bare run in the same second — or a file (or
+/// symlink) already sitting at the seconds-stamped name — is an error,
+/// not a silent replacement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DoctorBundleTarget {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) generated_name: bool,
+}
+
+/// Resolve the raw `--bundle` flag value (#1354) into the write target.
 /// `None` (flag absent) stays `None`; a bare flag (`Some(None)`, plus the
 /// defensively-treated empty value) becomes the default seconds-stamped
 /// name in the current directory; any other explicit path passes through
-/// unchanged. The bin forwards the result as `Option<&Path>`.
-pub fn resolve_doctor_bundle_path(
+/// unchanged.
+pub(crate) fn resolve_doctor_bundle_path(
     bundle: Option<Option<&Path>>,
-) -> Result<Option<std::path::PathBuf>> {
-    match bundle {
-        None => Ok(None),
-        Some(None) => Ok(Some(doctor_bundle_default_path()?)),
-        Some(Some(path)) if path.as_os_str().is_empty() => Ok(Some(doctor_bundle_default_path()?)),
-        Some(Some(path)) => Ok(Some(path.to_path_buf())),
-    }
+) -> Result<Option<DoctorBundleTarget>> {
+    let (path, generated_name) = match bundle {
+        None => return Ok(None),
+        Some(None) => (doctor_bundle_default_path()?, true),
+        Some(Some(path)) if path.as_os_str().is_empty() => (doctor_bundle_default_path()?, true),
+        Some(Some(path)) => (path.to_path_buf(), false),
+    };
+    Ok(Some(DoctorBundleTarget {
+        path,
+        generated_name,
+    }))
 }
 
-/// The `health` section of a bundle (#1354): a fresh `/health` fetch with
-/// the gated detail redacted, or `{"error": ...}` when the fetch fails.
-async fn doctor_bundle_health(client: &DaemonClient) -> serde_json::Value {
-    match client
-        .get_with_timeout("/health", DOCTOR_HEALTH_TIMEOUT)
-        .await
-    {
-        Ok(mut body) => {
-            // The bundle may be attached to an issue, so the loopback body
-            // gets the same #1480 Finding 3 gate as the non-loopback one.
+/// The gated `verdict.inputs` fields as JSON pointers — the same list
+/// [`crate::server::health_verdict::redact_health_detail`] strips, mirrored
+/// here for the full-detail detection below. A server-side addition there
+/// must be reflected here (the mock tests plant every pointer).
+const GATED_HEALTH_DETAIL_POINTERS: &[&str] = &[
+    "/verdict/inputs/disk/free_bytes",
+    "/verdict/inputs/disk/total_bytes",
+    "/verdict/inputs/upgrade/latest_version",
+    "/verdict/inputs/identity/user_present",
+    "/verdict/inputs/log/errors",
+    "/verdict/inputs/send_failure_rate/attempts",
+    "/verdict/inputs/send_failure_rate/failed",
+    "/verdict/inputs/send_failure_rate/rate",
+];
+
+/// The `health` section of a bundle (#1354): doctor's one
+/// `?detail=redacted` fetch, redacted for the file. A daemon that honours
+/// the parameter has already produced the redacted-audience body — reason
+/// sentences included — and none of the gated pointers are present. One
+/// that predates the parameter answers with the full loopback body: its
+/// gated inputs are stripped locally, and its reason sentences, which
+/// carry the #1480 gated measurements, are dropped rather than risked
+/// (#1997 review finding 1).
+fn doctor_bundle_health_section(health: &Result<serde_json::Value>) -> serde_json::Value {
+    match health {
+        Ok(body) => {
+            let mut body = body.clone();
+            let served_full_detail = GATED_HEALTH_DETAIL_POINTERS
+                .iter()
+                .any(|pointer| body.pointer(pointer).is_some());
             crate::server::health_verdict::redact_health_detail(&mut body);
+            if served_full_detail {
+                withhold_full_audience_reasons(&mut body);
+            }
             body
         }
         Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
+    }
+}
+
+/// Replace `verdict.reasons` with a fail-closed marker: the sentences in
+/// hand came from a full-detail body, and no local rewrite can be trusted
+/// to carry the redacted variants (#1480 gate).
+fn withhold_full_audience_reasons(body: &mut serde_json::Value) {
+    if let Some(reasons) = body
+        .get_mut("verdict")
+        .and_then(|verdict| verdict.get_mut("reasons"))
+    {
+        *reasons = serde_json::json!(["reason sentences withheld: this daemon predates \
+             /health?detail=redacted and served full-detail reasons, which \
+             can carry gated node measurements"]);
     }
 }
 
@@ -530,35 +653,70 @@ fn doctor_bundle_value(
     }))
 }
 
-/// Write one assembled doctor bundle (#1354): pretty JSON, `fs::write`,
-/// then a read-back parse — the write-verify discipline the Windows
-/// autostart wrapper uses — so a truncated write surfaces as an error
-/// instead of a silently broken file. The one-line notice goes to stderr,
+/// Write one assembled doctor bundle (#1354): pretty JSON, then a read-back
+/// parse — the write-verify discipline the Windows autostart wrapper uses —
+/// so a truncated write surfaces as an error instead of a silently broken
+/// file. A generated name is created fresh (`create_new`, mode 0600 on
+/// unix) and never overwrites; an explicit path keeps ordinary
+/// output-file semantics (truncate). The one-line notice goes to stderr,
 /// keeping `--json` stdout to exactly one JSON value.
-fn write_doctor_bundle_value(value: serde_json::Value, path: &Path) -> Result<()> {
+fn write_doctor_bundle_value(value: serde_json::Value, target: &DoctorBundleTarget) -> Result<()> {
     let text = serde_json::to_string_pretty(&value).context("serialize doctor bundle")?;
-    std::fs::write(path, &text)
-        .with_context(|| format!("failed to write doctor bundle {}", path.display()))?;
-    let written = std::fs::read(path)
-        .with_context(|| format!("failed to read back doctor bundle {}", path.display()))?;
+    let mut file = if target.generated_name {
+        std::fs::File::options()
+            .write(true)
+            .create_new(true)
+            .open(&target.path)
+    } else {
+        std::fs::File::options()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&target.path)
+    }
+    .with_context(|| format!("failed to write doctor bundle {}", target.path.display()))?;
+    // The bundle names ids and versions even redacted, so give a freshly
+    // generated artifact the same owner-local privacy as the other
+    // owner-local writers (peer evidence, storage) instead of the umask
+    // default.
+    #[cfg(unix)]
+    if target.generated_name {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&target.path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| {
+                format!(
+                    "failed to set mode on doctor bundle {}",
+                    target.path.display()
+                )
+            })?;
+    }
+    file.write_all(text.as_bytes())
+        .with_context(|| format!("failed to write doctor bundle {}", target.path.display()))?;
+    drop(file);
+    let written = std::fs::read(&target.path).with_context(|| {
+        format!(
+            "failed to read back doctor bundle {}",
+            target.path.display()
+        )
+    })?;
     serde_json::from_slice::<serde_json::Value>(&written).with_context(|| {
         format!(
             "doctor bundle {} did not parse back as JSON",
-            path.display()
+            target.path.display()
         )
     })?;
-    eprintln!("doctor bundle written to {}", path.display());
+    eprintln!("doctor bundle written to {}", target.path.display());
     Ok(())
 }
 
-/// Fetch `/health` (redacted), build and write the #1354 doctor bundle.
-pub(crate) async fn write_doctor_bundle(
-    client: &DaemonClient,
+/// Assemble and write the #1354 doctor bundle from a resolved `health`
+/// section and the doctor report.
+fn write_doctor_bundle(
+    health: serde_json::Value,
     report: &DoctorReport,
-    path: &Path,
+    target: &DoctorBundleTarget,
 ) -> Result<()> {
-    let health = doctor_bundle_health(client).await;
-    write_doctor_bundle_value(doctor_bundle_value(health, report)?, path)
+    write_doctor_bundle_value(doctor_bundle_value(health, report)?, target)
 }
 
 /// `x0x instances` — list running daemon instances.
@@ -1538,6 +1696,15 @@ mod tests {
         parsed
     }
 
+    /// Doctor's single `/health` fetch plus the report built from it — the
+    /// same two steps production `doctor` runs.
+    async fn doctor_report_via(client: &DaemonClient) -> DoctorReport {
+        let health = client
+            .get_with_timeout(DOCTOR_HEALTH_PATH, DOCTOR_HEALTH_TIMEOUT)
+            .await;
+        collect_doctor_report(client, &health).await
+    }
+
     /// Done-when for #1382: captured JSON stdout + non-zero exit on FAIL.
     /// Path-aware: /agent lacks identity so key_health fails by design.
     #[tokio::test]
@@ -1553,7 +1720,7 @@ mod tests {
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
 
-        let report = collect_doctor_report(&client).await;
+        let report = doctor_report_via(&client).await;
         let parsed = assert_doctor_json_stdout(&report, false);
 
         assert_eq!(
@@ -1580,7 +1747,7 @@ mod tests {
             crate::cli::OutputFormat::Json,
         )
         .unwrap();
-        let report = collect_doctor_report(&client).await;
+        let report = doctor_report_via(&client).await;
         let parsed = assert_doctor_json_stdout(&report, false);
         assert_eq!(parsed["connectivity"]["status"], "fail");
     }
@@ -1643,7 +1810,7 @@ mod tests {
         )
         .unwrap();
         let started = std::time::Instant::now();
-        let report = collect_doctor_report(&client).await;
+        let report = doctor_report_via(&client).await;
         let elapsed = started.elapsed();
 
         assert_eq!(report.connectivity.status, DoctorCheckStatus::Fail);
@@ -1673,7 +1840,7 @@ mod tests {
         });
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
-        let report = collect_doctor_report(&client).await;
+        let report = doctor_report_via(&client).await;
         let parsed = assert_doctor_json_stdout(&report, true);
         assert_eq!(parsed["upgrade"]["status"], "warn");
         assert_eq!(parsed["connectivity"]["status"], "ok");
@@ -1695,7 +1862,7 @@ mod tests {
         });
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
-        let report = collect_doctor_report(&client).await;
+        let report = doctor_report_via(&client).await;
         let parsed = assert_doctor_json_stdout(&report, true);
         assert_eq!(parsed["connectivity"]["status"], "warn");
     }
@@ -1705,8 +1872,12 @@ mod tests {
     // ===================================================================
 
     /// One body satisfying every doctor fetch at once (the mock server
-    /// answers any path with it), with canaries planted in the #1480
-    /// gated fields of `verdict.inputs`.
+    /// answers any path with it), shaped like a daemon that PREDATES
+    /// `?detail=redacted`: it ignores the parameter and serves the
+    /// full-audience body. The `reasons` are the real full-audience
+    /// sentences from `classify_with_detail`
+    /// (src/server/health_verdict.rs), and the gated `verdict.inputs`
+    /// fields carry canaries.
     fn doctor_bundle_mock_body() -> serde_json::Value {
         serde_json::json!({
             "ok": true,
@@ -1718,37 +1889,129 @@ mod tests {
             "update_available": false,
             "current_version": "0.1.0",
             "verdict": {
-                "overall": "ok",
+                "verdict": "degraded",
+                "reasons": [
+                    "75/100 publishes failed in the last 60s (rate 0.75 ≥ 0.50)",
+                    "data-dir filesystem has 536870912 bytes free (< 1073741824)",
+                    "57 error-level log events in the last 60s"
+                ],
                 "inputs": {
-                    "disk": { "state": "ok", "free_bytes": 999888777666u64, "total_bytes": 999888777999u64 },
+                    "disk": { "state": "degraded", "free_bytes": 999888777666u64, "total_bytes": 999888777999u64 },
                     "upgrade": {
                         "state": "ok",
                         "checks_enabled": true,
                         "latest_version": "canary-version-DO-NOT-SHIP"
                     },
                     "identity": { "state": "ok", "agent": true, "machine": true, "user_present": true },
-                    "log": { "state": "ok", "window_secs": 60, "errors": 424242 },
-                    "send_failure_rate": { "state": "ok", "attempts": 999111, "failed": 999222, "rate": 0.9993 }
+                    "log": { "state": "degraded", "window_secs": 60, "errors": 424242 },
+                    "send_failure_rate": { "state": "degraded", "window_secs": 60, "attempts": 999111, "failed": 999222, "rate": 0.9993 }
                 }
             }
         })
     }
 
+    /// The same daemon once it honours `?detail=redacted`: the
+    /// redacted-audience body — the real redacted reason sentences (bounds,
+    /// not measurements) and the gated inputs absent.
+    fn doctor_bundle_redacted_body() -> serde_json::Value {
+        serde_json::json!({
+            "ok": true,
+            "status": "healthy",
+            "peers": 5,
+            "agent_id": "abc123",
+            "machine_id": "def456",
+            "stores": [],
+            "update_available": false,
+            "current_version": "0.1.0",
+            "verdict": {
+                "verdict": "degraded",
+                "reasons": [
+                    "publish failures in the last 60s are at or above the degraded rate bound (≥ 0.50)",
+                    "data-dir filesystem free space is below the degraded bound (< 1073741824)",
+                    "error-level log events in the last 60s are at or above the storm threshold (50)"
+                ],
+                "inputs": {
+                    "disk": { "state": "degraded" },
+                    "upgrade": { "state": "ok", "checks_enabled": true },
+                    "identity": { "state": "ok", "agent": true, "machine": true },
+                    "log": { "state": "degraded", "window_secs": 60 },
+                    "send_failure_rate": { "state": "degraded", "window_secs": 60 }
+                }
+            }
+        })
+    }
+
+    /// A mock daemon that answers `/health?detail=redacted` with the
+    /// redacted-audience body and everything else with the full body,
+    /// recording every request URI so tests can pin doctor's single
+    /// `/health` fetch.
+    async fn start_detail_aware_health_mock() -> (
+        String,
+        tokio::sync::oneshot::Sender<()>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use std::sync::{Arc, Mutex};
+
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_router = Arc::clone(&seen);
+        let full = doctor_bundle_mock_body();
+        let redacted = doctor_bundle_redacted_body();
+        let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+            let seen = Arc::clone(&seen_router);
+            let full = full.clone();
+            let redacted = redacted.clone();
+            async move {
+                let uri = req
+                    .uri()
+                    .path_and_query()
+                    .map(|pq| pq.as_str().to_string())
+                    .unwrap_or_default();
+                seen.lock().unwrap().push(uri.clone());
+                let body = if uri.starts_with("/health?detail=redacted") {
+                    redacted
+                } else {
+                    full
+                };
+                axum::response::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap()
+            }
+        });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .with_graceful_shutdown(async {
+                    rx.await.ok();
+                })
+                .await
+                .ok();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        (format!("http://{addr}"), tx, seen)
+    }
+
     /// The bundle round-trips the #1354 schema (envelope, redacted health
-    /// body, four-check doctor report), the gated #1480 detail planted in
-    /// the mock `/health` body is absent from the written bytes, and
-    /// non-gated fields survive. Removing the `redact_health_detail` call
+    /// body, four-check doctor report) and — against a daemon that serves
+    /// the full body — none of the #1480 gated detail reaches the written
+    /// bytes: neither the gated `verdict.inputs` values nor the
+    /// measurements inside the full-audience reason sentences, which are
+    /// dropped whole (#1997 review finding 1). The classification
+    /// (`verdict`, input states) survives. Removing the redaction calls
     /// turns this red.
     #[tokio::test]
     async fn doctor_bundle_writes_redacted_file() {
         let (url, _shutdown) = start_mock_server(doctor_bundle_mock_body()).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
-        let report = collect_doctor_report(&client).await;
-        assert!(report.ok, "mock daemon must pass every check");
 
         let dir = tempfile::tempdir().expect("bundle dir");
         let path = dir.path().join("doctor-bundle.json");
-        write_doctor_bundle(&client, &report, &path)
+        let mut stdout = Vec::new();
+        doctor_with_output(&client, Some(Some(&path)), &mut stdout)
             .await
             .expect("write doctor bundle");
 
@@ -1763,6 +2026,11 @@ mod tests {
             "999111",                     // send_failure_rate.attempts
             "999222",                     // send_failure_rate.failed
             "0.9993",                     // send_failure_rate.rate
+            // The full-audience reason measurements (#1997 finding 1):
+            "75/100",
+            "rate 0.75",
+            "536870912 bytes free",
+            "57 error-level",
         ] {
             assert!(
                 !text.contains(canary),
@@ -1785,9 +2053,26 @@ mod tests {
         let health = &parsed["health"];
         assert_eq!(health["status"], "healthy");
         assert_eq!(health["peers"], 5);
-        assert_eq!(health["verdict"]["overall"], "ok");
+        assert_eq!(health["verdict"]["verdict"], "degraded");
+        // A full-detail body loses its reason sentences whole (they carry
+        // the gated measurements); the fail-closed marker names why.
+        let reasons = health["verdict"]["reasons"]
+            .as_array()
+            .expect("reasons stay an array");
+        assert_eq!(reasons.len(), 1, "one marker sentence: {reasons:?}");
+        assert!(
+            reasons[0]
+                .as_str()
+                .unwrap_or_default()
+                .contains("reason sentences withheld"),
+            "the marker explains the withholding: {reasons:?}"
+        );
         let inputs = &health["verdict"]["inputs"];
         assert!(inputs["disk"].is_object(), "disk input survives: {health}");
+        assert_eq!(
+            inputs["send_failure_rate"]["state"], "degraded",
+            "the classification survives: {health}"
+        );
         for gated in [
             ("disk", "free_bytes"),
             ("disk", "total_bytes"),
@@ -1810,10 +2095,80 @@ mod tests {
                 "doctor.{check} must be an object: {parsed}"
             );
         }
+        // The stdout contract holds on the success path too: exactly one
+        // JSON value even with --bundle in play.
+        let out_text = String::from_utf8(stdout).expect("doctor stdout utf-8");
+        let out: serde_json::Value = serde_json::from_str(out_text.trim())
+            .expect("doctor stdout must be exactly one JSON value");
+        assert_eq!(out["ok"], true);
+    }
+
+    /// Against a daemon that honours `?detail=redacted`, the bundle's
+    /// `health` section is the redacted-audience body: the redacted reason
+    /// sentences are kept verbatim (they carry bounds, not measurements),
+    /// and doctor fetched `/health` exactly once (#1997 review finding 1
+    /// and the double-fetch nit).
+    #[tokio::test]
+    async fn doctor_bundle_keeps_redacted_reasons_and_fetches_health_once() {
+        let (url, _shutdown, seen) = start_detail_aware_health_mock().await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+
+        let dir = tempfile::tempdir().expect("bundle dir");
+        let path = dir.path().join("doctor-bundle.json");
+        doctor_with_output(&client, Some(Some(&path)), &mut Vec::new())
+            .await
+            .expect("write doctor bundle");
+
+        let text = String::from_utf8(std::fs::read(&path).expect("read bundle back"))
+            .expect("bundle bytes utf-8");
+        // The redacted sentences survive verbatim...
+        for sentence in [
+            "publish failures in the last 60s are at or above the degraded rate bound (≥ 0.50)",
+            "data-dir filesystem free space is below the degraded bound (< 1073741824)",
+            "error-level log events in the last 60s are at or above the storm threshold (50)",
+        ] {
+            assert!(
+                text.contains(sentence),
+                "redacted reason sentence must be kept: {sentence}"
+            );
+        }
+        // ...and no full-audience measurement leaked in with them.
+        for canary in [
+            "75/100",
+            "rate 0.75",
+            "536870912 bytes free",
+            "57 error-level",
+            "999888777666",
+            "424242",
+        ] {
+            assert!(
+                !text.contains(canary),
+                "full-audience canary {canary} leaked into the bundle"
+            );
+        }
+        // Doctor made exactly one /health request, and it carried the
+        // parameter.
+        let requests = seen.lock().unwrap();
+        let health_requests: Vec<&String> = requests
+            .iter()
+            .filter(|uri| uri.starts_with("/health"))
+            .collect();
+        assert_eq!(
+            health_requests.len(),
+            1,
+            "doctor must fetch /health exactly once: {requests:?}"
+        );
+        assert_eq!(
+            health_requests[0].as_str(),
+            "/health?detail=redacted",
+            "the single fetch asks for the redacted body"
+        );
     }
 
     /// Named instance with no api.port plus `--bundle`: the bundle carries
-    /// the four-fail unreachable report and `health` = discovery error.
+    /// the four-fail unreachable report and `health` = discovery error —
+    /// and the summary still reaches stdout before the non-zero exit
+    /// (#1997 review finding 2).
     #[test]
     fn doctor_unreachable_bundle_writes_four_fail_report() {
         let err = match DaemonClient::new(
@@ -1827,8 +2182,17 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("bundle dir");
         let path = dir.path().join("doctor-bundle.json");
-        let result = doctor_unreachable(crate::cli::OutputFormat::Json, &err, Some(&path));
+        let mut stdout = Vec::new();
+        let result = doctor_unreachable_with_output(
+            crate::cli::OutputFormat::Json,
+            &err,
+            Some(Some(&path)),
+            &mut stdout,
+        );
         assert!(result.is_err(), "unreachable doctor must exit non-zero");
+        let out_text = String::from_utf8(stdout).expect("doctor stdout utf-8");
+        let out: serde_json::Value = serde_json::from_str(out_text.trim())
+            .expect("stdout must still be exactly one JSON value");
 
         let parsed: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).expect("read doctor bundle back"))
@@ -1844,12 +2208,120 @@ mod tests {
         assert_eq!(parsed["doctor"]["ok"], false);
         for check in ["connectivity", "key_health", "store_integrity", "upgrade"] {
             assert_eq!(parsed["doctor"][check]["status"], "fail");
+            assert_eq!(
+                out[check]["status"], "fail",
+                "stdout report matches the bundle"
+            );
         }
+    }
+
+    /// #1997 review finding 2: when the bundle write fails (unwritable
+    /// path), `--json` stdout still carries exactly one JSON value; the
+    /// bundle error then exits non-zero.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn doctor_json_stdout_survives_bundle_write_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (url, _shutdown) = start_mock_server(doctor_bundle_mock_body()).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let report_probe = doctor_report_via(&client).await;
+        assert!(report_probe.ok, "mock daemon must pass every check");
+
+        let dir = tempfile::tempdir().expect("bundle dir");
+        let readonly = dir.path().join("readonly");
+        std::fs::create_dir(&readonly).expect("create readonly dir");
+        std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o555))
+            .expect("make dir read-only");
+        let target = readonly.join("bundle.json");
+
+        let mut stdout = Vec::new();
+        let result = doctor_with_output(&client, Some(Some(&target)), &mut stdout).await;
+        std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o755))
+            .expect("restore dir mode for tempdir cleanup");
+
+        assert!(result.is_err(), "the bundle write failure must surface");
+        let text = String::from_utf8(stdout).expect("doctor stdout utf-8");
+        let parsed: serde_json::Value =
+            serde_json::from_str(text.trim()).expect("stdout must still be exactly one JSON value");
+        assert_eq!(parsed["ok"], true, "the report itself passed: {parsed}");
+        assert!(
+            parsed["connectivity"].is_object() && parsed["upgrade"].is_object(),
+            "the four-check summary is emitted: {parsed}"
+        );
+    }
+
+    /// #1997 review finding 4: a bare `--bundle` never overwrites — an
+    /// existing file at the generated name is an error and its bytes are
+    /// untouched — while an explicit path keeps overwrite semantics.
+    #[test]
+    fn doctor_bundle_generated_name_refuses_to_overwrite() {
+        let report = unreachable_doctor_report("overwrite probe");
+        let dir = tempfile::tempdir().expect("bundle dir");
+
+        let generated = dir
+            .path()
+            .join(doctor_bundle_default_filename(1_700_000_000));
+        std::fs::write(&generated, b"sentinel-bundle").expect("seed existing file");
+        let result = write_doctor_bundle(
+            serde_json::json!({ "status": "healthy" }),
+            &report,
+            &DoctorBundleTarget {
+                path: generated.clone(),
+                generated_name: true,
+            },
+        );
+        assert!(
+            result.is_err(),
+            "a generated name must refuse to overwrite an existing file"
+        );
+        assert_eq!(
+            std::fs::read(&generated).expect("seeded file still readable"),
+            b"sentinel-bundle",
+            "the existing file's bytes are untouched"
+        );
+
+        let explicit = dir.path().join("explicit.json");
+        std::fs::write(&explicit, b"sentinel-bundle").expect("seed existing file");
+        write_doctor_bundle(
+            serde_json::json!({ "status": "healthy" }),
+            &report,
+            &DoctorBundleTarget {
+                path: explicit.clone(),
+                generated_name: false,
+            },
+        )
+        .expect("an explicit path overwrites");
+        assert_ne!(
+            std::fs::read(&explicit).expect("explicit bundle readable"),
+            b"sentinel-bundle",
+            "an explicit path keeps ordinary output-file semantics"
+        );
+    }
+
+    /// `--dump-request` contacts no daemon (every fetch answers the
+    /// synthetic `{"ok":true}`), so `--bundle` must not write a stub-backed
+    /// file (#1997 review).
+    #[tokio::test]
+    async fn doctor_dump_request_skips_bundle_write() {
+        let (url, _shutdown) = start_mock_server(doctor_bundle_mock_body()).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json)
+            .unwrap()
+            .dump_requests(true);
+
+        let dir = tempfile::tempdir().expect("bundle dir");
+        let path = dir.path().join("bundle.json");
+        let _ = doctor_with_output(&client, Some(Some(&path)), &mut Vec::new()).await;
+        assert!(
+            !path.exists(),
+            "dump mode must not write a bundle from stub responses"
+        );
     }
 
     /// The three `--bundle` flag states resolve as specified (#1354):
     /// absent → `None`; bare (or empty) → the seconds-stamped default name
-    /// in the current directory; explicit → the given path.
+    /// in the current directory, marked generated (no-overwrite); explicit
+    /// → the given path, marked explicit.
     #[test]
     fn doctor_bundle_flag_resolution() {
         assert!(
@@ -1862,20 +2334,24 @@ mod tests {
         for bare in [None, Some(Path::new(""))] {
             let resolved = resolve_doctor_bundle_path(Some(bare))
                 .expect("bare flag resolves")
-                .expect("bare flag generates a path");
+                .expect("bare flag generates a target");
             assert!(
-                !resolved.is_absolute(),
+                !resolved.path.is_absolute(),
                 "default bundle path must be cwd-relative: {}",
-                resolved.display()
+                resolved.path.display()
             );
-            let name = resolved.to_string_lossy();
+            assert!(
+                resolved.generated_name,
+                "a bare flag generates the name (no-overwrite rule applies)"
+            );
+            let name = resolved.path.to_string_lossy();
             let secs: u64 = name
                 .trim_start_matches("x0x-doctor-bundle-")
                 .trim_end_matches(".json")
                 .parse()
                 .expect("default name carries unix secs");
             assert_eq!(
-                resolved,
+                resolved.path,
                 std::path::PathBuf::from(doctor_bundle_default_filename(secs)),
                 "bare flag must generate the seconds-stamped default name"
             );
@@ -1884,7 +2360,11 @@ mod tests {
         let explicit = resolve_doctor_bundle_path(Some(Some(Path::new("/tmp/diag.json"))))
             .expect("explicit path resolves")
             .expect("explicit path is Some");
-        assert_eq!(explicit, std::path::PathBuf::from("/tmp/diag.json"));
+        assert_eq!(explicit.path, std::path::PathBuf::from("/tmp/diag.json"));
+        assert!(
+            !explicit.generated_name,
+            "an explicit path keeps overwrite semantics"
+        );
     }
 
     #[tokio::test]

@@ -67,6 +67,24 @@ x0xd doctor
 # PASS  all checks passed
 ```
 
+Diagnostic bundle (owner-local):
+
+```bash
+x0x doctor --bundle           # writes x0x-doctor-bundle-<unix-secs>.json
+x0x doctor --bundle PATH      # writes PATH; an explicit path overwrites
+```
+
+One JSON file: an envelope (`schema`, `version`, `created_unix`,
+`generator`), the redacted `/health` body (fetched as
+`GET /health?detail=redacted`) and the four doctor checks
+(`connectivity`, `key_health`, `store_integrity`, `upgrade`). A bare
+`--bundle` refuses to overwrite the generated name (created fresh, mode
+0600 on unix). The `doctor` section still carries agent, machine and
+user ids and versions, so it is owner-local only: slice 2 of #1354 must
+redact those fields before anything is sent. No keys, tokens or message
+content enter the file. See
+[docs/api-reference.md](api-reference.md) (#1354).
+
 ## WebSocket outbound-queue health (WS1.1 / #122)
 
 ```bash

@@ -412,6 +412,8 @@ On the default loopback bind only the local operator can read them; on a
 non-loopback `api_address` bind (which logs a loud startup warning) the
 gate itself withholds the detail from callers without a token, so
 loopback-by-default and the gate together hold the boundary.
+`GET /health?detail=redacted` lets any caller opt into the redacted
+body; the parameter can only remove detail, never grant it.
 
 Loopback is decided from the peer address of the connection itself, so
 proxy headers (`X-Forwarded-For` and similar) are never consulted, and a
@@ -423,19 +425,29 @@ v4-mapped addresses, so they get the redacted payload; bind `127.0.0.1`
 (the default) or probe over IPv6 when the full detail is wanted.
 
 `x0x doctor --bundle [PATH]` (#1354) writes the owner-local diagnostic
-bundle: one JSON file with this redacted `/health` body — the CLI
-connects over loopback, so it applies the same withheld-fields redaction
-itself before the body goes into a file an owner may attach to a report —
-plus the four doctor checks (`connectivity`, `key_health`,
-`store_integrity`, `upgrade`) and a small envelope (`schema`, `version`,
-`created_unix`, `generator`). The bundle holds no keys, tokens or
-message content: the writer embeds only the redacted `/health` body and
-the check summaries, never route bodies that carry store values,
-history or auth material (a daemon-seeded test checks this). A bare
-`--bundle` writes `x0x-doctor-bundle-<unix-secs>.json` in the current
-directory. The file stays on the owner's machine: this slice adds no
-sending (`POST /report` and opt-in maintainer delivery are later slices
-of #1354).
+bundle: one JSON file whose `health` section is fetched as
+`GET /health?detail=redacted` — exactly the body a non-loopback caller
+without a token gets, reason sentences included (they name bounds, not
+measurements) — plus the four doctor checks (`connectivity`,
+`key_health`, `store_integrity`, `upgrade`) and a small envelope
+(`schema`, `version`, `created_unix`, `generator`). Against a daemon
+older than the parameter the writer fails closed: it strips the gated
+`verdict.inputs` fields itself (the same `redact_health_detail`) and
+drops the reason sentences rather than risk the full-audience numbers.
+The `doctor` section is the owner-local four-check report and, unlike
+the redacted health body, does carry identifiers: agent, machine and
+user ids, current and latest versions, and degraded store ids. The file
+is owner-local in this slice; before anything is sent anywhere
+(slice 2 of #1354) those fields must be redacted. The bundle holds no
+keys, tokens or message content: the writer embeds only the redacted
+`/health` body and the check summaries, never route bodies that carry
+store values, history or auth material (a daemon-seeded test checks
+this). A bare `--bundle` writes `x0x-doctor-bundle-<unix-secs>.json`
+in the current directory and refuses to overwrite an existing file at
+that generated name (it is created fresh, mode 0600 on unix); an
+explicit `--bundle <path>` overwrites as before. The file stays on the
+owner's machine: this slice adds no sending (`POST /report` and opt-in
+maintainer delivery are later slices of #1354).
 
 ### Example: status
 

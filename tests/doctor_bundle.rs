@@ -6,8 +6,10 @@
 //! token, the durable API token, and the machine/agent key files — runs the
 //! real `x0x` CLI, and proves none of it appears in the written bundle.
 //! Positive controls prove the secrets really were in daemon state first,
-//! so the absence is redaction, not a seeding failure. `#[ignore]`d like
-//! every daemon-backed test: run with
+//! so the absence is redaction, not a seeding failure. The companion
+//! failure-mode test pins the `--json` stdout contract — exactly one
+//! doctor report — even when the bundle write itself fails (#1997 review
+//! finding 2). `#[ignore]`d like every daemon-backed test: run with
 //! `cargo nextest run --test doctor_bundle -- --ignored`.
 
 #[path = "harness/src/daemon.rs"]
@@ -60,10 +62,14 @@ struct SecretCanaries {
 impl SecretCanaries {
     /// Text needles searched over the bundle bytes: the string canaries
     /// raw (the kv canary also in base64 — the encoding its PUT wire form
-    /// carries, so an embedded request body leaks it), plus the lowercase
-    /// hex of the key canaries.
+    /// carries, so an embedded request body leaks it), plus the key
+    /// canaries as lowercase hex and as base64 at all three encoder
+    /// phases. Base64 maps 3 bytes to 4 chars, so a raw needle only
+    /// surfaces verbatim inside an embedded base64 key blob when its
+    /// start offset lands on the encoder's 3-byte grid; one of three
+    /// consecutive starts always does, whatever the blob's alignment.
     fn text_needles(&self) -> Vec<(&'static str, String)> {
-        vec![
+        let mut needles = vec![
             ("kv canary value (raw)", self.kv_value.clone()),
             ("kv canary value (base64)", b64(self.kv_value.as_bytes())),
             ("session token (raw)", self.session_token.clone()),
@@ -76,7 +82,25 @@ impl SecretCanaries {
                 "agent.key secret-half (hex)",
                 hex::encode(mid_key_slice(&self.agent_key)),
             ),
-        ]
+        ];
+        for (name, file) in [
+            ("machine.key", &self.machine_key),
+            ("agent.key", &self.agent_key),
+        ] {
+            for phase in 0..3 {
+                let start = file.len() / 2 + phase;
+                let label = match (name, phase) {
+                    ("machine.key", 0) => "machine.key secret-half (base64, phase 0)",
+                    ("machine.key", 1) => "machine.key secret-half (base64, phase 1)",
+                    ("machine.key", 2) => "machine.key secret-half (base64, phase 2)",
+                    (_, 0) => "agent.key secret-half (base64, phase 0)",
+                    (_, 1) => "agent.key secret-half (base64, phase 1)",
+                    _ => "agent.key secret-half (base64, phase 2)",
+                };
+                needles.push((label, b64(&file[start..start + KEY_CANARY_LEN])));
+            }
+        }
+        needles
     }
 
     /// Byte needles searched over the raw bundle bytes: the key-file
@@ -166,12 +190,36 @@ async fn read_identity_file(dir: &Path, file: &str) -> Vec<u8> {
 /// Run the real `x0x` CLI binary (CARGO_BIN_EXE_x0x) as a subprocess
 /// against the fixture daemon. The token rides the child environment only
 /// (X0X_API_TOKEN), so no in-process env races with other tests.
+///
+/// Panics when the run exits non-zero; [`run_x0x_allow_failure`] is the
+/// variant for runs whose failure is the point.
 async fn run_x0x(
     api_addr: &str,
     token: &str,
     args: &[&str],
     cwd: Option<&Path>,
 ) -> std::process::ExitStatus {
+    let output = run_x0x_allow_failure(api_addr, token, args, cwd).await;
+    let code = output.status;
+    if !code.success() {
+        panic!(
+            "`x0x doctor {}` exited {code:?}\nstdout:\n{}\nstderr:\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    code
+}
+
+/// [`run_x0x`] without the success assert: returns the captured output
+/// untouched, so a test can pin what a failing run printed on each stream.
+async fn run_x0x_allow_failure(
+    api_addr: &str,
+    token: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+) -> std::process::Output {
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_x0x"));
     command
         .arg("--api")
@@ -188,7 +236,7 @@ async fn run_x0x(
     let child = command
         .spawn()
         .unwrap_or_else(|e| panic!("spawn {} doctor: {e}", env!("CARGO_BIN_EXE_x0x")));
-    let output = tokio::time::timeout(CLI_TIMEOUT, child.wait_with_output())
+    tokio::time::timeout(CLI_TIMEOUT, child.wait_with_output())
         .await
         .unwrap_or_else(|_| {
             panic!(
@@ -196,17 +244,7 @@ async fn run_x0x(
                 args.join(" ")
             )
         })
-        .expect("wait for `x0x doctor`");
-    let code = output.status;
-    if !code.success() {
-        panic!(
-            "`x0x doctor {}` exited {code:?}\nstdout:\n{}\nstderr:\n{}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    code
+        .expect("wait for `x0x doctor`")
 }
 
 /// Contract shape of the bundle: pretty JSON with the pinned envelope,
@@ -346,5 +384,77 @@ async fn doctor_bundle_contains_no_keys_tokens_or_message_content() {
     );
     let bare_bytes = std::fs::read(&found[0])
         .unwrap_or_else(|e| panic!("read bare bundle {}: {e}", found[0].display()));
+    assert_bundle_shape("bare --bundle", &bare_bytes);
     assert_no_secrets("bare --bundle", &bare_bytes, &secrets);
+}
+
+/// WHY PR #1997 review finding 2: the report contract — `x0x doctor
+/// --json --bundle <path>` prints exactly one JSON value (the doctor
+/// report) to stdout — holds even when the bundle write fails; the bundle
+/// error still exits non-zero and names the bundle on stderr. Here the
+/// write fails because the target directory is read-only.
+#[tokio::test]
+#[ignore]
+async fn doctor_json_stdout_survives_bundle_write_failure() {
+    if !cfg!(unix) {
+        // No portable way to make a directory unwritable; the
+        // daemon-backed suite runs on Linux CI.
+        return;
+    }
+    let d = DaemonFixture::start("doctor-bundle-stdout").await;
+    let token = d.api_token().to_string();
+
+    let dir = tempfile::TempDir::new().expect("temp dir made read-only below");
+    let bundle_path = dir.path().join("bundle.json");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555))
+            .expect("make the bundle target dir read-only (0o555)");
+    }
+
+    let output = run_x0x_allow_failure(
+        d.api_addr(),
+        &token,
+        &[
+            "--json",
+            "doctor",
+            "--bundle",
+            bundle_path.to_str().expect("utf-8 bundle path"),
+        ],
+        None,
+    )
+    .await;
+
+    // Restore write permission before any assertion can fail, so the
+    // temp dir's own cleanup can always remove the read-only directory.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("restore the bundle target dir to writable (0o755)");
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a failed bundle write must exit non-zero — got {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+    // `from_str` rejects trailing characters, so this pins exactly one
+    // JSON value on stdout, not one-plus-noise. The fields mirror the
+    // doctor checks assert_bundle_shape pins inside a written bundle.
+    let report: Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("stdout must be one JSON value (the doctor report): {e}\nstdout:\n{stdout}")
+    });
+    assert!(report.is_object(), "doctor report must be a JSON object");
+    assert!(
+        report["connectivity"]["status"].is_string(),
+        "doctor report must carry the connectivity check, got: {report}"
+    );
+    assert!(
+        stderr.contains("doctor bundle"),
+        "stderr must carry the bundle write error, got:\n{stderr}"
+    );
 }

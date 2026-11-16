@@ -2438,22 +2438,23 @@ async fn run(
             // leaves --json with empty stdout. Keep the named-instance
             // boundary: never silently target the default daemon.
             //
-            // --bundle resolution (bare flag → default seconds-stamped name
-            // in the current directory) lives in the lib (#1354); the bin
-            // forwards Option<&Path>.
-            let bundle_path = commands::daemon::resolve_doctor_bundle_path(
-                bundle.as_ref().map(|inner| inner.as_deref()),
-            )?;
+            // The raw `--bundle` flag value (bare vs explicit) travels to
+            // the lib (#1354): it resolves the path there and picks the
+            // no-overwrite rule for the generated name.
             return match DaemonClient::new(name, api, format) {
                 Ok(client) => {
                     commands::daemon::doctor(
                         &client.dump_requests(dump_request),
-                        bundle_path.as_deref(),
+                        bundle.as_ref().map(|inner| inner.as_deref()),
                     )
                     .await
                 }
                 Err(err) if name.is_some() && api.is_none() => {
-                    commands::daemon::doctor_unreachable(format, &err, bundle_path.as_deref())
+                    commands::daemon::doctor_unreachable(
+                        format,
+                        &err,
+                        bundle.as_ref().map(|inner| inner.as_deref()),
+                    )
                 }
                 Err(err) => Err(err),
             };
