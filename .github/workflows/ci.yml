@@ -190,7 +190,7 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@v2
         with:
-          tool: nextest@0.9.144  # exact pin: floating latest can silently change CI behaviour (refs #673)
+          tool: nextest@0.9.151  # exact pin: floating latest can silently change CI behaviour (refs #673)
 
       - name: Inert shared wrapper argument controls
         run: |
@@ -200,6 +200,13 @@ jobs:
       - name: Prepare bounded convergence custody
         id: prepare_convergence
         run: python3 scripts/ci/issue442-convergence-custody.py prepare
+
+      # nextest drains a test group's queue only when a test of that group
+      # finishes, so mixed `threads-required` values in one group can end
+      # the run with tests "not run" and no failure (scripts/ci/
+      # check-nextest-groups.py, .config/nextest.toml quic-localhost).
+      - name: Check nextest test-group weights
+        run: python3 -B scripts/ci/check-nextest-groups.py
 
       - name: Record disk before Run tests
         run: |
@@ -413,7 +420,7 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@v2
         with:
-          tool: nextest@0.9.144
+          tool: nextest@0.9.151
 
       - name: Exercise proof and isolation wrapper controls
         run: |
@@ -541,7 +548,7 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@v2
         with:
-          tool: nextest@0.9.144
+          tool: nextest@0.9.151
 
       - name: Run H-S3-home against v0.45.0 and v0.46.1
         env:
@@ -568,8 +575,10 @@ jobs:
   # ADR 0109 §10 H-S3-rm released-binary rows (#1572): rm1 (capability
   # floor) and rm3 (i) and (ii) (older receiver after the seal), and
   # H-S3-m (v0.46.1 on J's data dir between the H-S3-s segments; about
-  # 100 s in the VM, with two 45 s real-time waits). The filter also
-  # selects later rows in the same module. In rm1 and rm3, phase 1
+  # 100 s in the VM, with two 45 s real-time waits), and its OwnerCertified
+  # variant (v0.46.1 on J's copy after the H-S3-c phase 1, then rm1's
+  # re-seat on real sockets). The filter also selects later rows in the
+  # same module. In rm1 and rm3, phase 1
   # runs on the paused W3-H sim and phase 2 runs candidate daemons on
   # real loopback sockets, with member M on the published v0.46.1
   # daemon. H-S3-m stays on the paused sim: the published v0.46.1 runs
@@ -615,7 +624,7 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@v2
         with:
-          tool: nextest@0.9.144
+          tool: nextest@0.9.151
 
       - name: Install the published v0.46.1
         run: bash scripts/ci/prepare-released-h-s3-home.sh
@@ -790,7 +799,7 @@ jobs:
     # runs as four parallel parts (`s3-d3.1` to `s3-d3.4`, 5 reruns each;
     # `PARTS` in w3h-shards.py). The #1661 welcome-lost row has its own
     # group too (`s3-1661.1` and `s3-1661.2`, 10 reruns each), the
-    # H-S3-rm4 variants share `s3-rm4.1` to `s3-rm4.4`, H-S3-rm2 has its
+    # H-S3-rm4 variants share `s3-rm4.1` to `s3-rm4.5`, H-S3-rm2 has its
     # own group (`s3-rm2.1` and `s3-rm2.2`, 10 reruns each), H-S3-d2 has
     # `s3-d2`, H-S3-q (1) has `s3-q`, H-S3-q2 has `s3-q2`, and H-S3-q (3)
     # has `s3-q3.1` and `s3-q3.2` (10 reruns each). A group is omitted
@@ -875,7 +884,7 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@v2
         with:
-          tool: nextest@0.9.144  # same exact pin as the Test Suite
+          tool: nextest@0.9.151  # same exact pin as the Test Suite
 
       - name: Build the W3-H preload shim
         run: |
@@ -1407,7 +1416,7 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@v2
         with:
-          tool: nextest@0.9.144  # exact pin: floating latest can silently change CI behaviour (refs #673)
+          tool: nextest@0.9.151  # exact pin: floating latest can silently change CI behaviour (refs #673)
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
@@ -1655,7 +1664,7 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@v2
         with:
-          tool: nextest@0.9.144  # exact pin: floating latest can silently change CI behaviour (refs #673)
+          tool: nextest@0.9.151  # exact pin: floating latest can silently change CI behaviour (refs #673)
 
       # parity_cli spawns `x0x <cli_name> --help` so the binary must
       # exist. Build only what's needed.

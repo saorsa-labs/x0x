@@ -200,12 +200,46 @@ impl Owned {
         stop_and_reap(&mut self.child)?;
         Ok(self.identity.clone())
     }
+
+    /// Stop a committed or restored daemon as a service stop: SIGTERM and
+    /// up to `STOP_MS` for its own shutdown, then SIGKILL and the reap.
+    pub(super) fn stop(mut self) -> io::Result<Identity> {
+        terminate_and_reap(&mut self.child, STOP_MS)?;
+        Ok(self.identity.clone())
+    }
 }
 
 impl Drop for Owned {
     fn drop(&mut self) {
         let _ = stop_and_reap(&mut self.child);
     }
+}
+
+/// SIGTERM, then up to `grace_ms` for the child to exit, then
+/// `stop_and_reap` (SIGKILL and the bounded reap). The child is this
+/// process's own and unreaped, so its PID cannot be reused while it is
+/// signalled.
+pub(super) fn terminate_and_reap(child: &mut Child, grace_ms: u64) -> io::Result<()> {
+    if child.try_wait()?.is_some() {
+        return Ok(());
+    }
+    let pid = libc::pid_t::try_from(child.id()).map_err(invalid)?;
+    // SAFETY: `kill` takes no pointers; the PID is our own unreaped child.
+    if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
+        let start = Clock::now()?;
+        let until = start.ms.saturating_add(grace_ms);
+        loop {
+            if child.try_wait()?.is_some() {
+                return Ok(());
+            }
+            let now = Clock::now()?;
+            if now.boot != start.boot || now.ms >= until {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    stop_and_reap(child)
 }
 
 pub(super) fn stop_and_reap(child: &mut Child) -> io::Result<()> {
@@ -585,15 +619,32 @@ pub(super) fn absent(expected: &Identity) -> io::Result<bool> {
     }
     match identity(expected.pid) {
         Ok(actual) => Ok(actual != *expected),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) if process_gone(&error) => Ok(true),
         Err(error) => Err(error),
     }
+}
+
+/// A `/proc/<pid>/stat` read of a process that no longer exists. A process
+/// that exits and is reaped between the open and the read fails the read
+/// with ESRCH, not NotFound (studio1 train40 flake of
+/// `a_peer_recovery_failure_during_the_stop_is_final`).
+fn process_gone(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::ffi::OsStringExt;
+
+    /// A process that exits during the stat read is gone (ESRCH), as is a
+    /// missing `/proc` entry; any other read error is still an error.
+    #[test]
+    fn esrch_and_not_found_mean_the_process_is_gone() {
+        assert!(process_gone(&io::Error::from_raw_os_error(libc::ESRCH)));
+        assert!(process_gone(&io::Error::from(io::ErrorKind::NotFound)));
+        assert!(!process_gone(&io::Error::from_raw_os_error(libc::EACCES)));
+    }
 
     fn me() -> Identity {
         Identity {
@@ -822,6 +873,29 @@ mod tests {
         assert!(child.try_wait().unwrap().is_some());
         // A second call sees the reaped child and does not signal again.
         stop_and_reap(&mut child).unwrap();
+    }
+
+    #[test]
+    fn a_stop_gives_the_child_its_sigterm_window() {
+        use std::os::unix::process::ExitStatusExt;
+        // Exits cleanly on SIGTERM: no SIGKILL.
+        let mut graceful = Command::new("sh")
+            .args(["-c", "trap 'exit 0' TERM; while :; do sleep 0.05; done"])
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        terminate_and_reap(&mut graceful, 10_000).unwrap();
+        let status = graceful.try_wait().unwrap().unwrap();
+        assert!(status.success(), "{status:?}");
+        // Ignores SIGTERM: SIGKILL once the window ends.
+        let mut stubborn = Command::new("sh")
+            .args(["-c", "trap '' TERM; while :; do sleep 0.05; done"])
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        terminate_and_reap(&mut stubborn, 300).unwrap();
+        let status = stubborn.try_wait().unwrap().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
     }
 
     #[test]

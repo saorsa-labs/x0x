@@ -1663,6 +1663,9 @@ pub(super) struct NamedGroupTestRecorders {
     /// as `(recipient, group, exact payload)`, recorded at the serve
     /// DECISION (before any egress task runs). Tests read the payload here.
     pub(super) join_result_serves: StdMutex<Vec<(String, String, Vec<u8>)>>,
+    /// ADR 0109 §2: why a served join result carried no join-carry ATA,
+    /// as `(joiner, reason)` (W3-H H-S3-d2 receipts).
+    pub(super) join_carry_refusals: StdMutex<Vec<(String, String)>>,
     /// ADR 0107 (review r2): every join-artifact EGRESS handoff, as
     /// `(recipient, group, kind)`, recorded immediately before the bytes
     /// are handed to the transport (`join_result`, `join_result_reference`,

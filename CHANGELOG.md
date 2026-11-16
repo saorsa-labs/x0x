@@ -6,6 +6,34 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **The dormant launcher stops a committed daemon gracefully (#1378 slice 4;
+  A14 amendment of 16 Nov 2026).** A stop sends SIGTERM and waits up to 35 s
+  for x0xd's shutdown before SIGKILL. The retire after a host commit retries
+  only a failed host lock, ends its retries on a stop, and hands its result to
+  the caller. A start that finds a committed trial honours a stop.
+- **A KV merge keeps the earliest `created_at` (#1094, review of #1974).**
+  Every merge path now keeps the earlier `created_at` of the two entries
+  whichever wins, so replicas converge on it regardless of arrival order.
+- **The dormant launcher rolls back a multi-participant host through the
+  coordinator (#1378 slice 5; A14 amendment of 16 Nov 2026).** A launcher whose
+  own trial must roll back keeps its verdict under the host lock and runs the
+  coordinator pass, which restores the pair once for every participant. Before,
+  its single-trial restore refused a host it did not hold in full.
+- **`GET /stores/:id/:key` shows the verified writer (#1094 slice P2, A10
+  amendment of 16 Nov 2026).** New `writer` field: the agent (and rider
+  sub-agent) whose mark verifies for the returned value, or
+  `{"verified": false}`, writer unknown. The raw `x0x.writer.*` keys are no
+  longer in `metadata`. A rider's write names the rider. The Scratch app
+  shows the writer. Every KV merge path now refuses an entry whose content
+  hash does not match its value.
+- **The dormant launcher retires a committed trial (#1378 slice 3; A14
+  amendment of 16 Nov 2026).** When the host commits, the supervise driver
+  saves the trial `Committed` and hands the candidate to the caller, which
+  keeps or stops it as an ordinary committed daemon. A launcher that dies
+  between the host commit and the retire now retires the trial at its next
+  start and starts the installed daemon, instead of rolling back and ending
+  RecoveryFailed. The stop path's first host-lock pass is retried like the
+  rollback path's. The launcher is still dormant (`ENABLED` is false).
 - **Queued direct-send outcomes survive a restart (#1109 slice S2, A07
   amendment of 16 Nov 2026).** `delivered`, `expired`, `failed` and
   `cancelled`, with the payload digest, are kept 24 h in
@@ -309,6 +337,20 @@ All notable changes to this project will be documented in this file.
 
 ### Tests and tooling
 
+- **CI pins cargo-nextest 0.9.151 (was 0.9.144) in all 18 install steps.**
+  0.9.151 is the first release with `future-queue` 0.4.1
+  (nextest-rs/future-queue#603). Before it, a test queued behind a full
+  test group could be dropped without running when the group mixed
+  `threads-required` values, and the run then ended with tests "not run"
+  and no failure. `.config/nextest.toml` recommends 0.9.151.
+- **W3-H row H-S3-d2 (`w3h_1356_control_s3_d2_fork_exposure_contained`)
+  no longer races X's own events (#1572).** From X's rename until X has
+  served J its join-carry ATA, X's pubsub writes to J are held too. Before,
+  X's resent rename could move J's stub to r+1′ first; J's fetch then had
+  an empty chain, X served no carry, and the row ended INFRA ("X's
+  join-carry ATA was not recorded") in about 1 run in 15. A test-only
+  recorder now names why a served join result carried no ATA.
+
 - **Launcher supervise driver (#1378 slice 2; A14 amendment of 16 Nov
   2026).** The dormant launcher's supervise driver
   (`src/upgrade/launcher/supervise.rs`) runs a trial, then polls the host
@@ -454,6 +496,11 @@ All notable changes to this project will be documented in this file.
   `#`, `?` or `/` reaches the exact key. A slow granted read or write now
   runs on a detached task (at most 16 at once), so it does not hold the
   replies to other waiting requests.
+- **The dormant launcher reads a process that exits during its `/proc` read
+  as gone.** `child::absent` treated only NotFound as gone; a process reaped
+  between the open and the read of `/proc/<pid>/stat` fails with ESRCH, which
+  flaked `a_peer_recovery_failure_during_the_stop_is_final` on studio1 and
+  could make `stop_foreign` report a stopped process as an error.
 - **A #1427 catch-up probe no longer holds S4 seals (A09 fifth amendment
   of 16 Nov 2026).** A start or reconnect catch-up cycle asks for the next
   TreeKEM epoch without having seen it. Its target was read as ADR 0110 §2

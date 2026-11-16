@@ -75,7 +75,7 @@
       "revision": 1,
       "path": "A10-r01-shared-data-files-and-synchronization.md",
       "title": "Shared Data Files and Synchronization",
-      "sha256": "fdf77e3896467eed129f59a2d6a4ee034ca8f7d53f33de40cd91ffcc411a066b"
+      "sha256": "0f4481c3412b59e5760280fd3f7e932186a9e63916ece3880b5157d356fce83c"
     },
     {
       "id": "A11",
@@ -103,7 +103,7 @@
       "revision": 1,
       "path": "A14-r01-health-updates-and-recovery.md",
       "title": "Health Updates and Recovery",
-      "sha256": "df336a878fffd0f75764d124949a96c8c3e88962395cb48cc521afde7c2633cd"
+      "sha256": "7a439fdf38227c68b4c661b4623d7c6073c00a08d38445dec4cdc49321d8d947"
     },
     {
       "id": "A15",
