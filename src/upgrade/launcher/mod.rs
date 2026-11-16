@@ -57,6 +57,11 @@ const TRIAL_MS: u64 = 660_000;
 const READY_MS: u64 = 120_000;
 const STABLE_MS: u64 = 60_000;
 const REAP_MS: u64 = 10_000;
+/// The graceful-stop window for a committed or restored daemon: SIGTERM,
+/// then this long before SIGKILL. It covers x0xd's fixed shutdown flush
+/// budget (`shutdown_flush::LIMIT`, 30 s) plus its worker join bound (2 s),
+/// with margin. A unit's stop timeout must exceed it plus `REAP_MS`.
+const STOP_MS: u64 = 35_000;
 const GAP_MS: u64 = 10_000;
 const MAX_ATTEMPTS: u32 = 3;
 
