@@ -51,11 +51,11 @@ GROUPS = (
     # H-S3-q (2) (#1572): about 60 s per rerun in the 12-CPU VM (it
     # watches J past GATE_STALL), so about 40 min for 20 reruns on a
     # runner; its own shard, so the `s3-q` shard does not grow.
-    ('s3-qm', 'w3h_1356_red_s3_q_member_unreadable_sidecar$'),
-    ('s3-q', 'w3h_1356_red_s3_q_'),
+    ('s3-qm', 'w3h_1356_control_s3_q_member_unreadable_sidecar$'),
+    ('s3-q', 'w3h_1356_(red|control)_s3_q_joiner_'),
     # H-S3-q (3) (#1572) runs the H-S3-c3 prefix with O's restart, so it
     # has its own shard like the other owner-axis rows.
-    ('s3-q3', 'w3h_1356_red_s3_q3_issuer_unreadable_sidecar$'),
+    ('s3-q3', 'w3h_1356_control_s3_q3_issuer_unreadable_sidecar$'),
     # H-S3-q2 (#1572): about 60 s per rerun in the 12-CPU VM, so about
     # 40 min for 20 reruns on a runner; its own shard, as H-S3-q.
     ('s3-q2', 'w3h_1356_control_s3_q2_sidecar_fault_cases$'),
