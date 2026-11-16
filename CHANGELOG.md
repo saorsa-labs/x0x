@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **The dormant launcher's multi-participant rollback is final on a failed
+  pass and never overwrites a peer's restore (#1378 slice 6; A14 amendment of
+  16 Nov 2026).** A failed coordinator pass marks the host and trial
+  RecoveryFailed instead of repeating on every restart. A failed attempt is
+  requeued under the host lock and joins a restore a peer finished meanwhile;
+  a trial save refuses any stale write over a rollback or a restore.
 - **The dormant launcher rolls back a multi-participant host through the
   coordinator (#1378 slice 5; A14 amendment of 16 Nov 2026).** A launcher whose
   own trial must roll back keeps its verdict under the host lock and runs the

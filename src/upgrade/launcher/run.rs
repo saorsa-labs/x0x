@@ -174,9 +174,12 @@ pub(super) fn run_trial(
                     trial.save(path)?;
                     return Ok(Outcome::Stopped);
                 }
-                trial.phase = Phase::Authorized;
-                trial.next_launch_ms = now()?.ms.saturating_add(GAP_MS);
-                trial.save(path)?;
+                let next = now()?.ms.saturating_add(GAP_MS);
+                // The spawn recorded the exec failure in memory only.
+                let cause = trial.cause.clone();
+                if !requeue(host, path, trial, cause, next)? {
+                    return resume_peer_recovery(host, path, trial, &mut stop);
+                }
                 continue;
             }
         };
@@ -219,10 +222,10 @@ pub(super) fn run_trial(
             return Err(trial.recovery_failed(path, error));
         }
         trial.child = None;
-        trial.cause = Some(failure.to_string());
-        trial.phase = Phase::Authorized;
-        trial.next_launch_ms = now()?.ms.saturating_add(GAP_MS);
-        trial.save(path)?;
+        let next = now()?.ms.saturating_add(GAP_MS);
+        if !requeue(host, path, trial, Some(failure.to_string()), next)? {
+            return resume_peer_recovery(host, path, trial, &mut stop);
+        }
     }
 }
 
@@ -279,6 +282,83 @@ fn prior_child_absent(trial: &Trial) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Mark the host and this trial RecoveryFailed after a failed coordinator
+/// pass, so no later start repeats it. A committed host is never marked.
+/// The trial is re-read first: the pass may have written it.
+fn recovery_failed_final(
+    host: &recovery::Host,
+    path: &Path,
+    trial: &mut Trial,
+    error: io::Error,
+) -> io::Error {
+    let error = match host.mark_recovery_failed() {
+        Ok(()) => error,
+        Err(mark) => invalid(format!("{error}; host not marked recovery-failed: {mark}")),
+    };
+    if let Ok(current) = Trial::load(path, &trial.binding, &trial.instance) {
+        *trial = current;
+    }
+    if trial.phase == Phase::RecoveryFailed {
+        return error;
+    }
+    trial.recovery_failed(path, error)
+}
+
+/// Save a failed, reaped attempt `Authorized` for the next one, under the
+/// host lock from a fresh read (#1989 review). A peer's coordinator may have
+/// fenced the host and moved this trial while the attempt ran. Then the
+/// fresh trial is kept, `*trial` becomes it, and this returns false: the
+/// caller resumes that recovery and never writes `Authorized` over it.
+fn requeue(
+    host: &recovery::Host,
+    path: &Path,
+    trial: &mut Trial,
+    cause: Option<String>,
+    next_launch_ms: u64,
+) -> io::Result<bool> {
+    let (binding, instance) = (trial.binding.clone(), trial.instance.clone());
+    let (fresh, requeued) = host.locked(|_| {
+        let mut current = Trial::load(path, &binding, &instance)?;
+        if current.phase != Phase::Booting {
+            return Ok((current, false));
+        }
+        current.child = None;
+        if cause.is_some() {
+            current.cause = cause.clone();
+        }
+        current.phase = Phase::Authorized;
+        current.next_launch_ms = next_launch_ms;
+        current.save(path)?;
+        Ok((current, true))
+    })?;
+    *trial = fresh;
+    Ok(requeued)
+}
+
+/// A peer's coordinator moved this trial during an attempt. Join what it
+/// did: a Restored trial starts its restored child (unless a stop
+/// arrived), a RollingBack one resumes the pass, a RecoveryFailed one is
+/// final.
+fn resume_peer_recovery(
+    host: &recovery::Host,
+    path: &Path,
+    trial: &mut Trial,
+    stop: &mut impl FnMut() -> bool,
+) -> io::Result<Outcome> {
+    match trial.phase {
+        Phase::Restored if stop() => Ok(Outcome::Stopped),
+        Phase::Restored => start_restored(host, path, trial).map(Outcome::Restored),
+        Phase::RollingBack => rollback(
+            host,
+            path,
+            trial,
+            interrupted("a peer began recovery during an attempt"),
+        ),
+        Phase::RecoveryFailed => Err(invalid("automatic start is forbidden")),
+        _ => Err(invalid("trial changed during an attempt")),
+    }
 }
 
 /// Whether the host phase allows a candidate spawn. Checked under the host
@@ -423,7 +503,15 @@ fn rollback_through_coordinator(
         }
         Ok(current)
     })?;
-    let resolution = coordinator::recover(host)?;
+    // An error before the fence (a peer trial that does not load, a foreign
+    // handoff record, a live own child) would repeat on every restart and
+    // leave the host unfinished, so any error here is final, as on the
+    // single-participant path (#1989 review). The pass marks the host and
+    // every trial itself for an error after its fence.
+    let resolution = match coordinator::recover(host) {
+        Ok(resolution) => resolution,
+        Err(error) => return Err(recovery_failed_final(host, path, trial, error)),
+    };
     *trial = Trial::load(path, &binding, &instance)?;
     match resolution {
         coordinator::Resolution::Restored(_) => {
@@ -523,7 +611,8 @@ mod tests {
         let cause = journal_record(&root).cause.unwrap();
         assert_eq!(cause.class, journal::CauseClass::Failed);
         assert!(
-            cause.reason.contains("launch attempts exhausted"),
+            cause.reason.contains("launch attempts exhausted")
+                && cause.reason.contains("exec failed"),
             "{cause:?}"
         );
     }
@@ -572,6 +661,130 @@ mod tests {
             bob.verdict.map(|v| v.class),
             Some(journal::CauseClass::Failed)
         );
+    }
+
+    fn set_journal(root: &Path, phase: journal::Phase, cause: Option<journal::Cause>) {
+        let mut record = journal_record(root);
+        record.sequence += 1;
+        record.phase = phase;
+        record.cause = cause;
+        journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &record).unwrap();
+    }
+
+    /// #1989 review item 1: an error before the coordinator's fence (here
+    /// Bob's trial does not load) is final. The host and Alice's trial are
+    /// RecoveryFailed, no byte moved, and a restart does not repeat the
+    /// pass.
+    #[test]
+    fn a_pre_fence_recovery_error_is_final() {
+        let (_dir, root, host, _record) = fixture_with(journal::Phase::SwappedCli, with_bob);
+        write_probe(&host, 1, probe::ProbePhase::Passed);
+        let alice = coordinator::trial_path(&host.plan().participants[0]);
+        let bob = coordinator::trial_path(&host.plan().participants[1]);
+        std::fs::write(&bob, b"not a trial record").unwrap();
+        let mut trial = trial_in(&host, &alice, Phase::Authorized, 0);
+        let clock = fast_clock(&trial);
+        let outcome = run_trial(&host, &alice, &mut trial, clock, |_| Ok(false), || false);
+        assert!(outcome.is_err());
+        assert_eq!(journal_record(&root).phase, journal::Phase::RecoveryFailed);
+        let mut again = Trial::load(&alice, &trial.binding, "alice").unwrap();
+        assert_eq!(again.phase, Phase::RecoveryFailed);
+        assert_eq!(
+            filesystem::hash(&host.plan().daemon.target_path).unwrap(),
+            host.plan().daemon.candidate_sha256
+        );
+        let clock = fast_clock(&again);
+        let restart = run_trial(&host, &alice, &mut again, clock, |_| Ok(false), || false);
+        assert_eq!(
+            restart.err().map(|e| e.to_string()).as_deref(),
+            Some("automatic start is forbidden")
+        );
+    }
+
+    /// #1989 review item 2: a peer's coordinator restores the host and
+    /// marks this trial Restored while an attempt runs. The failed attempt
+    /// is requeued under the host lock from a fresh read, so it never
+    /// writes Authorized over Restored; the launcher joins the restore and
+    /// tries its restored start at once. (The fixture's pair was not
+    /// actually restored, so that start then fails and is RecoveryFailed.)
+    #[test]
+    fn a_peer_restore_during_an_attempt_is_never_overwritten() {
+        let (_dir, root, host, _record) = fixture_with(journal::Phase::SwappedCli, with_bob);
+        let alice = coordinator::trial_path(&host.plan().participants[0]);
+        let mut trial = trial_in(&host, &alice, Phase::Authorized, 0);
+        let mut clock = fast_clock(&trial);
+        let marked = std::cell::Cell::new(false);
+        let binding = trial.binding.clone();
+        let peer_clock = || {
+            let on_disk = Trial::load(&alice, &binding, "alice").unwrap();
+            if on_disk.phase == Phase::Booting && !marked.get() {
+                // The peer's pass, as `settle` leaves it.
+                let failed = cause(journal::CauseClass::Failed, "peer failed");
+                set_journal(&root, journal::Phase::Restored, Some(failed.clone()));
+                let mut restored = on_disk;
+                restored.verdict = Some(failed);
+                restored.phase = Phase::Restored;
+                restored.save(&alice).unwrap();
+                marked.set(true);
+            }
+            clock()
+        };
+        let outcome = run_trial(
+            &host,
+            &alice,
+            &mut trial,
+            peer_clock,
+            |_| Ok(false),
+            || false,
+        );
+        assert!(marked.get(), "the peer acted during the attempt");
+        assert!(outcome.is_err());
+        let on_disk = Trial::load(&alice, &trial.binding, "alice").unwrap();
+        assert_ne!(on_disk.phase, Phase::Authorized);
+        assert_eq!(on_disk.restored_starts, 1, "{on_disk:?}");
+        assert_eq!(on_disk.attempts, 1);
+        assert_eq!(on_disk.verdict.unwrap().reason, "peer failed");
+    }
+
+    /// #1989 review item 3: crash-resume at run level on a two-participant
+    /// host. Alice's launcher saved its verdict, then died either before
+    /// the coordinator's fence or after it (host RollingBack). The
+    /// restarted `run_trial` resumes the pass: the pair is restored once,
+    /// both trials are Restored, and the first verdict is the host cause.
+    #[test]
+    fn a_restart_resumes_an_interrupted_coordinator_rollback() {
+        for fenced in [false, true] {
+            let (_dir, root, host, _record) = fixture_with(journal::Phase::SwappedCli, with_bob);
+            write_probe(&host, 1, probe::ProbePhase::Passed);
+            let alice = coordinator::trial_path(&host.plan().participants[0]);
+            let bob = coordinator::trial_path(&host.plan().participants[1]);
+            let mut trial = trial_in(&host, &alice, Phase::Authorized, MAX_ATTEMPTS);
+            let first = cause(journal::CauseClass::Failed, "first failure");
+            trial.verdict = Some(first.clone());
+            trial.save(&alice).unwrap();
+            if fenced {
+                set_journal(&root, journal::Phase::RollingBack, Some(first.clone()));
+            }
+            let mut restarted = Trial::load(&alice, &trial.binding, "alice").unwrap();
+            let clock = fast_clock(&restarted);
+            // The restored start fails on the fixture's unexecutable bytes.
+            let _ = run_trial(
+                &host,
+                &alice,
+                &mut restarted,
+                clock,
+                |_| Ok(false),
+                || false,
+            );
+            assert_previous_pair(&host);
+            let record = journal_record(&root);
+            assert_eq!(record.phase, journal::Phase::Restored, "fenced={fenced}");
+            assert_eq!(record.cause.unwrap().reason, "first failure");
+            let bob = Trial::load(&bob, &trial.binding, "bob").unwrap();
+            assert_eq!(bob.phase, Phase::Restored, "fenced={fenced}");
+            let alice = Trial::load(&alice, &trial.binding, "alice").unwrap();
+            assert_eq!(alice.restored_starts, 1, "fenced={fenced}");
+        }
     }
 
     /// On a two-participant host the coordinator reads every trial at its
