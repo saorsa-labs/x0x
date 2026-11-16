@@ -1408,6 +1408,7 @@ pub async fn serve_with_options(
         )),
         treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
         treekem_start_catchup_pending: Default::default(),
+        treekem_reconnect_gate: Default::default(),
         treekem_network_join_ended: tokio::sync::watch::channel(false).0,
         treekem_start_catchup_passes: Default::default(),
         treekem_reconnect_catchup_passes: Default::default(),
@@ -3461,6 +3462,15 @@ pub async fn serve_with_options(
             "/grants/data/:agent/:group/:store/:key",
             get(data_read::get_granted_store_value),
         )
+        // #1094 D2: write a store through a received `rw` ShareCap::Data grant.
+        .route(
+            "/grants/data/:agent/:group/:store/:key",
+            put(data_read::put_granted_store_value),
+        )
+        .route(
+            "/grants/data/:agent/:group/:store/:key",
+            delete(data_read::delete_granted_store_value),
+        )
         // ADR-0074 §1: names (owner petnames, TOFU pins, resolution)
         .route("/names", get(routes::names_list))
         .route("/names/resolve", post(routes::names_resolve))
@@ -4223,6 +4233,11 @@ async fn start_dm_inbox_when_gossip_ready(
             )
             .with_typed_payload_route(
                 x0x::share_grant::data_read::DATA_READ_REPLY_DM_PREFIX,
+                data_read_route_tx.clone(),
+            )
+            // #1094 D2: a grantee's write; the reply uses the read reply route.
+            .with_typed_payload_route(
+                x0x::share_grant::data_read::DATA_WRITE_REQUEST_DM_PREFIX,
                 data_read_route_tx.clone(),
             );
         match agent

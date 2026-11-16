@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 226,
+  "endpoint_count": 228,
   "endpoints": [
     {
       "category": "status",
@@ -3720,6 +3720,40 @@
       "cli_name": "grant data get",
       "description": "Read one value of a store on a granted agent, through a received ShareCap::Data grant (#1094)",
       "method": "GET",
+      "path": "/grants/data/:agent/:group/:store/:key",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "grants",
+      "cli_name": "grant data put",
+      "description": "Set one value of a store on a granted agent, through a received rw ShareCap::Data grant (#1094)",
+      "method": "PUT",
+      "path": "/grants/data/:agent/:group/:store/:key",
+      "request": {
+        "fields": [
+          {
+            "cli": "VALUE",
+            "in": "body",
+            "name": "value",
+            "required": true
+          },
+          {
+            "cli": "--content-type",
+            "in": "body",
+            "name": "content_type",
+            "required": false
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "grants",
+      "cli_name": "grant data rm",
+      "description": "Remove one key of a store on a granted agent, through a received rw ShareCap::Data grant (#1094)",
+      "method": "DELETE",
       "path": "/grants/data/:agent/:group/:store/:key",
       "request": {
         "kind": "none"

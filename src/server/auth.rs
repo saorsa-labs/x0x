@@ -494,7 +494,8 @@ fn is_acl_admin_path(path: &str) -> bool {
 /// `/grants/<nonempty-segment>` (including `/grants/received`).
 fn is_grants_path(path: &str) -> bool {
     path == "/grants"
-        // #1094 D1: reading a store through this install's received grants.
+        // #1094 D1/D2: reading or writing a store through this install's
+        // received grants.
         || path.starts_with("/grants/data/")
         || path
             .strip_prefix("/grants/")
@@ -1586,7 +1587,7 @@ mod tests {
                 );
             }
         }
-        for method in [Method::GET] {
+        for method in [Method::GET, Method::PUT, Method::DELETE] {
             for path in ["/grants/data/aa/bb/scratch", "/grants/data/aa/bb/scratch/k"] {
                 assert!(
                     requires_durable_owner(&method, path),

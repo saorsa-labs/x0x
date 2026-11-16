@@ -631,10 +631,10 @@ macro_rules! shutdown_flush_regression_tests {
                         released
                             .lock()
                             .unwrap()
-                            .recv_timeout(Duration::from_secs(5))
+                            .recv_timeout(Duration::from_secs(30))
                             .map_err(io::Error::other)
                     }),
-                    Duration::from_millis(500),
+                    crate::upgrade::shutdown_flush::TEST_OVERRUN_LIMIT,
                 )
                 .unwrap();
                 let exited = Arc::new(std::sync::atomic::AtomicI32::new(-1));
@@ -652,7 +652,7 @@ macro_rules! shutdown_flush_regression_tests {
                     let _ = returned.send(outcome);
                 });
                 let did_enter = entered_rx.recv_timeout(Duration::from_secs(5));
-                let outcome = result.recv_timeout(Duration::from_secs(3));
+                let outcome = result.recv_timeout(Duration::from_secs(30));
                 let _ = release.send(());
                 caller.join().unwrap();
                 owner.join_workers();

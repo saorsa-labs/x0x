@@ -863,7 +863,7 @@ async fn unresolved_head_evidence(
         ids.iter().any(|id| {
             targets
                 .get(id)
-                .is_some_and(|target| target.epoch > local_epoch)
+                .is_some_and(|target| target.is_head_evidence(local_epoch))
         })
     };
     ahead || super::self_leave_rekey_fence_any_open(&ids)
@@ -4917,7 +4917,7 @@ pub(super) async fn write_bytes_durably(
     sync_dir_of(path).await
 }
 
-async fn sync_dir_of(path: &FsPath) -> std::io::Result<()> {
+pub(super) async fn sync_dir_of(path: &FsPath) -> std::io::Result<()> {
     let path = path.to_path_buf();
     if crate::w3h_inline::shim_active() {
         return super::sync_parent_dir_for_path(&path);

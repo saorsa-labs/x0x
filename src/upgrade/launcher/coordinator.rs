@@ -233,6 +233,13 @@ fn settle(
         let failed = Resolution::Final(journal::Phase::RecoveryFailed);
         match record.phase {
             journal::Phase::RollingBack => {
+                // A peer that failed with the host journal unwritable left
+                // the host RollingBack but marked the trials
+                // RecoveryFailed: final, write nothing (#1950 review).
+                reload(trials, binding)?;
+                if any_recovery_failed(trials) {
+                    return Ok(failed);
+                }
                 for (path, trial) in trials.iter_mut() {
                     begin_rollback(path, trial, cause)?;
                 }
@@ -1548,5 +1555,49 @@ mod tests {
             .map(|trial| trial.phase)
             .collect();
         assert_eq!(phases, vec![Phase::Booting, Phase::Authorized]);
+    }
+
+    /// Review of #1950: a peer pass fails while this pass stops the
+    /// candidate, but cannot write the host journal, so the host stays
+    /// RollingBack; it marks every trial RecoveryFailed. This pass reloads
+    /// the trials under the lock and is final: it overwrites no trial,
+    /// moves no byte and writes no Restored. Before the fix it rolled the
+    /// trials back over the peer's marks and restored the pair.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_peer_recovery_failure_with_an_unwritable_journal_is_final() {
+        let (_dir, root, host, _record) =
+            fixture_with(journal::Phase::SwappedCli, two_participants);
+        let trial_dir = tempfile::tempdir().unwrap();
+        let clock = now();
+        let (trials, identity, reaper) =
+            alice_runs_a_failed_candidate(&host, trial_dir.path(), &clock);
+        let paths: Vec<(PathBuf, String)> = trials
+            .iter()
+            .map(|(path, trial)| (path.clone(), trial.instance.clone()))
+            .collect();
+        let resolution = reconcile(&host, path_in(trial_dir.path()), true, &clock, |target| {
+            // The peer's `fail` with the host mark refused: trials only.
+            host.locked(|_| {
+                for (path, instance) in &paths {
+                    let mut trial = Trial::load(path, &host.binding()?, instance)?;
+                    trial.phase = Phase::RecoveryFailed;
+                    trial.save(path)?;
+                }
+                Ok(())
+            })?;
+            child::stop_foreign(target)
+        });
+        assert!(!reaper.join().unwrap().success());
+        assert!(child::absent(&identity).unwrap());
+        assert_eq!(
+            resolution.unwrap(),
+            Resolution::Final(journal::Phase::RecoveryFailed)
+        );
+        assert_candidate_pair(&host);
+        assert_eq!(journal_record(&root).phase, journal::Phase::RollingBack);
+        for trial in reload(&host, trial_dir.path()) {
+            assert_eq!(trial.phase, Phase::RecoveryFailed, "{}", trial.instance);
+        }
     }
 }

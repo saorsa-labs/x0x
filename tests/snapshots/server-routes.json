@@ -3724,6 +3724,40 @@
     }
   },
   {
+    "method": "PUT",
+    "path": "/grants/data/:agent/:group/:store/:key",
+    "cli_name": "grant data put",
+    "description": "Set one value of a store on a granted agent, through a received rw ShareCap::Data grant (#1094)",
+    "category": "grants",
+    "request": {
+      "fields": [
+        {
+          "cli": "VALUE",
+          "in": "body",
+          "name": "value",
+          "required": true
+        },
+        {
+          "cli": "--content-type",
+          "in": "body",
+          "name": "content_type",
+          "required": false
+        }
+      ],
+      "kind": "fields"
+    }
+  },
+  {
+    "method": "DELETE",
+    "path": "/grants/data/:agent/:group/:store/:key",
+    "cli_name": "grant data rm",
+    "description": "Remove one key of a store on a granted agent, through a received rw ShareCap::Data grant (#1094)",
+    "category": "grants",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
     "method": "GET",
     "path": "/names",
     "cli_name": "names list",
