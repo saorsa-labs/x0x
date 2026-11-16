@@ -2996,28 +2996,55 @@ pub async fn serve_with_options(
 
     // #1109: durable direct-send worker. Each pass settles obligations the
     // receipt ledger shows delivered, drops expired ones and sends the
-    // rest once under their logical id.
+    // rest once under their logical id. S2: a late v2 ACK with no waiter
+    // (after a restart) settles a held obligation without a send, and a
+    // recipient's durable-capable advert makes its held sends due at once.
     {
         let send_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
+            use routes::direct_outbox::{AgentDirectSendTransport, DirectSendNow, LedgerReceipt};
+            use tokio::sync::broadcast::error::RecvError;
             let mut shutdown_rx = send_state.shutdown_notify.subscribe();
             let acks = send_state.agent.dm_inflight_acks();
-            let transport = routes::direct_outbox::AgentDirectSendTransport(send_state.as_ref());
+            let mut orphan_acks = acks.subscribe_orphan_acks();
+            let mut adverts = send_state
+                .agent
+                .capability_store()
+                .subscribe_durable_adverts();
+            let transport = AgentDirectSendTransport(send_state.as_ref());
+            let outbox = &send_state.direct_send_outbox;
+            let ledger = |request_id: &[u8; 16]| LedgerReceipt::of(&acks, request_id);
             loop {
                 tokio::select! {
                     _ = shutdown_rx.changed() => break,
                     _ = tokio::time::sleep(routes::direct_outbox::DIRECT_SEND_TICK) => {
-                        send_state
-                            .direct_send_outbox
-                            .step(
-                                routes::direct_outbox::DirectSendNow::current(),
-                                &|request_id| {
-                                    routes::direct_outbox::LedgerReceipt::of(&acks, request_id)
-                                },
-                                &transport,
-                            )
-                            .await;
+                        outbox.step(DirectSendNow::current(), &ledger, &transport).await;
                     }
+                    ack = orphan_acks.recv() => match ack {
+                        Ok(ack) => {
+                            outbox.settle_late_ack(&ack.request_id, &ack.sender).await;
+                        }
+                        Err(RecvError::Lagged(_)) => {}
+                        Err(RecvError::Closed) => {
+                            orphan_acks = acks.subscribe_orphan_acks();
+                        }
+                    },
+                    advert = adverts.recv() => match advert {
+                        Ok(recipient) => {
+                            let now = DirectSendNow::current();
+                            if outbox.nudge_recipient(&recipient, now).await {
+                                outbox.step(now, &ledger, &transport).await;
+                            }
+                        }
+                        Err(RecvError::Lagged(_)) => {}
+                        Err(RecvError::Closed) => {
+                            adverts = send_state
+                                .agent
+                                .capability_store()
+                                .subscribe_durable_adverts();
+                            tokio::time::sleep(routes::direct_outbox::DIRECT_SEND_TICK).await;
+                        }
+                    },
                 }
             }
         }));

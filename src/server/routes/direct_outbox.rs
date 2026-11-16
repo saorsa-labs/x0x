@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
-use crate::dm::{DmError, DmReceiptStatus, DmSendConfig, RECEIPT_LEDGER_CAP, RECEIPT_LEDGER_TTL};
+use crate::dm::{DmError, DmReceiptStatus, DmSendConfig, RECEIPT_LEDGER_CAP};
 use crate::identity::AgentId;
 use crate::storage::outbox::{Outbox, OutboxCaps, OutboxMap, OutboxRecord, Settled};
 
@@ -334,18 +334,54 @@ impl DirectSendTerminal {
     }
 }
 
+/// Sidecar file name of the persisted terminal outcomes (#1109 S2).
+pub(in crate::server) const DIRECT_SEND_OUTCOMES_FILE: &str = "direct_send_outcomes.json";
+
+/// Outcomes sidecar format version.
+const DIRECT_SEND_OUTCOMES_VERSION: u32 = 1;
+
+/// How long a terminal outcome is kept (wall clock), across restarts.
+pub(in crate::server) const DIRECT_SEND_OUTCOMES_KEEP_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// The most terminal outcomes kept; the oldest goes first.
+pub(in crate::server) const DIRECT_SEND_OUTCOMES_CAP: usize = RECEIPT_LEDGER_CAP;
+
+/// A sidecar over this size is corrupt (an entry is well under 300 bytes).
+const DIRECT_SEND_OUTCOMES_MAX_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Debug)]
 struct TerminalEntry {
     outcome: DirectSendTerminal,
     /// BLAKE3 of the obligation's payload.
     digest: [u8; 32],
-    expires: Instant,
+    /// Unix ms when the outcome was recorded.
+    recorded_at_ms: u64,
     seq: u64,
 }
 
-/// Terminal outcomes, bounded by [`RECEIPT_LEDGER_TTL`] and
-/// [`RECEIPT_LEDGER_CAP`]. The order queue is capped too: a stale pair
-/// (an entry rewritten or removed since) still counts against the cap.
+/// One persisted outcome.
+#[derive(Debug, Serialize, Deserialize)]
+struct OutcomeRecord {
+    request_id: String,
+    status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    payload_digest: String,
+    recorded_at_ms: u64,
+}
+
+/// Outcomes sidecar shape: version + outcomes, oldest first.
+#[derive(Debug, Serialize, Deserialize)]
+struct OutcomesFile {
+    version: u32,
+    #[serde(default)]
+    outcomes: Vec<OutcomeRecord>,
+}
+
+/// Terminal outcomes, bounded by [`DIRECT_SEND_OUTCOMES_KEEP_MS`] and
+/// [`DIRECT_SEND_OUTCOMES_CAP`], persisted so a receipt answers the same
+/// after a restart. The order queue is capped too: a stale pair (an entry
+/// rewritten or removed since) still counts against the cap.
 #[derive(Debug, Default)]
 struct TerminalLedger {
     entries: HashMap<[u8; 16], TerminalEntry>,
@@ -353,11 +389,19 @@ struct TerminalLedger {
     next_seq: u64,
 }
 
+fn decode_hex_array<const N: usize>(text: &str) -> Option<[u8; N]> {
+    hex::decode(text).ok()?.try_into().ok()
+}
+
 impl TerminalLedger {
-    fn prune(&mut self, now: Instant) {
+    fn prune(&mut self, now_ms: u64) {
         while let Some(&(id, seq)) = self.order.front() {
             if let Some(entry) = self.entries.get(&id).filter(|e| e.seq == seq) {
-                if entry.expires > now {
+                if entry
+                    .recorded_at_ms
+                    .saturating_add(DIRECT_SEND_OUTCOMES_KEEP_MS)
+                    > now_ms
+                {
                     break;
                 }
                 self.entries.remove(&id);
@@ -371,9 +415,9 @@ impl TerminalLedger {
         request_id: [u8; 16],
         outcome: DirectSendTerminal,
         digest: [u8; 32],
-        now: Instant,
+        now_ms: u64,
     ) {
-        self.prune(now);
+        self.prune(now_ms);
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
         self.entries.insert(
@@ -381,12 +425,12 @@ impl TerminalLedger {
             TerminalEntry {
                 outcome,
                 digest,
-                expires: now + RECEIPT_LEDGER_TTL,
+                recorded_at_ms: now_ms,
                 seq,
             },
         );
         self.order.push_back((request_id, seq));
-        while self.order.len() > RECEIPT_LEDGER_CAP {
+        while self.order.len() > DIRECT_SEND_OUTCOMES_CAP {
             let Some((id, old_seq)) = self.order.pop_front() else {
                 break;
             };
@@ -403,13 +447,90 @@ impl TerminalLedger {
     fn get(
         &mut self,
         request_id: &[u8; 16],
-        now: Instant,
+        now_ms: u64,
     ) -> Option<(DirectSendTerminal, [u8; 32])> {
-        self.prune(now);
+        self.prune(now_ms);
         self.entries
             .get(request_id)
-            .filter(|e| e.expires > now)
+            .filter(|e| {
+                e.recorded_at_ms
+                    .saturating_add(DIRECT_SEND_OUTCOMES_KEEP_MS)
+                    > now_ms
+            })
             .map(|e| (e.outcome.clone(), e.digest))
+    }
+
+    /// The live outcomes, oldest first, as the sidecar holds them.
+    fn to_file(&self) -> OutcomesFile {
+        let outcomes = self
+            .order
+            .iter()
+            .filter_map(|(id, seq)| {
+                let entry = self.entries.get(id).filter(|e| e.seq == *seq)?;
+                let (status, error) = match &entry.outcome {
+                    DirectSendTerminal::Delivered => ("delivered", None),
+                    DirectSendTerminal::Expired => ("expired", None),
+                    DirectSendTerminal::Failed(code) => ("failed", Some(code.clone())),
+                    DirectSendTerminal::Cancelled => ("cancelled", None),
+                };
+                Some(OutcomeRecord {
+                    request_id: hex::encode(id),
+                    status: status.to_string(),
+                    error,
+                    payload_digest: hex::encode(entry.digest),
+                    recorded_at_ms: entry.recorded_at_ms,
+                })
+            })
+            .collect();
+        OutcomesFile {
+            version: DIRECT_SEND_OUTCOMES_VERSION,
+            outcomes,
+        }
+    }
+
+    /// Rebuild from sidecar bytes. Any malformed record fails the whole
+    /// file; expired records are dropped.
+    fn from_bytes(bytes: &[u8], now_ms: u64) -> Result<Self, String> {
+        if bytes.len() > DIRECT_SEND_OUTCOMES_MAX_BYTES {
+            return Err(format!(
+                "outcomes file is {} bytes, over the guard",
+                bytes.len()
+            ));
+        }
+        let file: OutcomesFile =
+            serde_json::from_slice(bytes).map_err(|e| format!("failed to parse: {e}"))?;
+        if file.version != DIRECT_SEND_OUTCOMES_VERSION {
+            return Err(format!("unsupported outcomes version {}", file.version));
+        }
+        if file.outcomes.len() > DIRECT_SEND_OUTCOMES_CAP {
+            return Err(format!("{} outcomes, over the cap", file.outcomes.len()));
+        }
+        let mut ledger = Self::default();
+        for record in file.outcomes {
+            let request_id = decode_hex_array::<16>(&record.request_id)
+                .ok_or_else(|| format!("invalid request_id {}", record.request_id))?;
+            let digest = decode_hex_array::<32>(&record.payload_digest)
+                .ok_or_else(|| format!("invalid payload_digest on {}", record.request_id))?;
+            let outcome = match (record.status.as_str(), record.error) {
+                ("delivered", None) => DirectSendTerminal::Delivered,
+                ("expired", None) => DirectSendTerminal::Expired,
+                ("cancelled", None) => DirectSendTerminal::Cancelled,
+                ("failed", Some(code)) => DirectSendTerminal::Failed(code),
+                (status, _) => {
+                    return Err(format!("invalid status {status} on {}", record.request_id))
+                }
+            };
+            if record
+                .recorded_at_ms
+                .saturating_add(DIRECT_SEND_OUTCOMES_KEEP_MS)
+                > now_ms
+            {
+                // Keep the file's order; `record` stamps the original time.
+                ledger.record(request_id, outcome, digest, record.recorded_at_ms);
+            }
+        }
+        ledger.prune(now_ms);
+        Ok(ledger)
     }
 }
 
@@ -561,6 +682,10 @@ pub(in crate::server) struct DirectSendOutbox {
     /// one step, so the generic insert never evicts an entry.
     admission: Mutex<()>,
     terminal: std::sync::Mutex<TerminalLedger>,
+    /// #1109 S2: sidecar of the terminal outcomes, and the lock that keeps
+    /// its writes in order.
+    outcomes_path: PathBuf,
+    outcomes_lock: Mutex<()>,
     /// Request ids with an attempt in flight. The value is the terminal
     /// code to record if the recipient was blocked during the attempt
     /// (then the obligation is not sent again).
@@ -569,10 +694,15 @@ pub(in crate::server) struct DirectSendOutbox {
 
 impl DirectSendOutbox {
     /// An empty outbox whose sidecar is `path`.
+    /// The terminal outcomes are kept in [`DIRECT_SEND_OUTCOMES_FILE`] in
+    /// the same directory.
     pub(in crate::server) fn new(path: PathBuf) -> Self {
+        let outcomes_path = path.with_file_name(DIRECT_SEND_OUTCOMES_FILE);
         Self {
             entries: RwLock::new(HashMap::new()),
             path,
+            outcomes_path,
+            outcomes_lock: Mutex::new(()),
             persist_lock: Mutex::new(()),
             admission: Mutex::new(()),
             terminal: std::sync::Mutex::new(TerminalLedger::default()),
@@ -605,24 +735,133 @@ impl DirectSendOutbox {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn record_terminal(&self, outcomes: Vec<([u8; 16], DirectSendTerminal, [u8; 32])>) {
-        let now = Instant::now();
-        let mut terminal = self.terminal();
-        for (request_id, outcome, digest) in outcomes {
-            terminal.record(request_id, outcome, digest, now);
+    /// Record terminal outcomes in memory, then write the outcomes sidecar
+    /// (owner-only, durable). A failed write is logged; memory keeps the
+    /// outcome.
+    async fn record_terminal(&self, outcomes: Vec<([u8; 16], DirectSendTerminal, [u8; 32])>) {
+        if outcomes.is_empty() {
+            return;
+        }
+        let _ordered = self.outcomes_lock.lock().await;
+        let encoded = {
+            let now_ms = now_unix_ms();
+            let mut terminal = self.terminal();
+            for (request_id, outcome, digest) in outcomes {
+                terminal.record(request_id, outcome, digest, now_ms);
+            }
+            serde_json::to_vec(&terminal.to_file())
+        };
+        let written = match encoded {
+            Ok(bytes) => {
+                crate::storage::write_private_bytes_durable_typed(&self.outcomes_path, bytes)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            Err(e) => Err(e.to_string()),
+        };
+        if let Err(error) = written {
+            tracing::error!("#1109: failed to write the direct send outcomes sidecar: {error}");
         }
     }
 
-    /// Load the sidecar at boot. Missing means empty; a bad file is moved
-    /// aside and the outbox starts empty (the error is returned). Every
-    /// loaded obligation is due at once: the persisted schedule belongs to
-    /// the previous process's monotonic clock.
+    /// Load the sidecars at boot. Missing means empty; a bad file is moved
+    /// aside, that part starts empty, and the error is returned (the daemon
+    /// still starts). Every loaded obligation is due at once: the persisted
+    /// schedule belongs to the previous process's monotonic clock.
     pub(in crate::server) async fn load(&self, aside_stamp_ms: u64) -> Result<(), String> {
         let loaded = self.outbox().load(aside_stamp_ms).await;
         for obligation in self.entries.write().await.values_mut().flatten() {
             obligation.next_retry_at_ms = 0;
         }
-        loaded
+        let outcomes = self.load_outcomes(aside_stamp_ms).await;
+        match (loaded, outcomes) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
+            (Err(a), Err(b)) => Err(format!("{a}; {b}")),
+        }
+    }
+
+    async fn load_outcomes(&self, aside_stamp_ms: u64) -> Result<(), String> {
+        let path = &self.outcomes_path;
+        let bytes = match crate::w3h_inline::fs::read(path).await {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(format!("failed to read {}: {e}", path.display())),
+        };
+        match TerminalLedger::from_bytes(&bytes, now_unix_ms()) {
+            Ok(ledger) => {
+                *self.terminal() = ledger;
+                Ok(())
+            }
+            Err(error) => {
+                let aside = path.with_extension(format!("corrupt-{aside_stamp_ms}"));
+                let _ = crate::w3h_inline::fs::rename(path, &aside).await;
+                Err(format!(
+                    "{}: direct send outcomes {error} (file moved aside to {})",
+                    path.display(),
+                    aside.display()
+                ))
+            }
+        }
+    }
+
+    /// #1109 S2: an accepted v2 ACK for `request_id` arrived with no waiter
+    /// and no tombstone (for example after a restart). When a held
+    /// obligation has that request id and `sender` is its recipient, it is
+    /// settled delivered without another send. Returns whether it was.
+    pub(in crate::server) async fn settle_late_ack(
+        &self,
+        request_id: &[u8; 16],
+        sender: &AgentId,
+    ) -> bool {
+        let _admission = self.admission.lock().await;
+        if self.is_in_flight(Some(*request_id)) {
+            // The attempt's own waiter takes the ACK.
+            return false;
+        }
+        let held = self
+            .entries
+            .read()
+            .await
+            .get(&hex::encode(sender.as_bytes()))
+            .and_then(|list| {
+                list.iter()
+                    .find(|o| o.request_id == hex::encode(request_id))
+                    .cloned()
+            });
+        let Some(held) = held else {
+            return false;
+        };
+        let digest = held.payload_digest();
+        match self.remove(vec![held]).await {
+            Ok(()) => {
+                tracing::info!(
+                    request_id = %hex::encode(request_id),
+                    "#1109: a late durable ACK settled a queued direct send"
+                );
+                self.record_terminal(vec![(*request_id, DirectSendTerminal::Delivered, digest)])
+                    .await;
+                true
+            }
+            Err(e) => {
+                tracing::error!("#1109: failed to settle a late ACK: {e}");
+                false
+            }
+        }
+    }
+
+    /// #1109 S2: `recipient`'s durable-capable advert arrived. Its held
+    /// obligations become due at `now` (in memory; the retry count is
+    /// unchanged). Returns whether any matched.
+    pub(in crate::server) async fn nudge_recipient(
+        &self,
+        recipient: &AgentId,
+        now: DirectSendNow,
+    ) -> bool {
+        let recipient_hex = hex::encode(recipient.as_bytes());
+        self.outbox()
+            .nudge(now.mono_ms, |o| o.recipient == recipient_hex)
+            .await
     }
 
     /// All held obligations (test view).
@@ -662,7 +901,7 @@ impl DirectSendOutbox {
             // A delivery of other bytes under this key: the recipient holds
             // them, so these bytes can never be delivered under it.
             let delivered_other = request_id
-                .and_then(|id| self.terminal().get(&id, Instant::now()))
+                .and_then(|id| self.terminal().get(&id, now_unix_ms()))
                 .is_some_and(|(outcome, d)| {
                     outcome == DirectSendTerminal::Delivered && d != digest
                 });
@@ -737,7 +976,8 @@ impl DirectSendOutbox {
         let digest = held.payload_digest();
         match self.remove(vec![held]).await {
             Ok(()) => {
-                self.record_terminal(vec![(*request_id, DirectSendTerminal::Cancelled, digest)]);
+                self.record_terminal(vec![(*request_id, DirectSendTerminal::Cancelled, digest)])
+                    .await;
                 CancelOutcome::Cancelled
             }
             Err(e) => CancelOutcome::WriteFailed(e),
@@ -790,7 +1030,7 @@ impl DirectSendOutbox {
         let count = held.len();
         match self.remove(held).await {
             Ok(()) => {
-                self.record_terminal(outcomes);
+                self.record_terminal(outcomes).await;
                 count + marked
             }
             Err(e) => {
@@ -854,7 +1094,8 @@ impl DirectSendOutbox {
         if ledger.delivered() {
             return DirectSendReceipt::plain(ledger.status.as_str(), ledger.digest);
         }
-        match self.terminal().get(request_id, Instant::now()) {
+        let terminal = self.terminal().get(request_id, now_unix_ms());
+        match terminal {
             Some((outcome, digest)) => outcome.receipt(digest),
             None => DirectSendReceipt::plain(ledger.status.as_str(), ledger.digest),
         }
@@ -1022,7 +1263,7 @@ impl DirectSendOutbox {
                 return;
             }
         }
-        self.record_terminal(outcomes);
+        self.record_terminal(outcomes).await;
         self.clear_in_flight(&sent_ids);
     }
 }

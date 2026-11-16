@@ -582,7 +582,7 @@ async fn issue1109_full_recipient_is_refused_not_evicted() {
 #[test]
 fn issue1109_terminal_ledger_order_queue_stays_bounded() {
     let mut ledger = TerminalLedger::default();
-    let now = Instant::now();
+    let now = NOW;
     for _ in 0..(RECEIPT_LEDGER_CAP * 2) {
         ledger.record([1; 16], DirectSendTerminal::Expired, [0; 32], now);
     }
@@ -808,4 +808,196 @@ async fn issue1109_block_during_an_attempt_records_it_and_never_resends() {
     let receipt = status(&outbox, peer, &rid).await;
     assert_eq!(receipt.status, "queued");
     assert_eq!(receipt.payload_digest, Some(digest_of(b"payload B")));
+}
+
+/// WHY: #1109 S2 a receipt must answer the same after a restart: every
+/// terminal status, its error code and its payload digest come back from
+/// the owner-only outcomes sidecar.
+#[cfg(unix)]
+#[tokio::test]
+async fn issue1109_outcomes_survive_restart_with_their_digest() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let peer = agent(2);
+    let wall = now_unix_ms();
+    let ids = [
+        "out-delivered",
+        "out-expired",
+        "out-failed",
+        "out-cancelled",
+    ];
+    {
+        let before = outbox_in(&dir);
+        for id in ids {
+            let until = if id == "out-expired" {
+                wall + 1
+            } else {
+                wall + 60_000
+            };
+            before
+                .enqueue(obligation(id, peer, until), no_record())
+                .await;
+        }
+        let cancel_rid = request_id_for("out-cancelled", peer);
+        assert_eq!(
+            before.cancel(&peer, &cancel_rid).await,
+            CancelOutcome::Cancelled
+        );
+        // One pass: "out-expired" is past its deadline, "out-failed" is
+        // rejected, "out-delivered" is delivered.
+        let failed_rid = request_id_for("out-failed", peer);
+        let transport = FailOne(failed_rid);
+        before.step(at(wall + 10, 0), &unknown, &transport).await;
+        assert!(before.snapshot().await.is_empty());
+    }
+    let mode = {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(dir.path().join(DIRECT_SEND_OUTCOMES_FILE))
+            .expect("outcomes sidecar written")
+            .permissions()
+            .mode()
+    };
+    assert_eq!(mode & 0o777, 0o600);
+    let after = outbox_in(&dir);
+    after.load(wall).await.expect("sidecars load");
+    let expect = [
+        ("out-delivered", "delivered", None),
+        ("out-expired", "expired", None),
+        ("out-failed", "failed", Some("recipient_rejected")),
+        ("out-cancelled", "cancelled", None),
+    ];
+    for (id, want, error) in expect {
+        let receipt = status(&after, peer, &request_id_for(id, peer)).await;
+        assert_eq!(receipt.status, want, "{id}");
+        assert_eq!(receipt.error.as_deref(), error, "{id}");
+        assert_eq!(receipt.payload_digest, Some(digest_of(b"hello")), "{id}");
+    }
+}
+
+/// A transport that rejects one request id and delivers the rest.
+struct FailOne([u8; 16]);
+
+impl DirectSendTransport for FailOne {
+    fn recipient_blocked(&self, _recipient: AgentId) -> TransportFuture<'_, bool> {
+        Box::pin(async { false })
+    }
+
+    fn send(
+        &self,
+        _recipient: AgentId,
+        _payload: Vec<u8>,
+        config: DmSendConfig,
+        _budget: Duration,
+    ) -> TransportFuture<'_, Result<(), DmError>> {
+        let fail = config.logical_request_id == Some(self.0);
+        Box::pin(async move {
+            if fail {
+                Err(DmError::RecipientRejected {
+                    reason: "no".to_string(),
+                })
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
+/// WHY: #1109 S2 after a restart the ACK waiter and tombstone are gone; a
+/// late ACK from the recipient must still settle the held obligation, so
+/// the worker does not send it again.
+#[tokio::test]
+async fn issue1109_late_ack_after_restart_settles_with_zero_sends() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let peer = agent(2);
+    let rid = request_id_for("order-r", peer);
+    outbox_in(&dir)
+        .enqueue(obligation("order-r", peer, NOW + 60_000), no_record())
+        .await;
+    let after = outbox_in(&dir);
+    after.load(NOW).await.expect("sidecar loads");
+    assert!(after.settle_late_ack(&rid, &peer).await);
+    assert!(after.snapshot().await.is_empty());
+    let transport = ScriptedTransport::default();
+    after.step(at(NOW, 0), &unknown, &transport).await;
+    assert_eq!(transport.calls(), 0);
+    let receipt = status(&after, peer, &rid).await;
+    assert_eq!(receipt.status, "delivered");
+    assert_eq!(receipt.payload_digest, Some(digest_of(b"hello")));
+}
+
+/// WHY: #1109 S2 only the recipient's ACK proves delivery: a late ACK
+/// from another agent (or for another request) changes nothing.
+#[tokio::test]
+async fn issue1109_late_ack_from_another_agent_changes_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let outbox = outbox_in(&dir);
+    let peer = agent(2);
+    let rid = request_id_for("order-s", peer);
+    outbox
+        .enqueue(obligation("order-s", peer, NOW + 60_000), no_record())
+        .await;
+    assert!(!outbox.settle_late_ack(&rid, &agent(9)).await);
+    assert!(!outbox.settle_late_ack(&[0x77; 16], &peer).await);
+    assert_eq!(outbox.snapshot().await.len(), 1);
+    assert_eq!(status(&outbox, peer, &rid).await.status, "queued");
+}
+
+/// WHY: #1109 S2 a durable-capable advert from a recipient makes its held
+/// sends due now instead of at the next retry time, and only its own.
+#[tokio::test]
+async fn issue1109_advert_nudge_makes_only_that_recipients_sends_due() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let outbox = outbox_in(&dir);
+    let (cold, other) = (agent(2), agent(3));
+    outbox
+        .enqueue(obligation("nudge-a", cold, NOW + 600_000), no_record())
+        .await;
+    outbox
+        .enqueue(obligation("nudge-b", other, NOW + 600_000), no_record())
+        .await;
+    let unavailable = || Err(DmError::AckSemanticsUnavailable("no v2 advert".to_string()));
+    let transport = ScriptedTransport::with(vec![unavailable(), unavailable()]);
+    outbox.step(at(NOW, 0), &unknown, &transport).await;
+    assert_eq!(transport.calls(), 2);
+
+    assert!(outbox.nudge_recipient(&cold, at(NOW + 100, 100)).await);
+    assert!(!outbox.nudge_recipient(&agent(9), at(NOW + 100, 100)).await);
+    outbox.step(at(NOW + 100, 100), &unknown, &transport).await;
+    assert_eq!(
+        transport.calls(),
+        3,
+        "only the nudged recipient was sent to"
+    );
+    let held = outbox.snapshot().await;
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].recipient, hex::encode(other.as_bytes()));
+    assert_eq!(
+        held[0].next_retry_at_ms, 2_000,
+        "the other schedule is unchanged"
+    );
+}
+
+/// WHY: #1109 S2 a bad outcomes sidecar must not stop the daemon: it is
+/// moved aside, the outcomes start empty and the outbox keeps working.
+#[tokio::test]
+async fn issue1109_corrupt_outcomes_sidecar_is_moved_aside() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(DIRECT_SEND_OUTCOMES_FILE);
+    std::fs::write(&path, b"{not json").expect("write garbage");
+    let outbox = outbox_in(&dir);
+    let error = outbox
+        .load(42)
+        .await
+        .expect_err("a corrupt sidecar is reported");
+    assert!(error.contains("moved aside"), "{error}");
+    assert!(!path.exists());
+    assert!(path.with_extension("corrupt-42").exists());
+    assert_eq!(
+        outbox
+            .enqueue(
+                obligation("after-corrupt", agent(2), NOW + 60_000),
+                no_record()
+            )
+            .await,
+        EnqueueOutcome::Queued
+    );
 }

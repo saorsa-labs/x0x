@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Queued direct-send outcomes survive a restart (#1109 slice S2, A07
+  amendment of 16 Nov 2026).** `delivered`, `expired`, `failed` and
+  `cancelled`, with the payload digest, are kept 24 h in
+  `direct_send_outcomes.json` (0600) and loaded at start. A late durable ACK
+  after a restart settles a held send without a resend, and a recipient's
+  durable-capable advert makes its held sends due at once.
 - **A refused granted write names a fixed reason (#1094, review of #1953;
   A03 amendment of 16 Nov 2026).** The granted agent no longer forwards its
   store's error text to a remote grantee; the reply carries one of
