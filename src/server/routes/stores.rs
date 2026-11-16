@@ -791,17 +791,12 @@ pub(in crate::server) async fn get_kv_value(
         handle.clone()
     };
 
-    match handle.get(&key).await {
-        Ok(Some(mut entry)) => {
+    match handle.get_with_writer(&key).await {
+        Ok(Some((mut entry, writer))) => {
             use base64::Engine;
             let value_b64 = BASE64.encode(&entry.value);
             // #1094 P2: the writer mark is shown as `writer`, not as raw
-            // metadata, and only for the version just read.
-            let writer = handle
-                .entry_writer_with_hash(&key)
-                .await
-                .filter(|(hash, _)| *hash == entry.content_hash)
-                .map(|(_, writer)| writer);
+            // metadata. It comes from the same snapshot as the value.
             x0x::kv::provenance::strip(&mut entry.metadata);
             (
                 StatusCode::OK,
@@ -812,7 +807,7 @@ pub(in crate::server) async fn get_kv_value(
                     "content_type": entry.content_type,
                     "content_hash": entry.content_hash,
                     "metadata": entry.metadata,
-                    "writer": writer_json(writer.as_ref()),
+                    "writer": writer_json(Some(&writer)),
                     "created_at": entry.created_at,
                     "updated_at": entry.updated_at,
                 })),

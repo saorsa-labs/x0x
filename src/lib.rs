@@ -28320,23 +28320,6 @@ impl KvStoreHandle {
         *self.sync.read().await.id()
     }
 
-    /// #1094 P2: who wrote `key`'s current entry, and the content hash
-    /// (hex) of the version that answer is for, read together. A caller
-    /// that read the value separately shows the writer only when the hash
-    /// matches, so a write in between is never attributed to the wrong
-    /// value. `None` when the key is not in the store.
-    pub async fn entry_writer_with_hash(
-        &self,
-        key: &str,
-    ) -> Option<(String, kv::provenance::EntryWriter)> {
-        let store = self.sync.read().await;
-        let entry = store.get(key)?;
-        Some((
-            hex::encode(entry.content_hash),
-            kv::provenance::verify(store.id(), key, entry),
-        ))
-    }
-
     /// Who wrote `key`'s current entry, by its writer mark (#1094 P1);
     /// `None` when the key is not in the store.
     pub async fn entry_writer(&self, key: &str) -> Option<kv::provenance::EntryWriter> {
@@ -28638,6 +28621,41 @@ impl KvStoreHandle {
             metadata: e.metadata.clone(),
             created_at: e.created_at,
             updated_at: e.updated_at,
+        }))
+    }
+
+    /// #1094 P2 (review of #1974): [`get`](Self::get) and the entry's
+    /// writer, read from one snapshot under one lock, so the writer shown
+    /// is always the writer of exactly the value, content type and metadata
+    /// returned.
+    ///
+    /// # Errors
+    ///
+    /// As [`get`](Self::get).
+    pub async fn get_with_writer(
+        &self,
+        key: &str,
+    ) -> error::Result<Option<(KvEntrySnapshot, kv::provenance::EntryWriter)>> {
+        self.sync
+            .authorize_local_read(&self.agent_id)
+            .await
+            .map_err(|error| match error {
+                kv::KvError::Unauthorized(message) => error::IdentityError::Unauthorized(message),
+                other => error::IdentityError::Storage(std::io::Error::other(other.to_string())),
+            })?;
+        let store = self.sync.read().await;
+        Ok(store.get(key).map(|e| {
+            let writer = kv::provenance::verify(store.id(), key, e);
+            let snapshot = KvEntrySnapshot {
+                key: e.key.clone(),
+                value: e.value.clone(),
+                content_hash: hex::encode(e.content_hash),
+                content_type: e.content_type.clone(),
+                metadata: e.metadata.clone(),
+                created_at: e.created_at,
+                updated_at: e.updated_at,
+            };
+            (snapshot, writer)
         }))
     }
 

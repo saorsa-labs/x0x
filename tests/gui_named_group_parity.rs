@@ -1891,7 +1891,11 @@ fn response_fields(method: Method, path: &str) -> &'static [&'static str] {
             "/groups/:id/stores/:app/legacy-imports/:source_id",
             &["snapshot_b64", "source_store_id", "source_digest"],
         ),
-        (Method::Get, "/stores/:id/:key", &["value", "published"]),
+        (
+            Method::Get,
+            "/stores/:id/:key",
+            &["value", "published", "writer"],
+        ),
         (Method::Put, "/stores/:id/:key", &["published"]),
         (Method::Get, "/stores/:id/keys", &["keys"]),
         (
