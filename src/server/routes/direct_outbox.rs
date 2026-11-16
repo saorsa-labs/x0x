@@ -19,9 +19,21 @@
 //! attempt. The store survives a restart. The commit, caps, retry schedule
 //! and boot load are the generic [`Outbox`].
 //!
-//! The terminal outcomes (`delivered`, `expired`, `failed`) are kept in
-//! memory with the same TTL and cap as the DM receipt ledger, so
-//! `GET /direct/receipts/{logical_id}` can report them.
+//! The terminal outcomes (`delivered`, `expired`, `failed`, `cancelled`)
+//! are kept in memory with the same TTL and cap as the DM receipt ledger,
+//! so `GET /direct/receipts/{logical_id}` can report them. Every receipt
+//! names the BLAKE3 digest of the bytes it proves delivered: a receipt for
+//! other bytes under the same `logical_id` never settles an obligation.
+//!
+//! Before each attempt the worker checks the recipient again: a blocked or
+//! revoked contact ends the obligation as `failed` (`recipient_blocked`).
+//!
+//! The retry schedule runs on a monotonic clock in memory; only the
+//! deadline and `first_seen_ms` use the wall clock. At load every held
+//! obligation is due at once.
+//!
+//! The sidecar holds the payloads unsealed (base64), written with
+//! owner-only permissions (0600) like the daemon's other sidecars.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -73,6 +85,62 @@ pub(in crate::server) fn now_unix_ms() -> u64 {
         .unwrap_or_default()
 }
 
+/// The two clocks a worker pass reads.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::server) struct DirectSendNow {
+    /// Unix ms: compared with `deliver_until_ms`.
+    pub(in crate::server) wall_ms: u64,
+    /// Monotonic ms since this process first read it: the retry schedule.
+    pub(in crate::server) mono_ms: u64,
+}
+
+impl DirectSendNow {
+    /// The current wall and monotonic time.
+    pub(in crate::server) fn current() -> Self {
+        static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        let start = START.get_or_init(Instant::now);
+        Self {
+            wall_ms: now_unix_ms(),
+            mono_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+        }
+    }
+}
+
+/// What the DM receipt ledger knows about one request id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::server) struct LedgerReceipt {
+    pub(in crate::server) status: DmReceiptStatus,
+    /// BLAKE3 of the bytes the recorded send carried, when known.
+    pub(in crate::server) digest: Option<[u8; 32]>,
+}
+
+impl LedgerReceipt {
+    /// Read the agent's ledger for `request_id`.
+    pub(in crate::server) fn of(acks: &crate::dm::InFlightAcks, request_id: &[u8; 16]) -> Self {
+        Self {
+            status: acks.receipt_status(request_id),
+            digest: acks.receipt_digest(request_id),
+        }
+    }
+
+    fn delivered(&self) -> bool {
+        matches!(
+            self.status,
+            DmReceiptStatus::Delivered | DmReceiptStatus::DeliveredLate
+        )
+    }
+
+    /// The ledger proves delivery of exactly the bytes with `digest`.
+    fn delivered_bytes(&self, digest: &[u8; 32]) -> bool {
+        self.delivered() && self.digest.as_ref() == Some(digest)
+    }
+
+    /// The ledger proves delivery of other bytes than `digest`.
+    fn delivered_other_bytes(&self, digest: &[u8; 32]) -> bool {
+        self.delivered() && self.digest.is_some_and(|d| d != *digest)
+    }
+}
+
 /// The request options of `POST /direct/send` that shape the send config.
 /// The worker builds the same config the route would build from them.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,7 +173,8 @@ pub(in crate::server) struct DirectSendObligation {
     pub(in crate::server) first_seen_ms: u64,
     /// Attempts completed so far.
     pub(in crate::server) retry_count: u32,
-    /// Unix ms when the next attempt is due.
+    /// When the next attempt is due, in ms of this process's monotonic
+    /// clock ([`DirectSendNow::mono_ms`]). Reset to 0 (due) at load.
     pub(in crate::server) next_retry_at_ms: u64,
     /// The route error code of the last failed attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -120,6 +189,11 @@ impl DirectSendObligation {
     pub(in crate::server) fn request_id_bytes(&self) -> Option<[u8; 16]> {
         let bytes = hex::decode(&self.request_id).ok()?;
         bytes.try_into().ok()
+    }
+
+    /// BLAKE3 of the payload: the bytes a receipt must name.
+    pub(in crate::server) fn payload_digest(&self) -> [u8; 32] {
+        blake3::hash(&self.payload).into()
     }
 }
 
@@ -166,10 +240,8 @@ impl OutboxRecord for DirectSendObligation {
         self.payload.len()
     }
 
-    /// An obligation is also due at its deadline, so a pass drops it as
-    /// `expired` then, not at a later retry time.
     fn next_retry_at_ms(&self) -> u64 {
-        self.next_retry_at_ms.min(self.deliver_until_ms)
+        self.next_retry_at_ms
     }
 
     fn retry_count(&self) -> u32 {
@@ -226,12 +298,16 @@ impl OutboxRecord for DirectSendObligation {
 /// What became of an obligation that left the outbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::server) enum DirectSendTerminal {
-    /// A send returned `Ok`, or the receipt ledger showed a delivery.
+    /// A send returned `Ok`, or the receipt ledger showed a delivery of
+    /// the same bytes.
     Delivered,
     /// The deadline passed before a delivery.
     Expired,
-    /// A send failed with an error a retry cannot repair (route code).
+    /// A send failed with an error a retry cannot repair, or the recipient
+    /// is blocked (route code).
     Failed(String),
+    /// The caller cancelled the queued send.
+    Cancelled,
 }
 
 impl DirectSendTerminal {
@@ -241,6 +317,7 @@ impl DirectSendTerminal {
             Self::Delivered => ("delivered", None),
             Self::Expired => ("expired", None),
             Self::Failed(code) => ("failed", Some(code)),
+            Self::Cancelled => ("cancelled", None),
         };
         DirectSendReceipt { status, error }
     }
@@ -249,6 +326,8 @@ impl DirectSendTerminal {
 #[derive(Debug)]
 struct TerminalEntry {
     outcome: DirectSendTerminal,
+    /// BLAKE3 of the obligation's payload.
+    digest: [u8; 32],
     expires: Instant,
     seq: u64,
 }
@@ -276,7 +355,13 @@ impl TerminalLedger {
         }
     }
 
-    fn record(&mut self, request_id: [u8; 16], outcome: DirectSendTerminal, now: Instant) {
+    fn record(
+        &mut self,
+        request_id: [u8; 16],
+        outcome: DirectSendTerminal,
+        digest: [u8; 32],
+        now: Instant,
+    ) {
         self.prune(now);
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
@@ -284,6 +369,7 @@ impl TerminalLedger {
             request_id,
             TerminalEntry {
                 outcome,
+                digest,
                 expires: now + RECEIPT_LEDGER_TTL,
                 seq,
             },
@@ -303,45 +389,67 @@ impl TerminalLedger {
         self.entries.remove(request_id);
     }
 
-    fn get(&mut self, request_id: &[u8; 16], now: Instant) -> Option<DirectSendTerminal> {
+    fn get(
+        &mut self,
+        request_id: &[u8; 16],
+        now: Instant,
+    ) -> Option<(DirectSendTerminal, [u8; 32])> {
         self.prune(now);
         self.entries
             .get(request_id)
             .filter(|e| e.expires > now)
-            .map(|e| e.outcome.clone())
+            .map(|e| (e.outcome.clone(), e.digest))
     }
 }
 
-/// The send a worker pass makes. Production sends through the agent;
-/// tests count calls and script the results.
+/// A boxed future the transport returns.
+pub(in crate::server) type TransportFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// The send a worker pass makes, and the recipient check before it.
+/// Production uses the daemon; tests count calls and script the results.
 pub(in crate::server) trait DirectSendTransport: Send + Sync {
+    /// Is `recipient` blocked or revoked now? Checked before each attempt,
+    /// as the route checks it at accept.
+    fn recipient_blocked(&self, recipient: AgentId) -> TransportFuture<'_, bool>;
+
     /// Send `payload` to `recipient` once with `config`, taking no longer
     /// than `budget`.
-    fn send<'a>(
-        &'a self,
+    fn send(
+        &self,
         recipient: AgentId,
         payload: Vec<u8>,
         config: DmSendConfig,
         budget: Duration,
-    ) -> Pin<Box<dyn Future<Output = Result<(), DmError>> + Send + 'a>>;
+    ) -> TransportFuture<'_, Result<(), DmError>>;
 }
 
-/// The production transport: the agent's durable DM send, the call the
-/// route makes.
-pub(in crate::server) struct AgentDirectSendTransport<'a>(pub(in crate::server) &'a crate::Agent);
+/// The production transport: the daemon's contact store and the agent's
+/// durable DM send, the call the route makes.
+pub(in crate::server) struct AgentDirectSendTransport<'a>(
+    pub(in crate::server) &'a crate::server::state::AppState,
+);
 
 impl DirectSendTransport for AgentDirectSendTransport<'_> {
-    fn send<'a>(
-        &'a self,
+    fn recipient_blocked(&self, recipient: AgentId) -> TransportFuture<'_, bool> {
+        Box::pin(async move {
+            let contacts = self.0.contacts.read().await;
+            contacts.trust_level(&recipient) == crate::contacts::TrustLevel::Blocked
+                || contacts.is_revoked(&recipient)
+        })
+    }
+
+    fn send(
+        &self,
         recipient: AgentId,
         payload: Vec<u8>,
         config: DmSendConfig,
         budget: Duration,
-    ) -> Pin<Box<dyn Future<Output = Result<(), DmError>> + Send + 'a>> {
+    ) -> TransportFuture<'_, Result<(), DmError>> {
         Box::pin(async move {
             match tokio::time::timeout(
                 budget,
                 self.0
+                    .agent
                     .send_direct_with_config_with_provenance(&recipient, payload, config),
             )
             .await
@@ -356,6 +464,9 @@ impl DirectSendTransport for AgentDirectSendTransport<'_> {
         })
     }
 }
+
+/// The terminal code of an obligation whose recipient is blocked.
+pub(in crate::server) const RECIPIENT_BLOCKED: &str = "recipient_blocked";
 
 /// Errors after which the worker keeps the obligation and tries again.
 pub(in crate::server) fn is_retryable(error: &DmError) -> bool {
@@ -377,16 +488,31 @@ pub(in crate::server) fn is_retryable(error: &DmError) -> bool {
 /// The answer to one enqueue.
 #[derive(Debug, PartialEq, Eq)]
 pub(in crate::server) enum EnqueueOutcome {
-    /// A new obligation is stored.
+    /// A new obligation is stored durably.
     Queued,
     /// The same `logical_id`, recipient and payload is already held; its
     /// stored deadline is returned and nothing new is stored.
     AlreadyQueued { deliver_until_ms: u64 },
-    /// The same `logical_id` and recipient is held with other bytes.
+    /// The same `logical_id` and recipient is held, or was delivered, with
+    /// other bytes.
     Conflict,
     /// The recipient's or the daemon's caps are full.
     Full,
+    /// The file was renamed into place but the directory fsync failed: the
+    /// obligation is held and may be sent, but may not survive a crash.
+    NotDurable(String),
     /// The durable write failed; nothing is stored.
+    WriteFailed(String),
+}
+
+/// The answer to one cancel.
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::server) enum CancelOutcome {
+    /// The held obligation was removed.
+    Cancelled,
+    /// No obligation is held under this key.
+    NotHeld,
+    /// The write failed before the rename; the obligation is still held.
     WriteFailed(String),
 }
 
@@ -397,14 +523,23 @@ pub(in crate::server) struct DirectSendReceipt {
     pub(in crate::server) error: Option<String>,
 }
 
+impl DirectSendReceipt {
+    fn plain(status: &'static str) -> Self {
+        Self {
+            status,
+            error: None,
+        }
+    }
+}
+
 /// The durable send outbox: the store, its sidecar path, the locks and
 /// the terminal-outcome ledger.
 pub(in crate::server) struct DirectSendOutbox {
     entries: RwLock<OutboxMap<DirectSendObligation>>,
     path: PathBuf,
     persist_lock: Mutex<()>,
-    /// Serializes enqueue: the idempotency and cap checks and the insert
-    /// are one step, so the generic insert never evicts an entry.
+    /// Serializes enqueue, cancel and drop: the checks and the write are
+    /// one step, so the generic insert never evicts an entry.
     admission: Mutex<()>,
     terminal: std::sync::Mutex<TerminalLedger>,
 }
@@ -436,10 +571,24 @@ impl DirectSendOutbox {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    fn record_terminal(&self, outcomes: Vec<([u8; 16], DirectSendTerminal, [u8; 32])>) {
+        let now = Instant::now();
+        let mut terminal = self.terminal();
+        for (request_id, outcome, digest) in outcomes {
+            terminal.record(request_id, outcome, digest, now);
+        }
+    }
+
     /// Load the sidecar at boot. Missing means empty; a bad file is moved
-    /// aside and the outbox starts empty (the error is returned).
+    /// aside and the outbox starts empty (the error is returned). Every
+    /// loaded obligation is due at once: the persisted schedule belongs to
+    /// the previous process's monotonic clock.
     pub(in crate::server) async fn load(&self, aside_stamp_ms: u64) -> Result<(), String> {
-        self.outbox().load(aside_stamp_ms).await
+        let loaded = self.outbox().load(aside_stamp_ms).await;
+        for obligation in self.entries.write().await.values_mut().flatten() {
+            obligation.next_retry_at_ms = 0;
+        }
+        loaded
     }
 
     /// All held obligations (test view).
@@ -448,12 +597,16 @@ impl DirectSendOutbox {
         self.outbox().snapshot().await
     }
 
-    /// Store `obligation` unless the same request is already held.
+    /// Store `obligation` unless the same request is already held. `ledger`
+    /// is what the DM receipt ledger knows about its request id.
     pub(in crate::server) async fn enqueue(
         &self,
-        obligation: DirectSendObligation,
+        mut obligation: DirectSendObligation,
+        ledger: LedgerReceipt,
     ) -> EnqueueOutcome {
         let _admission = self.admission.lock().await;
+        let digest = obligation.payload_digest();
+        let request_id = obligation.request_id_bytes();
         {
             let entries = self.entries.read().await;
             if let Some(held) = entries
@@ -468,7 +621,17 @@ impl DirectSendOutbox {
                     EnqueueOutcome::Conflict
                 };
             }
-            // The same caps `Outbox::validate` checks at load, applied to the
+            // A delivery of other bytes under this key: the recipient holds
+            // them, so these bytes can never be delivered under it.
+            let delivered_other = request_id
+                .and_then(|id| self.terminal().get(&id, Instant::now()))
+                .is_some_and(|(outcome, d)| {
+                    outcome == DirectSendTerminal::Delivered && d != digest
+                });
+            if delivered_other || ledger.delivered_other_bytes(&digest) {
+                return EnqueueOutcome::Conflict;
+            }
+            // The caps `Outbox::validate` checks at load, applied to the
             // store with this entry added.
             let caps = DIRECT_SEND_OUTBOX_CAPS;
             let size = obligation.byte_size();
@@ -490,83 +653,182 @@ impl DirectSendOutbox {
                 return EnqueueOutcome::Full;
             }
         }
-        let request_id = obligation.request_id_bytes();
-        let written = self.outbox().insert(obligation).await;
-        match written {
-            Ok(()) => {}
+        // Due at once on this process's monotonic clock.
+        obligation.next_retry_at_ms = 0;
+        let outcome = match self.outbox().insert(obligation).await {
+            Ok(()) => EnqueueOutcome::Queued,
             Err(e) if e.crossed_rename() => {
                 tracing::error!(
                     error = %e,
                     "#1109: direct send obligation stored, but durability is not confirmed \
                      (directory fsync failed)"
                 );
+                EnqueueOutcome::NotDurable(e.to_string())
             }
             Err(e) => return EnqueueOutcome::WriteFailed(e.to_string()),
-        }
+        };
         if let Some(request_id) = request_id {
             self.terminal().forget(&request_id);
         }
-        EnqueueOutcome::Queued
+        outcome
     }
 
-    async fn held(&self, recipient_hex: &str, request_id_hex: &str) -> bool {
+    /// Remove the held obligation `request_id` to `recipient` and record it
+    /// as `cancelled`. An attempt already in flight is not recalled.
+    pub(in crate::server) async fn cancel(
+        &self,
+        recipient: &AgentId,
+        request_id: &[u8; 16],
+    ) -> CancelOutcome {
+        let _admission = self.admission.lock().await;
+        let recipient_hex = hex::encode(recipient.as_bytes());
+        let request_hex = hex::encode(request_id);
+        let held = self
+            .entries
+            .read()
+            .await
+            .get(&recipient_hex)
+            .and_then(|list| list.iter().find(|o| o.request_id == request_hex).cloned());
+        let Some(held) = held else {
+            return CancelOutcome::NotHeld;
+        };
+        let digest = held.payload_digest();
+        match self.remove(vec![held]).await {
+            Ok(()) => {
+                self.record_terminal(vec![(*request_id, DirectSendTerminal::Cancelled, digest)]);
+                CancelOutcome::Cancelled
+            }
+            Err(e) => CancelOutcome::WriteFailed(e),
+        }
+    }
+
+    /// Remove every obligation held for `recipient` and record each as
+    /// `failed` with `code` (a contact was blocked). Returns how many.
+    pub(in crate::server) async fn drop_recipient(&self, recipient: &AgentId, code: &str) -> usize {
+        let _admission = self.admission.lock().await;
+        let held: Vec<DirectSendObligation> = self
+            .entries
+            .read()
+            .await
+            .get(&hex::encode(recipient.as_bytes()))
+            .cloned()
+            .unwrap_or_default();
+        if held.is_empty() {
+            return 0;
+        }
+        let outcomes: Vec<_> = held
+            .iter()
+            .filter_map(|o| {
+                o.request_id_bytes().map(|id| {
+                    (
+                        id,
+                        DirectSendTerminal::Failed(code.to_string()),
+                        o.payload_digest(),
+                    )
+                })
+            })
+            .collect();
+        let count = held.len();
+        match self.remove(held).await {
+            Ok(()) => {
+                self.record_terminal(outcomes);
+                count
+            }
+            Err(e) => {
+                tracing::error!("#1109: failed to drop queued sends to a blocked contact: {e}");
+                0
+            }
+        }
+    }
+
+    /// Remove `entries` durably. A failure after the rename counts as
+    /// removed (memory and disk hold the new set).
+    async fn remove(&self, entries: Vec<DirectSendObligation>) -> Result<(), String> {
+        match self
+            .outbox()
+            .settle(0, &entries, &[], DIRECT_SEND_RETRY_SECS)
+            .await
+        {
+            Settled::Committed { .. } => Ok(()),
+            Settled::Unconfirmed(e) => {
+                tracing::error!(
+                    error = %e,
+                    "#1109: direct send outbox applied, but durability is not confirmed"
+                );
+                Ok(())
+            }
+            Settled::RolledBack(e) => Err(e.to_string()),
+        }
+    }
+
+    async fn held(&self, recipient_hex: &str, request_id_hex: &str) -> Option<[u8; 32]> {
         self.entries
             .read()
             .await
             .get(recipient_hex)
-            .is_some_and(|list| list.iter().any(|o| o.request_id == request_id_hex))
+            .and_then(|list| list.iter().find(|o| o.request_id == request_id_hex))
+            .map(DirectSendObligation::payload_digest)
     }
 
-    /// The receipt status of `request_id` to `recipient`. A delivery in the
-    /// DM ledger wins; then a held obligation reads `queued`; then a
-    /// terminal outcome; then the DM ledger's own answer.
+    /// The receipt status of `request_id` to `recipient`. A held obligation
+    /// reads `queued`, unless the DM ledger already proves delivery of its
+    /// bytes; then a DM ledger delivery; then a terminal outcome; then the
+    /// DM ledger's own answer.
     pub(in crate::server) async fn receipt(
         &self,
         recipient: &AgentId,
         request_id: &[u8; 16],
-        ledger: DmReceiptStatus,
+        ledger: LedgerReceipt,
     ) -> DirectSendReceipt {
-        if matches!(
-            ledger,
-            DmReceiptStatus::Delivered | DmReceiptStatus::DeliveredLate
-        ) {
-            return DirectSendReceipt {
-                status: ledger.as_str(),
-                error: None,
-            };
-        }
-        if self
+        let held = self
             .held(&hex::encode(recipient.as_bytes()), &hex::encode(request_id))
-            .await
-        {
-            return DirectSendReceipt {
-                status: "queued",
-                error: None,
-            };
+            .await;
+        match held {
+            Some(digest) if ledger.delivered_bytes(&digest) => {
+                return DirectSendReceipt::plain(ledger.status.as_str());
+            }
+            Some(_) => return DirectSendReceipt::plain("queued"),
+            None => {}
+        }
+        if ledger.delivered() {
+            return DirectSendReceipt::plain(ledger.status.as_str());
         }
         match self.terminal().get(request_id, Instant::now()) {
-            Some(outcome) => outcome.receipt(),
-            None => DirectSendReceipt {
-                status: ledger.as_str(),
-                error: None,
-            },
+            Some((outcome, _)) => outcome.receipt(),
+            None => DirectSendReceipt::plain(ledger.status.as_str()),
         }
     }
 
-    /// One worker pass at `now_ms`. `ledger` is the DM receipt ledger
-    /// lookup; `transport` makes the sends.
+    /// Obligations due at `now`: the retry time has come on the monotonic
+    /// clock, or the deadline on the wall clock. First attempts first.
+    async fn due(&self, now: DirectSendNow) -> Vec<DirectSendObligation> {
+        let mut due: Vec<DirectSendObligation> = self
+            .entries
+            .read()
+            .await
+            .values()
+            .flatten()
+            .filter(|o| o.next_retry_at_ms <= now.mono_ms || o.deliver_until_ms <= now.wall_ms)
+            .cloned()
+            .collect();
+        due.sort_by_key(|o| (o.retry_count > 0, o.next_retry_at_ms));
+        due
+    }
+
+    /// One worker pass at `now`. `ledger` reads the DM receipt ledger;
+    /// `transport` checks the recipient and makes the sends.
     pub(in crate::server) async fn step(
         &self,
-        now_ms: u64,
-        ledger: &(dyn Fn(&[u8; 16]) -> DmReceiptStatus + Sync),
+        now: DirectSendNow,
+        ledger: &(dyn Fn(&[u8; 16]) -> LedgerReceipt + Sync),
         transport: &dyn DirectSendTransport,
     ) {
-        let due = self.outbox().due(now_ms).await;
+        let due = self.due(now).await;
         if due.is_empty() {
             return;
         }
         let mut resolved: Vec<DirectSendObligation> = Vec::new();
-        let mut outcomes: Vec<([u8; 16], DirectSendTerminal)> = Vec::new();
+        let mut outcomes: Vec<([u8; 16], DirectSendTerminal, [u8; 32])> = Vec::new();
         let mut to_send: Vec<(DirectSendObligation, [u8; 16], AgentId)> = Vec::new();
         for obligation in due {
             let parsed = obligation
@@ -577,16 +839,27 @@ impl DirectSendOutbox {
                 resolved.push(obligation);
                 continue;
             };
-            if matches!(
-                ledger(&request_id),
-                DmReceiptStatus::Delivered | DmReceiptStatus::DeliveredLate
-            ) {
-                outcomes.push((request_id, DirectSendTerminal::Delivered));
+            let digest = obligation.payload_digest();
+            if ledger(&request_id).delivered_bytes(&digest) {
+                outcomes.push((request_id, DirectSendTerminal::Delivered, digest));
                 resolved.push(obligation);
-            } else if now_ms >= obligation.deliver_until_ms {
-                outcomes.push((request_id, DirectSendTerminal::Expired));
+            } else if now.wall_ms >= obligation.deliver_until_ms {
+                outcomes.push((request_id, DirectSendTerminal::Expired, digest));
                 resolved.push(obligation);
-            } else if to_send.len() < DIRECT_SEND_PASS_BUDGET {
+            } else if to_send.len() >= DIRECT_SEND_PASS_BUDGET {
+                // Stays due for the next pass.
+            } else if transport.recipient_blocked(recipient).await {
+                tracing::warn!(
+                    request_id = %obligation.request_id,
+                    "#1109: queued direct send dropped: the recipient is blocked"
+                );
+                outcomes.push((
+                    request_id,
+                    DirectSendTerminal::Failed(RECIPIENT_BLOCKED.to_string()),
+                    digest,
+                ));
+                resolved.push(obligation);
+            } else {
                 to_send.push((obligation, request_id, recipient));
             }
         }
@@ -595,7 +868,7 @@ impl DirectSendOutbox {
             .into_iter()
             .map(|(obligation, request_id, recipient)| {
                 let left =
-                    Duration::from_millis(obligation.deliver_until_ms.saturating_sub(now_ms));
+                    Duration::from_millis(obligation.deliver_until_ms.saturating_sub(now.wall_ms));
                 let budget = left.min(DIRECT_SEND_ATTEMPT_BUDGET);
                 let mut config = super::direct::send_config_from_options(&obligation.options, true);
                 config.logical_request_id = Some(request_id);
@@ -611,9 +884,10 @@ impl DirectSendOutbox {
 
         let mut attempts: Vec<(DirectSendObligation, bool)> = Vec::new();
         for (mut obligation, request_id, result) in results {
+            let digest = obligation.payload_digest();
             match result {
                 Ok(()) => {
-                    outcomes.push((request_id, DirectSendTerminal::Delivered));
+                    outcomes.push((request_id, DirectSendTerminal::Delivered, digest));
                     attempts.push((obligation, true));
                 }
                 Err(error) => {
@@ -630,7 +904,11 @@ impl DirectSendOutbox {
                             request_id = %obligation.request_id,
                             "#1109: queued direct send failed ({code}): {error}"
                         );
-                        outcomes.push((request_id, DirectSendTerminal::Failed(code.to_string())));
+                        outcomes.push((
+                            request_id,
+                            DirectSendTerminal::Failed(code.to_string()),
+                            digest,
+                        ));
                         resolved.push(obligation);
                     }
                 }
@@ -639,7 +917,7 @@ impl DirectSendOutbox {
 
         match self
             .outbox()
-            .settle(now_ms, &resolved, &attempts, DIRECT_SEND_RETRY_SECS)
+            .settle(now.mono_ms, &resolved, &attempts, DIRECT_SEND_RETRY_SECS)
             .await
         {
             Settled::Committed { .. } => {}
@@ -656,11 +934,7 @@ impl DirectSendOutbox {
                 return;
             }
         }
-        let now = Instant::now();
-        let mut terminal = self.terminal();
-        for (request_id, outcome) in outcomes {
-            terminal.record(request_id, outcome, now);
-        }
+        self.record_terminal(outcomes);
     }
 }
 

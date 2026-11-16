@@ -17,7 +17,11 @@ All notable changes to this project will be documented in this file.
   restart. `GET /direct/receipts/:logical_id` adds `queued`, `expired` and
   `failed` (with `error`). New 400 codes `deliver_until_requires_durable`,
   `deliver_until_requires_logical_id`, `deliver_until_passed`,
-  `deliver_until_too_far`, and 429 `outbox_full`.
+  `deliver_until_too_far`, 429 `outbox_full` and 503 `outbox_not_durable`.
+  `DELETE /direct/receipts/:logical_id` (`x0x direct cancel`) cancels a held
+  send. Receipts are bound to a BLAKE3 digest of the payload; a blocked or
+  revoked contact gets no queued send (`failed`, `recipient_blocked`).
+  Queued payloads are stored unsealed in a 0600 file.
 - **An `rw` grantee writes a store through a `ShareCap::Data` grant (#1094
   slice D2, A03 amendment of 16 Nov 2026).** `PUT` and
   `DELETE /grants/data/:agent/:group/:store/:key` (`x0x grant data put|rm`)

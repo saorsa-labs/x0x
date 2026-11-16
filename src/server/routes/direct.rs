@@ -18,8 +18,8 @@ use std::time::Duration;
 use x0x::contacts::TrustLevel;
 
 use super::direct_outbox::{
-    now_unix_ms, DirectSendObligation, DirectSendOptions, DirectSendOutbox, DirectSendReceipt,
-    EnqueueOutcome, DIRECT_SEND_MAX_HORIZON_MS,
+    now_unix_ms, CancelOutcome, DirectSendObligation, DirectSendOptions, DirectSendOutbox,
+    DirectSendReceipt, EnqueueOutcome, LedgerReceipt, DIRECT_SEND_MAX_HORIZON_MS,
 };
 
 pub(in crate::server) fn direct_message_send_config() -> x0x::dm::DmSendConfig {
@@ -221,89 +221,113 @@ fn deliver_until_for_request(
     Ok(Some((deliver_until_ms, request_id)))
 }
 
-/// #1109: store a validated send as a durable obligation and answer 202
-/// `outcome: "queued"` (or the same 202 for a repeat of a held send).
-/// `deadline` is `(deliver_until_ms, request_id)` from
-/// [`deliver_until_for_request`].
-async fn queue_direct_send(
-    outbox: &DirectSendOutbox,
+/// #1109: the obligation a validated queued send stores. `deadline` is
+/// `(deliver_until_ms, request_id)` from [`deliver_until_for_request`].
+fn queued_obligation(
     logical_id: &str,
     options: DirectSendOptions,
     recipient: x0x::identity::AgentId,
     payload: Vec<u8>,
     (deliver_until_ms, request_id): (u64, [u8; 16]),
     now_ms: u64,
+) -> DirectSendObligation {
+    DirectSendObligation {
+        recipient: hex::encode(recipient.as_bytes()),
+        logical_id: logical_id.to_string(),
+        request_id: hex::encode(request_id),
+        payload,
+        deliver_until_ms,
+        first_seen_ms: now_ms,
+        retry_count: 0,
+        next_retry_at_ms: 0,
+        last_error: None,
+        options,
+    }
+}
+
+/// #1109: store `obligation` and answer 202 `outcome: "queued"` (or the
+/// same 202 for a repeat of a held send). `ledger` is what the DM receipt
+/// ledger knows about its request id.
+async fn queue_direct_send(
+    outbox: &DirectSendOutbox,
+    obligation: DirectSendObligation,
+    ledger: LedgerReceipt,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if payload.len() > x0x::dm::MAX_PAYLOAD_BYTES {
+    if obligation.payload.len() > x0x::dm::MAX_PAYLOAD_BYTES {
         return DirectSendRequestRejection {
             status: StatusCode::PAYLOAD_TOO_LARGE,
             code: "payload_too_large",
             detail: format!(
                 "DM payload exceeds MAX_PAYLOAD_BYTES ({} > {})",
-                payload.len(),
+                obligation.payload.len(),
                 x0x::dm::MAX_PAYLOAD_BYTES
             ),
         }
         .into_response();
     }
-    let agent_hex = hex::encode(recipient.as_bytes());
-    let request_hex = hex::encode(request_id);
-    let obligation = DirectSendObligation {
-        recipient: agent_hex.clone(),
-        logical_id: logical_id.to_string(),
-        request_id: request_hex.clone(),
-        payload,
-        deliver_until_ms,
-        first_seen_ms: now_ms,
-        retry_count: 0,
-        next_retry_at_ms: now_ms,
-        last_error: None,
-        options,
+    let body = serde_json::json!({
+        "ok": true,
+        "outcome": "queued",
+        "logical_id": obligation.logical_id,
+        "agent_id": obligation.recipient,
+        "request_id": obligation.request_id,
+        "deliver_until_ms": obligation.deliver_until_ms,
+    });
+    let logical_id = obligation.logical_id.clone();
+    let rejection = |status, code, detail| DirectSendRequestRejection {
+        status,
+        code,
+        detail,
     };
-    let held_until = match outbox.enqueue(obligation).await {
-        EnqueueOutcome::Queued => deliver_until_ms,
-        EnqueueOutcome::AlreadyQueued { deliver_until_ms } => deliver_until_ms,
+    let held_until = match outbox.enqueue(obligation, ledger).await {
+        EnqueueOutcome::Queued => None,
+        EnqueueOutcome::AlreadyQueued { deliver_until_ms } => Some(deliver_until_ms),
         EnqueueOutcome::Conflict => {
-            return DirectSendRequestRejection {
-                status: StatusCode::CONFLICT,
-                code: "idempotency_conflict",
-                detail: format!(
-                    "logical_id {logical_id} is already queued to this recipient with \
-                     different bytes"
+            return rejection(
+                StatusCode::CONFLICT,
+                "idempotency_conflict",
+                format!(
+                    "logical_id {logical_id} is already queued or delivered to this \
+                     recipient with different bytes"
                 ),
-            }
+            )
             .into_response();
         }
         EnqueueOutcome::Full => {
-            return DirectSendRequestRejection {
-                status: StatusCode::TOO_MANY_REQUESTS,
-                code: "outbox_full",
-                detail: "the durable send outbox is full for this recipient or daemon; \
-                         retry later"
+            return rejection(
+                StatusCode::TOO_MANY_REQUESTS,
+                "outbox_full",
+                "the durable send outbox is full for this recipient or daemon; retry later"
                     .to_string(),
-            }
+            )
+            .into_response();
+        }
+        EnqueueOutcome::NotDurable(detail) => {
+            return rejection(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "outbox_not_durable",
+                format!(
+                    "the send is held and may still be sent, but its durability is not \
+                     confirmed (directory fsync failed): {detail}; check \
+                     GET /direct/receipts/{logical_id} or cancel it"
+                ),
+            )
             .into_response();
         }
         EnqueueOutcome::WriteFailed(detail) => {
-            return DirectSendRequestRejection {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                code: "outbox_write_failed",
+            return rejection(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "outbox_write_failed",
                 detail,
-            }
+            )
             .into_response();
         }
     };
-    (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({
-            "ok": true,
-            "outcome": "queued",
-            "logical_id": logical_id,
-            "agent_id": agent_hex,
-            "request_id": request_hex,
-            "deliver_until_ms": held_until,
-        })),
-    )
+    let mut body = body;
+    if let Some(held_until) = held_until {
+        body["deliver_until_ms"] = serde_json::json!(held_until);
+    }
+    (StatusCode::ACCEPTED, Json(body))
 }
 
 fn direct_send_config_for_request(
@@ -567,16 +591,16 @@ pub(in crate::server) async fn direct_send(
 
     // #1109: a send with a deadline is stored and sent by the worker.
     if let Some(deadline) = deadline {
-        return queue_direct_send(
-            &state.direct_send_outbox,
+        let obligation = queued_obligation(
             req.logical_id.as_deref().unwrap_or_default(),
             direct_send_options(&req),
             agent_id,
             payload,
             deadline,
             now_ms,
-        )
-        .await;
+        );
+        let ledger = LedgerReceipt::of(&state.agent.dm_inflight_acks(), &deadline.1);
+        return queue_direct_send(&state.direct_send_outbox, obligation, ledger).await;
     }
 
     match state
@@ -843,7 +867,7 @@ struct ReceiptLookup {
     body: serde_json::Value,
     recipient: x0x::identity::AgentId,
     request_id: [u8; 16],
-    ledger: x0x::dm::DmReceiptStatus,
+    ledger: LedgerReceipt,
 }
 
 /// #1109: the response body for one receipt lookup, or the refusal.
@@ -867,13 +891,13 @@ fn direct_receipt_body(
             detail,
         })?;
     let request_id = logical_id.request_id(self_agent_id, recipient);
-    let ledger = acks.receipt_status(&request_id);
+    let ledger = LedgerReceipt::of(acks, &request_id);
     let body = serde_json::json!({
         "ok": true,
         "logical_id": logical_id.as_str(),
         "agent_id": hex::encode(recipient.as_bytes()),
         "request_id": hex::encode(request_id),
-        "status": ledger.as_str(),
+        "status": ledger.status.as_str(),
     });
     Ok(ReceiptLookup {
         body,
@@ -915,6 +939,47 @@ pub(in crate::server) async fn direct_receipt(
             (StatusCode::OK, Json(lookup.body))
         }
         Err(rejection) => rejection.into_response(),
+    }
+}
+
+/// DELETE /direct/receipts/{logical_id}?agent_id=<hex> — #1109: cancel a
+/// queued send. The held obligation is removed and its receipt reads
+/// `cancelled`; 404 `not_queued` when none is held. An attempt already in
+/// flight is not recalled.
+pub(in crate::server) async fn direct_cancel(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(logical_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<DirectReceiptQuery>,
+) -> impl IntoResponse {
+    let acks = state.agent.dm_inflight_acks();
+    match direct_receipt_body(&logical_id, &query.agent_id, state.agent.agent_id(), &acks) {
+        Ok(lookup) => cancel_queued_send(&state.direct_send_outbox, lookup).await,
+        Err(rejection) => rejection.into_response(),
+    }
+}
+
+/// #1109: cancel the held obligation named by `lookup`.
+async fn cancel_queued_send(
+    outbox: &DirectSendOutbox,
+    mut lookup: ReceiptLookup,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match outbox.cancel(&lookup.recipient, &lookup.request_id).await {
+        CancelOutcome::Cancelled => {
+            lookup.body["status"] = serde_json::json!("cancelled");
+            (StatusCode::OK, Json(lookup.body))
+        }
+        CancelOutcome::NotHeld => DirectSendRequestRejection {
+            status: StatusCode::NOT_FOUND,
+            code: "not_queued",
+            detail: "no queued send is held under this logical_id for this agent".to_string(),
+        }
+        .into_response(),
+        CancelOutcome::WriteFailed(detail) => DirectSendRequestRejection {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "outbox_write_failed",
+            detail,
+        }
+        .into_response(),
     }
 }
 
@@ -1642,15 +1707,15 @@ mod tests {
             .logical_request_id
             .expect("logical id derives a request id");
         let queue = |payload: &'static [u8], at: u64| {
-            queue_direct_send(
-                &outbox,
+            let obligation = queued_obligation(
                 "order-9",
                 direct_send_options(&req),
                 peer,
                 payload.to_vec(),
                 (until, rid),
                 at,
-            )
+            );
+            queue_direct_send(&outbox, obligation, no_ledger_record())
         };
         let (status, Json(body)) = queue(b"hello", now).await;
         assert_eq!(status, StatusCode::ACCEPTED);
@@ -1673,9 +1738,95 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(conflict["error"], "idempotency_conflict");
         assert_eq!(outbox.snapshot().await.len(), 1);
-        let receipt = outbox
-            .receipt(&peer, &rid, x0x::dm::DmReceiptStatus::Unknown)
-            .await;
+        let receipt = outbox.receipt(&peer, &rid, no_ledger_record()).await;
         assert_eq!(receipt.status, "queued");
+    }
+
+    fn no_ledger_record() -> LedgerReceipt {
+        LedgerReceipt {
+            status: x0x::dm::DmReceiptStatus::Unknown,
+            digest: None,
+        }
+    }
+
+    /// WHY: #1109 `DELETE /direct/receipts/{logical_id}` removes a held
+    /// send and answers `cancelled`; with none held it is 404 `not_queued`.
+    #[tokio::test]
+    async fn issue1109_cancel_removes_a_queued_send_and_404s_when_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outbox = DirectSendOutbox::new(dir.path().join("direct_send_outbox.json"));
+        let (me, peer) = (test_agent_id(1), test_agent_id(2));
+        let now = 1_800_000_000_000u64;
+        let req = parse_request(serde_json::json!({
+            "agent_id": hex::encode(peer.as_bytes()),
+            "payload": "aGVsbG8=",
+            "logical_id": "order-10",
+            "deliver_until_ms": now + 60_000,
+        }));
+        let rid = direct_send_config_for_request(&req, me, peer)
+            .expect("valid")
+            .logical_request_id
+            .expect("logical id derives a request id");
+        let obligation = queued_obligation(
+            "order-10",
+            direct_send_options(&req),
+            peer,
+            b"hello".to_vec(),
+            (now + 60_000, rid),
+            now,
+        );
+        let (status, _) = queue_direct_send(&outbox, obligation, no_ledger_record()).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let acks = x0x::dm::InFlightAcks::new();
+        let peer_hex = hex::encode(peer.as_bytes());
+        let lookup = || direct_receipt_body("order-10", &peer_hex, me, &acks).expect("valid");
+        let (status, Json(body)) = cancel_queued_send(&outbox, lookup()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "cancelled");
+        assert_eq!(body["request_id"], hex::encode(rid));
+        assert!(outbox.snapshot().await.is_empty());
+        let (status, Json(body)) = cancel_queued_send(&outbox, lookup()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "not_queued");
+        let receipt = outbox.receipt(&peer, &rid, no_ledger_record()).await;
+        assert_eq!(receipt.status, "cancelled");
+    }
+
+    /// WHY: #1109 blocking a contact through the contacts API removes the
+    /// queued sends to it, so they are never attempted.
+    #[tokio::test]
+    async fn issue1109_blocking_a_contact_drops_its_queued_sends() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let peer = test_agent_id(7);
+        let rid = x0x::dm::DmLogicalId::parse("order-11")
+            .expect("valid")
+            .request_id(state.agent.agent_id(), peer);
+        let obligation = queued_obligation(
+            "order-11",
+            DirectSendOptions::default(),
+            peer,
+            b"hello".to_vec(),
+            (now_unix_ms() + 60_000, rid),
+            now_unix_ms(),
+        );
+        let (status, _) =
+            queue_direct_send(&state.direct_send_outbox, obligation, no_ledger_record()).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        state
+            .contacts
+            .write()
+            .await
+            .set_trust(&peer, TrustLevel::Blocked);
+        super::super::contacts::sync_contact_relationship(&state, peer).await;
+        assert!(state.direct_send_outbox.snapshot().await.is_empty());
+        let receipt = state
+            .direct_send_outbox
+            .receipt(&peer, &rid, no_ledger_record())
+            .await;
+        assert_eq!(receipt.status, "failed");
+        assert_eq!(receipt.error.as_deref(), Some("recipient_blocked"));
     }
 }

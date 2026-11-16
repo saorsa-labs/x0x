@@ -1124,6 +1124,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         request: RequestSpec::Fields(&[RequestField::query_as("agent_id", true, "AGENT_ID")]),
     },
     EndpointDef {
+        method: Method::Delete,
+        path: "/direct/receipts/:logical_id",
+        cli_name: "direct cancel",
+        description: "Cancel a queued durable send by logical_id (#1109)",
+        category: "direct",
+        request: RequestSpec::Fields(&[RequestField::query_as("agent_id", true, "AGENT_ID")]),
+    },
+    EndpointDef {
         method: Method::Get,
         path: "/direct/events",
         cli_name: "direct events",

@@ -93,6 +93,20 @@ pub async fn receipt(client: &DaemonClient, logical_id: &str, agent_id: &str) ->
     Ok(())
 }
 
+/// `x0x direct cancel` — DELETE /direct/receipts/{logical_id}?agent_id=...
+///
+/// #1109: cancels a queued send (`--deliver-until-ms`) that is still held.
+/// Its receipt then reads `cancelled`; the daemon answers 404 `not_queued`
+/// when none is held.
+pub async fn cancel(client: &DaemonClient, logical_id: &str, agent_id: &str) -> Result<()> {
+    let path = format!("/direct/receipts/{logical_id}");
+    let resp = client
+        .delete_query(&path, &[("agent_id", agent_id)])
+        .await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
 /// `x0x direct events` — stream GET /direct/events
 pub async fn events(client: &DaemonClient, backfill: Option<usize>) -> Result<()> {
     client.ensure_running().await?;

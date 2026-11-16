@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 228,
+  "endpoint_count": 229,
   "endpoints": [
     {
       "category": "status",
@@ -1842,6 +1842,24 @@
       "cli_name": "direct receipt",
       "description": "Durable send outcome by logical_id (delivered, delivered_late, pending, unknown)",
       "method": "GET",
+      "path": "/direct/receipts/:logical_id",
+      "request": {
+        "fields": [
+          {
+            "cli": "AGENT_ID",
+            "in": "query",
+            "name": "agent_id",
+            "required": true
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "direct",
+      "cli_name": "direct cancel",
+      "description": "Cancel a queued durable send by logical_id (#1109)",
+      "method": "DELETE",
       "path": "/direct/receipts/:logical_id",
       "request": {
         "fields": [

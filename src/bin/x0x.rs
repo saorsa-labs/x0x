@@ -1617,6 +1617,15 @@ enum DirectSub {
         /// Recipient agent ID (hex).
         agent_id: String,
     },
+    /// Cancel a queued durable send (#1109) that is still held: the daemon
+    /// removes it and its receipt reads `cancelled`. An attempt already in
+    /// flight is not recalled.
+    Cancel {
+        /// The `--logical-id` the queued send used.
+        logical_id: String,
+        /// Recipient agent ID (hex).
+        agent_id: String,
+    },
     /// Stream incoming direct messages.
     Events {
         /// Replay the N most recent stored DM rows before the `live`
@@ -3068,6 +3077,10 @@ async fn run(
                 logical_id,
                 agent_id,
             } => commands::direct::receipt(&client, &logical_id, &agent_id).await,
+            DirectSub::Cancel {
+                logical_id,
+                agent_id,
+            } => commands::direct::cancel(&client, &logical_id, &agent_id).await,
             DirectSub::Events { backfill } => commands::direct::events(&client, backfill).await,
         },
         Commands::Groups { sub } => match sub {

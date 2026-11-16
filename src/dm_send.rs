@@ -220,6 +220,9 @@ pub(crate) async fn send_via_gossip_with_provenance(
         DM_PROTOCOL_V1
     };
 
+    // #1109: a durable receipt names the bytes it proves delivered.
+    let payload_digest: Option<[u8; 32]> =
+        (protocol_version >= DM_PROTOCOL_DURABLE_ACK).then(|| blake3::hash(&payload).into());
     let created = now_unix_ms();
     let expires = created.saturating_add(DEFAULT_ENVELOPE_LIFETIME_MS);
     let envelope = EnvelopeBuilder::build_payload_envelope_with_version(
@@ -270,6 +273,9 @@ pub(crate) async fn send_via_gossip_with_provenance(
         recipient_agent_id,
         recipient_machine_id,
     );
+    if let Some(digest) = payload_digest {
+        inflight.set_payload_digest(&request_id, digest);
+    }
     let mut guard = InFlightGuard::new(Arc::clone(&inflight), request_id);
 
     // X0X-0041: split the lifecycle hint into the per-peer match key and the

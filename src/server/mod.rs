@@ -82,8 +82,8 @@ use routes::{
     create_discovery_subscription, create_group_invite, create_group_kv_store, create_join_request,
     create_kv_store, create_mls_group, create_mls_welcome, create_named_group, create_task_list,
     daemon_shutdown_hook, delete_contact, delete_discovery_subscription, delete_kv_value,
-    delete_machine, direct_connections, direct_message_send_config, direct_receipt, direct_send,
-    discover_groups, discover_groups_nearby, discovered_agent, discovered_agents,
+    delete_machine, direct_cancel, direct_connections, direct_message_send_config, direct_receipt,
+    direct_send, discover_groups, discover_groups_nearby, discovered_agent, discovered_agents,
     discovered_machine, discovered_machines, dispatch_join_result_message,
     dispatch_welcome_blob_message, dm_diagnostics, enroll_device, ensure_named_group_listeners,
     evaluate_trust, exec_cancel, exec_diagnostics, exec_run, exec_sessions, file_accept_handler,
@@ -3002,8 +3002,7 @@ pub async fn serve_with_options(
         bg_tasks.push(tokio::spawn(async move {
             let mut shutdown_rx = send_state.shutdown_notify.subscribe();
             let acks = send_state.agent.dm_inflight_acks();
-            let transport =
-                routes::direct_outbox::AgentDirectSendTransport(send_state.agent.as_ref());
+            let transport = routes::direct_outbox::AgentDirectSendTransport(send_state.as_ref());
             loop {
                 tokio::select! {
                     _ = shutdown_rx.changed() => break,
@@ -3011,8 +3010,10 @@ pub async fn serve_with_options(
                         send_state
                             .direct_send_outbox
                             .step(
-                                routes::direct_outbox::now_unix_ms(),
-                                &|request_id| acks.receipt_status(request_id),
+                                routes::direct_outbox::DirectSendNow::current(),
+                                &|request_id| {
+                                    routes::direct_outbox::LedgerReceipt::of(&acks, request_id)
+                                },
                                 &transport,
                             )
                             .await;
@@ -3396,7 +3397,10 @@ pub async fn serve_with_options(
         .route("/agents/connect", post(connect_agent))
         .route("/direct/send", post(direct_send))
         .route("/direct/connections", get(direct_connections))
-        .route("/direct/receipts/:logical_id", get(direct_receipt))
+        .route(
+            "/direct/receipts/:logical_id",
+            get(direct_receipt).delete(direct_cancel),
+        )
         .route("/direct/events", get(direct_events_sse))
         // MLS group encryption endpoints
         .route("/mls/groups", post(create_mls_group))
