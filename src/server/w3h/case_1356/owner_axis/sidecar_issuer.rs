@@ -49,6 +49,13 @@ const CAUSE_Q3: &str = "after O's .grecov is rebuilt: the junk is not kept byte-
 const CAUSE_ADMITTED: &str = "O's rebuilt sidecar shows issued_reseats_lost, but O admits J's \
                               staged join for the lost authorisation: J is Active at r+4 and O's \
                               second re-seat call answers 409 subject_active (#1941)";
+/// The checks #1941 fails, sorted. [`CAUSE_ADMITTED`] applies only when
+/// the failing checks are exactly these.
+const ADMITTED_FAILING: [&str; 3] = [
+    "j_live_record_unchanged_after_the_refusal",
+    "j_reseat_required_reseat_failed",
+    "second_reseat_route_accepts",
+];
 /// O answers the re-seat call with one direct send to J (with its
 /// retries); it has ended by then.
 const PUSH_DONE: Duration = Duration::from_secs(120);
@@ -403,12 +410,14 @@ async fn issuer_rebuild(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         head.describe()
     );
     let red = received && !after_ok;
-    let pinned = kept
-        && lost
+    // The pin needs exactly the known set of failing checks. Any other
+    // failing check gives the unpinned cause, so a new regression is red.
+    let mut failing_set = failing.clone();
+    failing_set.sort_unstable();
+    let pinned = failing_set == ADMITTED_FAILING
         && admitted
         && again_code == StatusCode::CONFLICT
-        && again["error"] == "subject_active"
-        && o_after.state_revision == o_before.state_revision;
+        && again["error"] == "subject_active";
     let cause = if pinned { CAUSE_ADMITTED } else { CAUSE_Q3 };
     conclude_row(receipt, (FINAL_Q3, cause), &failing, observed, red, at(sim));
     Ok(())

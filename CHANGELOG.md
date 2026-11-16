@@ -134,7 +134,11 @@ All notable changes to this project will be documented in this file.
   that never ends no longer blocks the groups behind it), and asks again
   for a group still pending after 60 s, 300 s and 900 s. The outage
   record is written and removed under one lock. The #1427 W3-H rows have
-  their own CI shard (`1427`).
+  their own CI shard (`1427`). When a later pass marks a group whose
+  older catch-up still runs, the end of that older catch-up no longer
+  removes the mark or the outage record, so the later pass still retries
+  the group (#1936 review follow-up, A09 fourth amendment of 16 Nov 2026).
+  No wire format or API changes.
 
 - **A TreeKEM member that stays up through a network outage catches up
   when it connects again (#1427, A09 second amendment of 15 Nov 2026).**

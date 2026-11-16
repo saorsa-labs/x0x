@@ -50,8 +50,8 @@ must be rejected as predecessor evidence.
 When the authority's validation refuses a direct offer before any roster
 write, it releases its admission journal marker and sends one typed DM to
 the requester: `x0x-group-join-outcome-v1\0` followed by JSON
-`{group_id, request_id, envelope_digest, reason}`
-(`src/groups/join_outcome.rs`).
+`{group_id, request_id, envelope_digest, reason, head?}`
+(`src/groups/join_outcome.rs`). `head` is left out when it is empty.
 
 - The authority sends it only to the authenticated sender of the offer, only
   when that agent's verified capability advert has `join_request_outcome_v1`
