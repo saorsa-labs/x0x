@@ -482,7 +482,7 @@ fn entry_commitment_bytes(outer_key: &str, entry: &KvEntry) -> Vec<u8> {
 }
 
 /// Write a length-prefixed byte slice (64-bit LE length + data).
-fn lp_bytes(buf: &mut Vec<u8>, data: &[u8]) {
+pub(super) fn lp_bytes(buf: &mut Vec<u8>, data: &[u8]) {
     buf.extend_from_slice(&(data.len() as u64).to_le_bytes());
     buf.extend_from_slice(data);
 }
@@ -1954,6 +1954,30 @@ impl KvStore {
 
         self.version += 1;
         Ok(evicted)
+    }
+
+    /// #1094 P1: mark `key`'s current entry as written by the holder of
+    /// `public_key`, with `rider` when a rider wrote through it. The store
+    /// version does not move: call it in the same write lock as the put, so
+    /// the mark is part of what that put publishes and commits.
+    ///
+    /// # Errors
+    ///
+    /// [`KvError::Merge`] when the key has no entry or signing fails.
+    pub fn mark_entry_writer(
+        &mut self,
+        key: &str,
+        public_key: &ant_quic::MlDsaPublicKey,
+        secret_key: &ant_quic::MlDsaSecretKey,
+        rider: Option<&str>,
+    ) -> Result<()> {
+        let id = *self.id();
+        let entry = self
+            .entries
+            .get_mut(key)
+            .ok_or_else(|| KvError::Merge(format!("no entry to mark for key {key:?}")))?;
+        crate::kv::provenance::mark(entry, &id, public_key, secret_key, rider)
+            .map_err(KvError::Merge)
     }
 
     /// Get an entry by key.

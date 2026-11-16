@@ -26792,19 +26792,26 @@ impl Agent {
         let owner_signing = if is_self_keyed {
             None
         } else {
-            let (pk_bytes, sk_bytes) = self.identity().agent_keypair().to_bytes();
-            Some(std::sync::Arc::new(OwnerSigningMaterial {
-                public_key_bytes: pk_bytes,
-                secret_key_bytes: sk_bytes,
-            }))
+            Some(self.kv_writer_signing())
         };
         self.commit_snapshot_lease(snapshot_lease.as_ref(), &sync, "create")?;
         Ok(KvStoreHandle {
+            writer_signing: self.kv_writer_signing(),
             sync,
             agent_id: self.agent_id(),
             peer_id,
             owner_signing,
             snapshot_lease,
+        })
+    }
+
+    /// This agent's signing material, for owner checkpoints and #1094 P1
+    /// entry writer marks.
+    fn kv_writer_signing(&self) -> std::sync::Arc<OwnerSigningMaterial> {
+        let (public_key_bytes, secret_key_bytes) = self.identity().agent_keypair().to_bytes();
+        std::sync::Arc::new(OwnerSigningMaterial {
+            public_key_bytes,
+            secret_key_bytes,
         })
     }
 
@@ -27006,15 +27013,12 @@ impl Agent {
         // Only the GROUP CREATOR (the store's anchored owner) produces
         // owner-signed checkpoints; other members never do.
         let owner_signing = if self.agent_id() == creator {
-            let (pk_bytes, sk_bytes) = self.identity().agent_keypair().to_bytes();
-            Some(std::sync::Arc::new(OwnerSigningMaterial {
-                public_key_bytes: pk_bytes,
-                secret_key_bytes: sk_bytes,
-            }))
+            Some(self.kv_writer_signing())
         } else {
             None
         };
         Ok(KvStoreHandle {
+            writer_signing: self.kv_writer_signing(),
             sync,
             agent_id: self.agent_id(),
             peer_id,
@@ -27100,6 +27104,7 @@ impl Agent {
             .await?;
         self.commit_snapshot_lease(Some(&snapshot_lease), &sync, "TreeKEM group store open")?;
         Ok(KvStoreHandle {
+            writer_signing: self.kv_writer_signing(),
             sync,
             agent_id: self.agent_id(),
             peer_id,
@@ -27174,6 +27179,7 @@ impl Agent {
             .await?;
         self.commit_snapshot_lease(Some(&snapshot_lease), &sync, "public group store open")?;
         Ok(KvStoreHandle {
+            writer_signing: self.kv_writer_signing(),
             sync,
             agent_id: self.agent_id(),
             peer_id,
@@ -27290,6 +27296,7 @@ impl Agent {
 
         self.commit_snapshot_lease(snapshot_lease.as_ref(), &sync, "self_keyed join")?;
         Ok(KvStoreHandle {
+            writer_signing: self.kv_writer_signing(),
             sync,
             agent_id: self.agent_id(),
             peer_id,
@@ -27344,6 +27351,7 @@ impl Agent {
             .await?;
         self.commit_snapshot_lease(snapshot_lease.as_ref(), &sync, "join")?;
         Ok(KvStoreHandle {
+            writer_signing: self.kv_writer_signing(),
             sync,
             agent_id: self.agent_id(),
             peer_id,
@@ -27862,6 +27870,10 @@ pub struct KvStoreHandle {
     /// (creator path). Used to produce owner-signed content checkpoints on
     /// each write so replicas can cold-recover while the owner is offline.
     owner_signing: Option<std::sync::Arc<OwnerSigningMaterial>>,
+    /// #1094 P1: this agent's signing material, used to mark each entry it
+    /// writes to a group store (`x0x/group/...`) with a verifiable writer
+    /// signature ([`kv::provenance`]).
+    writer_signing: std::sync::Arc<OwnerSigningMaterial>,
     /// #760 lease over the canonical snapshot path (`None` for
     /// non-persistent stores). Shared by every clone: retirement marking
     /// is idempotent across clones, and the drain obligation completes
@@ -28164,6 +28176,34 @@ impl KvStoreHandle {
         }
     }
 
+    /// #1094 P1: sign `key`'s just-written entry as this agent's write, with
+    /// `rider` when a rider wrote through it. Only group stores
+    /// (`x0x/group/...`) are marked: their retained images and full serves
+    /// relay co-writers' entries, so the record's author does not name every
+    /// entry's writer. Other stores have one writer or key-implied writers.
+    ///
+    /// The put has already changed the store, so a failure here leaves the
+    /// entry unmarked (readers see it as unsigned) rather than failing an
+    /// applied write.
+    fn mark_written_entry(&self, store: &mut kv::KvStore, key: &str, rider: Option<&str>) {
+        if !self.sync.topic().starts_with("x0x/group/") {
+            return;
+        }
+        let signing = &self.writer_signing;
+        let keys = ant_quic::MlDsaPublicKey::from_bytes(&signing.public_key_bytes)
+            .ok()
+            .zip(ant_quic::MlDsaSecretKey::from_bytes(&signing.secret_key_bytes).ok());
+        let result = match keys {
+            Some((public_key, secret_key)) => store
+                .mark_entry_writer(key, &public_key, &secret_key, rider)
+                .map_err(|e| e.to_string()),
+            None => Err("unusable signing material".to_string()),
+        };
+        if let Err(error) = result {
+            tracing::warn!(%error, "#1094: kv entry left without a writer mark");
+        }
+    }
+
     /// Produce and install an owner-signed content checkpoint, returning it
     /// for attachment to the published delta.
     ///
@@ -28266,6 +28306,20 @@ impl KvStoreHandle {
     ) -> error::Result<()> {
         let _ = self.put_with_delta(key, value, content_type).await?;
         Ok(())
+    }
+
+    /// The store's id, which a writer mark is bound to (#1094 P1,
+    /// [`kv::provenance::verify`]).
+    pub async fn store_id(&self) -> kv::KvStoreId {
+        *self.sync.read().await.id()
+    }
+
+    /// Who wrote `key`'s current entry, by its writer mark (#1094 P1);
+    /// `None` when the key is not in the store.
+    pub async fn entry_writer(&self, key: &str) -> Option<kv::provenance::EntryWriter> {
+        let store = self.sync.read().await;
+        let entry = store.get(key)?;
+        Some(kv::provenance::verify(store.id(), entry))
     }
 
     /// Put a key-value pair and return the CRDT delta that was published.
@@ -28429,6 +28483,9 @@ impl KvStoreHandle {
                     publish_error: None,
                 });
             }
+            // #1094 P1: mark the entry with this writer's signature before
+            // the delta and the checkpoint capture it.
+            self.mark_written_entry(&mut store, &key, None);
             let entry = store.get(&key).cloned();
             let version = store.current_version();
             let mut delta = match entry {

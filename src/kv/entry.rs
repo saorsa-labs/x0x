@@ -10,6 +10,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// by content hash.
 pub const MAX_INLINE_SIZE: usize = 65_536;
 
+fn sorted_metadata(metadata: &HashMap<String, String>) -> Vec<(&String, &String)> {
+    let mut pairs: Vec<_> = metadata.iter().collect();
+    pairs.sort();
+    pairs
+}
+
 /// A single key-value entry in the store.
 ///
 /// Uses LWW (Last-Writer-Wins) semantics for conflict resolution:
@@ -71,8 +77,10 @@ impl KvEntry {
         }
     }
 
-    /// Update the value, bumping `updated_at`.
+    /// Update the value, bumping `updated_at`. The previous writer's mark
+    /// (#1094 P1) no longer covers the new content, so it is removed.
     pub fn update_value(&mut self, value: Vec<u8>, content_type: String) {
+        super::provenance::strip(&mut self.metadata);
         self.content_hash = *blake3::hash(&value).as_bytes();
         self.value = value;
         self.content_type = content_type;
@@ -87,9 +95,15 @@ impl KvEntry {
     /// The entry with the higher `updated_at` wins. Ties are broken
     /// by comparing content hashes (deterministic).
     pub fn merge(&mut self, other: &Self) {
-        if other.updated_at > self.updated_at
-            || (other.updated_at == self.updated_at && other.content_hash > self.content_hash)
-        {
+        // #1094 P1: equal time and content but different metadata (two
+        // writers' marks over the same bytes) is broken by the sorted
+        // metadata, so every replica keeps the same entry.
+        let wins = other.updated_at > self.updated_at
+            || (other.updated_at == self.updated_at
+                && (other.content_hash > self.content_hash
+                    || (other.content_hash == self.content_hash
+                        && sorted_metadata(&other.metadata) > sorted_metadata(&self.metadata))));
+        if wins {
             self.value = other.value.clone();
             self.content_hash = other.content_hash;
             self.content_type = other.content_type.clone();
