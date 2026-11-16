@@ -22094,6 +22094,54 @@ pub(in crate::server) async fn apply_listener_metadata_event(
     applied
 }
 
+/// #1366: whether a stored group record needs its metadata listener, by the
+/// local agent's own seat. A withdrawn group needs none. A record whose
+/// local seat is Removed or Banned needs none either: the running listener
+/// already ends on that exit, and a later join, re-add or request installs
+/// one again through its own path. Every other record keeps it: an Active
+/// member, a Pending request-access applicant (it waits for the approval
+/// event), and a record with no local seat (a card-import or join stub,
+/// which waits for its `MemberAdded`).
+pub(in crate::server) fn metadata_listener_wanted(
+    info: &x0x::groups::GroupInfo,
+    local_agent_hex: &str,
+) -> bool {
+    use x0x::groups::member::GroupMemberState;
+    if info.withdrawn {
+        return false;
+    }
+    !info.members_v2.get(local_agent_hex).is_some_and(|member| {
+        matches!(
+            member.state,
+            GroupMemberState::Removed | GroupMemberState::Banned
+        )
+    })
+}
+
+/// #1366: the listeners a restart installs for the stored groups. The
+/// metadata listener follows [`metadata_listener_wanted`]; the
+/// public-message listener follows the group's confidentiality, as in
+/// [`ensure_named_group_listeners`]. Before this, a restart started a
+/// metadata listener for every stored record, also for a group this agent
+/// had been removed from or banned in.
+pub(in crate::server) async fn restore_named_group_listeners(state: Arc<AppState>) {
+    let local = hex::encode(state.agent.agent_id().as_bytes());
+    let groups: Vec<(String, bool)> = {
+        let groups = state.named_groups.read().await;
+        groups
+            .iter()
+            .map(|(id, info)| (id.clone(), metadata_listener_wanted(info, &local)))
+            .collect()
+    };
+    for (group_id, wanted) in groups {
+        if wanted {
+            ensure_named_group_listeners(Arc::clone(&state), &group_id).await;
+        } else {
+            ensure_public_message_listener_for(Arc::clone(&state), &group_id).await;
+        }
+    }
+}
+
 /// Spawn every gossip listener a member needs for a named group.
 ///
 /// Members must be subscribed to both the metadata topic *and* the
@@ -22110,6 +22158,11 @@ pub(in crate::server) async fn apply_listener_metadata_event(
 /// `GET /groups/:id/messages`, which rejects MLS-encrypted groups outright.
 pub(in crate::server) async fn ensure_named_group_listeners(state: Arc<AppState>, group_id: &str) {
     ensure_named_group_metadata_listener(Arc::clone(&state), group_id).await;
+    ensure_public_message_listener_for(state, group_id).await;
+}
+
+/// The public-message half of [`ensure_named_group_listeners`].
+async fn ensure_public_message_listener_for(state: Arc<AppState>, group_id: &str) {
     let public_topic_key = {
         let groups = state.named_groups.read().await;
         groups.get(group_id).and_then(|info| {
@@ -54961,6 +55014,7 @@ pub(in crate::server) mod tests {
     pub(in crate::server) mod issue1275_listener_apply_shield;
     mod issue1288_bootstrap_outbox_shutdown;
     mod issue1347_join_request_token_class;
+    mod issue1366_metadata_listener;
     pub(in crate::server) mod issue1366_public_listener;
     pub(in crate::server) mod issue1368_crash_matrix;
     mod issue1427_start_catchup;
