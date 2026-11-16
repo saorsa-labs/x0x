@@ -1214,6 +1214,12 @@ jobs:
           --expect w3h_1581j_expiry_skew_run5a_announced_renewal_rebinds_at_expiry=GREEN
           --require w3h_1581j_expiry_skew_run8_signed_public
           --expect w3h_1581j_expiry_skew_run8_signed_public=GREEN
+          --require w3h_1581k_staged_join_machine_revoked_device_gets_no_key
+          --expect w3h_1581k_staged_join_machine_revoked_device_gets_no_key=GREEN
+          --require w3h_1581k_staged_join_agent_revoked_gets_no_key
+          --expect w3h_1581k_staged_join_agent_revoked_gets_no_key=GREEN
+          --require w3h_1581k_control_staged_join_unrevoked_gets_its_key
+          --expect w3h_1581k_control_staged_join_unrevoked_gets_its_key=GREEN
           --require w3h_1765_red_newer_file_revocation_waits_for_store_write
           --expect w3h_1765_red_newer_file_revocation_waits_for_store_write=GREEN
           --require w3h_1776_delayed_fresh_joiner_fetches_the_welcome
