@@ -45,6 +45,13 @@ All notable changes to this project will be documented in this file.
   known gap: after a later rotation a TreeKEM member's revoked device still
   reaches the new epoch through its kept leaf. The row has its own W3-H
   shard (`1581i`).
+- **W3-H row `s4_intake_and_egress`, staged-join part (#1581).** A
+  staged its artifacts for B's join, and B got none of them before the
+  trigger. B then revokes its own machine or agent. After the release,
+  B's further fetches get no key, and with only a machine revocation A
+  keeps B's agent seated (D70). A control arm does the same hold and
+  release with no revocation, and B gets its key. The row has its own W3-H
+  shard (`1581k`).
 - **A `stale` join-request outcome can carry the authority's head (#1840,
   A08 amendment of 15 Nov 2026).** New optional `head` field on
   `groups::join_outcome::JoinRequestOutcome` (signed head commit, roster
