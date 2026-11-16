@@ -1,6 +1,5 @@
 //! ADR 0109 §10 row H-S3-rm4 (the re-seat invite check, ADR 0059
-//! exception, D156; #1572), variants (1) to (5). Variant (6), the Home
-//! policy, is not in this file.
+//! exception, D156; #1572), variants (1) to (6).
 //!
 //! Setup: H-S3-c up to A's re-seat call. O stops and A removes J (r+3).
 //! J's writes and A's writes to J are held, and A re-seats J with basis
@@ -12,17 +11,25 @@
 //! policy, re-signed with A's key.
 //! (4) A sends J the re-seat invite with no authorisation paired to it.
 //! (5) A sends J a re-seat invite whose policy has no owner axis.
+//! (6) Home variant: the H-S3-c group has the Home policy, and every node
+//! has Home activation on by test configuration (ADR 0109 §4, as
+//! H-S3-home). As in (3), A sends J an authorisation whose invite names
+//! another Home: the Home policy of another owner, and Home metadata
+//! (`base_home`, with its digest in the public metadata) whose primary
+//! agent is that owner's.
 //! Last, J's writes pass and A sends J its real authorisation.
 //!
 //! Desired: J refuses (1) `reseat_invite_outside_staging`, (3)
 //! `owner_mismatch`, (4) `reseat_invite_unpaired` and (5)
-//! `invite_downgraded`. Each refusal is counted in `invites_refused
+//! `invite_downgraded` and (6) `owner_mismatch`. Each refusal is counted in `invites_refused
 //! {reason}`. J stays `reseat_required`, with no re-seat journal or
 //! staging record left, and
 //! `last_refusal` names the reason (the API reference adds the prefix
 //! `authorisation_refused:` to a refused authorisation). E refuses (2)
 //! `reseat_invite_outside_staging` and has no record of the group. Then
-//! A's real authorisation re-seats J: J is Active with keys at r+4.
+//! A's real authorisation re-seats J: J is Active with keys at r+4 (in
+//! (6) the staged join runs in Home mode, pinned to the owner of J's live
+//! record, as in every variant of this owner-axis group).
 //!
 //! `AttestAnswer::Reseat` always carries an authorisation, so (4) sends the
 //! real invite with an authorisation that A re-signed for another invite
@@ -36,6 +43,7 @@
 //! as for H-S3-rm2 option (b)): after the refusal J holds no re-seat
 //! journal and no staging record, and its live record is unchanged.
 //!
+//! (6) is a control: its refusal comes from the same owner pin as (3).
 //! (3) to (5) are the red proof of the fix in `group_recovery.rs`. Before
 //! it, the rollback of the refused staged join in (3) and (5) wrote
 //! `last_refusal = "join_409"`, and the refusal of (4) was not counted in
@@ -77,13 +85,14 @@ enum Variant {
     OtherOwner,
     Unpaired,
     Downgraded,
+    OtherHome,
 }
 
 impl Variant {
     fn reason(self) -> &'static str {
         match self {
             Self::PlainJoin | Self::Stranger => "reseat_invite_outside_staging",
-            Self::OtherOwner => "owner_mismatch",
+            Self::OtherOwner | Self::OtherHome => "owner_mismatch",
             Self::Unpaired => "reseat_invite_unpaired",
             Self::Downgraded => "invite_downgraded",
         }
@@ -96,6 +105,7 @@ impl Variant {
             Self::OtherOwner => "(3) an invite naming another owner",
             Self::Unpaired => "(4) the re-seat invite with no paired authorisation",
             Self::Downgraded => "(5) an invite with no owner axis",
+            Self::OtherHome => "(6) a Home invite naming another Home",
         }
     }
 }
@@ -195,14 +205,34 @@ fn forged(
     } else {
         let mut invite = crate::groups::invite::SignedInvite::from_link(&real.invite)
             .map_err(|e| anyhow!("A's re-seat invite: {e}"))?;
+        let other = crate::identity::UserKeypair::from_seed(&[0x31; 32])?;
         let policy = invite.policy.as_mut().context("A's invite has no policy")?;
-        policy.admission = match variant {
+        match variant {
             Variant::OtherOwner => {
-                let other = crate::identity::UserKeypair::from_seed(&[0x31; 32])?;
-                crate::groups::GroupAdmission::OwnerCertified(other.user_id())
+                policy.admission = crate::groups::GroupAdmission::OwnerCertified(other.user_id());
             }
-            _ => crate::groups::GroupAdmission::InviteOnly,
-        };
+            Variant::OtherHome => {
+                ensure!(
+                    *policy == crate::groups::GroupPolicy::home(&o_owner()?),
+                    "INFRA: A's invite policy is not O's Home policy"
+                );
+                *policy = crate::groups::GroupPolicy::home(&other.user_id());
+                // Another Home's metadata: its primary agent is the other
+                // owner's, and the public metadata carries its digest.
+                let home = crate::groups::HomeMetadata {
+                    primary_agent: hex::encode([0x32; 32]),
+                    placements: std::collections::BTreeMap::new(),
+                    provisioned_at_ms: 1,
+                };
+                let meta = invite
+                    .public_meta
+                    .as_mut()
+                    .context("A's invite has no public metadata")?;
+                meta.home_digest = Some(sc::compute_home_digest(&home));
+                invite.base_home = Some(home);
+            }
+            _ => policy.admission = crate::groups::GroupAdmission::InviteOnly,
+        }
         let view = crate::groups::invite::InviteSignedViewV4::from_invite(&invite)
             .map_err(|r| anyhow!("the changed invite's view: {}", r.reason()))?;
         let policy = view.policy.as_ref().context("the view has no policy")?;
@@ -228,6 +258,11 @@ fn forged(
     let authorisation = ReseatAuthorisation::sign(fields, a_key)
         .map_err(|e| anyhow!("A signs the authorisation: {}", e.as_str()))?;
     Ok((authorisation, link))
+}
+
+/// The H-S3-c owner (`fork_prefix`'s seed).
+fn o_owner() -> Result<crate::identity::UserId> {
+    Ok(crate::identity::UserKeypair::from_seed(&[0x13; 32])?.user_id())
 }
 
 /// What one variant left: its sub-checks, whether it reached its target,
@@ -332,7 +367,8 @@ async fn run_variant(
 
 /// H-S3-rm4 variant `variant` (ADR 0109 §10).
 async fn invite_check(sim: &mut Sim, receipt: &mut Receipt, variant: Variant) -> Result<()> {
-    let Some(p) = fork_prefix(sim, receipt, false, false, FINAL_RM4).await? else {
+    let home = variant == Variant::OtherHome;
+    let Some(p) = fork_prefix_with(sim, receipt, (false, false, home), FINAL_RM4).await? else {
         return Ok(());
     };
     let window = (GATE_WINDOW, "not_on_chain");
@@ -602,4 +638,16 @@ fn w3h_1356_control_s3_rm4_unpaired_invite_refused() -> Result<()> {
 fn w3h_1356_control_s3_rm4_downgraded_invite_refused() -> Result<()> {
     let case = "w3h_1356_control_s3_rm4_downgraded_invite_refused";
     super::super::super::block_on_paused(expect(case, 0x1356_0125, Variant::Downgraded))
+}
+
+/// H-S3-rm4 (6): on a Home-policy group, an invite naming another Home is
+/// refused.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+fn w3h_1356_control_s3_rm4_other_home_refused() -> Result<()> {
+    let case = "w3h_1356_control_s3_rm4_other_home_refused";
+    super::super::super::block_on_paused(expect(case, 0x1356_0126, Variant::OtherHome))
 }

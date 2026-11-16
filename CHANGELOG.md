@@ -11,6 +11,13 @@ All notable changes to this project will be documented in this file.
   for x0xd's shutdown before SIGKILL. The retire after a host commit retries
   only a failed host lock, ends its retries on a stop, and hands its result to
   the caller. A start that finds a committed trial honours a stop.
+- **`GET /stores/:id/:key` shows the verified writer (#1094 slice P2, A10
+  amendment of 16 Nov 2026).** New `writer` field: the agent (and rider
+  sub-agent) whose mark verifies for the returned value, or
+  `{"verified": false}`, writer unknown. The raw `x0x.writer.*` keys are no
+  longer in `metadata`. A rider's write names the rider. The Scratch app
+  shows the writer. Every KV merge path now refuses an entry whose content
+  hash does not match its value.
 - **The dormant launcher retires a committed trial (#1378 slice 3; A14
   amendment of 16 Nov 2026).** When the host commits, the supervise driver
   saves the trial `Committed` and hands the candidate to the caller, which
@@ -457,6 +464,11 @@ All notable changes to this project will be documented in this file.
   `#`, `?` or `/` reaches the exact key. A slow granted read or write now
   runs on a detached task (at most 16 at once), so it does not hold the
   replies to other waiting requests.
+- **The dormant launcher reads a process that exits during its `/proc` read
+  as gone.** `child::absent` treated only NotFound as gone; a process reaped
+  between the open and the read of `/proc/<pid>/stat` fails with ESRCH, which
+  flaked `a_peer_recovery_failure_during_the_stop_is_final` on studio1 and
+  could make `stop_foreign` report a stopped process as an error.
 - **A #1427 catch-up probe no longer holds S4 seals (A09 fifth amendment
   of 16 Nov 2026).** A start or reconnect catch-up cycle asks for the next
   TreeKEM epoch without having seen it. Its target was read as ADR 0110 §2

@@ -662,8 +662,9 @@ pub(crate) enum MergeRejection {
     UnauthorizedWriter,
     AnonymousWriter,
     AmbiguousDelta,
-    /// #1094 P1: an entry under another key than its own.
-    MisplacedEntry,
+    /// #1094 P1/P2: an entry under another key than its own, or whose
+    /// content hash is not the hash of its value.
+    InconsistentEntry,
 }
 
 /// Encoded bytes of a writer mark (#1094 P1): agent id, signature, version
@@ -681,13 +682,18 @@ const MAP_KEY_PREFIX_BYTES: usize = 8;
 /// Encoded bytes of one OR-Set tag for a key, besides the key.
 const KEY_TAG_BYTES: usize = 128;
 
-/// Whether any entry of `delta` sits under a map key other than its own.
-fn delta_has_misplaced_entry(delta: &KvStoreDelta) -> bool {
+/// Whether any entry of `delta` fails [`validate_entry_integrity`]: it sits
+/// under a map key other than its own, or its content hash is not the hash
+/// of its value (#1094 P1/P2, reviews of #1963).
+fn delta_has_inconsistent_entry(delta: &KvStoreDelta) -> bool {
     delta
         .added
         .iter()
-        .any(|(key, (entry, _))| *key != entry.key)
-        || delta.updated.iter().any(|(key, entry)| *key != entry.key)
+        .any(|(key, (entry, _))| validate_entry_integrity(key, entry).is_err())
+        || delta
+            .updated
+            .iter()
+            .any(|(key, entry)| validate_entry_integrity(key, entry).is_err())
 }
 
 /// A replicated key-value store using CRDTs with access control.
@@ -2017,6 +2023,13 @@ impl KvStore {
         Ok(())
     }
 
+    /// Test-only access to the raw entry map (#1094 P2 tests build an
+    /// inconsistent store).
+    #[cfg(test)]
+    pub(crate) fn entries_mut_for_test(&mut self) -> &mut HashMap<String, KvEntry> {
+        &mut self.entries
+    }
+
     /// #1094 P1: mark `key`'s current entry as written by the holder of
     /// `public_key`, with `rider` when a rider wrote through it. The store
     /// version does not move: call it in the same write lock as the put, so
@@ -2256,9 +2269,9 @@ impl KvStore {
             tracing::warn!("rejected anonymous self_keyed delta for store {}", self.id);
             return Ok(()); // silent whole-delta reject — applies nothing
         };
-        if delta_has_misplaced_entry(delta) {
+        if delta_has_inconsistent_entry(delta) {
             tracing::warn!(
-                "rejected self_keyed delta for store {}: an entry is not under its own key",
+                "rejected self_keyed delta for store {}: an entry is not under its own key or does not match its hash",
                 self.id
             );
             return Ok(());
@@ -2502,15 +2515,17 @@ impl KvStore {
                 return Ok(MergeOutcome::Rejected(MergeRejection::AmbiguousDelta));
             }
         }
-        // Slot gate, ALL policies (#1094 P1, review of #1963): an entry must
-        // sit under its own key. Otherwise one key's value and writer mark
-        // could be shown under another key. No legitimate producer emits it.
-        if delta_has_misplaced_entry(delta) {
+        // Entry gate, ALL policies (#1094 P1/P2, reviews of #1963): an entry
+        // must sit under its own key and match its content hash. Otherwise
+        // one key's value and writer mark could be shown under another key,
+        // or two replicas could hold different bytes under one LWW identity.
+        // No legitimate producer emits it.
+        if delta_has_inconsistent_entry(delta) {
             tracing::warn!(
-                "rejected delta for store {}: an entry is not under its own key",
+                "rejected delta for store {}: an entry is not under its own key or does not match its hash",
                 self.id
             );
-            return Ok(MergeOutcome::Rejected(MergeRejection::MisplacedEntry));
+            return Ok(MergeOutcome::Rejected(MergeRejection::InconsistentEntry));
         }
 
         // Apply allowlist changes from the delta (owner-only)
@@ -3034,6 +3049,11 @@ impl KvStore {
 
     /// The raw CRDT merge, without the AppendOnly freeze check.
     fn merge_unchecked(&mut self, other: &KvStore) -> Result<()> {
+        // #1094 P2 (review of #1963): every entry must sit under its own key
+        // and match its hash, checked before anything changes.
+        for (key, entry) in &other.entries {
+            validate_entry_integrity(key, entry)?;
+        }
         self.keys
             .merge_state(&other.keys)
             .map_err(|e| KvError::Merge(format!("OR-Set merge failed: {e}")))?;

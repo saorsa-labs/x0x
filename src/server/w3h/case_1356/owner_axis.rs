@@ -99,14 +99,29 @@ pub(super) async fn create_group(
     sim: &Sim,
     owner: &crate::identity::UserKeypair,
 ) -> Result<String> {
-    let policy = crate::groups::GroupPolicy {
-        admission: crate::groups::GroupAdmission::OwnerCertified(owner.user_id()),
-        write_access: crate::groups::GroupWriteAccess::AdminOnly,
-        ..crate::groups::GroupPolicyPreset::PrivateSecure.to_policy()
+    create_group_with(sim, owner, false).await
+}
+
+/// [`create_group`], or with `home` a group whose policy is the Home
+/// policy for `owner` (H-S3-rm4 (6); the case turns Home activation on).
+async fn create_group_with(
+    sim: &Sim,
+    owner: &crate::identity::UserKeypair,
+    home: bool,
+) -> Result<String> {
+    let home_policy = crate::groups::GroupPolicy::home(&owner.user_id());
+    let policy = if home {
+        home_policy.clone()
+    } else {
+        crate::groups::GroupPolicy {
+            admission: crate::groups::GroupAdmission::OwnerCertified(owner.user_id()),
+            write_access: crate::groups::GroupWriteAccess::AdminOnly,
+            ..crate::groups::GroupPolicyPreset::PrivateSecure.to_policy()
+        }
     };
     ensure!(
-        policy != crate::groups::GroupPolicy::home(&owner.user_id()),
-        "the fixture policy must not be the Home policy"
+        (policy == home_policy) == home,
+        "the fixture policy must be the Home policy exactly when asked"
     );
     let body = json!({"name": "w3h owner axis", "display_name": "O", "policy": policy});
     let (code, created) = sim.api("O", Method::POST, "/groups", Some(body)).await?;
@@ -381,11 +396,28 @@ async fn fork_prefix(
     m1: bool,
     last: &str,
 ) -> Result<Option<Prefix>> {
+    fork_prefix_with(sim, receipt, (both, m1, false), last).await
+}
+
+/// [`fork_prefix`] with `home` (H-S3-rm4 (6)): the group has the Home
+/// policy, and every node has Home activation on by test configuration
+/// (ADR 0109 §4, as H-S3-home), so S3 covers it.
+async fn fork_prefix_with(
+    sim: &mut Sim,
+    receipt: &mut Receipt,
+    (both, m1, home): (bool, bool, bool),
+    last: &str,
+) -> Result<Option<Prefix>> {
     let labels = if m1 { D3_LABELS } else { C_LABELS };
     let owner = crate::identity::UserKeypair::from_seed(&[0x13; 32])?;
     start_certified(sim, "O", &owner, true).await?;
     for label in labels.iter().filter(|l| **l != "O") {
         start_certified(sim, label, &owner, false).await?;
+    }
+    if home {
+        for label in labels {
+            sim.state(label)?.group_recovery.activate_home();
+        }
     }
     mesh(sim, labels).await?;
     // O is an owned install: let its deferred Home provisioning finish
@@ -413,7 +445,7 @@ async fn fork_prefix(
         true
     })
     .await?;
-    let group = create_group(sim, &owner).await?;
+    let group = create_group_with(sim, &owner, home).await?;
     let seated: &[&str] = if m1 { &["A", "X", "M1"] } else { &["A", "X"] };
     for member in seated {
         join_owner(sim, member, &group, &owner).await?;
@@ -438,7 +470,8 @@ async fn fork_prefix(
     // r, above O's r+2 MemberAdded, so the frontier gate does not queue
     // J's seal and the refused chain reaches the owner-anchored gap check
     // (ADR 0109, #818 part 2). A rename bumps the roster clock too, so it cannot skew.
-    // `read_access` keeps the policy non-Home throughout.
+    // `read_access` keeps a non-Home policy non-Home throughout; a Home
+    // policy ends as the Home policy again (members-only read).
     for read_access in ["public", "members_only", "public", "members_only"] {
         let path = format!("/groups/{group}/policy");
         let body = Some(json!({"read_access": read_access}));

@@ -619,15 +619,32 @@ pub(super) fn absent(expected: &Identity) -> io::Result<bool> {
     }
     match identity(expected.pid) {
         Ok(actual) => Ok(actual != *expected),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) if process_gone(&error) => Ok(true),
         Err(error) => Err(error),
     }
+}
+
+/// A `/proc/<pid>/stat` read of a process that no longer exists. A process
+/// that exits and is reaped between the open and the read fails the read
+/// with ESRCH, not NotFound (studio1 train40 flake of
+/// `a_peer_recovery_failure_during_the_stop_is_final`).
+fn process_gone(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::ffi::OsStringExt;
+
+    /// A process that exits during the stat read is gone (ESRCH), as is a
+    /// missing `/proc` entry; any other read error is still an error.
+    #[test]
+    fn esrch_and_not_found_mean_the_process_is_gone() {
+        assert!(process_gone(&io::Error::from_raw_os_error(libc::ESRCH)));
+        assert!(process_gone(&io::Error::from(io::ErrorKind::NotFound)));
+        assert!(!process_gone(&io::Error::from_raw_os_error(libc::EACCES)));
+    }
 
     fn me() -> Identity {
         Identity {
