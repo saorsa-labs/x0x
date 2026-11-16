@@ -985,10 +985,16 @@ pub(in crate::server) async fn seal_probe_for_test(
             .map(|id| pending.get(id).map_or(0, std::collections::VecDeque::len))
             .sum()
     };
-    let ahead: Option<u64> = {
+    // The epoch and the `observed` flag the §2 gate reads: a probe-only
+    // target (`observed=false`) holds no seal.
+    let ahead: Option<(u64, bool)> = {
         let targets = state.treekem_epoch_ahead_targets.lock().await;
         ids.iter()
-            .filter_map(|id| targets.get(id).map(|target| target.epoch))
+            .filter_map(|id| {
+                targets
+                    .get(id)
+                    .map(|target| (target.epoch, target.observed))
+            })
             .max()
     };
     let fence = super::self_leave_rekey_fence_any_open(&ids);
@@ -5477,6 +5483,65 @@ mod head_window_tests;
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    // ─── #1427: a catch-up probe is not higher-head evidence ───────────
+
+    /// A09 fifth amendment of 16 Nov 2026: the §2 gate's
+    /// `unresolved_head_evidence` ignores a #1427 start or reconnect
+    /// probe target, and holds for epoch-ahead traffic, also when a
+    /// probe later joins the same entry (`observed` is sticky).
+    #[tokio::test]
+    async fn issue1427_probe_target_holds_no_seal_but_traffic_does() -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let group_id = "1427".repeat(16);
+        let info = x0x::groups::GroupInfo::new(
+            "probe-gate".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.clone(),
+        );
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        let local_epoch = 2;
+        assert!(
+            !unresolved_head_evidence(&state, &group_id, &info, local_epoch).await,
+            "no target: no evidence"
+        );
+        // A start or reconnect cycle's probe for the next epoch.
+        assert!(super::super::note_epoch_ahead(
+            &mut *state.treekem_epoch_ahead_targets.lock().await,
+            &group_id,
+            local_epoch + 1,
+            false,
+        ));
+        assert!(
+            !unresolved_head_evidence(&state, &group_id, &info, local_epoch).await,
+            "a probe-only target holds no seal"
+        );
+        // Traffic first, then a probe on the same entry.
+        state.treekem_epoch_ahead_targets.lock().await.clear();
+        assert!(super::super::note_epoch_ahead(
+            &mut *state.treekem_epoch_ahead_targets.lock().await,
+            &group_id,
+            local_epoch + 1,
+            true,
+        ));
+        assert!(!super::super::note_epoch_ahead(
+            &mut *state.treekem_epoch_ahead_targets.lock().await,
+            &group_id,
+            local_epoch + 2,
+            false,
+        ));
+        assert!(
+            unresolved_head_evidence(&state, &group_id, &info, local_epoch).await,
+            "epoch-ahead traffic holds the seal, and a later probe keeps it"
+        );
+        Ok(())
+    }
 
     // ─── Codex round 1, item 2: persistence generation ─────────────────
 

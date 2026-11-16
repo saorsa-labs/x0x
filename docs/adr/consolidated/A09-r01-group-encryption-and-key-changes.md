@@ -252,7 +252,10 @@ a revocation eviction could miss its completion bound (W3-H row
 `w3h_1357_red_s4_idle_revocation_one_admin_home`, which failed about two
 runs in five without the shim, where the pass's random wait is not
 controlled). Epoch-ahead traffic that arrives during the cycle makes the
-target evidence as before. No wire format or API changes.
+target evidence as before. The flag stays set for the life of the
+group's catch-up entry: a later probe on the same entry, even for a
+higher epoch, keeps the seals held until the entry ends. That can wait
+longer than needed but never seals early. No wire format or API changes.
 
 [A08](A08-r01-groups-home-membership-and-repair.md) defines valid group-state and fork recovery. A09 must not bypass that authority to obtain keys faster.
 
