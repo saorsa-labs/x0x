@@ -227,7 +227,11 @@ All notable changes to this project will be documented in this file.
   systemd CI job now builds the launcher test binary and runs the launcher
   lifecycle cases: the six #690 cases and six coordinator cases (cross-
   launcher stop, coordinator restart, missing handoff, partial restore,
-  reboot, unwritable journal).
+  reboot, unwritable journal). Before it stops any participant, the pass
+  now fences the host to `RollingBack` under the host lock and loads every
+  trial again, so no launcher starts a candidate past the restore; a host
+  that a peer restored or committed in the meantime is left as it is
+  (#1940 review follow-up, A14 amendment of 16 Nov 2026).
 - **Host commit outcome classes and the latched-barrier hold (#1943 and
   #1939 review; A14 amendment of 15 Nov 2026).** The launcher's host
   commit returns a typed committed / not-yet / roll-back decision; a

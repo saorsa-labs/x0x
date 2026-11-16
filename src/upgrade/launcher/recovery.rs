@@ -53,7 +53,8 @@ impl Host {
         Ok(Self { root, expected })
     }
 
-    /// The directory that holds the host journal and handoff records.
+    /// The directory that holds the host journal. Each participant's
+    /// handoff and boot records are in its own `data_root`.
     pub(super) fn root(&self) -> &Path {
         &self.root
     }
@@ -164,6 +165,29 @@ impl Host {
         Ok(())
     }
 
+    /// Fence the host before the coordinator stops any participant: write
+    /// RollingBack and the cause under the host lock. `run::run_trial`
+    /// spawns only in SwappedCli or HandoffArmed under the same lock, so no
+    /// candidate starts after this returns (A14, #1940 review). Returns the
+    /// phase found under the lock. A host that a peer restored, committed or
+    /// marked recovery-failed in the meantime is left unchanged.
+    pub(super) fn fence(&self, cause: &journal::Cause) -> io::Result<journal::Phase> {
+        self.locked(|record| {
+            let found = record.phase;
+            if !matches!(
+                found,
+                journal::Phase::Restored
+                    | journal::Phase::HostCommitted
+                    | journal::Phase::RecoveryFailed
+            ) {
+                record_cause(record, cause.clone());
+                record.phase = journal::Phase::RollingBack;
+                self.save(record)?;
+            }
+            Ok(found)
+        })
+    }
+
     /// Every running OLD and NEW identity must be absent. The caller cannot
     /// use a success HTTP response, an exit signal or a stale PID as a reap.
     pub(super) fn restore(
@@ -204,28 +228,9 @@ impl Host {
                     }
                 }
             }
-            // ADR 0094 S4: once restoration is complete, the cause is
-            // retained. Restored children may already run, so a later cause
-            // must not change the hold decision behind them.
-            let restored = record.phase == journal::Phase::Restored;
             let result = (|| {
+                record_cause(record, cause);
                 record.phase = journal::Phase::RollingBack;
-                // A recorded Failed cause is never downgraded to Interrupted
-                // by a later launcher restart. Before restoration completes,
-                // the first cause wins, except that a Failed cause replaces
-                // an Interrupted one, so the hold is durable before any
-                // restored start.
-                let keep = match &record.cause {
-                    Some(_) if restored => true,
-                    Some(existing) => {
-                        existing.class == journal::CauseClass::Failed
-                            || cause.class != journal::CauseClass::Failed
-                    }
-                    None => false,
-                };
-                if !keep {
-                    record.cause = Some(cause);
-                }
                 self.save(record)?;
                 // The cause remains in the journal through Restored. An
                 // unresolved M2 record already blocks all apply ingress.
@@ -265,6 +270,26 @@ impl Host {
             }
             Ok(())
         })
+    }
+}
+
+/// Merge `cause` into the host record before it moves to RollingBack.
+/// ADR 0094 S4: once restoration is complete, the cause is retained.
+/// Restored children may already run, so a later cause must not change the
+/// hold decision behind them. Before that, the first cause wins, except
+/// that a Failed cause replaces an Interrupted one, so the hold is durable
+/// before any restored start and a Failed cause is never downgraded.
+fn record_cause(record: &mut journal::JournalRecord, cause: journal::Cause) {
+    let keep = match &record.cause {
+        Some(_) if record.phase == journal::Phase::Restored => true,
+        Some(existing) => {
+            existing.class == journal::CauseClass::Failed
+                || cause.class != journal::CauseClass::Failed
+        }
+        None => false,
+    };
+    if !keep {
+        record.cause = Some(cause);
     }
 }
 
