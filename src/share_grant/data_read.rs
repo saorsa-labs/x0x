@@ -107,8 +107,73 @@ pub const MAX_DATA_WRITE_VALUE_BYTES: usize = WRITE_VALUE_B64_BUDGET / 4 * 3;
 /// Base64 length of a value at [`MAX_DATA_WRITE_VALUE_BYTES`].
 const MAX_DATA_WRITE_VALUE_B64_BYTES: usize = MAX_DATA_WRITE_VALUE_BYTES.div_ceil(3) * 4;
 
-/// Longest error text a `refused` write reply carries.
+/// Longest error text a `refused` write reply carries. A reply carries one
+/// of the [`DataWriteRefusal`] codes, all far shorter; the bound is what a
+/// reader accepts.
 pub const MAX_DATA_WRITE_ERROR_BYTES: usize = 256;
+
+/// Why the store refused a granted write (review of #1953): a fixed set of
+/// codes, so the granted agent never forwards its own error text to a
+/// remote grantee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataWriteRefusal {
+    /// The store's access policy refuses this agent's write.
+    StorePolicy,
+    /// The store is append-only and the key exists.
+    ImmutableKey,
+    /// ADR 0110: the group's admin seats are all covered by revocations;
+    /// writes wait for an eligible admin.
+    WaitingForEligibleAdminRevocation,
+    /// ADR 0110: the group's admin was revoked.
+    GroupAdminRevoked,
+    /// Any other refusal.
+    Other,
+}
+
+impl DataWriteRefusal {
+    const ALL: [Self; 5] = [
+        Self::StorePolicy,
+        Self::ImmutableKey,
+        Self::WaitingForEligibleAdminRevocation,
+        Self::GroupAdminRevoked,
+        Self::Other,
+    ];
+
+    /// The wire code.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::StorePolicy => "store_policy",
+            Self::ImmutableKey => "immutable_key",
+            Self::WaitingForEligibleAdminRevocation => "waiting_for_eligible_admin_revocation",
+            Self::GroupAdminRevoked => "group_admin_revoked",
+            Self::Other => "refused",
+        }
+    }
+
+    /// The code a reply carries; anything else reads as [`Self::Other`].
+    #[must_use]
+    pub fn from_wire(code: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|refusal| refusal.as_str() == code)
+            .unwrap_or(Self::Other)
+    }
+
+    /// What the grantee's route says for this refusal.
+    #[must_use]
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::StorePolicy => "the store's access policy refuses the granted agent's write",
+            Self::ImmutableKey => "the store is append-only and the key exists",
+            Self::WaitingForEligibleAdminRevocation => {
+                "the group's writes wait for an eligible admin"
+            }
+            Self::GroupAdminRevoked => "the group's admin was revoked",
+            Self::Other => "the store refused the write",
+        }
+    }
+}
 
 const _: () = assert!(
     PUT_REQUEST_FIXED_BYTES
@@ -231,8 +296,8 @@ pub struct DataReadReply {
     /// (`false`: saved on the granted agent, not yet published).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published: Option<bool>,
-    /// Slice D2: why a write was `Refused`, at most
-    /// [`MAX_DATA_WRITE_ERROR_BYTES`].
+    /// Slice D2: why a write was `Refused`, as a [`DataWriteRefusal`] code
+    /// (at most [`MAX_DATA_WRITE_ERROR_BYTES`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -404,8 +469,8 @@ impl DataWriteRequest {
 }
 
 /// `text` cut to at most `max` bytes, at a character boundary.
-#[must_use]
-pub fn truncate_utf8(text: &str, max: usize) -> String {
+#[cfg(test)]
+fn truncate_utf8(text: &str, max: usize) -> String {
     let mut end = text.len().min(max);
     while !text.is_char_boundary(end) {
         end -= 1;
@@ -695,5 +760,17 @@ mod tests {
             .expect("encode");
         let text = String::from_utf8_lossy(&read);
         assert!(!text.contains("published") && !text.contains("error"));
+    }
+
+    #[test]
+    fn refusal_codes_round_trip() {
+        for refusal in DataWriteRefusal::ALL {
+            assert_eq!(DataWriteRefusal::from_wire(refusal.as_str()), refusal);
+            assert!(refusal.as_str().len() <= MAX_DATA_WRITE_ERROR_BYTES);
+        }
+        assert_eq!(
+            DataWriteRefusal::from_wire("disk /home/x full"),
+            DataWriteRefusal::Other
+        );
     }
 }

@@ -1,6 +1,6 @@
 //! ADR 0109 Validation table row H-S3-q (unreadable sidecar, D120, D119;
-//! #1572), variant (1): the joiner. The row is a control; on this build
-//! the arm is an expected RED (see "On main").
+//! #1572), variant (1): the joiner. The row is a control, GREEN since the
+//! #1937 fix (see "History").
 //!
 //! Setup: H-S3-s ([`super::segments_s`]) up to J stopped between the
 //! segments, with the segment length 2 by test configuration. J stops at
@@ -21,17 +21,13 @@
 //!   with an `exit`. In this build the exit is D43's remedy
 //!   (`manual_remove_and_reinvite`); ADR 0114's repair is not in effect.
 //!
-//! **On main (14 Nov 2026).** The quarantine works: the junk bytes sit
-//! in one history copy and a fresh `.grecov` names the rebuild `txid`.
-//! Nothing commits and no marker clears. But after the rebuild J has no
-//! `recovery` object at all (`GET /groups/:id` shows `recovery: null`),
-//! so `recovery_sidecar_rebuilt` never shows, and J sends A no request
-//! for the whole watch. `local_state_lost` is set by two paths in
-//! `group_recovery.rs`, and neither fires here: `ensure_placeholders`
-//! needs an authoritative record in the sidecar (the rebuild dropped it),
-//! and `local_state_lost` needs an admin-armed ATA (J asks for none). The
-//! arm pins that cause ([`CAUSE_SILENT`]); the fix belongs to the S3
-//! code, and with it the arm turns GREEN and is renamed a control.
+//! **History.** Before #1937 the arm was an expected RED: the quarantine
+//! worked and nothing committed, but after the rebuild J had no `recovery`
+//! object at all and asked A for nothing ([`CAUSE_SILENT`]).
+//! `ensure_placeholders` marked a placeholder `lost` only while the
+//! sidecar still held an authoritative record, which the rebuild had
+//! dropped. With the fix a rebuilt sidecar under a live placeholder is
+//! `lost` too, so J shows `readmission_required {local_state_lost}`.
 //!
 //! **Holds.** As H-S3-s: every gossip write to J on the group's metadata
 //! topic is dropped for the whole case, and J's writes are dropped from
@@ -479,8 +475,7 @@ fn w3h_1356_q_sidecar_shapes() {
     assert!(!run.silent(), "A answered J after the rebuild");
 }
 
-/// H-S3-q (1): an expected RED on main, pinned `=RED` in the W3-H gate
-/// with [`CAUSE_SILENT`]; GREEN with the S3 fix.
+/// H-S3-q (1): a control, GREEN with the #1937 fix.
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -492,17 +487,15 @@ fn w3h_1356_q_sidecar_shapes() {
               --run-ignored all); plain suites run unseeded entropy, which is not an \
               observation"
 )]
-fn w3h_1356_red_s3_q_joiner_unreadable_sidecar() -> Result<()> {
+fn w3h_1356_control_s3_q_joiner_unreadable_sidecar() -> Result<()> {
     // Every daemon of the case runs on this thread (`block_on_paused`).
     let _limit = AtaMaxLinksOverride::set(SEGMENT as usize);
     super::super::block_on_paused(async move {
-        let case = "w3h_1356_red_s3_q_joiner_unreadable_sidecar";
+        let case = "w3h_1356_control_s3_q_joiner_unreadable_sidecar";
         let receipt = run(case, 0x1356_0133).await;
-        // The pin names the exact failure, not any RED.
         ensure!(
-            receipt.verdict() == Some(Verdict::Red)
-                && receipt.named_causes().contains(&CAUSE_SILENT),
-            "{case}: expected Red with the silent-joiner cause, got {:?} {:?}",
+            receipt.verdict() == Some(Verdict::Green),
+            "{case}: expected Green, got {:?} {:?}",
             receipt.verdict(),
             receipt.named_causes()
         );

@@ -15671,14 +15671,18 @@ pub(in crate::server) fn spawn_treekem_epoch_ahead_catchup(
     let task_state = Arc::clone(state);
     let group_id = group_id.to_string();
     let _admitted = state.spawn_detached(async move {
-        request_treekem_catchup_for_epoch_ahead(&task_state, &group_id, observed_epoch).await;
+        request_treekem_catchup_for_epoch_ahead(&task_state, &group_id, observed_epoch, true).await;
     });
 }
 
+/// `observed` is `true` for epoch-ahead traffic and `false` for the
+/// #1427 start and reconnect cycles, which only probe for the next epoch
+/// ([`EpochAheadTarget::observed`]).
 async fn request_treekem_catchup_for_epoch_ahead(
     state: &Arc<AppState>,
     group_id: &str,
     observed_epoch: u64,
+    observed: bool,
 ) {
     let key = {
         let groups = state.named_groups.read().await;
@@ -15696,10 +15700,11 @@ async fn request_treekem_catchup_for_epoch_ahead(
         };
         key.clone()
     };
-    if !note_epoch_ahead_observation(
+    if !note_epoch_ahead(
         &mut *state.treekem_epoch_ahead_targets.lock().await,
         &key,
         observed_epoch,
+        observed,
     ) {
         // The running task picks up the observation.
         return;
@@ -15725,6 +15730,7 @@ async fn request_treekem_catchup_for_epoch_ahead(
             .unwrap_or(EpochAheadTarget {
                 epoch: target,
                 observations: covered,
+                observed,
             });
         let renewed = std::mem::take(&mut renew) || latest.epoch > target;
         if renewed {
@@ -15767,25 +15773,55 @@ pub(in crate::server) struct EpochAheadTarget {
     pub(in crate::server) epoch: u64,
     /// How many observations arrived after the first one, at any epoch.
     pub(in crate::server) observations: u64,
+    /// Whether traffic at a later epoch was seen. A #1427 start or
+    /// reconnect cycle only probes for the next epoch, so its target is
+    /// not higher-head evidence for ADR 0110 §2 until real epoch-ahead
+    /// traffic arrives ([`EpochAheadTarget::is_head_evidence`]).
+    pub(in crate::server) observed: bool,
+}
+
+impl EpochAheadTarget {
+    /// ADR 0110 §2: whether this target is unresolved higher-head evidence
+    /// for a member at `local_epoch`. A probe target is not: it shows no
+    /// later head, and S4's own head round already asks the holders. Before
+    /// this, a reconnect probe held every S4 seal for its whole pass.
+    pub(in crate::server) fn is_head_evidence(&self, local_epoch: u64) -> bool {
+        self.observed && self.epoch > local_epoch
+    }
 }
 
 /// Records one epoch-ahead observation for `key`. Returns `true` when no
 /// task runs for the group, so the caller must run one.
+#[cfg(test)]
 fn note_epoch_ahead_observation(
     targets: &mut HashMap<String, EpochAheadTarget>,
     key: &str,
     observed_epoch: u64,
 ) -> bool {
+    note_epoch_ahead(targets, key, observed_epoch, true)
+}
+
+/// Records one epoch-ahead observation (`observed`) or #1427 probe for
+/// `key`. Returns `true` when no task runs for the group, so the caller
+/// must run one. An observation turns a probe target into evidence.
+fn note_epoch_ahead(
+    targets: &mut HashMap<String, EpochAheadTarget>,
+    key: &str,
+    epoch: u64,
+    observed: bool,
+) -> bool {
     if let Some(target) = targets.get_mut(key) {
-        target.epoch = target.epoch.max(observed_epoch);
+        target.epoch = target.epoch.max(epoch);
         target.observations = target.observations.saturating_add(1);
+        target.observed |= observed;
         return false;
     }
     targets.insert(
         key.to_string(),
         EpochAheadTarget {
-            epoch: observed_epoch,
+            epoch,
             observations: 0,
+            observed,
         },
     );
     true
@@ -15947,31 +15983,16 @@ fn treekem_catchup_pending_path(state: &AppState) -> std::path::PathBuf {
     state.data_dir.join("treekem-catchup-pending")
 }
 
-/// #1427: remove `key`'s pending mark. `Some(true)`: no group is left.
-fn remove_treekem_pending_mark(
-    pending: &std::sync::Mutex<HashSet<String>>,
-    key: &str,
-) -> Option<bool> {
-    let mut pending = pending
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    pending.remove(key).then(|| pending.is_empty())
-}
-
 /// #1427: the start catch-up of `key` succeeded, or the group no longer
-/// needs it. When no group is left, the outage record is removed. A
-/// reconnect catch-up passes its `gate`: a mark that a later pass set
-/// while this catch-up ran then stays ([`TreeKemReconnectGate::unmark`]).
-async fn treekem_start_catchup_done(
-    state: &AppState,
-    key: &str,
-    gate: Option<&TreeKemReconnectGate>,
-) {
-    let pending = &state.treekem_start_catchup_pending;
-    let removed = match gate {
-        Some(gate) => gate.unmark(pending, key),
-        None => remove_treekem_pending_mark(pending, key),
-    };
+/// needs it. When no group is left, the outage record is removed. Every
+/// route to this end (a start pass, a reconnect catch-up, a member that
+/// reports the local head) removes the mark through the daemon's one
+/// reconnect gate: a mark that a later pass set while the group's
+/// reconnect catch-up ran stays ([`TreeKemReconnectGate::unmark`]).
+async fn treekem_start_catchup_done(state: &AppState, key: &str) {
+    let removed = state
+        .treekem_reconnect_gate
+        .unmark(&state.treekem_start_catchup_pending, key);
     if removed != Some(true) {
         return;
     }
@@ -15996,7 +16017,9 @@ async fn treekem_start_catchup_done(
 /// #1427: a verified last catch-up page from a member whose saved head
 /// equals the local saved head after the page applied. This member is as
 /// current as that member, so its start catch-up succeeded even though no
-/// commit was missed.
+/// commit was missed. A mark that a later reconnect pass set while the
+/// group's catch-up ran stays here too ([`treekem_start_catchup_done`]):
+/// the page can answer a request from before that pass's isolation.
 async fn treekem_start_catchup_note_head(state: &AppState, key: &str, reported: Option<&str>) {
     let Some(reported) = reported.filter(|head| !head.is_empty()) else {
         return;
@@ -16016,7 +16039,7 @@ async fn treekem_start_catchup_note_head(state: &AppState, key: &str, reported: 
         .get(key)
         .is_some_and(|info| info.state_hash == reported);
     if current {
-        treekem_start_catchup_done(state, key, None).await;
+        treekem_start_catchup_done(state, key).await;
     }
 }
 
@@ -16086,13 +16109,8 @@ where
 /// task for the group; when an epoch-ahead task already runs, that task
 /// takes the target. [`drive_treekem_start_catchup`] repeats the cycle
 /// while the group moves. The group stays pending until the pass is done,
-/// a member reports the local head, or this member leaves the group. A
-/// reconnect catch-up passes its `gate` ([`treekem_start_catchup_done`]).
-async fn request_treekem_catchup_after_start(
-    state: &Arc<AppState>,
-    key: &str,
-    gate: Option<&TreeKemReconnectGate>,
-) {
+/// a member reports the local head, or this member leaves the group.
+async fn request_treekem_catchup_after_start(state: &Arc<AppState>, key: &str) {
     state
         .treekem_start_catchup_passes
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -16106,7 +16124,7 @@ async fn request_treekem_catchup_after_start(
             let state = Arc::clone(state);
             let key = key.to_string();
             async move {
-                request_treekem_catchup_for_epoch_ahead(&state, &key, target).await;
+                request_treekem_catchup_for_epoch_ahead(&state, &key, target, false).await;
                 // When another epoch-ahead task already holds the group, the
                 // call above only hands it the target and returns at once.
                 // Judge the cycle only after that task ends, or a cycle that
@@ -16138,7 +16156,7 @@ async fn request_treekem_catchup_after_start(
             .iter()
             .any(|k| k == key)
     {
-        treekem_start_catchup_done(state, key, gate).await;
+        treekem_start_catchup_done(state, key).await;
     }
 }
 
@@ -16153,7 +16171,7 @@ fn spawn_treekem_start_catchup(state: &Arc<AppState>, keys: Vec<String>) {
         let task_state = Arc::clone(state);
         let mut join_ended = state.treekem_network_join_ended.subscribe();
         let _admitted = state.spawn_detached(async move {
-            request_treekem_catchup_after_start(&task_state, &key, None).await;
+            request_treekem_catchup_after_start(&task_state, &key).await;
             if join_ended.wait_for(|ended| *ended).await.is_err() {
                 return;
             }
@@ -16167,7 +16185,7 @@ fn spawn_treekem_start_catchup(state: &Arc<AppState>, keys: Vec<String>) {
                     group_id = %LogHexId::group(&key),
                     "network join ended; asking again for TreeKEM catch-up pages"
                 );
-                request_treekem_catchup_after_start(&task_state, &key, None).await;
+                request_treekem_catchup_after_start(&task_state, &key).await;
             }
         });
     }
@@ -16326,8 +16344,11 @@ const TREEKEM_RECONNECT_TURN: Duration = Duration::from_secs(120);
 /// runs, so a later turn does not start a second one; the value says that
 /// a later turn wanted the group meanwhile, so the running catch-up asks
 /// once more when it ends.
+///
+/// The daemon has one gate (`AppState::treekem_reconnect_gate`), so every
+/// removal of a pending mark sees `busy` ([`Self::unmark`]).
 #[derive(Debug, Default)]
-struct TreeKemReconnectGate {
+pub(in crate::server) struct TreeKemReconnectGate {
     running: std::sync::atomic::AtomicBool,
     rerun: std::sync::atomic::AtomicBool,
     wake: tokio::sync::Notify,
@@ -16432,8 +16453,9 @@ impl TreeKemReconnectGate {
         }
     }
 
-    /// `key`'s catch-up ended `Done`. Its mark is removed, unless a later
-    /// pass marked the group while it ran: that mark then stays for the
+    /// `key`'s catch-up ended `Done`, or a member reported the local head.
+    /// Its mark is removed, unless a later pass marked the group while
+    /// its reconnect catch-up ran: that mark then stays for the
     /// re-ask and that pass's retries. The re-ask runs with the flag taken
     /// ([`Self::ask_again`]), so its own `Done` removes the mark.
     /// `Some(true)`: the mark was removed and no group is left.
@@ -16445,7 +16467,10 @@ impl TreeKemReconnectGate {
         if busy.get(key).copied().unwrap_or(false) {
             return None;
         }
-        remove_treekem_pending_mark(pending, key)
+        let mut pending = pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.remove(key).then(|| pending.is_empty())
     }
 
     fn release(&self, key: &str) {
@@ -16582,7 +16607,7 @@ pub(in crate::server) async fn run_treekem_reconnect_catchup(state: Arc<AppState
     let mut events = network.subscribe();
     let mut shutdown = state.shutdown_notify.subscribe();
     let mut isolation = TreeKemIsolation::default();
-    let gate = Arc::new(TreeKemReconnectGate::default());
+    let gate = Arc::clone(&state.treekem_reconnect_gate);
     let mut tick = tokio::time::interval(TREEKEM_ISOLATION_CHECK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -16605,11 +16630,10 @@ pub(in crate::server) async fn run_treekem_reconnect_catchup(state: Arc<AppState
             continue;
         }
         let pass_state = Arc::clone(&state);
-        let pass_gate = Arc::clone(&gate);
         let admitted = state.spawn_detached(async move {
             loop {
-                run_treekem_reconnect_pass(&pass_state, &pass_gate).await;
-                if !pass_gate.finish() {
+                run_treekem_reconnect_pass(&pass_state).await;
+                if !pass_state.treekem_reconnect_gate.finish() {
                     return;
                 }
             }
@@ -16620,16 +16644,14 @@ pub(in crate::server) async fn run_treekem_reconnect_catchup(state: Arc<AppState
     }
 }
 
-/// #1427: a reconnect pass marks `keys` pending through `gate`
+/// #1427: a reconnect pass marks `keys` pending through the gate
 /// ([`TreeKemReconnectGate::mark`]) and keeps the outage record, both
 /// under the record lock.
-async fn mark_treekem_reconnect_pass(
-    state: &AppState,
-    gate: &TreeKemReconnectGate,
-    keys: &[String],
-) {
+async fn mark_treekem_reconnect_pass(state: &AppState, keys: &[String]) {
     let _record = state.treekem_catchup_record_lock.lock().await;
-    gate.mark(&state.treekem_start_catchup_pending, keys);
+    state
+        .treekem_reconnect_gate
+        .mark(&state.treekem_start_catchup_pending, keys);
     let record = treekem_catchup_pending_path(state);
     if !tokio::fs::try_exists(&record).await.unwrap_or(false) {
         if let Err(error) = crate::profile::write_atomically(&record, b"reconnect").await {
@@ -16646,12 +16668,12 @@ async fn mark_treekem_reconnect_pass(
 /// wait up to [`TREEKEM_RECONNECT_JITTER`] and for a turn of at most
 /// [`TREEKEM_RECONNECT_TURN`], and the groups that stay pending again
 /// after each wait of [`TREEKEM_RECONNECT_RETRY`].
-async fn run_treekem_reconnect_pass(state: &Arc<AppState>, gate: &Arc<TreeKemReconnectGate>) {
+async fn run_treekem_reconnect_pass(state: &Arc<AppState>) {
     let keys = treekem_start_catchup_groups(state).await;
     if keys.is_empty() {
         return;
     }
-    mark_treekem_reconnect_pass(state, gate, &keys).await;
+    mark_treekem_reconnect_pass(state, &keys).await;
     state
         .treekem_reconnect_catchup_passes
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -16675,10 +16697,10 @@ async fn run_treekem_reconnect_pass(state: &Arc<AppState>, gate: &Arc<TreeKemRec
             Duration::from_millis(rand::thread_rng().gen_range(0..=max_ms))
         },
         {
-            let (run_state, run_gate) = (Arc::clone(state), Arc::clone(gate));
+            let run_state = Arc::clone(state);
             move |key: String| {
-                let (state, gate) = (Arc::clone(&run_state), Arc::clone(&run_gate));
-                async move { request_treekem_catchup_after_start(&state, &key, Some(&gate)).await }
+                let state = Arc::clone(&run_state);
+                async move { request_treekem_catchup_after_start(&state, &key).await }
             }
         },
         &spawn,
@@ -16690,7 +16712,7 @@ async fn run_treekem_reconnect_pass(state: &Arc<AppState>, gate: &Arc<TreeKemRec
                 .contains(key)
         },
         &TREEKEM_RECONNECT_RETRY,
-        gate,
+        &state.treekem_reconnect_gate,
     )
     .await;
 }
@@ -21237,6 +21259,35 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     .await;
                     return ApplyMetadataResult::REJECTED;
                 }
+            }
+
+            // #1941 (ADR 0109 §4, D120): while this node cannot tell whether
+            // a targeted invite pairs with a re-seat authorisation it lost
+            // in a sidecar rebuild (the revocation is pending, or the
+            // sidecar is not loaded), its redemption is refused as for an
+            // unknown invite. The pending revocation then removes it.
+            if group_recovery::unpaired_join_held(state, &info, &invite_secret).await {
+                tracing::info!(
+                    group_id = %resolved_group_key,
+                    member = %member_agent_id,
+                    "MemberJoined: targeted invite held while issued re-seats are lost (#1941); not consumed"
+                );
+                state
+                    .groups_diagnostics
+                    .record_member_joined_rejected_invite_secret_unknown(&resolved_group_key);
+                state.groups_diagnostics.record_invite_refusal(
+                    &resolved_group_key,
+                    JoinRefusalReason::InviteSecretUnknown.as_str(),
+                );
+                stage_join_refusal(
+                    state,
+                    &resolved_group_key,
+                    &member_agent_id,
+                    &event_for_log,
+                    JoinRefusalReason::InviteSecretUnknown,
+                )
+                .await;
+                return ApplyMetadataResult::REJECTED;
             }
 
             // 8. Build the authoritative committed add on a clone first. If
@@ -55762,6 +55813,7 @@ pub(in crate::server) mod tests {
             )),
             treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
             treekem_start_catchup_pending: Default::default(),
+            treekem_reconnect_gate: Default::default(),
             treekem_network_join_ended: tokio::sync::watch::channel(false).0,
             treekem_start_catchup_passes: Default::default(),
             treekem_reconnect_catchup_passes: Default::default(),

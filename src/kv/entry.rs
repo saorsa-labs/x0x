@@ -10,6 +10,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// by content hash.
 pub const MAX_INLINE_SIZE: usize = 65_536;
 
+fn sorted_metadata(metadata: &HashMap<String, String>) -> Vec<(&String, &String)> {
+    let mut pairs: Vec<_> = metadata.iter().collect();
+    pairs.sort();
+    pairs
+}
+
 /// A single key-value entry in the store.
 ///
 /// Uses LWW (Last-Writer-Wins) semantics for conflict resolution:
@@ -71,8 +77,10 @@ impl KvEntry {
         }
     }
 
-    /// Update the value, bumping `updated_at`.
+    /// Update the value, bumping `updated_at`. The previous writer's mark
+    /// (#1094 P1) no longer covers the new content, so it is removed.
     pub fn update_value(&mut self, value: Vec<u8>, content_type: String) {
+        super::provenance::strip(&mut self.metadata);
         self.content_hash = *blake3::hash(&value).as_bytes();
         self.value = value;
         self.content_type = content_type;
@@ -84,12 +92,23 @@ impl KvEntry {
 
     /// Merge another entry into this one using LWW semantics.
     ///
-    /// The entry with the higher `updated_at` wins. Ties are broken
-    /// by comparing content hashes (deterministic).
+    /// The entry with the greater [`Self::lww_order`] wins: `updated_at`,
+    /// then the content hash, then the content type, then the sorted
+    /// metadata. This is the one LWW rule of every store merge path
+    /// (deltas, SelfKeyed, checkpoints, retained images, legacy history),
+    /// and it is a pure function of the two entries, so every replica keeps
+    /// the same winner whatever the order of arrival.
+    ///
+    /// #1094 P1 (A10, review of #1963): on a tie of time and content the
+    /// value is identical and only the metadata, such as a writer mark,
+    /// differs. The rule does not verify marks: verification depends on
+    /// which keys a daemon knows, and a merge must not. So any member or
+    /// relay can replace a mark on such a tie, as any member can overwrite
+    /// the entry; a mark shows who signed the current bytes, and the
+    /// absence of a valid mark shows nothing.
     pub fn merge(&mut self, other: &Self) {
-        if other.updated_at > self.updated_at
-            || (other.updated_at == self.updated_at && other.content_hash > self.content_hash)
-        {
+        let wins = other.lww_order() > self.lww_order();
+        if wins {
             self.value = other.value.clone();
             self.content_hash = other.content_hash;
             self.content_type = other.content_type.clone();
@@ -100,6 +119,18 @@ impl KvEntry {
                 self.created_at = other.created_at;
             }
         }
+    }
+
+    /// The LWW order of this entry: `updated_at`, content hash, content
+    /// type, sorted metadata. [`Self::merge`] keeps the greater.
+    #[must_use]
+    pub fn lww_order(&self) -> (u64, [u8; 32], &str, Vec<(&String, &String)>) {
+        (
+            self.updated_at,
+            self.content_hash,
+            &self.content_type,
+            sorted_metadata(&self.metadata),
+        )
     }
 
     /// Check if this entry's value is stored inline (vs externally).
