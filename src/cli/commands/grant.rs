@@ -22,7 +22,9 @@ pub async fn list(client: &DaemonClient) -> Result<()> {
 
 /// `x0x grant revoke GRANT_ID` — revoke with the owner key.
 pub async fn revoke(client: &DaemonClient, grant_id: &str) -> Result<()> {
-    let resp = client.delete(&format!("/grants/{grant_id}")).await?;
+    let resp = client
+        .delete(&format!("/grants/{}", encode_segment(grant_id)?))
+        .await?;
     print_value(client.format(), &resp);
     Ok(())
 }
@@ -44,11 +46,9 @@ pub async fn data(
     store: &str,
     key: Option<&str>,
 ) -> Result<()> {
-    let path = match key {
-        Some(key) => format!("/grants/data/{agent}/{group}/{store}/{key}"),
-        None => format!("/grants/data/{agent}/{group}/{store}"),
-    };
-    let resp = client.get(&path).await?;
+    let resp = client
+        .get(&granted_store_path(agent, group, store, key)?)
+        .await?;
     print_value(client.format(), &resp);
     Ok(())
 }
@@ -73,10 +73,7 @@ pub async fn data_put(
         body["content_type"] = serde_json::Value::String(ct.to_string());
     }
     let resp = client
-        .put(
-            &format!("/grants/data/{agent}/{group}/{store}/{key}"),
-            &body,
-        )
+        .put(&granted_store_path(agent, group, store, Some(key))?, &body)
         .await?;
     print_value(client.format(), &resp);
     Ok(())
@@ -93,10 +90,50 @@ pub async fn data_rm(
     key: &str,
 ) -> Result<()> {
     let resp = client
-        .delete(&format!("/grants/data/{agent}/{group}/{store}/{key}"))
+        .delete(&granted_store_path(agent, group, store, Some(key))?)
         .await?;
     print_value(client.format(), &resp);
     Ok(())
+}
+
+/// The `/grants/data/...` path for a store, or for one key of it. Each
+/// part is one percent-encoded path segment.
+///
+/// # Errors
+///
+/// A part that is empty, `.` or `..` (see [`encode_segment`]).
+fn granted_store_path(agent: &str, group: &str, store: &str, key: Option<&str>) -> Result<String> {
+    let mut path = String::from("/grants/data");
+    for segment in [agent, group, store].into_iter().chain(key) {
+        path.push('/');
+        path.push_str(&encode_segment(segment)?);
+    }
+    Ok(path)
+}
+
+/// Percent-encode `text` as one URL path segment: every byte but the RFC
+/// 3986 unreserved set (`A-Z a-z 0-9 - . _ ~`) becomes `%XX`, so a `/`,
+/// `?`, `#` or `%` in user text cannot end or change the segment.
+///
+/// # Errors
+///
+/// `text` is empty, `.` or `..` (review of #1966). A URL client resolves
+/// a dot segment, encoded or not, so `rm X .. .. ID` would reach
+/// `DELETE /grants/ID` and revoke that grant; an empty part would shift
+/// the others.
+fn encode_segment(text: &str) -> Result<String> {
+    if matches!(text, "" | "." | "..") {
+        anyhow::bail!("a path part cannot be empty, `.` or `..` (got {text:?})");
+    }
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    Ok(out)
 }
 
 /// `x0x grant renew GRANT_ID [--ttl-secs N] [--deliver-to AGENT]... [--no-names]` — renew an
@@ -110,7 +147,7 @@ pub async fn renew(
 ) -> Result<()> {
     let resp = client
         .post(
-            &format!("/grants/{grant_id}/renew"),
+            &format!("/grants/{}/renew", encode_segment(grant_id)?),
             &renew_body(ttl_secs, deliver_to, no_names),
         )
         .await?;
@@ -222,6 +259,122 @@ mod tests {
         );
         let _ = std::fs::remove_file(&p);
         assert!(read_json_arg("/nonexistent/x0x-grant.json").is_err());
+    }
+
+    /// WHY (#1953 review): each path part is one percent-encoded segment.
+    /// A raw `#` or `?` cut the key, so `put`/`rm` changed the wrong key.
+    #[test]
+    fn granted_store_path_encodes_each_segment() {
+        let path = |key| granted_store_path("aa", "g1", "scratch", Some(key)).expect("path");
+        assert_eq!(path("note"), "/grants/data/aa/g1/scratch/note");
+        assert_eq!(
+            path("note#draft"),
+            "/grants/data/aa/g1/scratch/note%23draft"
+        );
+        assert_eq!(path("a?b"), "/grants/data/aa/g1/scratch/a%3Fb");
+        assert_eq!(path("a/b"), "/grants/data/aa/g1/scratch/a%2Fb");
+        assert_eq!(path("a b"), "/grants/data/aa/g1/scratch/a%20b");
+        assert_eq!(path("100%"), "/grants/data/aa/g1/scratch/100%25");
+        assert_eq!(path("-._~"), "/grants/data/aa/g1/scratch/-._~");
+        assert_eq!(path("é"), "/grants/data/aa/g1/scratch/%C3%A9");
+        assert_eq!(
+            granted_store_path("a/a", "g?", "s#", None).expect("path"),
+            "/grants/data/a%2Fa/g%3F/s%23"
+        );
+    }
+
+    /// WHY (review of #1966): a URL client resolves dot segments, encoded
+    /// or not, so `grant data rm X .. .. ID` reached `DELETE /grants/ID`
+    /// and revoked that grant. An empty, `.` or `..` part is refused before
+    /// any request; `...` and a dot inside a part are ordinary text.
+    #[test]
+    fn dot_and_empty_segments_are_refused() {
+        for bad in ["", ".", ".."] {
+            assert!(encode_segment(bad).is_err(), "{bad:?}");
+            assert!(granted_store_path("aa", bad, "s", None).is_err());
+            assert!(granted_store_path("aa", "g", bad, None).is_err());
+            assert!(granted_store_path("aa", "g", "s", Some(bad)).is_err());
+            assert!(granted_store_path(bad, "g", "s", None).is_err());
+        }
+        assert!(granted_store_path("X", "..", "..", Some("00ff")).is_err());
+        assert_eq!(
+            granted_store_path("aa", "...", ".x", Some("a.b")).expect("path"),
+            "/grants/data/aa/.../.x/a.b"
+        );
+        assert_eq!(
+            granted_store_path("aa", "g", "s", Some("%2e%2e")).expect("path"),
+            "/grants/data/aa/g/s/%252e%252e",
+            "an encoded dot in user text stays text"
+        );
+    }
+
+    /// WHY (review of #1966): what reqwest actually sends. The dot-segment
+    /// path the old CLI built resolves to another route; the refused parts
+    /// never reach a URL, and every accepted path keeps its five segments.
+    #[test]
+    fn accepted_paths_do_not_collapse_in_the_url_parser() {
+        let base = reqwest::Url::parse("http://127.0.0.1:1").expect("base");
+        let old = base.join("/grants/data/X/../../00ff").expect("url");
+        assert_eq!(old.path(), "/grants/00ff", "the attack the fix closes");
+        for key in ["...", "a.b", "%2e%2e", ".hidden", "a/b", "é"] {
+            let path = granted_store_path("aa", "g", "s", Some(key)).expect("path");
+            let url = base.join(&path).expect("url");
+            assert_eq!(url.path(), path, "{key:?}");
+            assert_eq!(url.path_segments().expect("segments").count(), 6);
+        }
+    }
+
+    /// WHY (#1953 review): end to end, the CLI client sends the encoded
+    /// path unchanged (no double encoding of `%`), and the daemon's route
+    /// pattern with its `Path` extractor decodes each segment back to the
+    /// exact text, a `/` included, for get, put and rm.
+    #[tokio::test]
+    async fn granted_store_keys_reach_the_route_exactly() {
+        use axum::extract::Path;
+        use std::sync::{Arc, Mutex};
+
+        type Seen = Arc<Mutex<Vec<(String, [String; 4])>>>;
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let record = |method: &'static str, seen: Seen| {
+            move |Path((a, g, s, k)): Path<(String, String, String, String)>| async move {
+                seen.lock()
+                    .expect("lock")
+                    .push((method.to_string(), [a, g, s, k]));
+                axum::Json(serde_json::json!({"ok": true}))
+            }
+        };
+        let app = axum::Router::new().route(
+            "/grants/data/:agent/:group/:store/:key",
+            axum::routing::get(record("GET", Arc::clone(&seen)))
+                .put(record("PUT", Arc::clone(&seen)))
+                .delete(record("DELETE", Arc::clone(&seen))),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let client =
+            DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).expect("client");
+
+        let keys = ["note#draft", "a?b=c&d", "a/b", "100%25 é", "plain"];
+        for key in keys {
+            data(&client, "aa", "g/1", "s#1", Some(key))
+                .await
+                .expect("get");
+            data_put(&client, "aa", "g/1", "s#1", key, "v", None)
+                .await
+                .expect("put");
+            data_rm(&client, "aa", "g/1", "s#1", key).await.expect("rm");
+        }
+        server.abort();
+        let seen = seen.lock().expect("lock").clone();
+        assert_eq!(seen.len(), keys.len() * 3, "{seen:?}");
+        for (i, (method, parts)) in seen.iter().enumerate() {
+            assert_eq!(method, ["GET", "PUT", "DELETE"][i % 3]);
+            let want = ["aa", "g/1", "s#1", keys[i / 3]];
+            assert_eq!(parts, &want.map(String::from), "{method}");
+        }
     }
 
     #[test]

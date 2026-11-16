@@ -431,6 +431,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Granted-store CLI paths and serves (#1953 review).** `x0x grant data`
+  (and `grant revoke|renew`) percent-encode each path segment, so a key with
+  `#`, `?` or `/` reaches the exact key. A slow granted read or write now
+  runs on a detached task (at most 16 at once), so it does not hold the
+  replies to other waiting requests.
 - **A #1427 catch-up probe no longer holds S4 seals (A09 fifth amendment
   of 16 Nov 2026).** A start or reconnect catch-up cycle asks for the next
   TreeKEM epoch without having seen it. Its target was read as ADR 0110 §2
