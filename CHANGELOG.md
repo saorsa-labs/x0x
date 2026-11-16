@@ -13,6 +13,14 @@ All notable changes to this project will be documented in this file.
   longer in `metadata`. A rider's write names the rider. The Scratch app
   shows the writer. Every KV merge path now refuses an entry whose content
   hash does not match its value.
+- **The dormant launcher retires a committed trial (#1378 slice 3; A14
+  amendment of 16 Nov 2026).** When the host commits, the supervise driver
+  saves the trial `Committed` and hands the candidate to the caller, which
+  keeps or stops it as an ordinary committed daemon. A launcher that dies
+  between the host commit and the retire now retires the trial at its next
+  start and starts the installed daemon, instead of rolling back and ending
+  RecoveryFailed. The stop path's first host-lock pass is retried like the
+  rollback path's. The launcher is still dormant (`ENABLED` is false).
 - **A refused granted write names a fixed reason (#1094, review of #1953;
   A03 amendment of 16 Nov 2026).** The granted agent no longer forwards its
   store's error text to a remote grantee; the reply carries one of

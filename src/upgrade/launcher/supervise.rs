@@ -43,7 +43,14 @@ pub(super) enum Settled<C> {
 }
 
 pub(super) enum Supervised {
+    /// The host is committed with this candidate running, and the trial is
+    /// retired. The caller keeps it, or stops it, as a committed daemon
+    /// (`keep`).
     Committed(child::Owned),
+    /// The host is committed and the trial was already retired (a launcher
+    /// restart). No child runs: the caller starts the installed daemon as
+    /// an ordinary start.
+    Retired,
     Restored(child::Owned),
     Stopped,
     /// No automatic step is allowed (`RecoveryFailed`, or a host a peer
@@ -64,6 +71,7 @@ pub(super) fn supervise(
     {
         run::Outcome::Stopped => return Ok(Supervised::Stopped),
         run::Outcome::Restored(child) => return Ok(Supervised::Restored(child)),
+        run::Outcome::Committed => return Ok(Supervised::Retired),
         run::Outcome::Provisional(child) => child,
     };
     let settled = settle_provisional(
@@ -78,7 +86,18 @@ pub(super) fn supervise(
         || std::thread::sleep(COMMIT_POLL),
     )?;
     match settled {
-        Settled::Committed(child) => Ok(Supervised::Committed(child)),
+        Settled::Committed(child) => {
+            // Retire the trial, so a later restart does not read a
+            // provisional trial with its child gone as a lost child. A
+            // retire that keeps failing leaves the trial Provisional; the
+            // next start's `run_trial` retires it then. The child is never
+            // dropped here: dropping it would stop a committed daemon.
+            let _ = locked_retry(
+                || std::thread::sleep(COMMIT_POLL),
+                || run::retire(host, path, trial),
+            );
+            Ok(Supervised::Committed(child))
+        }
         Settled::Stopped => Ok(Supervised::Stopped),
         // Every trial is Restored: start this participant's restored child.
         Settled::Recovered(Resolution::Restored(_)) => {
@@ -90,6 +109,59 @@ pub(super) fn supervise(
         Settled::Recovered(Resolution::Final(phase)) => Ok(Supervised::Final(phase)),
         Settled::Recovered(Resolution::Proceed) => {
             Err(invalid("recovery found no cause after a rollback was due"))
+        }
+    }
+}
+
+/// What ended a kept daemon.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Kept {
+    /// The daemon exited by itself; the launcher exits so the service
+    /// manager applies the unit's restart policy.
+    Exited,
+    /// An intentional stop stopped and reaped the daemon.
+    Stopped,
+}
+
+/// The caller's custody of a committed or restored daemon: an ordinary
+/// daemon, no trial. A stop stops and reaps it; an exit is reaped and
+/// returned. Neither changes the trial or the host journal.
+pub(super) fn keep<C: Custody>(
+    mut child: C,
+    mut stop: impl FnMut() -> bool,
+    mut pause: impl FnMut(),
+) -> io::Result<Kept> {
+    loop {
+        if stop() {
+            child.reap()?;
+            return Ok(Kept::Stopped);
+        }
+        if child.exited()? {
+            child.reap()?;
+            return Ok(Kept::Exited);
+        }
+        pause();
+    }
+}
+
+/// Run `action` (one host-lock pass) until it succeeds, with one `pause`
+/// after each failure, up to `MAX_POLL_ERRORS` tries. The last error is
+/// returned.
+fn locked_retry<T>(
+    mut pause: impl FnMut(),
+    mut action: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    let mut attempts = 0;
+    loop {
+        match action() {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                attempts += 1;
+                if attempts >= MAX_POLL_ERRORS {
+                    return Err(error);
+                }
+                pause();
+            }
         }
     }
 }
@@ -149,7 +221,7 @@ pub(super) fn settle_provisional<C: Custody>(
     let mut errors = 0;
     let due = loop {
         if stop() {
-            return stop_trial(host, path, trial, child, now().ok());
+            return stop_trial(host, path, trial, child, now().ok(), &mut pause);
         }
         match poll(host, trial, &mut child, &trial_path, &mut now) {
             Ok(Poll::Committed) => return Ok(Settled::Committed(child)),
@@ -167,9 +239,10 @@ pub(super) fn settle_provisional<C: Custody>(
         }
         pause();
     };
-    let mut attempts = 0;
-    let committed = loop {
-        let fenced = host.locked(|record| {
+    // No durable verdict on an error: dropping the child stops it, and the
+    // next start finds a lost child (Interrupted).
+    let committed = locked_retry(&mut pause, || {
+        host.locked(|record| {
             if record.phase == journal::Phase::HostCommitted {
                 return Ok(true);
             }
@@ -184,20 +257,8 @@ pub(super) fn settle_provisional<C: Custody>(
                 }
             }
             Ok(false)
-        });
-        match fenced {
-            Ok(committed) => break committed,
-            Err(error) => {
-                attempts += 1;
-                if attempts >= MAX_POLL_ERRORS {
-                    // No durable verdict: dropping the child stops it, and
-                    // the next start finds a lost child (Interrupted).
-                    return Err(error);
-                }
-                pause();
-            }
-        }
-    };
+        })
+    })?;
     if committed {
         return Ok(Settled::Committed(child));
     }
@@ -250,7 +311,9 @@ fn poll<C: Custody>(
 ///    verdict now: Failed if the total budget ran out, else Interrupted
 ///    (the stop). `host_commit` reads trials under the same lock and rolls
 ///    back on a verdict, so no peer commits the host while this child is
-///    reaped.
+///    reaped. A failed lock is retried as on the rollback path; one that
+///    keeps failing returns the error and drops the child, which stops
+///    it, so the next start finds a lost child (Interrupted).
 /// 2. Reap the child.
 /// 3. Under the host lock with a fresh read, save a still-Provisional trial
 ///    `Stopped`. A trial a peer already moved to rollback is left as it is.
@@ -260,24 +323,27 @@ fn stop_trial<C: Custody>(
     trial: &mut Trial,
     child: C,
     clock: Option<Clock>,
+    pause: &mut impl FnMut(),
 ) -> io::Result<Settled<C>> {
     let (binding, instance) = (trial.binding.clone(), trial.instance.clone());
-    let committed = host.locked(|record| {
-        if record.phase == journal::Phase::HostCommitted {
-            return Ok(true);
-        }
-        let mut current = Trial::load(path, &binding, &instance)?;
-        if current.phase == Phase::Provisional && current.verdict.is_none() {
-            run::record_budget_verdict(&mut current, clock.as_ref());
-            current.verdict.get_or_insert_with(|| {
-                cause(
-                    journal::CauseClass::Interrupted,
-                    "service stopped during trial",
-                )
-            });
-            current.save(path)?;
-        }
-        Ok(false)
+    let committed = locked_retry(pause, || {
+        host.locked(|record| {
+            if record.phase == journal::Phase::HostCommitted {
+                return Ok(true);
+            }
+            let mut current = Trial::load(path, &binding, &instance)?;
+            if current.phase == Phase::Provisional && current.verdict.is_none() {
+                run::record_budget_verdict(&mut current, clock.as_ref());
+                current.verdict.get_or_insert_with(|| {
+                    cause(
+                        journal::CauseClass::Interrupted,
+                        "service stopped during trial",
+                    )
+                });
+                current.save(path)?;
+            }
+            Ok(false)
+        })
     })?;
     if committed {
         return Ok(Settled::Committed(child));
@@ -1113,5 +1179,141 @@ mod tests {
         assert!(!reaped.get());
         assert!(recovered.is_none());
         assert_eq!(journal_phase(&root), journal::Phase::HostCommitted);
+    }
+
+    /// #1968 approval, slice 3: the launcher dies after the host commit and
+    /// before it retires the trial. The restart finds a Provisional trial
+    /// whose child is gone on a committed host. It retires the trial and
+    /// starts nothing, never "lost child → rollback → restore refused →
+    /// RecoveryFailed". A retired trial stays retired on the next restart.
+    #[test]
+    fn a_restart_after_a_host_commit_retires_the_trial() {
+        let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
+        let path = root.join("trial.json");
+        let trial = provisional(&host, &path, gone_child());
+        set_journal_phase(&root, journal::Phase::HostCommitted);
+        let boot = trial.boot.clone();
+        for _restart in 0..2 {
+            let mut trial = Trial::load(&path, &trial.binding, "alice").unwrap();
+            let outcome = run::run_trial(
+                &host,
+                &path,
+                &mut trial,
+                || {
+                    Ok(Clock {
+                        boot: boot.clone(),
+                        ms: 3_000,
+                    })
+                },
+                |_| Ok(false),
+                || false,
+            )
+            .unwrap();
+            assert!(matches!(outcome, run::Outcome::Committed));
+            assert_eq!(trial.phase, Phase::Committed);
+            let on_disk = Trial::load(&path, &trial.binding, "alice").unwrap();
+            assert_eq!(on_disk.phase, Phase::Committed);
+            assert!(on_disk.verdict.is_none());
+            assert_eq!(journal_phase(&root), journal::Phase::HostCommitted);
+        }
+        // A retired trial is final: no stop, rollback or restart resets it.
+        for phase in [Phase::Stopped, Phase::RollingBack, Phase::Provisional] {
+            let mut stale = Trial::load(&path, &trial.binding, "alice").unwrap();
+            stale.phase = phase.clone();
+            assert!(stale.save(&path).is_err(), "{phase:?}");
+        }
+    }
+
+    /// Only a provisional trial on a committed host is retired.
+    #[test]
+    fn retire_needs_a_committed_host_and_a_provisional_trial() {
+        let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
+        let path = root.join("trial.json");
+        let mut trial = provisional(&host, &path, gone_child());
+        assert!(!run::retire(&host, &path, &mut trial).unwrap());
+        assert_eq!(
+            Trial::load(&path, &trial.binding, "alice").unwrap().phase,
+            Phase::Provisional
+        );
+        trial.child = None;
+        trial.phase = Phase::Stopped;
+        trial.save(&path).unwrap();
+        set_journal_phase(&root, journal::Phase::HostCommitted);
+        assert!(run::retire(&host, &path, &mut trial).is_err());
+        let mut stopped = Trial::load(&path, &trial.binding, "alice").unwrap();
+        stopped.phase = Phase::Committed;
+        assert!(stopped.save(&path).is_err());
+    }
+
+    /// #1968 approval, slice 3: the stop path's first host lock is retried
+    /// as on the rollback path. One failed lock, then the stop saves its
+    /// verdict, reaps and saves Stopped. A lock that keeps failing returns
+    /// the error with no verdict and no reap: dropping the child stops it.
+    #[test]
+    fn a_stop_retries_a_failed_host_lock() {
+        for recovers in [true, false] {
+            let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
+            let path = root.join("trial.json");
+            let mut trial = provisional(&host, &path, gone_child());
+            let boot = trial.boot.clone();
+            let journal_path = root.join(journal::JOURNAL_FILE_NAME);
+            let aside = root.join("journal.aside");
+            std::fs::rename(&journal_path, &aside).unwrap();
+            let pauses = Cell::new(0);
+            let (child, reaped) = stand(false);
+            let settled = settle_provisional(
+                &host,
+                &path,
+                &mut trial,
+                child,
+                |_| path.clone(),
+                || {
+                    Ok(Clock {
+                        boot: boot.clone(),
+                        ms: 2_000,
+                    })
+                },
+                || true,
+                |_| Ok(Resolution::Proceed),
+                || {
+                    pauses.set(pauses.get() + 1);
+                    if recovers {
+                        std::fs::rename(&aside, &journal_path).unwrap();
+                    }
+                },
+            );
+            let on_disk = Trial::load(&path, &trial.binding, "alice").unwrap();
+            if recovers {
+                assert!(matches!(settled.unwrap(), Settled::Stopped));
+                assert_eq!(pauses.get(), 1);
+                assert!(reaped.get());
+                assert_eq!(on_disk.phase, Phase::Stopped);
+                assert_eq!(
+                    on_disk.verdict.map(|v| v.class),
+                    Some(journal::CauseClass::Interrupted)
+                );
+            } else {
+                assert!(settled.is_err());
+                assert_eq!(pauses.get(), MAX_POLL_ERRORS - 1);
+                assert!(!reaped.get());
+                assert_eq!(on_disk.phase, Phase::Provisional);
+                assert!(on_disk.verdict.is_none());
+            }
+        }
+    }
+
+    /// The caller's custody of a committed daemon: a stop stops and reaps
+    /// it; an exit is reaped and returned. Neither touches the trial.
+    #[test]
+    fn keep_stops_or_reaps_a_committed_daemon() {
+        let (child, reaped) = stand(false);
+        let polls = Cell::new(0);
+        let kept = keep(child, || polls.get() >= 2, || polls.set(polls.get() + 1)).unwrap();
+        assert_eq!(kept, Kept::Stopped);
+        assert!(reaped.get());
+        assert_eq!(polls.get(), 2);
+        let (child, reaped) = stand(true);
+        assert_eq!(keep(child, || false, || {}).unwrap(), Kept::Exited);
+        assert!(reaped.get());
     }
 }

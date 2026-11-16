@@ -86,6 +86,10 @@ enum Phase {
     RollingBack,
     Restored,
     RecoveryFailed,
+    /// The host is committed with this trial's candidate. The trial is
+    /// retired: a restart starts the installed daemon as an ordinary start
+    /// and never rolls back (#1378 slice 3).
+    Committed,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -237,6 +241,11 @@ impl Trial {
                     // (#1968 review).
                     || (matches!(old.phase, Phase::RollingBack | Phase::Restored)
                         && self.phase == Phase::Stopped)
+                    // Only a provisional trial is retired, and a retired
+                    // trial stays retired.
+                    || (old.phase == Phase::Committed && self.phase != Phase::Committed)
+                    || (self.phase == Phase::Committed
+                        && !matches!(old.phase, Phase::Provisional | Phase::Committed))
                 {
                     return Err(invalid("existing trial cannot be replaced or reset"));
                 }
@@ -289,6 +298,7 @@ fn validate_trial(bytes: &[u8]) -> io::Result<()> {
         || trial.attempt_deadline_ms > trial.deadline_ms
         || trial.restored_starts > MAX_ATTEMPTS
         || (matches!(trial.phase, Phase::Restored) && trial.verdict.is_none())
+        || (trial.phase == Phase::Committed && (trial.verdict.is_some() || trial.attempts == 0))
     {
         return Err(invalid("invalid launcher trial"));
     }
