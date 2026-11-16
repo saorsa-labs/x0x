@@ -374,11 +374,12 @@ fn rollback(
     // The first verdict wins: a launcher restart that re-enters rollback
     // must not turn a Failed cause into Interrupted (ADR 0094 S4), and an
     // earlier per-attempt error never classifies the rollback.
+    if host.plan().participants.len() > 1 {
+        return rollback_through_coordinator(host, path, trial, cause);
+    }
     let cause = trial.verdict.get_or_insert(cause).clone();
     trial.phase = Phase::RollingBack;
     trial.save(path)?;
-    // A single launcher cannot restore on behalf of another participant.
-    // Multi-participant rollback must gather the full set through S3c.
     if let Err(error) = host.restore(&[(path.to_owned(), trial.clone())], cause) {
         return Err(trial.recovery_failed(path, error));
     }
@@ -388,9 +389,58 @@ fn rollback(
     Ok(Outcome::Restored(restored))
 }
 
+/// A single launcher cannot restore on behalf of another participant: on
+/// a host with more than one, the coordinator pass gathers the full set
+/// (#1378 slice 5). Under the host lock, this trial keeps its first verdict
+/// (`host_commit` reads trials under the same lock and rolls back on a
+/// verdict). Then `coordinator::recover` fences the host, stops every
+/// peer's live process, restores the pair once and marks every trial
+/// Restored, and this launcher starts its own restored child as on the
+/// single-participant path. The caller has no child of its own running:
+/// every path here reaped it, or found it absent.
+fn rollback_through_coordinator(
+    host: &recovery::Host,
+    path: &Path,
+    trial: &mut Trial,
+    cause: journal::Cause,
+) -> io::Result<Outcome> {
+    let p = host
+        .plan()
+        .participants
+        .iter()
+        .find(|p| p.instance_id == trial.instance)
+        .ok_or_else(|| invalid("participant missing"))?;
+    // The pass reads every trial at `coordinator::trial_path`.
+    if path != coordinator::trial_path(p) {
+        return Err(invalid("trial is not at its coordinator path"));
+    }
+    let (binding, instance) = (trial.binding.clone(), trial.instance.clone());
+    *trial = host.locked(|_| {
+        let mut current = Trial::load(path, &binding, &instance)?;
+        if current.verdict.is_none() {
+            current.verdict = Some(cause.clone());
+            current.save(path)?;
+        }
+        Ok(current)
+    })?;
+    let resolution = coordinator::recover(host)?;
+    *trial = Trial::load(path, &binding, &instance)?;
+    match resolution {
+        coordinator::Resolution::Restored(_) => {
+            start_restored(host, path, trial).map(Outcome::Restored)
+        }
+        coordinator::Resolution::Final(phase) => {
+            Err(invalid(format!("host recovery is final: {phase:?}")))
+        }
+        coordinator::Resolution::Proceed => {
+            Err(invalid("recovery found no cause after a rollback was due"))
+        }
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
-    use super::testkit::fixture;
+    use super::testkit::{fixture, fixture_with, write_probe};
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
@@ -476,6 +526,69 @@ mod tests {
             cause.reason.contains("launch attempts exhausted"),
             "{cause:?}"
         );
+    }
+
+    /// A two-participant host: Bob is a second running participant with
+    /// his own data root, so each trial has its own coordinator path.
+    fn with_bob(record: &mut journal::JournalRecord) {
+        let mut bob = record.plan.participants[0].clone();
+        bob.instance_id = "bob".into();
+        bob.data_root = bob.data_root.join("bob");
+        std::fs::create_dir_all(&bob.data_root).unwrap();
+        record.plan.participants.push(bob);
+    }
+
+    /// #1378 slice 5: on a two-participant host, Alice's own rollback
+    /// (here: launch attempts exhausted) goes through the coordinator. The
+    /// pass arms Bob's missing trial, restores the pair once for both and
+    /// marks both trials Restored with Alice's Failed cause. Before, the
+    /// single-trial restore refused a host whose full set it did not hold
+    /// and the trial ended RecoveryFailed with the candidate pair in place.
+    #[test]
+    fn a_two_participant_rollback_restores_through_the_coordinator() {
+        let (_dir, root, host, _record) = fixture_with(journal::Phase::SwappedCli, with_bob);
+        write_probe(&host, 1, probe::ProbePhase::Passed);
+        let alice = coordinator::trial_path(&host.plan().participants[0]);
+        let bob = coordinator::trial_path(&host.plan().participants[1]);
+        let mut trial = trial_in(&host, &alice, Phase::Authorized, 0);
+        let clock = fast_clock(&trial);
+        // The fixture's previous bytes are not executable, so the restored
+        // start fails after the restore; the restore itself is the check.
+        let outcome = run_trial(&host, &alice, &mut trial, clock, |_| Ok(false), || false);
+        assert!(outcome.is_err());
+        assert_eq!(trial.attempts, MAX_ATTEMPTS);
+        assert_previous_pair(&host);
+        let record = journal_record(&root);
+        assert_eq!(record.phase, journal::Phase::Restored);
+        let cause = record.cause.unwrap();
+        assert_eq!(cause.class, journal::CauseClass::Failed, "{cause:?}");
+        assert!(
+            cause.reason.contains("launch attempts exhausted"),
+            "{cause:?}"
+        );
+        let bob = Trial::load(&bob, &trial.binding, "bob").unwrap();
+        assert_eq!(bob.phase, Phase::Restored);
+        assert_eq!(
+            bob.verdict.map(|v| v.class),
+            Some(journal::CauseClass::Failed)
+        );
+    }
+
+    /// On a two-participant host the coordinator reads every trial at its
+    /// coordinator path; a trial anywhere else is refused before any write
+    /// to the host.
+    #[test]
+    fn a_two_participant_rollback_needs_the_coordinator_path() {
+        let (_dir, root, host, _record) = fixture_with(journal::Phase::SwappedCli, with_bob);
+        let path = root.join("elsewhere.json");
+        let mut trial = trial_in(&host, &path, Phase::Authorized, 0);
+        let clock = fast_clock(&trial);
+        let outcome = run_trial(&host, &path, &mut trial, clock, |_| Ok(false), || false);
+        assert_eq!(
+            outcome.err().map(|e| e.to_string()).as_deref(),
+            Some("trial is not at its coordinator path")
+        );
+        assert_eq!(journal_record(&root).phase, journal::Phase::SwappedCli);
     }
 
     /// A candidate that starts but whose boot setup fails (no permit

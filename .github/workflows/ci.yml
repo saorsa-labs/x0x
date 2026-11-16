@@ -190,7 +190,7 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@v2
         with:
-          tool: nextest@0.9.144  # exact pin: floating latest can silently change CI behaviour (refs #673)
+          tool: nextest@0.9.151  # exact pin: floating latest can silently change CI behaviour (refs #673)
 
       - name: Inert shared wrapper argument controls
         run: |
@@ -420,7 +420,7 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@v2
         with:
-          tool: nextest@0.9.144
+          tool: nextest@0.9.151
 
       - name: Exercise proof and isolation wrapper controls
         run: |
@@ -548,7 +548,7 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@v2
         with:
-          tool: nextest@0.9.144
+          tool: nextest@0.9.151
 
       - name: Run H-S3-home against v0.45.0 and v0.46.1
         env:
@@ -624,7 +624,7 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@v2
         with:
-          tool: nextest@0.9.144
+          tool: nextest@0.9.151
 
       - name: Install the published v0.46.1
         run: bash scripts/ci/prepare-released-h-s3-home.sh
@@ -884,7 +884,7 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@v2
         with:
-          tool: nextest@0.9.144  # same exact pin as the Test Suite
+          tool: nextest@0.9.151  # same exact pin as the Test Suite
 
       - name: Build the W3-H preload shim
         run: |
@@ -1422,7 +1422,7 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@v2
         with:
-          tool: nextest@0.9.144  # exact pin: floating latest can silently change CI behaviour (refs #673)
+          tool: nextest@0.9.151  # exact pin: floating latest can silently change CI behaviour (refs #673)
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
@@ -1670,7 +1670,7 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@v2
         with:
-          tool: nextest@0.9.144  # exact pin: floating latest can silently change CI behaviour (refs #673)
+          tool: nextest@0.9.151  # exact pin: floating latest can silently change CI behaviour (refs #673)
 
       # parity_cli spawns `x0x <cli_name> --help` so the binary must
       # exist. Build only what's needed.

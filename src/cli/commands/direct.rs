@@ -97,7 +97,8 @@ pub async fn receipt(client: &DaemonClient, logical_id: &str, agent_id: &str) ->
 ///
 /// #1109: cancels a queued send (`--deliver-until-ms`) that is still held.
 /// Its receipt then reads `cancelled`; the daemon answers 404 `not_queued`
-/// when none is held.
+/// when none is held, and 409 `send_in_flight` while an attempt is in
+/// flight (it cannot be recalled; retry after it ends).
 pub async fn cancel(client: &DaemonClient, logical_id: &str, agent_id: &str) -> Result<()> {
     let path = format!("/direct/receipts/{logical_id}");
     let resp = client
