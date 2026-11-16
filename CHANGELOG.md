@@ -15,6 +15,16 @@ All notable changes to this project will be documented in this file.
   uses `x0x-data-reply-v1`, with a new `refused` status, 409 on the grantee)
   and capability bit 21, `data_write_v1`; a peer without it is not sent a
   write (424). A value over 28 416 bytes is answered 413 and not sent.
+- **Each entry of a group store names its writer (#1094 slice P1, A10
+  amendment of 16 Nov 2026).** A put on a store under `x0x/group/` signs the
+  entry with the writer agent's key; the mark (agent id, signature, version)
+  rides in reserved `x0x.writer.*` metadata keys, so older peers keep and
+  relay it unchanged. `x0x::kv::provenance::verify` reports `verified`,
+  `unverified` (writer key not known here), `unsigned` or `invalid`; only
+  `verified` says anything, the rest mean writer unknown. A delta
+  that holds an entry under another key is refused. A mark adds about
+  4.7 KB; a put that would take a group store's image past the 16 MiB
+  retained-image limit is refused (`store full`, HTTP 507).
 - **Upgrade records: `clearable` matches the local clear (#1932 review; A14
   amendment of 15 Nov 2026).** A hold reports `clearable: true` only when
   `x0x upgrade --clear-hold` would clear it; an unresolved `.pending` probe
