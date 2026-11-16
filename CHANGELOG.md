@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **An `rw` grantee writes a store through a `ShareCap::Data` grant (#1094
+  slice D2, A03 amendment of 16 Nov 2026).** `PUT` and
+  `DELETE /grants/data/:agent/:group/:store/:key` (`x0x grant data put|rm`)
+  set or remove one key. The granted agent checks that the grant is `rw` and
+  applies the write as its own write to the store, so the store's policy and
+  write refusals apply unchanged. New typed DM `x0x-data-write-v1` (the reply
+  uses `x0x-data-reply-v1`, with a new `refused` status, 409 on the grantee)
+  and capability bit 21, `data_write_v1`; a peer without it is not sent a
+  write (424). A value over 28 416 bytes is answered 413 and not sent.
 - **Upgrade records: `clearable` matches the local clear (#1932 review; A14
   amendment of 15 Nov 2026).** A hold reports `clearable: true` only when
   `x0x upgrade --clear-hold` would clear it; an unresolved `.pending` probe

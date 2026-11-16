@@ -8,6 +8,11 @@
 //! - Grantee side ([`read_granted_store`], the `GET /grants/data/...`
 //!   routes): sends one request and waits for the matching reply from the
 //!   agent it was sent to.
+//! - Slice D2 (A03 amendment of 16 Nov 2026): an `rw` grantee writes the
+//!   store ([`serve_data_write`], the `PUT`/`DELETE /grants/data/...`
+//!   routes). The granted agent applies the write through the same code as
+//!   its own `PUT`/`DELETE /stores/:id/:key`, so the store's plane, access
+//!   policy and the ADR 0110 write refusal apply unchanged.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,9 +21,10 @@ use std::time::Duration;
 use crate::dm_inbox::{DmTypedPayload, DmTypedPayloadCompletion};
 use crate::identity::AgentId;
 use crate::share_grant::data_read::{
-    DataReadEntry, DataReadKey, DataReadOp, DataReadReply, DataReadRequest, DataReadStatus,
-    DATA_READ_REPLY_DM_PREFIX, DATA_READ_REQUEST_DM_PREFIX, MAX_DATA_READ_CONTENT_TYPE_BYTES,
-    MAX_DATA_READ_VALUE_BYTES,
+    truncate_utf8, DataReadEntry, DataReadKey, DataReadOp, DataReadReply, DataReadRequest,
+    DataReadStatus, DataWriteOp, DataWriteRequest, DATA_READ_REPLY_DM_PREFIX,
+    DATA_READ_REQUEST_DM_PREFIX, DATA_WRITE_REQUEST_DM_PREFIX, MAX_DATA_READ_CONTENT_TYPE_BYTES,
+    MAX_DATA_READ_VALUE_BYTES, MAX_DATA_WRITE_ERROR_BYTES, MAX_DATA_WRITE_VALUE_BYTES,
 };
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -75,6 +81,10 @@ fn finish(mut typed: DmTypedPayload) {
 pub(super) async fn handle_data_read_typed(state: &Arc<AppState>, typed: DmTypedPayload) {
     if typed.payload.starts_with(DATA_READ_REQUEST_DM_PREFIX) {
         if let Some((to, reply)) = serve_data_read(state, &typed).await {
+            send_payload(state, to, reply);
+        }
+    } else if typed.payload.starts_with(DATA_WRITE_REQUEST_DM_PREFIX) {
+        if let Some((to, reply)) = serve_data_write(state, &typed).await {
             send_payload(state, to, reply);
         }
     } else if typed.payload.starts_with(DATA_READ_REPLY_DM_PREFIX) && typed.verified {
@@ -165,16 +175,13 @@ async fn read_local_store(state: &AppState, request: &DataReadRequest) -> Option
                 DataReadReply::status(&request.request_id, DataReadStatus::TooLarge).encode()
             }
             Ok(Some(entry)) => DataReadReply {
-                request_id: request.request_id.clone(),
-                status: DataReadStatus::Ok,
-                keys: None,
-                truncated: false,
                 entry: Some(DataReadEntry {
                     key: entry.key.clone(),
                     value_b64: base64::engine::general_purpose::STANDARD.encode(&entry.value),
                     content_type: entry.content_type.clone(),
                     updated_at: entry.updated_at,
                 }),
+                ..DataReadReply::status(&request.request_id, DataReadStatus::Ok)
             }
             // Within the bounds above the reply always fits (const-checked
             // in `share_grant::data_read`); `None` would answer unavailable.
@@ -185,6 +192,92 @@ async fn read_local_store(state: &AppState, request: &DataReadRequest) -> Option
             Err(_) => None,
         },
     }
+}
+
+/// Slice D2, granted-agent side: the reply to one write request, and who
+/// gets it. `None` when nothing is sent (unverified, malformed, or over the
+/// serve limit, which reads and writes share).
+pub(super) async fn serve_data_write(
+    state: &Arc<AppState>,
+    typed: &DmTypedPayload,
+) -> Option<(AgentId, Vec<u8>)> {
+    if !typed.verified {
+        return None;
+    }
+    let request = DataWriteRequest::decode(&typed.payload)?;
+    let access = state
+        .agent
+        .share_grant_access(&typed.sender, &typed.machine_id)
+        .await;
+    if !admit_sender(state, &typed.sender, !access.data.is_empty(), now_ms()) {
+        return None;
+    }
+    let reply = if access.allows_data_write(&request.group, &request.store) {
+        write_local_store(state, &request).await
+    } else {
+        DataReadReply::status(&request.request_id, DataReadStatus::Forbidden)
+    };
+    let reply = reply.encode().or_else(|| {
+        DataReadReply::status(&request.request_id, DataReadStatus::Unavailable).encode()
+    })?;
+    Some((typed.sender, reply))
+}
+
+/// Apply an admitted write as this daemon's own write to the store, through
+/// the `PUT`/`DELETE /stores/:id/:key` handlers.
+async fn write_local_store(state: &Arc<AppState>, request: &DataWriteRequest) -> DataReadReply {
+    let (_, topic) = crate::kv::encrypted::group_store_identity(&request.group, &request.store);
+    let (code, Json(body)) = match &request.op {
+        DataWriteOp::Put {
+            key,
+            value_b64,
+            content_type,
+        } => {
+            super::routes::stores::put_kv_value(
+                State(Arc::clone(state)),
+                Path((topic, key.clone())),
+                Json(super::routes::stores::PutValueRequest {
+                    value: value_b64.clone(),
+                    content_type: Some(content_type.clone()),
+                }),
+            )
+            .await
+        }
+        DataWriteOp::Delete { key } => {
+            super::routes::stores::delete_kv_value(
+                State(Arc::clone(state)),
+                Path((topic, key.clone())),
+            )
+            .await
+        }
+    };
+    write_reply(&request.request_id, code, &body)
+}
+
+/// The write reply for the store handler's answer.
+fn write_reply(request_id: &str, code: StatusCode, body: &serde_json::Value) -> DataReadReply {
+    let status = match code {
+        StatusCode::OK | StatusCode::ACCEPTED => DataReadStatus::Ok,
+        // The store is not open here.
+        StatusCode::NOT_FOUND => DataReadStatus::Unavailable,
+        StatusCode::PAYLOAD_TOO_LARGE => DataReadStatus::TooLarge,
+        code if code.is_client_error() => DataReadStatus::Refused,
+        _ => DataReadStatus::Unavailable,
+    };
+    let mut reply = DataReadReply::status(request_id, status);
+    match status {
+        DataReadStatus::Ok => reply.published = Some(code == StatusCode::OK),
+        DataReadStatus::Refused => {
+            reply.error = Some(truncate_utf8(
+                body["error"]
+                    .as_str()
+                    .unwrap_or("the store refused the write"),
+                MAX_DATA_WRITE_ERROR_BYTES,
+            ));
+        }
+        _ => {}
+    }
+    reply
 }
 
 /// Send one data-read DM, one attempt, off the caller's task.
@@ -249,11 +342,21 @@ fn reply_response(reply: DataReadReply) -> (StatusCode, Json<serde_json::Value>)
                 body["content_type"] = serde_json::json!(entry.content_type);
                 body["updated_at"] = serde_json::json!(entry.updated_at);
             }
+            if let Some(published) = reply.published {
+                body["published"] = serde_json::json!(published);
+            }
             (StatusCode::OK, Json(body))
         }
+        DataReadStatus::Refused => api_error(
+            StatusCode::CONFLICT,
+            format!(
+                "the granted agent's store refused the write: {}",
+                reply.error.unwrap_or_default()
+            ),
+        ),
         DataReadStatus::Forbidden => api_error(
             StatusCode::FORBIDDEN,
-            "the granted agent holds no grant that lets this agent read the store",
+            "the granted agent holds no grant that lets this agent do this to the store",
         ),
         DataReadStatus::NotFound => api_error(StatusCode::NOT_FOUND, "key not found"),
         DataReadStatus::TooLarge => api_error(
@@ -283,14 +386,51 @@ pub(super) async fn read_granted_store(
     store: String,
     op: DataReadOp,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let request_id = hex::encode(rand::random::<[u8; 16]>());
-    let request = DataReadRequest {
-        request_id: request_id.clone(),
-        group,
-        store,
-        op,
+    let encode = |request_id| {
+        DataReadRequest {
+            request_id,
+            group,
+            store,
+            op,
+        }
+        .encode()
     };
-    let Some(payload) = request.encode() else {
+    let bit = crate::dm::CapabilityRegistry::DATA_READ_V1;
+    call_granted_agent(state, agent, encode, bit, "data_read_v1").await
+}
+
+/// Slice D2, grantee side: write `op` to `(group, store)` on `agent`.
+pub(super) async fn write_granted_store(
+    state: &AppState,
+    agent: AgentId,
+    group: String,
+    store: String,
+    op: DataWriteOp,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let encode = |request_id| {
+        DataWriteRequest {
+            request_id,
+            group,
+            store,
+            op,
+        }
+        .encode()
+    };
+    let bit = crate::dm::CapabilityRegistry::DATA_WRITE_V1;
+    call_granted_agent(state, agent, encode, bit, "data_write_v1").await
+}
+
+/// Send one request, built by `encode` from a fresh request id, to `agent`
+/// when its current verified advert sets `bit`, and answer with its reply.
+async fn call_granted_agent(
+    state: &AppState,
+    agent: AgentId,
+    encode: impl FnOnce(String) -> Option<Vec<u8>>,
+    bit: u64,
+    capability: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let request_id = hex::encode(rand::random::<[u8; 16]>());
+    let Some(payload) = encode(request_id.clone()) else {
         return api_error(
             StatusCode::BAD_REQUEST,
             "group, store or key is empty or too long",
@@ -299,12 +439,12 @@ pub(super) async fn read_granted_store(
     if state
         .agent
         .capability_store()
-        .verified_registry_supports(&agent, crate::dm::CapabilityRegistry::DATA_READ_V1)
+        .verified_registry_supports(&agent, bit)
         != Some(true)
     {
         return api_error(
             StatusCode::FAILED_DEPENDENCY,
-            "the agent does not advertise data_read_v1",
+            format!("the agent does not advertise {capability}"),
         );
     }
     let rx = {
@@ -313,7 +453,10 @@ pub(super) async fn read_granted_store(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if waiters.len() >= DATA_READ_WAITER_CAP {
-            return api_error(StatusCode::SERVICE_UNAVAILABLE, "too many reads in flight");
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "too many requests in flight",
+            );
         }
         let (tx, rx) = oneshot::channel();
         waiters.insert(request_id.clone(), (agent, tx));
@@ -351,6 +494,67 @@ pub(super) async fn get_granted_store_value(
         return api_error(StatusCode::BAD_REQUEST, "invalid agent id");
     };
     read_granted_store(&state, agent, group, store, DataReadOp::Get { key }).await
+}
+
+/// Body of `PUT /grants/data/:agent/:group/:store/:key`.
+#[derive(Debug, serde::Deserialize)]
+pub(super) struct PutGrantedValueRequest {
+    /// Base64 of the value bytes.
+    value: String,
+    /// The value's content type (default `application/octet-stream`).
+    content_type: Option<String>,
+}
+
+/// `PUT /grants/data/:agent/:group/:store/:key`: set one value of a granted
+/// store (slice D2; the grant must be `rw`).
+pub(super) async fn put_granted_store_value(
+    State(state): State<Arc<AppState>>,
+    Path((agent, group, store, key)): Path<(String, String, String, String)>,
+    Json(req): Json<PutGrantedValueRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Ok(agent) = parse_agent_id_hex(&agent) else {
+        return api_error(StatusCode::BAD_REQUEST, "invalid agent id");
+    };
+    let Ok(value) = base64::engine::general_purpose::STANDARD.decode(&req.value) else {
+        return api_error(StatusCode::BAD_REQUEST, "value is not base64");
+    };
+    if value.len() > MAX_DATA_WRITE_VALUE_BYTES {
+        return api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "the value is over the {MAX_DATA_WRITE_VALUE_BYTES}-byte limit of a granted write"
+            ),
+        );
+    }
+    let content_type = req
+        .content_type
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    if content_type.len() > MAX_DATA_READ_CONTENT_TYPE_BYTES {
+        return api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "the content type is over the {MAX_DATA_READ_CONTENT_TYPE_BYTES}-byte limit of a granted write"
+            ),
+        );
+    }
+    let op = DataWriteOp::Put {
+        key,
+        value_b64: base64::engine::general_purpose::STANDARD.encode(value),
+        content_type,
+    };
+    write_granted_store(&state, agent, group, store, op).await
+}
+
+/// `DELETE /grants/data/:agent/:group/:store/:key`: remove one key of a
+/// granted store (slice D2; the grant must be `rw`).
+pub(super) async fn delete_granted_store_value(
+    State(state): State<Arc<AppState>>,
+    Path((agent, group, store, key)): Path<(String, String, String, String)>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Ok(agent) = parse_agent_id_hex(&agent) else {
+        return api_error(StatusCode::BAD_REQUEST, "invalid agent id");
+    };
+    write_granted_store(&state, agent, group, store, DataWriteOp::Delete { key }).await
 }
 
 #[cfg(test)]

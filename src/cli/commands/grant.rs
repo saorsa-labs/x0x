@@ -53,6 +53,52 @@ pub async fn data(
     Ok(())
 }
 
+/// `x0x grant data put AGENT GROUP STORE KEY VALUE [--content-type T]` —
+/// set one value of a store on a granted agent through a received `rw`
+/// `ShareCap::Data` grant (#1094 D2).
+pub async fn data_put(
+    client: &DaemonClient,
+    agent: &str,
+    group: &str,
+    store: &str,
+    key: &str,
+    value: &str,
+    content_type: Option<&str>,
+) -> Result<()> {
+    use base64::Engine;
+    let mut body = serde_json::json!({
+        "value": base64::engine::general_purpose::STANDARD.encode(value.as_bytes()),
+    });
+    if let Some(ct) = content_type {
+        body["content_type"] = serde_json::Value::String(ct.to_string());
+    }
+    let resp = client
+        .put(
+            &format!("/grants/data/{agent}/{group}/{store}/{key}"),
+            &body,
+        )
+        .await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x grant data rm AGENT GROUP STORE KEY` — remove one key of a store
+/// on a granted agent through a received `rw` `ShareCap::Data` grant
+/// (#1094 D2).
+pub async fn data_rm(
+    client: &DaemonClient,
+    agent: &str,
+    group: &str,
+    store: &str,
+    key: &str,
+) -> Result<()> {
+    let resp = client
+        .delete(&format!("/grants/data/{agent}/{group}/{store}/{key}"))
+        .await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
 /// `x0x grant renew GRANT_ID [--ttl-secs N] [--deliver-to AGENT]... [--no-names]` — renew an
 /// issued grant (#1350): a new grant, valid from now for at most 90 days.
 pub async fn renew(
@@ -189,6 +235,8 @@ mod tests {
             ("grant renew", "/grants/:id/renew"),
             ("grant data keys", "/grants/data/:agent/:group/:store"),
             ("grant data get", "/grants/data/:agent/:group/:store/:key"),
+            ("grant data put", "/grants/data/:agent/:group/:store/:key"),
+            ("grant data rm", "/grants/data/:agent/:group/:store/:key"),
         ] {
             let ep = crate::api::find_by_cli_name(cli).expect("registered");
             assert_eq!(ep.path, path, "{cli}");
