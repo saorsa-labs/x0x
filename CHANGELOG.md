@@ -333,6 +333,13 @@ All notable changes to this project will be documented in this file.
   test group could be dropped without running when the group mixed
   `threads-required` values, and the run then ended with tests "not run"
   and no failure. `.config/nextest.toml` recommends 0.9.151.
+- **W3-H row H-S3-d2 (`w3h_1356_control_s3_d2_fork_exposure_contained`)
+  no longer races X's own events (#1572).** From X's rename until X has
+  served J its join-carry ATA, X's pubsub writes to J are held too. Before,
+  X's resent rename could move J's stub to r+1′ first; J's fetch then had
+  an empty chain, X served no carry, and the row ended INFRA ("X's
+  join-carry ATA was not recorded") in about 1 run in 15. A test-only
+  recorder now names why a served join result carried no ATA.
 
 - **Launcher supervise driver (#1378 slice 2; A14 amendment of 16 Nov
   2026).** The dormant launcher's supervise driver
