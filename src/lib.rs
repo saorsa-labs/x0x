@@ -28176,6 +28176,12 @@ impl KvStoreHandle {
         }
     }
 
+    /// Whether this is a group store (`x0x/group/...`): its entries are
+    /// marked and its image is bounded (#1094 P1).
+    fn is_group_store_topic(&self) -> bool {
+        self.sync.topic().starts_with("x0x/group/")
+    }
+
     /// #1094 P1: sign `key`'s just-written entry as this agent's write, with
     /// `rider` when a rider wrote through it. Only group stores
     /// (`x0x/group/...`) are marked: their retained images and full serves
@@ -28186,7 +28192,7 @@ impl KvStoreHandle {
     /// entry unmarked (readers see it as unsigned) rather than failing an
     /// applied write.
     fn mark_written_entry(&self, store: &mut kv::KvStore, key: &str, rider: Option<&str>) {
-        if !self.sync.topic().starts_with("x0x/group/") {
+        if !self.is_group_store_topic() {
             return;
         }
         let signing = &self.writer_signing;
@@ -28319,7 +28325,7 @@ impl KvStoreHandle {
     pub async fn entry_writer(&self, key: &str) -> Option<kv::provenance::EntryWriter> {
         let store = self.sync.read().await;
         let entry = store.get(key)?;
-        Some(kv::provenance::verify(store.id(), entry))
+        Some(kv::provenance::verify(store.id(), key, entry))
     }
 
     /// Put a key-value pair and return the CRDT delta that was published.
@@ -28451,6 +28457,16 @@ impl KvStoreHandle {
                     published: true,
                     publish_error: None,
                 });
+            }
+            // #1094 P1 (review of #1963): a group store's complete image
+            // must stay within the retained-image limit, or new and lagging
+            // members stop getting its history. Refuse the put instead.
+            if self.is_group_store_topic() {
+                store
+                    .check_image_room(&key, value.len(), content_type.len(), true)
+                    .map_err(|e| {
+                        error::IdentityError::Storage(std::io::Error::other(e.to_string()))
+                    })?;
             }
             let first_seq = store.reserve_sequences(2).map_err(|e| {
                 error::IdentityError::Storage(std::io::Error::other(format!("kv put failed: {e}")))

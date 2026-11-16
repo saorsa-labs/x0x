@@ -93,16 +93,32 @@ impl KvEntry {
     /// Merge another entry into this one using LWW semantics.
     ///
     /// The entry with the higher `updated_at` wins. Ties are broken
-    /// by comparing content hashes (deterministic).
+    /// by comparing content hashes (deterministic), then the sorted
+    /// metadata. A store merges with `merge_in_store`, which also
+    /// ranks writer marks.
     pub fn merge(&mut self, other: &Self) {
-        // #1094 P1: equal time and content but different metadata (two
-        // writers' marks over the same bytes) is broken by the sorted
-        // metadata, so every replica keeps the same entry.
+        self.merge_ranked(other, |_| 1);
+    }
+
+    /// [`Self::merge`] inside the store `store_id` (#1094 P1, review of
+    /// #1963): on equal time and content, a verified writer mark beats an
+    /// unverifiable or absent one, which beats an invalid one, so a relay
+    /// cannot replace a valid mark with a broken one. Equal ranks fall back
+    /// to the sorted metadata.
+    pub(crate) fn merge_in_store(&mut self, other: &Self, store_id: &super::store::KvStoreId) {
+        self.merge_ranked(other, |entry| {
+            super::provenance::verify(store_id, &entry.key, entry).tie_rank()
+        });
+    }
+
+    fn merge_ranked(&mut self, other: &Self, rank: impl Fn(&Self) -> u8) {
+        let tie = other.updated_at == self.updated_at && other.content_hash == self.content_hash;
         let wins = other.updated_at > self.updated_at
-            || (other.updated_at == self.updated_at
-                && (other.content_hash > self.content_hash
-                    || (other.content_hash == self.content_hash
-                        && sorted_metadata(&other.metadata) > sorted_metadata(&self.metadata))));
+            || (other.updated_at == self.updated_at && other.content_hash > self.content_hash)
+            || (tie
+                && other.metadata != self.metadata
+                && (rank(other), sorted_metadata(&other.metadata))
+                    > (rank(self), sorted_metadata(&self.metadata)));
         if wins {
             self.value = other.value.clone();
             self.content_hash = other.content_hash;

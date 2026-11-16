@@ -8,11 +8,13 @@ All notable changes to this project will be documented in this file.
 
 - **Each entry of a group store names its writer (#1094 slice P1, A10
   amendment of 16 Nov 2026).** A put on a store under `x0x/group/` signs the
-  entry with the writer agent's key; the mark rides in reserved
-  `x0x.writer.*` metadata keys, so older peers keep and relay it unchanged.
-  `x0x::kv::provenance::verify` reports `verified` (agent, rider),
-  `unsigned` or `invalid`, also for entries relayed by another holder. A
-  mark adds about 7 KB to an entry. The API and GUI do not show it yet (P2).
+  entry with the writer agent's key; the mark (agent id, signature, version)
+  rides in reserved `x0x.writer.*` metadata keys, so older peers keep and
+  relay it unchanged. `x0x::kv::provenance::verify` reports `verified`,
+  `unverified` (writer key not known here), `unsigned` or `invalid`. A delta
+  that holds an entry under another key is refused. A mark adds about
+  4.7 KB; a put that would take a group store's image past the 16 MiB
+  retained-image limit is refused (`store full`, HTTP 507).
 - **Upgrade records: `clearable` matches the local clear (#1932 review; A14
   amendment of 15 Nov 2026).** A hold reports `clearable: true` only when
   `x0x upgrade --clear-hold` would clear it; an unresolved `.pending` probe

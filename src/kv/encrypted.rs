@@ -701,6 +701,8 @@ pub fn verify_mutation_author(mutation: &SignedKvMutation) -> Result<()> {
     verify_with_ml_dsa(&pubkey, &mutation.signing_bytes(), &sig).map_err(|e| {
         KvError::SecureRecord(format!("author signature verification failed: {e:?}"))
     })?;
+    // #1094 P1: the verified author's key checks its entries' writer marks.
+    crate::kv::provenance::note_agent_key(&pubkey);
     Ok(())
 }
 
