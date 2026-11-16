@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **The dormant launcher rolls back a multi-participant host through the
+  coordinator (#1378 slice 5; A14 amendment of 16 Nov 2026).** A launcher whose
+  own trial must roll back keeps its verdict under the host lock and runs the
+  coordinator pass, which restores the pair once for every participant. Before,
+  its single-trial restore refused a host it did not hold in full.
 - **The dormant launcher stops a committed daemon gracefully (#1378 slice 4;
   A14 amendment of 16 Nov 2026).** A stop sends SIGTERM and waits up to 35 s
   for x0xd's shutdown before SIGKILL. The retire after a host commit retries
