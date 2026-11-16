@@ -10,6 +10,7 @@ pub(super) mod calls;
 pub(super) mod connect;
 pub(in crate::server) mod contacts;
 mod direct;
+pub(in crate::server) mod direct_outbox;
 mod discovery;
 mod exec;
 mod files;

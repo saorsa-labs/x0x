@@ -1816,6 +1816,12 @@
             "in": "body",
             "name": "logical_id",
             "required": false
+          },
+          {
+            "cli": "default",
+            "in": "body",
+            "name": "deliver_until_ms",
+            "required": false
           }
         ],
         "kind": "fields"

@@ -6,6 +6,18 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Queued durable direct sends (#1109 slice S1, A07 amendment of 16 Nov
+  2026).** `POST /direct/send` accepts `deliver_until_ms` (unix ms, at most
+  24 h ahead; needs a `logical_id` and durable semantics; CLI
+  `x0x direct send --deliver-until-ms`). The daemon runs the normal checks,
+  stores the send in `<data_dir>/direct_send_outbox.json` and answers 202
+  `outcome: "queued"`. A worker retries it under its logical id, holds a
+  recipient that has not advertised durable delivery yet, settles a late ACK
+  without a resend, and drops it at the deadline. The outbox survives a
+  restart. `GET /direct/receipts/:logical_id` adds `queued`, `expired` and
+  `failed` (with `error`). New 400 codes `deliver_until_requires_durable`,
+  `deliver_until_requires_logical_id`, `deliver_until_passed`,
+  `deliver_until_too_far`, and 429 `outbox_full`.
 - **An `rw` grantee writes a store through a `ShareCap::Data` grant (#1094
   slice D2, A03 amendment of 16 Nov 2026).** `PUT` and
   `DELETE /grants/data/:agent/:group/:store/:key` (`x0x grant data put|rm`)

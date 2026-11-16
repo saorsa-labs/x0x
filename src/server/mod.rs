@@ -1399,6 +1399,11 @@ pub async fn serve_with_options(
         causal_approval_queue_path,
         predecessor_relay_outbox_path,
         requester_offer_outbox_path,
+        direct_send_outbox: routes::direct_outbox::DirectSendOutbox::new(
+            config
+                .data_dir
+                .join(routes::direct_outbox::DIRECT_SEND_OUTBOX_FILE),
+        ),
         public_group_bootstrap_outbox_path,
         treekem_event_log: RwLock::new(HashMap::new()),
         treekem_member_key_packages,
@@ -1949,6 +1954,15 @@ pub async fn serve_with_options(
     // observe the metadata event, and the operator can inspect the file).
     if let Err(error) = load_requester_offer_outbox(&state).await {
         tracing::error!("#908 startup: requester offer outbox not loaded: {error}");
+    }
+    // #1109: queued direct sends load fail-visible like the requester
+    // offers: a bad sidecar is moved aside and the outbox starts empty.
+    if let Err(error) = state
+        .direct_send_outbox
+        .load(routes::direct_outbox::now_unix_ms())
+        .await
+    {
+        tracing::error!("#1109 startup: direct send outbox not loaded: {error}");
     }
     // ADR 0030 §5 fail-closed: a malformed or over-cap bootstrap outbox aborts
     // startup rather than silently dropping delivery obligations the authority
@@ -2975,6 +2989,34 @@ pub async fn serve_with_options(
                             tokio::time::sleep(Duration::from_millis(500)).await;
                         }
                     },
+                }
+            }
+        }));
+    }
+
+    // #1109: durable direct-send worker. Each pass settles obligations the
+    // receipt ledger shows delivered, drops expired ones and sends the
+    // rest once under their logical id.
+    {
+        let send_state = Arc::clone(&state);
+        bg_tasks.push(tokio::spawn(async move {
+            let mut shutdown_rx = send_state.shutdown_notify.subscribe();
+            let acks = send_state.agent.dm_inflight_acks();
+            let transport =
+                routes::direct_outbox::AgentDirectSendTransport(send_state.agent.as_ref());
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => break,
+                    _ = tokio::time::sleep(routes::direct_outbox::DIRECT_SEND_TICK) => {
+                        send_state
+                            .direct_send_outbox
+                            .step(
+                                routes::direct_outbox::now_unix_ms(),
+                                &|request_id| acks.receipt_status(request_id),
+                                &transport,
+                            )
+                            .await;
+                    }
                 }
             }
         }));

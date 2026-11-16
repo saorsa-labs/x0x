@@ -38,6 +38,7 @@ pub async fn send(
     require_gossip: bool,
     require_durable_app_ack: bool,
     logical_id: Option<&str>,
+    deliver_until_ms: Option<u64>,
 ) -> Result<()> {
     client.ensure_running().await?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(message.as_bytes());
@@ -65,6 +66,9 @@ pub async fn send(
     }
     if let Some(logical_id) = logical_id {
         body["logical_id"] = serde_json::json!(logical_id);
+    }
+    if let Some(deliver_until_ms) = deliver_until_ms {
+        body["deliver_until_ms"] = serde_json::json!(deliver_until_ms);
     }
     let resp = client.post("/direct/send", &body).await?;
     print_value(client.format(), &resp);
@@ -166,6 +170,7 @@ mod tests {
             false,
             true,
             None,
+            None,
         )
         .await;
         assert!(result.is_ok(), "send should succeed: {:?}", result);
@@ -186,6 +191,7 @@ mod tests {
             false,
             false,
             true,
+            None,
             None,
         )
         .await;
@@ -217,6 +223,7 @@ mod tests {
             false,
             false,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -231,6 +238,7 @@ mod tests {
             false,
             false,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -244,6 +252,7 @@ mod tests {
             false,
             false,
             false,
+            None,
             None,
         )
         .await
@@ -301,6 +310,7 @@ mod tests {
             false,
             true,
             Some("order-7"),
+            Some(1_800_000_000_000),
         )
         .await
         .unwrap();
@@ -314,6 +324,7 @@ mod tests {
             false,
             false,
             false,
+            None,
             None,
         )
         .await
@@ -333,6 +344,10 @@ mod tests {
         );
         assert_eq!(requests[0]["logical_id"], serde_json::json!("order-7"));
         assert_eq!(
+            requests[0]["deliver_until_ms"],
+            serde_json::json!(1_800_000_000_000u64)
+        );
+        assert_eq!(
             requests[1]["require_durable_app_ack"],
             serde_json::json!(false),
             "--no-durable-ack must reach the daemon, not be dropped"
@@ -341,6 +356,7 @@ mod tests {
             requests[1].get("logical_id").is_none(),
             "an omitted logical_id must not be sent as null"
         );
+        assert!(requests[1].get("deliver_until_ms").is_none());
     }
 
     async fn start_sse_server(body: &'static str) -> (String, tokio::sync::oneshot::Sender<()>) {

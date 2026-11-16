@@ -69,6 +69,11 @@ pub(crate) trait OutboxRecord: Clone {
     fn retry_count(&self) -> u32;
     /// Set the attempt count and the next due time.
     fn set_schedule(&mut self, retry_count: u32, next_retry_at_ms: u64);
+    /// Copy what one attempt learned from `attempted` (the copy the
+    /// worker sent) onto the stored entry, before [`Outbox::settle`]
+    /// reschedules it. The default keeps nothing (#1109 keeps the last
+    /// error code).
+    fn record_attempt(&mut self, _attempted: &Self) {}
     /// Load-time consistency check of one entry. `Err` is the reason.
     fn check(&self) -> Result<(), String>;
     /// Encode the whole store as sidecar bytes.
@@ -290,6 +295,7 @@ impl<'a, T: OutboxRecord> Outbox<'a, T> {
             else {
                 continue;
             };
+            live.record_attempt(entry);
             let retry_count = live.retry_count().saturating_add(1);
             if *ok {
                 delivered.push(entry.partition().to_string());

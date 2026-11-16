@@ -55661,6 +55661,9 @@ pub(in crate::server) mod tests {
             requester_offer_outbox: RwLock::new(HashMap::new()),
             requester_offer_outbox_path: data_dir.join("requester_offer_outbox.json"),
             requester_offer_outbox_persistence_lock: Mutex::new(()),
+            direct_send_outbox: crate::server::routes::direct_outbox::DirectSendOutbox::new(
+                data_dir.join(crate::server::routes::direct_outbox::DIRECT_SEND_OUTBOX_FILE),
+            ),
             public_group_bootstrap_outbox_persistence_lock: Mutex::new(()),
             cert_fetch_requested: StdMutex::new(HashMap::new()),
             cert_fetch_answered: StdMutex::new(HashMap::new()),
@@ -73766,6 +73769,7 @@ pub(in crate::server) mod tests {
             // semantics keeps them testing what they were written to test.
             require_durable_app_ack: Some(false),
             logical_id: None,
+            deliver_until_ms: None,
         }
     }
 
