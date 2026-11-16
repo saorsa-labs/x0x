@@ -2035,26 +2035,6 @@ impl KvStore {
         )
     }
 
-    /// #1970: upper estimate of this store's complete image after merging
-    /// `delta`'s content, in the spirit of [`Self::check_image_room`]. Every
-    /// added or updated entry counts at its full serialized size plus its
-    /// map key and a fresh OR-Set tag; a removed key counts a tombstone and
-    /// is not credited with the entry it frees, so the estimate never
-    /// understates the merged image.
-    fn projected_merge_image_bytes(&self, delta: &KvStoreDelta) -> Result<u64> {
-        let mut image = bincode::serialized_size(self)?;
-        let added = delta.added.iter().map(|(key, (entry, _))| (key, entry));
-        for (key, entry) in added.chain(delta.updated.iter()) {
-            let growth = bincode::serialized_size(entry)?
-                .saturating_add((MAP_KEY_PREFIX_BYTES + KEY_TAG_BYTES + 2 * key.len()) as u64);
-            image = image.saturating_add(growth);
-        }
-        for key in delta.removed.keys() {
-            image = image.saturating_add((KEY_TAG_BYTES + 2 * key.len()) as u64);
-        }
-        Ok(image)
-    }
-
     /// Test-only access to the raw entry map (#1094 P2 tests build an
     /// inconsistent store).
     #[cfg(test)]
@@ -2398,8 +2378,21 @@ impl KvStore {
     /// Merge a delta into this store.
     ///
     /// Enforces access control: if the store has a Signed or Allowlisted
-    /// policy, the `writer` must be authorized. Unauthorized deltas are
-    /// silently rejected (returns Ok but does not apply changes).
+    /// policy, the `writer` must be authorized. Unauthorized, ambiguous and
+    /// inconsistent deltas are rejected without applying changes (returning
+    /// `Ok` with a rejected outcome, not an error). On a store that serves
+    /// its complete state as a retained group image (#1970), a delta whose
+    /// merge would grow the image past the retained-image limit is refused
+    /// typed before any of it applies; a delta that does not grow the image
+    /// past the limit — a removal, a same-size overwrite, a re-delivery —
+    /// merges, so an over-limit store can still recover.
+    ///
+    /// # Errors
+    ///
+    /// [`KvError::StoreFull`] when the merged image would grow past the
+    /// retained-image limit (retained-image stores only); [`KvError::Merge`]
+    /// or [`KvError::Serialization`] when applying the admitted content
+    /// fails.
     pub fn merge_delta(
         &mut self,
         delta: &KvStoreDelta,
@@ -2565,22 +2558,66 @@ impl KvStore {
         // local writer's own puts; concurrent writers under the limit on
         // their own nodes, peers on versions without the gate, and served
         // images all merge through here, and past the limit no holder can
-        // serve a retained image. Refuse the whole delta, typed, before any
-        // of it applies — every replica then stays servable.
+        // serve a retained image. A store that serves its complete state as
+        // a retained image merges through a measured trial, so the refusal
+        // is exact and never freezes an over-limit store against the
+        // removals that recover it.
         if self.serves_retained_group_image() {
-            let max = crate::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES;
-            let image = self.projected_merge_image_bytes(delta)?;
-            if image > max as u64 {
-                tracing::warn!(
-                    "refused delta for store {}: the merged image would be {} bytes, above the {}-byte retained-image limit",
-                    self.id,
-                    image,
-                    max
-                );
-                return Err(KvError::StoreFull { image, max });
-            }
+            return self.merge_delta_bounded(delta, peer_id, writer);
         }
+        self.apply_delta_content(delta, peer_id, writer)
+    }
 
+    /// #1970: apply `delta` through a measured trial, so a merge cannot
+    /// grow this store's complete image past the retained-image limit. The
+    /// trial measures the exact merged image — the same bytes a retained
+    /// image serializes — so a writer and its receivers agree: a same-size
+    /// overwrite, a re-delivery or a removal is not counted as growth, and
+    /// no estimate can understate the merged image. A merge that would
+    /// grow the image past the limit is refused typed with nothing
+    /// applied; a merge that does not grow the image past the limit
+    /// commits — including one that shrinks a store already past the
+    /// limit, which is how such a store recovers and serves again.
+    ///
+    /// # Errors
+    ///
+    /// [`KvError::StoreFull`] when the merged image would grow past the
+    /// limit; nothing is applied. [`KvError::Serialization`] when either
+    /// measure fails, plus whatever applying the delta raises.
+    fn merge_delta_bounded(
+        &mut self,
+        delta: &KvStoreDelta,
+        peer_id: PeerId,
+        writer: Option<&AgentId>,
+    ) -> Result<MergeOutcome> {
+        let max = crate::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES;
+        let mut trial = self.clone();
+        let outcome = trial.apply_delta_content(delta, peer_id, writer)?;
+        let merged = bincode::serialized_size(&trial)?;
+        if merged > max as u64 && merged > bincode::serialized_size(self)? {
+            tracing::warn!(
+                "refused delta for store {}: the merged image would be {} bytes, above the {}-byte retained-image limit",
+                self.id,
+                merged,
+                max
+            );
+            return Err(KvError::StoreFull { image: merged, max });
+        }
+        *self = trial;
+        Ok(outcome)
+    }
+
+    /// Apply an admitted delta's content and authority: allowlist changes,
+    /// added, removed and updated entries, the name register, the cached
+    /// checkpoint and the version bump. Callers have already run the
+    /// admission gates (authorization, ambiguity, integrity and, for
+    /// retained-image stores, the #1970 size bound).
+    fn apply_delta_content(
+        &mut self,
+        delta: &KvStoreDelta,
+        peer_id: PeerId,
+        writer: Option<&AgentId>,
+    ) -> Result<MergeOutcome> {
         // Apply allowlist changes from the delta (owner-only)
         if let Some(ref additions) = delta.allowlist_additions {
             if writer.is_some_and(|w| self.owner.as_ref().is_some_and(|o| o == w)) {
@@ -3131,6 +3168,20 @@ impl KvStore {
 
     /// Merge a fully retained group CRDT image after its current endorser has
     /// been authenticated by the sync layer.
+    ///
+    /// #1970: a merge that would grow the complete image past the
+    /// retained-image limit is refused typed before anything applies; a
+    /// merge that does not grow the image past the limit commits, so a
+    /// holder already past the limit can still recover by merging newer,
+    /// smaller state.
+    ///
+    /// # Errors
+    ///
+    /// [`KvError::Unauthorized`] on a foreign store/group/owner binding;
+    /// [`KvError::ValueTooLarge`] or [`KvError::Merge`] on invalid image
+    /// content or OR-Set state; [`KvError::StoreFull`] when the merged
+    /// image would grow past the retained-image limit; and
+    /// [`KvError::Serialization`] if a measure fails.
     pub fn merge_group_retained_image(
         &mut self,
         other: &KvStore,
@@ -3212,14 +3263,17 @@ impl KvStore {
         if let Some(floor) = retained_sequence_floor {
             trial.restore_seq_counter(floor);
         }
-        // #1970: the merged image must stay servable. Refuse typed before
-        // the trial commits — the same limit `serialize_retained_group_image`
-        // enforces on the serving side, so a holder can never merge into a
-        // complete image it cannot serve to a new or lagging member.
+        // #1970: the merged image must stay servable. A merge that would
+        // grow the image past the limit — the same limit
+        // `serialize_retained_group_image` enforces on the serving side —
+        // is refused typed before the trial commits. A merge that does not
+        // grow the image past the limit commits, including one that shrinks
+        // a holder already past it, so an over-limit holder can recover by
+        // merging newer, smaller state.
         let max = crate::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES;
-        let image = bincode::serialized_size(&trial)?;
-        if image > max as u64 {
-            return Err(KvError::StoreFull { image, max });
+        let merged = bincode::serialized_size(&trial)?;
+        if merged > max as u64 && merged > bincode::serialized_size(self)? {
+            return Err(KvError::StoreFull { image: merged, max });
         }
         *self = trial;
         Ok(())
@@ -4683,6 +4737,292 @@ mod tests {
             150,
             "none of the refused delta's entries applied"
         );
+    }
+
+    /// One group store filled to within two 60 KB entries of the
+    /// retained-image limit — the closest under-cap state a replica can sit
+    /// at, where the merge bound decides. The bulk count and the per-entry
+    /// cost come from two serialized measurements; the corrective tail adds
+    /// whole entries only, never a measure per put (the review of this PR
+    /// flagged that shape as quadratic).
+    fn store_within_two_entries_of_the_limit(slot: u8, encrypted: Option<bool>) -> (KvStore, u64) {
+        let max = crate::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES as u64;
+        let owner = agent(1);
+        let ctx = TestCtx::new(7, &[owner]);
+        let mut s = match encrypted {
+            None => KvStore::new_group_signed(
+                store_id(slot),
+                "Wiki".to_string(),
+                owner,
+                vec![7u8; 16],
+                ctx,
+            ),
+            Some(treekem) if treekem => KvStore::new_treekem_encrypted(
+                store_id(slot),
+                "Wiki".to_string(),
+                owner,
+                vec![7u8; 16],
+                ctx,
+            ),
+            Some(_) => KvStore::new_encrypted(
+                store_id(slot),
+                "Wiki".to_string(),
+                owner,
+                vec![7u8; 16],
+                ctx,
+            ),
+        }
+        .expect("store");
+        let value = vec![b'v'; 60_000];
+        for i in 0..260u32 {
+            s.put(
+                format!("k{i:05}"),
+                value.clone(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+        }
+        let size_260 = bincode::serialized_size(&s).expect("size");
+        s.put(
+            "k00260".to_string(),
+            value.clone(),
+            "text/plain".to_string(),
+            peer(1),
+        )
+        .expect("put");
+        let per_entry = bincode::serialized_size(&s).expect("size") - size_260;
+        assert!(per_entry > 0, "per-entry cost measured: {per_entry}");
+        let fits = (max - bincode::serialized_size(&s).expect("size")) / per_entry;
+        for i in 261..(261 + fits.saturating_sub(1)) as u32 {
+            s.put(
+                format!("k{i:05}"),
+                value.clone(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+        }
+        let size = bincode::serialized_size(&s).expect("size");
+        assert!(size <= max, "fixture stays under the limit: {size}");
+        assert!(
+            max - size < 2 * per_entry,
+            "fixture sits within two entries of the limit: {}",
+            max - size
+        );
+        (s, max)
+    }
+
+    /// #1970 review: the writer's own node admits a same-size overwrite
+    /// near the limit (`check_image_room` credits the replaced entry), so
+    /// every replica must merge it too — the merged image does not grow.
+    #[test]
+    fn a_same_size_overwrite_at_the_limit_merges() {
+        let (mut s, max) = store_within_two_entries_of_the_limit(9, None);
+        let mut delta = KvStoreDelta::new(s.version);
+        for (key, old) in s.entries.iter().take(3) {
+            let mut replacement =
+                KvEntry::new(key.clone(), vec![b'w'; 60_000], "text/plain".to_string());
+            replacement.updated_at = old.updated_at + 10_000;
+            delta.updated.insert(key.clone(), replacement);
+        }
+        s.merge_delta(&delta, peer(1), Some(&agent(1)))
+            .expect("a same-size overwrite merges at the limit");
+        for key in delta.updated.keys() {
+            assert_eq!(
+                s.get(key).expect("entry").value.first(),
+                Some(&b'w'),
+                "the newer same-size value won LWW"
+            );
+        }
+        let after = bincode::serialized_size(&s).expect("size after");
+        assert!(after <= max, "the merged image stays servable: {after}");
+    }
+
+    /// #1970 review: gossip replays re-deliver entries the receiver already
+    /// holds. The merged image does not grow, so a replica near the limit
+    /// must merge the replay rather than count the entries twice.
+    #[test]
+    fn a_redelivered_entry_at_the_limit_merges() {
+        let (mut s, max) = store_within_two_entries_of_the_limit(10, None);
+        let mut delta = KvStoreDelta::new(s.version);
+        for (key, entry) in s.entries.iter().take(3) {
+            delta
+                .added
+                .insert(key.clone(), (entry.clone(), (peer(1), 9_000_000_000)));
+        }
+        s.merge_delta(&delta, peer(1), Some(&agent(1)))
+            .expect("a re-delivery merges at the limit");
+        let after = bincode::serialized_size(&s).expect("size after");
+        assert!(
+            after <= max,
+            "the re-delivery did not grow the image: {after}"
+        );
+    }
+
+    /// #1970 review: a store already past the limit (state merged before
+    /// the bound) must still merge removals — that is the only path back to
+    /// a servable image. A gate that measures growth from the current size
+    /// freezes such a store instead.
+    #[test]
+    fn a_removal_only_delta_on_an_over_cap_store_recovers() {
+        let (mut s, max) = store_within_two_entries_of_the_limit(11, None);
+        let value = vec![b'v'; 60_000];
+        for i in 0..10u32 {
+            s.put(
+                format!("r{i:05}"),
+                value.clone(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+        }
+        let over = bincode::serialized_size(&s).expect("size over");
+        assert!(over > max, "fixture is past the limit: {over}");
+        let mut delta = KvStoreDelta::new(s.version);
+        for key in s.entries.keys().take(10).cloned().collect::<Vec<_>>() {
+            delta.removed.insert(key, std::collections::HashSet::new());
+        }
+        s.merge_delta(&delta, peer(1), Some(&agent(1)))
+            .expect("a removal-only delta merges into an over-limit store");
+        for key in delta.removed.keys() {
+            assert!(s.get(key).is_none(), "removed key {key:?} is gone");
+        }
+        let after = bincode::serialized_size(&s).expect("size after");
+        assert!(
+            after <= max,
+            "the removals recover a servable image: {after}"
+        );
+    }
+
+    /// #1970 review: a retained image whose merge SHRINKS an over-limit
+    /// holder (newer, smaller entries winning LWW) must merge — the holder
+    /// recovers toward a servable image instead of being refused from an
+    /// over-limit base.
+    #[test]
+    fn a_shrinking_retained_image_merges_into_an_over_cap_holder() {
+        let (mut holder, max) = store_within_two_entries_of_the_limit(12, None);
+        let value = vec![b'v'; 60_000];
+        for i in 0..40u32 {
+            holder
+                .put(
+                    format!("r{i:05}"),
+                    value.clone(),
+                    "text/plain".to_string(),
+                    peer(1),
+                )
+                .expect("put");
+        }
+        let before = bincode::serialized_size(&holder).expect("size before");
+        assert!(before > max, "fixture is past the limit: {before}");
+        let owner = agent(1);
+        let mut other = KvStore::new_group_signed(
+            store_id(12),
+            "Wiki".to_string(),
+            owner,
+            vec![7u8; 16],
+            TestCtx::new(7, &[owner]),
+        )
+        .expect("store");
+        let mut keys: Vec<String> = holder.entries.keys().cloned().collect();
+        keys.sort();
+        for key in keys.iter().take(30) {
+            other
+                .put(
+                    key.clone(),
+                    vec![b's'; 1_000],
+                    "text/plain".to_string(),
+                    peer(2),
+                )
+                .expect("put");
+            other.entries.get_mut(key).expect("entry").updated_at += 10_000;
+        }
+        holder
+            .merge_group_retained_image(&other, agent(7), peer(2))
+            .expect("a shrinking image merges into an over-limit holder");
+        assert_eq!(
+            holder.get(&keys[0]).expect("entry").value.len(),
+            1_000,
+            "the newer smaller entry won LWW"
+        );
+        let after = bincode::serialized_size(&holder).expect("size after");
+        assert!(
+            after < before,
+            "the holder's image shrank: {after} vs {before}"
+        );
+        assert!(
+            after > max,
+            "still past the limit — recovering toward servable, not yet there: {after}"
+        );
+    }
+
+    /// Positive control: far from the limit, an ordinary growth delta still
+    /// merges — the bound refuses only growth past the limit.
+    #[test]
+    fn an_under_limit_delta_merges() {
+        let owner = agent(1);
+        let mut s = KvStore::new_group_signed(
+            store_id(13),
+            "Wiki".to_string(),
+            owner,
+            vec![7u8; 16],
+            TestCtx::new(7, &[owner]),
+        )
+        .expect("store");
+        for i in 0..10u32 {
+            s.put(
+                format!("k{i:05}"),
+                vec![b'v'; 1_000],
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+        }
+        let mut delta = KvStoreDelta::new(s.version);
+        for i in 0..5u32 {
+            delta.added.insert(
+                format!("n{i:05}"),
+                (
+                    KvEntry::new(
+                        format!("n{i:05}"),
+                        vec![b'n'; 1_000],
+                        "text/plain".to_string(),
+                    ),
+                    (peer(2), i as u64 + 100),
+                ),
+            );
+        }
+        s.merge_delta(&delta, peer(2), Some(&agent(1)))
+            .expect("an under-limit delta merges");
+        assert_eq!(s.entries.len(), 15, "every entry applied");
+    }
+
+    /// Coverage (#1970 review): the merge bound covers every store kind
+    /// that serves a retained image — Encrypted and TreeKemEncrypted take
+    /// the same typed refusal as GroupSigned.
+    #[test]
+    fn the_bound_covers_encrypted_and_treekem_stores() {
+        for encrypted in [Some(false), Some(true)] {
+            let (mut s, max) = store_within_two_entries_of_the_limit(14, encrypted);
+            let mut delta = KvStoreDelta::new(s.version);
+            for i in 0..3u32 {
+                delta.added.insert(
+                    format!("z{i:05}"),
+                    (
+                        KvEntry::new(
+                            format!("z{i:05}"),
+                            vec![b'z'; 60_000],
+                            "text/plain".to_string(),
+                        ),
+                        (peer(2), i as u64 + 100),
+                    ),
+                );
+            }
+            match s.merge_delta(&delta, peer(2), Some(&agent(1))) {
+                Err(KvError::StoreFull { image, .. }) => assert!(image > max),
+                other => panic!("expected a typed StoreFull refusal, got {other:?}"),
+            }
+        }
     }
 
     /// Socket-free characterization of retained-image paging (issue-802

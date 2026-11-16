@@ -369,7 +369,9 @@ fn every_store_merge_path_uses_the_one_lww_rule() {
     }
     for path in [
         "fn merge_delta_self_keyed(",
-        "fn merge_delta_with_outcome_inner(",
+        // The #1970 bound splits the delta path: the dispatcher refuses
+        // over-limit growth and `apply_delta_content` merges the entries.
+        "fn apply_delta_content(",
         "fn try_adopt_full_snapshot(",
         "fn merge_unchecked(",
         "pub fn merge_group_retained_image(",

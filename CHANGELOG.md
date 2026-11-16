@@ -491,6 +491,15 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **A merge can no longer push a group store past the 16 MiB retained-image
+  limit (#1970; A10 amendment of 16 Nov 2026).** An incoming group delta or
+  retained-image merge that would grow the store's image past the limit is
+  refused typed `StoreFull` before anything applies; the measure is an exact
+  trial merge. A merge that does not grow the image (removals, revocations,
+  same-size overwrites, re-deliveries) still applies, so an over-limit store
+  can shrink back and recover. Serving from an over-limit holder fails typed
+  `StoreFull` instead of a stringly gossip error. Refusals are counted in
+  `GET /diagnostics/state-sync`.
 - **Granted-store CLI paths and serves (#1953 review).** `x0x grant data`
   (and `grant revoke|renew`) percent-encode each path segment, so a key with
   `#`, `?` or `/` reaches the exact key. A slow granted read or write now
