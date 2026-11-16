@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **A refused granted write names a fixed reason (#1094, review of #1953;
+  A03 amendment of 16 Nov 2026).** The granted agent no longer forwards its
+  store's error text to a remote grantee; the reply carries one of
+  `store_policy`, `immutable_key`, `waiting_for_eligible_admin_revocation`,
+  `group_admin_revoked` or `refused`.
 - **An `rw` grantee writes a store through a `ShareCap::Data` grant (#1094
   slice D2, A03 amendment of 16 Nov 2026).** `PUT` and
   `DELETE /grants/data/:agent/:group/:store/:key` (`x0x grant data put|rm`)
