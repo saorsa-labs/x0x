@@ -863,7 +863,7 @@ async fn unresolved_head_evidence(
         ids.iter().any(|id| {
             targets
                 .get(id)
-                .is_some_and(|target| target.epoch > local_epoch)
+                .is_some_and(|target| target.is_head_evidence(local_epoch))
         })
     };
     ahead || super::self_leave_rekey_fence_any_open(&ids)

@@ -89,6 +89,10 @@
 //! offline until t = 10 s; a 0.46.1 member L; O silent for 24 virtual
 //! hours; and the joiner J's `JoinPendingNotice`.
 
+// #1581: ADR 0110 `s4_certificate_expiry_skew`, sim-feasible runs. A child
+// module, so that it uses this file's Home, seat and certificate helpers.
+mod expiry_skew;
+
 use super::*;
 use crate::groups::cert_rebind as cr;
 use crate::groups::eviction::EXPIRY_TOLERANCE_SECS as TAU;
@@ -306,6 +310,34 @@ fn all_bind(seats: &Seats, digest: &str) -> bool {
             seat.as_ref()
                 .is_some_and(|seat| seat.digest.as_deref() == Some(digest))
         })
+}
+
+/// No node binds `digest` to the seat, and every node except `gone` has
+/// a record of the group. A node other than `gone` with no record
+/// (`None`) fails: its read proves nothing about the seat. `gone` is the
+/// revoked seat's own node: the revocation removes it from the group and
+/// it drops its record (run (7) reads "B: no record"), so for `gone` no
+/// record passes and a record must not bind `digest`. At least one other
+/// node must be present.
+fn none_bind(seats: &Seats, digest: &str, gone: &str) -> bool {
+    let binds_not = |seat: &Seat| seat.digest.as_deref() != Some(digest);
+    seats.iter().any(|(label, _)| *label != gone)
+        && seats.iter().all(|(label, seat)| match seat {
+            Some(seat) => binds_not(seat),
+            None => *label == gone,
+        })
+}
+
+/// Run (7)'s refusal: the route's typed `403 rebind_signer_ineligible`
+/// (`precheck_renewal` → `rebind_refusal_status` in
+/// `routes/named_groups/revocation_eviction/rebind.rs`).
+fn signer_ineligible(status: StatusCode, body: &serde_json::Value) -> bool {
+    status == StatusCode::FORBIDDEN && body["error"] == "rebind_signer_ineligible"
+}
+
+/// Every holder holds the revocation record. An empty list fails.
+fn all_hold(held: &[(&str, bool)]) -> bool {
+    !held.is_empty() && held.iter().all(|(_, has)| *has)
 }
 
 /// Run (1)'s and (6)'s structural outcome: on every node the seat is still
@@ -985,6 +1017,16 @@ async fn pre_cutoff(
         "B self-revokes: {status_rv} {body_rv}"
     );
     await_holders(sim, &["A", "C"], b_hex).await?;
+    // `await_holders` does not fail when the wait ends without the record.
+    // B's route refuses from B's own revocation set, so run (7) proves
+    // nothing about A and C unless they hold the record. If not: INFRA.
+    let held7 = held_by(sim, &["A", "C"], b_hex).await?;
+    receipt.evidence(
+        "a_and_c_hold_b_revocation_before_run_7",
+        all_hold(&held7),
+        format!("revocation held {held7:?}"),
+        at(sim),
+    );
     let (status7, body7) = sim
         .api(
             "B",
@@ -995,15 +1037,13 @@ async fn pre_cutoff(
         .await?;
     pause(sim, "after the revoked agent's rebind", QUIET).await?;
     let after7 = seats(sim, THREE, group, b).await?;
-    let refused7 = body7["error"] == "rebind_signer_ineligible" && !status7.is_success();
-    let not_bound = after7.iter().all(|(_, seat)| {
-        seat.as_ref()
-            .is_none_or(|seat| seat.digest.as_deref() != Some(later_digest.as_str()))
-    });
+    let refused7 = signer_ineligible(status7, &body7);
+    let not_bound = none_bind(&after7, &later_digest, "B");
     let run7 = refused7 && not_bound;
     receipt.note(format!(
         "run (7) revoked agent's self-rebind (digest {later_digest}): {status7} {body7}; \
-         refused rebind_signer_ineligible {refused7}; no node binds it {not_bound}; {}",
+         refused 403 rebind_signer_ineligible {refused7}; A and C hold the group and none \
+         binds it {not_bound}; revocation held {held7:?}; {}",
         describe_seats(&after7)
     ));
 
@@ -1698,7 +1738,7 @@ async fn expect2(case: &str, seed: u64, arm: Arm2, want: Verdict) -> Result<()> 
     Ok(())
 }
 
-/// ADR 0110 `s4_certificate_rebind` runs (1) and (4): GREEN with S4.
+/// ADR 0110 `s4_certificate_rebind` runs (1), (4) and (7): GREEN with S4.
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -1750,4 +1790,87 @@ fn w3h_1357_s4_owner_recovery() -> Result<()> {
         )
         .await
     })
+}
+
+// ─── Unit tests of run (7)'s judgements ─────────────────────────────────────
+
+mod judge_tests {
+    use super::*;
+
+    fn seat(digest: Option<&str>) -> Option<Seat> {
+        Some(Seat {
+            view: View {
+                state_revision: 7,
+                lists_b: true,
+                b_state: Some("Active".to_string()),
+                quarantined: false,
+                epoch: Some(1),
+                leaves: Some(3),
+                tracks_b: None,
+                head_committed_by: None,
+            },
+            role: None,
+            digest: digest.map(str::to_string),
+            not_after: None,
+            head_committed_at_ms: None,
+        })
+    }
+
+    #[test]
+    fn none_bind_needs_every_seat_but_the_gone_one() {
+        let seats: Seats = vec![
+            ("A", seat(Some("d1"))),
+            ("B", seat(Some("d1"))),
+            ("C", None),
+        ];
+        assert!(!none_bind(&seats, "later", "B"));
+        let only_gone: Seats = vec![("B", None)];
+        assert!(!none_bind(&only_gone, "later", "B"));
+        assert!(!none_bind(&Vec::new(), "later", "B"));
+    }
+
+    #[test]
+    fn none_bind_refuses_a_bound_seat() {
+        let seats: Seats = vec![("A", seat(Some("d1"))), ("C", seat(Some("later")))];
+        assert!(!none_bind(&seats, "later", "B"));
+        let gone_binds: Seats = vec![
+            ("A", seat(Some("d1"))),
+            ("B", seat(Some("later"))),
+            ("C", seat(Some("d1"))),
+        ];
+        assert!(!none_bind(&gone_binds, "later", "B"));
+    }
+
+    #[test]
+    fn none_bind_holds_when_no_seat_binds_and_only_the_gone_one_lacks_a_record() {
+        let seats: Seats = vec![
+            ("A", seat(Some("d1"))),
+            ("B", None),
+            ("C", seat(Some("d1"))),
+        ];
+        assert!(none_bind(&seats, "later", "B"));
+        let all_present: Seats = vec![
+            ("A", seat(Some("d1"))),
+            ("B", seat(None)),
+            ("C", seat(Some("d1"))),
+        ];
+        assert!(none_bind(&all_present, "later", "B"));
+    }
+
+    #[test]
+    fn signer_ineligible_needs_403() {
+        let body = json!({"error": "rebind_signer_ineligible"});
+        assert!(signer_ineligible(StatusCode::FORBIDDEN, &body));
+        assert!(!signer_ineligible(StatusCode::INTERNAL_SERVER_ERROR, &body));
+        assert!(!signer_ineligible(StatusCode::CONFLICT, &body));
+        let other = json!({"error": "rebind_not_later"});
+        assert!(!signer_ineligible(StatusCode::FORBIDDEN, &other));
+    }
+
+    #[test]
+    fn all_hold_needs_every_holder() {
+        assert!(all_hold(&[("A", true), ("C", true)]));
+        assert!(!all_hold(&[("A", true), ("C", false)]));
+        assert!(!all_hold(&[]));
+    }
 }

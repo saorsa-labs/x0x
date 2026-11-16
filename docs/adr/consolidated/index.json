@@ -26,7 +26,7 @@
       "revision": 1,
       "path": "A03-r01-trust-permissions-sharing-and-revocation.md",
       "title": "Trust Permissions Sharing and Revocation",
-      "sha256": "6346e7fbdf40d36d15533776de7a12a693528017438f311136333cbb62fa46eb"
+      "sha256": "deef0366a56a63af4a62793c65ed2c36022bbc15d4be13abd7000c628c30f77d"
     },
     {
       "id": "A04",
@@ -68,14 +68,14 @@
       "revision": 1,
       "path": "A09-r01-group-encryption-and-key-changes.md",
       "title": "Group Encryption and Key Changes",
-      "sha256": "64cfa25c4dd1a1bca31b3c3a1fab3567c6d92856193716f145de687e8203ed68"
+      "sha256": "5b7567a3e05a24dca3e6990abf13587c67cdb7a93ee43a551228fef1b8b574c6"
     },
     {
       "id": "A10",
       "revision": 1,
       "path": "A10-r01-shared-data-files-and-synchronization.md",
       "title": "Shared Data Files and Synchronization",
-      "sha256": "46a6b1028b75f4a20b9102232fc3d9737fd35d7e57237424e320468bd34aece4"
+      "sha256": "fdf77e3896467eed129f59a2d6a4ee034ca8f7d53f33de40cd91ffcc411a066b"
     },
     {
       "id": "A11",
@@ -103,7 +103,7 @@
       "revision": 1,
       "path": "A14-r01-health-updates-and-recovery.md",
       "title": "Health Updates and Recovery",
-      "sha256": "8bb8d21855b0a1877cab632bfc5935377ddbcf51279db41944f5209805bd28ad"
+      "sha256": "df336a878fffd0f75764d124949a96c8c3e88962395cb48cc521afde7c2633cd"
     },
     {
       "id": "A15",

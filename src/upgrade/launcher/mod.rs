@@ -19,6 +19,7 @@ mod journal;
 mod probe;
 mod recovery;
 mod run;
+mod supervise;
 
 pub(crate) fn candidate_boot(version: &str) -> io::Result<()> {
     child::candidate_boot(version)
@@ -232,6 +233,10 @@ impl Trial {
                     // A stopped trial may only roll back (ADR 0094 S4).
                     || (old.phase == Phase::Stopped
                         && !matches!(self.phase, Phase::Stopped | Phase::RollingBack))
+                    // A stale stop never undoes a rollback or a restore
+                    // (#1968 review).
+                    || (matches!(old.phase, Phase::RollingBack | Phase::Restored)
+                        && self.phase == Phase::Stopped)
                 {
                     return Err(invalid("existing trial cannot be replaced or reset"));
                 }
@@ -252,7 +257,13 @@ impl Trial {
             ));
         }
         // Re-establish the barrier: readable bytes alone do not prove fsync.
-        trial.save(path)?;
+        // Sync, never rewrite: a reader outside the host lock must not write
+        // its older copy over a peer's newer trial (#1968 review).
+        journal::open_for_sync(path, false)?.sync_all()?;
+        let directory = path
+            .parent()
+            .ok_or_else(|| invalid("trial path has no directory"))?;
+        journal::open_for_sync(directory, true)?.sync_all()?;
         Ok(trial)
     }
 }

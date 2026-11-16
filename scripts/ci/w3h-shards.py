@@ -72,6 +72,11 @@ GROUPS = (
     # Lima VM. `rest` takes about 108 of its 120 minutes, so the rows have
     # their own shard; the budget is not raised (31 Oct ruling, #1733).
     ('1427', 'w3h_1427_'),
+    # #1581 `s4_certificate_expiry_skew` runs (1), (5a), (8): three
+    # five-node arms of about 700 virtual seconds each (B's certificate
+    # expires 600 s after issue, then N + τ + the bound), so the row has
+    # its own shard rather than a raised budget (31 Oct ruling, #1733).
+    ('1581j', 'w3h_1581j_'),
 )
 
 # The gate's reruns per case (D196). A group in `PARTS` runs them as that
@@ -98,7 +103,11 @@ RUNS = 20
 # H-S3-q (3): one rerun is 172-203 s in the 12-CPU VM, so about 400 s on
 # the runner and about 135 min for 20 reruns, too close to the 155-min S3
 # test deadline: 2 parts of 10 reruns take about 70 min each.
-PARTS = {'s3-d3': 4, 's3-1661': 2, 's3-rm4': 4, 's3-rm2': 2, 's3-q3': 2}
+# 1581j (#1581 `s4_certificate_expiry_skew`): one rerun of the three arms
+# is about 125 s in the 12-CPU VM, so about 250 s on the runner and
+# about 85 min for 20 reruns, too close to the 110-min test deadline of a
+# non-S3 group: 2 parts of 10 reruns take about 45 min each.
+PARTS = {'s3-d3': 4, 's3-1661': 2, 's3-rm4': 4, 's3-rm2': 2, 's3-q3': 2, '1581j': 2}
 
 ROOT = Path(__file__).resolve().parents[2]
 
