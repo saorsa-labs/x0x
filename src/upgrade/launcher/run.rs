@@ -31,6 +31,11 @@ pub(super) fn run_trial(
         return Err(invalid("automatic start is forbidden"));
     }
     if trial.phase == Phase::Restored {
+        // An intentional stop starts no restored child; the trial stays
+        // Restored, so the next start starts it (#1968 review).
+        if stop() {
+            return Ok(Outcome::Stopped);
+        }
         // ADR 0094 S4: a restarted launcher starts only a missing restored
         // child. The previous bytes are already installed, so no rollback
         // is repeated.
