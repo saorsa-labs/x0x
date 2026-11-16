@@ -6,8 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- **A joiner whose S3 sidecar is rebuilt under its placeholder shows
-  `readmission_required {local_state_lost}` (#1937).** The rebuild drops the
+- **A node whose S3 sidecar is rebuilt under its placeholder shows
+  `readmission_required {local_state_lost}` (#1937, #1946).** This covers a
+  joiner and a confirmed member with an armed attestation. The rebuild drops the
   authoritative record behind the placeholder, which no holder has; the group
   now stays inert and placeheld with D43's exit and
   `recovery_sidecar_rebuilt`, as ADR 0109 §4's rebuild table says. Before, the

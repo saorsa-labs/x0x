@@ -17,22 +17,18 @@
 //!   what was lost.
 //! - No node commits because of the rebuild: J stays at its stop head, A
 //!   at r+4 and B at r+2′. J's marker is the same before the damage and at the end.
-//! - J asks again from its head: it ends in `awaiting_attestation`, its
-//!   `recovery.asked` lists an admin as `pending`, and it names no
-//!   `exit`. This is the §4 rebuild table's outcome for a lost
-//!   `active_ata`: a fresh request from the current head, `awaiting_attestation`
-//!   until one answers. J's legacy view holds its real record and J holds
-//!   every link to A's head, so nothing else is lost.
+//! - J stays inert and shows `readmission_required {local_state_lost}`,
+//!   with an `exit` (D43's remedy; ADR 0114's retention re-Welcome is not
+//!   in effect).
 //!
-//! **Decision (16 Nov 2026, #1946; A08 amendment).** The row's cell (2)
-//! asked for `readmission_required {local_state_lost}`, which the §4
-//! rebuild table gives only to a record under a placeholder and to a
-//! pre-Welcome joiner whose gap it cannot re-fetch (D147). A confirmed
-//! member keeps its real record, so the table governs and the cell is
-//! read as the table's outcome. D119's retention re-Welcome stays the
-//! exit for a member behind every holder's retention (H-S3-r). Before
-//! this decision the arm was an expected RED pinned to #1946 with the
-//! same observations.
+//! **Why `local_state_lost`.** J armed A's ATA, so S3 wrote J's legacy
+//! view as the S3 placeholder, as it does for any armed gap. The §4
+//! rebuild table then applies its row "`authoritative_record`, when the
+//! legacy view holds an S3 placeholder": the record is on no holder, the
+//! group stays inert under the placeholder and the node shows
+//! `local_state_lost`. Before the #1937 fix the node missed this (a
+//! rebuilt sidecar was never `lost`): J stayed in `awaiting_attestation`
+//! and kept asking (#1946). The same fix covers both variants.
 //!
 //! **Stop point.** The row stops J after it applies r+3, before its next
 //! segment. On this build that state is not reached: the ATA attests A's
@@ -74,11 +70,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const LABELS: &[&str] = &["A", "M1", "M2", "B", "J"];
 /// The test segment length (H-S3-q (2)).
 const SEGMENT: u64 = 1;
-const FINAL: &str = "member_junk_sidecar_quarantined_rebuilt_and_j_asks_again_from_its_head";
+const FINAL: &str = "member_junk_sidecar_quarantined_rebuilt_and_j_inert_in_local_state_lost";
 const CAUSE: &str = "the junk .grecov was not kept byte-identical in one history copy, no \
                      fresh sidecar names the rebuild, recovery_sidecar_rebuilt is missing, a \
-                     node committed or a marker cleared after the rebuild, or J does not ask \
-                     again from its head (awaiting_attestation with a pending admin, no exit)";
+                     node committed or a marker cleared after the rebuild, or J does not stay \
+                     inert in readmission_required {local_state_lost}";
 /// ADR 0109 H-S3-a's window, also enough for one request round.
 const WINDOW: Duration = Duration::from_secs(130);
 const LOST: &str = "readmission_required{local_state_lost}";
@@ -301,11 +297,9 @@ impl Run {
             && self.markers.0 == self.markers.1
     }
 
-    /// J asks again from its head (§4 rebuild table, lost `active_ata`): it
-    /// never shows `local_state_lost`, ends in `awaiting_attestation`, still
-    /// asks (its last `recovery` lists B as `pending`) and names no exit.
-    /// `awaiting_attestation` alone is not enough: a node with no recovery
-    /// subject reports it with an empty `asked`.
+    /// The #1946 gap's shape, kept for the shape test: J never shows
+    /// `local_state_lost`, ends in `awaiting_attestation`, still asks (its
+    /// last `recovery` lists B as `pending`) and names no exit.
     fn asking(&self) -> bool {
         !self.states_after.is_empty()
             && self.asked.iter().any(|(agent, answer)| {
@@ -588,7 +582,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     let quarantined = disk.quarantined();
     let named = run.rebuild_named(&file, &disk);
     let still = run.nothing_committed();
-    let asks = run.asking();
+    let lost = run.inert_lost();
     receipt.note(format!(
         "old_bytes_in_one_history_copy_and_a_fresh_sidecar: ok={quarantined}"
     ));
@@ -599,10 +593,10 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         "no_commit_and_no_marker_cleared_after_the_rebuild: ok={still}"
     ));
     receipt.note(format!(
-        "j_asks_again_from_its_head_with_no_exit: ok={asks}"
+        "j_inert_in_readmission_required_local_state_lost_with_exit: ok={lost}"
     ));
     receipt.note(run.describe(&disk));
-    let passed = quarantined && named && still && asks;
+    let passed = quarantined && named && still && lost;
     if !passed {
         receipt.cause(CAUSE, Some(run.describe(&disk)), true, at(sim));
     }
@@ -744,7 +738,7 @@ fn w3h_1356_q_member_shapes() {
     assert!(policy.drops(&frame(j, b, None)), "J to B still held");
 }
 
-/// H-S3-q (2): a control (#1946 decision).
+/// H-S3-q (2): a control, GREEN with the #1937 fix (#1946).
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),
