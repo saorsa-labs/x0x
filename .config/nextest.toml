@@ -14,6 +14,12 @@
 # committed, so the cost is negligible.
 experimental = ["wrapper-scripts"]
 
+# cargo-nextest 0.9.151 is the first release with future-queue 0.4.1
+# (nextest-rs/future-queue#603): before it, a test queued behind a full
+# test group could end the run "not run" with no failure. CI pins 0.9.151;
+# an older local nextest warns.
+nextest-version = { recommended = "0.9.151" }
+
 [scripts.wrapper.x0x-test-home]
 command = 'env RUST_MIN_STACK=16777216 X0X_HOME=/tmp/x0x-nextest-home HOME=/tmp/x0x-nextest-home'
 
@@ -283,7 +289,7 @@ priority = 60
 # finisher always frees enough. 4 keeps the reservations that #316,
 # #1614 and ADR 0030 slice 3 added below. Upstream fixed the scheduler in
 # future-queue 0.4.1 (nextest-rs/future-queue#603), first used by
-# cargo-nextest 0.9.151; CI pins 0.9.144.
+# cargo-nextest 0.9.151.
 [test-groups.quic-localhost]
 max-threads = 1
 

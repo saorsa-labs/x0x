@@ -52445,6 +52445,22 @@ async fn handle_join_result_message_bound(
                 .await
                 .map(Box::new)
             } else {
+                // Test-only: the fetch was not verified, cannot take a
+                // control-blob reference, or has no attempt id.
+                #[cfg(test)]
+                if let Ok(mut list) = state.named_group_test_recorders.join_carry_refusals.lock() {
+                    list.push((
+                        member_agent_id.to_ascii_lowercase(),
+                        if !verified {
+                            "fetch_not_verified"
+                        } else if !accepts_control_blob_ref {
+                            "no_control_blob_ref"
+                        } else {
+                            "no_attempt_id"
+                        }
+                        .to_string(),
+                    ));
+                }
                 None
             };
             let response = JoinResultMessage::Result {

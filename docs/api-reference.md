@@ -1587,7 +1587,7 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 | POST | `/machines/connect` | `x0x machines connect <machine_id>` | Establish a machine-id transport connection |
 | POST | `/direct/send` | `x0x direct send <agent_id> <message> [--require-ack-ms <ms>] [--prefer-raw-quic-if-connected <BOOL>] [--raw-quic-receive-ack-ms <ms>] [--stop-fallback-on-raw-error] [--require-gossip] [--no-durable-ack] [--logical-id <token>] [--deliver-until-ms <unix_ms>]` | Send a direct base64 payload. Durable-by-default since v0.38.0. With `deliver_until_ms` the daemon stores the send and answers 202 `outcome: "queued"`; see [Queued durable send](#queued-durable-send-1109) |
 | GET | `/direct/connections` | `x0x direct connections` | List active direct connections |
-| DELETE | `/direct/receipts/:logical_id?agent_id=<hex>` | `x0x direct cancel <logical_id> <agent_id>` | Cancel a [queued send](#queued-durable-send-1109) that is still held. 200 with `status: "cancelled"`; 404 `not_queued` when none is held; 409 `send_in_flight` while an attempt is in flight (it cannot be recalled; retry after it ends) |
+| DELETE | `/direct/receipts/:logical_id?agent_id=<hex>` | `x0x direct cancel <logical_id> <agent_id>` | Cancel a [queued send](#queued-durable-send-1109) that is still held. 200 with `status: "cancelled"`; 404 `not_queued` when none is held; 503 `outbox_not_durable` when the cancel cannot be recorded (the send stays held); 409 `send_in_flight` while an attempt is in flight (it cannot be recalled; retry after it ends) |
 | GET | `/direct/receipts/:logical_id?agent_id=<hex>` | `x0x direct receipt <logical_id> <agent_id>` | Outcome of a durable send made under `logical_id` to `agent_id`: `delivered`, `delivered_late`, `pending` or `unknown`, and for a queued send also `queued`, `expired` or `failed` (#1109). See [Durable send receipts](#durable-send-receipts-1109) |
 | GET | `/history/message/:msg_id` | `x0x history message` | Point lookup of one durable history row by exposed `msg_id` (64 hex; canonical group ids need `?scope=`); 404 when absent, 400 on malformed id. Same record shape as `/history` (issue #319) |
 | GET | `/direct/events` | `x0x direct events` | SSE stream of direct messages; `?backfill=N` requests up to N stored `dm:` rows as `history_direct_message` events before a `live` marker and live frames (ADR-0023 §7). The attempt is best-effort; reconcile through [`/history`](#durable-history-adr-0023) |
@@ -1782,8 +1782,9 @@ GET /direct/receipts/order-42?agent_id=8a3f...
 | `expired` | A queued send reached `deliver_until_ms` without a delivery |
 | `failed` | A queued send got an error that a retry cannot repair, or its recipient was blocked. `error` has the `/direct/send` error code, for example `recipient_rejected`, or `recipient_blocked` |
 | `cancelled` | A queued send was cancelled with `DELETE /direct/receipts/:logical_id` |
+| `delivered_late` (queued) | A recipient ACK for the only bytes ever attempted arrived after the queued send ended as `expired`, `failed` or `cancelled` |
 
-The key is the pair (`logical_id`, `agent_id`), because a logical id is scoped to one recipient. Only sends that supplied `logical_id` can be queried. Records are kept in memory for 10 minutes after the send resolved or gave up, at most 4,096, oldest dropped first; a restart forgets them. Only an `Accepted` v2 ACK from the exact recipient agent and machine counts. A malformed `logical_id` or `agent_id` answers 400 `invalid_logical_id` or `invalid_agent_id`. Decision: [A07](adr/consolidated/A07-r01-messages-receipts-history-and-retry.md) (amendment of 14 Nov 2026).
+The key is the pair (`logical_id`, `agent_id`), because a logical id is scoped to one recipient. Only sends that supplied `logical_id` can be queried. Records of a synchronous send are kept in memory for 10 minutes after the send resolved or gave up, at most 4,096, oldest dropped first; a restart forgets them. The outcomes of a [queued send](#queued-durable-send-1109) survive a restart (see there). Only an `Accepted` v2 ACK from the exact recipient agent and machine counts. A malformed `logical_id` or `agent_id` answers 400 `invalid_logical_id` or `invalid_agent_id`. Decision: [A07](adr/consolidated/A07-r01-messages-receipts-history-and-retry.md) (amendment of 14 Nov 2026).
 
 ### Queued durable send (#1109)
 
@@ -1818,7 +1819,11 @@ Rules:
 - A receipt answer for a queued or finished send includes `payload_digest` (hex BLAKE3 of the bytes the status is about). Compare it with the bytes you sent: the same `logical_id` can have been used for other bytes.
 - Payloads are stored unsealed (base64) in `direct_send_outbox.json`, a file with owner-only permissions (0600).
 - Caps: 64 sends or 4 MiB per recipient, 1,024 sends or 32 MiB per daemon. A full outbox answers 429 `outbox_full`.
-- Read the outcome with [`GET /direct/receipts/:logical_id`](#durable-send-receipts-1109). `queued` is read from the outbox and survives a restart. `delivered`, `expired` and `failed` are kept in memory with the same 10-minute, 4,096-entry bounds as the other receipts.
+- Read the outcome with [`GET /direct/receipts/:logical_id`](#durable-send-receipts-1109). `queued` is read from the outbox and survives a restart. `delivered`, `expired`, `failed` (with `error`) and `cancelled`, each with its `payload_digest`, are written to `direct_send_outcomes.json` (owner-only, 0600) next to the outbox, kept 24 hours, at most 4,096, oldest dropped first, and loaded at start, so a receipt answers the same after a restart. A bad outcomes file is moved aside (`.corrupt-<ms>`) and the daemon still starts.
+- Before each attempt the daemon writes the digest of the bytes it is about to send under that `logical_id`. A late durable ACK after a restart (when the send's own record is gone) settles a held send as `delivered` without another send only when it comes from the send's recipient agent and exactly one digest was ever attempted under that key, equal to the held bytes. After `expired`, `failed` or `cancelled`, the same ACK turns the outcome into `delivered_late` (with that digest). Anything else changes nothing.
+- Once bytes were attempted under a `logical_id`, other bytes under it answer 409 `idempotency_conflict` (for 24 hours): the earlier bytes may have arrived.
+- An outcome is written durably before the send leaves the outbox. If it cannot be written, the send stays held (a cancel answers 503 `outbox_not_durable`) and the worker tries again on the next pass.
+- When a recipient's durable-capable capability advert arrives, its held sends are tried at once instead of at the next retry time.
 - A sidecar that fails its checks at startup is moved aside (`.corrupt-<ms>`), and the daemon starts with an empty outbox.
 
 Decision: [A07](adr/consolidated/A07-r01-messages-receipts-history-and-retry.md) (amendment of 16 Nov 2026).
@@ -3267,8 +3272,8 @@ claim, or conclude the task is gone if it stays absent.
 | POST | `/stores` | `x0x store create <name> <topic>` | Create a store |
 | POST | `/stores/:id/join` | `x0x store join <topic> --owner <hex>` or `x0x store join <topic> --policy self_keyed` | Join an existing store. An owner-anchored join REQUIRES `expected_owner` (a bare join is a 422 `owner_required`); `--policy self_keyed` is the one owner-free join and must be sent WITHOUT `--owner` (422 `owner_not_allowed` otherwise) |
 | GET | `/stores/:id/keys` | `x0x store keys <store_id>` | List keys |
-| PUT | `/stores/:id/:key` | `x0x store put <store_id> <key> <value>` | Put a base64 value |
-| GET | `/stores/:id/:key` | `x0x store get <store_id> <key>` | Get a value |
+| PUT | `/stores/:id/:key` | `x0x store put <store_id> <key> <value>` | Put a base64 value. On a group store (`x0x/group/...`) the entry is signed by this agent, and by the rider's sub-agent id when a rider token makes the write (#1094 P1/P2). 507 `store full` when the put would take the store's complete image past the 16 MiB retained-image limit |
+| GET | `/stores/:id/:key` | `x0x store get <store_id> <key>` | Get a value. `writer` is `{"verified": true, "agent": <hex>, "rider": <sub-agent hex or null>}` when the entry's writer mark verifies for this value, store and key, and `{"verified": false}` (writer unknown: an older writer, a writer key this daemon has not seen, or a replaced mark; not evidence of tampering) otherwise. The mark's reserved metadata keys (`x0x.writer.agent.v1`, `x0x.writer.sig.v1`, `x0x.writer.for.v1`, `x0x.writer.rider.v1`) are not returned in `metadata` (#1094 P2) |
 | DELETE | `/stores/:id/:key` | `x0x store rm <store_id> <key>` | Remove a value |
 
 ### The group scratch store (issue #1094)

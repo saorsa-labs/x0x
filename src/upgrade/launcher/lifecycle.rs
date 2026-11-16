@@ -322,7 +322,9 @@ fn systemd() {
             );
             child.reap().unwrap();
         }
-        run::Outcome::Provisional(_) => panic!("unhealthy fixture must not commit"),
+        run::Outcome::Provisional(_) | run::Outcome::Committed => {
+            panic!("unhealthy fixture must not commit")
+        }
     }
     fs::write(
         root.join("done.json"),

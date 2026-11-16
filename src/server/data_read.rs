@@ -279,6 +279,7 @@ async fn write_local_store(state: &Arc<AppState>, request: &DataWriteRequest) ->
             content_type,
         } => {
             super::routes::stores::put_kv_value(
+                None,
                 State(Arc::clone(state)),
                 Path((topic, key.clone())),
                 Json(super::routes::stores::PutValueRequest {

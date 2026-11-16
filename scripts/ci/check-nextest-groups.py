@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Check that every nextest test group has one `threads-required` value.
 
-nextest schedules with `future_queue_grouped` (future-queue 0.4.0). A test
+nextest before 0.9.151 schedules with `future_queue_grouped` from
+future-queue 0.4.0. A test
 queued behind a full group is retried only when a test of the same group
 finishes, and it starts only if the global limit has room for its own
 weight then. When a group mixes weights, a heavier head can stay queued
 after a lighter test of its group frees too little room, and the run ends
 with tests "not run" and no failure. One weight per group rules that out.
-future-queue 0.4.1 (nextest-rs/future-queue#603, cargo-nextest 0.9.151)
-fixes the scheduler; CI pins cargo-nextest 0.9.144.
+future-queue 0.4.1 (nextest-rs/future-queue#603, first used by
+cargo-nextest 0.9.151) fixes the scheduler; the check stays as a guard for
+any nextest version.
 
 nextest resolves `test-group` and `threads-required` field by field: each
 comes from the first matching override that sets it. An override that sets
