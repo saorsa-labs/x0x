@@ -304,6 +304,10 @@ All notable changes to this project will be documented in this file.
   and a stale stop never replaces a rollback. It stays dormant until the
   inventory issuer lands and `ENABLED` becomes true.
 
+- **#1427 probe gate follow-up (#1976 review).** A unit test drives the
+  ADR 0110 §2 gate with a probe-only target (no hold) and with traffic then
+  a probe (hold). The S4 seal probe in W3-H receipts shows the target's
+  `observed` flag. A09 notes that the flag is sticky per catch-up entry.
 - **Upgrade health commit review carry-over (#1378 slice 1; A14
   amendment of 16 Nov 2026).** The candidate writes canonical data and
   identity roots, and the launcher matches a planned root reached through a
