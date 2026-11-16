@@ -223,7 +223,10 @@ All notable changes to this project will be documented in this file.
   stable interval, with D193 peer continuity when the OLD instance had a
   send-ready peer (recorded in the handoff). Staging refuses a download
   that would leave less than 1 GiB free. A missing or symlinked installed
-  file rolls the host commit back as Failed at once.
+  file rolls the host commit back as Failed at once; a true I/O error is
+  retried. Review round (#1947): the candidate's local verdict reads the
+  live delivery probe, a failed health-commit write is retried at the next
+  observation, and the module compiles on Windows (no candidate there).
 - **Coordinator production pass and systemd recovery cases (#1376, S3c;
   A14 amendment of 15 Nov 2026).** `coordinator::recover` keeps trials at
   `<data_root>/upgrade-trial.json`, counts only a handoff that binds this

@@ -1684,22 +1684,19 @@ pub async fn serve_with_options(
                 .await;
                 if let Some(candidate) = &health_candidate {
                     let (_, send_ready, _) = snapshot_state.health_snapshot.load();
-                    let local =
-                        health_verdict::local_verdict(&health_verdict::classify_with_detail(
-                            &sample,
-                            health_verdict::DetailAccess::Full,
-                        ));
                     let observation = upgrade_health_commit::Observation {
                         stores_initialized: true,
-                        local_verdict: local,
+                        local_verdict: upgrade_health_commit::candidate_local_verdict(
+                            &snapshot_state.health_snapshot,
+                            &sample,
+                        ),
                         send_ready_peers: send_ready,
                     };
-                    if let Some(record) =
-                        health_tracker.observe(candidate, observation, std::time::Instant::now())
+                    // A failed write is retried at the next tick.
+                    if let Err(error) =
+                        health_tracker.commit(candidate, observation, std::time::Instant::now())
                     {
-                        if let Err(error) = upgrade_health_commit::write(candidate, &record) {
-                            tracing::warn!("upgrade health commit not written: {error}");
-                        }
+                        tracing::warn!("upgrade health commit not written: {error}");
                     }
                 }
                 snapshot_state.health_snapshot.store_verdict_sample(sample);

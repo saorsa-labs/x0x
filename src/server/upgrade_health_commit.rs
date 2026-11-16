@@ -74,9 +74,7 @@ fn detect_with(
         }
         _ => false,
     };
-    let executable_sha256 =
-        crate::upgrade::pair::digest_file(executable, crate::upgrade::pair::MAX_BINARY_BYTES)
-            .ok()?;
+    let executable_sha256 = executable_digest(executable)?;
     Some(Candidate {
         boot,
         data_root: data_root.to_path_buf(),
@@ -85,6 +83,19 @@ fn detect_with(
         executable_sha256,
         previously_connected,
     })
+}
+
+/// The executable's hash, as the pair engine hashes an installed file.
+#[cfg(unix)]
+fn executable_digest(executable: &Path) -> Option<[u8; 32]> {
+    crate::upgrade::pair::digest_file(executable, crate::upgrade::pair::MAX_BINARY_BYTES).ok()
+}
+
+/// The pair engine is Unix-only and the launcher is Linux-only: no
+/// candidate.
+#[cfg(not(unix))]
+fn executable_digest(_executable: &Path) -> Option<[u8; 32]> {
+    None
 }
 
 /// `(pid, start time, boot id)` of this process, as the launcher records
@@ -121,6 +132,22 @@ pub(super) struct Observation {
     pub send_ready_peers: usize,
 }
 
+/// The M1 verdict over the local inputs of `sample`, with the live
+/// delivery-probe results merged in. The refresher's sample does not carry
+/// them; without the merge the probe input is always `ok` and a candidate
+/// with a wedged local dispatch could commit.
+pub(super) fn candidate_local_verdict(
+    snapshot: &super::routes::status::HealthSnapshot,
+    sample: &super::health_verdict::VerdictSample,
+) -> LocalVerdict {
+    let mut sample = sample.clone();
+    snapshot.merge_probe_results(&mut sample);
+    super::health_verdict::local_verdict(&super::health_verdict::classify_with_detail(
+        &sample,
+        super::health_verdict::DetailAccess::Full,
+    ))
+}
+
 /// Continuity of the candidate's health across refresher ticks.
 #[derive(Debug, Default)]
 pub(super) struct Tracker {
@@ -130,7 +157,37 @@ pub(super) struct Tracker {
 }
 
 impl Tracker {
-    /// Record one observation. Returns the health commit to write, once:
+    /// Record one observation and write the health commit when it is due.
+    /// `Ok(true)` is the one successful write. A failed write leaves the
+    /// commit due: the next observation tries again, and the launcher's
+    /// trial deadline bounds the retries.
+    pub(super) fn commit(
+        &mut self,
+        candidate: &Candidate,
+        observation: Observation,
+        now: Instant,
+    ) -> std::io::Result<bool> {
+        self.commit_with(candidate, observation, now, write)
+    }
+
+    /// `commit` with the record writer given explicitly.
+    fn commit_with(
+        &mut self,
+        candidate: &Candidate,
+        observation: Observation,
+        now: Instant,
+        writer: impl FnOnce(&Candidate, &journal::HealthRecord) -> std::io::Result<()>,
+    ) -> std::io::Result<bool> {
+        let Some(record) = self.observe(candidate, observation, now) else {
+            return Ok(false);
+        };
+        writer(candidate, &record)?;
+        self.written = true;
+        Ok(true)
+    }
+
+    /// Record one observation. Returns the health commit that is due, until
+    /// `commit` has written one:
     /// - local health held for `STABLE` and, for a previously connected
     ///   host, a send-ready peer held for `STABLE`: `peer_continuity` true;
     /// - local health held for `PEER_WAIT` on a previously connected host
@@ -138,7 +195,7 @@ impl Tracker {
     ///   rolls back as Interrupted (D193).
     ///
     /// A host that never had a peer commits on local health alone.
-    pub(super) fn observe(
+    fn observe(
         &mut self,
         candidate: &Candidate,
         observation: Observation,
@@ -175,7 +232,6 @@ impl Tracker {
         } else {
             peer_held
         };
-        self.written = true;
         Some(record(candidate, observation, peer_continuity))
     }
 }
@@ -207,7 +263,7 @@ fn record(
 }
 
 /// Write the health commit beside the data root, with its record barrier.
-pub(super) fn write(candidate: &Candidate, record: &journal::HealthRecord) -> std::io::Result<()> {
+fn write(candidate: &Candidate, record: &journal::HealthRecord) -> std::io::Result<()> {
     journal::write_auxiliary_record(
         &candidate.data_root.join(journal::HEALTH_FILE_NAME),
         record,
@@ -264,9 +320,81 @@ mod tests {
         assert!(!record.previously_connected);
         assert_eq!(record.local_verdict, LocalVerdict::Ok);
         assert_eq!((record.pid, record.attempt), (41, 1));
+    }
+
+    /// A failed write leaves the commit due; the next observation writes
+    /// it, once. Before the fix `observe` marked the commit written before
+    /// the save, so one transient error ended in a trial rollback.
+    #[test]
+    fn a_failed_write_is_retried_and_a_successful_write_is_final() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut c = candidate(false);
+        c.data_root = dir.path().to_path_buf();
+        let mut tracker = Tracker::default();
+        let start = Instant::now();
+        assert!(!tracker.commit(&c, healthy(0), start).expect("not due"));
+        let failing = |candidate: &Candidate, record: &journal::HealthRecord| {
+            journal::write_auxiliary_record_with_failure(
+                &candidate.data_root.join(journal::HEALTH_FILE_NAME),
+                record,
+                journal::validate_health,
+                journal::BarrierStep::Rename,
+            )
+        };
+        tracker
+            .commit_with(&c, healthy(0), start + STABLE, failing)
+            .expect_err("the injected failure");
+        assert_eq!(journal::read_health(dir.path()).expect("read"), None);
+
+        let retry = start + STABLE + Duration::from_secs(5);
+        assert!(tracker.commit(&c, healthy(0), retry).expect("retry"));
+        let written = journal::read_health(dir.path())
+            .expect("read")
+            .expect("the retried commit");
+        assert_eq!((written.pid, written.attempt), (41, 1));
         // Written once.
+        assert!(!tracker
+            .commit(&c, healthy(0), start + STABLE * 2)
+            .expect("already written"));
+    }
+
+    /// The candidate's local verdict reads the live delivery probe: the
+    /// refresher's sample never carries probe results. Before the fix the
+    /// raw sample was classified and a failed probe still read `ok`.
+    #[test]
+    fn a_failed_delivery_probe_degrades_the_candidate_local_verdict() {
+        use crate::server::health_verdict::VerdictSample;
+        use crate::server::routes::status::HealthSnapshot;
+
+        let snapshot = HealthSnapshot::default();
+        let mut sample = VerdictSample::unsampled();
+        sample.seeds_configured = 2;
+        sample.seeds_connected = 2;
+        assert_eq!(
+            candidate_local_verdict(&snapshot, &sample),
+            LocalVerdict::Ok
+        );
+        snapshot.record_probe(true, Some(3));
+        assert_eq!(
+            candidate_local_verdict(&snapshot, &sample),
+            LocalVerdict::Ok
+        );
+
+        snapshot.record_probe(false, None);
+        assert_eq!(
+            candidate_local_verdict(&snapshot, &sample),
+            LocalVerdict::Degraded
+        );
+        // A degraded tick restarts the stable interval.
+        let c = candidate(false);
+        let mut tracker = Tracker::default();
+        let start = Instant::now();
+        tracker.observe(&c, healthy(0), start);
+        let mut observation = healthy(0);
+        observation.local_verdict = candidate_local_verdict(&snapshot, &sample);
+        assert!(tracker.observe(&c, observation, start + STABLE).is_none());
         assert!(tracker
-            .observe(&c, healthy(0), start + STABLE * 2)
+            .observe(&c, healthy(0), start + STABLE + Duration::from_secs(5))
             .is_none());
     }
 
