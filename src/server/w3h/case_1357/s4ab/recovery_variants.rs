@@ -103,11 +103,35 @@ async fn self_revoke(sim: &Sim, label: &str) -> Result<()> {
     Ok(())
 }
 
-/// Whether `observer` shows the owner-recovery wait naming A.
-async fn shows_wait(sim: &Sim, observer: &str, group: &str, a_hex: &str) -> bool {
-    group_body(sim, observer, group)
-        .await
-        .is_ok_and(|body| waits_for_owner_recovery(&body, a_hex))
+/// Whether `observer` shows the owner-recovery wait naming A. A failed
+/// read is an error, never "no wait": an absence check must not pass on
+/// an unreadable status.
+async fn shows_wait(sim: &Sim, observer: &str, group: &str, a_hex: &str) -> Result<bool> {
+    Ok(waits_for_owner_recovery(
+        &group_body(sim, observer, group).await?,
+        a_hex,
+    ))
+}
+
+/// After `await_holders` (which does not fail when the wait ends without
+/// the record): every holder must hold `subject_hex`'s revocation, else
+/// the arm tests nothing new and is INFRA.
+async fn holders_hold(
+    sim: &Sim,
+    receipt: &mut Receipt,
+    name: &str,
+    holders: &[&'static str],
+    subject_hex: &str,
+) -> Result<()> {
+    await_holders(sim, holders, subject_hex).await?;
+    let held = held_by(sim, holders, subject_hex).await?;
+    receipt.evidence(
+        name,
+        all_hold(&held),
+        format!("revocation held {held:?}"),
+        sim.fabric().now().as_micros(),
+    );
+    Ok(())
 }
 
 async fn not_needed(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
@@ -132,13 +156,20 @@ async fn not_needed(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         .fabric()
         .mark_indexed("case: t=0 A revokes its own agent; D stays eligible");
     self_revoke(sim, "A").await?;
-    await_holders(sim, &["D", "B", "C"], &a_hex).await?;
+    holders_hold(
+        sim,
+        receipt,
+        "d_b_and_c_hold_a_revocation_before_the_mandate",
+        &["D", "B", "C"],
+        &a_hex,
+    )
+    .await?;
     let (status, body) = mandate(sim, "C", &group, &b_hex).await?;
     pause(sim, "after the refused mandate", QUIET).await?;
     let refused = status == StatusCode::CONFLICT && body["error"] == "recovery_not_needed";
     let mut waits = Vec::new();
     for label in ["D", "B", "C"] {
-        waits.push((label, shows_wait(sim, label, &group, &a_hex).await));
+        waits.push((label, shows_wait(sim, label, &group, &a_hex).await?));
     }
     let no_wait = waits.iter().all(|(_, shown)| !shown);
     let b_admin = sees_admin(sim, "C", &group, "B").await?;
@@ -181,16 +212,33 @@ async fn mandate_variants(sim: &mut Sim, receipt: &mut Receipt, variant: Variant
     if variant.revokes_e() {
         self_revoke(sim, "E").await?;
     }
-    await_holders(sim, &["B", "C"], &a_hex).await?;
+    holders_hold(
+        sim,
+        receipt,
+        "b_and_c_hold_a_revocation",
+        &["B", "C"],
+        &a_hex,
+    )
+    .await?;
     if variant.revokes_e() {
-        await_holders(sim, &["B", "C"], &e_hex).await?;
+        holders_hold(
+            sim,
+            receipt,
+            "b_and_c_hold_e_revocation",
+            &["B", "C"],
+            &e_hex,
+        )
+        .await?;
     }
     let waited = sim
         .until(
             "B and C show the owner-recovery wait",
             EVIDENCE,
             async |s: &Sim| {
-                shows_wait(s, "B", &group, &a_hex).await && shows_wait(s, "C", &group, &a_hex).await
+                // A failed read while polling is "not yet"; the evidence
+                // stage below records the final state.
+                matches!(shows_wait(s, "B", &group, &a_hex).await, Ok(true))
+                    && matches!(shows_wait(s, "C", &group, &a_hex).await, Ok(true))
             },
         )
         .await;
@@ -285,6 +333,13 @@ async fn mandate_variants(sim: &mut Sim, receipt: &mut Receipt, variant: Variant
         format!("mandate replies {status_e} / {status_b}"),
         at(sim),
     );
+    let outcome = Outcome {
+        waits_typed,
+        refused_e,
+        signed,
+        early_admin,
+        committed,
+    };
     if !committed && variant.revokes_e() {
         // #1973: the seal refusal that names E is the pinned gap.
         let refusals = sim.logs_containing(&[
@@ -297,16 +352,46 @@ async fn mandate_variants(sim: &mut Sim, receipt: &mut Receipt, variant: Variant
             refusals.len(),
             refusals.first().map(|log| (log.at, log.text.clone()))
         ));
-        receipt.cause(
-            CAUSE_REVOKED_SEAT_BLOCKS_SEAL,
+        pin_1973(
+            receipt,
+            outcome,
             refusals.first().map(|log| log.text.clone()),
-            !refusals.is_empty(),
             at(sim),
         );
     }
-    let passed = waits_typed && refused_e && signed && !early_admin && committed;
-    receipt.finish(variant.final_name(), passed, at(sim));
+    receipt.finish(variant.final_name(), outcome.passed(), at(sim));
     Ok(())
+}
+
+/// What a mandate arm observed.
+#[derive(Clone, Copy, Debug)]
+struct Outcome {
+    waits_typed: bool,
+    refused_e: bool,
+    signed: bool,
+    early_admin: bool,
+    committed: bool,
+}
+
+impl Outcome {
+    /// Every desired step before the commit holds.
+    fn before_commit(self) -> bool {
+        self.waits_typed && self.refused_e && self.signed && !self.early_admin
+    }
+
+    fn passed(self) -> bool {
+        self.before_commit() && self.committed
+    }
+}
+
+/// Records the #1973 cause. It classifies (so the expected RED pin holds)
+/// only when B's seal refusal naming E was seen AND every step before the
+/// commit holds: a wrong reply to the mandate naming E or B, a missing
+/// owner-recovery wait, or B an admin early leaves the cause unmet and
+/// the arm INFRA, so the pin cannot hide those regressions.
+fn pin_1973(receipt: &mut Receipt, outcome: Outcome, refusal: Option<String>, at_us: u128) {
+    let ok = refusal.is_some() && outcome.before_commit();
+    receipt.cause(CAUSE_REVOKED_SEAT_BLOCKS_SEAL, refusal, ok, at_us);
 }
 
 async fn run_variant(case: &str, seed: u64, variant: Variant) -> Receipt {
@@ -344,7 +429,12 @@ async fn run_variant(case: &str, seed: u64, variant: Variant) -> Receipt {
 }
 
 async fn expect_variant(case: &str, seed: u64, variant: Variant, want: Verdict) -> Result<()> {
-    let receipt = run_variant(case, seed, variant).await;
+    meets(case, &run_variant(case, seed, variant).await, want)
+}
+
+/// The receipt has the expected verdict; an expected RED also names
+/// exactly the #1973 cause.
+fn meets(case: &str, receipt: &Receipt, want: Verdict) -> Result<()> {
     ensure!(
         receipt.verdict() == Some(want),
         "{case}: expected {want:?}, got {:?}",
@@ -417,4 +507,80 @@ fn w3h_1581m_recovery_offline_promotee_commits_on_return() -> Result<()> {
         )
         .await
     })
+}
+
+mod pin_tests {
+    use super::*;
+
+    const ALL_BUT_COMMIT: Outcome = Outcome {
+        waits_typed: true,
+        refused_e: true,
+        signed: true,
+        early_admin: false,
+        committed: false,
+    };
+    const REFUSAL: &str = "owner recovery deferred: seal failed: explicit eviction+rekey E";
+
+    /// The receipt the revoked-member arm writes after its preconditions
+    /// hold, for `outcome` and an optional seal refusal naming E.
+    fn arm(outcome: Outcome, refusal: Option<&str>) -> Receipt {
+        let mut receipt = Receipt::new("pin", 1);
+        receipt.setup_done(1);
+        receipt.evidence("b_and_c_hold_a_revocation", true, "", 2);
+        receipt.request_delivered("c_answered", true, "", 3);
+        if !outcome.committed {
+            pin_1973(&mut receipt, outcome, refusal.map(str::to_string), 4);
+        }
+        receipt.finish(FINAL_INELIGIBLE, outcome.passed(), 5);
+        receipt
+    }
+
+    #[test]
+    fn pin_1973_holds_only_when_the_commit_alone_is_missing() {
+        assert!(meets("pin", &arm(ALL_BUT_COMMIT, Some(REFUSAL)), Verdict::Red).is_ok());
+    }
+
+    #[test]
+    fn pin_1973_needs_the_seal_refusal() {
+        assert!(meets("pin", &arm(ALL_BUT_COMMIT, None), Verdict::Red).is_err());
+    }
+
+    #[test]
+    fn pin_1973_fails_on_a_broken_mandate_reply() {
+        for broken in [
+            Outcome {
+                refused_e: false,
+                ..ALL_BUT_COMMIT
+            },
+            Outcome {
+                signed: false,
+                ..ALL_BUT_COMMIT
+            },
+            Outcome {
+                waits_typed: false,
+                ..ALL_BUT_COMMIT
+            },
+            Outcome {
+                early_admin: true,
+                ..ALL_BUT_COMMIT
+            },
+        ] {
+            let receipt = arm(broken, Some(REFUSAL));
+            assert!(
+                meets("pin", &receipt, Verdict::Red).is_err(),
+                "{broken:?} kept the pin: {:?}",
+                receipt.verdict()
+            );
+        }
+    }
+
+    #[test]
+    fn a_committed_recovery_is_green() {
+        let done = Outcome {
+            committed: true,
+            ..ALL_BUT_COMMIT
+        };
+        assert!(meets("pin", &arm(done, None), Verdict::Green).is_ok());
+        assert!(meets("pin", &arm(done, None), Verdict::Red).is_err());
+    }
 }
