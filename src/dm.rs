@@ -2206,13 +2206,41 @@ impl EnvelopeBuilder {
 
 /// Map of request_id → the pending waiter that the inbox handler wakes when an
 /// ACK arrives.
-#[derive(Default)]
 pub struct InFlightAcks {
     inner: Arc<dashmap::DashMap<[u8; 16], InFlightAck>>,
     /// #1109: what became of durable (v2) requests after their waiter
     /// resolved or was abandoned. Bounded by [`RECEIPT_LEDGER_CAP`] and
     /// [`RECEIPT_LEDGER_TTL`].
     receipts: Arc<std::sync::Mutex<ReceiptLedger>>,
+    /// #1109 S2: accepted v2 ACKs that matched no waiter and no tombstone
+    /// (for example a late ACK after a restart). A durable outbox that
+    /// holds the request can settle it. See [`Self::subscribe_orphan_acks`].
+    orphan_acks: tokio::sync::broadcast::Sender<OrphanDurableAck>,
+}
+
+/// #1109 S2: an authenticated, accepted v2 ACK that matched no waiter and
+/// no tombstone on this daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrphanDurableAck {
+    /// The request id the ACK acknowledges.
+    pub request_id: [u8; 16],
+    /// The authenticated agent that sent the ACK.
+    pub sender: AgentId,
+    /// The authenticated machine that sent the ACK.
+    pub machine: MachineId,
+}
+
+/// #1109 S2: how many orphan ACKs a slow subscriber may lag behind.
+const ORPHAN_ACK_SIGNAL_CAPACITY: usize = 256;
+
+impl Default for InFlightAcks {
+    fn default() -> Self {
+        Self {
+            inner: Arc::default(),
+            receipts: Arc::default(),
+            orphan_acks: tokio::sync::broadcast::channel(ORPHAN_ACK_SIGNAL_CAPACITY).0,
+        }
+    }
 }
 
 /// #1109: how long the sender remembers a durable request's outcome after
@@ -2412,6 +2440,7 @@ impl Clone for InFlightAcks {
         Self {
             inner: Arc::clone(&self.inner),
             receipts: Arc::clone(&self.receipts),
+            orphan_acks: self.orphan_acks.clone(),
         }
     }
 }
@@ -2615,7 +2644,7 @@ impl InFlightAcks {
                 // gave up is still proof of delivery; record it. The return
                 // stays `false`: no waiter was resolved, and callers key
                 // origin attribution on a resolved waiter.
-                self.resolve_late(
+                let recorded = self.resolve_late(
                     request_id,
                     protocol_version,
                     ack_sender,
@@ -2623,6 +2652,19 @@ impl InFlightAcks {
                     &outcome,
                     Instant::now(),
                 );
+                // #1109 S2: no waiter and no tombstone (the sender
+                // restarted, or the record expired). An outbox that still
+                // holds this request may settle it.
+                if !recorded
+                    && protocol_version >= DM_PROTOCOL_DURABLE_ACK
+                    && matches!(outcome, DmAckOutcome::Accepted)
+                {
+                    let _ = self.orphan_acks.send(OrphanDurableAck {
+                        request_id: *request_id,
+                        sender: ack_sender,
+                        machine: ack_machine,
+                    });
+                }
                 false
             }
         }
@@ -2632,6 +2674,8 @@ impl InFlightAcks {
     /// carries the exact binding the abandoned waiter held. Anything else
     /// (no tombstone, a mismatched sender, machine or protocol, a refusal
     /// outcome) changes nothing.
+    /// Returns whether a tombstone for `request_id` exists (whether or not
+    /// this ACK matched it).
     fn resolve_late(
         &self,
         request_id: &[u8; 16],
@@ -2640,13 +2684,17 @@ impl InFlightAcks {
         ack_machine: MachineId,
         outcome: &DmAckOutcome,
         now: Instant,
-    ) {
+    ) -> bool {
         if !matches!(outcome, DmAckOutcome::Accepted) {
-            return;
+            return false;
         }
         let Ok(mut ledger) = self.receipts.lock() else {
-            return;
+            return false;
         };
+        ledger.prune(now);
+        if !ledger.entries.contains_key(request_id) {
+            return false;
+        }
         let binding = match ledger.entries.get(request_id) {
             Some(entry)
                 if entry.status == DmReceiptStatus::Pending
@@ -2660,9 +2708,10 @@ impl InFlightAcks {
             {
                 entry.binding
             }
-            _ => return,
+            _ => return true,
         };
         ledger.record(*request_id, DmReceiptStatus::DeliveredLate, binding, now);
+        true
     }
 
     fn record_receipt(
@@ -2767,6 +2816,14 @@ impl InFlightAcks {
                 None => recorded.and_then(|(_, digest)| digest),
             },
         }
+    }
+
+    /// #1109 S2: subscribe to accepted v2 ACKs that matched no waiter and no
+    /// tombstone. A lagged receiver loses only the prompt settle; the
+    /// outbox still sends again and the recipient re-ACKs.
+    #[must_use]
+    pub fn subscribe_orphan_acks(&self) -> tokio::sync::broadcast::Receiver<OrphanDurableAck> {
+        self.orphan_acks.subscribe()
     }
 
     /// Diagnostic count of remembered durable request outcomes.
@@ -3819,6 +3876,59 @@ mod tests {
         );
         assert_eq!(acks.receipt_digest(&rid), Some([0xd1; 32]));
         assert_eq!(acks.receipt_digest(&[0x1b; 16]), None);
+    }
+
+    /// WHY: #1109 S2 an accepted v2 ACK with no waiter and no tombstone
+    /// (a restart lost them) is offered to the outbox; one a tombstone
+    /// knows, a v1 ACK or a refusal is not.
+    #[test]
+    fn issue1109_orphan_v2_ack_is_signalled_only_without_a_record() {
+        let acks = super::InFlightAcks::new();
+        let mut rx = acks.subscribe_orphan_acks();
+        let (agent, machine) = (AgentId([0x41; 32]), MachineId([0x42; 32]));
+        let resolve = |rid: [u8; 16], version: u16, outcome: DmAckOutcome| {
+            acks.resolve_for_ingress(
+                &rid,
+                version,
+                agent,
+                machine,
+                outcome,
+                super::DmAckIngress::Subscription,
+            )
+        };
+        assert!(!resolve(
+            [0x21; 16],
+            DM_PROTOCOL_DURABLE_ACK,
+            DmAckOutcome::Accepted
+        ));
+        assert_eq!(
+            rx.try_recv().expect("signalled"),
+            super::OrphanDurableAck {
+                request_id: [0x21; 16],
+                sender: agent,
+                machine,
+            }
+        );
+        assert!(!resolve(
+            [0x22; 16],
+            super::DM_PROTOCOL_V1,
+            DmAckOutcome::Accepted
+        ));
+        assert!(!resolve(
+            [0x23; 16],
+            DM_PROTOCOL_DURABLE_ACK,
+            DmAckOutcome::RejectedByPolicy {
+                reason: "no".to_string()
+            }
+        ));
+        let _rx = issue1109_v2_waiter(&acks, [0x24; 16]);
+        acks.abandon(&[0x24; 16]);
+        assert!(!resolve(
+            [0x24; 16],
+            DM_PROTOCOL_DURABLE_ACK,
+            DmAckOutcome::Accepted
+        ));
+        assert!(rx.try_recv().is_err(), "nothing else was signalled");
     }
 
     /// #1109 risk: a tombstone keeps the exact ACK binding. A late ACK from

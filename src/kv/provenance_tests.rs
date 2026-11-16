@@ -408,8 +408,8 @@ fn arb_entry() -> impl proptest::strategy::Strategy<Value = KvEntry> {
         })
 }
 
-/// The winning fields of a merge (`created_at` is display provenance,
-/// kept only from a winner, and outside the LWW order).
+/// The winning fields of a merge (`created_at` is outside the LWW order;
+/// it converges to the earliest, checked separately).
 type Winner = (u64, [u8; 32], Vec<u8>, String, Vec<(String, String)>);
 
 fn winner(e: &KvEntry) -> Winner {
@@ -441,6 +441,16 @@ proptest::proptest! {
             winner(&merged(&a, &merged(&b, &c)))
         );
         proptest::prop_assert_eq!(winner(&merged(&a, &a)), winner(&a));
+        // Review of #1974: `created_at` converges too (the earliest).
+        proptest::prop_assert_eq!(merged(&a, &b).created_at, merged(&b, &a).created_at);
+        proptest::prop_assert_eq!(
+            merged(&merged(&a, &b), &c).created_at,
+            merged(&a, &merged(&b, &c)).created_at
+        );
+        proptest::prop_assert_eq!(
+            merged(&a, &b).created_at,
+            a.created_at.min(b.created_at)
+        );
     }
 }
 
