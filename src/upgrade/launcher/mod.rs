@@ -19,6 +19,7 @@ mod journal;
 mod probe;
 mod recovery;
 mod run;
+mod supervise;
 
 pub(crate) fn candidate_boot(version: &str) -> io::Result<()> {
     child::candidate_boot(version)

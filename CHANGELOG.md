@@ -234,6 +234,15 @@ All notable changes to this project will be documented in this file.
 
 ### Tests and tooling
 
+- **Launcher supervise driver (#1378 slice 2; A14 amendment of 16 Nov
+  2026).** The dormant launcher's supervise driver
+  (`src/upgrade/launcher/supervise.rs`) runs a trial, then polls the host
+  commit (its first production caller) until the full set commits, a stop
+  arrives, or a rollback is due. On a rollback it reaps its own candidate,
+  saves the cause as the trial verdict and runs the coordinator pass, then
+  starts the restored child. It stays dormant until the inventory issuer
+  lands and `ENABLED` becomes true.
+
 - **Upgrade candidate health commit and D194 staging reserve (#1377, S3d
   part 2; A14 amendment of 15 Nov 2026).** A launcher trial candidate
   writes `upgrade-health.json` once its local M1 inputs stay `ok` for the

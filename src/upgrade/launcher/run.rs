@@ -226,7 +226,7 @@ pub(super) fn failed_verdict(trial: &Trial, clock: &Clock) -> Option<journal::Ca
 /// On a stop during an attempt, record a Failed verdict only for a run-out
 /// total budget. The attempt is counted at reservation but has not failed,
 /// so the attempt count must not decide the verdict here.
-fn record_budget_verdict(trial: &mut Trial, clock: Option<&Clock>) {
+pub(super) fn record_budget_verdict(trial: &mut Trial, clock: Option<&Clock>) {
     if let Some(cause) = clock
         .and_then(|clock| trial.expired(clock))
         .filter(|cause| cause.class == journal::CauseClass::Failed)
