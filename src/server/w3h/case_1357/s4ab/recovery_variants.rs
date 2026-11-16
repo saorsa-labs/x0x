@@ -37,26 +37,42 @@ const OFFLINE: Duration = Duration::from_secs(10);
 
 const FINAL_NOT_NEEDED: &str = "a_mandate_while_a_second_admin_is_eligible_is_refused_not_needed";
 const FINAL_INELIGIBLE: &str =
-    "a_mandate_naming_a_revoked_member_is_refused_and_an_offline_promotee_commits_on_return";
+    "a_mandate_naming_a_revoked_member_is_refused_and_one_naming_b_is_committed";
+const FINAL_OFFLINE: &str = "an_offline_promotee_commits_the_recovery_on_its_return";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Variant {
     NotNeeded,
-    IneligibleThenOffline,
+    /// A and E revoked; the mandate naming E is refused; the one naming
+    /// B (online) is committed.
+    IneligibleMember,
+    /// Only A revoked; B is offline when the mandate names it.
+    OfflinePromotee,
+}
+
+impl Variant {
+    fn revokes_e(self) -> bool {
+        self == Self::IneligibleMember
+    }
+
+    fn b_offline(self) -> bool {
+        self == Self::OfflinePromotee
+    }
 }
 
 impl Variant {
     fn labels(self) -> &'static [&'static str] {
         match self {
             Self::NotNeeded => FOUR_D,
-            Self::IneligibleThenOffline => FOUR_E,
+            Self::IneligibleMember | Self::OfflinePromotee => FOUR_E,
         }
     }
 
     fn final_name(self) -> &'static str {
         match self {
             Self::NotNeeded => FINAL_NOT_NEEDED,
-            Self::IneligibleThenOffline => FINAL_INELIGIBLE,
+            Self::IneligibleMember => FINAL_INELIGIBLE,
+            Self::OfflinePromotee => FINAL_OFFLINE,
         }
     }
 }
@@ -134,7 +150,7 @@ async fn not_needed(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     Ok(())
 }
 
-async fn ineligible_then_offline(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
+async fn mandate_variants(sim: &mut Sim, receipt: &mut Receipt, variant: Variant) -> Result<()> {
     let at = |sim: &Sim| sim.fabric().now().as_micros();
     let (home, _) = home_with(sim, FOUR_E, None, &[]).await?;
     let group = home.gid.clone();
@@ -148,11 +164,15 @@ async fn ineligible_then_offline(sim: &mut Sim, receipt: &mut Receipt) -> Result
 
     let trigger = sim
         .fabric()
-        .mark_indexed("case: t=0 A and E revoke their own agents");
+        .mark_indexed(format!("case: t=0 revocations ({variant:?})"));
     self_revoke(sim, "A").await?;
-    self_revoke(sim, "E").await?;
+    if variant.revokes_e() {
+        self_revoke(sim, "E").await?;
+    }
     await_holders(sim, &["B", "C"], &a_hex).await?;
-    await_holders(sim, &["B", "C"], &e_hex).await?;
+    if variant.revokes_e() {
+        await_holders(sim, &["B", "C"], &e_hex).await?;
+    }
     let waited = sim
         .until(
             "B and C show the owner-recovery wait",
@@ -175,12 +195,21 @@ async fn ineligible_then_offline(sim: &mut Sim, receipt: &mut Receipt) -> Result
     );
 
     // A mandate naming the revoked member E.
-    let (status_e, body_e) = mandate(sim, "C", &group, &e_hex).await?;
-    let refused_e = !status_e.is_success() && body_e["error"] == "recovery_member_ineligible";
-    receipt.note(format!("C's mandate naming revoked E: {status_e} {body_e}"));
+    let (status_e, refused_e) = if variant.revokes_e() {
+        let (status_e, body_e) = mandate(sim, "C", &group, &e_hex).await?;
+        receipt.note(format!("C's mandate naming revoked E: {status_e} {body_e}"));
+        (
+            status_e,
+            !status_e.is_success() && body_e["error"] == "recovery_member_ineligible",
+        )
+    } else {
+        (StatusCode::OK, true)
+    };
 
-    // B is offline; C's mandate names B.
-    sim.stop("B", RestartMode::Graceful).await?;
+    // C's mandate names B (offline in the offline variant).
+    if variant.b_offline() {
+        sim.stop("B", RestartMode::Graceful).await?;
+    }
     let (status_b, body_b) = mandate(sim, "C", &group, &b_hex).await?;
     let signed = status_b == StatusCode::ACCEPTED
         && body_b["state"] == "waiting_for_recovery_member"
@@ -190,9 +219,14 @@ async fn ineligible_then_offline(sim: &mut Sim, receipt: &mut Receipt) -> Result
         "C's mandate naming offline B: {status_b} {body_b}; C's admin_availability {}",
         c_body["admin_availability"]
     ));
-    pause(sim, "B offline", OFFLINE).await?;
-    let early_admin = sees_admin(sim, "C", &group, "B").await?;
-    sim.start_again("B").await?;
+    let early_admin = if variant.b_offline() {
+        pause(sim, "B offline", OFFLINE).await?;
+        let early = sees_admin(sim, "C", &group, "B").await?;
+        sim.start_again("B").await?;
+        early
+    } else {
+        false
+    };
     let started = sim.fabric().now();
     let mut reached: Option<Duration> = None;
     let waited = sim
@@ -240,7 +274,7 @@ async fn ineligible_then_offline(sim: &mut Sim, receipt: &mut Receipt) -> Result
         at(sim),
     );
     let passed = waits_typed && refused_e && signed && !early_admin && committed;
-    receipt.finish(FINAL_INELIGIBLE, passed, at(sim));
+    receipt.finish(variant.final_name(), passed, at(sim));
     Ok(())
 }
 
@@ -257,8 +291,8 @@ async fn run_variant(case: &str, seed: u64, variant: Variant) -> Receipt {
             let watchdog = real_time_watchdog(case, fabric);
             let outcome = match variant {
                 Variant::NotNeeded => not_needed(&mut sim, &mut receipt).await,
-                Variant::IneligibleThenOffline => {
-                    ineligible_then_offline(&mut sim, &mut receipt).await
+                Variant::IneligibleMember | Variant::OfflinePromotee => {
+                    mandate_variants(&mut sim, &mut receipt, variant).await
                 }
             };
             watchdog.disarm();
@@ -307,19 +341,38 @@ fn w3h_1581m_recovery_not_needed_while_d_is_eligible() -> Result<()> {
     })
 }
 
-/// ADR 0110 `s4_owner_recovery`, the revoked-member and offline-promotee
-/// variants: GREEN with S4.
+/// ADR 0110 `s4_owner_recovery`, the revoked-member variant: GREEN with
+/// S4.
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-fn w3h_1581m_recovery_ineligible_member_then_offline_promotee() -> Result<()> {
+fn w3h_1581m_recovery_refuses_a_revoked_member() -> Result<()> {
     super::super::super::block_on_paused(async move {
         expect_variant(
-            "w3h_1581m_recovery_ineligible_member_then_offline_promotee",
+            "w3h_1581m_recovery_refuses_a_revoked_member",
             0x1581_0051,
-            Variant::IneligibleThenOffline,
+            Variant::IneligibleMember,
+            Verdict::Green,
+        )
+        .await
+    })
+}
+
+/// ADR 0110 `s4_owner_recovery`, the "B is offline until t = 10 s"
+/// variant: GREEN with S4.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+fn w3h_1581m_recovery_offline_promotee_commits_on_return() -> Result<()> {
+    super::super::super::block_on_paused(async move {
+        expect_variant(
+            "w3h_1581m_recovery_offline_promotee_commits_on_return",
+            0x1581_0052,
+            Variant::OfflinePromotee,
             Verdict::Green,
         )
         .await
