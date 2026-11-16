@@ -28,6 +28,7 @@ use std::path::Path;
 
 mod harness;
 mod m;
+mod m_owner;
 mod rm3;
 
 const CASE: &str = "released_s3_rm1_floor_names_the_released_member";

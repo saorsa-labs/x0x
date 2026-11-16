@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`GET /stores/:id/:key` shows the verified writer (#1094 slice P2, A10
+  amendment of 16 Nov 2026).** New `writer` field: the agent (and rider
+  sub-agent) whose mark verifies for the returned value, or
+  `{"verified": false}`, writer unknown. The raw `x0x.writer.*` keys are no
+  longer in `metadata`. A rider's write names the rider. The Scratch app
+  shows the writer. Every KV merge path now refuses an entry whose content
+  hash does not match its value.
 - **The dormant launcher retires a committed trial (#1378 slice 3; A14
   amendment of 16 Nov 2026).** When the host commits, the supervise driver
   saves the trial `Committed` and hands the candidate to the caller, which
@@ -35,6 +42,22 @@ All notable changes to this project will be documented in this file.
   until it is done (or while the sidecar is not loaded) such a join is
   refused. The subject shows `reseat_required {reseat_failed}`; the
   admin calls the re-seat route again.
+- **Queued durable direct sends (#1109 slice S1, A07 amendment of 16 Nov
+  2026).** `POST /direct/send` accepts `deliver_until_ms` (unix ms, at most
+  24 h ahead; needs a `logical_id` and durable semantics; CLI
+  `x0x direct send --deliver-until-ms`). The daemon runs the normal checks,
+  stores the send in `<data_dir>/direct_send_outbox.json` and answers 202
+  `outcome: "queued"`. A worker retries it under its logical id, holds a
+  recipient that has not advertised durable delivery yet, settles a late ACK
+  without a resend, and drops it at the deadline. The outbox survives a
+  restart. `GET /direct/receipts/:logical_id` adds `queued`, `expired` and
+  `failed` (with `error`). New 400 codes `deliver_until_requires_durable`,
+  `deliver_until_requires_logical_id`, `deliver_until_passed`,
+  `deliver_until_too_far`, 429 `outbox_full` and 503 `outbox_not_durable`.
+  `DELETE /direct/receipts/:logical_id` (`x0x direct cancel`) cancels a held
+  send. Receipts are bound to a BLAKE3 digest of the payload; a blocked or
+  revoked contact gets no queued send (`failed`, `recipient_blocked`).
+  Queued payloads are stored unsealed in a 0600 file.
 - **An `rw` grantee writes a store through a `ShareCap::Data` grant (#1094
   slice D2, A03 amendment of 16 Nov 2026).** `PUT` and
   `DELETE /grants/data/:agent/:group/:store/:key` (`x0x grant data put|rm`)
@@ -106,6 +129,14 @@ All notable changes to this project will be documented in this file.
   A09 (16 Nov 2026) records that reading of the row. Run (8) repeats run
   (1) in an owner-certified `SignedPublic` group. The row has its own W3-H
   shard (`1581j`).
+- **W3-H row `s4_intake_and_egress`, staged-join part (#1581).** A
+  staged its artifacts for B's join, and B got none of them before the
+  trigger. B then revokes its own machine or agent, and after the release
+  B gets no key; with only a machine revocation A keeps B's agent seated
+  (D70). A revoked B stops asking A, so these arms do not reach A's egress
+  guards; a fetch from a device that keeps asking stays open. A control arm does the same hold and
+  release with no revocation, and B gets its key. The row has its own W3-H
+  shard (`1581k`).
 - **A `stale` join-request outcome can carry the authority's head (#1840,
   A08 amendment of 15 Nov 2026).** New optional `head` field on
   `groups::join_outcome::JoinRequestOutcome` (signed head commit, roster
@@ -296,6 +327,10 @@ All notable changes to this project will be documented in this file.
   and a stale stop never replaces a rollback. It stays dormant until the
   inventory issuer lands and `ENABLED` becomes true.
 
+- **#1427 probe gate follow-up (#1976 review).** A unit test drives the
+  ADR 0110 §2 gate with a probe-only target (no hold) and with traffic then
+  a probe (hold). The S4 seal probe in W3-H receipts shows the target's
+  `observed` flag. A09 notes that the flag is sticky per catch-up entry.
 - **Upgrade health commit review carry-over (#1378 slice 1; A14
   amendment of 16 Nov 2026).** The candidate writes canonical data and
   identity roots, and the launcher matches a planned root reached through a
@@ -419,6 +454,16 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Granted-store CLI paths and serves (#1953 review).** `x0x grant data`
+  (and `grant revoke|renew`) percent-encode each path segment, so a key with
+  `#`, `?` or `/` reaches the exact key. A slow granted read or write now
+  runs on a detached task (at most 16 at once), so it does not hold the
+  replies to other waiting requests.
+- **The dormant launcher reads a process that exits during its `/proc` read
+  as gone.** `child::absent` treated only NotFound as gone; a process reaped
+  between the open and the read of `/proc/<pid>/stat` fails with ESRCH, which
+  flaked `a_peer_recovery_failure_during_the_stop_is_final` on studio1 and
+  could make `stop_foreign` report a stopped process as an error.
 - **A #1427 catch-up probe no longer holds S4 seals (A09 fifth amendment
   of 16 Nov 2026).** A start or reconnect catch-up cycle asks for the next
   TreeKEM epoch without having seen it. Its target was read as ADR 0110 §2

@@ -239,6 +239,29 @@ impl DaemonClient {
         self.handle_response(resp).await
     }
 
+    /// Send a DELETE request with query parameters.
+    pub async fn delete_query(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<serde_json::Value> {
+        if self.dump {
+            let body = serde_json::Map::from_iter(
+                query.iter().map(|(k, v)| ((*k).to_string(), json_str(v))),
+            );
+            return self.emit_dump("DELETE", path, Some(serde_json::Value::Object(body)));
+        }
+        let resp = self
+            .client
+            .delete(format!("{}{}", self.base_url, path))
+            .headers(self.auth_headers())
+            .query(query)
+            .send()
+            .await
+            .context("request failed")?;
+        self.handle_response(resp).await
+    }
+
     /// Send a POST request with a JSON body.
     pub async fn post<T: Serialize + ?Sized>(
         &self,

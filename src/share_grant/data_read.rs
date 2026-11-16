@@ -201,6 +201,17 @@ pub enum DataReadOp {
     },
 }
 
+impl DataReadOp {
+    /// The key a `get` reads; `None` for `keys`.
+    #[must_use]
+    pub fn key(&self) -> Option<&str> {
+        match self {
+            Self::Keys => None,
+            Self::Get { key } => Some(key),
+        }
+    }
+}
+
 /// A grantee's read of one store.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DataReadRequest {
@@ -386,6 +397,16 @@ pub enum DataWriteOp {
         /// The key.
         key: String,
     },
+}
+
+impl DataWriteOp {
+    /// The key the write changes.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        match self {
+            Self::Put { key, .. } | Self::Delete { key } => key,
+        }
+    }
 }
 
 /// A grantee's write to one store (slice D2).
