@@ -444,6 +444,11 @@ All notable changes to this project will be documented in this file.
   `#`, `?` or `/` reaches the exact key. A slow granted read or write now
   runs on a detached task (at most 16 at once), so it does not hold the
   replies to other waiting requests.
+- **The dormant launcher reads a process that exits during its `/proc` read
+  as gone.** `child::absent` treated only NotFound as gone; a process reaped
+  between the open and the read of `/proc/<pid>/stat` fails with ESRCH, which
+  flaked `a_peer_recovery_failure_during_the_stop_is_final` on studio1 and
+  could make `stop_foreign` report a stopped process as an error.
 - **A #1427 catch-up probe no longer holds S4 seals (A09 fifth amendment
   of 16 Nov 2026).** A start or reconnect catch-up cycle asks for the next
   TreeKEM epoch without having seen it. Its target was read as ADR 0110 §2
