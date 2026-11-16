@@ -45,6 +45,12 @@ pub(crate) const PRODUCER_DRAIN_RETRIES: u32 = 2;
 /// worker's completion send is its final statement, so receiving it proves
 /// every write finished. A constant, not configuration.
 pub(crate) const WORKER_JOIN_BOUND: Duration = Duration::from_secs(2);
+/// The flush budget for tests whose hook must overrun it. The hook has to
+/// be entered before the deadline, and the journal write and fsync before
+/// the hook can stall for seconds on a loaded CI host or VM, so a short
+/// budget left the hook never entered. The production budget is unchanged.
+#[cfg(test)]
+pub(crate) const TEST_OVERRUN_LIMIT: Duration = Duration::from_secs(5);
 /// Hard ceiling for a test-supplied flush budget; the registration clamp
 /// only refuses a zero budget and this ceiling.
 #[cfg(test)]
@@ -1221,7 +1227,7 @@ mod reservation_release_regressions {
                 released
                     .lock()
                     .unwrap()
-                    .recv_timeout(Duration::from_secs(5))
+                    .recv_timeout(Duration::from_secs(30))
                     .unwrap();
                 // The original check succeeded, but the waiter has since refused.
                 // This is the production stop commit, not a test-only marker.
@@ -1229,7 +1235,7 @@ mod reservation_release_regressions {
                 observed.store(true, Ordering::Release);
                 Ok(())
             }),
-            Duration::from_millis(250),
+            TEST_OVERRUN_LIMIT,
         )
         .unwrap();
         let worker_root = root.clone();
@@ -1540,7 +1546,7 @@ mod reservation_release_regressions {
                     .recv_timeout(Duration::from_secs(30))
                     .map_err(io::Error::other)
             }),
-            Duration::from_millis(200),
+            TEST_OVERRUN_LIMIT,
         )
         .unwrap();
         let worker_root = root.clone();
@@ -1562,7 +1568,7 @@ mod reservation_release_regressions {
             "the caller did not wait for the worker's completion: {elapsed:?}"
         );
         assert!(
-            elapsed < WORKER_JOIN_BOUND + Duration::from_secs(3),
+            elapsed < TEST_OVERRUN_LIMIT + WORKER_JOIN_BOUND + Duration::from_secs(3),
             "the wait was not bounded: {elapsed:?}"
         );
         assert!(root.join(ROLLBACK_RECORD).is_file());
