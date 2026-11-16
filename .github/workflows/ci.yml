@@ -1136,6 +1136,8 @@ jobs:
           --expect w3h_1356_control_s3_q3_issuer_unreadable_sidecar=GREEN
           --require w3h_1356_control_s3_q2_sidecar_fault_cases
           --expect w3h_1356_control_s3_q2_sidecar_fault_cases=GREEN
+          --require w3h_1356_control_s3_r_beyond_retention
+          --expect w3h_1356_control_s3_r_beyond_retention=GREEN
           --require w3h_1356_red_s3_forked_node_shows_reseat_required
           --expect w3h_1356_red_s3_forked_node_shows_reseat_required=GREEN
           --require w3h_1356_control_s3_forked_node_not_auto_recovered

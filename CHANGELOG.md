@@ -219,6 +219,16 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **A joiner whose authority's log no longer reaches its base now ends
+  typed (ADR 0109 §2 "Unserved join seal", A08 amendment of 16 Nov 2026,
+  #1572).** When the authority's join result carries no chain and no join
+  carry and the seal does not apply, the joiner asks the admins on its
+  roster with the ordinary `group_attest_request`. An admin whose log no
+  longer reaches the base answers `base_beyond_retention`, and the joiner
+  shows `readmission_required {base_beyond_retention}` with the
+  `manual_remove_and_reinvite` exit instead of timing out with no reason.
+  Each admin that answers is asked once per join attempt. No wire change.
+
 - **The TreeKEM reconnect catch-up pass is bounded (#1427, A09 third
   amendment of 15 Nov 2026).** A reconnect during a pass runs one more
   pass after it. A pass asks for at most 4 groups at a time, each after a

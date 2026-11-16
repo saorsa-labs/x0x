@@ -52828,6 +52828,14 @@ async fn handle_join_result_message_bound(
                 intervening_events,
             ))
             .await;
+            // ADR 0109 §2 "Unserved join seal" (H-S3-r): what the
+            // authority served, read before the chain moves below.
+            let unserved = verified
+                && chain.is_empty()
+                && admin_attestation.is_none()
+                && head_attestation
+                    .as_deref()
+                    .is_none_or(|attestation| attestation.terminal_signature_b64.is_none());
             // ADR 0109 §2: with a verified join-carry ATA, apply the
             // attested served links state-only (rule (b)) so `event`
             // chains from the new head.
@@ -52896,6 +52904,31 @@ async fn handle_join_result_message_bound(
                 &roster_certificates_b64,
             )
             .await;
+            // ADR 0109 §2 "Unserved join seal" (H-S3-r, #1572): the seal
+            // did not apply and nothing was served to reach it, so §2 asks
+            // the admins (`note_unserved_join_seal` checks the gap).
+            if unserved && !applied {
+                // An unbound result (a poll) is for the attempt pending
+                // for this joiner; a bound one was checked current above.
+                let attempt_id = bound_join_attempt.map(str::to_string).or_else(|| {
+                    state
+                        .pending_join_attempts
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .get(&expected_key)
+                        .map(|attempt| attempt.attempt_id.clone())
+                });
+                if let (Some(attempt_id), Some(terminal_revision)) = (attempt_id, terminal_revision)
+                {
+                    group_recovery::note_unserved_join_seal(
+                        state,
+                        &group_id,
+                        &attempt_id,
+                        terminal_revision,
+                    )
+                    .await;
+                }
+            }
             if attested {
                 group_recovery::retire_converged(state, &group_id).await;
             }
