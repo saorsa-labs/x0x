@@ -1408,6 +1408,7 @@ pub async fn serve_with_options(
         )),
         treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
         treekem_start_catchup_pending: Default::default(),
+        treekem_reconnect_gate: Default::default(),
         treekem_network_join_ended: tokio::sync::watch::channel(false).0,
         treekem_start_catchup_passes: Default::default(),
         treekem_reconnect_catchup_passes: Default::default(),

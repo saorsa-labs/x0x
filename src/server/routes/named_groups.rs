@@ -15947,31 +15947,16 @@ fn treekem_catchup_pending_path(state: &AppState) -> std::path::PathBuf {
     state.data_dir.join("treekem-catchup-pending")
 }
 
-/// #1427: remove `key`'s pending mark. `Some(true)`: no group is left.
-fn remove_treekem_pending_mark(
-    pending: &std::sync::Mutex<HashSet<String>>,
-    key: &str,
-) -> Option<bool> {
-    let mut pending = pending
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    pending.remove(key).then(|| pending.is_empty())
-}
-
 /// #1427: the start catch-up of `key` succeeded, or the group no longer
-/// needs it. When no group is left, the outage record is removed. A
-/// reconnect catch-up passes its `gate`: a mark that a later pass set
-/// while this catch-up ran then stays ([`TreeKemReconnectGate::unmark`]).
-async fn treekem_start_catchup_done(
-    state: &AppState,
-    key: &str,
-    gate: Option<&TreeKemReconnectGate>,
-) {
-    let pending = &state.treekem_start_catchup_pending;
-    let removed = match gate {
-        Some(gate) => gate.unmark(pending, key),
-        None => remove_treekem_pending_mark(pending, key),
-    };
+/// needs it. When no group is left, the outage record is removed. Every
+/// route to this end (a start pass, a reconnect catch-up, a member that
+/// reports the local head) removes the mark through the daemon's one
+/// reconnect gate: a mark that a later pass set while the group's
+/// reconnect catch-up ran stays ([`TreeKemReconnectGate::unmark`]).
+async fn treekem_start_catchup_done(state: &AppState, key: &str) {
+    let removed = state
+        .treekem_reconnect_gate
+        .unmark(&state.treekem_start_catchup_pending, key);
     if removed != Some(true) {
         return;
     }
@@ -15996,7 +15981,9 @@ async fn treekem_start_catchup_done(
 /// #1427: a verified last catch-up page from a member whose saved head
 /// equals the local saved head after the page applied. This member is as
 /// current as that member, so its start catch-up succeeded even though no
-/// commit was missed.
+/// commit was missed. A mark that a later reconnect pass set while the
+/// group's catch-up ran stays here too ([`treekem_start_catchup_done`]):
+/// the page can answer a request from before that pass's isolation.
 async fn treekem_start_catchup_note_head(state: &AppState, key: &str, reported: Option<&str>) {
     let Some(reported) = reported.filter(|head| !head.is_empty()) else {
         return;
@@ -16016,7 +16003,7 @@ async fn treekem_start_catchup_note_head(state: &AppState, key: &str, reported: 
         .get(key)
         .is_some_and(|info| info.state_hash == reported);
     if current {
-        treekem_start_catchup_done(state, key, None).await;
+        treekem_start_catchup_done(state, key).await;
     }
 }
 
@@ -16086,13 +16073,8 @@ where
 /// task for the group; when an epoch-ahead task already runs, that task
 /// takes the target. [`drive_treekem_start_catchup`] repeats the cycle
 /// while the group moves. The group stays pending until the pass is done,
-/// a member reports the local head, or this member leaves the group. A
-/// reconnect catch-up passes its `gate` ([`treekem_start_catchup_done`]).
-async fn request_treekem_catchup_after_start(
-    state: &Arc<AppState>,
-    key: &str,
-    gate: Option<&TreeKemReconnectGate>,
-) {
+/// a member reports the local head, or this member leaves the group.
+async fn request_treekem_catchup_after_start(state: &Arc<AppState>, key: &str) {
     state
         .treekem_start_catchup_passes
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -16138,7 +16120,7 @@ async fn request_treekem_catchup_after_start(
             .iter()
             .any(|k| k == key)
     {
-        treekem_start_catchup_done(state, key, gate).await;
+        treekem_start_catchup_done(state, key).await;
     }
 }
 
@@ -16153,7 +16135,7 @@ fn spawn_treekem_start_catchup(state: &Arc<AppState>, keys: Vec<String>) {
         let task_state = Arc::clone(state);
         let mut join_ended = state.treekem_network_join_ended.subscribe();
         let _admitted = state.spawn_detached(async move {
-            request_treekem_catchup_after_start(&task_state, &key, None).await;
+            request_treekem_catchup_after_start(&task_state, &key).await;
             if join_ended.wait_for(|ended| *ended).await.is_err() {
                 return;
             }
@@ -16167,7 +16149,7 @@ fn spawn_treekem_start_catchup(state: &Arc<AppState>, keys: Vec<String>) {
                     group_id = %LogHexId::group(&key),
                     "network join ended; asking again for TreeKEM catch-up pages"
                 );
-                request_treekem_catchup_after_start(&task_state, &key, None).await;
+                request_treekem_catchup_after_start(&task_state, &key).await;
             }
         });
     }
@@ -16326,8 +16308,11 @@ const TREEKEM_RECONNECT_TURN: Duration = Duration::from_secs(120);
 /// runs, so a later turn does not start a second one; the value says that
 /// a later turn wanted the group meanwhile, so the running catch-up asks
 /// once more when it ends.
+///
+/// The daemon has one gate (`AppState::treekem_reconnect_gate`), so every
+/// removal of a pending mark sees `busy` ([`Self::unmark`]).
 #[derive(Debug, Default)]
-struct TreeKemReconnectGate {
+pub(in crate::server) struct TreeKemReconnectGate {
     running: std::sync::atomic::AtomicBool,
     rerun: std::sync::atomic::AtomicBool,
     wake: tokio::sync::Notify,
@@ -16432,8 +16417,9 @@ impl TreeKemReconnectGate {
         }
     }
 
-    /// `key`'s catch-up ended `Done`. Its mark is removed, unless a later
-    /// pass marked the group while it ran: that mark then stays for the
+    /// `key`'s catch-up ended `Done`, or a member reported the local head.
+    /// Its mark is removed, unless a later pass marked the group while
+    /// its reconnect catch-up ran: that mark then stays for the
     /// re-ask and that pass's retries. The re-ask runs with the flag taken
     /// ([`Self::ask_again`]), so its own `Done` removes the mark.
     /// `Some(true)`: the mark was removed and no group is left.
@@ -16445,7 +16431,10 @@ impl TreeKemReconnectGate {
         if busy.get(key).copied().unwrap_or(false) {
             return None;
         }
-        remove_treekem_pending_mark(pending, key)
+        let mut pending = pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.remove(key).then(|| pending.is_empty())
     }
 
     fn release(&self, key: &str) {
@@ -16582,7 +16571,7 @@ pub(in crate::server) async fn run_treekem_reconnect_catchup(state: Arc<AppState
     let mut events = network.subscribe();
     let mut shutdown = state.shutdown_notify.subscribe();
     let mut isolation = TreeKemIsolation::default();
-    let gate = Arc::new(TreeKemReconnectGate::default());
+    let gate = Arc::clone(&state.treekem_reconnect_gate);
     let mut tick = tokio::time::interval(TREEKEM_ISOLATION_CHECK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -16605,11 +16594,10 @@ pub(in crate::server) async fn run_treekem_reconnect_catchup(state: Arc<AppState
             continue;
         }
         let pass_state = Arc::clone(&state);
-        let pass_gate = Arc::clone(&gate);
         let admitted = state.spawn_detached(async move {
             loop {
-                run_treekem_reconnect_pass(&pass_state, &pass_gate).await;
-                if !pass_gate.finish() {
+                run_treekem_reconnect_pass(&pass_state).await;
+                if !pass_state.treekem_reconnect_gate.finish() {
                     return;
                 }
             }
@@ -16620,16 +16608,14 @@ pub(in crate::server) async fn run_treekem_reconnect_catchup(state: Arc<AppState
     }
 }
 
-/// #1427: a reconnect pass marks `keys` pending through `gate`
+/// #1427: a reconnect pass marks `keys` pending through the gate
 /// ([`TreeKemReconnectGate::mark`]) and keeps the outage record, both
 /// under the record lock.
-async fn mark_treekem_reconnect_pass(
-    state: &AppState,
-    gate: &TreeKemReconnectGate,
-    keys: &[String],
-) {
+async fn mark_treekem_reconnect_pass(state: &AppState, keys: &[String]) {
     let _record = state.treekem_catchup_record_lock.lock().await;
-    gate.mark(&state.treekem_start_catchup_pending, keys);
+    state
+        .treekem_reconnect_gate
+        .mark(&state.treekem_start_catchup_pending, keys);
     let record = treekem_catchup_pending_path(state);
     if !tokio::fs::try_exists(&record).await.unwrap_or(false) {
         if let Err(error) = crate::profile::write_atomically(&record, b"reconnect").await {
@@ -16646,12 +16632,12 @@ async fn mark_treekem_reconnect_pass(
 /// wait up to [`TREEKEM_RECONNECT_JITTER`] and for a turn of at most
 /// [`TREEKEM_RECONNECT_TURN`], and the groups that stay pending again
 /// after each wait of [`TREEKEM_RECONNECT_RETRY`].
-async fn run_treekem_reconnect_pass(state: &Arc<AppState>, gate: &Arc<TreeKemReconnectGate>) {
+async fn run_treekem_reconnect_pass(state: &Arc<AppState>) {
     let keys = treekem_start_catchup_groups(state).await;
     if keys.is_empty() {
         return;
     }
-    mark_treekem_reconnect_pass(state, gate, &keys).await;
+    mark_treekem_reconnect_pass(state, &keys).await;
     state
         .treekem_reconnect_catchup_passes
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -16675,10 +16661,10 @@ async fn run_treekem_reconnect_pass(state: &Arc<AppState>, gate: &Arc<TreeKemRec
             Duration::from_millis(rand::thread_rng().gen_range(0..=max_ms))
         },
         {
-            let (run_state, run_gate) = (Arc::clone(state), Arc::clone(gate));
+            let run_state = Arc::clone(state);
             move |key: String| {
-                let (state, gate) = (Arc::clone(&run_state), Arc::clone(&run_gate));
-                async move { request_treekem_catchup_after_start(&state, &key, Some(&gate)).await }
+                let state = Arc::clone(&run_state);
+                async move { request_treekem_catchup_after_start(&state, &key).await }
             }
         },
         &spawn,
@@ -16690,7 +16676,7 @@ async fn run_treekem_reconnect_pass(state: &Arc<AppState>, gate: &Arc<TreeKemRec
                 .contains(key)
         },
         &TREEKEM_RECONNECT_RETRY,
-        gate,
+        &state.treekem_reconnect_gate,
     )
     .await;
 }
@@ -55762,6 +55748,7 @@ pub(in crate::server) mod tests {
             )),
             treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
             treekem_start_catchup_pending: Default::default(),
+            treekem_reconnect_gate: Default::default(),
             treekem_network_join_ended: tokio::sync::watch::channel(false).0,
             treekem_start_catchup_passes: Default::default(),
             treekem_reconnect_catchup_passes: Default::default(),

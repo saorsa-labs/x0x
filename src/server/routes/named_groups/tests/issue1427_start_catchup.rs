@@ -330,7 +330,7 @@ async fn issue1427_start_pass_waits_for_another_epoch_ahead_task() -> Result<()>
     let pass = tokio::spawn({
         let state = Arc::clone(&state);
         let key = key.clone();
-        async move { request_treekem_catchup_after_start(&state, &key, None).await }
+        async move { request_treekem_catchup_after_start(&state, &key).await }
     });
     tokio::time::sleep(Duration::from_secs(60)).await;
     assert!(
@@ -652,7 +652,7 @@ async fn issue1427_record_removal_waits_for_the_record_lock() -> Result<()> {
     let done_state = Arc::clone(&state);
     let done_key = key.clone();
     let mut done = tokio::spawn(async move {
-        treekem_start_catchup_done(&done_state, &done_key, None).await;
+        treekem_start_catchup_done(&done_state, &done_key).await;
     });
     let waited = tokio::time::timeout(Duration::from_millis(300), &mut done).await;
     assert!(waited.is_err(), "the removal waits for the record lock");
@@ -769,24 +769,52 @@ async fn issue1427_a_panicking_catchup_releases_its_group() {
 /// later pass's mark and the outage record stay, so the re-ask can end
 /// KeepPending and the later pass retries the group. A `Done` with no
 /// later mark still removes both.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn issue1427_a_later_pass_mark_survives_the_older_catchups_done() -> Result<()> {
+    later_pass_mark_survives(false).await
+}
+
+/// #1949 review: the same when the older catch-up's success is a member
+/// that reports the local head ([`treekem_start_catchup_note_head`]). That
+/// route has no gate of its own; it must not remove the later pass's mark.
+#[tokio::test(start_paused = true)]
+async fn issue1427_a_later_pass_mark_survives_a_reported_local_head() -> Result<()> {
+    later_pass_mark_survives(true).await
+}
+
+/// The older catch-up ends through `treekem_start_catchup_done`, or (with
+/// `by_head`) through a member's report of the local head. The clock is
+/// paused, so the older catch-up ends inside pass 2's retry wait.
+async fn later_pass_mark_survives(by_head: bool) -> Result<()> {
     let (state, _dir, key) = treekem_member_state().await?;
     let record = treekem_catchup_pending_path(&state);
-    let gate = Arc::new(TreeKemReconnectGate::default());
+    let gate = Arc::clone(&state.treekem_reconnect_gate);
+    let head = state.named_groups.read().await[&key].state_hash.clone();
+    assert!(!head.is_empty());
+    let done = {
+        let state = Arc::clone(&state);
+        move |key: String| {
+            let (state, head) = (Arc::clone(&state), head.clone());
+            async move {
+                if by_head {
+                    treekem_start_catchup_note_head(&state, &key, Some(&head)).await;
+                } else {
+                    treekem_start_catchup_done(&state, &key).await;
+                }
+            }
+        }
+    };
     let asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let first = Arc::new(tokio::sync::Notify::new());
     // The first catch-up waits, then ends Done. Later ones end KeepPending.
     let run = {
-        let (state, gate) = (Arc::clone(&state), Arc::clone(&gate));
-        let (asks, first) = (Arc::clone(&asks), Arc::clone(&first));
+        let (asks, first, done) = (Arc::clone(&asks), Arc::clone(&first), done.clone());
         move |key: String| {
-            let (state, gate) = (Arc::clone(&state), Arc::clone(&gate));
-            let (asks, first) = (Arc::clone(&asks), Arc::clone(&first));
+            let (asks, first, done) = (Arc::clone(&asks), Arc::clone(&first), done.clone());
             async move {
                 if asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                     first.notified().await;
-                    treekem_start_catchup_done(&state, &key, Some(&gate)).await;
+                    done(key).await;
                 }
             }
         }
@@ -794,7 +822,7 @@ async fn issue1427_a_later_pass_mark_survives_the_older_catchups_done() -> Resul
     let keys = vec![key.clone()];
     // Pass 1: the catch-up outlives its turn.
     assert!(gate.request());
-    mark_treekem_reconnect_pass(&state, &gate, &keys).await;
+    mark_treekem_reconnect_pass(&state, &keys).await;
     drive_treekem_reconnect_pass(
         keys.clone(),
         (4, Duration::from_millis(50)),
@@ -809,7 +837,7 @@ async fn issue1427_a_later_pass_mark_survives_the_older_catchups_done() -> Resul
     assert!(!gate.finish());
     // Pass 2, after another isolation: the group is busy.
     assert!(gate.request());
-    mark_treekem_reconnect_pass(&state, &gate, &keys).await;
+    mark_treekem_reconnect_pass(&state, &keys).await;
     let pass_state = Arc::clone(&state);
     let pass_gate = Arc::clone(&gate);
     let pass_keys = keys.clone();
@@ -839,7 +867,7 @@ async fn issue1427_a_later_pass_mark_survives_the_older_catchups_done() -> Resul
     assert!(tokio::fs::try_exists(&record).await?, "the record stays");
     // A Done with no later mark removes both: no permanent mark.
     assert!(gate.claim(&key), "the group is free");
-    treekem_start_catchup_done(&state, &key, Some(&gate)).await;
+    done(key.clone()).await;
     assert!(!pending(&state, &key));
     assert!(!tokio::fs::try_exists(&record).await?);
     Ok(())

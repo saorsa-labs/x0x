@@ -137,7 +137,8 @@ All notable changes to this project will be documented in this file.
   their own CI shard (`1427`). When a later pass marks a group whose
   older catch-up still runs, the end of that older catch-up no longer
   removes the mark or the outage record, so the later pass still retries
-  the group (#1936 review follow-up, A09 fourth amendment of 16 Nov 2026).
+  the group. This includes an end by a member that reports the local head
+  (#1936 review follow-up, A09 fourth amendment of 16 Nov 2026).
   No wire format or API changes.
 
 - **A TreeKEM member that stays up through a network outage catches up
