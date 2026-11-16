@@ -1219,6 +1219,7 @@ mod daemon_tests {
             ng::EpochAheadTarget {
                 epoch: info.secret_epoch.saturating_add(1),
                 observations: 0,
+                observed: true,
             },
         );
 

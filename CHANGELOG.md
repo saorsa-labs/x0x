@@ -357,6 +357,14 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **A #1427 catch-up probe no longer holds S4 seals (A09 fifth amendment
+  of 16 Nov 2026).** A start or reconnect catch-up cycle asks for the next
+  TreeKEM epoch without having seen it. Its target was read as ADR 0110 §2
+  higher-head evidence, so a reconnect pass held every revocation eviction
+  of the group while it ran. W3-H row
+  `w3h_1357_red_s4_idle_revocation_one_admin_home` failed 8 runs in 20
+  without the shim (the pass's random wait is not controlled there); with
+  the fix it passed 20 of 20. Epoch-ahead traffic stays evidence.
 - **An evidence Hello on a followed older connection gets a reply again
   (#1346, A05 amendment of 15 Nov 2026).** The Hello reply gate charged a
   high-water mark of connection generations, so after ant-quic made an older
