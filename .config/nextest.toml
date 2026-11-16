@@ -66,7 +66,7 @@ priority = 60
 
 # H-S3-q (3): see the `w3h-gate` override below.
 [[profile.w3h.overrides]]
-filter = 'test(/(^|::)w3h_1356_red_s3_q3_issuer_unreadable_sidecar$/)'
+filter = 'test(/(^|::)w3h_1356_control_s3_q3_issuer_unreadable_sidecar$/)'
 slow-timeout = { period = "60s", terminate-after = 15 }
 priority = 60
 
@@ -81,6 +81,13 @@ priority = 60
 filter = 'test(/(^|::)w3h_1356_control_s3_rm2_reseat_mandate_refusals_typed$/)'
 slow-timeout = { period = "60s", terminate-after = 15 }
 priority = 60
+
+# The #1581 `s4_certificate_expiry_skew` arms: see the `w3h-gate`
+# override below.
+[[profile.w3h.overrides]]
+filter = 'test(/(^|::)w3h_1581j_/)'
+slow-timeout = { period = "60s", terminate-after = 10 }
+priority = 50
 
 # The H-S3-s64 row: see the `w3h-gate` override below.
 [[profile.w3h.overrides]]
@@ -139,7 +146,7 @@ priority = 60
 # 4-vCPU runner, past the 300 s kill. Like the other prefix rows it gets
 # 15 minutes.
 [[profile.w3h-gate.overrides]]
-filter = 'test(/(^|::)w3h_1356_red_s3_q3_issuer_unreadable_sidecar$/)'
+filter = 'test(/(^|::)w3h_1356_control_s3_q3_issuer_unreadable_sidecar$/)'
 slow-timeout = { period = "60s", terminate-after = 15 }
 priority = 60
 
@@ -162,6 +169,17 @@ priority = 60
 filter = 'test(/(^|::)w3h_1356_control_s3_rm2_reseat_mandate_refusals_typed$/)'
 slow-timeout = { period = "60s", terminate-after = 15 }
 priority = 60
+
+# #1581 `s4_certificate_expiry_skew` (1581j): three five-node arms of
+# about 900 virtual seconds each (B's certificate expires 600 s after
+# issue, then N + tau + the completion bound), 105-125 s of wall time
+# each in the 12-CPU Lima VM with the three in parallel. The 300 s kill
+# above leaves no margin at about twice that on the 4-vCPU runner, so
+# these arms get 10 minutes and start early in each rerun.
+[[profile.w3h-gate.overrides]]
+filter = 'test(/(^|::)w3h_1581j_/)'
+slow-timeout = { period = "60s", terminate-after = 10 }
+priority = 50
 
 # ADR 0109 H-S3-s64 (#1572): three S0 groups, each with 63 to 65
 # renames and a join result of about 800 KB, about 135 s of wall time per
@@ -250,20 +268,39 @@ priority = 60
 # concurrently on macOS — ant-quic's dual-stack socket handling causes
 # intermittent connection failures and hangs when many endpoints share
 # the loopback interface. Serialise them via a shared test group.
+#
+# Every override that puts a test in this group sets the SAME
+# `threads-required` (4); `scripts/ci/check-nextest-groups.py` checks it.
+# nextest schedules with `future_queue_grouped` (future-queue 0.4.0): a
+# test queued behind the full group is retried only when a test of the
+# same group finishes, and starts only if the global limit has room for
+# its own weight then. The finisher frees only its own weight, and a
+# finishing test outside the group never retries the group queue. So a
+# weight-4 head behind a weight-1 finisher stayed queued while long W3-H
+# rows held the global threads, and the run ended with the group
+# undrained: "45/N tests were not run", "error: test run failed", no
+# failure (studio1 trains 18, 26, 42). With one weight in the group the
+# finisher always frees enough. 4 keeps the reservations that #316,
+# #1614 and ADR 0030 slice 3 added below. Upstream fixed the scheduler in
+# future-queue 0.4.1 (nextest-rs/future-queue#603), first used by
+# cargo-nextest 0.9.151; CI pins 0.9.144.
 [test-groups.quic-localhost]
 max-threads = 1
 
 [[profile.default.overrides]]
 filter = "test(mesh_connections) | test(/^test_local_/)"
 test-group = "quic-localhost"
+threads-required = 4
 
 [[profile.default.overrides]]
 filter = "test(/^d4_/) | test(/^c2_/) | test(/^e_/)"
 test-group = "quic-localhost"
+threads-required = 4
 
 [[profile.default.overrides]]
 filter = "binary(named_group_join_metadata_event) | binary(named_group_integration)"
 test-group = "quic-localhost"
+threads-required = 4
 
 # Issue #1283: the groups job's issue #321 acceptance selector runs three
 # daemon-mesh tests from this binary in one nextest invocation, and nextest
@@ -278,14 +315,17 @@ test-group = "quic-localhost"
 [[profile.default.overrides]]
 filter = "binary(delegation_spaces)"
 test-group = "quic-localhost"
+threads-required = 4
 
 [[profile.default.overrides]]
 filter = "binary(threading_integration)"
 test-group = "quic-localhost"
+threads-required = 4
 
 [[profile.default.overrides]]
 filter = "binary(f2_public_group_bootstrap_wiring) | binary(history_point_lookup_wiring)"
 test-group = "quic-localhost"
+threads-required = 4
 
 # Issue #316: these two loopback tests failed a full parallel run and
 # passed in isolation. Serial-group placement alone was not enough, so
@@ -337,6 +377,7 @@ threads-required = 4
 [[profile.default.overrides]]
 filter = "test(discovered_but_disconnected_peer_is_dialed_by_same_send) | test(identity_epoch_converges_with_linear_application_publishes) | test(non_treekem_self_leave_directly_delivers_member_removed_to_retained_owner) | binary(gossip_plane_isolation)"
 test-group = "quic-localhost"
+threads-required = 4
 
 # Issue #510: cap concurrent execution of the deadline-carrying membership
 # cluster tests at two. This bounds their overlap with one another while
@@ -355,12 +396,14 @@ test-group = "membership-cluster"
 [[profile.default.overrides]]
 filter = "test(legacy_bus_interop_tests::)"
 test-group = "quic-localhost"
+threads-required = 4
 
 # Pinned v0.47.0 file interop builds that daemon on a cache miss, then
 # runs two loopback daemons. The first match wins, so this stays specific.
 [[profile.default.overrides]]
 filter = "test(=v047_pinned_peer_stores_accepts_and_rejects_both_ways)"
 test-group = "quic-localhost"
+threads-required = 4
 slow-timeout = { period = "120s", terminate-after = 8 }
 
 # ADR 0109 H-S3-home released-binary gate (#1571). The tests are

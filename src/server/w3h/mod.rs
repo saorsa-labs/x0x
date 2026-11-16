@@ -82,6 +82,7 @@ mod case_1581f;
 mod case_1581g;
 mod case_1581h;
 mod case_1581i;
+mod case_1581k;
 mod case_1623;
 mod case_1765;
 mod case_1776;
@@ -2465,6 +2466,26 @@ impl Sim {
                  Sim::empty / Sim::start, and start each node once"
             )
         })
+    }
+
+    /// Reassign the pre-generated keys of `labels` so that their agent ids
+    /// ascend in the given label order (for example A < D < E). Call it
+    /// before any of these nodes starts; helpers that start a node with its
+    /// own pre-generated keys (the Home owner device and certified devices)
+    /// then get the ranked keys.
+    pub(crate) fn rank_keys(&mut self, labels: &[&str]) -> Result<()> {
+        let mut pairs = Vec::with_capacity(labels.len());
+        for label in labels {
+            pairs.push(self.take_keys(label)?);
+        }
+        pairs.sort_by_key(|pair| pair.1.agent_id().0);
+        for (label, pair) in labels.iter().zip(pairs) {
+            self.keys.insert((*label).to_string(), pair);
+        }
+        self.fabric.mark(format!(
+            "case: keys reassigned so that agent ids ascend in the order {labels:?}"
+        ));
+        Ok(())
     }
 
     fn daemon_config(&self, label: &str, index: usize) -> Result<DaemonConfig> {

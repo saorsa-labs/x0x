@@ -15,9 +15,10 @@
 //!   and its state revision and hash do not move through both released
 //!   runs. The sidecar sha256 is unchanged.
 //! - On the released binary: it starts; after the reload the group has no
-//!   Active and no admin seat (members API and legacy view); `POST
-//!   /groups/:id/invite` is refused; the roster revision in its API does
-//!   not move through a 45 s wait, and J's membership is not active.
+//!   Active and no admin seat (members API, which must answer a roster
+//!   array, and legacy view); `POST /groups/:id/invite` is refused with
+//!   403; the roster revision in its API does not move through a 45 s
+//!   wait, and J's membership is `not_member`.
 //! - The candidate resumes and converges: J is Active with keys at A's
 //!   terminal r+4, with no marker.
 //!
@@ -29,8 +30,7 @@
 //! H-S3-s. The released runs have no peers, so "no page applies" means no
 //! local commit; H-S3-home makes the same choice.
 //!
-//! The row also asks for the same with an OwnerCertified group in both
-//! views; that variant is not in this file (#1572). Home is H-S3-home.
+//! The OwnerCertified variant is [`super::m_owner`]. Home is H-S3-home.
 //! A failed row check is RED; a missing prerequisite is INFRA.
 
 use super::super::super::gaps::{remove, s0, seal_j, sees_s3};
@@ -56,19 +56,24 @@ const WINDOW: Duration = Duration::from_secs(130);
 const CONVERGE: Duration = Duration::from_secs(390);
 const QUIET: Duration = Duration::from_secs(30);
 /// Real time each released run stays up, for a commit to show.
-const RELEASED_WAIT: Duration = Duration::from_secs(45);
+pub(super) const RELEASED_WAIT: Duration = Duration::from_secs(45);
 
 /// J's legacy-view entry for the group in `named_groups.json`.
 #[derive(Debug, Clone, PartialEq)]
-struct Legacy {
+pub(super) struct Legacy {
     /// A non-empty roster with no Active member, so no admin.
-    seats_no_one: bool,
-    revision: Option<u64>,
-    hash: Option<String>,
+    pub(super) seats_no_one: bool,
+    pub(super) revision: Option<u64>,
+    pub(super) hash: Option<String>,
 }
 
 fn legacy(data: &Path, group: &str) -> Result<Option<Legacy>> {
-    let bytes = std::fs::read(data.join("named_groups.json"))?;
+    view_entry(data, "named_groups.json", group)
+}
+
+/// The group's entry in one of J's durable views (`file` in `data`).
+pub(super) fn view_entry(data: &Path, file: &str, group: &str) -> Result<Option<Legacy>> {
+    let bytes = std::fs::read(data.join(file))?;
     let map: serde_json::Map<String, Value> = serde_json::from_slice(&bytes)?;
     let entry = map.iter().find_map(|(key, entry)| {
         let named = key.eq_ignore_ascii_case(group)
@@ -88,10 +93,11 @@ fn legacy(data: &Path, group: &str) -> Result<Option<Legacy>> {
 
 /// One released run's live checks.
 #[derive(Debug, Default)]
-struct LiveRun {
+pub(super) struct LiveRun {
     invite: u16,
-    /// Active and admin rows in `GET /groups/:id/members`, and its status.
-    members: (u16, usize, usize),
+    /// The status of `GET /groups/:id/members` and its Active and admin
+    /// row counts; `None` when the body has no `members` array.
+    members: (u16, Option<(usize, usize)>),
     /// `roster_revision` in `GET /groups/:id` at the start and after the
     /// wait (v0.46.1 reports no state revision there; the legacy view's
     /// state revision is checked on disk).
@@ -102,19 +108,46 @@ struct LiveRun {
 }
 
 impl LiveRun {
-    fn ok(&self) -> bool {
-        (400..600).contains(&self.invite)
+    /// v0.46.1's answers on J's placeholder: the invite is refused by
+    /// `require_admin_or_above` (403), and `local_join_membership_state`
+    /// is `not_member` (J has no Active or Pending row). PR #1957's CI run
+    /// saw exactly these in both runs.
+    /// v0.46.1's answers on J's real record, with no placeholder (an
+    /// owner-reason gap, [`super::m_owner`]): as [`Self::ok`], but the
+    /// readable roster may seat others.
+    pub(super) fn inert_with_roster(&self) -> bool {
+        self.invite == 403
             && self.members.0 == 200
-            && self.members.1 == 0
-            && self.members.2 == 0
+            && self.members.1.is_some()
             && self.revisions.0.is_some()
             && self.revisions.1 == self.revisions.0
-            && self.membership.as_deref() != Some("active")
+            && self.membership.as_deref() == Some("not_member")
+            && self.up_after_wait
+    }
+
+    pub(super) fn ok(&self) -> bool {
+        self.invite == 403
+            && self.members == (200, Some((0, 0)))
+            && self.revisions.0.is_some()
+            && self.revisions.1 == self.revisions.0
+            && self.membership.as_deref() == Some("not_member")
             && self.up_after_wait
     }
 }
 
-async fn released_run(bin: &Path, node: &Path, group: &str) -> Result<LiveRun> {
+/// The members cell: the status, and the Active and admin row counts only
+/// when the body holds a `members` array (an unreadable body is not an
+/// empty roster).
+fn roster_counts(code: u16, body: &Value) -> (u16, Option<(usize, usize)>) {
+    let counts = body["members"].as_array().map(|rows| {
+        let active = rows.iter().filter(|row| row["state"] == "active");
+        let admins = active.clone().filter(|row| row["role"] == "admin").count();
+        (active.count(), admins)
+    });
+    (code, counts)
+}
+
+pub(super) async fn released_run(bin: &Path, node: &Path, group: &str) -> Result<LiveRun> {
     // The released runs have no peers: a loopback port bound and freed
     // here answers nothing (the daemon refuses a privileged port).
     let no_peer = std::net::UdpSocket::bind("127.0.0.1:0")?.local_addr()?;
@@ -134,14 +167,7 @@ async fn released_run(bin: &Path, node: &Path, group: &str) -> Result<LiveRun> {
     let (code, body) = released
         .call(Method::GET, &format!("{path}/members"), None)
         .await?;
-    let rows = body["members"].as_array().cloned().unwrap_or_default();
-    let active = |row: &&Value| row["state"] == "active";
-    let admin = |row: &&Value| row["state"] == "active" && row["role"] == "admin";
-    run.members = (
-        code,
-        rows.iter().filter(active).count(),
-        rows.iter().filter(admin).count(),
-    );
+    run.members = roster_counts(code, &body);
     let (code, body) = released.call(Method::GET, &path, None).await?;
     run.up_after_wait = code == 200;
     run.revisions.1 = body["roster_revision"].as_u64();
@@ -236,7 +262,8 @@ async fn scenario(sim: &mut Sim, bin: &Path, receipt: &mut Receipt) -> Result<Ch
     let sidecar_after = sidecar_state(&data, &j_hex)?.0;
     receipt.note(format!(
         "legacy before {legacy_before:?}, after both runs {legacy_after:?}; run 1 {first:?}; \
-         reload {reload:?}; sidecars before {sidecar_before:?} after {sidecar_after:?}"
+         reload {reload:?} (each run wants invite 403, members (200, Some((0, 0))), \
+         membership not_member); sidecars before {sidecar_before:?} after {sidecar_after:?}"
     ));
 
     // The candidate resumes.
@@ -338,4 +365,86 @@ fn released_s3_m_released_node_on_j_between_segments() -> Result<()> {
     let note = "ADR 0109 S3 (#1356, #1572) H-S3-m; J's data dir runs the released v0.46.1 \
                 between the H-S3-s segments";
     released_test(CASE, SEED, FINAL_M, note, row)
+}
+
+/// The live-cell judgement, without a daemon.
+mod cells {
+    use super::*;
+
+    fn inert_run(members: (u16, Option<(usize, usize)>)) -> LiveRun {
+        LiveRun {
+            invite: 403,
+            members,
+            revisions: (Some(7), Some(7)),
+            membership: Some("not_member".to_string()),
+            up_after_wait: true,
+        }
+    }
+
+    /// A body without a `members` array is not an empty roster.
+    #[test]
+    fn released_m_unreadable_roster_is_not_an_empty_roster() {
+        let bodies = [
+            Value::Null,
+            json!({}),
+            json!({"members": null}),
+            json!({"members": "none"}),
+            json!({"members": {"a": {"state": "active"}}}),
+        ];
+        for body in bodies {
+            let run = inert_run(roster_counts(200, &body));
+            assert!(!run.ok(), "{body} must fail the members cell");
+        }
+    }
+
+    /// An empty array is the inert answer; an Active admin is not.
+    #[test]
+    fn released_m_roster_counts_active_and_admin_rows() {
+        assert!(inert_run(roster_counts(200, &json!({"members": []}))).ok());
+        let seated = json!({"members": [
+            {"state": "active", "role": "admin"},
+            {"state": "active", "role": "member"},
+            {"state": "removed", "role": "admin"},
+        ]});
+        assert_eq!(roster_counts(200, &seated), (200, Some((2, 1))));
+        assert!(!inert_run(roster_counts(200, &seated)).ok());
+        assert!(!inert_run(roster_counts(500, &json!({"members": []}))).ok());
+    }
+
+    /// The owner-reason variant accepts a seated roster but still needs a
+    /// readable one, and the other cells as [`LiveRun::ok`].
+    #[test]
+    fn released_m_owner_cells_need_a_readable_roster() {
+        let seated = json!({"members": [{"state": "active", "role": "admin"}]});
+        assert!(inert_run(roster_counts(200, &seated)).inert_with_roster());
+        assert!(!inert_run(roster_counts(200, &json!({}))).inert_with_roster());
+        assert!(!inert_run(roster_counts(500, &seated)).inert_with_roster());
+        let mut run = inert_run(roster_counts(200, &seated));
+        run.invite = 200;
+        assert!(!run.inert_with_roster(), "a minted invite must fail");
+        let mut run = inert_run(roster_counts(200, &seated));
+        run.revisions = (Some(7), Some(8));
+        assert!(!run.inert_with_roster(), "a moved roster must fail");
+    }
+
+    /// The other live cells fail closed too, and pin v0.46.1's answers.
+    #[test]
+    fn released_m_live_cells_fail_closed() {
+        let base = || inert_run(roster_counts(200, &json!({"members": []})));
+        let mut run = base();
+        run.membership = None;
+        assert!(!run.ok(), "no membership_state must fail");
+        let mut run = base();
+        run.membership = Some("pending".to_string());
+        assert!(!run.ok(), "v0.46.1 answers not_member");
+        let mut run = base();
+        run.invite = 500;
+        assert!(!run.ok(), "v0.46.1 refuses the invite with 403");
+        let mut run = base();
+        run.invite = 404;
+        assert!(!run.ok(), "v0.46.1 refuses the invite with 403");
+        let mut run = base();
+        run.revisions = (None, None);
+        assert!(!run.ok(), "no roster_revision must fail");
+    }
 }

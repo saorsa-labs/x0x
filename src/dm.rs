@@ -2260,6 +2260,9 @@ struct ReceiptBinding {
     expected_recipient: AgentId,
     expected_machine: Option<MachineId>,
     protocol_version: u16,
+    /// #1109: BLAKE3 of the payload the send carried, when the sender
+    /// recorded it. A receipt proves delivery of these bytes only.
+    payload_digest: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2350,6 +2353,8 @@ struct InFlightAck {
     /// pin against. Strict v2 sends always supply the advert's machine.
     expected_machine: Option<MachineId>,
     protocol_version: u16,
+    /// #1109: BLAKE3 of the payload (see [`InFlightAcks::set_payload_digest`]).
+    payload_digest: Option<[u8; 32]>,
     reply: tokio::sync::oneshot::Sender<DmAckOutcome>,
     /// #461: locally stamped ingress of the transport that actually carried
     /// the winning ACK. Written immediately before `reply.send`, read after
@@ -2365,6 +2370,7 @@ impl InFlightAck {
             expected_recipient: self.expected_recipient,
             expected_machine: self.expected_machine,
             protocol_version: self.protocol_version,
+            payload_digest: self.payload_digest,
         }
     }
 }
@@ -2454,6 +2460,7 @@ impl InFlightAcks {
                 expected_recipient,
                 expected_machine,
                 protocol_version,
+                payload_digest: None,
                 reply: tx,
                 ingress_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
             },
@@ -2480,6 +2487,7 @@ impl InFlightAcks {
                 expected_recipient,
                 expected_machine,
                 protocol_version,
+                payload_digest: None,
                 reply: tx,
                 ingress_cell: std::sync::Arc::clone(&ingress_cell),
             },
@@ -2726,6 +2734,38 @@ impl InFlightAcks {
             }
             Some(status) => status,
             None => DmReceiptStatus::Unknown,
+        }
+    }
+
+    /// #1109: record the BLAKE3 digest of the payload the open waiter for
+    /// `request_id` is sending. Its receipt then names these bytes.
+    pub fn set_payload_digest(&self, request_id: &[u8; 16], digest: [u8; 32]) {
+        if let Some(mut waiter) = self.inner.get_mut(request_id) {
+            waiter.payload_digest = Some(digest);
+        }
+    }
+
+    /// #1109: the payload digest bound to what [`Self::receipt_status`]
+    /// reports for `request_id`: the recorded entry's when it reads
+    /// delivered, else the open waiter's, else the recorded entry's. `None`
+    /// when no digest was recorded.
+    #[must_use]
+    pub fn receipt_digest(&self, request_id: &[u8; 16]) -> Option<[u8; 32]> {
+        let now = Instant::now();
+        let recorded = self.receipts.lock().ok().and_then(|mut ledger| {
+            ledger.prune(now);
+            ledger
+                .entries
+                .get(request_id)
+                .filter(|entry| entry.expires > now)
+                .map(|entry| (entry.status, entry.binding.payload_digest))
+        });
+        match recorded {
+            Some((DmReceiptStatus::Delivered | DmReceiptStatus::DeliveredLate, digest)) => digest,
+            _ => match self.inner.get(request_id) {
+                Some(waiter) => waiter.payload_digest,
+                None => recorded.and_then(|(_, digest)| digest),
+            },
         }
     }
 
@@ -3752,6 +3792,33 @@ mod tests {
             acks.receipt_status(&rid),
             super::DmReceiptStatus::DeliveredLate
         );
+    }
+
+    /// WHY: #1109 a receipt names the bytes it proves delivered, so a later
+    /// send of other bytes under the same logical id cannot claim it.
+    #[test]
+    fn issue1109_late_receipt_keeps_the_payload_digest() {
+        let acks = super::InFlightAcks::new();
+        let rid = [0x1a; 16];
+        let _rx = issue1109_v2_waiter(&acks, rid);
+        assert_eq!(acks.receipt_digest(&rid), None);
+        acks.set_payload_digest(&rid, [0xd1; 32]);
+        assert_eq!(acks.receipt_digest(&rid), Some([0xd1; 32]));
+        acks.abandon(&rid);
+        assert!(!acks.resolve_for_ingress(
+            &rid,
+            DM_PROTOCOL_DURABLE_ACK,
+            AgentId([0x31; 32]),
+            MachineId([0x32; 32]),
+            DmAckOutcome::Accepted,
+            super::DmAckIngress::Subscription,
+        ));
+        assert_eq!(
+            acks.receipt_status(&rid),
+            super::DmReceiptStatus::DeliveredLate
+        );
+        assert_eq!(acks.receipt_digest(&rid), Some([0xd1; 32]));
+        assert_eq!(acks.receipt_digest(&[0x1b; 16]), None);
     }
 
     /// #1109 risk: a tombstone keeps the exact ACK binding. A late ACK from

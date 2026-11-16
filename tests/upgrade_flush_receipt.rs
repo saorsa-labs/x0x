@@ -135,7 +135,7 @@ macro_rules! flush_receipt_regression_tests {
                         released
                             .lock()
                             .unwrap()
-                            .recv_timeout(Duration::from_secs(5))
+                            .recv_timeout(Duration::from_secs(30))
                             .map_err(io::Error::other)?;
                         assert!(
                             !stopped.load(Ordering::SeqCst),
@@ -143,7 +143,7 @@ macro_rules! flush_receipt_regression_tests {
                         );
                         deadline.check()
                     }),
-                    Duration::from_millis(300),
+                    crate::upgrade::shutdown_flush::TEST_OVERRUN_LIMIT,
                 )
                 .unwrap();
                 let binding = Binding::new(uuid::Uuid::new_v4().to_string(), 1, &"plan").unwrap();
@@ -153,7 +153,7 @@ macro_rules! flush_receipt_regression_tests {
                     let _ = returned.send(acknowledge(&caller_root, binding, || Ok(())));
                 });
                 entering.recv_timeout(Duration::from_secs(5)).unwrap();
-                let outcome = result.recv_timeout(Duration::from_secs(5)).unwrap().unwrap_err();
+                let outcome = result.recv_timeout(Duration::from_secs(30)).unwrap().unwrap_err();
                 let _ = release.send(());
                 caller.join().unwrap();
                 owner.join_workers();

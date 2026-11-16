@@ -4,6 +4,7 @@
 //! server decomposition. The router registrations stay in the parent module.
 
 use super::super::crdt_subscriptions;
+use super::super::rider_auth::ActorContext;
 use super::super::sse::SseEvent;
 use super::super::state::AppState;
 use super::super::{
@@ -647,10 +648,16 @@ async fn group_store_write_refusal(
 }
 
 pub(in crate::server) async fn put_kv_value(
+    actor: Option<Extension<ActorContext>>,
     State(state): State<Arc<AppState>>,
     Path((id, key)): Path<(String, String)>,
     Json(req): Json<PutValueRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // #1094 P2: a rider's write is marked with its sub-agent id.
+    let rider = match actor {
+        Some(Extension(ActorContext::Rider { sub_agent_id, .. })) => Some(sub_agent_id),
+        _ => None,
+    };
     if let Some(refusal) = group_store_write_refusal(&state, &id).await {
         return refusal;
     }
@@ -675,7 +682,7 @@ pub(in crate::server) async fn put_kv_value(
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
     match handle
-        .put_with_outcome(key.clone(), value, content_type)
+        .put_with_outcome_by(key.clone(), value, content_type, rider.as_deref())
         .await
     {
         Ok(x0x::KvPutOutcome {
@@ -740,6 +747,10 @@ pub(in crate::server) async fn put_kv_value(
                 StatusCode::FORBIDDEN
             } else if format!("{e}").contains("value too large") {
                 StatusCode::PAYLOAD_TOO_LARGE
+            } else if format!("{e}").contains("store full") {
+                // #1094 P1: the store's image would pass the retained-image
+                // limit.
+                StatusCode::INSUFFICIENT_STORAGE
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             };
@@ -748,6 +759,22 @@ pub(in crate::server) async fn put_kv_value(
                 Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
             )
         }
+    }
+}
+
+/// #1094 P2: the `writer` field of `GET /stores/:id/:key`. Only a verified
+/// mark names a writer: `{"verified": true, "agent": <hex>, "rider":
+/// <sub-agent hex or null>}`. Anything else is `{"verified": false}`,
+/// "writer unknown": an older writer, an unknown key, or a replaced mark.
+/// It is not evidence of tampering (A10).
+fn writer_json(writer: Option<&x0x::kv::provenance::EntryWriter>) -> serde_json::Value {
+    match writer.and_then(x0x::kv::provenance::EntryWriter::verified_writer) {
+        Some((agent, rider)) => serde_json::json!({
+            "verified": true,
+            "agent": hex::encode(agent.as_bytes()),
+            "rider": rider,
+        }),
+        None => serde_json::json!({ "verified": false }),
     }
 }
 
@@ -764,10 +791,13 @@ pub(in crate::server) async fn get_kv_value(
         handle.clone()
     };
 
-    match handle.get(&key).await {
-        Ok(Some(entry)) => {
+    match handle.get_with_writer(&key).await {
+        Ok(Some((mut entry, writer))) => {
             use base64::Engine;
             let value_b64 = BASE64.encode(&entry.value);
+            // #1094 P2: the writer mark is shown as `writer`, not as raw
+            // metadata. It comes from the same snapshot as the value.
+            x0x::kv::provenance::strip(&mut entry.metadata);
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -777,6 +807,7 @@ pub(in crate::server) async fn get_kv_value(
                     "content_type": entry.content_type,
                     "content_hash": entry.content_hash,
                     "metadata": entry.metadata,
+                    "writer": writer_json(Some(&writer)),
                     "created_at": entry.created_at,
                     "updated_at": entry.updated_at,
                 })),
@@ -7443,6 +7474,7 @@ mod tests {
             let key = key.to_string();
             async move {
                 let response = put_kv_value(
+                    None,
                     State(state),
                     Path((topic, key)),
                     Json(PutValueRequest {
@@ -7982,6 +8014,7 @@ mod tests {
             let key = format!("{me}/{suffix}");
             async move {
                 let response = put_kv_value(
+                    None,
                     State(state),
                     Path((topic, key)),
                     Json(PutValueRequest {
@@ -8068,6 +8101,7 @@ mod tests {
         let key = format!("{me}/k");
         // Warm-up put publishes normally (200).
         let warm = put_kv_value(
+            None,
             State(Arc::clone(&state)),
             Path((topic.clone(), key.clone())),
             Json(PutValueRequest {
@@ -8082,6 +8116,7 @@ mod tests {
         handle.sync_fail_next_publish_for_test().await;
         let key = format!("{me}/k2");
         let response = put_kv_value(
+            None,
             State(Arc::clone(&state)),
             Path((topic, key.clone())),
             Json(PutValueRequest {
@@ -8148,6 +8183,7 @@ mod tests {
         });
         handle.sync_fail_next_publish_for_test().await;
         let response = put_kv_value(
+            None,
             State(Arc::clone(&state)),
             Path((topic.clone(), key)),
             Json(PutValueRequest {
@@ -8430,3 +8466,7 @@ mod tests {
             .expect("the installed share ends the hold");
     }
 }
+
+#[cfg(test)]
+#[path = "stores_writer_tests.rs"]
+mod writer_tests;

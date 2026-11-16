@@ -19,6 +19,7 @@ mod journal;
 mod probe;
 mod recovery;
 mod run;
+mod supervise;
 
 pub(crate) fn candidate_boot(version: &str) -> io::Result<()> {
     child::candidate_boot(version)
@@ -56,6 +57,11 @@ const TRIAL_MS: u64 = 660_000;
 const READY_MS: u64 = 120_000;
 const STABLE_MS: u64 = 60_000;
 const REAP_MS: u64 = 10_000;
+/// The graceful-stop window for a committed or restored daemon: SIGTERM,
+/// then this long before SIGKILL. It covers x0xd's fixed shutdown flush
+/// budget (`shutdown_flush::LIMIT`, 30 s) plus its worker join bound (2 s),
+/// with margin. A unit's stop timeout must exceed it plus `REAP_MS`.
+const STOP_MS: u64 = 35_000;
 const GAP_MS: u64 = 10_000;
 const MAX_ATTEMPTS: u32 = 3;
 
@@ -85,6 +91,10 @@ enum Phase {
     RollingBack,
     Restored,
     RecoveryFailed,
+    /// The host is committed with this trial's candidate. The trial is
+    /// retired: a restart starts the installed daemon as an ordinary start
+    /// and never rolls back (#1378 slice 3).
+    Committed,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -232,6 +242,15 @@ impl Trial {
                     // A stopped trial may only roll back (ADR 0094 S4).
                     || (old.phase == Phase::Stopped
                         && !matches!(self.phase, Phase::Stopped | Phase::RollingBack))
+                    // A stale stop never undoes a rollback or a restore
+                    // (#1968 review).
+                    || (matches!(old.phase, Phase::RollingBack | Phase::Restored)
+                        && self.phase == Phase::Stopped)
+                    // Only a provisional trial is retired, and a retired
+                    // trial stays retired.
+                    || (old.phase == Phase::Committed && self.phase != Phase::Committed)
+                    || (self.phase == Phase::Committed
+                        && !matches!(old.phase, Phase::Provisional | Phase::Committed))
                 {
                     return Err(invalid("existing trial cannot be replaced or reset"));
                 }
@@ -252,7 +271,13 @@ impl Trial {
             ));
         }
         // Re-establish the barrier: readable bytes alone do not prove fsync.
-        trial.save(path)?;
+        // Sync, never rewrite: a reader outside the host lock must not write
+        // its older copy over a peer's newer trial (#1968 review).
+        journal::open_for_sync(path, false)?.sync_all()?;
+        let directory = path
+            .parent()
+            .ok_or_else(|| invalid("trial path has no directory"))?;
+        journal::open_for_sync(directory, true)?.sync_all()?;
         Ok(trial)
     }
 }
@@ -278,6 +303,7 @@ fn validate_trial(bytes: &[u8]) -> io::Result<()> {
         || trial.attempt_deadline_ms > trial.deadline_ms
         || trial.restored_starts > MAX_ATTEMPTS
         || (matches!(trial.phase, Phase::Restored) && trial.verdict.is_none())
+        || (trial.phase == Phase::Committed && (trial.verdict.is_some() || trial.attempts == 0))
     {
         return Err(invalid("invalid launcher trial"));
     }

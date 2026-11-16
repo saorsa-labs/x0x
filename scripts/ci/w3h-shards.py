@@ -11,9 +11,9 @@ S3 case, and 20 reruns of them in one job do not fit the S3 test deadline.
 One rerun of H-S3-d3 takes about 16 min on a runner, so its 20 reruns
 are split across parallel parts (`PARTS`): matrix entries `s3-d3.1` to
 `s3-d3.4`, 5 reruns each. The #1661 welcome-lost row has its own shard
-too, split as `s3-1661.1` and `s3-1661.2`, 10 reruns each. The five
+too, split as `s3-1661.1` and `s3-1661.2`, 10 reruns each. The six
 H-S3-rm4 variants run the H-S3-c prefix and share one shard, split as
-`s3-rm4.1` to `s3-rm4.4`, 5 reruns each. H-S3-rm2 runs the H-S3-d3
+`s3-rm4.1` to `s3-rm4.5`, 4 reruns each. H-S3-rm2 runs the H-S3-d3
 five-node prefix with M1 seated, then the H-S3-c advance and re-seat; it
 has its own shard, split as `s3-rm2.1` and `s3-rm2.2`, 10 reruns each.
 H-S3-d2 has its own shard (`s3-d2`). The summary job still counts 20
@@ -51,11 +51,11 @@ GROUPS = (
     # H-S3-q (2) (#1572): about 60 s per rerun in the 12-CPU VM (it
     # watches J past GATE_STALL), so about 40 min for 20 reruns on a
     # runner; its own shard, so the `s3-q` shard does not grow.
-    ('s3-qm', 'w3h_1356_red_s3_q_member_unreadable_sidecar$'),
-    ('s3-q', 'w3h_1356_red_s3_q_'),
+    ('s3-qm', 'w3h_1356_control_s3_q_member_unreadable_sidecar$'),
+    ('s3-q', 'w3h_1356_(red|control)_s3_q_joiner_'),
     # H-S3-q (3) (#1572) runs the H-S3-c3 prefix with O's restart, so it
     # has its own shard like the other owner-axis rows.
-    ('s3-q3', 'w3h_1356_red_s3_q3_issuer_unreadable_sidecar$'),
+    ('s3-q3', 'w3h_1356_control_s3_q3_issuer_unreadable_sidecar$'),
     # H-S3-q2 (#1572): about 60 s per rerun in the 12-CPU VM, so about
     # 40 min for 20 reruns on a runner; its own shard, as H-S3-q.
     ('s3-q2', 'w3h_1356_control_s3_q2_sidecar_fault_cases$'),
@@ -68,6 +68,10 @@ GROUPS = (
     # 80-90 virtual seconds. `rest` is close to its deadline, so the row
     # has its own shard; the budget is not raised (31 Oct ruling, #1733).
     ('1581i', 'w3h_1581i_'),
+    # #1581 `s4_intake_and_egress`, staged join (1581k): two three-node
+    # arms; `rest` is close to its deadline, so the row has its own shard
+    # (31 Oct ruling, #1733).
+    ('1581k', 'w3h_1581k_'),
     # #1581 `s4_owner_recovery` variants (1581m): three four-node Home arms;
     # `rest` is close to its deadline, so the row has its own shard
     # (31 Oct ruling, #1733).
@@ -76,6 +80,11 @@ GROUPS = (
     # Lima VM. `rest` takes about 108 of its 120 minutes, so the rows have
     # their own shard; the budget is not raised (31 Oct ruling, #1733).
     ('1427', 'w3h_1427_'),
+    # #1581 `s4_certificate_expiry_skew` runs (1), (5a), (8): three
+    # five-node arms of about 700 virtual seconds each (B's certificate
+    # expires 600 s after issue, then N + τ + the bound), so the row has
+    # its own shard rather than a raised budget (31 Oct ruling, #1733).
+    ('1581j', 'w3h_1581j_'),
 )
 
 # The gate's reruns per case (D196). A group in `PARTS` runs them as that
@@ -93,7 +102,10 @@ RUNS = 20
 # runner (run 42163430876), so one rerun of all five is at most about
 # 25 min even when they run one after another. 20 reruns do not fit the
 # 155-min S3 test deadline; 4 parts of 5 reruns take at most about
-# 125 min each.
+# 125 min each. Variant (6) (the Home policy) makes six: 6 x 300 s x 5
+# reruns is 150 min, too close to the deadline, so split it, do not
+# raise the budget (31 Oct ruling, #1733): 5 parts of 4 reruns take at
+# most about 120 min each.
 # H-S3-rm2: one rerun took about 161 s in the 12-CPU Lima VM, so about
 # 320 s on the runner (the #1780 ratio; no runner measurement yet), and
 # 20 reruns about 107 min. That estimate is not a clear margin under the
@@ -102,7 +114,11 @@ RUNS = 20
 # H-S3-q (3): one rerun is 172-203 s in the 12-CPU VM, so about 400 s on
 # the runner and about 135 min for 20 reruns, too close to the 155-min S3
 # test deadline: 2 parts of 10 reruns take about 70 min each.
-PARTS = {'s3-d3': 4, 's3-1661': 2, 's3-rm4': 4, 's3-rm2': 2, 's3-q3': 2}
+# 1581j (#1581 `s4_certificate_expiry_skew`): one rerun of the three arms
+# is about 125 s in the 12-CPU VM, so about 250 s on the runner and
+# about 85 min for 20 reruns, too close to the 110-min test deadline of a
+# non-S3 group: 2 parts of 10 reruns take about 45 min each.
+PARTS = {'s3-d3': 4, 's3-1661': 2, 's3-rm4': 5, 's3-rm2': 2, 's3-q3': 2, '1581j': 2}
 
 ROOT = Path(__file__).resolve().parents[2]
 

@@ -26,7 +26,7 @@
       "revision": 1,
       "path": "A03-r01-trust-permissions-sharing-and-revocation.md",
       "title": "Trust Permissions Sharing and Revocation",
-      "sha256": "6346e7fbdf40d36d15533776de7a12a693528017438f311136333cbb62fa46eb"
+      "sha256": "deef0366a56a63af4a62793c65ed2c36022bbc15d4be13abd7000c628c30f77d"
     },
     {
       "id": "A04",
@@ -54,28 +54,28 @@
       "revision": 1,
       "path": "A07-r01-messages-receipts-history-and-retry.md",
       "title": "Messages Receipts History and Retry",
-      "sha256": "b4511aca5387dd98b5a8faf1424935d514796e5d6995a2e38c8f14a544cbc59d"
+      "sha256": "afb05e0fe2391960685c37f4bcebc90e9d1a8125505c73cba6b3ed55e026baff"
     },
     {
       "id": "A08",
       "revision": 1,
       "path": "A08-r01-groups-home-membership-and-repair.md",
       "title": "Groups Home Membership and Repair",
-      "sha256": "ee6044c2f975954d1862e622056fd9da18a6816361b9739d01e94dc0366e9b52"
+      "sha256": "deb31092cf05ef38ed6d3d986919e82c6b0dbdb265d2e1a619db3693e062eae6"
     },
     {
       "id": "A09",
       "revision": 1,
       "path": "A09-r01-group-encryption-and-key-changes.md",
       "title": "Group Encryption and Key Changes",
-      "sha256": "64cfa25c4dd1a1bca31b3c3a1fab3567c6d92856193716f145de687e8203ed68"
+      "sha256": "bbf7a7a5f1f0fbbdc08da18399839a9e67c5fb0f04a802348ad18d8dd17f64f1"
     },
     {
       "id": "A10",
       "revision": 1,
       "path": "A10-r01-shared-data-files-and-synchronization.md",
       "title": "Shared Data Files and Synchronization",
-      "sha256": "46a6b1028b75f4a20b9102232fc3d9737fd35d7e57237424e320468bd34aece4"
+      "sha256": "06cfaed633d293c63edd91066df381d295be8f5886c9a1cc5a90c417c30d74ad"
     },
     {
       "id": "A11",
@@ -103,7 +103,7 @@
       "revision": 1,
       "path": "A14-r01-health-updates-and-recovery.md",
       "title": "Health Updates and Recovery",
-      "sha256": "8bb8d21855b0a1877cab632bfc5935377ddbcf51279db41944f5209805bd28ad"
+      "sha256": "84bf97609883332af102272fb4dcc4d6838ee5658dd9e42ae4c33f021bf7eec8"
     },
     {
       "id": "A15",

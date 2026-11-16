@@ -18,18 +18,17 @@
 //! - No node commits because of the rebuild: J stays at its stop head, A
 //!   at r+4 and B at r+2′. J's marker is the same before the damage and at the end.
 //! - J stays inert and shows `readmission_required {local_state_lost}`,
-//!   with an `exit` that names ADR 0114's retention re-Welcome (§7), or
-//!   D43's remedy while that is not in effect.
+//!   with an `exit` (D43's remedy; ADR 0114's retention re-Welcome is not
+//!   in effect).
 //!
-//! **On main (16 Nov 2026): expected RED, #1946.** The quarantine works:
-//! the junk sits in one history copy, a fresh `.grecov` names the rebuild
-//! `txid`, `recovery_sidecar_rebuilt` names the file, the `txid` and the
-//! loss, and nothing commits or clears. But J never shows
-//! `readmission_required {local_state_lost}`: it stays in
-//! `awaiting_attestation` (`no_reply`, `no_capable_peer`), keeps asking
-//! (`recovery.asked` lists B as pending) and names no `exit`. The arm pins
-//! that cause ([`CAUSE_ASKING`]); with the fix it turns GREEN and is
-//! renamed a control.
+//! **Why `local_state_lost`.** J armed A's ATA, so S3 wrote J's legacy
+//! view as the S3 placeholder, as it does for any armed gap. The §4
+//! rebuild table then applies its row "`authoritative_record`, when the
+//! legacy view holds an S3 placeholder": the record is on no holder, the
+//! group stays inert under the placeholder and the node shows
+//! `local_state_lost`. Before the #1937 fix the node missed this (a
+//! rebuilt sidecar was never `lost`): J stayed in `awaiting_attestation`
+//! and kept asking (#1946). The same fix covers both variants.
 //!
 //! **Stop point.** The row stops J after it applies r+3, before its next
 //! segment. On this build that state is not reached: the ATA attests A's
@@ -76,11 +75,6 @@ const CAUSE: &str = "the junk .grecov was not kept byte-identical in one history
                      fresh sidecar names the rebuild, recovery_sidecar_rebuilt is missing, a \
                      node committed or a marker cleared after the rebuild, or J does not stay \
                      inert in readmission_required {local_state_lost}";
-/// The cause the expected-RED arm pins (#1946).
-const CAUSE_ASKING: &str = "after the rebuild J names recovery_sidecar_rebuilt and nothing \
-                            commits, but J stays in awaiting_attestation and keeps asking, \
-                            with no exit, instead of readmission_required {local_state_lost} \
-                            (#1946)";
 /// ADR 0109 H-S3-a's window, also enough for one request round.
 const WINDOW: Duration = Duration::from_secs(130);
 const LOST: &str = "readmission_required{local_state_lost}";
@@ -303,11 +297,9 @@ impl Run {
             && self.markers.0 == self.markers.1
     }
 
-    /// The gap the expected-RED arm pins: J never shows `local_state_lost`,
-    /// ends in `awaiting_attestation`, still asks (its last `recovery`
-    /// lists B as `pending`) and names no exit. `awaiting_attestation`
-    /// alone is not the pin: a node with no recovery subject reports it
-    /// with an empty `asked`.
+    /// The #1946 gap's shape, kept for the shape test: J never shows
+    /// `local_state_lost`, ends in `awaiting_attestation`, still asks (its
+    /// last `recovery` lists B as `pending`) and names no exit.
     fn asking(&self) -> bool {
         !self.states_after.is_empty()
             && self.asked.iter().any(|(agent, answer)| {
@@ -606,12 +598,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     receipt.note(run.describe(&disk));
     let passed = quarantined && named && still && lost;
     if !passed {
-        let expected = if quarantined && named && still && run.asking() {
-            CAUSE_ASKING
-        } else {
-            CAUSE
-        };
-        receipt.cause(expected, Some(run.describe(&disk)), true, at(sim));
+        receipt.cause(CAUSE, Some(run.describe(&disk)), true, at(sim));
     }
     receipt.finish(FINAL, passed, at(sim));
     Ok(())
@@ -751,8 +738,7 @@ fn w3h_1356_q_member_shapes() {
     assert!(policy.drops(&frame(j, b, None)), "J to B still held");
 }
 
-/// H-S3-q (2): an expected RED on main, pinned `=RED` in the W3-H gate
-/// with [`CAUSE_ASKING`] (#1946); GREEN with the S3 fix.
+/// H-S3-q (2): a control, GREEN with the #1937 fix (#1946).
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -764,17 +750,15 @@ fn w3h_1356_q_member_shapes() {
               --run-ignored all); plain suites run unseeded entropy, which is not an \
               observation"
 )]
-fn w3h_1356_red_s3_q_member_unreadable_sidecar() -> Result<()> {
+fn w3h_1356_control_s3_q_member_unreadable_sidecar() -> Result<()> {
     // Every daemon of the case runs on this thread (`block_on_paused`).
     let _limit = AtaMaxLinksOverride::set(SEGMENT as usize);
     super::super::block_on_paused(async move {
-        let case = "w3h_1356_red_s3_q_member_unreadable_sidecar";
+        let case = "w3h_1356_control_s3_q_member_unreadable_sidecar";
         let receipt = run(case, 0x1356_0134).await;
-        // The pin names the exact failure, not any RED.
         ensure!(
-            receipt.verdict() == Some(Verdict::Red)
-                && receipt.named_causes().contains(&CAUSE_ASKING),
-            "{case}: expected Red with the asking-member cause, got {:?} {:?}",
+            receipt.verdict() == Some(Verdict::Green),
+            "{case}: expected Green, got {:?} {:?}",
             receipt.verdict(),
             receipt.named_causes()
         );

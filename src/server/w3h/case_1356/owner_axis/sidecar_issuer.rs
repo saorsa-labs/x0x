@@ -23,12 +23,14 @@
 //! RED: the authorisation reached J and one of these steps is wrong. Any
 //! other failure is INFRA.
 //!
-//! **On main (15 Nov 2026): expected RED, #1941.** The quarantine works,
-//! nothing commits and O shows `issued_reseats_lost`, but O's guard admits
-//! J's staged join for the lost authorisation: J is Active at r+4 at once,
-//! and O's second re-seat call answers `409 subject_active`. The arm pins
-//! that cause ([`CAUSE_ADMITTED`]); with the fix it turns GREEN and is
-//! renamed a control.
+//! **History.** On main before #1941 the arm was an expected RED: the
+//! quarantine worked, nothing committed and O showed `issued_reseats_lost`,
+//! but O admitted J's staged join for the lost authorisation (J Active at
+//! r+4 at once, O's second re-seat call `409 subject_active`; cause
+//! [`CAUSE_ADMITTED`]). With the fix the load that rebuilds O's sidecar
+//! revokes O's unconsumed invites that name a joiner who is not Active
+//! (A08 amendment of 16 Nov 2026), so J's staged join for the lost
+//! authorisation is refused and the arm is a control.
 
 use super::super::gaps::recovery_route;
 use super::*;
@@ -445,21 +447,19 @@ async fn run(case: &str, seed: u64) -> Receipt {
     receipt
 }
 
-/// H-S3-q (3): an expected RED on main (#1941), pinned `=RED` in the W3-H
-/// gate with [`CAUSE_ADMITTED`]. With the fix the issuer's rebuilt sidecar
-/// refuses the lost re-seat, a new re-seat seats J, and the arm is GREEN.
+/// H-S3-q (3): a control, GREEN with the #1941 fix. Before it the arm was
+/// an expected RED with [`CAUSE_ADMITTED`].
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-fn w3h_1356_red_s3_q3_issuer_unreadable_sidecar() -> Result<()> {
-    let case = "w3h_1356_red_s3_q3_issuer_unreadable_sidecar";
+fn w3h_1356_control_s3_q3_issuer_unreadable_sidecar() -> Result<()> {
+    let case = "w3h_1356_control_s3_q3_issuer_unreadable_sidecar";
     let receipt = super::super::super::block_on_paused(run(case, 0x1356_0143));
-    // The pin names the exact failure, not any RED.
     ensure!(
-        receipt.verdict() == Some(Verdict::Red) && receipt.named_causes().contains(&CAUSE_ADMITTED),
-        "{case}: expected Red with the admitted-lost-authorisation cause, got {:?} {:?}",
+        receipt.verdict() == Some(Verdict::Green),
+        "{case}: expected Green, got {:?} {:?}",
         receipt.verdict(),
         receipt.named_causes()
     );

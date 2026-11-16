@@ -92,6 +92,12 @@ async fn resume_file(
     names: &[String],
 ) -> Result<(), &'static str> {
     let path = dir.join(file);
+    // #1941: a rebuild loses `issued_reseats`, so the group's revocation
+    // marker is written before this resume quarantines or rebuilds (a
+    // quarantine begun by an older binary has none).
+    let stem = file
+        .strip_suffix(&format!(".{}", s3::GROUP_RECOVERY_EXTENSION))
+        .unwrap_or(file);
     let mut verified: Vec<([u8; 16], PathBuf)> = Vec::new();
     let mut unverified: Vec<PathBuf> = Vec::new();
     for (txid, h, copy) in copies {
@@ -131,6 +137,9 @@ async fn resume_file(
                     cause,
                     "ADR 0109 S3: damaged sidecar during resume; quarantining (D120)"
                 );
+                if !super::mark_revoke_pending(dir, stem).await {
+                    return Err("revoke_marker");
+                }
                 let quarantined =
                     super::super::revocation_eviction::quarantine_file(&path, &bytes).await?;
                 verified.push(quarantined);
@@ -142,6 +151,9 @@ async fn resume_file(
     if missing {
         if verified.is_empty() {
             return Err("verify");
+        }
+        if !super::mark_revoke_pending(dir, stem).await {
+            return Err("revoke_marker");
         }
         let temp_prefix = format!("{file}.tmp-");
         for name in names.iter().filter(|name| name.starts_with(&temp_prefix)) {

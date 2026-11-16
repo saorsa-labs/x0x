@@ -65,9 +65,9 @@ class ShardPlanTest(unittest.TestCase):
             's3-1661': 'w3h_1356_red_1661_welcome_lost_after_readmission_ends_typed',
             's3-rm2': 'w3h_1356_control_s3_rm2_reseat_mandate_refusals_typed',
             's3-d2': 'w3h_1356_control_s3_d2_fork_exposure_contained',
-            's3-q': 'w3h_1356_red_s3_q_joiner_unreadable_sidecar',
-            's3-q3': 'w3h_1356_red_s3_q3_issuer_unreadable_sidecar',
-            's3-qm': 'w3h_1356_red_s3_q_member_unreadable_sidecar',
+            's3-q': 'w3h_1356_control_s3_q_joiner_unreadable_sidecar',
+            's3-q3': 'w3h_1356_control_s3_q3_issuer_unreadable_sidecar',
+            's3-qm': 'w3h_1356_control_s3_q_member_unreadable_sidecar',
             's3-q2': 'w3h_1356_control_s3_q2_sidecar_fault_cases',
         }
         assigned = SHARDS.assign(self.names)
@@ -85,10 +85,12 @@ class ShardPlanTest(unittest.TestCase):
         self.assertTrue(rm4)
         self.assertEqual(sorted(assigned.get('s3-rm4', [])), sorted(rm4))
         self.assertFalse(set(rm4) & set(assigned.get('s3', [])))
-        # (1) to (5): one rerun of all five is about 1100 s on a runner, so
-        # 4 parts of 5 reruns stay under the 155-min S3 test deadline.
-        self.assertGreaterEqual(len(rm4), 5)
-        self.assertEqual(SHARDS.stress_count('s3-rm4.1'), 5)
+        # (1) to (6): one rerun of all six is at most about 1800 s on a
+        # runner, so 5 parts of 4 reruns stay under the 155-min S3 test
+        # deadline.
+        self.assertGreaterEqual(len(rm4), 6)
+        self.assertEqual(SHARDS.stress_count('s3-rm4.1'), 4)
+        self.assertEqual(SHARDS.stress_count('s3-rm4.5'), 4)
 
     def test_gate_requires_h_s3_d2_green(self):
         # H-S3-d2 (#1572) is a gating row: the W3-H gate step fails when

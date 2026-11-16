@@ -1,11 +1,17 @@
 use super::*;
 
 pub(super) enum Outcome {
+    /// An intentional stop: nothing runs. A Committed trial stays
+    /// Committed; any other stopped trial rolls back at the next start.
     Stopped,
     Restored(child::Owned),
     // Ownership remains with this launcher. The S3c host coordinator must
     // still verify all participants before it can commit the host.
     Provisional(child::Owned),
+    /// The host is committed and this trial is retired. No child of this
+    /// launcher runs: the caller starts the installed (committed) daemon as
+    /// an ordinary start.
+    Committed,
 }
 
 /// `health` must be the candidate's version/root/ownership-bound M1 evidence,
@@ -30,7 +36,20 @@ pub(super) fn run_trial(
     if trial.phase == Phase::RecoveryFailed {
         return Err(invalid("automatic start is forbidden"));
     }
+    if trial.phase == Phase::Committed {
+        prior_child_absent(trial)?;
+        // As for Restored: a stop starts no daemon (#1981 review).
+        if stop() {
+            return Ok(Outcome::Stopped);
+        }
+        return Ok(Outcome::Committed);
+    }
     if trial.phase == Phase::Restored {
+        // An intentional stop starts no restored child; the trial stays
+        // Restored, so the next start starts it (#1968 review).
+        if stop() {
+            return Ok(Outcome::Stopped);
+        }
         // ADR 0094 S4: a restarted launcher starts only a missing restored
         // child. The previous bytes are already installed, so no rollback
         // is repeated.
@@ -46,6 +65,16 @@ pub(super) fn run_trial(
     if let Some(identity) = &trial.child {
         if !child::absent(identity)? {
             return Err(invalid("prior child still exists"));
+        }
+        // The launcher died after the host commit and before it retired
+        // the trial: the committed host keeps the candidate. Without this a
+        // lost child would roll back, the restore would refuse the
+        // committed host, and the trial would end RecoveryFailed.
+        match retire(host, path, trial)? {
+            Retire::Retired if stop() => return Ok(Outcome::Stopped),
+            Retire::Retired => return Ok(Outcome::Committed),
+            Retire::Uncommitted => return Err(uncommitted()),
+            Retire::NotCommitted => {}
         }
         return rollback(
             host,
@@ -197,6 +226,61 @@ pub(super) fn run_trial(
     }
 }
 
+/// What a retire found. Only an `Err` from `retire` can change on a retry.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Retire {
+    /// The trial is saved `Committed`, and `*trial` is that saved trial.
+    Retired,
+    /// The host is not committed. Nothing was written.
+    NotCommitted,
+    /// The host is committed but the trial is neither Provisional nor
+    /// Committed. `host_commit` refuses such a trial, so this is a broken
+    /// host, not a transient state. Nothing was written.
+    Uncommitted,
+}
+
+pub(super) fn uncommitted() -> io::Error {
+    invalid("committed host has an uncommitted trial")
+}
+
+/// Retire a provisional trial whose host is committed: under the host lock,
+/// a fresh read, saved `Committed`.
+pub(super) fn retire(host: &recovery::Host, path: &Path, trial: &mut Trial) -> io::Result<Retire> {
+    let (binding, instance) = (trial.binding.clone(), trial.instance.clone());
+    let retired = host.locked(|record| {
+        if record.phase != journal::Phase::HostCommitted {
+            return Ok(Err(Retire::NotCommitted));
+        }
+        let mut current = Trial::load(path, &binding, &instance)?;
+        match current.phase {
+            Phase::Provisional => {
+                current.phase = Phase::Committed;
+                current.save(path)?;
+            }
+            Phase::Committed => {}
+            _ => return Ok(Err(Retire::Uncommitted)),
+        }
+        Ok(Ok(current))
+    })?;
+    Ok(match retired {
+        Ok(current) => {
+            *trial = current;
+            Retire::Retired
+        }
+        Err(found) => found,
+    })
+}
+
+/// ADR 0094 S4: never overlap a surviving process of an earlier start.
+fn prior_child_absent(trial: &Trial) -> io::Result<()> {
+    if let Some(identity) = &trial.child {
+        if !child::absent(identity)? {
+            return Err(invalid("prior child still exists"));
+        }
+    }
+    Ok(())
+}
+
 /// Whether the host phase allows a candidate spawn. Checked under the host
 /// lock; the coordinator's RollingBack fence makes it false.
 pub(super) fn protected_start_allowed(phase: journal::Phase) -> bool {
@@ -226,7 +310,7 @@ pub(super) fn failed_verdict(trial: &Trial, clock: &Clock) -> Option<journal::Ca
 /// On a stop during an attempt, record a Failed verdict only for a run-out
 /// total budget. The attempt is counted at reservation but has not failed,
 /// so the attempt count must not decide the verdict here.
-fn record_budget_verdict(trial: &mut Trial, clock: Option<&Clock>) {
+pub(super) fn record_budget_verdict(trial: &mut Trial, clock: Option<&Clock>) {
     if let Some(cause) = clock
         .and_then(|clock| trial.expired(clock))
         .filter(|cause| cause.class == journal::CauseClass::Failed)

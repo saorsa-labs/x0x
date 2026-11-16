@@ -3552,6 +3552,7 @@ function renderSpaceScratch(el,sid){
   <div id="scratch-keys"></div>
   <div id="scratch-editor" style="display:none" class="mt">
     <h3 id="scratch-title"></h3>
+    <div id="scratch-writer" style="font-size:11px;color:var(--tx3);margin-bottom:6px"></div>
     <textarea id="scratch-value" rows="8" style="width:100%;resize:vertical;font-family:var(--mono);font-size:12px"></textarea>
     <div id="scratch-error" class="mt" style="display:none;font-size:12px;color:var(--rd)"></div>
     <div class="row mt"><button class="pri" onclick="saveScratchKey('${sid}')">Save</button><button onclick="deleteScratchKey('${sid}')">Delete</button><button onclick="document.getElementById('scratch-editor').style.display='none'">Cancel</button></div>
@@ -3566,12 +3567,22 @@ function scratchError(msg){
   e.textContent=msg;e.style.display='block';
 }
 
+// #1094 P2: only a verified writer mark names a writer. Anything else is
+// "writer unknown" (an older writer, an unknown key, a replaced mark), never
+// a warning (A10).
+function scratchWriterText(w){
+  if(!w||w.verified!==true||typeof w.agent!=='string')return 'Writer unknown';
+  const short=h=>h.slice(0,8)+'…';
+  return 'Written by agent '+short(w.agent)+(typeof w.rider==='string'?' through rider '+short(w.rider):'');
+}
+
 function createScratchKey(sid){
   const key=document.getElementById('scratch-key').value.trim();
   if(!key)return;
   currentScratchKey=key;
   document.getElementById('scratch-title').textContent=key;
   document.getElementById('scratch-value').value='';
+  document.getElementById('scratch-writer').textContent='';
   document.getElementById('scratch-editor').style.display='block';
   document.getElementById('scratch-key').value='';
   scratchError('');
@@ -3611,6 +3622,7 @@ async function editScratchKey(sid,key){
   currentScratchKey=key;
   scratchError('');
   document.getElementById('scratch-title').textContent=key;
+  document.getElementById('scratch-writer').textContent=scratchWriterText(r.writer);
   const v=r.value===undefined||r.value===null?'':r.value;
   try{document.getElementById('scratch-value').value=u8decode(v)}catch(e){document.getElementById('scratch-value').value=String(v)}
   document.getElementById('scratch-editor').style.display='block';
