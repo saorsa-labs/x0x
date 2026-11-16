@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **The dormant launcher stops a committed daemon gracefully (#1378 slice 4;
+  A14 amendment of 16 Nov 2026).** A stop sends SIGTERM and waits up to 35 s
+  for x0xd's shutdown before SIGKILL. The retire after a host commit retries
+  only a failed host lock, ends its retries on a stop, and hands its result to
+  the caller. A start that finds a committed trial honours a stop.
 - **A KV merge keeps the earliest `created_at` (#1094, review of #1974).**
   Every merge path now keeps the earlier `created_at` of the two entries
   whichever wins, so replicas converge on it regardless of arrival order.
@@ -316,6 +321,13 @@ All notable changes to this project will be documented in this file.
   alone do not install updates.
 
 ### Tests and tooling
+
+- **CI pins cargo-nextest 0.9.151 (was 0.9.144) in all 18 install steps.**
+  0.9.151 is the first release with `future-queue` 0.4.1
+  (nextest-rs/future-queue#603). Before it, a test queued behind a full
+  test group could be dropped without running when the group mixed
+  `threads-required` values, and the run then ended with tests "not run"
+  and no failure. `.config/nextest.toml` recommends 0.9.151.
 
 - **Launcher supervise driver (#1378 slice 2; A14 amendment of 16 Nov
   2026).** The dormant launcher's supervise driver
