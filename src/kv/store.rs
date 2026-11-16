@@ -2023,6 +2023,38 @@ impl KvStore {
         Ok(())
     }
 
+    /// #1970: whether this store serves its complete state as a retained
+    /// group image, and so lives under the retained-image limit. Mirrors
+    /// the store kinds `merge_group_retained_image` admits.
+    fn serves_retained_group_image(&self) -> bool {
+        matches!(
+            self.policy,
+            AccessPolicy::GroupSigned { .. }
+                | AccessPolicy::Encrypted { .. }
+                | AccessPolicy::TreeKemEncrypted { .. }
+        )
+    }
+
+    /// #1970: upper estimate of this store's complete image after merging
+    /// `delta`'s content, in the spirit of [`Self::check_image_room`]. Every
+    /// added or updated entry counts at its full serialized size plus its
+    /// map key and a fresh OR-Set tag; a removed key counts a tombstone and
+    /// is not credited with the entry it frees, so the estimate never
+    /// understates the merged image.
+    fn projected_merge_image_bytes(&self, delta: &KvStoreDelta) -> Result<u64> {
+        let mut image = bincode::serialized_size(self)?;
+        let added = delta.added.iter().map(|(key, (entry, _))| (key, entry));
+        for (key, entry) in added.chain(delta.updated.iter()) {
+            let growth = bincode::serialized_size(entry)?
+                .saturating_add((MAP_KEY_PREFIX_BYTES + KEY_TAG_BYTES + 2 * key.len()) as u64);
+            image = image.saturating_add(growth);
+        }
+        for key in delta.removed.keys() {
+            image = image.saturating_add((KEY_TAG_BYTES + 2 * key.len()) as u64);
+        }
+        Ok(image)
+    }
+
     /// Test-only access to the raw entry map (#1094 P2 tests build an
     /// inconsistent store).
     #[cfg(test)]
@@ -2526,6 +2558,27 @@ impl KvStore {
                 self.id
             );
             return Ok(MergeOutcome::Rejected(MergeRejection::InconsistentEntry));
+        }
+
+        // #1970: bound remote growth to the retained-image limit. The
+        // put-time `check_image_room` gate (review of #1963) only sees the
+        // local writer's own puts; concurrent writers under the limit on
+        // their own nodes, peers on versions without the gate, and served
+        // images all merge through here, and past the limit no holder can
+        // serve a retained image. Refuse the whole delta, typed, before any
+        // of it applies — every replica then stays servable.
+        if self.serves_retained_group_image() {
+            let max = crate::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES;
+            let image = self.projected_merge_image_bytes(delta)?;
+            if image > max as u64 {
+                tracing::warn!(
+                    "refused delta for store {}: the merged image would be {} bytes, above the {}-byte retained-image limit",
+                    self.id,
+                    image,
+                    max
+                );
+                return Err(KvError::StoreFull { image, max });
+            }
         }
 
         // Apply allowlist changes from the delta (owner-only)
@@ -3158,6 +3211,15 @@ impl KvStore {
         }
         if let Some(floor) = retained_sequence_floor {
             trial.restore_seq_counter(floor);
+        }
+        // #1970: the merged image must stay servable. Refuse typed before
+        // the trial commits — the same limit `serialize_retained_group_image`
+        // enforces on the serving side, so a holder can never merge into a
+        // complete image it cannot serve to a new or lagging member.
+        let max = crate::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES;
+        let image = bincode::serialized_size(&trial)?;
+        if image > max as u64 {
+            return Err(KvError::StoreFull { image, max });
         }
         *self = trial;
         Ok(())
@@ -4524,6 +4586,103 @@ mod tests {
             target.policy(),
             AccessPolicy::GroupSigned { group_id } if group_id == &group
         ));
+    }
+
+    /// Two one-writer group stores for the #1970 regression tests: each
+    /// writer's own puts keep its replica under the retained-image limit
+    /// (direct `put` takes no put-time gate — the shape of a peer on a
+    /// version before #1963, or of a writer the handle-level gate has not
+    /// bounded), while the union of the two passes the limit.
+    fn two_writers_past_the_limit() -> (KvStore, KvStore, u64) {
+        let max = crate::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES as u64;
+        let owner = agent(1);
+        let ctx = TestCtx::new(7, &[owner]);
+        let value = vec![b'v'; 60_000];
+        let build = |prefix: char, writer_peer: u8| {
+            let mut s = KvStore::new_group_signed(
+                store_id(8),
+                "Wiki".to_string(),
+                owner,
+                vec![7u8; 16],
+                ctx.clone(),
+            )
+            .expect("store");
+            for i in 0..150u32 {
+                s.put(
+                    format!("{prefix}{i:05}"),
+                    value.clone(),
+                    "text/plain".to_string(),
+                    peer(writer_peer),
+                )
+                .expect("put");
+            }
+            s
+        };
+        let a = build('a', 1);
+        let b = build('b', 2);
+        let size_a = bincode::serialized_size(&a).expect("size a");
+        let size_b = bincode::serialized_size(&b).expect("size b");
+        assert!(size_a <= max, "writer A stays under the limit: {size_a}");
+        assert!(size_b <= max, "writer B stays under the limit: {size_b}");
+        assert!(
+            size_a.saturating_add(size_b) > max,
+            "the merged state passes the limit: {size_a} + {size_b}"
+        );
+        (a, b, max)
+    }
+
+    /// #1970: a served retained image whose merge would take the local
+    /// image past the retained-image limit is refused with a typed
+    /// `StoreFull` and the holder stays servable, instead of merging into
+    /// an image that cannot be served to any new or lagging member.
+    #[test]
+    fn a_merged_retained_image_past_the_limit_is_refused() {
+        let (mut a, b, max) = two_writers_past_the_limit();
+
+        match a.merge_group_retained_image(&b, agent(7), peer(2)) {
+            Err(KvError::StoreFull { image, .. }) => assert!(image > max),
+            other => panic!("expected a typed StoreFull refusal, got {other:?}"),
+        }
+        assert!(
+            a.merge_group_retained_image(&b, agent(7), peer(2)).is_err(),
+            "the refusal is stable on replay"
+        );
+        let size = bincode::serialized_size(&a).expect("size after refusal");
+        assert!(size <= max, "the refusing holder stays servable: {size}");
+        assert_eq!(
+            a.entries.len(),
+            150,
+            "none of the refused image's entries applied"
+        );
+    }
+
+    /// #1970: the same two-writer union arriving as a group writer's
+    /// content delta (the concurrent-writer and older-peer path) is refused
+    /// the same way, before any of its entries apply.
+    #[test]
+    fn a_group_delta_past_the_limit_is_refused() {
+        let (mut a, b, max) = two_writers_past_the_limit();
+
+        // A content-only delta — no name, allowlist or checkpoint rider —
+        // as a group writer's `for_put` stream emits.
+        let mut delta = KvStoreDelta::new(b.version);
+        for (i, (key, entry)) in b.entries.iter().enumerate() {
+            delta
+                .added
+                .insert(key.clone(), (entry.clone(), (peer(2), i as u64)));
+        }
+
+        match a.merge_delta(&delta, peer(2), Some(&agent(1))) {
+            Err(KvError::StoreFull { image, .. }) => assert!(image > max),
+            other => panic!("expected a typed StoreFull refusal, got {other:?}"),
+        }
+        let size = bincode::serialized_size(&a).expect("size after refusal");
+        assert!(size <= max, "the refusing holder stays servable: {size}");
+        assert_eq!(
+            a.entries.len(),
+            150,
+            "none of the refused delta's entries applied"
+        );
     }
 
     /// Socket-free characterization of retained-image paging (issue-802

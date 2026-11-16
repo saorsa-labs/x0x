@@ -366,11 +366,13 @@ fn serialize_retained_group_image(store: &KvStore) -> Result<Vec<u8>> {
     let bytes = bincode::serialize(store)
         .map_err(|e| KvError::Gossip(format!("retained group image serialization failed: {e}")))?;
     if bytes.len() > MAX_RETAINED_GROUP_IMAGE_BYTES {
-        return Err(KvError::Gossip(format!(
-            "complete group history is {} bytes, above the {}-byte retained-image resource limit",
-            bytes.len(),
-            MAX_RETAINED_GROUP_IMAGE_BYTES
-        )));
+        // #1970: typed, matching the put-time and merge-time bounds, so a
+        // holder over the limit surfaces as `StoreFull` instead of a
+        // stringly gossip error the responder can only log and drop.
+        return Err(KvError::StoreFull {
+            image: bytes.len() as u64,
+            max: MAX_RETAINED_GROUP_IMAGE_BYTES,
+        });
     }
     Ok(bytes)
 }
@@ -8617,6 +8619,55 @@ mod tests {
             reassembled.as_deref() == Some(image.as_slice()),
             "reassembled retained image must match source bytes"
         );
+    }
+
+    /// #1970: a holder whose complete image passes the retained-image limit
+    /// (state that merges could build before the merge bound) fails typed
+    /// at serve time — [`KvError::StoreFull`], not a stringly gossip error
+    /// the responder can only log and drop.
+    #[test]
+    fn an_over_cap_group_image_fails_typed_at_serve() {
+        let owner = agent(1);
+        let mut group = crate::groups::GroupInfo::new(
+            "public".to_string(),
+            String::new(),
+            owner,
+            "fa".repeat(16),
+        );
+        group.migrate_from_v1();
+        group.policy.confidentiality = crate::groups::GroupConfidentiality::SignedPublic;
+        group.policy.read_access = crate::groups::GroupReadAccess::Public;
+        let ctx = Arc::new(
+            crate::groups::PublicGroupKvContext::from_group(&group).expect("public context"),
+        );
+        let mut store = KvStore::new_group_signed(
+            store_id(4),
+            "Wiki".to_string(),
+            owner,
+            group.stable_group_id().as_bytes().to_vec(),
+            ctx,
+        )
+        .expect("store");
+        let max = crate::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES as u64;
+        let value = vec![b'v'; 60_000];
+        let mut puts = 0u32;
+        while bincode::serialized_size(&store).expect("size") <= max {
+            store
+                .put(
+                    format!("over-{puts:05}"),
+                    value.clone(),
+                    "text/plain".to_string(),
+                    peer(1),
+                )
+                .expect("put");
+            puts += 1;
+        }
+        assert!(puts > 1, "fixture crossed the limit: {puts} puts");
+
+        match serialize_retained_group_image(&store) {
+            Err(KvError::StoreFull { image, .. }) => assert!(image > max),
+            other => panic!("expected a typed StoreFull refusal, got {other:?}"),
+        }
     }
 
     #[test]
