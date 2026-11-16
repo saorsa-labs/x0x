@@ -65,7 +65,7 @@ class ShardPlanTest(unittest.TestCase):
             's3-1661': 'w3h_1356_red_1661_welcome_lost_after_readmission_ends_typed',
             's3-rm2': 'w3h_1356_control_s3_rm2_reseat_mandate_refusals_typed',
             's3-d2': 'w3h_1356_control_s3_d2_fork_exposure_contained',
-            's3-q': 'w3h_1356_red_s3_q_joiner_unreadable_sidecar',
+            's3-q': 'w3h_1356_control_s3_q_joiner_unreadable_sidecar',
             's3-q3': 'w3h_1356_control_s3_q3_issuer_unreadable_sidecar',
             's3-qm': 'w3h_1356_red_s3_q_member_unreadable_sidecar',
             's3-q2': 'w3h_1356_control_s3_q2_sidecar_fault_cases',

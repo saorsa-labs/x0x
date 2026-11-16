@@ -2440,9 +2440,10 @@ async fn resave_legacy(state: &AppState) -> LegacyWrite {
 ///   durable authoritative record when the sidecar holds one) and its
 ///   legacy views are written again.
 /// - A live record that is itself a placeholder while the sidecar holds an
-///   authoritative record matched neither end at load: it stays inert and
-///   placeheld (`lost`), and the node shows
-///   `readmission_required {local_state_lost}` (§4 rebuild table).
+///   authoritative record matched neither end at load, or while the
+///   sidecar was rebuilt (D120; the record behind a placeholder is on no
+///   holder, #1937): it stays inert and placeheld (`lost`), and the node
+///   shows `readmission_required {local_state_lost}` (§4 rebuild table).
 /// - A group that no longer needs it is un-placeheld: the real record is
 ///   written to the legacy views, and only once that is durable are the
 ///   authoritative record dropped from the sidecar and the entry itself
@@ -2461,7 +2462,9 @@ pub(super) async fn ensure_placeholders(state: &Arc<AppState>) {
             .iter()
             .filter(|(stable, body)| {
                 !inner.sidecar_status.contains_key(*stable)
-                    && (body.active_ata.is_some() || body.authoritative_record.is_some())
+                    && (body.active_ata.is_some()
+                        || body.authoritative_record.is_some()
+                        || !body.rebuilt_from.is_empty())
             })
             .map(|(stable, body)| (stable.clone(), body.clone()))
             .collect()
@@ -2506,7 +2509,12 @@ pub(super) async fn ensure_placeholders(state: &Arc<AppState>) {
         let Some((key, info)) = live.get(stable) else {
             continue;
         };
-        let lost = body.authoritative_record.is_some() && s3::is_s3_placeholder(info);
+        // #1937 (§4 rebuild table): a rebuilt sidecar has no authoritative
+        // record, so a live record that is still the S3 placeholder can
+        // never be spliced back. It is lost, as when the record matched
+        // neither end at load.
+        let lost = s3::is_s3_placeholder(info)
+            && (body.authoritative_record.is_some() || !body.rebuilt_from.is_empty());
         let wanted = lost || needs_placeholder(state, info, body).await;
         let entry = registered.get(stable);
         if wanted {
@@ -10878,6 +10886,72 @@ mod tests {
         );
         assert_eq!(held_secrets(&state, &key).await, AFTER_REVOKE);
         assert!(!marker_exists(&state, &stable));
+        Ok(())
+    }
+
+    /// #1937 (§4 rebuild table, D120): a joiner whose legacy view holds
+    /// its S3 placeholder restarts with a damaged sidecar. The rebuild has
+    /// no authoritative record, so the group stays inert under the
+    /// placeholder and the node shows `readmission_required
+    /// {local_state_lost}` with D43's exit and `recovery_sidecar_rebuilt`.
+    /// Control: the same restart with a readable sidecar splices the real
+    /// record back and shows no loss. Inert.
+    #[tokio::test]
+    async fn a_rebuilt_sidecar_under_a_placeholder_is_local_state_lost() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, ata) = armed_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        assert!(arm_in_place(&state, &key, &info, ata).await);
+        let placeholder = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("legacy entry"))?;
+        assert!(s3::is_s3_placeholder(&placeholder));
+
+        // A restart: the loaded live record is the placeholder and the
+        // placeheld map is empty. The sidecar is then damaged.
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), placeholder.clone());
+        with_placeheld(&state, HashMap::clear);
+        state.group_recovery.inner.lock().await.sidecars.clear();
+        let path = sidecar_path(&state, &stable);
+        tokio::fs::write(&path, [b"JUNKJUNK".as_slice(), &[0u8; 56]].concat()).await?;
+        load_sidecars(&state).await;
+        assert_eq!(
+            sidecar_on_disk(&state, &stable).await?.rebuilt_from.len(),
+            1
+        );
+        ensure_placeholders(&state).await;
+        assert_eq!(
+            view_of(&state, &stable).await,
+            Some(SubjectView::Readmission {
+                cause: "local_state_lost"
+            })
+        );
+        assert!(
+            is_placeheld(&state, &stable),
+            "it stays inert and placeheld"
+        );
+        let live = state
+            .named_groups
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("live record"))?;
+        assert!(s3::is_s3_placeholder(&live), "containment is unchanged");
+        let recovery = recovery_json(&state, &live)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("recovery object"))?;
+        assert_eq!(recovery["state"], "readmission_required");
+        assert_eq!(recovery["cause"], "local_state_lost");
+        assert_eq!(recovery["exit"], "manual_remove_and_reinvite");
+        assert!(
+            recovery["recovery_sidecar_rebuilt"]["txid"].is_string(),
+            "{recovery}"
+        );
         Ok(())
     }
 
