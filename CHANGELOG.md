@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **The dormant launcher stops a committed daemon gracefully (#1378 slice 4;
+  A14 amendment of 16 Nov 2026).** A stop sends SIGTERM and waits up to 35 s
+  for x0xd's shutdown before SIGKILL. The retire after a host commit retries
+  only a failed host lock, ends its retries on a stop, and hands its result to
+  the caller. A start that finds a committed trial honours a stop.
 - **`GET /stores/:id/:key` shows the verified writer (#1094 slice P2, A10
   amendment of 16 Nov 2026).** New `writer` field: the agent (and rider
   sub-agent) whose mark verifies for the returned value, or
