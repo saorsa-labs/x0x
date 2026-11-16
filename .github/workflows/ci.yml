@@ -569,10 +569,13 @@ jobs:
   # floor) and rm3 (i) and (ii) (older receiver after the seal), and
   # H-S3-m (v0.46.1 on J's data dir between the H-S3-s segments; about
   # 100 s in the VM, with two 45 s real-time waits). The filter also
-  # selects later rows in the same module. Phase 1 of each
-  # row runs on the paused W3-H sim; phase 2 runs candidate daemons on
+  # selects later rows in the same module. In rm1 and rm3, phase 1
+  # runs on the paused W3-H sim and phase 2 runs candidate daemons on
   # real loopback sockets, with member M on the published v0.46.1
-  # daemon. The rows are `#[ignore]` and run only here, one at a time.
+  # daemon. H-S3-m stays on the paused sim: the published v0.46.1 runs
+  # on J's data dir with no peers while the sim waits, then J resumes
+  # on the candidate in the sim.
+  # The rows are `#[ignore]` and run only here, one at a time.
   # A row took 145-250 s on a 12-CPU VM, and the 4-vCPU runner takes
   # about twice as long. The job is separate because it needs the
   # released binary. It is not a required check.
