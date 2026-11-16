@@ -3946,6 +3946,10 @@ environment or free-text causes.
 | `backups` | Backup files beside the daemon and its sibling CLI: `{artifact, name, size_bytes, modified_unix}`, `artifact` `daemon` or `cli`, at most 32. Names are `<binary>.backup` (legacy) or `<binary>.backup-<version>-<transaction>` (pair apply) |
 | `records_error` | `null`, or fixed text naming a record that could not be read (`install path unavailable`, `probe record unreadable`, `probe terminalization record unreadable`, `hold clear receipt unreadable`, `journal record unreadable`, `handoff record unreadable`, `boot record unreadable`); several are joined with `; ` |
 
+Probe records and holds exist only on Unix installs. On Windows the fields are
+all present: `last_attempt` and `last_hold_clear` are `null` and `holds` is
+`[]`; `plan`, `backups` and `records_error` are read as on Unix.
+
 **Minimum supported version and support window (#1384, D35).** The same
 response carries `minimum_supported_version` and `support_window`. Both ship
 as explicit `null` — by David's 20 Oct 2026 ruling the fields exist now and
