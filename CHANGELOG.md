@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **A rebuilt issuer refuses a lost re-seat (#1941, A08 amendment of 16 Nov
+  2026).** When a damaged S3 sidecar is rebuilt, the load revokes the group's
+  unconsumed invites that name a joiner who is not Active, so a re-seat
+  authorisation sent before the damage can no longer seat its subject through
+  the old invite. The subject shows `reseat_required {reseat_failed}`; the
+  admin calls the re-seat route again.
+
 - **Upgrade records: `clearable` matches the local clear (#1932 review; A14
   amendment of 15 Nov 2026).** A hold reports `clearable: true` only when
   `x0x upgrade --clear-hold` would clear it; an unresolved `.pending` probe

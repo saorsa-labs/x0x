@@ -1087,16 +1087,18 @@ async fn sidecar_snapshot(state: &AppState, stable_group_id: &str) -> Option<Gro
 /// `quarantine_open` is false (inside an uncommitted ADR 0094 trial), a
 /// damaged file also stays in place, as `QuarantineDeferred` (§4 "Before
 /// host commit"). Returns the loaded bodies and the faults, keyed by file
-/// stem.
+/// stem, and the stems this scan rebuilt.
 async fn scan_sidecar_dir(
     dir: &FsPath,
     quarantine_open: bool,
 ) -> (
     HashMap<String, GroupRecoveryV1>,
     HashMap<String, SidecarFault>,
+    HashSet<String>,
 ) {
     let mut loaded = HashMap::new();
     let mut faults = HashMap::new();
+    let mut rebuilt_stems = HashSet::new();
     for (file, step) in sidecar_resume::resume_pending(dir).await {
         let stem = file
             .strip_suffix(&format!(".{}", s3::GROUP_RECOVERY_EXTENSION))
@@ -1112,7 +1114,7 @@ async fn scan_sidecar_dir(
         );
     }
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
-        return (loaded, faults);
+        return (loaded, faults, rebuilt_stems);
     };
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
@@ -1170,6 +1172,7 @@ async fn scan_sidecar_dir(
                         };
                         if write_sidecar_rebuild(&path, &rebuilt).await {
                             let _ = super::revocation_eviction::finalize_quarantine(&pending).await;
+                            rebuilt_stems.insert(stem.to_string());
                             loaded.insert(stem.to_string(), rebuilt);
                         } else {
                             faults.insert(
@@ -1194,7 +1197,7 @@ async fn scan_sidecar_dir(
             }
         }
     }
-    (loaded, faults)
+    (loaded, faults, rebuilt_stems)
 }
 
 /// Load every `.grecov` file at worker start (§4), under the sidecar
@@ -1202,7 +1205,7 @@ async fn scan_sidecar_dir(
 async fn load_sidecars(state: &AppState) {
     let dir = sidecar_dir(state);
     let quarantine_open = super::revocation_eviction::host_commit_gate_open(state);
-    let (mut loaded, mut faults) = {
+    let (mut loaded, mut faults, rebuilt_stems) = {
         let _writer = state.group_recovery.writer.lock().await;
         scan_sidecar_dir(&dir, quarantine_open).await
     };
@@ -1240,6 +1243,82 @@ async fn load_sidecars(state: &AppState) {
     for (stable, body) in &inner.sidecars {
         state.group_recovery.refresh_staging(stable, Some(body));
     }
+    drop(inner);
+    revoke_unpaired_invites_after_rebuild(state, &stables, &rebuilt_stems).await;
+}
+
+/// #1941 (§4, D120): a rebuild empties `issued_reseats`, so this node can
+/// no longer tell which of its unconsumed invites pair with a re-seat
+/// authorisation it issued before the damage. Such an authorisation may
+/// still be in flight, and its subject's staged join would consume the
+/// invite as an ordinary add. So, for each group whose sidecar this load
+/// rebuilt, revoke every unconsumed issued invite that names an intended
+/// joiner who is not Active in the live roster: a re-seat invite always
+/// names its subject, and the subject is never Active (its basis is its
+/// removal). An ordinary targeted invite to such an agent is revoked too,
+/// which is the safe outcome for a field no holder has. The issuer mints
+/// a new one, or calls the re-seat route again. Local records only: no
+/// commit, no wire change.
+async fn revoke_unpaired_invites_after_rebuild(
+    state: &AppState,
+    stables: &[String],
+    rebuilt_stems: &HashSet<String>,
+) {
+    for stable in stables {
+        if !rebuilt_stems.contains(&sidecar_stem(stable)) {
+            continue;
+        }
+        let key = {
+            let groups = state.named_groups.read().await;
+            groups
+                .iter()
+                .find(|(_, info)| info.stable_group_id() == stable.as_str())
+                .map(|(key, _)| key.clone())
+        };
+        let Some(key) = key else {
+            continue;
+        };
+        let Some(lock) = super::group_membership_lock_for_known_group(state, &key).await else {
+            continue;
+        };
+        let _membership = lock.lock().await;
+        let secrets = state
+            .named_groups
+            .read()
+            .await
+            .get(&key)
+            .map(unpaired_targeted_invites)
+            .unwrap_or_default();
+        if secrets.is_empty() {
+            continue;
+        }
+        let durable = revoke_replaced_reseat_invite(state, &key, &secrets).await;
+        tracing::warn!(
+            group_id = %LogHexId::group(stable),
+            revoked = secrets.len(),
+            durable,
+            "ADR 0109 S3: sidecar rebuilt; unconsumed targeted invites revoked (issued re-seats lost, #1941)"
+        );
+    }
+}
+
+/// The unconsumed issued invites of `info` that name an intended joiner
+/// who is not Active ([`revoke_unpaired_invites_after_rebuild`]).
+fn unpaired_targeted_invites(info: &GroupInfo) -> Vec<String> {
+    let mut secrets: Vec<String> = info
+        .issued_invites
+        .iter()
+        .filter(|(_, record)| record.consumed_by.is_none())
+        .filter(|(_, record)| {
+            record
+                .intended_joiner
+                .as_deref()
+                .is_some_and(|joiner| !info.has_active_member(joiner))
+        })
+        .map(|(secret, _)| secret.clone())
+        .collect();
+    secrets.sort();
+    secrets
 }
 
 /// §4 "Before host commit": a damaged sidecar found inside an ADR 0094
@@ -1261,12 +1340,12 @@ async fn resume_deferred_quarantine(state: &AppState) {
     if deferred.is_empty() {
         return;
     }
-    let (mut loaded, mut faults) = {
+    let (mut loaded, mut faults, rebuilt_stems) = {
         let _writer = state.group_recovery.writer.lock().await;
         scan_sidecar_dir(&sidecar_dir(state), true).await
     };
     let mut inner = state.group_recovery.inner.lock().await;
-    for stable in deferred {
+    for stable in deferred.clone() {
         let stem = sidecar_stem(&stable);
         inner.sidecar_status.remove(&stable);
         if let Some(body) = loaded.remove(&stem) {
@@ -1277,6 +1356,8 @@ async fn resume_deferred_quarantine(state: &AppState) {
             inner.sidecar_status.insert(stable, fault);
         }
     }
+    drop(inner);
+    revoke_unpaired_invites_after_rebuild(state, &deferred, &rebuilt_stems).await;
 }
 
 /// §4 "Crash reconciliation at load": a crash between the sidecar write
@@ -10430,6 +10511,102 @@ mod tests {
             live.set_member_role(&local_hex(&state), x0x::groups::GroupRole::Member);
         }
         assert_eq!(recovery().await?["issued_reseats_lost"], false);
+        Ok(())
+    }
+
+    /// #1941 (§4, D120): a rebuild empties `issued_reseats`, so the load
+    /// that rebuilds a sidecar revokes every unconsumed issued invite that
+    /// names an intended joiner who is not Active; a re-seat authorisation
+    /// still in flight then pairs with no invite. Controls: an untargeted
+    /// invite, one that names an Active member and a consumed one stay; a
+    /// later load that rebuilds nothing revokes nothing. Inert.
+    #[tokio::test]
+    async fn a_rebuilt_sidecar_revokes_unconsumed_targeted_invites() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let subject = "ab".repeat(32);
+        let (key, info, _basis) = removed_subject_group(&state, &subject, None).await?;
+        let stable = info.stable_group_id().to_string();
+        let local = local_hex(&state);
+        let record = |info: &mut GroupInfo, secret: &str, joiner: Option<&str>| {
+            info.record_issued_invite_v2(
+                secret.to_string(),
+                1,
+                u64::MAX / 4,
+                x0x::groups::GroupRole::Member,
+                joiner.map(str::to_string),
+                x0x::groups::InviteOrigin::Explicit,
+                None,
+            );
+        };
+        {
+            let mut groups = state.named_groups.write().await;
+            let live = groups
+                .get_mut(&key)
+                .ok_or_else(|| anyhow::anyhow!("live record"))?;
+            record(live, "reseat-secret", Some(&subject));
+            record(live, "open-secret", None);
+            record(live, "active-secret", Some(&local));
+            record(live, "consumed-secret", Some(&subject));
+            if let Some(consumed) = live.issued_invites.get_mut("consumed-secret") {
+                consumed.consumed_by = Some(subject.clone());
+            }
+        }
+        let secrets = |state: Arc<AppState>, key: String| async move {
+            let groups = state.named_groups.read().await;
+            let mut held: Vec<String> = groups
+                .get(&key)
+                .map(|info| info.issued_invites.keys().cloned().collect())
+                .unwrap_or_default();
+            held.sort();
+            held
+        };
+
+        // Control: a load that rebuilds nothing revokes nothing.
+        load_sidecars(&state).await;
+        assert_eq!(
+            secrets(Arc::clone(&state), key.clone()).await,
+            [
+                "active-secret",
+                "consumed-secret",
+                "open-secret",
+                "reseat-secret"
+            ]
+        );
+
+        let path = sidecar_path(&state, &stable);
+        tokio::fs::create_dir_all(sidecar_dir(&state)).await?;
+        tokio::fs::write(&path, [b"JUNKJUNK".as_slice(), &[0u8; 56]].concat()).await?;
+        load_sidecars(&state).await;
+        assert_eq!(
+            sidecar_on_disk(&state, &stable).await?.rebuilt_from.len(),
+            1
+        );
+        assert_eq!(
+            secrets(Arc::clone(&state), key.clone()).await,
+            ["active-secret", "consumed-secret", "open-secret"],
+            "the unconsumed invite for the subject is revoked"
+        );
+        let live = state
+            .named_groups
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("live record"))?;
+        assert!(!live.issued_invite_secrets.contains("reseat-secret"));
+
+        // Control: a targeted invite minted after the rebuild survives the
+        // next load, which rebuilds nothing.
+        {
+            let mut groups = state.named_groups.write().await;
+            if let Some(live) = groups.get_mut(&key) {
+                record(live, "later-secret", Some(&subject));
+            }
+        }
+        load_sidecars(&state).await;
+        assert!(secrets(Arc::clone(&state), key.clone())
+            .await
+            .contains(&"later-secret".to_string()));
         Ok(())
     }
 
