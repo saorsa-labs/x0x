@@ -134,7 +134,14 @@ async fn released_run(bin: &Path, node: &Path, group: &str) -> Result<LiveRun> {
     let (code, body) = released
         .call(Method::GET, &format!("{path}/members"), None)
         .await?;
-    let rows = body["members"].as_array().cloned().unwrap_or_default();
+    // #1957 review: a 200 with no members array is no evidence; fail.
+    let rows = match body["members"].as_array() {
+        Some(rows) => rows.clone(),
+        None if code == 200 => {
+            bail!("INFRA: v0.46.1 members answer has no members array: {body}")
+        }
+        None => Vec::new(),
+    };
     let active = |row: &&Value| row["state"] == "active";
     let admin = |row: &&Value| row["state"] == "active" && row["role"] == "admin";
     run.members = (
