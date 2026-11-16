@@ -110,6 +110,18 @@ impl FairAdmission {
             .sum()
     }
 
+    /// How many requests for any key reached [`Self::try_admit`],
+    /// admitted or not (tests).
+    #[cfg(test)]
+    pub(in crate::server) fn asked_total(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .asked
+            .values()
+            .sum()
+    }
+
     /// In-flight handlers (diagnostics and tests).
     #[cfg(test)]
     pub(in crate::server) fn in_flight(&self) -> usize {

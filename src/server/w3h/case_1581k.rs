@@ -303,13 +303,20 @@ async fn release_and_watch(
 ) -> Result<()> {
     let at = |sim: &Sim| sim.fabric().now().as_micros();
     // Release B's poll; watch B for SETTLE.
-    // Receiver-side evidence (#1956 review): A's join-result fetch
-    // admission logs each `FetchRequest` that reaches it; a raw B->A frame
-    // count would also count membership and `MemberJoined` retries.
-    let fetches_before = sim
-        .state("A")?
-        .join_result_fetch_admission
-        .asked_for_member(b_hex);
+    // Receiver-side evidence (#1956 review): A's join-result and Welcome
+    // fetch admissions log each request that reaches them; a raw B->A
+    // frame count would also count membership and `MemberJoined` retries.
+    // B is the only joiner with a staged Welcome on A at this point, and
+    // after the release B can learn `MemberAdded` by gossip and fetch the
+    // Welcome directly, so both handlers count.
+    let fetches = |sim: &Sim| -> Result<(usize, usize)> {
+        let state = sim.state("A")?;
+        Ok((
+            state.join_result_fetch_admission.asked_for_member(b_hex),
+            state.welcome_fetch_admission.asked_total(),
+        ))
+    };
+    let (results_before, welcomes_before) = fetches(sim)?;
     let dropped = hold.release(sim);
     let released = sim
         .fabric()
@@ -335,17 +342,17 @@ async fn release_and_watch(
         .fabric()
         .delivered_writes_after(&sim.peer("B")?, &sim.peer("A")?, released)
         .len();
-    let fetches_after = sim
-        .state("A")?
-        .join_result_fetch_admission
-        .asked_for_member(b_hex);
-    let fetched = fetches_after.saturating_sub(fetches_before);
+    let (results_after, welcomes_after) = fetches(sim)?;
+    let results = results_after.saturating_sub(results_before);
+    let welcomes = welcomes_after.saturating_sub(welcomes_before);
+    let fetched = results + welcomes;
     receipt.request_delivered(
         "a_received_b_join_result_fetches_after_the_release",
         dropped > 0 && fetched > 0,
         format!(
-            "dropped A/C->B frames {dropped}; B's join-result fetches at A: {fetches_before} \
-             before the release, {fetched} after; B->A frames since release {b_to_a}"
+            "dropped A/C->B frames {dropped}; at A since the release: {results} join-result \
+             fetches from B (before: {results_before}), {welcomes} Welcome fetches (before: \
+             {welcomes_before}); B->A frames since release {b_to_a}"
         ),
         at(sim),
     );
