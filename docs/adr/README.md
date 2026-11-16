@@ -72,7 +72,8 @@ This table is the live allocation table for capability bits. Allocate the next b
 | 18 | `caps_unicast_response_v1` | Takes a targeted capability answer as one direct frame (`x0x/caps/v1/unicast-response\0`) to the machine its targeted request names; the response topic stays the fallback | #504 (A06 amendment 14 Nov 2026, under David's 10 Nov delegation; bit 17 is claimed by open PR #1898) |
 | 19 | `join_request_head_v1` | Reads the optional `head` (signed head commit, roster projection, public metadata) of a `stale` join-request outcome and signs the same request again over it; an authority puts a head on an outcome only for a requester whose current verified advert sets this bit; route-gated with bit 16 | #1840 (A08 amendment of 15 Nov 2026, Claude under David's 10 Nov delegation and A15; next free bit) |
 | 20 | `data_read_v1` | Answers a grantee's read of a store it holds a `ShareCap::Data` grant for (`x0x-data-read-v1`) and takes the reply (`x0x-data-reply-v1`); a grantee sends a read only to an agent whose current verified advert sets this bit; route-gated | #1094 slice D1 (A03 amendment of 15 Nov 2026, Claude under David's 10 Nov delegation and A15; next free bit) |
-| 21–63 | unallocated | Must not be advertised until allocated | — |
+| 21 | `data_write_v1` | Applies an `rw` grantee's write to a store it holds a `ShareCap::Data` grant for (`x0x-data-write-v1`) as the granted agent's own write; the reply uses `x0x-data-reply-v1`; a grantee sends a write only to an agent whose current verified advert sets this bit; route-gated | #1094 slice D2 (A03 amendment of 16 Nov 2026, Claude under David's 10 Nov delegation and A15; next free bit) |
+| 22–63 | unallocated | Must not be advertised until allocated | — |
 
 ## Checks
 

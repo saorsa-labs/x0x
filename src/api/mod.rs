@@ -2056,6 +2056,22 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         category: "grants",
         request: RequestSpec::None,
     },
+    EndpointDef {
+        method: Method::Put,
+        path: "/grants/data/:agent/:group/:store/:key",
+        cli_name: "grant data put",
+        description: "Set one value of a store on a granted agent, through a received rw ShareCap::Data grant (#1094)",
+        category: "grants",
+        request: RequestSpec::Fields(&[RequestField::body_as("value", true, "VALUE"), RequestField::body_as("content_type", false, "--content-type")]),
+    },
+    EndpointDef {
+        method: Method::Delete,
+        path: "/grants/data/:agent/:group/:store/:key",
+        cli_name: "grant data rm",
+        description: "Remove one key of a store on a granted agent, through a received rw ShareCap::Data grant (#1094)",
+        category: "grants",
+        request: RequestSpec::None,
+    },
     // ── Names (ADR-0074 §1; durable owner token only) ───────────────────
     EndpointDef {
         method: Method::Get,
