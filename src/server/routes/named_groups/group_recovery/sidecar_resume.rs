@@ -92,6 +92,12 @@ async fn resume_file(
     names: &[String],
 ) -> Result<(), &'static str> {
     let path = dir.join(file);
+    // #1941: a rebuild loses `issued_reseats`, so the group's revocation
+    // marker is written before this resume quarantines or rebuilds (a
+    // quarantine begun by an older binary has none).
+    let stem = file
+        .strip_suffix(&format!(".{}", s3::GROUP_RECOVERY_EXTENSION))
+        .unwrap_or(file);
     let mut verified: Vec<([u8; 16], PathBuf)> = Vec::new();
     let mut unverified: Vec<PathBuf> = Vec::new();
     for (txid, h, copy) in copies {
@@ -131,6 +137,9 @@ async fn resume_file(
                     cause,
                     "ADR 0109 S3: damaged sidecar during resume; quarantining (D120)"
                 );
+                if !super::mark_revoke_pending(dir, stem).await {
+                    return Err("revoke_marker");
+                }
                 let quarantined =
                     super::super::revocation_eviction::quarantine_file(&path, &bytes).await?;
                 verified.push(quarantined);
@@ -142,6 +151,9 @@ async fn resume_file(
     if missing {
         if verified.is_empty() {
             return Err("verify");
+        }
+        if !super::mark_revoke_pending(dir, stem).await {
+            return Err("revoke_marker");
         }
         let temp_prefix = format!("{file}.tmp-");
         for name in names.iter().filter(|name| name.starts_with(&temp_prefix)) {
@@ -211,7 +223,7 @@ mod tests {
     }
 
     async fn loaded_rebuild(dir: &Path) -> Vec<[u8; 16]> {
-        let (loaded, faults, _) = super::super::scan_sidecar_dir(dir, true).await;
+        let (loaded, faults) = super::super::scan_sidecar_dir(dir, true).await;
         assert!(faults.is_empty(), "{faults:?}");
         loaded
             .get("abc")
@@ -296,7 +308,7 @@ mod tests {
             .path()
             .join(format!("{F}.q-{}-{}", "07".repeat(16), "a".repeat(32)));
         tokio::fs::write(&history, b"old").await.expect("write");
-        let (loaded, faults, _) = super::super::scan_sidecar_dir(dir.path(), true).await;
+        let (loaded, faults) = super::super::scan_sidecar_dir(dir.path(), true).await;
         assert!(faults.is_empty());
         assert_eq!(loaded.get("abc").map(|b| b.generation), Some(4));
         assert_eq!(names(dir.path()).await.len(), 2);
@@ -314,7 +326,7 @@ mod tests {
             .path()
             .join(s4::quarantine_pending_name(F, &txid, b"original"));
         tokio::fs::write(&bad, b"bit rot").await.expect("write");
-        let (loaded, faults, _) = super::super::scan_sidecar_dir(dir.path(), true).await;
+        let (loaded, faults) = super::super::scan_sidecar_dir(dir.path(), true).await;
         assert!(loaded.is_empty());
         assert!(matches!(
             faults.get("abc"),
@@ -359,7 +371,7 @@ mod tests {
             .join(s4::quarantine_pending_name(F, &[3u8; 16], b"original"));
         tokio::fs::write(&bad, b"bit rot").await.expect("write");
 
-        let (_, faults, _) = super::super::scan_sidecar_dir(dir.path(), true).await;
+        let (_, faults) = super::super::scan_sidecar_dir(dir.path(), true).await;
         assert!(matches!(
             faults.get("abc"),
             Some(super::super::SidecarFault::QuarantineFailed { step, .. }) if step == "verify"
@@ -405,7 +417,7 @@ mod tests {
             .path()
             .join(s4::quarantine_pending_name(F, &[9u8; 16], b"original"));
         tokio::fs::write(&bad, b"bit rot").await.expect("write");
-        let (loaded, faults, _) = super::super::scan_sidecar_dir(dir.path(), true).await;
+        let (loaded, faults) = super::super::scan_sidecar_dir(dir.path(), true).await;
         assert!(faults.is_empty(), "{faults:?}");
         assert_eq!(loaded.get("abc").map(|b| b.generation), Some(6));
         assert_eq!(

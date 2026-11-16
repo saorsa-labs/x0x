@@ -7,10 +7,12 @@ All notable changes to this project will be documented in this file.
 ### Added
 
 - **A rebuilt issuer refuses a lost re-seat (#1941, A08 amendment of 16 Nov
-  2026).** When a damaged S3 sidecar is rebuilt, the load revokes the group's
+  2026).** When a damaged S3 sidecar is rebuilt, the node revokes the group's
   unconsumed invites that name a joiner who is not Active, so a re-seat
   authorisation sent before the damage can no longer seat its subject through
-  the old invite. The subject shows `reseat_required {reseat_failed}`; the
+  the old invite. A durable marker carries the revocation across a crash, and
+  until it is done (or while the sidecar is not loaded) such a join is
+  refused. The subject shows `reseat_required {reseat_failed}`; the
   admin calls the re-seat route again.
 
 - **Upgrade records: `clearable` matches the local clear (#1932 review; A14
