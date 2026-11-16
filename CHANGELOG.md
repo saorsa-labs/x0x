@@ -244,9 +244,10 @@ All notable changes to this project will be documented in this file.
 
 - **A restart starts a group's metadata listener only when its stored
   state needs one (#1366 first slice; A08 amendment of 16 Nov 2026).** A
-  withdrawn group, or one where this agent's own seat is Removed or
-  Banned, gets none; an Active member, a Pending access applicant and a
-  stub with no local seat keep it. Before, every stored record got one.
+  withdrawn group, or one where this agent's own seat is Banned, gets
+  none; an Active member, a Pending access applicant, a stub with no local
+  seat and a Removed seat (re-seat or re-add) keep it. Before, every
+  stored record got one.
 - **The TreeKEM reconnect catch-up pass is bounded (#1427, A09 third
   amendment of 15 Nov 2026).** A reconnect during a pass runs one more
   pass after it. A pass asks for at most 4 groups at a time, each after a

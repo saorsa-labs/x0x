@@ -54,7 +54,7 @@ const CLASSES: [(&str, LocalSeat, bool, bool); 6] = [
     ("1366-meta-active", LocalSeat::Active, false, true),
     ("1366-meta-pending", LocalSeat::Pending, false, true),
     ("1366-meta-stub", LocalSeat::None, false, true),
-    ("1366-meta-removed", LocalSeat::Removed, false, false),
+    ("1366-meta-removed", LocalSeat::Removed, false, true),
     ("1366-meta-banned", LocalSeat::Banned, false, false),
     ("1366-meta-withdrawn", LocalSeat::Active, true, false),
 ];
@@ -77,7 +77,7 @@ async fn issue1366_metadata_listener_wanted_by_class() -> Result<()> {
 
 /// A restart installs exactly the metadata listeners the stored state
 /// needs. Before #1366 it installed one for every stored record, also for
-/// a group this agent was removed from or banned in.
+/// a group this agent was banned in.
 #[tokio::test]
 async fn issue1366_restart_keeps_only_the_metadata_listeners_the_state_needs() -> Result<()> {
     let (state, _dir) = networked_test_state("1366-metadata-restart").await?;

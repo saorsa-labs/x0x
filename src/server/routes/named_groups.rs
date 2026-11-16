@@ -22096,12 +22096,14 @@ pub(in crate::server) async fn apply_listener_metadata_event(
 
 /// #1366: whether a stored group record needs its metadata listener, by the
 /// local agent's own seat. A withdrawn group needs none. A record whose
-/// local seat is Removed or Banned needs none either: the running listener
-/// already ends on that exit, and a later join, re-add or request installs
-/// one again through its own path. Every other record keeps it: an Active
-/// member, a Pending request-access applicant (it waits for the approval
-/// event), and a record with no local seat (a card-import or join stub,
-/// which waits for its `MemberAdded`).
+/// local seat is Banned needs none either: a ban ends the seat for good
+/// until an admin lifts it, and a later join installs a listener again
+/// through its own path. Every other record keeps it: an Active member, a
+/// Pending request-access applicant (it waits for the approval event), a
+/// record with no local seat (a card-import or join stub, which waits for
+/// its `MemberAdded`), and a Removed seat, which an ADR 0109 re-seat or an
+/// ordinary re-add can still follow on this topic (W3-H H-S3-q (3) needs
+/// it).
 pub(in crate::server) fn metadata_listener_wanted(
     info: &x0x::groups::GroupInfo,
     local_agent_hex: &str,
@@ -22110,12 +22112,10 @@ pub(in crate::server) fn metadata_listener_wanted(
     if info.withdrawn {
         return false;
     }
-    !info.members_v2.get(local_agent_hex).is_some_and(|member| {
-        matches!(
-            member.state,
-            GroupMemberState::Removed | GroupMemberState::Banned
-        )
-    })
+    !info
+        .members_v2
+        .get(local_agent_hex)
+        .is_some_and(|member| member.state == GroupMemberState::Banned)
 }
 
 /// #1366: the listeners a restart installs for the stored groups. The
@@ -22123,7 +22123,7 @@ pub(in crate::server) fn metadata_listener_wanted(
 /// public-message listener follows the group's confidentiality, as in
 /// [`ensure_named_group_listeners`]. Before this, a restart started a
 /// metadata listener for every stored record, also for a group this agent
-/// had been removed from or banned in.
+/// had been banned in.
 pub(in crate::server) async fn restore_named_group_listeners(state: Arc<AppState>) {
     let local = hex::encode(state.agent.agent_id().as_bytes());
     let groups: Vec<(String, bool)> = {
