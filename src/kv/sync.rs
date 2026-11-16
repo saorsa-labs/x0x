@@ -81,7 +81,12 @@ struct StateSyncCounters {
 }
 
 /// Cumulative state-sync activity for one currently open local store.
+///
+/// `#[non_exhaustive]`: this diagnostics surface gains fields as counters
+/// are added (for example the #1970 `StoreFull` refusals); consumers read
+/// the fields they know and tolerate new ones in the JSON.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct StateSyncSnapshot {
     pub requests_sent: u64,
     pub request_seal_failed: u64,
@@ -393,7 +398,13 @@ const DIGEST_BEACON_INTERVAL: std::time::Duration = std::time::Duration::from_se
 const MAX_RETAINED_GROUP_IMAGE_BYTES: usize = crate::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES;
 
 fn serialize_retained_group_image(store: &KvStore) -> Result<Vec<u8>> {
-    let bytes = bincode::serialize(store)
+    // #1970: serve the canonical image — the complete image with the
+    // OR-Set's replica-local delta bookkeeping cleared — which is exactly
+    // what `KvStore::canonical_retained_image_len` measures on the merge
+    // side. Re-delivery history must neither push a servable store over
+    // the limit nor change what two holders of the same content serve.
+    let canonical = store.canonical_retained_wire_copy()?;
+    let bytes = bincode::serialize(&canonical)
         .map_err(|e| KvError::Gossip(format!("retained group image serialization failed: {e}")))?;
     if bytes.len() > MAX_RETAINED_GROUP_IMAGE_BYTES {
         // #1970: typed, matching the put-time and merge-time bounds, so a
@@ -8868,10 +8879,11 @@ mod tests {
     /// #1970: the over-cap refusals must surface, not just log and drop —
     /// after a serve refusal and a refused merge, the store's state-sync
     /// snapshot (what GET /diagnostics/state-sync serves) carries both
-    /// `StoreFull` counters. The merge counter is exercised directly here
-    /// through the counted receive helper; the encrypted and TreeKEM
-    /// receive arms share its increment, and the store-layer tests own the
-    /// merge-bound semantics itself.
+    /// `StoreFull` counters. Each receive arm increments the merge
+    /// counter at its own refusal site: the group-signed arm is exercised
+    /// directly here through its counted receive helper, the encrypted
+    /// and TreeKEM arms by their own tests below, and the store-layer
+    /// tests own the merge-bound semantics itself.
     #[tokio::test]
     async fn store_full_refusals_surface_in_state_sync_snapshot() {
         let keypair = crate::identity::AgentKeypair::generate().expect("owner keypair");
@@ -8995,6 +9007,356 @@ mod tests {
         assert_eq!(
             snap.refused_store_full_serves, 0,
             "a merge refusal is not a serve refusal"
+        );
+    }
+
+    /// #1970 review round 2 (nit): the encrypted receive arm counts its
+    /// own `StoreFull` refusals — a sealed over-cap delta refused on an
+    /// encrypted store increments that store's merge counter, exercising
+    /// the arm's separate refusal site (not the group-signed arm's).
+    #[tokio::test]
+    async fn an_encrypted_record_refused_store_full_increments_the_merge_counter() {
+        let keypair = AgentKeypair::generate().expect("admin keypair");
+        let admin = keypair.agent_id();
+        let (mut group, mut contexts, group_id) = encrypted_group(&[admin]);
+        group.policy.write_access = crate::groups::GroupWriteAccess::AdminOnly;
+        let context = contexts.pop().expect("context");
+        context.update_from_group(&group);
+        let secure = context.clone() as SharedKvSecureContext;
+        let id = store_id(31);
+
+        // Target: an encrypted store filled to within one entry of the
+        // retained-image limit, so one more 60 KB entry crosses it.
+        let mut target = KvStore::new_encrypted(id, "Enc".to_string(), admin, group_id, context)
+            .expect("target store");
+        let max = crate::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES as u64;
+        let value = vec![b'v'; 60_000];
+        for i in 0..260u32 {
+            target
+                .put(
+                    format!("k{i:05}"),
+                    value.clone(),
+                    "text/plain".to_string(),
+                    peer(1),
+                )
+                .expect("put");
+        }
+        let size_260 = bincode::serialized_size(&target).expect("size");
+        target
+            .put(
+                "k00260".to_string(),
+                value,
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+        let per_entry = bincode::serialized_size(&target).expect("size") - size_260;
+        let fits = (max - size_260) / per_entry;
+        for i in 261..(261 + fits) as u32 {
+            target
+                .put(
+                    format!("k{i:05}"),
+                    vec![b'v'; 60_000],
+                    "text/plain".to_string(),
+                    peer(1),
+                )
+                .expect("put");
+        }
+        let target = Arc::new(RwLock::new(target));
+
+        let over = KvStoreDelta::for_put(
+            "over".to_string(),
+            KvEntry::new(
+                "over".to_string(),
+                vec![b'v'; 60_000],
+                "text/plain".to_string(),
+            ),
+            (peer(1), 1),
+            1,
+        );
+        let signing = Arc::new(AuthorSigning::from_keypair(&keypair).expect("admin signer"));
+        let record = secure
+            .seal_authorized(
+                &signing,
+                KvMutationKind::Delta,
+                &id,
+                &bincode::serialize(&over).expect("over-cap delta"),
+            )
+            .expect("sealed over-cap delta");
+        let wire = encode_delta(peer(1), &record).expect("wire record");
+        let pages = Arc::new(std::sync::Mutex::new(RetainedPagePool::default()));
+        let counters = StateSyncCounters::default();
+        assert!(
+            !KvStoreSync::merge_encrypted_record_counted(
+                &secure,
+                None,
+                &target,
+                &id,
+                peer(2),
+                &wire,
+                &pages,
+                Some(&counters),
+            )
+            .await,
+            "the over-cap encrypted record is refused"
+        );
+        assert!(
+            target.read().await.get("over").is_none(),
+            "the refused record applied nothing"
+        );
+        let snap = counters.snapshot();
+        assert_eq!(
+            snap.refused_store_full_merges, 1,
+            "the encrypted arm counts its refusal"
+        );
+        assert_eq!(
+            snap.refused_store_full_serves, 0,
+            "a merge refusal is not a serve refusal"
+        );
+        assert_eq!(
+            snap.incoming_record_merges, 0,
+            "a refused record is not an applied merge"
+        );
+    }
+
+    /// #1970 review round 2 (nit): the TreeKEM receive arm counts its own
+    /// `StoreFull` refusals — an over-cap delta opened from a sealed
+    /// TreeKEM record increments the store's merge counter through the
+    /// arm's separate refusal site.
+    #[tokio::test]
+    async fn a_treekem_record_refused_store_full_increments_the_merge_counter() {
+        let owner_kp = AgentKeypair::generate().expect("owner kp");
+        let writer_kp = AgentKeypair::generate().expect("writer kp");
+        let reader_kp = AgentKeypair::generate().expect("reader kp");
+        let owner = owner_kp.agent_id();
+        let writer = writer_kp.agent_id();
+        let reader = reader_kp.agent_id();
+        let (group_info, mut contexts, group_id) = encrypted_group(&[owner, writer, reader]);
+        let reader_ctx = contexts.pop().expect("reader context");
+        let writer_ctx = contexts.pop().expect("writer context");
+        let _owner_ctx = contexts.pop().expect("owner context");
+        drop(group_info);
+
+        let mut owner_group =
+            crate::mls::TreeKemMlsGroup::create(group_id.clone(), owner, &[1; 32])
+                .expect("owner group");
+        let writer_prepared =
+            crate::mls::TreeKemMlsGroup::prepare_member(writer, &[2; 32]).expect("writer kp");
+        let writer_add = owner_group
+            .add_member(writer, writer_prepared.key_package_bytes())
+            .expect("add writer");
+        let mut writer_group =
+            crate::mls::TreeKemMlsGroup::join_from_welcome(writer_prepared, &writer_add.welcome)
+                .expect("writer join");
+        let reader_prepared =
+            crate::mls::TreeKemMlsGroup::prepare_member(reader, &[3; 32]).expect("reader kp");
+        let reader_add = owner_group
+            .add_member(reader, reader_prepared.key_package_bytes())
+            .expect("add reader");
+        writer_group
+            .process_commit(&reader_add.commit)
+            .expect("writer advances");
+        let reader_group =
+            crate::mls::TreeKemMlsGroup::join_from_welcome(reader_prepared, &reader_add.welcome)
+                .expect("reader join");
+        drop(owner_group);
+
+        let readers = std::collections::HashSet::from([owner, writer, reader]);
+        let writers = std::collections::HashSet::from([owner, writer]);
+        let authorization = *blake3::hash(b"current roster and AdminOnly policy").as_bytes();
+        let writer_protector = Arc::new(TestTreeKemProtector {
+            group_id: group_id.clone(),
+            group: tokio::sync::Mutex::new(writer_group),
+            readers: readers.clone(),
+            writers: std::sync::Mutex::new(writers.clone()),
+            authorization,
+        });
+        let reader_protector = Arc::new(TestTreeKemProtector {
+            group_id: group_id.clone(),
+            group: tokio::sync::Mutex::new(reader_group),
+            readers,
+            writers: std::sync::Mutex::new(writers),
+            authorization,
+        });
+        let reader_trait: SharedTreeKemKvProtector = reader_protector.clone();
+
+        // Target: a TreeKEM-encrypted store filled to within one entry of
+        // the retained-image limit, held under the reader's context.
+        let id = store_id(32);
+        let mut target =
+            KvStore::new_treekem_encrypted(id, "Home".to_string(), owner, group_id, writer_ctx)
+                .expect("target store");
+        let max = crate::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES as u64;
+        for i in 0..260u32 {
+            target
+                .put(
+                    format!("k{i:05}"),
+                    vec![b'v'; 60_000],
+                    "text/plain".to_string(),
+                    peer(1),
+                )
+                .expect("put");
+        }
+        let size_260 = bincode::serialized_size(&target).expect("size");
+        target
+            .put(
+                "k00260".to_string(),
+                vec![b'v'; 60_000],
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+        let per_entry = bincode::serialized_size(&target).expect("size") - size_260;
+        let fits = (max - size_260) / per_entry;
+        for i in 261..(261 + fits) as u32 {
+            target
+                .put(
+                    format!("k{i:05}"),
+                    vec![b'v'; 60_000],
+                    "text/plain".to_string(),
+                    peer(1),
+                )
+                .expect("put");
+        }
+        target
+            .set_secure_context(reader_ctx)
+            .expect("reader context");
+        let target = Arc::new(RwLock::new(target));
+
+        let over = KvStoreDelta::for_put(
+            "over".to_string(),
+            KvEntry::new(
+                "over".to_string(),
+                vec![b'v'; 60_000],
+                "text/plain".to_string(),
+            ),
+            (peer(2), 1),
+            1,
+        );
+        let record = writer_protector
+            .seal_record(
+                &AuthorSigning::from_keypair(&writer_kp).expect("writer signing"),
+                KvMutationKind::Delta,
+                &id,
+                &bincode::serialize(&over).expect("over-cap delta"),
+                false,
+            )
+            .await
+            .expect("sealed over-cap TreeKEM record");
+        let wire = encode_delta(peer(2), &record).expect("wire record");
+        let pages = Arc::new(std::sync::Mutex::new(RetainedPagePool::default()));
+        let counters = StateSyncCounters::default();
+        assert!(
+            !KvStoreSync::merge_treekem_record_counted(
+                &reader_trait,
+                &target,
+                &id,
+                peer(3),
+                &wire,
+                &pages,
+                Some(&counters),
+            )
+            .await,
+            "the over-cap TreeKEM record is refused"
+        );
+        assert!(
+            target.read().await.get("over").is_none(),
+            "the refused record applied nothing"
+        );
+        let snap = counters.snapshot();
+        assert_eq!(
+            snap.refused_store_full_merges, 1,
+            "the TreeKEM arm counts its refusal"
+        );
+        assert_eq!(
+            snap.refused_store_full_serves, 0,
+            "a merge refusal is not a serve refusal"
+        );
+        assert_eq!(
+            snap.incoming_record_merges, 0,
+            "a refused record is not an applied merge"
+        );
+    }
+
+    /// #1970 review round 2: a store whose raw serialized bytes pass the
+    /// limit through OR-Set changelog bookkeeping — gossip replays —
+    /// still serves. The served image is the canonical one, so
+    /// re-delivery history cannot make a holder unservable, and the
+    /// served bytes are exactly what the merge bound measures.
+    #[test]
+    fn replays_do_not_make_a_store_unservable() {
+        let keypair = crate::identity::AgentKeypair::generate().expect("owner keypair");
+        let owner = keypair.agent_id();
+        let mut group = crate::groups::GroupInfo::new(
+            "public".to_string(),
+            String::new(),
+            owner,
+            "fa".repeat(16),
+        );
+        group.migrate_from_v1();
+        group.policy.confidentiality = crate::groups::GroupConfidentiality::SignedPublic;
+        group.policy.read_access = crate::groups::GroupReadAccess::Public;
+        let ctx = Arc::new(
+            crate::groups::PublicGroupKvContext::from_group(&group).expect("public context"),
+        );
+        let group_id = group.stable_group_id().as_bytes().to_vec();
+        let (mut s, _) =
+            group_store_within_one_entry_of_the_limit(owner, group_id, ctx, store_id(9));
+        let max = crate::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES as u64;
+
+        // Land the raw bytes within ~80 bytes of the limit — closer than
+        // whole entries reach: probe one put on a clone for its fixed
+        // cost, then size the real put's value to close the gap.
+        let key = "zzz-land".to_string();
+        let mut probe = s.clone();
+        let before = bincode::serialized_size(&probe).expect("size before probe");
+        probe
+            .put(
+                key.clone(),
+                vec![b'p'; 1],
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("probe put");
+        let overhead = bincode::serialized_size(&probe).expect("size after probe") - before;
+        let current = bincode::serialized_size(&s).expect("size");
+        let value_len = (max - 80 - current - overhead + 1) as usize;
+        s.put(
+            key,
+            vec![b'l'; value_len],
+            "text/plain".to_string(),
+            peer(1),
+        )
+        .expect("landing put");
+        assert!(bincode::serialized_size(&s).expect("size") <= max);
+
+        // A put-shaped delta for keys the store already holds; its
+        // re-deliveries append changelog bookkeeping until the RAW bytes
+        // pass the limit, while the canonical image does not move.
+        let mut delta = KvStoreDelta::new(s.current_version());
+        for i in 0..3u32 {
+            let dk = format!("k{i:05}");
+            let entry = s.get(&dk).expect("entry").clone();
+            delta.added.insert(dk, (entry, (peer(1), 9_000_000_000)));
+        }
+        for _ in 0..6 {
+            s.merge_delta(&delta, peer(1), Some(&owner))
+                .expect("delivery and replays merge");
+        }
+        assert!(
+            bincode::serialized_size(&s).expect("raw size") > max,
+            "the replays pushed the raw bytes past the limit — bookkeeping only"
+        );
+        let image = serialize_retained_group_image(&s).expect("the store still serves its image");
+        assert!(
+            image.len() as u64 <= max,
+            "the canonical image is servable: {}",
+            image.len()
+        );
+        assert_eq!(
+            image.len() as u64,
+            s.canonical_retained_image_len().expect("canonical len"),
+            "serve and merge measure the same canonical bytes"
         );
     }
 

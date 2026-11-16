@@ -493,12 +493,18 @@ All notable changes to this project will be documented in this file.
 
 - **A merge can no longer push a group store past the 16 MiB retained-image
   limit (#1970; A10 amendment of 16 Nov 2026).** An incoming group delta or
-  retained-image merge that would grow the store's image past the limit is
-  refused typed `StoreFull` before anything applies; the measure is an exact
-  trial merge. A merge that does not grow the image (removals, revocations,
-  same-size overwrites, re-deliveries) still applies, so an over-limit store
-  can shrink back and recover. Serving from an over-limit holder fails typed
-  `StoreFull` instead of a stringly gossip error. Refusals are counted in
+  retained-image merge that would grow the store's canonical retained image
+  past the limit is refused typed `StoreFull` before anything applies (the
+  shared sequence allocator included). The measure is an exact trial merge of
+  the canonical image — the complete image with the OR-Set's replica-local
+  delta bookkeeping cleared, exactly the bytes a served retained image
+  carries — so re-deliveries and same-tag re-adds are not growth and writer
+  and receivers agree at the limit. A merge that does not grow the canonical
+  image (removals, revocations, same-size overwrites, re-deliveries) still
+  applies, so an over-limit store can shrink back and recover. Serving
+  serializes the same canonical image, so re-delivery history cannot make a
+  holder unservable; an over-limit holder fails typed `StoreFull` instead of
+  a stringly gossip error. Refusals are counted in
   `GET /diagnostics/state-sync`.
 - **Granted-store CLI paths and serves (#1953 review).** `x0x grant data`
   (and `grant revoke|renew`) percent-encode each path segment, so a key with
