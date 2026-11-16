@@ -259,6 +259,19 @@ All notable changes to this project will be documented in this file.
 
 ### Tests and tooling
 
+- **Launcher supervise driver (#1378 slice 2; A14 amendment of 16 Nov
+  2026).** The dormant launcher's supervise driver
+  (`src/upgrade/launcher/supervise.rs`) runs a trial, then polls the host
+  commit (its first production caller) until the full set commits, a stop
+  arrives, or a rollback is due. On a rollback it reaps its own candidate,
+  saves the cause as the trial verdict and runs the coordinator pass, then
+  starts the restored child. Before the reap it checks, under the host
+  lock, that no peer committed the host, and saves its verdict there; the
+  host commit reads every trial under that lock and refuses one with a
+  verdict or past its deadline. Trial loads no longer rewrite the record,
+  and a stale stop never replaces a rollback. It stays dormant until the
+  inventory issuer lands and `ENABLED` becomes true.
+
 - **Upgrade health commit review carry-over (#1378 slice 1; A14
   amendment of 16 Nov 2026).** The candidate writes canonical data and
   identity roots, and the launcher matches a planned root reached through a
