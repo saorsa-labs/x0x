@@ -2055,7 +2055,7 @@ pub(crate) mod apply_attempt_seam {
     }
 }
 
-/// D194 (#1377): the refusal when staging `expected` archive bytes would
+/// D194 (#1377): the refusal when staging `expected` more bytes would
 /// leave less than the 1 GiB reserve free, or `None` to proceed.
 #[cfg(unix)]
 fn staging_space_refusal(available: u64, expected: u64) -> Option<String> {
@@ -2064,10 +2064,52 @@ fn staging_space_refusal(available: u64, expected: u64) -> Option<String> {
     };
     (available < needed).then(|| {
         format!(
-            "insufficient_disk: staging needs {needed} bytes free (the archive plus a 1 GiB \
+            "insufficient_disk: staging needs {needed} bytes free (the file plus a 1 GiB \
              reserve), {available} available"
         )
     })
+}
+
+/// Free bytes in `directory`. Tests set `STAGING_FREE_BYTES` to drive the
+/// D194 wiring without a full disk.
+#[cfg(unix)]
+fn staging_free_bytes(directory: &Path) -> std::io::Result<u64> {
+    #[cfg(test)]
+    if let Some(free) = STAGING_FREE_BYTES.with(std::cell::Cell::get) {
+        return Ok(free);
+    }
+    super::pair::available_bytes(directory)
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static STAGING_FREE_BYTES: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// D194: refuse to write `expected` bytes at `path` unless the reserve
+/// stays free in its directory. Every staged file is charged: the archive,
+/// its signature and each extracted binary (#1947 review).
+#[cfg(unix)]
+fn check_staging_space(path: &Path, expected: u64) -> Result<(), String> {
+    let directory = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let available =
+        staging_free_bytes(directory).map_err(|e| format!("free space unavailable: {e}"))?;
+    match staging_space_refusal(available, expected) {
+        Some(reason) => {
+            warn!("{reason}");
+            Err(reason)
+        }
+        None => Ok(()),
+    }
+}
+
+/// The pair engine and its reserve are Unix-only.
+#[cfg(not(unix))]
+fn check_staging_space(_path: &Path, _expected: u64) -> Result<(), String> {
+    Ok(())
 }
 
 /// Download a URL to a local file, enforcing a maximum size limit.
@@ -2110,19 +2152,10 @@ async fn download_to_file(url: &str, destination: &Path) -> Result<(), UpgradeEr
         }
     }
 
-    // D194 (#1377): staging must leave 1 GiB free after the archive. An
+    // D194 (#1377): staging must leave 1 GiB free after the download. An
     // unknown length is charged at the archive limit.
-    #[cfg(unix)]
-    {
-        let expected = response.content_length().unwrap_or(MAX_BINARY_SIZE_BYTES);
-        let directory = destination.parent().unwrap_or_else(|| Path::new("."));
-        let available = super::pair::available_bytes(directory)
-            .map_err(|e| UpgradeError::DownloadError(format!("free space unavailable: {e}")))?;
-        if let Some(reason) = staging_space_refusal(available, expected) {
-            warn!("{reason}");
-            return Err(UpgradeError::DownloadError(reason));
-        }
-    }
+    let expected = response.content_length().unwrap_or(MAX_BINARY_SIZE_BYTES);
+    check_staging_space(destination, expected).map_err(UpgradeError::DownloadError)?;
 
     // Stream to disk with running byte counter
     let mut file = std::fs::File::create(destination)
@@ -2298,6 +2331,8 @@ fn extract_from_tar_gz(
         }
 
         debug!(archive_path = %path_str, "Found binary in tar.gz archive: {}", path_str);
+        check_staging_space(output_path, entry.header().size().unwrap_or(u64::MAX))
+            .map_err(UpgradeError::ExtractionError)?;
         let mut output = std::fs::File::create(output_path)
             .map_err(|e| UpgradeError::ExtractionError(format!("failed to create output: {e}")))?;
         std::io::copy(&mut entry, &mut output)
@@ -2374,6 +2409,7 @@ fn extract_from_zip(
             )));
         }
 
+        check_staging_space(output_path, entry.size()).map_err(UpgradeError::ExtractionError)?;
         let mut output = std::fs::File::create(output_path)
             .map_err(|e| UpgradeError::ExtractionError(format!("failed to create output: {e}")))?;
         std::io::copy(&mut entry, &mut output)
@@ -3618,6 +3654,89 @@ mod tests {
 
         download_to_file(&url, &destination).await.unwrap();
         assert_eq!(std::fs::read_to_string(destination).unwrap(), body);
+    }
+
+    /// Sets the D194 free-space reading for this test thread, and clears
+    /// it on drop.
+    #[cfg(unix)]
+    struct FreeBytes;
+
+    #[cfg(unix)]
+    impl FreeBytes {
+        fn set(free: u64) -> Self {
+            STAGING_FREE_BYTES.with(|cell| cell.set(Some(free)));
+            FreeBytes
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FreeBytes {
+        fn drop(&mut self) {
+            STAGING_FREE_BYTES.with(|cell| cell.set(None));
+        }
+    }
+
+    /// D194 wiring (#1947 review): the download charges its Content-Length
+    /// against the reserve before it creates the file.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn download_to_file_keeps_the_d194_reserve() {
+        let reserve = crate::upgrade::pair::RESERVE_BYTES;
+        let dir = TempDir::new().unwrap();
+        let body = "download bytes";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let refused = dir.path().join("refused.bin");
+        let url = serve_once(response.clone()).await;
+        let error = {
+            let _free = FreeBytes::set(reserve + body.len() as u64 - 1);
+            download_to_file(&url, &refused).await.unwrap_err()
+        };
+        assert!(
+            matches!(&error, UpgradeError::DownloadError(m) if m.starts_with("insufficient_disk")),
+            "{error:?}"
+        );
+        assert!(!refused.exists(), "no file is created on a refusal");
+
+        let staged = dir.path().join("staged.bin");
+        let url = serve_once(response).await;
+        {
+            let _free = FreeBytes::set(reserve + body.len() as u64);
+            download_to_file(&url, &staged).await.unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(staged).unwrap(), body);
+    }
+
+    /// D194 wiring (#1947 review): each extracted binary is charged too, so
+    /// a disk the archive download left near the reserve refuses the
+    /// extraction and stages nothing.
+    #[cfg(unix)]
+    #[test]
+    fn extraction_keeps_the_d194_reserve() {
+        let reserve = crate::upgrade::pair::RESERVE_BYTES;
+        let dir = TempDir::new().unwrap();
+        let binary = fake_binary(b"daemon");
+        let elf = binary.as_slice();
+        let archive = create_tar_gz_with_entries(dir.path(), &[("x0xd", elf)]);
+        let output = dir.path().join("x0xd");
+        let error = {
+            let _free = FreeBytes::set(reserve + elf.len() as u64 - 1);
+            extract_binary_from_archive(&archive, &output, "x0xd").unwrap_err()
+        };
+        assert!(
+            matches!(&error, UpgradeError::ExtractionError(m) if m.starts_with("insufficient_disk")),
+            "{error:?}"
+        );
+        assert!(!output.exists());
+        {
+            let _free = FreeBytes::set(reserve + elf.len() as u64);
+            extract_binary_from_archive(&archive, &output, "x0xd").unwrap();
+        }
+        assert_eq!(std::fs::read(&output).unwrap(), elf);
     }
 
     #[tokio::test]

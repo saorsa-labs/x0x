@@ -55,6 +55,17 @@ pub(super) fn instance_health(
     }
 }
 
+/// The candidate writes canonical roots; the plan holds them as the
+/// operator gave them. A root reached through a symlink is the same
+/// directory (#1947 review).
+fn same_directory(recorded: &Path, planned: &Path) -> bool {
+    recorded == planned
+        || matches!(
+            (recorded.canonicalize(), planned.canonicalize()),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
 fn check_record(
     host: &recovery::Host,
     participant: &journal::Participant,
@@ -81,8 +92,8 @@ fn check_record(
     // it can never be this transaction's healthy candidate.
     if record.version != plan.candidate_version
         || record.executable_sha256 != plan.daemon.candidate_sha256
-        || record.data_root != participant.data_root
-        || record.identity_root != participant.identity_root
+        || !same_directory(&record.data_root, &participant.data_root)
+        || !same_directory(&record.identity_root, &participant.identity_root)
     {
         return Health::RollBack(cause(
             journal::CauseClass::Failed,
@@ -233,6 +244,22 @@ mod tests {
             check_record(&host, p, &trial, &wrong_roots),
             Health::RollBack(c) if c.class == journal::CauseClass::Failed
         ));
+        // The candidate writes canonical roots; the plan may name them
+        // through a symlink.
+        #[cfg(unix)]
+        {
+            let link = root.join("data-link");
+            std::os::unix::fs::symlink(&p.data_root, &link).unwrap();
+            let mut planned = p.clone();
+            planned.data_root = link;
+            let mut canonical = good.clone();
+            canonical.data_root = p.data_root.canonicalize().unwrap();
+            canonical.identity_root = p.identity_root.canonicalize().unwrap();
+            assert_eq!(
+                check_record(&host, &planned, &trial, &canonical),
+                Health::Committed
+            );
+        }
         let mut wrong_release = good.clone();
         wrong_release.version = "0.0.2".into();
         assert!(matches!(

@@ -77,8 +77,10 @@ fn detect_with(
     let executable_sha256 = executable_digest(executable)?;
     Some(Candidate {
         boot,
-        data_root: data_root.to_path_buf(),
-        // As the flush owner compares it with the plan: canonical.
+        // As the flush owner compares them with the plan: canonical. A
+        // relative or symlinked `--data-dir` then still names the planned
+        // root, and the record passes `validate_health` (#1947 review).
+        data_root: data_root.canonicalize().ok()?,
         identity_root: identity_root?.canonicalize().ok()?,
         executable_sha256,
         previously_connected,
@@ -191,7 +193,8 @@ impl Tracker {
     /// - local health held for `STABLE` and, for a previously connected
     ///   host, a send-ready peer held for `STABLE`: `peer_continuity` true;
     /// - local health held for `PEER_WAIT` on a previously connected host
-    ///   with no stable peer: `peer_continuity` false, which the launcher
+    ///   with no stable peer and none that arrived within `PEER_WAIT` and
+    ///   still holds: `peer_continuity` false, which the launcher
     ///   rolls back as Interrupted (D193).
     ///
     /// A host that never had a peer commits on local health alone.
@@ -224,14 +227,19 @@ impl Tracker {
         let peer_held = self
             .peer_since
             .is_some_and(|since| now.duration_since(since) >= STABLE);
-        let peer_continuity = if candidate.previously_connected {
-            if !peer_held && local_held < PEER_WAIT {
+        if candidate.previously_connected && !peer_held {
+            // A peer that arrived within `PEER_WAIT` keeps its full stable
+            // interval: one at 61-119 s is held to `PEER_WAIT + STABLE`,
+            // not cut at `PEER_WAIT` (#1947 review). The trial budget
+            // (`TRIAL_MS`) covers that bound.
+            let peer_in_window = self
+                .peer_since
+                .is_some_and(|since| since.duration_since(local_since) <= PEER_WAIT);
+            if local_held < PEER_WAIT || peer_in_window {
                 return None;
             }
-            peer_held
-        } else {
-            peer_held
-        };
+        }
+        let peer_continuity = peer_held;
         Some(record(candidate, observation, peer_continuity))
     }
 }
@@ -441,6 +449,45 @@ mod tests {
             .observe(&c, healthy(0), start + PEER_WAIT)
             .expect("the miss is recorded");
         assert!(miss.previously_connected && !miss.peer_continuity);
+    }
+
+    /// D193 (#1947 review): a peer that arrives late inside `PEER_WAIT`
+    /// gets its full stable interval; one that drops, or arrives after
+    /// `PEER_WAIT`, records the miss.
+    #[test]
+    fn d193_a_late_peer_inside_the_wait_gets_its_stable_interval() {
+        let c = candidate(true);
+        let start = Instant::now();
+        let late = start + PEER_WAIT - Duration::from_secs(1);
+
+        let mut tracker = Tracker::default();
+        tracker.observe(&c, healthy(0), start);
+        assert!(tracker.observe(&c, healthy(1), late).is_none());
+        assert!(tracker.observe(&c, healthy(1), start + PEER_WAIT).is_none());
+        assert!(tracker
+            .observe(&c, healthy(1), late + STABLE - Duration::from_secs(1))
+            .is_none());
+        let record = tracker
+            .observe(&c, healthy(1), late + STABLE)
+            .expect("the late peer held");
+        assert!(record.peer_continuity);
+
+        // The late peer drops after `PEER_WAIT`: the miss.
+        let mut tracker = Tracker::default();
+        tracker.observe(&c, healthy(0), start);
+        tracker.observe(&c, healthy(1), late);
+        let miss = tracker
+            .observe(&c, healthy(0), start + PEER_WAIT + Duration::from_secs(1))
+            .expect("the dropped peer is a miss");
+        assert!(!miss.peer_continuity);
+
+        // A peer first seen after `PEER_WAIT` comes too late.
+        let mut tracker = Tracker::default();
+        tracker.observe(&c, healthy(0), start);
+        let miss = tracker
+            .observe(&c, healthy(1), start + PEER_WAIT + Duration::from_secs(1))
+            .expect("a peer after the wait is a miss");
+        assert!(!miss.peer_continuity);
     }
 
     #[test]

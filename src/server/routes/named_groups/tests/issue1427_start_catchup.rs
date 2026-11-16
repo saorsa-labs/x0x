@@ -769,7 +769,13 @@ async fn issue1427_a_panicking_catchup_releases_its_group() {
 /// later pass's mark and the outage record stay, so the re-ask can end
 /// KeepPending and the later pass retries the group. A `Done` with no
 /// later mark still removes both.
-#[tokio::test]
+///
+/// The clock is paused and the steps are ordered by signals, not by real
+/// sleeps (#1949 review): the older catch-up ends only after pass 2 has
+/// checked its pending groups, that is, inside pass 2's retry wait. From
+/// there to the re-ask's end nothing waits on a timer or on file I/O, so
+/// the paused clock cannot move the retry ahead of the re-ask.
+#[tokio::test(start_paused = true)]
 async fn issue1427_a_later_pass_mark_survives_the_older_catchups_done() -> Result<()> {
     let (state, _dir, key) = treekem_member_state().await?;
     let record = treekem_catchup_pending_path(&state);
@@ -813,6 +819,10 @@ async fn issue1427_a_later_pass_mark_survives_the_older_catchups_done() -> Resul
     let pass_state = Arc::clone(&state);
     let pass_gate = Arc::clone(&gate);
     let pass_keys = keys.clone();
+    // Signalled when pass 2 checks its pending groups after its first
+    // round; its retry wait starts right after.
+    let retry_wait = Arc::new(tokio::sync::Notify::new());
+    let in_retry_wait = Arc::clone(&retry_wait);
     let pass2 = tokio::spawn(async move {
         drive_treekem_reconnect_pass(
             pass_keys,
@@ -820,13 +830,16 @@ async fn issue1427_a_later_pass_mark_survives_the_older_catchups_done() -> Resul
             || Duration::ZERO,
             run,
             &tokio_spawn,
-            |key| pending(&pass_state, key),
+            |key| {
+                in_retry_wait.notify_one();
+                pending(&pass_state, key)
+            },
             &[Duration::from_secs(1)],
             &pass_gate,
         )
         .await;
     });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    retry_wait.notified().await;
     // The older catch-up ends Done during pass 2's retry wait.
     first.notify_one();
     pass2.await?;
