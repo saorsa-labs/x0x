@@ -196,10 +196,18 @@ impl CapabilityRegistry {
     /// only when the data-read route is registered.
     pub const DATA_READ_V1: u64 = 1 << 20;
 
+    /// Issue #1094 slice D2 (A03 amendment of 16 Nov 2026): applies an `rw`
+    /// grantee's write to a store it holds a `ShareCap::Data` grant for
+    /// (`x0x-data-write-v1`); the reply uses `x0x-data-reply-v1`. Bit 21,
+    /// the next free bit. A grantee sends a write only to an agent whose
+    /// current verified advert has this bit. ROUTE-GATED: advertised only
+    /// when the data-write route is registered.
+    pub const DATA_WRITE_V1: u64 = 1 << 21;
+
     /// The routes supported by every receiver of this release.
     /// Route-gated bits (`grant_revocation_push_v1`,
-    /// `join_request_outcome_v1`, `join_request_head_v1`, `data_read_v1`) are NOT here: they are
-    /// added per daemon by [`Self::advertised`] from the typed routes the
+    /// `join_request_outcome_v1`, `join_request_head_v1`, `data_read_v1`,
+    /// `data_write_v1`) are NOT here: they are added per daemon by [`Self::advertised`] from the typed routes the
     /// DM inbox actually registered, so a library embedder that never wires
     /// the route never advertises the bit.
     pub const fn current() -> Self {
@@ -241,6 +249,8 @@ impl CapabilityRegistry {
                 registry.bits |= Self::JOIN_REQUEST_OUTCOME_V1 | Self::JOIN_REQUEST_HEAD_V1;
             } else if prefix == crate::share_grant::data_read::DATA_READ_REQUEST_DM_PREFIX {
                 registry.bits |= Self::DATA_READ_V1;
+            } else if prefix == crate::share_grant::data_read::DATA_WRITE_REQUEST_DM_PREFIX {
+                registry.bits |= Self::DATA_WRITE_V1;
             }
         }
         registry
@@ -288,6 +298,8 @@ impl CapabilityRegistry {
             || payload.starts_with(crate::share_grant::data_read::DATA_READ_REPLY_DM_PREFIX)
         {
             Some((Self::DATA_READ_V1, "data_read_v1"))
+        } else if payload.starts_with(crate::share_grant::data_read::DATA_WRITE_REQUEST_DM_PREFIX) {
+            Some((Self::DATA_WRITE_V1, "data_write_v1"))
         } else {
             None
         }

@@ -253,8 +253,8 @@ pub(in crate::server) struct CreateStoreRequest {
 /// Request body for PUT /stores/:id/:key.
 #[derive(Debug, Deserialize)]
 pub(in crate::server) struct PutValueRequest {
-    value: String,
-    content_type: Option<String>,
+    pub(in crate::server) value: String,
+    pub(in crate::server) content_type: Option<String>,
 }
 
 /// Request body for POST /stores/:id/join.
@@ -650,7 +650,7 @@ pub(in crate::server) async fn put_kv_value(
     State(state): State<Arc<AppState>>,
     Path((id, key)): Path<(String, String)>,
     Json(req): Json<PutValueRequest>,
-) -> impl IntoResponse {
+) -> (StatusCode, Json<serde_json::Value>) {
     if let Some(refusal) = group_store_write_refusal(&state, &id).await {
         return refusal;
     }
@@ -798,7 +798,7 @@ pub(in crate::server) async fn get_kv_value(
 pub(in crate::server) async fn delete_kv_value(
     State(state): State<Arc<AppState>>,
     Path((id, key)): Path<(String, String)>,
-) -> impl IntoResponse {
+) -> (StatusCode, Json<serde_json::Value>) {
     if let Some(refusal) = group_store_write_refusal(&state, &id).await {
         return refusal;
     }

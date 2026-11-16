@@ -566,8 +566,10 @@ jobs:
           if-no-files-found: warn
 
   # ADR 0109 §10 H-S3-rm released-binary rows (#1572): rm1 (capability
-  # floor) and rm3 (i) and (ii) (older receiver after the seal). The
-  # filter also selects later rows in the same module. Phase 1 of each
+  # floor) and rm3 (i) and (ii) (older receiver after the seal), and
+  # H-S3-m (v0.46.1 on J's data dir between the H-S3-s segments; about
+  # 100 s in the VM, with two 45 s real-time waits). The filter also
+  # selects later rows in the same module. Phase 1 of each
   # row runs on the paused W3-H sim; phase 2 runs candidate daemons on
   # real loopback sockets, with member M on the published v0.46.1
   # daemon. The rows are `#[ignore]` and run only here, one at a time.
@@ -1203,6 +1205,12 @@ jobs:
           --expect w3h_1581i_control_machine_revoked_device_keeps_its_seat=GREEN
           --require w3h_1581i_egress_machine_revoked_device_gets_no_new_key
           --expect w3h_1581i_egress_machine_revoked_device_gets_no_new_key=RED
+          --require w3h_1581j_expiry_skew_run1_all_offsets_zero
+          --expect w3h_1581j_expiry_skew_run1_all_offsets_zero=GREEN
+          --require w3h_1581j_expiry_skew_run5a_announced_renewal_rebinds_at_expiry
+          --expect w3h_1581j_expiry_skew_run5a_announced_renewal_rebinds_at_expiry=GREEN
+          --require w3h_1581j_expiry_skew_run8_signed_public
+          --expect w3h_1581j_expiry_skew_run8_signed_public=GREEN
           --require w3h_1765_red_newer_file_revocation_waits_for_store_write
           --expect w3h_1765_red_newer_file_revocation_waits_for_store_write=GREEN
           --require w3h_1776_delayed_fresh_joiner_fetches_the_welcome
