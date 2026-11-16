@@ -171,19 +171,29 @@ impl Host {
     /// candidate starts after this returns (A14, #1940 review). Returns the
     /// phase found under the lock. A host that a peer restored, committed or
     /// marked recovery-failed in the meantime is left unchanged.
-    pub(super) fn fence(&self, cause: &journal::Cause) -> io::Result<journal::Phase> {
+    ///
+    /// `snapshot` runs under the same lock unless the host is final. The
+    /// coordinator loads every trial there. A restored child starts only
+    /// under this lock with the host `Restored`, and a Restored host never
+    /// returns to RollingBack, so when this returns any other phase, every
+    /// child in that snapshot is a candidate.
+    pub(super) fn fence(
+        &self,
+        cause: &journal::Cause,
+        snapshot: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<journal::Phase> {
         self.locked(|record| {
             let found = record.phase;
-            if !matches!(
-                found,
-                journal::Phase::Restored
-                    | journal::Phase::HostCommitted
-                    | journal::Phase::RecoveryFailed
-            ) {
-                record_cause(record, cause.clone());
-                record.phase = journal::Phase::RollingBack;
-                self.save(record)?;
+            match found {
+                journal::Phase::HostCommitted | journal::Phase::RecoveryFailed => return Ok(found),
+                journal::Phase::Restored => {}
+                _ => {
+                    record_cause(record, cause.clone());
+                    record.phase = journal::Phase::RollingBack;
+                    self.save(record)?;
+                }
             }
+            snapshot()?;
             Ok(found)
         })
     }
@@ -195,81 +205,96 @@ impl Host {
         trials: &[(PathBuf, Trial)],
         cause: journal::Cause,
     ) -> io::Result<()> {
-        self.locked(|record| {
-            if matches!(
-                record.phase,
-                journal::Phase::RecoveryFailed | journal::Phase::HostCommitted
-            ) {
-                return Err(invalid("automatic recovery is forbidden in this phase"));
-            }
-            for p in &self.plan().participants {
-                if p.was_running {
-                    let old = Identity {
-                        pid: p.old_pid.ok_or_else(|| invalid("old pid missing"))?,
-                        start: p
-                            .process_start
-                            .ok_or_else(|| invalid("old start missing"))?,
-                        boot: p.boot_id.clone(),
-                    };
-                    if !child::absent(&old)? {
-                        return Err(invalid("OLD participant still exists"));
-                    }
-                    let (_, trial) = trials
-                        .iter()
-                        .find(|(_, t)| t.instance == p.instance_id)
-                        .ok_or_else(|| invalid("participant trial missing"))?;
-                    if trial.binding != self.binding()? {
-                        return Err(invalid("trial binding mismatch"));
-                    }
-                    if let Some(identity) = &trial.child {
-                        if !child::absent(identity)? {
-                            return Err(invalid("candidate still exists"));
-                        }
-                    }
+        self.locked(|record| self.restore_locked(record, trials, cause))
+    }
+
+    /// `restore` with the host lock held and `record` read under it. The
+    /// coordinator calls it inside its own `locked` section, so the phase
+    /// read, the trial marks and the restore are one step.
+    pub(super) fn restore_locked(
+        &self,
+        record: &mut journal::JournalRecord,
+        trials: &[(PathBuf, Trial)],
+        cause: journal::Cause,
+    ) -> io::Result<()> {
+        if matches!(
+            record.phase,
+            journal::Phase::RecoveryFailed | journal::Phase::HostCommitted
+        ) {
+            return Err(invalid("automatic recovery is forbidden in this phase"));
+        }
+        for p in &self.plan().participants {
+            if p.was_running {
+                let old = Identity {
+                    pid: p.old_pid.ok_or_else(|| invalid("old pid missing"))?,
+                    start: p
+                        .process_start
+                        .ok_or_else(|| invalid("old start missing"))?,
+                    boot: p.boot_id.clone(),
+                };
+                if !child::absent(&old)? {
+                    return Err(invalid("OLD participant still exists"));
                 }
-            }
-            let result = (|| {
-                record_cause(record, cause);
-                record.phase = journal::Phase::RollingBack;
-                self.save(record)?;
-                // The cause remains in the journal through Restored. An
-                // unresolved M2 record already blocks all apply ingress.
-                for (index, a) in [self.plan().daemon.clone(), self.plan().cli.clone()]
+                let (_, trial) = trials
                     .iter()
-                    .enumerate()
-                {
-                    let observed = hash(&a.target_path)?;
-                    if observed != a.previous_sha256 && observed != a.candidate_sha256 {
-                        return Err(invalid("restore target contains unrelated bytes"));
-                    }
-                    if hash(&a.backup_path)? != a.previous_sha256 {
-                        return Err(invalid("rollback copy changed"));
-                    }
-                    if observed != a.previous_sha256 {
-                        restore_one(a)?;
-                    }
-                    if hash(&a.target_path)? != a.previous_sha256 {
-                        return Err(invalid("restore hash mismatch"));
-                    }
-                    let progress = if index == 0 {
-                        &mut record.daemon_progress
-                    } else {
-                        &mut record.cli_progress
-                    };
-                    progress.restored = true;
-                    progress.observed_sha256 = Some(a.previous_sha256);
-                    self.save(record)?;
+                    .find(|(_, t)| t.instance == p.instance_id)
+                    .ok_or_else(|| invalid("participant trial missing"))?;
+                if trial.binding != self.binding()? {
+                    return Err(invalid("trial binding mismatch"));
                 }
-                record.phase = journal::Phase::Restored;
-                self.save(record)
-            })();
-            if let Err(error) = result {
-                record.phase = journal::Phase::RecoveryFailed;
-                let _ = self.save(record);
-                return Err(error);
+                if let Some(identity) = &trial.child {
+                    if !child::absent(identity)? {
+                        return Err(invalid("candidate still exists"));
+                    }
+                }
             }
-            Ok(())
-        })
+        }
+        let result = (|| {
+            record_cause(record, cause);
+            // A Restored host never returns to RollingBack: restored
+            // children may run, and a crash here must not leave a phase
+            // that tells the next pass to stop them.
+            if record.phase != journal::Phase::Restored {
+                record.phase = journal::Phase::RollingBack;
+            }
+            self.save(record)?;
+            // The cause remains in the journal through Restored. An
+            // unresolved M2 record already blocks all apply ingress.
+            for (index, a) in [self.plan().daemon.clone(), self.plan().cli.clone()]
+                .iter()
+                .enumerate()
+            {
+                let observed = hash(&a.target_path)?;
+                if observed != a.previous_sha256 && observed != a.candidate_sha256 {
+                    return Err(invalid("restore target contains unrelated bytes"));
+                }
+                if hash(&a.backup_path)? != a.previous_sha256 {
+                    return Err(invalid("rollback copy changed"));
+                }
+                if observed != a.previous_sha256 {
+                    restore_one(a)?;
+                }
+                if hash(&a.target_path)? != a.previous_sha256 {
+                    return Err(invalid("restore hash mismatch"));
+                }
+                let progress = if index == 0 {
+                    &mut record.daemon_progress
+                } else {
+                    &mut record.cli_progress
+                };
+                progress.restored = true;
+                progress.observed_sha256 = Some(a.previous_sha256);
+                self.save(record)?;
+            }
+            record.phase = journal::Phase::Restored;
+            self.save(record)
+        })();
+        if let Err(error) = result {
+            record.phase = journal::Phase::RecoveryFailed;
+            let _ = self.save(record);
+            return Err(error);
+        }
+        Ok(())
     }
 }
 
