@@ -10482,7 +10482,10 @@ mod tests {
                 cause: "local_state_lost"
             })
         );
-        assert!(is_placeheld(&state, &stable), "it stays inert and placeheld");
+        assert!(
+            is_placeheld(&state, &stable),
+            "it stays inert and placeheld"
+        );
         let live = state
             .named_groups
             .read()
