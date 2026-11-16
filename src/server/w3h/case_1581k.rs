@@ -6,15 +6,26 @@
 //! then fetches from A. From B's join until the trigger has reached A
 //! and C, the case drops every frame from A and C to B except membership
 //! and plane hellos, so whatever A stages or answers in that time never
-//! reaches B; after the release, B's next fetch passes A's guards anew.
+//! reaches B. Receiver-side evidence (A's join-result and Welcome fetch
+//! admissions log every request that reaches them, in test builds) shows
+//! that B's join-result fetch for the staged join reached A during the
+//! hold, so A's answer was staged and held.
+//!
+//! What the revoked arms prove, and what they do not: once B holds its
+//! own revocation, B's daemon sends A no further join-result or Welcome
+//! fetch (0 of each after the release; the control sends its Welcome
+//! fetch). So the revoked joiner gets no staged key end to end, but A's
+//! egress guards are not reached on this path. A fetch from a revoked
+//! device that does not stop asking (injected outside B's own client) is
+//! still open on #1581.
 //!
 //! - machine arm (`staged_join_machine_revoked_device_gets_no_key`): B
 //!   revokes its own machine (`POST /identity/revoke`, `machine_id`).
 //!   ADR 0110 §3 (L236) and D70: the revoked device gets no key; B's
 //!   agent keeps its seat. Desired: once A and C hold the revocation and
-//!   B's poll reaches A again, B's device installs no TreeKEM group and
-//!   does not decrypt A's ciphertext through the settle window, while A
-//!   still lists B Active.
+//!   the hold is released, B's device installs no TreeKEM group and does
+//!   not decrypt A's ciphertext through the settle window, while A still
+//!   lists B Active.
 //! - agent arm (`staged_join_agent_revoked_gets_no_key`): B revokes its
 //!   own agent (`agent_id`). Desired: B installs no TreeKEM group and
 //!   does not decrypt A's ciphertext through the settle window (the
@@ -346,16 +357,28 @@ async fn release_and_watch(
     let results = results_after.saturating_sub(results_before);
     let welcomes = welcomes_after.saturating_sub(welcomes_before);
     let fetched = results + welcomes;
+    // B's fetch for the staged join reached A (and A's answer was held);
+    // in the control B's later fetch also reaches A. A revoked B sends
+    // none after the trigger (its own client stops), which is noted.
+    let control_fetched = trigger != Trigger::NoneControl || fetched > 0;
     receipt.request_delivered(
-        "a_received_b_join_result_fetches_after_the_release",
-        dropped > 0 && fetched > 0,
+        "a_received_b_fetch_for_the_staged_join",
+        dropped > 0 && results_before > 0 && control_fetched,
         format!(
-            "dropped A/C->B frames {dropped}; at A since the release: {results} join-result \
-             fetches from B (before: {results_before}), {welcomes} Welcome fetches (before: \
-             {welcomes_before}); B->A frames since release {b_to_a}"
+            "dropped A/C->B frames {dropped}; B's join-result fetches at A before the release \
+             {results_before}; at A since the release: {results} join-result fetches from B, \
+             {welcomes} Welcome fetches (before: {welcomes_before}); B->A frames since release \
+             {b_to_a}"
         ),
         at(sim),
     );
+    if trigger != Trigger::NoneControl {
+        receipt.note(format!(
+            "after the trigger B sent A {results} join-result and {welcomes} Welcome fetches: \
+             B's own client stops asking once it holds its revocation, so A's egress guards \
+             are not reached on this path"
+        ));
+    }
     let a_lists_b = lists(sim, "A", group, b_hex).await;
     receipt.note(format!(
         "{trigger:?} arm: A lists B at the end {a_lists_b}; B {why}; served {served:?}"
