@@ -14,6 +14,11 @@ All notable changes to this project will be documented in this file.
 - **A KV merge keeps the earliest `created_at` (#1094, review of #1974).**
   Every merge path now keeps the earlier `created_at` of the two entries
   whichever wins, so replicas converge on it regardless of arrival order.
+- **The dormant launcher rolls back a multi-participant host through the
+  coordinator (#1378 slice 5; A14 amendment of 16 Nov 2026).** A launcher whose
+  own trial must roll back keeps its verdict under the host lock and runs the
+  coordinator pass, which restores the pair once for every participant. Before,
+  its single-trial restore refused a host it did not hold in full.
 - **`GET /stores/:id/:key` shows the verified writer (#1094 slice P2, A10
   amendment of 16 Nov 2026).** New `writer` field: the agent (and rider
   sub-agent) whose mark verifies for the returned value, or

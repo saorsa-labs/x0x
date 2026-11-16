@@ -107,3 +107,29 @@ pub(super) fn fixture_with(
     let host = recovery::Host::new(root.clone(), record.clone()).unwrap();
     (dir, root, host, record)
 }
+
+/// Seed the candidate release's probe record, as staging leaves it.
+pub(super) fn write_probe(host: &recovery::Host, attempt: u32, phase: probe::ProbePhase) {
+    let plan = host.plan();
+    let install = plan.daemon.target_path.clone();
+    let state = probe::ProbeState {
+        schema_version: 1,
+        record_kind: "probe".into(),
+        install: install.clone(),
+        version: plan.candidate_version.clone(),
+        platform: "fixture-platform".into(),
+        archive_sha256: [1; 32],
+        transaction_id: "00000000-0000-4000-8000-000000000001".into(),
+        attempt,
+        phase,
+        cause: None,
+        last_pid: None,
+        boot_id: "fixture-boot".into(),
+        retry_remaining_ms: 0,
+        retry_deadline_ms: 0,
+        daemon_sha256: Some(plan.daemon.candidate_sha256),
+        cli_sha256: Some(plan.cli.candidate_sha256),
+    };
+    journal::write_auxiliary_record(&probe::state_path(&install).unwrap(), &state, |_| Ok(()))
+        .unwrap();
+}
