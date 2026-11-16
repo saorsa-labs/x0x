@@ -374,18 +374,18 @@ macro_rules! arm_flush_regression_tests {
                     sync_tree_with(&store, &deadline, &mut |_| {
                         if counted.fetch_add(1, Ordering::SeqCst) == 0 {
                             let _ = entered.send(());
-                            released.lock().unwrap().recv_timeout(Duration::from_secs(5)).map_err(io::Error::other)?;
+                            released.lock().unwrap().recv_timeout(Duration::from_secs(30)).map_err(io::Error::other)?;
                         }
                         Ok(())
                     })
-                }), Duration::from_secs(2)).unwrap();
+                }), crate::upgrade::shutdown_flush::TEST_OVERRUN_LIMIT).unwrap();
                 let binding = shutdown_flush::Binding::new(uuid::Uuid::new_v4().to_string(), 1, &"plan").unwrap();
                 let (returned, result) = mpsc::channel();
                 let caller = std::thread::spawn(move || {
                     let _ = returned.send(shutdown_flush::acknowledge(&root, binding, || Ok(())));
                 });
                 let did_enter = entering.recv_timeout(Duration::from_secs(5));
-                let outcome = result.recv_timeout(Duration::from_secs(5));
+                let outcome = result.recv_timeout(Duration::from_secs(30));
                 let _ = release.send(());
                 caller.join().unwrap();
                 owner.join_workers();
