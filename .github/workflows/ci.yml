@@ -201,6 +201,13 @@ jobs:
         id: prepare_convergence
         run: python3 scripts/ci/issue442-convergence-custody.py prepare
 
+      # nextest drains a test group's queue only when a test of that group
+      # finishes, so mixed `threads-required` values in one group can end
+      # the run with tests "not run" and no failure (scripts/ci/
+      # check-nextest-groups.py, .config/nextest.toml quic-localhost).
+      - name: Check nextest test-group weights
+        run: python3 -B scripts/ci/check-nextest-groups.py
+
       - name: Record disk before Run tests
         run: |
           echo "=== disk before Run tests ==="
