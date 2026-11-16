@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **An `rw` grantee writes a store through a `ShareCap::Data` grant (#1094
+  slice D2, A03 amendment of 16 Nov 2026).** `PUT` and
+  `DELETE /grants/data/:agent/:group/:store/:key` (`x0x grant data put|rm`)
+  set or remove one key. The granted agent checks that the grant is `rw` and
+  applies the write as its own write to the store, so the store's policy and
+  write refusals apply unchanged. New typed DM `x0x-data-write-v1` (the reply
+  uses `x0x-data-reply-v1`, with a new `refused` status, 409 on the grantee)
+  and capability bit 21, `data_write_v1`; a peer without it is not sent a
+  write (424). A value over 28 416 bytes is answered 413 and not sent.
 - **Upgrade records: `clearable` matches the local clear (#1932 review; A14
   amendment of 15 Nov 2026).** A hold reports `clearable: true` only when
   `x0x upgrade --clear-hold` would clear it; an unresolved `.pending` probe
@@ -39,6 +48,10 @@ All notable changes to this project will be documented in this file.
   and after approval it can apply the approval link. A requester that waits
   behind another turn gets no outcome until its turn. New capability bit 19,
   `join_request_head_v1`; a peer without it keeps the earlier behaviour.
+- **W3-H row `s4_certificate_rebind` run (7) (#1581).** After B revokes
+  its own agent and A and C hold the record, B's self-rebind of a later
+  renewal is refused with `rebind_signer_ineligible`, and no node binds
+  it. The step runs at the end of the existing pre-cutoff arm.
 - **W3-H row `s4_intake_and_egress`, machine-revocation part (#1581, D70).**
   A control arm checks that a machine-only revocation keeps the agent's
   group seat and opens no S4 row. An egress arm, pinned RED, records a
@@ -141,7 +154,11 @@ All notable changes to this project will be documented in this file.
   that never ends no longer blocks the groups behind it), and asks again
   for a group still pending after 60 s, 300 s and 900 s. The outage
   record is written and removed under one lock. The #1427 W3-H rows have
-  their own CI shard (`1427`).
+  their own CI shard (`1427`). When a later pass marks a group whose
+  older catch-up still runs, the end of that older catch-up no longer
+  removes the mark or the outage record, so the later pass still retries
+  the group (#1936 review follow-up, A09 fourth amendment of 16 Nov 2026).
+  No wire format or API changes.
 
 - **A TreeKEM member that stays up through a network outage catches up
   when it connects again (#1427, A09 second amendment of 15 Nov 2026).**
@@ -224,6 +241,16 @@ All notable changes to this project will be documented in this file.
 
 ### Tests and tooling
 
+- **Upgrade candidate health commit and D194 staging reserve (#1377, S3d
+  part 2; A14 amendment of 15 Nov 2026).** A launcher trial candidate
+  writes `upgrade-health.json` once its local M1 inputs stay `ok` for the
+  stable interval, with D193 peer continuity when the OLD instance had a
+  send-ready peer (recorded in the handoff). Staging refuses a download
+  that would leave less than 1 GiB free. A missing or symlinked installed
+  file rolls the host commit back as Failed at once; a true I/O error is
+  retried. Review round (#1947): the candidate's local verdict reads the
+  live delivery probe, a failed health-commit write is retried at the next
+  observation, and the module compiles on Windows (no candidate there).
 - **Coordinator production pass and systemd recovery cases (#1376, S3c;
   A14 amendment of 15 Nov 2026).** `coordinator::recover` keeps trials at
   `<data_root>/upgrade-trial.json`, counts only a handoff that binds this
@@ -234,7 +261,14 @@ All notable changes to this project will be documented in this file.
   systemd CI job now builds the launcher test binary and runs the launcher
   lifecycle cases: the six #690 cases and six coordinator cases (cross-
   launcher stop, coordinator restart, missing handoff, partial restore,
-  reboot, unwritable journal).
+  reboot, unwritable journal). Before it stops any participant, the pass
+  now fences the host to `RollingBack` under the host lock and loads every
+  trial again, so no launcher starts a candidate past the restore; a host
+  that a peer restored or committed in the meantime is left as it is. The
+  host lock is free during the stop, so the pass reads the phase again,
+  restores, records the outcome and marks the trials in one lock: it never
+  stops a restored child or demotes a host that a peer restored (#1940 and #1950 review follow-ups, A14 amendment
+  of 16 Nov 2026).
 - **Host commit outcome classes and the latched-barrier hold (#1943 and
   #1939 review; A14 amendment of 15 Nov 2026).** The launcher's host
   commit returns a typed committed / not-yet / roll-back decision; a

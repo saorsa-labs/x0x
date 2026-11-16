@@ -523,3 +523,393 @@ async fn issue1094_strangers_cannot_crowd_out_grantees() {
         "the grantee is still served"
     );
 }
+
+// ── Slice D2: an `rw` grantee writes ────────────────────────────────────
+
+fn write_request(op: DataWriteOp) -> Vec<u8> {
+    DataWriteRequest {
+        request_id: hex::encode(rand::random::<[u8; 16]>()),
+        group: GROUP.to_string(),
+        store: STORE.to_string(),
+        op,
+    }
+    .encode()
+    .expect("encode")
+}
+
+fn put_op(key: &str, value: &[u8]) -> DataWriteOp {
+    DataWriteOp::Put {
+        key: key.to_string(),
+        value_b64: base64::engine::general_purpose::STANDARD.encode(value),
+        content_type: "text/plain".to_string(),
+    }
+}
+
+async fn serve_write(
+    state: &Arc<AppState>,
+    sender: AgentId,
+    machine: MachineId,
+    op: DataWriteOp,
+) -> DataReadReply {
+    let (to, bytes) = serve_data_write(state, &typed(sender, machine, write_request(op)))
+        .await
+        .expect("a reply");
+    assert_eq!(to, sender, "the reply goes to the sender");
+    DataReadReply::decode(&bytes).expect("reply")
+}
+
+async fn stored(state: &AppState, key: &str) -> Option<Vec<u8>> {
+    let (_, topic) = crate::kv::encrypted::group_store_identity(GROUP, STORE);
+    let handle = state
+        .kv_stores
+        .read()
+        .await
+        .get(&topic)
+        .cloned()
+        .expect("store");
+    handle.get(key).await.expect("get").map(|e| e.value)
+}
+
+/// #1094: "a `ro` grantee cannot write". A `ro` grantee, a grantee with
+/// other caps only, a stranger and an `rw` grant for another store are all
+/// `forbidden`, and the store is unchanged.
+#[tokio::test]
+async fn issue1094_d2_ro_grantee_cannot_write() {
+    let (state, _dir) = state_with_store().await;
+    let (ro, ro_machine) = bound_sender(&state).await;
+    let (other_caps, other_machine) = bound_sender(&state).await;
+    let (stranger, stranger_machine) = bound_sender(&state).await;
+    let (wrong_store, wrong_machine) = bound_sender(&state).await;
+    let owner = UserKeypair::generate().expect("owner");
+    let local = state.agent.agent_id();
+    let grants = Arc::new(ShareGrantStore::in_memory(local, Some(owner.user_id())));
+    for (grantee, caps) in [
+        (ro, vec![data_cap(DataAccess::Ro)]),
+        (other_caps, vec![ShareCap::Dm]),
+        (
+            wrong_store,
+            vec![ShareCap::Data {
+                group: GROUP.to_string(),
+                store: "notes".to_string(),
+                access: DataAccess::Rw,
+            }],
+        ),
+    ] {
+        let grant = ShareGrant::sign(
+            &owner,
+            rand::random(),
+            Grantee::Agent(grantee),
+            vec![local],
+            caps,
+            unix_secs().saturating_sub(30),
+            unix_secs().saturating_add(3_600),
+        )
+        .expect("sign");
+        grants.accept(grant, unix_secs()).await.expect("accept");
+    }
+    state.agent.install_share_grant_store(grants);
+
+    for (agent, machine) in [
+        (ro, ro_machine),
+        (other_caps, other_machine),
+        (stranger, stranger_machine),
+        (wrong_store, wrong_machine),
+    ] {
+        for op in [
+            put_op("note", b"changed"),
+            DataWriteOp::Delete {
+                key: "note".to_string(),
+            },
+        ] {
+            let reply = serve_write(&state, agent, machine, op).await;
+            assert_eq!(reply.status, DataReadStatus::Forbidden);
+            assert_eq!(reply_response(reply).0, StatusCode::FORBIDDEN);
+        }
+    }
+    assert_eq!(stored(&state, "note").await.as_deref(), Some(&b"hello"[..]));
+    // A `ro` grantee still reads.
+    let read = serve(&state, ro, ro_machine, DataReadOp::Keys).await;
+    assert_eq!(read.status, DataReadStatus::Ok);
+}
+
+/// #1094: "a `rw` grantee's put is read back". The granted agent applies
+/// the put and the delete as its own writes to the store: the store holds
+/// the new value, and a reader (here the grantee, through the D1 read
+/// path) sees it. The same agent on an unauthenticated machine is refused.
+#[tokio::test]
+async fn issue1094_d2_rw_grantee_writes_and_reads_back() {
+    let (state, _dir) = state_with_store().await;
+    let (agent, machine) = bound_sender(&state).await;
+    install_grant(&state, agent, vec![data_cap(DataAccess::Rw)]).await;
+
+    let put = serve_write(&state, agent, machine, put_op("note", b"from the grantee")).await;
+    assert_eq!(put.status, DataReadStatus::Ok);
+    assert!(put.published.is_some(), "a write says whether it published");
+    assert_eq!(
+        stored(&state, "note").await.as_deref(),
+        Some(&b"from the grantee"[..])
+    );
+    let new = serve_write(&state, agent, machine, put_op("fresh", b"new key")).await;
+    assert_eq!(new.status, DataReadStatus::Ok);
+    let read = serve(
+        &state,
+        agent,
+        machine,
+        DataReadOp::Get {
+            key: "fresh".to_string(),
+        },
+    )
+    .await;
+    assert_eq!(read.status, DataReadStatus::Ok);
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(read.entry.expect("entry").value_b64)
+            .expect("b64"),
+        b"new key"
+    );
+
+    let removed = serve_write(
+        &state,
+        agent,
+        machine,
+        DataWriteOp::Delete {
+            key: "fresh".to_string(),
+        },
+    )
+    .await;
+    assert_eq!(removed.status, DataReadStatus::Ok);
+    assert_eq!(stored(&state, "fresh").await, None);
+
+    let spoofed = serve_write(
+        &state,
+        agent,
+        MachineId(rand::random()),
+        put_op("note", b"spoofed"),
+    )
+    .await;
+    assert_eq!(spoofed.status, DataReadStatus::Forbidden);
+    assert_eq!(
+        stored(&state, "note").await.as_deref(),
+        Some(&b"from the grantee"[..])
+    );
+}
+
+/// The store handler's answer maps to a typed write status: a store or
+/// group refusal is `refused` with its reason (409 on the grantee's route),
+/// an unheld store is `unavailable`, and an over-limit value `too_large`.
+#[tokio::test]
+async fn issue1094_d2_store_refusals_are_typed() {
+    let body = serde_json::json!({ "ok": false, "error": "waiting_for_eligible_admin_revocation" });
+    for (code, status) in [
+        (StatusCode::OK, DataReadStatus::Ok),
+        (StatusCode::ACCEPTED, DataReadStatus::Ok),
+        (StatusCode::CONFLICT, DataReadStatus::Refused),
+        (StatusCode::FORBIDDEN, DataReadStatus::Refused),
+        (StatusCode::GONE, DataReadStatus::Refused),
+        (StatusCode::NOT_FOUND, DataReadStatus::Unavailable),
+        (StatusCode::PAYLOAD_TOO_LARGE, DataReadStatus::TooLarge),
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            DataReadStatus::Unavailable,
+        ),
+    ] {
+        assert_eq!(write_reply("id", code, &body).status, status, "{code}");
+    }
+    assert_eq!(
+        write_reply("id", StatusCode::ACCEPTED, &body).published,
+        Some(false)
+    );
+    let refused = write_reply("id", StatusCode::CONFLICT, &body);
+    assert_eq!(
+        refused.error.as_deref(),
+        Some("waiting_for_eligible_admin_revocation")
+    );
+    let (code, json) = reply_response(refused);
+    assert_eq!(code, StatusCode::CONFLICT);
+    assert!(json
+        .0
+        .to_string()
+        .contains("waiting_for_eligible_admin_revocation"));
+    let long = serde_json::json!({ "error": "x".repeat(1_000) });
+    assert!(write_reply("id", StatusCode::CONFLICT, &long)
+        .error
+        .is_some_and(|e| e.len() == MAX_DATA_WRITE_ERROR_BYTES));
+
+    // A store this daemon does not hold is `unavailable`, for real.
+    let (state, _dir) = state_with_store().await;
+    let (agent, machine) = bound_sender(&state).await;
+    let other_group = "ee".repeat(16);
+    install_grant(
+        &state,
+        agent,
+        vec![ShareCap::Data {
+            group: other_group.clone(),
+            store: STORE.to_string(),
+            access: DataAccess::Rw,
+        }],
+    )
+    .await;
+    let payload = DataWriteRequest {
+        request_id: "aa".repeat(16),
+        group: other_group,
+        store: STORE.to_string(),
+        op: put_op("k", b"v"),
+    }
+    .encode()
+    .expect("encode");
+    let (_, bytes) = serve_data_write(&state, &typed(agent, machine, payload.clone()))
+        .await
+        .expect("reply");
+    assert_eq!(
+        DataReadReply::decode(&bytes).expect("reply").status,
+        DataReadStatus::Unavailable
+    );
+    // Unverified or malformed: no reply.
+    let mut unverified = typed(agent, machine, payload);
+    unverified.verified = false;
+    assert!(serve_data_write(&state, &unverified).await.is_none());
+    assert!(serve_data_write(
+        &state,
+        &typed(agent, machine, b"x0x-data-write-v1\0{".to_vec())
+    )
+    .await
+    .is_none());
+}
+
+/// Grantee side: the write routes send one write request to the granted
+/// agent and answer with its reply. Mixed versions: an agent that
+/// advertises `data_read_v1` but not `data_write_v1` is never sent a write
+/// (424). An over-limit value is 413 and nothing is sent.
+#[tokio::test]
+async fn issue1094_d2_grantee_write_routes() {
+    let (grantee, _dir) = crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+        .await
+        .expect("state");
+    let insert_peer = |bits: u64| {
+        let peer = AgentKeypair::generate().expect("peer").agent_id();
+        let mut caps = crate::dm::DmCapabilities::v2_durable_gossip_ready(
+            grantee.agent_kem_keypair.public_bytes.clone(),
+        );
+        caps.application_registry = crate::dm::CapabilityRegistry { version: 1, bits };
+        assert!(grantee.agent.capability_store().insert(
+            peer,
+            MachineId(rand::random()),
+            caps,
+            crate::dm_capability::now_unix_ms(),
+        ));
+        peer
+    };
+    let read_only_peer = insert_peer(crate::dm::CapabilityRegistry::DATA_READ_V1);
+    let granted = insert_peer(
+        crate::dm::CapabilityRegistry::DATA_READ_V1 | crate::dm::CapabilityRegistry::DATA_WRITE_V1,
+    );
+    let hex_of = |agent: AgentId| hex::encode(agent.as_bytes());
+
+    let (code, _) = put_granted_store_value(
+        State(Arc::clone(&grantee)),
+        Path((
+            hex_of(read_only_peer),
+            GROUP.to_string(),
+            STORE.to_string(),
+            "k".to_string(),
+        )),
+        Json(PutGrantedValueRequest {
+            value: base64::engine::general_purpose::STANDARD.encode(b"v"),
+            content_type: None,
+        }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::FAILED_DEPENDENCY);
+    let (code, _) = put_granted_store_value(
+        State(Arc::clone(&grantee)),
+        Path((
+            hex_of(granted),
+            GROUP.to_string(),
+            STORE.to_string(),
+            "k".to_string(),
+        )),
+        Json(PutGrantedValueRequest {
+            value: base64::engine::general_purpose::STANDARD.encode(vec![
+                b'v';
+                MAX_DATA_WRITE_VALUE_BYTES
+                    + 1
+            ]),
+            content_type: None,
+        }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(
+        test_seam::sent_by(&grantee).is_empty(),
+        "nothing is sent for a refused call"
+    );
+
+    for (delete, status, code) in [
+        (false, DataReadStatus::Forbidden, StatusCode::FORBIDDEN),
+        (false, DataReadStatus::Ok, StatusCode::OK),
+        (true, DataReadStatus::Refused, StatusCode::CONFLICT),
+        (true, DataReadStatus::Ok, StatusCode::OK),
+    ] {
+        let route_state = Arc::clone(&grantee);
+        let path = (
+            hex_of(granted),
+            GROUP.to_string(),
+            STORE.to_string(),
+            "k".to_string(),
+        );
+        let call = tokio::spawn(async move {
+            if delete {
+                delete_granted_store_value(State(route_state), Path(path)).await
+            } else {
+                put_granted_store_value(
+                    State(route_state),
+                    Path(path),
+                    Json(PutGrantedValueRequest {
+                        value: base64::engine::general_purpose::STANDARD.encode(b"v"),
+                        content_type: Some("text/plain".to_string()),
+                    }),
+                )
+                .await
+            }
+        });
+        let request = loop {
+            if let Some(request) = test_seam::sent_by(&grantee)
+                .into_iter()
+                .filter(|(to, _)| *to == granted)
+                .filter_map(|(_, p)| DataWriteRequest::decode(&p))
+                .find(|r| {
+                    grantee
+                        .data_read_waiters
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .contains_key(&r.request_id)
+                })
+            {
+                break request;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(
+            matches!(request.op, DataWriteOp::Delete { .. }),
+            delete,
+            "the op the route was called with"
+        );
+        let mut reply = DataReadReply::status(&request.request_id, status);
+        if status == DataReadStatus::Ok {
+            reply.published = Some(true);
+        }
+        handle_data_read_typed(
+            &grantee,
+            typed(granted, MachineId([0; 32]), reply.encode().expect("encode")),
+        )
+        .await;
+        let (got, body) = call.await.expect("route");
+        assert_eq!(got, code);
+        if status == DataReadStatus::Ok {
+            assert_eq!(body.0["published"], serde_json::json!(true));
+        }
+    }
+    assert!(test_seam::sent_by(&grantee)
+        .iter()
+        .all(|(to, _)| *to != read_only_peer));
+}

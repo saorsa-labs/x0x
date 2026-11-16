@@ -3,7 +3,8 @@
 //! from the complete inventory issuer (#1378), so nothing calls it yet.
 //!
 //! One pass reconciles the host after a crash, a stop or a reboot. It never
-//! starts a child. It stops and reaps every live participant before a pair
+//! starts a child. It fences the host to RollingBack, so no launcher can
+//! start a candidate, then stops and reaps every live participant before a pair
 //! restore, restores the pair once for all participants, records the D189 or
 //! D190 outcome in the release's probe record, and only then leaves each
 //! trial `Restored`, so each launcher starts only its missing restored child
@@ -141,10 +142,7 @@ pub(super) fn reconcile(
     }
     // A RecoveryFailed trial or host survives restart and blocks every
     // automatic step (ADR 0094 §4).
-    if trials
-        .iter()
-        .any(|(_, trial)| trial.phase == Phase::RecoveryFailed)
-    {
+    if any_recovery_failed(&trials) {
         return Ok(Resolution::Final(journal::Phase::RecoveryFailed));
     }
     if phase == journal::Phase::HostCommitted {
@@ -156,7 +154,7 @@ pub(super) fn reconcile(
         let cause = journal_cause.ok_or_else(|| invalid("restored host has no cause"))?;
         arm(&mut trials, unarmed, &binding, clock)
             .map_err(|error| fail(host, &mut trials, error))?;
-        return finish(host, &mut trials, &cause, clock);
+        return settle(host, &mut trials, &binding, &cause, clock);
     }
     let Some(cause) = recovery_cause(host, &trials, phase, journal_cause, handoff_present, clock)?
     else {
@@ -170,24 +168,97 @@ pub(super) fn reconcile(
     if let Err(error) = arm(&mut trials, unarmed, &binding, clock) {
         return Err(fail(host, &mut trials, error));
     }
-    // Stop and reap every participant before the pair restore. A
-    // provisional commit by a healthy participant is invalidated here.
-    if let Err(error) = stop_all(host, &trials, &mut stop) {
-        return Err(fail(host, &mut trials, error));
+    // Fence the host first: once RollingBack is durable under the host lock,
+    // no launcher can spawn a candidate or commit the host. A peer may have
+    // spawned after the first load; its child is durable in its trial
+    // (spawn saves it under the same lock), so load every trial again,
+    // under the fence's lock. A restored child starts only under that lock
+    // on a Restored host, so every child in a snapshot taken with the host
+    // not Restored is a candidate: the stop below can never reach a
+    // restored child, whatever a peer does after the lock is free.
+    // A peer may also have committed or restored the host since the first
+    // read: the fence leaves such a host alone.
+    let fenced = host.fence(&cause, || reload(&mut trials, &binding));
+    let found = fenced.map_err(|error| fail(host, &mut trials, error))?;
+    if matches!(
+        found,
+        journal::Phase::HostCommitted | journal::Phase::RecoveryFailed
+    ) {
+        return Ok(Resolution::Final(found));
     }
-    for (path, trial) in trials.iter_mut() {
-        if let Err(error) = begin_rollback(path, trial, &cause) {
+    // A trial that a peer marked RecoveryFailed in the meantime is final.
+    if any_recovery_failed(&trials) {
+        return Ok(Resolution::Final(journal::Phase::RecoveryFailed));
+    }
+    // A peer finished the restore: as the partial-restore case, no stop.
+    if found != journal::Phase::Restored {
+        // Stop and reap every participant before the pair restore. A
+        // provisional commit by a healthy participant is invalidated here.
+        if let Err(error) = stop_all(host, &trials, &mut stop) {
             return Err(fail(host, &mut trials, error));
         }
     }
-    if let Err(error) = host.restore(&trials, cause) {
-        return Err(fail(host, &mut trials, error));
-    }
-    // `restore` keeps an earlier Failed cause: read back the durable one.
-    let kept = host
-        .locked(|record| Ok(record.cause.clone()))?
-        .ok_or_else(|| invalid("restored host has no cause"))?;
-    finish(host, &mut trials, &kept, clock)
+    settle(host, &mut trials, &binding, &cause, clock)
+}
+
+fn any_recovery_failed(trials: &[(PathBuf, Trial)]) -> bool {
+    trials
+        .iter()
+        .any(|(_, trial)| trial.phase == Phase::RecoveryFailed)
+}
+
+/// The last step of a pass, in one host lock: read the phase again, then
+/// act on it. The lock was free during the stop, so a peer may have
+/// finished the restore and a launcher may have started a restored child
+/// (#1950 review).
+///
+/// - `RollingBack`: mark the trials, restore the pair.
+/// - `Restored`: a peer restored the pair (or an earlier pass did). Load
+///   the trials again; stop nothing and move no byte.
+/// - `RecoveryFailed`, or a trial that is: final. A peer marked what it
+///   could; this pass writes nothing.
+///
+/// Then, still under the lock, record the D189 or D190 outcome in the
+/// probe record (the hold barrier before any restored start) and mark
+/// every trial Restored. A launcher starts a restored child only under
+/// this lock, so none starts between the restore and the marks.
+fn settle(
+    host: &recovery::Host,
+    trials: &mut [(PathBuf, Trial)],
+    binding: &Binding,
+    cause: &journal::Cause,
+    clock: &Clock,
+) -> io::Result<Resolution> {
+    let settled = host.locked(|record| {
+        let failed = Resolution::Final(journal::Phase::RecoveryFailed);
+        match record.phase {
+            journal::Phase::RollingBack => {
+                for (path, trial) in trials.iter_mut() {
+                    begin_rollback(path, trial, cause)?;
+                }
+                host.restore_locked(record, trials, cause.clone())?;
+            }
+            journal::Phase::Restored => {
+                reload(trials, binding)?;
+                if any_recovery_failed(trials) {
+                    return Ok(failed);
+                }
+            }
+            journal::Phase::RecoveryFailed => return Ok(failed),
+            // The fence allows no other phase: refuse and stay failed.
+            _ => return Err(invalid("host left RollingBack without a restore")),
+        }
+        // `restore_locked` and a peer's restore keep an earlier Failed
+        // cause: use the durable one.
+        let kept = record
+            .cause
+            .clone()
+            .ok_or_else(|| invalid("restored host has no cause"))?;
+        let after = record_outcome(host, &kept, clock)?;
+        mark_restored(trials, &kept)?;
+        Ok(Resolution::Restored(after))
+    });
+    settled.map_err(|error| fail(host, trials, error))
 }
 
 /// Save an Armed trial for each participant that has none.
@@ -205,18 +276,12 @@ fn arm(
     Ok(())
 }
 
-/// With the pair restored: record the D189 or D190 outcome in the probe
-/// record (the hold barrier before any restored start), then mark every
-/// trial Restored.
-fn finish(
-    host: &recovery::Host,
-    trials: &mut [(PathBuf, Trial)],
-    cause: &journal::Cause,
-    clock: &Clock,
-) -> io::Result<Resolution> {
-    let after = record_outcome(host, cause, clock).map_err(|error| fail(host, trials, error))?;
-    mark_restored(trials, cause).map_err(|error| fail(host, trials, error))?;
-    Ok(Resolution::Restored(after))
+/// Load every trial from disk again, under the host lock.
+fn reload(trials: &mut [(PathBuf, Trial)], binding: &Binding) -> io::Result<()> {
+    for (path, trial) in trials.iter_mut() {
+        *trial = Trial::load(path, binding, &trial.instance)?;
+    }
+    Ok(())
 }
 
 fn record_outcome(
@@ -1020,11 +1085,11 @@ mod tests {
         }
     }
 
-    /// The production pass reads the handoff from the host root and keeps
-    /// trials at `trial_path`. With no handoff and no trial it arms one
-    /// there and restores.
+    /// The production pass reads each participant's handoff from its data
+    /// root and keeps trials at `trial_path`. With no handoff and no trial
+    /// it arms one there and restores.
     #[test]
-    fn recover_uses_the_root_handoff_and_the_fixed_trial_path() {
+    fn recover_uses_the_data_root_handoff_and_the_fixed_trial_path() {
         let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
         let resolution = recover(&host).unwrap();
         assert_eq!(
@@ -1184,5 +1249,304 @@ mod tests {
         assert!(child::absent(&identity).unwrap());
         assert!(!reaper.join().unwrap().success());
         assert_previous_pair(&host);
+    }
+
+    /// A peer launcher's protected start, as `run::run_trial` does it:
+    /// under the host lock, refuse unless the host phase allows a spawn,
+    /// else reserve the attempt and record the child in the trial on disk.
+    fn peer_spawn(host: &recovery::Host, path: &Path, instance: &str, child: &Identity) -> bool {
+        host.locked(|record| {
+            if !run::protected_start_allowed(record.phase) {
+                return Ok(false);
+            }
+            let mut trial = Trial::load(path, &host.binding()?, instance)?;
+            trial.reserve(path, &now())?;
+            trial.child = Some(child.clone());
+            trial.save(path)?;
+            Ok(true)
+        })
+        .unwrap()
+    }
+
+    /// Review of #1940: Alice's launcher spawns a candidate after the pass
+    /// loaded her trial. The pass must not restore the pair past that
+    /// child. On Linux it stops the child and restores. Elsewhere process
+    /// custody is unsupported, so the pass fails closed on that child and
+    /// moves no byte. Before the fix the pass never saw the child: on Linux
+    /// its stale save failed, and in the later window it restored past it.
+    #[test]
+    fn a_peer_spawn_after_the_first_load_is_never_restored_past() {
+        let (_dir, root, host, _record) =
+            fixture_with(journal::Phase::SwappedCli, two_participants);
+        let trial_dir = tempfile::tempdir().unwrap();
+        let clock = now();
+        let mut trials = make_trials(&host, trial_dir.path(), &clock, Phase::Authorized);
+        {
+            let (path, b) = &mut trials[1];
+            b.verdict = Some(cause(journal::CauseClass::Failed, "peer failed"));
+            b.phase = Phase::RollingBack;
+            b.save(path).unwrap();
+        }
+        let alice = trials[0].0.clone();
+        #[cfg(target_os = "linux")]
+        let (identity, reaper) = {
+            let mut live = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            let identity = child::identity(live.id()).unwrap();
+            (identity, std::thread::spawn(move || live.wait().unwrap()))
+        };
+        #[cfg(not(target_os = "linux"))]
+        let identity = Identity {
+            pid: std::process::id(),
+            start: 0,
+            boot: clock.boot.clone(),
+        };
+        let spawned = std::cell::Cell::new(false);
+        let paths = path_in(trial_dir.path());
+        // Alice's launcher spawns while the pass loads Bob's trial.
+        let trial_path = |p: &journal::Participant| {
+            if p.instance_id == "bob" && !spawned.replace(true) {
+                assert!(peer_spawn(&host, &alice, "alice", &identity));
+            }
+            paths(p)
+        };
+        #[cfg(target_os = "linux")]
+        {
+            let resolution =
+                reconcile(&host, trial_path, true, &clock, child::stop_foreign).unwrap();
+            assert!(matches!(resolution, Resolution::Restored(After::Hold(_))));
+            assert!(child::absent(&identity).unwrap());
+            assert!(!reaper.join().unwrap().success());
+            assert_previous_pair(&host);
+            assert_eq!(journal_record(&root).phase, journal::Phase::Restored);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let error = reconcile(&host, trial_path, true, &clock, no_stop).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported, "{error}");
+            assert_candidate_pair(&host);
+            assert_eq!(journal_record(&root).phase, journal::Phase::RecoveryFailed);
+        }
+    }
+
+    /// Review of #1940: the host is fenced before any stop. Bob's launcher
+    /// tries a protected start while the pass stops Alice's candidate; the
+    /// fence refuses it, so no new candidate runs when the pair is restored.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_peer_spawn_during_the_stop_is_refused_by_the_fence() {
+        let (_dir, _root, host, _record) =
+            fixture_with(journal::Phase::SwappedCli, two_participants);
+        let trial_dir = tempfile::tempdir().unwrap();
+        let clock = now();
+        let mut trials = make_trials(&host, trial_dir.path(), &clock, Phase::Authorized);
+        let mut live = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let identity = child::identity(live.id()).unwrap();
+        let reaper = std::thread::spawn(move || live.wait().unwrap());
+        {
+            let (path, a) = &mut trials[0];
+            a.reserve(path, &clock).unwrap();
+            a.child = Some(identity.clone());
+            a.verdict = Some(cause(journal::CauseClass::Failed, "peer failed"));
+            a.save(path).unwrap();
+        }
+        let bob = trials[1].0.clone();
+        let mut spawns = Vec::new();
+        let resolution = reconcile(&host, path_in(trial_dir.path()), true, &clock, |target| {
+            spawns.push(peer_spawn(&host, &bob, "bob", target));
+            child::stop_foreign(target)
+        })
+        .unwrap();
+        assert_eq!(spawns, vec![false], "the fence must refuse the spawn");
+        assert!(matches!(resolution, Resolution::Restored(After::Hold(_))));
+        assert!(!reaper.join().unwrap().success());
+        assert_previous_pair(&host);
+    }
+
+    /// Review of #1940: a peer restores or commits the host after the
+    /// pass's first read. The fence leaves that host alone: no stop of the
+    /// restored child, and no trial on a committed host is marked failed.
+    #[test]
+    fn a_peer_restore_or_commit_after_the_first_read_is_not_fenced() {
+        for found in [journal::Phase::Restored, journal::Phase::HostCommitted] {
+            let (_dir, root, host, _record) =
+                fixture_with(journal::Phase::SwappedCli, two_participants);
+            let trial_dir = tempfile::tempdir().unwrap();
+            let clock = now();
+            let mut trials = make_trials(&host, trial_dir.path(), &clock, Phase::Authorized);
+            let (path, b) = &mut trials[1];
+            b.verdict = Some(cause(journal::CauseClass::Failed, "peer failed"));
+            b.phase = Phase::RollingBack;
+            b.save(path).unwrap();
+            let alice = trials[0].0.clone();
+            let (paths, done) = (path_in(trial_dir.path()), std::cell::Cell::new(false));
+            // The peer finishes while the pass loads Bob's trial; Alice's
+            // restored child then runs.
+            let trial_path = |p: &journal::Participant| {
+                if p.instance_id == "bob" && !done.replace(true) {
+                    let mut record = journal_record(&root);
+                    record.phase = found;
+                    record.cause = Some(cause(journal::CauseClass::Failed, "peer failed"));
+                    journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &record).unwrap();
+                    if found == journal::Phase::Restored {
+                        for a in [&host.plan().daemon, &host.plan().cli] {
+                            filesystem::restore_one(a).unwrap();
+                        }
+                        let mut a = Trial::load(&alice, &host.binding().unwrap(), "alice").unwrap();
+                        a.phase = Phase::Restored;
+                        a.verdict = Some(cause(journal::CauseClass::Failed, "peer failed"));
+                        a.child = Some(Identity {
+                            pid: std::process::id(),
+                            start: 0,
+                            boot: clock.boot.clone(),
+                        });
+                        a.save(&alice).unwrap();
+                    }
+                }
+                paths(p)
+            };
+            let resolution = reconcile(&host, trial_path, true, &clock, no_stop).unwrap();
+            assert_eq!(journal_record(&root).phase, found);
+            if found == journal::Phase::Restored {
+                assert!(matches!(resolution, Resolution::Restored(After::Hold(_))));
+                assert_previous_pair(&host);
+            } else {
+                assert_eq!(resolution, Resolution::Final(found));
+            }
+            for trial in reload(&host, trial_dir.path()) {
+                assert_ne!(trial.phase, Phase::RecoveryFailed, "{}", trial.instance);
+            }
+        }
+    }
+
+    /// Two participants, Alice with a live candidate and a Failed verdict.
+    /// Returns the trials, the candidate's identity and its reaper.
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::type_complexity)]
+    fn alice_runs_a_failed_candidate(
+        host: &recovery::Host,
+        dir: &Path,
+        clock: &Clock,
+    ) -> (
+        Vec<(PathBuf, Trial)>,
+        Identity,
+        std::thread::JoinHandle<std::process::ExitStatus>,
+    ) {
+        let mut trials = make_trials(host, dir, clock, Phase::Authorized);
+        let mut live = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let identity = child::identity(live.id()).unwrap();
+        let reaper = std::thread::spawn(move || live.wait().unwrap());
+        let (path, a) = &mut trials[0];
+        a.reserve(path, clock).unwrap();
+        a.child = Some(identity.clone());
+        a.verdict = Some(cause(journal::CauseClass::Failed, "peer failed"));
+        a.save(path).unwrap();
+        (trials, identity, reaper)
+    }
+
+    /// Review of #1950: the host lock is free while the pass stops Alice's
+    /// candidate. A peer pass finishes the restore in that time and Bob's
+    /// launcher starts his restored child, as `run::start_restored` does.
+    /// This pass must then act on the phase it reads under the lock, not
+    /// the phase it found at the fence: it stops no restored child, moves
+    /// no byte and demotes nothing. Before the fix it wrote its stale
+    /// RollingBack trials over the restored ones and, when Bob's save
+    /// refused, marked the restored host and trials RecoveryFailed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_peer_restore_during_the_stop_keeps_the_restored_host_and_child() {
+        let (_dir, root, host, _record) =
+            fixture_with(journal::Phase::SwappedCli, two_participants);
+        let trial_dir = tempfile::tempdir().unwrap();
+        let clock = now();
+        let (trials, identity, reaper) =
+            alice_runs_a_failed_candidate(&host, trial_dir.path(), &clock);
+        let bob = trials[1].0.clone();
+        let mut stopped = Vec::new();
+        let mut restored_child = None;
+        let resolution = reconcile(&host, path_in(trial_dir.path()), true, &clock, |target| {
+            stopped.push(target.clone());
+            let peer = reconcile(
+                &host,
+                path_in(trial_dir.path()),
+                true,
+                &clock,
+                child::stop_foreign,
+            )?;
+            assert!(matches!(peer, Resolution::Restored(After::Hold(_))));
+            let mut b = Trial::load(&bob, &host.binding()?, "bob")?;
+            assert_eq!(b.phase, Phase::Restored);
+            b.restored_starts += 1;
+            b.save(&bob)?;
+            let child = host.locked(|record| {
+                assert_eq!(record.phase, journal::Phase::Restored);
+                std::process::Command::new("sleep").arg("30").spawn()
+            })?;
+            b.child = Some(child::identity(child.id())?);
+            b.save(&bob)?;
+            restored_child = Some(child);
+            Ok(())
+        });
+        let mut restored_child = restored_child.expect("the peer ran");
+        let restored = child::identity(restored_child.id()).unwrap();
+        let alive = !child::absent(&restored).unwrap();
+        restored_child.kill().unwrap();
+        restored_child.wait().unwrap();
+        assert!(!reaper.join().unwrap().success());
+
+        assert!(
+            matches!(resolution, Ok(Resolution::Restored(After::Hold(_)))),
+            "{resolution:?}"
+        );
+        assert_eq!(stopped, vec![identity], "only the candidate is stopped");
+        assert!(alive, "the restored child must keep running");
+        assert_previous_pair(&host);
+        assert_eq!(journal_record(&root).phase, journal::Phase::Restored);
+        let trials = reload(&host, trial_dir.path());
+        for trial in &trials {
+            assert_eq!(trial.phase, Phase::Restored, "{}", trial.instance);
+        }
+        assert_eq!(trials[1].child, Some(restored));
+        assert_eq!(trials[1].restored_starts, 1);
+    }
+
+    /// Review of #1950: a peer marks the host RecoveryFailed while this
+    /// pass stops the candidate. The pass reads that under the lock and is
+    /// final: it moves no byte and rolls no trial back. Before the fix it
+    /// wrote RollingBack to the trial and then failed in the restore.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_peer_recovery_failure_during_the_stop_is_final() {
+        let (_dir, root, host, _record) =
+            fixture_with(journal::Phase::SwappedCli, two_participants);
+        let trial_dir = tempfile::tempdir().unwrap();
+        let clock = now();
+        let (_trials, identity, reaper) =
+            alice_runs_a_failed_candidate(&host, trial_dir.path(), &clock);
+        let resolution = reconcile(&host, path_in(trial_dir.path()), true, &clock, |target| {
+            host.mark_recovery_failed()?;
+            child::stop_foreign(target)
+        });
+        assert!(!reaper.join().unwrap().success());
+        assert!(child::absent(&identity).unwrap());
+        assert_eq!(
+            resolution.unwrap(),
+            Resolution::Final(journal::Phase::RecoveryFailed)
+        );
+        assert_candidate_pair(&host);
+        assert_eq!(journal_record(&root).phase, journal::Phase::RecoveryFailed);
+        let phases: Vec<Phase> = reload(&host, trial_dir.path())
+            .into_iter()
+            .map(|trial| trial.phase)
+            .collect();
+        assert_eq!(phases, vec![Phase::Booting, Phase::Authorized]);
     }
 }

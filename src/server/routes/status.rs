@@ -175,10 +175,7 @@ impl HealthSnapshot {
         sample.one_sided_peers = one_sided_peers;
         sample.uptime_secs = uptime_secs;
 
-        let (probes_run, last_probe_ok, last_probe_latency_ms) = self.probe_results();
-        sample.probes_run = probes_run;
-        sample.last_probe_ok = last_probe_ok;
-        sample.last_probe_latency_ms = last_probe_latency_ms;
+        self.merge_probe_results(&mut sample);
 
         let refreshed_at = *self
             .verdict_sample_refreshed_at
@@ -189,6 +186,19 @@ impl HealthSnapshot {
             None => uptime_secs,
         });
         sample
+    }
+
+    /// Put the live delivery-probe results into `sample`. The refresher's
+    /// `sample_verdict_inputs` leaves them out: the probe task records them
+    /// in atomics, and every classifier of a sample must merge them first.
+    pub(in crate::server) fn merge_probe_results(
+        &self,
+        sample: &mut super::super::health_verdict::VerdictSample,
+    ) {
+        let (probes_run, last_probe_ok, last_probe_latency_ms) = self.probe_results();
+        sample.probes_run = probes_run;
+        sample.last_probe_ok = last_probe_ok;
+        sample.last_probe_latency_ms = last_probe_latency_ms;
     }
 
     /// Record one delivery-probe outcome (#1380). `latency_ms` is `None`

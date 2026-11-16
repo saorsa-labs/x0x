@@ -330,7 +330,7 @@ async fn issue1427_start_pass_waits_for_another_epoch_ahead_task() -> Result<()>
     let pass = tokio::spawn({
         let state = Arc::clone(&state);
         let key = key.clone();
-        async move { request_treekem_catchup_after_start(&state, &key).await }
+        async move { request_treekem_catchup_after_start(&state, &key, None).await }
     });
     tokio::time::sleep(Duration::from_secs(60)).await;
     assert!(
@@ -652,7 +652,7 @@ async fn issue1427_record_removal_waits_for_the_record_lock() -> Result<()> {
     let done_state = Arc::clone(&state);
     let done_key = key.clone();
     let mut done = tokio::spawn(async move {
-        treekem_start_catchup_done(&done_state, &done_key).await;
+        treekem_start_catchup_done(&done_state, &done_key, None).await;
     });
     let waited = tokio::time::timeout(Duration::from_millis(300), &mut done).await;
     assert!(waited.is_err(), "the removal waits for the record lock");
@@ -762,4 +762,124 @@ async fn issue1427_a_panicking_catchup_releases_its_group() {
     .await;
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert!(gate.claim("g"), "the panicked task's group is free again");
+}
+
+/// #1936 review follow-up: a later pass marks a group whose catch-up from
+/// an earlier pass still runs. That older catch-up then ends `Done`. The
+/// later pass's mark and the outage record stay, so the re-ask can end
+/// KeepPending and the later pass retries the group. A `Done` with no
+/// later mark still removes both.
+///
+/// The clock is paused and the steps are ordered by signals, not by real
+/// sleeps (#1949 review): the older catch-up ends only after pass 2 has
+/// checked its pending groups, that is, inside pass 2's retry wait. From
+/// there to the re-ask's end nothing waits on a timer or on file I/O, so
+/// the paused clock cannot move the retry ahead of the re-ask.
+#[tokio::test(start_paused = true)]
+async fn issue1427_a_later_pass_mark_survives_the_older_catchups_done() -> Result<()> {
+    let (state, _dir, key) = treekem_member_state().await?;
+    let record = treekem_catchup_pending_path(&state);
+    let gate = Arc::new(TreeKemReconnectGate::default());
+    let asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let first = Arc::new(tokio::sync::Notify::new());
+    // The first catch-up waits, then ends Done. Later ones end KeepPending.
+    let run = {
+        let (state, gate) = (Arc::clone(&state), Arc::clone(&gate));
+        let (asks, first) = (Arc::clone(&asks), Arc::clone(&first));
+        move |key: String| {
+            let (state, gate) = (Arc::clone(&state), Arc::clone(&gate));
+            let (asks, first) = (Arc::clone(&asks), Arc::clone(&first));
+            async move {
+                if asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    first.notified().await;
+                    treekem_start_catchup_done(&state, &key, Some(&gate)).await;
+                }
+            }
+        }
+    };
+    let keys = vec![key.clone()];
+    // Pass 1: the catch-up outlives its turn.
+    assert!(gate.request());
+    mark_treekem_reconnect_pass(&state, &gate, &keys).await;
+    drive_treekem_reconnect_pass(
+        keys.clone(),
+        (4, Duration::from_millis(50)),
+        || Duration::ZERO,
+        run.clone(),
+        &tokio_spawn,
+        |_key| false,
+        &[],
+        &gate,
+    )
+    .await;
+    assert!(!gate.finish());
+    // Pass 2, after another isolation: the group is busy.
+    assert!(gate.request());
+    mark_treekem_reconnect_pass(&state, &gate, &keys).await;
+    let pass_state = Arc::clone(&state);
+    let pass_gate = Arc::clone(&gate);
+    let pass_keys = keys.clone();
+    // Signalled when pass 2 checks its pending groups after its first
+    // round; its retry wait starts right after.
+    let retry_wait = Arc::new(tokio::sync::Notify::new());
+    let in_retry_wait = Arc::clone(&retry_wait);
+    let pass2 = tokio::spawn(async move {
+        drive_treekem_reconnect_pass(
+            pass_keys,
+            (4, Duration::from_millis(50)),
+            || Duration::ZERO,
+            run,
+            &tokio_spawn,
+            |key| {
+                in_retry_wait.notify_one();
+                pending(&pass_state, key)
+            },
+            &[Duration::from_secs(1)],
+            &pass_gate,
+        )
+        .await;
+    });
+    retry_wait.notified().await;
+    // The older catch-up ends Done during pass 2's retry wait.
+    first.notify_one();
+    pass2.await?;
+    assert_eq!(
+        asks.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "the re-ask, then pass 2's retry"
+    );
+    assert!(pending(&state, &key), "pass 2's mark stays");
+    assert!(tokio::fs::try_exists(&record).await?, "the record stays");
+    // A Done with no later mark removes both: no permanent mark.
+    assert!(gate.claim(&key), "the group is free");
+    treekem_start_catchup_done(&state, &key, Some(&gate)).await;
+    assert!(!pending(&state, &key));
+    assert!(!tokio::fs::try_exists(&record).await?);
+    Ok(())
+}
+
+/// #1936 review follow-up: a claim whose task the spawner refuses
+/// (shutdown) is released. This pins the driver's claim guard with a
+/// stand-in spawner; the real `spawn_detached` drops a refused task the
+/// same way.
+#[tokio::test]
+async fn issue1427_a_refused_spawn_releases_its_group() {
+    let gate = Arc::new(TreeKemReconnectGate::default());
+    assert!(gate.request());
+    let refuse = |task: TaskFuture| {
+        drop(task);
+        false
+    };
+    drive_treekem_reconnect_pass(
+        vec!["g".to_string()],
+        (4, Duration::from_secs(120)),
+        || Duration::ZERO,
+        |_key: String| async move {},
+        &refuse,
+        |_key| false,
+        &[],
+        &gate,
+    )
+    .await;
+    assert!(gate.claim("g"), "the refused task's group is free again");
 }

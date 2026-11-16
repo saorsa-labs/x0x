@@ -21,8 +21,9 @@ use sha2::{Digest, Sha256};
 
 use super::{journal, manifest, probe};
 
-const RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
-const MAX_BINARY_BYTES: u64 = 200 * 1024 * 1024;
+/// D194: free space every staging and pair copy must leave.
+pub(crate) const RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
+pub(crate) const MAX_BINARY_BYTES: u64 = 200 * 1024 * 1024;
 const MAX_SKILL_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -808,7 +809,7 @@ fn add_required(
     Ok(())
 }
 
-fn available_bytes(directory: &Path) -> io::Result<u64> {
+pub(crate) fn available_bytes(directory: &Path) -> io::Result<u64> {
     let path = CString::new(directory.as_os_str().as_bytes()).map_err(invalid)?;
     // SAFETY: statvfs receives a valid C path and an owned writable result.
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -1374,7 +1375,7 @@ fn open_regular(path: &Path, limit: u64) -> io::Result<File> {
     Ok(file)
 }
 
-fn digest_file(path: &Path, limit: u64) -> io::Result<[u8; 32]> {
+pub(crate) fn digest_file(path: &Path, limit: u64) -> io::Result<[u8; 32]> {
     let mut input = open_regular(path, limit)?;
     let mut digest = Sha256::new();
     let mut bytes = 0_u64;
