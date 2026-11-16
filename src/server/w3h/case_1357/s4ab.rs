@@ -88,6 +88,9 @@
 //! offline until t = 10 s; a 0.46.1 member L; O silent for 24 virtual
 //! hours; and the joiner J's `JoinPendingNotice`.
 
+// #1581: the `s4_owner_recovery` variants the public mandate route drives.
+mod recovery_variants;
+
 use super::*;
 use crate::groups::cert_rebind as cr;
 use crate::groups::eviction::EXPIRY_TOLERANCE_SECS as TAU;
