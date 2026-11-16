@@ -234,6 +234,16 @@ All notable changes to this project will be documented in this file.
 
 ### Tests and tooling
 
+- **Upgrade health commit review carry-over (#1378 slice 1; A14
+  amendment of 16 Nov 2026).** The candidate writes canonical data and
+  identity roots, and the launcher matches a planned root reached through a
+  symlink. A D193 send-ready peer first seen inside the 120 s wait keeps its
+  full 60 s stable interval. D194 charges the signature download and each
+  extracted binary against the 1 GiB reserve, not only the archive, and the
+  download and extraction wiring is tested. The coordinator's last step
+  loads the trials again on a `RollingBack` host, so a peer's
+  `RecoveryFailed` trials are never overwritten.
+
 - **Upgrade candidate health commit and D194 staging reserve (#1377, S3d
   part 2; A14 amendment of 15 Nov 2026).** A launcher trial candidate
   writes `upgrade-health.json` once its local M1 inputs stay `ok` for the
