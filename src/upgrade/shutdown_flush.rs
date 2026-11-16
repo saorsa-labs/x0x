@@ -1564,9 +1564,11 @@ mod reservation_release_regressions {
         owner.join_workers();
         assert!(matches!(result, Err(FlushFailure::Started(_))));
         // The deadline alone accounts for `TEST_OVERRUN_LIMIT`; only the
-        // bounded worker wait adds `WORKER_JOIN_BOUND` on top (#1595).
+        // bounded worker wait adds `WORKER_JOIN_BOUND` on top (#1595). The
+        // deadline is held in whole milliseconds and can fire up to 1 ms
+        // early, hence the 50 ms margin.
         assert!(
-            elapsed >= TEST_OVERRUN_LIMIT + WORKER_JOIN_BOUND,
+            elapsed >= TEST_OVERRUN_LIMIT + WORKER_JOIN_BOUND - Duration::from_millis(50),
             "the caller did not wait for the worker's completion: {elapsed:?}"
         );
         assert!(
