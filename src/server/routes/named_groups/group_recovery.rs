@@ -3464,12 +3464,37 @@ pub(super) async fn join_carry_attestation(
     attempt_id: Option<&str>,
     owner_terminal_served: bool,
 ) -> Option<AdminTerminalAttestation> {
+    // Test-only: why this serve carries no ATA (W3-H H-S3-d2 receipts).
+    #[cfg(test)]
+    let refuse = |reason: &'static str| {
+        if let Ok(mut list) = state.named_group_test_recorders.join_carry_refusals.lock() {
+            list.push((
+                member_hex.to_ascii_lowercase(),
+                format!(
+                    "{reason} from_revision={from_revision:?} chain={}",
+                    chain.len()
+                ),
+            ));
+        }
+    };
+    #[cfg(not(test))]
+    let refuse = |_reason: &'static str| {};
     let (Some(from_revision), Some(base_state_hash), Some(terminal), Some(attempt_id)) =
         (from_revision, base_state_hash, terminal, attempt_id)
     else {
+        refuse("missing_base_terminal_or_attempt");
         return None;
     };
-    if owner_terminal_served || chain.is_empty() || !state.group_recovery.runs_s3() {
+    if owner_terminal_served {
+        refuse("owner_terminal_served");
+        return None;
+    }
+    if chain.is_empty() {
+        refuse("empty_chain");
+        return None;
+    }
+    if !state.group_recovery.runs_s3() {
+        refuse("no_s3");
         return None;
     }
     if chain
@@ -3477,6 +3502,7 @@ pub(super) async fn join_carry_attestation(
         .and_then(|link| link.commit.prev_state_hash.as_deref())
         != Some(base_state_hash)
     {
+        refuse("chain_not_from_base");
         return None;
     }
     let member = x0x::identity::AgentId(parse_raw(member_hex)?);
@@ -3499,14 +3525,28 @@ pub(super) async fn join_carry_attestation(
             .verified_registry_supports(&member, bit);
     }
     if supported != Some(true) {
+        refuse(if supported.is_none() {
+            "joiner_advert_unknown"
+        } else {
+            "joiner_lacks_bit"
+        });
         return None;
     }
-    let info = state.named_groups.read().await.get(group_key).cloned()?;
+    let Some(info) = state.named_groups.read().await.get(group_key).cloned() else {
+        refuse("group_not_stored");
+        return None;
+    };
     let local = local_hex(state);
-    if home_gate_closed(state, &info)
-        || !s3::signer_is_active_admin(&info, &local)
-        || contained(state, &info).await
-    {
+    if home_gate_closed(state, &info) {
+        refuse("home_gate_closed");
+        return None;
+    }
+    if !s3::signer_is_active_admin(&info, &local) {
+        refuse("signer_not_active_admin");
+        return None;
+    }
+    if contained(state, &info).await {
+        refuse("signer_contained");
         return None;
     }
     let cache_key = (attempt_id.to_string(), from_revision);
@@ -3522,6 +3562,7 @@ pub(super) async fn join_carry_attestation(
         // which rolls the window there, so the rate check rolls it
         // here.
         if !inner.responder.may_sign_carry(member.0, Instant::now()) {
+            refuse("rate_or_budget");
             return None;
         }
     }
