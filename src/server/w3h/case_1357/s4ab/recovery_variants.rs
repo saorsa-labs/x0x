@@ -11,12 +11,20 @@
 //!   refuses with `recovery_not_needed`, no survivor shows
 //!   `waiting_for_eligible_admin_revocation`, and B does not become an
 //!   admin.
-//! - `w3h_1581m_recovery_ineligible_member_then_offline_promotee` (nodes
-//!   A, B, C, E; A the only admin). At t = 0 A and E revoke their own
-//!   agents; B and C hold both records and show the owner-recovery wait.
-//!   Desired: C's mandate naming the revoked member E is refused with
-//!   `recovery_member_ineligible`. Then B stops (the ADR's "B is offline
-//!   until t = 10 s"), and C's mandate naming B answers `202
+//! - `w3h_1581m_recovery_refuses_a_revoked_member` (nodes A, B, C, E; A
+//!   the only admin). At t = 0 A and E revoke their own agents; B and C
+//!   hold both records and show the owner-recovery wait. C's mandate
+//!   naming the revoked member E is refused with
+//!   `recovery_member_ineligible`; C's mandate naming B answers `202
+//!   waiting_for_recovery_member`. Desired: B commits the recovery (on C,
+//!   B is an Admin and A is Removed). RED today, pinned
+//!   ([`CAUSE_REVOKED_SEAT_BLOCKS_SEAL`], #1973): B's seal fails the
+//!   ADR-0038 check because revoked E is still seated, and E's own
+//!   eviction waits for an eligible admin, so the two wait on each other.
+//!   B's status shows `mandate_received` with no cause.
+//! - `w3h_1581m_recovery_offline_promotee_commits_on_return` (nodes A, B,
+//!   C, E; A the only admin, only A revoked). B stops (the ADR's "B is
+//!   offline until t = 10 s"), and C's mandate naming B answers `202
 //!   waiting_for_recovery_member`; for 10 s B is not an admin on C. B
 //!   starts again and commits the recovery: on C, B is an Admin and A is
 //!   Removed.
@@ -39,12 +47,16 @@ const FINAL_NOT_NEEDED: &str = "a_mandate_while_a_second_admin_is_eligible_is_re
 const FINAL_INELIGIBLE: &str =
     "a_mandate_naming_a_revoked_member_is_refused_and_one_naming_b_is_committed";
 const FINAL_OFFLINE: &str = "an_offline_promotee_commits_the_recovery_on_its_return";
+/// #1973: the recovery seal refuses while another revoked member is seated.
+const CAUSE_REVOKED_SEAT_BLOCKS_SEAL: &str = "B's owner-recovery seal is refused (ADR-0038 \
+     explicit eviction+rekey) for revoked member E, which is still seated, so the recovery never \
+     commits";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Variant {
     NotNeeded,
     /// A and E revoked; the mandate naming E is refused; the one naming
-    /// B (online) is committed.
+    /// B (online) should be committed (#1973: it is not).
     IneligibleMember,
     /// Only A revoked; B is offline when the mandate names it.
     OfflinePromotee,
@@ -216,7 +228,7 @@ async fn mandate_variants(sim: &mut Sim, receipt: &mut Receipt, variant: Variant
         && body_b["promoted_member"].as_str() == Some(b_hex.as_str());
     let c_body = group_body(sim, "C", &group).await?;
     receipt.note(format!(
-        "C's mandate naming offline B: {status_b} {body_b}; C's admin_availability {}",
+        "C's mandate naming B: {status_b} {body_b}; C's admin_availability {}",
         c_body["admin_availability"]
     ));
     let early_admin = if variant.b_offline() {
@@ -273,6 +285,25 @@ async fn mandate_variants(sim: &mut Sim, receipt: &mut Receipt, variant: Variant
         format!("mandate replies {status_e} / {status_b}"),
         at(sim),
     );
+    if !committed && variant.revokes_e() {
+        // #1973: the seal refusal that names E is the pinned gap.
+        let refusals = sim.logs_containing(&[
+            "owner recovery deferred: seal failed",
+            "explicit eviction+rekey",
+            e_hex.as_str(),
+        ]);
+        receipt.note(format!(
+            "B's seal refusals naming E: {}; first {:?}",
+            refusals.len(),
+            refusals.first().map(|log| (log.at, log.text.clone()))
+        ));
+        receipt.cause(
+            CAUSE_REVOKED_SEAT_BLOCKS_SEAL,
+            refusals.first().map(|log| log.text.clone()),
+            !refusals.is_empty(),
+            at(sim),
+        );
+    }
     let passed = waits_typed && refused_e && signed && !early_admin && committed;
     receipt.finish(variant.final_name(), passed, at(sim));
     Ok(())
@@ -319,6 +350,14 @@ async fn expect_variant(case: &str, seed: u64, variant: Variant, want: Verdict) 
         "{case}: expected {want:?}, got {:?}",
         receipt.verdict()
     );
+    // An expected RED is eligible only with the named gap observed.
+    if want == Verdict::Red {
+        ensure!(
+            receipt.named_causes() == [CAUSE_REVOKED_SEAT_BLOCKS_SEAL],
+            "{case}: RED for another cause: {:?}",
+            receipt.named_causes()
+        );
+    }
     Ok(())
 }
 
@@ -341,8 +380,9 @@ fn w3h_1581m_recovery_not_needed_while_d_is_eligible() -> Result<()> {
     })
 }
 
-/// ADR 0110 `s4_owner_recovery`, the revoked-member variant: GREEN with
-/// S4.
+/// ADR 0110 `s4_owner_recovery`, the revoked-member variant. The refusal
+/// of the mandate naming E holds; pinned RED for #1973 because B's
+/// recovery never commits while E is seated. Flip to GREEN with the fix.
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -354,7 +394,7 @@ fn w3h_1581m_recovery_refuses_a_revoked_member() -> Result<()> {
             "w3h_1581m_recovery_refuses_a_revoked_member",
             0x1581_0051,
             Variant::IneligibleMember,
-            Verdict::Green,
+            Verdict::Red,
         )
         .await
     })

@@ -48,6 +48,15 @@ All notable changes to this project will be documented in this file.
   and after approval it can apply the approval link. A requester that waits
   behind another turn gets no outcome until its turn. New capability bit 19,
   `join_request_head_v1`; a peer without it keeps the earlier behaviour.
+- **W3-H row `s4_owner_recovery`, three variants (#1581).** A mandate
+  sent while a second admin D is still eligible is refused with
+  `recovery_not_needed`, and no member shows the owner-recovery wait. A
+  promoted member B that is offline when the mandate is signed commits the
+  recovery when it starts again. A mandate naming a revoked member E is
+  refused with `recovery_member_ineligible`; this arm is pinned RED for a
+  known gap (#1973): while E is still seated, B's recovery seal fails the
+  ADR-0038 eviction check and never commits. The row has its own W3-H
+  shard (`1581m`).
 - **W3-H row `s4_certificate_rebind` run (7) (#1581).** After B revokes
   its own agent and A and C hold the record, B's self-rebind of a later
   renewal is refused with `rebind_signer_ineligible`, and no node binds

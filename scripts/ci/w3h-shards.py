@@ -68,7 +68,7 @@ GROUPS = (
     # 80-90 virtual seconds. `rest` is close to its deadline, so the row
     # has its own shard; the budget is not raised (31 Oct ruling, #1733).
     ('1581i', 'w3h_1581i_'),
-    # #1581 `s4_owner_recovery` variants (1581m): two four-node Home arms;
+    # #1581 `s4_owner_recovery` variants (1581m): three four-node Home arms;
     # `rest` is close to its deadline, so the row has its own shard
     # (31 Oct ruling, #1733).
     ('1581m', 'w3h_1581m_'),
