@@ -988,10 +988,13 @@ async fn cancel_queued_send(
             detail: "no queued send is held under this logical_id for this agent".to_string(),
         }
         .into_response(),
-        CancelOutcome::WriteFailed(detail) => DirectSendRequestRejection {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            code: "outbox_write_failed",
-            detail,
+        CancelOutcome::NotDurable(detail) => DirectSendRequestRejection {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "outbox_not_durable",
+            detail: format!(
+                "the cancel could not be recorded durably ({detail}); the send is still \
+                 held and may still go out; retry the cancel"
+            ),
         }
         .into_response(),
         CancelOutcome::InFlight => DirectSendRequestRejection {

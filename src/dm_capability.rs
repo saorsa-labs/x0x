@@ -342,6 +342,9 @@ pub struct CapabilityStore {
     /// #1158: a verified advert arrived for a recipient with a running
     /// obligation wait. Outbox workers subscribe and retry at once.
     obligation_adverts: tokio::sync::broadcast::Sender<AgentId>,
+    /// #1109 S2: a fresh verified advert that supports durable delivery
+    /// arrived. The direct-send outbox makes that recipient's held sends due.
+    durable_adverts: tokio::sync::broadcast::Sender<AgentId>,
 }
 
 /// One recipient's obligation wait (#1158). Memory only.
@@ -426,6 +429,7 @@ impl CapabilityStore {
             prefiltered_stale_adverts: AtomicU64::new(0),
             obligation_adverts: tokio::sync::broadcast::channel(OBLIGATION_ADVERT_SIGNAL_CAPACITY)
                 .0,
+            durable_adverts: tokio::sync::broadcast::channel(OBLIGATION_ADVERT_SIGNAL_CAPACITY).0,
             evidence_wire: Default::default(),
             evidence: Default::default(),
         }
@@ -440,6 +444,7 @@ impl CapabilityStore {
             prefiltered_stale_adverts: AtomicU64::new(0),
             obligation_adverts: tokio::sync::broadcast::channel(OBLIGATION_ADVERT_SIGNAL_CAPACITY)
                 .0,
+            durable_adverts: tokio::sync::broadcast::channel(OBLIGATION_ADVERT_SIGNAL_CAPACITY).0,
             evidence_wire: Default::default(),
             evidence: Default::default(),
         }
@@ -533,6 +538,15 @@ impl CapabilityStore {
     #[must_use]
     pub fn subscribe_obligation_adverts(&self) -> tokio::sync::broadcast::Receiver<AgentId> {
         self.obligation_adverts.subscribe()
+    }
+
+    /// #1109 S2: agents whose fresh verified advert supports durable
+    /// delivery (signalled on each fresh advert). The direct-send outbox
+    /// retries that recipient's held sends at once. A lagged receiver loses
+    /// only the prompt retry.
+    #[must_use]
+    pub fn subscribe_durable_adverts(&self) -> tokio::sync::broadcast::Receiver<AgentId> {
+        self.durable_adverts.subscribe()
     }
 
     /// `Some(true)` only when this agent's current verified advert sets
@@ -727,6 +741,7 @@ impl CapabilityStore {
             }
         }
         let mut capabilities = capabilities;
+        let durable = capabilities.supports_durable_app_ack();
         // #448: the base advert rides the frozen v1 wire shape, so a
         // true `digest_support` bit arrives here only from a pre-fix
         // peer's v2-shaped advert (kept verbatim — the signer signed
@@ -754,6 +769,10 @@ impl CapabilityStore {
             && inner.obligation_waits.remove(agent_id.as_bytes()).is_some()
         {
             let _ = self.obligation_adverts.send(agent_id);
+        }
+        // #1109 S2: a durable-capable advert may unblock held direct sends.
+        if durable && machine_id.as_bytes() != &[0; 32] {
+            let _ = self.durable_adverts.send(agent_id);
         }
         true
     }
@@ -1079,6 +1098,30 @@ mod tests {
             machine_id: MachineId([2u8; 32]),
         };
         assert!(!binding_is_gossip_usable(&pending), "pending advert");
+    }
+
+    /// WHY: #1109 S2 the direct-send outbox retries a recipient's held
+    /// sends when its durable-capable advert arrives, and only then.
+    #[test]
+    fn issue1109_durable_advert_is_signalled_for_that_agent_only() {
+        let store = CapabilityStore::new();
+        let mut rx = store.subscribe_durable_adverts();
+        let mut durable = DmCapabilities::v1_gossip_ready(vec![7u8; 1184]);
+        durable.max_protocol_version = crate::dm::DM_PROTOCOL_DURABLE_ACK;
+        let now = now_unix_ms();
+        assert!(store.insert(
+            AgentId([1; 32]),
+            MachineId([2; 32]),
+            DmCapabilities::pending(),
+            now
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "a non-durable advert is not signalled"
+        );
+        assert!(store.insert(AgentId([3; 32]), MachineId([4; 32]), durable, now));
+        assert_eq!(rx.try_recv().expect("signalled"), AgentId([3; 32]));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
