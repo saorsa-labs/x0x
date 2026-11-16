@@ -54,7 +54,7 @@
       "revision": 1,
       "path": "A07-r01-messages-receipts-history-and-retry.md",
       "title": "Messages Receipts History and Retry",
-      "sha256": "b4511aca5387dd98b5a8faf1424935d514796e5d6995a2e38c8f14a544cbc59d"
+      "sha256": "afb05e0fe2391960685c37f4bcebc90e9d1a8125505c73cba6b3ed55e026baff"
     },
     {
       "id": "A08",
@@ -68,7 +68,7 @@
       "revision": 1,
       "path": "A09-r01-group-encryption-and-key-changes.md",
       "title": "Group Encryption and Key Changes",
-      "sha256": "5b7567a3e05a24dca3e6990abf13587c67cdb7a93ee43a551228fef1b8b574c6"
+      "sha256": "bbf7a7a5f1f0fbbdc08da18399839a9e67c5fb0f04a802348ad18d8dd17f64f1"
     },
     {
       "id": "A10",

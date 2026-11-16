@@ -82,8 +82,8 @@ use routes::{
     create_discovery_subscription, create_group_invite, create_group_kv_store, create_join_request,
     create_kv_store, create_mls_group, create_mls_welcome, create_named_group, create_task_list,
     daemon_shutdown_hook, delete_contact, delete_discovery_subscription, delete_kv_value,
-    delete_machine, direct_connections, direct_message_send_config, direct_receipt, direct_send,
-    discover_groups, discover_groups_nearby, discovered_agent, discovered_agents,
+    delete_machine, direct_cancel, direct_connections, direct_message_send_config, direct_receipt,
+    direct_send, discover_groups, discover_groups_nearby, discovered_agent, discovered_agents,
     discovered_machine, discovered_machines, dispatch_join_result_message,
     dispatch_welcome_blob_message, dm_diagnostics, enroll_device, ensure_named_group_listeners,
     evaluate_trust, exec_cancel, exec_diagnostics, exec_run, exec_sessions, file_accept_handler,
@@ -1399,6 +1399,11 @@ pub async fn serve_with_options(
         causal_approval_queue_path,
         predecessor_relay_outbox_path,
         requester_offer_outbox_path,
+        direct_send_outbox: routes::direct_outbox::DirectSendOutbox::new(
+            config
+                .data_dir
+                .join(routes::direct_outbox::DIRECT_SEND_OUTBOX_FILE),
+        ),
         public_group_bootstrap_outbox_path,
         treekem_event_log: RwLock::new(HashMap::new()),
         treekem_member_key_packages,
@@ -1950,6 +1955,15 @@ pub async fn serve_with_options(
     // observe the metadata event, and the operator can inspect the file).
     if let Err(error) = load_requester_offer_outbox(&state).await {
         tracing::error!("#908 startup: requester offer outbox not loaded: {error}");
+    }
+    // #1109: queued direct sends load fail-visible like the requester
+    // offers: a bad sidecar is moved aside and the outbox starts empty.
+    if let Err(error) = state
+        .direct_send_outbox
+        .load(routes::direct_outbox::now_unix_ms())
+        .await
+    {
+        tracing::error!("#1109 startup: direct send outbox not loaded: {error}");
     }
     // ADR 0030 §5 fail-closed: a malformed or over-cap bootstrap outbox aborts
     // startup rather than silently dropping delivery obligations the authority
@@ -2981,6 +2995,35 @@ pub async fn serve_with_options(
         }));
     }
 
+    // #1109: durable direct-send worker. Each pass settles obligations the
+    // receipt ledger shows delivered, drops expired ones and sends the
+    // rest once under their logical id.
+    {
+        let send_state = Arc::clone(&state);
+        bg_tasks.push(tokio::spawn(async move {
+            let mut shutdown_rx = send_state.shutdown_notify.subscribe();
+            let acks = send_state.agent.dm_inflight_acks();
+            let transport = routes::direct_outbox::AgentDirectSendTransport(send_state.as_ref());
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => break,
+                    _ = tokio::time::sleep(routes::direct_outbox::DIRECT_SEND_TICK) => {
+                        send_state
+                            .direct_send_outbox
+                            .step(
+                                routes::direct_outbox::DirectSendNow::current(),
+                                &|request_id| {
+                                    routes::direct_outbox::LedgerReceipt::of(&acks, request_id)
+                                },
+                                &transport,
+                            )
+                            .await;
+                    }
+                }
+            }
+        }));
+    }
+
     // ADR 0030 §5: strict v2 signed-public bootstrap listener. Unlike the
     // legacy unprefixed fan-out, this route resolves the authenticated DM
     // completion only after the consent gate and a directory-durable install,
@@ -3355,7 +3398,10 @@ pub async fn serve_with_options(
         .route("/agents/connect", post(connect_agent))
         .route("/direct/send", post(direct_send))
         .route("/direct/connections", get(direct_connections))
-        .route("/direct/receipts/:logical_id", get(direct_receipt))
+        .route(
+            "/direct/receipts/:logical_id",
+            get(direct_receipt).delete(direct_cancel),
+        )
         .route("/direct/events", get(direct_events_sse))
         // MLS group encryption endpoints
         .route("/mls/groups", post(create_mls_group))
