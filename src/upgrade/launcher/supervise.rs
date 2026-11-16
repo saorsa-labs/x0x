@@ -492,7 +492,7 @@ mod tests {
         assert_eq!(journal_phase(&root), journal::Phase::Restored);
         assert_eq!(trial.phase, Phase::Restored);
         assert_eq!(
-            trial.verdict.as_ref().map(|v| v.class.clone()),
+            trial.verdict.as_ref().map(|v| v.class),
             Some(journal::CauseClass::Failed)
         );
     }
