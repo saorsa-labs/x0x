@@ -22,6 +22,11 @@ impl OutboxRecord for Note {
     fn id(&self) -> &str {
         &self.id
     }
+    /// The toy's "content" is its size: an id may be reused for another
+    /// size, as #1109 reuses a logical id for other bytes.
+    fn same_entry(&self, other: &Self) -> bool {
+        self.id == other.id && self.size == other.size
+    }
     fn first_seen_ms(&self) -> u64 {
         self.first_seen_ms
     }
@@ -115,6 +120,42 @@ fn retry_offsets_clamp_at_the_last_entry() {
     assert_eq!(retry_delay_secs(SCHEDULE, 4), 4);
     assert_eq!(retry_delay_secs(SCHEDULE, 99), 4, "bounded interval");
     assert_eq!(retry_delay_secs(&[], 3), 0, "no table, no panic");
+}
+
+/// WHY: #1109 a settle for one entry must not touch a later entry that
+/// reuses its id with other content (an attempt's outcome belongs only to
+/// the bytes it sent).
+#[tokio::test]
+async fn issue1109_settle_leaves_a_same_id_entry_with_other_content() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cells = Cells::new(dir.path());
+    let sent = note("g1", "a", 10);
+    let mut requeued = sent.clone();
+    requeued.size = 20;
+    cells
+        .outbox()
+        .insert(requeued.clone())
+        .await
+        .expect("insert");
+    let delivered = cells
+        .outbox()
+        .settle(
+            50,
+            std::slice::from_ref(&sent),
+            &[(sent.clone(), true)],
+            SCHEDULE,
+        )
+        .await;
+    assert!(
+        matches!(delivered, Settled::Committed { ref delivered, ref dropped }
+        if delivered.is_empty() && dropped.is_empty())
+    );
+    let failed = cells
+        .outbox()
+        .settle(60, &[], &[(sent, false)], SCHEDULE)
+        .await;
+    assert!(matches!(failed, Settled::Committed { .. }));
+    assert_eq!(cells.outbox().snapshot().await, vec![requeued]);
 }
 
 /// #1840: `replace_if` replaces only a stored entry that `accept` admits,

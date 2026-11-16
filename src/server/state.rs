@@ -1239,6 +1239,9 @@ pub(super) struct AppState {
     /// #908: serializes snapshot-and-write of the requester offer outbox
     /// sidecar (the relay outbox's discipline).
     pub(super) requester_offer_outbox_persistence_lock: Mutex<()>,
+    /// #1109: durable `POST /direct/send` obligations (`deliver_until_ms`),
+    /// keyed by recipient. See `routes::direct_outbox`.
+    pub(super) direct_send_outbox: crate::server::routes::direct_outbox::DirectSendOutbox,
     /// Serializes bootstrap outbox mutation and durable replacement. The retry
     /// worker never holds this while awaiting network delivery.
     pub(super) public_group_bootstrap_outbox_persistence_lock: Mutex<()>,

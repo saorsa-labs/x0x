@@ -5248,7 +5248,7 @@ pub fn verify_envelope_signature(envelope: &DmEnvelope, public_key_bytes: &[u8])
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::contacts::TrustLevel;
     use crate::dm::MAX_ENVELOPE_BYTES;
@@ -5720,6 +5720,69 @@ mod tests {
         );
         sign_envelope_with_agent(&mut envelope, sender);
         wrap_in_pubsub(harness, sender, &envelope)
+    }
+
+    /// #1109: the real durable receiver path, for sender-side tests
+    /// outside this module (the queued direct-send worker).
+    pub(crate) struct DurableReceiverFixture {
+        harness: InboxHarness,
+        _history: crate::history::HistoryService,
+        sender: AgentKeypair,
+        machine: MachineId,
+    }
+
+    impl DurableReceiverFixture {
+        pub(crate) async fn new() -> Self {
+            let sender = test_keypair();
+            let machine = MachineId([0xE1; 32]);
+            let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
+            let history = attach_history(&mut harness);
+            Self {
+                harness,
+                _history: history,
+                sender,
+                machine,
+            }
+        }
+
+        /// Run `payload` under `request_id` through the receiver's durable
+        /// path (replay binding check, history commit, dispatch, ACK). True
+        /// when the receiver ACKs it as accepted.
+        pub(crate) async fn deliver(&self, request_id: [u8; 16], payload: &[u8]) -> bool {
+            let mut envelope = craft_unsigned_payload_envelope_versioned(
+                &self.harness,
+                &self.sender,
+                self.machine,
+                0,
+                DM_PROTOCOL_DURABLE_ACK,
+                payload.to_vec(),
+            );
+            envelope.request_id = request_id;
+            sign_envelope_with_agent(&mut envelope, &self.sender);
+            let decision = self
+                .harness
+                .pipeline
+                .handle_payload_durable(
+                    envelope,
+                    payload.to_vec(),
+                    TrustDecision::Accept,
+                    self.machine,
+                    true,
+                    self.sender.public_key().as_bytes().to_vec(),
+                    false,
+                )
+                .await;
+            matches!(decision, DurableAckDecision::Acked { accepted: true, .. })
+        }
+
+        /// Messages the receiver dispatched to its subscribers so far.
+        pub(crate) fn drain_dispatched(&mut self) -> Vec<Vec<u8>> {
+            let mut out = Vec::new();
+            while let Some(message) = self.harness.receiver.try_recv() {
+                out.push(message.payload);
+            }
+            out
+        }
     }
 
     fn committed_rows(

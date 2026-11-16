@@ -10,6 +10,7 @@ pub(super) mod calls;
 pub(super) mod connect;
 pub(in crate::server) mod contacts;
 mod direct;
+pub(in crate::server) mod direct_outbox;
 mod discovery;
 mod exec;
 mod files;
@@ -53,8 +54,8 @@ pub(super) use contacts::{
     update_contact,
 };
 pub(super) use direct::{
-    connect_agent, connect_machine, direct_connections, direct_message_send_config, direct_receipt,
-    direct_send,
+    connect_agent, connect_machine, direct_cancel, direct_connections, direct_message_send_config,
+    direct_receipt, direct_send,
 };
 pub(super) use discovery::{
     agent_reachability, agents_by_user_handler, discovered_agent, discovered_agent_entry,

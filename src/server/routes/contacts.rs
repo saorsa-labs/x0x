@@ -34,6 +34,32 @@ pub(in crate::server) async fn sync_contact_relationship(
         |_| (),
     )
     .await;
+    drop_queued_sends_if_blocked(state, agent_id).await;
+}
+
+/// #1109: a blocked or revoked contact gets no queued send. Its held
+/// obligations end as `failed` (`recipient_blocked`). The worker also
+/// checks before each attempt, so a block set elsewhere is caught too.
+pub(in crate::server) async fn drop_queued_sends_if_blocked(
+    state: &AppState,
+    agent_id: x0x::identity::AgentId,
+) {
+    let blocked = {
+        let contacts = state.contacts.read().await;
+        contacts.trust_level(&agent_id) == TrustLevel::Blocked || contacts.is_revoked(&agent_id)
+    };
+    if blocked {
+        let dropped = state
+            .direct_send_outbox
+            .drop_recipient(&agent_id, super::direct_outbox::RECIPIENT_BLOCKED)
+            .await;
+        if dropped > 0 {
+            tracing::info!(
+                dropped,
+                "#1109: dropped queued direct sends to a blocked contact"
+            );
+        }
+    }
 }
 
 /// POST /contacts request body.

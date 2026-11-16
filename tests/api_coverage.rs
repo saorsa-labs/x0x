@@ -325,6 +325,11 @@ const COVERED: &[CoveredEndpoint] = &[
         "/direct/receipts/:logical_id",
         daemon_api_direct_receipt_unknown_and_invalid
     ),
+    covered!(
+        Delete,
+        "/direct/receipts/:logical_id",
+        issue1109_cancel_removes_a_queued_send_and_404s_when_none
+    ),
     covered!(Get, "/direct/events", daemon_api_direct_events_sse),
     // ── Exec ───────────────────────────────────────────────────────────
     covered!(Post, "/exec/run", daemon_api_exec_run_bad_agent_id),
@@ -709,6 +714,12 @@ const COVERED: &[CoveredEndpoint] = &[
 ];
 
 const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
+    // #1109: the queued-send cancel route's coverage lives in the direct
+    // route lib tests.
+    (
+        "src/server/routes/direct.rs",
+        include_str!("../src/server/routes/direct.rs"),
+    ),
     // #1094 D1/D2: the granted-store read and write routes' coverage lives
     // in the data-read lib tests.
     (
