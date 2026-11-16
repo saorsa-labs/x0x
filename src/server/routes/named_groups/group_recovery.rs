@@ -1368,7 +1368,13 @@ async fn revoke_pending_invites(state: &AppState) {
                 durable
             }
         };
-        if !durable || !roster_durability_confirmed(state).await {
+        // #1941 review: an earlier roster save that replaced the file but
+        // did not sync its directory leaves a revocation in memory only, so
+        // "nothing left to revoke" proves nothing until the roster is
+        // `Durable`. The confirmation saves and clears the flag under the
+        // persistence lock: a concurrent not-durable save cannot be
+        // overwritten by a late clear.
+        if !durable || !super::confirm_named_groups_durability(state).await {
             continue;
         }
         let path = revoke_marker_path(&dir, &sidecar_stem(&stable));
@@ -1393,30 +1399,6 @@ async fn revoke_pending_invites(state: &AppState) {
             .await
             .revoke_pending
             .remove(&stable);
-    }
-}
-
-/// #1941 review: an earlier roster save that replaced the file but did not
-/// sync its directory (`named_groups_requires_durability_confirmation`)
-/// leaves a revocation in memory only. "Nothing left to revoke" then proves
-/// nothing, so the roster is saved again and must be `Durable` before the
-/// marker may go.
-async fn roster_durability_confirmed(state: &AppState) -> bool {
-    use std::sync::atomic::Ordering;
-    if !state
-        .named_groups_requires_durability_confirmation
-        .load(Ordering::Acquire)
-    {
-        return true;
-    }
-    match super::save_named_groups_checked(state).await {
-        Ok(super::AtomicWriteOutcome::Durable) => {
-            state
-                .named_groups_requires_durability_confirmation
-                .store(false, Ordering::Release);
-            true
-        }
-        _ => false,
     }
 }
 
