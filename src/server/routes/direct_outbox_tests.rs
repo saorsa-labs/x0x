@@ -763,8 +763,8 @@ async fn issue1109_cancel_and_requeue_during_an_attempt_are_refused() {
 }
 
 /// WHY: blocking a contact during an attempt records that attempt's
-/// outcome and never sends again; bytes queued later under the same key
-/// are not reported delivered by the old attempt.
+/// outcome and never sends again; other bytes cannot then be queued under
+/// the same key, so the old attempt never reports them delivered.
 #[tokio::test]
 async fn issue1109_block_during_an_attempt_records_it_and_never_resends() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -802,12 +802,16 @@ async fn issue1109_block_during_an_attempt_records_it_and_never_resends() {
         "never sent again"
     );
 
+    // A was attempted with an unknown outcome: other bytes are refused.
     let mut b = a;
     b.payload = b"payload B".to_vec();
-    assert_eq!(outbox.enqueue(b, no_record()).await, EnqueueOutcome::Queued);
+    assert_eq!(
+        outbox.enqueue(b, no_record()).await,
+        EnqueueOutcome::Conflict
+    );
     let receipt = status(&outbox, peer, &rid).await;
-    assert_eq!(receipt.status, "queued");
-    assert_eq!(receipt.payload_digest, Some(digest_of(b"payload B")));
+    assert_eq!(receipt.status, "failed");
+    assert_eq!(receipt.payload_digest, Some(digest_of(b"hello")));
 }
 
 /// WHY: #1109 S2 a receipt must answer the same after a restart: every
@@ -909,9 +913,20 @@ async fn issue1109_late_ack_after_restart_settles_with_zero_sends() {
     let dir = tempfile::tempdir().expect("tempdir");
     let peer = agent(2);
     let rid = request_id_for("order-r", peer);
-    outbox_in(&dir)
-        .enqueue(obligation("order-r", peer, NOW + 60_000), no_record())
-        .await;
+    {
+        let before = outbox_in(&dir);
+        before
+            .enqueue(obligation("order-r", peer, NOW + 60_000), no_record())
+            .await;
+        // One attempt whose ACK is lost; then the daemon restarts.
+        before
+            .step(
+                at(NOW, 0),
+                &unknown,
+                &ScriptedTransport::with(vec![Err(timeout())]),
+            )
+            .await;
+    }
     let after = outbox_in(&dir);
     after.load(NOW).await.expect("sidecar loads");
     assert!(after.settle_late_ack(&rid, &peer).await);
@@ -1000,4 +1015,254 @@ async fn issue1109_corrupt_outcomes_sidecar_is_moved_aside() {
             .await,
         EnqueueOutcome::Queued
     );
+}
+
+fn timeout() -> DmError {
+    DmError::Timeout {
+        retries: 0,
+        elapsed: Duration::from_secs(1),
+    }
+}
+
+/// One attempt whose ACK is lost (a retryable timeout).
+async fn attempt_once(outbox: &DirectSendOutbox, wall: u64, mono: u64) {
+    let transport = ScriptedTransport::with(vec![Err(timeout())]);
+    outbox.step(at(wall, mono), &unknown, &transport).await;
+    assert_eq!(transport.calls(), 1, "one attempt was made");
+}
+
+/// WHY: #1109 S2 review — the outcome is written before the obligation is
+/// removed; if a crash comes between, the reload removes the obligation
+/// and the recorded outcome wins.
+#[tokio::test]
+async fn issue1109_outcome_written_before_removal_wins_on_reload() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let peer = agent(2);
+    let rid = request_id_for("crash-1", peer);
+    {
+        let before = outbox_in(&dir);
+        before
+            .enqueue(obligation("crash-1", peer, NOW + 60_000), no_record())
+            .await;
+        before
+            .record_outcomes_only(vec![(
+                rid,
+                DirectSendTerminal::Expired,
+                digest_of(b"hello"),
+            )])
+            .await
+            .expect("outcome written");
+        // Crash: the obligation was not removed.
+        assert_eq!(before.snapshot().await.len(), 1);
+    }
+    let after = outbox_in(&dir);
+    after.load(NOW).await.expect("sidecars load");
+    assert!(after.snapshot().await.is_empty(), "the outcome wins");
+    assert_eq!(status(&after, peer, &rid).await.status, "expired");
+    let transport = ScriptedTransport::default();
+    after.step(at(NOW, 0), &unknown, &transport).await;
+    assert_eq!(transport.calls(), 0);
+}
+
+/// WHY: #1109 S2 review — when the outcome cannot be written, nothing ends:
+/// the send stays held, a cancel answers not-durable, and no attempt is
+/// made until the attempt record can be written.
+#[tokio::test]
+async fn issue1109_failed_outcome_write_keeps_the_send_held() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let outbox = outbox_in(&dir);
+    let peer = agent(2);
+    let rid = request_id_for("nowrite-1", peer);
+    outbox
+        .enqueue(obligation("nowrite-1", peer, NOW + 60_000), no_record())
+        .await;
+    // A directory where the outcomes file goes: every write fails.
+    let blocker = dir.path().join(DIRECT_SEND_OUTCOMES_FILE);
+    std::fs::create_dir(&blocker).expect("blocker dir");
+    assert!(matches!(
+        outbox.cancel(&peer, &rid).await,
+        CancelOutcome::NotDurable(_)
+    ));
+    assert_eq!(outbox.snapshot().await.len(), 1, "still held");
+    assert_eq!(status(&outbox, peer, &rid).await.status, "queued");
+    let transport = ScriptedTransport::default();
+    outbox.step(at(NOW, 0), &unknown, &transport).await;
+    assert_eq!(
+        transport.calls(),
+        0,
+        "no send without a durable attempt record"
+    );
+    std::fs::remove_dir(&blocker).expect("remove blocker");
+    outbox.step(at(NOW, 1), &unknown, &transport).await;
+    assert_eq!(transport.calls(), 1);
+    assert!(outbox.snapshot().await.is_empty());
+    assert_eq!(status(&outbox, peer, &rid).await.status, "delivered");
+}
+
+/// WHY: #1109 S2 review — a late ACK for the only bytes ever attempted,
+/// arriving after the send expired, is recorded truthfully.
+#[tokio::test]
+async fn issue1109_late_ack_after_expiry_reads_delivered_late() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let outbox = outbox_in(&dir);
+    let peer = agent(2);
+    let rid = request_id_for("late-exp", peer);
+    outbox
+        .enqueue(obligation("late-exp", peer, NOW + 1_000), no_record())
+        .await;
+    attempt_once(&outbox, NOW, 0).await;
+    outbox
+        .step(
+            at(NOW + 1_000, 1_000),
+            &unknown,
+            &ScriptedTransport::default(),
+        )
+        .await;
+    assert_eq!(status(&outbox, peer, &rid).await.status, "expired");
+    assert!(outbox.settle_late_ack(&rid, &peer).await);
+    let receipt = status(&outbox, peer, &rid).await;
+    assert_eq!(receipt.status, "delivered_late");
+    assert_eq!(receipt.payload_digest, Some(digest_of(b"hello")));
+}
+
+/// WHY: #1109 S2 review — a late ACK for the only bytes ever attempted,
+/// arriving after a cancel, is recorded truthfully.
+#[tokio::test]
+async fn issue1109_late_ack_after_cancel_reads_delivered_late() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let outbox = outbox_in(&dir);
+    let peer = agent(2);
+    let rid = request_id_for("late-cancel", peer);
+    outbox
+        .enqueue(obligation("late-cancel", peer, NOW + 60_000), no_record())
+        .await;
+    attempt_once(&outbox, NOW, 0).await;
+    assert_eq!(outbox.cancel(&peer, &rid).await, CancelOutcome::Cancelled);
+    assert!(
+        !outbox.settle_late_ack(&rid, &agent(9)).await,
+        "another agent"
+    );
+    assert!(outbox.settle_late_ack(&rid, &peer).await);
+    assert_eq!(status(&outbox, peer, &rid).await.status, "delivered_late");
+}
+
+/// WHY: #1109 S2 review — once bytes were attempted under a key, other
+/// bytes cannot be queued under it (their delivery is unknowable), and a
+/// held send whose bytes were never attempted is not settled by a late
+/// ACK.
+#[tokio::test]
+async fn issue1109_late_ack_never_settles_bytes_that_were_not_attempted() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let outbox = outbox_in(&dir);
+    let peer = agent(2);
+    let rid = request_id_for("requeue", peer);
+    let a = obligation("requeue", peer, NOW + 60_000);
+    outbox.enqueue(a.clone(), no_record()).await;
+    attempt_once(&outbox, NOW, 0).await;
+    assert_eq!(outbox.cancel(&peer, &rid).await, CancelOutcome::Cancelled);
+    let mut b = a;
+    b.payload = b"payload B".to_vec();
+    assert_eq!(
+        outbox.enqueue(b.clone(), no_record()).await,
+        EnqueueOutcome::Conflict
+    );
+
+    // B held under a key whose only attempt was other bytes (A).
+    let other_dir = tempfile::tempdir().expect("tempdir");
+    let other = outbox_in(&other_dir);
+    assert_eq!(other.enqueue(b, no_record()).await, EnqueueOutcome::Queued);
+    other
+        .note_attempts(vec![(
+            rid,
+            hex::encode(peer.as_bytes()),
+            digest_of(b"hello"),
+        )])
+        .await
+        .expect("noted");
+    assert!(!other.settle_late_ack(&rid, &peer).await);
+    assert_eq!(other.snapshot().await.len(), 1, "B is still held");
+    let receipt = status(&other, peer, &rid).await;
+    assert_eq!(receipt.status, "queued");
+    assert_eq!(receipt.payload_digest, Some(digest_of(b"payload B")));
+}
+
+/// WHY: #1109 S2 review — with two digests attempted under one key, a late
+/// ACK cannot say which bytes it proves, so it changes nothing.
+#[tokio::test]
+async fn issue1109_two_attempted_digests_make_a_late_ack_change_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let outbox = outbox_in(&dir);
+    let peer = agent(2);
+    let rid = request_id_for("two-digests", peer);
+    outbox
+        .enqueue(obligation("two-digests", peer, NOW + 60_000), no_record())
+        .await;
+    outbox
+        .note_attempts(vec![(
+            rid,
+            hex::encode(peer.as_bytes()),
+            digest_of(b"other"),
+        )])
+        .await
+        .expect("noted");
+    attempt_once(&outbox, NOW, 0).await;
+    assert!(!outbox.settle_late_ack(&rid, &peer).await);
+    assert_eq!(outbox.snapshot().await.len(), 1);
+    assert_eq!(status(&outbox, peer, &rid).await.status, "queued");
+}
+
+/// WHY: #1109 S2 review — wake-ups arriving faster than the tick must not
+/// starve the scheduled passes: due sends are still attempted and a
+/// past-deadline send still expires.
+#[tokio::test(start_paused = true)]
+async fn issue1109_wake_up_flood_does_not_starve_the_scheduled_passes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let outbox = std::sync::Arc::new(outbox_in(&dir));
+    let peer = agent(2);
+    let rid = request_id_for("flood", peer);
+    outbox
+        .enqueue(obligation("flood", peer, NOW + 6_000), no_record())
+        .await;
+    let transport = std::sync::Arc::new(ScriptedTransport::with(vec![
+        Err(timeout()),
+        Err(timeout()),
+        Err(timeout()),
+    ]));
+    let (wake_tx, wake_rx) = tokio::sync::mpsc::channel(64);
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let worker = {
+        let outbox = std::sync::Arc::clone(&outbox);
+        let transport = std::sync::Arc::clone(&transport);
+        tokio::spawn(async move {
+            let start = tokio::time::Instant::now();
+            let clock = move || {
+                let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                at(NOW + elapsed, elapsed)
+            };
+            run_direct_send_worker(
+                &outbox,
+                &unknown,
+                transport.as_ref(),
+                &clock,
+                wake_rx,
+                async move {
+                    let _ = stop_rx.await;
+                },
+            )
+            .await;
+        })
+    };
+    // A wake-up every 300 ms for 9 s, for a recipient with nothing held.
+    for _ in 0..30 {
+        wake_tx
+            .send(DirectSendWake::Advert(agent(9)))
+            .await
+            .expect("worker alive");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    assert!(transport.calls() >= 2, "retries ran on schedule");
+    assert!(outbox.snapshot().await.is_empty());
+    assert_eq!(status(&outbox, peer, &rid).await.status, "expired");
+    let _ = stop_tx.send(());
+    worker.await.expect("worker ends");
 }

@@ -10,8 +10,12 @@ All notable changes to this project will be documented in this file.
   amendment of 16 Nov 2026).** `delivered`, `expired`, `failed` and
   `cancelled`, with the payload digest, are kept 24 h in
   `direct_send_outcomes.json` (0600) and loaded at start. A late durable ACK
-  after a restart settles a held send without a resend, and a recipient's
-  durable-capable advert makes its held sends due at once.
+  after a restart settles a held send without a resend only when the only
+  bytes ever attempted under that `logical_id` are the held ones (after
+  `expired` or `cancelled` it reads `delivered_late`), and a recipient's
+  durable-capable advert makes its held sends due at once. Outcomes are
+  written before a send leaves the outbox; other bytes under an attempted
+  `logical_id` answer 409.
 - **A refused granted write names a fixed reason (#1094, review of #1953;
   A03 amendment of 16 Nov 2026).** The granted agent no longer forwards its
   store's error text to a remote grantee; the reply carries one of
