@@ -6,6 +6,19 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **The dormant launcher stops a committed daemon gracefully (#1378 slice 4;
+  A14 amendment of 16 Nov 2026).** A stop sends SIGTERM and waits up to 35 s
+  for x0xd's shutdown before SIGKILL. The retire after a host commit retries
+  only a failed host lock, ends its retries on a stop, and hands its result to
+  the caller. A start that finds a committed trial honours a stop.
+- **A KV merge keeps the earliest `created_at` (#1094, review of #1974).**
+  Every merge path now keeps the earlier `created_at` of the two entries
+  whichever wins, so replicas converge on it regardless of arrival order.
+- **The dormant launcher rolls back a multi-participant host through the
+  coordinator (#1378 slice 5; A14 amendment of 16 Nov 2026).** A launcher whose
+  own trial must roll back keeps its verdict under the host lock and runs the
+  coordinator pass, which restores the pair once for every participant. Before,
+  its single-trial restore refused a host it did not hold in full.
 - **`GET /stores/:id/:key` shows the verified writer (#1094 slice P2, A10
   amendment of 16 Nov 2026).** New `writer` field: the agent (and rider
   sub-agent) whose mark verifies for the returned value, or
@@ -314,6 +327,12 @@ All notable changes to this project will be documented in this file.
 
 ### Tests and tooling
 
+- **CI pins cargo-nextest 0.9.151 (was 0.9.144) in all 18 install steps.**
+  0.9.151 is the first release with `future-queue` 0.4.1
+  (nextest-rs/future-queue#603). Before it, a test queued behind a full
+  test group could be dropped without running when the group mixed
+  `threads-required` values, and the run then ended with tests "not run"
+  and no failure. `.config/nextest.toml` recommends 0.9.151.
 - **W3-H row H-S3-d2 (`w3h_1356_control_s3_d2_fork_exposure_contained`)
   no longer races X's own events (#1572).** From X's rename until X has
   served J its join-carry ATA, X's pubsub writes to J are held too. Before,
@@ -321,6 +340,7 @@ All notable changes to this project will be documented in this file.
   an empty chain, X served no carry, and the row ended INFRA ("X's
   join-carry ATA was not recorded") in about 1 run in 15. A test-only
   recorder now names why a served join result carried no ATA.
+
 - **Launcher supervise driver (#1378 slice 2; A14 amendment of 16 Nov
   2026).** The dormant launcher's supervise driver
   (`src/upgrade/launcher/supervise.rs`) runs a trial, then polls the host

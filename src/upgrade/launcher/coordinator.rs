@@ -1,6 +1,9 @@
 //! S3c host coordinator recovery (ADR 0094 §3, §4; #1376). Dormant like the
-//! rest of this module. `recover` is the production pass; it needs a `Host`
-//! from the complete inventory issuer (#1378), so nothing calls it yet.
+//! rest of this module. `recover` is the production pass. The supervise
+//! driver calls it after a due rollback, and `run::run_trial` calls it for
+//! its own rollback on a host with more than one participant. Both need a
+//! `Host` from the complete inventory issuer (#1378), which does not exist
+//! yet, so no live path reaches it.
 //!
 //! One pass reconciles the host after a crash, a stop or a reboot. It never
 //! starts a child. It fences the host to RollingBack, so no launcher can
@@ -50,8 +53,8 @@ pub(super) fn trial_path(participant: &journal::Participant) -> PathBuf {
 /// The production pass: trial records at `trial_path`, each running
 /// participant's handoff record read from its data root, the live clock,
 /// and `child::stop_foreign` for every live participant. `host` must come
-/// from the complete inventory issuer (#1378). There is none yet, so the
-/// launcher does not call this while `ENABLED` is false.
+/// from the complete inventory issuer (#1378). There is none yet, so no
+/// live path calls this while `ENABLED` is false.
 ///
 /// Contract for the caller: it stops and reaps its own child
 /// (`child::Owned::reap`) first. `stop_foreign` only signals; a child of
@@ -475,6 +478,7 @@ fn fail_all(trials: &mut [(PathBuf, Trial)], error: io::Error) -> io::Error {
 #[cfg(all(test, unix))]
 mod tests {
     use super::super::testkit;
+    use super::testkit::write_probe;
     use super::*;
 
     fn now() -> Clock {
@@ -506,31 +510,6 @@ mod tests {
         let fixture = testkit::fixture_with(phase, edit);
         write_probe(&fixture.2, 1, probe::ProbePhase::Passed);
         fixture
-    }
-
-    fn write_probe(host: &recovery::Host, attempt: u32, phase: probe::ProbePhase) {
-        let plan = host.plan();
-        let install = plan.daemon.target_path.clone();
-        let state = probe::ProbeState {
-            schema_version: 1,
-            record_kind: "probe".into(),
-            install: install.clone(),
-            version: plan.candidate_version.clone(),
-            platform: "fixture-platform".into(),
-            archive_sha256: [1; 32],
-            transaction_id: "00000000-0000-4000-8000-000000000001".into(),
-            attempt,
-            phase,
-            cause: None,
-            last_pid: None,
-            boot_id: "fixture-boot".into(),
-            retry_remaining_ms: 0,
-            retry_deadline_ms: 0,
-            daemon_sha256: Some(plan.daemon.candidate_sha256),
-            cli_sha256: Some(plan.cli.candidate_sha256),
-        };
-        journal::write_auxiliary_record(&probe::state_path(&install).unwrap(), &state, |_| Ok(()))
-            .unwrap();
     }
 
     fn probe_state(host: &recovery::Host) -> Option<probe::ProbeState> {
