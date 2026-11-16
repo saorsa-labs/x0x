@@ -2055,6 +2055,21 @@ pub(crate) mod apply_attempt_seam {
     }
 }
 
+/// D194 (#1377): the refusal when staging `expected` archive bytes would
+/// leave less than the 1 GiB reserve free, or `None` to proceed.
+#[cfg(unix)]
+fn staging_space_refusal(available: u64, expected: u64) -> Option<String> {
+    let Some(needed) = super::pair::RESERVE_BYTES.checked_add(expected) else {
+        return Some("insufficient_disk: staging size overflow".into());
+    };
+    (available < needed).then(|| {
+        format!(
+            "insufficient_disk: staging needs {needed} bytes free (the archive plus a 1 GiB \
+             reserve), {available} available"
+        )
+    })
+}
+
 /// Download a URL to a local file, enforcing a maximum size limit.
 ///
 /// Checks `Content-Length` upfront and streams the response to disk with
@@ -2092,6 +2107,20 @@ async fn download_to_file(url: &str, destination: &Path) -> Result<(), UpgradeEr
                 size: content_length,
                 limit: MAX_BINARY_SIZE_BYTES,
             });
+        }
+    }
+
+    // D194 (#1377): staging must leave 1 GiB free after the archive. An
+    // unknown length is charged at the archive limit.
+    #[cfg(unix)]
+    {
+        let expected = response.content_length().unwrap_or(MAX_BINARY_SIZE_BYTES);
+        let directory = destination.parent().unwrap_or_else(|| Path::new("."));
+        let available = super::pair::available_bytes(directory)
+            .map_err(|e| UpgradeError::DownloadError(format!("free space unavailable: {e}")))?;
+        if let Some(reason) = staging_space_refusal(available, expected) {
+            warn!("{reason}");
+            return Err(UpgradeError::DownloadError(reason));
         }
     }
 
@@ -4856,5 +4885,22 @@ mod tests {
             !real.join(&lock_name).exists(),
             "the real directory is not the CLI swap target"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod d194_tests {
+    use super::*;
+
+    /// D194: staging refuses when the archive would leave less than 1 GiB
+    /// free, and proceeds at exactly the reserve.
+    #[test]
+    fn staging_keeps_a_one_gib_reserve() {
+        let reserve = crate::upgrade::pair::RESERVE_BYTES;
+        assert!(staging_space_refusal(reserve + 10, 10).is_none());
+        let refusal = staging_space_refusal(reserve + 9, 10).expect("refused");
+        assert!(refusal.starts_with("insufficient_disk"), "{refusal}");
+        assert!(staging_space_refusal(0, 0).is_some());
+        assert!(staging_space_refusal(u64::MAX, u64::MAX).is_some());
     }
 }

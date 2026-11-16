@@ -690,6 +690,31 @@ pub(in crate::server) struct HealthVerdict {
     pub(in crate::server) sample_age_secs: Option<u64>,
 }
 
+/// D193 (#1377): the worst state over the local inputs only. Network
+/// inputs (peers, seed reachability, send failures) never block a health
+/// commit on their own, and the upgrade input reports the trial itself.
+pub(in crate::server) fn local_verdict(
+    verdict: &HealthVerdict,
+) -> crate::upgrade::journal::LocalVerdict {
+    use crate::upgrade::journal::LocalVerdict;
+    let inputs = &verdict.inputs;
+    let states = [
+        inputs.plane.state,
+        inputs.delivery_probe.state,
+        inputs.recv_pump_shed.state,
+        inputs.disk.state,
+        inputs.log.state,
+        inputs.identity.state,
+    ];
+    if states.contains(&"error") {
+        LocalVerdict::Error
+    } else if states.contains(&"degraded") {
+        LocalVerdict::Degraded
+    } else {
+        LocalVerdict::Ok
+    }
+}
+
 /// Classify the M1 verdict over a sample for the full-detail audience —
 /// the loopback/authenticated view, and the default of the tests below.
 /// Pure: no I/O, no locks beyond the caller's — safe to run inside a

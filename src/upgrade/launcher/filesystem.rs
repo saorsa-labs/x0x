@@ -11,9 +11,25 @@ pub(super) fn hash(path: &Path) -> io::Result<[u8; 32]> {
         .open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.len() > MAX_BINARY_BYTES {
-        return Err(invalid("not a bounded regular binary"));
+        return Err(not_binary("not a bounded regular binary"));
     }
     hash_bounded(&mut file, MAX_BINARY_BYTES)
+}
+
+/// A refusal about the file itself, not the read: `InvalidData`, so callers
+/// can tell it from an I/O error (`persistent_hash_error`).
+fn not_binary(reason: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, reason)
+}
+
+/// Whether a `hash` error will repeat on every retry: the file is gone
+/// (`NotFound`), is a symlink (`ELOOP` from `O_NOFOLLOW`), is not a regular
+/// file, or is past the read bound. Every other error is I/O that a retry
+/// may clear.
+pub(super) fn persistent_hash_error(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound
+        || error.kind() == io::ErrorKind::InvalidData
+        || error.raw_os_error() == Some(libc::ELOOP)
 }
 
 const MAX_BINARY_BYTES: u64 = 200 * 1024 * 1024;
@@ -32,7 +48,7 @@ fn hash_bounded(source: impl Read, limit: u64) -> io::Result<[u8; 32]> {
         }
         total = total.saturating_add(n as u64);
         if total > limit {
-            return Err(invalid("binary grew past the read limit"));
+            return Err(not_binary("binary grew past the read limit"));
         }
         hash.update(&buf[..n]);
     }

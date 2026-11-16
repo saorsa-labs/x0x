@@ -351,6 +351,30 @@ mod tests {
         assert_eq!(journal_phase(&root), journal::Phase::SwappedCli);
     }
 
+    /// A deleted or symlinked installed file fails every retry: it rolls
+    /// back as Failed at once instead of waiting for the total deadline.
+    #[test]
+    fn a_missing_or_symlinked_installed_file_rolls_back_as_failed() {
+        for symlink in [false, true] {
+            let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
+            let trials = vec![provisional(&host, &root, gone_child())];
+            write_health(&root, &healthy_record(&host, &trials[0].1));
+            let cli = host.plan().cli.target_path.clone();
+            std::fs::remove_file(&cli).unwrap();
+            if symlink {
+                std::os::unix::fs::symlink(&host.plan().daemon.target_path, &cli).unwrap();
+            }
+            assert!(
+                matches!(
+                    host_commit(&host, &trials).unwrap(),
+                    Commit::RollBack(c) if c.class == journal::CauseClass::Failed
+                ),
+                "symlink = {symlink}"
+            );
+            assert_eq!(journal_phase(&root), journal::Phase::SwappedCli);
+        }
+    }
+
     /// A transient read error on an installed file is an I/O error for the
     /// caller to retry, never a Failed cause that would hold the release.
     #[test]

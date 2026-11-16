@@ -45,7 +45,8 @@ macro_rules! arm_flush_regression_tests {
                 let request = json!({"token": "owned fixture credential", "instance_id": "alice",
                     "transaction_id": journal["transaction_id"], "generation": 3, "plan": journal["plan"]});
                 let state = ControlContext { api_token: "owned fixture credential".into(),
-                    api_address: "127.0.0.1:1".parse().unwrap(), identity_root: root };
+                    api_address: "127.0.0.1:1".parse().unwrap(), identity_root: root,
+                    health_snapshot: std::sync::Arc::default() };
                 (dir, journal, request, state)
             }
 
