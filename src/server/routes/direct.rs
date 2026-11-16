@@ -17,6 +17,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use x0x::contacts::TrustLevel;
 
+use super::direct_outbox::{
+    now_unix_ms, CancelOutcome, DirectSendObligation, DirectSendOptions, DirectSendOutbox,
+    DirectSendReceipt, EnqueueOutcome, LedgerReceipt, DIRECT_SEND_MAX_HORIZON_MS,
+};
+
 pub(in crate::server) fn direct_message_send_config() -> x0x::dm::DmSendConfig {
     // Generic daemon/UI DMs should only return success after the inbox path
     // observes the recipient ACK. Callers that intentionally want
@@ -105,6 +110,13 @@ pub(in crate::server) struct DirectSendRequest {
     /// different bytes is a 409 `idempotency_conflict`.
     #[serde(default)]
     pub(in crate::server) logical_id: Option<String>,
+    /// #1109: deliver durably until this unix-ms deadline. When set, the
+    /// route stores the send and answers 202 `outcome: "queued"`; a worker
+    /// sends it (and holds a cold recipient) until the recipient's durable
+    /// ACK, an error a retry cannot repair, or the deadline. Requires
+    /// durable semantics and a `logical_id`; at most 24 h ahead.
+    #[serde(default)]
+    pub(in crate::server) deliver_until_ms: Option<u64>,
 }
 
 /// A request the route refuses before any send is attempted, carrying the
@@ -129,6 +141,206 @@ impl DirectSendRequestRejection {
     }
 }
 
+/// The request options that shape the send config. A queued send (#1109)
+/// stores them, so its worker builds the config this route would build.
+fn direct_send_options(req: &DirectSendRequest) -> DirectSendOptions {
+    DirectSendOptions {
+        prefer_raw_quic_if_connected: req.prefer_raw_quic_if_connected,
+        raw_quic_receive_ack_ms: req.raw_quic_receive_ack_ms,
+        stop_fallback_on_raw_error: req.stop_fallback_on_raw_error,
+        require_gossip: req.require_gossip,
+    }
+}
+
+/// The `/direct/send` config for `options`, before any `logical_id`.
+pub(super) fn send_config_from_options(
+    options: &DirectSendOptions,
+    require_durable_app_ack: bool,
+) -> x0x::dm::DmSendConfig {
+    let mut config = direct_message_send_config();
+    if let Some(prefer_raw_quic_if_connected) = options.prefer_raw_quic_if_connected {
+        config.prefer_raw_quic_if_connected = prefer_raw_quic_if_connected;
+    }
+    config.stop_fallback_on_raw_error = options.stop_fallback_on_raw_error;
+    config.require_gossip = options.require_gossip;
+    config.require_durable_app_ack = require_durable_app_ack;
+    if let Some(raw_ack_ms) = options.raw_quic_receive_ack_ms {
+        config.raw_quic_receive_ack_timeout = Some(std::time::Duration::from_millis(
+            raw_ack_ms.clamp(100, 30_000),
+        ));
+    }
+    config
+}
+
+/// #1109: check `deliver_until_ms` against the validated config. Returns
+/// the deadline and the request id derived from `logical_id`; `Ok(None)`
+/// when the field is absent (the synchronous send runs as before).
+fn deliver_until_for_request(
+    req: &DirectSendRequest,
+    config: &x0x::dm::DmSendConfig,
+    now_ms: u64,
+) -> Result<Option<(u64, [u8; 16])>, DirectSendRequestRejection> {
+    let Some(deliver_until_ms) = req.deliver_until_ms else {
+        return Ok(None);
+    };
+    let refuse = |code: &'static str, detail: String| DirectSendRequestRejection {
+        status: StatusCode::BAD_REQUEST,
+        code,
+        detail,
+    };
+    if !config.require_durable_app_ack {
+        return Err(refuse(
+            "deliver_until_requires_durable",
+            "deliver_until_ms needs durable delivery; remove require_durable_app_ack: false"
+                .to_string(),
+        ));
+    }
+    // `logical_request_id` is set exactly when a valid `logical_id` was given.
+    let Some(request_id) = config.logical_request_id else {
+        return Err(refuse(
+            "deliver_until_requires_logical_id",
+            "deliver_until_ms needs a logical_id: it is the key of the queued send \
+             and of GET /direct/receipts/{logical_id}"
+                .to_string(),
+        ));
+    };
+    if deliver_until_ms <= now_ms {
+        return Err(refuse(
+            "deliver_until_passed",
+            format!("deliver_until_ms {deliver_until_ms} is not after now ({now_ms})"),
+        ));
+    }
+    if deliver_until_ms - now_ms > DIRECT_SEND_MAX_HORIZON_MS {
+        return Err(refuse(
+            "deliver_until_too_far",
+            format!(
+                "deliver_until_ms is more than {DIRECT_SEND_MAX_HORIZON_MS} ms (24 h) after now"
+            ),
+        ));
+    }
+    Ok(Some((deliver_until_ms, request_id)))
+}
+
+/// #1109: the obligation a validated queued send stores. `deadline` is
+/// `(deliver_until_ms, request_id)` from [`deliver_until_for_request`].
+fn queued_obligation(
+    logical_id: &str,
+    options: DirectSendOptions,
+    recipient: x0x::identity::AgentId,
+    payload: Vec<u8>,
+    (deliver_until_ms, request_id): (u64, [u8; 16]),
+    now_ms: u64,
+) -> DirectSendObligation {
+    DirectSendObligation {
+        recipient: hex::encode(recipient.as_bytes()),
+        logical_id: logical_id.to_string(),
+        request_id: hex::encode(request_id),
+        payload,
+        deliver_until_ms,
+        first_seen_ms: now_ms,
+        retry_count: 0,
+        next_retry_at_ms: 0,
+        last_error: None,
+        options,
+    }
+}
+
+/// #1109: store `obligation` and answer 202 `outcome: "queued"` (or the
+/// same 202 for a repeat of a held send). `ledger` is what the DM receipt
+/// ledger knows about its request id.
+async fn queue_direct_send(
+    outbox: &DirectSendOutbox,
+    obligation: DirectSendObligation,
+    ledger: LedgerReceipt,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if obligation.payload.len() > x0x::dm::MAX_PAYLOAD_BYTES {
+        return DirectSendRequestRejection {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            code: "payload_too_large",
+            detail: format!(
+                "DM payload exceeds MAX_PAYLOAD_BYTES ({} > {})",
+                obligation.payload.len(),
+                x0x::dm::MAX_PAYLOAD_BYTES
+            ),
+        }
+        .into_response();
+    }
+    let body = serde_json::json!({
+        "ok": true,
+        "outcome": "queued",
+        "logical_id": obligation.logical_id,
+        "agent_id": obligation.recipient,
+        "request_id": obligation.request_id,
+        "deliver_until_ms": obligation.deliver_until_ms,
+    });
+    let logical_id = obligation.logical_id.clone();
+    let rejection = |status, code, detail| DirectSendRequestRejection {
+        status,
+        code,
+        detail,
+    };
+    let held_until = match outbox.enqueue(obligation, ledger).await {
+        EnqueueOutcome::Queued => None,
+        EnqueueOutcome::AlreadyQueued { deliver_until_ms } => Some(deliver_until_ms),
+        EnqueueOutcome::Conflict => {
+            return rejection(
+                StatusCode::CONFLICT,
+                "idempotency_conflict",
+                format!(
+                    "logical_id {logical_id} is already queued or delivered to this \
+                     recipient with different bytes"
+                ),
+            )
+            .into_response();
+        }
+        EnqueueOutcome::Full => {
+            return rejection(
+                StatusCode::TOO_MANY_REQUESTS,
+                "outbox_full",
+                "the durable send outbox is full for this recipient or daemon; retry later"
+                    .to_string(),
+            )
+            .into_response();
+        }
+        EnqueueOutcome::NotDurable(detail) => {
+            return rejection(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "outbox_not_durable",
+                format!(
+                    "the send is held and may still be sent, but its durability is not \
+                     confirmed (directory fsync failed): {detail}; check \
+                     GET /direct/receipts/{logical_id} or cancel it"
+                ),
+            )
+            .into_response();
+        }
+        EnqueueOutcome::WriteFailed(detail) => {
+            return rejection(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "outbox_write_failed",
+                detail,
+            )
+            .into_response();
+        }
+        EnqueueOutcome::InFlight => {
+            return rejection(
+                StatusCode::CONFLICT,
+                "send_in_flight",
+                format!(
+                    "an attempt for logical_id {logical_id} to this recipient is in flight; \
+                     retry after it ends"
+                ),
+            )
+            .into_response();
+        }
+    };
+    let mut body = body;
+    if let Some(held_until) = held_until {
+        body["deliver_until_ms"] = serde_json::json!(held_until);
+    }
+    (StatusCode::ACCEPTED, Json(body))
+}
+
 fn direct_send_config_for_request(
     req: &DirectSendRequest,
     self_agent_id: x0x::identity::AgentId,
@@ -148,19 +360,11 @@ fn direct_send_config_for_request(
         });
     }
 
-    let mut config = direct_message_send_config();
-    if let Some(prefer_raw_quic_if_connected) = req.prefer_raw_quic_if_connected {
-        config.prefer_raw_quic_if_connected = prefer_raw_quic_if_connected;
-    }
-    config.stop_fallback_on_raw_error = req.stop_fallback_on_raw_error;
-    config.require_gossip = req.require_gossip;
     // ADR 0030 §4 product tier: durable unless the caller opts out.
-    config.require_durable_app_ack = req.require_durable_app_ack.unwrap_or(true);
-    if let Some(raw_ack_ms) = req.raw_quic_receive_ack_ms {
-        config.raw_quic_receive_ack_timeout = Some(std::time::Duration::from_millis(
-            raw_ack_ms.clamp(100, 30_000),
-        ));
-    }
+    let mut config = send_config_from_options(
+        &direct_send_options(req),
+        req.require_durable_app_ack.unwrap_or(true),
+    );
     if let Some(raw_logical_id) = &req.logical_id {
         let logical_id = x0x::dm::DmLogicalId::parse(raw_logical_id).map_err(|detail| {
             DirectSendRequestRejection {
@@ -344,6 +548,11 @@ pub(in crate::server) async fn direct_send(
         Err(rejection) => return rejection.into_response(),
     };
     let durable = send_config.require_durable_app_ack;
+    let now_ms = now_unix_ms();
+    let deadline = match deliver_until_for_request(&req, &send_config, now_ms) {
+        Ok(deadline) => deadline,
+        Err(rejection) => return rejection.into_response(),
+    };
 
     // Check trust level before sending — reject blocked agents
     {
@@ -389,6 +598,20 @@ pub(in crate::server) async fn direct_send(
                 "error": "reserved exec payloads via /direct/send require the durable API token (not a session token)"
             })),
         );
+    }
+
+    // #1109: a send with a deadline is stored and sent by the worker.
+    if let Some(deadline) = deadline {
+        let obligation = queued_obligation(
+            req.logical_id.as_deref().unwrap_or_default(),
+            direct_send_options(&req),
+            agent_id,
+            payload,
+            deadline,
+            now_ms,
+        );
+        let ledger = LedgerReceipt::of(&state.agent.dm_inflight_acks(), &deadline.1);
+        return queue_direct_send(&state.direct_send_outbox, obligation, ledger).await;
     }
 
     match state
@@ -481,101 +704,7 @@ pub(in crate::server) async fn direct_send(
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
-            let (status, err_kind) = match &e {
-                x0x::dm::DmError::RecipientRejected { .. } => {
-                    (StatusCode::FORBIDDEN, "recipient_rejected")
-                }
-                // ADR-0043 §9: the local B/P gate denied the resolved
-                // (agent, machine) pairing; nothing was sent. A policy
-                // refusal, not a server fault, so 403 and not 500.
-                x0x::dm::DmError::RecipientPairingDenied { .. } => {
-                    (StatusCode::FORBIDDEN, "recipient_pairing_denied")
-                }
-                // ADR 0110 §3 (D70; #1597 item 4): the recipient's resolved
-                // machine is revoked; that device is denied, nothing was
-                // sent, and the agent keeps its seat. A policy refusal.
-                x0x::dm::DmError::RecipientMachineRevoked { .. } => {
-                    (StatusCode::FORBIDDEN, "recipient_machine_revoked")
-                }
-                x0x::dm::DmError::RecipientKeyUnavailable(_) => {
-                    (StatusCode::NOT_FOUND, "recipient_key_unavailable")
-                }
-                // Issue #188: the cached capability advert / contact card is
-                // not converged (or corrupt) — transient, safe to retry. 409,
-                // NOT 400: the request itself was well-formed.
-                x0x::dm::DmError::RecipientKeyInvalid(_) => {
-                    (StatusCode::CONFLICT, "recipient_key_invalid")
-                }
-                // ADR 0030 §2: the caller demanded durable application-ACK
-                // semantics and the recipient has no current v2 capability
-                // advert. 409 rather than 400 — the request was well-formed,
-                // the peer state is not what it requires — and never a silent
-                // downgrade. Callers retry, surface "peer needs upgrade", or
-                // resend with `require_durable_app_ack = false`.
-                x0x::dm::DmError::RecipientUndiscovered(_) => {
-                    // #1091: a discovery gap, not missing key material —
-                    // retryable once the peer re-announces (seconds with
-                    // the reconnect-triggered re-announce).
-                    (StatusCode::SERVICE_UNAVAILABLE, "recipient_undiscovered")
-                }
-                x0x::dm::DmError::RecipientUpgradeRequired { .. } => {
-                    (StatusCode::CONFLICT, "recipient_upgrade_required")
-                }
-                // #1158: an obligation-carrying typed payload and no
-                // current verified capability advert. Nothing was sent;
-                // retry after the recipient's advert arrives.
-                x0x::dm::DmError::RecipientCapabilityPending { .. } => {
-                    (StatusCode::CONFLICT, "recipient_capability_pending")
-                }
-                x0x::dm::DmError::RecipientCapabilityUnavailable { .. } => {
-                    (StatusCode::CONFLICT, "recipient_capability_unavailable")
-                }
-                x0x::dm::DmError::AckSemanticsUnavailable(_) => {
-                    (StatusCode::CONFLICT, "recipient_ack_semantics_unavailable")
-                }
-                // ADR 0030 §1: the recipient holds this `logical_id` bound to
-                // different bytes. 409 like the line above, but the caller's
-                // repair is the opposite — not "retry / upgrade the peer" but
-                // "you reused an idempotency key; pick a new one or resend the
-                // original bytes". Retrying this one is guaranteed to fail.
-                x0x::dm::DmError::IdempotencyConflict(_) => {
-                    (StatusCode::CONFLICT, "idempotency_conflict")
-                }
-                x0x::dm::DmError::Timeout { .. } => (StatusCode::GATEWAY_TIMEOUT, "timeout"),
-                x0x::dm::DmError::PeerLikelyOffline { .. } => {
-                    (StatusCode::BAD_GATEWAY, "peer_likely_offline")
-                }
-                x0x::dm::DmError::PeerDisconnected { .. } => {
-                    (StatusCode::BAD_GATEWAY, "peer_disconnected")
-                }
-                x0x::dm::DmError::ReceiverBackpressured { .. } => {
-                    (StatusCode::SERVICE_UNAVAILABLE, "receiver_backpressured")
-                }
-                x0x::dm::DmError::LocalGossipUnavailable(_) => {
-                    (StatusCode::SERVICE_UNAVAILABLE, "local_gossip_unavailable")
-                }
-                // Local envelope build/crypto failure (signing, AEAD, KEM
-                // encap, serialization). A well-formed client request cannot
-                // cause this — it is a server fault, never a 400 (issue #188).
-                x0x::dm::DmError::EnvelopeConstruction(_) => {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "envelope_construction")
-                }
-                x0x::dm::DmError::PayloadTooLarge { .. } => {
-                    (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large")
-                }
-                x0x::dm::DmError::NoConnectivity(_) => {
-                    (StatusCode::SERVICE_UNAVAILABLE, "no_connectivity")
-                }
-                x0x::dm::DmError::PublishFailed(_) => {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "publish_failed")
-                }
-                x0x::dm::DmError::NoRelayCandidate => {
-                    (StatusCode::SERVICE_UNAVAILABLE, "no_relay_candidate")
-                }
-                x0x::dm::DmError::RelayBuildFailed(_) => {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "relay_build_failed")
-                }
-            };
+            let (status, err_kind) = dm_error_status_code(&e);
             tracing::error!("direct_send failed ({err_kind}): {e}");
             let snap = state.agent.direct_messaging().diagnostics_snapshot();
             let timeout_stages = matches!(e, x0x::dm::DmError::Timeout { .. })
@@ -593,6 +722,95 @@ pub(in crate::server) async fn direct_send(
                 }
             }
             (status, Json(body))
+        }
+    }
+}
+
+/// The HTTP status and stable error code `/direct/send` answers for a
+/// send error. The #1109 worker records the same code for a failed
+/// queued send.
+pub(super) fn dm_error_status_code(e: &x0x::dm::DmError) -> (StatusCode, &'static str) {
+    match e {
+        x0x::dm::DmError::RecipientRejected { .. } => (StatusCode::FORBIDDEN, "recipient_rejected"),
+        // ADR-0043 §9: the local B/P gate denied the resolved
+        // (agent, machine) pairing; nothing was sent. A policy
+        // refusal, not a server fault, so 403 and not 500.
+        x0x::dm::DmError::RecipientPairingDenied { .. } => {
+            (StatusCode::FORBIDDEN, "recipient_pairing_denied")
+        }
+        // ADR 0110 §3 (D70; #1597 item 4): the recipient's resolved
+        // machine is revoked; that device is denied, nothing was
+        // sent, and the agent keeps its seat. A policy refusal.
+        x0x::dm::DmError::RecipientMachineRevoked { .. } => {
+            (StatusCode::FORBIDDEN, "recipient_machine_revoked")
+        }
+        x0x::dm::DmError::RecipientKeyUnavailable(_) => {
+            (StatusCode::NOT_FOUND, "recipient_key_unavailable")
+        }
+        // Issue #188: the cached capability advert / contact card is
+        // not converged (or corrupt) — transient, safe to retry. 409,
+        // NOT 400: the request itself was well-formed.
+        x0x::dm::DmError::RecipientKeyInvalid(_) => (StatusCode::CONFLICT, "recipient_key_invalid"),
+        // ADR 0030 §2: the caller demanded durable application-ACK
+        // semantics and the recipient has no current v2 capability
+        // advert. 409 rather than 400 — the request was well-formed,
+        // the peer state is not what it requires — and never a silent
+        // downgrade. Callers retry, surface "peer needs upgrade", or
+        // resend with `require_durable_app_ack = false`.
+        x0x::dm::DmError::RecipientUndiscovered(_) => {
+            // #1091: a discovery gap, not missing key material —
+            // retryable once the peer re-announces (seconds with
+            // the reconnect-triggered re-announce).
+            (StatusCode::SERVICE_UNAVAILABLE, "recipient_undiscovered")
+        }
+        x0x::dm::DmError::RecipientUpgradeRequired { .. } => {
+            (StatusCode::CONFLICT, "recipient_upgrade_required")
+        }
+        // #1158: an obligation-carrying typed payload and no
+        // current verified capability advert. Nothing was sent;
+        // retry after the recipient's advert arrives.
+        x0x::dm::DmError::RecipientCapabilityPending { .. } => {
+            (StatusCode::CONFLICT, "recipient_capability_pending")
+        }
+        x0x::dm::DmError::RecipientCapabilityUnavailable { .. } => {
+            (StatusCode::CONFLICT, "recipient_capability_unavailable")
+        }
+        x0x::dm::DmError::AckSemanticsUnavailable(_) => {
+            (StatusCode::CONFLICT, "recipient_ack_semantics_unavailable")
+        }
+        // ADR 0030 §1: the recipient holds this `logical_id` bound to
+        // different bytes. 409 like the line above, but the caller's
+        // repair is the opposite — not "retry / upgrade the peer" but
+        // "you reused an idempotency key; pick a new one or resend the
+        // original bytes". Retrying this one is guaranteed to fail.
+        x0x::dm::DmError::IdempotencyConflict(_) => (StatusCode::CONFLICT, "idempotency_conflict"),
+        x0x::dm::DmError::Timeout { .. } => (StatusCode::GATEWAY_TIMEOUT, "timeout"),
+        x0x::dm::DmError::PeerLikelyOffline { .. } => {
+            (StatusCode::BAD_GATEWAY, "peer_likely_offline")
+        }
+        x0x::dm::DmError::PeerDisconnected { .. } => (StatusCode::BAD_GATEWAY, "peer_disconnected"),
+        x0x::dm::DmError::ReceiverBackpressured { .. } => {
+            (StatusCode::SERVICE_UNAVAILABLE, "receiver_backpressured")
+        }
+        x0x::dm::DmError::LocalGossipUnavailable(_) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "local_gossip_unavailable")
+        }
+        // Local envelope build/crypto failure (signing, AEAD, KEM
+        // encap, serialization). A well-formed client request cannot
+        // cause this — it is a server fault, never a 400 (issue #188).
+        x0x::dm::DmError::EnvelopeConstruction(_) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "envelope_construction")
+        }
+        x0x::dm::DmError::PayloadTooLarge { .. } => {
+            (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large")
+        }
+        x0x::dm::DmError::NoConnectivity(_) => (StatusCode::SERVICE_UNAVAILABLE, "no_connectivity"),
+        x0x::dm::DmError::PublishFailed(_) => (StatusCode::INTERNAL_SERVER_ERROR, "publish_failed"),
+        x0x::dm::DmError::NoRelayCandidate => {
+            (StatusCode::SERVICE_UNAVAILABLE, "no_relay_candidate")
+        }
+        x0x::dm::DmError::RelayBuildFailed(_) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "relay_build_failed")
         }
     }
 }
@@ -653,13 +871,23 @@ pub(in crate::server) struct DirectReceiptQuery {
     pub(in crate::server) agent_id: String,
 }
 
+/// #1109: one receipt lookup: the response body, its keys, and the DM
+/// ledger status the body reports.
+#[derive(Debug)]
+struct ReceiptLookup {
+    body: serde_json::Value,
+    recipient: x0x::identity::AgentId,
+    request_id: [u8; 16],
+    ledger: LedgerReceipt,
+}
+
 /// #1109: the response body for one receipt lookup, or the refusal.
 fn direct_receipt_body(
     raw_logical_id: &str,
     raw_agent_id: &str,
     self_agent_id: x0x::identity::AgentId,
     acks: &x0x::dm::InFlightAcks,
-) -> Result<serde_json::Value, DirectSendRequestRejection> {
+) -> Result<ReceiptLookup, DirectSendRequestRejection> {
     let logical_id = x0x::dm::DmLogicalId::parse(raw_logical_id).map_err(|detail| {
         DirectSendRequestRejection {
             status: StatusCode::BAD_REQUEST,
@@ -674,19 +902,41 @@ fn direct_receipt_body(
             detail,
         })?;
     let request_id = logical_id.request_id(self_agent_id, recipient);
-    Ok(serde_json::json!({
+    let ledger = LedgerReceipt::of(acks, &request_id);
+    let body = serde_json::json!({
         "ok": true,
         "logical_id": logical_id.as_str(),
         "agent_id": hex::encode(recipient.as_bytes()),
         "request_id": hex::encode(request_id),
-        "status": acks.receipt_status(&request_id).as_str(),
-    }))
+        "status": ledger.status.as_str(),
+    });
+    Ok(ReceiptLookup {
+        body,
+        recipient,
+        request_id,
+        ledger,
+    })
+}
+
+/// #1109: overlay the durable outbox's answer (`queued`, `expired`,
+/// `failed` with `error`) on a receipt body.
+fn apply_queued_receipt(body: &mut serde_json::Value, receipt: DirectSendReceipt) {
+    body["status"] = serde_json::json!(receipt.status);
+    if let Some(error) = receipt.error {
+        body["error"] = serde_json::json!(error);
+    }
+    if let Some(digest) = receipt.payload_digest {
+        body["payload_digest"] = serde_json::json!(hex::encode(digest));
+    }
 }
 
 /// GET /direct/receipts/{logical_id}?agent_id=<hex> — #1109: what this daemon
 /// knows about a durable send it made under `logical_id` to `agent_id`:
-/// `delivered`, `delivered_late`, `pending` or `unknown`. Records live for
-/// ten minutes after the send resolved or gave up.
+/// `delivered`, `delivered_late`, `pending` or `unknown`, and for a queued
+/// send (`deliver_until_ms`) also `queued`, `expired` or `failed` (with
+/// `error`). Records live for ten minutes after the send resolved or gave
+/// up; a held obligation reads `queued` until it leaves the outbox, across
+/// a restart.
 pub(in crate::server) async fn direct_receipt(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(logical_id): axum::extract::Path<String>,
@@ -694,8 +944,63 @@ pub(in crate::server) async fn direct_receipt(
 ) -> impl IntoResponse {
     let acks = state.agent.dm_inflight_acks();
     match direct_receipt_body(&logical_id, &query.agent_id, state.agent.agent_id(), &acks) {
-        Ok(body) => (StatusCode::OK, Json(body)),
+        Ok(mut lookup) => {
+            let receipt = state
+                .direct_send_outbox
+                .receipt(&lookup.recipient, &lookup.request_id, lookup.ledger)
+                .await;
+            apply_queued_receipt(&mut lookup.body, receipt);
+            (StatusCode::OK, Json(lookup.body))
+        }
         Err(rejection) => rejection.into_response(),
+    }
+}
+
+/// DELETE /direct/receipts/{logical_id}?agent_id=<hex> — #1109: cancel a
+/// queued send. The held obligation is removed and its receipt reads
+/// `cancelled`; 404 `not_queued` when none is held. An attempt already in
+/// flight is not recalled.
+pub(in crate::server) async fn direct_cancel(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(logical_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<DirectReceiptQuery>,
+) -> impl IntoResponse {
+    let acks = state.agent.dm_inflight_acks();
+    match direct_receipt_body(&logical_id, &query.agent_id, state.agent.agent_id(), &acks) {
+        Ok(lookup) => cancel_queued_send(&state.direct_send_outbox, lookup).await,
+        Err(rejection) => rejection.into_response(),
+    }
+}
+
+/// #1109: cancel the held obligation named by `lookup`.
+async fn cancel_queued_send(
+    outbox: &DirectSendOutbox,
+    mut lookup: ReceiptLookup,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match outbox.cancel(&lookup.recipient, &lookup.request_id).await {
+        CancelOutcome::Cancelled => {
+            lookup.body["status"] = serde_json::json!("cancelled");
+            (StatusCode::OK, Json(lookup.body))
+        }
+        CancelOutcome::NotHeld => DirectSendRequestRejection {
+            status: StatusCode::NOT_FOUND,
+            code: "not_queued",
+            detail: "no queued send is held under this logical_id for this agent".to_string(),
+        }
+        .into_response(),
+        CancelOutcome::WriteFailed(detail) => DirectSendRequestRejection {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "outbox_write_failed",
+            detail,
+        }
+        .into_response(),
+        CancelOutcome::InFlight => DirectSendRequestRejection {
+            status: StatusCode::CONFLICT,
+            code: "send_in_flight",
+            detail: "an attempt is in flight and cannot be recalled; retry after it ends"
+                .to_string(),
+        }
+        .into_response(),
     }
 }
 
@@ -1126,6 +1431,7 @@ mod tests {
                 require_ack_ms: None,
                 require_durable_app_ack: None,
                 logical_id: None,
+                deliver_until_ms: None,
             }),
         )
         .await
@@ -1214,6 +1520,7 @@ mod tests {
                 require_ack_ms: None,
                 require_durable_app_ack: None,
                 logical_id: None,
+                deliver_until_ms: None,
             }),
         )
         .await
@@ -1271,7 +1578,9 @@ mod tests {
             .expect("logical id derives a request id");
         let acks = x0x::dm::InFlightAcks::new();
         let query = |acks: &x0x::dm::InFlightAcks| {
-            direct_receipt_body("order-42", &peer_hex, me, acks).expect("valid query")
+            direct_receipt_body("order-42", &peer_hex, me, acks)
+                .expect("valid query")
+                .body
         };
         assert_eq!(query(&acks)["status"], "unknown");
         let machine = x0x::identity::MachineId([9; 32]);
@@ -1293,7 +1602,9 @@ mod tests {
         assert_eq!(body["logical_id"], "order-42");
         // The same token to another recipient is another request.
         let other = hex::encode(test_agent_id(3).as_bytes());
-        let elsewhere = direct_receipt_body("order-42", &other, me, &acks).expect("valid");
+        let elsewhere = direct_receipt_body("order-42", &other, me, &acks)
+            .expect("valid")
+            .body;
         assert_eq!(elsewhere["status"], "unknown");
     }
 
@@ -1310,5 +1621,233 @@ mod tests {
             .expect_err("not an agent id");
         assert_eq!(bad_agent.status, StatusCode::BAD_REQUEST);
         assert_eq!(bad_agent.code, "invalid_agent_id");
+    }
+
+    fn deliver_until_check(
+        value: serde_json::Value,
+        now_ms: u64,
+    ) -> Result<Option<u64>, &'static str> {
+        let req = parse_request(value);
+        let config = direct_send_config_for_request(&req, test_agent_id(1), test_agent_id(2))
+            .expect("request validation passes");
+        deliver_until_for_request(&req, &config, now_ms)
+            .map(|deadline| {
+                deadline.map(|(until, rid)| {
+                    assert_eq!(config.logical_request_id, Some(rid));
+                    until
+                })
+            })
+            .map_err(|rejection| {
+                assert_eq!(rejection.status, StatusCode::BAD_REQUEST);
+                rejection.code
+            })
+    }
+
+    /// WHY: #1109 S1 refuses each unusable `deliver_until_ms` with its own
+    /// 400 code, and a send without the field keeps the synchronous path.
+    #[test]
+    fn issue1109_deliver_until_refusals_are_typed_400s() {
+        let now = 1_800_000_000_000u64;
+        let base = |extra: serde_json::Value| {
+            let mut body = serde_json::json!({
+                "agent_id": hex::encode(test_agent_id(2).as_bytes()),
+                "payload": "aGVsbG8=",
+            });
+            if let (Some(body), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
+                body.extend(extra.clone());
+            }
+            body
+        };
+        assert_eq!(
+            deliver_until_check(base(serde_json::json!({})), now),
+            Ok(None)
+        );
+        assert_eq!(
+            deliver_until_check(
+                base(
+                    serde_json::json!({"deliver_until_ms": now + 1_000, "require_durable_app_ack": false})
+                ),
+                now
+            ),
+            Err("deliver_until_requires_durable")
+        );
+        assert_eq!(
+            deliver_until_check(
+                base(serde_json::json!({"deliver_until_ms": now + 1_000})),
+                now
+            ),
+            Err("deliver_until_requires_logical_id")
+        );
+        assert_eq!(
+            deliver_until_check(
+                base(serde_json::json!({"deliver_until_ms": now, "logical_id": "order-1"})),
+                now
+            ),
+            Err("deliver_until_passed")
+        );
+        assert_eq!(
+            deliver_until_check(
+                base(serde_json::json!({
+                    "deliver_until_ms": now + DIRECT_SEND_MAX_HORIZON_MS + 1,
+                    "logical_id": "order-1"
+                })),
+                now
+            ),
+            Err("deliver_until_too_far")
+        );
+        assert_eq!(
+            deliver_until_check(
+                base(serde_json::json!({
+                    "deliver_until_ms": now + DIRECT_SEND_MAX_HORIZON_MS,
+                    "logical_id": "order-1"
+                })),
+                now
+            ),
+            Ok(Some(now + DIRECT_SEND_MAX_HORIZON_MS))
+        );
+    }
+
+    /// WHY: #1109 S1's 202 names the queued send's keys; a repeat with the
+    /// same bytes is the same 202 and stores nothing new; other bytes under
+    /// the same key are a 409 `idempotency_conflict`.
+    #[tokio::test]
+    async fn issue1109_queued_send_answers_202_idempotently_and_409_on_conflict() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outbox = DirectSendOutbox::new(dir.path().join("direct_send_outbox.json"));
+        let (me, peer) = (test_agent_id(1), test_agent_id(2));
+        let now = 1_800_000_000_000u64;
+        let until = now + 60_000;
+        let req = parse_request(serde_json::json!({
+            "agent_id": hex::encode(peer.as_bytes()),
+            "payload": "aGVsbG8=",
+            "logical_id": "order-9",
+            "deliver_until_ms": until,
+        }));
+        let rid = direct_send_config_for_request(&req, me, peer)
+            .expect("valid")
+            .logical_request_id
+            .expect("logical id derives a request id");
+        let queue = |payload: &'static [u8], at: u64| {
+            let obligation = queued_obligation(
+                "order-9",
+                direct_send_options(&req),
+                peer,
+                payload.to_vec(),
+                (until, rid),
+                at,
+            );
+            queue_direct_send(&outbox, obligation, no_ledger_record())
+        };
+        let (status, Json(body)) = queue(b"hello", now).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "ok": true,
+                "outcome": "queued",
+                "logical_id": "order-9",
+                "agent_id": hex::encode(peer.as_bytes()),
+                "request_id": hex::encode(rid),
+                "deliver_until_ms": until,
+            })
+        );
+        let (status, Json(repeat)) = queue(b"hello", now + 5).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(repeat, body);
+        assert_eq!(outbox.snapshot().await.len(), 1);
+        let (status, Json(conflict)) = queue(b"other", now + 10).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(conflict["error"], "idempotency_conflict");
+        assert_eq!(outbox.snapshot().await.len(), 1);
+        let receipt = outbox.receipt(&peer, &rid, no_ledger_record()).await;
+        assert_eq!(receipt.status, "queued");
+    }
+
+    fn no_ledger_record() -> LedgerReceipt {
+        LedgerReceipt {
+            status: x0x::dm::DmReceiptStatus::Unknown,
+            digest: None,
+        }
+    }
+
+    /// WHY: #1109 `DELETE /direct/receipts/{logical_id}` removes a held
+    /// send and answers `cancelled`; with none held it is 404 `not_queued`.
+    #[tokio::test]
+    async fn issue1109_cancel_removes_a_queued_send_and_404s_when_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outbox = DirectSendOutbox::new(dir.path().join("direct_send_outbox.json"));
+        let (me, peer) = (test_agent_id(1), test_agent_id(2));
+        let now = 1_800_000_000_000u64;
+        let req = parse_request(serde_json::json!({
+            "agent_id": hex::encode(peer.as_bytes()),
+            "payload": "aGVsbG8=",
+            "logical_id": "order-10",
+            "deliver_until_ms": now + 60_000,
+        }));
+        let rid = direct_send_config_for_request(&req, me, peer)
+            .expect("valid")
+            .logical_request_id
+            .expect("logical id derives a request id");
+        let obligation = queued_obligation(
+            "order-10",
+            direct_send_options(&req),
+            peer,
+            b"hello".to_vec(),
+            (now + 60_000, rid),
+            now,
+        );
+        let (status, _) = queue_direct_send(&outbox, obligation, no_ledger_record()).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let acks = x0x::dm::InFlightAcks::new();
+        let peer_hex = hex::encode(peer.as_bytes());
+        let lookup = || direct_receipt_body("order-10", &peer_hex, me, &acks).expect("valid");
+        let (status, Json(body)) = cancel_queued_send(&outbox, lookup()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "cancelled");
+        assert_eq!(body["request_id"], hex::encode(rid));
+        assert!(outbox.snapshot().await.is_empty());
+        let (status, Json(body)) = cancel_queued_send(&outbox, lookup()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "not_queued");
+        let receipt = outbox.receipt(&peer, &rid, no_ledger_record()).await;
+        assert_eq!(receipt.status, "cancelled");
+    }
+
+    /// WHY: #1109 blocking a contact through the contacts API removes the
+    /// queued sends to it, so they are never attempted.
+    #[tokio::test]
+    async fn issue1109_blocking_a_contact_drops_its_queued_sends() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let peer = test_agent_id(7);
+        let rid = x0x::dm::DmLogicalId::parse("order-11")
+            .expect("valid")
+            .request_id(state.agent.agent_id(), peer);
+        let obligation = queued_obligation(
+            "order-11",
+            DirectSendOptions::default(),
+            peer,
+            b"hello".to_vec(),
+            (now_unix_ms() + 60_000, rid),
+            now_unix_ms(),
+        );
+        let (status, _) =
+            queue_direct_send(&state.direct_send_outbox, obligation, no_ledger_record()).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        state
+            .contacts
+            .write()
+            .await
+            .set_trust(&peer, TrustLevel::Blocked);
+        super::super::contacts::sync_contact_relationship(&state, peer).await;
+        assert!(state.direct_send_outbox.snapshot().await.is_empty());
+        let receipt = state
+            .direct_send_outbox
+            .receipt(&peer, &rid, no_ledger_record())
+            .await;
+        assert_eq!(receipt.status, "failed");
+        assert_eq!(receipt.error.as_deref(), Some("recipient_blocked"));
     }
 }

@@ -1597,6 +1597,14 @@ enum DirectSub {
         /// after a round trip to the daemon, which refuses the same pair.
         #[arg(long, conflicts_with = "no_durable_ack")]
         logical_id: Option<String>,
+        /// Deliver durably until this unix-ms deadline (#1109): the daemon
+        /// stores the send, answers 202 `outcome: "queued"`, and retries
+        /// (holding a recipient that has not advertised durable delivery
+        /// yet) until the durable ACK or the deadline. At most 24 h ahead;
+        /// needs --logical-id (so it cannot be used with --no-durable-ack).
+        /// Check the outcome with `x0x direct receipt`.
+        #[arg(long, requires = "logical_id")]
+        deliver_until_ms: Option<u64>,
     },
     /// List established direct connections.
     Connections,
@@ -1605,6 +1613,15 @@ enum DirectSub {
     /// (`outcome: "ack_unknown"`) to learn whether a late ACK arrived.
     Receipt {
         /// The `--logical-id` the send used.
+        logical_id: String,
+        /// Recipient agent ID (hex).
+        agent_id: String,
+    },
+    /// Cancel a queued durable send (#1109) that is still held: the daemon
+    /// removes it and its receipt reads `cancelled`. An attempt already in
+    /// flight is not recalled.
+    Cancel {
+        /// The `--logical-id` the queued send used.
         logical_id: String,
         /// Recipient agent ID (hex).
         agent_id: String,
@@ -3038,6 +3055,7 @@ async fn run(
                 require_gossip,
                 no_durable_ack,
                 logical_id,
+                deliver_until_ms,
             } => {
                 commands::direct::send(
                     &client,
@@ -3050,6 +3068,7 @@ async fn run(
                     require_gossip,
                     !no_durable_ack,
                     logical_id.as_deref(),
+                    deliver_until_ms,
                 )
                 .await
             }
@@ -3058,6 +3077,10 @@ async fn run(
                 logical_id,
                 agent_id,
             } => commands::direct::receipt(&client, &logical_id, &agent_id).await,
+            DirectSub::Cancel {
+                logical_id,
+                agent_id,
+            } => commands::direct::cancel(&client, &logical_id, &agent_id).await,
             DirectSub::Events { backfill } => commands::direct::events(&client, backfill).await,
         },
         Commands::Groups { sub } => match sub {
