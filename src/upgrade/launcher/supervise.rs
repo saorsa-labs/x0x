@@ -110,8 +110,10 @@ enum Poll {
 /// After the run loop returned a provisional candidate: poll the host
 /// commit until one of these:
 /// - the full set commits, here or by a peer: `Committed`;
-/// - an intentional stop: the child is reaped and, under the host lock, a
-///   still-Provisional trial is saved `Stopped`;
+/// - an intentional stop: under the host lock and before the reap, a host a
+///   peer committed keeps the candidate (`Committed`, and the caller stops
+///   it as a committed daemon); otherwise the trial's verdict is saved, the
+///   child is reaped and the trial saved `Stopped` (`stop_trial`);
 /// - a rollback is due: the host commit says so, the candidate exited, the
 ///   trial's total deadline passed, or a peer has begun recovery.
 ///
@@ -240,10 +242,18 @@ fn poll<C: Custody>(
     })
 }
 
-/// An intentional stop: reap the child, then, under the host lock with a
-/// fresh read, save a still-Provisional trial `Stopped` (with a Failed
-/// verdict if the total budget ran out). A trial a peer already moved to
-/// rollback, or a host a peer committed, is left as it is (#1968 review).
+/// An intentional stop, in the order the rollback path uses (#1968
+/// re-review):
+/// 1. Under the host lock, before any reap: a host a peer committed keeps
+///    this candidate (`Committed`; the caller stops it as an ordinary stop
+///    of a committed daemon). Otherwise a still-Provisional trial gets its
+///    verdict now: Failed if the total budget ran out, else Interrupted
+///    (the stop). `host_commit` reads trials under the same lock and rolls
+///    back on a verdict, so no peer commits the host while this child is
+///    reaped.
+/// 2. Reap the child.
+/// 3. Under the host lock with a fresh read, save a still-Provisional trial
+///    `Stopped`. A trial a peer already moved to rollback is left as it is.
 fn stop_trial<C: Custody>(
     host: &recovery::Host,
     path: &Path,
@@ -251,14 +261,33 @@ fn stop_trial<C: Custody>(
     child: C,
     clock: Option<Clock>,
 ) -> io::Result<Settled<C>> {
+    let (binding, instance) = (trial.binding.clone(), trial.instance.clone());
+    let committed = host.locked(|record| {
+        if record.phase == journal::Phase::HostCommitted {
+            return Ok(true);
+        }
+        let mut current = Trial::load(path, &binding, &instance)?;
+        if current.phase == Phase::Provisional && current.verdict.is_none() {
+            run::record_budget_verdict(&mut current, clock.as_ref());
+            current.verdict.get_or_insert_with(|| {
+                cause(
+                    journal::CauseClass::Interrupted,
+                    "service stopped during trial",
+                )
+            });
+            current.save(path)?;
+        }
+        Ok(false)
+    })?;
+    if committed {
+        return Ok(Settled::Committed(child));
+    }
     if let Err(error) = child.reap() {
         return Err(trial.recovery_failed(path, error));
     }
-    let (binding, instance) = (trial.binding.clone(), trial.instance.clone());
-    *trial = host.locked(|record| {
+    *trial = host.locked(|_| {
         let mut current = Trial::load(path, &binding, &instance)?;
-        if record.phase != journal::Phase::HostCommitted && current.phase == Phase::Provisional {
-            run::record_budget_verdict(&mut current, clock.as_ref());
+        if current.phase == Phase::Provisional {
             current.child = None;
             current.phase = Phase::Stopped;
             current.save(path)?;
@@ -278,6 +307,8 @@ mod tests {
     struct Stand {
         exited: bool,
         reaped: std::rc::Rc<Cell<bool>>,
+        /// Runs at the start of the reap, as a peer acting meanwhile.
+        on_reap: Option<Box<dyn FnOnce()>>,
     }
 
     impl Custody for Stand {
@@ -285,6 +316,9 @@ mod tests {
             Ok(self.exited)
         }
         fn reap(self) -> io::Result<()> {
+            if let Some(on_reap) = self.on_reap {
+                on_reap();
+            }
             self.reaped.set(true);
             Ok(())
         }
@@ -296,6 +330,7 @@ mod tests {
             Stand {
                 exited,
                 reaped: reaped.clone(),
+                on_reap: None,
             },
             reaped,
         )
@@ -682,6 +717,99 @@ mod tests {
             Some(commit::Commit::RollBack(c)) if c.reason == "total trial deadline reached"
         ));
         assert_eq!(journal_phase(&root), journal::Phase::SwappedCli);
+    }
+
+    /// #1968 re-review: a stop while the trial is Provisional and healthy.
+    /// The verdict is saved under the lock before the reap, so a peer's host
+    /// commit during the reap rolls back instead of committing; the trial
+    /// ends Stopped with an Interrupted verdict. A host a peer committed
+    /// before the stop keeps its candidate: no reap, the trial stays
+    /// Provisional with no verdict.
+    #[test]
+    fn a_stop_saves_its_verdict_before_the_reap_and_spares_a_committed_host() {
+        let (_dir, root, host, record) = fixture(journal::Phase::SwappedCli);
+        let path = root.join("trial.json");
+        let mut trial = provisional(&host, &path, gone_child());
+        let boot = trial.boot.clone();
+        let peer = std::rc::Rc::new(Cell::new(None));
+        // The peer launcher binds its own Host to the same journal.
+        let peer_host = recovery::Host::new(root.clone(), record).unwrap();
+        let (seen, peer_path, peer_boot) = (peer.clone(), path.clone(), boot.clone());
+        let reaped = std::rc::Rc::new(Cell::new(false));
+        let child = Stand {
+            exited: false,
+            reaped: reaped.clone(),
+            on_reap: Some(Box::new(move || {
+                let clock = Clock {
+                    boot: peer_boot,
+                    ms: 2_000,
+                };
+                seen.set(Some(
+                    commit::host_commit(&peer_host, |_| peer_path.clone(), &clock).unwrap(),
+                ));
+            })),
+        };
+        let settled = settle_provisional(
+            &host,
+            &path,
+            &mut trial,
+            child,
+            |_| path.clone(),
+            || {
+                Ok(Clock {
+                    boot: boot.clone(),
+                    ms: 2_000,
+                })
+            },
+            || true,
+            |_| Ok(Resolution::Proceed),
+            || {},
+        )
+        .unwrap();
+        assert!(matches!(settled, Settled::Stopped));
+        assert!(reaped.get());
+        assert!(matches!(
+            peer.take(),
+            Some(commit::Commit::RollBack(c)) if c.class == journal::CauseClass::Interrupted
+        ));
+        let on_disk = Trial::load(&path, &trial.binding, "alice").unwrap();
+        assert_eq!(on_disk.phase, Phase::Stopped);
+        assert_eq!(
+            on_disk.verdict.map(|v| v.class),
+            Some(journal::CauseClass::Interrupted)
+        );
+        assert_eq!(journal_phase(&root), journal::Phase::SwappedCli);
+
+        // A peer committed the host after the last poll: the stop keeps
+        // the committed candidate for the caller's ordinary stop.
+        let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
+        let path = root.join("trial.json");
+        let mut trial = provisional(&host, &path, gone_child());
+        let boot = trial.boot.clone();
+        set_journal_phase(&root, journal::Phase::HostCommitted);
+        let (child, reaped) = stand(false);
+        let settled = settle_provisional(
+            &host,
+            &path,
+            &mut trial,
+            child,
+            |_| path.clone(),
+            || {
+                Ok(Clock {
+                    boot: boot.clone(),
+                    ms: 2_000,
+                })
+            },
+            || true,
+            |_| Ok(Resolution::Proceed),
+            || {},
+        )
+        .unwrap();
+        assert!(matches!(settled, Settled::Committed(_)));
+        assert!(!reaped.get(), "a committed candidate is never reaped here");
+        let on_disk = Trial::load(&path, &trial.binding, "alice").unwrap();
+        assert_eq!(on_disk.phase, Phase::Provisional);
+        assert!(on_disk.verdict.is_none());
     }
 
     /// #1968 review MINOR 2: a failed clock read is polled again, not
