@@ -59,6 +59,13 @@ pub(crate) trait OutboxRecord: Clone {
     fn partition(&self) -> &str;
     /// The entry identity inside its partition.
     fn id(&self) -> &str;
+    /// Is `other` this exact entry? [`Outbox::settle`] only touches the
+    /// entry an attempt was made for. The default is the id; a record whose
+    /// id can be reused for other content also compares that content
+    /// (#1109).
+    fn same_entry(&self, other: &Self) -> bool {
+        self.id() == other.id()
+    }
     /// When the entry was first created (eviction order).
     fn first_seen_ms(&self) -> u64;
     /// Accounted size for the byte caps.
@@ -155,7 +162,7 @@ fn remove_entry<T: OutboxRecord>(map: &mut OutboxMap<T>, entry: &T) -> bool {
         return false;
     };
     let before = list.len();
-    list.retain(|o| o.id() != entry.id());
+    list.retain(|o| !o.same_entry(entry));
     let after = list.len();
     if after == 0 {
         map.remove(entry.partition());
@@ -291,7 +298,7 @@ impl<'a, T: OutboxRecord> Outbox<'a, T> {
         for (entry, ok) in attempts {
             let Some(live) = next
                 .get_mut(entry.partition())
-                .and_then(|list| list.iter_mut().find(|o| o.id() == entry.id()))
+                .and_then(|list| list.iter_mut().find(|o| o.same_entry(entry)))
             else {
                 continue;
             };
@@ -312,7 +319,7 @@ impl<'a, T: OutboxRecord> Outbox<'a, T> {
         for (entry, ok) in attempts {
             if *ok {
                 if let Some(list) = next.get_mut(entry.partition()) {
-                    list.retain(|o| o.id() != entry.id());
+                    list.retain(|o| !o.same_entry(entry));
                 }
             }
         }

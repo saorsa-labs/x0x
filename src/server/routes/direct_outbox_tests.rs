@@ -669,3 +669,143 @@ async fn issue1109_retry_after_a_lost_ack_is_delivered_once_at_a_real_receiver()
         "dispatched exactly once"
     );
 }
+
+/// A transport whose single attempt waits at a gate, so a test can act
+/// while the attempt is in flight.
+struct GatedTransport {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    result: std::sync::Mutex<Option<Result<(), DmError>>>,
+    calls: AtomicUsize,
+}
+
+impl GatedTransport {
+    fn new(result: Result<(), DmError>) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            result: std::sync::Mutex::new(Some(result)),
+            calls: AtomicUsize::new(0),
+        })
+    }
+}
+
+impl DirectSendTransport for GatedTransport {
+    fn recipient_blocked(&self, _recipient: AgentId) -> TransportFuture<'_, bool> {
+        Box::pin(async { false })
+    }
+
+    fn send(
+        &self,
+        _recipient: AgentId,
+        _payload: Vec<u8>,
+        _config: DmSendConfig,
+        _budget: Duration,
+    ) -> TransportFuture<'_, Result<(), DmError>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            self.release.notified().await;
+            self.result
+                .lock()
+                .expect("result lock")
+                .take()
+                .unwrap_or(Ok(()))
+        })
+    }
+}
+
+fn spawn_step(
+    outbox: &std::sync::Arc<DirectSendOutbox>,
+    transport: &std::sync::Arc<GatedTransport>,
+    now: DirectSendNow,
+) -> tokio::task::JoinHandle<()> {
+    let outbox = std::sync::Arc::clone(outbox);
+    let transport = std::sync::Arc::clone(transport);
+    tokio::spawn(async move { outbox.step(now, &unknown, transport.as_ref()).await })
+}
+
+/// WHY: a cancel cannot recall an attempt in flight, so it must say so
+/// (409) rather than answer `cancelled`; other bytes under the same key
+/// are refused while the attempt runs, and its outcome is then recorded
+/// against the bytes it sent.
+#[tokio::test]
+async fn issue1109_cancel_and_requeue_during_an_attempt_are_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let outbox = std::sync::Arc::new(outbox_in(&dir));
+    let peer = agent(2);
+    let rid = request_id_for("order-f", peer);
+    let a = obligation("order-f", peer, NOW + 60_000);
+    outbox.enqueue(a.clone(), no_record()).await;
+    let transport = GatedTransport::new(Ok(()));
+    let step = spawn_step(&outbox, &transport, at(NOW, 0));
+    transport.started.notified().await;
+
+    assert_eq!(outbox.cancel(&peer, &rid).await, CancelOutcome::InFlight);
+    let mut b = a.clone();
+    b.payload = b"payload B".to_vec();
+    assert_eq!(
+        outbox.enqueue(b.clone(), no_record()).await,
+        EnqueueOutcome::InFlight
+    );
+
+    transport.release.notify_one();
+    step.await.expect("step task");
+    assert!(outbox.snapshot().await.is_empty());
+    let receipt = status(&outbox, peer, &rid).await;
+    assert_eq!(receipt.status, "delivered");
+    assert_eq!(receipt.payload_digest, Some(digest_of(b"hello")));
+    // A was delivered under this key: B can never be.
+    assert_eq!(
+        outbox.enqueue(b, no_record()).await,
+        EnqueueOutcome::Conflict
+    );
+}
+
+/// WHY: blocking a contact during an attempt records that attempt's
+/// outcome and never sends again; bytes queued later under the same key
+/// are not reported delivered by the old attempt.
+#[tokio::test]
+async fn issue1109_block_during_an_attempt_records_it_and_never_resends() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let outbox = std::sync::Arc::new(outbox_in(&dir));
+    let peer = agent(2);
+    let rid = request_id_for("order-g", peer);
+    let a = obligation("order-g", peer, NOW + 60_000);
+    outbox.enqueue(a.clone(), no_record()).await;
+    let transport = GatedTransport::new(Err(DmError::Timeout {
+        retries: 0,
+        elapsed: Duration::from_secs(1),
+    }));
+    let step = spawn_step(&outbox, &transport, at(NOW, 0));
+    transport.started.notified().await;
+
+    assert_eq!(outbox.drop_recipient(&peer, RECIPIENT_BLOCKED).await, 1);
+    assert_eq!(
+        outbox.snapshot().await.len(),
+        1,
+        "held until the attempt ends"
+    );
+
+    transport.release.notify_one();
+    step.await.expect("step task");
+    assert!(outbox.snapshot().await.is_empty());
+    let receipt = status(&outbox, peer, &rid).await;
+    assert_eq!(receipt.status, "failed");
+    assert_eq!(receipt.error.as_deref(), Some(RECIPIENT_BLOCKED));
+    outbox
+        .step(at(NOW + 5_000, 5_000), &unknown, transport.as_ref())
+        .await;
+    assert_eq!(
+        transport.calls.load(Ordering::SeqCst),
+        1,
+        "never sent again"
+    );
+
+    let mut b = a;
+    b.payload = b"payload B".to_vec();
+    assert_eq!(outbox.enqueue(b, no_record()).await, EnqueueOutcome::Queued);
+    let receipt = status(&outbox, peer, &rid).await;
+    assert_eq!(receipt.status, "queued");
+    assert_eq!(receipt.payload_digest, Some(digest_of(b"payload B")));
+}

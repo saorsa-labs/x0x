@@ -322,6 +322,17 @@ async fn queue_direct_send(
             )
             .into_response();
         }
+        EnqueueOutcome::InFlight => {
+            return rejection(
+                StatusCode::CONFLICT,
+                "send_in_flight",
+                format!(
+                    "an attempt for logical_id {logical_id} to this recipient is in flight; \
+                     retry after it ends"
+                ),
+            )
+            .into_response();
+        }
     };
     let mut body = body;
     if let Some(held_until) = held_until {
@@ -914,6 +925,9 @@ fn apply_queued_receipt(body: &mut serde_json::Value, receipt: DirectSendReceipt
     if let Some(error) = receipt.error {
         body["error"] = serde_json::json!(error);
     }
+    if let Some(digest) = receipt.payload_digest {
+        body["payload_digest"] = serde_json::json!(hex::encode(digest));
+    }
 }
 
 /// GET /direct/receipts/{logical_id}?agent_id=<hex> — #1109: what this daemon
@@ -978,6 +992,13 @@ async fn cancel_queued_send(
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "outbox_write_failed",
             detail,
+        }
+        .into_response(),
+        CancelOutcome::InFlight => DirectSendRequestRejection {
+            status: StatusCode::CONFLICT,
+            code: "send_in_flight",
+            detail: "an attempt is in flight and cannot be recalled; retry after it ends"
+                .to_string(),
         }
         .into_response(),
     }

@@ -1587,7 +1587,7 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 | POST | `/machines/connect` | `x0x machines connect <machine_id>` | Establish a machine-id transport connection |
 | POST | `/direct/send` | `x0x direct send <agent_id> <message> [--require-ack-ms <ms>] [--prefer-raw-quic-if-connected <BOOL>] [--raw-quic-receive-ack-ms <ms>] [--stop-fallback-on-raw-error] [--require-gossip] [--no-durable-ack] [--logical-id <token>] [--deliver-until-ms <unix_ms>]` | Send a direct base64 payload. Durable-by-default since v0.38.0. With `deliver_until_ms` the daemon stores the send and answers 202 `outcome: "queued"`; see [Queued durable send](#queued-durable-send-1109) |
 | GET | `/direct/connections` | `x0x direct connections` | List active direct connections |
-| DELETE | `/direct/receipts/:logical_id?agent_id=<hex>` | `x0x direct cancel <logical_id> <agent_id>` | Cancel a [queued send](#queued-durable-send-1109) that is still held. 200 with `status: "cancelled"`; 404 `not_queued` when none is held. An attempt already in flight is not recalled |
+| DELETE | `/direct/receipts/:logical_id?agent_id=<hex>` | `x0x direct cancel <logical_id> <agent_id>` | Cancel a [queued send](#queued-durable-send-1109) that is still held. 200 with `status: "cancelled"`; 404 `not_queued` when none is held; 409 `send_in_flight` while an attempt is in flight (it cannot be recalled; retry after it ends) |
 | GET | `/direct/receipts/:logical_id?agent_id=<hex>` | `x0x direct receipt <logical_id> <agent_id>` | Outcome of a durable send made under `logical_id` to `agent_id`: `delivered`, `delivered_late`, `pending` or `unknown`, and for a queued send also `queued`, `expired` or `failed` (#1109). See [Durable send receipts](#durable-send-receipts-1109) |
 | GET | `/history/message/:msg_id` | `x0x history message` | Point lookup of one durable history row by exposed `msg_id` (64 hex; canonical group ids need `?scope=`); 404 when absent, 400 on malformed id. Same record shape as `/history` (issue #319) |
 | GET | `/direct/events` | `x0x direct events` | SSE stream of direct messages; `?backfill=N` requests up to N stored `dm:` rows as `history_direct_message` events before a `live` marker and live frames (ADR-0023 §7). The attempt is best-effort; reconcile through [`/history`](#durable-history-adr-0023) |
@@ -1704,6 +1704,7 @@ Notable codes:
 | 400 | `deliver_until_passed` | `deliver_until_ms` is not after the daemon's current time. |
 | 400 | `deliver_until_too_far` | `deliver_until_ms` is more than 24 h after the daemon's current time. |
 | 409 | `idempotency_conflict` (queued) | A queued send with this `logical_id` to this recipient is held, or was delivered, with different bytes. |
+| 409 | `send_in_flight` | An attempt for this queued `logical_id` and recipient is in flight. Retry after it ends; then read the receipt. |
 | 503 | `outbox_not_durable` | The queued send was written but the directory fsync failed: it is held and may still be sent, but may not survive a crash. Read its receipt or cancel it. |
 | 429 | `outbox_full` | The queued-send outbox is full for this recipient (64 sends or 4 MiB) or for the daemon (1,024 sends or 32 MiB). Nothing was stored; an accepted send is never evicted. |
 | 400 | `invalid_logical_id` | `logical_id` was empty, longer than 128 characters, or contained a character outside `[a-z0-9._:-]`. |
@@ -1813,7 +1814,8 @@ Rules:
 - A second queued send with the same `logical_id`, recipient and payload answers the same 202 and stores nothing new. Its `deliver_until_ms` is the stored one. Other bytes than a held or delivered send under that key answer 409 `idempotency_conflict`.
 - 202 means the send is written and the directory is synced. If the directory sync fails the answer is 503 `outbox_not_durable`; the send is held and may still go out.
 - Retries run on a monotonic clock, so a wall-clock step does not stall them; the deadline uses the wall clock. After a restart every held send is due at once.
-- Cancel a held send with `DELETE /direct/receipts/:logical_id?agent_id=<hex>` (`x0x direct cancel`).
+- Cancel a held send with `DELETE /direct/receipts/:logical_id?agent_id=<hex>` (`x0x direct cancel`). While an attempt is in flight, a cancel or a new send under that key answers 409 `send_in_flight`. Blocking the contact during an attempt records that attempt's outcome and the send is not tried again.
+- A receipt answer for a queued or finished send includes `payload_digest` (hex BLAKE3 of the bytes the status is about). Compare it with the bytes you sent: the same `logical_id` can have been used for other bytes.
 - Payloads are stored unsealed (base64) in `direct_send_outbox.json`, a file with owner-only permissions (0600).
 - Caps: 64 sends or 4 MiB per recipient, 1,024 sends or 32 MiB per daemon. A full outbox answers 429 `outbox_full`.
 - Read the outcome with [`GET /direct/receipts/:logical_id`](#durable-send-receipts-1109). `queued` is read from the outbox and survives a restart. `delivered`, `expired` and `failed` are kept in memory with the same 10-minute, 4,096-entry bounds as the other receipts.
