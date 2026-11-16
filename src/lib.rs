@@ -28320,6 +28320,23 @@ impl KvStoreHandle {
         *self.sync.read().await.id()
     }
 
+    /// #1094 P2: who wrote `key`'s current entry, and the content hash
+    /// (hex) of the version that answer is for, read together. A caller
+    /// that read the value separately shows the writer only when the hash
+    /// matches, so a write in between is never attributed to the wrong
+    /// value. `None` when the key is not in the store.
+    pub async fn entry_writer_with_hash(
+        &self,
+        key: &str,
+    ) -> Option<(String, kv::provenance::EntryWriter)> {
+        let store = self.sync.read().await;
+        let entry = store.get(key)?;
+        Some((
+            hex::encode(entry.content_hash),
+            kv::provenance::verify(store.id(), key, entry),
+        ))
+    }
+
     /// Who wrote `key`'s current entry, by its writer mark (#1094 P1);
     /// `None` when the key is not in the store.
     pub async fn entry_writer(&self, key: &str) -> Option<kv::provenance::EntryWriter> {
@@ -28366,6 +28383,25 @@ impl KvStoreHandle {
         key: String,
         value: Vec<u8>,
         content_type: String,
+    ) -> error::Result<KvPutOutcome> {
+        self.put_with_outcome_by(key, value, content_type, None)
+            .await
+    }
+
+    /// [`put_with_outcome`](Self::put_with_outcome) for a write made
+    /// through this agent by a rider (#1094 P2): a group store's writer mark
+    /// names the rider (its sub-agent id, at most 64 bytes) beside this
+    /// agent.
+    ///
+    /// # Errors
+    ///
+    /// As [`put_with_delta`](Self::put_with_delta).
+    pub async fn put_with_outcome_by(
+        &self,
+        key: String,
+        value: Vec<u8>,
+        content_type: String,
+        rider: Option<&str>,
     ) -> error::Result<KvPutOutcome> {
         self.sync
             .authorize_local_write(&self.agent_id)
@@ -28501,7 +28537,7 @@ impl KvStoreHandle {
             }
             // #1094 P1: mark the entry with this writer's signature before
             // the delta and the checkpoint capture it.
-            self.mark_written_entry(&mut store, &key, None);
+            self.mark_written_entry(&mut store, &key, rider);
             let entry = store.get(&key).cloned();
             let version = store.current_version();
             let mut delta = match entry {

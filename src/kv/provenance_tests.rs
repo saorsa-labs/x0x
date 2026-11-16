@@ -577,3 +577,53 @@ async fn a_group_store_put_is_marked_by_its_writer() {
     assert_eq!(plain.entry_writer("k").await, Some(EntryWriter::Unsigned));
     assert_eq!(plain.entry_writer("absent").await, None);
 }
+
+/// P2 (review of #1963): a delta entry whose content hash is not the hash
+/// of its value is refused. Otherwise a member could resend A's entry with
+/// A's hash and mark but other bytes, and replicas would keep whichever
+/// arrived first.
+#[test]
+fn a_delta_entry_whose_hash_does_not_match_its_value_is_refused() {
+    let writer = AgentKeypair::generate().expect("writer");
+    let mut target = signed_store(10, &writer);
+    let peer = PeerId::new([7; 32]);
+    let mut forged = KvEntry::new("note".to_string(), b"real".to_vec(), "text/plain".into());
+    forged.value = b"forged".to_vec();
+    for updated in [false, true] {
+        let mut delta = KvStoreDelta::new(1);
+        if updated {
+            delta.updated.insert("note".to_string(), forged.clone());
+        } else {
+            delta
+                .added
+                .insert("note".to_string(), (forged.clone(), (peer, 1)));
+        }
+        target
+            .merge_delta(&delta, peer, Some(&writer.agent_id()))
+            .expect("merge call");
+        assert!(target.get("note").is_none(), "updated={updated}");
+    }
+
+    // A whole-store merge refuses it too, before anything changes.
+    let mut source = signed_store(10, &writer);
+    source
+        .put(
+            "note".to_string(),
+            b"real".to_vec(),
+            "text/plain".into(),
+            peer,
+        )
+        .expect("put");
+    let mut hostile: KvStore =
+        bincode::deserialize(&bincode::serialize(&source).expect("encode")).expect("decode");
+    hostile
+        .entries_mut_for_test()
+        .insert("note".to_string(), forged);
+    let mut replica = signed_store(10, &writer);
+    assert!(replica.merge(&hostile).is_err());
+    assert!(replica.get("note").is_none());
+    assert!(
+        replica.merge(&source).is_ok(),
+        "the consistent store merges"
+    );
+}

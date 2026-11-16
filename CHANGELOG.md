@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`GET /stores/:id/:key` shows the verified writer (#1094 slice P2, A10
+  amendment of 16 Nov 2026).** New `writer` field: the agent (and rider
+  sub-agent) whose mark verifies for the returned value, or
+  `{"verified": false}`, writer unknown. The raw `x0x.writer.*` keys are no
+  longer in `metadata`. A rider's write names the rider. The Scratch app
+  shows the writer. Every KV merge path now refuses an entry whose content
+  hash does not match its value.
 - **Each entry of a group store names its writer (#1094 slice P1, A10
   amendment of 16 Nov 2026).** A put on a store under `x0x/group/` signs the
   entry with the writer agent's key; the mark (agent id, signature, version)
