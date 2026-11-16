@@ -894,11 +894,14 @@ async fn typed_waits(sim: &mut Sim, receipt: &mut Receipt, host_commit: bool) ->
 // ─── Origin holds ─────────────────────────────────────────────────────────
 
 /// One write as an [`OriginHold`] policy sees it.
-struct Frame {
+pub(super) struct Frame {
     /// The node whose write carried this pubsub message ID first, or the
     /// sender of any other write.
-    origin: Key,
-    dst: Key,
+    pub(super) origin: Key,
+    pub(super) dst: Key,
+    /// The pubsub topic of the write, if it is a pubsub write.
+    pub(super) topic: Option<[u8; 32]>,
+    pub(super) class: crate::network::sim::LaneClass,
 }
 
 type Policy = Box<dyn Fn(&Frame) -> bool + Send + Sync>;
@@ -907,15 +910,15 @@ type Policy = Box<dyn Fn(&Frame) -> bool + Send + Sync>;
 /// policy decides from the [`Frame`] whether a write is dropped, and can
 /// change.
 #[derive(Clone)]
-struct OriginHold {
+pub(super) struct OriginHold {
     policy: Arc<Mutex<Policy>>,
     dropped: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-type Key = crate::network::sim::Key;
+pub(super) type Key = crate::network::sim::Key;
 
 impl OriginHold {
-    fn install(sim: &Sim, what: &str) -> Self {
+    pub(super) fn install(sim: &Sim, what: &str) -> Self {
         use crate::network::sim::{Fault, LaneClass};
         use std::collections::HashMap;
         let hold = Self {
@@ -938,6 +941,8 @@ impl OriginHold {
             let frame = Frame {
                 origin,
                 dst: write.lane.dst,
+                topic: msg.map(|(topic, _)| topic),
+                class: write.lane.class,
             };
             let drop = policy.lock().map_or(true, |policy| policy(&frame));
             if drop {
@@ -952,19 +957,24 @@ impl OriginHold {
         hold
     }
 
-    fn set(&self, sim: &Sim, what: &str, policy: impl Fn(&Frame) -> bool + Send + Sync + 'static) {
+    pub(super) fn set(
+        &self,
+        sim: &Sim,
+        what: &str,
+        policy: impl Fn(&Frame) -> bool + Send + Sync + 'static,
+    ) {
         if let Ok(mut slot) = self.policy.lock() {
             *slot = Box::new(policy);
         }
         sim.fabric().mark(format!("fault: origin hold now {what}"));
     }
 
-    fn dropped(&self) -> usize {
+    pub(super) fn dropped(&self) -> usize {
         self.dropped.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
-fn keys(sim: &Sim, labels: &[&str]) -> Result<Vec<Key>> {
+pub(super) fn keys(sim: &Sim, labels: &[&str]) -> Result<Vec<Key>> {
     labels.iter().map(|label| Ok(sim.peer(label)?.0)).collect()
 }
 

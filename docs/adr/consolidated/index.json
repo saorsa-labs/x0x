@@ -68,7 +68,7 @@
       "revision": 1,
       "path": "A09-r01-group-encryption-and-key-changes.md",
       "title": "Group Encryption and Key Changes",
-      "sha256": "2d2f6c9c3cbbcb010652dd6ea72c03fa56a49eb3dfd8c08f83f7c36684f7b4b9"
+      "sha256": "64cfa25c4dd1a1bca31b3c3a1fab3567c6d92856193716f145de687e8203ed68"
     },
     {
       "id": "A10",
@@ -103,7 +103,7 @@
       "revision": 1,
       "path": "A14-r01-health-updates-and-recovery.md",
       "title": "Health Updates and Recovery",
-      "sha256": "d2e5e219a7a7a2b8d2d6a79a546d1172f67b92429bee5283de567fe02ea19e83"
+      "sha256": "6de42e62bf7dfd198435bd8c9bc62288aa700d084ef691ad2265dcb96052025a"
     },
     {
       "id": "A15",

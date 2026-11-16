@@ -134,7 +134,11 @@ All notable changes to this project will be documented in this file.
   that never ends no longer blocks the groups behind it), and asks again
   for a group still pending after 60 s, 300 s and 900 s. The outage
   record is written and removed under one lock. The #1427 W3-H rows have
-  their own CI shard (`1427`).
+  their own CI shard (`1427`). When a later pass marks a group whose
+  older catch-up still runs, the end of that older catch-up no longer
+  removes the mark or the outage record, so the later pass still retries
+  the group (#1936 review follow-up, A09 fourth amendment of 16 Nov 2026).
+  No wire format or API changes.
 
 - **A TreeKEM member that stays up through a network outage catches up
   when it connects again (#1427, A09 second amendment of 15 Nov 2026).**
@@ -217,6 +221,16 @@ All notable changes to this project will be documented in this file.
 
 ### Tests and tooling
 
+- **Upgrade candidate health commit and D194 staging reserve (#1377, S3d
+  part 2; A14 amendment of 15 Nov 2026).** A launcher trial candidate
+  writes `upgrade-health.json` once its local M1 inputs stay `ok` for the
+  stable interval, with D193 peer continuity when the OLD instance had a
+  send-ready peer (recorded in the handoff). Staging refuses a download
+  that would leave less than 1 GiB free. A missing or symlinked installed
+  file rolls the host commit back as Failed at once; a true I/O error is
+  retried. Review round (#1947): the candidate's local verdict reads the
+  live delivery probe, a failed health-commit write is retried at the next
+  observation, and the module compiles on Windows (no candidate there).
 - **Coordinator production pass and systemd recovery cases (#1376, S3c;
   A14 amendment of 15 Nov 2026).** `coordinator::recover` keeps trials at
   `<data_root>/upgrade-trial.json`, counts only a handoff that binds this
