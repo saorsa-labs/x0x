@@ -1123,8 +1123,8 @@ jobs:
           --expect w3h_1356_control_s3_x_attestation_conflict_stops_at_common_prefix=GREEN
           --require w3h_1356_red_s3_q_joiner_unreadable_sidecar
           --expect w3h_1356_red_s3_q_joiner_unreadable_sidecar=RED
-          --require w3h_1356_red_s3_q_member_unreadable_sidecar
-          --expect w3h_1356_red_s3_q_member_unreadable_sidecar=RED
+          --require w3h_1356_control_s3_q_member_unreadable_sidecar
+          --expect w3h_1356_control_s3_q_member_unreadable_sidecar=GREEN
           --require w3h_1356_red_s3_q3_issuer_unreadable_sidecar
           --expect w3h_1356_red_s3_q3_issuer_unreadable_sidecar=RED
           --require w3h_1356_control_s3_q2_sidecar_fault_cases

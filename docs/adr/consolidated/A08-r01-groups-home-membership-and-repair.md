@@ -88,6 +88,8 @@ Recovery must preserve the owner's or group's legitimate authority. It must not 
 
 Persist membership, key transitions and incomplete work in a recoverable order. Keep old release-readable state where rollback requires it. [A09](A09-r01-group-encryption-and-key-changes.md) governs cryptographic exclusion.
 
+**Amendment, 16 Nov 2026 (Claude, under David's delegation of 10 Nov 2026 and A15 as amended on 12 Nov 2026; #1946).** ADR 0109's row H-S3-q (2) asks that a confirmed member whose S3 sidecar is rebuilt (D120) stay inert in `readmission_required {local_state_lost}`. The §4 rebuild table, which David accepted as D147, says otherwise: a lost `active_ata` is re-derived by a fresh request from the current head, and the node shows `awaiting_attestation` until a capable admin answers. Only a record under an S3 placeholder, and a pre-Welcome joiner whose gap it cannot re-fetch, end in `local_state_lost`. Decision: the table governs. A confirmed member keeps its real record in the legacy view, so after a rebuild it keeps its containment (every marker and gate stays), names `recovery_sidecar_rebuilt`, and asks again from its head; nothing commits because of the rebuild, and every later link still needs a fresh verified ATA (ADR 0109 L4). Row H-S3-q (2) is read as that outcome. D119's retention re-Welcome stays the exit for a member behind every holder's retention (row H-S3-r). No code change; this records the reading the code already implements.
+
 ## Consequences
 
 Repair can use reachable authorized peers instead of one original process. Some cases must wait for valid evidence or human recovery. Typed states and persisted repair records add implementation work.
