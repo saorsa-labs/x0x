@@ -114,6 +114,14 @@ All notable changes to this project will be documented in this file.
   A09 (16 Nov 2026) records that reading of the row. Run (8) repeats run
   (1) in an owner-certified `SignedPublic` group. The row has its own W3-H
   shard (`1581j`).
+- **W3-H row `s4_intake_and_egress`, staged-join part (#1581).** A
+  staged its artifacts for B's join, and B got none of them before the
+  trigger. B then revokes its own machine or agent, and after the release
+  B gets no key; with only a machine revocation A keeps B's agent seated
+  (D70). A revoked B stops asking A, so these arms do not reach A's egress
+  guards; a fetch from a device that keeps asking stays open. A control arm does the same hold and
+  release with no revocation, and B gets its key. The row has its own W3-H
+  shard (`1581k`).
 - **A `stale` join-request outcome can carry the authority's head (#1840,
   A08 amendment of 15 Nov 2026).** New optional `head` field on
   `groups::join_outcome::JoinRequestOutcome` (signed head commit, roster
@@ -431,6 +439,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Granted-store CLI paths and serves (#1953 review).** `x0x grant data`
+  (and `grant revoke|renew`) percent-encode each path segment, so a key with
+  `#`, `?` or `/` reaches the exact key. A slow granted read or write now
+  runs on a detached task (at most 16 at once), so it does not hold the
+  replies to other waiting requests.
 - **The dormant launcher reads a process that exits during its `/proc` read
   as gone.** `child::absent` treated only NotFound as gone; a process reaped
   between the open and the read of `/proc/<pid>/stat` fails with ESRCH, which
