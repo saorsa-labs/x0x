@@ -242,6 +242,18 @@ the second ask and the later rounds of that pass. The record carries it
 through a restart. The second ask removes the mark as usual when the
 group is current. No wire format or API changes.
 
+Fifth amendment of 16 Nov 2026 (#1427), recorded by Claude under the
+design delegation of 10 Nov 2026. A start or reconnect catch-up cycle
+asks for the next epoch without having seen it. Its target is now kept
+apart from epoch-ahead traffic and is not higher-head evidence for the
+ADR 0110 §2 seal gate; S4's own head round still asks the holders. Before
+this, a reconnect pass held every S4 seal of the group while it ran, and
+a revocation eviction could miss its completion bound (W3-H row
+`w3h_1357_red_s4_idle_revocation_one_admin_home`, which failed about two
+runs in five without the shim, where the pass's random wait is not
+controlled). Epoch-ahead traffic that arrives during the cycle makes the
+target evidence as before. No wire format or API changes.
+
 On 16 Nov 2026 Claude recorded how run (5a) of the ADR 0110 row
 `s4_certificate_expiry_skew` is read, under David's delegation of design
 decisions of 10 Nov 2026
