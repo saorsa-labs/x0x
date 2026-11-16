@@ -15671,14 +15671,18 @@ pub(in crate::server) fn spawn_treekem_epoch_ahead_catchup(
     let task_state = Arc::clone(state);
     let group_id = group_id.to_string();
     let _admitted = state.spawn_detached(async move {
-        request_treekem_catchup_for_epoch_ahead(&task_state, &group_id, observed_epoch).await;
+        request_treekem_catchup_for_epoch_ahead(&task_state, &group_id, observed_epoch, true).await;
     });
 }
 
+/// `observed` is `true` for epoch-ahead traffic and `false` for the
+/// #1427 start and reconnect cycles, which only probe for the next epoch
+/// ([`EpochAheadTarget::observed`]).
 async fn request_treekem_catchup_for_epoch_ahead(
     state: &Arc<AppState>,
     group_id: &str,
     observed_epoch: u64,
+    observed: bool,
 ) {
     let key = {
         let groups = state.named_groups.read().await;
@@ -15696,10 +15700,11 @@ async fn request_treekem_catchup_for_epoch_ahead(
         };
         key.clone()
     };
-    if !note_epoch_ahead_observation(
+    if !note_epoch_ahead(
         &mut *state.treekem_epoch_ahead_targets.lock().await,
         &key,
         observed_epoch,
+        observed,
     ) {
         // The running task picks up the observation.
         return;
@@ -15725,6 +15730,7 @@ async fn request_treekem_catchup_for_epoch_ahead(
             .unwrap_or(EpochAheadTarget {
                 epoch: target,
                 observations: covered,
+                observed,
             });
         let renewed = std::mem::take(&mut renew) || latest.epoch > target;
         if renewed {
@@ -15767,25 +15773,55 @@ pub(in crate::server) struct EpochAheadTarget {
     pub(in crate::server) epoch: u64,
     /// How many observations arrived after the first one, at any epoch.
     pub(in crate::server) observations: u64,
+    /// Whether traffic at a later epoch was seen. A #1427 start or
+    /// reconnect cycle only probes for the next epoch, so its target is
+    /// not higher-head evidence for ADR 0110 §2 until real epoch-ahead
+    /// traffic arrives ([`EpochAheadTarget::is_head_evidence`]).
+    pub(in crate::server) observed: bool,
+}
+
+impl EpochAheadTarget {
+    /// ADR 0110 §2: whether this target is unresolved higher-head evidence
+    /// for a member at `local_epoch`. A probe target is not: it shows no
+    /// later head, and S4's own head round already asks the holders. Before
+    /// this, a reconnect probe held every S4 seal for its whole pass.
+    pub(in crate::server) fn is_head_evidence(&self, local_epoch: u64) -> bool {
+        self.observed && self.epoch > local_epoch
+    }
 }
 
 /// Records one epoch-ahead observation for `key`. Returns `true` when no
 /// task runs for the group, so the caller must run one.
+#[cfg(test)]
 fn note_epoch_ahead_observation(
     targets: &mut HashMap<String, EpochAheadTarget>,
     key: &str,
     observed_epoch: u64,
 ) -> bool {
+    note_epoch_ahead(targets, key, observed_epoch, true)
+}
+
+/// Records one epoch-ahead observation (`observed`) or #1427 probe for
+/// `key`. Returns `true` when no task runs for the group, so the caller
+/// must run one. An observation turns a probe target into evidence.
+fn note_epoch_ahead(
+    targets: &mut HashMap<String, EpochAheadTarget>,
+    key: &str,
+    epoch: u64,
+    observed: bool,
+) -> bool {
     if let Some(target) = targets.get_mut(key) {
-        target.epoch = target.epoch.max(observed_epoch);
+        target.epoch = target.epoch.max(epoch);
         target.observations = target.observations.saturating_add(1);
+        target.observed |= observed;
         return false;
     }
     targets.insert(
         key.to_string(),
         EpochAheadTarget {
-            epoch: observed_epoch,
+            epoch,
             observations: 0,
+            observed,
         },
     );
     true
@@ -16088,7 +16124,7 @@ async fn request_treekem_catchup_after_start(state: &Arc<AppState>, key: &str) {
             let state = Arc::clone(state);
             let key = key.to_string();
             async move {
-                request_treekem_catchup_for_epoch_ahead(&state, &key, target).await;
+                request_treekem_catchup_for_epoch_ahead(&state, &key, target, false).await;
                 // When another epoch-ahead task already holds the group, the
                 // call above only hands it the target and returns at once.
                 // Judge the cycle only after that task ends, or a cycle that

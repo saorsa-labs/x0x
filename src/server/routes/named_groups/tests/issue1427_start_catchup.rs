@@ -325,6 +325,7 @@ async fn issue1427_start_pass_waits_for_another_epoch_ahead_task() -> Result<()>
         EpochAheadTarget {
             epoch: 99,
             observations: 0,
+            observed: true,
         },
     );
     let pass = tokio::spawn({
@@ -908,4 +909,42 @@ async fn issue1427_a_refused_spawn_releases_its_group() {
     )
     .await;
     assert!(gate.claim("g"), "the refused task's group is free again");
+}
+
+/// #1427 (A09 fifth amendment of 16 Nov 2026): a start or reconnect
+/// cycle's probe target is not ADR 0110 §2 higher-head evidence; real
+/// epoch-ahead traffic is, and it turns a running probe into evidence.
+#[test]
+fn issue1427_probe_target_is_not_head_evidence() {
+    let mut targets = HashMap::new();
+    let key = "1427";
+    assert!(
+        note_epoch_ahead(&mut targets, key, 3, false),
+        "the first probe starts the task"
+    );
+    let probe = targets.get(key).copied().expect("probe target kept");
+    assert!(
+        !probe.is_head_evidence(2),
+        "a probe for epoch 3 is no evidence"
+    );
+    assert!(
+        !note_epoch_ahead_observation(&mut targets, key, 3),
+        "the running task takes the observation"
+    );
+    let observed = targets.get(key).copied().expect("target kept");
+    assert!(observed.is_head_evidence(2), "seen traffic is evidence");
+    assert!(
+        !observed.is_head_evidence(3),
+        "a target at the local epoch is not ahead"
+    );
+    assert!(
+        !note_epoch_ahead(&mut targets, key, 4, false),
+        "a later probe joins the running task"
+    );
+    assert!(
+        targets
+            .get(key)
+            .is_some_and(|target| target.is_head_evidence(3) && target.epoch == 4),
+        "a probe never clears an observation"
+    );
 }

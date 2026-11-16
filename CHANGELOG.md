@@ -58,6 +58,15 @@ All notable changes to this project will be documented in this file.
   known gap: after a later rotation a TreeKEM member's revoked device still
   reaches the new epoch through its kept leaf. The row has its own W3-H
   shard (`1581i`).
+- **W3-H row `s4_certificate_expiry_skew`, runs (1), (5a) and (8) (#1581).**
+  In a Home with admins A < D < E, B's device certificate expires and the
+  survivors exclude B once: after B's raw `not_after`, signed by A, within
+  the completion bound from A's trigger. In run (5a), B's renewal reaches
+  the admins only by announce; at expiry A commits the rebind instead of
+  the removal (ADR 0110 §4a), so B keeps its seat with no epoch change.
+  A09 (16 Nov 2026) records that reading of the row. Run (8) repeats run
+  (1) in an owner-certified `SignedPublic` group. The row has its own W3-H
+  shard (`1581j`).
 - **A `stale` join-request outcome can carry the authority's head (#1840,
   A08 amendment of 15 Nov 2026).** New optional `head` field on
   `groups::join_outcome::JoinRequestOutcome` (signed head commit, roster
@@ -235,6 +244,16 @@ All notable changes to this project will be documented in this file.
 
 ### Tests and tooling
 
+- **Upgrade health commit review carry-over (#1378 slice 1; A14
+  amendment of 16 Nov 2026).** The candidate writes canonical data and
+  identity roots, and the launcher matches a planned root reached through a
+  symlink. A D193 send-ready peer first seen inside the 120 s wait keeps its
+  full 60 s stable interval. D194 charges the signature download and each
+  extracted binary against the 1 GiB reserve, not only the archive, and the
+  download and extraction wiring is tested. The coordinator's last step
+  loads the trials again on a `RollingBack` host, so a peer's
+  `RecoveryFailed` trials are never overwritten.
+
 - **Upgrade candidate health commit and D194 staging reserve (#1377, S3d
   part 2; A14 amendment of 15 Nov 2026).** A launcher trial candidate
   writes `upgrade-health.json` once its local M1 inputs stay `ok` for the
@@ -348,6 +367,14 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **A #1427 catch-up probe no longer holds S4 seals (A09 fifth amendment
+  of 16 Nov 2026).** A start or reconnect catch-up cycle asks for the next
+  TreeKEM epoch without having seen it. Its target was read as ADR 0110 §2
+  higher-head evidence, so a reconnect pass held every revocation eviction
+  of the group while it ran. W3-H row
+  `w3h_1357_red_s4_idle_revocation_one_admin_home` failed 8 runs in 20
+  without the shim (the pass's random wait is not controlled there); with
+  the fix it passed 20 of 20. Epoch-ahead traffic stays evidence.
 - **An evidence Hello on a followed older connection gets a reply again
   (#1346, A05 amendment of 15 Nov 2026).** The Hello reply gate charged a
   high-water mark of connection generations, so after ant-quic made an older

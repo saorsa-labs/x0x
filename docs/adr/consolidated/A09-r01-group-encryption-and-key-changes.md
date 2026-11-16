@@ -245,6 +245,35 @@ request from before the later isolation. The daemon has one gate, and
 every removal of a mark goes through it. The second ask removes the mark
 as usual when the group is current. No wire format or API changes.
 
+Fifth amendment of 16 Nov 2026 (#1427), recorded by Claude under the
+design delegation of 10 Nov 2026. A start or reconnect catch-up cycle
+asks for the next epoch without having seen it. Its target is now kept
+apart from epoch-ahead traffic and is not higher-head evidence for the
+ADR 0110 §2 seal gate; S4's own head round still asks the holders. Before
+this, a reconnect pass held every S4 seal of the group while it ran, and
+a revocation eviction could miss its completion bound (W3-H row
+`w3h_1357_red_s4_idle_revocation_one_admin_home`, which failed about two
+runs in five without the shim, where the pass's random wait is not
+controlled). Epoch-ahead traffic that arrives during the cycle makes the
+target evidence as before. No wire format or API changes.
+
+On 16 Nov 2026 Claude recorded how run (5a) of the ADR 0110 row
+`s4_certificate_expiry_skew` is read, under David's delegation of design
+decisions of 10 Nov 2026
+([#1581](https://github.com/saorsa-labs/x0x/issues/1581)). The row says
+that a renewal reaching the admins only by announce cancels nothing and
+that B is evicted. That text predates §4a. §4a (L289) and
+`s4_certificate_rebind` run (2) have the designated expiry worker commit
+the rebind instead of `MemberRemoved` when it holds a verified renewal
+from any source, an announce cache included. The two agree on D135: the
+announce alone cancels nothing, and only a rebinding commit keeps the
+seat. Run (5a) therefore passes when nothing moves before raw
+`not_after`, and the designated admin then commits the rebind within the
+completion bound from its trigger, with no epoch change. When the
+mixed-version rule forbids a rebind, the seat is evicted, as run (3) of
+`s4_certificate_rebind` states. No code, wire format or API changes. ADR
+0110 stays Accepted and its text is unchanged.
+
 [A08](A08-r01-groups-home-membership-and-repair.md) defines valid group-state and fork recovery. A09 must not bypass that authority to obtain keys faster.
 
 ## Security claims
