@@ -68,12 +68,12 @@ const WINDOW: Duration = Duration::from_secs(130);
 const QUIET: Duration = Duration::from_secs(30);
 const LOST: &str = "readmission_required{local_state_lost}";
 /// The 64 junk bytes the row writes: `JUNKJUNK` and 56 more.
-fn junk() -> Vec<u8> {
+pub(super) fn junk() -> Vec<u8> {
     [b"JUNKJUNK".as_slice(), &[0u8; 56]].concat()
 }
 
 /// The sidecar directory of `label`, and the files in it.
-fn sidecar_files(sim: &Sim, label: &str) -> Result<(std::path::PathBuf, Vec<String>)> {
+pub(super) fn sidecar_files(sim: &Sim, label: &str) -> Result<(std::path::PathBuf, Vec<String>)> {
     let dir = sim.data_dir(label)?.join(GROUP_RECOVERY_DIR);
     let mut names: Vec<String> = std::fs::read_dir(&dir)
         .with_context(|| format!("read {}", dir.display()))?
@@ -86,19 +86,19 @@ fn sidecar_files(sim: &Sim, label: &str) -> Result<(std::path::PathBuf, Vec<Stri
 
 /// What the case read of J's sidecar directory after the rebuild.
 #[derive(Default, Debug)]
-struct Disk {
+pub(super) struct Disk {
     /// History copies of the damaged file (`<file>.q-...`, no `.pending`).
-    history: Vec<String>,
+    pub(super) history: Vec<String>,
     /// History copies whose bytes are the junk, byte for byte.
-    identical: usize,
+    pub(super) identical: usize,
     /// The fresh sidecar decodes; its `rebuilt_from` as hex.
-    fresh_rebuilt_from: Option<Vec<String>>,
+    pub(super) fresh_rebuilt_from: Option<Vec<String>>,
     /// Pending copies left in the directory.
-    pending: usize,
+    pub(super) pending: usize,
 }
 
 impl Disk {
-    fn read(dir: &Path, names: &[String], file: &str, junk: &[u8]) -> Self {
+    pub(super) fn read(dir: &Path, names: &[String], file: &str, junk: &[u8]) -> Self {
         let prefix = format!("{file}.q-");
         let mut disk = Disk::default();
         for name in names {
@@ -120,7 +120,7 @@ impl Disk {
 
     /// One history copy holds the junk byte for byte, no pending copy is
     /// left, and the fresh sidecar names exactly one rebuild.
-    fn quarantined(&self) -> bool {
+    pub(super) fn quarantined(&self) -> bool {
         self.history.len() == 1
             && self.identical == 1
             && self.pending == 0
