@@ -2026,8 +2026,9 @@ pub async fn serve_with_options(
     // The metadata + public-message listeners spawned here self-register in
     // `state.group_metadata_tasks` / `state.public_message_tasks`; the
     // shutdown tail drains and aborts those maps directly (Fix C), so there
-    // is nothing to collect into `bg_tasks` from this call. #1366: each
-    // record gets only the listeners its stored state needs.
+    // is nothing to collect into `bg_tasks` from this call. #1366: the
+    // restore applies `metadata_listener_wanted` (only a withdrawn record
+    // gets no listener; a Banned seat keeps it to receive an unban).
     routes::named_groups::restore_named_group_listeners(Arc::clone(&state)).await;
 
     // ADR-0038: auto-provision the Home space for an owned install. Runs

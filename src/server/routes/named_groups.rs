@@ -22094,51 +22094,40 @@ pub(in crate::server) async fn apply_listener_metadata_event(
     applied
 }
 
-/// #1366: whether a stored group record needs its metadata listener, by the
-/// local agent's own seat. A withdrawn group needs none. A record whose
-/// local seat is Banned needs none either: a ban ends the seat for good
-/// until an admin lifts it, and a later join installs a listener again
-/// through its own path. Every other record keeps it: an Active member, a
-/// Pending request-access applicant (it waits for the approval event), a
-/// record with no local seat (a card-import or join stub, which waits for
-/// its `MemberAdded`), and a Removed seat, which an ADR 0109 re-seat or an
-/// ordinary re-add can still follow on this topic (W3-H H-S3-q (3) needs
-/// it).
-pub(in crate::server) fn metadata_listener_wanted(
-    info: &x0x::groups::GroupInfo,
-    local_agent_hex: &str,
-) -> bool {
-    use x0x::groups::member::GroupMemberState;
-    if info.withdrawn {
-        return false;
-    }
-    !info
-        .members_v2
-        .get(local_agent_hex)
-        .is_some_and(|member| member.state == GroupMemberState::Banned)
+/// #1366: whether a stored group record needs its metadata listener after a
+/// restart. Only a withdrawn group needs none. Every local seat keeps it:
+/// - an Active member;
+/// - a Pending request-access applicant, which waits for the approval event;
+/// - a record with no local seat (a card-import or join stub), which waits
+///   for its `MemberAdded`;
+/// - a Removed seat, which an ADR 0109 re-seat or an ordinary re-add can
+///   still follow on this topic (W3-H H-S3-q (3) needs it);
+/// - a Banned seat: an admin lifts a ban with a `MemberUnbanned` event that
+///   [`unban_group_member`] publishes only on this topic. Without the
+///   listener the agent keeps its stored ban and its request-access stays
+///   refused as `banned`.
+pub(in crate::server) fn metadata_listener_wanted(info: &x0x::groups::GroupInfo) -> bool {
+    !info.withdrawn
 }
 
-/// #1366: the listeners a restart installs for the stored groups. The
-/// metadata listener follows [`metadata_listener_wanted`]; the
-/// public-message listener follows the group's confidentiality, as in
-/// [`ensure_named_group_listeners`]. Before this, a restart started a
-/// metadata listener for every stored record, also for a group this agent
-/// had been banned in.
+/// #1366: the listeners a restart installs for the stored groups. A record
+/// that [`metadata_listener_wanted`] accepts gets
+/// [`ensure_named_group_listeners`]: the metadata listener, and the
+/// public-message listener when the group is SignedPublic. A withdrawn
+/// record gets neither. This is the same set as before #1366, when the
+/// restart called [`ensure_named_group_listeners`] for every record and
+/// both of its halves skipped a withdrawn group.
 pub(in crate::server) async fn restore_named_group_listeners(state: Arc<AppState>) {
-    let local = hex::encode(state.agent.agent_id().as_bytes());
-    let groups: Vec<(String, bool)> = {
+    let wanted: Vec<String> = {
         let groups = state.named_groups.read().await;
         groups
             .iter()
-            .map(|(id, info)| (id.clone(), metadata_listener_wanted(info, &local)))
+            .filter(|(_, info)| metadata_listener_wanted(info))
+            .map(|(id, _)| id.clone())
             .collect()
     };
-    for (group_id, wanted) in groups {
-        if wanted {
-            ensure_named_group_listeners(Arc::clone(&state), &group_id).await;
-        } else {
-            ensure_public_message_listener_for(Arc::clone(&state), &group_id).await;
-        }
+    for group_id in wanted {
+        ensure_named_group_listeners(Arc::clone(&state), &group_id).await;
     }
 }
 
@@ -22158,11 +22147,6 @@ pub(in crate::server) async fn restore_named_group_listeners(state: Arc<AppState
 /// `GET /groups/:id/messages`, which rejects MLS-encrypted groups outright.
 pub(in crate::server) async fn ensure_named_group_listeners(state: Arc<AppState>, group_id: &str) {
     ensure_named_group_metadata_listener(Arc::clone(&state), group_id).await;
-    ensure_public_message_listener_for(state, group_id).await;
-}
-
-/// The public-message half of [`ensure_named_group_listeners`].
-async fn ensure_public_message_listener_for(state: Arc<AppState>, group_id: &str) {
     let public_topic_key = {
         let groups = state.named_groups.read().await;
         groups.get(group_id).and_then(|info| {
