@@ -285,11 +285,12 @@ fn the_mark_survives_the_entry_encoding() {
     );
 }
 
-/// MAJOR 2 of the review of #1963, attack 1: a relay resends A's entry
-/// with a junk mark that sorts higher. Inside the store, a valid mark is
-/// never replaced by an invalid one, in either arrival order.
+/// Re-review of #1963, attack 1: a relay resends A's entry with a junk
+/// mark that sorts higher. The merge does not verify, so the junk mark may
+/// win; what holds is the one-way guarantee: the result is never
+/// `Verified` for anyone but A, and both arrival orders agree.
 #[test]
-fn a_junk_mark_never_beats_a_valid_one() {
+fn a_junk_mark_is_never_verified() {
     let a = AgentKeypair::generate().expect("a");
     let good = marked(&a, None);
     let mut junk = good.clone();
@@ -297,35 +298,150 @@ fn a_junk_mark_never_beats_a_valid_one() {
         .insert(WRITER_SIG_KEY.to_string(), "zzzz".repeat(16));
     junk.metadata
         .insert(WRITER_AGENT_KEY.to_string(), "ff".repeat(32));
-    for (first, second) in [(&good, &junk), (&junk, &good)] {
-        let mut held = first.clone();
-        held.merge_in_store(second, &store(1));
-        assert_eq!(verify(&store(1), "note", &held), verified(&a, None));
+    let mut first = good.clone();
+    first.merge(&junk);
+    let mut second = junk.clone();
+    second.merge(&good);
+    assert_eq!(
+        first.metadata, second.metadata,
+        "one winner in either order"
+    );
+    match verify(&store(1), "note", &first).verified_writer() {
+        None => {}
+        Some((agent, _)) => assert_eq!(agent, a.agent_id(), "only A can be named"),
     }
+    assert_eq!(
+        verify(&store(1), "note", &junk).verified_writer(),
+        None,
+        "a junk mark is writer unknown"
+    );
 }
 
-/// MAJOR 2, attack 2: W re-signs A's exact bytes. Between two valid marks
-/// the rule is deterministic (both arrival orders agree), so the mark then
-/// proves "a member signed these bytes at this time", not first authorship.
+/// Re-review of #1963, attack 2: W re-signs A's exact bytes. Whichever
+/// mark the merge keeps, its verified writer is the agent that signed that
+/// mark: `Verified { W }` is a true statement, and W's mark never reads as
+/// A's.
 #[test]
-fn two_valid_marks_over_the_same_bytes_merge_to_one_winner() {
+fn a_re_signed_entry_names_its_real_signer() {
     let a = AgentKeypair::generate().expect("a");
     let w = AgentKeypair::generate().expect("w");
     let from_a = marked(&a, None);
     let mut from_w = from_a.clone();
     mark(&mut from_w, &store(1), w.public_key(), w.secret_key(), None).expect("mark");
+    assert_eq!(verify(&store(1), "note", &from_w), verified(&w, None));
     let mut first = from_a.clone();
-    first.merge_in_store(&from_w, &store(1));
+    first.merge(&from_w);
     let mut second = from_w.clone();
-    second.merge_in_store(&from_a, &store(1));
+    second.merge(&from_a);
     assert_eq!(
         first.metadata, second.metadata,
         "one winner in either order"
     );
-    assert!(matches!(
-        verify(&store(1), "note", &first),
-        EntryWriter::Verified { .. }
-    ));
+    let expected = if first.metadata == from_w.metadata {
+        verified(&w, None)
+    } else {
+        verified(&a, None)
+    };
+    assert_eq!(verify(&store(1), "note", &first), expected);
+}
+
+/// Re-review of #1963: every store merge path uses the one LWW rule,
+/// `KvEntry::merge`, including retained images and legacy history; no path
+/// compares entries itself.
+#[test]
+fn every_store_merge_path_uses_the_one_lww_rule() {
+    let source = include_str!("store.rs");
+    let production = source
+        .split("#[cfg(test)]\nmod tests {")
+        .next()
+        .expect("source");
+    for forbidden in [
+        "updated_at >",
+        "updated_at <",
+        "content_hash >",
+        "content_hash <",
+        "merge_in_store",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "store.rs compares entries itself: {forbidden}"
+        );
+    }
+    for path in [
+        "fn merge_delta_self_keyed(",
+        "fn merge_delta_with_outcome_inner(",
+        "fn try_adopt_full_snapshot(",
+        "fn merge_unchecked(",
+        "pub fn merge_group_retained_image(",
+        "pub fn merge_legacy_signed_history(",
+    ] {
+        let start = production.find(path).expect(path);
+        let body = &production[start + path.len()..];
+        let end = ["\n    pub fn ", "\n    fn ", "\n    pub(crate) fn "]
+            .iter()
+            .filter_map(|next| body.find(next))
+            .min()
+            .unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains(".merge(entry)") || body.contains(".merge(other_entry)"),
+            "{path} must merge entries with KvEntry::merge"
+        );
+    }
+}
+
+fn arb_entry() -> impl proptest::strategy::Strategy<Value = KvEntry> {
+    use proptest::prelude::*;
+    (
+        0u64..3,
+        0u8..3,
+        prop::sample::select(vec!["text/plain", "application/json"]),
+        prop::collection::btree_map("[a-c]", "[x-z]{0,2}", 0..3),
+        0u64..5,
+    )
+        .prop_map(|(updated_at, value, content_type, metadata, created_at)| {
+            let mut e = KvEntry::new("k".to_string(), vec![value], content_type.to_string());
+            e.updated_at = updated_at;
+            e.created_at = created_at;
+            e.metadata = metadata.into_iter().collect();
+            e
+        })
+}
+
+/// The winning fields of a merge (`created_at` is display provenance,
+/// kept only from a winner, and outside the LWW order).
+type Winner = (u64, [u8; 32], Vec<u8>, String, Vec<(String, String)>);
+
+fn winner(e: &KvEntry) -> Winner {
+    let mut metadata: Vec<_> = e.metadata.clone().into_iter().collect();
+    metadata.sort();
+    (
+        e.updated_at,
+        e.content_hash,
+        e.value.clone(),
+        e.content_type.clone(),
+        metadata,
+    )
+}
+
+fn merged(a: &KvEntry, b: &KvEntry) -> KvEntry {
+    let mut out = a.clone();
+    out.merge(b);
+    out
+}
+
+proptest::proptest! {
+    /// Re-review of #1963: the LWW rule is commutative, associative and
+    /// idempotent on every winning field, including the metadata.
+    #[test]
+    fn the_lww_rule_is_a_pure_merge(a in arb_entry(), b in arb_entry(), c in arb_entry()) {
+        proptest::prop_assert_eq!(winner(&merged(&a, &b)), winner(&merged(&b, &a)));
+        proptest::prop_assert_eq!(
+            winner(&merged(&merged(&a, &b), &c)),
+            winner(&merged(&a, &merged(&b, &c)))
+        );
+        proptest::prop_assert_eq!(winner(&merged(&a, &a)), winner(&a));
+    }
 }
 
 /// MAJOR 3 of the review of #1963: the mark's encoded size is within the
@@ -447,7 +563,7 @@ async fn a_group_store_put_is_marked_by_its_writer() {
         bincode::deserialize(&bincode::serialize(delta_entry).expect("encode")).expect("decode");
     let mut replica = KvEntry::new("note".to_string(), b"older".to_vec(), "text/plain".into());
     replica.updated_at = 0;
-    replica.merge_in_store(&relayed, &store_id);
+    replica.merge(&relayed);
     assert_eq!(verify(&store_id, "note", &replica), writer);
 
     let plain = agent

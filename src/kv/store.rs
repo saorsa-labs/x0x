@@ -2310,7 +2310,7 @@ impl KvStore {
                 .add(key.clone(), *tag)
                 .map_err(|e| KvError::Merge(format!("OR-Set add failed: {e}")))?;
             if let Some(existing) = self.entries.get_mut(key) {
-                existing.merge_in_store(entry, &self.id);
+                existing.merge(entry);
             } else {
                 self.entries.insert(key.clone(), entry.clone());
             }
@@ -2320,7 +2320,7 @@ impl KvStore {
                 continue;
             }
             if let Some(existing) = self.entries.get_mut(key) {
-                existing.merge_in_store(entry, &self.id);
+                existing.merge(entry);
             } else {
                 self.keys
                     .add(key.clone(), (peer_id, 0))
@@ -2539,7 +2539,7 @@ impl KvStore {
                 .map_err(|e| KvError::Merge(format!("OR-Set add failed: {e}")))?;
 
             if let Some(existing) = self.entries.get_mut(key) {
-                existing.merge_in_store(entry, &self.id);
+                existing.merge(entry);
             } else {
                 self.entries.insert(key.clone(), entry.clone());
             }
@@ -2570,7 +2570,7 @@ impl KvStore {
                 continue; // skip this entry; the rest of the delta still applies
             }
             if let Some(existing) = self.entries.get_mut(key) {
-                existing.merge_in_store(entry, &self.id);
+                existing.merge(entry);
             } else {
                 self.keys
                     .add(key.clone(), (peer_id, 0))
@@ -2836,14 +2836,14 @@ impl KvStore {
         for (key, (entry, tag)) in &delta.added {
             let _ = self.keys.add(key.clone(), *tag);
             if let Some(existing) = self.entries.get_mut(key) {
-                existing.merge_in_store(entry, &self.id);
+                existing.merge(entry);
             } else {
                 self.entries.insert(key.clone(), entry.clone());
             }
         }
         for (key, entry) in &delta.updated {
             if let Some(existing) = self.entries.get_mut(key) {
-                existing.merge_in_store(entry, &self.id);
+                existing.merge(entry);
             } else {
                 let _ = self.keys.add(key.clone(), (peer_id, 0));
                 self.entries.insert(key.clone(), entry.clone());
@@ -3040,7 +3040,7 @@ impl KvStore {
 
         for (key, other_entry) in &other.entries {
             if let Some(our_entry) = self.entries.get_mut(key) {
-                our_entry.merge_in_store(other_entry, &self.id);
+                our_entry.merge(other_entry);
             } else {
                 self.entries.insert(key.clone(), other_entry.clone());
             }

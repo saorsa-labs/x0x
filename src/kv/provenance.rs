@@ -58,7 +58,9 @@ const DOMAIN: &[u8] = b"x0x.kv.entry-writer.v2\0";
 /// Agent keys [`known_agent_key`] keeps; the oldest is dropped first.
 const KNOWN_AGENT_KEYS_CAP: usize = 8192;
 
-/// Who wrote an entry, as far as its mark shows.
+/// Who wrote an entry, as far as its mark shows. Only
+/// [`EntryWriter::Verified`] says anything; the other states all mean
+/// "writer unknown" (see [`EntryWriter::verified_writer`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryWriter {
     /// The mark verifies: `agent` signed this entry's current content, under
@@ -79,7 +81,8 @@ pub enum EntryWriter {
     /// a store whose writes are not marked, or a rewrite after the mark.
     Unsigned,
     /// The entry carries a mark that does not verify for its current
-    /// content, key and store; `reason` says why.
+    /// content, key and store; `reason` says why. Writer unknown: not
+    /// evidence of tampering.
     Invalid {
         /// Why the mark does not verify.
         reason: &'static str,
@@ -87,14 +90,19 @@ pub enum EntryWriter {
 }
 
 impl EntryWriter {
-    /// Merge rank on an exact tie (review of #1963): a verified mark beats
-    /// an unverifiable or absent one, which beats an invalid one.
+    /// The writer and rider when the mark verifies; `None` otherwise.
+    ///
+    /// The guarantee is one-way (A10, review of #1963): `Verified { agent }`
+    /// means `agent` signed exactly these bytes for this store and key. The
+    /// other three states all mean "writer unknown". They are not evidence
+    /// of tampering: any group member or relay can replace a mark on a tie
+    /// of time and content, as any member can overwrite the entry, and a
+    /// daemon may simply not know the writer's key. Show them as unknown.
     #[must_use]
-    pub(crate) fn tie_rank(&self) -> u8 {
+    pub fn verified_writer(&self) -> Option<(AgentId, Option<&str>)> {
         match self {
-            Self::Verified { .. } => 2,
-            Self::Unverified { .. } | Self::Unsigned => 1,
-            Self::Invalid { .. } => 0,
+            Self::Verified { agent, rider } => Some((*agent, rider.as_deref())),
+            Self::Unverified { .. } | Self::Unsigned | Self::Invalid { .. } => None,
         }
     }
 }

@@ -11,7 +11,8 @@ All notable changes to this project will be documented in this file.
   entry with the writer agent's key; the mark (agent id, signature, version)
   rides in reserved `x0x.writer.*` metadata keys, so older peers keep and
   relay it unchanged. `x0x::kv::provenance::verify` reports `verified`,
-  `unverified` (writer key not known here), `unsigned` or `invalid`. A delta
+  `unverified` (writer key not known here), `unsigned` or `invalid`; only
+  `verified` says anything, the rest mean writer unknown. A delta
   that holds an entry under another key is refused. A mark adds about
   4.7 KB; a put that would take a group store's image past the 16 MiB
   retained-image limit is refused (`store full`, HTTP 507).

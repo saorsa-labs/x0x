@@ -92,33 +92,22 @@ impl KvEntry {
 
     /// Merge another entry into this one using LWW semantics.
     ///
-    /// The entry with the higher `updated_at` wins. Ties are broken
-    /// by comparing content hashes (deterministic), then the sorted
-    /// metadata. A store merges with `merge_in_store`, which also
-    /// ranks writer marks.
+    /// The entry with the greater [`Self::lww_order`] wins: `updated_at`,
+    /// then the content hash, then the content type, then the sorted
+    /// metadata. This is the one LWW rule of every store merge path
+    /// (deltas, SelfKeyed, checkpoints, retained images, legacy history),
+    /// and it is a pure function of the two entries, so every replica keeps
+    /// the same winner whatever the order of arrival.
+    ///
+    /// #1094 P1 (A10, review of #1963): on a tie of time and content the
+    /// value is identical and only the metadata, such as a writer mark,
+    /// differs. The rule does not verify marks: verification depends on
+    /// which keys a daemon knows, and a merge must not. So any member or
+    /// relay can replace a mark on such a tie, as any member can overwrite
+    /// the entry; a mark shows who signed the current bytes, and the
+    /// absence of a valid mark shows nothing.
     pub fn merge(&mut self, other: &Self) {
-        self.merge_ranked(other, |_| 1);
-    }
-
-    /// [`Self::merge`] inside the store `store_id` (#1094 P1, review of
-    /// #1963): on equal time and content, a verified writer mark beats an
-    /// unverifiable or absent one, which beats an invalid one, so a relay
-    /// cannot replace a valid mark with a broken one. Equal ranks fall back
-    /// to the sorted metadata.
-    pub(crate) fn merge_in_store(&mut self, other: &Self, store_id: &super::store::KvStoreId) {
-        self.merge_ranked(other, |entry| {
-            super::provenance::verify(store_id, &entry.key, entry).tie_rank()
-        });
-    }
-
-    fn merge_ranked(&mut self, other: &Self, rank: impl Fn(&Self) -> u8) {
-        let tie = other.updated_at == self.updated_at && other.content_hash == self.content_hash;
-        let wins = other.updated_at > self.updated_at
-            || (other.updated_at == self.updated_at && other.content_hash > self.content_hash)
-            || (tie
-                && other.metadata != self.metadata
-                && (rank(other), sorted_metadata(&other.metadata))
-                    > (rank(self), sorted_metadata(&self.metadata)));
+        let wins = other.lww_order() > self.lww_order();
         if wins {
             self.value = other.value.clone();
             self.content_hash = other.content_hash;
@@ -130,6 +119,18 @@ impl KvEntry {
                 self.created_at = other.created_at;
             }
         }
+    }
+
+    /// The LWW order of this entry: `updated_at`, content hash, content
+    /// type, sorted metadata. [`Self::merge`] keeps the greater.
+    #[must_use]
+    pub fn lww_order(&self) -> (u64, [u8; 32], &str, Vec<(&String, &String)>) {
+        (
+            self.updated_at,
+            self.content_hash,
+            &self.content_type,
+            sorted_metadata(&self.metadata),
+        )
     }
 
     /// Check if this entry's value is stored inline (vs externally).
