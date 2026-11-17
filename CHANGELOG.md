@@ -560,6 +560,14 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Groups (H-S3-r, studio1 train 60):** a joiner whose join seal was not
+  served now keeps its group record and its `readmission_required
+  {base_beyond_retention}` after the join attempt times out. Before, a stub
+  still at the invite base was removed on the timeout and the joiner answered
+  404. W3-H row H-S3-r also no longer passes or fails by gossip timing: J gets
+  no gossip replay of the metadata messages published before it redeemed, so
+  its head stays beyond A's retention.
+
 - **The dormant launcher's issuer refuses fixed faults with 78 (#1378,
   review of #2014).** A plan path that is missing or not canonical, and a
   symlinked or non-regular trial record, now exit 78 instead of 75. The tests
