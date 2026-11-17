@@ -251,7 +251,7 @@ macro_rules! fleet_startup_regression_tests {
             };
             let attempts = Arc::new(AtomicU64::new(0));
             let counted = Arc::clone(&attempts);
-            let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |plan, manifest| {
+            let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |plan, manifest, _admission| {
                 assert!(!plan.systemd_verified.as_ref().unwrap().user_manager);
                 counted.fetch_add(1, Ordering::SeqCst);
                 x0x::upgrade::UpgradeResult::Success { version: manifest.version.clone() }
@@ -427,7 +427,7 @@ macro_rules! fleet_startup_regression_tests {
             if let Some(path) = &blocked_path { std::fs::write(path, b"corrupt retained intent").unwrap(); }
             let attempts = Arc::new(AtomicU64::new(0));
             let counted = Arc::clone(&attempts);
-            let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |_, manifest| {
+            let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |_, manifest, _admission| {
                 counted.fetch_add(1, Ordering::SeqCst);
                 x0x::upgrade::UpgradeResult::Success { version: manifest.version.clone() }
             }));
@@ -582,7 +582,7 @@ macro_rules! fleet_startup_regression_tests {
             let attempts = Arc::new(AtomicU64::new(0));
             let counted = Arc::clone(&attempts);
             let expected_unit = unit.to_owned();
-            let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |plan, manifest| {
+            let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |plan, manifest, _admission| {
                 let verified = plan.systemd_verified.as_ref().unwrap();
                 assert_eq!(verified.unit, expected_unit);
                 assert!(!verified.user_manager);

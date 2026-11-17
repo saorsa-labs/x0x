@@ -1040,16 +1040,27 @@ no gossip, binds nothing, and takes no instance lock.
    (Engineer ruling 3 Nov 2026 17:40 GMT).
    `/upgrade/apply` applies the release it announces, so it records its
    payload as apply-route-owned in the shared self-published tracker
-   before publishing: any gossip copy of those bytes — the announcing
-   node's own echo or a peer's — neither rebroadcasts nor queues a second
-   apply on the background owner while that apply runs. The claim is
-   released on drop: any exit other than a successful apply releases it,
-   including a client disconnect during the apply wait or a panic. Gossip
-   copies then reach the owner again; only a successful apply keeps it.
-   After a fast failure, the node's own gossip echo can still arrive
-   after the claim is released and cause one background-owner attempt of
-   the same release. The owner's 30-minute `failed_at` backoff bounds
-   that attempt, so it cannot loop.
+   before publishing: while the tracker holds that claim, any gossip
+   copy of those bytes — the announcing node's own echo or a peer's —
+   neither rebroadcasts nor queues a second apply on the background
+   owner. The tracker entry that holds the claim expires 30 minutes
+   after the route records it. The default rollout window is 60 minutes,
+   so the entry can expire while the apply still waits. A gossip copy
+   of the payload is then treated like a peer's copy and can queue a
+   background apply again. The claim is released on drop while the apply
+   was never admitted: a failed, rolled-back or no-op apply, a client
+   disconnect during the apply wait, or a panic all release it, and
+   gossip copies reach the owner again. Once the apply's blocking worker
+   is admitted — host locks held, replacement and restart owned by the
+   worker — a dropped handler no longer releases the claim: the install
+   still runs, and a gossip copy arriving in the seconds before the
+   restart must not queue a second apply of it. A successful apply keeps
+   the claim; every other post-admission exit leaves it to expire with
+   the tracker entry. After a fast failure, the node's own gossip echo
+   can still arrive after the claim is released and queue a
+   background-owner attempt of the same release. The owner's 30-minute
+   `failed_at` backoff bounds the rate of those attempts, not their
+   count: at most one new attempt per 30 minutes.
    The GitHub poll cadence does not change (A14 / ADR 0045): gossip is
    the fast path. The announcement is bounded (10 s) and best effort;
    peer rebroadcast limiting and the apply owner's dedup handle repeats.

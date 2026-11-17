@@ -115,23 +115,35 @@ impl SelfPublishedReleaseManifests {
 
 /// The `/upgrade/apply` claim on its announced payload: [`SelfPublishedReleaseManifests::record_apply_route_payload`]
 /// records the digest, and dropping this guard without [`ApplyRouteClaim::keep`]
-/// releases it again. Every handler exit other than a successful apply
-/// releases the claim — a failed, rolled-back or no-op apply, a client
-/// disconnect that drops the handler future mid-wait, or a panic — so
-/// gossip copies of the payload reach the background owner again instead
-/// of being dropped for the tracker's TTL. The claim lives in the tracker
-/// entry, whose TTL runs from the first record: an apply still running
-/// after that TTL lets the entry — claim included — expire mid-apply.
+/// releases it again — but only while the apply was never admitted. Before
+/// admission every handler exit other than a successful apply releases the
+/// claim: a failed, rolled-back or no-op apply, a client disconnect that
+/// drops the handler future mid-wait, or a panic, so gossip copies of the
+/// payload reach the background owner again instead of being dropped for
+/// the tracker's TTL. Once the apply's blocking worker is admitted (host
+/// locks held; replacement and restart owned by the worker), a dropped
+/// handler no longer releases the claim: the install still runs, and a
+/// gossip copy arriving in the seconds before restart must not queue a
+/// second apply of it. On success the claim is kept; on every other
+/// post-admission exit it simply ages out with the tracker entry, whose
+/// TTL runs from the latest record — `record_apply_route_payload`
+/// refreshes the entry's clock, so only a fresh record extends it.
 pub(in crate::server) struct ApplyRouteClaim {
     tracker: Arc<StdMutex<SelfPublishedReleaseManifests>>,
     digest: [u8; 32],
+    permit: ReleasePermit,
     kept: bool,
 }
 
 impl ApplyRouteClaim {
     /// Record the announced payload as apply-route-owned and hold the
-    /// claim for the guard's lifetime.
-    fn record(tracker: Arc<StdMutex<SelfPublishedReleaseManifests>>, payload: &[u8]) -> Self {
+    /// claim for the guard's lifetime. `permit` is the apply's admission
+    /// owner: its `admitted` flag decides whether a drop still releases.
+    fn record(
+        tracker: Arc<StdMutex<SelfPublishedReleaseManifests>>,
+        payload: &[u8],
+        permit: ReleasePermit,
+    ) -> Self {
         let digest = release_manifest_payload_digest(payload);
         tracker
             .lock()
@@ -140,12 +152,14 @@ impl ApplyRouteClaim {
         Self {
             tracker,
             digest,
+            permit,
             kept: false,
         }
     }
 
-    /// The only outcome that keeps the claim: this route installed the
-    /// release, so its own echo must not start a second apply of it.
+    /// The only outcome that keeps the claim unconditionally: this route
+    /// installed the release, so its own echo must not start a second
+    /// apply of it.
     fn keep(mut self) {
         self.kept = true;
     }
@@ -153,7 +167,10 @@ impl ApplyRouteClaim {
 
 impl Drop for ApplyRouteClaim {
     fn drop(&mut self) {
-        if !self.kept {
+        // Post-admission the blocking worker owns the replacement and the
+        // restart; the claim outlives this handler and expires with the
+        // tracker TTL instead.
+        if !self.kept && !self.permit.admitted() {
             self.tracker
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2359,6 +2376,21 @@ pub(in crate::server) async fn apply_upgrade(
     // receipt/probe wait must release the shared replacement lock.
     drop(upgrade_guard);
 
+    let runtime = HttpUpgradeRuntime {
+        config: state.update_config.clone(),
+        restart_context,
+        apply_lock: Arc::clone(&state.upgrade_apply_lock),
+        wait_slot: Arc::new(http_wait_guard),
+        shutdown: state.shutdown_notify.subscribe(),
+        #[cfg(unix)]
+        staging: state.upgrade_staging.clone(),
+        #[cfg(test)]
+        operation_observer: None,
+    };
+    // Created before the claim so the claim's drop — a client disconnect
+    // or panic — can ask the permit whether the apply was ever admitted.
+    let permit = ReleasePermit::for_http(Arc::clone(&runtime.wait_slot));
+
     // #1169: announce before the apply work — the receipt, staging and
     // rollout waits below can take minutes, and peers must not wait for
     // their own fallback poll while this node already saw the release.
@@ -2370,11 +2402,14 @@ pub(in crate::server) async fn apply_upgrade(
     // recorded as published by this route first, so the gossip driver skips
     // both the rebroadcast and the submit for that echo: this route already
     // owns the apply. The claim guard outlives this block: it releases the
-    // claim unless this route installs the release, whatever way the
-    // handler leaves — outcome, client disconnect or panic.
+    // claim unless this route installs the release — or the apply was
+    // admitted, in which case the blocking worker owns the install and the
+    // claim must survive whatever way the handler leaves: outcome, client
+    // disconnect or panic.
     let claim = ApplyRouteClaim::record(
         Arc::clone(&state.self_published_release_manifests),
         &release.gossip_payload,
+        permit.clone(),
     );
     {
         let agent = Arc::clone(&state.agent);
@@ -2387,23 +2422,14 @@ pub(in crate::server) async fn apply_upgrade(
         .await;
     }
 
-    let runtime = HttpUpgradeRuntime {
-        config: state.update_config.clone(),
-        restart_context,
-        apply_lock: Arc::clone(&state.upgrade_apply_lock),
-        wait_slot: Arc::new(http_wait_guard),
-        shutdown: state.shutdown_notify.subscribe(),
-        #[cfg(unix)]
-        staging: state.upgrade_staging.clone(),
-        #[cfg(test)]
-        operation_observer: None,
-    };
-    let (upgrader, result) = apply_http_release(&runtime, &release, query.now).await;
+    let (upgrader, result) =
+        apply_http_release(&runtime, permit.clone(), &release, query.now).await;
     // While the apply ran, the claim kept the announcement's self-echo
     // from queueing a second apply. A release this route did not install
-    // is not its to keep: `claim` releases it when it drops at the end of
-    // this handler — including a handler future dropped mid-wait by a
-    // client disconnect, or unwound by a panic.
+    // is not its to keep — unless the apply was admitted: then the
+    // blocking worker owns the replacement and restart, so `claim` holds
+    // on its way out (handler return, mid-wait drop by a client
+    // disconnect, or a panic unwind) and ages out with the tracker TTL.
     if matches!(result, Ok(x0x::upgrade::UpgradeResult::Success { .. })) {
         claim.keep();
     }
@@ -2602,15 +2628,17 @@ impl Drop for HttpRequestCustody {
 
 /// The route owns the HTTP wait slot. This future owns cancellation and takes
 /// the shared apply mutex only after staging and mandatory retry waits finish.
+/// `permit` is the handler's admission owner — created there so the
+/// apply-route claim can consult it after this future is dropped.
 async fn apply_http_release(
     runtime: &HttpUpgradeRuntime,
+    permit: ReleasePermit,
     verified: &VerifiedRelease,
     now: bool,
 ) -> (
     AutoApplyUpgrader,
     Result<x0x::upgrade::UpgradeResult, x0x::upgrade::UpgradeError>,
 ) {
-    let permit = ReleasePermit::for_http(Arc::clone(&runtime.wait_slot));
     #[cfg(test)]
     let permit = {
         let mut permit = permit;
@@ -3506,6 +3534,9 @@ mod tests {
         agent.shutdown().await;
     }
 
+    /// Every caller is unix-gated like `current_binary_path_seam`, so the
+    /// helper is too; on Windows it would be dead code.
+    #[cfg(unix)]
     fn lock_tracker(
         state: &Arc<AppState>,
     ) -> std::sync::MutexGuard<'_, SelfPublishedReleaseManifests> {
@@ -3518,6 +3549,7 @@ mod tests {
     /// Assert the announced payload's tracker state after a route exit:
     /// still recorded (this node never rebroadcasts bytes it published),
     /// and apply-route owned exactly when `owned` says.
+    #[cfg(unix)]
     fn assert_claim(state: &Arc<AppState>, digest: &[u8; 32], owned: bool, because: &str) {
         let mut tracker = lock_tracker(state);
         assert!(
@@ -3533,9 +3565,13 @@ mod tests {
 
     /// A staging context like `e2e_startup_runtime`'s: an install fixture
     /// the host upgrade lock can flock, an identity root under the data
-    /// dir, a fixed machine id, and a monotonic clock.
+    /// dir, a fixed machine id, a monotonic clock, and optionally an
+    /// observer that sees every staging-gate decision the route makes.
     #[cfg(unix)]
-    fn route_staging_context(data_dir: &std::path::Path) -> StartupStagingContext {
+    fn route_staging_context(
+        data_dir: &std::path::Path,
+        observed: Option<crate::upgrade::staging_runtime::Observer>,
+    ) -> StartupStagingContext {
         let root = data_dir.canonicalize().expect("canonical data dir");
         let install = root.join("x0xd");
         std::fs::write(&install, b"owned route staging executable fixture")
@@ -3545,7 +3581,7 @@ mod tests {
             install,
             identity_root: root,
             machine_id: [42; 32],
-            observed: None,
+            observed,
             clock: Some(Arc::new(move || {
                 Ok(crate::upgrade::probe::ProbeClock {
                     boot_id: "route-fixture".into(),
@@ -3567,6 +3603,18 @@ mod tests {
         data_dir: &std::path::Path,
         rollout_window_minutes: u64,
     ) -> Arc<AppState> {
+        staging_route_state_observed(agent, data_dir, rollout_window_minutes, None).await
+    }
+
+    /// [`staging_route_state`] with a staging-gate observer, for tests
+    /// that must know the handler is inside the staging wait.
+    #[cfg(unix)]
+    async fn staging_route_state_observed(
+        agent: Arc<Agent>,
+        data_dir: &std::path::Path,
+        rollout_window_minutes: u64,
+        observed: Option<crate::upgrade::staging_runtime::Observer>,
+    ) -> Arc<AppState> {
         let update_config = DaemonUpdateConfig {
             rollout_window_minutes,
             ..DaemonUpdateConfig::default()
@@ -3575,7 +3623,7 @@ mod tests {
             data_dir,
             agent,
             true,
-            Some(route_staging_context(data_dir)),
+            Some(route_staging_context(data_dir, observed)),
             update_config,
         )
         .await
@@ -3612,19 +3660,32 @@ mod tests {
     /// #1169 review round 2, the cancellation half of the claim-release
     /// invariant: a client that walks away mid-apply (for example
     /// `curl -m 60` against the staging wait) drops the handler future.
-    /// The claim guard must release the claim on that drop — no outcome
-    /// was ever produced — so gossip copies of the payload reach the
-    /// background owner again. The handler runs against a 60-minute
-    /// rollout window on a real staging gate under the data dir, so it
-    /// cannot finish on its own; the test observes the live claim,
-    /// confirms the handler is still running, then drops the future the
+    /// Before admission the claim guard must release the claim on that
+    /// drop — no outcome was ever produced — so gossip copies of the
+    /// payload reach the background owner again. The handler runs against
+    /// a 60-minute rollout window on a real staging gate under the data
+    /// dir, so it cannot finish on its own; the test observes the live
+    /// claim, confirms through the staging observer that the handler is
+    /// parked in the staging wait (a `Waiting` gate decision, not a
+    /// version-string-lucky sub-second wait), then drops the future the
     /// way a client disconnect would.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_cancelled_apply_route_releases_the_release_to_the_background_owner() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let agent = loopback_gossip_agent(dir.path()).await;
-        let state = staging_route_state(Arc::clone(&agent), dir.path(), 60).await;
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let state = staging_route_state_observed(
+            Arc::clone(&agent),
+            dir.path(),
+            60,
+            Some(Arc::new(move |decision| {
+                if matches!(decision, crate::upgrade::staging::Decision::Waiting(_)) {
+                    let _ = waiting_tx.send(());
+                }
+            })),
+        )
+        .await;
         let install = dir.path().canonicalize().expect("canonical").join("x0xd");
         let _current = crate::upgrade::apply::current_binary_path_seam::install(install.clone());
         let _readback =
@@ -3649,9 +3710,18 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        // Let the handler settle into its apply work, then confirm it is
-        // still running: the 60-minute window cannot elapse on its own.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The staging gate itself says the handler is parked in the
+        // rollout wait: the 60-minute window cannot elapse on its own, so
+        // the handler cannot finish from here either.
+        let wait_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while waiting_rx.try_recv().is_err() {
+            assert!(
+                std::time::Instant::now() < wait_deadline,
+                "the handler never reached the staging wait; handler finished: {}",
+                handler.is_finished()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert!(
             !handler.is_finished(),
             "the handler must still be waiting inside its apply"
@@ -3684,6 +3754,70 @@ mod tests {
         agent.shutdown().await;
     }
 
+    /// #1169 review round 3, the admission half of the claim-release
+    /// invariant: the claim follows admission, not the handler outcome.
+    /// The injected attempt stands in for the destructive half past the
+    /// real worker's admission point (it marks the permit admitted via
+    /// the attempt's admission handle) and then rolls the apply back.
+    /// The handler leaves the way every non-Success exit does — the same
+    /// drop-guard path a client disconnect takes — and because the apply
+    /// was admitted, the claim survives the exit and ages out with the
+    /// tracker TTL: the install was owned by the destructive half, and
+    /// its echo must not queue a second apply. Fails on the round-2
+    /// rule, where every drop released the claim. The literal disconnect
+    /// against the real worker is pinned one layer down, in
+    /// `post_admission_disconnect_keeps_the_permit_admitted`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_post_admission_exit_keeps_the_release_claim() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = loopback_gossip_agent(dir.path()).await;
+        let state = staging_route_state(Arc::clone(&agent), dir.path(), 0).await;
+        let install = dir.path().canonicalize().expect("canonical").join("x0xd");
+        let _current = crate::upgrade::apply::current_binary_path_seam::install(install.clone());
+        let _readback =
+            restart::systemd_readback_seam::install(route_readback_scenario(8, &install));
+
+        let verified = submittable_release(&version_newer_than_current());
+        let digest = release_manifest_payload_digest(&verified.gossip_payload);
+        let _feed = upgrade_check_feed_seam::install(Some(verified.clone()));
+        let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(
+            |_plan, _manifest, admission| {
+                admission.admit();
+                x0x::upgrade::UpgradeResult::RolledBack {
+                    reason: "fixture post-admission rollback".into(),
+                }
+            },
+        ));
+
+        let (status, body) = route_response_json(
+            apply_upgrade(State(Arc::clone(&state)), Query(Default::default()))
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(body["rolled_back"], serde_json::json!(true));
+        assert_claim(
+            &state,
+            &digest,
+            true,
+            "a post-admission exit keeps the claim: the destructive half owned the install",
+        );
+
+        let (rebroadcasts, selected) = drive_one_gossip_release(
+            verified,
+            Arc::clone(&state.self_published_release_manifests),
+        )
+        .await;
+        assert_eq!(rebroadcasts, 0, "self-published bytes are not rebroadcast");
+        assert_eq!(
+            selected, None,
+            "the echo of an apply the destructive half owned must not queue a second apply"
+        );
+        agent.shutdown().await;
+    }
+
     /// #1169 review round 2, the panic half of the claim-release
     /// invariant: a handler that unwinds mid-apply (here a panicking
     /// apply attempt) releases the claim on its way out, exactly like a
@@ -3698,9 +3832,10 @@ mod tests {
         let _current = crate::upgrade::apply::current_binary_path_seam::install(install.clone());
         let _readback =
             restart::systemd_readback_seam::install(route_readback_scenario(8, &install));
-        let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(|_, _| {
-            panic!("apply attempt fixture panic")
-        }));
+        let _apply =
+            crate::upgrade::apply::apply_attempt_seam::install(Box::new(|_, _, _admission| {
+                panic!("apply attempt fixture panic")
+            }));
 
         let verified = submittable_release(&version_newer_than_current());
         let expected_version = verified.manifest.version.clone();
@@ -3749,11 +3884,12 @@ mod tests {
         let _current = crate::upgrade::apply::current_binary_path_seam::install(install.clone());
         let _readback =
             restart::systemd_readback_seam::install(route_readback_scenario(8, &install));
-        let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(|_, _| {
-            x0x::upgrade::UpgradeResult::RolledBack {
-                reason: "fixture rollback".into(),
-            }
-        }));
+        let _apply =
+            crate::upgrade::apply::apply_attempt_seam::install(Box::new(|_, _, _admission| {
+                x0x::upgrade::UpgradeResult::RolledBack {
+                    reason: "fixture rollback".into(),
+                }
+            }));
 
         let verified = submittable_release(&version_newer_than_current());
         let expected_version = verified.manifest.version.clone();
@@ -3842,11 +3978,11 @@ mod tests {
         let _current = crate::upgrade::apply::current_binary_path_seam::install(install.clone());
         let _readback =
             restart::systemd_readback_seam::install(route_readback_scenario(8, &install));
-        let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(|_, manifest| {
-            x0x::upgrade::UpgradeResult::Success {
+        let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(
+            |_, manifest, _admission| x0x::upgrade::UpgradeResult::Success {
                 version: manifest.version.clone(),
-            }
-        }));
+            },
+        ));
 
         let verified = submittable_release(&version_newer_than_current());
         let expected_version = verified.manifest.version.clone();
@@ -3884,7 +4020,8 @@ mod tests {
 
     /// #1169 review round 2: the claim release on an unknown digest is a
     /// no-op, and releasing a claim never refreshes the record's TTL —
-    /// the tracker entry still ages out from its first record.
+    /// the tracker entry ages out from its latest record, and only a
+    /// fresh `record_apply_route_payload` would move that clock.
     #[test]
     fn clearing_an_unknown_digest_is_a_no_op_and_does_not_refresh_the_ttl() {
         let payload = encoded_payload_for_manifest(&manifest_with_version("9.9.7"));
@@ -3915,7 +4052,7 @@ mod tests {
         let after_ttl = now + SELF_PUBLISHED_RELEASE_TTL + Duration::from_secs(1);
         assert!(
             !tracker.contains_recent_digest(&digest, after_ttl),
-            "the clear does not refresh the TTL: it still runs from the first record"
+            "the clear does not refresh the TTL: it still runs from the record"
         );
     }
 
@@ -4848,13 +4985,14 @@ mod tests {
         // destructive half succeeding on the new version.
         let attempts = Arc::new(AtomicU64::new(0));
         let hook_attempts = Arc::clone(&attempts);
-        let _apply =
-            crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |_plan, manifest| {
+        let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(
+            move |_plan, manifest, _admission| {
                 hook_attempts.fetch_add(1, Ordering::SeqCst);
                 x0x::upgrade::UpgradeResult::Success {
                     version: manifest.version.clone(),
                 }
-            }));
+            },
+        ));
 
         let _release = startup_release_seam::install(crate::upgrade::monitor::VerifiedRelease {
             manifest: manifest_for_this_platform("9.9.9"),
@@ -4912,13 +5050,14 @@ mod tests {
         ));
         let attempts = Arc::new(AtomicU64::new(0));
         let hook_attempts = Arc::clone(&attempts);
-        let _apply =
-            crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |_plan, manifest| {
+        let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(
+            move |_plan, manifest, _admission| {
                 hook_attempts.fetch_add(1, Ordering::SeqCst);
                 x0x::upgrade::UpgradeResult::Success {
                     version: manifest.version.clone(),
                 }
-            }));
+            },
+        ));
         let _release = startup_release_seam::install(crate::upgrade::monitor::VerifiedRelease {
             manifest: manifest_for_this_platform("9.9.9"),
             manifest_json: Vec::new(),
@@ -4965,13 +5104,14 @@ mod tests {
         ));
         let attempts = Arc::new(AtomicU64::new(0));
         let hook_attempts = Arc::clone(&attempts);
-        let _apply =
-            crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |_plan, manifest| {
+        let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(
+            move |_plan, manifest, _admission| {
                 hook_attempts.fetch_add(1, Ordering::SeqCst);
                 x0x::upgrade::UpgradeResult::Success {
                     version: manifest.version.clone(),
                 }
-            }));
+            },
+        ));
         let _release = startup_release_seam::install(crate::upgrade::monitor::VerifiedRelease {
             manifest: manifest_for_this_platform("9.9.9"),
             manifest_json: Vec::new(),

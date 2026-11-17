@@ -141,7 +141,7 @@ macro_rules! staging_regression_tests {
             let hook_attempts = Arc::clone(&attempts);
             let hook_request = request.clone();
             let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(
-                move |_plan, manifest| {
+                move |_plan, manifest, _admission| {
                     assert_eq!(
                         crate::upgrade::staging::read_receipt(&hook_request)
                             .unwrap()

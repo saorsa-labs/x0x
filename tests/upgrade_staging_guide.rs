@@ -163,7 +163,7 @@ macro_rules! staging_guide_regression_tests {
                 });
                 let attempts = Arc::new(AtomicU64::new(0));
                 let attempted = Arc::clone(&attempts);
-                let _apply = apply::apply_attempt_seam::install(Box::new(move |_, manifest| {
+                let _apply = apply::apply_attempt_seam::install(Box::new(move |_, manifest, _admission| {
                     attempted.fetch_add(1, Ordering::SeqCst);
                     x0x::upgrade::UpgradeResult::Success { version: manifest.version.clone() }
                 }));

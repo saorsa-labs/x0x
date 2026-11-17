@@ -43,7 +43,7 @@ macro_rules! http_readback_regression_tests {
                         staging_readback(one_call_scenario("0", "5"), &startup));
                     let attempts = Arc::new(AtomicU64::new(0));
                     let observed_attempts = Arc::clone(&attempts);
-                    let apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |_, manifest| {
+                    let apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |_, manifest, _admission| {
                         observed_attempts.fetch_add(1, Ordering::SeqCst);
                         x0x::upgrade::UpgradeResult::Success { version: manifest.version.clone() }
                     }));
@@ -184,7 +184,10 @@ macro_rules! http_readback_regression_tests {
                     // release/drain real workers before their inputs disappear.
                     let drain = Drain { shared: Arc::clone(&shared), changed: changed_rx };
                     if queued && target == ReadbackKind::Launchd { shared.block_pool(&handle); }
-                    let mut operation = Box::pin(apply_http_release(fixture.runtime.as_ref().unwrap(), &release, false));
+                    let permit = ReleasePermit::for_http(Arc::clone(
+                        &fixture.runtime.as_ref().unwrap().wait_slot,
+                    ));
+                    let mut operation = Box::pin(apply_http_release(fixture.runtime.as_ref().unwrap(), permit, &release, false));
                     let deadline = std::time::Instant::now() + Duration::from_secs(10);
                     let expected = if queued { ReadbackEvent::Queued } else { ReadbackEvent::Entered };
                     loop {
@@ -361,8 +364,11 @@ macro_rules! http_readback_regression_tests {
                 };
                 // Execute the real helper, then the same retry scheduler the
                 // route calls on its returned error. No copied retry flow.
+                let permit = ReleasePermit::for_http(Arc::clone(
+                    &fixture.runtime.as_ref().unwrap().wait_slot,
+                ));
                 let (upgrader, result) = tokio::time::timeout(Duration::from_secs(10),
-                    apply_http_release(fixture.runtime.as_ref().unwrap(), &release, false)).await.unwrap();
+                    apply_http_release(fixture.runtime.as_ref().unwrap(), permit, &release, false)).await.unwrap();
                 drop(cut);
                 let error = result.unwrap_err().to_string();
                 let before = bytes(fixture.root.path());
@@ -455,8 +461,11 @@ macro_rules! http_readback_regression_tests {
                     }
                 }));
                 let drain = Drain { shared, changed };
+                let permit = ReleasePermit::for_http(Arc::clone(
+                    &fixture.runtime.as_ref().unwrap().wait_slot,
+                ));
                 let outcome = tokio::time::timeout(Duration::from_secs(10),
-                    apply_http_release(fixture.runtime.as_ref().unwrap(), &release, false)).await;
+                    apply_http_release(fixture.runtime.as_ref().unwrap(), permit, &release, false)).await;
                 let success = matches!(&outcome, Ok((_, Ok(x0x::upgrade::UpgradeResult::Success { .. }))));
                 drop(outcome);
                 drop(fixture.runtime.take());

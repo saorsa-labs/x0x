@@ -80,7 +80,7 @@ macro_rules! staging_supersession_regression_tests {
             let attempts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
             let counted = Arc::clone(&attempts);
             let expected_install = install.clone();
-            let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |plan, manifest| {
+            let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |plan, manifest, _admission| {
                 assert_eq!(plan.executable, expected_install);
                 counted.lock().unwrap().push(manifest.version.clone());
                 // Observe admission only. This does not change installed bytes,
@@ -246,7 +246,7 @@ macro_rules! staging_supersession_regression_tests {
                         .with_staging_clock(Some(Arc::new(|| Ok(clock()))));
                     let attempts = Arc::new(AtomicU64::new(0));
                     let counted = Arc::clone(&attempts);
-                    let apply = apply::apply_attempt_seam::install(Box::new(move |_, manifest| {
+                    let apply = apply::apply_attempt_seam::install(Box::new(move |_, manifest, _admission| {
                         counted.fetch_add(1, Ordering::SeqCst);
                         // Stop before download, candidate execution, swap or restart.
                         x0x::upgrade::UpgradeResult::Success { version: manifest.version.clone() }
