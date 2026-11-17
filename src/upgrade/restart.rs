@@ -324,6 +324,36 @@ fn path_basename(s: &str) -> &str {
     s.rsplit('/').next().unwrap_or(s)
 }
 
+/// Basename of the stable launcher a launchd job may run (#1379).
+pub const LAUNCHER_BASENAME: &str = "x0x-launcher";
+
+/// The daemon argv a launchd job runs: `ProgramArguments` itself, or, when
+/// the job's program is the stable launcher, the daemon argv after the
+/// launcher's own arguments (`x0x-launcher /abs/x0xd ...` or
+/// `x0x-launcher --host-root R --instance I -- /abs/x0xd ...`, #1378). The
+/// launcher passes through to the daemon by `exec`, so the job's process
+/// is that daemon. `None` for a launcher argv that names no daemon.
+pub fn launchd_daemon_argv(arguments: &[String]) -> Option<&[String]> {
+    let program = arguments.first()?;
+    if path_basename(program) != LAUNCHER_BASENAME {
+        return Some(arguments);
+    }
+    let rest = &arguments[1..];
+    let daemon = if rest.first().map(String::as_str) == Some("--host-root") {
+        match rest {
+            [_, _, flag, _, separator, daemon @ ..]
+                if flag == "--instance" && separator == "--" =>
+            {
+                daemon
+            }
+            _ => return None,
+        }
+    } else {
+        rest
+    };
+    (!daemon.is_empty()).then_some(daemon)
+}
+
 /// Whether a loaded launchd job runs THIS daemon instance — the job whose
 /// program is our executable and whose flags select our instance.
 ///
@@ -337,10 +367,28 @@ pub fn launchd_job_runs_this_instance(job: &LaunchdLoadedJob, argv: &[String]) -
     let Some(argv0) = argv.first() else {
         return false;
     };
-    if path_basename(&job.program.to_string_lossy()) != path_basename(argv0) {
+    // A launcher-bound job (#1379) runs the daemon named after the
+    // launcher's own arguments; any other job runs its program.
+    let launcher_bound = path_basename(&job.program.to_string_lossy()) == LAUNCHER_BASENAME;
+    let daemon_args: &[String] = if launcher_bound {
+        match launchd_daemon_argv(&job.arguments) {
+            Some(daemon) => daemon,
+            None => return false,
+        }
+    } else {
+        if path_basename(&job.program.to_string_lossy()) != path_basename(argv0) {
+            return false;
+        }
+        &job.arguments
+    };
+    if launcher_bound
+        && daemon_args
+            .first()
+            .is_none_or(|daemon| path_basename(daemon) != path_basename(argv0))
+    {
         return false;
     }
-    let job_tail: &[String] = job.arguments.get(1..).unwrap_or(&[]);
+    let job_tail: &[String] = daemon_args.get(1..).unwrap_or(&[]);
     let argv_tail: &[String] = argv.get(1..).unwrap_or(&[]);
     job_tail == argv_tail
 }
@@ -687,11 +735,17 @@ fn readback_launchd_policy_in(
             refusal.get_or_insert_with(|| format!("unreadable plist {}", path.display()));
             continue;
         };
-        let program = job_plist
+        let arguments: Option<Vec<String>> = job_plist
             .get("ProgramArguments")
             .and_then(|a| a.as_array())
-            .and_then(|a| a.first())
-            .and_then(|p| p.as_str())
+            .and_then(|a| a.iter().map(|v| v.as_str().map(str::to_owned)).collect());
+        // A launcher-bound job (#1379) is a candidate when the daemon it
+        // runs is this executable.
+        let program = arguments
+            .as_deref()
+            .and_then(launchd_daemon_argv)
+            .and_then(|daemon| daemon.first())
+            .map(String::as_str)
             .or_else(|| job_plist.get("Program").and_then(|p| p.as_str()));
         if program.is_none_or(|p| path_basename(p) != executable_basename) {
             continue; // not an x0xd job for this executable
@@ -4563,6 +4617,80 @@ mod tests {
         let foreign = parse_launchd_loaded_job(&launchd_print_dump(&["/usr/local/bin/x0xd"], true))
             .expect("parses");
         assert!(!launchd_job_runs_this_instance(&foreign, &alice_argv));
+    }
+
+    /// #1379 slice 2: a launcher-bound job runs the daemon after the
+    /// launcher's own arguments (plain or trial form); the readback matches
+    /// this instance through it, and a launcher argv naming no daemon, or
+    /// another daemon, never matches.
+    #[test]
+    fn launchd_readback_sees_through_the_launcher() {
+        let alice_argv = vec![
+            "/usr/local/bin/x0xd".to_string(),
+            "--name".to_string(),
+            "alice".to_string(),
+        ];
+        let trial_form = [
+            "/opt/x0x/bin/x0x-launcher",
+            "--host-root",
+            "/data/alice",
+            "--instance",
+            "alice",
+            "--",
+            "/opt/x0x/bin/x0xd",
+            "--name",
+            "alice",
+        ];
+        let plain_form = [
+            "/opt/x0x/bin/x0x-launcher",
+            "/opt/x0x/bin/x0xd",
+            "--name",
+            "alice",
+        ];
+        for form in [&trial_form[..], &plain_form[..]] {
+            let job = parse_launchd_loaded_job(&launchd_print_dump(form, true)).expect("parses");
+            assert!(
+                launchd_job_runs_this_instance(&job, &alice_argv),
+                "{form:?}"
+            );
+        }
+        let bob = parse_launchd_loaded_job(&launchd_print_dump(
+            &[
+                "/opt/x0x/bin/x0x-launcher",
+                "/opt/x0x/bin/x0xd",
+                "--name",
+                "bob",
+            ],
+            true,
+        ))
+        .expect("parses");
+        assert!(!launchd_job_runs_this_instance(&bob, &alice_argv));
+        let no_daemon = parse_launchd_loaded_job(&launchd_print_dump(
+            &["/opt/x0x/bin/x0x-launcher", "--host-root", "/data/alice"],
+            true,
+        ))
+        .expect("parses");
+        assert!(!launchd_job_runs_this_instance(&no_daemon, &alice_argv));
+        let other = parse_launchd_loaded_job(&launchd_print_dump(
+            &[
+                "/opt/x0x/bin/x0x-launcher",
+                "/usr/bin/other",
+                "--name",
+                "alice",
+            ],
+            true,
+        ))
+        .expect("parses");
+        assert!(!launchd_job_runs_this_instance(&other, &alice_argv));
+        let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            launchd_daemon_argv(&strings(&trial_form)),
+            Some(&strings(&trial_form)[6..])
+        );
+        assert_eq!(
+            launchd_daemon_argv(&strings(&["/opt/x0x/bin/x0x-launcher"])),
+            None
+        );
     }
 
     #[test]

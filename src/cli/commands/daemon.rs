@@ -624,18 +624,73 @@ fn render_systemd_unit(executable: &str, args: &[String]) -> Result<String> {
 
 #[cfg(any(test, target_os = "macos"))]
 fn render_launchd_plist(executable: &str, args: &[String], log_path: &Path) -> Result<String> {
+    render_launchd_plist_with(executable, args, log_path, None)
+}
+
+/// The launcher's worst-case stop of a committed daemon: the 35 s graceful
+/// window, then SIGKILL and up to 10 s to reap (#1378, A14). A launchd job
+/// that binds the launcher needs an `ExitTimeOut` above it.
+#[cfg(any(test, target_os = "macos"))]
+const LAUNCHER_STOP_WORST_CASE_SECS: u64 = 45;
+
+/// `ExitTimeOut` for a launcher-bound job: above the worst-case stop.
+const LAUNCHER_EXIT_TIMEOUT_SECS: u64 = 60;
+
+/// The stable launcher a launchd job can bind (#1379), with its trial
+/// authority in the launcher argv (#1378).
+pub(crate) struct LauncherBinding<'a> {
+    pub(crate) launcher: &'a str,
+    pub(crate) host_root: &'a str,
+    pub(crate) instance: &'a str,
+}
+
+/// As `render_launchd_plist`; with a launcher binding the job runs
+/// `x0x-launcher --host-root R --instance I -- x0xd args...` and sets
+/// `ExitTimeOut` above the launcher's worst-case stop. Not wired into
+/// `x0x autostart` yet: the launcher is dormant.
+fn render_launchd_plist_with(
+    executable: &str,
+    args: &[String],
+    log_path: &Path,
+    launcher: Option<&LauncherBinding<'_>>,
+) -> Result<String> {
     validate_autostart_value(executable)?;
     for arg in args {
         validate_autostart_value(arg)?;
     }
     let log_path = log_path.to_string_lossy();
     validate_autostart_value(&log_path)?;
-    let prog_args = std::iter::once(executable)
+    let mut program: Vec<&str> = Vec::new();
+    if let Some(binding) = launcher {
+        for value in [binding.launcher, binding.host_root, binding.instance] {
+            validate_autostart_value(value)?;
+        }
+        if !Path::new(binding.launcher).is_absolute() || !Path::new(binding.host_root).is_absolute()
+        {
+            anyhow::bail!("launcher and host root must be absolute paths");
+        }
+        program.extend([
+            binding.launcher,
+            "--host-root",
+            binding.host_root,
+            "--instance",
+            binding.instance,
+            "--",
+        ]);
+    }
+    let prog_args = program
+        .into_iter()
+        .chain(std::iter::once(executable))
         .chain(args.iter().map(String::as_str))
         .map(|arg| format!("        <string>{}</string>\n", xml_escape(arg)))
         .collect::<String>();
+    let exit_timeout = if launcher.is_some() {
+        format!("    <key>ExitTimeOut</key>\n    <integer>{LAUNCHER_EXIT_TIMEOUT_SECS}</integer>\n")
+    } else {
+        String::new()
+    };
     Ok(format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n    <key>Label</key>\n    <string>com.saorsalabs.x0xd</string>\n    <key>ProgramArguments</key>\n    <array>\n{prog_args}    </array>\n    <key>EnvironmentVariables</key>\n    <dict>\n        <key>{supervised_key}</key>\n        <string>1</string>\n    </dict>\n    <key>RunAtLoad</key>\n    <true/>\n    <key>KeepAlive</key>\n    <true/>\n    <key>{template_key}</key>\n    <integer>{template_version}</integer>\n    <key>StandardOutPath</key>\n    <string>{log}</string>\n    <key>StandardErrorPath</key>\n    <string>{log}</string>\n</dict>\n</plist>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n    <key>Label</key>\n    <string>com.saorsalabs.x0xd</string>\n    <key>ProgramArguments</key>\n    <array>\n{prog_args}    </array>\n    <key>EnvironmentVariables</key>\n    <dict>\n        <key>{supervised_key}</key>\n        <string>1</string>\n    </dict>\n    <key>RunAtLoad</key>\n    <true/>\n    <key>KeepAlive</key>\n    <true/>\n{exit_timeout}    <key>{template_key}</key>\n    <integer>{template_version}</integer>\n    <key>StandardOutPath</key>\n    <string>{log}</string>\n    <key>StandardErrorPath</key>\n    <string>{log}</string>\n</dict>\n</plist>\n",
         supervised_key = crate::upgrade::restart::SUPERVISED_ENV_VAR,
         template_key = crate::upgrade::restart::LAUNCHD_TEMPLATE_VERSION_KEY,
         template_version = AUTOSTART_TEMPLATE_VERSION,
@@ -945,18 +1000,53 @@ fn program_basename(program: &str) -> &str {
 // for the unit tests, which is where the decision table is pinned.
 #[cfg(any(test, target_os = "macos"))]
 pub(crate) fn classify_launchd_job(plist: &serde_json::Value) -> RepairVerdict {
-    let program = plist
+    let arguments: Option<Vec<String>> = plist
         .get("ProgramArguments")
         .and_then(|a| a.as_array())
+        .and_then(|a| a.iter().map(|v| v.as_str().map(str::to_owned)).collect());
+    let launcher_bound = arguments
+        .as_deref()
         .and_then(|a| a.first())
-        .and_then(|p| p.as_str())
-        .or_else(|| plist.get("Program").and_then(|p| p.as_str()));
+        .is_some_and(|p| program_basename(p) == crate::upgrade::restart::LAUNCHER_BASENAME);
+    let program = match arguments.as_deref() {
+        // A launcher-bound job (#1379) runs the daemon after the launcher's
+        // own arguments.
+        Some(arguments) if launcher_bound => {
+            match crate::upgrade::restart::launchd_daemon_argv(arguments) {
+                Some(daemon) => daemon.first().map(String::as_str),
+                None => {
+                    return RepairVerdict::Refused(
+                        "job runs x0x-launcher with arguments that name no daemon; review it \
+                         by hand"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        Some(arguments) => arguments.first().map(String::as_str),
+        None => None,
+    }
+    .or_else(|| plist.get("Program").and_then(|p| p.as_str()));
 
     let Some(program) = program else {
         return RepairVerdict::NotAnX0xdJob;
     };
     if program_basename(program) != "x0xd" {
         return RepairVerdict::NotAnX0xdJob;
+    }
+    // The launcher stops a committed daemon in up to 45 s (graceful window
+    // plus reap, #1378); launchd's default ExitTimeOut (20 s) would SIGKILL
+    // the launcher first and orphan its child.
+    if launcher_bound
+        && plist
+            .get("ExitTimeOut")
+            .and_then(serde_json::Value::as_u64)
+            .is_none_or(|seconds| seconds <= LAUNCHER_STOP_WORST_CASE_SECS)
+    {
+        return RepairVerdict::Refused(format!(
+            "job runs x0x-launcher without `ExitTimeOut` above {LAUNCHER_STOP_WORST_CASE_SECS} s, \
+             so launchd can kill the launcher before it stops x0xd; set it by hand"
+        ));
     }
 
     // A supervised exit is only safe if something is guaranteed to bring the
@@ -1655,6 +1745,101 @@ mod tests {
     /// #1379: `AbandonProcessGroup` defeats launchd's process-group cleanup,
     /// so the repair refuses it, even on a job that already has the marker.
     /// `AbandonProcessGroup: false` is launchd's default and is accepted.
+    /// #1379 slice 2: a launcher-bound job is an x0xd job; the daemon is
+    /// the program after the launcher's own arguments. It also needs an
+    /// ExitTimeOut above the launcher's 45 s worst-case stop.
+    #[test]
+    fn repair_sees_through_the_launcher_to_the_daemon() {
+        let launcher = |extra: serde_json::Value| {
+            let mut base = job(extra);
+            base["ProgramArguments"] = serde_json::json!([
+                "/opt/x0x/bin/x0x-launcher",
+                "--host-root",
+                "/Users/a/Library/Application Support/x0x-alice",
+                "--instance",
+                "alice",
+                "--",
+                "/opt/x0x/bin/x0xd",
+                "--name",
+                "alice"
+            ]);
+            base
+        };
+        assert_eq!(
+            classify_launchd_job(&launcher(serde_json::json!({ "ExitTimeOut": 60 }))),
+            RepairVerdict::Repairable {
+                has_env_dict: false
+            }
+        );
+        for short in [
+            serde_json::json!({}),
+            serde_json::json!({ "ExitTimeOut": 45 }),
+        ] {
+            assert!(matches!(
+                classify_launchd_job(&launcher(short)),
+                RepairVerdict::Refused(reason) if reason.contains("ExitTimeOut")
+            ));
+        }
+        let mut other = launcher(serde_json::json!({ "ExitTimeOut": 60 }));
+        other["ProgramArguments"] =
+            serde_json::json!(["/opt/x0x/bin/x0x-launcher", "/usr/bin/something-else"]);
+        assert_eq!(classify_launchd_job(&other), RepairVerdict::NotAnX0xdJob);
+        let mut malformed = launcher(serde_json::json!({ "ExitTimeOut": 60 }));
+        malformed["ProgramArguments"] =
+            serde_json::json!(["/opt/x0x/bin/x0x-launcher", "--host-root", "/r"]);
+        assert!(matches!(
+            classify_launchd_job(&malformed),
+            RepairVerdict::Refused(reason) if reason.contains("name no daemon")
+        ));
+    }
+
+    /// The launcher-bound plist runs the trial-form argv, sets ExitTimeOut
+    /// above the worst-case stop, and classifies as a repairable x0xd job.
+    #[test]
+    fn launcher_bound_plist_renders_the_trial_form() {
+        let log = std::path::PathBuf::from("/tmp/x0xd.log");
+        let binding = LauncherBinding {
+            launcher: "/opt/x0x/bin/x0x-launcher",
+            host_root: "/Users/a/Library/Application Support/x0x",
+            instance: "default",
+        };
+        let rendered = render_launchd_plist_with(
+            "/opt/x0x/bin/x0xd",
+            &["--name".to_string(), "a".to_string()],
+            &log,
+            Some(&binding),
+        )
+        .unwrap();
+        let order = [
+            "<string>/opt/x0x/bin/x0x-launcher</string>",
+            "<string>--host-root</string>",
+            "<string>/Users/a/Library/Application Support/x0x</string>",
+            "<string>--instance</string>",
+            "<string>default</string>",
+            "<string>--</string>",
+            "<string>/opt/x0x/bin/x0xd</string>",
+            "<string>--name</string>",
+        ];
+        let mut at = 0;
+        for piece in order {
+            let found = rendered[at..]
+                .find(piece)
+                .unwrap_or_else(|| panic!("{piece}"));
+            at += found + piece.len();
+        }
+        assert!(rendered.contains("<key>ExitTimeOut</key>\n    <integer>60</integer>"));
+        assert!(!rendered.contains("AbandonProcessGroup"));
+        let plain = render_launchd_plist("/opt/x0x/bin/x0xd", &[], &log).unwrap();
+        assert!(!plain.contains("ExitTimeOut"), "the plain job is unchanged");
+        let relative = LauncherBinding {
+            launcher: "x0x-launcher",
+            ..binding
+        };
+        assert!(
+            render_launchd_plist_with("/opt/x0x/bin/x0xd", &[], &log, Some(&relative)).is_err()
+        );
+    }
+
     #[test]
     fn repair_refuses_jobs_that_abandon_their_process_group() {
         let mut job = serde_json::json!({

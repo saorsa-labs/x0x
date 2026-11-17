@@ -18,6 +18,18 @@ pub(crate) const EXIT_TEMPFAIL: u8 = 75;
 /// final host phase). The unit must not restart on it; an operator acts.
 pub(crate) const EXIT_FINAL: u8 = 78;
 
+/// Hold after a final refusal instead of exiting, until a stop (#1379).
+/// launchd has no "do not restart on this status": the `KeepAlive: true`
+/// the supervised upgrade exit needs would restart a 78 every
+/// `ThrottleInterval` (10 s) for ever. Holding keeps one quiet process;
+/// a stop (SIGTERM when armed, else its default action) ends it. systemd
+/// does not need this: `RestartPreventExitStatus=78` stops the job.
+pub(crate) fn hold_final(mut stop: impl FnMut() -> bool, mut pause: impl FnMut()) {
+    while !stop() {
+        pause();
+    }
+}
+
 /// What one launcher start decided.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Start {
@@ -505,5 +517,19 @@ mod tests {
             ),
             Start::Exit(EXIT_FINAL)
         );
+    }
+
+    #[test]
+    fn a_final_hold_lasts_until_a_stop() {
+        let mut checks = 0;
+        let mut pauses = 0;
+        hold_final(
+            || {
+                checks += 1;
+                checks > 3
+            },
+            || pauses += 1,
+        );
+        assert_eq!(pauses, 3);
     }
 }

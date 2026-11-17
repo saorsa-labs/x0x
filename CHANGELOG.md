@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **launchd jobs that run the stable launcher are recognised (#1379 slice 2;
+  A14 amendment of 17 Nov 2026).** `x0x autostart --repair` and the
+  upgrade-time launchd readback look through `x0x-launcher`'s own arguments
+  to the x0xd it runs, so binding the launcher does not fail supervised
+  upgrades closed. A launcher-bound job must set `ExitTimeOut` above 45 s.
+  On macOS a launcher final refusal holds until stopped, since launchd would
+  restart an exit. The launcher-bound plist is rendered but not yet installed
+  by `x0x autostart`.
 - **The dormant launcher has process custody on macOS (#1379 slice 1; A14
   amendment of 17 Nov 2026).** Process identity (PID, start time, boot) comes
   from libproc, zombies included; stopping another launcher's process pins it
