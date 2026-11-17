@@ -18,6 +18,28 @@ pub(crate) const EXIT_TEMPFAIL: u8 = 75;
 /// final host phase). The unit must not restart on it; an operator acts.
 pub(crate) const EXIT_FINAL: u8 = 78;
 
+/// A refusal no restart can change (a mixed pair, an argv that does not
+/// match its journal, a record of the wrong owner or mode): the main loop
+/// exits 78. Any other issuer error, such as a failed read, exits 75.
+#[derive(Debug)]
+pub(super) struct Refused(&'static str);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+pub(super) fn refused(reason: &'static str) -> io::Error {
+    io::Error::other(Refused(reason))
+}
+
+pub(super) fn is_refusal(error: &io::Error) -> bool {
+    error.get_ref().is_some_and(|inner| inner.is::<Refused>())
+}
+
 /// Hold after a final refusal instead of exiting, until a stop (#1379).
 /// launchd has no "do not restart on this status": the `KeepAlive: true`
 /// the supervised upgrade exit needs would restart a 78 every
@@ -65,21 +87,32 @@ impl Issuer for NoIssuer {
 /// One start of the installed launcher. `arm` installs the stop handler;
 /// it runs only once an issuer gives this launcher a trial. A passthrough
 /// never catches a signal, so a stop before the `exec` still ends the
-/// launcher as it ends a direct job. `stop` reads the stop flag.
+/// launcher as it ends a direct job. `stop` reads the stop flag. Only the
+/// argv's trial form (`--host-root ... --instance ...`) consults the
+/// journal issuer; the plain form is always a passthrough.
 pub(crate) fn start(
-    command: &forward::DaemonCommand,
+    args: &issuer::LauncherArgs,
     arm: impl FnOnce(),
     stop: impl FnMut() -> bool,
 ) -> Start {
     if !ENABLED {
         return Start::Passthrough;
     }
-    start_with(&NoIssuer, command, arm, Clock::now, stop, || {
-        std::thread::sleep(std::time::Duration::from_millis(100))
-    })
+    let pause = || std::thread::sleep(std::time::Duration::from_millis(100));
+    match &args.trial {
+        None => start_with(&NoIssuer, &args.command, arm, Clock::now, stop, pause),
+        Some(trial) => start_with(
+            &issuer::JournalIssuer(trial),
+            &args.command,
+            arm,
+            Clock::now,
+            stop,
+            pause,
+        ),
+    }
 }
 
-fn start_with(
+pub(super) fn start_with(
     issuer: &impl Issuer,
     command: &forward::DaemonCommand,
     arm: impl FnOnce(),
@@ -94,7 +127,11 @@ fn start_with(
         // and a passthrough could start a candidate outside its trial.
         Err(error) => {
             eprintln!("x0x-launcher: inventory issuer: {error}");
-            return Start::Exit(EXIT_TEMPFAIL);
+            return Start::Exit(if is_refusal(&error) {
+                EXIT_FINAL
+            } else {
+                EXIT_TEMPFAIL
+            });
         }
     };
     arm();
@@ -270,10 +307,14 @@ mod tests {
         // ENABLED = false; the held engine never consults an issuer or
         // installs a stop handler.
         let mut armed = false;
-        assert_eq!(
-            start(&command(), || armed = true, || false),
-            Start::Passthrough
-        );
+        let args = issuer::LauncherArgs {
+            trial: Some(issuer::TrialArgs {
+                host_root: "/nonexistent".into(),
+                instance: "alice".into(),
+            }),
+            command: command(),
+        };
+        assert_eq!(start(&args, || armed = true, || false), Start::Passthrough);
         assert!(!armed);
     }
 

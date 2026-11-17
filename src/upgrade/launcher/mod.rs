@@ -14,6 +14,7 @@ mod control;
 mod coordinator;
 mod filesystem;
 pub(crate) mod forward;
+pub(crate) mod issuer;
 #[path = "../journal.rs"]
 mod journal;
 #[path = "../probe.rs"]
