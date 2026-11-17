@@ -1,61 +1,29 @@
 //! Keep non-connected peers out of gossip send-target sets (x0x#1036).
 //!
-//! Every x0x gossip send goes through ant-quic's `send`, which needs a live
-//! connection: a send to a peer with none fails fast with `Peer not found`.
-//! Two send-target sets were not bounded by the transport:
-//!
-//! - **HyParView active view.** saorsa-gossip adds peers to the active view
-//!   from JOIN/FORWARDJOIN random walks — including peers several hops away
-//!   that this node never connects to — and nothing prunes the view by
-//!   transport connectivity. The view's peers are SWIM-probed (1 s period),
-//!   shuffled and forwarded to for as long as they stay in it.
-//! - **Presence broadcast set.** x0x seeded presence beacon and FOAF targets
-//!   from `active_view() ∪ connected_peers()`, so every stale active-view
-//!   entry also received a beacon every interval.
-//!
-//! On a relay node those stale entries produced thousands of fast-fail sends
-//! per hour, each one a `WARN` line in ant-quic (x0x#1036).
-//!
-//! The fix keeps a short grace (a peer that disconnected between two
-//! connected-peer snapshots is fine) but never lets a peer that has been
-//! disconnected for [`STALE_SEND_TARGET_AFTER`] stay a target:
-//! [`StaleTargetTracker`] prunes it from the HyParView active view and
-//! restores it once it is connected again. Presence targets are filtered to
-//! connected peers by [`presence_broadcast_targets`]. PlumTree topic planes
-//! are already refreshed from the connected plane every second, so lazy/IHAVE
-//! and anti-entropy repair reach a reconnecting peer as soon as it is
-//! connected again; nothing here touches them.
+//! saorsa-gossip adds peers to the HyParView active view from
+//! JOIN/FORWARDJOIN random walks, including peers this node never connects
+//! to, and nothing prunes the view by transport connectivity. ant-quic's
+//! `send` to such a peer fails fast with `Peer not found`.
 
 use saorsa_gossip_membership::Membership;
 use saorsa_gossip_types::PeerId;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-/// A peer disconnected for at least this long stops being a send target.
 pub(crate) const STALE_SEND_TARGET_AFTER: Duration = Duration::from_secs(60);
 
-/// Upper bound on peers tracked as absent or pruned.
 const MAX_TRACKED_PEERS: usize = 4096;
 
-/// What one maintenance pass changed.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct StaleTargetPlan {
-    /// Targets disconnected for at least the threshold; remove them.
     pub prune: Vec<PeerId>,
-    /// Previously pruned peers that are connected again; restore them.
     pub restore: Vec<PeerId>,
 }
 
-/// Tracks how long each send target has been without a connection.
 #[derive(Debug)]
 pub(crate) struct StaleTargetTracker {
     threshold: Duration,
-    /// First time a target was seen without a connection. Kept after the
-    /// target is pruned, so a peer re-added by a random walk while still
-    /// disconnected is pruned again on the next pass instead of getting a
-    /// fresh grace period.
     absent_since: HashMap<PeerId, Instant>,
-    /// Peers this tracker pruned, restored when they reconnect.
     pruned: HashSet<PeerId>,
 }
 
@@ -74,7 +42,6 @@ impl StaleTargetTracker {
         }
     }
 
-    /// Compare the current `targets` with the `connected` snapshot at `now`.
     pub(crate) fn observe(
         &mut self,
         targets: &[PeerId],
@@ -83,7 +50,6 @@ impl StaleTargetTracker {
     ) -> StaleTargetPlan {
         let mut plan = StaleTargetPlan::default();
 
-        // Connected peers are never stale; pruned ones come back.
         self.absent_since
             .retain(|peer, _| !connected.contains(peer));
         self.pruned.retain(|peer| {
@@ -123,15 +89,11 @@ impl StaleTargetTracker {
             }
         }
         if self.pruned.len() > MAX_TRACKED_PEERS {
-            // Losing a pruned mark only skips an explicit restore; PlumTree
-            // and presence still target the peer once it is connected.
             self.pruned.clear();
         }
     }
 }
 
-/// Run one pass over the HyParView active view: remove targets disconnected
-/// for at least the tracker's threshold and restore reconnected ones.
 pub(crate) async fn maintain_active_view<M>(
     membership: &M,
     tracker: &mut StaleTargetTracker,
@@ -166,9 +128,6 @@ where
     plan
 }
 
-/// Presence beacon/FOAF targets: the HyParView active view and the transport
-/// table, restricted to connected peers. A beacon to a peer with no
-/// connection can only fail, so active-view entries without one are dropped.
 pub(crate) fn presence_broadcast_targets(
     active_view: Vec<PeerId>,
     connected: &[PeerId],
@@ -197,7 +156,6 @@ mod tests {
         peers.iter().copied().collect()
     }
 
-    /// Minimal `Membership` whose active view is a plain set.
     #[derive(Default)]
     struct FakeMembership {
         active: Mutex<HashSet<PeerId>>,
@@ -236,13 +194,11 @@ mod tests {
         let targets = [peer(1), peer(2)];
         let connected = set(&[peer(1)]);
 
-        // Disconnected between snapshots: still inside the grace period.
         assert!(tracker.observe(&targets, &connected, t0).prune.is_empty());
         assert!(tracker
             .observe(&targets, &connected, t0 + Duration::from_secs(59))
             .prune
             .is_empty());
-        // Missing for the whole threshold: stop targeting it.
         assert_eq!(
             tracker
                 .observe(&targets, &connected, t0 + Duration::from_secs(60))
@@ -268,7 +224,6 @@ mod tests {
         assert_eq!(plan.restore, vec![peer(3)]);
         assert!(plan.prune.is_empty());
 
-        // A later disconnect starts a fresh grace period.
         let t1 = t0 + Duration::from_secs(80);
         assert!(tracker.observe(&[peer(3)], &none, t1).prune.is_empty());
         assert!(tracker
@@ -289,8 +244,6 @@ mod tests {
                 .prune,
             vec![peer(4)]
         );
-        // Pruned, absent from the view for a pass, then re-added by a random
-        // walk while still disconnected: pruned again immediately.
         tracker.observe(&[], &none, t0 + Duration::from_secs(75));
         assert_eq!(
             tracker
@@ -300,9 +253,6 @@ mod tests {
         );
     }
 
-    /// x0x#1036 wiring: a peer disconnected longer than the threshold leaves
-    /// the HyParView active view (so SWIM, shuffle and presence stop
-    /// targeting it) and comes back when it reconnects.
     #[tokio::test]
     async fn active_view_drops_stale_peer_and_restores_it_on_reconnect() {
         let membership = FakeMembership::default();
@@ -350,27 +300,10 @@ mod tests {
             presence_broadcast_targets(vec![peer(1), peer(2), peer(9)], &[peer(1), peer(3)]);
         assert_eq!(targets, vec![peer(1), peer(3)]);
 
-        // Reconnected: targeted again.
         let targets = presence_broadcast_targets(vec![peer(9)], &[peer(9)]);
         assert_eq!(targets, vec![peer(9)]);
     }
 
-    /// x0x#1036 W2 row (a): a pool-tombstoned peer is a disconnected peer.
-    ///
-    /// `disconnect_pool_candidates` (LRU/idle pool eviction) records a
-    /// `PoolEviction` reconnect-suppression tombstone and then closes the
-    /// connection, so the peer leaves ant-quic's `connected_peers()` — the
-    /// `send_ready_peers()` snapshot the keepalive pass feeds this tracker —
-    /// and the tombstone stops proactive redial from bringing it back.
-    /// HyParView knows nothing of the pool and keeps the peer in the active
-    /// view, so without pruning SWIM, shuffle and presence would keep
-    /// sending to it ("Peer not found") for the tombstone's lifetime.
-    ///
-    /// Pinned: the absence clock starts at the first pass after the close
-    /// (not while the tombstone is live but the connection is still open),
-    /// the peer is pruned once it has been absent for the threshold, it is
-    /// not restored while it stays evicted, and a random walk that re-adds
-    /// it while still evicted does not buy it a fresh grace period.
     #[tokio::test]
     async fn pool_tombstoned_peer_is_pruned_after_threshold() {
         let membership = FakeMembership::default();
@@ -381,12 +314,9 @@ mod tests {
         let mut tracker = StaleTargetTracker::new(Duration::from_secs(60));
         let t0 = Instant::now();
 
-        // Tombstone set, close still in flight: ant-quic still reports the
-        // connection, so the peer is connected for send-target purposes.
         let both = set(&[kept, evicted]);
         maintain_active_view(&membership, &mut tracker, &both, t0).await;
 
-        // Closed by the pool: gone from the send-ready snapshot.
         let only_kept = set(&[kept]);
         let t_close = t0 + Duration::from_secs(15);
         let plan = maintain_active_view(&membership, &mut tracker, &only_kept, t_close).await;
@@ -414,8 +344,6 @@ mod tests {
             "a pool-evicted peer must stop being a send target"
         );
 
-        // Still evicted: not restored, and a random-walk re-add is pruned on
-        // the very next pass.
         let plan = maintain_active_view(
             &membership,
             &mut tracker,
@@ -436,31 +364,12 @@ mod tests {
         assert_eq!(membership.active_view(), vec![kept]);
     }
 
-    /// x0x#1036 W2 row (b): a plane-pending peer counts as connected.
-    ///
-    /// `PeerAdmission::PlanePending` means ant-quic holds a live connection
-    /// but the issue #206 plane hello has not resolved yet (at most
-    /// `PLANE_LEGACY_GRACE`, 10 s). The keepalive pass feeds this tracker
-    /// `NetworkNode::send_ready_peers()`, which is ant-quic's
-    /// `connected_peers()` with no admission filter, so a plane-pending peer
-    /// is in the snapshot exactly like an admitted one. That is the intended
-    /// semantics: this tracker bounds send targets by *transport*
-    /// connectivity, because only a send with no connection fails with
-    /// "Peer not found". Gossip admission is enforced elsewhere
-    /// (`gossip_plane_peers`, `peer_admission`) and is not this tracker's job.
-    ///
-    /// Pinned, in consequence: a pruned peer that reconnects is restored even
-    /// while plane-pending, and being seen plane-pending restarts the absence
-    /// clock. If the plane is then refused, the peer is disconnected with a
-    /// `PolicyRejection` tombstone and is pruned one full threshold after
-    /// that disconnect: never earlier, and never left in the view for good.
     #[test]
     fn plane_pending_peer_counts_as_connected() {
         let mut tracker = StaleTargetTracker::new(Duration::from_secs(60));
         let t0 = Instant::now();
         let p = peer(20);
         let none = HashSet::new();
-        // Seen only as plane-pending: in the send-ready snapshot.
         let plane_pending = set(&[p]);
 
         tracker.observe(&[p], &none, t0);
@@ -471,11 +380,9 @@ mod tests {
             vec![p]
         );
 
-        // Reconnects; the plane hello is still in flight.
         let plan = tracker.observe(&[], &plane_pending, t0 + Duration::from_secs(70));
         assert_eq!(plan.restore, vec![p], "restored while plane-pending");
 
-        // Absent 50 s, seen plane-pending once, then refused and dropped.
         let t1 = t0 + Duration::from_secs(100);
         tracker.observe(&[p], &none, t1);
         tracker.observe(&[p], &plane_pending, t1 + Duration::from_secs(50));
@@ -496,16 +403,6 @@ mod tests {
         );
     }
 
-    /// x0x#1036 W2 row (c): presence targeting and active-view pruning agree.
-    ///
-    /// Presence targets come from `NetworkNode::connected_peers()`; pruning
-    /// comes from `NetworkNode::send_ready_peers()`. Both are ant-quic
-    /// `Node::connected_peers()` projected to peer ids, with no further
-    /// filter, so over one connectivity snapshot they are the same set. This
-    /// test drives both off one snapshot and pins the invariant: a pruned
-    /// peer is never a presence target, a presence target is never pruned,
-    /// and pruning never removes a presence target (presence computed from
-    /// the pruned view equals presence computed from the unpruned view).
     #[tokio::test]
     async fn presence_targets_and_pruning_agree() {
         let membership = FakeMembership::default();
@@ -525,7 +422,6 @@ mod tests {
         )
         .await;
 
-        // One snapshot for both consumers.
         let snapshot = vec![up, transport_only];
         let now = t0 + Duration::from_secs(60);
         let view_before = membership.active_view();
