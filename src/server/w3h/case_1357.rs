@@ -149,6 +149,8 @@ const BASE64: base64::engine::GeneralPurpose = base64::engine::general_purpose::
 
 // ADR 0110 §4a `s4_certificate_rebind` and §4b(1) `s4_owner_recovery`.
 mod s4ab;
+// #1973: `s4_owner_recovery` while another revoked member is seated.
+mod s4_owner_recovery_1973;
 
 /// ADR 0110 §2 timing: the product's measured values (D69, D73), read from
 /// [`S4Timing::default`] so that the case and the product have one source.
