@@ -514,6 +514,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **The dormant launcher records Failed when a peer's fence ends its last
+  attempt (#1378, review of #1991).** A failed attempt on a host a peer has
+  fenced now takes the Failed verdict when its attempts or total budget are
+  used up, and Interrupted only otherwise. The coordinator lets Failed win, so
+  the failed release is held instead of retried.
 - **Granted-store CLI paths and serves (#1953 review).** `x0x grant data`
   (and `grant revoke|renew`) percent-encode each path segment, so a key with
   `#`, `?` or `/` reaches the exact key. A slow granted read or write now
