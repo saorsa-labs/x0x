@@ -1444,7 +1444,8 @@ pub(super) struct AppState {
     /// driver's own publishes still reach the owner, whose version
     /// dedup absorbs them. A plain mutex: no caller
     /// holds it across an await, and `/upgrade/apply`'s claim guard
-    /// releases its claim synchronously from `Drop`.
+    /// decides its claim synchronously from `Drop` — release before
+    /// admission with nothing resuming the install, keep otherwise.
     pub(super) self_published_release_manifests: Arc<StdMutex<SelfPublishedReleaseManifests>>,
     /// Releases seen on the topic and the last release check (#1381),
     /// reported by `GET /diagnostics/upgrade`. Memory only.

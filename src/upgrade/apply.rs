@@ -118,6 +118,31 @@ async fn probe_retry_delay_for_install(
     probe_retry_delay_owned(install, version, None).await
 }
 
+/// Whether the durable record holds an interrupted probe wait for
+/// `version` — the precheck that decides a probe retry will actually
+/// re-apply it (#1169: the HTTP route keeps its apply-route claim for
+/// exactly that hand-off). Read-only, unlike the inspection
+/// [`inspect_admission`] performs: it acknowledges no probe-clock
+/// progress and resolves no staging identity, because it runs on an
+/// HTTP response path that must neither mutate retained records nor
+/// wait on readback subprocesses. The spawned retry loop still runs
+/// the full gated check before every attempt.
+#[cfg(unix)]
+pub(crate) async fn has_durable_probe_wait(install: PathBuf, version: String) -> bool {
+    tokio::task::spawn_blocking(move || {
+        crate::upgrade::probe::read_state(&install)
+            .map(|state| {
+                state.is_some_and(|state| {
+                    state.version == version
+                        && state.phase == super::probe::ProbePhase::InterruptedWait
+                })
+            })
+            .unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false)
+}
+
 #[cfg(unix)]
 async fn probe_retry_delay_owned(
     install: PathBuf,
@@ -508,7 +533,10 @@ impl ReleasePermit {
     /// Test-seam stand-in for [`ReleasePermit::admit_if_alive`]: an
     /// injected apply attempt IS the destructive half, and it runs on the
     /// caller's own task, so its liveness is the task running it.
+    /// Unix-gated tests are its only callers; without this attribute a
+    /// Windows test build warns it is dead code.
     #[cfg(test)]
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn admit(&self) {
         self.state
             .lock()
@@ -2084,6 +2112,9 @@ pub(crate) mod apply_attempt_seam {
     pub(crate) struct AttemptAdmission<'a>(Option<&'a ReleasePermit>);
 
     impl AttemptAdmission<'_> {
+        /// Unix-gated tests are its only callers; without this attribute
+        /// a Windows test build warns it is dead code.
+        #[cfg_attr(not(unix), allow(dead_code))]
         pub(crate) fn admit(&self) {
             if let Some(permit) = self.0 {
                 permit.admit();
@@ -2539,6 +2570,25 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::TempDir;
+
+    /// #1169 review round 4 (Claude should-fix 3): the admission decision
+    /// refuses a dead caller without marking the permit — changing the
+    /// body to set `admitted` unconditionally fails the refusal arm here,
+    /// which no other test reached — and the live control admits and
+    /// marks.
+    #[test]
+    fn admit_if_alive_refuses_a_dead_caller_without_marking_the_permit() {
+        let permit = ReleasePermit::default();
+        let dead = AtomicBool::new(false);
+        assert!(!permit.admit_if_alive(&dead));
+        assert!(
+            !permit.admitted(),
+            "a refused admission must not mark the permit"
+        );
+        let live = AtomicBool::new(true);
+        assert!(permit.admit_if_alive(&live));
+        assert!(permit.admitted());
+    }
 
     #[cfg(unix)]
     async fn check_supervised_unused_reservation_after_replacement(rollback: bool) {

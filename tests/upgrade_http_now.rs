@@ -102,7 +102,8 @@ macro_rules! http_now_regression_tests {
                     manifest.assets[0].signature_url = "http-owned-fixture://not-downloaded".into();
                     let mut raw = serde_json::to_vec(&manifest).unwrap(); raw.extend_from_slice(b" \n");
                     crate::upgrade::monitor::VerifiedRelease { manifest, manifest_json: raw, signature: vec![], gossip_payload: vec![] }
-                }                fn request(&self, release: &crate::upgrade::monitor::VerifiedRelease) -> staging::StagingRequest {
+                }
+                fn request(&self, release: &crate::upgrade::monitor::VerifiedRelease) -> staging::StagingRequest {
                     staging::StagingRequest {
                         install: self.install.clone(), data_root: self.data.clone(), identity_root: self.identity.clone(),
                         machine_id: [42;32], version: release.manifest.version.clone(),

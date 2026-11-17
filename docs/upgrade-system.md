@@ -1043,21 +1043,31 @@ no gossip, binds nothing, and takes no instance lock.
    before publishing: while the tracker holds that claim, any gossip
    copy of those bytes — the announcing node's own echo or a peer's —
    neither rebroadcasts nor queues a second apply on the background
-   owner. The tracker entry that holds the claim expires 30 minutes
-   after the route records it. The default rollout window is 60 minutes,
+   owner. Echoes of the node's non-apply-route publishes (the boot
+   broadcast, the fallback poll, the gossip relay) are not rebroadcast
+   either, but they are still submitted to the owner, whose version
+   dedup absorbs them. The tracker entry that holds the claim expires
+   30 minutes after its latest record: a later record of the same bytes
+   — the boot broadcast, a fallback publish or a driver rebroadcast —
+   restarts that clock. The default rollout window is 60 minutes,
    so the entry can expire while the apply still waits. A gossip copy
    of the payload is then treated like a peer's copy and can queue a
-   background apply again. The claim is released on drop while the apply
-   was never admitted: a failed, rolled-back or no-op apply, a client
+   background apply again. The claim is released on drop while the
+   apply was never admitted and nothing will resume the install: a
+   failed apply with no probe retry scheduled, a no-op apply, a client
    disconnect during the apply wait, or a panic all release it, and
-   gossip copies reach the owner again. Once the apply's blocking worker
-   is admitted — host locks held, replacement and restart owned by the
-   worker — a dropped handler no longer releases the claim: the install
-   still runs, and a gossip copy arriving in the seconds before the
-   restart must not queue a second apply of it. A successful apply keeps
-   the claim; every other post-admission exit leaves it to expire with
-   the tracker entry. After a fast failure, the node's own gossip echo
-   can still arrive after the claim is released and queue a
+   gossip copies reach the owner again. A failed apply that schedules
+   a probe retry keeps the claim — the retry still owns the install
+   for this version — as does every admitted apply: once the apply's
+   blocking worker is admitted — host locks held, replacement and
+   restart owned by the worker — a dropped handler no longer releases
+   the claim: the install still runs, and a gossip copy arriving in
+   the seconds before the restart must not queue a second apply of it.
+   A real rolled-back apply is always on this post-admission side (the
+   rollback runs after admission), so it keeps the claim. A successful
+   apply keeps the claim; every other post-admission exit leaves it to
+   expire with the tracker entry. After a fast failure, the node's own
+   gossip echo can still arrive after the claim is released and queue a
    background-owner attempt of the same release. The owner's 30-minute
    `failed_at` backoff bounds the rate of those attempts, not their
    count: at most one new attempt per 30 minutes.

@@ -383,9 +383,15 @@ macro_rules! http_readback_regression_tests {
                 // On unwind, withdraw the scheduled retry before releasing its
                 // actual readback worker or removing any scoped input hook.
                 let _stop_retry = StopRetry(fixture._shutdown.clone());
-                schedule_probe_retry(&upgrader, &release.manifest, apply_lock, shutdown);
+                // #1169 review round 4: the scheduler now reads the durable
+                // record up front, so it answers — and spawns — only when an
+                // interrupted probe actually exists. The seeded wait makes
+                // this case schedule; the staging refusal case has no record
+                // and schedules nothing at all, still without readback.
+                let scheduled =
+                    schedule_probe_retry(&upgrader, &release.manifest, apply_lock, shutdown).await;
                 let claim = probe_retry::claim_retry(fixture.install.clone(), release.manifest.version.clone());
-                let scheduled = claim.is_none();
+                assert_eq!(claim.is_none(), scheduled, "retry ownership matches the scheduler's answer");
                 drop(claim);
                 let deadline = std::time::Instant::now() + Duration::from_secs(10);
                 let mut retry_owned_while_paused = false;
@@ -419,7 +425,10 @@ macro_rules! http_readback_regression_tests {
                 drop(drain);
                 drop(hook);
                 drop(upgrader);
-                assert!(scheduled && free_after_response);
+                // A staging refusal has no durable interrupted probe, so
+                // round 4's up-front record read schedules nothing.
+                assert_eq!(scheduled, !staging_refusal);
+                assert!(free_after_response);
                 assert!(drained && !shared.expired.load(Ordering::SeqCst));
                 assert_eq!(after, before, "returned/cancelled retry must preserve retained records");
                 assert_eq!(fixture.attempts.load(Ordering::SeqCst), 0);
