@@ -147,36 +147,8 @@ impl DaemonFixture {
         }
         std::fs::write(&config_path, config).expect("write config");
 
-        let mut process_cmd = Command::new(&binary);
-        process_cmd
-            .arg("--config")
-            .arg(&config_path)
-            .arg("--skip-update-check")
-            .stdout(Stdio::null());
-        let stderr_log = if retain_stderr {
-            let path = tempdir.path().join("child-stderr.log");
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .expect("open child stderr log");
-            process_cmd.stderr(Stdio::from(file));
-            Some(path)
-        } else {
-            process_cmd.stderr(Stdio::null());
-            None
-        };
-        // `Command` inherits the parent environment by default, so `RUST_LOG`
-        // and `X0X_LOG_DIR` set in the test parent's env reach the daemon
-        // without explicit forwarding. The single non-redundant behavior
-        // here is the `X0X_TEST_LOG_DIR` alias: when set, map it to the
-        // daemon's actual log-dir env var so test scripts don't need to
-        // know the daemon's variable name. When neither is set, the
-        // daemon behaves exactly as before.
-        if let Some(v) = std::env::var_os("X0X_TEST_LOG_DIR") {
-            process_cmd.env("X0X_LOG_DIR", v);
-        }
-        let process = process_cmd.spawn().expect("Failed to start x0xd");
+        let stderr_log = retain_stderr.then(|| tempdir.path().join("child-stderr.log"));
+        let process = spawn_x0xd(&binary, &config_path, stderr_log.as_deref());
 
         let mut fixture = Self {
             process,
@@ -362,6 +334,32 @@ impl DaemonFixture {
             .unwrap_or_default()
     }
 
+    /// `<data_dir>/config.toml` path. A test may edit it before [`Self::restart`].
+    pub fn config_path(&self) -> PathBuf {
+        self.tempdir.path().join("config.toml")
+    }
+
+    /// Kill the daemon (SIGKILL, no clean shutdown) and leave its data and
+    /// identity in place. [`Self::restart`] starts it again.
+    pub fn kill(&mut self) {
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+    }
+
+    /// Kill the daemon if it runs, then start it again on the same config,
+    /// data dir and identity. The API port and token are read again.
+    pub async fn restart(&mut self) {
+        self.kill();
+        // A stale port file would point the startup wait at the old port.
+        let _ = std::fs::remove_file(self.port_file());
+        self.process = spawn_x0xd(
+            &find_x0xd_binary(),
+            &self.config_path(),
+            self.stderr_log.as_deref(),
+        );
+        self.wait_for_startup().await;
+    }
+
     fn panic_with_child_stderr(&self, message: &str) -> ! {
         let log = self.child_stderr();
         if log.is_empty() {
@@ -377,6 +375,40 @@ impl Drop for DaemonFixture {
         let _ = self.process.wait();
         let _ = std::fs::remove_dir_all(&self.identity_dir);
     }
+}
+
+/// Spawn x0xd on `config_path`. `stderr_log`, when set, is appended to.
+/// `--no-hard-coded-bootstrap` keeps the built-in seeds out even if a
+/// config ever omits `bootstrap_peers`.
+fn spawn_x0xd(binary: &Path, config_path: &Path, stderr_log: Option<&Path>) -> Child {
+    let mut process_cmd = Command::new(binary);
+    process_cmd
+        .arg("--config")
+        .arg(config_path)
+        .arg("--skip-update-check")
+        .arg("--no-hard-coded-bootstrap")
+        .stdout(Stdio::null());
+    if let Some(path) = stderr_log {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("open child stderr log");
+        process_cmd.stderr(Stdio::from(file));
+    } else {
+        process_cmd.stderr(Stdio::null());
+    }
+    // `Command` inherits the parent environment by default, so `RUST_LOG`
+    // and `X0X_LOG_DIR` set in the test parent's env reach the daemon
+    // without explicit forwarding. The single non-redundant behavior
+    // here is the `X0X_TEST_LOG_DIR` alias: when set, map it to the
+    // daemon's actual log-dir env var so test scripts don't need to
+    // know the daemon's variable name. When neither is set, the
+    // daemon behaves exactly as before.
+    if let Some(v) = std::env::var_os("X0X_TEST_LOG_DIR") {
+        process_cmd.env("X0X_LOG_DIR", v);
+    }
+    process_cmd.spawn().expect("Failed to start x0xd")
 }
 
 fn find_x0xd_binary() -> PathBuf {
