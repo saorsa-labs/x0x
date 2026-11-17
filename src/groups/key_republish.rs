@@ -1,13 +1,9 @@
 //! #1663: `MemberKeyRepublishV1`, the signed republication of a member's
 //! KEM key on its own already-Active seat.
 //!
-//! A GSS survivor of an encrypted group whose roster seat carries no KEM
-//! public key can not receive the re-sealed share of a rotated secret
-//! (#1578). David's ruling of 28 Oct 2026 02:25 GMT: such a member
-//! republishes a key **without leaving and re-joining**, through this
-//! typed frame. Peers verify it and seat the key on the member's row; the
-//! next share is then sealed to that seat through the existing share
-//! path, which ends the keyless hold and the head disclaimer.
+//! A GSS survivor whose roster seat has no KEM public key cannot receive
+//! a re-sealed share (#1578). It republishes a key through this frame
+//! without leaving and re-joining.
 //!
 //! This module is pure and I/O-free. It holds:
 //!
@@ -275,8 +271,7 @@ pub fn validate_against_seat(
     if !crate::groups::crypto_exclusion::is_gss_encrypted(info) {
         return Err(MemberKeyRepublishRefusal::CryptoPlaneUnsupported);
     }
-    // Only an Active row is a seat. The join's key-only marker row
-    // (#1578 rc11) is Pending, so this check refuses it too.
+    // Only an Active row is a seat: the join's key-only marker row is Pending.
     let Some(seat) = info
         .members_v2
         .get(&hex::encode(body.actor))
@@ -315,7 +310,6 @@ mod tests {
         base64::engine::general_purpose::STANDARD.encode(kem.public_bytes)
     }
 
-    /// A GSS `MlsEncrypted` group whose actor seat is Active and keyless.
     fn group(actor: &AgentKeypair, actor_key: Option<&str>) -> GroupInfo {
         let mut info = GroupInfo::new(
             "g".to_string(),
@@ -388,15 +382,12 @@ mod tests {
             verify_signatures(&frame),
             Err(MemberKeyRepublishRefusal::BadSignature)
         );
-        // A key that does not derive the claimed actor can not sign for it.
         let other = keypair();
         let body = body_for(&info, &actor, 1);
         assert_eq!(
             sign(body, &other).err(),
             Some(MemberKeyRepublishRefusal::ActorIneligible)
         );
-        // A frame another key signed, then re-labelled with the actor's
-        // id, does not verify: the claim is inside the signed bytes.
         let mut frame = sign(body_for(&info, &other, 1), &other).expect("sign");
         frame.body.actor = *actor.agent_id().as_bytes();
         assert_eq!(
@@ -441,8 +432,6 @@ mod tests {
     fn stale_sequence_replay_and_each_seat_violation_refused() {
         let actor = keypair();
         let mut info = group(&actor, None);
-        // A seated sequence refuses a replay (the same sequence) and a
-        // stale key (a lower one).
         if let Some(member) = info
             .members_v2
             .get_mut(&hex::encode(actor.agent_id().as_bytes()))
@@ -461,8 +450,6 @@ mod tests {
         );
         let fresh = body_for(&info, &actor, 4);
         assert!(validate_against_seat(&fresh, &info).is_ok());
-        // A removed actor is not seated; a contained group and another
-        // plane refuse the frame.
         let mut removed = info.clone();
         if let Some(member) = removed
             .members_v2
@@ -488,12 +475,6 @@ mod tests {
         );
     }
 
-    /// #1663 review round 4 (Claude, 30 Oct): a Removed row that becomes
-    /// Active again starts a fresh republication epoch. The re-joined
-    /// member's own row is new (no counter), so a counter retained across
-    /// the re-admission would refuse its every republication as stale;
-    /// the reset rides the re-admission every peer applies alike, and an
-    /// already-Active row keeps its position.
     #[test]
     fn a_readmitted_seat_starts_a_fresh_republication_counter() {
         let actor = keypair();
@@ -534,9 +515,6 @@ mod tests {
         );
     }
 
-    /// #1663 round 6 (Claude review, 2 Nov): an unban is a re-admission
-    /// too. Before the fix `unban_member` kept the counter, so the
-    /// unbanned member's restarted counter was refused `stale_key`.
     #[test]
     fn an_unbanned_seat_starts_a_fresh_republication_counter() {
         let actor = keypair();
@@ -561,11 +539,6 @@ mod tests {
         );
     }
 
-    /// David's ruling (2 Nov 2026 20:34 GMT): the signed `state_revision`
-    /// binds the frame to the seat's admission. A frame the actor signed
-    /// before its removal, relayed after its re-admission, is refused even
-    /// though the re-admission restarted the counter; the actor's new
-    /// frame, signed at the revision it holds now, seats.
     #[test]
     fn a_frame_from_an_earlier_admission_is_refused_after_readmission() {
         let actor = keypair();
@@ -573,7 +546,6 @@ mod tests {
         info.state_revision = 3;
         let actor_hex = hex::encode(actor.agent_id().as_bytes());
         let old = sign(body_for(&info, &actor, 4), &actor).expect("sign");
-        // The removal and the re-admission each advance the chain.
         info.remove_member(&actor_hex, None);
         info.state_revision = 4;
         info.add_member(actor_hex.clone(), GroupRole::Member, None, None);
@@ -600,10 +572,6 @@ mod tests {
         ));
     }
 
-    /// The join's key-only marker row (#1578 rc7/rc11) is not a seat: it
-    /// is Pending, and only an Active row seats a key. Shown red against
-    /// a variant of `validate_against_seat` that accepts any present row
-    /// (evidence under `~/x0x-claude/evidence/rc-1716-2140/`).
     #[test]
     fn join_marker_row_is_not_a_seat() {
         let actor = keypair();
@@ -625,8 +593,6 @@ mod tests {
         );
     }
 
-    /// #1663 round 6 nit: a 1184-byte value that is not an ML-KEM-768
-    /// public key is refused, not seated.
     #[test]
     fn a_kem_key_that_does_not_parse_is_refused() {
         let actor = keypair();
