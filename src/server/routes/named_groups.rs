@@ -22094,6 +22094,43 @@ pub(in crate::server) async fn apply_listener_metadata_event(
     applied
 }
 
+/// #1366: whether a stored group record needs its metadata listener after a
+/// restart. Only a withdrawn group needs none. Every local seat keeps it:
+/// - an Active member;
+/// - a Pending request-access applicant, which waits for the approval event;
+/// - a record with no local seat (a card-import or join stub), which waits
+///   for its `MemberAdded`;
+/// - a Removed seat, which an ADR 0109 re-seat or an ordinary re-add can
+///   still follow on this topic (W3-H H-S3-q (3) needs it);
+/// - a Banned seat: an admin lifts a ban with a `MemberUnbanned` event that
+///   [`unban_group_member`] publishes only on this topic. Without the
+///   listener the agent keeps its stored ban and its request-access stays
+///   refused as `banned`.
+pub(in crate::server) fn metadata_listener_wanted(info: &x0x::groups::GroupInfo) -> bool {
+    !info.withdrawn
+}
+
+/// #1366: the listeners a restart installs for the stored groups. A record
+/// that [`metadata_listener_wanted`] accepts gets
+/// [`ensure_named_group_listeners`]: the metadata listener, and the
+/// public-message listener when the group is SignedPublic. A withdrawn
+/// record gets neither. This is the same set as before #1366, when the
+/// restart called [`ensure_named_group_listeners`] for every record and
+/// both of its halves skipped a withdrawn group.
+pub(in crate::server) async fn restore_named_group_listeners(state: Arc<AppState>) {
+    let wanted: Vec<String> = {
+        let groups = state.named_groups.read().await;
+        groups
+            .iter()
+            .filter(|(_, info)| metadata_listener_wanted(info))
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    for group_id in wanted {
+        ensure_named_group_listeners(Arc::clone(&state), &group_id).await;
+    }
+}
+
 /// Spawn every gossip listener a member needs for a named group.
 ///
 /// Members must be subscribed to both the metadata topic *and* the
@@ -54961,6 +54998,7 @@ pub(in crate::server) mod tests {
     pub(in crate::server) mod issue1275_listener_apply_shield;
     mod issue1288_bootstrap_outbox_shutdown;
     mod issue1347_join_request_token_class;
+    mod issue1366_metadata_listener;
     pub(in crate::server) mod issue1366_public_listener;
     pub(in crate::server) mod issue1368_crash_matrix;
     mod issue1427_start_catchup;
