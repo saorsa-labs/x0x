@@ -634,10 +634,12 @@ fn render_launchd_plist(executable: &str, args: &[String], log_path: &Path) -> R
 const LAUNCHER_STOP_WORST_CASE_SECS: u64 = 45;
 
 /// `ExitTimeOut` for a launcher-bound job: above the worst-case stop.
+#[cfg(any(test, target_os = "macos"))]
 const LAUNCHER_EXIT_TIMEOUT_SECS: u64 = 60;
 
 /// The stable launcher a launchd job can bind (#1379), with its trial
 /// authority in the launcher argv (#1378).
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) struct LauncherBinding<'a> {
     pub(crate) launcher: &'a str,
     pub(crate) host_root: &'a str,
@@ -648,6 +650,7 @@ pub(crate) struct LauncherBinding<'a> {
 /// `x0x-launcher --host-root R --instance I -- x0xd args...` and sets
 /// `ExitTimeOut` above the launcher's worst-case stop. Not wired into
 /// `x0x autostart` yet: the launcher is dormant.
+#[cfg(any(test, target_os = "macos"))]
 fn render_launchd_plist_with(
     executable: &str,
     args: &[String],
