@@ -4127,6 +4127,12 @@ pub(super) async fn begin_join_attempt(state: &AppState, stable: &str) {
 /// ordinary request (no refs), so an authority whose log no longer
 /// reaches the base answers `base_beyond_retention`, and the node shows
 /// `readmission_required` with D43's exit. Nothing new goes on the wire.
+///
+/// The S3 recovery then owns the joiner's stub, as an armed record does
+/// (#1661): the stub is persisted, so it is no longer a pending join stub
+/// that the attempt's timeout removes. Before, a stub still at the invite
+/// base was removed on the timeout, and with it the typed state, so the
+/// joiner's API answered 404 instead of `readmission_required`.
 pub(super) async fn note_unserved_join_seal(
     state: &AppState,
     group_id: &str,
@@ -4164,12 +4170,40 @@ pub(super) async fn note_unserved_join_seal(
         terminal_revision,
         answered: HashSet::new(),
     });
+    drop(inner);
     tracing::info!(
         group_id = %LogHexId::group(&stable),
         head = info.state_revision,
         terminal_revision,
         "ADR 0109 S3: the join seal did not apply and its authority served no chain and no join carry; asking the admins"
     );
+    own_pending_stub(state, &group_key).await;
+}
+
+/// The S3 recovery owns `group_key`'s pending join stub: persist the stub
+/// as it is, which ends its pending state (`persist_named_group_info`), so
+/// the join attempt's timeout keeps it and its typed state. A stub that is
+/// already durable is left alone.
+async fn own_pending_stub(state: &AppState, group_key: &str) {
+    let pending = state
+        .pending_join_stubs
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(group_key);
+    if !pending {
+        return;
+    }
+    let lock = super::group_membership_lock(state, group_key).await;
+    let _membership_guard = lock.lock().await;
+    let Some(stub) = state.named_groups.read().await.get(group_key).cloned() else {
+        return;
+    };
+    if !matches!(
+        super::persist_named_group_info(state, group_key, stub).await,
+        Ok(super::AtomicWriteOutcome::Durable)
+    ) {
+        tracing::warn!(group_id = %LogHexId::group(group_key), "ADR 0109 S3: the unserved joiner's stub is not durable yet; its attempt's timeout may remove it");
+    }
 }
 
 /// Whether `info`'s unserved join seal still asks: its seal is not applied.
@@ -19592,6 +19626,45 @@ mod tests {
             view_of(&state, &stable).await,
             awaiting("no_capable_peer"),
             "the round reached the targets"
+        );
+        Ok(())
+    }
+
+    /// H-S3-r (studio1 train 60): once the unserved-seal trigger arms, the
+    /// S3 recovery owns the joiner's stub. The stub was still a pending
+    /// join stub at the invite base, and the attempt's timeout removes a
+    /// pending stub, so the joiner's `readmission_required` vanished (its
+    /// API answered 404). Now the stub is persisted when the trigger arms,
+    /// so the timeout keeps it. A seal one link ahead arms nothing and
+    /// leaves the stub pending. RED on main: the stub stayed pending.
+    #[tokio::test]
+    async fn an_unserved_join_seal_keeps_the_joiner_stub() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, _admin) = unserved_fixture(&state, "attempt-1").await?;
+        let stable = info.stable_group_id().to_string();
+        let pending = || {
+            state
+                .pending_join_stubs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(&key)
+        };
+        state
+            .pending_join_stubs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key.clone());
+
+        // One link ahead: no trigger, the stub stays pending.
+        note_unserved_join_seal(&state, &stable, "attempt-1", info.state_revision + 1).await;
+        assert!(pending(), "no trigger, no ownership");
+
+        // Five links ahead, nothing served: the trigger arms and owns it.
+        note_unserved_join_seal(&state, &stable, "attempt-1", info.state_revision + 5).await;
+        assert!(!pending(), "the stub is no longer a pending join stub");
+        assert!(
+            state.named_groups.read().await.contains_key(&key),
+            "the stub stays"
         );
         Ok(())
     }
