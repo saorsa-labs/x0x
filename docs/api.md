@@ -43,7 +43,7 @@ token (`Authorization: Bearer …`). The token is auto-discovered from
 | GET | `/profile` | `x0x profile` | Stored self-profile names (human/display/machine, ADR-0036) |
 | PUT | `/profile` | `x0x profile set` | Partial update of self-profile names (persists across restart) |
 | GET | `/owner/agents` | `x0x owner agents` | Roster of agents certified by this install's owner (ADR-0036) |
-| POST | `/owner/groups/:id/recovery-mandate` | `x0x owner groups recovery-mandate <GROUP_ID> --promoted <AGENT_ID>` | Owner-sign an `OwnerRecoveryMandateV1` for an `OwnerCertified` group whose admins are all revoked (ADR 0110 §4b(1)). The commit tolerates seated revoked non-admin members (#1973): each keeps its own eviction under the admin the recovery seats, and a still-refused seal waits typed (`waiting_for_member_eviction`) naming the members |
+| POST | `/owner/groups/:id/recovery-mandate` | `x0x owner groups recovery-mandate <GROUP_ID> --promoted <AGENT_ID>` | Owner-sign an `OwnerRecoveryMandateV1` for an `OwnerCertified` group whose admins are all revoked (ADR 0110 §4b(1)). The commit tolerates seated revoked non-admin members (#1973); each keeps its own eviction under the admin the recovery seats. A still-refused seal waits typed (`waiting_for_member_eviction`) naming the members |
 
 ## Network and diagnostics
 

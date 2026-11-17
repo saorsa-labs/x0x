@@ -2185,14 +2185,6 @@ every wait. A wait always names its cause; it does not stop silently.
     certificate's signed `not_after` yet.
   - `waiting_for_host_commit` — an upgrade trial is running.
   - `rebuilding_obligation_store` — the `.evs` file is being rebuilt.
-  - `waiting_for_member_eviction` — the owner-recovery seal was refused
-    (ADR-0038 B3, #1973): `named` lists each seated member the recovery
-    still requires an explicit eviction+rekey for. The recovery commit
-    tolerates seated revoked non-admin members; each keeps its own
-    eviction under the admin the recovery seats. When an unrelated
-    seat's grace or digest-pending hold is what refuses the seal,
-    `named` still lists the failing seats, not the hold; the wait
-    clears when the hold ends.
 - `receiver_upgrade_members` — on the admin that committed a crypto-only
   exclusion: each Active member that could not take it yet. `advert` is
   `lacking` (its current verified advert lacks `crypto_exclusion_v1`; it
@@ -2219,10 +2211,17 @@ every wait. A wait always names its cause; it does not stop silently.
     `mandate_received`, `waiting_for_receiver_upgrade` (D76 hold, `named`
     lists each Active member whose current advert lacks bit 7),
     `waiting_for_member_key_package`, `waiting_for_member_eviction`
-    (#1973: the recovery seal was refused; `named` lists each seated
-    member that still needs its own eviction under the admin the
-    recovery seats) or `recovery_not_needed` (the named revocation
-    records have not arrived yet). After the commit,
+    (#1973: the recovery seal was refused) or `recovery_not_needed` (the
+    named revocation records have not arrived yet).
+    `waiting_for_member_eviction` appears only here, in
+    `promoted_member.state`; no obligation row emits it, and its only
+    producer is the recovery's own wait. `named` lists each seated
+    member that still needs its own eviction and rekey under the admin
+    the recovery seats. The recovery commit tolerates seated revoked
+    non-admin members; each keeps its own eviction. When an unrelated
+    seat's grace or digest-pending hold is what refuses the seal,
+    `named` still lists the failing seats, not the hold. The wait
+    clears when the hold ends. After the commit,
     `receiver_upgrade_members` lists the stranded members with
     `gap_revision`.
 
