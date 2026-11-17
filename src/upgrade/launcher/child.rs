@@ -541,7 +541,7 @@ pub(super) fn identity(pid: u32) -> io::Result<Identity> {
 pub(super) fn identity(_pid: u32) -> io::Result<Identity> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "launcher process custody requires Linux",
+        "launcher process custody requires Linux or macOS",
     ))
 }
 
@@ -620,7 +620,7 @@ pub(super) fn stop_foreign(expected: &Identity) -> io::Result<()> {
 /// to 99999 before any reuse.)
 #[cfg(target_os = "macos")]
 pub(super) fn stop_foreign(expected: &Identity) -> io::Result<()> {
-    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::fd::OwnedFd;
     if absent(expected)? {
         return Ok(());
     }
@@ -720,7 +720,7 @@ fn survived_unless(gone: bool) -> io::Result<()> {
 pub(super) fn stop_foreign(_expected: &Identity) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "launcher process custody requires Linux",
+        "launcher process custody requires Linux or macOS",
     ))
 }
 
@@ -751,7 +751,7 @@ pub(super) fn is_own_child(expected: &Identity) -> io::Result<bool> {
 pub(super) fn is_own_child(_expected: &Identity) -> io::Result<bool> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "launcher process custody requires Linux",
+        "launcher process custody requires Linux or macOS",
     ))
 }
 
@@ -1174,8 +1174,8 @@ mod boot_guards {
     }
 
     fn boot_fd_role() {
-        // Non-Linux refuses the boot right after the take; Linux refuses it
-        // on the fixture identity. Either way the marker must already be
+        // Off Linux and macOS the boot is refused right after the take; on
+        // Linux and macOS it is refused on the fixture identity. Either way the marker must already be
         // gone, or a later self-update child would treat its own unrelated
         // descriptor 3 as a boot channel.
         let _ = candidate_boot_owned("fixture-version");
@@ -1299,7 +1299,7 @@ mod boot_guards {
     fn held_boot_refuses_a_present_permit_that_fails_its_checks() {
         // In-process, not a re-exec: the old child fixture named a
         // nonexistent executable, so hashing failed before `check_permit`
-        // (and identity failed first off Linux); a held path that skipped
+        // (and identity failed first off Linux and macOS); a held path that skipped
         // the check stayed green (#1375). Here every earlier step runs
         // against a real temp executable — parsing, hashing, observing
         // this process — so the refusal can only come from the check. The
@@ -1340,13 +1340,13 @@ mod boot_guards {
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            // Every well-formed permit still refuses the boot off Linux
+            // Every well-formed permit still refuses the boot off Linux and macOS
             // today: observed identity is unavailable, so the refusal
             // fires in `observed_for` before any field is compared.
             assert!(
                 error
                     .to_string()
-                    .contains("launcher process custody requires Linux"),
+                    .contains("launcher process custody requires Linux or macOS"),
                 "unexpected refusal: {error}"
             );
         }
