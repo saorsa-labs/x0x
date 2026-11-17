@@ -638,7 +638,8 @@ name the instance, with that participant's data root equal to the host
 root, its executable equal to the daemon path and its arguments
 (`argv[1..]`) equal to the daemon's. A refusal no restart can change
 (mismatch, mixed pair, wrong owner, mode or type, corrupt journal, unknown
-schema, unfinished trial) exits 78; a failed read exits 75. The journal
+schema, unfinished trial, a missing or non-canonical plan path, a symlinked
+or non-regular trial record) exits 78; a failed read exits 75. The journal
 has no hash or signature: anything that runs as the launcher's account,
 the candidate daemon included, is trusted to write it, until the producer
 (#2012) adds an integrity binding. The writer of that journal is the M2

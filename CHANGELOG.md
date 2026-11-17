@@ -554,6 +554,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **The dormant launcher's issuer refuses fixed faults with 78 (#1378,
+  review of #2014).** A plan path that is missing or not canonical, and a
+  symlinked or non-regular trial record, now exit 78 instead of 75. The tests
+  now reach the journal owner check and cover the `.` and `..` instance ids.
 - **The dormant launcher's main loop keeps a last-attempt Failed on a clock
   error, honours a late stop, and does not restart on a fixed refusal (#1378,
   review of #2006).** A clock error after the last failed attempt rolls back
