@@ -1022,13 +1022,13 @@ async fn cap_log(sim: &Sim, label: &str, group: &str) -> Result<(usize, u64)> {
 /// admins on J's roster. Desired: A answers `base_beyond_retention`; J
 /// shows `readmission_required {base_beyond_retention}` with an `exit` on
 /// its API and has not caught up. Then the B–J messages pass: J asks B,
-/// which has not answered for this attempt, B attests, and J leaves the
-/// state for a verified `catching_up`. Main: J sends no request and times
-/// out with no typed state.
+/// which has not answered for this attempt, B attests, and J's recovery
+/// state leaves `readmission_required` for `catching_up`. Main: J sends no
+/// request and times out with no typed state.
 ///
 /// Not checked here: J reaching B's head with keys. With nothing served
 /// for the seal, this pre-Welcome joiner stays at its head after B's
-/// attestation (seen in the VM, #1572 follow-up).
+/// attestation (seen in the VM; #2003).
 async fn beyond_retention(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     mesh(sim, R_LABELS).await?;
     let group = create_group(sim, "A").await?;
@@ -1125,7 +1125,7 @@ async fn beyond_retention(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         sim,
         &group,
         "A",
-        "J catches up through B",
+        "J leaves readmission_required through B",
         TRANSITION,
         true,
         &mut second,
@@ -1141,6 +1141,9 @@ async fn beyond_retention(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         "after the release: {end_text}; states {:?}; B requesters {}",
         second.recovery_states, b_route["requesters"]
     ));
+    // J's recovery state after the release shows `catching_up` (B's
+    // attestation armed the catch-up), or J caught up. Reaching B's head
+    // with keys is not required here (#2003).
     let left = second
         .recovery_states
         .iter()
@@ -1836,8 +1839,10 @@ fn w3h_1356_red_s3_t_deferred_until_host_commit() -> Result<()> {
 /// capped at 4, A serves J no chain and no join carry, so J holds no
 /// marker and no gap record. J's seal did not apply, so §2 asks the admins
 /// on J's roster: A answers `base_beyond_retention`, and J shows
-/// `readmission_required` with D43's exit. Then B attests and J catches
-/// up. Before the trigger J sent no request and timed out with no reason.
+/// `readmission_required` with D43's exit. Then B attests and J's
+/// recovery state leaves `readmission_required` for `catching_up`; J
+/// reaching B's head with keys is not checked here (#2003). Before the
+/// trigger J sent no request and timed out with no reason.
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),

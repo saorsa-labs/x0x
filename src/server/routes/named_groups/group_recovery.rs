@@ -4842,22 +4842,34 @@ async fn next_target(
     subject.note_progress(info.state_revision, now);
     // §2 "Unserved join seal": with no marker and no gap record, the node
     // asks only the admins on its roster that have not answered for this
-    // attempt, at once (no stall); see [`note_unserved_join_seal`].
-    let unserved = refs
+    // attempt, at once (no stall); see [`note_unserved_join_seal`]. The
+    // list keeps the admins that answered, so `next_target` stays the
+    // index of the admin last asked; the round skips the answered ones.
+    let answered: Option<HashSet<[u8; 32]>> = refs
         .is_empty()
         .then_some(subject.unserved_seal.as_ref())
-        .flatten();
-    let targets: Vec<AgentId> = match unserved {
-        Some(seal) => targets
+        .flatten()
+        .map(|seal| seal.answered.clone());
+    let targets: Vec<AgentId> = match answered {
+        Some(_) => targets
             .into_iter()
-            .filter(|agent| {
-                !seal.answered.contains(agent.as_bytes())
-                    && roster_admin(info, &hex::encode(agent.as_bytes()))
-            })
+            .filter(|agent| roster_admin(info, &hex::encode(agent.as_bytes())))
             .collect(),
         None => targets,
     };
-    let unserved = unserved.is_some();
+    let is_answered = |agent: &AgentId| {
+        answered
+            .as_ref()
+            .is_some_and(|set| set.contains(agent.as_bytes()))
+    };
+    let skip_answered = |subject: &mut SubjectState| {
+        while targets.get(subject.next_target).is_some_and(is_answered) {
+            subject.next_target = subject.next_target.saturating_add(1);
+        }
+    };
+    // No target left to ask in this attempt (or none at all).
+    let none_left = targets.iter().all(is_answered);
+    let unserved = answered.is_some();
     // The node left the head its last request named. §2 drops an answer
     // for an old head, so a request still open is void, and the last
     // round's silence was for that head: its backoff does not hold here.
@@ -4912,6 +4924,7 @@ async fn next_target(
         // No reply from that target: try the next one in this round.
         subject.pending = None;
         subject.next_target = subject.next_target.saturating_add(1);
+        skip_answered(subject);
         if subject.next_target >= targets.len() {
             if !subject.holds_view(now) {
                 subject.view = SubjectView::Awaiting {
@@ -4925,12 +4938,13 @@ async fn next_target(
     if now < subject.next_retry_at {
         return None;
     }
-    if subject.next_target >= targets.len() && !targets.is_empty() {
+    skip_answered(subject);
+    if subject.next_target >= targets.len() && !none_left {
         // Every target in this round refused: back off.
         subject.end_round(now);
         return None;
     }
-    if targets.is_empty() {
+    if none_left {
         if !subject.holds_view(now) {
             subject.view = SubjectView::Awaiting {
                 reason: "no_capable_peer".to_string(),
@@ -19634,6 +19648,128 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
         assert!(unserved_seal_open(&state, &info).await);
+        Ok(())
+    }
+
+    /// A current verified advert for `agent` that sets the terminal-attest
+    /// bit, so [`ordered_targets`] counts it as capable.
+    fn advertise_attest(state: &AppState, agent: &AgentId) -> anyhow::Result<()> {
+        static BUMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let mut capabilities = x0x::dm::DmCapabilities::pending();
+        capabilities.application_registry = x0x::dm::CapabilityRegistry {
+            version: 1,
+            bits: x0x::dm::CapabilityRegistry::GROUP_TERMINAL_ATTEST_V1,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis();
+        let created_at =
+            u64::try_from(now)? + 1_000 + BUMP.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        anyhow::ensure!(
+            state.agent.capability_store().insert(
+                *agent,
+                x0x::identity::MachineId([7u8; 32]),
+                capabilities,
+                created_at,
+            ),
+            "the advert inserts"
+        );
+        Ok(())
+    }
+
+    /// H-S3-r (#1572) review of #1993: the answered admin stays in the
+    /// round's list, so the round goes on to the next admin. Two capable
+    /// admins; the first answers `base_beyond_retention`, and the second is
+    /// asked in the same round, with no back-off. Red before the fix: the
+    /// answered admin left the list while the index still moved past it,
+    /// so the second admin was skipped and the round backed off.
+    #[tokio::test]
+    async fn an_unserved_join_seal_asks_the_next_admin_in_the_same_round() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let (key, mut info, first) = unserved_fixture(&state, "attempt-1").await?;
+        let second = x0x::identity::AgentKeypair::generate()?;
+        info.add_member(
+            hex::encode(second.agent_id().as_bytes()),
+            x0x::groups::GroupRole::Admin,
+            Some(hex::encode(first.agent_id().as_bytes())),
+            None,
+        );
+        info.seal_commit(&first, 2_000)?;
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), info.clone());
+        let stable = info.stable_group_id().to_string();
+        // §2 order: the lower agent ID first.
+        let (low, high) = if first.agent_id().as_bytes() < second.agent_id().as_bytes() {
+            (&first, &second)
+        } else {
+            (&second, &first)
+        };
+        advertise_attest(&state, &low.agent_id())?;
+        advertise_attest(&state, &high.agent_id())?;
+        let terminal = info.state_revision + 5;
+        note_unserved_join_seal(&state, &stable, "attempt-1", terminal).await;
+        let attempts = || async {
+            state
+                .group_recovery
+                .inner
+                .lock()
+                .await
+                .subjects
+                .get(&stable)
+                .map(|subject| subject.attempts)
+        };
+
+        let now = Instant::now();
+        assert_eq!(
+            next_target(&state, &key, &info, &local, &[], now).await,
+            Some(low.agent_id())
+        );
+        let before = attempts().await;
+        answer_from(
+            &state,
+            &info,
+            low,
+            AttestAnswer::Refused(AttestRefusalReason::BaseBeyondRetention),
+        )
+        .await?;
+        assert_eq!(
+            next_target(&state, &key, &info, &local, &[], Instant::now()).await,
+            Some(high.agent_id()),
+            "the second admin is asked in the same round"
+        );
+        assert_eq!(attempts().await, before, "the round did not back off");
+
+        // Both answered: no admin is left to ask in this attempt.
+        answer_from(
+            &state,
+            &info,
+            high,
+            AttestAnswer::Refused(AttestRefusalReason::BaseBeyondRetention),
+        )
+        .await?;
+        assert_eq!(
+            next_target(&state, &key, &info, &local, &[], Instant::now()).await,
+            None
+        );
+        let pending = state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .subjects
+            .get(&stable)
+            .and_then(|subject| subject.pending.clone());
+        assert_eq!(pending, None, "no admin is asked twice");
+        assert_eq!(
+            view_of(&state, &stable).await,
+            Some(SubjectView::Readmission {
+                cause: "base_beyond_retention"
+            })
+        );
         Ok(())
     }
 }
