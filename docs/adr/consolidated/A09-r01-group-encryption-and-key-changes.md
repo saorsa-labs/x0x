@@ -285,19 +285,23 @@ decisions of 10 Nov 2026
 revoked admins and promotes one member. A revoked below-Admin seat that
 is still seated no longer refuses the recovery seal: the seal tolerates
 it, as an S4 removal seal tolerates the group's other open S4 targets
-(§3). The tolerated seat keeps its key material until its own S4 row
-commits under the admin the recovery seats; that row performs the
-eviction and the rekey. Every other failing seat keeps the all-clean
-refusal. A recovery seal that is still refused keeps a typed wait,
-`waiting_for_member_eviction`, naming the members it still requires an
-eviction for, so the status never falls back to a bare
-`mandate_received`. Before this, the recovery could never commit while
-a revoked member was seated, and that member's eviction waited for the
-admin the recovery would seat, so the group stayed without an admin
-(#1973). The `OwnerRecoveryV1` body still removes exactly the named
-admins; no wire format changes. The local status of a promoted member
-can name the new wait cause. ADR 0110 stays Accepted and its text is
-unchanged.
+(the #1023 Engineer ruling of 1 Nov 2026 02:36 GMT, as the S4 seal code
+implements it). The tolerated seat receives the recovery epoch's key
+material until its own S4 row commits under the admin the recovery
+seats; ADR 0110 §1 opens that row for every seated revoked target, and
+that row performs the eviction and the rekey. Every other failing seat
+keeps the all-clean refusal. A recovery seal that is still refused
+keeps a typed wait, `waiting_for_member_eviction`, naming the failing
+members it still requires an eviction for, so the status never falls
+back to a bare `mandate_received`; a grace or digest-pending hold that
+refuses the seal is not eviction work, so a tolerated seat can stay
+named until the hold ends. Before this, the recovery could never commit
+while a revoked member was seated, and that member's eviction waited
+for the admin the recovery would seat, so the group stayed without an
+admin (#1973). The `OwnerRecoveryV1` body still removes exactly the
+named admins; no wire format changes. The local status of a promoted
+member can name the new wait cause. ADR 0110 stays Accepted and its
+text is unchanged.
 
 [A08](A08-r01-groups-home-membership-and-repair.md) defines valid group-state and fork recovery. A09 must not bypass that authority to obtain keys faster.
 

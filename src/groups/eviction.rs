@@ -155,7 +155,10 @@ pub enum WaitingCause {
     WaitingForCertificateExpiry,
     /// An `OwnerCertified` seal was refused because these members still
     /// require an explicit eviction+rekey (ADR-0038 B3) that the waiting
-    /// transition cannot perform itself (#1973).
+    /// transition cannot perform itself (#1973). When an unrelated
+    /// seat's grace or digest-pending hold is what refuses the seal, the
+    /// failing seats are still the members named; the wait clears when
+    /// the hold ends.
     WaitingForMemberEviction,
 }
 
@@ -2479,6 +2482,7 @@ mod tests {
             WaitingCause::WaitingForHostCommit,
             WaitingCause::RebuildingObligationStore,
             WaitingCause::WaitingForCertificateExpiry,
+            WaitingCause::WaitingForMemberEviction,
         ] {
             let json = serde_json::to_string(&cause).expect("json");
             assert_eq!(json, format!("\"{}\"", cause.as_str()));
