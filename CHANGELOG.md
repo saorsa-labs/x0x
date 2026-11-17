@@ -604,6 +604,13 @@ All notable changes to this project will be documented in this file.
   A joiner whose seal was not served stops counting rounds once every admin
   has answered (`awaiting_attestation {admins_answered}`), and a finished
   catch-up no longer stays `catching_up`. ADR A08 amendment of 17 Nov 2026.
+- **Groups (#2003, review of #2021):** an admin that attested a joiner keeps
+  relaying other admins' renames, role changes and unbans to it after a later
+  `rate_limited` answer; before, that answer ended the relay until the admin
+  attested again. Any other later answer still ends it. The relay goes only
+  to a requester that is an Active member when the page is served. A relayed
+  link's `actor` now matches its signer without regard to hex case. ADR A08
+  correction of 17 Nov 2026.
 
 - **Granted-store CLI paths and serves (#1953 review).** `x0x grant data`
   (and `grant revoke|renew`) percent-encode each path segment, so a key with

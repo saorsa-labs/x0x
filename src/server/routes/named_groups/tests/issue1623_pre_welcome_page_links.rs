@@ -3176,3 +3176,56 @@ async fn a_rejection_is_not_relayed() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn a_mixed_case_actor_still_matches_its_signer() -> anyhow::Result<()> {
+    let owner = AgentKeypair::generate()?;
+    let base = base_with_ban(&owner)?;
+    for (_, commit, mut event) in state_only_links(&base, &owner)? {
+        match &mut event {
+            NamedGroupMetadataEvent::MemberRoleUpdated { actor, .. }
+            | NamedGroupMetadataEvent::GroupMetadataUpdated { actor, .. }
+            | NamedGroupMetadataEvent::MemberUnbanned { actor, .. } => {
+                *actor = actor.to_ascii_uppercase();
+                anyhow::ensure!(*actor != commit.committed_by, "the case differs");
+            }
+            _ => anyhow::bail!("not a state-only link"),
+        }
+        assert!(
+            relayable_state_only_link(&event).is_some(),
+            "{} is relayable",
+            named_group_metadata_event_kind(&event)
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_attested_requester_served_by_a_cached_add_gets_no_relayed_link() -> anyhow::Result<()> {
+    let owner = AgentKeypair::generate()?;
+    let (responder, _rdir, key, base, links) = relaying_responder(&owner).await?;
+    let (joiner, _jdir) = armed_joiner(&base, &links, &owner).await?;
+    let joiner_hex = hex::encode(joiner.agent.agent_id().as_bytes());
+    responder
+        .treekem_event_log
+        .write()
+        .await
+        .entry(key.clone())
+        .or_default()
+        .push_back(issue1427_added(&joiner_hex));
+    group_recovery::note_attested_for_test(&responder, base.stable_group_id(), &joiner_hex).await;
+
+    let served = page_from_responder(&joiner, &responder, &key).await?;
+
+    assert!(
+        !served.iter().any(|kind| [
+            "member_role_updated",
+            "group_metadata_updated",
+            "member_unbanned"
+        ]
+        .contains(kind)),
+        "nothing relayed: {served:?}"
+    );
+    assert_eq!(head_of(&joiner, &key).await?.state_hash, base.state_hash);
+    Ok(())
+}

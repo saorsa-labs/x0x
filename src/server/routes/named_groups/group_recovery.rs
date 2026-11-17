@@ -485,6 +485,9 @@ struct RecoveryListEntry {
     answer: String,
     at: Instant,
     at_ms: u64,
+    /// The last `attested` answer to the requester, while no later answer
+    /// ended its relay grant ([`record_recovery_list`]).
+    attested_at: Option<Instant>,
 }
 
 /// The §11 responder limits.
@@ -3408,10 +3411,10 @@ async fn remember_reseat_bases(
 
 /// #2003 (ADR 0109 §2, A08 amendment of 17 Nov 2026): this node, an
 /// admin, answered `requester_hex`'s request for the group with a signed
-/// attestation, and the recovery-list entry is still held
-/// ([`s3::RECOVERY_LIST_TTL`]). Only such a requester gets the state-only
-/// links that another admin signed on a catch-up page
-/// (`relayed_state_only_links_allowed`).
+/// attestation less than [`s3::RECOVERY_LIST_TTL`] ago, and no later
+/// answer ended that grant ([`record_recovery_list`]). Only such a
+/// requester gets the state-only links that another admin signed on a
+/// catch-up page.
 pub(super) async fn attested_requester(
     state: &AppState,
     stable_group_id: &str,
@@ -3428,8 +3431,9 @@ pub(super) async fn attested_requester(
         .is_some_and(|list| {
             list.iter().any(|entry| {
                 entry.requester.eq_ignore_ascii_case(requester_hex)
-                    && entry.answer == "attested"
-                    && now.saturating_duration_since(entry.at) < s3::RECOVERY_LIST_TTL
+                    && entry
+                        .attested_at
+                        .is_some_and(|at| now.saturating_duration_since(at) < s3::RECOVERY_LIST_TTL)
             })
         })
 }
@@ -3458,6 +3462,7 @@ pub(in crate::server) async fn note_attested_for_test(
             answer: "attested".to_string(),
             at: Instant::now(),
             at_ms: now_ms(),
+            attested_at: Some(Instant::now()),
         });
 }
 
@@ -3474,10 +3479,25 @@ async fn record_recovery_list(
         .recovery_lists
         .entry(stable_group_id.to_string())
         .or_default();
+    let earlier_grant = list
+        .iter()
+        .filter(|entry| entry.requester.eq_ignore_ascii_case(requester_hex))
+        .find_map(|entry| entry.attested_at);
     list.retain(|entry| {
-        entry.requester != requester_hex
+        !entry.requester.eq_ignore_ascii_case(requester_hex)
             && now.saturating_duration_since(entry.at) < s3::RECOVERY_LIST_TTL
     });
+    // `rate_limited` is about this node's signature budget: the gap and
+    // the requester's standing are as the grant found them. Every other
+    // answer says this node has no link ahead of the requester's head to
+    // relay, or that the requester or this node lost its standing.
+    let attested_at = if answer == "attested" {
+        Some(now)
+    } else if answer == AttestRefusalReason::RateLimited.as_str() {
+        earlier_grant
+    } else {
+        None
+    };
     list.push(RecoveryListEntry {
         requester: requester_hex.to_string(),
         head_revision: request.head_revision,
@@ -3486,6 +3506,7 @@ async fn record_recovery_list(
         answer: answer.to_string(),
         at: now,
         at_ms: now_ms(),
+        attested_at,
     });
     let excess = list.len().saturating_sub(s3::RECOVERY_LIST_CAP);
     list.drain(..excess);
@@ -20103,6 +20124,54 @@ mod tests {
         subject_tick(&state).await;
         assert_eq!(view_of(&state, &stable).await, None);
         assert!(recovery_json(&state, &info).await.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn only_a_rate_limited_answer_keeps_the_relay_grant() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let requester = [0x2a; 32];
+        let requester_hex = hex::encode(requester);
+        let rate_limited = AttestRefusalReason::RateLimited.as_str();
+        let ending = [
+            "on_chain",
+            "not_on_chain",
+            "reseat",
+            AttestRefusalReason::AttesterQuarantined.as_str(),
+            AttestRefusalReason::AttesterBehind.as_str(),
+            AttestRefusalReason::NotAnAdmin.as_str(),
+            AttestRefusalReason::NotAMember.as_str(),
+            AttestRefusalReason::BannedOrRevoked.as_str(),
+            AttestRefusalReason::BaseBeyondRetention.as_str(),
+        ];
+        for (index, answer) in ending.into_iter().enumerate() {
+            let stable = format!("{index:064x}");
+            let request = GroupAttestRequestV1 {
+                group: stable.clone(),
+                requester,
+                head_revision: 3,
+                head_state_hash: "h3".to_string(),
+                refs: Vec::new(),
+            };
+            note_attested_for_test(&state, &stable, &requester_hex).await;
+            for _ in 0..2 {
+                record_recovery_list(&state, &stable, &requester_hex, &request, rate_limited).await;
+                assert!(
+                    attested_requester(&state, &stable, &requester_hex).await,
+                    "rate_limited keeps the grant"
+                );
+            }
+            record_recovery_list(&state, &stable, &requester_hex, &request, answer).await;
+            assert!(
+                !attested_requester(&state, &stable, &requester_hex).await,
+                "{answer} ends the grant"
+            );
+            record_recovery_list(&state, &stable, &requester_hex, &request, rate_limited).await;
+            assert!(
+                !attested_requester(&state, &stable, &requester_hex).await,
+                "rate_limited after {answer} grants nothing"
+            );
+        }
         Ok(())
     }
 }

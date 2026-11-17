@@ -9462,14 +9462,16 @@ fn treekem_state_only_link(
 /// change or an unban whose `actor` signed its commit. The ordinary apply
 /// recomputes the state hash, which covers all of their content, and
 /// checks it against the signed commit. A join-request rejection is not
-/// one: its commit does not cover `actor` or the request it names.
+/// one: it changes only the join requests, which no state-hash input
+/// covers, so its signed commit verifies for any request it names.
 fn relayable_state_only_link(
     event: &NamedGroupMetadataEvent,
 ) -> Option<(&x0x::groups::GroupStateCommit, &str)> {
     if matches!(event, NamedGroupMetadataEvent::JoinRequestRejected { .. }) {
         return None;
     }
-    treekem_state_only_link(event).filter(|(commit, actor)| *actor == commit.committed_by)
+    treekem_state_only_link(event)
+        .filter(|(commit, actor)| actor.eq_ignore_ascii_case(&commit.committed_by))
 }
 
 /// #1623: the catch-up cursor of a logged link, `(revision, TreeKEM
@@ -13688,10 +13690,12 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     };
     // #2003 (ADR 0109 §2, A08 amendment of 17 Nov 2026): a state-only
     // link that another admin signed goes only to a requester this node
-    // attested; it applies there under the armed attested sequence.
-    // `log_keys` holds every name of the group, its stable id included.
+    // attested and that is an Active member now; it applies there under
+    // the armed attested sequence. A requester served only as the target
+    // of a cached add gets none. `log_keys` holds every name of the
+    // group, its stable id included.
     let mut relay = false;
-    if held_group.is_some() {
+    if authorized {
         for key in &log_keys {
             if group_recovery::attested_requester(state, key, &sender_hex).await {
                 relay = true;
