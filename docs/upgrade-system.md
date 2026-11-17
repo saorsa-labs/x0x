@@ -367,9 +367,10 @@ applies that rule to the boot marker by analogy: fail closed means "start
 the configured binary normally and report degraded", never brick startup.
 The degraded report in the code is one warning line on stderr. The refusal
 covers only a permit present on descriptor 3: one that fails its checks,
-or one the process cannot verify. On a non-Linux Unix host, every well-formed
-permit refuses the boot today, because the process-custody identity check
-needs Linux `/proc`. When activation turns the engine on, the full boot
+or one the process cannot verify. On Linux and macOS the process-custody
+identity is observed (`/proc` on Linux, libproc on macOS, #1379), so a
+permit reaches its field checks. On any other Unix host, every well-formed
+permit refuses the boot today, because no identity can be observed. When activation turns the engine on, the full boot
 barrier applies as specified: permit checks, boot record write, then the
 barrier ack.
 
@@ -622,7 +623,35 @@ direct unit. `Restart=always` also restarts on exit 64, so a unit that
 binds the launcher must set `RestartPreventExitStatus=64`: a wrong
 `ExecStart` then stops the job and does not restart it every 5 s. The
 argv contract and the exit codes are provisional and dormant. They are
-frozen before `ENABLED = true`, like the fd 3 boot contract. The launcher strips a stray `X0X_M2_BOOT_FD` from the daemon's
+frozen before `ENABLED = true`, like the fd 3 boot contract. The main
+loop (`start.rs`, #1378) owns the trial only when the engine is enabled
+and the issuer gives it a host. Only the trial form of the argv,
+`x0x-launcher --host-root /abs/data-root --instance ID -- /abs/x0xd [args]`,
+consults the issuer (`issuer.rs`): it opens `<host-root>/upgrade-journal.json`
+once without following a symlink and requires, on that descriptor, a
+regular file of the launcher's account with mode exactly 0600, in a
+canonical root that no other account can write. No journal, or one before
+the swap or settled (`staged`, `probed`, `prepared`, `idle`, `superseded`),
+is an ordinary start, unless an unfinished trial (not Committed or
+Restored) is on disk, which refuses the start. An in-flight journal must
+name the instance, with that participant's data root equal to the host
+root, its executable equal to the daemon path and its arguments
+(`argv[1..]`) equal to the daemon's. A refusal no restart can change
+(mismatch, mixed pair, wrong owner, mode or type, corrupt journal, unknown
+schema, unfinished trial, a missing or non-canonical plan path, a symlinked
+or non-regular trial record) exits 78; a failed read exits 75. The journal
+has no hash or signature: anything that runs as the launcher's account,
+the candidate daemon included, is trusted to write it, until the producer
+(#2012) adds an integrity binding. The writer of that journal is the M2
+prepare producer (#2012), which does not exist yet, so with the engine
+held every start is still the passthrough. An owned start installs its SIGTERM and
+SIGINT handler only then, and exits 0 after a stop, 75 when the daemon
+exits or a step can be retried (an issuer error never falls back to the
+passthrough), and 78 (`EX_CONFIG`) when no automatic start is allowed
+(`RecoveryFailed`, a final host phase, a participant missing from the
+plan or stopped, or a prior child that still runs). A unit that binds the owned
+launcher must also set `RestartPreventExitStatus=78`. A retired trial on a
+committed host is an ordinary start: the passthrough. The launcher strips a stray `X0X_M2_BOOT_FD` from the daemon's
 environment before the `exec`. While activation is held, `x0xd` ignores a
 stray `X0X_M2_BOOT_FD` with one warning. It refuses to start only for a
 permit present on descriptor 3 that fails its checks or cannot be
@@ -981,6 +1010,17 @@ a running daemon itself. The repair-time check is not the last word: every
 apply re-verifies the **loaded** job policy (#615 above), so a `KeepAlive`
 removed after repair refuses further upgrades instead of exiting into a job
 that will not restart.
+
+A job whose program is the stable launcher (`x0x-launcher /abs/x0xd ...`,
+or the trial form `x0x-launcher --host-root R --instance I -- /abs/x0xd ...`)
+is treated as the x0xd job it runs: `--repair` and the upgrade-time
+readback both look through the launcher's own arguments to the daemon
+(#1379). Such a job also needs `ExitTimeOut` above 45 s (the launcher's
+worst-case stop of a committed daemon); `--repair` refuses one without it.
+Under launchd an unconditional `KeepAlive` restarts every exit, so a
+launcher that reaches a final refusal (exit 78 elsewhere) holds until it is
+stopped instead of exiting. `x0x autostart` does not bind the launcher yet:
+it is dormant.
 
 The handoff transaction (`upgrade::restart`):
 

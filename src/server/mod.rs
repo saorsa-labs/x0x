@@ -85,10 +85,10 @@ use routes::{
     delete_machine, direct_cancel, direct_connections, direct_message_send_config, direct_receipt,
     direct_send, discover_groups, discover_groups_nearby, discovered_agent, discovered_agents,
     discovered_machine, discovered_machines, dispatch_join_result_message,
-    dispatch_welcome_blob_message, dm_diagnostics, enroll_device, ensure_named_group_listeners,
-    evaluate_trust, exec_cancel, exec_diagnostics, exec_run, exec_sessions, file_accept_handler,
-    file_reject_handler, file_send_handler, file_transfer_status_handler, file_transfers_handler,
-    find_agent, forward_add, forward_list, forward_remove, get_a2a_agent_card, get_agent_card,
+    dispatch_welcome_blob_message, dm_diagnostics, enroll_device, evaluate_trust, exec_cancel,
+    exec_diagnostics, exec_run, exec_sessions, file_accept_handler, file_reject_handler,
+    file_send_handler, file_transfer_status_handler, file_transfers_handler, find_agent,
+    forward_add, forward_list, forward_remove, get_a2a_agent_card, get_agent_card,
     get_constitution, get_constitution_json, get_group_card, get_group_join_status,
     get_group_public_messages, get_group_state, get_group_state_commits, get_kv_value,
     get_mls_group, get_named_group, get_named_group_members, get_onboard, get_profile,
@@ -2023,17 +2023,13 @@ pub async fn serve_with_options(
         }
     }));
 
-    let existing_group_ids: Vec<String> = {
-        let groups = state.named_groups.read().await;
-        groups.keys().cloned().collect()
-    };
-    for group_id in existing_group_ids {
-        // The metadata + public-message listeners spawned here self-register in
-        // `state.group_metadata_tasks` / `state.public_message_tasks`; the
-        // shutdown tail drains and aborts those maps directly (Fix C), so there
-        // is nothing to collect into `bg_tasks` from this call.
-        ensure_named_group_listeners(Arc::clone(&state), &group_id).await;
-    }
+    // The metadata + public-message listeners spawned here self-register in
+    // `state.group_metadata_tasks` / `state.public_message_tasks`; the
+    // shutdown tail drains and aborts those maps directly (Fix C), so there
+    // is nothing to collect into `bg_tasks` from this call. #1366: the
+    // restore applies `metadata_listener_wanted` (only a withdrawn record
+    // gets no listener; a Banned seat keeps it to receive an unban).
+    routes::named_groups::restore_named_group_listeners(Arc::clone(&state)).await;
 
     // ADR-0038: auto-provision the Home space for an owned install. Runs
     // AFTER restore so an existing Home is adopted (marker + roster scan)

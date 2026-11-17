@@ -74,12 +74,22 @@ pub(super) fn supervise(
     host: &recovery::Host,
     path: &Path,
     trial: &mut Trial,
+    stop: impl FnMut() -> bool,
+) -> io::Result<Supervised> {
+    supervise_with(host, path, trial, Clock::now, stop)
+}
+
+/// As `supervise`, with the clock supplied (tests inject clock errors).
+pub(super) fn supervise_with(
+    host: &recovery::Host,
+    path: &Path,
+    trial: &mut Trial,
+    mut now: impl FnMut() -> io::Result<Clock>,
     mut stop: impl FnMut() -> bool,
 ) -> io::Result<Supervised> {
     // Readiness is the boot barrier plus `STABLE_MS` alive; the health
     // commit is checked by the host commit below.
-    let provisional = match run::run_trial(host, path, trial, Clock::now, |_| Ok(true), &mut stop)?
-    {
+    let provisional = match run::run_trial(host, path, trial, &mut now, |_| Ok(true), &mut stop)? {
         run::Outcome::Stopped => return Ok(Supervised::Stopped),
         run::Outcome::Restored(child) => return Ok(Supervised::Restored(child)),
         run::Outcome::Committed => return Ok(Supervised::Retired),
@@ -91,7 +101,7 @@ pub(super) fn supervise(
         trial,
         provisional,
         coordinator::trial_path,
-        Clock::now,
+        &mut now,
         &mut stop,
         coordinator::recover,
         || std::thread::sleep(COMMIT_POLL),
@@ -110,7 +120,7 @@ pub(super) fn supervise(
         Settled::Stopped => Ok(Supervised::Stopped),
         // Every trial is Restored: start this participant's restored child.
         Settled::Recovered(Resolution::Restored(_)) => {
-            match run::run_trial(host, path, trial, Clock::now, |_| Ok(true), &mut stop)? {
+            match run::run_trial(host, path, trial, &mut now, |_| Ok(true), &mut stop)? {
                 run::Outcome::Restored(child) => Ok(Supervised::Restored(child)),
                 _ => Err(invalid("restored trial did not start the restored child")),
             }
@@ -1156,7 +1166,7 @@ mod tests {
 
     /// A healthy live full set commits the host through the driver, and the
     /// child is handed back unreaped.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_healthy_live_candidate_commits_the_host() {
         let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
@@ -1522,7 +1532,7 @@ mod tests {
 
     /// #1981 review item 4: a Committed trial whose old child still runs
     /// is refused; the launcher never overlaps it.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_committed_trial_with_a_live_old_child_is_refused() {
         let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);

@@ -35,7 +35,7 @@
 //! The sidecar holds the payloads unsealed (base64), written with
 //! owner-only permissions (0600) like the daemon's other sidecars.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -76,6 +76,11 @@ const DIRECT_SEND_ATTEMPT_BUDGET: Duration = Duration::from_secs(10);
 
 /// The most sends one worker pass starts. The others stay due.
 const DIRECT_SEND_PASS_BUDGET: usize = 16;
+
+/// The shortest time between two advert nudges for one recipient
+/// (monotonic ms). A flood of adverts runs at most one extra pass per
+/// recipient in this time, and never resends faster than the first retry.
+pub(in crate::server) const DIRECT_SEND_NUDGE_MIN_MS: u64 = 2_000;
 
 /// Unix time in ms (0 if the clock is before the epoch).
 pub(in crate::server) fn now_unix_ms() -> u64 {
@@ -810,6 +815,10 @@ impl DirectSendReceipt {
 /// A terminal outcome to record: request id, outcome, payload digest.
 type Outcome = ([u8; 16], DirectSendTerminal, [u8; 32]);
 
+/// Outcomes decided but not yet written, by request id: the outcome and
+/// the digest of the bytes it is about.
+type UnwrittenOutcomes = HashMap<[u8; 16], (DirectSendTerminal, [u8; 32])>;
+
 /// The durable send outbox: the store, its sidecar path, the locks and
 /// the terminal-outcome ledger.
 ///
@@ -833,6 +842,13 @@ pub(in crate::server) struct DirectSendOutbox {
     /// code to record if the recipient was blocked during the attempt
     /// (then the obligation is not sent again).
     in_flight: std::sync::Mutex<HashMap<[u8; 16], Option<String>>>,
+    /// Outcomes a pass decided but could not write, by request id, with the
+    /// digest they are about. The next pass writes them again and makes no
+    /// attempt for those bytes. In memory only: after a restart the send is
+    /// decided again.
+    unwritten: std::sync::Mutex<UnwrittenOutcomes>,
+    /// Recipient (64 hex) to the monotonic ms of its latest advert nudge.
+    nudged: std::sync::Mutex<HashMap<String, u64>>,
 }
 
 impl DirectSendOutbox {
@@ -849,7 +865,21 @@ impl DirectSendOutbox {
             admission: Mutex::new(()),
             terminal: std::sync::Mutex::new(TerminalLedger::default()),
             in_flight: std::sync::Mutex::new(HashMap::new()),
+            unwritten: std::sync::Mutex::new(HashMap::new()),
+            nudged: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    fn unwritten(&self) -> std::sync::MutexGuard<'_, UnwrittenOutcomes> {
+        self.unwritten
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn nudged(&self) -> std::sync::MutexGuard<'_, HashMap<String, u64>> {
+        self.nudged
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn in_flight(&self) -> std::sync::MutexGuard<'_, HashMap<[u8; 16], Option<String>>> {
@@ -1087,16 +1117,35 @@ impl DirectSendOutbox {
 
     /// #1109 S2: `recipient`'s durable-capable advert arrived. Its held
     /// obligations become due at `now` (in memory; the retry count is
-    /// unchanged). Returns whether any matched.
+    /// unchanged). Returns whether any matched. A recipient nudged less
+    /// than [`DIRECT_SEND_NUDGE_MIN_MS`] ago is not nudged again.
     pub(in crate::server) async fn nudge_recipient(
         &self,
         recipient: &AgentId,
         now: DirectSendNow,
     ) -> bool {
         let recipient_hex = hex::encode(recipient.as_bytes());
-        self.outbox()
+        {
+            let mut nudged = self.nudged();
+            let nudged_recently =
+                |at: u64| at.saturating_add(DIRECT_SEND_NUDGE_MIN_MS) > now.mono_ms;
+            if nudged
+                .get(&recipient_hex)
+                .is_some_and(|&at| nudged_recently(at))
+            {
+                return false;
+            }
+            // Only recent nudges are kept, so the map stays small.
+            nudged.retain(|_, at| nudged_recently(*at));
+        }
+        let matched = self
+            .outbox()
             .nudge(now.mono_ms, |o| o.recipient == recipient_hex)
-            .await
+            .await;
+        if matched {
+            self.nudged().insert(recipient_hex, now.mono_ms);
+        }
+        matched
     }
 
     /// All held obligations (test view).
@@ -1171,6 +1220,7 @@ impl DirectSendOutbox {
                 || part_bytes.saturating_add(size) > caps.per_partition_bytes
                 || total_count >= caps.total
                 || total_bytes.saturating_add(size) > caps.total_bytes
+                || !self.attempt_room(&entries, request_id)
             {
                 return EnqueueOutcome::Full;
             }
@@ -1182,6 +1232,11 @@ impl DirectSendOutbox {
             if let Err(e) = self.commit_ledger(|ledger, _| ledger.forget(&id)).await {
                 return EnqueueOutcome::WriteFailed(e);
             }
+        }
+        // A new send under this key: an outcome an earlier pass could not
+        // write was about a send that is gone.
+        if let Some(id) = request_id {
+            self.unwritten().remove(&id);
         }
         // Due at once on this process's monotonic clock.
         obligation.next_retry_at_ms = 0;
@@ -1197,6 +1252,30 @@ impl DirectSendOutbox {
             }
             Err(e) => EnqueueOutcome::WriteFailed(e.to_string()),
         }
+    }
+
+    /// Is there room in the attempt memory for one more request id? Every
+    /// held send without an attempt record will need one, so they count
+    /// too. Refusing here keeps the promise that an attempt record lasts
+    /// [`DIRECT_SEND_OUTCOMES_KEEP_MS`]: [`TerminalLedger::note_attempt`]
+    /// then never evicts one by count.
+    fn attempt_room(
+        &self,
+        entries: &OutboxMap<DirectSendObligation>,
+        request_id: Option<[u8; 16]>,
+    ) -> bool {
+        let mut terminal = self.terminal();
+        terminal.prune(now_unix_ms());
+        if request_id.is_some_and(|id| terminal.attempts.contains_key(&id)) {
+            return true;
+        }
+        let pending = entries
+            .values()
+            .flatten()
+            .filter_map(DirectSendObligation::request_id_bytes)
+            .filter(|id| !terminal.attempts.contains_key(id))
+            .count();
+        terminal.attempts.len().saturating_add(pending) < DIRECT_SEND_OUTCOMES_CAP
     }
 
     /// Record `cancelled` durably for the held obligation `request_id` to
@@ -1358,6 +1437,23 @@ impl DirectSendOutbox {
         }
     }
 
+    /// Drop unwritten outcomes whose send is no longer held (cancelled or
+    /// dropped since), so a later send under the same key starts fresh.
+    async fn forget_unwritten_not_held(&self) {
+        if self.unwritten().is_empty() {
+            return;
+        }
+        let held: HashSet<[u8; 16]> = self
+            .entries
+            .read()
+            .await
+            .values()
+            .flatten()
+            .filter_map(DirectSendObligation::request_id_bytes)
+            .collect();
+        self.unwritten().retain(|id, _| held.contains(id));
+    }
+
     fn clear_in_flight(&self, request_ids: &[[u8; 16]]) {
         let mut in_flight = self.in_flight();
         for request_id in request_ids {
@@ -1392,6 +1488,7 @@ impl DirectSendOutbox {
         // Selection runs under the admission lock and marks each chosen
         // send in flight, so a cancel, block or enqueue sees the attempt.
         let admission = self.admission.lock().await;
+        self.forget_unwritten_not_held().await;
         let due = self.due(now).await;
         if due.is_empty() {
             return;
@@ -1414,6 +1511,11 @@ impl DirectSendOutbox {
             let digest = obligation.payload_digest();
             // The ledger runs on the wall clock it records with.
             let recorded = self.terminal().get(&request_id, now_unix_ms());
+            let unwritten_outcome = self
+                .unwritten()
+                .get(&request_id)
+                .filter(|(_, d)| *d == digest)
+                .map(|(outcome, _)| outcome.clone());
             if recorded.is_some_and(|(_, ended)| ended == digest) {
                 finished.push(obligation);
             } else if ledger(&request_id).delivered_bytes(&digest) {
@@ -1421,6 +1523,10 @@ impl DirectSendOutbox {
                     obligation,
                     (request_id, DirectSendTerminal::Delivered, digest),
                 ));
+            } else if let Some(outcome) = unwritten_outcome {
+                // An earlier pass decided this send but could not write the
+                // outcome: write it again, send nothing.
+                ending.push((obligation, (request_id, outcome, digest)));
             } else if now.wall_ms >= obligation.deliver_until_ms {
                 ending.push((
                     obligation,
@@ -1525,13 +1631,29 @@ impl DirectSendOutbox {
         }
 
         // Outcomes first: an obligation leaves the outbox only once its
-        // outcome is durable. A failed write keeps them all held; the next
-        // pass repeats (a delivery is then found in the receipt ledger).
+        // outcome is durable. A failed write keeps them all held, and the
+        // outcomes are kept in memory: the next pass writes them again and
+        // sends none of those bytes.
         let outcomes: Vec<Outcome> = ending.iter().map(|(_, outcome)| outcome.clone()).collect();
         let mut resolved = finished;
-        match self.record_terminal(outcomes).await {
-            Ok(()) => resolved.extend(ending.into_iter().map(|(o, _)| o)),
-            Err(e) => tracing::error!("#1109: outcomes not recorded; sends stay held: {e}"),
+        match self.record_terminal(outcomes.clone()).await {
+            Ok(()) => {
+                {
+                    let mut unwritten = self.unwritten();
+                    for (request_id, _, _) in &outcomes {
+                        unwritten.remove(request_id);
+                    }
+                }
+                resolved.extend(ending.into_iter().map(|(o, _)| o));
+            }
+            Err(e) => {
+                tracing::error!("#1109: outcomes not recorded; sends stay held: {e}");
+                self.unwritten().extend(
+                    outcomes
+                        .into_iter()
+                        .map(|(request_id, outcome, digest)| (request_id, (outcome, digest))),
+                );
+            }
         }
         match self
             .outbox()
