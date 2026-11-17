@@ -553,10 +553,10 @@ pub(crate) fn doctor_bundle_default_path() -> Result<std::path::PathBuf> {
 }
 
 /// Where a `--bundle` write goes (#1354): the resolved path plus whether
-/// the name was generated (bare flag). A generated name is written with
-/// `create_new`, so a second bare run in the same second — or a file (or
-/// symlink) already sitting at the seconds-stamped name — is an error,
-/// not a silent replacement.
+/// the name was generated (bare flag). Every target is written with
+/// `create_new`, so a second bare run in the same second, or a file (or
+/// symlink) already at the path, is an error, not a silent replacement;
+/// `generated_name` only picks the error hint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DoctorBundleTarget {
     pub(crate) path: std::path::PathBuf,
@@ -583,20 +583,21 @@ pub(crate) fn resolve_doctor_bundle_path(
     }))
 }
 
-/// The gated `verdict.inputs` fields as JSON pointers — the same list
-/// [`crate::server::health_verdict::redact_health_detail`] strips, mirrored
-/// here for the full-detail detection below. A server-side addition there
-/// must be reflected here (the mock tests plant every pointer).
-const GATED_HEALTH_DETAIL_POINTERS: &[&str] = &[
-    "/verdict/inputs/disk/free_bytes",
-    "/verdict/inputs/disk/total_bytes",
-    "/verdict/inputs/upgrade/latest_version",
-    "/verdict/inputs/identity/user_present",
-    "/verdict/inputs/log/errors",
-    "/verdict/inputs/send_failure_rate/attempts",
-    "/verdict/inputs/send_failure_rate/failed",
-    "/verdict/inputs/send_failure_rate/rate",
-];
+/// Whether a `/health` body carries any gated `verdict.inputs` field —
+/// read from [`crate::server::health_verdict::GATED_HEALTH_DETAIL`], the
+/// same list the server redaction strips, so the two cannot drift.
+fn health_body_has_gated_detail(body: &serde_json::Value) -> bool {
+    let Some(inputs) = body.pointer("/verdict/inputs") else {
+        return false;
+    };
+    crate::server::health_verdict::GATED_HEALTH_DETAIL
+        .iter()
+        .any(|(input, keys)| {
+            inputs
+                .get(*input)
+                .is_some_and(|object| keys.iter().any(|key| object.get(*key).is_some()))
+        })
+}
 
 /// The `health` section of a bundle (#1354): doctor's one
 /// `?detail=redacted` fetch, redacted for the file. A daemon that honours
@@ -610,9 +611,7 @@ fn doctor_bundle_health_section(health: &Result<serde_json::Value>) -> serde_jso
     match health {
         Ok(body) => {
             let mut body = body.clone();
-            let served_full_detail = GATED_HEALTH_DETAIL_POINTERS
-                .iter()
-                .any(|pointer| body.pointer(pointer).is_some());
+            let served_full_detail = health_body_has_gated_detail(&body);
             crate::server::health_verdict::redact_health_detail(&mut body);
             if served_full_detail {
                 withhold_full_audience_reasons(&mut body);
@@ -656,40 +655,36 @@ fn doctor_bundle_value(
 /// Write one assembled doctor bundle (#1354): pretty JSON, then a read-back
 /// parse — the write-verify discipline the Windows autostart wrapper uses —
 /// so a truncated write surfaces as an error instead of a silently broken
-/// file. A generated name is created fresh (`create_new`, mode 0600 on
-/// unix) and never overwrites; an explicit path keeps ordinary
-/// output-file semantics (truncate). The one-line notice goes to stderr,
-/// keeping `--json` stdout to exactly one JSON value.
+/// file. Every target, generated or explicit, is created fresh: the open
+/// is `create_new` (`O_CREAT|O_EXCL`, which also refuses a symlink — even
+/// a dangling one — at the path) with mode 0600 set at open time on unix,
+/// so the bundle never replaces an existing file, never writes through a
+/// planted link, and is never briefly readable under the umask mode
+/// (#1997 review at 368b6f32c, finding 2). The one-line notice goes to
+/// stderr, keeping `--json` stdout to exactly one JSON value.
 fn write_doctor_bundle_value(value: serde_json::Value, target: &DoctorBundleTarget) -> Result<()> {
     let text = serde_json::to_string_pretty(&value).context("serialize doctor bundle")?;
-    let mut file = if target.generated_name {
-        std::fs::File::options()
-            .write(true)
-            .create_new(true)
-            .open(&target.path)
-    } else {
-        std::fs::File::options()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&target.path)
-    }
-    .with_context(|| format!("failed to write doctor bundle {}", target.path.display()))?;
-    // The bundle names ids and versions even redacted, so give a freshly
-    // generated artifact the same owner-local privacy as the other
-    // owner-local writers (peer evidence, storage) instead of the umask
-    // default.
+    let mut options = std::fs::File::options();
+    options.write(true).create_new(true);
+    // The bundle names ids and versions even redacted, so it gets the same
+    // owner-local privacy as the other owner-local writers (peer evidence,
+    // storage) instead of the umask default.
     #[cfg(unix)]
-    if target.generated_name {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&target.path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| {
-                format!(
-                    "failed to set mode on doctor bundle {}",
-                    target.path.display()
-                )
-            })?;
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    let mut file = options.open(&target.path).with_context(|| {
+        let hint = if target.generated_name {
+            "a file already has this generated name; run again in a moment"
+        } else {
+            "the path must not exist yet (an existing file or symlink is refused)"
+        };
+        format!(
+            "failed to create doctor bundle {} ({hint})",
+            target.path.display()
+        )
+    })?;
     file.write_all(text.as_bytes())
         .with_context(|| format!("failed to write doctor bundle {}", target.path.display()))?;
     drop(file);
@@ -2344,52 +2339,102 @@ mod tests {
         );
     }
 
-    /// #1997 review finding 4: a bare `--bundle` never overwrites — an
-    /// existing file at the generated name is an error and its bytes are
-    /// untouched — while an explicit path keeps overwrite semantics.
+    /// #1997 review findings 4 and (at 368b6f32c) 2: no `--bundle` target
+    /// overwrites. An existing file at a generated or an explicit path is
+    /// an error and its bytes are untouched.
     #[test]
-    fn doctor_bundle_generated_name_refuses_to_overwrite() {
+    fn doctor_bundle_refuses_to_overwrite_any_existing_file() {
         let report = unreachable_doctor_report("overwrite probe");
         let dir = tempfile::tempdir().expect("bundle dir");
 
-        let generated = dir
-            .path()
-            .join(doctor_bundle_default_filename(1_700_000_000));
-        std::fs::write(&generated, b"sentinel-bundle").expect("seed existing file");
-        let result = write_doctor_bundle(
-            serde_json::json!({ "status": "healthy" }),
-            &report,
-            &DoctorBundleTarget {
-                path: generated.clone(),
-                generated_name: true,
-            },
+        for (name, generated_name) in [
+            (doctor_bundle_default_filename(1_700_000_000), true),
+            ("explicit.json".to_string(), false),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"sentinel-bundle").expect("seed existing file");
+            let result = write_doctor_bundle(
+                serde_json::json!({ "status": "healthy" }),
+                &report,
+                &DoctorBundleTarget {
+                    path: path.clone(),
+                    generated_name,
+                },
+            );
+            assert!(
+                result.is_err(),
+                "generated_name={generated_name}: an existing file must be refused"
+            );
+            assert_eq!(
+                std::fs::read(&path).expect("seeded file still readable"),
+                b"sentinel-bundle",
+                "generated_name={generated_name}: the existing file's bytes are untouched"
+            );
+        }
+    }
+
+    /// #1997 review at 368b6f32c, finding 2: an explicit `--bundle` path
+    /// that is a symlink is refused — the write never follows the link,
+    /// neither to an existing file nor to a dangling target it would
+    /// create — and a fresh explicit path is created with mode 0600 at
+    /// open time, independent of the umask.
+    #[cfg(unix)]
+    #[test]
+    fn doctor_bundle_explicit_path_refuses_symlinks_and_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let report = unreachable_doctor_report("symlink probe");
+        let dir = tempfile::tempdir().expect("bundle dir");
+
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"victim-bytes").expect("seed victim");
+        let link_to_existing = dir.path().join("link-existing.json");
+        std::os::unix::fs::symlink(&victim, &link_to_existing).expect("symlink to victim");
+        let dangling_target = dir.path().join("not-yet.txt");
+        let link_dangling = dir.path().join("link-dangling.json");
+        std::os::unix::fs::symlink(&dangling_target, &link_dangling).expect("dangling symlink");
+
+        for link in [&link_to_existing, &link_dangling] {
+            let result = write_doctor_bundle(
+                serde_json::json!({ "status": "healthy" }),
+                &report,
+                &DoctorBundleTarget {
+                    path: link.clone(),
+                    generated_name: false,
+                },
+            );
+            assert!(
+                result.is_err(),
+                "{}: a symlink must be refused",
+                link.display()
+            );
+        }
+        assert_eq!(
+            std::fs::read(&victim).expect("victim readable"),
+            b"victim-bytes",
+            "the link target's bytes are untouched"
         );
         assert!(
-            result.is_err(),
-            "a generated name must refuse to overwrite an existing file"
-        );
-        assert_eq!(
-            std::fs::read(&generated).expect("seeded file still readable"),
-            b"sentinel-bundle",
-            "the existing file's bytes are untouched"
+            !dangling_target.exists(),
+            "the dangling link's target must not be created"
         );
 
-        let explicit = dir.path().join("explicit.json");
-        std::fs::write(&explicit, b"sentinel-bundle").expect("seed existing file");
+        let fresh = dir.path().join("fresh.json");
         write_doctor_bundle(
             serde_json::json!({ "status": "healthy" }),
             &report,
             &DoctorBundleTarget {
-                path: explicit.clone(),
+                path: fresh.clone(),
                 generated_name: false,
             },
         )
-        .expect("an explicit path overwrites");
-        assert_ne!(
-            std::fs::read(&explicit).expect("explicit bundle readable"),
-            b"sentinel-bundle",
-            "an explicit path keeps ordinary output-file semantics"
-        );
+        .expect("a fresh explicit path is written");
+        let mode = std::fs::metadata(&fresh)
+            .expect("fresh bundle metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the bundle is owner-only: {mode:o}");
     }
 
     /// `--dump-request` contacts no daemon (every fetch answers the

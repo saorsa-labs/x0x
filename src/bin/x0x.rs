@@ -80,7 +80,8 @@ enum Commands {
     Doctor {
         /// Write a redacted diagnostic bundle (owner-local, #1354) to this
         /// file. Optional value; a bare --bundle writes
-        /// ./x0x-doctor-bundle-<unix-secs>.json
+        /// ./x0x-doctor-bundle-<unix-secs>.json. The file must not exist
+        /// yet (an existing file or symlink is refused).
         //
         // No `default_missing_value`: clap's PathBuf parser rejects the
         // empty sentinel, and plain `num_args = 0..=1` already yields the
@@ -2439,8 +2440,8 @@ async fn run(
             // boundary: never silently target the default daemon.
             //
             // The raw `--bundle` flag value (bare vs explicit) travels to
-            // the lib (#1354): it resolves the path there and picks the
-            // no-overwrite rule for the generated name.
+            // the lib (#1354): it resolves the path there; every target is
+            // created fresh and never overwritten.
             return match DaemonClient::new(name, api, format) {
                 Ok(client) => {
                     commands::daemon::doctor(

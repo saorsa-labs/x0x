@@ -3,7 +3,8 @@
 //! Issue done-when: "A bundle has no keys, tokens or message content (a
 //! test checks this)." Seeds a real daemon fixture with every secret class
 //! — a KV value carrying a unique canary (message content), a live session
-//! token, the durable API token, and the machine/agent key files — runs the
+//! token, the durable API token, the machine/agent key files, and planted
+//! user-key, group-key (`mls_groups.bin`) and exec-ACL canaries — runs the
 //! real `x0x` CLI, and proves none of it appears in the written bundle.
 //! Positive controls prove the secrets really were in daemon state first,
 //! so the absence is redaction, not a seeding failure. The companion
@@ -57,9 +58,27 @@ struct SecretCanaries {
     machine_key: Vec<u8>,
     /// Raw bytes of <identity_dir>/agent.key.
     agent_key: Vec<u8>,
+    /// Canary bytes planted at <identity_dir>/user.key (the optional human
+    /// key is never auto-generated, so the fixture has none of its own).
+    user_key: Vec<u8>,
+    /// Canary bytes planted as group key material at
+    /// <data_dir>/mls_groups.bin (the MLS group store file).
+    group_key: Vec<u8>,
+    /// Canary command planted in an exec ACL file in the data dir.
+    exec_acl_command: String,
 }
 
 impl SecretCanaries {
+    /// Every key-file canary, by name.
+    fn key_files(&self) -> [(&'static str, &[u8]); 4] {
+        [
+            ("machine.key", &self.machine_key),
+            ("agent.key", &self.agent_key),
+            ("user.key", &self.user_key),
+            ("mls_groups.bin group key", &self.group_key),
+        ]
+    }
+
     /// Text needles searched over the bundle bytes: the string canaries
     /// raw (the kv canary also in base64 — the encoding its PUT wire form
     /// carries, so an embedded request body leaks it), plus the key
@@ -68,36 +87,34 @@ impl SecretCanaries {
     /// surfaces verbatim inside an embedded base64 key blob when its
     /// start offset lands on the encoder's 3-byte grid; one of three
     /// consecutive starts always does, whatever the blob's alignment.
-    fn text_needles(&self) -> Vec<(&'static str, String)> {
+    fn text_needles(&self) -> Vec<(String, String)> {
         let mut needles = vec![
-            ("kv canary value (raw)", self.kv_value.clone()),
-            ("kv canary value (base64)", b64(self.kv_value.as_bytes())),
-            ("session token (raw)", self.session_token.clone()),
-            ("api token (raw)", self.api_token.clone()),
+            ("kv canary value (raw)".to_string(), self.kv_value.clone()),
             (
-                "machine.key secret-half (hex)",
-                hex::encode(mid_key_slice(&self.machine_key)),
+                "kv canary value (base64)".to_string(),
+                b64(self.kv_value.as_bytes()),
             ),
             (
-                "agent.key secret-half (hex)",
-                hex::encode(mid_key_slice(&self.agent_key)),
+                "session token (raw)".to_string(),
+                self.session_token.clone(),
+            ),
+            ("api token (raw)".to_string(), self.api_token.clone()),
+            (
+                "exec ACL canary command (raw)".to_string(),
+                self.exec_acl_command.clone(),
             ),
         ];
-        for (name, file) in [
-            ("machine.key", &self.machine_key),
-            ("agent.key", &self.agent_key),
-        ] {
+        for (name, file) in self.key_files() {
+            needles.push((
+                format!("{name} secret-half (hex)"),
+                hex::encode(mid_key_slice(file)),
+            ));
             for phase in 0..3 {
                 let start = file.len() / 2 + phase;
-                let label = match (name, phase) {
-                    ("machine.key", 0) => "machine.key secret-half (base64, phase 0)",
-                    ("machine.key", 1) => "machine.key secret-half (base64, phase 1)",
-                    ("machine.key", 2) => "machine.key secret-half (base64, phase 2)",
-                    (_, 0) => "agent.key secret-half (base64, phase 0)",
-                    (_, 1) => "agent.key secret-half (base64, phase 1)",
-                    _ => "agent.key secret-half (base64, phase 2)",
-                };
-                needles.push((label, b64(&file[start..start + KEY_CANARY_LEN])));
+                needles.push((
+                    format!("{name} secret-half (base64, phase {phase})"),
+                    b64(&file[start..start + KEY_CANARY_LEN]),
+                ));
             }
         }
         needles
@@ -106,12 +123,28 @@ impl SecretCanaries {
     /// Byte needles searched over the raw bundle bytes: the key-file
     /// secret-half slices, catching non-UTF8 embeddings a text scan
     /// over the lossy string could miss.
-    fn byte_needles(&self) -> Vec<(&'static str, &[u8])> {
-        vec![
-            ("machine.key secret-half", mid_key_slice(&self.machine_key)),
-            ("agent.key secret-half", mid_key_slice(&self.agent_key)),
-        ]
+    fn byte_needles(&self) -> Vec<(String, &[u8])> {
+        self.key_files()
+            .into_iter()
+            .map(|(name, file)| (format!("{name} secret-half"), mid_key_slice(file)))
+            .collect()
     }
+}
+
+/// Plant `len` random canary bytes at `path` (creating its parent) and
+/// read them back — the positive control that the secret is on disk
+/// beside the daemon's own state when doctor runs.
+fn plant_canary_file(path: &Path, len: usize) -> Vec<u8> {
+    let bytes: Vec<u8> = (0..len).map(|_| rand::random::<u8>()).collect();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .unwrap_or_else(|e| panic!("create {}: {e}", parent.display()));
+    }
+    std::fs::write(path, &bytes).unwrap_or_else(|e| panic!("plant {}: {e}", path.display()));
+    let read_back =
+        std::fs::read(path).unwrap_or_else(|e| panic!("read back {}: {e}", path.display()));
+    assert_eq!(read_back, bytes, "{}: planted canary", path.display());
+    bytes
 }
 
 /// Create a signed KV store and write a message-content canary value into
@@ -331,12 +364,40 @@ async fn doctor_bundle_contains_no_keys_tokens_or_message_content() {
     assert!(!api_token.is_empty(), "api token canary");
 
     let identity_dir = d.data_dir().join("identity");
+
+    // #1997 review at 368b6f32c (minor): also plant a user key, group key
+    // material and an exec ACL beside the daemon's own state. The fixture
+    // has no user key (never auto-generated) and cannot write the system
+    // exec ACL path, so these are canary files at the owner-local paths.
+    let user_key = plant_canary_file(&identity_dir.join("user.key"), 4096);
+    let group_key = plant_canary_file(&d.data_dir().join("mls_groups.bin"), 4096);
+    let exec_acl_command = format!("/usr/bin/x0x-canary-exec-{:016x}", rand::random::<u64>());
+    let exec_acl_path = d.data_dir().join("exec-acl.toml");
+    std::fs::write(
+        &exec_acl_path,
+        format!(
+            "[exec]\nenabled = true\n\n[[exec.allow]]\nagent_id = \"{}\"\nmachine_id = \"{}\"\ncommands = [\"{exec_acl_command}\"]\n",
+            "0".repeat(64),
+            "0".repeat(64)
+        ),
+    )
+    .unwrap_or_else(|e| panic!("plant {}: {e}", exec_acl_path.display()));
+    assert!(
+        std::fs::read_to_string(&exec_acl_path)
+            .expect("read back planted exec ACL")
+            .contains(&exec_acl_command),
+        "exec ACL canary must be on disk before doctor runs"
+    );
+
     let secrets = SecretCanaries {
         kv_value: kv_canary,
         session_token,
         api_token,
         machine_key: read_identity_file(&identity_dir, "machine.key").await,
         agent_key: read_identity_file(&identity_dir, "agent.key").await,
+        user_key,
+        group_key,
+        exec_acl_command,
     };
 
     // ── `doctor --bundle <path>` with an explicit path ──────────────────

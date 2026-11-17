@@ -443,9 +443,10 @@ keys, tokens or message content: the writer embeds only the redacted
 `/health` body and the check summaries, never route bodies that carry
 store values, history or auth material (a daemon-seeded test checks
 this). A bare `--bundle` writes `x0x-doctor-bundle-<unix-secs>.json`
-in the current directory and refuses to overwrite an existing file at
-that generated name (it is created fresh, mode 0600 on unix); an
-explicit `--bundle <path>` overwrites as before. The file stays on the
+in the current directory; `--bundle <path>` writes that path. Either
+way the file is created fresh, with mode 0600 set at open time on
+unix: an existing file or a symlink at the path is refused, never
+overwritten or followed. The file stays on the
 owner's machine: this slice adds no sending (`POST /report` and opt-in
 maintainer delivery are later slices of #1354).
 
