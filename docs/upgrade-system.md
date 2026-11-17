@@ -624,8 +624,19 @@ binds the launcher must set `RestartPreventExitStatus=64`: a wrong
 argv contract and the exit codes are provisional and dormant. They are
 frozen before `ENABLED = true`, like the fd 3 boot contract. The main
 loop (`start.rs`, #1378) owns the trial only when the engine is enabled
-and the complete inventory issuer gives it a host; there is no issuer yet,
-so every start is the passthrough. An owned start installs its SIGTERM and
+and the issuer gives it a host. Only the trial form of the argv,
+`x0x-launcher --host-root /abs/data-root --instance ID -- /abs/x0xd [args]`,
+consults the issuer (`issuer.rs`): it reads `<host-root>/upgrade-journal.json`,
+which must be a 0600 regular file of the launcher's account in a canonical
+root that no other account can write. No journal, or one before the swap
+or settled (`staged`, `probed`, `prepared`, `idle`, `superseded`), is an
+ordinary start. An in-flight journal must name the instance, with that
+participant's data root equal to the host root, its executable equal to
+the daemon path and its arguments (`argv[1..]`) equal to the daemon's;
+anything else, a journal between the daemon and CLI swap, or one that
+cannot be read is an issuer error. The writer of that journal is the M2
+prepare producer (#2012), which does not exist yet, so with the engine
+held every start is still the passthrough. An owned start installs its SIGTERM and
 SIGINT handler only then, and exits 0 after a stop, 75 when the daemon
 exits or a step can be retried (an issuer error never falls back to the
 passthrough), and 78 (`EX_CONFIG`) when no automatic start is allowed

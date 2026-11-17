@@ -53,21 +53,32 @@ impl Issuer for NoIssuer {
 /// One start of the installed launcher. `arm` installs the stop handler;
 /// it runs only once an issuer gives this launcher a trial. A passthrough
 /// never catches a signal, so a stop before the `exec` still ends the
-/// launcher as it ends a direct job. `stop` reads the stop flag.
+/// launcher as it ends a direct job. `stop` reads the stop flag. Only the
+/// argv's trial form (`--host-root ... --instance ...`) consults the
+/// journal issuer; the plain form is always a passthrough.
 pub(crate) fn start(
-    command: &forward::DaemonCommand,
+    args: &issuer::LauncherArgs,
     arm: impl FnOnce(),
     stop: impl FnMut() -> bool,
 ) -> Start {
     if !ENABLED {
         return Start::Passthrough;
     }
-    start_with(&NoIssuer, command, arm, Clock::now, stop, || {
-        std::thread::sleep(std::time::Duration::from_millis(100))
-    })
+    let pause = || std::thread::sleep(std::time::Duration::from_millis(100));
+    match &args.trial {
+        None => start_with(&NoIssuer, &args.command, arm, Clock::now, stop, pause),
+        Some(trial) => start_with(
+            &issuer::JournalIssuer(trial),
+            &args.command,
+            arm,
+            Clock::now,
+            stop,
+            pause,
+        ),
+    }
 }
 
-fn start_with(
+pub(super) fn start_with(
     issuer: &impl Issuer,
     command: &forward::DaemonCommand,
     arm: impl FnOnce(),
@@ -258,10 +269,14 @@ mod tests {
         // ENABLED = false; the held engine never consults an issuer or
         // installs a stop handler.
         let mut armed = false;
-        assert_eq!(
-            start(&command(), || armed = true, || false),
-            Start::Passthrough
-        );
+        let args = issuer::LauncherArgs {
+            trial: Some(issuer::TrialArgs {
+                host_root: "/nonexistent".into(),
+                instance: "alice".into(),
+            }),
+            command: command(),
+        };
+        assert_eq!(start(&args, || armed = true, || false), Start::Passthrough);
         assert!(!armed);
     }
 

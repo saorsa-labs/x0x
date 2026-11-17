@@ -34,8 +34,8 @@ fn main() -> std::process::ExitCode {
     #[cfg(unix)]
     {
         let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-        let command = match launcher::forward::daemon_argv(&argv) {
-            Ok(command) => command,
+        let args = match launcher::issuer::launcher_argv(&argv) {
+            Ok(args) => args,
             Err(error) => {
                 eprintln!("x0x-launcher: {error}");
                 return std::process::ExitCode::from(EXIT_USAGE);
@@ -46,14 +46,14 @@ fn main() -> std::process::ExitCode {
             libc::signal(libc::SIGTERM, stop as *const () as libc::sighandler_t);
             libc::signal(libc::SIGINT, stop as *const () as libc::sighandler_t);
         };
-        match launcher::start::start(&command, arm, || STOP.load(Ordering::Relaxed)) {
+        match launcher::start::start(&args, arm, || STOP.load(Ordering::Relaxed)) {
             launcher::start::Start::Exit(status) => return std::process::ExitCode::from(status),
             launcher::start::Start::Passthrough => {}
         }
-        let error = launcher::forward::exec_daemon(&command);
+        let error = launcher::forward::exec_daemon(&args.command);
         eprintln!(
             "x0x-launcher: cannot exec {}: {error}",
-            command.executable.display()
+            args.command.executable.display()
         );
         std::process::ExitCode::from(EXIT_TEMPFAIL)
     }

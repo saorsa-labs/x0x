@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **The dormant launcher reads and verifies the host journal (#1378; A14
+  amendment of 17 Nov 2026).** A unit can name the host root and instance in
+  the launcher argv (`--host-root <data_root> --instance <id> -- /abs/x0xd
+  ...`). The launcher then reads `<host-root>/upgrade-journal.json` (0600,
+  owned by its account, in a root no other account can write) and owns the
+  trial only for an in-flight journal that names it with the same executable,
+  arguments and data root. Anything it cannot verify exits 75. The writer of
+  that journal is #2012; with the engine held every start is still the
+  passthrough.
 - **The dormant launcher has process custody on macOS (#1379 slice 1; A14
   amendment of 17 Nov 2026).** Process identity (PID, start time, boot) comes
   from libproc, zombies included; stopping another launcher's process pins it
