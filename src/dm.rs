@@ -2226,7 +2226,8 @@ pub struct OrphanDurableAck {
     pub request_id: [u8; 16],
     /// The authenticated agent that sent the ACK.
     pub sender: AgentId,
-    /// The authenticated machine that sent the ACK.
+    /// The machine that sent the ACK: the attested or retained-binding
+    /// machine, else the sender's unattested claim.
     pub machine: MachineId,
 }
 

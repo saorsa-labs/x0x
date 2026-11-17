@@ -1619,3 +1619,43 @@ fn issue2007_attempt_machines_round_trip_the_sidecar() {
     let bad = serde_json::to_vec(&bad).expect("encode");
     assert!(TerminalLedger::from_bytes(&bad, NOW).is_err());
 }
+
+/// WHY: #2007 each of the first `DIRECT_SEND_ATTEMPT_MACHINES_CAP` pinned
+/// machines can settle, a machine past the cap cannot, and a sidecar
+/// naming more machines than the cap fails to load.
+#[test]
+fn issue2007_attempt_machines_are_capped() {
+    let rid = [0x5b; 16];
+    let recipient = hex::encode([2u8; 32]);
+    let machines: Vec<MachineId> = (0..=DIRECT_SEND_ATTEMPT_MACHINES_CAP)
+        .map(|i| MachineId([0xc0 + i as u8; 32]))
+        .collect();
+    let mut ledger = TerminalLedger::default();
+    ledger.note_attempt(rid, &recipient, [7; 32], NOW);
+    for machine in &machines {
+        ledger.note_machine(&rid, *machine);
+    }
+    let bytes = serde_json::to_vec(&ledger.to_file()).expect("encode");
+    let loaded = TerminalLedger::from_bytes(&bytes, NOW).expect("decode");
+    let (kept, past_cap) = machines.split_at(DIRECT_SEND_ATTEMPT_MACHINES_CAP);
+    for machine in kept {
+        assert_eq!(
+            loaded.only_attempted(&rid, &recipient, machine),
+            Some([7; 32])
+        );
+    }
+    assert_eq!(loaded.only_attempted(&rid, &recipient, &past_cap[0]), None);
+
+    let over = serde_json::json!({
+        "version": 1,
+        "attempts": [{
+            "request_id": hex::encode(rid),
+            "recipient": recipient,
+            "digests": [hex::encode([7u8; 32])],
+            "machines": machines.iter().map(|m| hex::encode(m.0)).collect::<Vec<_>>(),
+            "last_ms": NOW,
+        }],
+    });
+    let over = serde_json::to_vec(&over).expect("encode");
+    assert!(TerminalLedger::from_bytes(&over, NOW).is_err());
+}
