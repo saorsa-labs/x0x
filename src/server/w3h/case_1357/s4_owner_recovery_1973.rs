@@ -9,7 +9,10 @@
 //! mandate naming B answers `202 waiting_for_recovery_member`. Desired:
 //! B commits the recovery (on C, B is an Admin and A is Removed), and B
 //! then works E's own S4 row (on C, E is Removed) under the admin the
-//! recovery seated. On `main` the ADR-0038 seal check refused B's commit
+//! recovery seated. Each commit advances the TreeKEM epoch one step —
+//! the recovery to n-1 leaves with E still seated, E's own row to n-2
+//! — and after that row commits, E can no longer open the group's
+//! ciphertext. On `main` the ADR-0038 seal check refused B's commit
 //! while revoked E was seated, and E's eviction waited for the eligible
 //! admin the recovery would have seated, so the two waits on each other
 //! and the group stayed without an admin forever (the issue's deadlock);
@@ -23,7 +26,7 @@ use super::receipt::{Receipt, Verdict};
 use super::*;
 use crate::groups::eviction::S4Timing;
 use crate::identity::UserKeypair;
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use serde_json::json;
 
 const FOUR_E: &[&str] = &["A", "B", "C", "E"];
@@ -219,6 +222,40 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     let b_hex = sim.agent_hex("B")?;
     let e_hex = sim.agent_hex("E")?;
     settled(sim, FOUR_E, &group, &a).await?;
+    // Baseline for the two commits this arm measures (`s4ab`'s
+    // recovery_scenario): one epoch and leaf count, with E seated.
+    let base = view(sim, "C", &group, &a).await?;
+    let e0 = base.epoch.context("C has no live TreeKEM group")?;
+    let leaves0 = base.leaves.context("C has no live TreeKEM group")?;
+    let e_base = view(sim, "C", &group, &e).await?;
+    receipt.evidence(
+        "home_treekem_group_settled_with_e_seated",
+        e_base.lists_b
+            && e_base.b_state.as_deref() == Some("Active")
+            && u32::try_from(FOUR_E.len()).is_ok_and(|seats| seats == leaves0)
+            && !base.quarantined,
+        format!(
+            "e0={e0} leaves0={leaves0}; C about A: {}; C about E: {}",
+            base.describe(),
+            e_base.describe()
+        ),
+        at(sim),
+    );
+    // E opens the probe at e0, so a later refusal on E means exclusion,
+    // not a broken path (the parent case's data-plane control).
+    let control = match encrypt(sim, "A", &group).await? {
+        Ok(ciphertext) => (
+            decrypts(sim, "C", &group, &ciphertext).await?,
+            decrypts(sim, "E", &group, &ciphertext).await?,
+        ),
+        Err(error) => ((false, error.clone()), (false, error)),
+    };
+    receipt.evidence(
+        "c_and_e_decrypt_at_e0_before_the_trigger",
+        control.0 .0 && control.1 .0,
+        format!("{}; {}", control.0 .1, control.1 .1),
+        at(sim),
+    );
     receipt.setup_done(at(sim));
     past_sync_wait(sim, receipt).await?;
 
@@ -281,21 +318,35 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         statuses(sim, &["B", "C"], &group).await?
     ));
 
-    // B commits the recovery: on C, B is an Admin and A is Removed.
+    // B commits the recovery: on C, B is an Admin and A is Removed. The
+    // same poll also reads C's view of E: when the poll catches the
+    // commit before B works E's own row, E is still seated and Active
+    // on C — #1973's precondition, recorded in the note. C's
+    // convergence can batch both commits into one poll, so the gated
+    // proof of the precondition is the durable one below (B's S4 rows:
+    // E's eviction lands one epoch after the recovery).
     let started = sim.fabric().now();
     let mut committed_at: Option<Duration> = None;
+    let mut e_active_when_committed: Option<bool> = None;
     let committed = sim
         .until("B commits the owner recovery", RECOVERY, async |s: &Sim| {
+            let e_on_c = views_now(s, &["C"], &group, &e).await;
             let done = sees_admin(s, "C", &group, "B").await.unwrap_or(false)
                 && views_now(s, &["C"], &group, &a).await.is_ok_and(|seen| {
                     seen.iter().all(|(_, view)| {
-                        view.as_ref().is_some_and(|view| {
-                            !view.lists_b && view.b_state.as_deref() == Some("Removed")
-                        })
+                        view.as_ref()
+                            .is_some_and(|view| view.b_state.as_deref() == Some("Removed"))
                     })
                 });
             if done {
                 committed_at.get_or_insert(s.fabric().now().saturating_sub(started));
+                e_active_when_committed.get_or_insert(e_on_c.is_ok_and(|seen| {
+                    seen.iter().all(|(_, view)| {
+                        view.as_ref().is_some_and(|view| {
+                            view.lists_b && view.b_state.as_deref() == Some("Active")
+                        })
+                    })
+                }));
             }
             done
         })
@@ -303,13 +354,18 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         .is_ok();
     receipt.note(format!(
         "refused E recovery_member_ineligible {refused_e}; B mandate signed {signed}; recovery \
-         committed {committed} at {committed_at:?}; C about A: {}; S4 status {}",
+         committed {committed} at {committed_at:?}; E active at the commit \
+         {e_active_when_committed:?}; C about A: {}; S4 status {}",
         describe_all(&views(sim, &["C"], &group, &a).await?),
         statuses(sim, &["B", "C"], &group).await?
     ));
+    receipt.note(format!(
+        "C listed E active at the commit: {e_active_when_committed:?}"
+    ));
 
     // B, now the eligible admin, works E's own S4 row: on C, E is
-    // Removed ("B commits and later evicts E", #1973).
+    // Removed ("B commits and later evicts E", #1973) and the exclusion
+    // advanced the epoch a second step, to n-2 leaves.
     let e_evicted = sim
         .until(
             "B ejects the seated revoked member E",
@@ -318,7 +374,11 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
                 views_now(s, &["C"], &group, &e).await.is_ok_and(|seen| {
                     seen.iter().all(|(_, view)| {
                         view.as_ref().is_some_and(|view| {
-                            !view.lists_b && view.b_state.as_deref() == Some("Removed")
+                            !view.lists_b
+                                && view.b_state.as_deref() == Some("Removed")
+                                && view.epoch == Some(e0 + 2)
+                                && view.leaves == Some(leaves0 - 2)
+                                && !view.quarantined
                         })
                     })
                 })
@@ -330,6 +390,72 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         "E evicted on C {e_evicted}; C about E: {}",
         describe_all(&views(sim, &["C"], &group, &e).await?)
     ));
+    // The exclusion settles at exactly e0 + 2 with two fewer leaves: one
+    // epoch step per commit, no duplicate rekey (`s4ab`'s settle read at
+    // exactly e0 + 1, one step further here).
+    pause(sim, "the second exclusion settles", SETTLE).await?;
+    let end = views(sim, &["C"], &group, &e).await?;
+    let e_end_excluded = all_at(&end, e0 + 2)
+        && end.iter().all(|(_, view)| {
+            view.as_ref().is_some_and(|view| {
+                !view.lists_b
+                    && view.b_state.as_deref() == Some("Removed")
+                    && view.leaves == Some(leaves0 - 2)
+            })
+        });
+    receipt.evidence(
+        "c_holds_exactly_e0_plus_2_with_two_fewer_leaves_after_settle",
+        e_end_excluded,
+        describe_all(&end),
+        at(sim),
+    );
+    // The crypto plane agrees: B's new ciphertext opens on C and no
+    // longer on the ejected member E (`s4ab`'s `plane_ok`).
+    let (c_after, e_after) = match encrypt(sim, "B", &group).await? {
+        Ok(ciphertext) => (
+            decrypts(sim, "C", &group, &ciphertext).await?,
+            decrypts(sim, "E", &group, &ciphertext).await?,
+        ),
+        Err(error) => ((false, error.clone()), (false, error)),
+    };
+    let plane_ok = c_after.0 && !e_after.0;
+    receipt.evidence(
+        "e_cannot_decrypt_after_its_own_eviction_row_commits",
+        plane_ok,
+        format!("{}; {}", c_after.1, e_after.1),
+        at(sim),
+    );
+    // #1973's precondition, durably: B's own S4 rows show the recovery
+    // (A's row) complete in epoch e0 + 1 while E was still seated — E's
+    // own row then completes one epoch later, under the admin the
+    // recovery seated (its designated_admin). A removed member has no
+    // leaf to evict in a later epoch, so E's row completing at e0 + 2
+    // is only possible if E was seated when the recovery committed.
+    let s4 = eviction_status(sim, "B", &group).await?;
+    let row = |target: &str| {
+        s4["revocation_evictions"].as_array().and_then(|rows| {
+            rows.iter().find(|row| {
+                row["target"]
+                    .as_str()
+                    .is_some_and(|id| id.eq_ignore_ascii_case(target))
+            })
+        })
+    };
+    let recovery_row = row(&a_hex).cloned().unwrap_or(serde_json::Value::Null);
+    let eviction_row = row(&e_hex).cloned().unwrap_or(serde_json::Value::Null);
+    let rows_prove_precondition = recovery_row["phase"].as_str() == Some("complete")
+        && recovery_row["result_epoch"].as_u64() == Some(e0 + 1)
+        && eviction_row["phase"].as_str() == Some("complete")
+        && eviction_row["result_epoch"].as_u64() == Some(e0 + 2)
+        && eviction_row["designated_admin"]
+            .as_str()
+            .is_some_and(|id| id.eq_ignore_ascii_case(&b_hex));
+    receipt.evidence(
+        "bs_rows_prove_e_was_seated_when_the_recovery_committed",
+        rows_prove_precondition,
+        format!("A's row: {recovery_row}; E's row: {eviction_row}"),
+        at(sim),
+    );
 
     receipt.request_delivered(
         "c_answered_the_mandates_and_a_reached_c",
@@ -364,7 +490,14 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     }
     receipt.finish(
         FINAL,
-        waits_typed && refused_e && signed && committed && e_evicted,
+        waits_typed
+            && refused_e
+            && signed
+            && committed
+            && e_evicted
+            && e_end_excluded
+            && plane_ok
+            && rows_prove_precondition,
         at(sim),
     );
     Ok(())

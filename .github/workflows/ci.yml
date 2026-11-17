@@ -1113,6 +1113,8 @@ jobs:
           --expect w3h_1357_s4_certificate_rebind_post_cutoff=GREEN
           --require w3h_1357_s4_owner_recovery
           --expect w3h_1357_s4_owner_recovery=GREEN
+          --require w3h_1357_s4_owner_recovery_revoked_member_1973
+          --expect w3h_1357_s4_owner_recovery_revoked_member_1973=GREEN
           --require w3h_1023_red_baseline_all_holders_offline_wait_is_typed_then_resumes
           --expect w3h_1023_red_baseline_all_holders_offline_wait_is_typed_then_resumes=RED
           --require w3h_1023_restart_one_holder_online_admits
