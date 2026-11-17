@@ -1030,47 +1030,76 @@ no gossip, binds nothing, and takes no instance lock.
    payload; both paths build it through the same monitor funnel.
 2. **Gossip listener**: Receive manifests on `x0x/release` topic, verify signature, rebroadcast, apply if newer
 3. **GitHub poller**: Periodic fallback poll, broadcast discovered manifests to gossip
-4. **Announce on first observation** (#1169): the publish points are the
-   startup manifest broadcast (`broadcast_current_manifest`, on every
-   launch), the fallback poll, the gossip relay and a manual
-   `/upgrade/apply`. The startup check and the read-only `/upgrade` check
-   announce nothing — the former's discovery is covered by the manifest
-   broadcast, and for the latter gossip self-delivery would feed this
-   node's own apply owner, i.e. a background install triggered by a read
-   (Engineer ruling 3 Nov 2026 17:40 GMT).
-   `/upgrade/apply` applies the release it announces, so it records its
+4. **Announce on first observation** (#1169): a node announces a release
+   at four publish points:
+
+   - the startup manifest broadcast (`broadcast_current_manifest`, on
+     every launch)
+   - the fallback poll
+   - the gossip relay
+   - a manual `/upgrade/apply`
+
+   The startup check and the read-only `/upgrade` check announce
+   nothing. The startup check's discovery is covered by the manifest
+   broadcast. For the read-only check, gossip self-delivery would feed
+   this node's own apply owner — a background install triggered by a
+   read (Engineer ruling 3 Nov 2026 17:40 GMT).
+
+   `/upgrade/apply` applies the release it announces. It records its
    payload as apply-route-owned in the shared self-published tracker
-   before publishing: while the tracker holds that claim, any gossip
+   before publishing. While the tracker holds that claim, any gossip
    copy of those bytes — the announcing node's own echo or a peer's —
    neither rebroadcasts nor queues a second apply on the background
-   owner. Echoes of the node's non-apply-route publishes (the boot
-   broadcast, the fallback poll, the gossip relay) are not rebroadcast
-   either, but they are still submitted to the owner, whose version
-   dedup absorbs them. The tracker entry that holds the claim expires
-   30 minutes after its latest record: a later record of the same bytes
-   — the boot broadcast, a fallback publish or a driver rebroadcast —
-   restarts that clock. The default rollout window is 60 minutes,
-   so the entry can expire while the apply still waits. A gossip copy
-   of the payload is then treated like a peer's copy and can queue a
-   background apply again. The claim is released on drop while the
-   apply was never admitted and nothing will resume the install: a
-   failed apply with no probe retry scheduled, a no-op apply, a client
-   disconnect during the apply wait, or a panic all release it, and
-   gossip copies reach the owner again. A failed apply that schedules
-   a probe retry keeps the claim — the retry still owns the install
-   for this version — as does every admitted apply: once the apply's
-   blocking worker is admitted — host locks held, replacement and
-   restart owned by the worker — a dropped handler no longer releases
-   the claim: the install still runs, and a gossip copy arriving in
-   the seconds before the restart must not queue a second apply of it.
-   A real rolled-back apply is always on this post-admission side (the
-   rollback runs after admission), so it keeps the claim. A successful
-   apply keeps the claim; every other post-admission exit leaves it to
-   expire with the tracker entry. After a fast failure, the node's own
-   gossip echo can still arrive after the claim is released and queue a
-   background-owner attempt of the same release. The owner's 30-minute
-   `failed_at` backoff bounds the rate of those attempts, not their
-   count: at most one new attempt per 30 minutes.
+   owner.
+
+   Echoes of the node's non-apply-route publishes — the boot broadcast,
+   the fallback poll, the gossip relay — are not rebroadcast either.
+   They still reach the owner, and the owner's version dedup absorbs
+   them.
+
+   The tracker entry that holds the claim expires 30 minutes after its
+   latest record. A later record of the same bytes — the boot
+   broadcast, a fallback publish or a driver rebroadcast — restarts
+   that clock. The default rollout window is 60 minutes, so the entry
+   can expire while the apply still waits. A gossip copy of the payload
+   is then treated like a peer's copy and can queue a background apply
+   again.
+
+   The handler's drop releases the claim only when the apply was never
+   admitted and nothing will resume the install. These drops release
+   it, and gossip copies reach the owner again:
+
+   - a failed apply that leaves no live probe retry owning the install
+   - a no-op apply
+   - a client disconnect during the apply wait
+   - a panic
+
+   A failed apply that leaves a live probe retry owning the install
+   keeps the claim. It keeps the claim whether this request scheduled
+   the retry or an earlier failed apply in the same process already
+   left it in place. A second failed `/upgrade/apply` of the same bytes
+   must not release the first failure's live retry claim.
+
+   Every admitted apply keeps the claim. Once the apply's blocking
+   worker is admitted — host locks held, replacement and restart owned
+   by the worker — no handler exit releases the claim. A dropped
+   handler keeps it: the install still runs. `RolledBack` keeps it: a
+   real rollback runs after admission, so a rolled-back apply is always
+   on this post-admission side. `NoUpgrade` keeps it, and so do errors
+   that resume nothing. A successful apply keeps it as well.
+
+   The motivating case is a gossip copy arriving in the seconds before
+   the restart. Such a copy must not queue a second apply of that
+   install. That case is not the whole rule. The keep is bounded only
+   by the tracker TTL: the claim ages out with the entry even when the
+   worker has finished and the handler is alive.
+
+   After a fast failure, the node's own gossip echo can still arrive
+   after the claim is released and queue a background-owner attempt of
+   the same release. The owner's 30-minute `failed_at` backoff bounds
+   the rate of those attempts, not their count: at most one new attempt
+   per 30 minutes.
+
    The GitHub poll cadence does not change (A14 / ADR 0045): gossip is
    the fast path. The announcement is bounded (10 s) and best effort;
    peer rebroadcast limiting and the apply owner's dedup handle repeats.
