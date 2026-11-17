@@ -251,7 +251,6 @@ fn stamped_receive_session(
 /// SG's own `admit` callback is allowed to produce bytes; only then is the
 /// stream-type byte prepended. A refusal returns an error and ant-quic
 /// admits zero bytes without reconnect fallback.
-#[allow(clippy::too_many_arguments)] // matches the targeted allow used in named_groups.rs
 fn frame_guarded_admission(
     stream_type: GossipStreamType,
     expected_generation: u64,
@@ -260,7 +259,6 @@ fn frame_guarded_admission(
     current_session: Option<(u64, AuthenticatedSession)>,
     policy_allows: bool,
     admit: &saorsa_gossip_transport::SessionAdmission,
-    bandwidth: &BandwidthCounters,
 ) -> Result<Vec<u8>, ant_quic::EndpointError> {
     if actual_generation != expected_generation
         || current_session != Some((expected_generation, expected_session))
@@ -279,9 +277,6 @@ fn frame_guarded_admission(
     let mut framed = Vec::with_capacity(1 + data.len());
     framed.push(stream_type.to_byte());
     framed.extend_from_slice(&data);
-    // #1964 request 5: this closure is the only place the guarded frame's
-    // bytes exist, so it is metered exactly where they are produced.
-    bandwidth.record_sent(BandwidthKind::Gossip, framed.len() as u64);
     Ok(framed)
 }
 
@@ -9341,10 +9336,15 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
             }
         }
 
+        // #1964 request 5: the frame exists only inside the admission
+        // callback, so the callback notes its length and the send is
+        // metered after the write succeeds (a refused admission or a failed
+        // write counts nothing).
+        let admitted_len = AtomicU64::new(0);
         {
             let node = self.require_node().await?;
             node.send_on_generation_with_admission(&ant_peer, ant_generation, |actual| {
-                frame_guarded_admission(
+                let framed = frame_guarded_admission(
                     stream_type,
                     ant_generation,
                     actual,
@@ -9361,12 +9361,18 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
                     // landed during the wait refuses the bytes here.
                     self.guarded_send_policy_allows(&node, &ant_peer),
                     &admit,
-                    &self.bandwidth,
-                )
+                )?;
+                admitted_len.store(
+                    u64::try_from(framed.len()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+                Ok(framed)
             })
             .await
             .map_err(|e| anyhow::anyhow!("guarded send failed: {}", e))?;
         }
+        self.bandwidth
+            .record_sent(BandwidthKind::Gossip, admitted_len.load(Ordering::Relaxed));
         // Match the ordinary send path's pool bookkeeping on success.
         self.note_connection_pool_activity(ant_peer).await;
         Ok(())
@@ -9853,7 +9859,6 @@ mod session_provenance_tests {
             Some((6, token(2))),
             true,
             &admit,
-            &BandwidthCounters::new(),
         )
         .unwrap_err();
         assert!(
@@ -9884,7 +9889,6 @@ mod session_provenance_tests {
             Some((5, token(2))),
             true,
             &admit,
-            &BandwidthCounters::new(),
         )
         .unwrap_err();
         assert!(matches!(err, ant_quic::EndpointError::Connection(_)));
@@ -9911,7 +9915,6 @@ mod session_provenance_tests {
             Some((5, token(1))),
             false,
             &admit,
-            &BandwidthCounters::new(),
         )
         .unwrap_err();
         assert!(matches!(err, ant_quic::EndpointError::Connection(_)));
@@ -9930,7 +9933,6 @@ mod session_provenance_tests {
             Some((5, token(1))),
             true,
             &admit,
-            &BandwidthCounters::new(),
         )
         .unwrap_err();
         let ant_quic::EndpointError::Connection(reason) = err else {
@@ -9954,9 +9956,6 @@ mod session_provenance_tests {
                 Ok(Bytes::from_static(b"payload"))
             })
         };
-        // #1964 request 5: an admitted frame is metered as gossip bytes at
-        // the production site (1 stream byte + 7 payload bytes).
-        let bandwidth = BandwidthCounters::new();
         let framed = frame_guarded_admission(
             GossipStreamType::PubSub,
             5,
@@ -9965,7 +9964,6 @@ mod session_provenance_tests {
             Some((5, expected)),
             true,
             &admit,
-            &bandwidth,
         )
         .unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 1);
@@ -9975,7 +9973,6 @@ mod session_provenance_tests {
                 .chain(b"payload".iter().copied())
                 .collect::<Vec<u8>>()
         );
-        assert_eq!(bandwidth.snapshot().sent_bytes.gossip, 8);
         let observed = seen
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -10090,6 +10087,84 @@ mod tests {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "the relayed frame was never metered on the receive side"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// #1964 request 5 (#2000 review): a guarded gossip send is metered
+    /// only after the write succeeds. A refused admission sends no bytes
+    /// and counts none; an admitted frame counts its framed length once on
+    /// the sender and once at the receiver's demux.
+    #[tokio::test]
+    async fn bandwidth_guarded_gossip_send_counts_only_written_frames() {
+        let plane = "issue1964-bandwidth-guarded";
+        let fabric = sim::SimFabric::new(19641);
+        sim::register(plane, &fabric);
+        let config = |host: u8| NetworkConfig {
+            bind_addr: Some(SocketAddr::from(([198, 18, 0, host], 5483))),
+            network_id: Some(plane.to_string()),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..NetworkConfig::default()
+        };
+        let a = NetworkNode::new(config(1), None, None).await.unwrap();
+        let b = NetworkNode::new(config(2), None, None).await.unwrap();
+        let peer_b = a
+            .connect_addr(SocketAddr::from(([198, 18, 0, 2], 5483)))
+            .await
+            .unwrap();
+        let gossip_b = ant_to_gossip_peer_id(&peer_b);
+        let payload = b"issue-1964-guarded-gossip".to_vec();
+        let framed = u64::try_from(1 + payload.len()).unwrap_or(u64::MAX);
+
+        // Refused admission: the callback runs, produces no bytes, and the
+        // meter stays still. Retry until the plane gate clears so the
+        // refusal comes from the admission itself.
+        let refuse: saorsa_gossip_transport::SessionAdmission =
+            Arc::new(|_session| Err(anyhow::anyhow!("refused by the test")));
+        let before = a.bandwidth_usage().sent_bytes.gossip;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let err = a
+                .send_to_peer_guarded(gossip_b, GossipStreamType::PubSub, Arc::clone(&refuse))
+                .await
+                .unwrap_err();
+            if err.to_string().contains("refused by the test") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the guarded send never reached the admission callback: {err}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            a.bandwidth_usage().sent_bytes.gossip,
+            before,
+            "a refused guarded send counts nothing"
+        );
+
+        // Admitted frame: counted once, after the write, by framed length.
+        let admit: saorsa_gossip_transport::SessionAdmission = {
+            let payload = bytes::Bytes::from(payload.clone());
+            Arc::new(move |_session| Ok(payload.clone()))
+        };
+        let before_b = b.bandwidth_usage().received_bytes.gossip;
+        a.send_to_peer_guarded(gossip_b, GossipStreamType::PubSub, admit)
+            .await
+            .unwrap();
+        assert_eq!(
+            a.bandwidth_usage().sent_bytes.gossip - before,
+            framed,
+            "the written guarded frame is metered once under `gossip`"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while b.bandwidth_usage().received_bytes.gossip - before_b < framed {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the guarded frame was never metered on the receive side"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

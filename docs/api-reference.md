@@ -454,13 +454,16 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:12700/status
 `up_bps` and `down_bps` are bits per second over `window_secs`. A read
 measures from the newest earlier read that is at least 60 s old, so a
 steady poller sees a window of about 60 s; with no such read the window
-starts at process start, and the rate is the lifetime average. The kinds are `gossip` (pub/sub,
-membership and bulk lanes, which include CRDT/KV sync), `direct` (DM
-frames), `relay` (relayed DM frames and their forward) and `other`. QUIC
+starts at process start, and the rate is the lifetime average. The kinds
+are `gossip` (pub/sub, membership and bulk lanes, which include CRDT/KV
+sync), `direct` (DM frames), `relay` (relayed DM frames and their forward)
+and `other`. QUIC
 and UDP overhead, streams, and the evidence wire are not counted. The
-field is zero when the agent has no network node. `x0x status` prints the
-same values and adds `sent_bytes_human`, `received_bytes_human`,
-`up_human` and `down_human` for the totals.
+field is zero when the agent has no network node. A send counts after the
+write succeeds; a received frame counts when it arrives, before any check.
+In text output `x0x status` adds `sent_bytes_human`, `received_bytes_human`,
+`up_human` and `down_human` for the totals; `x0x status --json` prints the
+raw values only.
 
 `status` is `connected` when a send-ready peer exists. It is `degraded` when
 `GET /health` would be degraded. That includes a one-sided link: one

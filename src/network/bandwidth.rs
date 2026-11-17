@@ -19,8 +19,9 @@
 //!
 //! Counters are `AtomicU64` adds on the hot path — monotonic for the
 //! process lifetime, never cleared by a read. Rates are computed on read
-//! over a rolling window: each snapshot stores a `(instant, counters)`
-//! sample and the rate spans the window between the oldest retained
+//! over a rolling window: a snapshot stores a `(instant, counters)`
+//! sample (at most one per second for the shipped window, so the sample
+//! count stays bounded under any poll rate) and the rate spans the window between the oldest retained
 //! sample and now. Retention keeps the newest sample at least
 //! [`BANDWIDTH_RATE_WINDOW`](crate::network::bandwidth::BANDWIDTH_RATE_WINDOW)
 //! old as the baseline (so a steady poller sees
@@ -38,6 +39,11 @@ use serde::Serialize;
 
 /// Rolling window the read-side rate calculation keeps between samples.
 pub const BANDWIDTH_RATE_WINDOW: Duration = Duration::from_secs(60);
+
+/// A read stores a rate sample only when the newest stored one is at least
+/// `rate_window / RATE_SAMPLE_SLOTS` old (1 s for the shipped window), so
+/// the window holds at most about this many samples plus the baseline.
+const RATE_SAMPLE_SLOTS: u32 = 60;
 
 /// The traffic kinds the transport edge can tell apart without decoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,8 +201,8 @@ impl BandwidthCounters {
 
     /// Load the totals, sample the rate window, compute the rates.
     ///
-    /// The read never clears the process-lifetime counters; it only stores
-    /// one window sample (see the module docs for the retention rule).
+    /// The read never clears the process-lifetime counters; it stores at
+    /// most one window sample (see the module docs for the retention rule).
     #[must_use]
     pub fn snapshot(&self) -> BandwidthUsage {
         let tx = load_kinds(&self.tx);
@@ -212,10 +218,22 @@ impl BandwidthCounters {
                 .samples
                 .push_back((birth, [0; KIND_COUNT], [0; KIND_COUNT]));
         }
-        window.samples.push_back((now, tx, rx));
+        // Store at most one read sample per `rate_window / RATE_SAMPLE_SLOTS`
+        // so a fast poller cannot grow the window without bound (#2000
+        // review). A skipped read still reports exact totals and a rate
+        // against the retained baseline; it only stores nothing.
+        let spacing = self.rate_window / RATE_SAMPLE_SLOTS;
+        let store = window.samples.len() == 1
+            || window
+                .samples
+                .back()
+                .is_some_and(|(at, _, _)| now.duration_since(*at) >= spacing);
+        if store {
+            window.samples.push_back((now, tx, rx));
+        }
         // Retain the newest sample at least one window old as the rate
         // baseline plus every sample newer than it; drop older baselines.
-        while window.samples.len() > 2
+        while window.samples.len() > 1
             && now.duration_since(window.samples[1].0) >= self.rate_window
         {
             window.samples.pop_front();
@@ -331,6 +349,53 @@ mod tests {
             second.window_secs < 121.0 && second.window_secs >= 119.0,
             "span must track the retained baseline, not birth: {}",
             second.window_secs
+        );
+    }
+
+    fn stored_samples(counters: &BandwidthCounters) -> usize {
+        counters
+            .window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .samples
+            .len()
+    }
+
+    /// #2000 review: a fast poller must not grow the sample window without
+    /// bound. Reads closer together than the sample spacing store nothing
+    /// but still report exact totals; spaced reads are kept up to one
+    /// window, then old baselines are dropped.
+    #[test]
+    fn sample_window_stays_bounded_under_fast_polling() {
+        let counters = BandwidthCounters::with_rate_window(Duration::from_secs(60));
+        for i in 0..10_000u64 {
+            counters.record_sent(BandwidthKind::Gossip, 1);
+            let usage = counters.snapshot();
+            assert_eq!(usage.sent_bytes.gossip, i + 1, "totals stay exact");
+        }
+        // Birth plus the first read; every later read was within 1 s.
+        assert!(
+            stored_samples(&counters) <= 2,
+            "fast reads stored {} samples",
+            stored_samples(&counters)
+        );
+
+        // One read per spacing over three windows: the window keeps about
+        // one window of samples plus the baseline, never all 180.
+        for _ in 0..180 {
+            counters.backdate(Duration::from_secs(1));
+            let _ = counters.snapshot();
+        }
+        let kept = stored_samples(&counters);
+        assert!(
+            kept <= usize::try_from(RATE_SAMPLE_SLOTS).unwrap_or(usize::MAX) + 2,
+            "kept {kept} samples"
+        );
+        let usage = counters.snapshot();
+        assert!(
+            usage.window_secs >= 59.0 && usage.window_secs < 62.0,
+            "a steady poller sees about one window: {}",
+            usage.window_secs
         );
     }
 

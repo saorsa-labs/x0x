@@ -1,6 +1,6 @@
 //! Network and status CLI commands.
 
-use crate::cli::{print_value, DaemonClient};
+use crate::cli::{print_value, DaemonClient, OutputFormat};
 use anyhow::Result;
 use four_word_networking::FourWordAdaptiveEncoder;
 
@@ -51,9 +51,17 @@ pub async fn status(client: &DaemonClient) -> Result<()> {
     let encoder = four_word_networking::IdentityEncoder::new();
     super::identity::inject_identity_words(&encoder, &mut resp);
     inject_location_words(&mut resp);
-    inject_bandwidth_human(&mut resp);
+    annotate_bandwidth_for(client.format(), &mut resp);
     print_value(client.format(), &resp);
     Ok(())
+}
+
+/// #2000 review: `--json` keeps the bandwidth block numeric only; the
+/// human-readable `*_human` siblings are added for the text view only.
+fn annotate_bandwidth_for(format: OutputFormat, value: &mut serde_json::Value) {
+    if matches!(format, OutputFormat::Text) {
+        inject_bandwidth_human(value);
+    }
 }
 
 /// #1964 request 5: annotate the `/status` bandwidth block with
@@ -410,6 +418,30 @@ mod tests {
         let mut non_object = serde_json::json!([1, 2, 3]);
         inject_bandwidth_human(&mut non_object);
         assert!(non_object.is_array());
+    }
+
+    /// #2000 review: `x0x status --json` keeps the bandwidth block numeric
+    /// only; the text view gets the `*_human` siblings.
+    #[test]
+    fn bandwidth_human_fields_are_text_only() {
+        let raw = serde_json::json!({
+            "bandwidth": {
+                "sent_bytes": {"total": 2048, "gossip": 0, "direct": 0, "relay": 0, "other": 0},
+                "received_bytes": {"total": 0, "gossip": 0, "direct": 0, "relay": 0, "other": 0},
+                "up_bps": {"total": 1500.0, "gossip": 0.0, "direct": 0.0, "relay": 0.0, "other": 0.0},
+                "down_bps": {"total": 0.0, "gossip": 0.0, "direct": 0.0, "relay": 0.0, "other": 0.0},
+                "window_secs": 60.0
+            }
+        });
+
+        let mut json = raw.clone();
+        annotate_bandwidth_for(crate::cli::OutputFormat::Json, &mut json);
+        assert_eq!(json, raw, "--json output is unchanged");
+
+        let mut text = raw.clone();
+        annotate_bandwidth_for(crate::cli::OutputFormat::Text, &mut text);
+        assert_eq!(text["bandwidth"]["sent_bytes_human"], "2.0 KiB");
+        assert_eq!(text["bandwidth"]["up_human"], "1.5 kbps");
     }
 }
 
