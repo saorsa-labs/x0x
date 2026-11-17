@@ -47313,6 +47313,9 @@ mod peer_connected_handler_integration_tests {
 mod asymmetric_capability_convergence_tests;
 
 #[cfg(test)]
+mod issue1964_relay_bandwidth_tests;
+
+#[cfg(test)]
 mod caps_unicast_504_tests;
 
 #[cfg(test)]
