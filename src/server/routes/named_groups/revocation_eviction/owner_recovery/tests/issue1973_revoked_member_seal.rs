@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! #1973, daemon level: the owner-recovery commit must not deadlock
 //! while another revoked member is still seated (the ADR-0038 seal
 //! check).
@@ -35,6 +36,41 @@ async fn seat_revoked_member(
     agent: &x0x::identity::AgentKeypair,
 ) {
     let member = seat(state.agent.identity().user_keypair().unwrap(), agent);
+    let hex = member.agent_id.clone();
+    info.members_v2.insert(hex.clone(), member);
+    info.recompute_state_hash();
+    let stable = info.stable_group_id().to_string();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(stable, info.clone());
+    let record = x0x::revocation::RevocationRecord::sign(
+        x0x::revocation::RevokedSubject::Agent(agent.agent_id()),
+        agent.public_key(),
+        agent.secret_key(),
+        1,
+        None,
+    )
+    .unwrap();
+    assert!(state
+        .agent
+        .revocation_set()
+        .write()
+        .await
+        .verify_and_insert(record, None)
+        .unwrap());
+}
+
+/// A seated admin whose own agent revocation this node holds verified,
+/// seated the way the fixture seats its first revoked admin.
+async fn seat_revoked_admin(
+    state: &Arc<AppState>,
+    info: &mut GroupInfo,
+    agent: &x0x::identity::AgentKeypair,
+) {
+    let mut member = seat(state.agent.identity().user_keypair().unwrap(), agent);
+    member.role = x0x::groups::GroupRole::Admin;
     let hex = member.agent_id.clone();
     info.members_v2.insert(hex.clone(), member);
     info.recompute_state_hash();
@@ -167,5 +203,33 @@ async fn a_standing_seal_refusal_keeps_a_typed_wait_naming_the_members() {
         status["promoted_member"]["named"],
         serde_json::json!([expired_hex])
     );
+    state.agent.shutdown().await;
+}
+
+/// #1973: the below-Admin filter of the scope builder itself
+/// (`owner_recovery_seal_scope`). A revoked Admin — removed by the
+/// recovery's own seat writes — and an unrevoked seat never join the
+/// tolerated set; the pure `recovery_seal_tolerates` test covers the
+/// set-matching side.
+#[tokio::test]
+async fn the_recovery_seal_scope_collects_only_below_admin_revoked_seats() {
+    let (_dir, state, mut info, admin_hex) = recovery_fixture().await;
+    let second_admin = x0x::identity::AgentKeypair::generate().unwrap();
+    seat_revoked_admin(&state, &mut info, &second_admin).await;
+    let member_e = x0x::identity::AgentKeypair::generate().unwrap();
+    let e_hex = hex::encode(member_e.agent_id().as_bytes());
+    seat_revoked_member(&state, &mut info, &member_e).await;
+
+    let scope = super::super::super::owner_recovery_seal_scope(&state, &info).await;
+    assert_eq!(scope.stable_group_id, info.stable_group_id().to_string());
+    assert_eq!(
+        scope.revoked_members,
+        BTreeSet::from([e_hex.clone()]),
+        "only the revoked Member seat joins the tolerated set"
+    );
+    assert!(!scope.revoked_members.contains(&admin_hex));
+    assert!(!scope
+        .revoked_members
+        .contains(&hex::encode(second_admin.agent_id().as_bytes())));
     state.agent.shutdown().await;
 }

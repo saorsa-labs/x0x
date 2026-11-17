@@ -1473,9 +1473,11 @@ async fn finish_commit(
         Err(error) => {
             rollback(&mut tree, &next, "owner_recovery_seal_failed");
             tracing::warn!(group_id = %ng::LogHexId::group(group_key), "ADR 0110 S4: owner recovery deferred: seal failed: {error}");
-            // #1973: a seal refusal that still names members keeps a
-            // typed wait naming them; the status never falls back to a
-            // bare `mandate_received` with no cause.
+            // #1973: a refusal that names failing members keeps a
+            // typed wait naming them. A refusal caused only by a
+            // grace or digest-pending hold is `OwnerCertMemberPending`
+            // and keeps the bare `mandate_received` until the hold
+            // ends.
             let wait = match &error {
                 x0x::groups::state_commit::ApplyError::OwnerCertifiedEvictionRequired {
                     members,
