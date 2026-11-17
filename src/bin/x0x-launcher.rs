@@ -13,7 +13,19 @@ const EXIT_USAGE: u8 = 64;
 /// 75 is `EX_TEMPFAIL`: the manager restarts the job, as it does for a
 /// direct unit whose daemon cannot exec.
 #[cfg(unix)]
-const EXIT_TEMPFAIL: u8 = 75;
+const EXIT_TEMPFAIL: u8 = launcher::start::EXIT_TEMPFAIL;
+
+/// Set by SIGTERM or SIGINT: the manager asked for a stop.
+#[cfg(unix)]
+static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(unix)]
+use std::sync::atomic::Ordering;
+
+#[cfg(unix)]
+extern "C" fn stop(_: libc::c_int) {
+    STOP.store(true, Ordering::Relaxed);
+}
+
 /// 69 is `EX_UNAVAILABLE`: this host cannot run process custody.
 #[cfg(not(unix))]
 const EXIT_UNAVAILABLE: u8 = 69;
@@ -29,6 +41,15 @@ fn main() -> std::process::ExitCode {
                 return std::process::ExitCode::from(EXIT_USAGE);
             }
         };
+        // SAFETY: the handler only stores a lock-free atomic flag.
+        let arm = || unsafe {
+            libc::signal(libc::SIGTERM, stop as *const () as libc::sighandler_t);
+            libc::signal(libc::SIGINT, stop as *const () as libc::sighandler_t);
+        };
+        match launcher::start::start(&command, arm, || STOP.load(Ordering::Relaxed)) {
+            launcher::start::Start::Exit(status) => return std::process::ExitCode::from(status),
+            launcher::start::Start::Passthrough => {}
+        }
         let error = launcher::forward::exec_daemon(&command);
         eprintln!(
             "x0x-launcher: cannot exec {}: {error}",

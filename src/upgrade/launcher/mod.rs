@@ -1,6 +1,7 @@
 //! Private, dormant S3b engine. Only the `x0x-launcher` and `x0xd` binaries
 //! include it; no installer or daemon apply path calls it. The only live
-//! calls are the launcher's exec passthrough (`forward`) and `candidate_boot`
+//! calls are the launcher's main loop (`start`), which is the exec
+//! passthrough (`forward`) while the engine is held, and `candidate_boot`
 //! at x0xd start, which ignores a stray `X0X_M2_BOOT_FD` with one warning
 //! while activation is held and refuses only a present permit that fails
 //! its checks (ADR 0094 §6). The complete inventory issuer and host
@@ -19,6 +20,7 @@ mod journal;
 mod probe;
 mod recovery;
 mod run;
+pub(crate) mod start;
 mod supervise;
 
 pub(crate) fn candidate_boot(version: &str) -> io::Result<()> {
