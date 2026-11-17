@@ -589,6 +589,20 @@ enum Admission {
     Drop,
 }
 
+/// §2 "Unserved join seal" (H-S3-r, #1572, A08 amendment of 16 Nov 2026):
+/// the join attempt whose seal did not apply because the authority served
+/// no chain and no join carry, the seal's revision, and the admins that
+/// have answered a request for it. Each admin answers at most once per
+/// attempt; an admin that has not answered is asked again under the
+/// requester back-off. It ends when the seal applies or a new attempt
+/// begins.
+#[derive(Debug, Clone, PartialEq)]
+struct UnservedSeal {
+    attempt_id: String,
+    terminal_revision: u64,
+    answered: HashSet<[u8; 32]>,
+}
+
 /// The subject's own recovery, per group.
 #[derive(Debug, Clone)]
 struct SubjectState {
@@ -632,6 +646,10 @@ struct SubjectState {
     /// staged Welcome is gone, so the attempt has ended with ADR 0107's
     /// typed outcome (see [`end_on_welcome_loss`]).
     welcome_lost: bool,
+    /// §2 "Unserved join seal" (H-S3-r, #1572): this joiner's seal did not
+    /// apply, and its authority served no chain and no join carry. The
+    /// node asks without a marker or gap record ([`note_unserved_join_seal`]).
+    unserved_seal: Option<UnservedSeal>,
 }
 
 impl SubjectState {
@@ -655,6 +673,7 @@ impl SubjectState {
             readmitted: false,
             welcome_unfetched_at: None,
             welcome_lost: false,
+            unserved_seal: None,
         }
     }
 
@@ -664,6 +683,7 @@ impl SubjectState {
         self.readmitted = false;
         self.welcome_unfetched_at = None;
         self.welcome_lost = false;
+        self.unserved_seal = None;
     }
 
     fn end_round(&mut self, now: Instant) {
@@ -4097,6 +4117,82 @@ pub(super) async fn begin_join_attempt(state: &AppState, stable: &str) {
     }
 }
 
+/// §2 "Unserved join seal" (H-S3-r, #1572, A08 amendment of 16 Nov
+/// 2026). The authority's verified join result for `attempt_id` did not
+/// apply: it served no chain, no join carry and no owner terminal
+/// attestation, and the seal (`terminal_revision`) is more than one link
+/// past this joiner's head. Without this the joiner holds no marker and no
+/// gap record, so §2 sent no request and the attempt only timed out with
+/// no reason. Now the node asks the admins on its roster with the
+/// ordinary request (no refs), so an authority whose log no longer
+/// reaches the base answers `base_beyond_retention`, and the node shows
+/// `readmission_required` with D43's exit. Nothing new goes on the wire.
+pub(super) async fn note_unserved_join_seal(
+    state: &AppState,
+    group_id: &str,
+    attempt_id: &str,
+    terminal_revision: u64,
+) {
+    if !state.group_recovery.runs_s3() {
+        return;
+    }
+    let Some(group_key) = super::resolve_named_group_storage_key(state, group_id).await else {
+        return;
+    };
+    let Some(info) = state.named_groups.read().await.get(&group_key).cloned() else {
+        return;
+    };
+    if info.state_revision.saturating_add(1) >= terminal_revision {
+        return;
+    }
+    let stable = info.stable_group_id().to_string();
+    let now = Instant::now();
+    let mut inner = state.group_recovery.inner.lock().await;
+    let subject = inner
+        .subjects
+        .entry(stable.clone())
+        .or_insert_with(|| SubjectState::new(now, info.state_revision));
+    if subject
+        .unserved_seal
+        .as_ref()
+        .is_some_and(|seal| seal.attempt_id == attempt_id)
+    {
+        return;
+    }
+    subject.unserved_seal = Some(UnservedSeal {
+        attempt_id: attempt_id.to_string(),
+        terminal_revision,
+        answered: HashSet::new(),
+    });
+    tracing::info!(
+        group_id = %LogHexId::group(&stable),
+        head = info.state_revision,
+        terminal_revision,
+        "ADR 0109 S3: the join seal did not apply and its authority served no chain and no join carry; asking the admins"
+    );
+}
+
+/// Whether `info`'s unserved join seal still asks: its seal is not applied.
+/// A seal that applied clears it, and a new join attempt resets it
+/// ([`begin_join_attempt`]). The attempt that saw the seal may time out
+/// meanwhile; its stub stays, so the node still asks an admin that has not
+/// answered (one that is unreachable now may attest later), and the typed
+/// state stays.
+async fn unserved_seal_open(state: &AppState, info: &GroupInfo) -> bool {
+    let mut inner = state.group_recovery.inner.lock().await;
+    let Some(subject) = inner.subjects.get_mut(info.stable_group_id()) else {
+        return false;
+    };
+    let open = subject
+        .unserved_seal
+        .as_ref()
+        .is_some_and(|seal| info.state_revision < seal.terminal_revision);
+    if !open {
+        subject.unserved_seal = None;
+    }
+    open
+}
+
 /// §2 "Join attempt (D64)" on the readmission path (#1661). A readmitted
 /// pre-Welcome joiner's own seal did not apply because its staged Welcome
 /// could not be fetched ([`note_welcome_unfetched`]). Only the sealer holds
@@ -4603,7 +4699,7 @@ async fn subject_tick(state: &Arc<AppState>) {
             continue;
         }
         retire_converged(state, &key).await;
-        if refs.is_empty() {
+        if refs.is_empty() && !unserved_seal_open(state, &info).await {
             let mut inner = state.group_recovery.inner.lock().await;
             let drop_entry = inner
                 .subjects
@@ -4785,6 +4881,36 @@ async fn next_target(
         .entry(stable.clone())
         .or_insert_with(|| SubjectState::new(now, info.state_revision));
     subject.note_progress(info.state_revision, now);
+    // §2 "Unserved join seal": with no marker and no gap record, the node
+    // asks only the admins on its roster that have not answered for this
+    // attempt, at once (no stall); see [`note_unserved_join_seal`]. The
+    // list keeps the admins that answered, so `next_target` stays the
+    // index of the admin last asked; the round skips the answered ones.
+    let answered: Option<HashSet<[u8; 32]>> = refs
+        .is_empty()
+        .then_some(subject.unserved_seal.as_ref())
+        .flatten()
+        .map(|seal| seal.answered.clone());
+    let targets: Vec<AgentId> = match answered {
+        Some(_) => targets
+            .into_iter()
+            .filter(|agent| roster_admin(info, &hex::encode(agent.as_bytes())))
+            .collect(),
+        None => targets,
+    };
+    let is_answered = |agent: &AgentId| {
+        answered
+            .as_ref()
+            .is_some_and(|set| set.contains(agent.as_bytes()))
+    };
+    let skip_answered = |subject: &mut SubjectState| {
+        while targets.get(subject.next_target).is_some_and(is_answered) {
+            subject.next_target = subject.next_target.saturating_add(1);
+        }
+    };
+    // No target left to ask in this attempt (or none at all).
+    let none_left = targets.iter().all(is_answered);
+    let unserved = answered.is_some();
     // The node left the head its last request named. §2 drops an answer
     // for an old head, so a request still open is void, and the last
     // round's silence was for that head: its backoff does not hold here.
@@ -4805,7 +4931,8 @@ async fn next_target(
     }
     // A gap record alone asks only after GATE_STALL without progress; an
     // armed admin ATA asks for its renewal after ATA_ARMED_LIFETIME.
-    let gap_only = !marker && refs.iter().all(|r| matches!(r, RecoveryRef::Gap { .. }));
+    let gap_only =
+        !unserved && !marker && refs.iter().all(|r| matches!(r, RecoveryRef::Gap { .. }));
     let admin_armed = refs.iter().any(
         |r| matches!(r, RecoveryRef::Gap { reason, .. } if reason == s3::ADMIN_ATTESTED_GAP_REASON),
     );
@@ -4838,6 +4965,7 @@ async fn next_target(
         // No reply from that target: try the next one in this round.
         subject.pending = None;
         subject.next_target = subject.next_target.saturating_add(1);
+        skip_answered(subject);
         if subject.next_target >= targets.len() {
             if !subject.holds_view(now) {
                 subject.view = SubjectView::Awaiting {
@@ -4851,12 +4979,13 @@ async fn next_target(
     if now < subject.next_retry_at {
         return None;
     }
-    if subject.next_target >= targets.len() && !targets.is_empty() {
+    skip_answered(subject);
+    if subject.next_target >= targets.len() && !none_left {
         // Every target in this round refused: back off.
         subject.end_round(now);
         return None;
     }
-    if targets.is_empty() {
+    if none_left {
         if !subject.holds_view(now) {
             subject.view = SubjectView::Awaiting {
                 reason: "no_capable_peer".to_string(),
@@ -5058,6 +5187,15 @@ async fn handle_response(state: &Arc<AppState>, sender: AgentId, response: Group
     if from_pending {
         subject.asked.insert(sender_hex, answer_name);
         subject.pending = None;
+        // §2 "Unserved join seal": an admin that answered is not asked
+        // again for this attempt. `rate_limited` is not an answer.
+        let answered = !matches!(
+            response.answer,
+            AttestAnswer::Refused(AttestRefusalReason::RateLimited)
+        );
+        if let Some(seal) = subject.unserved_seal.as_mut().filter(|_| answered) {
+            seal.answered.insert(*sender.as_bytes());
+        }
     }
     match response.answer {
         AttestAnswer::NotOnChain(_) => {
@@ -19299,6 +19437,379 @@ mod tests {
             label().await,
             "pending_authority_commit",
             "closed: as before"
+        );
+        Ok(())
+    }
+
+    // ─── §2 "Unserved join seal" (H-S3-r, #1572) ───────────────────────
+    use anyhow::Context as _;
+
+    /// A group that `admin` created and sealed with this node seated as a
+    /// member, stored under its key, with join attempt `attempt` pending.
+    async fn unserved_fixture(
+        state: &AppState,
+        attempt: &str,
+    ) -> anyhow::Result<(String, GroupInfo, x0x::identity::AgentKeypair)> {
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let admin_hex = hex::encode(admin.agent_id().as_bytes());
+        let mut info = GroupInfo::new(
+            "adr0109-unserved-seal".to_string(),
+            String::new(),
+            admin.agent_id(),
+            "5172".repeat(16),
+        );
+        info.add_member(
+            local_hex(state),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex),
+            None,
+        );
+        info.seal_commit(&admin, 1_000)?;
+        let key = info.mls_group_id.clone();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), info.clone());
+        set_pending_attempt(state, &info, attempt);
+        Ok((key, info, admin))
+    }
+
+    fn set_pending_attempt(state: &AppState, info: &GroupInfo, attempt: &str) {
+        let stable = info.stable_group_id().to_string();
+        let key = super::super::join_result_key(&stable, &local_hex(state));
+        state
+            .pending_join_attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                key,
+                super::super::PendingJoinAttempt {
+                    attempt_id: attempt.to_string(),
+                    local_group_key: info.mls_group_id.clone(),
+                    invite_fingerprint: "test".to_string(),
+                    invite_group_id: stable,
+                    inviter_public_key_b64: String::new(),
+                    stored_resend: None,
+                    polls: Vec::new(),
+                    tasks: Vec::new(),
+                    listener_token: None,
+                    held_pending_notice: None,
+                },
+            );
+    }
+
+    async fn unserved_of(state: &AppState, stable: &str) -> Option<UnservedSeal> {
+        state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .subjects
+            .get(stable)
+            .and_then(|subject| subject.unserved_seal.clone())
+    }
+
+    /// `admin` answers this node's open request for its head with `answer`.
+    async fn answer_from(
+        state: &Arc<AppState>,
+        info: &GroupInfo,
+        admin: &x0x::identity::AgentKeypair,
+        answer: AttestAnswer,
+    ) -> anyhow::Result<()> {
+        let stable = info.stable_group_id().to_string();
+        let target = *admin.agent_id().as_bytes();
+        if let Some(subject) = state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .subjects
+            .get_mut(&stable)
+        {
+            subject.pending = Some((target, Instant::now(), info.state_hash.clone()));
+            subject
+                .asked
+                .insert(hex::encode(target), "pending".to_string());
+        }
+        let subject = parse_raw(&local_hex(state)).context("local agent id")?;
+        let response = GroupAttestResponseV1 {
+            group: stable,
+            subject,
+            for_head_state_hash: info.state_hash.clone(),
+            answer,
+        };
+        handle_response(state, admin.agent_id(), response).await;
+        Ok(())
+    }
+
+    /// H-S3-r (#1572, A08 amendment of 16 Nov 2026): a joiner whose seal
+    /// did not apply, with nothing served to reach it, holds no marker and
+    /// no gap record, yet asks the admins on its roster at once. Control:
+    /// with no unserved seal the same node waits for the gap stall and
+    /// asks no one. The trigger needs a gap: a seal one link ahead does
+    /// not arm it. Red on main: there is no trigger, and the node waits.
+    /// Inert: an offline agent, so the round ends `no_capable_peer`.
+    #[tokio::test]
+    async fn an_unserved_join_seal_asks_the_roster_admins_at_once() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let (key, info, _admin) = unserved_fixture(&state, "attempt-1").await?;
+        let stable = info.stable_group_id().to_string();
+        assert!(
+            live_refs(&state, &info).await.is_empty(),
+            "no marker, no gap"
+        );
+
+        // Control: no unserved seal, so the gap-only wait holds.
+        fresh_subject(&state, &info, Instant::now()).await;
+        assert_eq!(
+            next_target(&state, &key, &info, &local, &[], Instant::now()).await,
+            None
+        );
+        assert_eq!(view_of(&state, &stable).await, awaiting("no_reply"));
+
+        // A seal one link ahead is not a gap: no trigger.
+        let next = info.state_revision + 1;
+        note_unserved_join_seal(&state, &stable, "attempt-1", next).await;
+        assert_eq!(unserved_of(&state, &stable).await, None);
+
+        // A seal five links ahead, nothing served: the node asks at once.
+        let terminal = info.state_revision + 5;
+        note_unserved_join_seal(&state, &stable, "attempt-1", terminal).await;
+        assert_eq!(
+            unserved_of(&state, &stable)
+                .await
+                .map(|seal| (seal.attempt_id, seal.terminal_revision)),
+            Some(("attempt-1".to_string(), terminal))
+        );
+        assert!(unserved_seal_open(&state, &info).await);
+        assert_eq!(
+            next_target(&state, &key, &info, &local, &[], Instant::now()).await,
+            None
+        );
+        assert_eq!(
+            view_of(&state, &stable).await,
+            awaiting("no_capable_peer"),
+            "the round reached the targets"
+        );
+        Ok(())
+    }
+
+    /// H-S3-r (#1572): the bound. An admin that answers is not asked again
+    /// for the attempt, and its `base_beyond_retention` gives
+    /// `readmission_required` with D43's exit on the API. A `rate_limited`
+    /// refusal is not an answer. Noting the same attempt again keeps the
+    /// answers; a new attempt starts again. A seal that applied closes the
+    /// trigger; the end of the attempt alone does not. Inert: an offline
+    /// agent.
+    #[tokio::test]
+    async fn an_unserved_join_seal_asks_each_admin_once_per_attempt() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let (key, info, admin) = unserved_fixture(&state, "attempt-1").await?;
+        let stable = info.stable_group_id().to_string();
+        let admin_raw = *admin.agent_id().as_bytes();
+        let terminal = info.state_revision + 5;
+        note_unserved_join_seal(&state, &stable, "attempt-1", terminal).await;
+
+        // rate_limited is not an answer: the admin can be asked again.
+        answer_from(
+            &state,
+            &info,
+            &admin,
+            AttestAnswer::Refused(AttestRefusalReason::RateLimited),
+        )
+        .await?;
+        let seal = unserved_of(&state, &stable).await.context("seal")?;
+        assert!(!seal.answered.contains(&admin_raw));
+
+        // base_beyond_retention: answered, and the typed end shows.
+        answer_from(
+            &state,
+            &info,
+            &admin,
+            AttestAnswer::Refused(AttestRefusalReason::BaseBeyondRetention),
+        )
+        .await?;
+        let seal = unserved_of(&state, &stable).await.context("seal")?;
+        assert!(seal.answered.contains(&admin_raw));
+        assert_eq!(
+            view_of(&state, &stable).await,
+            Some(SubjectView::Readmission {
+                cause: "base_beyond_retention"
+            })
+        );
+        let object = recovery_json(&state, &info).await.context("recovery")?;
+        assert_eq!(object["state"], "readmission_required");
+        assert_eq!(object["cause"], "base_beyond_retention");
+        assert_eq!(object["exit"], "manual_remove_and_reinvite");
+
+        // The answered admin is not asked again: no request opens.
+        assert_eq!(
+            next_target(&state, &key, &info, &local, &[], Instant::now()).await,
+            None
+        );
+        let pending = state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .subjects
+            .get(&stable)
+            .and_then(|subject| subject.pending.clone());
+        assert_eq!(pending, None, "no new request for this attempt");
+
+        // The same attempt noted again keeps its answers.
+        note_unserved_join_seal(&state, &stable, "attempt-1", terminal).await;
+        let seal = unserved_of(&state, &stable).await.context("seal")?;
+        assert!(seal.answered.contains(&admin_raw));
+
+        // A new attempt starts again.
+        begin_join_attempt(&state, &stable).await;
+        assert_eq!(unserved_of(&state, &stable).await, None);
+        set_pending_attempt(&state, &info, "attempt-2");
+        note_unserved_join_seal(&state, &stable, "attempt-2", terminal).await;
+        let seal = unserved_of(&state, &stable).await.context("seal")?;
+        assert!(seal.answered.is_empty());
+        assert!(unserved_seal_open(&state, &info).await);
+
+        // The seal applied: closed.
+        let mut applied = info.clone();
+        applied.state_revision = terminal;
+        assert!(!unserved_seal_open(&state, &applied).await);
+        assert_eq!(unserved_of(&state, &stable).await, None);
+
+        // The attempt that saw the seal ended (timed out): its stub stays
+        // and the trigger still asks.
+        note_unserved_join_seal(&state, &stable, "attempt-2", terminal).await;
+        state
+            .pending_join_attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        assert!(unserved_seal_open(&state, &info).await);
+        Ok(())
+    }
+
+    /// A current verified advert for `agent` that sets the terminal-attest
+    /// bit, so [`ordered_targets`] counts it as capable.
+    fn advertise_attest(state: &AppState, agent: &AgentId) -> anyhow::Result<()> {
+        static BUMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let mut capabilities = x0x::dm::DmCapabilities::pending();
+        capabilities.application_registry = x0x::dm::CapabilityRegistry {
+            version: 1,
+            bits: x0x::dm::CapabilityRegistry::GROUP_TERMINAL_ATTEST_V1,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis();
+        let created_at =
+            u64::try_from(now)? + 1_000 + BUMP.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        anyhow::ensure!(
+            state.agent.capability_store().insert(
+                *agent,
+                x0x::identity::MachineId([7u8; 32]),
+                capabilities,
+                created_at,
+            ),
+            "the advert inserts"
+        );
+        Ok(())
+    }
+
+    /// H-S3-r (#1572) review of #1993: the answered admin stays in the
+    /// round's list, so the round goes on to the next admin. Two capable
+    /// admins; the first answers `base_beyond_retention`, and the second is
+    /// asked in the same round, with no back-off. Red before the fix: the
+    /// answered admin left the list while the index still moved past it,
+    /// so the second admin was skipped and the round backed off.
+    #[tokio::test]
+    async fn an_unserved_join_seal_asks_the_next_admin_in_the_same_round() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let (key, mut info, first) = unserved_fixture(&state, "attempt-1").await?;
+        let second = x0x::identity::AgentKeypair::generate()?;
+        info.add_member(
+            hex::encode(second.agent_id().as_bytes()),
+            x0x::groups::GroupRole::Admin,
+            Some(hex::encode(first.agent_id().as_bytes())),
+            None,
+        );
+        info.seal_commit(&first, 2_000)?;
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), info.clone());
+        let stable = info.stable_group_id().to_string();
+        // §2 order: the lower agent ID first.
+        let (low, high) = if first.agent_id().as_bytes() < second.agent_id().as_bytes() {
+            (&first, &second)
+        } else {
+            (&second, &first)
+        };
+        advertise_attest(&state, &low.agent_id())?;
+        advertise_attest(&state, &high.agent_id())?;
+        let terminal = info.state_revision + 5;
+        note_unserved_join_seal(&state, &stable, "attempt-1", terminal).await;
+        let attempts = || async {
+            state
+                .group_recovery
+                .inner
+                .lock()
+                .await
+                .subjects
+                .get(&stable)
+                .map(|subject| subject.attempts)
+        };
+
+        let now = Instant::now();
+        assert_eq!(
+            next_target(&state, &key, &info, &local, &[], now).await,
+            Some(low.agent_id())
+        );
+        let before = attempts().await;
+        answer_from(
+            &state,
+            &info,
+            low,
+            AttestAnswer::Refused(AttestRefusalReason::BaseBeyondRetention),
+        )
+        .await?;
+        assert_eq!(
+            next_target(&state, &key, &info, &local, &[], Instant::now()).await,
+            Some(high.agent_id()),
+            "the second admin is asked in the same round"
+        );
+        assert_eq!(attempts().await, before, "the round did not back off");
+
+        // Both answered: no admin is left to ask in this attempt.
+        answer_from(
+            &state,
+            &info,
+            high,
+            AttestAnswer::Refused(AttestRefusalReason::BaseBeyondRetention),
+        )
+        .await?;
+        assert_eq!(
+            next_target(&state, &key, &info, &local, &[], Instant::now()).await,
+            None
+        );
+        let pending = state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .subjects
+            .get(&stable)
+            .and_then(|subject| subject.pending.clone());
+        assert_eq!(pending, None, "no admin is asked twice");
+        assert_eq!(
+            view_of(&state, &stable).await,
+            Some(SubjectView::Readmission {
+                cause: "base_beyond_retention"
+            })
         );
         Ok(())
     }
