@@ -1027,7 +1027,10 @@ no gossip, binds nothing, and takes no instance lock.
    (#1169). A boot-time discovery is announced by the separate
    every-launch manifest broadcast task, `broadcast_current_manifest`.
    That broadcast runs under the same gates and with the byte-identical
-   payload; both paths build it through the same monitor funnel.
+   payload; both paths build it through the same monitor funnel. It is
+   best effort: the broadcast task does its own fetch, and a failed
+   fetch announces nothing — such a discovery is announced only when a
+   later publish point (fallback poll, gossip relay) sees the release.
 2. **Gossip listener**: Receive manifests on `x0x/release` topic, verify signature, rebroadcast, apply if newer
 3. **GitHub poller**: Periodic fallback poll, broadcast discovered manifests to gossip
 4. **Announce on first observation** (#1169): a node announces a release
@@ -1041,9 +1044,11 @@ no gossip, binds nothing, and takes no instance lock.
 
    The startup check and the read-only `/upgrade` check announce
    nothing. The startup check's discovery is covered by the manifest
-   broadcast. For the read-only check, gossip self-delivery would feed
-   this node's own apply owner — a background install triggered by a
-   read (Engineer ruling 3 Nov 2026 17:40 GMT).
+   broadcast on a best-effort basis: the broadcast fetches independently,
+   and a failed broadcast fetch announces nothing. For the read-only
+   check, gossip self-delivery would feed this node's own apply owner —
+   a background install triggered by a read (Engineer ruling 3 Nov 2026
+   17:40 GMT).
 
    `/upgrade/apply` applies the release it announces. It records its
    payload as apply-route-owned in the shared self-published tracker
@@ -1059,8 +1064,10 @@ no gossip, binds nothing, and takes no instance lock.
 
    The tracker entry that holds the claim expires 30 minutes after its
    latest record. A later record of the same bytes — the boot
-   broadcast, a fallback publish or a driver rebroadcast — restarts
-   that clock. The default rollout window is 60 minutes, so the entry
+   broadcast, a fallback publish or a repeat `/upgrade/apply` of those
+   bytes — restarts that clock; a gossip driver rebroadcast never does,
+   because self-published bytes are skipped before any record is
+   written. The default rollout window is 60 minutes, so the entry
    can expire while the apply still waits. A gossip copy of the payload
    is then treated like a peer's copy and can queue a background apply
    again.
@@ -1070,15 +1077,25 @@ no gossip, binds nothing, and takes no instance lock.
    it, and gossip copies reach the owner again:
 
    - a failed apply that leaves no live probe retry owning the install
+     — including a failure before any attempt (staging wait, identity
+     readback, permit or manifest-timestamp checks): its cancelled
+     release permit disqualifies it from the hand-off, so it schedules
+     no retry
    - a no-op apply
-   - a client disconnect during the apply wait
-   - a panic
+   - a client disconnect during the apply wait — unless a live probe
+     retry owns the install for that version
+   - a panic — same unless
 
    A failed apply that leaves a live probe retry owning the install
    keeps the claim. It keeps the claim whether this request scheduled
    the retry or an earlier failed apply in the same process already
    left it in place. A second failed `/upgrade/apply` of the same bytes
-   must not release the first failure's live retry claim.
+   must not release the first failure's live retry claim — and neither
+   may a later request that is dropped before admission (disconnect or
+   panic) or fails without scheduling anything: such a request's guard
+   kept nothing, but its drop checks the process-local retry ownership
+   first and clears a claim only when no live retry is left. A poisoned
+   ownership map counts as owned, so it keeps the claim too.
 
    Every admitted apply keeps the claim. Once the apply's blocking
    worker is admitted — host locks held, replacement and restart owned
@@ -1090,9 +1107,11 @@ no gossip, binds nothing, and takes no instance lock.
 
    The motivating case is a gossip copy arriving in the seconds before
    the restart. Such a copy must not queue a second apply of that
-   install. That case is not the whole rule. The keep is bounded only
-   by the tracker TTL: the claim ages out with the entry even when the
-   worker has finished and the handler is alive.
+   install. That case is not the whole rule. The keep is bounded by the
+   tracker TTL — a sliding bound, because every later record of the
+   same bytes restarts it: the claim ages out with the entry even when
+   the worker has finished and the handler is alive, but fresh echoes
+   keep extending it.
 
    After a fast failure, the node's own gossip echo can still arrive
    after the claim is released and queue a background-owner attempt of

@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
@@ -37,6 +37,17 @@ pub(crate) fn claim_retry(install: PathBuf, version: String) -> Option<RetryOwne
     let key = (install, version);
     let mut active = owners().lock().ok()?;
     active.insert(key.clone()).then(|| RetryOwner(key))
+}
+
+/// Whether a retry currently owns `install`+`version` — read-only, so a
+/// claim guard can ask without taking ownership. A poisoned map answers
+/// true: like [`claim_retry`] it refuses to vouch that no waiter lives,
+/// so a caller must not release what it holds on the map's say-so.
+pub(crate) fn retry_is_owned(install: &Path, version: &str) -> bool {
+    match owners().lock() {
+        Ok(active) => active.contains(&(install.to_path_buf(), version.to_string())),
+        Err(_) => true,
+    }
 }
 
 /// Wait without the apply mutex, then take a fresh staging/probe attempt.

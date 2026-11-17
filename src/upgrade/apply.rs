@@ -122,7 +122,7 @@ async fn probe_retry_delay_for_install(
 /// `version` — the precheck that decides a probe retry will actually
 /// re-apply it (#1169: the HTTP route keeps its apply-route claim for
 /// exactly that hand-off). Read-only, unlike the inspection
-/// [`inspect_admission`] performs: it acknowledges no probe-clock
+/// [`super::probe::inspect_admission`] performs: it acknowledges no probe-clock
 /// progress and resolves no staging identity, because it runs on an
 /// HTTP response path that must neither mutate retained records nor
 /// wait on readback subprocesses. The spawned retry loop still runs
@@ -950,7 +950,7 @@ impl AutoApplyUpgrader {
         self
     }
 
-    fn check_release(&self) -> Result<(), UpgradeError> {
+    pub(crate) fn check_release(&self) -> Result<(), UpgradeError> {
         self.release_permit
             .as_ref()
             .map_or(Ok(()), ReleasePermit::check)

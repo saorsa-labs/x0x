@@ -352,6 +352,16 @@ macro_rules! http_readback_regression_tests {
                 let request = http_staging_request(fixture.runtime.as_ref().unwrap(), &release).unwrap();
                 let cut = if staging_refusal {
                     std::fs::write(staging_selection::selection_path(&request).unwrap(), b"unknown retained selection").unwrap();
+                    // #1169 review round 6: seed the durable record the
+                    // scheduler would resume — here, before the request's
+                    // refusal, so the record-preserving snapshot below
+                    // covers it and the scheduler's answer turns on the
+                    // one thing that differs: the request's cancelled
+                    // permit. The refusal failed before any attempt, so a
+                    // retry spawned here would share that permit and die
+                    // on its first gated check: the scheduler must refuse
+                    // the spawn and answer false.
+                    seed_retry(&fixture.install, &release);
                     None
                 } else {
                     let observed = release.clone();
@@ -383,11 +393,11 @@ macro_rules! http_readback_regression_tests {
                 // On unwind, withdraw the scheduled retry before releasing its
                 // actual readback worker or removing any scoped input hook.
                 let _stop_retry = StopRetry(fixture._shutdown.clone());
-                // #1169 review round 4: the scheduler now reads the durable
+                // #1169 review round 4: the scheduler reads the durable
                 // record up front, so it answers — and spawns — only when an
-                // interrupted probe actually exists. The seeded wait makes
-                // this case schedule; the staging refusal case has no record
-                // and schedules nothing at all, still without readback.
+                // interrupted probe actually exists; round 6 seeds the
+                // refusal case's record up front (see `cut` above), so its
+                // answer turns on the cancelled permit instead.
                 let scheduled =
                     schedule_probe_retry(&upgrader, &release.manifest, apply_lock, shutdown).await;
                 let claim = probe_retry::claim_retry(fixture.install.clone(), release.manifest.version.clone());
@@ -425,8 +435,10 @@ macro_rules! http_readback_regression_tests {
                 drop(drain);
                 drop(hook);
                 drop(upgrader);
-                // A staging refusal has no durable interrupted probe, so
-                // round 4's up-front record read schedules nothing.
+                // A staging refusal holds a durable interrupted probe but a
+                // cancelled permit — round 6's disqualifier — so it must
+                // schedule nothing; the seeded case answers true and hands
+                // the install to the retry.
                 assert_eq!(scheduled, !staging_refusal);
                 assert!(free_after_response);
                 assert!(drained && !shared.expired.load(Ordering::SeqCst));

@@ -405,7 +405,8 @@ macro_rules! background_permit_regression_tests {
 
                 // The disconnect: the async observer is dropped mid-worker.
                 drop(operation);
-                assert!(permit.admitted(), "the mark survives the observer drop");
+                assert!(permit.check().is_ok(),
+                    "the observer drop must not cancel the admitted release");
 
                 release_tx.send(()).unwrap();
                 let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -414,8 +415,8 @@ macro_rules! background_permit_regression_tests {
                         "the worker must finish the replace and clean its custody after the disconnect");
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                assert!(permit.admitted(),
-                    "the permit stays admitted after the worker completes");
+                assert!(permit.check().is_ok(),
+                    "the worker completing must not cancel the admitted release");
             }
         }
     };

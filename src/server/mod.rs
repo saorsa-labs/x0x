@@ -2267,7 +2267,9 @@ pub async fn serve_with_options(
     // `--skip-update-check`) AND `[update] enabled`. #1169: the check
     // itself announces nothing; a boot-time discovery is announced by the
     // every-launch manifest broadcast task below (same gates, same
-    // payload), so an announce here would only duplicate those bytes.
+    // payload), so an announce here would only duplicate those bytes —
+    // best effort: that task does its own fetch and a failed fetch
+    // announces nothing, leaving the discovery to a later publish point.
     if self_update_enabled && config.update.enabled {
         let startup_check_config = config.clone();
         // #261: the apply's restart planner needs the bound API address

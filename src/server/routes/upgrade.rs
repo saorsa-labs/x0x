@@ -121,17 +121,24 @@ impl SelfPublishedReleaseManifests {
 
 /// The `/upgrade/apply` claim on its announced payload: [`SelfPublishedReleaseManifests::record_apply_route_payload`]
 /// records the digest, and dropping this guard without [`ApplyRouteClaim::keep`]
-/// releases it again — but only while the apply was never admitted. Before
+/// releases it again — but only while the apply was never admitted and no
+/// live probe retry owns the install for the manifest's version. Before
 /// admission every handler exit other than a successful apply or a live
 /// probe-retry hand-off releases the claim: a failed apply with no
-/// interrupted probe to resume, a no-op apply, a client disconnect that
-/// drops the handler future mid-wait, or a panic, so gossip copies of the
-/// payload reach the background owner again instead of being dropped for
-/// the tracker's TTL. A failed apply that leaves a live probe retry
-/// owning its install — one it scheduled, or one an earlier failed apply
-/// in this process already left in place — keeps the claim: the retry
-/// re-applies this same version when its durable wait elapses, and an
-/// echo must not queue a second apply beside it.
+/// interrupted probe to resume (including a failure before any attempt,
+/// whose cancelled permit disqualifies it from the hand-off), a no-op
+/// apply, a client disconnect that drops the handler future mid-wait, or
+/// a panic, so gossip copies of the payload reach the background owner
+/// again instead of being dropped for the tracker's TTL. A failed apply
+/// that leaves a live probe retry owning its install — one it scheduled,
+/// or one an earlier failed apply in this process already left in place
+/// — keeps the claim: the retry re-applies this same version when its
+/// durable wait elapses, and an echo must not queue a second apply
+/// beside it. That keep also covers a later request of the same bytes
+/// whose own exit kept nothing: a disconnect, a panic or a scheduler
+/// refusal drops this guard without `keep`, but the drop asks the
+/// process-local retry ownership first, so it clears a claim a live
+/// retry still needs only when no retry is left (#1169 round 6).
 /// Once the apply's blocking worker is admitted (host locks held;
 /// replacement and restart owned by the worker), a dropped handler no
 /// longer releases the claim: the install still runs, and a gossip copy
@@ -146,6 +153,7 @@ pub(in crate::server) struct ApplyRouteClaim {
     tracker: Arc<StdMutex<SelfPublishedReleaseManifests>>,
     digest: [u8; 32],
     permit: ReleasePermit,
+    manifest_version: String,
     kept: bool,
 }
 
@@ -153,10 +161,13 @@ impl ApplyRouteClaim {
     /// Record the announced payload as apply-route-owned and hold the
     /// claim for the guard's lifetime. `permit` is the apply's admission
     /// owner: its `admitted` flag decides whether a drop still releases.
+    /// `manifest_version` is what the drop's retry-ownership check keys
+    /// on, matching the scheduler's own claim.
     fn record(
         tracker: Arc<StdMutex<SelfPublishedReleaseManifests>>,
         payload: &[u8],
         permit: ReleasePermit,
+        manifest_version: String,
     ) -> Self {
         let digest = release_manifest_payload_digest(payload);
         tracker
@@ -167,6 +178,7 @@ impl ApplyRouteClaim {
             tracker,
             digest,
             permit,
+            manifest_version,
             kept: false,
         }
     }
@@ -186,12 +198,39 @@ impl Drop for ApplyRouteClaim {
         // Post-admission the blocking worker owns the replacement and the
         // restart; the claim outlives this handler and expires with the
         // tracker TTL instead.
-        if !self.kept && !self.permit.admitted() {
-            self.tracker
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clear_apply_route_digest(&self.digest, Instant::now());
+        if self.kept || self.permit.admitted() {
+            return;
         }
+        // This request installed nothing and scheduled nothing, but its
+        // drop must not clear a claim a live probe retry still needs:
+        // whichever earlier failure left that retry owning this install
+        // and version, a later request's disconnect, panic or scheduler
+        // refusal releases only what this request recorded (#1169
+        // round 6). A poisoned ownership map counts as owned, exactly
+        // like the scheduler's own claim.
+        if live_probe_retry_owns(&self.manifest_version) {
+            return;
+        }
+        self.tracker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear_apply_route_digest(&self.digest, Instant::now());
+    }
+}
+
+/// Whether a live probe retry owns this install and `version` — the same
+/// process-local ownership [`schedule_probe_retry`] claims. Resolved at
+/// drop time, so the answer matches whoever owns the install now; an
+/// unresolvable install path answers false, matching the scheduler's own
+/// refusal to spawn for it.
+fn live_probe_retry_owns(version: &str) -> bool {
+    let install = x0x::upgrade::apply::current_binary_path().and_then(|path| {
+        std::fs::canonicalize(path)
+            .map_err(|error| x0x::upgrade::UpgradeError::Other(error.to_string()))
+    });
+    match install {
+        Ok(install) => x0x::upgrade::probe_retry::retry_is_owned(&install, version),
+        Err(_) => false,
     }
 }
 
@@ -525,9 +564,13 @@ pub(in crate::server) type UpdateShutdown = (Arc<dyn Fn() + Send + Sync>, watch:
 /// apply-route claim for exactly the hand-off that answers `true` — the
 /// retry re-applies this same version when its durable wait elapses,
 /// whichever request left it in place — and releases it otherwise
-/// (#1169). The spawned loop rereads the full gated state before every
-/// attempt, so a record that changes between the two reads is still
-/// caught by the loop's own checks.
+/// (#1169). A request that failed before any attempt hands off nothing
+/// either: its exit cancelled the release permit a spawned retry would
+/// share, so the retry would die on its first gated check owning
+/// nothing — the scheduler refuses that spawn and answers `false`
+/// (#1169 round 6). The spawned loop rereads the full gated state
+/// before every attempt, so a record that changes between the two reads
+/// is still caught by the loop's own checks.
 async fn schedule_probe_retry(
     upgrader: &AutoApplyUpgrader,
     manifest: &ReleaseManifest,
@@ -558,6 +601,17 @@ async fn schedule_probe_retry(
         // suppression that retry still needs (#1169 round 5).
         return true;
     };
+    // A retry spawned from this upgrader shares its release permit. A
+    // request that failed before any attempt — staging wait, identity
+    // readback, permit or manifest-timestamp checks — exits through a
+    // custody that has already cancelled the permit, and the retry's
+    // first gated check would fail on it: nothing would own the install,
+    // yet the kept claim would suppress gossip copies for the tracker's
+    // TTL. Hand off nothing and answer false; the owner claimed above is
+    // released here (#1169 round 6).
+    if upgrader.check_release().is_err() {
+        return false;
+    }
     // The claim follows the retry, not the spawn: a timer without a durable
     // interrupted probe never applies anything, so read the record once here
     // — read-only; the response path acknowledges no probe-clock progress —
@@ -2480,6 +2534,7 @@ pub(in crate::server) async fn apply_upgrade(
         Arc::clone(&state.self_published_release_manifests),
         &release.gossip_payload,
         permit.clone(),
+        release.manifest.version.clone(),
     );
     {
         let agent = Arc::clone(&state.agent);
@@ -2541,7 +2596,10 @@ pub(in crate::server) async fn apply_upgrade(
             // this same version when its durable wait elapses, and until
             // then a gossip copy must not queue a second apply beside it.
             // A failure with no interrupted probe to resume keeps nothing
-            // — the claim releases on drop like every other pre-admission
+            // — and so does a failure before any attempt (staging wait,
+            // identity readback, permit or manifest-timestamp checks):
+            // its cancelled permit disqualifies it from the hand-off, and
+            // the claim releases on drop like every other pre-admission
             // exit.
             if schedule_probe_retry(
                 &upgrader,
@@ -2789,7 +2847,9 @@ async fn apply_http_release(
             result = upgrader.apply_upgrade_from_manifest(&verified.manifest) => result,
         };
         // Completed attempts retain the existing error-response/probe-retry
-        // handoff. Setup, staging and cancelled requests cannot spawn a retry.
+        // handoff. Setup, staging and cancelled requests cannot spawn a
+        // retry: the scheduler refuses a request whose exit cancelled its
+        // release permit.
         custody.completed_attempt = true;
         result
     }.await;
@@ -3755,7 +3815,7 @@ mod tests {
     /// version-string-lucky sub-second wait), then drops the future the
     /// way a client disconnect would.
     #[cfg(unix)]
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn a_cancelled_apply_route_releases_the_release_to_the_background_owner() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let agent = loopback_gossip_agent(dir.path()).await;
@@ -4016,11 +4076,17 @@ mod tests {
     /// install, the pre-admission identity refusal every supervised
     /// apply fails on — so B's handler answers promptly and its Err arm
     /// reaches the scheduler with the install resolvable and the owner
-    /// still held. Fails on the round-4 rule, where only the request
-    /// that scheduled the retry kept the claim and B's guard released
-    /// it on the way out.
+    /// still held. Round 6 replaces the fixed sleep that used to wait
+    /// for A's retry to settle with an assertion of the precondition it
+    /// waited for: retry ownership is claimed synchronously before A's
+    /// handler answers, so `claim_retry` answering `Some` (nothing
+    /// owns the pair) here means A's retry died instead of settling —
+    /// and the test fails rather than letting request B pass vacuously
+    /// through a spawn of its own. Fails on the round-4 rule, where
+    /// only the request that scheduled the retry kept the claim and B's
+    /// guard released it on the way out.
     #[cfg(unix)]
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn a_second_failed_apply_keeps_a_live_retry_claim() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let agent = loopback_gossip_agent(dir.path()).await;
@@ -4086,12 +4152,30 @@ mod tests {
             "the first failed apply hands off to a probe retry and keeps the claim",
         );
 
-        // Give the spawned retry time to settle into its durable wait
-        // (its first gated read resolves the staging identity against
-        // the verified scenario), then swap the readback for a unit that
-        // no longer names this install and re-arm the one-shot feed seam
-        // so request B verifies and applies the same bytes.
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        // A's retry owns this install and version from the moment its
+        // scheduler claimed it — inside A's handler, before it answered —
+        // so this is an assertion, not a wait: `claim_retry` answers
+        // `Some` exactly while no retry owns the pair, and `None` means
+        // the live hand-off B must not disturb is in place. A's retry
+        // that died before settling (round 6 refuses to spawn it a
+        // cancelled permit, but a post-attempt retry can still die on
+        // its own reads) shows up here as `Some` and fails the test.
+        let owner_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while crate::upgrade::probe_retry::claim_retry(
+            install.clone(),
+            verified.manifest.version.clone(),
+        )
+        .is_some()
+        {
+            assert!(
+                std::time::Instant::now() < owner_deadline,
+                "the first failure's probe retry never owned the install"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Swap the readback for a unit that no longer names this install
+        // and re-arm the one-shot feed seam so request B verifies and
+        // applies the same bytes.
         let _readback_second =
             restart::systemd_readback_seam::install(restart::systemd_readback_seam::Scenario {
                 cgroup: "0::/system.slice/x0x-staging-test.service".to_string(),
@@ -4116,6 +4200,257 @@ mod tests {
             true,
             "a second failed apply must not release the live retry's claim: the retry the first failure left still owns the install",
         );
+        // And the hand-off is still live: B's exit kept the owner in
+        // place, so a gossip echo stays suppressed by a retry that
+        // exists, not by a claim nothing backs.
+        assert!(
+            crate::upgrade::probe_retry::claim_retry(
+                install.clone(),
+                verified.manifest.version.clone()
+            )
+            .is_none(),
+            "the live retry must still own the install after the second failed apply"
+        );
+
+        let (rebroadcasts, selected) = drive_one_gossip_release(
+            verified,
+            Arc::clone(&state.self_published_release_manifests),
+        )
+        .await;
+        assert_eq!(rebroadcasts, 0, "self-published bytes are not rebroadcast");
+        assert_eq!(
+            selected, None,
+            "the echo of a release a live probe retry owns must not queue a second apply"
+        );
+        agent.shutdown().await;
+    }
+
+    /// #1169 review round 6 (Claude should-fix 1): a request that fails
+    /// before any attempt hands off nothing, even with a durable
+    /// interrupted probe present and no owner — here the failure is an
+    /// expired manifest timestamp, refused before the staging wait. The
+    /// exit's custody cancels the request's release permit, and a probe
+    /// retry spawned from this request would share that permit and die
+    /// on its first gated check owning nothing; the scheduler must
+    /// refuse the spawn and answer false, so the claim releases and
+    /// gossip copies of the payload reach the background owner again.
+    /// The durable wait is seeded directly at the install — no request
+    /// reaches an attempt that could seed it the round-5 way. Fails on
+    /// the round-5 rule, which spawned the doomed retry, kept the claim
+    /// and left the payload suppressed for the tracker's TTL.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pre_attempt_failure_hands_off_nothing_and_releases_the_claim() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = loopback_gossip_agent(dir.path()).await;
+        let state = staging_route_state(Arc::clone(&agent), dir.path(), 0).await;
+        let install = dir.path().canonicalize().expect("canonical").join("x0xd");
+        let _current = crate::upgrade::apply::current_binary_path_seam::install(install.clone());
+
+        let mut expired = submittable_release(&version_newer_than_current());
+        expired.manifest.timestamp = 1;
+        expired.manifest_json =
+            serde_json::to_vec(&expired.manifest).expect("serialize expired manifest");
+        expired.gossip_payload =
+            x0x::upgrade::manifest::encode_signed_manifest(&expired.manifest_json, b"announce");
+        let digest = release_manifest_payload_digest(&expired.gossip_payload);
+        let _feed = upgrade_check_feed_seam::install(Some(expired.clone()));
+
+        // Seed the durable interrupted probe the scheduler would find —
+        // deadline 30 minutes out, at the install the seam resolves —
+        // exactly the wait a live hand-off would resume.
+        let clock = crate::upgrade::probe::ProbeClock::now().expect("probe clock");
+        let seeded = crate::upgrade::probe::ProbeState {
+            schema_version: 1,
+            record_kind: "probe".into(),
+            install: install.clone(),
+            version: expired.manifest.version.clone(),
+            platform: expired.manifest.assets[0].target.clone(),
+            archive_sha256: expired.manifest.assets[0].archive_sha256,
+            transaction_id: "53535353-5353-5353-8353-535353535353".into(),
+            attempt: 1,
+            phase: crate::upgrade::probe::ProbePhase::InterruptedWait,
+            cause: Some(crate::upgrade::probe::ProbeCause::Timeout),
+            last_pid: None,
+            boot_id: clock.boot_id,
+            retry_remaining_ms: 1_800_000,
+            retry_deadline_ms: clock.monotonic_ms + 1_800_000,
+            daemon_sha256: None,
+            cli_sha256: None,
+        };
+        let path = crate::upgrade::probe::state_path(&install).expect("probe state path");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&seeded).expect("probe state json"),
+        )
+        .expect("seed probe state");
+
+        let (status, body) = route_response_json(
+            apply_upgrade(State(Arc::clone(&state)), Query(Default::default()))
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(body["applied"], serde_json::json!(false));
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("manifest too old")),
+            "the failure must be the pre-attempt timestamp refusal: {body}"
+        );
+        assert_claim(
+            &state,
+            &digest,
+            false,
+            "a failure before any attempt hands off nothing: the claim releases",
+        );
+        // Nothing was spawned: no retry owns this install and version,
+        // so the released claim is backed by no dead timer.
+        assert!(
+            crate::upgrade::probe_retry::claim_retry(
+                install.clone(),
+                expired.manifest.version.clone()
+            )
+            .is_some(),
+            "a pre-attempt failure must not leave a probe retry owning the install"
+        );
+        agent.shutdown().await;
+    }
+
+    /// #1169 review round 6 (Claude should-fix 2): request A fails and
+    /// hands the install to a live probe retry, keeping its claim;
+    /// request B for the same bytes is then dropped before admission —
+    /// here aborted mid staging wait, the client-disconnect drop. B's
+    /// guard kept nothing and was never admitted, but its drop must not
+    /// clear A's claim: it asks the process-local retry ownership first,
+    /// and A's retry still owns this install and version. Fails on the
+    /// round-5 rule, where any not-kept, not-admitted drop cleared the
+    /// digest. The durable `InterruptedWait` — deadline 30 minutes out,
+    /// so the wait cannot elapse on its own — is seeded at the
+    /// pre-probe-admission point of A's attempt, the way the round-5
+    /// test seeds it: A's own staging wait runs before the seed exists,
+    /// so A reaches its attempt and fails on the fresh wait, while B
+    /// parks on it. A's staging decisions are all `Due` (zero rollout
+    /// window, no probe wait yet), so the first `Waiting` the observer
+    /// reports is B's park.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_request_dropped_before_admission_keeps_a_live_retry_claim() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = loopback_gossip_agent(dir.path()).await;
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let state = staging_route_state_observed(
+            Arc::clone(&agent),
+            dir.path(),
+            0,
+            Some(Arc::new(move |decision| {
+                if matches!(decision, crate::upgrade::staging::Decision::Waiting(_)) {
+                    let _ = waiting_tx.send(());
+                }
+            })),
+        )
+        .await;
+        let install = dir.path().canonicalize().expect("canonical").join("x0xd");
+        let _current = crate::upgrade::apply::current_binary_path_seam::install(install.clone());
+        let _readback =
+            restart::systemd_readback_seam::install(route_readback_scenario(16, &install));
+
+        let verified = submittable_release(&version_newer_than_current());
+        let digest = release_manifest_payload_digest(&verified.gossip_payload);
+        let _feed = upgrade_check_feed_seam::install(Some(verified.clone()));
+        let seed_version = verified.manifest.version.clone();
+        let seed_platform = verified.manifest.assets[0].target.clone();
+        let seed_archive_sha256 = verified.manifest.assets[0].archive_sha256;
+        let _probe_seed = crate::upgrade::apply::pre_probe_admission_seam::install(
+            install.clone(),
+            Box::new(move |target| {
+                let clock = crate::upgrade::probe::ProbeClock::now().expect("probe clock");
+                let seeded = crate::upgrade::probe::ProbeState {
+                    schema_version: 1,
+                    record_kind: "probe".into(),
+                    install: target.to_path_buf(),
+                    version: seed_version,
+                    platform: seed_platform,
+                    archive_sha256: seed_archive_sha256,
+                    transaction_id: "44444444-4444-4444-8444-444444444444".into(),
+                    attempt: 1,
+                    phase: crate::upgrade::probe::ProbePhase::InterruptedWait,
+                    cause: Some(crate::upgrade::probe::ProbeCause::Timeout),
+                    last_pid: None,
+                    boot_id: clock.boot_id,
+                    retry_remaining_ms: 1_800_000,
+                    retry_deadline_ms: clock.monotonic_ms + 1_800_000,
+                    daemon_sha256: None,
+                    cli_sha256: None,
+                };
+                let path = crate::upgrade::probe::state_path(target).expect("probe state path");
+                std::fs::write(
+                    &path,
+                    serde_json::to_vec(&seeded).expect("probe state json"),
+                )
+                .expect("seed probe state");
+            }),
+        );
+
+        // Request A: fails on the wait it just seeded, hands the install
+        // to a live probe retry and keeps the claim.
+        let (status, body) = route_response_json(
+            apply_upgrade(State(Arc::clone(&state)), Query(Default::default()))
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(body["applied"], serde_json::json!(false));
+        assert_claim(
+            &state,
+            &digest,
+            true,
+            "the first failed apply hands off to a probe retry and keeps the claim",
+        );
+
+        // Request B, same bytes: parks on the seeded durable wait (the
+        // first `Waiting` the observer reports) and is then dropped the
+        // way a client disconnect would.
+        let _feed_second = upgrade_check_feed_seam::install(Some(verified.clone()));
+        let handler_state = Arc::clone(&state);
+        let handler = tokio::spawn(async move {
+            apply_upgrade(State(handler_state), Query(Default::default())).await
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while waiting_rx.try_recv().is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "request B never reached the staging wait; handler finished: {}",
+                handler.is_finished()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !handler.is_finished(),
+            "request B must still be waiting inside its apply"
+        );
+        handler.abort();
+        let joined = handler.await;
+        assert!(
+            matches!(&joined, Err(error) if error.is_cancelled()),
+            "request B's handler future was dropped mid-wait"
+        );
+        assert_claim(
+            &state,
+            &digest,
+            true,
+            "a request dropped before admission must not clear the live retry's claim",
+        );
+        assert!(
+            crate::upgrade::probe_retry::claim_retry(
+                install.clone(),
+                verified.manifest.version.clone()
+            )
+            .is_none(),
+            "the dropped request must leave the live retry owning the install"
+        );
 
         let (rebroadcasts, selected) = drive_one_gossip_release(
             verified,
@@ -4136,7 +4471,7 @@ mod tests {
     /// claim on its way out, exactly like every other pre-admission
     /// non-Success exit.
     #[cfg(unix)]
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn a_panicking_apply_route_releases_the_release_to_the_background_owner() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let agent = loopback_gossip_agent(dir.path()).await;
