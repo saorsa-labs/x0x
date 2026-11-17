@@ -251,7 +251,7 @@ macro_rules! fleet_startup_regression_tests {
             };
             let attempts = Arc::new(AtomicU64::new(0));
             let counted = Arc::clone(&attempts);
-            let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |plan, manifest| {
+            let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |plan, manifest, _admission| {
                 assert!(!plan.systemd_verified.as_ref().unwrap().user_manager);
                 counted.fetch_add(1, Ordering::SeqCst);
                 x0x::upgrade::UpgradeResult::Success { version: manifest.version.clone() }
@@ -261,7 +261,7 @@ macro_rules! fleet_startup_regression_tests {
             });
             let mut config = DaemonConfig { data_dir: root, ..Default::default() };
             config.update.rollout_window_minutes = 0;
-            let mut startup = Box::pin(run_startup_update_check(&config, None, Some(runtime)));
+            let mut startup = Box::pin(run_startup_update_check(&config, Some(runtime)));
             let mut next = match staging_next_observation(startup.as_mut(), &mut observations, deadline).await {
                 Ok(decision) => decision,
                 Err(result) => {
@@ -427,7 +427,7 @@ macro_rules! fleet_startup_regression_tests {
             if let Some(path) = &blocked_path { std::fs::write(path, b"corrupt retained intent").unwrap(); }
             let attempts = Arc::new(AtomicU64::new(0));
             let counted = Arc::clone(&attempts);
-            let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |_, manifest| {
+            let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |_, manifest, _admission| {
                 counted.fetch_add(1, Ordering::SeqCst);
                 x0x::upgrade::UpgradeResult::Success { version: manifest.version.clone() }
             }));
@@ -439,7 +439,7 @@ macro_rules! fleet_startup_regression_tests {
                 });
                 let mut config = DaemonConfig { data_dir: root.clone(), ..Default::default() };
                 config.update.rollout_window_minutes = 0;
-                let mut startup = Box::pin(run_startup_update_check(&config, None, Some(runtime)));
+                let mut startup = Box::pin(run_startup_update_check(&config, Some(runtime)));
                 let result = loop {
                     assert!(std::time::Instant::now() < deadline, "startup refusal did not finish");
                     tokio::select! { biased;
@@ -582,7 +582,7 @@ macro_rules! fleet_startup_regression_tests {
             let attempts = Arc::new(AtomicU64::new(0));
             let counted = Arc::clone(&attempts);
             let expected_unit = unit.to_owned();
-            let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |plan, manifest| {
+            let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |plan, manifest, _admission| {
                 let verified = plan.systemd_verified.as_ref().unwrap();
                 assert_eq!(verified.unit, expected_unit);
                 assert!(!verified.user_manager);
@@ -595,7 +595,7 @@ macro_rules! fleet_startup_regression_tests {
             let mut config = DaemonConfig { data_dir: root, ..Default::default() };
             config.update.rollout_window_minutes = 0;
             let started = tokio::time::Instant::now();
-            let startup = run_startup_update_check(&config, None, Some(runtime));
+            let startup = run_startup_update_check(&config, Some(runtime));
             tokio::pin!(startup);
             // Keep virtual time fixed while real blocking filesystem work runs.
             // A rewritten sixty-minute receipt is a failure, not a long timeout.

@@ -55811,6 +55811,28 @@ pub(in crate::server) mod tests {
         agent: Arc<Agent>,
         self_update_enabled: bool,
     ) -> Result<Arc<AppState>> {
+        secure_endpoint_test_state_with_upgrade_options(
+            data_dir,
+            agent,
+            self_update_enabled,
+            #[cfg(unix)]
+            None,
+            DaemonUpdateConfig::default(),
+        )
+        .await
+    }
+
+    /// #1169 review round 2: route tests that drive `/upgrade/apply` past
+    /// its fast staging refusal need the state to carry a staging identity
+    /// (and, for applies that must complete, a zero rollout window). The
+    /// shared fixture above keeps neither; everything else stays identical.
+    pub(in crate::server) async fn secure_endpoint_test_state_with_upgrade_options(
+        data_dir: &FsPath,
+        agent: Arc<Agent>,
+        self_update_enabled: bool,
+        #[cfg(unix)] upgrade_staging: Option<crate::server::routes::StartupStagingContext>,
+        update_config: crate::server::state::DaemonUpdateConfig,
+    ) -> Result<Arc<AppState>> {
         let treekem_dir = data_dir.join("treekem");
         tokio::fs::create_dir_all(&treekem_dir).await?;
         let named_groups_path = data_dir.join("named_groups.json");
@@ -56023,7 +56045,7 @@ pub(in crate::server) mod tests {
             transfers_dir: data_dir.join("transfers"),
             shutdown_tx,
             shutdown_notify,
-            update_config: DaemonUpdateConfig::default(),
+            update_config,
             self_update_enabled,
             upgrade_check_cache: Mutex::new(None),
             upgrade_apply_lock: Arc::new(Mutex::new(())),
@@ -56032,7 +56054,7 @@ pub(in crate::server) mod tests {
             upgrade_observations: Default::default(),
             background_submit: std::sync::OnceLock::new(),
             #[cfg(unix)]
-            upgrade_staging: None,
+            upgrade_staging,
             api_token: "test-token".to_string(),
             sessions: auth::SessionStore::new(auth::SESSION_TOKEN_TTL),
             rider_tokens: tokio::sync::Mutex::new(
