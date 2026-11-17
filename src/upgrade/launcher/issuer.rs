@@ -84,15 +84,26 @@ impl start::Issuer for JournalIssuer<'_> {
     }
 }
 
-/// `uid` is the account the records must belong to: the launcher's
-/// effective uid (tests pass another to see a foreign owner).
+/// `uid` is the account the root and records must belong to: the
+/// launcher's effective uid.
 fn issue_as(
     args: &TrialArgs,
     command: &forward::DaemonCommand,
     uid: u32,
 ) -> io::Result<Option<start::Issued>> {
-    check_root(&args.host_root, uid)?;
-    let Some(record) = read_journal(&args.host_root, uid)? else {
+    issue_with(args, command, uid, uid)
+}
+
+/// As `issue_as`, with the root's and the journal's expected owners apart,
+/// so a test can make only the journal foreign (#2014 review).
+fn issue_with(
+    args: &TrialArgs,
+    command: &forward::DaemonCommand,
+    root_uid: u32,
+    record_uid: u32,
+) -> io::Result<Option<start::Issued>> {
+    check_root(&args.host_root, root_uid)?;
+    let Some(record) = read_journal(&args.host_root, record_uid)? else {
         return no_authority(args);
     };
     if !owns_trial(record.phase)? {
@@ -121,7 +132,15 @@ fn issue_as(
         ));
     }
     // Canonical install and participant paths (`Host::new`).
-    let host = recovery::Host::new(args.host_root.clone(), record)?;
+    // A plan path that is missing or not canonical stays so on a restart:
+    // a fixed refusal. Any other I/O error may pass (#2014 review).
+    let host = recovery::Host::new(args.host_root.clone(), record).map_err(|error| {
+        if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::Other) {
+            start::refused(format!("host journal plan is not usable: {error}"))
+        } else {
+            error
+        }
+    })?;
     Ok(Some(start::Issued {
         host,
         instance: args.instance.clone(),
@@ -186,6 +205,14 @@ fn no_authority(args: &TrialArgs) -> io::Result<Option<start::Issued>> {
     let bytes = match journal::read_auxiliary_record(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        // A symlinked, non-regular or oversized trial record stays so: a
+        // fixed refusal, never a passthrough (#2014 review).
+        Err(error)
+            if error.kind() == io::ErrorKind::InvalidData
+                || error.raw_os_error() == Some(libc::ELOOP) =>
+        {
+            return Err(start::refused(format!("trial record is unusable: {error}")));
+        }
         Err(error) => return Err(error),
     };
     let trial: Trial =
@@ -297,6 +324,22 @@ mod tests {
                 "/r",
                 "--instance",
                 "a/b",
+                "--",
+                "/usr/bin/x0xd",
+            ],
+            vec![
+                "--host-root",
+                "/r",
+                "--instance",
+                ".",
+                "--",
+                "/usr/bin/x0xd",
+            ],
+            vec![
+                "--host-root",
+                "/r",
+                "--instance",
+                "..",
                 "--",
                 "/usr/bin/x0xd",
             ],
@@ -609,8 +652,13 @@ mod tests {
         assert!(issue_as(&args, &command, effective_uid())
             .unwrap()
             .is_some());
+        // Only the journal is foreign: the root check passes, so the
+        // descriptor owner check is the one that refuses (#2014 review).
         let foreign = effective_uid().wrapping_add(1);
-        assert!(refused(issue_as(&args, &command, foreign)), "foreign owner");
+        assert!(
+            refused(issue_with(&args, &command, effective_uid(), foreign)),
+            "foreign journal owner"
+        );
     }
 
     /// Fixed refusals exit 78; a failed read (here a host root that does
@@ -635,5 +683,39 @@ mod tests {
             instance: "alice".into(),
         };
         assert_eq!(exit(&missing), start::Start::Exit(start::EXIT_TEMPFAIL));
+    }
+
+    /// #2014 review item 4: a plan path that is missing is a fixed
+    /// refusal (78), not a retry.
+    #[test]
+    fn a_missing_plan_path_is_a_fixed_refusal() {
+        let (_dir, root, mut record) = rooted(journal::Phase::SwappedCli);
+        record.plan.cli.backup_path = root.join("missing-backup");
+        journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &record).unwrap();
+        let (args, command) = matching(&record);
+        assert!(refused(issue_as(&args, &command, effective_uid())));
+    }
+
+    /// #2014 review item 4: a symlinked or non-regular trial record with no
+    /// in-flight journal is a fixed refusal, never a passthrough.
+    #[test]
+    fn an_unusable_trial_record_is_a_fixed_refusal() {
+        let (_dir, root, record) = rooted(journal::Phase::SwappedCli);
+        let (args, command) = matching(&record);
+        std::fs::remove_file(root.join(journal::JOURNAL_FILE_NAME)).unwrap();
+        let trial = root.join(coordinator::TRIAL_FILE_NAME);
+        let target = root.join("elsewhere.json");
+        std::fs::write(&target, b"{}").unwrap();
+        std::os::unix::fs::symlink(&target, &trial).unwrap();
+        assert!(
+            refused(issue_as(&args, &command, effective_uid())),
+            "symlink"
+        );
+        std::fs::remove_file(&trial).unwrap();
+        std::fs::create_dir(&trial).unwrap();
+        assert!(
+            refused(issue_as(&args, &command, effective_uid())),
+            "directory"
+        );
     }
 }
