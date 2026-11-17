@@ -54,14 +54,14 @@
       "revision": 1,
       "path": "A07-r01-messages-receipts-history-and-retry.md",
       "title": "Messages Receipts History and Retry",
-      "sha256": "cef0446cc48ddb2db7c5fa505dc4ecce650c09fa3c4501ac9ddb1e1cd9f5b500"
+      "sha256": "5dfaee3ba36513bf97a0667cea1864bfbc52db073233a37d9764dfa430185144"
     },
     {
       "id": "A08",
       "revision": 1,
       "path": "A08-r01-groups-home-membership-and-repair.md",
       "title": "Groups Home Membership and Repair",
-      "sha256": "bef97cfba2f38eeff3c96d53e98423fdd5872fcf745747a1e5b5b6c858aa0e2a"
+      "sha256": "9a5793c3d516cc6b50cc8aa3d7d426d4f595f7bf37b334635e1defe2d5679b96"
     },
     {
       "id": "A09",
@@ -75,7 +75,7 @@
       "revision": 1,
       "path": "A10-r01-shared-data-files-and-synchronization.md",
       "title": "Shared Data Files and Synchronization",
-      "sha256": "0f4481c3412b59e5760280fd3f7e932186a9e63916ece3880b5157d356fce83c"
+      "sha256": "1972d0c6c0bc8f0924a6e48b7f026b19a4753bc40a3a9138b2f9cb4db3551e8e"
     },
     {
       "id": "A11",

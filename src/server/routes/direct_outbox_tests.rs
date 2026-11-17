@@ -1266,3 +1266,197 @@ async fn issue1109_wake_up_flood_does_not_starve_the_scheduled_passes() {
     let _ = stop_tx.send(());
     worker.await.expect("worker ends");
 }
+
+/// WHY: #1983 review MINOR 1 — a flood of adverts from a recipient that
+/// HAS held sends must not resend on every advert: one nudge per
+/// recipient per [`DIRECT_SEND_NUDGE_MIN_MS`].
+#[tokio::test(start_paused = true)]
+async fn issue1109_advert_flood_for_a_held_recipient_is_rate_limited() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let outbox = std::sync::Arc::new(outbox_in(&dir));
+    let peer = agent(2);
+    outbox
+        .enqueue(obligation("advert-flood", peer, NOW + 600_000), no_record())
+        .await;
+    // Every attempt times out, so the send stays held throughout.
+    let transport = std::sync::Arc::new(ScriptedTransport::with(
+        (0..200).map(|_| Err(timeout())).collect(),
+    ));
+    let (wake_tx, wake_rx) = tokio::sync::mpsc::channel(256);
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let worker = {
+        let outbox = std::sync::Arc::clone(&outbox);
+        let transport = std::sync::Arc::clone(&transport);
+        tokio::spawn(async move {
+            let start = tokio::time::Instant::now();
+            let clock = move || {
+                let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                at(NOW + elapsed, elapsed)
+            };
+            run_direct_send_worker(
+                &outbox,
+                &unknown,
+                transport.as_ref(),
+                &clock,
+                wake_rx,
+                async move {
+                    let _ = stop_rx.await;
+                },
+            )
+            .await;
+        })
+    };
+    // 100 adverts from the held recipient over 10 s (one every 100 ms).
+    for _ in 0..100 {
+        wake_tx
+            .send(DirectSendWake::Advert(peer))
+            .await
+            .expect("worker alive");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let _ = stop_tx.send(());
+    worker.await.expect("worker ends");
+    // Without the limit every advert would resend (about 100). With it, at
+    // most one nudge per 2 s plus the scheduled passes: well under 20.
+    let calls = transport.calls();
+    assert!(calls >= 2, "the held send was still tried: {calls}");
+    assert!(calls <= 12, "advert flood resent too often: {calls}");
+    assert_eq!(outbox.snapshot().await.len(), 1, "still held");
+}
+
+/// WHY: #1983 review MINOR 1 — the nudge limit is per recipient: a nudge
+/// of one recipient does not hold back another's.
+#[tokio::test]
+async fn issue1109_nudge_limit_is_per_recipient() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let outbox = outbox_in(&dir);
+    let (a, b) = (agent(2), agent(3));
+    for (id, peer) in [("lim-a", a), ("lim-b", b)] {
+        outbox
+            .enqueue(obligation(id, peer, NOW + 600_000), no_record())
+            .await;
+    }
+    assert!(outbox.nudge_recipient(&a, at(NOW, 100)).await);
+    assert!(
+        !outbox.nudge_recipient(&a, at(NOW, 1_000)).await,
+        "too soon"
+    );
+    assert!(
+        outbox.nudge_recipient(&b, at(NOW, 1_000)).await,
+        "other recipient"
+    );
+    assert!(
+        outbox
+            .nudge_recipient(&a, at(NOW, 100 + DIRECT_SEND_NUDGE_MIN_MS))
+            .await,
+        "after the interval"
+    );
+}
+
+/// WHY: #1983 review MINOR 2 — the attempt memory must not drop a record
+/// before its 24 hours: when held sends and attempt records fill it, a new
+/// queued send is refused instead.
+#[tokio::test]
+async fn issue1109_full_attempt_memory_refuses_new_queued_sends() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let outbox = outbox_in(&dir);
+    let peer = agent(2);
+    // Fill the attempt memory up to one below its cap, with recent records.
+    let now_ms = now_unix_ms();
+    {
+        let mut terminal = outbox.terminal();
+        for i in 0..(DIRECT_SEND_OUTCOMES_CAP - 1) {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            terminal.note_attempt(id, "aa", [1; 32], now_ms);
+        }
+    }
+    // One held send without an attempt record fills the last place.
+    assert_eq!(
+        outbox
+            .enqueue(obligation("mem-1", peer, NOW + 60_000), no_record())
+            .await,
+        EnqueueOutcome::Queued
+    );
+    assert_eq!(
+        outbox
+            .enqueue(obligation("mem-2", peer, NOW + 60_000), no_record())
+            .await,
+        EnqueueOutcome::Full,
+        "no room for another attempt record"
+    );
+    assert_eq!(
+        outbox
+            .enqueue(obligation("mem-1", peer, NOW + 60_000), no_record())
+            .await,
+        EnqueueOutcome::AlreadyQueued {
+            deliver_until_ms: NOW + 60_000
+        },
+        "a repeat of a held send is still answered"
+    );
+    assert_eq!(
+        outbox.terminal().attempts.len(),
+        DIRECT_SEND_OUTCOMES_CAP - 1
+    );
+}
+
+/// WHY: #1983 review MINOR 3 — when a pass decides `failed` but cannot
+/// write it, the next pass must write it again and send nothing: the send
+/// was already refused by the recipient's side.
+#[tokio::test]
+async fn issue1109_unwritten_failed_outcome_is_not_resent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let outbox = outbox_in(&dir);
+    let peer = agent(2);
+    let rid = request_id_for("unwritten-1", peer);
+    outbox
+        .enqueue(obligation("unwritten-1", peer, NOW + 60_000), no_record())
+        .await;
+    // The first attempt fails with a terminal error, and the outcomes
+    // file becomes unwritable while it runs.
+    let blocker = dir.path().join(DIRECT_SEND_OUTCOMES_FILE);
+    let transport = BlockDuringSend {
+        inner: ScriptedTransport::with(vec![Err(DmError::RecipientRejected {
+            reason: "blocked".to_string(),
+        })]),
+        blocker: blocker.clone(),
+    };
+    outbox.step(at(NOW, 0), &unknown, &transport).await;
+    assert_eq!(transport.inner.calls(), 1);
+    assert_eq!(outbox.snapshot().await.len(), 1, "held: outcome unwritten");
+    // Still unwritable: no send.
+    outbox.step(at(NOW, 3_000), &unknown, &transport).await;
+    assert_eq!(transport.inner.calls(), 1, "no resend");
+    std::fs::remove_dir(&blocker).expect("remove blocker");
+    outbox.step(at(NOW, 6_000), &unknown, &transport).await;
+    assert_eq!(transport.inner.calls(), 1, "no resend once writable");
+    assert!(outbox.snapshot().await.is_empty());
+    let receipt = status(&outbox, peer, &rid).await;
+    assert_eq!(receipt.status, "failed");
+    assert_eq!(receipt.error.as_deref(), Some("recipient_rejected"));
+}
+
+/// A scripted transport that makes the outcomes file unwritable (a
+/// directory in its place) during the send.
+struct BlockDuringSend {
+    inner: ScriptedTransport,
+    blocker: std::path::PathBuf,
+}
+
+impl DirectSendTransport for BlockDuringSend {
+    fn recipient_blocked(&self, recipient: AgentId) -> TransportFuture<'_, bool> {
+        self.inner.recipient_blocked(recipient)
+    }
+
+    fn send(
+        &self,
+        recipient: AgentId,
+        payload: Vec<u8>,
+        config: DmSendConfig,
+        budget: Duration,
+    ) -> TransportFuture<'_, Result<(), DmError>> {
+        let _ = std::fs::remove_file(&self.blocker);
+        std::fs::create_dir(&self.blocker).expect("blocker dir");
+        self.inner.send(recipient, payload, config, budget)
+    }
+}
