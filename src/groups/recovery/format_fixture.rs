@@ -1,14 +1,5 @@
 //! ADR 0085 rule 6 format fixture for the S3 sidecar (#1568).
 //!
-//! `tests/fixtures/group_recovery_v1.bin` is a `X0GRCV1\0` file written by
-//! this crate's own [`encode_sidecar`], with every [`GroupRecoveryV1`] field
-//! set, including the two fields that #1533 added beyond the ADR 0109 §4
-//! list: `attestation_conflict` and `authoritative_binding`. The format is
-//! not released yet, so this is the initial encoder fixture (provenance in
-//! `tests/fixtures/group_recovery_v1.PROVENANCE.txt`). Keep it unchanged
-//! when the format releases: a change to the field order or to a field's
-//! type then fails [`v1_sidecar_fixture_decodes_and_re_encodes_exactly`].
-//!
 //! postcard is positional. If two fields of the same type held the same
 //! bytes, a swap of their declarations would still decode and re-encode
 //! exactly. So no two same-typed fields in the fixture hold the same value,
@@ -23,7 +14,6 @@ use std::path::{Path, PathBuf};
 use super::*;
 use crate::groups::member::GroupRole;
 
-/// Signed-time and issue-time stamp for every signed record (unix ms).
 const NOW_MS: u64 = 2_000_000_000_000;
 
 fn fixture_path() -> PathBuf {
@@ -46,46 +36,34 @@ fn ata(admin: &AgentKeypair, group: &str, sequence: &[&str]) -> AdminTerminalAtt
     AdminTerminalAttestation::sign(fields, admin).expect("sign ata")
 }
 
-/// The ATA and re-seat subject (hex agent id).
 const SUBJECT: &str = "abababababababababababababababababababababababababababababababab";
 
-/// The ATA sequence of `active_ata`.
 const ACTIVE_SEQUENCE: [&str; 2] = ["h2", "h3"];
-/// The ATA sequence of `attestation_conflict` (forks at the second step).
 const CONFLICT_SEQUENCE: [&str; 3] = ["h2", "x3", "x4"];
-/// The exact `queued_terminal` bytes.
 const QUEUED_TERMINAL: &[u8] = br#"{"event":"fixture-queued-terminal"}"#;
 const JOURNAL_INVITE: &str = "x0x://invite/fixture-journal";
 const ISSUED_INVITE: &str = "x0x://invite/fixture-issued";
 const LIVE_TREE: [u8; 8] = [0x22; 8];
 const RETIRED_CAUSE: &str = "reseat";
 
-/// Each embedded `GroupInfo` record carries its own description, so that a
-/// decoded record shows which field it came from. Postcard is positional:
-/// identical bytes in two same-typed fields would hide a swap of the two.
 const AUTHORITATIVE_LABEL: &str = "fixture authoritative_record";
 const STAGING_LABEL: &str = "fixture staging_record";
 const LIVE_LABEL: &str = "fixture reseat_journal.live_record";
 const RETIRED_LABEL: &str = "fixture retired.record";
 const BEFORE_LABEL: &str = "fixture authoritative_binding.before_record";
 
-/// `info` as JSON, with `label` as its description.
 fn labelled_record(info: &GroupInfo, label: &str) -> Vec<u8> {
     let mut copy = info.clone();
     copy.description = label.to_string();
     serde_json::to_vec(&copy).expect("record json")
 }
 
-/// The description of a JSON `GroupInfo` record.
 fn record_label(bytes: &[u8]) -> String {
     serde_json::from_slice::<GroupInfo>(bytes)
         .expect("record json")
         .description
 }
 
-/// A sidecar with every field set, as a subject that holds an S3
-/// placeholder, a conflicting ATA and an open re-seat would write it.
-/// Two fields of the same type never hold the same value.
 fn full_sidecar(admin: &AgentKeypair) -> GroupRecoveryV1 {
     let mut info = GroupInfo::new(
         "fixture".to_string(),
@@ -181,12 +159,6 @@ fn generate_initial_v1_sidecar_fixture() {
     output.write_all(&bytes).expect("write fixture");
 }
 
-/// The fixture decodes, every field holds its own expected value and is
-/// verifiable, and the current encoder writes the same bytes again. A
-/// reordered, removed, added (other than at a new format version) or
-/// retyped field fails here. Postcard is positional, so a swap of two
-/// same-typed fields still round-trips: the per-field value checks below
-/// catch it, because no two same-typed fields hold the same value.
 #[test]
 fn v1_sidecar_fixture_decodes_and_re_encodes_exactly() {
     let bytes = fs::read(fixture_path()).expect("read fixture");
@@ -202,7 +174,6 @@ fn v1_sidecar_fixture_decodes_and_re_encodes_exactly() {
             .expect("served link json");
     }
 
-    // The three `Option<Vec<u8>>` fields.
     assert_eq!(body.queued_terminal.as_deref(), Some(QUEUED_TERMINAL));
     let record_bytes = body.authoritative_record.as_deref().expect("record");
     assert_eq!(record_label(record_bytes), AUTHORITATIVE_LABEL);
@@ -210,7 +181,6 @@ fn v1_sidecar_fixture_decodes_and_re_encodes_exactly() {
     let staging = body.staging_record.as_deref().expect("staging_record");
     assert_eq!(record_label(staging), STAGING_LABEL);
 
-    // The two `Option<AdminTerminalAttestation>` fields.
     let active = body.active_ata.as_ref().expect("active_ata");
     active.verify_signature().expect("active_ata signature");
     assert_eq!(active.fields.sequence, ACTIVE_SEQUENCE);
