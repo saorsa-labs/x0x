@@ -177,8 +177,8 @@ pub(super) fn run_trial(
                 let next = now()?.ms.saturating_add(GAP_MS);
                 // The spawn recorded the exec failure in memory only.
                 let cause = trial.cause.clone();
-                if !requeue(host, path, trial, cause, next)? {
-                    return resume_peer_recovery(host, path, trial, &mut stop);
+                if !requeue(host, path, trial, cause.clone(), next)? {
+                    return resume_peer_recovery(host, path, trial, cause, &mut now, &mut stop);
                 }
                 continue;
             }
@@ -223,8 +223,9 @@ pub(super) fn run_trial(
         }
         trial.child = None;
         let next = now()?.ms.saturating_add(GAP_MS);
-        if !requeue(host, path, trial, Some(failure.to_string()), next)? {
-            return resume_peer_recovery(host, path, trial, &mut stop);
+        let cause = Some(failure.to_string());
+        if !requeue(host, path, trial, cause.clone(), next)? {
+            return resume_peer_recovery(host, path, trial, cause, &mut now, &mut stop);
         }
     }
 }
@@ -360,21 +361,44 @@ fn requeue(
 /// RecoveryFailed one is final. A trial still Booting on a fenced host
 /// (the peer had not marked it yet) runs the coordinator pass itself; the
 /// pass joins or finishes the peer's restore and keeps its first cause.
+///
+/// `cause` is the failure of the attempt that just ended. On a Booting
+/// trial that attempt has failed, so a used-up attempt count or total
+/// budget gives a Failed verdict, as at the loop head; only otherwise is
+/// the verdict Interrupted. The coordinator lets a Failed verdict win, so
+/// the failed release is held (#1991 review). A last attempt that a peer's
+/// stop ended also counts as Failed: fail-safe, the release is held (A14,
+/// 17 Nov 2026). The attempt count needs no clock, so a clock error cannot
+/// turn a last-attempt Failed into Interrupted.
 fn resume_peer_recovery(
     host: &recovery::Host,
     path: &Path,
     trial: &mut Trial,
+    cause: Option<String>,
+    now: &mut impl FnMut() -> io::Result<Clock>,
     stop: &mut impl FnMut() -> bool,
 ) -> io::Result<Outcome> {
     match trial.phase {
         Phase::Restored if stop() => Ok(Outcome::Stopped),
         Phase::Restored => start_restored(host, path, trial).map(Outcome::Restored),
-        Phase::RollingBack | Phase::Booting => rollback(
+        Phase::RollingBack => rollback(
             host,
             path,
             trial,
             interrupted("a peer began recovery during an attempt"),
         ),
+        Phase::Booting => {
+            if cause.is_some() {
+                trial.cause = cause;
+            }
+            let failed = match now() {
+                Ok(clock) => failed_verdict(trial, &clock),
+                Err(_) => exhausted_verdict(trial),
+            };
+            let verdict =
+                failed.unwrap_or_else(|| interrupted("a peer began recovery during an attempt"));
+            rollback(host, path, trial, verdict)
+        }
         Phase::RecoveryFailed => Err(invalid("automatic start is forbidden")),
         _ => Err(invalid("trial changed during an attempt")),
     }
@@ -394,16 +418,22 @@ pub(super) fn protected_start_allowed(phase: journal::Phase) -> bool {
 /// boot. Do not call it while an attempt runs: that attempt is counted but
 /// has not failed.
 pub(super) fn failed_verdict(trial: &Trial, clock: &Clock) -> Option<journal::Cause> {
-    if trial.attempts >= MAX_ATTEMPTS {
+    exhausted_verdict(trial).or_else(|| {
+        trial
+            .expired(clock)
+            .filter(|cause| cause.class == journal::CauseClass::Failed)
+    })
+}
+
+/// The Failed verdict for a used-up attempt count. It needs no clock.
+fn exhausted_verdict(trial: &Trial) -> Option<journal::Cause> {
+    (trial.attempts >= MAX_ATTEMPTS).then(|| {
         let reason = format!(
             "launch attempts exhausted: {}",
             trial.cause.as_deref().unwrap_or("no health commit")
         );
-        return Some(cause(journal::CauseClass::Failed, reason));
-    }
-    trial
-        .expired(clock)
-        .filter(|cause| cause.class == journal::CauseClass::Failed)
+        cause(journal::CauseClass::Failed, reason)
+    })
 }
 
 /// On a stop during an attempt, record a Failed verdict only for a run-out
@@ -820,6 +850,152 @@ mod tests {
         assert_eq!(on_disk.attempts, 1, "{on_disk:?}");
         assert_eq!(on_disk.restored_starts, 1, "{on_disk:?}");
         assert_eq!(on_disk.phase, Phase::RecoveryFailed, "{on_disk:?}");
+    }
+
+    /// #1991 review (23ce1538): a peer fences the host with an Interrupted
+    /// cause during Alice's last allowed attempt, and her trial is still
+    /// Booting. That attempt failed, so her verdict is Failed (attempts
+    /// exhausted), not Interrupted, and the Failed verdict wins in the
+    /// coordinator: the host records Failed and the release is held.
+    #[test]
+    fn a_peer_fence_on_the_last_attempt_records_failed() {
+        let (_dir, root, host, _record) = fixture_with(journal::Phase::SwappedCli, with_bob);
+        write_probe(&host, 1, probe::ProbePhase::Passed);
+        let alice = coordinator::trial_path(&host.plan().participants[0]);
+        let bob = coordinator::trial_path(&host.plan().participants[1]);
+        let mut trial = trial_in(&host, &alice, Phase::Authorized, MAX_ATTEMPTS - 1);
+        let mut clock = fast_clock(&trial);
+        let fenced = std::cell::Cell::new(false);
+        let binding = trial.binding.clone();
+        let peer_clock = || {
+            let on_disk = Trial::load(&alice, &binding, "alice").unwrap();
+            if on_disk.phase == Phase::Booting && !fenced.get() {
+                let peer = cause(journal::CauseClass::Interrupted, "peer interrupted");
+                set_journal(&root, journal::Phase::RollingBack, Some(peer));
+                fenced.set(true);
+            }
+            clock()
+        };
+        let outcome = run_trial(
+            &host,
+            &alice,
+            &mut trial,
+            peer_clock,
+            |_| Ok(false),
+            || false,
+        );
+        assert!(fenced.get(), "the peer fenced during the attempt");
+        // The restored start fails on the fixture's unexecutable bytes.
+        assert!(outcome.is_err());
+        assert_previous_pair(&host);
+        let record = journal_record(&root);
+        assert_eq!(record.phase, journal::Phase::Restored);
+        let cause = record.cause.unwrap();
+        assert_eq!(cause.class, journal::CauseClass::Failed, "{cause:?}");
+        assert!(
+            cause.reason.contains("launch attempts exhausted"),
+            "{cause:?}"
+        );
+        let on_disk = Trial::load(&alice, &binding, "alice").unwrap();
+        assert_eq!(on_disk.attempts, MAX_ATTEMPTS, "{on_disk:?}");
+        assert_eq!(
+            on_disk.verdict.map(|v| v.class),
+            Some(journal::CauseClass::Failed)
+        );
+        let bob = Trial::load(&bob, &binding, "bob").unwrap();
+        assert_eq!(bob.phase, Phase::Restored);
+        assert_eq!(
+            bob.verdict.map(|v| v.class),
+            Some(journal::CauseClass::Failed)
+        );
+    }
+
+    /// #2005 review: a peer fences the host with an Interrupted cause
+    /// during an earlier (not the last) attempt. The attempt count is not
+    /// used up, so the verdict stays Interrupted and the release is not
+    /// held as Failed.
+    #[test]
+    fn a_peer_fence_on_an_earlier_attempt_stays_interrupted() {
+        let (_dir, root, host, _record) = fixture_with(journal::Phase::SwappedCli, with_bob);
+        write_probe(&host, 1, probe::ProbePhase::Passed);
+        let alice = coordinator::trial_path(&host.plan().participants[0]);
+        let bob = coordinator::trial_path(&host.plan().participants[1]);
+        let mut trial = trial_in(&host, &alice, Phase::Authorized, 0);
+        let mut clock = fast_clock(&trial);
+        let fenced = std::cell::Cell::new(false);
+        let binding = trial.binding.clone();
+        let peer_clock = || {
+            let on_disk = Trial::load(&alice, &binding, "alice").unwrap();
+            if on_disk.phase == Phase::Booting && !fenced.get() {
+                let peer = cause(journal::CauseClass::Interrupted, "peer interrupted");
+                set_journal(&root, journal::Phase::RollingBack, Some(peer));
+                fenced.set(true);
+            }
+            clock()
+        };
+        let outcome = run_trial(
+            &host,
+            &alice,
+            &mut trial,
+            peer_clock,
+            |_| Ok(false),
+            || false,
+        );
+        assert!(fenced.get(), "the peer fenced during the attempt");
+        // The restored start fails on the fixture's unexecutable bytes.
+        assert!(outcome.is_err());
+        assert_previous_pair(&host);
+        let record = journal_record(&root);
+        assert_eq!(record.phase, journal::Phase::Restored);
+        let cause = record.cause.unwrap();
+        assert_eq!(cause.class, journal::CauseClass::Interrupted, "{cause:?}");
+        let on_disk = Trial::load(&alice, &binding, "alice").unwrap();
+        assert_eq!(on_disk.attempts, 1, "{on_disk:?}");
+        assert_eq!(
+            on_disk.verdict.map(|v| v.class),
+            Some(journal::CauseClass::Interrupted)
+        );
+        let bob = Trial::load(&bob, &binding, "bob").unwrap();
+        assert_eq!(
+            bob.verdict.map(|v| v.class),
+            Some(journal::CauseClass::Interrupted)
+        );
+    }
+
+    /// #2005 review: a clock error when a fenced last attempt joins the
+    /// recovery does not leave the trial Booting (a restart would roll back
+    /// as lost custody, Interrupted). The attempt count needs no clock, so
+    /// the verdict is still Failed and the release is held.
+    #[test]
+    fn a_clock_error_on_a_fenced_last_attempt_still_records_failed() {
+        let (_dir, root, host, _record) = fixture_with(journal::Phase::SwappedCli, with_bob);
+        write_probe(&host, 1, probe::ProbePhase::Passed);
+        let alice = coordinator::trial_path(&host.plan().participants[0]);
+        let mut trial = trial_in(&host, &alice, Phase::Booting, MAX_ATTEMPTS);
+        let peer = cause(journal::CauseClass::Interrupted, "peer interrupted");
+        set_journal(&root, journal::Phase::RollingBack, Some(peer));
+        let mut broken = || -> io::Result<Clock> { Err(io::Error::other("clock")) };
+        let outcome = resume_peer_recovery(
+            &host,
+            &alice,
+            &mut trial,
+            Some("candidate exited before commit".into()),
+            &mut broken,
+            &mut || false,
+        );
+        // The restored start fails on the fixture's unexecutable bytes.
+        assert!(outcome.is_err());
+        assert_previous_pair(&host);
+        let record = journal_record(&root);
+        assert_eq!(record.phase, journal::Phase::Restored);
+        let cause = record.cause.unwrap();
+        assert_eq!(cause.class, journal::CauseClass::Failed, "{cause:?}");
+        assert!(
+            cause.reason.contains("launch attempts exhausted"),
+            "{cause:?}"
+        );
+        let on_disk = Trial::load(&alice, &trial.binding, "alice").unwrap();
+        assert_ne!(on_disk.phase, Phase::Booting, "{on_disk:?}");
     }
 
     /// #1991 review: a failed coordinator pass on a host that a peer has
