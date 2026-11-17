@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`GET /status` reports transport bandwidth (#1964 request 5; A06
+  amendment of 17 Nov 2026).** A new additive `bandwidth` object gives
+  process-lifetime `sent_bytes` and `received_bytes` and the `up_bps` and
+  `down_bps` rates, each split into `gossip`, `direct`, `relay` and `other`.
+  `x0x status` adds human-readable totals in text output; `--json` keeps the
+  raw numbers only. No limits change.
 - **launchd jobs that run the stable launcher are recognised (#1379 slice 2;
   A14 amendment of 17 Nov 2026).** `x0x autostart --repair` and the
   upgrade-time launchd readback look through `x0x-launcher`'s own arguments
