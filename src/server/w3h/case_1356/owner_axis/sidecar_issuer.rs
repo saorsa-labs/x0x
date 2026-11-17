@@ -131,9 +131,21 @@ async fn send_reseat(sim: &Sim, group: &str, issued: &IssuedReseatV1) -> Result<
     sim.fabric()
         .mark("case: O sends J the authorisation issued before its stop");
     let agent = sim.state("O")?.agent.clone();
-    // Right after its restart O can have no link to J yet, so a send can
-    // fail before anything leaves: send again until J has received it.
+    // O's restart emptied its discovery cache, so the first send ends at
+    // once (`RecipientUndiscovered`) and starts O's lookup of J: send again
+    // until J has received it. Before the restart J's last announce is its
+    // heartbeat, minutes of virtual time old. Measured in the plain build
+    // (no shim): the second send found J when that announce was 23-24 s of
+    // real time old, and all six sends failed when it was 71-75 s old (the
+    // row on one CPU with two busy loops, as slow as the coverage build on
+    // the CI runner). The gossip message cache keeps a message for 60 s of
+    // real time (saorsa-gossip-pubsub `MAX_CACHE_AGE_SECS`, a
+    // `std::time::Instant`), not virtual time, and J's next heartbeat is
+    // later than every send here. So J announces before each send: the
+    // lookup then has an announce that is new in real time too, at any
+    // speed of the run.
     for _ in 0..SEND_ATTEMPTS {
+        announce_all(sim, &["J"]).await?;
         sim.within("O sends the lost authorisation", SEND_BOUND, async {
             let _ = agent.send_direct(&j, payload.clone()).await;
         })
@@ -338,7 +350,13 @@ async fn issuer_rebuild(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         at(sim),
     );
 
-    // O calls the route again; J is re-seated.
+    // O calls the route again; J is re-seated. The route pushes the
+    // authorisation only to a subject whose current capability advert O
+    // holds (ADR 0109 §5: unknown support asks for a refresh and sends
+    // nothing now), and O's restart emptied that cache too. O had the
+    // advert again only when the refresh that J's first request started
+    // had ended before this call, so O gets it first.
+    super::super::conflict::fresh_advert(sim, "O", "J").await?;
     let j_removal_now = view(sim, "O", &group).await?;
     let (again_code, again) = sim
         .api(

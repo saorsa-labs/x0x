@@ -489,11 +489,59 @@ pub(super) fn identity(pid: u32) -> io::Result<Identity> {
     })
 }
 
-#[cfg(not(target_os = "linux"))]
+/// macOS: the BSD status of `pid`, zombies included (the nonzero arg asks
+/// libproc for them), so a zombie still counts as present, as on Linux.
+#[cfg(target_os = "macos")]
+fn bsd_info(pid: u32) -> io::Result<libc::proc_bsdinfo> {
+    let raw_pid = i32::try_from(pid).map_err(invalid)?;
+    // SAFETY: proc_bsdinfo holds integers and fixed byte arrays; zero is a
+    // valid value for each field.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = i32::try_from(std::mem::size_of_val(&info)).map_err(invalid)?;
+    // SAFETY: proc_pidinfo writes at most `size` bytes into the owned,
+    // sized `info` buffer and reads only the arguments passed.
+    let received = unsafe {
+        libc::proc_pidinfo(
+            raw_pid,
+            libc::PROC_PIDTBSDINFO,
+            1,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if received == 0 {
+        // ESRCH for a process that does not exist: `process_gone`.
+        return Err(io::Error::last_os_error());
+    }
+    if received != size || info.pbi_pid != pid {
+        return Err(invalid("incomplete process status"));
+    }
+    Ok(info)
+}
+
+/// macOS (#1379): the process start time in microseconds since the epoch,
+/// from libproc. It stays fixed for the life of the process, zombie
+/// included, so with the PID and boot it names one process.
+#[cfg(target_os = "macos")]
+pub(super) fn identity(pid: u32) -> io::Result<Identity> {
+    let info = bsd_info(pid)?;
+    let start = info
+        .pbi_start_tvsec
+        .checked_mul(1_000_000)
+        .and_then(|micros| micros.checked_add(info.pbi_start_tvusec))
+        .ok_or_else(|| invalid("process start overflow"))?;
+    Ok(Identity {
+        pid,
+        start,
+        boot: Clock::now()?.boot,
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(super) fn identity(_pid: u32) -> io::Result<Identity> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "launcher process custody requires Linux",
+        "launcher process custody requires Linux or macOS",
     ))
 }
 
@@ -562,11 +610,117 @@ pub(super) fn stop_foreign(expected: &Identity) -> io::Result<()> {
     ))
 }
 
-#[cfg(not(target_os = "linux"))]
+/// macOS (#1379): as on Linux, but there is no pidfd. A kqueue watch for
+/// the process's exit pins it instead: the watch is bound to the process,
+/// not the number. The identity is checked again after the watch is set,
+/// and before each signal the watch is read: while it shows no exit, the
+/// PID still names the watched process, so a reused PID is never
+/// signalled. (Between that read and the `kill` the process would have to
+/// exit, be reaped and its PID be reused; macOS hands out PIDs in order up
+/// to 99999 before any reuse.)
+#[cfg(target_os = "macos")]
+pub(super) fn stop_foreign(expected: &Identity) -> io::Result<()> {
+    use std::os::fd::OwnedFd;
+    if absent(expected)? {
+        return Ok(());
+    }
+    let pid = libc::pid_t::try_from(expected.pid).map_err(invalid)?;
+    // SAFETY: kqueue takes no arguments and returns a new descriptor or -1.
+    let raw = unsafe { libc::kqueue() };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is the new descriptor kqueue returned; this is its only
+    // owner.
+    let queue = unsafe { OwnedFd::from_raw_fd(raw) };
+    let watch = proc_exit_watch(pid)?;
+    // SAFETY: one change from an owned, initialized kevent; no event list.
+    let added = unsafe {
+        libc::kevent(
+            queue.as_raw_fd(),
+            &watch,
+            1,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    if added < 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error);
+        }
+        // Already exited: only its parent's reap is left.
+        return survived_unless(wait_absent(expected)?);
+    }
+    // The watch now names one process. If that process is not the expected
+    // identity, the PID was reused: signal nothing.
+    if absent(expected)? {
+        return Ok(());
+    }
+    for signal in [libc::SIGTERM, libc::SIGKILL] {
+        if exit_seen(&queue)? {
+            return survived_unless(wait_absent(expected)?);
+        }
+        // SAFETY: kill takes a pid and a signal number and reads no memory.
+        if unsafe { libc::kill(pid, signal) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(());
+            }
+            return Err(error);
+        }
+        if wait_absent(expected)? {
+            return Ok(());
+        }
+    }
+    survived_unless(false)
+}
+
+#[cfg(target_os = "macos")]
+fn proc_exit_watch(pid: libc::pid_t) -> io::Result<libc::kevent> {
+    // SAFETY: kevent holds integers and a pointer; zero is valid for each.
+    let mut watch: libc::kevent = unsafe { std::mem::zeroed() };
+    watch.ident = usize::try_from(pid).map_err(invalid)?;
+    watch.filter = libc::EVFILT_PROC;
+    watch.flags = libc::EV_ADD;
+    watch.fflags = libc::NOTE_EXIT;
+    Ok(watch)
+}
+
+/// Whether the pinned process has exited (non-blocking read of the watch).
+#[cfg(target_os = "macos")]
+fn exit_seen(queue: &std::os::fd::OwnedFd) -> io::Result<bool> {
+    // SAFETY: as in `proc_exit_watch`.
+    let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+    let zero = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: no changes; one owned event slot; a zero timeout polls.
+    let seen =
+        unsafe { libc::kevent(queue.as_raw_fd(), std::ptr::null(), 0, &mut event, 1, &zero) };
+    if seen < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(seen > 0 && event.fflags & libc::NOTE_EXIT != 0)
+}
+
+#[cfg(target_os = "macos")]
+fn survived_unless(gone: bool) -> io::Result<()> {
+    if gone {
+        return Ok(());
+    }
+    Err(invalid(
+        "recovery-failed: participant of another launcher survived SIGKILL",
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(super) fn stop_foreign(_expected: &Identity) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "launcher process custody requires Linux",
+        "launcher process custody requires Linux or macOS",
     ))
 }
 
@@ -588,16 +742,21 @@ pub(super) fn is_own_child(expected: &Identity) -> io::Result<bool> {
     Ok(parent == std::process::id())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+pub(super) fn is_own_child(expected: &Identity) -> io::Result<bool> {
+    Ok(bsd_info(expected.pid)?.pbi_ppid == std::process::id())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(super) fn is_own_child(_expected: &Identity) -> io::Result<bool> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "launcher process custody requires Linux",
+        "launcher process custody requires Linux or macOS",
     ))
 }
 
 /// Wait up to `REAP_MS` for the identity to be absent.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn wait_absent(expected: &Identity) -> io::Result<bool> {
     let start = Clock::now()?;
     let until = start.ms.saturating_add(REAP_MS);
@@ -914,7 +1073,7 @@ mod tests {
         assert!(absent(&other).unwrap());
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn launcher_child_identity_tracks_live_and_reaped_processes() {
         let mine = identity(std::process::id()).unwrap();
@@ -1015,8 +1174,8 @@ mod boot_guards {
     }
 
     fn boot_fd_role() {
-        // Non-Linux refuses the boot right after the take; Linux refuses it
-        // on the fixture identity. Either way the marker must already be
+        // Off Linux and macOS the boot is refused right after the take; on
+        // Linux and macOS it is refused on the fixture identity. Either way the marker must already be
         // gone, or a later self-update child would treat its own unrelated
         // descriptor 3 as a boot channel.
         let _ = candidate_boot_owned("fixture-version");
@@ -1140,7 +1299,7 @@ mod boot_guards {
     fn held_boot_refuses_a_present_permit_that_fails_its_checks() {
         // In-process, not a re-exec: the old child fixture named a
         // nonexistent executable, so hashing failed before `check_permit`
-        // (and identity failed first off Linux); a held path that skipped
+        // (and identity failed first off Linux and macOS); a held path that skipped
         // the check stayed green (#1375). Here every earlier step runs
         // against a real temp executable — parsing, hashing, observing
         // this process — so the refusal can only come from the check. The
@@ -1168,7 +1327,7 @@ mod boot_guards {
             "fixture-version",
         )
         .unwrap_err();
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             // Custody, hashing and path capture all succeeded, so only
             // `check_permit` can refuse, with its authority-mismatch line.
@@ -1179,15 +1338,15 @@ mod boot_guards {
                 "held boot refused before check_permit: {error}"
             );
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            // Every well-formed permit still refuses the boot off Linux
+            // Every well-formed permit still refuses the boot off Linux and macOS
             // today: observed identity is unavailable, so the refusal
             // fires in `observed_for` before any field is compared.
             assert!(
                 error
                     .to_string()
-                    .contains("launcher process custody requires Linux"),
+                    .contains("launcher process custody requires Linux or macOS"),
                 "unexpected refusal: {error}"
             );
         }
@@ -1242,7 +1401,7 @@ mod boot_guards {
 
     /// A live process of another owner is stopped and its own parent
     /// reaps it; a PID whose identity changed is never signalled.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn stop_foreign_stops_a_live_process_and_skips_a_reused_pid() {
         let mut live = Command::new("sleep").arg("30").spawn().unwrap();

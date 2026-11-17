@@ -6,6 +6,44 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **launchd jobs that run the stable launcher are recognised (#1379 slice 2;
+  A14 amendment of 17 Nov 2026).** `x0x autostart --repair` and the
+  upgrade-time launchd readback look through `x0x-launcher`'s own arguments
+  to the x0xd it runs, so binding the launcher does not fail supervised
+  upgrades closed. A launcher-bound job must set `ExitTimeOut` above 45 s.
+  On macOS a launcher final refusal holds until stopped, since launchd would
+  restart an exit. The launcher-bound plist is rendered but not yet installed
+  by `x0x autostart`.
+- **The dormant launcher reads and verifies the host journal (#1378; A14
+  amendment of 17 Nov 2026).** A unit can name the host root and instance in
+  the launcher argv (`--host-root <data_root> --instance <id> -- /abs/x0xd
+  ...`). The launcher then reads `<host-root>/upgrade-journal.json` through
+  one descriptor (exactly 0600, owned by its account, in a root no other
+  account can write) and owns the trial only for an in-flight journal that
+  names it with the same executable, arguments and data root. It never
+  passes through while an unfinished trial is on disk. Fixed refusals exit
+  78, failed reads 75. The writer of
+  that journal is #2012; with the engine held every start is still the
+  passthrough.
+- **The dormant launcher has process custody on macOS (#1379 slice 1; A14
+  amendment of 17 Nov 2026).** Process identity (PID, start time, boot) comes
+  from libproc, zombies included; stopping another launcher's process pins it
+  with a kqueue exit watch instead of a pidfd. The launcher's custody,
+  coordinator and stop tests now run on macOS as well as Linux.
+- **The dormant launcher has its main loop (#1378; A14 amendment of 17 Nov
+  2026).** The `x0x-launcher` start goes through `start.rs`: with the engine
+  held, or no host from the inventory issuer, it is the exec passthrough as
+  before. With a host it runs the trial through the supervise driver, keeps a
+  committed or restored daemon, and exits 0 after a stop, 75 to be restarted,
+  or 78 when no automatic start is allowed. No issuer exists yet, so live
+  behaviour is unchanged.
+- **The dormant launcher's multi-participant rollback is final on a failed
+  pass and never overwrites a peer's restore (#1378 slice 6; A14 amendment of
+  16 Nov 2026).** A failed coordinator pass marks the host and trial
+  RecoveryFailed instead of repeating on every restart; a host a peer already
+  restored is never marked. A failed attempt is requeued under the host lock
+  and joins a peer's fence or restore from meanwhile;
+  a trial save refuses any stale write over a rollback or a restore.
 - **The dormant launcher stops a committed daemon gracefully (#1378 slice 4;
   A14 amendment of 16 Nov 2026).** A stop sends SIGTERM and waits up to 35 s
   for x0xd's shutdown before SIGKILL. The retire after a host commit retries
@@ -133,6 +171,15 @@ All notable changes to this project will be documented in this file.
   and after approval it can apply the approval link. A requester that waits
   behind another turn gets no outcome until its turn. New capability bit 19,
   `join_request_head_v1`; a peer without it keeps the earlier behaviour.
+- **W3-H row `s4_owner_recovery`, three variants (#1581).** A mandate
+  sent while a second admin D is still eligible is refused with
+  `recovery_not_needed`, and no member shows the owner-recovery wait. A
+  promoted member B that is offline when the mandate is signed commits the
+  recovery when it starts again. A mandate naming a revoked member E is
+  refused with `recovery_member_ineligible`; this arm is pinned RED for a
+  known gap (#1973): while E is still seated, B's recovery seal fails the
+  ADR-0038 eviction check and never commits. The row has its own W3-H
+  shard (`1581m`).
 - **W3-H row `s4_certificate_rebind` run (7) (#1581).** After B revokes
   its own agent and A and C hold the record, B's self-rebind of a later
   renewal is refused with `rebind_signer_ineligible`, and no node binds
@@ -242,6 +289,22 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **The listeners a restart starts for stored groups follow one written
+  rule (#1366 first slice, A08 amendment of 16 Nov 2026).** Only a
+  withdrawn group gets no metadata listener. An Active member, a Pending
+  access applicant, a stub with no local seat, a Removed seat (re-seat or
+  re-add) and a Banned seat keep it. A Banned seat needs it to receive an
+  admin's `MemberUnbanned`, which is published only on that topic. The
+  set of listeners is the same as before.
+- **A joiner whose authority's log no longer reaches its base now ends
+  typed (ADR 0109 §2 "Unserved join seal", A08 amendment of 16 Nov 2026,
+  #1572).** When the authority's join result carries no chain and no join
+  carry and the seal does not apply, the joiner asks the admins on its
+  roster with the ordinary `group_attest_request`. An admin whose log no
+  longer reaches the base answers `base_beyond_retention`, and the joiner
+  shows `readmission_required {base_beyond_retention}` with the
+  `manual_remove_and_reinvite` exit instead of timing out with no reason.
+  Each admin that answers is asked once per join attempt. No wire change.
 - **The TreeKEM reconnect catch-up pass is bounded (#1427, A09 third
   amendment of 15 Nov 2026).** A reconnect during a pass runs one more
   pass after it. A pass asks for at most 4 groups at a time, each after a
@@ -491,6 +554,23 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **The dormant launcher's issuer refuses fixed faults with 78 (#1378,
+  review of #2014).** A plan path that is missing or not canonical, and a
+  symlinked or non-regular trial record, now exit 78 instead of 75. The tests
+  now reach the journal owner check and cover the `.` and `..` instance ids.
+- **The dormant launcher's main loop keeps a last-attempt Failed on a clock
+  error, honours a late stop, and does not restart on a fixed refusal (#1378,
+  review of #2006).** A clock error after the last failed attempt rolls back
+  as Failed at once. A stop caught after a retired trial's own stop check
+  exits 0 instead of starting the daemon. A missing or stopped participant
+  and a prior child that still runs exit 78, not 75.
+- **The dormant launcher records Failed when a peer's fence ends its last
+  attempt (#1378, review of #1991).** A failed attempt on a host a peer has
+  fenced now takes the Failed verdict when its attempts or total budget are
+  used up, and Interrupted only otherwise; a clock error no longer turns that
+  Failed into Interrupted, and a last attempt ended by a peer's stop counts as
+  Failed (A14 amendment of 17 Nov 2026). The coordinator lets Failed win, so
+  the failed release is held instead of retried.
 - **Granted-store CLI paths and serves (#1953 review).** `x0x grant data`
   (and `grant revoke|renew`) percent-encode each path segment, so a key with
   `#`, `?` or `/` reaches the exact key. A slow granted read or write now

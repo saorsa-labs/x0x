@@ -77,7 +77,11 @@ class Group:
 
 
 _GROUP = re.compile(r"group: (\S+?)(?: \(max threads = (\S+)\))?")
-_SOURCE = re.compile(r"\* (?:override for \S+ profile with filter '.*'|from default settings):")
+# Newer nextest (seen on 0.9.151) names the config file an override comes from.
+_SOURCE = re.compile(
+    r"\* (?:override for \S+ profile with filter '.*'(?: \(from [^()]+\))?"
+    r"|from default settings):"
+)
 _BINARY_ID = re.compile(r"[A-Za-z0-9_\-]+(?:::[A-Za-z0-9_\-/]+)?:")
 _TEST_NAME = re.compile(r"[A-Za-z0-9_:]+")
 
@@ -85,10 +89,11 @@ _TEST_NAME = re.compile(r"[A-Za-z0-9_:]+")
 def parse_show_test_groups(text: str) -> dict[str, Group]:
     """Parse `cargo nextest show-config test-groups` output.
 
-    Accepted shapes, by indentation (nextest 0.9.12x–0.9.14x):
+    Accepted shapes, by indentation (nextest 0.9.12x–0.9.15x):
 
         group: <name> (max threads = <n>)     | group: @global
           * override for <profile> profile with filter '<expr>':
+          * override for <profile> profile with filter '<expr>' (from <file>):
           * from default settings:
             (no matches)
               <binary-id>:

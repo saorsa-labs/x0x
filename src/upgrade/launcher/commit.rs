@@ -482,7 +482,7 @@ mod tests {
     }
 
     /// A healthy live candidate with a binding record commits the host.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_healthy_live_full_set_commits_the_host() {
         let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);

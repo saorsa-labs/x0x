@@ -370,7 +370,7 @@ impl Seen {
 /// Returns once `observer` holds a current verified advert from `label`
 /// that sets bit 8. It asks for a fresh advert every [`C_LATE`], not on
 /// every poll, so a late answer does not meet a flood of requests.
-async fn fresh_advert(sim: &Sim, observer: &str, label: &str) -> Result<()> {
+pub(super) async fn fresh_advert(sim: &Sim, observer: &str, label: &str) -> Result<()> {
     let bit = crate::dm::CapabilityRegistry::GROUP_TERMINAL_ATTEST_V1;
     let agent = sim.ids(label)?.0;
     let mut asked: Option<Duration> = None;
