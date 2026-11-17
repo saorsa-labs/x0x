@@ -80,7 +80,7 @@ const WINDOW: Duration = Duration::from_secs(130);
 const LOST: &str = "readmission_required{local_state_lost}";
 
 /// The metadata topic of `group`, as A holds it.
-async fn meta_topic(sim: &Sim, group: &str) -> Result<[u8; 32]> {
+pub(super) async fn meta_topic(sim: &Sim, group: &str) -> Result<[u8; 32]> {
     let state = sim.state("A")?;
     let groups = state.named_groups.read().await;
     let (_, info) = crate::server::resolve_group_entry_locked(&groups, group)
