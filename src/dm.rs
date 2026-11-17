@@ -2818,6 +2818,28 @@ impl InFlightAcks {
         }
     }
 
+    /// #2007: the recipient machine a durable send of `request_id` was
+    /// pinned to: the recorded entry's when one is held, else the open
+    /// waiter's. `None` when neither names a machine (no record, or a v1
+    /// send).
+    #[must_use]
+    pub fn receipt_machine(&self, request_id: &[u8; 16]) -> Option<MachineId> {
+        let now = Instant::now();
+        let recorded = self.receipts.lock().ok().and_then(|mut ledger| {
+            ledger.prune(now);
+            ledger
+                .entries
+                .get(request_id)
+                .filter(|entry| entry.expires > now)
+                .and_then(|entry| entry.binding.expected_machine)
+        });
+        recorded.or_else(|| {
+            self.inner
+                .get(request_id)
+                .and_then(|waiter| waiter.expected_machine)
+        })
+    }
+
     /// #1109 S2: subscribe to accepted v2 ACKs that matched no waiter and no
     /// tombstone. A lagged receiver loses only the prompt settle; the
     /// outbox still sends again and the recipient re-ACKs.
@@ -3876,6 +3898,21 @@ mod tests {
         );
         assert_eq!(acks.receipt_digest(&rid), Some([0xd1; 32]));
         assert_eq!(acks.receipt_digest(&[0x1b; 16]), None);
+    }
+
+    /// WHY: #2007 the outbox persists the machine a durable send was pinned
+    /// to, so the ledger must name it while the waiter is open and after the
+    /// sender gave up.
+    #[test]
+    fn issue2007_receipt_names_the_pinned_machine() {
+        let acks = super::InFlightAcks::new();
+        let rid = [0x1c; 16];
+        assert_eq!(acks.receipt_machine(&rid), None);
+        let _rx = issue1109_v2_waiter(&acks, rid);
+        assert_eq!(acks.receipt_machine(&rid), Some(MachineId([0x32; 32])));
+        acks.abandon(&rid);
+        assert_eq!(acks.receipt_machine(&rid), Some(MachineId([0x32; 32])));
+        assert_eq!(acks.receipt_machine(&[0x1d; 16]), None);
     }
 
     /// WHY: #1109 S2 an accepted v2 ACK with no waiter and no tombstone

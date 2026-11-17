@@ -554,6 +554,15 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **A late ACK after a restart must come from the recipient machine (#2007;
+  A07 amendment of 17 Nov 2026).** Each queued-send attempt record in
+  `direct_send_outcomes.json` now also keeps the recipient machine IDs the
+  attempts were sent to (`machines`, hex). An orphan v2 ACK settles a held
+  send, or records `delivered_late`, only when its authenticated machine is
+  in that list. An ACK from the right agent on another machine changes
+  nothing. A record without `machines` (written before this change, or whose
+  machine was never known) still loads, but no orphan ACK settles it; the
+  send is sent again.
 - **The dormant launcher's issuer refuses fixed faults with 78 (#1378,
   review of #2014).** A plan path that is missing or not canonical, and a
   symlinked or non-regular trial record, now exit 78 instead of 75. The tests
