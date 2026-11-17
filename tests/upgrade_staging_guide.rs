@@ -200,7 +200,7 @@ macro_rules! staging_guide_regression_tests {
                 let mut config = DaemonConfig { data_dir: data.clone(), ..Default::default() };
                 config.update.rollout_window_minutes = 0;
                 let apply_lock = Arc::clone(&runtime.upgrade_apply_lock);
-                let startup = run_startup_update_check(&config, None, None, Some(runtime));
+                let startup = run_startup_update_check(&config, Some(runtime));
                 tokio::pin!(startup);
                 loop {
                     assert!(Instant::now() < deadline, "download did not start");

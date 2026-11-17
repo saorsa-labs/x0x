@@ -169,7 +169,7 @@ macro_rules! staging_regression_tests {
             };
             config.update.rollout_window_minutes = window_minutes;
             let apply_lock = Arc::clone(&runtime.upgrade_apply_lock);
-            let startup = run_startup_update_check(&config, None, None, Some(runtime));
+            let startup = run_startup_update_check(&config, Some(runtime));
             tokio::pin!(startup);
 
             let first = staging_next_observation(startup.as_mut(), &mut observed_rx, wall_deadline)

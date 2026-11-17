@@ -261,7 +261,7 @@ macro_rules! fleet_startup_regression_tests {
             });
             let mut config = DaemonConfig { data_dir: root, ..Default::default() };
             config.update.rollout_window_minutes = 0;
-            let mut startup = Box::pin(run_startup_update_check(&config, None, None, Some(runtime)));
+            let mut startup = Box::pin(run_startup_update_check(&config, Some(runtime)));
             let mut next = match staging_next_observation(startup.as_mut(), &mut observations, deadline).await {
                 Ok(decision) => decision,
                 Err(result) => {
@@ -439,7 +439,7 @@ macro_rules! fleet_startup_regression_tests {
                 });
                 let mut config = DaemonConfig { data_dir: root.clone(), ..Default::default() };
                 config.update.rollout_window_minutes = 0;
-                let mut startup = Box::pin(run_startup_update_check(&config, None, None, Some(runtime)));
+                let mut startup = Box::pin(run_startup_update_check(&config, Some(runtime)));
                 let result = loop {
                     assert!(std::time::Instant::now() < deadline, "startup refusal did not finish");
                     tokio::select! { biased;
@@ -595,7 +595,7 @@ macro_rules! fleet_startup_regression_tests {
             let mut config = DaemonConfig { data_dir: root, ..Default::default() };
             config.update.rollout_window_minutes = 0;
             let started = tokio::time::Instant::now();
-            let startup = run_startup_update_check(&config, None, None, Some(runtime));
+            let startup = run_startup_update_check(&config, Some(runtime));
             tokio::pin!(startup);
             // Keep virtual time fixed while real blocking filesystem work runs.
             // A rewritten sixty-minute receipt is a failure, not a long timeout.

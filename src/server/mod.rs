@@ -2268,9 +2268,10 @@ pub async fn serve_with_options(
     // bound, so a firewalled update endpoint blocks for the monitor's ~30 s
     // HTTP timeout in the background instead of delaying API readiness.
     // Gates unchanged: `self_update_enabled` (embedders /
-    // `--skip-update-check`) AND `[update] enabled`. #1169: it runs with
-    // the real agent, so its discovery is announced on `x0x/release`
-    // instead of leaving peers to their own fallback poll.
+    // `--skip-update-check`) AND `[update] enabled`. #1169: the check
+    // itself announces nothing; a boot-time discovery is announced by the
+    // every-launch manifest broadcast task below (same gates, same
+    // payload), so an announce here would only duplicate those bytes.
     if self_update_enabled && config.update.enabled {
         let startup_check_config = config.clone();
         // #261: the apply's restart planner needs the bound API address
@@ -2281,8 +2282,6 @@ pub async fn serve_with_options(
         let startup_apply_lock = Arc::clone(&state.upgrade_apply_lock);
         let startup_shutdown_watch = state.shutdown_notify.subscribe();
         let startup_observations = Arc::clone(&state.upgrade_observations);
-        let startup_agent = Arc::clone(&state.agent);
-        let startup_self_published = Arc::clone(&self_published_release_manifests);
         #[cfg(unix)]
         let startup_identity_dir = identity_dir.clone();
         #[cfg(unix)]
@@ -2315,8 +2314,6 @@ pub async fn serve_with_options(
             };
             if let Err(e) = run_startup_update_check(
                 &startup_check_config,
-                Some(&startup_agent),
-                Some(&startup_self_published),
                 Some(StartupUpdateCheckRuntime {
                     restart_context: listener_restart_context(
                         &data_dir,
