@@ -521,6 +521,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **The dormant launcher's main loop keeps a last-attempt Failed on a clock
+  error, honours a late stop, and does not restart on a fixed refusal (#1378,
+  review of #2006).** A clock error after the last failed attempt rolls back
+  as Failed at once. A stop caught after a retired trial's own stop check
+  exits 0 instead of starting the daemon. A missing or stopped participant
+  and a prior child that still runs exit 78, not 75.
 - **The dormant launcher records Failed when a peer's fence ends its last
   attempt (#1378, review of #1991).** A failed attempt on a host a peer has
   fenced now takes the Failed verdict when its attempts or total budget are

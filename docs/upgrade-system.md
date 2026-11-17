@@ -629,7 +629,8 @@ so every start is the passthrough. An owned start installs its SIGTERM and
 SIGINT handler only then, and exits 0 after a stop, 75 when the daemon
 exits or a step can be retried (an issuer error never falls back to the
 passthrough), and 78 (`EX_CONFIG`) when no automatic start is allowed
-(`RecoveryFailed`, or a final host phase). A unit that binds the owned
+(`RecoveryFailed`, a final host phase, a participant missing from the
+plan or stopped, or a prior child that still runs). A unit that binds the owned
 launcher must also set `RestartPreventExitStatus=78`. A retired trial on a
 committed host is an ordinary start: the passthrough. The launcher strips a stray `X0X_M2_BOOT_FD` from the daemon's
 environment before the `exec`. While activation is held, `x0xd` ignores a

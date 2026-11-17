@@ -174,9 +174,12 @@ pub(super) fn run_trial(
                     trial.save(path)?;
                     return Ok(Outcome::Stopped);
                 }
-                let next = now()?.ms.saturating_add(GAP_MS);
                 // The spawn recorded the exec failure in memory only.
                 let cause = trial.cause.clone();
+                let next = match now() {
+                    Ok(clock) => clock.ms.saturating_add(GAP_MS),
+                    Err(error) => return clock_lost(host, path, trial, cause, error),
+                };
                 if !requeue(host, path, trial, cause.clone(), next)? {
                     return resume_peer_recovery(host, path, trial, cause, &mut now, &mut stop);
                 }
@@ -222,11 +225,36 @@ pub(super) fn run_trial(
             return Err(trial.recovery_failed(path, error));
         }
         trial.child = None;
-        let next = now()?.ms.saturating_add(GAP_MS);
         let cause = Some(failure.to_string());
+        let next = match now() {
+            Ok(clock) => clock.ms.saturating_add(GAP_MS),
+            Err(error) => return clock_lost(host, path, trial, cause, error),
+        };
         if !requeue(host, path, trial, cause.clone(), next)? {
             return resume_peer_recovery(host, path, trial, cause, &mut now, &mut stop);
         }
+    }
+}
+
+/// The clock failed after a failed attempt, so the next attempt cannot be
+/// scheduled. A used-up attempt count needs no clock: it rolls back as
+/// Failed now, so the failed release is held. Otherwise the error is
+/// returned with the trial still Booting, and the next start rolls back as
+/// lost custody (Interrupted), which is the verdict an earlier attempt
+/// gets anyway (#2006 review).
+fn clock_lost(
+    host: &recovery::Host,
+    path: &Path,
+    trial: &mut Trial,
+    cause: Option<String>,
+    error: io::Error,
+) -> io::Result<Outcome> {
+    if cause.is_some() {
+        trial.cause = cause;
+    }
+    match exhausted_verdict(trial) {
+        Some(verdict) => rollback(host, path, trial, verdict),
+        None => Err(error),
     }
 }
 

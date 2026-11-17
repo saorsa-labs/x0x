@@ -74,12 +74,22 @@ pub(super) fn supervise(
     host: &recovery::Host,
     path: &Path,
     trial: &mut Trial,
+    stop: impl FnMut() -> bool,
+) -> io::Result<Supervised> {
+    supervise_with(host, path, trial, Clock::now, stop)
+}
+
+/// As `supervise`, with the clock supplied (tests inject clock errors).
+pub(super) fn supervise_with(
+    host: &recovery::Host,
+    path: &Path,
+    trial: &mut Trial,
+    mut now: impl FnMut() -> io::Result<Clock>,
     mut stop: impl FnMut() -> bool,
 ) -> io::Result<Supervised> {
     // Readiness is the boot barrier plus `STABLE_MS` alive; the health
     // commit is checked by the host commit below.
-    let provisional = match run::run_trial(host, path, trial, Clock::now, |_| Ok(true), &mut stop)?
-    {
+    let provisional = match run::run_trial(host, path, trial, &mut now, |_| Ok(true), &mut stop)? {
         run::Outcome::Stopped => return Ok(Supervised::Stopped),
         run::Outcome::Restored(child) => return Ok(Supervised::Restored(child)),
         run::Outcome::Committed => return Ok(Supervised::Retired),
@@ -91,7 +101,7 @@ pub(super) fn supervise(
         trial,
         provisional,
         coordinator::trial_path,
-        Clock::now,
+        &mut now,
         &mut stop,
         coordinator::recover,
         || std::thread::sleep(COMMIT_POLL),
@@ -110,7 +120,7 @@ pub(super) fn supervise(
         Settled::Stopped => Ok(Supervised::Stopped),
         // Every trial is Restored: start this participant's restored child.
         Settled::Recovered(Resolution::Restored(_)) => {
-            match run::run_trial(host, path, trial, Clock::now, |_| Ok(true), &mut stop)? {
+            match run::run_trial(host, path, trial, &mut now, |_| Ok(true), &mut stop)? {
                 run::Outcome::Restored(child) => Ok(Supervised::Restored(child)),
                 _ => Err(invalid("restored trial did not start the restored child")),
             }
