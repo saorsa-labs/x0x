@@ -9456,6 +9456,22 @@ fn treekem_state_only_link(
     }
 }
 
+/// #2003 (ADR 0109 §2 rule (b), A08 amendment of 17 Nov 2026): a
+/// state-only link that a node other than its signer may log and serve, and
+/// that a pre-Welcome node may apply from such a relay: a rename, a role
+/// change or an unban whose `actor` signed its commit. The ordinary apply
+/// recomputes the state hash, which covers all of their content, and
+/// checks it against the signed commit. A join-request rejection is not
+/// one: its commit does not cover `actor` or the request it names.
+fn relayable_state_only_link(
+    event: &NamedGroupMetadataEvent,
+) -> Option<(&x0x::groups::GroupStateCommit, &str)> {
+    if matches!(event, NamedGroupMetadataEvent::JoinRequestRejected { .. }) {
+        return None;
+    }
+    treekem_state_only_link(event).filter(|(commit, actor)| *actor == commit.committed_by)
+}
+
 /// #1623: the catch-up cursor of a logged link, `(revision, TreeKEM
 /// epoch)`, compared with the requester's `(from_revision,
 /// from_treekem_epoch)`. A membership link keeps its frontier values, so
@@ -9744,11 +9760,15 @@ async fn should_queue_treekem_membership_event(
 /// (`AppState::treekem_event_log`), which `handle_treekem_catchup_request`
 /// serves. It keeps the membership links and (#1623, ADR 0109 §7 (b)) the
 /// state-only links of [`treekem_state_only_link`]. A state-only link is
-/// kept only when this node signed it. The receiver applies a rename, a
-/// role change, an unban or a rejection only when the page sender is the
-/// event's `actor` and an Active admin. So a copy relayed by another node
-/// would be refused, and a released receiver with no #1685 stop would ask
-/// for the same page again. Each class has its own
+/// kept when this node signed it, or when it may be relayed
+/// ([`relayable_state_only_link`], #2003). The receiver applies a rename,
+/// a role change, an unban or a rejection only when the page sender is the
+/// event's `actor` and an Active admin, except on a pre-Welcome node whose
+/// armed attested sequence admits the link
+/// ([`pre_welcome_relayed_link_author`]). So the responder serves a link it
+/// did not sign only to a requester it attested: an ordinary receiver
+/// would refuse the relayed copy, and a released receiver with no #1685
+/// stop would ask for the same page again. Each class has its own
 /// [`TREEKEM_EVENT_LOG_PER_GROUP_CAP`], oldest out first, so state-only
 /// links never evict a membership link that key catch-up needs.
 ///
@@ -9770,9 +9790,14 @@ async fn log_treekem_membership_event(state: &AppState, event: &NamedGroupMetada
         treekem_state_only_link(event),
     ) {
         (Some(_), _) => false,
+        // A state-only link is kept when this node signed it, or (#2003)
+        // when it may be relayed ([`relayable_state_only_link`]). The
+        // responder serves a link it did not sign only to a requester it
+        // attested (see `handle_treekem_catchup_request`).
         (None, Some((commit, actor))) => {
             let local_hex = hex::encode(state.agent.agent_id().as_bytes());
-            if actor != local_hex || commit.committed_by != local_hex {
+            let own = actor == local_hex && commit.committed_by == local_hex;
+            if !own && relayable_state_only_link(event).is_none() {
                 return false;
             }
             true
@@ -13661,6 +13686,25 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
             })
             .collect::<Vec<_>>()
     };
+    // #2003 (ADR 0109 §2, A08 amendment of 17 Nov 2026): a state-only
+    // link that another admin signed goes only to a requester this node
+    // attested; it applies there under the armed attested sequence.
+    // `log_keys` holds every name of the group, its stable id included.
+    let mut relay = false;
+    if held_group.is_some() {
+        for key in &log_keys {
+            if group_recovery::attested_requester(state, key, &sender_hex).await {
+                relay = true;
+                break;
+            }
+        }
+    }
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    events.retain(|event| match treekem_state_only_link(event) {
+        None => true,
+        Some((_, actor)) if actor == local_hex => true,
+        Some(_) => relay && relayable_state_only_link(event).is_some(),
+    });
     events.sort_by_key(treekem_catchup_link_sort_key);
     let truncated = events.len() > request.limit.min(TREEKEM_CATCHUP_RESPONSE_EVENT_CAP);
     events.truncate(request.limit.min(TREEKEM_CATCHUP_RESPONSE_EVENT_CAP));
@@ -14126,6 +14170,13 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                 let apply_sender = verified_catchup_member_removed_author(&event)
                     .filter(|author| catchup_may_apply_removed_as_author(&event, sender, author))
                     .unwrap_or(*sender);
+                // #2003: a state-only link that another admin signed and
+                // the armed attested sequence admits applies as its actor's.
+                let apply_sender =
+                    match pre_welcome_relayed_link_author(state, &response_key, &event).await {
+                        Some(author) => author,
+                        None => apply_sender,
+                    };
                 // #1623: rule (b) gates a pre-Welcome page link (see
                 // `refuse_unarmed_pre_welcome_page_link`).
                 let page_link = named_group_metadata_event_commit(&event)
@@ -19682,6 +19733,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
+            // #2003: keep the applied state-only link, so this node can serve it.
+            remember_treekem_membership_event(state, &event_for_log).await;
             *replay_group_id = Some(resolved_group_key.clone());
             ApplyMetadataResult::ACCEPTED_CONTINUE
         }
@@ -19986,6 +20039,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
+            // #2003: keep the applied state-only link, so this node can serve it.
+            remember_treekem_membership_event(state, &event_for_log).await;
             *replay_group_id = Some(resolved_group_key.clone());
             ApplyMetadataResult::ACCEPTED_CONTINUE
         }
@@ -20656,6 +20711,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
+            // #2003: keep the applied state-only link, so this node can serve it.
+            remember_treekem_membership_event(state, &event_for_log).await;
             *replay_group_id = Some(resolved_group_key.clone());
             ApplyMetadataResult::ACCEPTED_CONTINUE
         }
@@ -30031,6 +30088,37 @@ async fn refuse_unarmed_pre_welcome_page_link(
 ) -> bool {
     is_pre_welcome_page_link(state, group_key, info, event, local_agent_hex).await
         && refuse_unadmitted_pre_welcome_link(state, info, event, local_agent_hex).await
+}
+
+/// #2003 (ADR 0109 §2 rule (b), A08 amendment of 17 Nov 2026): the author
+/// under whose authority a pre-Welcome node applies a relayed state-only
+/// page link. The page sender may be any admin that attested this node;
+/// the link's authority is its actor, who signed its commit, and the
+/// node's armed attested sequence, whose next hash the commit must be
+/// ([`admit_pre_welcome_state_only_link`]). The ordinary apply then checks
+/// that the actor is an Active admin, the commit signature and the
+/// recomputed state hash. `None`: not such a link (the page sender stays
+/// the authority, as before).
+async fn pre_welcome_relayed_link_author(
+    state: &AppState,
+    group_key: &str,
+    event: &NamedGroupMetadataEvent,
+) -> Option<AgentId> {
+    let (_, actor) = relayable_state_only_link(event)?;
+    let author = AgentId(hex::decode(actor).ok()?.try_into().ok()?);
+    let info = state.named_groups.read().await.get(group_key).cloned()?;
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let pre_welcome = info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+        && !info.has_active_member(&local_agent_hex)
+        && !state.treekem_groups.read().await.contains_key(group_key);
+    if !pre_welcome {
+        return None;
+    }
+    let mut scratch = info.clone();
+    admit_pre_welcome_state_only_link(state, &info, &mut scratch, event, &local_agent_hex)
+        .await
+        .ok()?;
+    Some(author)
 }
 
 /// #1623: the admission half of [`refuse_unarmed_pre_welcome_page_link`],

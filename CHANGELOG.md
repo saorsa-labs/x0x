@@ -579,6 +579,16 @@ All notable changes to this project will be documented in this file.
   Failed into Interrupted, and a last attempt ended by a peer's stop counts as
   Failed (A14 amendment of 17 Nov 2026). The coordinator lets Failed win, so
   the failed release is held instead of retried.
+- **Groups (#2003):** a joiner past its authority's retention that another
+  admin attests now catches up to the head and ends Active with keys; before,
+  it stayed `catching_up` at its head. An admin keeps the renames, role
+  changes and unbans it applies, whoever signed them, and serves them on a
+  catch-up page only to a joiner it attested. A pre-Welcome joiner applies
+  such a relayed link as its signer's only inside its armed attested sequence.
+  A joiner whose seal was not served stops counting rounds once every admin
+  has answered (`awaiting_attestation {admins_answered}`), and a finished
+  catch-up no longer stays `catching_up`. ADR A08 amendment of 17 Nov 2026.
+
 - **Granted-store CLI paths and serves (#1953 review).** `x0x grant data`
   (and `grant revoke|renew`) percent-encode each path segment, so a key with
   `#`, `?` or `/` reaches the exact key. A slow granted read or write now
