@@ -19,6 +19,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch, Mutex};
 use x0x::upgrade::apply::{AutoApplyUpgrader, ReleasePermit, RestartContext};
@@ -44,11 +45,12 @@ pub(in crate::server) struct SelfPublishedReleaseManifests {
 
 /// One self-published payload: when it was first recorded, and whether
 /// `/upgrade/apply` recorded it (#1169). Only a route-recorded payload is
-/// owned by an apply in progress or by one that succeeded; a route whose
-/// apply does not succeed releases the claim, so gossip copies still reach
-/// the background owner. Driver rebroadcasts, fallback publishes and the
-/// start-up broadcast record without the claim; the owner's version dedup
-/// absorbs their repeats.
+/// owned by an apply in progress or by one that succeeded; every other
+/// handler exit — a failed, rolled-back or no-op apply, a cancelled
+/// request, a panic — releases the claim through [`ApplyRouteClaim`], so
+/// gossip copies still reach the background owner. Driver rebroadcasts,
+/// fallback publishes and the start-up broadcast record without the
+/// claim; the owner's version dedup absorbs their repeats.
 #[derive(Debug, Clone, Copy)]
 struct SelfPublished {
     first_seen: Instant,
@@ -66,17 +68,13 @@ impl SelfPublishedReleaseManifests {
         self.record(payload, now, true);
     }
 
-    /// Release the apply-route claim a route made before publishing. The
-    /// route calls this when its own apply does not succeed: gossip copies
-    /// of the payload must reach the background owner again instead of
-    /// being dropped for the tracker's TTL. The digest stays recorded, so
-    /// the node still does not rebroadcast bytes it already published.
-    fn clear_apply_route_payload(&mut self, payload: &[u8], now: Instant) {
+    /// Release the apply-route claim on an already-digested payload. The
+    /// digest stays recorded, so the node still does not rebroadcast
+    /// bytes it already published; only the claim that suppresses owner
+    /// submission is dropped.
+    fn clear_apply_route_digest(&mut self, digest: &[u8; 32], now: Instant) {
         self.prune(now);
-        if let Some(entry) = self
-            .published_at
-            .get_mut(&release_manifest_payload_digest(payload))
-        {
+        if let Some(entry) = self.published_at.get_mut(digest) {
             entry.apply_route = false;
         }
     }
@@ -100,7 +98,7 @@ impl SelfPublishedReleaseManifests {
     }
 
     /// Whether `/upgrade/apply` recorded this payload within the TTL and
-    /// has not released it after a failed apply.
+    /// has not released it after a non-Success exit.
     fn recorded_by_apply_route(&mut self, digest: &[u8; 32], now: Instant) -> bool {
         self.prune(now);
         self.published_at
@@ -112,6 +110,55 @@ impl SelfPublishedReleaseManifests {
         self.published_at.retain(|_, entry| {
             now.saturating_duration_since(entry.first_seen) < SELF_PUBLISHED_RELEASE_TTL
         });
+    }
+}
+
+/// The `/upgrade/apply` claim on its announced payload: [`SelfPublishedReleaseManifests::record_apply_route_payload`]
+/// records the digest, and dropping this guard without [`ApplyRouteClaim::keep`]
+/// releases it again. Every handler exit other than a successful apply
+/// releases the claim — a failed, rolled-back or no-op apply, a client
+/// disconnect that drops the handler future mid-wait, or a panic — so
+/// gossip copies of the payload reach the background owner again instead
+/// of being dropped for the tracker's TTL. The claim lives in the tracker
+/// entry, whose TTL runs from the first record: an apply still running
+/// after that TTL lets the entry — claim included — expire mid-apply.
+pub(in crate::server) struct ApplyRouteClaim {
+    tracker: Arc<StdMutex<SelfPublishedReleaseManifests>>,
+    digest: [u8; 32],
+    kept: bool,
+}
+
+impl ApplyRouteClaim {
+    /// Record the announced payload as apply-route-owned and hold the
+    /// claim for the guard's lifetime.
+    fn record(tracker: Arc<StdMutex<SelfPublishedReleaseManifests>>, payload: &[u8]) -> Self {
+        let digest = release_manifest_payload_digest(payload);
+        tracker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_apply_route_payload(payload, Instant::now());
+        Self {
+            tracker,
+            digest,
+            kept: false,
+        }
+    }
+
+    /// The only outcome that keeps the claim: this route installed the
+    /// release, so its own echo must not start a second apply of it.
+    fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for ApplyRouteClaim {
+    fn drop(&mut self) {
+        if !self.kept {
+            self.tracker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear_apply_route_digest(&self.digest, Instant::now());
+        }
     }
 }
 
@@ -844,7 +891,7 @@ pub(in crate::server) async fn broadcast_current_manifest(
     repo: &str,
     include_prereleases: bool,
     data_dir: &std::path::Path,
-    self_published_release_manifests: Arc<Mutex<SelfPublishedReleaseManifests>>,
+    self_published_release_manifests: Arc<StdMutex<SelfPublishedReleaseManifests>>,
 ) {
     let monitor = match UpgradeMonitor::new(repo, "x0xd", x0x::VERSION) {
         Ok(m) => m.with_include_prereleases(include_prereleases),
@@ -854,7 +901,7 @@ pub(in crate::server) async fn broadcast_current_manifest(
         }
     };
 
-    match monitor.fetch_current_manifest().await {
+    match broadcast_fetch_current_manifest(&monitor).await {
         Ok(Some(verified)) => {
             if x0x::upgrade::monitor::validate_manifest_timestamp(&verified.manifest).is_err() {
                 return;
@@ -872,7 +919,9 @@ pub(in crate::server) async fn broadcast_current_manifest(
             }
             let gossip_payload = verified.gossip_payload;
             {
-                let mut self_published = self_published_release_manifests.lock().await;
+                let mut self_published = self_published_release_manifests
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 self_published.record_payload(&gossip_payload, Instant::now());
             }
             if let Err(e) = agent.publish(RELEASE_TOPIC, gossip_payload).await {
@@ -1325,7 +1374,7 @@ fn background_staging_request(
 pub(in crate::server) async fn run_gossip_update_listener(
     agent: Arc<Agent>,
     submit: Option<BackgroundSubmit>,
-    self_published: Arc<Mutex<SelfPublishedReleaseManifests>>,
+    self_published: Arc<StdMutex<SelfPublishedReleaseManifests>>,
     observations: Arc<std::sync::Mutex<UpgradeObservations>>,
     shutdown: watch::Receiver<bool>,
 ) {
@@ -1443,7 +1492,7 @@ async fn announce_observed_release<Publish, PublishFuture>(
 async fn run_gossip_update_driver<S, Publish, PublishFuture>(
     releases: S,
     submit: impl Into<Option<BackgroundSubmit>>,
-    self_published: Arc<Mutex<SelfPublishedReleaseManifests>>,
+    self_published: Arc<StdMutex<SelfPublishedReleaseManifests>>,
     mut publish: Publish,
     mut shutdown: watch::Receiver<bool>,
 ) where
@@ -1466,7 +1515,9 @@ async fn run_gossip_update_driver<S, Publish, PublishFuture>(
             continue;
         }
         let (decision, apply_route_echo) = {
-            let mut published = self_published.lock().await;
+            let mut published = self_published
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let digest = release_manifest_payload_digest(&verified.gossip_payload);
             let decision = decide_release_manifest_rebroadcast(
                 &verified.manifest.version,
@@ -1498,7 +1549,7 @@ async fn run_gossip_update_driver<S, Publish, PublishFuture>(
         if decision == ReleaseRebroadcastDecision::Rebroadcast {
             self_published
                 .lock()
-                .await
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .record_payload(&verified.gossip_payload, Instant::now());
             // Keep publication bounded; no detached task accumulates while the
             // owner waits for rollout or another process's canonical lock.
@@ -1519,7 +1570,7 @@ pub(in crate::server) async fn run_fallback_github_poll(
     agent: Arc<Agent>,
     config: DaemonUpdateConfig,
     submit: Option<BackgroundSubmit>,
-    self_published: Arc<Mutex<SelfPublishedReleaseManifests>>,
+    self_published: Arc<StdMutex<SelfPublishedReleaseManifests>>,
     observations: Arc<std::sync::Mutex<UpgradeObservations>>,
     shutdown: watch::Receiver<bool>,
 ) {
@@ -1583,7 +1634,7 @@ async fn run_fallback_update_driver<S, Check, CheckFuture, Publish, PublishFutur
     ticks: S,
     mut check: Check,
     submit: impl Into<Option<BackgroundSubmit>>,
-    self_published: Arc<Mutex<SelfPublishedReleaseManifests>>,
+    self_published: Arc<StdMutex<SelfPublishedReleaseManifests>>,
     mut publish: Publish,
     mut shutdown: watch::Receiver<bool>,
 ) where
@@ -1629,7 +1680,7 @@ async fn run_fallback_update_driver<S, Check, CheckFuture, Publish, PublishFutur
         }
         self_published
             .lock()
-            .await
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .record_payload(&verified.gossip_payload, Instant::now());
         tokio::select! {
             result = tokio::time::timeout(Duration::from_secs(10), publish(verified.gossip_payload.clone())) => {
@@ -2009,6 +2060,65 @@ mod upgrade_check_feed_seam {
     }
 }
 
+/// The boot broadcast's injected manifest answer (`Some(release)` = a
+/// verified current manifest, `None` = fetch found nothing), mirroring
+/// [`upgrade_check_feed_seam`] for `fetch_current_manifest`. Thread-local
+/// for the same reason; compiled out entirely in non-test builds.
+#[cfg(test)]
+mod broadcast_feed_seam {
+    use crate::upgrade::monitor::VerifiedRelease;
+    use std::cell::RefCell;
+
+    type Answer = Result<Option<VerifiedRelease>, crate::upgrade::UpgradeError>;
+
+    thread_local! {
+        static INJECTED: RefCell<Option<Answer>> = const { RefCell::new(None) };
+    }
+
+    /// Uninstalls the injection on drop, so a test cannot leak its answer
+    /// into sibling tests on the same thread.
+    pub(super) struct Guard {
+        _private: (),
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            INJECTED.with(|slot| slot.borrow_mut().take());
+        }
+    }
+
+    /// Inject the broadcast's next fetch answer for the guard's lifetime.
+    pub(super) fn install(answer: Answer) -> Guard {
+        INJECTED.with(|slot| *slot.borrow_mut() = Some(answer));
+        Guard { _private: () }
+    }
+
+    /// Take the injected answer, or `None` when nothing is installed
+    /// (fall through to the real fetch).
+    pub(super) fn take() -> Option<Answer> {
+        INJECTED.with(|slot| slot.borrow_mut().take())
+    }
+}
+
+/// The boot broadcast's manifest fetch: the injected test answer when
+/// installed, else the verbatim `fetch_current_manifest`.
+#[cfg(test)]
+async fn broadcast_fetch_current_manifest(
+    monitor: &UpgradeMonitor,
+) -> Result<Option<crate::upgrade::monitor::VerifiedRelease>, x0x::upgrade::UpgradeError> {
+    match broadcast_feed_seam::take() {
+        Some(injected) => injected,
+        None => monitor.fetch_current_manifest().await,
+    }
+}
+
+#[cfg(not(test))]
+async fn broadcast_fetch_current_manifest(
+    monitor: &UpgradeMonitor,
+) -> Result<Option<crate::upgrade::monitor::VerifiedRelease>, x0x::upgrade::UpgradeError> {
+    monitor.fetch_current_manifest().await
+}
+
 /// The update-monitor answer for a route: the injected test answer when
 /// installed, else the real fetch. Test builds only see the seam; the
 /// production body is the verbatim `check_for_updates` call.
@@ -2259,13 +2369,14 @@ pub(in crate::server) async fn apply_upgrade(
     // announcement to this node's own gossip listener. The payload is
     // recorded as published by this route first, so the gossip driver skips
     // both the rebroadcast and the submit for that echo: this route already
-    // owns the apply.
+    // owns the apply. The claim guard outlives this block: it releases the
+    // claim unless this route installs the release, whatever way the
+    // handler leaves — outcome, client disconnect or panic.
+    let claim = ApplyRouteClaim::record(
+        Arc::clone(&state.self_published_release_manifests),
+        &release.gossip_payload,
+    );
     {
-        state
-            .self_published_release_manifests
-            .lock()
-            .await
-            .record_apply_route_payload(&release.gossip_payload, Instant::now());
         let agent = Arc::clone(&state.agent);
         announce_observed_release(&release, move |payload| async move {
             agent
@@ -2288,17 +2399,13 @@ pub(in crate::server) async fn apply_upgrade(
         operation_observer: None,
     };
     let (upgrader, result) = apply_http_release(&runtime, &release, query.now).await;
-    // While the apply ran, the apply-route claim kept the announcement's
-    // self-echo from queueing a second apply. A release this route did not
-    // install is not its to keep: release the claim, so gossip copies of
-    // the payload reach the background owner again instead of being
-    // dropped for the tracker's TTL.
-    if !matches!(result, Ok(x0x::upgrade::UpgradeResult::Success { .. })) {
-        state
-            .self_published_release_manifests
-            .lock()
-            .await
-            .clear_apply_route_payload(&release.gossip_payload, Instant::now());
+    // While the apply ran, the claim kept the announcement's self-echo
+    // from queueing a second apply. A release this route did not install
+    // is not its to keep: `claim` releases it when it drops at the end of
+    // this handler — including a handler future dropped mid-wait by a
+    // client disconnect, or unwound by a panic.
+    if matches!(result, Ok(x0x::upgrade::UpgradeResult::Success { .. })) {
+        claim.keep();
     }
     match result {
         Ok(x0x::upgrade::UpgradeResult::Success { version }) => (
@@ -2786,7 +2893,7 @@ mod tests {
             run_gossip_update_driver(
                 futures::stream::iter([verified.clone()]),
                 None,
-                Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
+                Arc::new(StdMutex::new(SelfPublishedReleaseManifests::default())),
                 move |_| {
                     count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     async { Ok(()) }
@@ -2802,7 +2909,7 @@ mod tests {
                     async { Ok(Some(verified)) }
                 },
                 None,
-                Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
+                Arc::new(StdMutex::new(SelfPublishedReleaseManifests::default())),
                 move |_| {
                     count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     async { Ok(()) }
@@ -2934,7 +3041,7 @@ mod tests {
     /// selected.
     async fn drive_one_gossip_release(
         verified: VerifiedRelease,
-        self_published: Arc<Mutex<SelfPublishedReleaseManifests>>,
+        self_published: Arc<StdMutex<SelfPublishedReleaseManifests>>,
     ) -> (usize, Option<String>) {
         let submit = BackgroundSubmit::default();
         let (_keep_running, shutdown) = watch::channel(false);
@@ -2973,10 +3080,10 @@ mod tests {
     async fn self_published_release_is_not_resubmitted_to_the_background_owner() {
         let version = version_newer_than_current();
         let verified = submittable_release(&version);
-        let self_published = Arc::new(Mutex::new(SelfPublishedReleaseManifests::default()));
+        let self_published = Arc::new(StdMutex::new(SelfPublishedReleaseManifests::default()));
         self_published
             .lock()
-            .await
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .record_apply_route_payload(&verified.gossip_payload, Instant::now());
 
         let (rebroadcasts, selected) = drive_one_gossip_release(verified, self_published).await;
@@ -2998,10 +3105,10 @@ mod tests {
     async fn non_route_self_published_echo_is_still_submitted() {
         let version = version_newer_than_current();
         let verified = submittable_release(&version);
-        let self_published = Arc::new(Mutex::new(SelfPublishedReleaseManifests::default()));
+        let self_published = Arc::new(StdMutex::new(SelfPublishedReleaseManifests::default()));
         self_published
             .lock()
-            .await
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .record_payload(&verified.gossip_payload, Instant::now());
 
         let (rebroadcasts, selected) = drive_one_gossip_release(verified, self_published).await;
@@ -3020,7 +3127,7 @@ mod tests {
     async fn peer_published_release_is_rebroadcast_and_submitted() {
         let version = version_newer_than_current();
         let verified = submittable_release(&version);
-        let self_published = Arc::new(Mutex::new(SelfPublishedReleaseManifests::default()));
+        let self_published = Arc::new(StdMutex::new(SelfPublishedReleaseManifests::default()));
 
         let (rebroadcasts, selected) = drive_one_gossip_release(verified, self_published).await;
 
@@ -3142,7 +3249,7 @@ mod tests {
         run_gossip_update_driver(
             releases,
             Some(relayer_submit),
-            Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
+            Arc::new(StdMutex::new(SelfPublishedReleaseManifests::default())),
             move |_| {
                 let _ = relayed_tx.try_send(tokio::time::Instant::now());
                 async { Ok(()) }
@@ -3289,7 +3396,7 @@ mod tests {
         let b_driver = tokio::spawn(run_gossip_update_driver(
             releases,
             Some(b_submit),
-            Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
+            Arc::new(StdMutex::new(SelfPublishedReleaseManifests::default())),
             |_| async { Ok(()) },
             b_shutdown,
         ));
@@ -3304,7 +3411,7 @@ mod tests {
                 async move { Ok(Some(verified)) }
             },
             None::<BackgroundSubmit>,
-            Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
+            Arc::new(StdMutex::new(SelfPublishedReleaseManifests::default())),
             move |payload| {
                 let agent = Arc::clone(&a_publish);
                 async move {
@@ -3339,7 +3446,10 @@ mod tests {
     /// background owner again instead of being dropped for the tracker's
     /// TTL. Without the release, the driver's apply-route skip swallows
     /// every copy for 30 minutes and the owner depends on a peer
-    /// re-announce or the fallback poll.
+    /// re-announce or the fallback poll. Unix-gated like
+    /// `current_binary_path_seam`, which the fast hermetic refusal leans
+    /// on.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_failed_apply_route_releases_the_release_to_the_background_owner() {
         let dir = tempfile::tempdir().expect("tmpdir");
@@ -3362,7 +3472,10 @@ mod tests {
 
         let digest = release_manifest_payload_digest(&verified.gossip_payload);
         {
-            let mut tracker = state.self_published_release_manifests.lock().await;
+            let mut tracker = state
+                .self_published_release_manifests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert!(
                 tracker.contains_recent_digest(&digest, Instant::now()),
                 "the announced payload stays recorded: this node does not rebroadcast bytes it already published"
@@ -3390,6 +3503,560 @@ mod tests {
             Some(expected_version),
             "a gossip copy after the failed apply reaches the background owner"
         );
+        agent.shutdown().await;
+    }
+
+    fn lock_tracker(
+        state: &Arc<AppState>,
+    ) -> std::sync::MutexGuard<'_, SelfPublishedReleaseManifests> {
+        state
+            .self_published_release_manifests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Assert the announced payload's tracker state after a route exit:
+    /// still recorded (this node never rebroadcasts bytes it published),
+    /// and apply-route owned exactly when `owned` says.
+    fn assert_claim(state: &Arc<AppState>, digest: &[u8; 32], owned: bool, because: &str) {
+        let mut tracker = lock_tracker(state);
+        assert!(
+            tracker.contains_recent_digest(digest, Instant::now()),
+            "the announced payload stays recorded: {because}"
+        );
+        assert_eq!(
+            tracker.recorded_by_apply_route(digest, Instant::now()),
+            owned,
+            "{because}"
+        );
+    }
+
+    /// A staging context like `e2e_startup_runtime`'s: an install fixture
+    /// the host upgrade lock can flock, an identity root under the data
+    /// dir, a fixed machine id, and a monotonic clock.
+    #[cfg(unix)]
+    fn route_staging_context(data_dir: &std::path::Path) -> StartupStagingContext {
+        let root = data_dir.canonicalize().expect("canonical data dir");
+        let install = root.join("x0xd");
+        std::fs::write(&install, b"owned route staging executable fixture")
+            .expect("install fixture");
+        let started = std::time::Instant::now();
+        StartupStagingContext {
+            install,
+            identity_root: root,
+            machine_id: [42; 32],
+            observed: None,
+            clock: Some(Arc::new(move || {
+                Ok(crate::upgrade::probe::ProbeClock {
+                    boot_id: "route-fixture".into(),
+                    monotonic_ms: 1000
+                        + u64::try_from(started.elapsed().as_millis())
+                            .map_err(std::io::Error::other)?,
+                })
+            })),
+        }
+    }
+
+    /// A route state whose `/upgrade/apply` can get past the fast
+    /// staging refusal: it carries the staging identity and the given
+    /// rollout window. Zero window lets an apply complete; the default
+    /// parks it in the staging wait.
+    #[cfg(unix)]
+    async fn staging_route_state(
+        agent: Arc<Agent>,
+        data_dir: &std::path::Path,
+        rollout_window_minutes: u64,
+    ) -> Arc<AppState> {
+        let update_config = DaemonUpdateConfig {
+            rollout_window_minutes,
+            ..DaemonUpdateConfig::default()
+        };
+        super::super::named_groups::tests::secure_endpoint_test_state_with_upgrade_options(
+            data_dir,
+            agent,
+            true,
+            Some(route_staging_context(data_dir)),
+            update_config,
+        )
+        .await
+        .expect("staging-capable route state")
+    }
+
+    /// Readback answers for the route's staging identity and restart
+    /// contract resolution: an untracked unit with no start-rate limit.
+    /// `show_for_this_process` renders the seam-observed install path as
+    /// ExecStart but the real argv[0] inside `argv[]`; the structured
+    /// binding check requires both to name the install, so argv[0] is
+    /// rewritten like `staging_readback` does. Call after installing
+    /// `current_binary_path_seam` on `install`.
+    #[cfg(unix)]
+    fn route_readback_scenario(
+        calls: usize,
+        install: &std::path::Path,
+    ) -> restart::systemd_readback_seam::Scenario {
+        let install_display = install.to_string_lossy().into_owned();
+        let show_output = show_for_this_process("0", "5", 1_000_000)
+            .replace(&restart::current_argv()[0], &install_display);
+        restart::systemd_readback_seam::Scenario {
+            cgroup: "0::/system.slice/x0x-staging-test.service".to_string(),
+            invocation_id: Some(SEAM_INVOCATION_ID.to_string()),
+            calls: (0..calls)
+                .map(|_| restart::systemd_readback_seam::ReadbackCall {
+                    show_output: show_output.clone(),
+                    monotonic_now_us: 3_000_000,
+                })
+                .collect(),
+        }
+    }
+
+    /// #1169 review round 2, the cancellation half of the claim-release
+    /// invariant: a client that walks away mid-apply (for example
+    /// `curl -m 60` against the staging wait) drops the handler future.
+    /// The claim guard must release the claim on that drop — no outcome
+    /// was ever produced — so gossip copies of the payload reach the
+    /// background owner again. The handler runs against a 60-minute
+    /// rollout window on a real staging gate under the data dir, so it
+    /// cannot finish on its own; the test observes the live claim,
+    /// confirms the handler is still running, then drops the future the
+    /// way a client disconnect would.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancelled_apply_route_releases_the_release_to_the_background_owner() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = loopback_gossip_agent(dir.path()).await;
+        let state = staging_route_state(Arc::clone(&agent), dir.path(), 60).await;
+        let install = dir.path().canonicalize().expect("canonical").join("x0xd");
+        let _current = crate::upgrade::apply::current_binary_path_seam::install(install.clone());
+        let _readback =
+            restart::systemd_readback_seam::install(route_readback_scenario(4, &install));
+
+        let verified = submittable_release(&version_newer_than_current());
+        let expected_version = verified.manifest.version.clone();
+        let digest = release_manifest_payload_digest(&verified.gossip_payload);
+        let _feed = upgrade_check_feed_seam::install(Some(verified.clone()));
+
+        let handler_state = Arc::clone(&state);
+        let handler = tokio::spawn(async move {
+            apply_upgrade(State(handler_state), Query(Default::default())).await
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !lock_tracker(&state).recorded_by_apply_route(&digest, Instant::now()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the route never recorded its apply-route claim; handler finished: {}",
+                handler.is_finished()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Let the handler settle into its apply work, then confirm it is
+        // still running: the 60-minute window cannot elapse on its own.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !handler.is_finished(),
+            "the handler must still be waiting inside its apply"
+        );
+
+        handler.abort();
+        let joined = handler.await;
+        assert!(
+            matches!(&joined, Err(error) if error.is_cancelled()),
+            "the handler future was dropped mid-wait"
+        );
+        assert_claim(
+            &state,
+            &digest,
+            false,
+            "a cancelled apply releases the claim: gossip copies must reach the owner again",
+        );
+
+        let (rebroadcasts, selected) = drive_one_gossip_release(
+            verified,
+            Arc::clone(&state.self_published_release_manifests),
+        )
+        .await;
+        assert_eq!(rebroadcasts, 0, "self-published bytes are not rebroadcast");
+        assert_eq!(
+            selected,
+            Some(expected_version),
+            "a gossip copy after the cancelled apply reaches the background owner"
+        );
+        agent.shutdown().await;
+    }
+
+    /// #1169 review round 2, the panic half of the claim-release
+    /// invariant: a handler that unwinds mid-apply (here a panicking
+    /// apply attempt) releases the claim on its way out, exactly like a
+    /// non-Success outcome.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_panicking_apply_route_releases_the_release_to_the_background_owner() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = loopback_gossip_agent(dir.path()).await;
+        let state = staging_route_state(Arc::clone(&agent), dir.path(), 0).await;
+        let install = dir.path().canonicalize().expect("canonical").join("x0xd");
+        let _current = crate::upgrade::apply::current_binary_path_seam::install(install.clone());
+        let _readback =
+            restart::systemd_readback_seam::install(route_readback_scenario(8, &install));
+        let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(|_, _| {
+            panic!("apply attempt fixture panic")
+        }));
+
+        let verified = submittable_release(&version_newer_than_current());
+        let expected_version = verified.manifest.version.clone();
+        let digest = release_manifest_payload_digest(&verified.gossip_payload);
+        let _feed = upgrade_check_feed_seam::install(Some(verified.clone()));
+
+        let handler_state = Arc::clone(&state);
+        let handler = tokio::spawn(async move {
+            apply_upgrade(State(handler_state), Query(Default::default())).await
+        });
+        let joined = handler.await;
+        assert!(
+            matches!(&joined, Err(error) if error.is_panic()),
+            "the handler unwound mid-apply"
+        );
+        assert_claim(
+            &state,
+            &digest,
+            false,
+            "a panicking apply releases the claim: gossip copies must reach the owner again",
+        );
+
+        let (rebroadcasts, selected) = drive_one_gossip_release(
+            verified,
+            Arc::clone(&state.self_published_release_manifests),
+        )
+        .await;
+        assert_eq!(rebroadcasts, 0, "self-published bytes are not rebroadcast");
+        assert_eq!(
+            selected,
+            Some(expected_version),
+            "a gossip copy after the panicking apply reaches the background owner"
+        );
+        agent.shutdown().await;
+    }
+
+    /// The route's outcome space beyond `Err`: a rolled-back apply is not
+    /// a success, so it releases the claim like a failure does.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rolled_back_apply_route_releases_the_release_to_the_background_owner() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = loopback_gossip_agent(dir.path()).await;
+        let state = staging_route_state(Arc::clone(&agent), dir.path(), 0).await;
+        let install = dir.path().canonicalize().expect("canonical").join("x0xd");
+        let _current = crate::upgrade::apply::current_binary_path_seam::install(install.clone());
+        let _readback =
+            restart::systemd_readback_seam::install(route_readback_scenario(8, &install));
+        let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(|_, _| {
+            x0x::upgrade::UpgradeResult::RolledBack {
+                reason: "fixture rollback".into(),
+            }
+        }));
+
+        let verified = submittable_release(&version_newer_than_current());
+        let expected_version = verified.manifest.version.clone();
+        let digest = release_manifest_payload_digest(&verified.gossip_payload);
+        let _feed = upgrade_check_feed_seam::install(Some(verified.clone()));
+        let (status, body) = route_response_json(
+            apply_upgrade(State(Arc::clone(&state)), Query(Default::default()))
+                .await
+                .into_response(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(body["applied"], serde_json::json!(false));
+        assert_eq!(body["rolled_back"], serde_json::json!(true));
+        assert_claim(
+            &state,
+            &digest,
+            false,
+            "a rolled-back apply releases the claim: gossip copies must reach the owner again",
+        );
+
+        let (rebroadcasts, selected) = drive_one_gossip_release(
+            verified,
+            Arc::clone(&state.self_published_release_manifests),
+        )
+        .await;
+        assert_eq!(rebroadcasts, 0, "self-published bytes are not rebroadcast");
+        assert_eq!(
+            selected,
+            Some(expected_version),
+            "a gossip copy after the rolled-back apply reaches the background owner"
+        );
+        agent.shutdown().await;
+    }
+
+    /// The route's outcome space beyond `Err`: a release that is not
+    /// newer answers `NoUpgrade`; the announcement's claim is released
+    /// because nothing was installed. Needs the staging identity (the
+    /// staging request is built before the version check), but never
+    /// reaches the staging wait. No driver consequence is asserted here:
+    /// a same-version copy is skipped by the driver's own version gate,
+    /// not by any claim — copies reaching the owner is pinned by the
+    /// failed, rolled-back, cancelled and panicking variants.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_no_upgrade_apply_route_releases_the_release_to_the_background_owner() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = loopback_gossip_agent(dir.path()).await;
+        let state = staging_route_state(Arc::clone(&agent), dir.path(), 0).await;
+
+        let verified = submittable_release(x0x::VERSION);
+        let digest = release_manifest_payload_digest(&verified.gossip_payload);
+        let _feed = upgrade_check_feed_seam::install(Some(verified.clone()));
+        let (status, body) = route_response_json(
+            apply_upgrade(State(Arc::clone(&state)), Query(Default::default()))
+                .await
+                .into_response(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["applied"], serde_json::json!(false));
+        assert_eq!(body["reason"], serde_json::json!("no upgrade required"));
+        assert_claim(
+            &state,
+            &digest,
+            false,
+            "an apply that installed nothing releases the claim",
+        );
+        agent.shutdown().await;
+    }
+
+    /// The claim's purpose, pinned from the keep side: only a successful
+    /// apply keeps it. Inverting the route's keep decision (releasing on
+    /// success instead) fails this test — the echo of the route's own
+    /// announcement would queue a second apply of the release it just
+    /// installed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_successful_apply_route_keeps_its_release_claim() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = loopback_gossip_agent(dir.path()).await;
+        let state = staging_route_state(Arc::clone(&agent), dir.path(), 0).await;
+        let install = dir.path().canonicalize().expect("canonical").join("x0xd");
+        let _current = crate::upgrade::apply::current_binary_path_seam::install(install.clone());
+        let _readback =
+            restart::systemd_readback_seam::install(route_readback_scenario(8, &install));
+        let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(|_, manifest| {
+            x0x::upgrade::UpgradeResult::Success {
+                version: manifest.version.clone(),
+            }
+        }));
+
+        let verified = submittable_release(&version_newer_than_current());
+        let expected_version = verified.manifest.version.clone();
+        let digest = release_manifest_payload_digest(&verified.gossip_payload);
+        let _feed = upgrade_check_feed_seam::install(Some(verified.clone()));
+        let (status, body) = route_response_json(
+            apply_upgrade(State(Arc::clone(&state)), Query(Default::default()))
+                .await
+                .into_response(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["applied"], serde_json::json!(true));
+        assert_eq!(body["version"], serde_json::json!(expected_version));
+        assert_claim(
+            &state,
+            &digest,
+            true,
+            "the route that installed the release keeps the claim",
+        );
+
+        let (rebroadcasts, selected) = drive_one_gossip_release(
+            verified,
+            Arc::clone(&state.self_published_release_manifests),
+        )
+        .await;
+        assert_eq!(rebroadcasts, 0, "self-published bytes are not rebroadcast");
+        assert_eq!(
+            selected, None,
+            "the echo of a successful route apply must not queue a second apply"
+        );
+        agent.shutdown().await;
+    }
+
+    /// #1169 review round 2: the claim release on an unknown digest is a
+    /// no-op, and releasing a claim never refreshes the record's TTL —
+    /// the tracker entry still ages out from its first record.
+    #[test]
+    fn clearing_an_unknown_digest_is_a_no_op_and_does_not_refresh_the_ttl() {
+        let payload = encoded_payload_for_manifest(&manifest_with_version("9.9.7"));
+        let other = encoded_payload_for_manifest(&manifest_with_version("9.9.8"));
+        let digest = release_manifest_payload_digest(&payload);
+        let other_digest = release_manifest_payload_digest(&other);
+        let now = Instant::now();
+
+        let mut tracker = SelfPublishedReleaseManifests::default();
+        tracker.record_apply_route_payload(&payload, now);
+        assert!(tracker.recorded_by_apply_route(&digest, now));
+
+        tracker.clear_apply_route_digest(&other_digest, now);
+        assert!(
+            tracker.recorded_by_apply_route(&digest, now),
+            "clearing an unknown digest changes nothing"
+        );
+
+        let cleared_at = now + Duration::from_secs(5);
+        tracker.clear_apply_route_digest(&digest, cleared_at);
+        assert!(!tracker.recorded_by_apply_route(&digest, cleared_at));
+        assert!(
+            tracker.contains_recent_digest(&digest, cleared_at),
+            "the release stays recorded: no rebroadcast of published bytes"
+        );
+        let just_inside_ttl = now + SELF_PUBLISHED_RELEASE_TTL - Duration::from_secs(1);
+        assert!(tracker.contains_recent_digest(&digest, just_inside_ttl));
+        let after_ttl = now + SELF_PUBLISHED_RELEASE_TTL + Duration::from_secs(1);
+        assert!(
+            !tracker.contains_recent_digest(&digest, after_ttl),
+            "the clear does not refresh the TTL: it still runs from the first record"
+        );
+    }
+
+    /// #1169 review round 2: the gossip funnel has its own wrong-key
+    /// rejection, independent of the binary-file signature tests — a
+    /// manifest signed by a key that is not the trusted release key is
+    /// dropped before any version or timestamp consideration.
+    #[tokio::test]
+    async fn gossip_release_verification_rejects_a_wrong_signing_key() {
+        use x0x::upgrade::signature::sign_with_context;
+        let (pk, sk) = saorsa_pqc::api::sig::ml_dsa_65()
+            .generate_keypair()
+            .unwrap();
+        let (other_pk, _) = saorsa_pqc::api::sig::ml_dsa_65()
+            .generate_keypair()
+            .unwrap();
+        let manifest = manifest_with_version(&version_newer_than_current());
+        let manifest_json = serde_json::to_vec(&manifest).unwrap();
+        let signature = sign_with_context(&sk.to_bytes(), &manifest_json).unwrap();
+        let payload = x0x::upgrade::manifest::encode_signed_manifest(&manifest_json, &signature);
+
+        assert!(
+            verify_gossip_release_with_key(&payload, &other_pk.to_bytes()).is_none(),
+            "a manifest signed by an untrusted key is rejected"
+        );
+        assert!(
+            verify_gossip_release_with_key(&payload, &pk.to_bytes()).is_some(),
+            "control: the same manifest verifies under its own key"
+        );
+    }
+
+    /// #1169 review round 2: the boot broadcast — the every-launch
+    /// announce point — publishes the fetched manifest exactly once and
+    /// records it without the apply-route claim, so its echo still
+    /// reaches the background owner.
+    #[tokio::test]
+    async fn startup_broadcast_publishes_and_records_the_current_manifest() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = loopback_gossip_agent(dir.path()).await;
+        let mut release_topic = agent
+            .subscribe(RELEASE_TOPIC)
+            .await
+            .expect("release topic subscription");
+        let tracker = Arc::new(StdMutex::new(SelfPublishedReleaseManifests::default()));
+
+        // Current version and an empty skill URL with the missing-file
+        // hash: the SKILL.md sync takes its already-up-to-date return, no
+        // HTTP. The broadcast publishes what the fetch funnel returned —
+        // newer-than-current is not its precondition.
+        let mut manifest = manifest_for_this_platform(x0x::VERSION);
+        manifest.skill_url = String::new();
+        manifest.skill_sha256 = [0u8; 32];
+        let manifest_json = serde_json::to_vec(&manifest).expect("manifest fixture");
+        let payload = x0x::upgrade::manifest::encode_signed_manifest(&manifest_json, b"announce");
+        let verified = VerifiedRelease {
+            manifest,
+            manifest_json,
+            signature: b"announce".to_vec(),
+            gossip_payload: payload.clone(),
+        };
+        let _feed = broadcast_feed_seam::install(Ok(Some(verified)));
+
+        broadcast_current_manifest(
+            &agent,
+            "saorsa-labs/x0x",
+            false,
+            dir.path(),
+            Arc::clone(&tracker),
+        )
+        .await;
+
+        let received = tokio::time::timeout(Duration::from_secs(5), release_topic.recv())
+            .await
+            .expect("the broadcast self-delivers within the timeout")
+            .expect("subscription still live");
+        assert_eq!(
+            &received.payload[..],
+            payload.as_slice(),
+            "the boot broadcast publishes the fetched manifest's payload"
+        );
+        let digest = release_manifest_payload_digest(&payload);
+        {
+            let mut recorded = tracker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                recorded.contains_recent_digest(&digest, Instant::now()),
+                "the broadcast records its payload: no rebroadcast of published bytes"
+            );
+            assert!(
+                !recorded.recorded_by_apply_route(&digest, Instant::now()),
+                "the boot broadcast is not apply-route owned: its echo still reaches the owner"
+            );
+        }
+        agent.shutdown().await;
+    }
+
+    /// The boot broadcast's eligibility gate: a manifest outside the
+    /// timestamp window is neither published nor recorded.
+    #[tokio::test]
+    async fn startup_broadcast_skips_an_ineligible_manifest() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = loopback_gossip_agent(dir.path()).await;
+        let mut release_topic = agent
+            .subscribe(RELEASE_TOPIC)
+            .await
+            .expect("release topic subscription");
+        let tracker = Arc::new(StdMutex::new(SelfPublishedReleaseManifests::default()));
+
+        let mut manifest = manifest_for_this_platform(x0x::VERSION);
+        manifest.timestamp = 0;
+        let manifest_json = serde_json::to_vec(&manifest).expect("manifest fixture");
+        let payload = x0x::upgrade::manifest::encode_signed_manifest(&manifest_json, b"announce");
+        let digest = release_manifest_payload_digest(&payload);
+        let verified = VerifiedRelease {
+            manifest,
+            manifest_json,
+            signature: b"announce".to_vec(),
+            gossip_payload: payload,
+        };
+        let _feed = broadcast_feed_seam::install(Ok(Some(verified)));
+
+        broadcast_current_manifest(
+            &agent,
+            "saorsa-labs/x0x",
+            false,
+            dir.path(),
+            Arc::clone(&tracker),
+        )
+        .await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), release_topic.recv())
+                .await
+                .is_err(),
+            "an ineligible manifest is not published"
+        );
+        assert!(!tracker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_recent_digest(&digest, Instant::now()));
         agent.shutdown().await;
     }
 
@@ -3831,7 +4498,10 @@ mod tests {
             expected_payload.as_slice(),
             "the announced payload is the verified gossip payload"
         );
-        let mut tracker = state.self_published_release_manifests.lock().await;
+        let mut tracker = state
+            .self_published_release_manifests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let digest = release_manifest_payload_digest(&expected_payload);
         assert!(
             tracker.contains_recent_digest(&digest, Instant::now()),

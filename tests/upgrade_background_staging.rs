@@ -468,7 +468,7 @@ macro_rules! background_driver_regression_tests {
                         receive.recv().await.map(|value| (value, receive))
                     });
                     let future = run_gossip_update_driver(releases, self.submit.clone(),
-                        Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
+                        Arc::new(StdMutex::new(SelfPublishedReleaseManifests::default())),
                         |_| async { Ok(()) }, self.shutdown_watch.clone());
                     (send, Box::pin(future))
                 }
@@ -487,7 +487,7 @@ macro_rules! background_driver_regression_tests {
                             checks.fetch_add(1, Ordering::SeqCst);
                             let release = queued.lock().unwrap().pop_front();
                             async move { Ok(release) }
-                        }, submit, Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
+                        }, submit, Arc::new(StdMutex::new(SelfPublishedReleaseManifests::default())),
                             |_| async { Ok(()) }, shutdown).await;
                     })
                 }
@@ -1098,7 +1098,7 @@ macro_rules! background_init_regression_tests {
                 // An apply owner cannot be constructed from this result.
                 let submit = boot.ok().map(|runtime| background_channel(runtime).0);
                 assert!(submit.is_none());
-                let published = Arc::new(Mutex::new(SelfPublishedReleaseManifests::default()));
+                let published = Arc::new(StdMutex::new(SelfPublishedReleaseManifests::default()));
                 let observations = Arc::new(StdMutex::new(Observations::default()));
                 let gossip_release = release("9.9.9");
                 let fallback_release = release("9.9.10");

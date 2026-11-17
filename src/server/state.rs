@@ -1439,8 +1439,10 @@ pub(super) struct AppState {
     /// Release-topic payloads this daemon published itself. Shared by
     /// `/upgrade/apply` and the gossip/fallback/startup publishers so the
     /// gossip driver neither rebroadcasts nor re-submits its own
-    /// self-delivered announcement (#1169).
-    pub(super) self_published_release_manifests: Arc<Mutex<SelfPublishedReleaseManifests>>,
+    /// self-delivered announcement (#1169). A plain mutex: no caller
+    /// holds it across an await, and `/upgrade/apply`'s claim guard
+    /// releases its claim synchronously from `Drop`.
+    pub(super) self_published_release_manifests: Arc<StdMutex<SelfPublishedReleaseManifests>>,
     /// Releases seen on the topic and the last release check (#1381),
     /// reported by `GET /diagnostics/upgrade`. Memory only.
     pub(super) upgrade_observations: Arc<std::sync::Mutex<super::routes::UpgradeObservations>>,

@@ -1020,7 +1020,14 @@ no gossip, binds nothing, and takes no instance lock.
 
 ## Update Flow (for x0xd)
 
-1. **Startup (background, post-bind)**: after the API listener is bound — and as a non-blocking background task, so an unreachable GitHub never delays API readiness (#1086) — check GitHub for a new release and apply it if found. The check itself announces nothing (#1169): a boot-time discovery is announced by the separate every-launch manifest broadcast task, `broadcast_current_manifest`, under the same gates and with the byte-identical payload (both paths build it through the same monitor funnel).
+1. **Startup (background, post-bind)**: after the API listener is bound,
+   check GitHub for a new release and apply it if found. This check runs
+   as a non-blocking background task, so an unreachable GitHub never
+   delays API readiness (#1086). The check itself announces nothing
+   (#1169). A boot-time discovery is announced by the separate
+   every-launch manifest broadcast task, `broadcast_current_manifest`.
+   That broadcast runs under the same gates and with the byte-identical
+   payload; both paths build it through the same monitor funnel.
 2. **Gossip listener**: Receive manifests on `x0x/release` topic, verify signature, rebroadcast, apply if newer
 3. **GitHub poller**: Periodic fallback poll, broadcast discovered manifests to gossip
 4. **Announce on first observation** (#1169): the publish points are the
@@ -1035,9 +1042,14 @@ no gossip, binds nothing, and takes no instance lock.
    payload as apply-route-owned in the shared self-published tracker
    before publishing: any gossip copy of those bytes — the announcing
    node's own echo or a peer's — neither rebroadcasts nor queues a second
-   apply on the background owner while that apply runs. When the route's
-   apply does not succeed it releases the claim, so gossip copies reach
-   the owner again; only a successful apply keeps it.
+   apply on the background owner while that apply runs. The claim is
+   released on drop: any exit other than a successful apply releases it,
+   including a client disconnect during the apply wait or a panic. Gossip
+   copies then reach the owner again; only a successful apply keeps it.
+   After a fast failure, the node's own gossip echo can still arrive
+   after the claim is released and cause one background-owner attempt of
+   the same release. The owner's 30-minute `failed_at` backoff bounds
+   that attempt, so it cannot loop.
    The GitHub poll cadence does not change (A14 / ADR 0045): gossip is
    the fast path. The announcement is bounded (10 s) and best effort;
    peer rebroadcast limiting and the apply owner's dedup handle repeats.

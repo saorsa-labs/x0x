@@ -1449,7 +1449,7 @@ pub async fn serve_with_options(
         upgrade_check_cache: Mutex::new(None),
         upgrade_apply_lock: Arc::new(Mutex::new(())),
         http_upgrade_wait_lock: Arc::new(Mutex::new(())),
-        self_published_release_manifests: Arc::new(Mutex::new(
+        self_published_release_manifests: Arc::new(std::sync::Mutex::new(
             SelfPublishedReleaseManifests::default(),
         )),
         upgrade_observations: Default::default(),
