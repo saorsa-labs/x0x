@@ -92,6 +92,9 @@
 // #1581: ADR 0110 `s4_certificate_expiry_skew`, sim-feasible runs. A child
 // module, so that it uses this file's Home, seat and certificate helpers.
 mod expiry_skew;
+// #1973: ADR 0110 `s4_owner_recovery` while another revoked member is
+// seated. A child module for the same reason.
+mod s4_owner_recovery_1973;
 
 use super::*;
 use crate::groups::cert_rebind as cr;
