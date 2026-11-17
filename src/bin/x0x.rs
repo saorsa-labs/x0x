@@ -2430,7 +2430,7 @@ async fn run(
             return match DaemonClient::new(name, api, format) {
                 Ok(client) => commands::daemon::doctor(&client.dump_requests(dump_request)).await,
                 Err(err) if name.is_some() && api.is_none() => {
-                    commands::daemon::doctor_unreachable(format, &err)
+                    commands::daemon::doctor_unreachable(format, name, &err)
                 }
                 Err(err) => Err(err),
             };

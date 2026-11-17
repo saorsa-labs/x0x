@@ -35,7 +35,9 @@ impl Host {
             if artifact.target_path.canonicalize()? != artifact.target_path
                 || artifact.backup_path.canonicalize()? != artifact.backup_path
             {
-                return Err(invalid("non-canonical independently approved install"));
+                return Err(start::refused(
+                    "non-canonical independently approved install",
+                ));
             }
         }
         // `data_root` decides where the flush token is sent and where the
@@ -47,7 +49,7 @@ impl Host {
                 || participant.cwd.canonicalize()? != participant.cwd
                 || participant.executable != expected.plan.daemon.target_path
             {
-                return Err(invalid("non-canonical participant paths"));
+                return Err(start::refused("non-canonical participant paths"));
             }
         }
         Ok(Self { root, expected })

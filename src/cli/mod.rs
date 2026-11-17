@@ -27,6 +27,9 @@ pub struct DaemonClient {
     api_token: Option<String>,
     /// `--dump-request` [dev]: print the wire request instead of sending it.
     dump: bool,
+    /// The instance's local data directory, unless `--api` names the
+    /// daemon (it may then be another host's).
+    instance_dir: Option<std::path::PathBuf>,
 }
 
 /// Read the daemon's bearer token from its effective data directory.
@@ -74,7 +77,13 @@ impl DaemonClient {
             format,
             api_token,
             dump: false,
+            instance_dir: api_override.is_none().then(|| data_dir.join(&dir_name)),
         })
+    }
+
+    /// The instance's local data directory (`None` with `--api`).
+    pub(crate) fn instance_dir(&self) -> Option<&std::path::Path> {
+        self.instance_dir.as_deref()
     }
 
     /// Enable `--dump-request` mode: every verb prints

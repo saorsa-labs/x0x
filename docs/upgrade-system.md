@@ -638,8 +638,11 @@ name the instance, with that participant's data root equal to the host
 root, its executable equal to the daemon path and its arguments
 (`argv[1..]`) equal to the daemon's. A refusal no restart can change
 (mismatch, mixed pair, wrong owner, mode or type, corrupt journal, unknown
-schema, unfinished trial, a missing or non-canonical plan path, a symlinked
-or non-regular trial record) exits 78; a failed read exits 75. The journal
+schema, unfinished trial, a non-canonical plan path, a symlinked,
+non-regular or oversized trial record) exits 78; a failed read exits 75,
+and so does a plan path that is missing, since it may appear by itself (a
+volume not yet mounted at boot). Only the issuer's typed refusal exits 78;
+an untyped I/O error is a failed read. The journal
 has no hash or signature: anything that runs as the launcher's account,
 the candidate daemon included, is trusted to write it, until the producer
 (#2012) adds an integrity binding. The writer of that journal is the M2
@@ -649,8 +652,12 @@ SIGINT handler only then, and exits 0 after a stop, 75 when the daemon
 exits or a step can be retried (an issuer error never falls back to the
 passthrough), and 78 (`EX_CONFIG`) when no automatic start is allowed
 (`RecoveryFailed`, a final host phase, a participant missing from the
-plan or stopped, or a prior child that still runs). A unit that binds the owned
-launcher must also set `RestartPreventExitStatus=78`. A retired trial on a
+plan or stopped, or a prior child that still runs after a 45 s wait for it
+to end). A unit that binds the owned launcher must also set
+`RestartPreventExitStatus=78`. A trial-form launcher records each final
+refusal in `<host-root>/launcher-refusal.json` (reason, launcher pid, time;
+mode 0600) and the next start that is not final removes it; `x0x doctor`
+reports it while the daemon is unreachable. A retired trial on a
 committed host is an ordinary start: the passthrough. The launcher strips a stray `X0X_M2_BOOT_FD` from the daemon's
 environment before the `exec`. While activation is held, `x0xd` ignores a
 stray `X0X_M2_BOOT_FD` with one warning. It refuses to start only for a
@@ -1015,11 +1022,15 @@ A job whose program is the stable launcher (`x0x-launcher /abs/x0xd ...`,
 or the trial form `x0x-launcher --host-root R --instance I -- /abs/x0xd ...`)
 is treated as the x0xd job it runs: `--repair` and the upgrade-time
 readback both look through the launcher's own arguments to the daemon
-(#1379). Such a job also needs `ExitTimeOut` above 45 s (the launcher's
+(#1379). The program is the executable launchd runs: `Program` when the
+job sets it, else `ProgramArguments[0]`. The launcher's arguments are
+checked with the launcher's own parser, so `--repair` refuses a relative
+host root or an invalid instance that the launcher would refuse. Such a job also needs `ExitTimeOut` above 45 s (the launcher's
 worst-case stop of a committed daemon); `--repair` refuses one without it.
 Under launchd an unconditional `KeepAlive` restarts every exit, so a
 launcher that reaches a final refusal (exit 78 elsewhere) holds until it is
-stopped instead of exiting. `x0x autostart` does not bind the launcher yet:
+stopped instead of exiting. launchd then shows the job running with no
+daemon; `x0x doctor` shows the launcher's refusal reason. `x0x autostart` does not bind the launcher yet:
 it is dormant.
 
 The handoff transaction (`upgrade::restart`):

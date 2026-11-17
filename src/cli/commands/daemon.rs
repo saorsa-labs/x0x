@@ -206,10 +206,69 @@ pub(crate) async fn collect_doctor_report(client: &DaemonClient) -> DoctorReport
     let upgrade = if daemon_up {
         check_upgrade_state(client).await
     } else {
-        DoctorCheck::fail("skipped: daemon unreachable")
+        down_upgrade_check(client.instance_dir())
     };
 
     DoctorReport::from_checks(connectivity, key_health, store_integrity, upgrade)
+}
+
+/// The upgrade check while the daemon is unreachable: the stable
+/// launcher's refusal, if it left one in the instance's data directory
+/// (#2016 review), else skipped.
+fn down_upgrade_check(instance_dir: Option<&std::path::Path>) -> DoctorCheck {
+    instance_dir
+        .and_then(launcher_refusal_check)
+        .unwrap_or_else(|| DoctorCheck::fail("skipped: daemon unreachable"))
+}
+
+/// Read the launcher refusal record (`launcher_contract::REFUSAL_FILE_NAME`)
+/// from `dir`. The stable launcher writes it when it refuses to start x0xd
+/// for a reason no restart changes; on macOS it then holds until a stop, so
+/// launchd shows the job running with no daemon. The record is only for
+/// this report: `None` when it is absent or unreadable. Only the default
+/// data directory of the instance is read; a daemon configured with
+/// another `data_dir` is not found here.
+fn launcher_refusal_check(dir: &std::path::Path) -> Option<DoctorCheck> {
+    use crate::upgrade::launcher_contract::{
+        LauncherRefusal, MAX_REFUSAL_BYTES, REFUSAL_FILE_NAME,
+    };
+    use std::io::Read;
+    let file = std::fs::File::open(dir.join(REFUSAL_FILE_NAME)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_REFUSAL_BYTES).read_to_end(&mut bytes).ok()?;
+    let record: LauncherRefusal = serde_json::from_slice(&bytes).ok()?;
+    let holding = process_alive(record.pid);
+    let state = if holding {
+        "holding until the job is stopped"
+    } else {
+        "no longer running"
+    };
+    Some(DoctorCheck {
+        status: DoctorCheckStatus::Fail,
+        detail: format!(
+            "x0x-launcher refused to start x0xd: {} (launcher pid {}, {state}); fix the cause, \
+             then restart the job",
+            record.reason, record.pid
+        ),
+        evidence: Some(serde_json::json!({
+            "launcher_refusal": record,
+            "launcher_holding": holding,
+        })),
+    })
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 only checks that the process exists.
+    pid > 0 && unsafe { libc::kill(pid, 0) } == 0
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: u32) -> bool {
+    false
 }
 
 async fn check_connectivity(client: &DaemonClient) -> DoctorCheck {
@@ -422,8 +481,17 @@ pub(crate) fn finish_doctor_write(
 
 /// `x0x doctor` when named-instance discovery fails before any HTTP client
 /// exists. Still emits the JSON/text summary; does not fall back to default.
-pub fn doctor_unreachable(format: OutputFormat, err: &anyhow::Error) -> Result<()> {
-    let report = unreachable_doctor_report(format!("daemon not reachable: {err:#}"));
+pub fn doctor_unreachable(
+    format: OutputFormat,
+    name: Option<&str>,
+    err: &anyhow::Error,
+) -> Result<()> {
+    let mut report = unreachable_doctor_report(format!("daemon not reachable: {err:#}"));
+    let instance_dir = dirs::data_dir().map(|data| match name {
+        Some(name) => data.join(format!("x0x-{name}")),
+        None => data.join("x0x"),
+    });
+    report.upgrade = down_upgrade_check(instance_dir.as_deref());
     finish_doctor(format, &report)
 }
 
@@ -1007,34 +1075,25 @@ pub(crate) fn classify_launchd_job(plist: &serde_json::Value) -> RepairVerdict {
         .get("ProgramArguments")
         .and_then(|a| a.as_array())
         .and_then(|a| a.iter().map(|v| v.as_str().map(str::to_owned)).collect());
-    let launcher_bound = arguments
-        .as_deref()
-        .and_then(|a| a.first())
-        .is_some_and(|p| program_basename(p) == crate::upgrade::restart::LAUNCHER_BASENAME);
-    let program = match arguments.as_deref() {
-        // A launcher-bound job (#1379) runs the daemon after the launcher's
-        // own arguments.
-        Some(arguments) if launcher_bound => {
-            match crate::upgrade::restart::launchd_daemon_argv(arguments) {
-                Some(daemon) => daemon.first().map(String::as_str),
-                None => {
-                    return RepairVerdict::Refused(
-                        "job runs x0x-launcher with arguments that name no daemon; review it \
-                         by hand"
-                            .to_string(),
-                    );
-                }
-            }
+    // launchd runs `Program` when it is set, so the launcher is detected
+    // from the executable launchd runs, as the upgrade-time readback does;
+    // a launcher-bound job (#1379) runs the daemon its argv names, checked
+    // with the launcher's own parser (#2016 review).
+    let daemon = match crate::upgrade::restart::launchd_job_daemon(
+        plist.get("Program").and_then(|p| p.as_str()),
+        arguments.as_deref().unwrap_or_default(),
+    ) {
+        None => return RepairVerdict::NotAnX0xdJob,
+        Some(Ok(daemon)) => daemon,
+        Some(Err(usage)) => {
+            return RepairVerdict::Refused(format!(
+                "job runs x0x-launcher with arguments the launcher refuses ({usage}); review \
+                 it by hand"
+            ));
         }
-        Some(arguments) => arguments.first().map(String::as_str),
-        None => None,
-    }
-    .or_else(|| plist.get("Program").and_then(|p| p.as_str()));
-
-    let Some(program) = program else {
-        return RepairVerdict::NotAnX0xdJob;
     };
-    if program_basename(program) != "x0xd" {
+    let launcher_bound = daemon.via_launcher;
+    if program_basename(daemon.executable) != "x0xd" {
         return RepairVerdict::NotAnX0xdJob;
     }
     // The launcher stops a committed daemon in up to 45 s (graceful window
@@ -1745,9 +1804,6 @@ mod tests {
         ));
     }
 
-    /// #1379: `AbandonProcessGroup` defeats launchd's process-group cleanup,
-    /// so the repair refuses it, even on a job that already has the marker.
-    /// `AbandonProcessGroup: false` is launchd's default and is accepted.
     /// #1379 slice 2: a launcher-bound job is an x0xd job; the daemon is
     /// the program after the launcher's own arguments. It also needs an
     /// ExitTimeOut above the launcher's 45 s worst-case stop.
@@ -1792,8 +1848,55 @@ mod tests {
             serde_json::json!(["/opt/x0x/bin/x0x-launcher", "--host-root", "/r"]);
         assert!(matches!(
             classify_launchd_job(&malformed),
-            RepairVerdict::Refused(reason) if reason.contains("name no daemon")
+            RepairVerdict::Refused(reason) if reason.contains("launcher refuses")
         ));
+    }
+
+    /// #2016 review items 2 and 3: launchd runs `Program` when it is set,
+    /// so a launcher in `Program` is detected even when `ProgramArguments[0]`
+    /// is only an argv0, as the upgrade-time readback detects it; and a
+    /// launcher argv the launcher itself refuses (a relative host root, an
+    /// instance of `..`) is refused, not repaired into a job that exits 78.
+    #[test]
+    fn repair_detects_the_launcher_as_the_readback_does() {
+        let mut by_program = job(serde_json::json!({ "ExitTimeOut": 60 }));
+        by_program["Program"] = serde_json::json!("/opt/x0x/bin/x0x-launcher");
+        by_program["ProgramArguments"] =
+            serde_json::json!(["launcher", "/opt/x0x/bin/x0xd", "--name", "alice"]);
+        assert_eq!(
+            classify_launchd_job(&by_program),
+            RepairVerdict::Repairable {
+                has_env_dict: false
+            }
+        );
+        // The same job without the long ExitTimeOut is still a launcher job.
+        by_program
+            .as_object_mut()
+            .expect("object")
+            .remove("ExitTimeOut");
+        assert!(matches!(
+            classify_launchd_job(&by_program),
+            RepairVerdict::Refused(reason) if reason.contains("ExitTimeOut")
+        ));
+        for (root, instance) in [("relative", "alice"), ("/data/alice", ".."), ("/d", "a/b")] {
+            let mut bad = job(serde_json::json!({ "ExitTimeOut": 60 }));
+            bad["ProgramArguments"] = serde_json::json!([
+                "/opt/x0x/bin/x0x-launcher",
+                "--host-root",
+                root,
+                "--instance",
+                instance,
+                "--",
+                "/opt/x0x/bin/x0xd"
+            ]);
+            assert!(
+                matches!(
+                    classify_launchd_job(&bad),
+                    RepairVerdict::Refused(ref reason) if reason.contains("launcher refuses")
+                ),
+                "{root} {instance}"
+            );
+        }
     }
 
     /// The launcher-bound plist runs the trial-form argv, sets ExitTimeOut
@@ -1843,6 +1946,49 @@ mod tests {
         );
     }
 
+    /// #2016 review item 1: while the daemon is down, doctor shows the
+    /// launcher's refusal reason and whether the launcher still holds.
+    #[test]
+    fn doctor_shows_a_launcher_refusal_while_the_daemon_is_down() {
+        use crate::upgrade::launcher_contract::*;
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            down_upgrade_check(Some(dir.path())).detail,
+            "skipped: daemon unreachable"
+        );
+        let record = LauncherRefusal {
+            schema: REFUSAL_SCHEMA,
+            reason: "prior child still exists".into(),
+            pid: std::process::id(),
+            at_unix_ms: 1,
+        };
+        std::fs::write(
+            dir.path().join(REFUSAL_FILE_NAME),
+            serde_json::to_vec(&record).expect("json"),
+        )
+        .expect("write");
+        let check = down_upgrade_check(Some(dir.path()));
+        assert_eq!(check.status, DoctorCheckStatus::Fail);
+        assert!(
+            check.detail.contains("prior child still exists"),
+            "{}",
+            check.detail
+        );
+        assert!(check.detail.contains("holding"), "{}", check.detail);
+        assert_eq!(
+            check.evidence.expect("evidence")["launcher_holding"],
+            serde_json::json!(true)
+        );
+        std::fs::write(dir.path().join(REFUSAL_FILE_NAME), b"not json").expect("write");
+        assert_eq!(
+            down_upgrade_check(Some(dir.path())).detail,
+            "skipped: daemon unreachable"
+        );
+    }
+
+    /// #1379: `AbandonProcessGroup` defeats launchd's process-group cleanup,
+    /// so the repair refuses it, even on a job that already has the marker.
+    /// `AbandonProcessGroup: false` is launchd's default and is accepted.
     #[test]
     fn repair_refuses_jobs_that_abandon_their_process_group() {
         let mut job = serde_json::json!({
