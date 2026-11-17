@@ -554,6 +554,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Groups (H-S3-r, studio1 train 60):** a joiner whose join seal was not
+  served now keeps its group record and its `readmission_required
+  {base_beyond_retention}` after the join attempt times out. Before, a stub
+  still at the invite base was removed on the timeout and the joiner answered
+  404. W3-H row H-S3-r also no longer passes or fails by gossip timing: J gets
+  no gossip replay of the metadata messages published before it redeemed, so
+  its head stays beyond A's retention.
 - **Launcher refusals that can clear by themselves no longer stop the job,
   and `x0x doctor` shows why the launcher refuses (#2015 and #2016 reviews;
   A14 amendment of 17 Nov 2026).** A prior child that still exists gets up

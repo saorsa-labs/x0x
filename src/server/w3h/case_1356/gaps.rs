@@ -1013,8 +1013,52 @@ async fn cap_log(sim: &Sim, label: &str, group: &str) -> Result<(usize, u64)> {
     Ok((info.commit_log.len(), oldest))
 }
 
+/// H-S3-r: drops every write to `j` of a metadata-topic message first seen
+/// while the returned flag is set (the row clears it when J redeems). Every
+/// copy of a gossip message has one message ID, so no later replay of such
+/// a message reaches J either.
+async fn hold_pre_join_gossip(
+    sim: &Sim,
+    group: &str,
+    j: Key,
+) -> Result<Arc<std::sync::atomic::AtomicBool>> {
+    use crate::network::sim::{Fault, LaneClass};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let topic = super::sidecar_q_member::meta_topic(sim, group).await?;
+    let recording = Arc::new(AtomicBool::new(true));
+    let seen: Mutex<std::collections::HashSet<[u8; 32]>> = Mutex::new(Default::default());
+    let flag = Arc::clone(&recording);
+    sim.fabric().add_rule(move |write| {
+        if write.lane.class != LaneClass::PubSub {
+            return Fault::Pass;
+        }
+        let Some((on, msg_id)) = pubsub_header(&write.bytes) else {
+            return Fault::Pass;
+        };
+        if on != topic {
+            return Fault::Pass;
+        }
+        let Ok(mut seen) = seen.lock() else {
+            return Fault::Drop;
+        };
+        if flag.load(Ordering::SeqCst) {
+            seen.insert(msg_id);
+        }
+        if write.lane.dst == j && seen.contains(&msg_id) {
+            Fault::Drop
+        } else {
+            Fault::Pass
+        }
+    });
+    sim.fabric()
+        .mark("fault: H-S3-r holds J's copies of pre-join metadata gossip");
+    Ok(recording)
+}
+
 /// H-S3-r: S0 with A's commit log capped at 4 and admin B (default cap)
-/// seated after step 2. Every message between B and J is held. After the
+/// seated after step 2. Every message between B and J is held, and so is
+/// every gossip copy to J of a metadata message published before J
+/// redeems. After the
 /// mint A renames 6 times (r+1 to r+6) and seals J (r+7); B applies them.
 /// Advance 130 s and one request interval. A serves J's seal with no chain
 /// and no join carry, so J holds no marker and no gap record; the §2
@@ -1059,6 +1103,13 @@ async fn beyond_retention(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     hold.set(sim, "holding every message between B and J", move |f| {
         (f.origin == b && f.dst == j) || (f.origin == j && f.dst == b)
     });
+    // No gossip copy of a metadata message published before J redeems
+    // reaches J. A replay of A's renames from the gossip message cache
+    // (which ages in real time) could otherwise move J's head to r+3: A
+    // keeps r+4 to r+7, and a head one below its oldest kept commit is
+    // still provable (`chain_position`), so A attests J and J catches up
+    // through A while B is held. J's own join traffic passes.
+    let before_join = hold_pre_join_gossip(sim, &group, j).await?;
     let minted = view(sim, "A", &group).await?;
     let link = invite(sim, "A", &group).await?;
     for n in 1..=6 {
@@ -1070,6 +1121,7 @@ async fn beyond_retention(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         tokio::time::sleep(RESENDS_DONE).await;
     })
     .await?;
+    before_join.store(false, std::sync::atomic::Ordering::SeqCst);
     let joined_at = sim.fabric().mark_indexed("case: J redeems invite I");
     let sealed = seal_j(sim, &link, &group).await?;
     let (kept_after, _) = cap_log(sim, "A", &group).await?;
