@@ -2996,30 +2996,68 @@ pub async fn serve_with_options(
 
     // #1109: durable direct-send worker. Each pass settles obligations the
     // receipt ledger shows delivered, drops expired ones and sends the
-    // rest once under their logical id.
+    // rest once under their logical id. S2: a late v2 ACK with no waiter
+    // (after a restart) can settle a held obligation without a send, and a
+    // recipient's durable-capable advert makes its held sends due at once.
+    // The wake-ups reach the worker through one channel; its own interval
+    // keeps the scheduled passes whatever the wake-up rate.
     {
+        use routes::direct_outbox::{
+            run_direct_send_worker, AgentDirectSendTransport, DirectSendNow, DirectSendWake,
+            LedgerReceipt,
+        };
+        use tokio::sync::broadcast::error::RecvError;
+        let (wake_tx, wake_rx) = tokio::sync::mpsc::channel::<DirectSendWake>(256);
+        let acks = state.agent.dm_inflight_acks();
+        let mut orphan_acks = acks.subscribe_orphan_acks();
+        let ack_tx = wake_tx.clone();
+        bg_tasks.push(tokio::spawn(async move {
+            loop {
+                match orphan_acks.recv().await {
+                    Ok(ack) => {
+                        if ack_tx.send(DirectSendWake::LateAck(ack)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        }));
+        let mut adverts = state.agent.capability_store().subscribe_durable_adverts();
+        bg_tasks.push(tokio::spawn(async move {
+            loop {
+                match adverts.recv().await {
+                    Ok(recipient) => {
+                        if wake_tx
+                            .send(DirectSendWake::Advert(recipient))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        }));
         let send_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
             let mut shutdown_rx = send_state.shutdown_notify.subscribe();
-            let acks = send_state.agent.dm_inflight_acks();
-            let transport = routes::direct_outbox::AgentDirectSendTransport(send_state.as_ref());
-            loop {
-                tokio::select! {
-                    _ = shutdown_rx.changed() => break,
-                    _ = tokio::time::sleep(routes::direct_outbox::DIRECT_SEND_TICK) => {
-                        send_state
-                            .direct_send_outbox
-                            .step(
-                                routes::direct_outbox::DirectSendNow::current(),
-                                &|request_id| {
-                                    routes::direct_outbox::LedgerReceipt::of(&acks, request_id)
-                                },
-                                &transport,
-                            )
-                            .await;
-                    }
-                }
-            }
+            let transport = AgentDirectSendTransport(send_state.as_ref());
+            let ledger = |request_id: &[u8; 16]| LedgerReceipt::of(&acks, request_id);
+            run_direct_send_worker(
+                &send_state.direct_send_outbox,
+                &ledger,
+                &transport,
+                &DirectSendNow::current,
+                wake_rx,
+                async move {
+                    let _ = shutdown_rx.changed().await;
+                },
+            )
+            .await;
         }));
     }
 

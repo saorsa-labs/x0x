@@ -153,3 +153,37 @@ async fn issue1094_p2_an_unmarked_entry_is_writer_unknown() {
         "invalid is shown as writer unknown, not as tampering"
     );
 }
+
+/// Review of #1974: the same bytes rewritten by another writer (here a
+/// rider) with another content type. GET pairs the new content type with
+/// the new writer: value, content type and writer come from one snapshot.
+#[tokio::test]
+async fn issue1094_p2_get_pairs_content_type_with_its_writer() {
+    let (state, _dir, topic) = state_with_group_store().await;
+    assert!(put(&state, None, &topic, "note").await.is_success());
+    let rider = "5d".repeat(32);
+    let actor = ActorContext::Rider {
+        sub_agent_id: rider.clone(),
+        token_id: 2,
+        token_hash: "11".repeat(32),
+        groups: vec!["2b".repeat(16)],
+        scopes: vec!["scratch:read_write".to_string()],
+    };
+    let status = put_kv_value(
+        Some(Extension(actor)),
+        State(Arc::clone(&state)),
+        Path((topic.clone(), "note".to_string())),
+        Json(PutValueRequest {
+            value: BASE64.encode(b"v"),
+            content_type: Some("application/json".to_string()),
+        }),
+    )
+    .await
+    .into_response()
+    .status();
+    assert!(status.is_success(), "{status}");
+    let body = get(&state, &topic, "note").await;
+    assert_eq!(body["content_type"], serde_json::json!("application/json"));
+    assert_eq!(body["writer"]["verified"], serde_json::json!(true));
+    assert_eq!(body["writer"]["rider"], serde_json::json!(rider));
+}

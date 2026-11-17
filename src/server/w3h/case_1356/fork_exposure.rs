@@ -29,6 +29,10 @@
 //! J's own check of the ATA refuses it (`HeadMismatch`), and J's DM layer
 //! receives the exact response bytes from X.
 //!
+//! J joins through the join-result fetch: from X's rename until X has
+//! served J its join-carry ATA, X's pubsub writes to J are held as well.
+//! Otherwise X's own events can reach J first, and X serves no carry.
+//!
 //! Fidelity: the hold keys on a write's origin (the first sender of its
 //! pubsub message ID), so relays are held too. Transport control passes.
 //! Before the hold, each node fetches the others' adverts (§5).
@@ -41,7 +45,7 @@ use crate::groups::recovery::{
     GroupRecoveryMessageV1, RecoveryRefusal,
 };
 use crate::network::sim::{Fault, Key, LaneClass};
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 const LABELS: &[&str] = &["A", "M1", "M2", "X", "J"];
 const MAIN: [&str; 3] = ["A", "M1", "M2"];
@@ -70,6 +74,13 @@ const INJECT: u8 = 3;
 struct Hold {
     phase: Arc<AtomicU8>,
     dropped: Arc<AtomicUsize>,
+    /// From X's rename (r+1′) until X has served J its join-carry ATA,
+    /// X's pubsub writes to J are held too, so J joins through the
+    /// join-result fetch from its stale base r. Without it, X's r+1′ or
+    /// r+2′ event could reach J first; J's fetch then starts at r+1′ (an
+    /// empty chain) or never comes, X serves no carry, and the row has no
+    /// ATA to inject (INFRA, about 1 run in 15 in the VM).
+    x_pubsub_to_j: Arc<AtomicBool>,
 }
 
 impl Hold {
@@ -81,6 +92,8 @@ impl Hold {
             .collect::<Result<_>>()?;
         let phase = Arc::new(AtomicU8::new(OPEN));
         let dropped = Arc::new(AtomicUsize::new(0));
+        let x_pubsub_to_j = Arc::new(AtomicBool::new(false));
+        let rule_x_pubsub = Arc::clone(&x_pubsub_to_j);
         let origins: Mutex<std::collections::HashMap<[u8; 32], Key>> = Mutex::default();
         let (rule_phase, rule_dropped) = (Arc::clone(&phase), Arc::clone(&dropped));
         sim.fabric().add_rule(move |write| {
@@ -99,6 +112,14 @@ impl Hold {
                 (None, _) => write.lane.src,
             };
             let dst = write.lane.dst;
+            if rule_x_pubsub.load(Ordering::SeqCst)
+                && write.lane.class == LaneClass::PubSub
+                && origin == x
+                && dst == j
+            {
+                rule_dropped.fetch_add(1, Ordering::SeqCst);
+                return Fault::Drop;
+            }
             let side = |key: Key| key == x || key == j;
             let drop = match rule_phase.load(Ordering::SeqCst) {
                 SPLIT => {
@@ -114,7 +135,19 @@ impl Hold {
             }
             Fault::Pass
         });
-        Ok(Self { phase, dropped })
+        Ok(Self {
+            phase,
+            dropped,
+            x_pubsub_to_j,
+        })
+    }
+
+    fn hold_x_pubsub_to_j(&self, sim: &Sim, on: bool) {
+        self.x_pubsub_to_j.store(on, Ordering::SeqCst);
+        sim.fabric().mark(format!(
+            "fault: H-S3-d2 X's pubsub to J {}",
+            if on { "held" } else { "released" }
+        ));
     }
 
     fn set(&self, sim: &Sim, phase: u8, what: &str) {
@@ -177,6 +210,40 @@ fn join_carry(sim: &Sim, issuer: &str, joiner: &str) -> Result<Option<AdminTermi
             }) => admin_attestation.map(|ata| *ata),
             _ => None,
         }))
+}
+
+/// `issuer`'s join-result serves to `joiner` (whether each carried an
+/// ATA) and its recorded carry refusals, for a receipt.
+fn carry_trace(sim: &Sim, issuer: &str, joiner: &str) -> Result<String> {
+    use crate::server::routes::named_groups::JoinResultMessage;
+    let joiner_hex = sim.agent_hex(joiner)?.to_ascii_lowercase();
+    let state = sim.state(issuer)?;
+    let serves: Vec<&'static str> = {
+        let served = state.named_group_test_recorders.join_result_serves.lock();
+        let served = served.unwrap_or_else(std::sync::PoisonError::into_inner);
+        served
+            .iter()
+            .filter(|(to, _, _)| to.eq_ignore_ascii_case(&joiner_hex))
+            .map(|(_, _, payload)| match serde_json::from_slice(payload) {
+                Ok(JoinResultMessage::Result {
+                    admin_attestation: Some(_),
+                    ..
+                }) => "result+ata",
+                Ok(JoinResultMessage::Result { .. }) => "result",
+                Ok(_) => "other",
+                Err(_) => "undecoded",
+            })
+            .collect()
+    };
+    let refusals: Vec<String> = {
+        let list = state.named_group_test_recorders.join_carry_refusals.lock();
+        let list = list.unwrap_or_else(std::sync::PoisonError::into_inner);
+        list.iter()
+            .filter(|(to, _)| *to == joiner_hex)
+            .map(|(_, reason)| reason.clone())
+            .collect()
+    };
+    Ok(format!("serves {serves:?}; carry refusals {refusals:?}"))
 }
 
 /// Each label's `(state revision, state hash)`.
@@ -253,16 +320,29 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         .context("A's r+1 event was not recorded")?;
     settled(sim, &["M1", "M2"], &group, "M1 and M2 hold A's r+1").await?;
     let removal = view(sim, "A", &group).await?;
+    // X's r+1′ must not reach J before J's fetch: J's stub then starts at
+    // r+1′, the chain to r+2′ is empty, and X serves no carry.
+    hold.hold_x_pubsub_to_j(sim, true);
     rename(sim, "X", &group, "w3h d2 X fork").await?;
     let fork = view(sim, "X", &group).await?;
     let joined_at = sim.fabric().mark_indexed("case: J redeems I_X");
     join(sim, "J", &link).await?;
-    sim.until("X seals J", SETUP, async |s: &Sim| {
-        view_now(s, "X", &group)
-            .await
-            .is_ok_and(|v| v.lists(&j_hex))
-    })
-    .await?;
+    sim.until(
+        "X seals J and serves its join carry",
+        SETUP,
+        async |s: &Sim| {
+            view_now(s, "X", &group)
+                .await
+                .is_ok_and(|v| v.lists(&j_hex))
+                && join_carry(s, "X", "J").is_ok_and(|carry| carry.is_some())
+        },
+    )
+    .await
+    .map_err(|error| {
+        let trace = carry_trace(sim, "X", "J").unwrap_or_else(|e| format!("{e:#}"));
+        error.context(format!("X's serves to J: {trace}"))
+    })?;
+    hold.hold_x_pubsub_to_j(sim, false);
     let sealed = view(sim, "X", &group).await?;
     receipt.setup_done(at(sim));
     receipt.evidence(
@@ -318,6 +398,14 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     seen.verify("the first advance")?;
     // X records its join result when it serves it, after the seal.
     let carry = join_carry(sim, "X", "J")?;
+    if carry.is_none() {
+        receipt.note(format!(
+            "X's serves to J: {}; base r={} fork r+1'={}",
+            carry_trace(sim, "X", "J")?,
+            base.state_revision,
+            fork.state_revision
+        ));
+    }
     receipt.evidence(
         "x_seals_j_at_r_plus_2_prime_with_a_join_carry_ata",
         sealed.state_revision == base.state_revision + 2

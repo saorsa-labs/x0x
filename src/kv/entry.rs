@@ -114,11 +114,13 @@ impl KvEntry {
             self.content_type = other.content_type.clone();
             self.metadata = other.metadata.clone();
             self.updated_at = other.updated_at;
-            // Keep earliest created_at
-            if other.created_at < self.created_at {
-                self.created_at = other.created_at;
-            }
         }
+        // #1094 (review of #1974): `created_at` is the earliest of the two
+        // whichever entry wins, so the merge is commutative on it too and
+        // every replica converges on the same value. Before, a losing
+        // entry's earlier `created_at` was dropped, so the result depended
+        // on arrival order.
+        self.created_at = self.created_at.min(other.created_at);
     }
 
     /// The LWW order of this entry: `updated_at`, content hash, content
