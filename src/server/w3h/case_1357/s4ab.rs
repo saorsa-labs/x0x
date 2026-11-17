@@ -79,19 +79,21 @@
 //!   commit is B's; `admin_availability` clears; B's new ciphertext opens
 //!   on C and not on A.
 //!
-//! Not in this case yet: the ADR's form of `recovery_not_needed` (A
-//! revoked while a second admin D stays eligible; the arm above checks the
-//! refusal with A itself eligible, before t = 0); the `SignedPublic` and non-Home `OwnerCertified`
-//! variants (the harness has no non-Home owner-certified group setup);
-//! a mandate naming a revoked or expired member, an older head, a
-//! non-owner signer or a replay (each needs a mandate built outside the
-//! route, which always signs the current head with the local U); B
-//! offline until t = 10 s; a 0.46.1 member L; O silent for 24 virtual
-//! hours; and the joiner J's `JoinPendingNotice`.
+//! The ADR's form of `recovery_not_needed` (A revoked while a second
+//! admin D stays eligible), a mandate naming a revoked member, and B
+//! offline until t = 10 s are in `recovery_variants` (1581m). Not in this
+//! case yet: the `SignedPublic` and non-Home `OwnerCertified` variants
+//! (the harness has no non-Home owner-certified group setup); a mandate
+//! naming an expired member, an older head, a non-owner signer or a
+//! replay (each needs a mandate built outside the route, which always
+//! signs the current head with the local U); a 0.46.1 member L; O silent
+//! for 24 virtual hours; and the joiner J's `JoinPendingNotice`.
 
 // #1581: ADR 0110 `s4_certificate_expiry_skew`, sim-feasible runs. A child
 // module, so that it uses this file's Home, seat and certificate helpers.
 mod expiry_skew;
+// #1581: the `s4_owner_recovery` variants the public mandate route drives.
+mod recovery_variants;
 
 use super::*;
 use crate::groups::cert_rebind as cr;
