@@ -367,9 +367,10 @@ applies that rule to the boot marker by analogy: fail closed means "start
 the configured binary normally and report degraded", never brick startup.
 The degraded report in the code is one warning line on stderr. The refusal
 covers only a permit present on descriptor 3: one that fails its checks,
-or one the process cannot verify. On a non-Linux Unix host, every well-formed
-permit refuses the boot today, because the process-custody identity check
-needs Linux `/proc`. When activation turns the engine on, the full boot
+or one the process cannot verify. On Linux and macOS the process-custody
+identity is observed (`/proc` on Linux, libproc on macOS, #1379), so a
+permit reaches its field checks. On any other Unix host, every well-formed
+permit refuses the boot today, because no identity can be observed. When activation turns the engine on, the full boot
 barrier applies as specified: permit checks, boot record write, then the
 barrier ack.
 
@@ -626,15 +627,21 @@ frozen before `ENABLED = true`, like the fd 3 boot contract. The main
 loop (`start.rs`, #1378) owns the trial only when the engine is enabled
 and the issuer gives it a host. Only the trial form of the argv,
 `x0x-launcher --host-root /abs/data-root --instance ID -- /abs/x0xd [args]`,
-consults the issuer (`issuer.rs`): it reads `<host-root>/upgrade-journal.json`,
-which must be a 0600 regular file of the launcher's account in a canonical
-root that no other account can write. No journal, or one before the swap
-or settled (`staged`, `probed`, `prepared`, `idle`, `superseded`), is an
-ordinary start. An in-flight journal must name the instance, with that
-participant's data root equal to the host root, its executable equal to
-the daemon path and its arguments (`argv[1..]`) equal to the daemon's;
-anything else, a journal between the daemon and CLI swap, or one that
-cannot be read is an issuer error. The writer of that journal is the M2
+consults the issuer (`issuer.rs`): it opens `<host-root>/upgrade-journal.json`
+once without following a symlink and requires, on that descriptor, a
+regular file of the launcher's account with mode exactly 0600, in a
+canonical root that no other account can write. No journal, or one before
+the swap or settled (`staged`, `probed`, `prepared`, `idle`, `superseded`),
+is an ordinary start, unless an unfinished trial (not Committed or
+Restored) is on disk, which refuses the start. An in-flight journal must
+name the instance, with that participant's data root equal to the host
+root, its executable equal to the daemon path and its arguments
+(`argv[1..]`) equal to the daemon's. A refusal no restart can change
+(mismatch, mixed pair, wrong owner, mode or type, corrupt journal, unknown
+schema, unfinished trial) exits 78; a failed read exits 75. The journal
+has no hash or signature: anything that runs as the launcher's account,
+the candidate daemon included, is trusted to write it, until the producer
+(#2012) adds an integrity binding. The writer of that journal is the M2
 prepare producer (#2012), which does not exist yet, so with the engine
 held every start is still the passthrough. An owned start installs its SIGTERM and
 SIGINT handler only then, and exits 0 after a stop, 75 when the daemon

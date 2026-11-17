@@ -61,7 +61,10 @@ pub(crate) fn launcher_argv(argv: &[OsString]) -> io::Result<LauncherArgs> {
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
         })
-        .ok_or_else(|| invalid("--instance must be 1-128 of [A-Za-z0-9._-]"))?
+        // `.` and `..` would name a directory if the id were ever joined to
+        // a path; the character set already excludes any separator.
+        .filter(|id| *id != "." && *id != "..")
+        .ok_or_else(|| invalid("--instance must be 1-128 of [A-Za-z0-9._-], not . or .."))?
         .to_owned();
     Ok(LauncherArgs {
         trial: Some(TrialArgs {
@@ -77,40 +80,30 @@ pub(super) struct JournalIssuer<'a>(pub(super) &'a TrialArgs);
 
 impl start::Issuer for JournalIssuer<'_> {
     fn issue(&self, command: &forward::DaemonCommand) -> io::Result<Option<start::Issued>> {
-        issue(self.0, command)
+        issue_as(self.0, command, effective_uid())
     }
 }
 
-fn issue(args: &TrialArgs, command: &forward::DaemonCommand) -> io::Result<Option<start::Issued>> {
-    check_root(&args.host_root)?;
-    let journal_path = args.host_root.join(journal::JOURNAL_FILE_NAME);
-    let metadata = match std::fs::symlink_metadata(&journal_path) {
-        // No transaction on this host: an ordinary start.
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-        Ok(metadata) => metadata,
-    };
-    // The record's authority is its owner, mode and place (#2012): only
-    // this account may have written it, and nobody else may change it.
-    if !metadata.is_file() || metadata.uid() != effective_uid() || metadata.mode() & 0o077 != 0 {
-        return Err(invalid(
-            "host journal must be a regular file of this account with mode 0600",
-        ));
-    }
-    let record = match journal::read_boot_records(&args.host_root).journal {
-        journal::RecordRead::Journal(record) => *record,
-        journal::RecordRead::Missing => return Ok(None),
-        _ => return Err(invalid("host journal is unreadable or not a journal")),
+/// `uid` is the account the records must belong to: the launcher's
+/// effective uid (tests pass another to see a foreign owner).
+fn issue_as(
+    args: &TrialArgs,
+    command: &forward::DaemonCommand,
+    uid: u32,
+) -> io::Result<Option<start::Issued>> {
+    check_root(&args.host_root, uid)?;
+    let Some(record) = read_journal(&args.host_root, uid)? else {
+        return no_authority(args);
     };
     if !owns_trial(record.phase)? {
-        return Ok(None);
+        return no_authority(args);
     }
     let participant = record
         .plan
         .participants
         .iter()
         .find(|p| p.instance_id == args.instance)
-        .ok_or_else(|| invalid("instance is not a participant of the host journal"))?;
+        .ok_or_else(|| start::refused("instance is not a participant of the host journal"))?;
     // `argv[0]` is the process's argv0, which the launcher sets itself at
     // spawn; the daemon's arguments are the rest (`child::Owned::spawn`).
     let planned = participant.argv.get(1..).unwrap_or_default();
@@ -123,7 +116,7 @@ fn issue(args: &TrialArgs, command: &forward::DaemonCommand) -> io::Result<Optio
         || participant.executable.as_os_str() != command.executable
         || !args_match
     {
-        return Err(invalid(
+        return Err(start::refused(
             "launcher argv does not match its participant in the host journal",
         ));
     }
@@ -135,15 +128,88 @@ fn issue(args: &TrialArgs, command: &forward::DaemonCommand) -> io::Result<Optio
     }))
 }
 
+/// Read the host journal through one descriptor: open it without following
+/// a symlink, check owner, mode, type and size on that descriptor, and read
+/// from it, so nothing can swap the file between the check and the read
+/// (#2014 review). `Ok(None)` only when there is no journal.
+fn read_journal(root: &Path, uid: u32) -> io::Result<Option<journal::JournalRecord>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = root.join(journal::JOURNAL_FILE_NAME);
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        // No symlink is followed; a FIFO opens without blocking and then
+        // fails the regular-file check.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path);
+    let file = match opened {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(start::refused("host journal is a symlink"));
+        }
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    // The record's authority is its owner, mode and place (#2012): only
+    // this account wrote it, and only this account can read or change it.
+    if !metadata.is_file()
+        || metadata.uid() != uid
+        || metadata.mode() & 0o777 != 0o600
+        || metadata.len() > journal::MAX_RECORD_BYTES
+    {
+        return Err(start::refused(
+            "host journal must be a regular file of this account with mode 0600",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(journal::MAX_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > journal::MAX_RECORD_BYTES {
+        return Err(start::refused("host journal exceeds the size limit"));
+    }
+    match journal::classify_record(&bytes, "journal") {
+        journal::RecordRead::Journal(record) => Ok(Some(*record)),
+        _ => Err(start::refused(
+            "host journal is corrupt or of an unknown schema",
+        )),
+    }
+}
+
+/// No in-flight journal names this launcher. That is an ordinary start
+/// only if no unfinished trial of this participant is on disk: a Booting or
+/// Authorized trial means a swapped candidate could start unsupervised, so
+/// the start is refused instead (#2014 review). A Committed or Restored
+/// trial is finished: its daemon is the installed or the restored bytes.
+fn no_authority(args: &TrialArgs) -> io::Result<Option<start::Issued>> {
+    let path = args.host_root.join(coordinator::TRIAL_FILE_NAME);
+    let bytes = match journal::read_auxiliary_record(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let trial: Trial =
+        serde_json::from_slice(&bytes).map_err(|_| start::refused("trial record is unreadable"))?;
+    match trial.phase {
+        Phase::Committed | Phase::Restored if trial.instance == args.instance => Ok(None),
+        _ => Err(start::refused(
+            "an unfinished trial exists without an in-flight host journal",
+        )),
+    }
+}
+
 /// Whether the journal phase gives the launcher trial authority. Before
 /// any swap the installed bytes are unchanged and idle or superseded
-/// records are history: an ordinary start. A daemon swapped without its
-/// CLI is a mixed pair the launcher must not start or guess at.
+/// records are history (an ordinary start, unless a trial is unfinished).
+/// A daemon swapped without its CLI is a mixed pair the launcher must not
+/// start or guess at.
 fn owns_trial(phase: journal::Phase) -> io::Result<bool> {
     use journal::Phase::*;
     match phase {
         Staged | Probed | Prepared | Idle | Superseded => Ok(false),
-        SwappedDaemon => Err(invalid("host journal is between the daemon and CLI swap")),
+        SwappedDaemon => Err(start::refused(
+            "host journal is between the daemon and CLI swap",
+        )),
         SwappedCli | HandoffArmed | Booting | HealthCommitted | HostCommitted | RollingBack
         | FailedReleaseHold | Restored | RecoveryFailed => Ok(true),
     }
@@ -151,13 +217,13 @@ fn owns_trial(phase: journal::Phase) -> io::Result<bool> {
 
 /// The host root must be canonical (no symlink can move it), a directory
 /// of this account, and writable by nobody else.
-fn check_root(root: &Path) -> io::Result<()> {
+fn check_root(root: &Path, uid: u32) -> io::Result<()> {
     if root.canonicalize()? != root {
-        return Err(invalid("--host-root must be canonical"));
+        return Err(start::refused("--host-root must be canonical"));
     }
     let metadata = std::fs::symlink_metadata(root)?;
-    if !metadata.is_dir() || metadata.uid() != effective_uid() || metadata.mode() & 0o022 != 0 {
-        return Err(invalid(
+    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o022 != 0 {
+        return Err(start::refused(
             "--host-root must be a directory of this account that no other can write",
         ));
     }
@@ -270,7 +336,9 @@ mod tests {
     fn a_matching_in_flight_journal_issues_a_host() {
         let (_dir, root, record) = rooted(journal::Phase::SwappedCli);
         let (args, command) = matching(&record);
-        let issued = issue(&args, &command).unwrap().expect("issued");
+        let issued = issue_as(&args, &command, effective_uid())
+            .unwrap()
+            .expect("issued");
         assert_eq!(issued.instance, "alice");
         assert_eq!(issued.host.root(), root);
     }
@@ -287,17 +355,24 @@ mod tests {
             let mut settled = record.clone();
             settled.phase = phase;
             journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &settled).unwrap();
-            assert!(issue(&args, &command).unwrap().is_none(), "{phase:?}");
+            assert!(
+                issue_as(&args, &command, effective_uid())
+                    .unwrap()
+                    .is_none(),
+                "{phase:?}"
+            );
         }
         std::fs::remove_file(root.join(journal::JOURNAL_FILE_NAME)).unwrap();
-        assert!(issue(&args, &command).unwrap().is_none());
+        assert!(issue_as(&args, &command, effective_uid())
+            .unwrap()
+            .is_none());
     }
 
     #[test]
     fn a_half_swapped_pair_is_refused() {
         let (_dir, _root, record) = rooted(journal::Phase::SwappedDaemon);
         let (args, command) = matching(&record);
-        assert!(issue(&args, &command).is_err());
+        assert!(issue_as(&args, &command, effective_uid()).is_err());
     }
 
     /// Every mismatch between the launcher argv and the participant is an
@@ -308,15 +383,15 @@ mod tests {
         let (args, command) = matching(&record);
         let mut other_instance = args.clone();
         other_instance.instance = "nobody".into();
-        assert!(issue(&other_instance, &command).is_err());
+        assert!(issue_as(&other_instance, &command, effective_uid()).is_err());
         let mut other_exe = forward::DaemonCommand {
             executable: "/usr/bin/other".into(),
             args: command.args.clone(),
         };
-        assert!(issue(&args, &other_exe).is_err());
+        assert!(issue_as(&args, &other_exe, effective_uid()).is_err());
         other_exe.executable = command.executable.clone();
         other_exe.args.push("--extra".into());
-        assert!(issue(&args, &other_exe).is_err());
+        assert!(issue_as(&args, &other_exe, effective_uid()).is_err());
     }
 
     #[test]
@@ -325,10 +400,16 @@ mod tests {
         let (args, command) = matching(&record);
         let journal = root.join(journal::JOURNAL_FILE_NAME);
         std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(issue(&args, &command).is_err(), "group-readable journal");
+        assert!(
+            issue_as(&args, &command, effective_uid()).is_err(),
+            "group-readable journal"
+        );
         std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o770)).unwrap();
-        assert!(issue(&args, &command).is_err(), "group-writable root");
+        assert!(
+            issue_as(&args, &command, effective_uid()).is_err(),
+            "group-writable root"
+        );
     }
 
     /// A symlinked host root could move the journal out from under the
@@ -340,7 +421,7 @@ mod tests {
         let link = dir.path().canonicalize().unwrap().join("link");
         std::os::unix::fs::symlink(&args.host_root, &link).unwrap();
         args.host_root = link;
-        assert!(issue(&args, &command).is_err());
+        assert!(issue_as(&args, &command, effective_uid()).is_err());
     }
 
     /// End to end: the trial-form argv, the journal issuer and the main
@@ -370,5 +451,189 @@ mod tests {
         assert_eq!(exit, start::Start::Exit(0));
         let on_disk = Trial::load(&path, &host.binding().unwrap(), "alice").unwrap();
         assert_eq!(on_disk.phase, Phase::Stopped);
+    }
+
+    fn refused(result: io::Result<Option<start::Issued>>) -> bool {
+        match result {
+            Err(error) => start::is_refusal(&error),
+            Ok(_) => false,
+        }
+    }
+
+    fn write_0600(path: &Path, bytes: &[u8]) {
+        std::fs::write(path, bytes).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// Save alice's trial through `phases` (the save guard checks each).
+    fn trial_through(root: &Path, record: &journal::JournalRecord, phases: &[Phase]) {
+        let host = recovery::Host::new(root.to_path_buf(), record.clone()).unwrap();
+        let path = coordinator::trial_path(&host.plan().participants[0]);
+        let mut trial = Trial::new(
+            host.binding().unwrap(),
+            "alice".into(),
+            &Clock::now().unwrap(),
+        )
+        .unwrap();
+        for phase in phases {
+            match phase {
+                Phase::Booting | Phase::Provisional => {
+                    trial.attempts = 1;
+                    trial.ready_since_ms = Some(trial.started_ms);
+                    trial.child = Some(Identity {
+                        pid: 1,
+                        start: 1,
+                        boot: trial.boot.clone(),
+                    });
+                }
+                _ => trial.child = None,
+            }
+            trial.phase = phase.clone();
+            trial.save(&path).unwrap();
+        }
+    }
+
+    /// #2014 review item 2: no in-flight journal (absent, or rewritten to
+    /// a settled phase) while an unfinished trial is on disk is a fixed
+    /// refusal, never an unsupervised start of a swapped candidate.
+    #[test]
+    fn an_unfinished_trial_without_an_in_flight_journal_is_refused() {
+        for unfinished in [
+            &[Phase::Authorized][..],
+            &[Phase::Authorized, Phase::Booting][..],
+            &[Phase::Authorized, Phase::Stopped][..],
+        ] {
+            let (_dir, root, record) = rooted(journal::Phase::SwappedCli);
+            let (args, command) = matching(&record);
+            trial_through(&root, &record, unfinished);
+            for phase in [
+                journal::Phase::Staged,
+                journal::Phase::Prepared,
+                journal::Phase::Idle,
+            ] {
+                let mut settled = record.clone();
+                settled.phase = phase;
+                journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &settled).unwrap();
+                assert!(
+                    refused(issue_as(&args, &command, effective_uid())),
+                    "{unfinished:?} {phase:?}"
+                );
+            }
+            std::fs::remove_file(root.join(journal::JOURNAL_FILE_NAME)).unwrap();
+            assert!(
+                refused(issue_as(&args, &command, effective_uid())),
+                "{unfinished:?} no journal"
+            );
+        }
+    }
+
+    /// A Committed trial is finished: an idle or absent journal is an
+    /// ordinary start.
+    #[test]
+    fn a_finished_trial_allows_an_ordinary_start() {
+        let (_dir, root, record) = rooted(journal::Phase::SwappedCli);
+        let (args, command) = matching(&record);
+        trial_through(
+            &root,
+            &record,
+            &[Phase::Authorized, Phase::Provisional, Phase::Committed],
+        );
+        let mut idle = record.clone();
+        idle.phase = journal::Phase::Idle;
+        journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &idle).unwrap();
+        assert!(issue_as(&args, &command, effective_uid())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn a_corrupt_or_unknown_schema_journal_is_refused() {
+        let (_dir, root, record) = rooted(journal::Phase::SwappedCli);
+        let (args, command) = matching(&record);
+        let journal = root.join(journal::JOURNAL_FILE_NAME);
+        write_0600(&journal, b"{ not json");
+        assert!(
+            refused(issue_as(&args, &command, effective_uid())),
+            "corrupt"
+        );
+        let mut value = serde_json::to_value(&record).unwrap();
+        value["schema_version"] = 99.into();
+        write_0600(&journal, &serde_json::to_vec(&value).unwrap());
+        assert!(
+            refused(issue_as(&args, &command, effective_uid())),
+            "schema 99"
+        );
+    }
+
+    #[test]
+    fn a_participant_in_another_data_root_is_refused() {
+        let (_dir, root, mut record) = rooted(journal::Phase::SwappedCli);
+        let other = root.join("other");
+        std::fs::create_dir(&other).unwrap();
+        record.plan.participants[0].data_root = other;
+        journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &record).unwrap();
+        let (mut args, command) = matching(&record);
+        args.host_root = root;
+        assert!(refused(issue_as(&args, &command, effective_uid())));
+    }
+
+    #[test]
+    fn a_symlinked_or_irregular_journal_is_refused() {
+        let (_dir, root, record) = rooted(journal::Phase::SwappedCli);
+        let (args, command) = matching(&record);
+        let journal = root.join(journal::JOURNAL_FILE_NAME);
+        let moved = root.join("elsewhere.json");
+        std::fs::rename(&journal, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &journal).unwrap();
+        assert!(
+            refused(issue_as(&args, &command, effective_uid())),
+            "symlink"
+        );
+        std::fs::remove_file(&journal).unwrap();
+        std::fs::create_dir(&journal).unwrap();
+        assert!(
+            refused(issue_as(&args, &command, effective_uid())),
+            "directory"
+        );
+    }
+
+    /// Exactly 0600 and this account: 0400 and a foreign owner are refused.
+    #[test]
+    fn a_journal_that_is_not_0600_of_this_account_is_refused() {
+        let (_dir, root, record) = rooted(journal::Phase::SwappedCli);
+        let (args, command) = matching(&record);
+        let journal = root.join(journal::JOURNAL_FILE_NAME);
+        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(refused(issue_as(&args, &command, effective_uid())), "0400");
+        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(issue_as(&args, &command, effective_uid())
+            .unwrap()
+            .is_some());
+        let foreign = effective_uid().wrapping_add(1);
+        assert!(refused(issue_as(&args, &command, foreign)), "foreign owner");
+    }
+
+    /// Fixed refusals exit 78; a failed read (here a host root that does
+    /// not exist) exits 75.
+    #[test]
+    fn issuer_refusals_exit_78_and_read_errors_75() {
+        let (_dir, root, record) = rooted(journal::Phase::SwappedDaemon);
+        let (args, command) = matching(&record);
+        let exit = |args: &TrialArgs| {
+            start::start_with(
+                &JournalIssuer(args),
+                &command,
+                || {},
+                Clock::now,
+                || false,
+                || {},
+            )
+        };
+        assert_eq!(exit(&args), start::Start::Exit(start::EXIT_FINAL));
+        let missing = TrialArgs {
+            host_root: root.join("missing"),
+            instance: "alice".into(),
+        };
+        assert_eq!(exit(&missing), start::Start::Exit(start::EXIT_TEMPFAIL));
     }
 }

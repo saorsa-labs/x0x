@@ -18,6 +18,28 @@ pub(crate) const EXIT_TEMPFAIL: u8 = 75;
 /// final host phase). The unit must not restart on it; an operator acts.
 pub(crate) const EXIT_FINAL: u8 = 78;
 
+/// A refusal no restart can change (a mixed pair, an argv that does not
+/// match its journal, a record of the wrong owner or mode): the main loop
+/// exits 78. Any other issuer error, such as a failed read, exits 75.
+#[derive(Debug)]
+pub(super) struct Refused(&'static str);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+pub(super) fn refused(reason: &'static str) -> io::Error {
+    io::Error::other(Refused(reason))
+}
+
+pub(super) fn is_refusal(error: &io::Error) -> bool {
+    error.get_ref().is_some_and(|inner| inner.is::<Refused>())
+}
+
 /// What one launcher start decided.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Start {
@@ -93,7 +115,11 @@ pub(super) fn start_with(
         // and a passthrough could start a candidate outside its trial.
         Err(error) => {
             eprintln!("x0x-launcher: inventory issuer: {error}");
-            return Start::Exit(EXIT_TEMPFAIL);
+            return Start::Exit(if is_refusal(&error) {
+                EXIT_FINAL
+            } else {
+                EXIT_TEMPFAIL
+            });
         }
     };
     arm();
