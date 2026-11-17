@@ -554,6 +554,17 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Launcher refusals that can clear by themselves no longer stop the job,
+  and `x0x doctor` shows why the launcher refuses (#2015 and #2016 reviews;
+  A14 amendment of 17 Nov 2026).** A prior child that still exists gets up
+  to 45 s to end before the start refuses (on macOS a refusal holds until a
+  stop). A missing plan path, for example a data root on a volume not yet
+  mounted, is retried (75) instead of refused (78); only typed refusals are
+  final. Each final refusal is recorded in the host root and reported by
+  `x0x doctor` while the daemon is down. The launchd classifiers detect the
+  launcher from `Program` when it is set, and check launcher arguments with
+  the launcher's own parser. The launcher stays dormant.
+
 - **The dormant launcher's issuer refuses fixed faults with 78 (#1378,
   review of #2014).** A plan path that is missing or not canonical, and a
   symlinked or non-regular trial record, now exit 78 instead of 75. The tests
