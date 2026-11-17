@@ -1459,11 +1459,13 @@ async fn finish_commit(
         }
     };
     let signing_kp = state.agent.identity().agent_keypair();
-    let commit = match ng::seal_commit_owner_certified(
-        state,
-        &mut next,
-        signing_kp,
-        ng::now_millis_u64(),
+    // #1973: the seal runs inside the owner-recovery scope, so the
+    // seated revoked non-admins — whose own S4 rows wait for the admin
+    // this commit seats — no longer trip the ADR-0038 all-clean refusal.
+    let scope = super::owner_recovery_seal_scope(state, &next).await;
+    let commit = match super::within_owner_recovery_seal_scope(
+        scope,
+        ng::seal_commit_owner_certified(state, &mut next, signing_kp, ng::now_millis_u64()),
     )
     .await
     {
@@ -1471,7 +1473,20 @@ async fn finish_commit(
         Err(error) => {
             rollback(&mut tree, &next, "owner_recovery_seal_failed");
             tracing::warn!(group_id = %ng::LogHexId::group(group_key), "ADR 0110 S4: owner recovery deferred: seal failed: {error}");
-            set_wait(state, &stable, None).await;
+            // #1973: a seal refusal that still names members keeps a
+            // typed wait naming them; the status never falls back to a
+            // bare `mandate_received` with no cause.
+            let wait = match &error {
+                x0x::groups::state_commit::ApplyError::OwnerCertifiedEvictionRequired {
+                    members,
+                    ..
+                } => Some((
+                    x0x::groups::eviction::WaitingCause::WaitingForMemberEviction.as_str(),
+                    members.iter().filter_map(|id| agent_bytes(id)).collect(),
+                )),
+                _ => None,
+            };
+            set_wait(state, &stable, wait).await;
             return false;
         }
     };
@@ -3875,6 +3890,8 @@ pub(super) async fn status_json(state: &AppState, stable_group_id: &str) -> serd
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod issue1973_revoked_member_seal;
 
     #[test]
     fn refusals_map_to_http_statuses() {

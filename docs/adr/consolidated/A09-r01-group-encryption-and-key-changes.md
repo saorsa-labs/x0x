@@ -277,6 +277,28 @@ mixed-version rule forbids a rebind, the seat is evicted, as run (3) of
 `s4_certificate_rebind` states. No code, wire format or API changes. ADR
 0110 stays Accepted and its text is unchanged.
 
+On 16 Nov 2026 Claude decided what a seated revoked non-admin member
+means for the owner-recovery seal, under David's delegation of design
+decisions of 10 Nov 2026
+([#1973](https://github.com/saorsa-labs/x0x/issues/1973); ADR 0110
+§4b(1), ADR-0038 review B3). The recovery commit removes only the named
+revoked admins and promotes one member. A revoked below-Admin seat that
+is still seated no longer refuses the recovery seal: the seal tolerates
+it, as an S4 removal seal tolerates the group's other open S4 targets
+(§3). The tolerated seat keeps its key material until its own S4 row
+commits under the admin the recovery seats; that row performs the
+eviction and the rekey. Every other failing seat keeps the all-clean
+refusal. A recovery seal that is still refused keeps a typed wait,
+`waiting_for_member_eviction`, naming the members it still requires an
+eviction for, so the status never falls back to a bare
+`mandate_received`. Before this, the recovery could never commit while
+a revoked member was seated, and that member's eviction waited for the
+admin the recovery would seat, so the group stayed without an admin
+(#1973). The `OwnerRecoveryV1` body still removes exactly the named
+admins; no wire format changes. The local status of a promoted member
+can name the new wait cause. ADR 0110 stays Accepted and its text is
+unchanged.
+
 [A08](A08-r01-groups-home-membership-and-repair.md) defines valid group-state and fork recovery. A09 must not bypass that authority to obtain keys faster.
 
 ## Security claims

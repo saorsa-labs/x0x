@@ -153,6 +153,10 @@ pub enum WaitingCause {
     RebuildingObligationStore,
     /// The expiry clock check has not passed the raw `not_after` yet.
     WaitingForCertificateExpiry,
+    /// An `OwnerCertified` seal was refused because these members still
+    /// require an explicit eviction+rekey (ADR-0038 B3) that the waiting
+    /// transition cannot perform itself (#1973).
+    WaitingForMemberEviction,
 }
 
 impl WaitingCause {
@@ -175,6 +179,7 @@ impl WaitingCause {
             Self::WaitingForHostCommit => "waiting_for_host_commit",
             Self::RebuildingObligationStore => "rebuilding_obligation_store",
             Self::WaitingForCertificateExpiry => "waiting_for_certificate_expiry",
+            Self::WaitingForMemberEviction => "waiting_for_member_eviction",
         }
     }
 }
