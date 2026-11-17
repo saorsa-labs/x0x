@@ -1020,17 +1020,21 @@ no gossip, binds nothing, and takes no instance lock.
 
 ## Update Flow (for x0xd)
 
-1. **Startup (background, post-bind)**: after the API listener is bound — and as a non-blocking background task, so an unreachable GitHub never delays API readiness (#1086) — check GitHub for a new release and apply it if found (the startup manifest broadcast is a separate task, run by `broadcast_current_manifest`)
+1. **Startup (background, post-bind)**: after the API listener is bound — and as a non-blocking background task, so an unreachable GitHub never delays API readiness (#1086) — check GitHub for a new release, announce it on `x0x/release` (#1169), and apply it if found (the startup manifest broadcast is a separate task, run by `broadcast_current_manifest`)
 2. **Gossip listener**: Receive manifests on `x0x/release` topic, verify signature, rebroadcast, apply if newer
 3. **GitHub poller**: Periodic fallback poll, broadcast discovered manifests to gossip
 4. **Announce on first observation** (#1169): the publish points that
    predate #1169 are the startup manifest broadcast
-   (`broadcast_current_manifest`, on every launch; the startup check's own
-   publish site is dormant because the daemon runs it with no agent), the
-   fallback poll and the gossip relay. #1169 adds the one that stayed
-   silent: a manual `/upgrade/apply` announces the signed manifest on the
-   release topic before its apply work, so subscribed peers start their
-   update check from the announcement instead of their own fallback poll.
+   (`broadcast_current_manifest`, on every launch), the fallback poll and
+   the gossip relay. #1169 adds two more: a manual `/upgrade/apply`, and
+   the startup check itself — the daemon now runs it with the real gossip
+   agent, so a boot-time discovery is announced on the release topic
+   before the check applies the release itself. Both of these apply the
+   release they announce, so each records its payload as apply-route-owned
+   in the shared self-published tracker before publishing; the announcing
+   node's own gossip echo neither rebroadcasts nor queues a second apply
+   on the background owner. Subscribed peers start their update check
+   from the announcement instead of their own fallback poll.
    The GitHub poll cadence does not change (A14 / ADR 0045): gossip is
    the fast path. The announcement is bounded (10 s) and best effort;
    peer rebroadcast limiting and the apply owner's dedup handle repeats.
@@ -1038,15 +1042,9 @@ no gossip, binds nothing, and takes no instance lock.
    3 Nov 2026 17:40 GMT): a check-path announce self-delivers through
    gossip and feeds this node's own apply owner — a background install
    triggered by a read, which no credential gate on a GET can justify.
-   Self-delivery also applies to the apply-path announcement: the
-   applying node's own gossip listener receives it back. The route
-   records its payload as published by `/upgrade/apply` in the shared
-   self-published tracker on the daemon state before it publishes, so
-   the gossip driver neither rebroadcasts that echo nor submits it to the
-   background apply owner: the route already applies that release
-   (#1169). Echoes of the driver's own rebroadcasts, fallback-poll
-   publishes and the start-up broadcast are not rebroadcast again but are
-   still submitted; the owner's version dedup absorbs them.
+   Echoes of the driver's own rebroadcasts, fallback-poll publishes and
+   the start-up broadcast are not rebroadcast again but are still
+   submitted; the owner's version dedup absorbs them.
 5. **Authenticated HTTP apply**: Verify the release and wait for staging, then
    recheck admission under the install lock before replacement. The CLI
    `upgrade --apply` uses this route; `--now` skips only the staging delay.

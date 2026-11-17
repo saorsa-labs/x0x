@@ -645,9 +645,15 @@ where
 /// supply a runtime. The legacy `None` branch remains for a separate cleanup;
 /// `x0xd --check-updates` now uses the read-only reporter and never calls this
 /// installer.
+///
+/// With both `agent` and `self_published` supplied (the daemon does), a
+/// discovered release is announced on `RELEASE_TOPIC` before the apply
+/// (#1169): subscribed peers start their update check from the announcement
+/// instead of their own fallback poll.
 pub(in crate::server) async fn run_startup_update_check(
     config: &DaemonConfig,
     agent: Option<&Arc<Agent>>,
+    self_published: Option<&Arc<Mutex<SelfPublishedReleaseManifests>>>,
     runtime: Option<StartupUpdateCheckRuntime>,
 ) -> Result<Option<String>> {
     let monitor = UpgradeMonitor::new(&config.update.repo, "x0xd", x0x::VERSION)
@@ -698,13 +704,27 @@ pub(in crate::server) async fn run_startup_update_check(
     );
 
     // Broadcast to gossip so other nodes benefit from our discovery
-    if let Some(agent) = agent {
-        if let Err(e) = agent
-            .publish(RELEASE_TOPIC, verified.gossip_payload.clone())
+    // (#1169). The startup check applies the release itself below, exactly
+    // like `/upgrade/apply`: the payload is recorded as apply-route-owned
+    // first, so the announcement's self-delivery neither rebroadcasts nor
+    // queues a second apply on the background owner. Best effort and
+    // bounded, like every announcement site.
+    if let (Some(agent), Some(self_published)) = (agent, self_published) {
+        self_published
+            .lock()
             .await
-        {
-            tracing::debug!(error = %e, "Failed to broadcast discovered release: {e}");
-        }
+            .record_apply_route_payload(&verified.gossip_payload, Instant::now());
+        let announce_agent = Arc::clone(agent);
+        announce_observed_release(&verified, move |payload| {
+            let agent = Arc::clone(&announce_agent);
+            async move {
+                agent
+                    .publish(RELEASE_TOPIC, payload)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+        })
+        .await;
     }
 
     // The startup check runs beside the gossip release listener and the
@@ -1390,14 +1410,12 @@ fn verify_gossip_release_with_key(payload: &[u8], trusted_key: &[u8]) -> Option<
 
 /// #1169: a node that first observes a new release must not stay silent
 /// until each peer's fallback poll fires. The announcing observation
-/// points — the every-launch manifest broadcast, the fallback poll, gossip
-/// relay and a manual `/upgrade/apply` — publish the signed manifest on
-/// `RELEASE_TOPIC`. The read-only `/upgrade` check announces nothing
-/// (Engineer ruling 3 Nov 2026 17:40 GMT): gossip self-delivery would feed
-/// this node's own apply owner, i.e. a background install triggered by a
-/// read. (The startup check also has a publish site, but the daemon
-/// currently runs it with no agent, so boot coverage comes from the
-/// manifest broadcast.) The GitHub poll cadence stays at its documented
+/// points — the every-launch manifest broadcast, the startup check, the
+/// fallback poll, gossip relay and a manual `/upgrade/apply` — publish the
+/// signed manifest on `RELEASE_TOPIC`. The read-only `/upgrade` check
+/// announces nothing (Engineer ruling 3 Nov 2026 17:40 GMT): gossip
+/// self-delivery would feed this node's own apply owner, i.e. a background
+/// install triggered by a read. The GitHub poll cadence stays at its documented
 /// fallback (A14 / ADR 0045); gossip is the fast path. Best effort and
 /// bounded: a stuck mesh must never block the observer, and peer
 /// rebroadcast limiting plus the apply owner's dedup handle repeats.
@@ -3301,6 +3319,253 @@ mod tests {
         b.shutdown().await;
     }
 
+    /// #1169, the daemon's own discovery path: the startup check runs with
+    /// the real agent and the shared self-published tracker, so a release
+    /// its monitor observes at boot is announced on `x0x/release` — the
+    /// dead `None`-agent wiring was why the v0.46.0 canary fleet waited
+    /// out its fallback polls. Node A's real `run_startup_update_check`
+    /// (seam-fed release, stubbed apply leg) publishes the signed payload;
+    /// subscribed, connected node B's real gossip driver queues it with
+    /// its background apply owner. The issue's bar is under 2 × the
+    /// heartbeat (2 × 600 s); the test allows 10 s.
+    #[tokio::test]
+    async fn startup_check_discovery_is_announced_to_a_subscribed_peer() {
+        use x0x::upgrade::signature::sign_with_context;
+        let (pk, sk) = saorsa_pqc::api::sig::ml_dsa_65()
+            .generate_keypair()
+            .expect("test release key");
+        let manifest = manifest_for_this_platform(&version_newer_than_current());
+        let expected_version = manifest.version.clone();
+        let manifest_json = serde_json::to_vec(&manifest).expect("manifest json");
+        let signature = sign_with_context(&sk.to_bytes(), &manifest_json).expect("sign");
+        let gossip_payload =
+            x0x::upgrade::manifest::encode_signed_manifest(&manifest_json, &signature);
+        let verified = VerifiedRelease {
+            manifest,
+            manifest_json,
+            signature,
+            gossip_payload: gossip_payload.clone(),
+        };
+
+        let dir_a = tempfile::tempdir().expect("tmpdir a");
+        let dir_b = tempfile::tempdir().expect("tmpdir b");
+        let a = loopback_gossip_agent(dir_a.path()).await;
+        let b = loopback_gossip_agent(dir_b.path()).await;
+        a.join_network().await.expect("a joins");
+        b.join_network().await.expect("b joins");
+        let _a_topic = a.subscribe(RELEASE_TOPIC).await.expect("a subscribes");
+        let b_topic = b.subscribe(RELEASE_TOPIC).await.expect("b subscribes");
+        let b_addr = b.bound_addr().await.expect("b bound");
+        let b_addr = SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), b_addr.port());
+        a.network()
+            .expect("a network")
+            .connect_addr(b_addr)
+            .await
+            .expect("a connects to b");
+
+        // Wait until the release topic carries A's messages to B, so the
+        // startup check's one real publish below cannot race the mesh.
+        let mut b_probe = b
+            .subscribe(RELEASE_TOPIC)
+            .await
+            .expect("b probe subscribes");
+        let mut probe_seq = 0u32;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                probe_seq += 1;
+                let probe = format!("mesh-probe-{probe_seq}").into_bytes();
+                a.publish(RELEASE_TOPIC, probe)
+                    .await
+                    .expect("a publishes probe");
+                if let Ok(Some(message)) =
+                    tokio::time::timeout(Duration::from_millis(250), b_probe.recv()).await
+                {
+                    if message.payload.starts_with(b"mesh-probe-") {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the release topic did not carry A's probes to B within 10 s");
+        drop(b_probe);
+
+        // Peer B: subscription -> verifier -> real driver -> owner intake.
+        let (queued_tx, mut queued_rx) = mpsc::unbounded_channel();
+        let b_submit = BackgroundSubmit {
+            processed: Some(Arc::new(move |version, outcome| {
+                let _ = queued_tx.send((version, outcome));
+            })),
+            ..Default::default()
+        };
+        let releases = futures::stream::unfold(
+            (b_topic, pk.to_bytes()),
+            |(mut subscription, key)| async move {
+                loop {
+                    let message = subscription.recv().await?;
+                    if let Some(verified) = verify_gossip_release_with_key(&message.payload, &key) {
+                        return Some((verified, (subscription, key)));
+                    }
+                }
+            },
+        );
+        let (_b_running, b_shutdown) = watch::channel(false);
+        let b_driver = tokio::spawn(run_gossip_update_driver(
+            releases,
+            Some(b_submit),
+            Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
+            |_| async { Ok(()) },
+            b_shutdown,
+        ));
+
+        // Node A: the daemon-shaped startup check. The apply leg is stubbed
+        // (one attempt, NoUpgrade) so the check completes without touching a
+        // binary; the announce under test happens before it either way.
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let mut config = DaemonConfig {
+            data_dir: data_dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        config.update.rollout_window_minutes = 0;
+        let (runtime, _shutdown_tx) = e2e_startup_runtime(data_dir.path());
+        #[cfg(unix)]
+        let _observed_executable = crate::upgrade::apply::current_binary_path_seam::install(
+            data_dir.path().canonicalize().unwrap().join("x0xd"),
+        );
+        #[cfg(unix)]
+        let _readback = restart::systemd_readback_seam::install(staging_readback(
+            one_call_scenario("0", "5"),
+            &runtime,
+        ));
+        let attempts = Arc::new(AtomicU64::new(0));
+        let hook_attempts = Arc::clone(&attempts);
+        let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(
+            move |_plan, _manifest| {
+                hook_attempts.fetch_add(1, Ordering::SeqCst);
+                x0x::upgrade::UpgradeResult::NoUpgrade
+            },
+        ));
+        let _release = startup_release_seam::install(verified.clone());
+        let a_self_published = Arc::new(Mutex::new(SelfPublishedReleaseManifests::default()));
+
+        let started = std::time::Instant::now();
+        let a_agent = Arc::clone(&a);
+        let result = run_startup_update_check(
+            &config,
+            Some(&a_agent),
+            Some(&a_self_published),
+            Some(runtime),
+        )
+        .await;
+        assert!(
+            matches!(result, Ok(None)),
+            "the stubbed apply leg reports no upgrade: {result:?}"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "the startup check still ran its own apply leg after announcing"
+        );
+
+        let queued = tokio::time::timeout(Duration::from_secs(10), queued_rx.recv())
+            .await
+            .expect("the peer did not queue the release within 10 s");
+        assert_eq!(
+            queued,
+            Some((expected_version, SubmitOutcome::Accepted)),
+            "the subscribed peer started its own update check from the announcement"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2 * x0x::IDENTITY_HEARTBEAT_INTERVAL_SECS),
+            "propagation stayed inside the issue's 2 x heartbeat bar"
+        );
+
+        // The announcement is apply-route-owned: A's own gossip echo must
+        // neither rebroadcast nor queue a second apply (the #1891 contract;
+        // the driver-level tests pin the behaviour, this pins the recording).
+        let digest = release_manifest_payload_digest(&gossip_payload);
+        assert!(
+            a_self_published
+                .lock()
+                .await
+                .recorded_by_apply_route(&digest, Instant::now()),
+            "the startup check records its announcement as apply-route-owned"
+        );
+        b_driver.abort();
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    /// #1169 negative: an announcement the trusted key did not sign is
+    /// dropped by the listener's verifier, so a subscribed peer neither
+    /// rebroadcasts it nor starts an update check from it. The forged
+    /// payload is followed by an honestly signed one — same manifest
+    /// bytes, attacker's key — to show the driver was live and ignored the
+    /// forgery specifically.
+    #[tokio::test]
+    async fn a_forged_release_announcement_is_ignored_by_the_subscribed_peer() {
+        use x0x::upgrade::signature::sign_with_context;
+        let (pk, sk) = saorsa_pqc::api::sig::ml_dsa_65()
+            .generate_keypair()
+            .expect("trusted release key");
+        let (forged_pk, forged_sk) = saorsa_pqc::api::sig::ml_dsa_65()
+            .generate_keypair()
+            .expect("attacker release key");
+        let expected_version = version_newer_than_current();
+        let manifest = submittable_release(&expected_version).manifest;
+        let manifest_json = serde_json::to_vec(&manifest).expect("manifest json");
+        let honest = sign_with_context(&sk.to_bytes(), &manifest_json).expect("honest sign");
+        let forged = sign_with_context(&forged_sk.to_bytes(), &manifest_json).expect("forged sign");
+        let forged_payload =
+            x0x::upgrade::manifest::encode_signed_manifest(&manifest_json, &forged);
+        let honest_payload =
+            x0x::upgrade::manifest::encode_signed_manifest(&manifest_json, &honest);
+        assert!(
+            verify_gossip_release_with_key(&forged_payload, &pk.to_bytes()).is_none(),
+            "the forged payload fails the trusted verifier"
+        );
+        assert!(forged_pk.to_bytes() != pk.to_bytes());
+
+        let published = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&published);
+        let submit = BackgroundSubmit::default();
+        let (_keep_running, shutdown) = watch::channel(false);
+        let key = pk.to_bytes();
+        let releases =
+            futures::stream::iter([forged_payload, honest_payload]).filter_map(move |payload| {
+                let key = key.clone();
+                async move { verify_gossip_release_with_key(&payload, &key) }
+            });
+        run_gossip_update_driver(
+            releases,
+            submit.clone(),
+            Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
+            move |_| {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Ok(()) }
+            },
+            shutdown,
+        )
+        .await;
+        assert_eq!(
+            published.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the honestly signed release is rebroadcast"
+        );
+        let selected = submit
+            .slot
+            .lock()
+            .unwrap()
+            .latest
+            .as_ref()
+            .map(|release| release.manifest.version.clone());
+        assert_eq!(
+            selected,
+            Some(expected_version),
+            "the update check starts only from the honestly signed release"
+        );
+    }
+
     async fn upgrade_route_state(agent: Arc<Agent>, data_dir: &std::path::Path) -> Arc<AppState> {
         super::super::named_groups::tests::secure_endpoint_test_state_at_with_self_update(
             data_dir, agent, true,
@@ -4099,7 +4364,7 @@ mod tests {
         });
 
         let before = tokio::time::Instant::now();
-        let result = run_startup_update_check(&config, None, Some(runtime)).await;
+        let result = run_startup_update_check(&config, None, None, Some(runtime)).await;
 
         assert_eq!(
             attempts.load(Ordering::SeqCst),
@@ -4162,7 +4427,7 @@ mod tests {
         });
 
         let before = tokio::time::Instant::now();
-        let result = run_startup_update_check(&config, None, Some(runtime)).await;
+        let result = run_startup_update_check(&config, None, None, Some(runtime)).await;
         assert_eq!(
             attempts.load(Ordering::SeqCst),
             1,
@@ -4215,7 +4480,7 @@ mod tests {
         });
 
         let before = tokio::time::Instant::now();
-        let result = run_startup_update_check(&config, None, Some(runtime)).await;
+        let result = run_startup_update_check(&config, None, None, Some(runtime)).await;
         assert_eq!(
             attempts.load(Ordering::SeqCst),
             1,

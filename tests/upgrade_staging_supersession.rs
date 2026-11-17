@@ -91,7 +91,7 @@ macro_rules! staging_supersession_regression_tests {
             config.update.rollout_window_minutes = 60;
 
             let older_injection = startup_release_seam::install(older_release);
-            let older = run_startup_update_check(&config, None, Some(older_runtime));
+            let older = run_startup_update_check(&config, None, None, Some(older_runtime));
             tokio::pin!(older);
             assert_eq!(staging_next_observation(older.as_mut(), &mut older_rx, deadline).await.unwrap(),
                 crate::upgrade::staging::Decision::Waiting(Duration::from_secs(3260)));
@@ -104,7 +104,7 @@ macro_rules! staging_supersession_regression_tests {
             assert_eq!(older_first.manifest_sha256, older_request.manifest_sha256);
 
             let newer_injection = startup_release_seam::install(newer_release);
-            let newer = run_startup_update_check(&config, None, Some(newer_runtime));
+            let newer = run_startup_update_check(&config, None, None, Some(newer_runtime));
             tokio::pin!(newer);
             assert_eq!(staging_next_observation(newer.as_mut(), &mut newer_rx, deadline).await.unwrap(),
                 crate::upgrade::staging::Decision::Waiting(Duration::from_secs(1276)));
