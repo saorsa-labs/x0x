@@ -27,6 +27,10 @@ use crate::error::{NetworkError, NetworkResult};
 mod churn;
 use self::churn::ChurnCounters;
 pub use self::churn::ChurnSnapshot;
+/// #1964 request 5: transport bandwidth counters + rates (module docs
+/// state exactly what is and is not metered).
+pub mod bandwidth;
+use self::bandwidth::{BandwidthCounters, BandwidthKind};
 mod link;
 use self::link::LinkNode;
 mod stream;
@@ -2224,6 +2228,22 @@ pub const RELAYED_DM_STREAM_TYPE: u8 = 0x11;
 /// (same pattern as [`RELAYED_DM_STREAM_TYPE`]).
 pub const PLANE_HELLO_STREAM_TYPE: u8 = 0x20;
 
+/// #1964 request 5: map a wire stream-type byte to the coarse bandwidth
+/// kind the transport edge meters it under ([`BandwidthKind`]). This is
+/// the full classification available with zero extra decoding — see the
+/// [`bandwidth`] module docs for what rides which kind.
+fn bandwidth_kind_from_type_byte(byte: u8) -> BandwidthKind {
+    if saorsa_gossip_transport::GossipStreamType::from_byte(byte).is_some() {
+        BandwidthKind::Gossip
+    } else if byte == DIRECT_MESSAGE_STREAM_TYPE {
+        BandwidthKind::Direct
+    } else if byte == RELAYED_DM_STREAM_TYPE {
+        BandwidthKind::Relay
+    } else {
+        BandwidthKind::Other
+    }
+}
+
 /// Maximum plane-id length accepted on the wire (bytes of UTF-8).
 pub const MAX_PLANE_ID_LEN: usize = 64;
 
@@ -2884,6 +2904,10 @@ pub struct NetworkNode {
     /// Connection-churn observation counters (#368 gate 2). Arc so the
     /// Clone derive shares state; fed by the spawn_observer task.
     churn: Arc<ChurnCounters>,
+    /// #1964 request 5: process-lifetime transport byte counters + rolling
+    /// rates. Arc so the Clone derive (and the spawned receive pump) shares
+    /// one meter across every send funnel and the inbound demux.
+    bandwidth: Arc<BandwidthCounters>,
     /// Receiver channel for direct messages (separate from gossip).
     direct_tx: mpsc::Sender<DirectEvent>,
     direct_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<DirectEvent>>>,
@@ -3424,6 +3448,7 @@ impl NetworkNode {
             #[cfg(test)]
             receiver_captured_priority: Arc::new(OnceLock::new()),
             churn: Arc::new(ChurnCounters::default()),
+            bandwidth: Arc::new(BandwidthCounters::new()),
             direct_tx,
             direct_rx: Arc::new(tokio::sync::Mutex::new(direct_rx)),
             relayed_dm_tx,
@@ -3549,6 +3574,16 @@ impl NetworkNode {
     /// runs maintenance.
     pub fn bootstrap_cache(&self) -> Option<Arc<ant_quic::BootstrapCache>> {
         self.bootstrap_cache.clone()
+    }
+
+    /// #1964 request 5: transport bandwidth snapshot — per-kind byte totals
+    /// for the process lifetime plus rolling up/down rates (see the
+    /// [`bandwidth`] module docs for what is metered). Surfaced additively
+    /// by `GET /status` and the CLI so users can see what the node costs
+    /// them.
+    #[must_use]
+    pub fn bandwidth_usage(&self) -> bandwidth::BandwidthUsage {
+        self.bandwidth.snapshot()
     }
 
     /// Get the configured bind address (may contain port 0 before binding).
@@ -4317,6 +4352,9 @@ impl NetworkNode {
         let node = self.node.read().await.as_ref().cloned()?;
         let result = node.send_with_receive_ack(&peer_id, data, timeout).await;
         if result.is_ok() {
+            // #1964 request 5: raw-QUIC DM path (`send_direct_raw_quic`).
+            self.bandwidth
+                .record_sent(BandwidthKind::Direct, data.len() as u64);
             self.note_connection_pool_activity(peer_id).await;
         }
         Some(result)
@@ -7003,6 +7041,7 @@ impl NetworkNode {
             sender_agent_id,
             DIRECT_MESSAGE_STREAM_TYPE,
             payload,
+            BandwidthKind::Direct,
         )
         .await
     }
@@ -7037,6 +7076,9 @@ impl NetworkNode {
         buf.push(DIRECT_MESSAGE_STREAM_TYPE);
         buf.extend_from_slice(sender_agent_id);
         buf.extend_from_slice(payload);
+        // #1964 request 5: the frame is moved into the admission closure, so
+        // capture its length for the post-success metering below.
+        let counted_bytes = u64::try_from(buf.len()).unwrap_or(u64::MAX);
         let node = self.require_node().await?;
         let generation = node
             .current_connection_generation(peer_id)
@@ -7062,6 +7104,8 @@ impl NetworkNode {
         })
         .await
         .map_err(|e| NetworkError::ConnectionFailed(format!("pinned send failed: {e}")))?;
+        self.bandwidth
+            .record_sent(BandwidthKind::Direct, counted_bytes);
         self.note_connection_pool_activity(*peer_id).await;
         Ok(())
     }
@@ -7079,6 +7123,11 @@ impl NetworkNode {
     /// upwards. See [`DIRECT_MESSAGE_STREAM_TYPE`] +
     /// [`RELAYED_DM_STREAM_TYPE`].
     ///
+    /// `count_as` is the #1964 bandwidth kind the frame is metered under.
+    /// It matches the stream type on the two DM paths, except for the
+    /// relay-side forward, which exits as `0x10` but is relay work, so its
+    /// caller passes [`BandwidthKind::Relay`].
+    ///
     /// # Errors
     ///
     /// Returns `NetworkError` if the peer is not connected or send fails.
@@ -7088,6 +7137,7 @@ impl NetworkNode {
         sender_agent_id: &[u8; 32],
         stream_type: u8,
         payload: &[u8],
+        count_as: BandwidthKind,
     ) -> NetworkResult<()> {
         self.get_or_connect_pooled_peer(peer_id).await?;
 
@@ -7101,6 +7151,7 @@ impl NetworkNode {
         node.send(peer_id, &buf)
             .await
             .map_err(|e| NetworkError::ConnectionFailed(format!("send failed: {}", e)))?;
+        self.bandwidth.record_sent(count_as, buf.len() as u64);
         self.note_connection_pool_activity(*peer_id).await;
 
         debug!(
@@ -7407,6 +7458,16 @@ impl NetworkNode {
 
                         // Parse stream type from first byte (safe: data is non-empty)
                         let type_byte = data[0];
+
+                        // #1964 request 5: meter every inbound frame at the
+                        // wire edge, before any gate or parse can drop it —
+                        // the bytes reached the interface whatever happens
+                        // next. `plane_node` shares the sender-side meter
+                        // (Arc field on the Clone).
+                        plane_node.bandwidth.record_received(
+                            bandwidth_kind_from_type_byte(type_byte),
+                            data.len() as u64,
+                        );
 
                         // Handle direct messages separately (0x10)
                         if type_byte == DIRECT_MESSAGE_STREAM_TYPE {
@@ -9197,6 +9258,10 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
                 send.await
             };
             send_result?;
+            // #1964 request 5: meter only frames actually written (the
+            // suppressed/plane-held early return above sends nothing).
+            self.bandwidth
+                .record_sent(BandwidthKind::Gossip, buf.len() as u64);
 
             debug!(
                 "[1/6 network] send: {} bytes ({:?}) to peer {:?}",
@@ -9271,10 +9336,15 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
             }
         }
 
+        // #1964 request 5: the frame exists only inside the admission
+        // callback, so the callback notes its length and the send is
+        // metered after the write succeeds (a refused admission or a failed
+        // write counts nothing).
+        let admitted_len = AtomicU64::new(0);
         {
             let node = self.require_node().await?;
             node.send_on_generation_with_admission(&ant_peer, ant_generation, |actual| {
-                frame_guarded_admission(
+                let framed = frame_guarded_admission(
                     stream_type,
                     ant_generation,
                     actual,
@@ -9291,11 +9361,18 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
                     // landed during the wait refuses the bytes here.
                     self.guarded_send_policy_allows(&node, &ant_peer),
                     &admit,
-                )
+                )?;
+                admitted_len.store(
+                    u64::try_from(framed.len()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+                Ok(framed)
             })
             .await
             .map_err(|e| anyhow::anyhow!("guarded send failed: {}", e))?;
         }
+        self.bandwidth
+            .record_sent(BandwidthKind::Gossip, admitted_len.load(Ordering::Relaxed));
         // Match the ordinary send path's pool bookkeeping on success.
         self.note_connection_pool_activity(ant_peer).await;
         Ok(())
@@ -9924,6 +10001,173 @@ mod tests {
 
     fn test_ant_peer(byte: u8) -> AntPeerId {
         ant_quic::PeerId([byte; 32])
+    }
+
+    // #1964 request 5 ------------------------------------------------------
+
+    /// #1964 request 5: the transport funnels meter real frames. A direct
+    /// DM and a relayed-DM frame crossing the simulated fabric must move
+    /// both nodes' counters by the exact framed length, under the right
+    /// kinds, with the receiving side metered at the wire edge no matter
+    /// what the downstream parse does with the payload.
+    #[tokio::test]
+    async fn bandwidth_counters_track_frames_over_the_sim_fabric() {
+        let plane = "issue1964-bandwidth-meter";
+        let fabric = sim::SimFabric::new(1964);
+        sim::register(plane, &fabric);
+        let config = |host: u8| NetworkConfig {
+            bind_addr: Some(SocketAddr::from(([198, 18, 0, host], 5483))),
+            network_id: Some(plane.to_string()),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..NetworkConfig::default()
+        };
+        let a = NetworkNode::new(config(1), None, None).await.unwrap();
+        let b = NetworkNode::new(config(2), None, None).await.unwrap();
+        let peer_b = a
+            .connect_addr(SocketAddr::from(([198, 18, 0, 2], 5483)))
+            .await
+            .unwrap();
+        assert_eq!(peer_b, b.peer_id());
+
+        let sender = [7u8; 32];
+        let payload = b"issue-1964-metering-payload".to_vec();
+        let framed = u64::try_from(1 + 32 + payload.len()).unwrap_or(u64::MAX);
+
+        // Direct DM frame: [0x10][sender: 32][payload].
+        let before_a = a.bandwidth_usage();
+        let before_b = b.bandwidth_usage();
+        a.send_direct(&peer_b, &sender, &payload).await.unwrap();
+        let (_peer, received) = tokio::time::timeout(Duration::from_secs(5), b.recv_direct())
+            .await
+            .expect("the direct frame arrives")
+            .expect("the direct channel stays open");
+        assert_eq!(&received[..32], &sender[..]);
+        let after_a = a.bandwidth_usage();
+        let after_b = b.bandwidth_usage();
+        assert_eq!(
+            after_a.sent_bytes.direct - before_a.sent_bytes.direct,
+            framed,
+            "the sender meters the framed DM length under `direct`"
+        );
+        assert_eq!(after_a.sent_bytes.gossip, before_a.sent_bytes.gossip);
+        assert_eq!(
+            after_b.received_bytes.direct - before_b.received_bytes.direct,
+            framed,
+            "the receiver meters the same frame at the demux"
+        );
+
+        // Relayed-DM frame: [0x11] rides `relay` on both sides. The body is
+        // deliberately NOT a valid RelayedDm postcard: the demux meters the
+        // frame before the parse, so the rx count holds even when the frame
+        // is then dropped as malformed.
+        let before_a = a.bandwidth_usage();
+        let before_b = b.bandwidth_usage();
+        a.send_direct_typed(
+            &peer_b,
+            &sender,
+            RELAYED_DM_STREAM_TYPE,
+            &payload,
+            BandwidthKind::Relay,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            a.bandwidth_usage().sent_bytes.relay - before_a.sent_bytes.relay,
+            framed,
+            "the relayed frame is metered under `relay` on send"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let received_relay = b.bandwidth_usage().received_bytes.relay;
+            if received_relay - before_b.received_bytes.relay >= framed {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the relayed frame was never metered on the receive side"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// #1964 request 5 (#2000 review): a guarded gossip send is metered
+    /// only after the write succeeds. A refused admission sends no bytes
+    /// and counts none; an admitted frame counts its framed length once on
+    /// the sender and once at the receiver's demux.
+    #[tokio::test]
+    async fn bandwidth_guarded_gossip_send_counts_only_written_frames() {
+        let plane = "issue1964-bandwidth-guarded";
+        let fabric = sim::SimFabric::new(19641);
+        sim::register(plane, &fabric);
+        let config = |host: u8| NetworkConfig {
+            bind_addr: Some(SocketAddr::from(([198, 18, 0, host], 5483))),
+            network_id: Some(plane.to_string()),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..NetworkConfig::default()
+        };
+        let a = NetworkNode::new(config(1), None, None).await.unwrap();
+        let b = NetworkNode::new(config(2), None, None).await.unwrap();
+        let peer_b = a
+            .connect_addr(SocketAddr::from(([198, 18, 0, 2], 5483)))
+            .await
+            .unwrap();
+        let gossip_b = ant_to_gossip_peer_id(&peer_b);
+        let payload = b"issue-1964-guarded-gossip".to_vec();
+        let framed = u64::try_from(1 + payload.len()).unwrap_or(u64::MAX);
+
+        // Refused admission: the callback runs, produces no bytes, and the
+        // meter stays still. Retry until the plane gate clears so the
+        // refusal comes from the admission itself.
+        let refuse: saorsa_gossip_transport::SessionAdmission =
+            Arc::new(|_session| Err(anyhow::anyhow!("refused by the test")));
+        let before = a.bandwidth_usage().sent_bytes.gossip;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let err = a
+                .send_to_peer_guarded(gossip_b, GossipStreamType::PubSub, Arc::clone(&refuse))
+                .await
+                .unwrap_err();
+            if err.to_string().contains("refused by the test") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the guarded send never reached the admission callback: {err}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            a.bandwidth_usage().sent_bytes.gossip,
+            before,
+            "a refused guarded send counts nothing"
+        );
+
+        // Admitted frame: counted once, after the write, by framed length.
+        let admit: saorsa_gossip_transport::SessionAdmission = {
+            let payload = bytes::Bytes::from(payload.clone());
+            Arc::new(move |_session| Ok(payload.clone()))
+        };
+        let before_b = b.bandwidth_usage().received_bytes.gossip;
+        a.send_to_peer_guarded(gossip_b, GossipStreamType::PubSub, admit)
+            .await
+            .unwrap();
+        assert_eq!(
+            a.bandwidth_usage().sent_bytes.gossip - before,
+            framed,
+            "the written guarded frame is metered once under `gossip`"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while b.bandwidth_usage().received_bytes.gossip - before_b < framed {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the guarded frame was never metered on the receive side"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     // #1380 RC5 -----------------------------------------------------------

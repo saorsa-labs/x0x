@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`GET /status` reports transport bandwidth (#1964 request 5; A06
+  amendment of 17 Nov 2026).** A new additive `bandwidth` object gives
+  process-lifetime `sent_bytes` and `received_bytes` and the `up_bps` and
+  `down_bps` rates, each split into `gossip`, `direct`, `relay` and `other`.
+  `x0x status` adds human-readable totals in text output; `--json` keeps the
+  raw numbers only. No limits change.
 - **launchd jobs that run the stable launcher are recognised (#1379 slice 2;
   A14 amendment of 17 Nov 2026).** `x0x autostart --repair` and the
   upgrade-time launchd readback look through `x0x-launcher`'s own arguments
@@ -563,6 +569,23 @@ All notable changes to this project will be documented in this file.
   nothing. A record without `machines` (written before this change, or whose
   machine was never known) still loads, but no orphan ACK settles it; the
   send is sent again.
+- **Groups (H-S3-r, studio1 train 60):** a joiner whose join seal was not
+  served now keeps its group record and its `readmission_required
+  {base_beyond_retention}` after the join attempt times out. Before, a stub
+  still at the invite base was removed on the timeout and the joiner answered
+  404. W3-H row H-S3-r also no longer passes or fails by gossip timing: J gets
+  no gossip replay of the metadata messages published before it redeemed, so
+  its head stays beyond A's retention.
+- **Launcher refusals that can clear by themselves no longer stop the job,
+  and `x0x doctor` shows why the launcher refuses (#2015 and #2016 reviews;
+  A14 amendment of 17 Nov 2026).** A prior child that still exists gets up
+  to 45 s to end before the start refuses (on macOS a refusal holds until a
+  stop). A missing plan path, for example a data root on a volume not yet
+  mounted, is retried (75) instead of refused (78); only typed refusals are
+  final. Each final refusal is recorded in the host root and reported by
+  `x0x doctor` while the daemon is down. The launchd classifiers detect the
+  launcher from `Program` when it is set, and check launcher arguments with
+  the launcher's own parser. The launcher stays dormant.
 - **The dormant launcher's issuer refuses fixed faults with 78 (#1378,
   review of #2014).** A plan path that is missing or not canonical, and a
   symlinked or non-regular trial record, now exit 78 instead of 75. The tests
@@ -580,6 +603,16 @@ All notable changes to this project will be documented in this file.
   Failed into Interrupted, and a last attempt ended by a peer's stop counts as
   Failed (A14 amendment of 17 Nov 2026). The coordinator lets Failed win, so
   the failed release is held instead of retried.
+- **Groups (#2003):** a joiner past its authority's retention that another
+  admin attests now catches up to the head and ends Active with keys; before,
+  it stayed `catching_up` at its head. An admin keeps the renames, role
+  changes and unbans it applies, whoever signed them, and serves them on a
+  catch-up page only to a joiner it attested. A pre-Welcome joiner applies
+  such a relayed link as its signer's only inside its armed attested sequence.
+  A joiner whose seal was not served stops counting rounds once every admin
+  has answered (`awaiting_attestation {admins_answered}`), and a finished
+  catch-up no longer stays `catching_up`. ADR A08 amendment of 17 Nov 2026.
+
 - **Granted-store CLI paths and serves (#1953 review).** `x0x grant data`
   (and `grant revoke|renew`) percent-encode each path segment, so a key with
   `#`, `?` or `/` reaches the exact key. A slow granted read or write now

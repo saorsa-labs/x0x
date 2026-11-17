@@ -1437,10 +1437,16 @@ pub(super) struct AppState {
     /// Bounds HTTP staging waits without holding the shared replacement lock.
     pub(super) http_upgrade_wait_lock: Arc<Mutex<()>>,
     /// Release-topic payloads this daemon published itself. Shared by
-    /// `/upgrade/apply` and the gossip/fallback/startup publishers so the
-    /// gossip driver neither rebroadcasts nor re-submits its own
-    /// self-delivered announcement (#1169).
-    pub(super) self_published_release_manifests: Arc<Mutex<SelfPublishedReleaseManifests>>,
+    /// `/upgrade/apply` and the gossip/fallback publishers plus the boot
+    /// manifest broadcast so the gossip driver never rebroadcasts its own
+    /// self-delivered announcement (#1169). Only a payload claimed by
+    /// `/upgrade/apply` also skips the submit to the background owner;
+    /// echoes of the driver's own publishes still reach the owner, whose
+    /// version dedup absorbs them. A plain mutex: no caller
+    /// holds it across an await, and `/upgrade/apply`'s claim guard
+    /// decides its claim synchronously from `Drop` — release before
+    /// admission with nothing resuming the install, keep otherwise.
+    pub(super) self_published_release_manifests: Arc<StdMutex<SelfPublishedReleaseManifests>>,
     /// Releases seen on the topic and the last release check (#1381),
     /// reported by `GET /diagnostics/upgrade`. Memory only.
     pub(super) upgrade_observations: Arc<std::sync::Mutex<super::routes::UpgradeObservations>>,

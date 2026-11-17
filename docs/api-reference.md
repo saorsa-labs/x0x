@@ -438,9 +438,32 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:12700/status
 #   "peers": 4,
 #   "send_ready_peers": 4,
 #   "revocation_resync_required": false,
-#   "warnings": []
+#   "warnings": [],
+#   "bandwidth": {
+#     "sent_bytes":     { "total": 0, "gossip": 0, "direct": 0, "relay": 0, "other": 0 },
+#     "received_bytes": { "total": 0, "gossip": 0, "direct": 0, "relay": 0, "other": 0 },
+#     "up_bps":         { "total": 0.0, "gossip": 0.0, "direct": 0.0, "relay": 0.0, "other": 0.0 },
+#     "down_bps":       { "total": 0.0, "gossip": 0.0, "direct": 0.0, "relay": 0.0, "other": 0.0 },
+#     "window_secs": 60.0
+#   }
 # }
 ```
+
+`bandwidth` shows the transport bytes of this process. `sent_bytes` and
+`received_bytes` are totals since start; a read does not clear them.
+`up_bps` and `down_bps` are bits per second over `window_secs`. A read
+measures from the newest earlier read that is at least 60 s old, so a
+steady poller sees a window of about 60 s; with no such read the window
+starts at process start, and the rate is the lifetime average. The kinds
+are `gossip` (pub/sub, membership and bulk lanes, which include CRDT/KV
+sync), `direct` (DM frames), `relay` (relayed DM frames and their forward)
+and `other`. QUIC
+and UDP overhead, streams, and the evidence wire are not counted. The
+field is zero when the agent has no network node. A send counts after the
+write succeeds; a received frame counts when it arrives, before any check.
+In text output `x0x status` adds `sent_bytes_human`, `received_bytes_human`,
+`up_human` and `down_human` for the totals; `x0x status --json` prints the
+raw values only.
 
 `status` is `connected` when a send-ready peer exists. It is `degraded` when
 `GET /health` would be degraded. That includes a one-sided link: one
@@ -2486,7 +2509,7 @@ the fields shown:
 | `state` | Fields | Meaning |
 |---|---|---|
 | `catching_up` | `attested_by`, `verified`, `cursor`, `segment_terminal` | An admin's attestation (ATA) covers this node's gap. The node applies the attested links. While a verified catch-up makes progress, a soft refusal (for example `rate_limited`) or a silent round does not change the state. A new verified attestation counts as progress for the hold only; it does not defer `renewal_due`. After 10 minutes without progress, the next refusal or silent round replaces it with `awaiting_attestation`; the timeout alone does not change the state. An armed attestation with no progress asks for renewal (`renewal_due`) after 30 minutes. A hard refusal, for example `not_a_member`, replaces it at once. |
-| `awaiting_attestation` | `reason`, `asked`, `next_retry_at_ms` | The node asks capable admins, then members. `reason` is `no_capable_peer`, `no_reply`, `segment_exhausted`, `renewal_due`, `provisional_unverified`, or the last refusal reason. |
+| `awaiting_attestation` | `reason`, `asked`, `next_retry_at_ms` | The node asks capable admins, then members. `reason` is `no_capable_peer`, `no_reply`, `segment_exhausted`, `renewal_due`, `provisional_unverified`, `admins_answered` (a joiner whose seal was not served: every capable admin on its roster answered for this join attempt, none attested, and the node asks no one again until an admin attests or a new attempt begins), or the last refusal reason. |
 | `readmission_required` | `cause`, `asked`, `exit` | `cause` is `base_beyond_retention` or `local_state_lost`. `exit` is `manual_remove_and_reinvite` until ADR 0114's repair is in effect. A readmitted joiner whose own admission commit (`MemberAdded` or `JoinRequestApproved` with a Welcome reference) cannot fetch its staged Welcome (the admitting admin restarted, or the Welcome's 10-minute lifetime passed) comes back to this state and stops asking. Its join attempt ends with `last_join_outcome` `timed_out`, reason `rearm_original_result_unavailable` (ADR 0107), and it applies no later attestation for that attempt. A node that holds its keys never ends this way. A new verified invite starts a new attempt. |
 | `manual_clear_required` | `ref` | The head is on the admin's chain, but the marker names a sibling. Use `POST /groups/:id/quarantine/clear`. |
 | `reseat_required` | `cause`, `ref`, `last_refusal`, `asked` | `cause` is `not_on_chain`, `attestation_conflict`, `not_a_member` or `reseat_failed`. An admin must re-seat this node by hand. When this node refuses a re-seat authorisation, `last_refusal` is `authorisation_refused:<cause>`, where `<cause>` is `signature`, `signer`, `subject`, `basis`, `base_seats_subject` or `expired` (ADR 0109 §3); other failed checks, for example `group_mismatch` or `reseat_invite_unpaired`, show their own name. When the join route refuses the staged join with 409, `last_refusal` is that refusal's reason, for example `owner_mismatch` or `invite_downgraded` (another status shows `join_<status>`). Each re-seat invite refusal is also counted in `invites_refused {reason}`. |

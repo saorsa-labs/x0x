@@ -22,6 +22,7 @@ mod inventory_systemd_exec;
 #[cfg(unix)]
 mod inventory_systemd_lists;
 pub(crate) mod journal;
+pub mod launcher_contract;
 pub(crate) mod log_flush;
 pub mod manifest;
 pub mod monitor;

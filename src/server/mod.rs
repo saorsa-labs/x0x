@@ -1449,7 +1449,7 @@ pub async fn serve_with_options(
         upgrade_check_cache: Mutex::new(None),
         upgrade_apply_lock: Arc::new(Mutex::new(())),
         http_upgrade_wait_lock: Arc::new(Mutex::new(())),
-        self_published_release_manifests: Arc::new(Mutex::new(
+        self_published_release_manifests: Arc::new(std::sync::Mutex::new(
             SelfPublishedReleaseManifests::default(),
         )),
         upgrade_observations: Default::default(),
@@ -2264,7 +2264,12 @@ pub async fn serve_with_options(
     // bound, so a firewalled update endpoint blocks for the monitor's ~30 s
     // HTTP timeout in the background instead of delaying API readiness.
     // Gates unchanged: `self_update_enabled` (embedders /
-    // `--skip-update-check`) AND `[update] enabled`.
+    // `--skip-update-check`) AND `[update] enabled`. #1169: the check
+    // itself announces nothing; a boot-time discovery is announced by the
+    // every-launch manifest broadcast task below (same gates, same
+    // payload), so an announce here would only duplicate those bytes —
+    // best effort: that task does its own fetch and a failed fetch
+    // announces nothing, leaving the discovery to a later publish point.
     if self_update_enabled && config.update.enabled {
         let startup_check_config = config.clone();
         // #261: the apply's restart planner needs the bound API address
@@ -2307,7 +2312,6 @@ pub async fn serve_with_options(
             };
             if let Err(e) = run_startup_update_check(
                 &startup_check_config,
-                None,
                 Some(StartupUpdateCheckRuntime {
                     restart_context: listener_restart_context(
                         &data_dir,
