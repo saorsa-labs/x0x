@@ -22,18 +22,18 @@ pub(crate) const EXIT_FINAL: u8 = 78;
 /// match its journal, a record of the wrong owner or mode): the main loop
 /// exits 78. Any other issuer error, such as a failed read, exits 75.
 #[derive(Debug)]
-pub(super) struct Refused(&'static str);
+pub(super) struct Refused(String);
 
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0)
+        f.write_str(&self.0)
     }
 }
 
 impl std::error::Error for Refused {}
 
-pub(super) fn refused(reason: &'static str) -> io::Error {
-    io::Error::other(Refused(reason))
+pub(super) fn refused(reason: impl Into<String>) -> io::Error {
+    io::Error::other(Refused(reason.into()))
 }
 
 pub(super) fn is_refusal(error: &io::Error) -> bool {
