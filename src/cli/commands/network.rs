@@ -51,8 +51,76 @@ pub async fn status(client: &DaemonClient) -> Result<()> {
     let encoder = four_word_networking::IdentityEncoder::new();
     super::identity::inject_identity_words(&encoder, &mut resp);
     inject_location_words(&mut resp);
+    inject_bandwidth_human(&mut resp);
     print_value(client.format(), &resp);
     Ok(())
+}
+
+/// #1964 request 5: annotate the `/status` bandwidth block with
+/// human-readable headline numbers (`*_human` siblings; the raw byte and
+/// bits-per-second values stay untouched for scripts).
+fn inject_bandwidth_human(value: &mut serde_json::Value) {
+    fn human_bytes(bytes: u64) -> String {
+        const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+        let mut size = bytes as f64;
+        let mut unit = 0;
+        while size >= 1024.0 && unit < UNITS.len() - 1 {
+            size /= 1024.0;
+            unit += 1;
+        }
+        if unit == 0 {
+            format!("{bytes} B")
+        } else {
+            format!("{size:.1} {}", UNITS[unit])
+        }
+    }
+
+    fn human_bps(bps: f64) -> String {
+        const UNITS: [&str; 4] = ["bps", "kbps", "Mbps", "Gbps"];
+        let mut size = bps.max(0.0);
+        let mut unit = 0;
+        while size >= 1000.0 && unit < UNITS.len() - 1 {
+            size /= 1000.0;
+            unit += 1;
+        }
+        if unit == 0 {
+            format!("{} bps", size as u64)
+        } else {
+            format!("{size:.1} {}", UNITS[unit])
+        }
+    }
+
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    let Some(bandwidth) = obj.get_mut("bandwidth").and_then(|b| b.as_object_mut()) else {
+        return;
+    };
+    for (source, key, format) in [
+        (
+            "sent_bytes",
+            "sent_bytes_human",
+            human_bytes as fn(u64) -> String,
+        ),
+        ("received_bytes", "received_bytes_human", human_bytes),
+    ] {
+        if let Some(total) = bandwidth
+            .get(source)
+            .and_then(|v| v.get("total"))
+            .and_then(|v| v.as_u64())
+        {
+            bandwidth.insert(key.to_string(), serde_json::Value::String(format(total)));
+        }
+    }
+    for (source, key) in [("up_bps", "up_human"), ("down_bps", "down_human")] {
+        if let Some(total) = bandwidth
+            .get(source)
+            .and_then(|v| v.get("total"))
+            .and_then(|v| v.as_f64())
+        {
+            bandwidth.insert(key.to_string(), serde_json::Value::String(human_bps(total)));
+        }
+    }
 }
 
 /// `x0x peers` — GET /peers
@@ -309,6 +377,39 @@ mod tests {
         // May or may not encode depending on FourWordAdaptiveEncoder
         // Just verify it doesn't panic
         let _ = value;
+    }
+
+    /// #1964 request 5: a daemon that already serves the bandwidth block
+    /// gets the headline `*_human` siblings; older daemons without the
+    /// block (or non-object payloads) pass through untouched.
+    #[test]
+    fn inject_bandwidth_human_annotates_the_headline_numbers() {
+        let mut value = serde_json::json!({
+            "status": "connected",
+            "bandwidth": {
+                "sent_bytes": {"total": 2_634_565_930u64, "gossip": 1, "direct": 2, "relay": 3, "other": 4},
+                "received_bytes": {"total": 1024, "gossip": 0, "direct": 0, "relay": 0, "other": 0},
+                "up_bps": {"total": 11_233_445.6, "gossip": 1.0, "direct": 2.0, "relay": 3.0, "other": 4.0},
+                "down_bps": {"total": 0.0, "gossip": 0.0, "direct": 0.0, "relay": 0.0, "other": 0.0},
+                "window_secs": 60.0
+            }
+        });
+        inject_bandwidth_human(&mut value);
+        let bandwidth = &value["bandwidth"];
+        assert_eq!(bandwidth["sent_bytes_human"], "2.5 GiB");
+        assert_eq!(bandwidth["received_bytes_human"], "1.0 KiB");
+        assert_eq!(bandwidth["up_human"], "11.2 Mbps");
+        assert_eq!(bandwidth["down_human"], "0 bps");
+        // The raw values stay for scripts.
+        assert_eq!(bandwidth["sent_bytes"]["total"], 2_634_565_930_u64);
+
+        let mut without = serde_json::json!({"status": "connected"});
+        inject_bandwidth_human(&mut without);
+        assert!(without.get("bandwidth").is_none());
+
+        let mut non_object = serde_json::json!([1, 2, 3]);
+        inject_bandwidth_human(&mut non_object);
+        assert!(non_object.is_array());
     }
 }
 
