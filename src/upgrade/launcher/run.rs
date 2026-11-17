@@ -174,9 +174,12 @@ pub(super) fn run_trial(
                     trial.save(path)?;
                     return Ok(Outcome::Stopped);
                 }
-                let next = now()?.ms.saturating_add(GAP_MS);
                 // The spawn recorded the exec failure in memory only.
                 let cause = trial.cause.clone();
+                let next = match now() {
+                    Ok(clock) => clock.ms.saturating_add(GAP_MS),
+                    Err(error) => return clock_lost(host, path, trial, cause, error),
+                };
                 if !requeue(host, path, trial, cause.clone(), next)? {
                     return resume_peer_recovery(host, path, trial, cause, &mut now, &mut stop);
                 }
@@ -222,11 +225,36 @@ pub(super) fn run_trial(
             return Err(trial.recovery_failed(path, error));
         }
         trial.child = None;
-        let next = now()?.ms.saturating_add(GAP_MS);
         let cause = Some(failure.to_string());
+        let next = match now() {
+            Ok(clock) => clock.ms.saturating_add(GAP_MS),
+            Err(error) => return clock_lost(host, path, trial, cause, error),
+        };
         if !requeue(host, path, trial, cause.clone(), next)? {
             return resume_peer_recovery(host, path, trial, cause, &mut now, &mut stop);
         }
+    }
+}
+
+/// The clock failed after a failed attempt, so the next attempt cannot be
+/// scheduled. A used-up attempt count needs no clock: it rolls back as
+/// Failed now, so the failed release is held. Otherwise the error is
+/// returned with the trial still Booting, and the next start rolls back as
+/// lost custody (Interrupted), which is the verdict an earlier attempt
+/// gets anyway (#2006 review).
+fn clock_lost(
+    host: &recovery::Host,
+    path: &Path,
+    trial: &mut Trial,
+    cause: Option<String>,
+    error: io::Error,
+) -> io::Result<Outcome> {
+    if cause.is_some() {
+        trial.cause = cause;
+    }
+    match exhausted_verdict(trial) {
+        Some(verdict) => rollback(host, path, trial, verdict),
+        None => Err(error),
     }
 }
 
@@ -1373,7 +1401,7 @@ mod tests {
     /// A stop that arrives while a live candidate is health-checked, after
     /// the total budget ran out, records the Failed verdict before it saves
     /// Stopped. The next start rolls back as Failed.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_stop_during_health_checks_after_the_budget_ran_out_stays_failed() {
         let (_dir, root, _host, record) = fixture(journal::Phase::SwappedCli);
@@ -1417,7 +1445,7 @@ mod tests {
 
     /// A stop during the last attempt, inside the budget, is Interrupted:
     /// that attempt is counted but has not failed.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_stop_during_the_last_attempt_is_interrupted() {
         let (_dir, root, _host, record) = fixture(journal::Phase::SwappedCli);
@@ -1456,7 +1484,7 @@ mod tests {
     /// A stop that ends the last attempt's child before the next poll sees
     /// it is still a stop: the exit is not charged, and the next start
     /// rolls back as Interrupted.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_stop_that_ends_the_last_child_stays_interrupted() {
         let (_dir, root, _host, record) = fixture(journal::Phase::SwappedCli);
@@ -1496,7 +1524,7 @@ mod tests {
         assert_eq!(cause.class, journal::CauseClass::Interrupted, "{cause:?}");
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn restored_starts_are_reserved_and_bounded() {
         let (_dir, root, _host, mut record) = fixture(journal::Phase::SwappedCli);
