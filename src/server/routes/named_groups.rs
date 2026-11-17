@@ -22094,6 +22094,43 @@ pub(in crate::server) async fn apply_listener_metadata_event(
     applied
 }
 
+/// #1366: whether a stored group record needs its metadata listener after a
+/// restart. Only a withdrawn group needs none. Every local seat keeps it:
+/// - an Active member;
+/// - a Pending request-access applicant, which waits for the approval event;
+/// - a record with no local seat (a card-import or join stub), which waits
+///   for its `MemberAdded`;
+/// - a Removed seat, which an ADR 0109 re-seat or an ordinary re-add can
+///   still follow on this topic (W3-H H-S3-q (3) needs it);
+/// - a Banned seat: an admin lifts a ban with a `MemberUnbanned` event that
+///   [`unban_group_member`] publishes only on this topic. Without the
+///   listener the agent keeps its stored ban and its request-access stays
+///   refused as `banned`.
+pub(in crate::server) fn metadata_listener_wanted(info: &x0x::groups::GroupInfo) -> bool {
+    !info.withdrawn
+}
+
+/// #1366: the listeners a restart installs for the stored groups. A record
+/// that [`metadata_listener_wanted`] accepts gets
+/// [`ensure_named_group_listeners`]: the metadata listener, and the
+/// public-message listener when the group is SignedPublic. A withdrawn
+/// record gets neither. This is the same set as before #1366, when the
+/// restart called [`ensure_named_group_listeners`] for every record and
+/// both of its halves skipped a withdrawn group.
+pub(in crate::server) async fn restore_named_group_listeners(state: Arc<AppState>) {
+    let wanted: Vec<String> = {
+        let groups = state.named_groups.read().await;
+        groups
+            .iter()
+            .filter(|(_, info)| metadata_listener_wanted(info))
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    for group_id in wanted {
+        ensure_named_group_listeners(Arc::clone(&state), &group_id).await;
+    }
+}
+
 /// Spawn every gossip listener a member needs for a named group.
 ///
 /// Members must be subscribed to both the metadata topic *and* the
@@ -52844,6 +52881,14 @@ async fn handle_join_result_message_bound(
                 intervening_events,
             ))
             .await;
+            // ADR 0109 §2 "Unserved join seal" (H-S3-r): what the
+            // authority served, read before the chain moves below.
+            let unserved = verified
+                && chain.is_empty()
+                && admin_attestation.is_none()
+                && head_attestation
+                    .as_deref()
+                    .is_none_or(|attestation| attestation.terminal_signature_b64.is_none());
             // ADR 0109 §2: with a verified join-carry ATA, apply the
             // attested served links state-only (rule (b)) so `event`
             // chains from the new head.
@@ -52912,6 +52957,31 @@ async fn handle_join_result_message_bound(
                 &roster_certificates_b64,
             )
             .await;
+            // ADR 0109 §2 "Unserved join seal" (H-S3-r, #1572): the seal
+            // did not apply and nothing was served to reach it, so §2 asks
+            // the admins (`note_unserved_join_seal` checks the gap).
+            if unserved && !applied {
+                // An unbound result (a poll) is for the attempt pending
+                // for this joiner; a bound one was checked current above.
+                let attempt_id = bound_join_attempt.map(str::to_string).or_else(|| {
+                    state
+                        .pending_join_attempts
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .get(&expected_key)
+                        .map(|attempt| attempt.attempt_id.clone())
+                });
+                if let (Some(attempt_id), Some(terminal_revision)) = (attempt_id, terminal_revision)
+                {
+                    group_recovery::note_unserved_join_seal(
+                        state,
+                        &group_id,
+                        &attempt_id,
+                        terminal_revision,
+                    )
+                    .await;
+                }
+            }
             if attested {
                 group_recovery::retire_converged(state, &group_id).await;
             }
@@ -54961,6 +55031,7 @@ pub(in crate::server) mod tests {
     pub(in crate::server) mod issue1275_listener_apply_shield;
     mod issue1288_bootstrap_outbox_shutdown;
     mod issue1347_join_request_token_class;
+    mod issue1366_metadata_listener;
     pub(in crate::server) mod issue1366_public_listener;
     pub(in crate::server) mod issue1368_crash_matrix;
     mod issue1427_start_catchup;

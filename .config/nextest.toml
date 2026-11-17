@@ -289,7 +289,7 @@ priority = 60
 # finisher always frees enough. 4 keeps the reservations that #316,
 # #1614 and ADR 0030 slice 3 added below. Upstream fixed the scheduler in
 # future-queue 0.4.1 (nextest-rs/future-queue#603), first used by
-# cargo-nextest 0.9.151; CI pins 0.9.144.
+# cargo-nextest 0.9.151.
 [test-groups.quic-localhost]
 max-threads = 1
 
@@ -397,6 +397,7 @@ max-threads = 2
 [[profile.default.overrides]]
 filter = "test(hs_f2_membership_cluster) | test(issue506_public_broadcast_control)"
 test-group = "membership-cluster"
+threads-required = 1
 
 # #501: real multi-peer controls share the existing localhost serialization.
 [[profile.default.overrides]]
@@ -423,6 +424,7 @@ slow-timeout = { period = "120s", terminate-after = 8 }
 [[profile.default.overrides]]
 filter = "binary(h_s3_home_released)"
 test-group = "h-s3-home-released"
+threads-required = 1
 slow-timeout = { period = "60s", terminate-after = 25 }
 
 [test-groups.h-s3-home-released]
@@ -439,6 +441,7 @@ max-threads = 2
 [[profile.default.overrides]]
 filter = 'test(/::owner_axis::released::/)'
 test-group = "h-s3-released-rows"
+threads-required = 1
 slow-timeout = { period = "60s", terminate-after = 25 }
 
 [test-groups.h-s3-released-rows]

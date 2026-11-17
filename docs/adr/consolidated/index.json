@@ -61,7 +61,7 @@
       "revision": 1,
       "path": "A08-r01-groups-home-membership-and-repair.md",
       "title": "Groups Home Membership and Repair",
-      "sha256": "deb31092cf05ef38ed6d3d986919e82c6b0dbdb265d2e1a619db3693e062eae6"
+      "sha256": "9a5793c3d516cc6b50cc8aa3d7d426d4f595f7bf37b334635e1defe2d5679b96"
     },
     {
       "id": "A09",
@@ -103,7 +103,7 @@
       "revision": 1,
       "path": "A14-r01-health-updates-and-recovery.md",
       "title": "Health Updates and Recovery",
-      "sha256": "7a439fdf38227c68b4c661b4623d7c6073c00a08d38445dec4cdc49321d8d947"
+      "sha256": "d57aa2e8bf533cc40bf903440df98274ae3a9995187ea445ae037a506f21b013"
     },
     {
       "id": "A15",

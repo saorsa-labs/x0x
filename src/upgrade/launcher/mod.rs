@@ -242,10 +242,17 @@ impl Trial {
                     // A stopped trial may only roll back (ADR 0094 S4).
                     || (old.phase == Phase::Stopped
                         && !matches!(self.phase, Phase::Stopped | Phase::RollingBack))
-                    // A stale stop never undoes a rollback or a restore
-                    // (#1968 review).
-                    || (matches!(old.phase, Phase::RollingBack | Phase::Restored)
-                        && self.phase == Phase::Stopped)
+                    // A stale save never undoes a rollback or a restore
+                    // (#1968 and #1989 reviews): RollingBack only moves to
+                    // Restored or RecoveryFailed, Restored only to
+                    // RecoveryFailed.
+                    || (old.phase == Phase::RollingBack
+                        && !matches!(
+                            self.phase,
+                            Phase::RollingBack | Phase::Restored | Phase::RecoveryFailed
+                        ))
+                    || (old.phase == Phase::Restored
+                        && !matches!(self.phase, Phase::Restored | Phase::RecoveryFailed))
                     // Only a provisional trial is retired, and a retired
                     // trial stays retired.
                     || (old.phase == Phase::Committed && self.phase != Phase::Committed)
