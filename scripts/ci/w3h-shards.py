@@ -59,9 +59,9 @@ GROUPS = (
     # H-S3-q2 (#1572): about 60 s per rerun in the 12-CPU VM, so about
     # 40 min for 20 reruns on a runner; its own shard, as H-S3-q.
     ('s3-q2', 'w3h_1356_control_s3_q2_sidecar_fault_cases$'),
-    # H-S3-r (#1572): about 36 s per rerun in the 12-CPU VM, so about
-    # 24 min for 20 reruns on a runner; its own shard, so `s3` (about
-    # 90 min) does not grow.
+    # H-S3-r (#1572): 35 to 86 s per rerun in the 12-CPU VM, so at most
+    # about 60 min for 20 reruns on a runner; its own shard, so `s3`
+    # (about 90 min) does not grow.
     ('s3-r', 'w3h_1356_control_s3_r_beyond_retention$'),
     ('s3', 'w3h_1356_'),
     # #1623 (refs #1356): about 11 s per rerun on macOS; `rest` already
