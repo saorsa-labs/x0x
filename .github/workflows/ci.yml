@@ -206,7 +206,9 @@ jobs:
       # the run with tests "not run" and no failure (scripts/ci/
       # check-nextest-groups.py, .config/nextest.toml quic-localhost).
       - name: Check nextest test-group weights
-        run: python3 -B scripts/ci/check-nextest-groups.py
+        run: |
+          python3 -B scripts/ci/test_check_nextest_groups.py -v
+          python3 -B scripts/ci/check-nextest-groups.py
 
       - name: Record disk before Run tests
         run: |
@@ -1231,6 +1233,12 @@ jobs:
           --expect w3h_1581k_staged_join_agent_revoked_gets_no_key=GREEN
           --require w3h_1581k_control_staged_join_unrevoked_gets_its_key
           --expect w3h_1581k_control_staged_join_unrevoked_gets_its_key=GREEN
+          --require w3h_1581m_recovery_not_needed_while_d_is_eligible
+          --expect w3h_1581m_recovery_not_needed_while_d_is_eligible=GREEN
+          --require w3h_1581m_recovery_offline_promotee_commits_on_return
+          --expect w3h_1581m_recovery_offline_promotee_commits_on_return=GREEN
+          --require w3h_1581m_recovery_refuses_a_revoked_member
+          --expect w3h_1581m_recovery_refuses_a_revoked_member=RED
           --require w3h_1765_red_newer_file_revocation_waits_for_store_write
           --expect w3h_1765_red_newer_file_revocation_waits_for_store_write=GREEN
           --require w3h_1776_delayed_fresh_joiner_fetches_the_welcome

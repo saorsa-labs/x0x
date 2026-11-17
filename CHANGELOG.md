@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **The dormant launcher's multi-participant rollback is final on a failed
+  pass and never overwrites a peer's restore (#1378 slice 6; A14 amendment of
+  16 Nov 2026).** A failed coordinator pass marks the host and trial
+  RecoveryFailed instead of repeating on every restart; a host a peer already
+  restored is never marked. A failed attempt is requeued under the host lock
+  and joins a peer's fence or restore from meanwhile;
+  a trial save refuses any stale write over a rollback or a restore.
 - **The dormant launcher stops a committed daemon gracefully (#1378 slice 4;
   A14 amendment of 16 Nov 2026).** A stop sends SIGTERM and waits up to 35 s
   for x0xd's shutdown before SIGKILL. The retire after a host commit retries
@@ -133,6 +140,15 @@ All notable changes to this project will be documented in this file.
   and after approval it can apply the approval link. A requester that waits
   behind another turn gets no outcome until its turn. New capability bit 19,
   `join_request_head_v1`; a peer without it keeps the earlier behaviour.
+- **W3-H row `s4_owner_recovery`, three variants (#1581).** A mandate
+  sent while a second admin D is still eligible is refused with
+  `recovery_not_needed`, and no member shows the owner-recovery wait. A
+  promoted member B that is offline when the mandate is signed commits the
+  recovery when it starts again. A mandate naming a revoked member E is
+  refused with `recovery_member_ineligible`; this arm is pinned RED for a
+  known gap (#1973): while E is still seated, B's recovery seal fails the
+  ADR-0038 eviction check and never commits. The row has its own W3-H
+  shard (`1581m`).
 - **W3-H row `s4_certificate_rebind` run (7) (#1581).** After B revokes
   its own agent and A and C hold the record, B's self-rebind of a later
   renewal is refused with `rebind_signer_ineligible`, and no node binds
@@ -242,6 +258,13 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **The listeners a restart starts for stored groups follow one written
+  rule (#1366 first slice, A08 amendment of 16 Nov 2026).** Only a
+  withdrawn group gets no metadata listener. An Active member, a Pending
+  access applicant, a stub with no local seat, a Removed seat (re-seat or
+  re-add) and a Banned seat keep it. A Banned seat needs it to receive an
+  admin's `MemberUnbanned`, which is published only on that topic. The
+  set of listeners is the same as before.
 - **A joiner whose authority's log no longer reaches its base now ends
   typed (ADR 0109 §2 "Unserved join seal", A08 amendment of 16 Nov 2026,
   #1572).** When the authority's join result carries no chain and no join
@@ -251,7 +274,6 @@ All notable changes to this project will be documented in this file.
   shows `readmission_required {base_beyond_retention}` with the
   `manual_remove_and_reinvite` exit instead of timing out with no reason.
   Each admin that answers is asked once per join attempt. No wire change.
-
 - **The TreeKEM reconnect catch-up pass is bounded (#1427, A09 third
   amendment of 15 Nov 2026).** A reconnect during a pass runs one more
   pass after it. A pass asks for at most 4 groups at a time, each after a

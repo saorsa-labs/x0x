@@ -117,6 +117,24 @@ impl Host {
         })
     }
 
+    /// As `mark_recovery_failed`, for one launcher's failed coordinator pass
+    /// (#1991 review): a host that a peer has already restored is also left
+    /// alone. Its pair is back, and a RecoveryFailed mark would block every
+    /// participant's restored start. Returns the phase found under the lock.
+    pub(super) fn mark_unrestored_recovery_failed(&self) -> io::Result<journal::Phase> {
+        self.locked(|record| match record.phase {
+            journal::Phase::HostCommitted => {
+                Err(invalid("a committed host is never marked failed"))
+            }
+            journal::Phase::Restored => Ok(journal::Phase::Restored),
+            found => {
+                record.phase = journal::Phase::RecoveryFailed;
+                self.save(record)?;
+                Ok(found)
+            }
+        })
+    }
+
     /// Write the host commit (ADR 0094 §3 `host-committed`). Under the host
     /// lock: the transaction must be uncommitted and not rolling back, both
     /// installed files must hash to the candidate pair, and `check` (the
