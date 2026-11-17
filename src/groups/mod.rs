@@ -223,8 +223,6 @@ pub const MAX_LIVE_ISSUED_INVITES_PER_GROUP: usize = 64;
 
 /// Locally-issued invite record used to authenticate joiner-authored
 /// `MemberJoined` requests at the original inviter.
-/// #470: full equality (consumption state included) so `GroupInfo`'s
-/// derived `PartialEq` covers `issued_invites` completely.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssuedInviteRecord {
     /// Unix seconds when the invite was minted.
@@ -411,12 +409,6 @@ impl ForkQuarantine {
 /// detail derived from the same evidence, so it cannot differ between two
 /// markers whose identity fields agree, and carrying it would make every
 /// token clone a deep copy of two commit headers for no decision value.
-///
-/// **The destructuring in this type's `from_marker` constructor is exhaustive
-/// on purpose.** A field added to [`ForkQuarantine`] that this type should
-/// consider fails the BUILD there rather than silently widening the set of
-/// marker changes the epoch token cannot see. That is a stronger guarantee
-/// than a test, and it is why no `..` appears in that pattern.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForkQuarantineIdentity {
     revision: u64,
@@ -428,7 +420,6 @@ pub struct ForkQuarantineIdentity {
 
 impl ForkQuarantineIdentity {
     fn from_marker(marker: &ForkQuarantine) -> Self {
-        // Exhaustive — see the type doc. Do NOT add `..`.
         let ForkQuarantine {
             revision,
             state_hash,
@@ -456,25 +447,6 @@ impl ForkQuarantineIdentity {
 /// ADR-0067: the lifecycle epoch token, captured at an authorization check
 /// and re-validated inside the critical section that performs the
 /// irreversible act.
-///
-/// **Why this exists.** Every ADR-0066 gate (slices 1–6) consults the
-/// marker at the START of an operation. A marker installed — or cleared, or
-/// advanced to a new evidence revision — BETWEEN that check and the persist
-/// lets a contested write through, or wrongly refuses a permitted one.
-/// ADR-0066 §4 closes that window with a token; ADR-0067 settles what the
-/// token is.
-///
-/// **Why it is derived and not counted.** ADR-0066 §4 specified a
-/// `quarantine_generation` counter "on the group entry" while its own
-/// ratified R4 forbade "no new #470 full-equality participant" — and
-/// [`GroupInfo`] derives [`PartialEq`] with that full equality deliberately
-/// load-bearing for `persist_named_groups_mutation_unlocked`'s
-/// compare-and-restore rollback. The two cannot both hold. Worse, a census
-/// found three marker writers no process-local counter reaches: the on-disk
-/// recovery install, and the two clears that mutate the roster under a raw
-/// `named_groups.write()` without the persistence lock. A counter's
-/// completeness would rest on an enumeration whose failure mode is
-/// **fail-open**.
 ///
 /// So the token is DERIVED from the live record on demand:
 /// `(state_revision, marker identity)`. Nothing is stored, so nothing can go
@@ -540,7 +512,6 @@ impl LifecycleEpochToken {
     }
 }
 
-/// #732 r8: one symmetric fold contribution for [`LifecycleEpochToken::spanning_aliases`].
 /// splitmix64's finalizer, so structurally adjacent revisions (4 and 5)
 /// cannot compensate each other the way raw addition would (`4 + 9 == 5 + 8`
 /// would mask a real advance behind a rollback).
@@ -600,7 +571,6 @@ impl LifecycleEpochToken {
 /// #470 failure).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GroupInfo {
-    // ── v1 compat (read-only) ───────────────────────────────────────────
     #[serde(default, skip_serializing)]
     pub members: BTreeSet<String>,
     #[serde(default, skip_serializing)]
@@ -608,7 +578,6 @@ pub struct GroupInfo {
     #[serde(default, skip_serializing)]
     pub membership_revision: u64,
 
-    // ── v2 identity + topics ────────────────────────────────────────────
     pub name: String,
     pub description: String,
     pub creator: AgentId,
@@ -619,7 +588,6 @@ pub struct GroupInfo {
     pub metadata_topic: String,
     pub chat_topic_prefix: String,
 
-    // ── v2 policy + roster ──────────────────────────────────────────────
     #[serde(default)]
     pub policy: GroupPolicy,
     #[serde(default)]
@@ -633,14 +601,8 @@ pub struct GroupInfo {
     #[serde(default)]
     pub discovery_card_topic: Option<String>,
 
-    // ── Phase D.2: Group Shared Secret (GSS) for cross-daemon encrypted
-    //    content delivery. This is a symmetric-key layer distributed via
-    //    welcomes, NOT full MLS TreeKEM. It gives:
-    //      - cross-daemon encrypt/decrypt (proven from the correct peer)
-    //      - rekey-on-ban semantics (banned peer loses future access)
-    //    It does NOT give per-message forward secrecy within an epoch.
-    //    Full TreeKEM cross-daemon join is blocked on saorsa-mls upstream
-    //    providing a `from_welcome` constructor.
+    // The shared secret is a symmetric key sent in welcomes, not TreeKEM:
+    // rekey-on-ban, but no forward secrecy within an epoch.
     /// 32-byte random secret for MlsEncrypted groups. None for SignedPublic or
     /// for stub entries created via card import (importer isn't a member yet).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -657,7 +619,6 @@ pub struct GroupInfo {
     #[serde(default = "secure_plane_legacy_default")]
     pub secure_plane: SecureGroupPlane,
 
-    // ── Phase D.3: Stable identity + evolving validity ──────────────────
     /// Stable genesis record — establishes the group's permanent `group_id`.
     /// Reconstructed from `mls_group_id` + creator + created_at when
     /// migrating pre-D.3 blobs (see [`GroupInfo::migrate_from_v1`]).
@@ -921,15 +882,10 @@ pub fn sole_member_in_being_excluding_join_markers(
 
 /// The single self-leave routing predicate (#369): classify `leaver_hex`'s
 /// DELETE against the live roster and join-request view.
-///
-/// Replaces the former `last_admin_self_leave_precheck_error` hand-synced
-/// pair: the last-admin evaluation still runs on a clone so rejected leaves
-/// cannot mutate live group state.
 #[must_use]
 pub fn leave_disposition(info: &GroupInfo, leaver_hex: &str) -> LeaveDisposition {
-    // Pending comes from join_requests (authoritative), NOT the roster's
-    // seeded Pending entries: reject/cancel clear the roster mirror, and a
-    // KEM-less request never seeds one at all (PR #370 r2 blocker 1).
+    // `join_requests` is the authority for a pending joiner: a KEM-less
+    // request seeds no roster row, and reject/cancel clear the roster mirror.
     let has_pending_request = info.has_pending_join_request();
     if !has_pending_request && info.sole_member_in_being_excluding_join_markers(leaver_hex) {
         return LeaveDisposition::SoleMemberDelete;
@@ -940,10 +896,6 @@ pub fn leave_disposition(info: &GroupInfo, leaver_hex: &str) -> LeaveDisposition
     {
         return LeaveDisposition::Proceed;
     }
-    // Blocked. When the leaver is the only ACTIVE member and a join request
-    // is still pending, the actionable recovery is resolving the request
-    // (approve it, or reject/cancel it so the delete unlocks), not promoting
-    // a member that does not exist.
     let leaver_is_only_active =
         info.has_active_member(leaver_hex) && info.active_member_count() == 1;
     if leaver_is_only_active && has_pending_request {
@@ -976,10 +928,6 @@ impl std::fmt::Display for SetMemberCertificateError {
     }
 }
 impl GroupInfo {
-    /// ADR-0064 (Guard A): whether this node currently refuses
-    /// membership-gated routes for the group because authenticated fork
-    /// evidence is outstanding. ADR-0066 §2: true for ordinary groups too
-    /// (the marker then carries `no_anchor`).
     /// ADR-0067: this group's lifecycle epoch token, derived from the live
     /// record.
     ///
@@ -999,6 +947,10 @@ impl GroupInfo {
         }
     }
 
+    /// ADR-0064 (Guard A): whether this node currently refuses
+    /// membership-gated routes for the group because authenticated fork
+    /// evidence is outstanding. ADR-0066 §2: true for ordinary groups too
+    /// (the marker then carries `no_anchor`).
     #[must_use]
     pub fn is_fork_quarantined(&self) -> bool {
         self.fork_quarantine.is_some()
@@ -1085,8 +1037,6 @@ impl GroupInfo {
             GroupMember::new_admin(creator_hex.clone(), None, now),
         );
 
-        // Generate a fresh shared secret for MlsEncrypted groups. SignedPublic
-        // groups don't need one — their content is signed but not encrypted.
         let shared_secret = if policy.confidentiality == GroupConfidentiality::MlsEncrypted {
             use rand::RngCore;
             let mut secret = vec![0u8; 32];
@@ -1096,12 +1046,6 @@ impl GroupInfo {
             None
         };
 
-        // All groups are MLS groups — the MLS group id IS the stable group id.
-        // The genesis record is retained for audit (creator + creation timestamp),
-        // but its `group_id` is pinned to the MLS group id so every id surface
-        // (owner named_groups key, card.group_id, metadata_topic) converges on
-        // a single value. Prior to this, genesis.group_id was a separately
-        // derived BLAKE3 hash which caused cross-daemon lookup drift.
         let genesis = state_commit::GroupGenesis::with_existing_id(
             mls_group_id.clone(),
             creator_hex.clone(),
@@ -1133,11 +1077,8 @@ impl GroupInfo {
             commit_log: Vec::new(),
             shared_secret,
             secret_epoch: 0,
-            // Generic constructor stays on the legacy GSS plane (matching the
-            // shared_secret generated above). The secure-by-default TreeKEM
-            // routing is applied explicitly in the daemon's create-group path
-            // (ADR-0012 Phase 2), not here, so card-import stubs and other
-            // constructors are not silently relabelled.
+            // The generic constructor stays on the GSS plane. The daemon create
+            // path picks TreeKEM, so card-import stubs are not relabelled.
             secure_plane: SecureGroupPlane::Gss,
 
             genesis: Some(genesis),
@@ -1145,8 +1086,6 @@ impl GroupInfo {
             state_hash: String::new(),
             prev_state_hash: None,
             security_binding: match confidentiality {
-                // #1604: an unknown confidentiality is treated as the most
-                // restrictive (encrypted) plane.
                 GroupConfidentiality::MlsEncrypted | GroupConfidentiality::Unknown => {
                     Some("gss:epoch=0".into())
                 }
@@ -1189,8 +1128,6 @@ impl GroupInfo {
         (new_secret, self.secret_epoch)
     }
 
-    // ── Phase D.3: state-commit chain ──────────────────────────────────
-
     /// The stable `group_id` (Phase D.3). Falls back to `mls_group_id` for
     /// pre-D.3 groups where genesis has not yet been reconstructed.
     #[must_use]
@@ -1210,9 +1147,6 @@ impl GroupInfo {
             tags: self.tags.clone(),
             avatar_url: self.avatar_url.clone(),
             banner_url: self.banner_url.clone(),
-            // ADR-0038 review fix 1: the Home metadata commitment rides
-            // the signed state hash; forging `home` after the fact breaks
-            // state-hash validation.
             home_digest: self.home.as_ref().map(state_commit::compute_home_digest),
         }
     }
@@ -1353,32 +1287,18 @@ impl GroupInfo {
         ),
         state_commit::ApplyError,
     > {
-        // Round-4: consumes the CALLER'S verdict — no re-evaluation, no
-        // fresh clock read; the commit and the evaluation cannot disagree.
         let original = self.clone();
         let signer_hex = hex::encode(keypair.agent_id().as_bytes());
         let evicted = self.enforce_owner_certified_admission(&signer_hex, verdict);
         match self.seal_commit_inner(keypair, now_ms) {
             Ok(commit) => {
-                // Round-4 regression rule: the restore quarantine lifts
-                // ONLY on an all-clean verdict — a grace-admitted
-                // evidence-missing member must keep the group
-                // quarantined.
-                // ADR-0064 r2: this shared wrapper is what ~22 ROUTINE
-                // mutation sites (rename, policy, add/ban/promote, …)
-                // seal through, so it must NOT clear the fork-quarantine
-                // marker — the owner-anchored local clear is
-                // [`Self::clear_fork_quarantine_on_explicit_owner_seal`],
-                // called only from the explicit seal route.
+                // Only an all-clean verdict lifts the restore quarantine. Routine
+                // mutations seal through here, so the fork-quarantine marker stays.
                 if verdict.is_all_clean() {
                     self.owner_cert_reverify_required = false;
                 }
                 Ok((commit, evicted))
             }
-            // A failed seal leaves the group untouched: without this
-            // restore, the prune above would outlive the commit it was
-            // meant to be part of, and a retry (or the last-admin veto
-            // itself) would see a silently-amputated roster.
             Err(err) => {
                 *self = original;
                 Err(err)
@@ -1424,8 +1344,6 @@ impl GroupInfo {
             return;
         }
         self.fork_quarantine = None;
-        // Slice 4: the clear re-arms the evidence gate (see
-        // `reset_fork_evidence_after_quarantine_clear`).
         self.reset_fork_evidence_after_quarantine_clear();
     }
 
@@ -1461,28 +1379,15 @@ impl GroupInfo {
     ) -> Result<state_commit::GroupStateCommit, state_commit::ApplyError> {
         self.seal_commit_inner(keypair, now_ms)
     }
-    /// Shared sealing core: chain advance + signature. No admission logic —
-    /// the public entry points own that.
     fn seal_commit_inner(
         &mut self,
         keypair: &AgentKeypair,
         now_ms: u64,
     ) -> Result<state_commit::GroupStateCommit, state_commit::ApplyError> {
-        // #1604 G5: never sign a state that holds a variant this node does
-        // not know (its policy and roster hashes cannot be computed).
         self.refuse_unknown_variants()?;
-        // ADR-0016 R2: never author a commit whose post-mutation,
-        // non-withdrawn state has zero active admins. `self` already holds
-        // the caller's domain mutations, so this evaluates the proposed
-        // post-mutation roster before any chain field is touched.
         state_commit::enforce_last_admin_invariant(&self.members_v2, self.withdrawn)?;
         if self.withdrawn {
             let signer_hex = hex::encode(keypair.agent_id().as_bytes());
-            // #369: withdrawn commits are admin-authored, except by the sole
-            // member-in-being — their terminal exit IS the group's unanimous
-            // decision (see `seal_withdrawal`). #1578 rc11: the join's
-            // key-only marker row is not a seat, so it does not make the
-            // pre-admission joiner a sole member-in-being.
             let authorized =
                 state_commit::active_signer_is_admin_or_higher(&self.members_v2, &signer_hex)
                     || self.sole_member_in_being_excluding_join_markers(&signer_hex);
@@ -1493,25 +1398,18 @@ impl GroupInfo {
                 });
             }
         }
-        // Ensure the genesis record is present — callers may reach here via
-        // migrated paths that didn't set it yet.
         if self.genesis.is_none() {
             let creator_hex = hex::encode(self.creator.as_bytes());
             self.genesis = Some(state_commit::GroupGenesis::with_existing_id(
                 self.mls_group_id.clone(),
                 creator_hex,
                 self.created_at,
-                // Deterministic nonce from mls_group_id so migration is
-                // idempotent across daemon restarts.
+                // Derived from `mls_group_id`: the migration is idempotent across restarts.
                 hex::encode(blake3::hash(self.mls_group_id.as_bytes()).as_bytes()),
             ));
         }
-        // NOTE: do NOT recompute here. `self.state_hash` reflects the
-        // *last committed* state; that is what the new commit's
-        // `prev_state_hash` must link to. Mutations the caller made
-        // since the last commit are intentionally not yet reflected in
-        // `self.state_hash` — the recompute below folds them in under
-        // the new revision.
+        // `state_hash` is still the last committed state here; the new
+        // commit's `prev_state_hash` must link to it.
         let prev = self.state_hash.clone();
         self.state_revision = self.state_revision.saturating_add(1);
         self.prev_state_hash = Some(prev.clone());
@@ -1534,8 +1432,6 @@ impl GroupInfo {
             now_ms,
             keypair,
         )?;
-        // issue #111: retain the locally-authored commit + the roster it
-        // committed. `self` already reflects the committed state here.
         self.retain_commit(&commit);
         Ok(commit)
     }
@@ -1585,14 +1481,6 @@ impl GroupInfo {
                 {
                     return None;
                 }
-                // Digest-gated embedded fallback (round-3): the committed
-                // cert seats the member ONLY when the agent's latest
-                // announce does not contradict it. A known announce digest
-                // different from the embedded cert's digest means the owner
-                // re-keyed/re-issued — the embedded cert is STALE and must
-                // not seat. ADR 0108 §4: in Home scope an anonymous digest
-                // from the agent's bound machine is no announce at all,
-                // never a contradiction.
                 let embedded_is_stale = m.certificate.as_ref().is_some_and(|cert| {
                     evidence
                         .disclosed_digest_for(agent_hex, home_scope)
@@ -1612,9 +1500,6 @@ impl GroupInfo {
                     return None;
                 }
 
-                // Neither source verifies: report the informative failure
-                // kind — the resolved cert's own failure when one existed,
-                // otherwise "no certificate at all".
                 let failure = evidence
                     .cert_for(agent_hex)
                     .map(check)
@@ -1739,17 +1624,6 @@ impl GroupInfo {
                 );
                 continue;
             }
-            // Invite-auth #468/#469 (design v5 D2 / v6 E2): a DIGEST-ONLY
-            // seat — the signed roster root commits to this member's
-            // certificate digest but the bytes are not embedded
-            // (key-stripped invite/recovery state, a projection-materialized
-            // adoption member, or a restart before hydration). PENDING,
-            // never missing evidence: no grace-window stamping and no
-            // missing-evidence eviction can touch the seat, while every
-            // operation needing the certificate BYTES fails closed
-            // (`is_all_clean` stays false until
-            // `hydrate_member_certificates` installs them). Only revocation
-            // (checked above) outranks it.
             let digest_only = embedded.is_none()
                 && self
                     .members_v2
@@ -1761,10 +1635,6 @@ impl GroupInfo {
                 per_member.insert(agent_hex, owner_cert::MemberCertStatus::DigestPending);
                 continue;
             }
-            // ADR 0108 §4: in Home scope an anonymous digest from the
-            // agent's bound machine is no announce at all, so it can
-            // neither stale the embedded certificate nor leave a fetch in
-            // flight below.
             let embedded_is_stale = embedded.as_ref().is_some_and(|cert| {
                 evidence
                     .disclosed_digest_for(&agent_hex, home_scope)
@@ -1783,9 +1653,6 @@ impl GroupInfo {
                 per_member.insert(agent_hex, owner_cert::MemberCertStatus::Clean);
                 continue;
             }
-            // Evidence in flight: a warranted fetch outstanding means the
-            // member is mid-rotation (INCLUDING a stale/expired embedded
-            // cert awaiting its replacement). Grace applies.
             if evidence.disclosed_fetch_in_flight(&agent_hex, home_scope) {
                 match Self::apply_missing_evidence_grace(
                     &mut self.members_v2,
@@ -1800,11 +1667,6 @@ impl GroupInfo {
                         );
                     }
                     None => {
-                        // #1023 (Engineer ruling 1 Nov 2026 02:36 GMT): an
-                        // unfetchable renewal must not make the creator's
-                        // own expired certificate eviction-eligible through
-                        // the grace window either — the hold applies past
-                        // the window too.
                         if self.creator_expired_certificate_hold(&agent_hex, now) {
                             per_member
                                 .insert(agent_hex, owner_cert::MemberCertStatus::DigestPending);
@@ -1820,30 +1682,12 @@ impl GroupInfo {
                 }
                 continue;
             }
-            // A present-but-failing certificate is a definitive failure:
-            // no grace.
             if resolved.is_some() || embedded.is_some() {
                 clear_ts(&mut self.members_v2);
                 let reason = resolved
                     .and_then(|cert| check(cert).err())
                     .or_else(|| embedded.as_ref().and_then(|cert| check(cert).err()))
                     .unwrap_or(owner_cert::OwnerCertFailure::NoCertificate);
-                // Engineer ruling 1 Nov 2026 02:36 GMT: the creator seat
-                // never becomes eviction-eligible from its own EXPIRED
-                // certificate alone. The hold keys on the COMMITTED
-                // (embedded) certificate's failure — never an announced
-                // one — and an expired committed certificate on the
-                // creator holds like a digest-only seat: `DigestPending`
-                // is never in `OwnerCertVerdict::failed()`, so no
-                // ordinary-seal eviction set names the creator seat while
-                // its renewal is outstanding, while every operation that
-                // needs valid creator bytes still fails closed
-                // (`is_all_clean` stays false). The S4 eviction paths
-                // treat a held creator as non-blocking
-                // (`creator_expired_certificate_hold`), so revocation
-                // evictions of other members still seal. Any other
-                // failure (revocation is checked above; wrong owner or
-                // agent, a bad signature) stays `Failed`.
                 if self.creator_expired_certificate_hold(&agent_hex, now) {
                     per_member.insert(agent_hex, owner_cert::MemberCertStatus::DigestPending);
                     continue;
@@ -1851,7 +1695,6 @@ impl GroupInfo {
                 per_member.insert(agent_hex, owner_cert::MemberCertStatus::Failed { reason });
                 continue;
             }
-            // Totally missing evidence: grace window bookkeeping.
             match Self::apply_missing_evidence_grace(
                 &mut self.members_v2,
                 &agent_hex,
@@ -1880,11 +1723,6 @@ impl GroupInfo {
         }
     }
 
-    /// Grace-window bookkeeping shared by every missing-evidence path:
-    /// first observation stamps `certificate_missing_since_ms` and returns
-    /// `Some(now)`; inside the window returns `Some(window_start)`; past
-    /// the window returns `None` — the member is evictable as
-    /// `NoCertificate`.
     fn apply_missing_evidence_grace(
         members_v2: &mut BTreeMap<String, GroupMember>,
         agent_hex: &str,
@@ -1916,9 +1754,6 @@ impl GroupInfo {
         authority_hex: &str,
         verdict: &owner_cert::OwnerCertVerdict,
     ) -> Vec<(String, owner_cert::OwnerCertFailure)> {
-        // Round-4: enforcement consumes the verdict produced by
-        // [`Self::owner_cert_verdict`] — `Failed` members only; `InGrace`
-        // members are retained by construction.
         let failures = verdict.failed();
         for (agent_hex, failure) in &failures {
             tracing::warn!(
@@ -1983,10 +1818,6 @@ impl GroupInfo {
         &mut self,
         certificates: &[(String, crate::identity::AgentCertificate)],
     ) -> usize {
-        // #1023: collect the commit-log fallback before any mutation (the
-        // scan borrows `self` immutably). A seat the caller covers is left
-        // to the caller's entry — the shared loop below skips byte-bearing
-        // seats, so an overlap cannot double-install.
         let mut from_commit_log: Vec<(String, crate::identity::AgentCertificate)> = Vec::new();
         for (agent_hex, member) in &self.members_v2 {
             if member.certificate.is_some() {
@@ -2006,9 +1837,6 @@ impl GroupInfo {
                     from_commit_log.push((agent_hex.clone(), cert.clone()));
                     break;
                 }
-                // A byte-bearing snapshot for a DIFFERENT admission is not
-                // a verdict on this seat: keep looking — a record
-                // installed whole can hold byte-bearing older links.
             }
         }
         let mut hydrated = 0usize;
@@ -2017,13 +1845,9 @@ impl GroupInfo {
                 continue;
             };
             if member.certificate.is_some() {
-                // Bytes already seated — the committed entry is complete;
-                // hydration targets digest-only seats exclusively.
                 continue;
             }
             let Some(committed) = member.certificate_digest.clone() else {
-                // No committed digest: nothing binds this certificate to
-                // the seat — hydration is digest-anchored by design.
                 tracing::debug!(
                     group_id = %self.stable_group_id(),
                     member = %agent_hex,
@@ -2033,10 +1857,6 @@ impl GroupInfo {
             };
             let digest = owner_cert::certificate_digest_hex(cert);
             if digest != committed {
-                // Evidence for a DIFFERENT admission (e.g. the owner
-                // re-keyed while this roster still commits to the old
-                // digest): the seat stays pending; never rewrite the
-                // commitment.
                 tracing::debug!(
                     group_id = %self.stable_group_id(),
                     member = %agent_hex,
@@ -2068,8 +1888,6 @@ impl GroupInfo {
                 continue;
             };
             let actual = owner_cert::certificate_digest_hex(cert);
-            // Repair ONLY the both-present mismatch: a digest-less legacy
-            // entry stays digest-less (its root already covers the bytes).
             if member
                 .certificate_digest
                 .as_deref()
@@ -2086,9 +1904,6 @@ impl GroupInfo {
                 repaired += 1;
             }
         }
-        // #1023: age the certificate carry at load too — a record
-        // installed whole (a backup restore, a peer-built file) keeps old
-        // byte-bearing links until its next commit otherwise.
         self.age_certificate_carry();
         repaired
     }
@@ -2105,11 +1920,6 @@ impl GroupInfo {
             .and_then(|m| m.certificate.as_ref())
     }
 
-    /// Append a retained commit for the just-committed state and enforce
-    /// [`COMMIT_LOG_CAP`]. `self` must already reflect the committed roster
-    /// (callers mutate then seal/finalize, so this holds). The single
-    /// chokepoint both commit-production paths route through, so retention
-    /// cannot be forgotten at an individual apply site.
     fn retain_commit(&mut self, commit: &state_commit::GroupStateCommit) {
         self.commit_log.push(state_commit::RetainedCommit::capture(
             commit.clone(),
@@ -2170,9 +1980,6 @@ impl GroupInfo {
         now_ms: u64,
     ) -> Result<state_commit::GroupStateCommit, state_commit::ApplyError> {
         let signer_hex = hex::encode(keypair.agent_id().as_bytes());
-        // #1578 rc11: as in `seal_commit_inner`, the join's key-only
-        // marker row is not a seat — the pre-admission joiner is not a
-        // sole member-in-being.
         let authorized =
             state_commit::active_signer_is_admin_or_higher(&self.members_v2, &signer_hex)
                 || self.sole_member_in_being_excluding_join_markers(&signer_hex);
@@ -2185,10 +1992,8 @@ impl GroupInfo {
 
         let original = self.clone();
         self.withdrawn = true;
-        // Terminal withdrawal seals via the inner path: a withdrawn
-        // tombstone grants no access, so OwnerCertified re-verification is
-        // moot and must not be able to block tearing a group down
-        // (ADR-0038 enforcement targets LIVE admission, not exits).
+        // A withdrawal seals through the inner path: owner-certificate
+        // re-verification must not block the teardown of a group.
         match self.seal_commit_inner(keypair, now_ms) {
             Ok(commit) => {
                 self.shared_secret = None;
@@ -2235,8 +2040,6 @@ impl GroupInfo {
         commit: &state_commit::GroupStateCommit,
         allow_live_withdrawal: bool,
     ) -> Result<(), state_commit::ApplyError> {
-        // #1604 G5: never accept a state that holds a variant this node does
-        // not know.
         self.refuse_unknown_variants()?;
         if self.withdrawn && !commit.withdrawn {
             return Err(state_commit::ApplyError::Withdrawn);
@@ -2259,19 +2062,20 @@ impl GroupInfo {
                 got: self.state_hash.clone(),
             });
         }
-        // ADR-0016 R2: reject any applied commit whose post-mutation,
-        // non-withdrawn state has zero active admins. Runs after the hash
-        // check so the roster being validated is provably the roster the
-        // signed commit's `roster_root` committed to.
+        // After the hash check: the roster checked here is the roster the
+        // signed `roster_root` commits to.
         state_commit::enforce_last_admin_invariant(&self.members_v2, self.withdrawn)?;
         if live_to_withdrawn {
             self.shared_secret = None;
         }
-        // issue #111: retain the peer-authored commit only after it has
-        // validated and applied cleanly (post hash-match + invariants), so
-        // rejected commits never enter the history.
         self.retain_commit(commit);
         Ok(())
+    }
+
+    fn refuse_unknown_variants(&self) -> Result<(), state_commit::ApplyError> {
+        crate::wire_compat::reject_unknown("GroupInfo", self)
+            .map(|_| ())
+            .map_err(|e| state_commit::ApplyError::Invariant(e.to_string()))
     }
 
     /// Finalize a non-terminal commit **after** the caller has already performed
@@ -2285,15 +2089,6 @@ impl GroupInfo {
     /// finalizer deliberately rejects live -> withdrawn commits; use
     /// [`GroupInfo::finalize_applied_terminal_commit`] only from explicit
     /// terminal event handling.
-    /// #1604 G5: refuse a state that holds an `Unknown` variant before it is
-    /// hashed, signed or applied. `Unknown` is never encoded, so its policy
-    /// and roster hashes cannot be computed.
-    fn refuse_unknown_variants(&self) -> Result<(), state_commit::ApplyError> {
-        crate::wire_compat::reject_unknown("GroupInfo", self)
-            .map(|_| ())
-            .map_err(|e| state_commit::ApplyError::Invariant(e.to_string()))
-    }
-
     pub fn finalize_applied_commit(
         &mut self,
         commit: &state_commit::GroupStateCommit,
@@ -2301,28 +2096,6 @@ impl GroupInfo {
         self.finalize_applied_commit_with_terminal_mode(commit, false)
     }
 
-    /// #458 (review r2): finalize a commit a joiner stub ADOPTED across a
-    /// `prev_state_hash` gap, WITHOUT ever blind-copying the commit's
-    /// chain fields onto content they do not cover.
-    ///
-    /// Verified before anything mutates:
-    /// - the reconstructed roster's root equals the commit's SIGNED
-    ///   `roster_root` — the joiner's seat, role, state and committed
-    ///   certificate are exactly what the authority signed;
-    /// - the last-admin invariant holds on that roster.
-    ///
-    /// Then the joiner FORKS its local chain at its own frontier, keeping
-    /// internal consistency: `state_revision` advances to the commit's
-    /// revision and `security_binding` follows the commit (an epoch
-    /// input), but `prev_state_hash` chains from the LOCAL hash and
-    /// `state_hash` is RECOMPUTED from local content — never copied.
-    /// Copying the commit's hash would bind the joiner's stored hash to
-    /// intermediate metadata (e.g. a rename) the stub never saw, leaving
-    /// hash ≠ content; the next normal apply/seal would then recompute
-    /// and reject, wedging the very joiner this path exists to free.
-    /// A forked joiner converges on later authority commits through this
-    /// same roster-root-verified path until a full resync (restart,
-    /// catch-up) rebuilds the chain link.
     /// #458 r4: fold a VERIFIED roster projection (its root already
     /// re-derived the signed `roster_root`) into the live roster: entries
     /// adopt the projection's role/state, members absent from the
@@ -2342,7 +2115,6 @@ impl GroupInfo {
         &mut self,
         projection: &BTreeMap<String, state_commit::RosterMemberSnapshot>,
     ) {
-        // Remove entries the projection dropped (or made non-root-visible).
         let dropped: Vec<String> = self
             .members_v2
             .keys()
@@ -2353,15 +2125,6 @@ impl GroupInfo {
             self.members_v2.remove(&id);
         }
         for (id, snap) in projection {
-            // #1023: snapshot-carried certificate bytes install on
-            // adoption ONLY when they hash to the entry's committed
-            // `certificate_digest` — the same digest-anchored rule as
-            // [`Self::hydrate_member_certificates`]. Bytes without a
-            // committed digest, or hashing to a different one, are not
-            // evidence for this admission: the seat stays digest-only
-            // (`MemberCertStatus::DigestPending`). A byte-bearing seat
-            // hashes identically to its digest-only form, so the adopted
-            // root never moves.
             let snapshot_certificate = snap
                 .certificate
                 .as_ref()
@@ -2380,19 +2143,8 @@ impl GroupInfo {
                         .as_ref()
                         .map(owner_cert::certificate_digest_hex);
                     if local_digest.as_deref() != snap.certificate_digest.as_deref() {
-                        // The projection is authoritative for cert identity:
-                        // a local cert whose digest no longer matches is
-                        // STALE — drop the BYTES but KEEP the projection's
-                        // digest (assigned below), so the member stays
-                        // digest-seated instead of evidence-less.
                         member.certificate = None;
                     }
-                    // Invite-auth #468/#469 (design v5 D2): the projection's
-                    // digest rides onto the entry whether or not local bytes
-                    // survived, so `compute_roster_root` re-derives the
-                    // projection's signed root and a byte-less member
-                    // remains digest-committed
-                    // (`MemberCertStatus::DigestPending`).
                     member.certificate_digest = snap.certificate_digest.clone();
                     if member.certificate.is_none() {
                         member.certificate = snapshot_certificate;
@@ -2426,7 +2178,6 @@ impl GroupInfo {
         if self.withdrawn && !commit.withdrawn {
             return Err(state_commit::ApplyError::Withdrawn);
         }
-        // Fold the verified metadata so content matches the hash we adopt.
         self.name = meta.name.clone();
         self.description = meta.description.clone();
         self.tags = meta.tags.clone();
@@ -2456,15 +2207,8 @@ impl GroupInfo {
                 got: recomputed,
             });
         }
-        // #458 r5d — GSS/Legacy `security_binding`: for non-TreeKEM
-        // planes the binding string ("gss:epoch=N") is NOT tied to any
-        // key material a joiner can independently verify; adopting it from
-        // the verified terminal commit makes it HASH-CONSISTENT-ONLY (the
-        // full-hash equality above proves the authority committed to this
-        // exact string). TreeKEM planes bind epochs to the snapshot the
-        // rebind path verifies separately. Adoption itself is restricted
-        // to OwnerCertified groups anchored by the owner-signed head
-        // attestation, which is the real integrity bound here.
+        // On a non-TreeKEM plane the adopted binding is hash-consistent only:
+        // no key material lets a joiner verify it.
         self.security_binding = commit.security_binding.clone();
         self.state_revision = commit.revision;
         self.prev_state_hash = commit.prev_state_hash.clone();
@@ -2498,6 +2242,28 @@ impl GroupInfo {
         result
     }
 
+    /// #458 (review r2): finalize a commit a joiner stub ADOPTED across a
+    /// `prev_state_hash` gap, WITHOUT ever blind-copying the commit's
+    /// chain fields onto content they do not cover.
+    ///
+    /// Verified before anything mutates:
+    /// - the reconstructed roster's root equals the commit's SIGNED
+    ///   `roster_root` — the joiner's seat, role, state and committed
+    ///   certificate are exactly what the authority signed;
+    /// - the last-admin invariant holds on that roster.
+    ///
+    /// Then the joiner FORKS its local chain at its own frontier, keeping
+    /// internal consistency: `state_revision` advances to the commit's
+    /// revision and `security_binding` follows the commit (an epoch
+    /// input), but `prev_state_hash` chains from the LOCAL hash and
+    /// `state_hash` is RECOMPUTED from local content — never copied.
+    /// Copying the commit's hash would bind the joiner's stored hash to
+    /// intermediate metadata (e.g. a rename) the stub never saw, leaving
+    /// hash ≠ content; the next normal apply/seal would then recompute
+    /// and reject, wedging the very joiner this path exists to free.
+    /// A forked joiner converges on later authority commits through this
+    /// same roster-root-verified path until a full resync (restart,
+    /// catch-up) rebuilds the chain link.
     pub fn finalize_adopted_commit_roster_checked(
         &mut self,
         commit: &state_commit::GroupStateCommit,
@@ -2603,9 +2369,6 @@ impl GroupInfo {
                 self.updated_at = self.created_at;
             }
         }
-        // Phase D.3: backfill stable-genesis deterministically from the
-        // existing mls_group_id so migrated blobs carry the same
-        // `stable_group_id` across restarts.
         if self.genesis.is_none() {
             let creator_hex = hex::encode(self.creator.as_bytes());
             let nonce = hex::encode(blake3::hash(self.mls_group_id.as_bytes()).as_bytes());
@@ -2616,14 +2379,11 @@ impl GroupInfo {
                 nonce,
             ));
         }
-        // Phase D.3: if security_binding is unset on an MlsEncrypted group,
-        // derive it from the current secret_epoch.
         if self.security_binding.is_none()
             && self.policy.confidentiality == GroupConfidentiality::MlsEncrypted
         {
             self.security_binding = Some(format!("gss:epoch={}", self.secret_epoch));
         }
-        // Phase D.3: recompute state_hash if absent.
         if self.state_hash.is_empty() {
             self.recompute_state_hash();
         }
@@ -2807,14 +2567,8 @@ impl GroupInfo {
         self.members_v2
             .entry(agent_id_hex.clone())
             .and_modify(|m| {
-                // #1663 review round 4 (Claude, 30 Oct): a row returning
-                // to Active from Removed or Banned starts a fresh
-                // republication epoch — the re-joined member's own row is
-                // new, so a retained counter would refuse its every
-                // republication as stale. The reset rides the signed
-                // re-admission every peer applies alike; an already-Active
-                // row keeps its counter. The admission floor (David's
-                // ruling, 2 Nov) refuses a frame signed before it.
+                // A row that returns to Active starts a fresh republication epoch: a
+                // kept counter would refuse the member's every republication as stale.
                 if m.state != GroupMemberState::Active {
                     m.note_readmission(admission_revision);
                 }
@@ -2971,8 +2725,6 @@ impl GroupInfo {
     pub fn unban_member(&mut self, agent_id_hex: &str) {
         if let Some(m) = self.members_v2.get_mut(agent_id_hex) {
             if m.state == GroupMemberState::Banned {
-                // #1663: an unban is a re-admission — the same fresh
-                // republication epoch as `add_member_with_kem`.
                 m.note_readmission(self.state_revision);
                 m.state = GroupMemberState::Active;
                 m.updated_at = now_millis();
@@ -3014,15 +2766,9 @@ impl GroupInfo {
         self.join_requests.values().any(JoinRequest::is_pending)
     }
 
-    /// #1578 rc7/rc8, moved from the server layer (rc11): the local
-    /// join's own-key marker row. The join seats the joiner's own
-    /// published KEM key on a Pending row of its own stub (rc7); the
-    /// row carries no admission state — only the key — so every seat
-    /// check must treat it as absent, exactly main's roster, where the
-    /// joiner holds no row before its `MemberAdded` lands. A Pending
-    /// row with a live join request is a real seat marker (the
-    /// request/approve path seats the requester on the authority's
-    /// copy), not the join's key carrier, so it does not match.
+    /// The local join's own-key marker: a Pending row that carries only the
+    /// joiner's KEM key and has no live join request. Seat checks treat it
+    /// as absent.
     #[must_use]
     pub(crate) fn join_seat_key_marker_only(&self, joiner_hex: &str) -> bool {
         if self.join_requests.values().any(|req| {
@@ -3045,11 +2791,6 @@ impl GroupInfo {
         )
     }
 
-    /// #1578 rc11 (Claude blocking 1, audit): the agents whose only
-    /// roster row is the local join's key-only marker
-    /// ([`Self::join_seat_key_marker_only`]) — the rows every
-    /// seat-count lookup must treat as absent, exactly main's roster
-    /// before the joiner's `MemberAdded` lands.
     #[must_use]
     pub(crate) fn join_seat_key_marker_agents(&self) -> BTreeSet<String> {
         self.members_v2
@@ -3059,14 +2800,6 @@ impl GroupInfo {
             .collect()
     }
 
-    /// #1578 rc11 (Claude blocking 1, audit): [`sole_member_in_being`]
-    /// counting the local join's key-only marker row
-    /// ([`Self::join_seat_key_marker_only`]) diverges from main, where
-    /// the joiner holds no roster row before its `MemberAdded` lands. A
-    /// marker row must neither make its joiner the sole member-in-being
-    /// nor inflate the count and hide a real one (a real sole member's
-    /// terminal exit must not turn into a refusal because the joiner's
-    /// stub also carries its own key marker).
     #[must_use]
     pub(crate) fn sole_member_in_being_excluding_join_markers(&self, agent_hex: &str) -> bool {
         sole_member_in_being_excluding_join_markers(
@@ -3234,11 +2967,6 @@ impl GroupInfo {
     }
 }
 
-/// Whether `sender_hex` may reopen a corrupt revocation carrier (#1116).
-///
-/// The sender must be an Active owner or admin. The local agent must be
-/// Active in that same group. A withdrawn group does not qualify. A
-/// moderator, member, guest, outsider, or inactive seat does not qualify.
 pub(crate) fn sender_is_active_group_authority<'a>(
     groups: impl IntoIterator<Item = &'a GroupInfo>,
     local_agent_hex: &str,
