@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **The dormant launcher has process custody on macOS (#1379 slice 1; A14
+  amendment of 17 Nov 2026).** Process identity (PID, start time, boot) comes
+  from libproc, zombies included; stopping another launcher's process pins it
+  with a kqueue exit watch instead of a pidfd. The launcher's custody,
+  coordinator and stop tests now run on macOS as well as Linux.
 - **The dormant launcher has its main loop (#1378; A14 amendment of 17 Nov
   2026).** The `x0x-launcher` start goes through `start.rs`: with the engine
   held, or no host from the inventory issuer, it is the exec passthrough as

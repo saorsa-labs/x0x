@@ -1166,7 +1166,7 @@ mod tests {
 
     /// A healthy live full set commits the host through the driver, and the
     /// child is handed back unreaped.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_healthy_live_candidate_commits_the_host() {
         let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
@@ -1532,7 +1532,7 @@ mod tests {
 
     /// #1981 review item 4: a Committed trial whose old child still runs
     /// is refused; the launcher never overlaps it.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_committed_trial_with_a_live_old_child_is_refused() {
         let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);

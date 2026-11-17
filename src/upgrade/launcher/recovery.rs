@@ -535,7 +535,7 @@ mod tests {
     }
 
     /// Restore never runs while an OLD or candidate process still exists.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn restore_refuses_while_an_old_or_candidate_process_lives() {
         let mut live = std::process::Command::new("sleep")

@@ -483,7 +483,7 @@ mod tests {
 
     /// A prior child that still runs (here: this test process) is final.
     /// Process identity needs Linux procfs.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_surviving_prior_child_is_a_final_exit() {
         let (_dir, _root, host, _record) = fixture(journal::Phase::SwappedCli);

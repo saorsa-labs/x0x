@@ -769,7 +769,7 @@ mod tests {
 
     /// Case 2 with live processes: the coordinator stops and reaps the
     /// healthy candidate before the pair restore.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_live_healthy_candidate_is_stopped_and_reaped_before_restore() {
         let (_dir, _root, host, _record) =
@@ -812,7 +812,7 @@ mod tests {
 
     /// A participant that survives its stop leaves no safe restore: no byte
     /// moves and the host and every trial are RecoveryFailed.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_participant_that_survives_its_stop_fails_recovery_without_restore() {
         let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
@@ -981,7 +981,7 @@ mod tests {
 
     /// A final attempt that is still running has not failed: the pass
     /// proceeds and stops nothing.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_running_final_attempt_is_not_treated_as_failed() {
         let (_dir, _root, host, _record) = fixture(journal::Phase::SwappedCli);
@@ -1178,7 +1178,7 @@ mod tests {
 
     /// The caller must reap its own child first: a live child of this
     /// process refuses the pass before any action.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn recover_refuses_a_live_child_of_this_process() {
         let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
@@ -1204,7 +1204,7 @@ mod tests {
 
     /// A live candidate of another launcher is stopped through
     /// `child::stop_foreign`; that launcher's reaper collects it.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_live_candidate_of_another_launcher_is_stopped_before_restore() {
         let (_dir, _root, host, _record) = fixture(journal::Phase::SwappedCli);
@@ -1274,7 +1274,7 @@ mod tests {
             b.save(path).unwrap();
         }
         let alice = trials[0].0.clone();
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let (identity, reaper) = {
             let mut live = std::process::Command::new("sleep")
                 .arg("30")
@@ -1283,7 +1283,7 @@ mod tests {
             let identity = child::identity(live.id()).unwrap();
             (identity, std::thread::spawn(move || live.wait().unwrap()))
         };
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let identity = Identity {
             pid: std::process::id(),
             start: 0,
@@ -1298,7 +1298,7 @@ mod tests {
             }
             paths(p)
         };
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let resolution =
                 reconcile(&host, trial_path, true, &clock, child::stop_foreign).unwrap();
@@ -1308,7 +1308,7 @@ mod tests {
             assert_previous_pair(&host);
             assert_eq!(journal_record(&root).phase, journal::Phase::Restored);
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let error = reconcile(&host, trial_path, true, &clock, no_stop).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::Unsupported, "{error}");
@@ -1320,7 +1320,7 @@ mod tests {
     /// Review of #1940: the host is fenced before any stop. Bob's launcher
     /// tries a protected start while the pass stops Alice's candidate; the
     /// fence refuses it, so no new candidate runs when the pair is restored.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_peer_spawn_during_the_stop_is_refused_by_the_fence() {
         let (_dir, _root, host, _record) =
@@ -1412,7 +1412,7 @@ mod tests {
 
     /// Two participants, Alice with a live candidate and a Failed verdict.
     /// Returns the trials, the candidate's identity and its reaper.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[allow(clippy::type_complexity)]
     fn alice_runs_a_failed_candidate(
         host: &recovery::Host,
@@ -1446,7 +1446,7 @@ mod tests {
     /// no byte and demotes nothing. Before the fix it wrote its stale
     /// RollingBack trials over the restored ones and, when Bob's save
     /// refused, marked the restored host and trials RecoveryFailed.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_peer_restore_during_the_stop_keeps_the_restored_host_and_child() {
         let (_dir, root, host, _record) =
@@ -1508,7 +1508,7 @@ mod tests {
     /// pass stops the candidate. The pass reads that under the lock and is
     /// final: it moves no byte and rolls no trial back. Before the fix it
     /// wrote RollingBack to the trial and then failed in the restore.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_peer_recovery_failure_during_the_stop_is_final() {
         let (_dir, root, host, _record) =
@@ -1542,7 +1542,7 @@ mod tests {
     /// the trials under the lock and is final: it overwrites no trial,
     /// moves no byte and writes no Restored. Before the fix it rolled the
     /// trials back over the peer's marks and restored the pair.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_peer_recovery_failure_with_an_unwritable_journal_is_final() {
         let (_dir, root, host, _record) =
