@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **The dormant launcher has its main loop (#1378; A14 amendment of 17 Nov
+  2026).** The `x0x-launcher` start goes through `start.rs`: with the engine
+  held, or no host from the inventory issuer, it is the exec passthrough as
+  before. With a host it runs the trial through the supervise driver, keeps a
+  committed or restored daemon, and exits 0 after a stop, 75 to be restarted,
+  or 78 when no automatic start is allowed. No issuer exists yet, so live
+  behaviour is unchanged.
 - **The dormant launcher's multi-participant rollback is final on a failed
   pass and never overwrites a peer's restore (#1378 slice 6; A14 amendment of
   16 Nov 2026).** A failed coordinator pass marks the host and trial

@@ -622,7 +622,16 @@ direct unit. `Restart=always` also restarts on exit 64, so a unit that
 binds the launcher must set `RestartPreventExitStatus=64`: a wrong
 `ExecStart` then stops the job and does not restart it every 5 s. The
 argv contract and the exit codes are provisional and dormant. They are
-frozen before `ENABLED = true`, like the fd 3 boot contract. The launcher strips a stray `X0X_M2_BOOT_FD` from the daemon's
+frozen before `ENABLED = true`, like the fd 3 boot contract. The main
+loop (`start.rs`, #1378) owns the trial only when the engine is enabled
+and the complete inventory issuer gives it a host; there is no issuer yet,
+so every start is the passthrough. An owned start installs its SIGTERM and
+SIGINT handler only then, and exits 0 after a stop, 75 when the daemon
+exits or a step can be retried (an issuer error never falls back to the
+passthrough), and 78 (`EX_CONFIG`) when no automatic start is allowed
+(`RecoveryFailed`, or a final host phase). A unit that binds the owned
+launcher must also set `RestartPreventExitStatus=78`. A retired trial on a
+committed host is an ordinary start: the passthrough. The launcher strips a stray `X0X_M2_BOOT_FD` from the daemon's
 environment before the `exec`. While activation is held, `x0xd` ignores a
 stray `X0X_M2_BOOT_FD` with one warning. It refuses to start only for a
 permit present on descriptor 3 that fails its checks or cannot be
