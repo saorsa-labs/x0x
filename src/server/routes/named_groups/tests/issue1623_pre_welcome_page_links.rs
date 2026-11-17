@@ -1249,10 +1249,9 @@ async fn page_role_removal_rename(log_order: &[usize]) -> anyhow::Result<()> {
 }
 
 /// The log keeps state-only links under their own cap, so they never evict
-/// a membership link. It keeps only the state-only links this node signed
-/// (the receiver applies a rename, a role change, an unban or a rejection
-/// only when the page sender is the event's `actor` and an Active admin),
-/// and a repeat of one link once.
+/// a membership link. It keeps a state-only link only when its actor signed
+/// its commit (#2003: also when another node did; it serves such a link
+/// only to a joiner it attested), and a repeat of one link once.
 #[tokio::test]
 async fn state_only_links_keep_their_own_log_cap() -> anyhow::Result<()> {
     let (state, _dir) = secure_endpoint_test_state().await?;
@@ -1285,8 +1284,10 @@ async fn state_only_links_keep_their_own_log_cap() -> anyhow::Result<()> {
         remember_treekem_membership_event(&state, &event).await;
         remember_treekem_membership_event(&state, &event).await;
     }
-    // A link this node did not sign: another actor, another commit
-    // signer, or both. Each half of the signer check refuses one case.
+    // A link whose actor did not sign its commit: another actor, or
+    // another commit signer. Each half of the check refuses one case.
+    // #2003: a link that another node both authored and signed is kept,
+    // so this node can relay it to a joiner it attested.
     let other = AgentKeypair::generate()?;
     let other_hex = hex::encode(other.agent_id().as_bytes());
     let mut foreign_actor = rename(&mut ahead.clone(), owner, 997)?;
@@ -1318,15 +1319,20 @@ async fn state_only_links_keep_their_own_log_cap() -> anyhow::Result<()> {
     );
     assert_eq!(
         renames.first().map(String::as_str),
-        Some(format!("rename {extra}").as_str()),
+        Some(format!("rename {}", extra + 1).as_str()),
         "the oldest state-only links go first"
     );
-    for foreign in ["rename 997", "rename 998", "rename 999"] {
+    for foreign in ["rename 997", "rename 998"] {
         assert!(
             !renames.iter().any(|name| name == foreign),
-            "a link this node did not sign is not kept: {foreign}"
+            "a link whose actor did not sign it is not kept: {foreign}"
         );
     }
+    assert_eq!(
+        renames.last().map(String::as_str),
+        Some("rename 999"),
+        "#2003: another node's own signed link is kept"
+    );
     assert!(
         log.iter()
             .any(|event| matches!(event, NamedGroupMetadataEvent::MemberRemoved { .. })),
@@ -2998,5 +3004,175 @@ async fn restore_with_held_removal(readd: bool) -> anyhow::Result<()> {
             "#1427: the add and the removal of a held target both stay out"
         );
     }
+    Ok(())
+}
+
+// ─── #2003: relayed state-only links (A08 amendment of 17 Nov 2026) ──────
+
+/// A responder that is not the signer but holds a seat (the joiner takes
+/// a page only from a member on its roster): it holds the base with
+/// `BANNED` banned and applies the owner's role change, rename and unban as
+/// ordinary deliveries. Returns the responder, the group key, the base and
+/// the links.
+async fn relaying_responder(
+    owner: &AgentKeypair,
+) -> anyhow::Result<(
+    Arc<AppState>,
+    tempfile::TempDir,
+    String,
+    GroupInfo,
+    Vec<Link>,
+)> {
+    let (responder, dir) = secure_endpoint_test_state().await?;
+    let owner_hex = hex::encode(owner.agent_id().as_bytes());
+    let responder_hex = hex::encode(responder.agent.agent_id().as_bytes());
+    let mut base = base_group(owner, Some(&responder_hex))?;
+    seal_link(&mut base, owner, 1_500, |next| {
+        next.ban_member(&agent(BANNED), Some(owner_hex));
+    })?;
+    let key = install_stub(&responder, base.clone()).await?;
+    let links = state_only_links(&base, owner)?;
+    for (_, _, event) in &links {
+        deliver_direct(&responder, &key, owner, event.clone()).await;
+    }
+    let last = links.last().map(|(_, commit, _)| commit.state_hash.clone());
+    anyhow::ensure!(
+        Some(head_of(&responder, &key).await?.state_hash) == last,
+        "the responder applied the owner's three links"
+    );
+    Ok((responder, dir, key, base, links))
+}
+
+/// A pre-Welcome joiner on `base`, armed with the links' hashes.
+async fn armed_joiner(
+    base: &GroupInfo,
+    links: &[Link],
+    owner: &AgentKeypair,
+) -> anyhow::Result<(Arc<AppState>, tempfile::TempDir)> {
+    let (joiner, dir) = secure_endpoint_test_state().await?;
+    let mut stub = base.clone();
+    arm(
+        &mut stub,
+        links
+            .iter()
+            .map(|(_, commit, _)| commit.state_hash.clone())
+            .collect(),
+        owner,
+    );
+    install_stub(&joiner, stub).await?;
+    Ok((joiner, dir))
+}
+
+/// #2003 (ADR 0109 §2, A08 amendment of 17 Nov 2026): an admin that did
+/// not sign a role change, a rename or an unban keeps it when it applies
+/// it, and serves it to a pre-Welcome joiner it attested. The joiner
+/// applies each relayed link as its signer's, inside its armed attested
+/// sequence, and reaches the head. RED on main: the responder kept only
+/// links it signed, so the page was empty and the joiner stayed at its
+/// base (H-S3-r: J stayed `catching_up` with no keys).
+#[tokio::test]
+async fn an_attested_joiner_gets_relayed_state_only_links() -> anyhow::Result<()> {
+    let owner = AgentKeypair::generate()?;
+    let (responder, _rdir, key, base, links) = relaying_responder(&owner).await?;
+    let (joiner, _jdir) = armed_joiner(&base, &links, &owner).await?;
+    let joiner_hex = hex::encode(joiner.agent.agent_id().as_bytes());
+    seat_joiner_on_responder(&responder, &key, &joiner_hex).await;
+    group_recovery::note_attested_for_test(&responder, base.stable_group_id(), &joiner_hex).await;
+
+    let served = page_from_responder(&joiner, &responder, &key).await?;
+
+    assert_eq!(
+        served,
+        [
+            "member_role_updated",
+            "group_metadata_updated",
+            "member_unbanned"
+        ],
+        "the relayed links are served in chain order"
+    );
+    let head = head_of(&joiner, &key).await?;
+    assert_eq!(
+        Some(&head.state_hash),
+        links.last().map(|(_, commit, _)| &commit.state_hash),
+        "the joiner is at the head"
+    );
+    assert_eq!(head.name, "renamed on a page");
+    assert!(!head.has_active_member(&joiner_hex), "still pre-Welcome");
+    assert_no_tree(&joiner, &key).await;
+    Ok(())
+}
+
+/// #2003: the bound on the relay. A requester this node did not attest
+/// gets no link that another node signed: an ordinary or released
+/// receiver would refuse the relayed copy and ask again. Control for
+/// [`an_attested_joiner_gets_relayed_state_only_links`].
+#[tokio::test]
+async fn an_unattested_requester_gets_no_relayed_link() -> anyhow::Result<()> {
+    let owner = AgentKeypair::generate()?;
+    let (responder, _rdir, key, base, links) = relaying_responder(&owner).await?;
+    let (joiner, _jdir) = armed_joiner(&base, &links, &owner).await?;
+    let joiner_hex = hex::encode(joiner.agent.agent_id().as_bytes());
+    seat_joiner_on_responder(&responder, &key, &joiner_hex).await;
+
+    let served = page_from_responder(&joiner, &responder, &key).await?;
+
+    assert!(served.is_empty(), "nothing relayed: {served:?}");
+    assert_eq!(head_of(&joiner, &key).await?.state_hash, base.state_hash);
+    Ok(())
+}
+
+/// #2003: a relayed link applies as its signer's only on a pre-Welcome
+/// node whose armed sequence admits it. With no armed sequence the page
+/// sender stays the authority, so another admin's copy is refused, as
+/// before.
+#[tokio::test]
+async fn a_relayed_link_outside_an_armed_sequence_is_refused() -> anyhow::Result<()> {
+    let owner = AgentKeypair::generate()?;
+    // The relay holds a seat, so only the missing armed sequence refuses.
+    let relay = AgentKeypair::generate()?;
+    let base = base_group(&owner, Some(&hex::encode(relay.agent_id().as_bytes())))?;
+    let links = state_only_links(&base, &owner)?;
+    let (joiner, _dir) = secure_endpoint_test_state().await?;
+    let key = install_stub(&joiner, base.clone()).await?;
+    let (_, _, event) = links.first().ok_or_else(|| anyhow::anyhow!("role link"))?;
+    deliver_page(&joiner, &key, &relay, vec![event.clone()]).await;
+    assert_eq!(
+        head_of(&joiner, &key).await?.state_hash,
+        base.state_hash,
+        "an unarmed joiner refuses the relayed copy"
+    );
+    Ok(())
+}
+
+/// #2003: a join-request rejection is not relayed. Its commit does not
+/// cover `actor`, so only its signer may serve it; a responder that did not
+/// sign it does not keep it, even for a requester it attested.
+#[tokio::test]
+async fn a_rejection_is_not_relayed() -> anyhow::Result<()> {
+    let owner = AgentKeypair::generate()?;
+    let (responder, _rdir) = secure_endpoint_test_state().await?;
+    let responder_hex = hex::encode(responder.agent.agent_id().as_bytes());
+    let base = base_group(&owner, Some(&responder_hex))?;
+    let key = install_stub(&responder, base.clone()).await?;
+    let (commit, event) = reject_link(&base, &owner)?;
+    deliver_direct(&responder, &key, &owner, event).await;
+    anyhow::ensure!(
+        head_of(&responder, &key).await?.state_hash == commit.state_hash,
+        "the responder applied the rejection"
+    );
+    let (joiner, _jdir) = secure_endpoint_test_state().await?;
+    let mut stub = invite_stub(&base);
+    arm(&mut stub, vec![commit.state_hash.clone()], &owner);
+    install_stub(&joiner, stub).await?;
+    let joiner_hex = hex::encode(joiner.agent.agent_id().as_bytes());
+    seat_joiner_on_responder(&responder, &key, &joiner_hex).await;
+    group_recovery::note_attested_for_test(&responder, base.stable_group_id(), &joiner_hex).await;
+
+    let served = page_from_responder(&joiner, &responder, &key).await?;
+
+    assert!(
+        served.is_empty(),
+        "the rejection is not relayed: {served:?}"
+    );
     Ok(())
 }
