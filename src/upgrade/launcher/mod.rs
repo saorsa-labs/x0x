@@ -1,6 +1,7 @@
 //! Private, dormant S3b engine. Only the `x0x-launcher` and `x0xd` binaries
 //! include it; no installer or daemon apply path calls it. The only live
-//! calls are the launcher's exec passthrough (`forward`) and `candidate_boot`
+//! calls are the launcher's main loop (`start`), which is the exec
+//! passthrough (`forward`) while the engine is held, and `candidate_boot`
 //! at x0xd start, which ignores a stray `X0X_M2_BOOT_FD` with one warning
 //! while activation is held and refuses only a present permit that fails
 //! its checks (ADR 0094 §6). The complete inventory issuer and host
@@ -13,12 +14,14 @@ mod control;
 mod coordinator;
 mod filesystem;
 pub(crate) mod forward;
+pub(crate) mod issuer;
 #[path = "../journal.rs"]
 mod journal;
 #[path = "../probe.rs"]
 mod probe;
 mod recovery;
 mod run;
+pub(crate) mod start;
 mod supervise;
 
 pub(crate) fn candidate_boot(version: &str) -> io::Result<()> {
@@ -242,10 +245,17 @@ impl Trial {
                     // A stopped trial may only roll back (ADR 0094 S4).
                     || (old.phase == Phase::Stopped
                         && !matches!(self.phase, Phase::Stopped | Phase::RollingBack))
-                    // A stale stop never undoes a rollback or a restore
-                    // (#1968 review).
-                    || (matches!(old.phase, Phase::RollingBack | Phase::Restored)
-                        && self.phase == Phase::Stopped)
+                    // A stale save never undoes a rollback or a restore
+                    // (#1968 and #1989 reviews): RollingBack only moves to
+                    // Restored or RecoveryFailed, Restored only to
+                    // RecoveryFailed.
+                    || (old.phase == Phase::RollingBack
+                        && !matches!(
+                            self.phase,
+                            Phase::RollingBack | Phase::Restored | Phase::RecoveryFailed
+                        ))
+                    || (old.phase == Phase::Restored
+                        && !matches!(self.phase, Phase::Restored | Phase::RecoveryFailed))
                     // Only a provisional trial is retired, and a retired
                     // trial stays retired.
                     || (old.phase == Phase::Committed && self.phase != Phase::Committed)

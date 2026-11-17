@@ -69,6 +69,7 @@ class ShardPlanTest(unittest.TestCase):
             's3-q3': 'w3h_1356_control_s3_q3_issuer_unreadable_sidecar',
             's3-qm': 'w3h_1356_control_s3_q_member_unreadable_sidecar',
             's3-q2': 'w3h_1356_control_s3_q2_sidecar_fault_cases',
+            's3-r': 'w3h_1356_control_s3_r_beyond_retention',
         }
         assigned = SHARDS.assign(self.names)
         for group, name in rows.items():

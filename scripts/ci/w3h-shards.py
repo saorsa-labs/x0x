@@ -16,8 +16,8 @@ H-S3-rm4 variants run the H-S3-c prefix and share one shard, split as
 `s3-rm4.1` to `s3-rm4.5`, 4 reruns each. H-S3-rm2 runs the H-S3-d3
 five-node prefix with M1 seated, then the H-S3-c advance and re-seat; it
 has its own shard, split as `s3-rm2.1` and `s3-rm2.2`, 10 reruns each.
-H-S3-d2 has its own shard (`s3-d2`). The summary job still counts 20
-receipts.
+H-S3-d2 has its own shard (`s3-d2`), as has H-S3-r (`s3-r`). The
+summary job still counts 20 receipts.
 
 The S3 shard is omitted when the tree has no `w3h_1356_` test, so `main`
 does not spend a runner on an empty filter. Adding those tests makes the
@@ -59,6 +59,10 @@ GROUPS = (
     # H-S3-q2 (#1572): about 60 s per rerun in the 12-CPU VM, so about
     # 40 min for 20 reruns on a runner; its own shard, as H-S3-q.
     ('s3-q2', 'w3h_1356_control_s3_q2_sidecar_fault_cases$'),
+    # H-S3-r (#1572): 35 to 86 s per rerun in the 12-CPU VM, so at most
+    # about 60 min for 20 reruns on a runner; its own shard, so `s3`
+    # (about 90 min) does not grow.
+    ('s3-r', 'w3h_1356_control_s3_r_beyond_retention$'),
     ('s3', 'w3h_1356_'),
     # #1623 (refs #1356): about 11 s per rerun on macOS; `rest` already
     # takes about 104 of its 120 minutes (run 41624339394), so the row
@@ -72,6 +76,10 @@ GROUPS = (
     # arms; `rest` is close to its deadline, so the row has its own shard
     # (31 Oct ruling, #1733).
     ('1581k', 'w3h_1581k_'),
+    # #1581 `s4_owner_recovery` variants (1581m): three four-node Home arms;
+    # `rest` is close to its deadline, so the row has its own shard
+    # (31 Oct ruling, #1733).
+    ('1581m', 'w3h_1581m_'),
     # #1427: five catch-up rows, each about 25 s per rerun in the 12-CPU
     # Lima VM. `rest` takes about 108 of its 120 minutes, so the rows have
     # their own shard; the budget is not raised (31 Oct ruling, #1733).

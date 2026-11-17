@@ -83,6 +83,11 @@ def check_text(text: str) -> None:
     CHECK.check_assignment(CHECK.parse_show_test_groups(text))
 
 
+OVERRIDE_HEAD = "  * override for default profile with filter 'binary(delegation_spaces)'"
+OVERRIDE = OVERRIDE_HEAD + ":\n"
+OVERRIDE_FROM_FILE = OVERRIDE_HEAD + " (from .config/nextest.toml):\n"
+
+
 class Parser(unittest.TestCase):
     def test_serialised_output_passes(self) -> None:
         check_text(SERIALISED)
@@ -133,6 +138,38 @@ class Parser(unittest.TestCase):
             "",
         ):
             with self.assertRaises(CHECK.CheckError):
+                check_text(bad)
+
+    def test_override_source_file_suffix_is_accepted(self) -> None:
+        # nextest 0.9.151 (Integration (groups) job 133383701797 on main).
+        check_text(SERIALISED.replace(OVERRIDE, OVERRIDE_FROM_FILE))
+        line = (
+            "  * override for default profile with filter 'binary(delegation_spaces)' "
+            "(from target/mesh-group-controls/retargeted.toml):"
+        )
+        groups = CHECK.parse_show_test_groups(
+            "group: quic-localhost (max threads = 1)\n"
+            f"{line}\n"
+            "      x0x::delegation_spaces:\n"
+            "          delegation_survives_restart_via_history\n"
+        )
+        self.assertEqual(
+            groups["quic-localhost"].tests,
+            [("x0x::delegation_spaces", "delegation_survives_restart_via_history")],
+        )
+
+    def test_unknown_override_suffixes_fail_closed(self) -> None:
+        for suffix in (
+            " (via .config/nextest.toml)",
+            " (from )",
+            " (from .config/nextest.toml",
+            " (from .config/nextest.toml) extra",
+            " (from .config/nextest.toml) (from other.toml)",
+            " from .config/nextest.toml",
+        ):
+            bad = SERIALISED.replace(OVERRIDE, OVERRIDE_HEAD + suffix + ":\n")
+            self.assertNotEqual(bad, SERIALISED)
+            with self.assertRaises(CHECK.CheckError, msg=suffix):
                 check_text(bad)
 
     def test_tests_without_a_source_line_fail_closed(self) -> None:

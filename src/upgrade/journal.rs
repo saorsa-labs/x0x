@@ -27,7 +27,7 @@ pub(crate) const HEALTH_FILE_NAME: &str = "upgrade-health.json";
 /// count when it armed the handoff (D193 `previously_connected`, #1377).
 pub(crate) const HANDOFF_SEND_READY_PEERS: &str = "send_ready_peers";
 pub(crate) const SCHEMA_VERSION: u32 = 1;
-const MAX_RECORD_BYTES: u64 = 1024 * 1024;
+pub(crate) const MAX_RECORD_BYTES: u64 = 1024 * 1024;
 
 /// Frozen paths and hashes are evidence, not trusted recovery destinations.
 /// Recovery must compare them with independent install inventory under the
@@ -483,6 +483,16 @@ fn read_bytes(path: &Path) -> io::Result<Vec<u8>> {
         return Err(invalid("record exceeds the size limit"));
     }
     Ok(bytes)
+}
+
+/// Classify record bytes the caller has already read from a file it
+/// opened and checked itself (the launcher's issuer opens the host journal
+/// once and checks owner, mode and size on that descriptor, #2014 review).
+pub(crate) fn classify_record(bytes: &[u8], expected: &str) -> RecordRead {
+    match classify(bytes, expected) {
+        Ok(record) => record,
+        Err(error) => RecordRead::Refused(error.to_string()),
+    }
 }
 
 /// Read an auxiliary upgrade record through the journal's bounded,
