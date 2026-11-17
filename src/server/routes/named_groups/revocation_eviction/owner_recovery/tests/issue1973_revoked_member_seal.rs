@@ -156,5 +156,16 @@ async fn a_standing_seal_refusal_keeps_a_typed_wait_naming_the_members() {
     );
     assert_eq!(wait.1, vec![*expired.agent_id().as_bytes()]);
     drop(inner);
+    // The promoted member's status renders the same typed wait — the
+    // state and its `named` list — not a bare `mandate_received`.
+    let status = status_json(&state, &stable).await;
+    assert_eq!(
+        status["promoted_member"]["state"],
+        x0x::groups::eviction::WaitingCause::WaitingForMemberEviction.as_str()
+    );
+    assert_eq!(
+        status["promoted_member"]["named"],
+        serde_json::json!([expired_hex])
+    );
     state.agent.shutdown().await;
 }

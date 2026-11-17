@@ -6250,6 +6250,53 @@ pub(super) mod tests {
         assert!(second_scope.pending_targets.contains(&hex::encode(first)));
     }
 
+    /// #1973: the owner-recovery seal tolerates exactly this group's
+    /// verified-revoked, below-Admin seats — nothing else. The
+    /// below-Admin filter itself lives in the scope builder
+    /// ([`owner_recovery_seal_scope`]); the daemon tests of
+    /// `issue1973_revoked_member_seal` run it end to end.
+    #[test]
+    fn an_owner_recovery_seal_tolerates_only_its_revoked_member_seats() {
+        let (admin, member, revoked, expired) = ([1; 32], [2; 32], [3; 32], [4; 32]);
+        let mut info = group_with(admin, member);
+        info.add_member(hex::encode(revoked), GroupRole::Member, None, None);
+        info.add_member(hex::encode(expired), GroupRole::Member, None, None);
+        let scope = RecoverySealScope {
+            stable_group_id: info.stable_group_id().to_string(),
+            revoked_members: BTreeSet::from([hex::encode(revoked)]),
+        };
+        let failed_revoked = vec![hex::encode(revoked)];
+        // The scope's own revoked member seat is tolerated.
+        assert!(recovery_seal_tolerates(&scope, &info, &failed_revoked));
+        // A failing id is matched case-insensitively.
+        assert!(recovery_seal_tolerates(
+            &scope,
+            &info,
+            &[hex::encode(revoked).to_uppercase()]
+        ));
+        // An empty failing set keeps the refusal.
+        assert!(!recovery_seal_tolerates(&scope, &info, &[]));
+        // A mixed set — a tolerated revoked seat plus a merely expired
+        // one — keeps the all-clean refusal.
+        let mixed = vec![hex::encode(revoked), hex::encode(expired)];
+        assert!(!recovery_seal_tolerates(&scope, &info, &mixed));
+        // An Admin-or-higher seat the builder never collects keeps the
+        // refusal.
+        assert!(!recovery_seal_tolerates(
+            &scope,
+            &info,
+            &[hex::encode(admin)]
+        ));
+        // Another group's scope tolerates nothing here.
+        let other = RecoverySealScope {
+            stable_group_id: "other".into(),
+            revoked_members: BTreeSet::from([hex::encode(revoked)]),
+        };
+        assert!(!recovery_seal_tolerates(&other, &info, &failed_revoked));
+        // Outside an owner-recovery scope nothing is tolerated.
+        assert!(!s4_eviction_seal_tolerates(&info, &failed_revoked));
+    }
+
     #[test]
     fn retained_leaves_unknown_group_is_not_tracked() {
         let leaves = RetainedLeaves::default();
