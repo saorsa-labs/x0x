@@ -47,6 +47,17 @@ fn main() -> std::process::ExitCode {
             libc::signal(libc::SIGINT, stop as *const () as libc::sighandler_t);
         };
         match launcher::start::start(&args, arm, || STOP.load(Ordering::Relaxed)) {
+            // launchd restarts every exit of a KeepAlive job, so a final
+            // refusal holds until a stop instead (#1379).
+            #[cfg(target_os = "macos")]
+            launcher::start::Start::Exit(status) if status == launcher::start::EXIT_FINAL => {
+                eprintln!("x0x-launcher: holding until stopped (launchd would restart an exit)");
+                launcher::start::hold_final(
+                    || STOP.load(Ordering::Relaxed),
+                    || std::thread::sleep(std::time::Duration::from_secs(1)),
+                );
+                return std::process::ExitCode::from(0);
+            }
             launcher::start::Start::Exit(status) => return std::process::ExitCode::from(status),
             launcher::start::Start::Passthrough => {}
         }

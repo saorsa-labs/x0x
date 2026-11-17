@@ -1011,6 +1011,17 @@ apply re-verifies the **loaded** job policy (#615 above), so a `KeepAlive`
 removed after repair refuses further upgrades instead of exiting into a job
 that will not restart.
 
+A job whose program is the stable launcher (`x0x-launcher /abs/x0xd ...`,
+or the trial form `x0x-launcher --host-root R --instance I -- /abs/x0xd ...`)
+is treated as the x0xd job it runs: `--repair` and the upgrade-time
+readback both look through the launcher's own arguments to the daemon
+(#1379). Such a job also needs `ExitTimeOut` above 45 s (the launcher's
+worst-case stop of a committed daemon); `--repair` refuses one without it.
+Under launchd an unconditional `KeepAlive` restarts every exit, so a
+launcher that reaches a final refusal (exit 78 elsewhere) holds until it is
+stopped instead of exiting. `x0x autostart` does not bind the launcher yet:
+it is dormant.
+
 The handoff transaction (`upgrade::restart`):
 
 1. The old daemon writes `data_dir/upgrade-handoff.json` (from/to versions,
