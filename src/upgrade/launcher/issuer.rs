@@ -16,62 +16,21 @@ use super::*;
 use std::ffi::OsString;
 use std::os::unix::fs::MetadataExt;
 
-/// Where this launcher's trial authority would be.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TrialArgs {
-    pub(crate) host_root: PathBuf,
-    pub(crate) instance: String,
-}
+pub(crate) use contract::TrialArgs;
 
 pub(crate) struct LauncherArgs {
     pub(crate) trial: Option<TrialArgs>,
     pub(crate) command: forward::DaemonCommand,
 }
 
-/// Parse the launcher argv (after the launcher's own name).
+/// Parse the launcher argv (after the launcher's own name) with the shared
+/// contract parser (`contract::parse_launcher_argv`), which the launchd
+/// classifiers also use (#2016 review).
 pub(crate) fn launcher_argv(argv: &[OsString]) -> io::Result<LauncherArgs> {
-    if argv.first().map(OsString::as_os_str) != Some(std::ffi::OsStr::new("--host-root")) {
-        return Ok(LauncherArgs {
-            trial: None,
-            command: forward::daemon_argv(argv)?,
-        });
-    }
-    let usage = || {
-        invalid(
-            "usage: x0x-launcher --host-root /absolute/data-root --instance ID -- \
-             /absolute/daemon [daemon args]",
-        )
-    };
-    let [_, root, flag, instance, separator, rest @ ..] = argv else {
-        return Err(usage());
-    };
-    if flag != "--instance" || separator != "--" {
-        return Err(usage());
-    }
-    let host_root = PathBuf::from(root);
-    if !host_root.is_absolute() {
-        return Err(invalid("--host-root must be absolute"));
-    }
-    let instance = instance
-        .to_str()
-        .filter(|id| {
-            !id.is_empty()
-                && id.len() <= 128
-                && id
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-        })
-        // `.` and `..` would name a directory if the id were ever joined to
-        // a path; the character set already excludes any separator.
-        .filter(|id| *id != "." && *id != "..")
-        .ok_or_else(|| invalid("--instance must be 1-128 of [A-Za-z0-9._-], not . or .."))?
-        .to_owned();
+    let parsed = contract::parse_launcher_argv(argv).map_err(invalid)?;
     Ok(LauncherArgs {
-        trial: Some(TrialArgs {
-            host_root,
-            instance,
-        }),
-        command: forward::daemon_argv(rest)?,
+        trial: parsed.trial,
+        command: forward::daemon_argv(parsed.daemon)?,
     })
 }
 
@@ -131,16 +90,12 @@ fn issue_with(
             "launcher argv does not match its participant in the host journal",
         ));
     }
-    // Canonical install and participant paths (`Host::new`).
-    // A plan path that is missing or not canonical stays so on a restart:
-    // a fixed refusal. Any other I/O error may pass (#2014 review).
-    let host = recovery::Host::new(args.host_root.clone(), record).map_err(|error| {
-        if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::Other) {
-            start::refused(format!("host journal plan is not usable: {error}"))
-        } else {
-            error
-        }
-    })?;
+    // Canonical install and participant paths (`Host::new`). A plan path
+    // that is not canonical stays so on a restart: `Host::new` returns a
+    // typed refusal (78). A missing path may appear by itself (a data root
+    // on a volume not yet mounted at boot), so it is a failed read (75),
+    // as is every other I/O error (#2015 review).
+    let host = recovery::Host::new(args.host_root.clone(), record)?;
     Ok(Some(start::Issued {
         host,
         instance: args.instance.clone(),
@@ -244,7 +199,7 @@ fn owns_trial(phase: journal::Phase) -> io::Result<bool> {
 
 /// The host root must be canonical (no symlink can move it), a directory
 /// of this account, and writable by nobody else.
-fn check_root(root: &Path, uid: u32) -> io::Result<()> {
+pub(super) fn check_root(root: &Path, uid: u32) -> io::Result<()> {
     if root.canonicalize()? != root {
         return Err(start::refused("--host-root must be canonical"));
     }
@@ -257,7 +212,7 @@ fn check_root(root: &Path, uid: u32) -> io::Result<()> {
     Ok(())
 }
 
-fn effective_uid() -> u32 {
+pub(super) fn effective_uid() -> u32 {
     // SAFETY: geteuid takes no arguments and cannot fail.
     unsafe { libc::geteuid() }
 }
@@ -677,7 +632,7 @@ mod tests {
                 || {},
             )
         };
-        assert_eq!(exit(&args), start::Start::Exit(start::EXIT_FINAL));
+        assert!(matches!(exit(&args), start::Start::Final(_)));
         let missing = TrialArgs {
             host_root: root.join("missing"),
             instance: "alice".into(),
@@ -685,14 +640,52 @@ mod tests {
         assert_eq!(exit(&missing), start::Start::Exit(start::EXIT_TEMPFAIL));
     }
 
-    /// #2014 review item 4: a plan path that is missing is a fixed
-    /// refusal (78), not a retry.
+    /// #2015 review: a plan path that is missing may appear by itself (a
+    /// volume not yet mounted at boot), so it is a failed read (75), not a
+    /// fixed refusal. A plan path that is not canonical stays so: 78.
     #[test]
-    fn a_missing_plan_path_is_a_fixed_refusal() {
+    fn a_missing_plan_path_retries_and_a_non_canonical_one_is_refused() {
         let (_dir, root, mut record) = rooted(journal::Phase::SwappedCli);
         record.plan.cli.backup_path = root.join("missing-backup");
         journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &record).unwrap();
         let (args, command) = matching(&record);
+        let error = issue_as(&args, &command, effective_uid())
+            .err()
+            .expect("a missing plan path is an error");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
+        assert!(!start::is_refusal(&error), "{error}");
+
+        let real = root.join("real-backup");
+        std::fs::write(&real, b"cli").unwrap();
+        let link = root.join("linked-backup");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        record.plan.cli.backup_path = link;
+        journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &record).unwrap();
+        assert!(refused(issue_as(&args, &command, effective_uid())));
+    }
+
+    /// #2015 review: only the typed refusal is fixed. An untyped
+    /// `io::Error::other` (any future I/O helper) is a failed read.
+    #[test]
+    fn only_a_typed_refusal_is_fixed() {
+        assert!(start::is_refusal(&start::refused("fixed")));
+        assert!(!start::is_refusal(&io::Error::other("untyped")));
+        assert!(!start::is_refusal(&io::Error::from(
+            io::ErrorKind::NotFound
+        )));
+    }
+
+    /// #2015 review: an oversized trial record with no in-flight journal
+    /// is a fixed refusal, never a passthrough.
+    #[test]
+    fn an_oversized_trial_record_is_a_fixed_refusal() {
+        let (_dir, root, record) = rooted(journal::Phase::SwappedCli);
+        let (args, command) = matching(&record);
+        std::fs::remove_file(root.join(journal::JOURNAL_FILE_NAME)).unwrap();
+        let trial = root.join(coordinator::TRIAL_FILE_NAME);
+        let file = std::fs::File::create(&trial).unwrap();
+        file.set_len(journal::MAX_RECORD_BYTES + 1).unwrap();
+        std::fs::set_permissions(&trial, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(refused(issue_as(&args, &command, effective_uid())));
     }
 
