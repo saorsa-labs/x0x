@@ -34,7 +34,7 @@ use super::state::AppState;
 /// 4. [`accepts_query_token`] paths: **session** token in `?token=` only —
 ///    the durable token is **never** accepted in a query string (#127/WS1.6).
 /// 5. `POST /auth/session/refresh` only: a bearer **session** token that
-///    lapsed less than [`SESSION_REFRESH_GRACE`] ago → `Ok`
+///    lapsed, while its session is inside the idle timeout → `Ok`
 /// 6. otherwise → `Err(UNAUTHORIZED)`
 pub(super) fn authorize(
     path: &str,
@@ -308,23 +308,37 @@ pub(super) async fn create_session(
         Json(serde_json::json!({
             "session_token": token,
             "expires_in": SESSION_TOKEN_TTL_SECS,
+            "idle_timeout_secs": state.sessions.idle_timeout().as_secs(),
         })),
     )
         .into_response()
 }
 
+/// Optional body of `POST /auth/session/refresh`.
+#[derive(Debug, Default, serde::Deserialize)]
+struct SessionRefreshRequest {
+    /// Milliseconds since the last user input in the client. Absent means
+    /// a background refresh, which does not extend the session.
+    #[serde(default)]
+    idle_ms: Option<u64>,
+}
+
+/// Largest refresh body read; the only field is one integer.
+const SESSION_REFRESH_BODY_LIMIT: usize = 1024;
+
 /// `POST /auth/session/refresh` — swap a browser session token for a fresh
-/// one (#893, sliding refresh with a hard cap).
+/// one (#893).
 ///
-/// Accepts **only** a session bearer that is live or lapsed less than
-/// [`SESSION_REFRESH_GRACE`] ago. The durable token is refused
-/// (it keeps using `POST /auth/session`), and rider tokens never reach this
+/// Accepts **only** a session bearer that is live, or lapsed while its
+/// session is inside the idle timeout. The durable token is refused (it
+/// keeps using `POST /auth/session`), and rider tokens never reach this
 /// handler (ADR-0039 deny-by-default route set). The new token is an
-/// ordinary session token, with the same authority as the one it replaces,
-/// and it inherits the ORIGINAL mint time. Once
-/// [`SESSION_MAX_LIFETIME`] has passed since that mint, refresh is refused
-/// and the user re-opens the GUI with `x0x gui`. The presented token is
-/// revoked in the same critical section (no overlap window).
+/// ordinary session token, with the same authority as the one it replaces.
+/// The body may carry `idle_ms`, the time since the last user input; only
+/// that moves the session's last activity. A session with no activity for
+/// the idle timeout is refused, and the user re-opens the GUI with
+/// `x0x gui`. The presented token is revoked in the same critical section
+/// (no overlap window).
 pub(super) async fn refresh_session(
     State(state): State<Arc<AppState>>,
     req: axum::http::Request<axum::body::Body>,
@@ -338,7 +352,24 @@ pub(super) async fn refresh_session(
             "session refresh requires a session token; mint one with POST /auth/session",
         );
     }
-    match state.sessions.refresh(&bearer, Instant::now()) {
+    let Ok(body) = axum::body::to_bytes(req.into_body(), SESSION_REFRESH_BODY_LIMIT).await else {
+        return session_refresh_refused(StatusCode::BAD_REQUEST, "refresh body is too large");
+    };
+    let request = if body.iter().all(u8::is_ascii_whitespace) {
+        SessionRefreshRequest::default()
+    } else {
+        match serde_json::from_slice::<SessionRefreshRequest>(&body) {
+            Ok(request) => request,
+            Err(_) => {
+                return session_refresh_refused(
+                    StatusCode::BAD_REQUEST,
+                    "refresh body must be JSON like {\"idle_ms\": 1200}",
+                )
+            }
+        }
+    };
+    let idle = request.idle_ms.map(Duration::from_millis);
+    match state.sessions.refresh(&bearer, Instant::now(), idle) {
         Ok(token) => {
             // The GUI may refresh before the socket reconnects. The pending
             // banner and any hidden socket still holding this token must
@@ -352,6 +383,7 @@ pub(super) async fn refresh_session(
                 Json(serde_json::json!({
                     "session_token": token,
                     "expires_in": SESSION_TOKEN_TTL_SECS,
+                    "idle_timeout_secs": state.sessions.idle_timeout().as_secs(),
                 })),
             )
                 .into_response()
@@ -360,11 +392,40 @@ pub(super) async fn refresh_session(
             StatusCode::UNAUTHORIZED,
             "session token is invalid or expired; reopen with `x0x gui`",
         ),
-        Err(SessionRefreshError::LifetimeCapReached) => session_refresh_refused(
+        Err(SessionRefreshError::IdleTimeout) => session_refresh_refused(
             StatusCode::UNAUTHORIZED,
-            "session reached its maximum lifetime; reopen with `x0x gui`",
+            "session ended after inactivity; reopen with `x0x gui`",
         ),
     }
+}
+
+/// `POST /auth/session/revoke` — end the caller's own browser session.
+///
+/// Accepts only a live session bearer; the durable token is refused, since
+/// it is not a session. The token stops working at once, and a pending GUI
+/// show bound to it is dropped. No other session is touched.
+pub(super) async fn revoke_session(
+    State(state): State<Arc<AppState>>,
+    req: axum::http::Request<axum::body::Body>,
+) -> Response {
+    let Some(bearer) = extract_bearer(req.headers()) else {
+        return session_refresh_refused(StatusCode::UNAUTHORIZED, "session bearer token required");
+    };
+    if ct_eq(&bearer, &state.api_token) {
+        return session_refresh_refused(
+            StatusCode::FORBIDDEN,
+            "session revoke requires a session token; the durable token is not a session",
+        );
+    }
+    let revoked = state.sessions.revoke(&bearer);
+    if revoked {
+        state.gui_show.drop_pending_for_session(&bearer);
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "revoked": revoked })),
+    )
+        .into_response()
 }
 
 fn session_refresh_refused(status: StatusCode, error: &str) -> Response {
@@ -655,15 +716,26 @@ fn ct_eq(a: &str, b: &str) -> bool {
 pub(crate) const SESSION_TOKEN_TTL: Duration = Duration::from_secs(10 * 60);
 /// Same value in seconds, surfaced in the `expires_in` JSON field.
 const SESSION_TOKEN_TTL_SECS: u64 = 10 * 60;
-/// Hard cap on a refreshed session chain (#893): refresh is refused once
-/// this long has passed since the ORIGINAL `POST /auth/session` mint. A
-/// chain can therefore live at most this plus one [`SESSION_TOKEN_TTL`].
-pub(super) const SESSION_MAX_LIFETIME: Duration = Duration::from_secs(12 * 60 * 60);
-/// How long after it lapses a session token can still be swapped by
-/// `POST /auth/session/refresh`. A lapsed token authorizes no other route,
-/// and [`SESSION_MAX_LIFETIME`] still applies.
-pub(super) const SESSION_REFRESH_GRACE: Duration = Duration::from_secs(4 * 60 * 60);
+/// Default idle timeout of a browser session, in minutes.
+pub const DEFAULT_GUI_IDLE_TIMEOUT_MINUTES: u64 = 60;
+/// Largest accepted idle timeout, in minutes (24 h).
+pub const MAX_GUI_IDLE_TIMEOUT_MINUTES: u64 = 24 * 60;
 const SESSION_REFRESH_PATH: &str = "/auth/session/refresh";
+
+/// Check a configured idle timeout and turn it into a [`Duration`].
+///
+/// # Errors
+///
+/// Returns a message when `minutes` is 0 or above
+/// [`MAX_GUI_IDLE_TIMEOUT_MINUTES`].
+pub fn gui_idle_timeout(minutes: u64) -> Result<Duration, String> {
+    if minutes == 0 || minutes > MAX_GUI_IDLE_TIMEOUT_MINUTES {
+        return Err(format!(
+            "gui_idle_timeout_minutes must be 1..={MAX_GUI_IDLE_TIMEOUT_MINUTES}, got {minutes}"
+        ));
+    }
+    Ok(Duration::from_secs(minutes * 60))
+}
 
 /// A single issued browser session token, stored as a SHA-256 digest.
 ///
@@ -672,25 +744,19 @@ const SESSION_REFRESH_PATH: &str = "/auth/session/refresh";
 struct AuthSession {
     token_hash: [u8; 32],
     expires_at: Instant,
-    /// Mint time of the first token in this refresh chain; refreshed tokens
-    /// inherit it so [`SESSION_MAX_LIFETIME`] cannot be extended (#893).
-    minted_at: Instant,
-}
-
-impl AuthSession {
-    fn refreshable_at(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.expires_at) < SESSION_REFRESH_GRACE
-    }
+    /// Last user activity of this refresh chain. Refreshed tokens inherit
+    /// it; only a refresh that reports user input moves it.
+    last_activity: Instant,
 }
 
 /// Why [`SessionStore::refresh`] refused.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum SessionRefreshError {
-    /// Not a refreshable session token (unknown, lapsed for longer than
-    /// [`SESSION_REFRESH_GRACE`], or already refreshed).
+    /// Not a known session token (never issued, revoked, or already
+    /// refreshed).
     Unknown,
-    /// The chain is older than [`SESSION_MAX_LIFETIME`].
-    LifetimeCapReached,
+    /// The session had no user activity for the idle timeout.
+    IdleTimeout,
 }
 
 /// In-memory store of short-lived browser session tokens (#127 / WS1.6).
@@ -699,36 +765,48 @@ pub(super) enum SessionRefreshError {
 /// on browser endpoints (WS/SSE); the durable API token is never valid in a
 /// query string. The store uses a `std::sync::Mutex` because the critical
 /// sections are trivial (hash + linear scan + prune) and never cross an await.
+///
+/// A session ends when it has had no user activity for `idle_timeout`.
+/// There is no cap on total lifetime.
 pub(super) struct SessionStore {
     sessions: StdMutex<Vec<AuthSession>>,
     ttl: Duration,
+    idle_timeout: Duration,
 }
 
 impl SessionStore {
-    pub(super) fn new(ttl: Duration) -> Self {
+    pub(super) fn new(ttl: Duration, idle_timeout: Duration) -> Self {
         Self {
             sessions: StdMutex::new(Vec::new()),
             ttl,
+            idle_timeout,
         }
     }
 
+    pub(super) fn idle_timeout(&self) -> Duration {
+        self.idle_timeout
+    }
+
+    fn active_at(&self, session: &AuthSession, now: Instant) -> bool {
+        now.saturating_duration_since(session.last_activity) < self.idle_timeout
+    }
+
     /// Issue a fresh session token, store its digest, and return the raw token
-    /// to hand to the client. `now` is injected so expiry can be unit-tested
-    /// without sleeping.
+    /// to hand to the client. A mint is user activity. `now` is injected so
+    /// expiry can be unit-tested without sleeping.
     pub(super) fn issue(&self, now: Instant) -> String {
         let (token, session) = self.new_session(now, now);
         if let Ok(mut guard) = self.sessions.lock() {
             guard.push(session);
-            // Bound the store: lazy-prune expired entries on every issue so a
+            // Bound the store: lazy-prune idle entries on every issue so a
             // flood of session mints cannot grow the vector without bound.
-            guard.retain(|s| s.refreshable_at(now));
+            guard.retain(|s| self.active_at(s, now));
         }
         token
     }
 
-    /// Generate a raw token plus its stored entry, expiring `ttl` from `now`
-    /// and carrying the chain's original `minted_at`.
-    fn new_session(&self, now: Instant, minted_at: Instant) -> (String, AuthSession) {
+    /// Generate a raw token plus its stored entry, expiring `ttl` from `now`.
+    fn new_session(&self, now: Instant, last_activity: Instant) -> (String, AuthSession) {
         use rand::RngCore;
         let mut bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut bytes);
@@ -736,75 +814,88 @@ impl SessionStore {
         let session = AuthSession {
             token_hash: Sha256::digest(token.as_bytes()).into(),
             expires_at: now + self.ttl,
-            minted_at,
+            last_activity,
         };
         (token, session)
     }
 
     /// Replace a session token with a fresh one (#893). The token may have
-    /// lapsed up to [`SESSION_REFRESH_GRACE`] ago.
+    /// lapsed, but the session must be inside the idle timeout.
     ///
-    /// The new entry keeps the original `minted_at`; the presented token is
-    /// removed in the same critical section, so it stops working at once.
-    /// Refused once `now - minted_at` exceeds [`SESSION_MAX_LIFETIME`].
-    pub(super) fn refresh(&self, token: &str, now: Instant) -> Result<String, SessionRefreshError> {
+    /// The idle check uses the activity recorded before this call, so a
+    /// claim cannot revive a session that already timed out. `idle` is the
+    /// client's time since its last user input; it moves `last_activity` to
+    /// `now - idle` when that is later, and never past `now`. `None` (a
+    /// background refresh) leaves it alone. The presented token is removed
+    /// in the same critical section, so it stops working at once.
+    pub(super) fn refresh(
+        &self,
+        token: &str,
+        now: Instant,
+        idle: Option<Duration>,
+    ) -> Result<String, SessionRefreshError> {
         use subtle::ConstantTimeEq;
         let candidate = Sha256::digest(token.as_bytes());
         let mut guard = self
             .sessions
             .lock()
             .map_err(|_| SessionRefreshError::Unknown)?;
-        guard.retain(|s| s.refreshable_at(now));
         let index = guard
             .iter()
             .position(|s| bool::from(candidate.ct_eq(&s.token_hash)))
             .ok_or(SessionRefreshError::Unknown)?;
-        let minted_at = guard
-            .get(index)
-            .map(|s| s.minted_at)
-            .ok_or(SessionRefreshError::Unknown)?;
-        if now.saturating_duration_since(minted_at) > SESSION_MAX_LIFETIME {
-            return Err(SessionRefreshError::LifetimeCapReached);
+        let session = guard.swap_remove(index);
+        guard.retain(|s| self.active_at(s, now));
+        if !self.active_at(&session, now) {
+            return Err(SessionRefreshError::IdleTimeout);
         }
-        guard.swap_remove(index);
-        let (fresh, session) = self.new_session(now, minted_at);
+        let claimed = idle.and_then(|idle| now.checked_sub(idle));
+        let last_activity = match claimed {
+            Some(at) if at > session.last_activity => at.min(now),
+            _ => session.last_activity,
+        };
+        let (fresh, session) = self.new_session(now, last_activity);
         guard.push(session);
         Ok(fresh)
     }
 
-    /// Remove one session token. An unknown token is left unchanged.
+    /// Remove one session token. Returns whether it was present.
     ///
     /// The lookup hashes the candidate and compares with
     /// [`subtle::ConstantTimeEq`], the same way as [`Self::refresh`].
-    pub(super) fn revoke(&self, token: &str) {
+    pub(super) fn revoke(&self, token: &str) -> bool {
         use subtle::ConstantTimeEq;
         let candidate = Sha256::digest(token.as_bytes());
         let Ok(mut guard) = self.sessions.lock() else {
-            return;
+            return false;
         };
-        if let Some(index) = guard
+        match guard
             .iter()
             .position(|s| bool::from(candidate.ct_eq(&s.token_hash)))
         {
-            guard.swap_remove(index);
+            Some(index) => {
+                guard.swap_remove(index);
+                true
+            }
+            None => false,
         }
     }
 
-    /// Original mint time of a live token's refresh chain (tests only).
+    /// Recorded last activity of a known token's chain (tests only).
     #[cfg(test)]
-    fn minted_at(&self, token: &str, now: Instant) -> Option<Instant> {
+    fn last_activity(&self, token: &str) -> Option<Instant> {
         use subtle::ConstantTimeEq;
         let candidate = Sha256::digest(token.as_bytes());
         let guard = self.sessions.lock().ok()?;
         guard
             .iter()
-            .find(|s| s.expires_at > now && bool::from(candidate.ct_eq(&s.token_hash)))
-            .map(|s| s.minted_at)
+            .find(|s| bool::from(candidate.ct_eq(&s.token_hash)))
+            .map(|s| s.last_activity)
     }
 
     /// Validate a candidate token: constant-time compare against every active
-    /// session digest, pruning expired entries along the way. Returns `true`
-    /// only if an unexpired entry matches.
+    /// session digest, pruning idle entries along the way. Returns `true`
+    /// only if an unexpired entry of an active session matches.
     ///
     /// `POST /gui/show` calls this at the navigate decision. A WebSocket
     /// stays up after the token expires, and visibility alone is not a
@@ -815,21 +906,21 @@ impl SessionStore {
         let Ok(mut guard) = self.sessions.lock() else {
             return false;
         };
-        guard.retain(|s| s.refreshable_at(now));
+        guard.retain(|s| self.active_at(s, now));
         guard
             .iter()
             .any(|s| s.expires_at > now && bool::from(candidate.ct_eq(&s.token_hash)))
     }
 
-    /// Whether `token` is live or lapsed less than [`SESSION_REFRESH_GRACE`]
-    /// ago. Only `POST /auth/session/refresh` may use this.
+    /// Whether `token` belongs to a session inside the idle timeout, live
+    /// or lapsed. Only `POST /auth/session/refresh` may use this.
     fn is_refreshable(&self, token: &str, now: Instant) -> bool {
         use subtle::ConstantTimeEq;
         let candidate = Sha256::digest(token.as_bytes());
         let Ok(mut guard) = self.sessions.lock() else {
             return false;
         };
-        guard.retain(|s| s.refreshable_at(now));
+        guard.retain(|s| self.active_at(s, now));
         guard
             .iter()
             .any(|s| bool::from(candidate.ct_eq(&s.token_hash)))
@@ -841,7 +932,7 @@ impl SessionStore {
         self.is_valid(token, now)
     }
 
-    /// Lapse one session. It stays inside [`SESSION_REFRESH_GRACE`].
+    /// Lapse one session token. The session stays inside the idle timeout.
     #[cfg(test)]
     pub(super) fn expire_for_test(&self, token: &str) {
         use subtle::ConstantTimeEq;
@@ -926,6 +1017,9 @@ mod tests {
 
     /// Durable API token the tests treat as valid. Mirrors `state.api_token`.
     const TEST_API_TOKEN: &str = "x0x-test-auth-matrix-token";
+    /// The default idle timeout (60 min).
+    const IDLE: Duration = Duration::from_secs(DEFAULT_GUI_IDLE_TIMEOUT_MINUTES * 60);
+    const MIN: Duration = Duration::from_secs(60);
 
     /// HTTP method each protected route is registered under in production, so
     /// the accept tests exercise the same method the real router would see.
@@ -959,7 +1053,7 @@ mod tests {
 
     #[test]
     fn auth_matrix_protected_endpoints_reject_without_token() {
-        let sessions = SessionStore::new(SESSION_TOKEN_TTL);
+        let sessions = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
         for path in ["/status", "/agent", "/agent/sign", "/agent/verify"] {
             assert_eq!(
                 authorize_protected(path, None, None, &sessions),
@@ -971,7 +1065,7 @@ mod tests {
 
     #[test]
     fn auth_matrix_protected_endpoints_reject_wrong_token() {
-        let sessions = SessionStore::new(SESSION_TOKEN_TTL);
+        let sessions = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
         for path in ["/status", "/agent", "/agent/sign", "/agent/verify"] {
             assert_eq!(
                 authorize_protected(path, Some("not-the-real-token"), None, &sessions),
@@ -983,7 +1077,7 @@ mod tests {
 
     #[test]
     fn auth_matrix_protected_endpoints_accept_correct_token() {
-        let sessions = SessionStore::new(SESSION_TOKEN_TTL);
+        let sessions = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
         for path in ["/status", "/agent", "/agent/sign", "/agent/verify"] {
             assert!(
                 authorize_protected(path, Some(TEST_API_TOKEN), None, &sessions).is_ok(),
@@ -997,7 +1091,7 @@ mod tests {
         // #127 / WS1.6: a short-lived session token in the Bearer header is
         // accepted on protected endpoints too (browser clients use it after
         // exchange, so REST calls work without the durable secret).
-        let sessions = SessionStore::new(SESSION_TOKEN_TTL);
+        let sessions = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
         let now = Instant::now();
         let session = sessions.issue(now);
         for path in ["/status", "/agent", "/agent/verify"] {
@@ -1020,7 +1114,7 @@ mod tests {
         // `routes::identity::owner_act_tests::owner_act_matrix_universal`,
         // which drives the production middleware itself — no test-only
         // reimplementation of the decision anywhere.
-        let sessions = SessionStore::new(SESSION_TOKEN_TTL);
+        let sessions = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
         let now = Instant::now();
         let session = sessions.issue(now);
         for (method, path) in [
@@ -1086,7 +1180,7 @@ mod tests {
 
     #[test]
     fn auth_matrix_exempt_paths_serve_without_token() {
-        let sessions = SessionStore::new(SESSION_TOKEN_TTL);
+        let sessions = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
         for path in ["/health", "/constitution", "/constitution/json"] {
             assert!(
                 authorize(
@@ -1111,7 +1205,7 @@ mod tests {
         // #127 / WS1.6: only a short-lived SESSION token is accepted via
         // ?token= on browser endpoints (WS/SSE/GUI). The durable token must
         // never appear in a URL.
-        let sessions = SessionStore::new(SESSION_TOKEN_TTL);
+        let sessions = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
         let now = Instant::now();
         let session = sessions.issue(now);
         for path in [
@@ -1146,7 +1240,7 @@ mod tests {
         // token in a query string is REJECTED, even on browser endpoints that
         // accept ?token=. Only session tokens are valid in URLs. This is what
         // keeps the long-lived secret out of history/Referer/HAR.
-        let sessions = SessionStore::new(SESSION_TOKEN_TTL);
+        let sessions = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
         let now = Instant::now();
         for path in ["/gui", "/ws", "/ws/direct", "/events", "/peers/events"] {
             assert_eq!(
@@ -1169,7 +1263,7 @@ mod tests {
     fn auth_matrix_query_token_rejected_on_protected_paths() {
         // A query token must NOT authenticate non-browser endpoints — that
         // would leak the credential via history/Referer/HAR.
-        let sessions = SessionStore::new(SESSION_TOKEN_TTL);
+        let sessions = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
         let now = Instant::now();
         for path in ["/status", "/agent/sign", "/agent/verify"] {
             assert_eq!(
@@ -1194,7 +1288,7 @@ mod tests {
     fn auth_matrix_options_preflight_bypasses_auth() {
         // Browsers cannot attach auth headers to a CORS preflight; the
         // middleware must pass OPTIONS through even on a protected path.
-        let sessions = SessionStore::new(SESSION_TOKEN_TTL);
+        let sessions = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
         assert!(
             authorize(
                 "/status",
@@ -1299,7 +1393,7 @@ mod tests {
 
     #[test]
     fn session_store_issues_and_validates_a_token() {
-        let store = SessionStore::new(SESSION_TOKEN_TTL);
+        let store = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
         let now = Instant::now();
         let token = store.issue(now);
         assert!(token.len() >= 32, "session token must be opaque hex");
@@ -1315,7 +1409,7 @@ mod tests {
 
     #[test]
     fn session_store_token_expires_after_ttl() {
-        let store = SessionStore::new(SESSION_TOKEN_TTL);
+        let store = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
         let t0 = Instant::now();
         let token = store.issue(t0);
         assert!(store.is_valid(&token, t0));
@@ -1337,7 +1431,7 @@ mod tests {
     fn session_store_prunes_expired_entries_on_validate() {
         // Pruning is lazy (on issue/validate) so the Vec cannot grow without
         // bound even if clients never explicitly revoke.
-        let store = SessionStore::new(SESSION_TOKEN_TTL);
+        let store = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
         let t0 = Instant::now();
         let dead = store.issue(t0); // expires at t0 + TTL
         let alive = store.issue(t0); // same expiry, but we validate after pruning
@@ -1350,83 +1444,185 @@ mod tests {
         assert!(store.is_valid(&fresh, far_future));
     }
 
-    // -- #893 sliding refresh with a hard cap.
+    // -- #893 sliding refresh with an idle timeout.
 
     #[test]
-    fn session_refresh_rotates_token_and_keeps_original_mint_time() {
-        // The cap is only meaningful if a refreshed token inherits the FIRST
-        // mint time; if refresh reset it, an open tab could live forever.
-        let store = SessionStore::new(SESSION_TOKEN_TTL);
+    fn session_refresh_rotates_token_and_carries_last_activity() {
+        let store = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
         let t0 = Instant::now();
         let first = store.issue(t0);
-        let t1 = t0 + Duration::from_secs(8 * 60);
-        let second = store.refresh(&first, t1).expect("live session refreshes");
+        assert_eq!(store.last_activity(&first), Some(t0), "a mint is activity");
+        let t1 = t0 + 8 * MIN;
+        let second = store
+            .refresh(&first, t1, None)
+            .expect("live session refreshes");
         assert_ne!(first, second, "refresh must mint a new token");
-        assert_eq!(store.minted_at(&second, t1), Some(t0));
+        assert_eq!(store.last_activity(&second), Some(t0));
         assert!(
             !store.is_valid(&first, t1),
             "the replaced token must stop working immediately (no overlap)"
         );
         assert!(store.is_valid(&second, t1));
-        // The new token gets a full TTL from the refresh, not from t0.
         assert!(store.is_valid(&second, t1 + SESSION_TOKEN_TTL - Duration::from_nanos(1)));
-        // A replaced token can never be refreshed again.
-        assert_eq!(store.refresh(&first, t1), Err(SessionRefreshError::Unknown));
+        assert_eq!(
+            store.refresh(&first, t1, None),
+            Err(SessionRefreshError::Unknown)
+        );
     }
 
     #[test]
-    fn session_refresh_is_refused_past_the_hard_cap() {
-        // Refresh every 8 min (as the GUI does) on a simulated clock. The
-        // chain must be refused at original mint + 12 h even though the
-        // LAST refresh was only minutes earlier and the token is still live:
-        // the cap counts from the ORIGINAL issue time, not the last refresh.
-        let store = SessionStore::new(SESSION_TOKEN_TTL);
+    fn active_session_survives_well_past_twelve_hours() {
+        // Refresh every 8 min (as the GUI does), with input 1 min earlier.
+        let store = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
         let t0 = Instant::now();
-        let step = Duration::from_secs(8 * 60);
         let mut token = store.issue(t0);
         let mut now = t0;
-        let mut refreshes = 0u32;
-        while now + step <= t0 + SESSION_MAX_LIFETIME {
-            now += step;
-            token = store.refresh(&token, now).expect("within the cap");
-            refreshes += 1;
-            assert_eq!(store.minted_at(&token, now), Some(t0));
+        while now < t0 + Duration::from_secs(36 * 60 * 60) {
+            now += 8 * MIN;
+            token = store
+                .refresh(&token, now, Some(MIN))
+                .expect("an active session refreshes");
+            assert_eq!(store.last_activity(&token), Some(now - MIN));
         }
-        let last_refresh = now;
-        assert!(refreshes > 80, "the chain must span many refreshes");
-        // Exactly at original + 12 h a refresh is still allowed.
-        let at_cap = t0 + SESSION_MAX_LIFETIME;
-        assert!(at_cap - last_refresh < SESSION_TOKEN_TTL);
-        token = store.refresh(&token, at_cap).expect("at the cap boundary");
-        // One second past original + 12 h: refused, although only seconds
-        // have passed since the last refresh and the token is still valid.
-        let attempt = at_cap + Duration::from_secs(1);
-        assert!(attempt - at_cap < SESSION_MAX_LIFETIME);
-        assert!(
-            store.is_valid(&token, attempt),
-            "refusal must be the cap, not expiry"
-        );
+        assert!(store.is_valid(&token, now));
+    }
+
+    #[test]
+    fn background_refreshes_do_not_extend_an_idle_session() {
+        let store = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
+        let t0 = Instant::now();
+        let mut token = store.issue(t0);
+        let mut now = t0;
+        while now + 8 * MIN < t0 + IDLE {
+            now += 8 * MIN;
+            token = store
+                .refresh(&token, now, None)
+                .expect("inside the idle timeout");
+            assert_eq!(store.last_activity(&token), Some(t0));
+        }
+        // A claim of input older than the recorded activity changes nothing.
+        now += MIN;
+        token = store
+            .refresh(&token, now, Some(now - t0 + MIN))
+            .expect("inside the idle timeout");
+        assert_eq!(store.last_activity(&token), Some(t0));
+
+        // The token is unexpired at the limit, but the session is idle.
+        let at_limit = t0 + IDLE;
+        assert!(at_limit - now < SESSION_TOKEN_TTL);
+        assert!(store.is_valid(&token, at_limit - Duration::from_nanos(1)));
+        assert!(!store.is_valid(&token, at_limit), "idle ends a live token");
+        assert!(!authorize_refresh(&store, &token, at_limit));
+    }
+
+    #[test]
+    fn refresh_at_the_idle_limit_reports_the_timeout() {
+        let store = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
+        let t0 = Instant::now();
+        let token = store.issue(t0);
+        let token = store
+            .refresh(&token, t0 + 55 * MIN, None)
+            .expect("inside the idle timeout");
         assert_eq!(
-            store.refresh(&token, attempt),
-            Err(SessionRefreshError::LifetimeCapReached)
+            store.refresh(&token, t0 + IDLE, None),
+            Err(SessionRefreshError::IdleTimeout)
         );
     }
 
     #[test]
-    fn session_refresh_refuses_unknown_expired_and_durable_tokens() {
-        let store = SessionStore::new(SESSION_TOKEN_TTL);
+    fn idle_session_is_refused_even_with_a_fresh_activity_claim() {
+        // The check uses the recorded activity, so a claim made after the
+        // limit cannot revive the session.
+        let store = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
+        let t0 = Instant::now();
+        let token = store.issue(t0);
+        let refreshed = store
+            .refresh(&token, t0 + 5 * MIN, None)
+            .expect("live refresh");
+        let late = t0 + IDLE;
+        assert_eq!(
+            store.refresh(&refreshed, late, Some(Duration::ZERO)),
+            Err(SessionRefreshError::IdleTimeout)
+        );
+        assert_eq!(
+            store.refresh(&refreshed, late, Some(Duration::ZERO)),
+            Err(SessionRefreshError::Unknown),
+            "the timed-out session is gone"
+        );
+    }
+
+    #[test]
+    fn activity_claim_never_moves_last_activity_past_now() {
+        let store = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
+        let t0 = Instant::now();
+        let token = store.issue(t0);
+        let t1 = t0 + 5 * MIN;
+        let token = store
+            .refresh(&token, t1, Some(Duration::ZERO))
+            .expect("refresh");
+        assert_eq!(store.last_activity(&token), Some(t1));
+        let t2 = t1 + MIN;
+        let token = store
+            .refresh(&token, t2, Some(Duration::from_millis(u64::MAX)))
+            .expect("an impossible claim is ignored, not an error");
+        assert_eq!(store.last_activity(&token), Some(t1));
+        let token = store
+            .refresh(&token, t2, Some(Duration::from_secs(30)))
+            .expect("refresh");
+        assert_eq!(
+            store.last_activity(&token),
+            Some(t2 - Duration::from_secs(30))
+        );
+        assert!(store.last_activity(&token).is_some_and(|at| at <= t2));
+    }
+
+    #[test]
+    fn configured_idle_timeout_is_honoured_and_bad_values_rejected() {
+        assert_eq!(
+            gui_idle_timeout(0),
+            Err(format!(
+                "gui_idle_timeout_minutes must be 1..={MAX_GUI_IDLE_TIMEOUT_MINUTES}, got 0"
+            ))
+        );
+        assert!(gui_idle_timeout(MAX_GUI_IDLE_TIMEOUT_MINUTES + 1).is_err());
+        assert_eq!(gui_idle_timeout(1), Ok(MIN));
+        assert_eq!(
+            gui_idle_timeout(MAX_GUI_IDLE_TIMEOUT_MINUTES),
+            Ok(Duration::from_secs(24 * 60 * 60))
+        );
+        assert_eq!(gui_idle_timeout(DEFAULT_GUI_IDLE_TIMEOUT_MINUTES), Ok(IDLE));
+
+        let idle = gui_idle_timeout(15).expect("valid");
+        let store = SessionStore::new(SESSION_TOKEN_TTL, idle);
+        assert_eq!(store.idle_timeout(), idle);
+        let t0 = Instant::now();
+        let token = store.issue(t0);
+        store.expire_for_test(&token);
+        assert!(authorize_refresh(
+            &store,
+            &token,
+            t0 + 15 * MIN - Duration::from_nanos(1)
+        ));
+        assert!(!authorize_refresh(&store, &token, t0 + 15 * MIN));
+    }
+
+    #[test]
+    fn session_refresh_refuses_unknown_and_durable_tokens() {
+        let store = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
         let t0 = Instant::now();
         let token = store.issue(t0);
         // The durable token is not in the session store, so the store can
         // never turn it into a session (the handler also refuses it first).
         assert_eq!(
-            store.refresh(TEST_API_TOKEN, t0),
+            store.refresh(TEST_API_TOKEN, t0, Some(Duration::ZERO)),
             Err(SessionRefreshError::Unknown)
         );
-        let after = t0 + SESSION_TOKEN_TTL + SESSION_REFRESH_GRACE;
+        assert!(store.revoke(&token));
+        assert!(!store.revoke(&token));
         assert_eq!(
-            store.refresh(&token, after),
-            Err(SessionRefreshError::Unknown)
+            store.refresh(&token, t0, Some(Duration::ZERO)),
+            Err(SessionRefreshError::Unknown),
+            "a revoked token cannot refresh"
         );
     }
 
@@ -1444,16 +1640,23 @@ mod tests {
     }
 
     #[test]
-    fn lapsed_session_recovers_by_refresh_within_grace() {
-        let store = SessionStore::new(SESSION_TOKEN_TTL);
+    fn lapsed_session_recovers_by_refresh_inside_the_idle_timeout() {
+        // A laptop that slept 30 min recovers.
+        let store = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
         let t0 = Instant::now();
         let hidden = store.issue(t0);
-        let back = t0 + SESSION_TOKEN_TTL + SESSION_REFRESH_GRACE - Duration::from_nanos(1);
+        let back = t0 + 30 * MIN;
 
         assert!(!store.is_valid(&hidden, back), "a lapsed token is not live");
         for (method, path, header, query) in [
             (Method::GET, "/agent", Some(hidden.as_str()), None),
             (Method::POST, "/auth/session", Some(hidden.as_str()), None),
+            (
+                Method::POST,
+                "/auth/session/revoke",
+                Some(hidden.as_str()),
+                None,
+            ),
             (
                 Method::GET,
                 SESSION_REFRESH_PATH,
@@ -1476,56 +1679,47 @@ mod tests {
         }
         assert!(authorize_refresh(&store, &hidden, back));
 
-        let fresh = store.refresh(&hidden, back).expect("refresh within grace");
+        let fresh = store
+            .refresh(&hidden, back, Some(Duration::ZERO))
+            .expect("refresh inside the idle timeout");
         assert!(store.is_valid(&fresh, back));
-        assert_eq!(store.minted_at(&fresh, back), Some(t0));
+        assert_eq!(store.last_activity(&fresh), Some(back));
         assert!(!authorize_refresh(&store, &hidden, back));
         assert_eq!(
-            store.refresh(&hidden, back),
+            store.refresh(&hidden, back, None),
             Err(SessionRefreshError::Unknown),
             "a lapsed token is swapped once"
         );
     }
 
     #[test]
-    fn lapsed_session_is_refused_after_grace() {
-        let store = SessionStore::new(SESSION_TOKEN_TTL);
+    fn lapsed_session_is_refused_at_the_idle_timeout() {
+        // A laptop that slept 2 h must sign in again.
+        let store = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
         let t0 = Instant::now();
         let hidden = store.issue(t0);
-        let late = t0 + SESSION_TOKEN_TTL + SESSION_REFRESH_GRACE;
-        assert!(late - t0 < SESSION_MAX_LIFETIME, "the refusal is the grace");
-
-        assert!(!authorize_refresh(&store, &hidden, late));
-        assert_eq!(
-            store.refresh(&hidden, late),
-            Err(SessionRefreshError::Unknown)
-        );
-    }
-
-    #[test]
-    fn lapsed_session_is_refused_past_the_hard_cap() {
-        let store = SessionStore::new(SESSION_TOKEN_TTL);
-        let t0 = Instant::now();
-        let last_refresh = t0 + SESSION_MAX_LIFETIME - Duration::from_secs(30 * 60);
-        let mut token = store.issue(t0);
-        let mut now = t0;
-        while now + SESSION_REFRESH_GRACE < last_refresh {
-            now += SESSION_REFRESH_GRACE;
-            token = store.refresh(&token, now).expect("within grace and cap");
+        for late in [t0 + IDLE, t0 + 120 * MIN] {
+            assert!(!authorize_refresh(&store, &hidden, late));
+            for (method, path) in [(Method::GET, "/agent"), (Method::POST, "/auth/session")] {
+                assert_eq!(
+                    authorize(
+                        path,
+                        &method,
+                        Some(&hidden),
+                        None,
+                        TEST_API_TOKEN,
+                        &store,
+                        late
+                    ),
+                    Err(StatusCode::UNAUTHORIZED)
+                );
+            }
         }
-        token = store.refresh(&token, last_refresh).expect("before the cap");
-
-        let past_cap = t0 + SESSION_MAX_LIFETIME + Duration::from_secs(1);
-        assert!(
-            past_cap - (last_refresh + SESSION_TOKEN_TTL) < SESSION_REFRESH_GRACE,
-            "the token is inside its grace window"
-        );
-        assert!(!store.is_valid(&token, past_cap));
         assert_eq!(
-            store.refresh(&token, past_cap),
-            Err(SessionRefreshError::LifetimeCapReached)
+            store.refresh(&hidden, t0 + 120 * MIN, Some(Duration::ZERO)),
+            Err(SessionRefreshError::Unknown),
+            "the idle session was pruned"
         );
-        assert!(!store.is_valid(&token, past_cap));
     }
 
     #[test]
@@ -1533,7 +1727,7 @@ mod tests {
         use std::sync::Barrier;
         use std::thread;
 
-        let store = SessionStore::new(SESSION_TOKEN_TTL);
+        let store = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
         let token = store.issue(Instant::now());
         store.expire_for_test(&token);
         let now = Instant::now();
@@ -1542,11 +1736,11 @@ mod tests {
         let (r1, r2) = thread::scope(|s| {
             let h1 = s.spawn(|| {
                 barrier.wait();
-                store.refresh(&token, now)
+                store.refresh(&token, now, Some(Duration::ZERO))
             });
             let h2 = s.spawn(|| {
                 barrier.wait();
-                store.refresh(&token, now)
+                store.refresh(&token, now, Some(Duration::ZERO))
             });
             (h1.join().unwrap(), h2.join().unwrap())
         });
@@ -1564,10 +1758,10 @@ mod tests {
         // A refreshed token is an ordinary session bearer: accepted on
         // protected routes and browser query-token routes, still classified
         // non-durable on owner-act routes (the middleware 403s it there).
-        let store = SessionStore::new(SESSION_TOKEN_TTL);
+        let store = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
         let t0 = Instant::now();
         let first = store.issue(t0);
-        let refreshed = store.refresh(&first, t0).expect("refresh");
+        let refreshed = store.refresh(&first, t0, None).expect("refresh");
         for (path, header, query) in [
             ("/agent", Some(refreshed.as_str()), None),
             ("/ws/direct", None, Some(refreshed.as_str())),

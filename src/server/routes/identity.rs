@@ -2084,6 +2084,83 @@ mod owner_act_tests {
     }
 
     #[tokio::test]
+    async fn session_revoke_ends_only_the_callers_session() -> anyhow::Result<()> {
+        use crate::server::auth::{auth_middleware, refresh_session, revoke_session};
+        use axum::routing::get;
+        let (state, _dir) = matrix_state().await?;
+        let app = axum::Router::new()
+            .route("/auth/session/refresh", post(refresh_session))
+            .route("/auth/session/revoke", post(revoke_session))
+            .route("/agent", get(echo_actor))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                auth_middleware,
+            ))
+            .with_state(Arc::clone(&state));
+
+        let durable = state.api_token.clone();
+        let empty = serde_json::json!({});
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/auth/session/revoke",
+            &durable,
+            empty.clone(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "the durable token is not a session"
+        );
+
+        let mine = session_token(&state).await;
+        let other = session_token(&state).await;
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/auth/session/refresh",
+            &mine,
+            serde_json::json!({ "idle_ms": 1500 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "refresh with activity: {json}");
+        assert_eq!(json["idle_timeout_secs"], 3600);
+        let mine = json["session_token"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/auth/session/refresh",
+            &mine,
+            serde_json::json!({ "idle_ms": "soon" }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a malformed claim is refused"
+        );
+
+        let (status, json) = call(&app, "POST", "/auth/session/revoke", &mine, empty.clone()).await;
+        assert_eq!(status, StatusCode::OK, "revoke: {json}");
+        assert_eq!(json["revoked"], true);
+        let (status, _) = get_status(&app, "/agent", Some(&mine)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "a revoked session ends");
+        let (status, _) = call(&app, "POST", "/auth/session/refresh", &mine, empty).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a revoked session cannot refresh"
+        );
+        let (status, _) = get_status(&app, "/agent", Some(&other)).await;
+        assert_eq!(status, StatusCode::OK, "another session is untouched");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn lapsed_session_reaches_only_refresh_and_recovers() -> anyhow::Result<()> {
         use crate::server::auth::{auth_middleware, refresh_session};
         use axum::routing::get;

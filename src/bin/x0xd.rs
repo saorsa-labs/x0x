@@ -47,6 +47,31 @@ pub static MALLOC_CONF: &[u8] =
 
 use x0x::server::{DaemonConfig, InstanceName, ServeOptions};
 
+/// The GUI idle timeout requested on the command line or, failing that, in
+/// `X0X_GUI_IDLE_TIMEOUT_MINUTES`. Bounds are checked with the config value.
+fn gui_idle_timeout_override(args: &[OsString]) -> Result<Option<u64>> {
+    gui_idle_timeout_from(args, std::env::var_os("X0X_GUI_IDLE_TIMEOUT_MINUTES"))
+}
+
+fn gui_idle_timeout_from(args: &[OsString], env: Option<OsString>) -> Result<Option<u64>> {
+    const FLAG: &str = "--gui-idle-timeout-minutes";
+    let (source, raw) = if let Some(index) = args.iter().position(|a| a == FLAG) {
+        let value = args
+            .get(index + 1)
+            .with_context(|| format!("{FLAG} requires a number of minutes"))?;
+        (FLAG, value.clone())
+    } else if let Some(value) = env {
+        ("X0X_GUI_IDLE_TIMEOUT_MINUTES", value)
+    } else {
+        return Ok(None);
+    };
+    let minutes = raw
+        .to_str()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .with_context(|| format!("{source} must be a whole number of minutes"))?;
+    Ok(Some(minutes))
+}
+
 /// First `--name value` or `--name=value` on `args`.
 ///
 /// An empty value is the same error as a missing value. `x0xd` and the CLI
@@ -142,6 +167,9 @@ async fn run_daemon() -> anyhow::Result<()> {
         println!("    --config <PATH>                 Path to config file (TOML)");
         println!("    --name <NAME>                   Instance name for multi-instance support");
         println!("    --api-port <PORT>               Override API server port");
+        println!(
+            "    --gui-idle-timeout-minutes <MIN> End a GUI session after MIN idle minutes (1-1440, default 60; env X0X_GUI_IDLE_TIMEOUT_MINUTES)"
+        );
         println!(
             "    --no-hard-coded-bootstrap       Skip embedded bootstrap peers (config peers kept)"
         );
@@ -247,6 +275,8 @@ async fn run_daemon() -> anyhow::Result<()> {
         None
     };
 
+    let gui_idle_override = gui_idle_timeout_override(&args)?;
+
     // Parse and validate --name before using it to locate a named config file.
     // `--name alice` and `--name=alice` are the same flag.
     let cli_instance_name = match cli_name_argument(&args)? {
@@ -346,6 +376,12 @@ async fn run_daemon() -> anyhow::Result<()> {
     if let Some(port) = api_port_override {
         config.api_address.set_port(port);
     }
+
+    if let Some(minutes) = gui_idle_override {
+        config.gui_idle_timeout_minutes = minutes;
+    }
+    x0x::server::gui_idle_timeout(config.gui_idle_timeout_minutes)
+        .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
 
     // CLI --no-hard-coded-bootstrap clears the *embedded* global bootstrap
     // network only. When the config file explicitly set `bootstrap_peers`
@@ -973,6 +1009,39 @@ fn init_logging(level: &str, format: &str) -> Result<Vec<log_flush::LogGuard>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gui_idle_timeout_flag_wins_over_env_and_bad_values_fail() {
+        use std::ffi::OsString;
+        let args = |v: &[&str]| v.iter().map(OsString::from).collect::<Vec<_>>();
+        let env = Some(OsString::from("90"));
+        assert_eq!(
+            super::gui_idle_timeout_from(&args(&["x0xd"]), None).unwrap(),
+            None
+        );
+        assert_eq!(
+            super::gui_idle_timeout_from(&args(&["x0xd"]), env.clone()).unwrap(),
+            Some(90)
+        );
+        assert_eq!(
+            super::gui_idle_timeout_from(
+                &args(&["x0xd", "--gui-idle-timeout-minutes", "15"]),
+                env.clone()
+            )
+            .unwrap(),
+            Some(15)
+        );
+        for bad in [
+            args(&["x0xd", "--gui-idle-timeout-minutes"]),
+            args(&["x0xd", "--gui-idle-timeout-minutes", "ten"]),
+            args(&["x0xd", "--gui-idle-timeout-minutes", "-5"]),
+        ] {
+            assert!(super::gui_idle_timeout_from(&bad, None).is_err(), "{bad:?}");
+        }
+        assert!(
+            super::gui_idle_timeout_from(&args(&["x0xd"]), Some(OsString::from("1h"))).is_err()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn shutdown_log_directory_skips_unrelated_existing_ancestors() {

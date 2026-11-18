@@ -59,7 +59,7 @@ Every endpoint except `GET /health` and `GET /constitution*` requires an
 | Class | Lifetime | Source | Can act as |
 |---|---|---|---|
 | **Durable API token** | until rotated | `<data_dir>/api-token` | the local owner (full control) |
-| **Session token** | 10 minutes; refreshable while live or for 4 h after it lapses, up to 12 h after the original mint | `POST /auth/session` (exchanged from the durable token); `POST /auth/session/refresh` (session token only, old token revoked) | browser/GUI surfaces |
+| **Session token** | 10 minutes; refreshable, live or lapsed, until the session has had no user activity for the idle timeout (default 60 min, `gui_idle_timeout_minutes`, 1–1440); no absolute cap | `POST /auth/session` (exchanged from the durable token); `POST /auth/session/refresh` (session token only, old token revoked) | browser/GUI surfaces |
 | **Rider token** | ≤ 90 days (default 7) | `POST /owner/riders` | a scoped sub-agent principal |
 
 Auth-class labels used throughout this reference:
@@ -258,8 +258,9 @@ daemon, so it shows the routes of the CLI build, not of a running `x0xd`.
 | GET | `/health` | `x0x health` | Health probe with the M1 structured verdict (#1380); the node-specific detail is gated to loopback/authenticated callers (see the privacy boundary below) |
 | GET | `/status` | `x0x status` | Runtime status, bound API address, connectivity, peers, warnings |
 | POST | `/shutdown` | `x0x stop` | Gracefully stop the daemon |
-| POST | `/auth/session` | `x0x auth session` | Exchange the durable API token for a short-lived browser session token (WS1.6) |
-| POST | `/auth/session/refresh` | `x0x auth refresh` | Swap a **session** token for a fresh 10-minute one. The token can be live, or lapsed for less than 4 h; a lapsed token is accepted on this route only. The durable token gets `403`, the replaced token stops working at once, and refresh is refused (`401`) 12 h after the original `/auth/session` mint (#893) |
+| POST | `/auth/session` | `x0x auth session` | Exchange the durable API token for a short-lived browser session token (WS1.6). Response: `session_token`, `expires_in`, `idle_timeout_secs`; a mint counts as user activity |
+| POST | `/auth/session/refresh` | `x0x auth refresh` | Swap a **session** token for a fresh 10-minute one. Optional body `{"idle_ms": n}`: milliseconds since the client's last user input; the daemon moves the session's last activity to `now - idle_ms` when later, never past now. No body (or no `idle_ms`) is a background refresh and does not extend the session. The token can be live or lapsed; a lapsed token is accepted on this route only. Refused (`401`) once the session has had no recorded activity for the idle timeout (default 60 min; `gui_idle_timeout_minutes`, `--gui-idle-timeout-minutes`, `X0X_GUI_IDLE_TIMEOUT_MINUTES`, 1–1440). The durable token gets `403`, a malformed body `400`, and the replaced token stops working at once. Response: `session_token`, `expires_in`, `idle_timeout_secs` (#893) |
+| POST | `/auth/session/revoke` | `x0x auth revoke` | End the caller's own **session**: the bearer session token stops working at once and a pending GUI show bound to it is dropped. Live session token only; the durable token gets `403`. Response: `{"revoked": bool}` |
 | GET | `/constitution` | `x0x constitution` | Display the x0x Constitution (Markdown) |
 | GET | `/constitution/json` | `x0x constitution --json` | Constitution with version metadata (JSON) |
 

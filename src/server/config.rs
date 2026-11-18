@@ -42,6 +42,7 @@ const ROOT_OWNED_KEYS: &[&str] = &[
     "directory_digest_interval_secs",
     "directory_resubscribe_jitter_ms",
     "group_card_republish_interval_secs",
+    "gui_idle_timeout_minutes",
     "heartbeat_interval_secs",
     "identity_dir",
     "identity_ttl_secs",
