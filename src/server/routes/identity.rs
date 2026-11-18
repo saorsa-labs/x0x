@@ -1970,7 +1970,7 @@ mod owner_act_tests {
     }
 
     async fn session_token(state: &AppState) -> String {
-        state.sessions.issue(std::time::Instant::now())
+        state.sessions.issue()
     }
 
     async fn rider_token(state: &AppState) -> String {
@@ -2157,6 +2157,32 @@ mod owner_act_tests {
         );
         let (status, _) = get_status(&app, "/agent", Some(&other)).await;
         assert_eq!(status, StatusCode::OK, "another session is untouched");
+
+        let lapsed = session_token(&state).await;
+        state.sessions.expire_for_test(&lapsed);
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/auth/session/revoke",
+            &lapsed,
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "a lapsed token can revoke: {json}");
+        assert_eq!(json["revoked"], true);
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/auth/session/refresh",
+            &lapsed,
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a revoked lapsed session cannot refresh"
+        );
         Ok(())
     }
 

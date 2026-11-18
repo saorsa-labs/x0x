@@ -680,7 +680,7 @@ async fn names_and_forwards_refuse_session_and_rider_tokens() -> anyhow::Result<
     let (state, _dir) =
         crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
     let app = names_router_with_auth(Arc::clone(&state));
-    let session = state.sessions.issue(std::time::Instant::now());
+    let session = state.sessions.issue();
     let rider = {
         let mut store = state.rider_tokens.lock().await;
         let (token, _record) = store
@@ -840,7 +840,7 @@ async fn forward_delete_refuses_session_and_rider_and_accepts_durable_owner() ->
 {
     let (state, _dir) =
         crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
-    let session = state.sessions.issue(std::time::Instant::now());
+    let session = state.sessions.issue();
     let rider = {
         let mut store = state.rider_tokens.lock().await;
         let (token, _record) = store

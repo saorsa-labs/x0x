@@ -2828,9 +2828,16 @@ function mint(token) {
   location.search = '?token=' + token;
 }
 function daemonActive() { return daemon && now - daemon.lastActivity < IDLE; }
+const revoked = [];
 async function apiWith(token, path, opt) {
   await null;
   const known = daemon && token === daemon.token;
+  if (path === '/auth/session/revoke') {
+    revoked.push(token);
+    if (!known || !daemonActive()) return { _http_ok: false, _http_status: 401 };
+    daemon = null;
+    return { _http_ok: true, revoked: true };
+  }
   if (path !== '/auth/session/refresh') {
     return known && now < daemon.expiresAt && daemonActive()
       ? { _http_ok: true, _http_status: 200 }
@@ -2894,12 +2901,18 @@ async function load(token) {
   await maybeRefreshSession();
   if (!(await api('/agent'))._http_ok || sessionExpired) fail('a reveal after 30 min did not recover');
 
-  // A hidden tab that keeps polling, with no input, ends at the idle limit.
+  // A hidden tab that keeps polling, with no input, ends at the idle limit
+  // and revokes its token, which the daemon still accepts.
   document.visibilityState = 'hidden';
   const quietSince = lastUserActivity;
+  const heldToken = SESSION_TOKEN;
   await tick(61, false);
   if (!sessionExpired || toasts !== 1) fail('a hidden polling tab outlived the idle timeout');
   if (now - quietSince < IDLE) fail('the tab ended before the idle timeout');
+  await null; await null;
+  if (revoked[revoked.length - 1] !== heldToken) fail('idle expiry did not revoke the token');
+  if (daemon && daemonActive()) fail('the daemon session survived the idle expiry');
+  if (sessionStorage.getItem('x0x_session_token') !== null) fail('idle expiry left the token stored');
   if (liveGuiTab()) fail('an ended session is not a live tab');
   document.visibilityState = 'visible';
   noteUserActivity();
@@ -2918,17 +2931,15 @@ async function load(token) {
   if (daemon.lastActivity !== mintedAt) fail('a background refresh moved the daemon activity');
   if (!sessionExpired || toasts !== 1) fail('a visible tab with no input outlived the idle timeout');
 
-  // Sign out revokes the token and ends the session once.
+  // Sign out revokes the token, even a lapsed one, and ends the session once.
   await load('minted-c');
-  let revoked = null;
-  const realApiWith = apiWith;
-  apiWith = async (token, path, opt) => {
-    if (path === '/auth/session/revoke') { revoked = token; daemon = null; return { _http_ok: true, revoked: true }; }
-    return realApiWith(token, path, opt);
-  };
   const signedOut = SESSION_TOKEN;
-  await signOut();
-  if (revoked !== signedOut) fail('sign out did not revoke this tab token');
+  document.visibilityState = 'hidden';
+  await tick(20, false);
+  signOut();
+  await null; await null;
+  if (revoked[revoked.length - 1] !== signedOut) fail('sign out did not revoke this tab token');
+  if (daemon !== null) fail('sign out left the daemon session alive');
   if (!sessionExpired || toasts !== 1) fail('sign out must end the session once');
   if (sessionStorage.getItem('x0x_session_token') !== null) fail('sign out left the token stored');
 })().catch((error) => { console.error(error); process.exit(1); });

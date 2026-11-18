@@ -170,7 +170,7 @@ mod issue870_session_read_tests {
     ) -> anyhow::Result<()> {
         let (state, _dir) = fixture().await?;
         let app = router(Arc::clone(&state));
-        let session = state.sessions.issue(std::time::Instant::now());
+        let session = state.sessions.issue();
         let path = format!("/groups/{GROUP}/delegations");
 
         let (status, body) = read(&app, &path, &session).await?;
@@ -231,7 +231,7 @@ mod issue870_session_read_tests {
     ) -> anyhow::Result<()> {
         let (state, _dir) = fixture().await?;
         let app = router(Arc::clone(&state));
-        let session = state.sessions.issue(std::time::Instant::now());
+        let session = state.sessions.issue();
         let path = format!("/history?scope=group:{GROUP}");
 
         let (status, body) = read(&app, &path, &session).await?;
@@ -3106,7 +3106,7 @@ mod adr0116_policy_tests {
                 history_enabled.then(|| enabled(dir.path(), HistoryConfig::daemon_default()));
             let state = state_with(dir.path(), history).await?;
             let app = policy_router(Arc::clone(&state));
-            let session = state.sessions.issue(std::time::Instant::now());
+            let session = state.sessions.issue();
             let rider = rider(&state).await;
             let cases = [
                 (
@@ -3488,7 +3488,7 @@ mod adr0116_retain_tests {
         let dir = tempfile::tempdir()?;
         let state = state_with(dir.path(), Some(aged(dir.path()))).await?;
         let app = retain_router(Arc::clone(&state));
-        let session = state.sessions.issue(std::time::Instant::now());
+        let session = state.sessions.issue();
         let rider = rider(&state).await;
         let cases = [
             (

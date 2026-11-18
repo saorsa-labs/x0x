@@ -1714,7 +1714,7 @@ async fn card_session_bearer_through_middleware_omits_owner_axis() -> Result<()>
         .with_state(Arc::clone(&state));
 
     // A short-lived browser SESSION token (NOT the durable api token).
-    let session = state.sessions.issue(std::time::Instant::now());
+    let session = state.sessions.issue();
     let response = app
         .oneshot(
             axum::http::Request::builder()

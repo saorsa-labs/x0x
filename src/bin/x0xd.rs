@@ -55,11 +55,27 @@ fn gui_idle_timeout_override(args: &[OsString]) -> Result<Option<u64>> {
 
 fn gui_idle_timeout_from(args: &[OsString], env: Option<OsString>) -> Result<Option<u64>> {
     const FLAG: &str = "--gui-idle-timeout-minutes";
-    let (source, raw) = if let Some(index) = args.iter().position(|a| a == FLAG) {
-        let value = args
-            .get(index + 1)
-            .with_context(|| format!("{FLAG} requires a number of minutes"))?;
-        (FLAG, value.clone())
+    let mut flag_value = None;
+    for (index, arg) in args.iter().enumerate() {
+        if arg == FLAG {
+            let value = args
+                .get(index + 1)
+                .with_context(|| format!("{FLAG} requires a number of minutes"))?;
+            flag_value = Some(value.clone());
+            break;
+        }
+        if let Some(value) = arg
+            .as_encoded_bytes()
+            .strip_prefix(b"--gui-idle-timeout-minutes=")
+        {
+            let value = std::str::from_utf8(value)
+                .with_context(|| format!("{FLAG} must be a whole number of minutes"))?;
+            flag_value = Some(OsString::from(value));
+            break;
+        }
+    }
+    let (source, raw) = if let Some(value) = flag_value {
+        (FLAG, value)
     } else if let Some(value) = env {
         ("X0X_GUI_IDLE_TIMEOUT_MINUTES", value)
     } else {
@@ -638,6 +654,10 @@ async fn run_doctor(config: &DaemonConfig) -> Result<()> {
     }
 
     print_pass("configuration loaded");
+    print_pass(&format!(
+        "GUI session idle timeout: {} min",
+        config.gui_idle_timeout_minutes
+    ));
 
     // Probe daemon endpoints
     let client = reqwest::Client::builder()
@@ -1030,7 +1050,17 @@ mod tests {
             .unwrap(),
             Some(15)
         );
+        assert_eq!(
+            super::gui_idle_timeout_from(
+                &args(&["x0xd", "--gui-idle-timeout-minutes=15"]),
+                env.clone()
+            )
+            .unwrap(),
+            Some(15)
+        );
         for bad in [
+            args(&["x0xd", "--gui-idle-timeout-minutes="]),
+            args(&["x0xd", "--gui-idle-timeout-minutes=ten"]),
             args(&["x0xd", "--gui-idle-timeout-minutes"]),
             args(&["x0xd", "--gui-idle-timeout-minutes", "ten"]),
             args(&["x0xd", "--gui-idle-timeout-minutes", "-5"]),

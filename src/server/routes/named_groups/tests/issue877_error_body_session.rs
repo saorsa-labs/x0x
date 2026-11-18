@@ -78,7 +78,7 @@ async fn issue877_nonmember_session_cannot_read_quarantine_error_body() -> Resul
     });
     state.named_groups.write().await.insert(GROUP.into(), info);
     let app = router(Arc::clone(&state));
-    let session = state.sessions.issue(std::time::Instant::now());
+    let session = state.sessions.issue();
     let session_actor = crate::server::rider_auth::ActorContext::Owner { durable: false };
     let (status, late) = reject_fork_quarantine_installed_before_effect_for_actor(
         &state,
@@ -277,7 +277,7 @@ async fn issue877_late_send_refusal_redacts_for_nonmember_session() -> Result<()
         .await
         .insert(LATE_GROUP.into(), info);
     let app = router(Arc::clone(&state));
-    let session = state.sessions.issue(std::time::Instant::now());
+    let session = state.sessions.issue();
     let path = format!("/groups/{LATE_GROUP}/send");
     let body = serde_json::json!({"body":"must not publish"});
     let publishes_before = state

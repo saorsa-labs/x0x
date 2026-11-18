@@ -798,17 +798,26 @@ async function swapSessionToken(){
   if(!r)return; // daemon unreachable: retry on the next tick
   endSession('Session expired — reopen with `x0x gui`');
 }
-function endSession(message){
+// revoke: the daemon may still accept this token (the GUI ended the
+// session on its own clock), so end it there too. Best effort.
+function endSession(message,revoke){
   if(sessionExpired)return;
+  const token=SESSION_TOKEN;
   sessionExpired=true;
   advertiseGuiVisibility();
+  try{
+    sessionStorage.removeItem('x0x_session_token');
+    sessionStorage.removeItem('x0x_session_issued_at');
+    sessionStorage.removeItem('x0x_last_activity');
+  }catch(e){}
+  if(revoke&&token)apiWith(token,'/auth/session/revoke',{method:'POST'});
   const el=document.createElement('div');
   el.className='toast error';
   el.textContent=message;
   document.getElementById('toasts').appendChild(el);
 }
 function maybeRefreshSession(){
-  if(SESSION_TOKEN&&sessionIdleLapsed()){endSession('Session expired — reopen with `x0x gui`');return}
+  if(SESSION_TOKEN&&sessionIdleLapsed()){endSession('Session expired — reopen with `x0x gui`',true);return}
   if(document.visibilityState==='visible'&&Date.now()-sessionIssuedAt>=SESSION_REFRESH_MS)return refreshSession();
 }
 async function bootstrapGuiSession(){
@@ -835,18 +844,15 @@ function sessionIdleLapsed(){
 function noteUserActivity(){
   if(!SESSION_TOKEN||sessionExpired)return;
   // Input after the limit cannot revive the session: the daemon refuses it.
-  if(sessionIdleLapsed()){endSession('Session expired — reopen with `x0x gui`');return}
+  if(sessionIdleLapsed()){endSession('Session expired — reopen with `x0x gui`',true);return}
   const now=Date.now();
   if(now-lastUserActivity<ACTIVITY_THROTTLE_MS)return;
   lastUserActivity=now;
   try{sessionStorage.setItem('x0x_last_activity',String(now))}catch(e){}
 }
-async function signOut(){
+function signOut(){
   if(!SESSION_TOKEN||sessionExpired)return;
-  const token=SESSION_TOKEN;
-  await apiWith(token,'/auth/session/revoke',{method:'POST'});
-  try{sessionStorage.removeItem('x0x_session_token');sessionStorage.removeItem('x0x_session_issued_at');sessionStorage.removeItem('x0x_last_activity')}catch(e){}
-  endSession('Signed out — reopen with `x0x gui`');
+  endSession('Signed out — reopen with `x0x gui`',true);
 }
 
 // Issue #446: owner-act surfaces (/agent/sign, /exec/*, /shutdown,

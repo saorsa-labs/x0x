@@ -4209,7 +4209,7 @@ pub(in crate::server::routes) mod tests {
             "an unknown bearer is 401"
         );
 
-        let session = state.sessions.issue(std::time::Instant::now());
+        let session = state.sessions.issue();
         for body in [well_formed, "{\"agent_id\":", "not json at all"] {
             let response = call(session.clone(), body).await?;
             assert_eq!(
@@ -5628,7 +5628,7 @@ pub(in crate::server::routes) mod tests {
             }
         };
 
-        let session = state.sessions.issue(std::time::Instant::now());
+        let session = state.sessions.issue();
         let response = call(session, "Session Rename").await?;
         let (status, body) = response_json(response.into_response()).await?;
         assert_eq!(
@@ -5737,7 +5737,7 @@ pub(in crate::server::routes) mod tests {
         };
 
         // Session bearer: Home PATCH → 403 …
-        let session = state.sessions.issue(std::time::Instant::now());
+        let session = state.sessions.issue();
         let response = patch(session.clone(), home_id.clone()).await?;
         let (status, body) = response_json(response).await?;
         assert_eq!(
@@ -5808,7 +5808,7 @@ pub(in crate::server::routes) mod tests {
         };
         let rename_body = serde_json::json!({ "name": "Stolen Rename" }).to_string();
         let flip_body = serde_json::json!({ "discoverability": "listed_to_contacts" }).to_string();
-        let session = state.sessions.issue(std::time::Instant::now());
+        let session = state.sessions.issue();
 
         // Chain step 1 — flip the Home's discoverability: refused.
         let response = call(
@@ -5993,7 +5993,7 @@ pub(in crate::server::routes) mod tests {
                 .await?;
             token
         };
-        let session = state.sessions.issue(std::time::Instant::now());
+        let session = state.sessions.issue();
 
         // (label, method, path, body, durable_expects_200). The durable
         // arm must prove AUTHORIZED pass: rename/policy really mutate
@@ -6351,10 +6351,7 @@ pub(in crate::server::routes) mod tests {
                 Request::delete(format!("/groups/{home_l}"))
                     .header(
                         "authorization",
-                        format!(
-                            "Bearer {}",
-                            state_l.sessions.issue(std::time::Instant::now())
-                        ),
+                        format!("Bearer {}", state_l.sessions.issue()),
                     )
                     .body(Body::empty())?,
             )
@@ -6402,10 +6399,7 @@ pub(in crate::server::routes) mod tests {
                 Request::post(format!("/groups/{home2}/state/withdraw"))
                     .header(
                         "authorization",
-                        format!(
-                            "Bearer {}",
-                            state2.sessions.issue(std::time::Instant::now())
-                        ),
+                        format!("Bearer {}", state2.sessions.issue()),
                     )
                     .body(Body::empty())?,
             )
