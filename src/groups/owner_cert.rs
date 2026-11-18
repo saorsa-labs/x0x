@@ -141,36 +141,19 @@ impl OwnerCertVerdict {
 
 /// Snapshot of the certificate evidence available to a verifier at one
 /// decision point (invite-accept or seal).
-/// Deliberately a value snapshot, not a live view: the underlying discovery
-/// cache and revocation set are async-guarded, while the verification
-/// predicates here are pure and synchronous (and callable from the sealing
-/// path, which must not hold cross-lock await points). Seals are rare,
-/// membership-scale events, so the copy cost is irrelevant next to the
-/// ML-DSA-65 signature verifications each check performs.
+///
+/// A value snapshot, not a live view: the sealing path must not hold a
+/// lock across an await.
 #[derive(Debug, Clone, Default)]
 pub struct OwnerCertEvidence {
-    /// Verified certificates by agent id (hex), resolved via the V3 announce
-    /// blob path or held locally by this daemon's own identity. A member
-    /// whose latest announce committed to a digest that has NOT resolved
-    /// yet is ABSENT here (fetch in flight) — see `digests`.
     certs: HashMap<String, AgentCertificate>,
-    /// The cert digest each agent's LATEST announcement committed to (hex
-    /// keyed). Round-3: this is what couples evidence freshness to the
-    /// announce stream — a digest present without a matching `certs` entry
-    /// means a warranted fetch is outstanding; a digest that differs from
-    /// the roster-embedded cert's digest means the embedded cert is STALE
-    /// and must not seat the member.
+    /// The digest each agent's latest announce committed to. A digest with
+    /// no `certs` entry means a fetch is outstanding.
     digests: HashMap<String, [u8; 32]>,
-    /// Agent ids (hex) present in the local ADR-0018 revocation set.
     revoked: HashSet<String>,
-    /// ADR 0108 §4 premise: agent ids (hex) whose recorded digest is the
-    /// canonical anonymous one AND was announced by the agent's current
-    /// authenticated bound machine (the builder checks that). Only these
-    /// anonymous digests are absence of disclosure in a Home scope.
-    /// Recording a pending digest for the agent clears its entry; a
-    /// certificate's digest is never the anonymous one.
+    /// ADR 0108 §4: agents whose anonymous digest came from their bound
+    /// machine. Only these count as no disclosure in a Home scope.
     bound_anonymous: HashSet<String>,
-    /// Wall-clock unix seconds used for expiry checks.
     now_unix: u64,
 }
 
@@ -352,11 +335,8 @@ pub fn verify_owner_certified_member(
     member_agent_hex: &str,
     evidence: &OwnerCertEvidence,
 ) -> Result<(), OwnerCertFailure> {
-    // Revocation first (positive knowledge of compromise dominates), then
-    // resolve the announce-path certificate and run the pure core over it.
-    // A cache MISS is `NoCertificate` — deny + retryable, never fail-open:
-    // the background blob fetch (PR #419) fills the discovery cache, and
-    // the next invite volley / seal re-runs this check.
+    // Revocation first. A cache miss below is `NoCertificate`: deny and
+    // retry, never fail-open.
     if evidence.is_revoked(member_agent_hex) {
         return Err(OwnerCertFailure::Revoked);
     }
@@ -423,25 +403,22 @@ pub fn verify_cert_against_owner(
     revoked: bool,
     now_unix: u64,
 ) -> Result<(), OwnerCertFailure> {
-    // Revocation first: positive knowledge of compromise outranks everything
-    // else — a still-valid-looking certificate must not rescue a revoked key.
+    // Revocation first: a valid-looking certificate must not rescue a
+    // revoked key.
     if revoked {
         return Err(OwnerCertFailure::Revoked);
     }
     cert.verify()
         .map_err(|_| OwnerCertFailure::InvalidSignature)?;
-    // The chain: the cert must have been signed by the group owner's user
-    // key. `cert.user_id()` is derived from the user public key inside the
-    // (just-verified) certificate signature, so this comparison IS the
-    // chain check.
+    // `cert.user_id()` comes from the user key inside the verified
+    // certificate, so this comparison is the chain check.
     let cert_user = cert
         .user_id()
         .map_err(|_| OwnerCertFailure::InvalidSignature)?;
     if &cert_user != owner {
         return Err(OwnerCertFailure::NotChainedToOwner);
     }
-    // The cert must bind exactly the member claiming it — otherwise agent A
-    // could present agent B's owner-signed cert.
+    // Otherwise agent A could present agent B's owner-signed certificate.
     let cert_agent = cert
         .agent_id()
         .map_err(|_| OwnerCertFailure::InvalidSignature)?;
@@ -479,8 +456,6 @@ mod tests {
 
     #[test]
     fn certified_agent_passes() {
-        // WHY: the positive case — a fresh owner-signed cert binding exactly
-        // this agent — must verify, else Home could never hold any member.
         let (user, agent, cert) = owner_and_certified_agent();
         let mut evidence = OwnerCertEvidence::new(1_000);
         evidence.insert_cert(agent_hex(&agent), cert);
@@ -492,9 +467,6 @@ mod tests {
 
     #[test]
     fn missing_certificate_fails_closed() {
-        // WHY: "no evidence" must mean "no admission" — otherwise a node
-        // that simply has not fetched the announce blob yet would admit (or
-        // keep) an uncertified agent.
         let (user, agent, _cert) = owner_and_certified_agent();
         let evidence = OwnerCertEvidence::new(1_000);
         assert_eq!(
@@ -505,9 +477,6 @@ mod tests {
 
     #[test]
     fn revoked_agent_fails_even_with_valid_certificate() {
-        // WHY: revocation is positive knowledge of compromise and must
-        // outrank a still-verifiable signature — checked FIRST so a
-        // later-added expiry or chain check can never mask it.
         let (user, agent, cert) = owner_and_certified_agent();
         let hex = agent_hex(&agent);
         let mut evidence = OwnerCertEvidence::new(1_000);
@@ -521,8 +490,6 @@ mod tests {
 
     #[test]
     fn foreign_owner_certificate_fails() {
-        // WHY: a cert signed by ANOTHER user must not admit — this is the
-        // "no other human can ever join" guarantee.
         let (_owner, agent, cert) = owner_and_certified_agent();
         let stranger = UserKeypair::generate().expect("stranger keypair");
         let mut evidence = OwnerCertEvidence::new(1_000);
@@ -535,8 +502,6 @@ mod tests {
 
     #[test]
     fn certificate_for_other_agent_fails() {
-        // WHY: presenting someone else's owner-signed cert must fail the
-        // agent binding, else one certified agent could vouch the fleet.
         let (user, _agent, cert) = owner_and_certified_agent();
         let other = AgentKeypair::generate().expect("other keypair");
         let mut evidence = OwnerCertEvidence::new(1_000);
@@ -549,8 +514,6 @@ mod tests {
 
     #[test]
     fn expired_certificate_fails() {
-        // WHY: ADR-0018 expiry must actually evict — a stale cert that still
-        // verifies must not carry membership past `not_after`.
         let user = UserKeypair::generate().expect("user keypair");
         let agent = AgentKeypair::generate().expect("agent keypair");
         let past = 1_700_000_000;
@@ -566,11 +529,6 @@ mod tests {
 
     #[test]
     fn tampered_certificate_fails_signature() {
-        // WHY: the signature is the only thing binding the cert payload to
-        // the owner's key. Corrupt one byte inside the serialized signature
-        // (the trailing 9 bytes are `issued_at` + `not_after` tag, so the
-        // byte just before them is signature payload) and the cert must
-        // fail at signature verification rather than being trusted.
         let (user, agent, cert) = owner_and_certified_agent();
         let mut bytes = bincode::serialize(&cert).expect("cert serializes for tampering");
         let corrupt_at = bytes.len() - 10;
@@ -588,10 +546,6 @@ mod tests {
 
     #[test]
     fn failing_active_members_skips_inactive_and_orders_by_roster() {
-        // WHY: eviction must sweep exactly the ACCESS-BEARING roster —
-        // Removed/Pending members hold no key material, and re-verifying
-        // them would produce spurious eviction noise; order must be
-        // deterministic (BTreeMap) so committed rosters are reproducible.
         let (user, good, good_cert) = owner_and_certified_agent();
         let bad = AgentKeypair::generate().expect("bad keypair");
         let mut members = BTreeMap::new();
