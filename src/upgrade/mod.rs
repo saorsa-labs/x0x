@@ -27,6 +27,10 @@ pub(crate) mod log_flush;
 pub mod manifest;
 pub mod monitor;
 pub(crate) mod pair;
+#[cfg(unix)]
+pub(crate) mod prepare;
+#[cfg(unix)]
+pub(crate) mod prepare_live;
 pub(crate) mod probe;
 pub(crate) mod probe_retry;
 pub mod restart;

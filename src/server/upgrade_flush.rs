@@ -772,8 +772,9 @@ fn sync_tree_with(
 }
 
 // Native start identity: Linux /proc start ticks, Darwin start microseconds,
-// Windows creation time in 100 ns FILETIME units.
-fn process_start() -> io::Result<u64> {
+// Windows creation time in 100 ns FILETIME units. The prepare producer
+// (`upgrade::prepare_live`, #2012) records the same value.
+pub(crate) fn process_start() -> io::Result<u64> {
     #[cfg(target_os = "linux")]
     {
         let stat = std::fs::read_to_string("/proc/self/stat")?;
