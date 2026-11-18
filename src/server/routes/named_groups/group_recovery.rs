@@ -4864,6 +4864,12 @@ async fn subject_tick(state: &Arc<AppState>) {
                             subject.terminal_unkeyed_at = None;
                             (false, false)
                         }
+                        // #2022: the attempt ended typed on a lost Welcome
+                        // (`end_on_welcome_loss`). The sticky outcome and
+                        // `welcome_lost` stay while the node has no keys,
+                        // so its recovery object keeps D43's exit; a new
+                        // attempt or the keys clear them.
+                        view if subject.welcome_lost && view.sticky() && !keyed => (false, false),
                         _ => (true, false),
                     },
                     None => (false, false),
@@ -4877,6 +4883,20 @@ async fn subject_tick(state: &Arc<AppState>) {
                 end_on_welcome_loss(state, &key, &info, now).await;
             }
             continue;
+        }
+        // #2022: `terminal_unkeyed_at` belongs to the empty-refs terminal
+        // view above. With live refs (or an open unserved seal) a new
+        // catch-up runs, and a stale stamp must not end it as a lost
+        // Welcome.
+        if let Some(subject) = state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .subjects
+            .get_mut(&stable)
+        {
+            subject.terminal_unkeyed_at = None;
         }
         if home_gate_closed(state, &info) {
             set_view(
@@ -20244,15 +20264,26 @@ mod tests {
                 "{case}: the recovery object stays"
             );
         }
-        // No Welcome within its lifetime: the attempt ends typed.
+        // No Welcome within its lifetime: the attempt ends typed, and the
+        // outcome stays on later ticks (the empty-refs branch keeps it).
         tokio::time::advance(super::super::PENDING_WELCOME_TTL).await;
-        subject_tick(&state).await;
-        assert_eq!(
-            view_of(&state, &stable).await,
-            Some(SubjectView::Readmission {
-                cause: "base_beyond_retention"
-            })
-        );
+        for tick in ["the ending tick", "a later tick"] {
+            subject_tick(&state).await;
+            assert_eq!(
+                view_of(&state, &stable).await,
+                Some(SubjectView::Readmission {
+                    cause: "base_beyond_retention"
+                }),
+                "{tick}"
+            );
+            assert!(welcome_lost(&state, &stable).await, "{tick}");
+            let record = state.named_groups.read().await.get(&key).cloned();
+            let record = record.ok_or_else(|| anyhow::anyhow!("record"))?;
+            assert!(
+                recovery_json(&state, &record).await.is_some(),
+                "{tick}: the recovery object stays"
+            );
+        }
         // Control: with its TreeKEM group the node is keyed and a
         // `catching_up` view at the terminal is dropped.
         install_tree(&state, &key).await?;
