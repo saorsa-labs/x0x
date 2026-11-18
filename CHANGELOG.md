@@ -408,9 +408,9 @@ All notable changes to this project will be documented in this file.
 
 - **CI cancels superseded PR runs via concurrency groups.** Five workflows
   (`adr-governance`, `build`, `integration`, `release-custody-check`,
-  `security`) now carry a `concurrency:` block that cancels an in-progress run
-  when a newer push arrives on the same PR. Runs on `main`, tags, scheduled
-  triggers, and `workflow_dispatch` are never cancelled.
+  `security`) now carry a `concurrency:` block; only `pull_request` runs are
+  grouped; push, tag, schedule and manual runs are never grouped, cancelled or
+  replaced.
 
 - **CI pins cargo-nextest 0.9.151 (was 0.9.144) in all 18 install steps.**
   0.9.151 is the first release with `future-queue` 0.4.1
