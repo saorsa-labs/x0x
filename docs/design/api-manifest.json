@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 229,
+  "endpoint_count": 230,
   "endpoints": [
     {
       "category": "status",
@@ -62,9 +62,27 @@
     {
       "category": "status",
       "cli_name": "auth refresh",
-      "description": "Swap a session token, live or lapsed under 4h, for a fresh one (12h cap from the original mint)",
+      "description": "Swap a session token, live or lapsed, for a fresh one; refused once the session is idle past its timeout",
       "method": "POST",
       "path": "/auth/session/refresh",
+      "request": {
+        "fields": [
+          {
+            "cli": "default",
+            "in": "body",
+            "name": "idle_ms",
+            "required": false
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "status",
+      "cli_name": "auth revoke",
+      "description": "End the caller's own browser session (session token only)",
+      "method": "POST",
+      "path": "/auth/session/revoke",
       "request": {
         "kind": "none"
       }

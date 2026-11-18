@@ -27,6 +27,24 @@ All notable changes to this project will be documented in this file.
   The arm handler now compares the canonical running executable, so a
   daemon started through a symlink is no longer refused. `upgrade::prepare_live` reads the running daemon's own
   participant entry. No apply path calls either yet.
+- **GUI sessions end after inactivity, not 12 h after mint (#2070; A11
+  amendment of 18 Nov 2026).** A browser session is a sliding session with
+  no absolute cap. It ends after `gui_idle_timeout_minutes` (default 60,
+  1–1440; flag `--gui-idle-timeout-minutes[=]<MIN>`, env
+  `X0X_GUI_IDLE_TIMEOUT_MINUTES`) without user activity, measured on the
+  wall clock, so time asleep counts. A clock step back of more than 60 s
+  (such as a corrected forward jump) ends every session; users sign in
+  again. `POST /auth/session/refresh` takes an
+  optional `{"idle_ms": n}`; only that extends the session. **Behaviour
+  change:** a client that refreshes without `idle_ms` (including
+  `x0x auth refresh` without `--idle-ms`) now ends after the idle timeout,
+  60 min by default, where it had 12 h. New `POST /auth/session/revoke`
+  (`x0x auth revoke`, GUI "Sign out") ends the caller's own session, every
+  token of it, live or lapsed, even when a refresh raced the sign-out.
+  `GET /status` adds `gui_idle_timeout_secs`; `x0xd --doctor` prints the
+  timeout. Known limit: open WebSocket and SSE streams of a revoked or
+  idle-expired session are not closed; such a stream can outlive sign-out
+  until the client disconnects, with no time bound.
 - **Relay serving follows participation mode (#1642; A06 amendment of
   18 Nov 2026).** New `NetworkConfig.relay_service_enabled` (default `true`)
   is passed to ant-quic. x0xd reads an optional TOML `relay_service_enabled`;

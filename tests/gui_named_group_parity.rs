@@ -1776,7 +1776,7 @@ fn response_fields(method: Method, path: &str) -> &'static [&'static str] {
         (
             Method::Post,
             "/auth/session/refresh",
-            &["session_token", "expires_in"],
+            &["session_token", "expires_in", "idle_timeout_secs"],
         ),
         (
             Method::Get,

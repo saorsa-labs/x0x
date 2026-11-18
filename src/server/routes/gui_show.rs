@@ -264,14 +264,11 @@ async fn display_show(
         rider,
         request_id: request_id.to_string(),
     };
-    let decided_at = Instant::now();
     let accepted = {
         let sessions = state.ws_sessions.read().await;
         let mut accepted = false;
         for session in sessions.values() {
-            if session
-                .try_accept_gui_show(&show, |token| state.sessions.is_valid(token, decided_at))
-            {
+            if session.try_accept_gui_show(&show, |token| state.sessions.is_valid(token)) {
                 accepted = true;
             }
         }
@@ -285,7 +282,7 @@ async fn display_show(
     // Queue the banner before the opener so a browser that connects during
     // the launch wait still receives it. A failed launch drops that entry
     // and revokes the session so the token is not valid.
-    let session = state.sessions.issue(Instant::now());
+    let session = state.sessions.issue();
     let url = show_loopback_url(state.api_address, &session, &route);
     state.gui_show.enqueue_pending(PendingGuiShow {
         view: route,
@@ -1009,10 +1006,10 @@ fn show_dm_request(
 /// the tab was visible. The socket must hold a live session token.
 /// A session refresh does not write this stamp.
 pub(crate) async fn fresh_gui_visible_at(state: &AppState) -> Option<u64> {
-    let now_instant = Instant::now();
-    let live = state.ws_sessions.read().await.values().any(|session| {
-        session.visible_with_live_session(|token| state.sessions.is_valid(token, now_instant))
-    });
+    let live =
+        state.ws_sessions.read().await.values().any(|session| {
+            session.visible_with_live_session(|token| state.sessions.is_valid(token))
+        });
     if live {
         let now = unix_secs();
         state.gui_show.note_gui_visible(now);
@@ -1272,7 +1269,7 @@ mod tests {
             ))
             .with_state(Arc::clone(&state));
 
-        let session = state.sessions.issue(Instant::now());
+        let session = state.sessions.issue();
         let (status, body) = post_show_as(&app, &session).await?;
         assert_eq!(
             status,
@@ -1374,7 +1371,7 @@ mod tests {
     async fn gui_show_scope_rider_response_has_no_token_or_url() -> anyhow::Result<()> {
         let (state, _dir) = secure_endpoint_test_state().await?;
         let cap = install_capturing_opener(&state);
-        let tab = state.sessions.issue(Instant::now());
+        let tab = state.sessions.issue();
         let probe = {
             let mut sessions = state.ws_sessions.write().await;
             crate::server::ws::insert_visible_gui_with_queue(&mut sessions, "rider-tab", 4, 0, &tab)
@@ -1686,7 +1683,7 @@ mod tests {
     async fn open_ws_session_yields_navigated_when_the_queue_accepts() -> anyhow::Result<()> {
         let (state, _dir) = secure_endpoint_test_state().await?;
         let cap = install_capturing_opener(&state);
-        let token = state.sessions.issue(Instant::now());
+        let token = state.sessions.issue();
         let probe = {
             let mut sessions = state.ws_sessions.write().await;
             crate::server::ws::insert_visible_gui_with_queue(
@@ -1722,7 +1719,7 @@ mod tests {
     async fn saturated_live_tab_does_not_report_navigated() -> anyhow::Result<()> {
         let (state, _dir) = secure_endpoint_test_state().await?;
         let cap = install_capturing_opener(&state);
-        let token = state.sessions.issue(Instant::now());
+        let token = state.sessions.issue();
         let probe = {
             let mut sessions = state.ws_sessions.write().await;
             crate::server::ws::insert_visible_gui_with_queue(
@@ -1761,7 +1758,7 @@ mod tests {
     async fn expired_visible_tab_does_not_report_navigated() -> anyhow::Result<()> {
         let (state, _dir) = secure_endpoint_test_state().await?;
         let cap = install_capturing_opener(&state);
-        let token = state.sessions.issue(Instant::now());
+        let token = state.sessions.issue();
         let probe = {
             let mut sessions = state.ws_sessions.write().await;
             crate::server::ws::insert_visible_gui_with_queue(
@@ -1774,7 +1771,7 @@ mod tests {
         };
         state.sessions.expire_for_test(&token);
         assert!(
-            !state.sessions.is_live_for_test(&token, Instant::now()),
+            !state.sessions.is_live_for_test(&token),
             "the fixture must be an expired GUI session"
         );
         let app = router(Arc::clone(&state));
@@ -1893,9 +1890,7 @@ mod tests {
             "a failed opener must drop the banner it queued"
         );
         assert!(
-            !state
-                .sessions
-                .is_live_for_test(&token, std::time::Instant::now()),
+            !state.sessions.is_live_for_test(&token),
             "a failed opener must revoke the session it minted"
         );
         Ok(())
@@ -2340,7 +2335,7 @@ mod tests {
             "a visible flag with no live session is not active: {body}"
         );
 
-        let token = state.sessions.issue(std::time::Instant::now());
+        let token = state.sessions.issue();
         state.ws_sessions.write().await.insert(
             "visible".to_string(),
             crate::server::ws::test_live_gui_ws_session("visible", &token),

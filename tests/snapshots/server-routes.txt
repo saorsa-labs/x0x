@@ -4,7 +4,8 @@ GET  /health                                             health                 
 GET  /status                                             status                                                  Runtime status with uptime
 POST  /shutdown                                           stop                                                    Gracefully stop the daemon
 POST  /auth/session                                       auth session                                            Exchange the durable API token for a short-lived browser session token
-POST  /auth/session/refresh                               auth refresh                                            Swap a session token, live or lapsed under 4h, for a fresh one (12h cap from the original mint)
+POST  /auth/session/refresh                               auth refresh              body: idle_ms                 Swap a session token, live or lapsed, for a fresh one; refused once the session is idle past its timeout
+POST  /auth/session/revoke                                auth revoke                                             End the caller's own browser session (session token only)
 GET  /constitution                                       constitution                                            Display the x0x Constitution (Markdown)
 GET  /constitution/json                                  constitution --json                                     Constitution with version metadata (JSON)
 GET  /groups/:id/stores/:app/legacy-imports/:source_id   group store legacy download  query: idempotency_key        Download the exact reviewed legacy Wiki/Web snapshot without changing it
@@ -230,4 +231,4 @@ DELETE  /names/pins/:name                                   names unpin         
 POST  /names/accept                                       names accept              body: label                   Apply a pending grant-names suggestion (ADR 0079)
 DELETE  /names/suggestions/:label                           names dismiss                                           Drop a pending grant-names suggestion
 
-229 endpoints total
+230 endpoints total
