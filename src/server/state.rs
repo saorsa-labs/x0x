@@ -335,6 +335,12 @@ pub struct DaemonConfig {
     #[serde(default = "default_mdns_enabled")]
     pub(super) mdns_enabled: bool,
 
+    /// #1642: serve MASQUE relay sessions (TOML `relay_service_enabled`).
+    /// Unset follows the resolved participation mode: Full serves, Leaf
+    /// refuses. See [`x0x::network::resolve_relay_service_enabled`].
+    #[serde(default)]
+    pub(super) relay_service_enabled: Option<bool>,
+
     /// X0X-0070b: peer-relay fallback configuration (TOML `[peer_relay]`).
     /// Defaults to disabled — opt in by setting `peer_relay.enabled = true`
     /// and listing relay-candidate hex agent IDs under
@@ -813,6 +819,7 @@ impl Default for DaemonConfig {
             bootstrap_peers: None,
             port_mapping_enabled: default_port_mapping_enabled(),
             mdns_enabled: default_mdns_enabled(),
+            relay_service_enabled: None,
             peer_relay: x0x::network::PeerRelayConfig::default(),
             observed_prefix_enabled: false,
             skip_legacy_dm_bus: false,

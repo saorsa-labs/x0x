@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Relay serving follows participation mode (#1642; A06 amendment of
+  18 Nov 2026).** New `NetworkConfig.relay_service_enabled` (default `true`)
+  is passed to ant-quic. x0xd reads an optional TOML `relay_service_enabled`;
+  unset, a `Full` daemon serves MASQUE relay sessions and a `Leaf` daemon
+  refuses them with `403`. A default desktop daemon therefore stops serving
+  relay sessions after upgrade; it still uses relays.
 - **`GET /status` reports transport bandwidth (#1964 request 5; A06
   amendment of 17 Nov 2026).** A new additive `bandwidth` object gives
   process-lifetime `sent_bytes` and `received_bytes` and the `up_bps` and
@@ -672,6 +678,11 @@ pub/sub constructors now take `Arc<SigningContext>` instead of
 
 ### Dependencies
 
+- **ant-quic `=0.28.0`** (was `=0.27.62`) and **saorsa-gossip `=0.5.92`** for
+  all eleven `saorsa-gossip-*` crates (was `=0.5.91`; #1642). ant-quic 0.28.0
+  honours `relay_service_enabled` (ADR-019). The optional `voice` feature
+  moves to `saorsa-webrtc-core` and `saorsa-webrtc-codecs` `0.6.1` (was
+  `0.6.0`), which use the same ant-quic.
 - **ant-quic `=0.27.62`** (was `=0.27.61`). It adds
   `SendStream`/`RecvStream::connection_generation()` only (ant-quic#327).
 - **saorsa-gossip `=0.5.91`** for all eleven `saorsa-gossip-*` crates (was

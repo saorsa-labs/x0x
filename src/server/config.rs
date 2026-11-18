@@ -55,6 +55,7 @@ const ROOT_OWNED_KEYS: &[&str] = &[
     "presence_beacon_interval_secs",
     "presence_event_poll_interval_secs",
     "presence_offline_timeout_secs",
+    "relay_service_enabled",
     "rendezvous_enabled",
     "rendezvous_validity_ms",
     "skip_legacy_dm_bus",

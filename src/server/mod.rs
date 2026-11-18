@@ -638,27 +638,6 @@ pub async fn serve_with_options(
             "Gossip plane isolation DISABLED (network_id = \"\") — this daemon will \n             exchange gossip with every plane, including cross-plane mDNS peers"
         ),
     }
-    let network_config = NetworkConfig {
-        bind_addr: Some(bind_address),
-        bootstrap_nodes: config.resolved_bootstrap_peers(),
-        max_connections: 50,
-        connection_timeout: std::time::Duration::from_secs(30),
-        stats_interval: std::time::Duration::from_secs(60),
-        pinned_bootstrap_peers: std::collections::HashSet::new(),
-        inbound_allowlist: std::collections::HashSet::new(),
-        max_peers_per_ip: 3,
-        port_mapping_enabled: config.port_mapping_enabled && !cli_no_port_mapping,
-        mdns_enabled: config.mdns_enabled,
-        peer_relay: config.peer_relay.clone(),
-        network_id,
-        observed_prefix_enabled: config.observed_prefix_enabled,
-    };
-
-    let contacts_path = config.data_dir.join("contacts.json");
-    let mut history_config = config.history.clone();
-    if history_config.db_path.is_none() {
-        history_config.db_path = Some(config.data_dir.join("history.db"));
-    }
     let exe = std::env::current_exe().ok();
     // ADR-0034: `--relay` is ONE operator concept — "be a relay node". Any of
     // the three sources (CLI flag, `X0X_RELAY_OPT_IN=1`, TOML `gossip.relay`)
@@ -689,6 +668,37 @@ pub async fn serve_with_options(
     let mut gossip_config = config.gossip.clone();
     gossip_config.participation = participation.mode;
     gossip_config.participation_reason = participation.reason.to_string();
+    let relay_service_enabled = x0x::network::resolve_relay_service_enabled(
+        config.relay_service_enabled,
+        participation.mode,
+    );
+    tracing::info!(
+        relay_service_enabled,
+        explicit = config.relay_service_enabled.is_some(),
+        "resolved relay serving"
+    );
+    let network_config = NetworkConfig {
+        bind_addr: Some(bind_address),
+        bootstrap_nodes: config.resolved_bootstrap_peers(),
+        max_connections: 50,
+        connection_timeout: std::time::Duration::from_secs(30),
+        stats_interval: std::time::Duration::from_secs(60),
+        pinned_bootstrap_peers: std::collections::HashSet::new(),
+        inbound_allowlist: std::collections::HashSet::new(),
+        max_peers_per_ip: 3,
+        port_mapping_enabled: config.port_mapping_enabled && !cli_no_port_mapping,
+        mdns_enabled: config.mdns_enabled,
+        peer_relay: config.peer_relay.clone(),
+        network_id,
+        observed_prefix_enabled: config.observed_prefix_enabled,
+        relay_service_enabled,
+    };
+
+    let contacts_path = config.data_dir.join("contacts.json");
+    let mut history_config = config.history.clone();
+    if history_config.db_path.is_none() {
+        history_config.db_path = Some(config.data_dir.join("history.db"));
+    }
 
     let mut builder = Agent::builder()
         .with_network_config(network_config)
