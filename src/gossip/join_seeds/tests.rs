@@ -1,8 +1,3 @@
-//! Unit tests for the JOIN seed choice. They run the real saorsa-gossip
-//! `HyParViewMembership` (its step API, ledger, frame and side effects)
-//! over a scripted transport that also supplies the admission verdicts.
-//! Paused time, no sockets.
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -33,52 +28,32 @@ fn plan(admitted: usize, pending: usize, lost: usize) -> JoinSeedPlan {
     }
 }
 
-/// One scripted seed dial.
 #[derive(Debug, Clone, Copy)]
 enum FakeDial {
-    /// The dial takes this long, then fails.
     Fail(Duration),
-    /// The dial takes this long, then this peer answers. With a verdict,
-    /// the peer's verdict becomes that (a new connection); without, it stays
-    /// as it is (the dial reused a connection).
     Answer(Duration, ant_quic::PeerId, Option<PeerAdmission>),
 }
 
-/// One scripted JOIN send.
 #[derive(Debug, Clone, Copy)]
 enum FakeSend {
     Sent,
-    /// The send fails.
     Fail,
-    /// The connection is lost at the send: it fails, and the peer reads as
-    /// not connected from now on.
     Lost,
-    /// The send takes this long, then succeeds.
     Slow(Duration),
 }
 
 #[derive(Default)]
 struct FakeState {
     verdicts: HashMap<ant_quic::PeerId, PeerAdmission>,
-    /// Per address: the dial outcomes in order; the last one repeats.
     dial_plan: HashMap<SocketAddr, Vec<FakeDial>>,
-    /// Per peer: the JOIN send outcomes in order; the last one repeats.
     send_plan: HashMap<ant_quic::PeerId, Vec<FakeSend>>,
     dials: Vec<(SocketAddr, Instant)>,
     join_sends: Vec<(ant_quic::PeerId, Instant)>,
-    /// Admission reads made so far.
     reads: usize,
-    /// After this many reads, each admission read takes this long.
     slow_reads_after: Option<(usize, Duration)>,
-    /// Peers that independent transport recovery admits again just after
-    /// one read has seen them not connected.
     recover_after_loss: Vec<ant_quic::PeerId>,
 }
 
-/// A scripted saorsa-gossip transport that is also the admission source.
-/// It records every `dial_bootstrap` and every JOIN send. Other frames
-/// (SWIM probes, shuffles from the membership's background tasks) are
-/// accepted and not recorded.
 #[derive(Default)]
 struct Fake {
     state: Mutex<FakeState>,
@@ -97,13 +72,10 @@ impl Fake {
         self.state.lock().unwrap().send_plan.insert(peer, sends);
     }
 
-    /// After `reads` fast admission reads, each read takes `took`.
     fn slow_reads_after(&self, reads: usize, took: Duration) {
         self.state.lock().unwrap().slow_reads_after = Some((reads, took));
     }
 
-    /// The first read that sees `peer` not connected returns that, and then
-    /// independent transport recovery admits `peer` again (once).
     fn recover_after_loss(&self, peer: ant_quic::PeerId) {
         self.state.lock().unwrap().recover_after_loss.push(peer);
     }
@@ -285,7 +257,6 @@ async fn join(
         .await
 }
 
-/// The 0.5.87 JOIN backoff (before jitter) after `attempts` failed dials.
 fn backoff_ms(attempts: usize) -> u64 {
     let mut delay = 100_u64;
     let mut total = 0;
@@ -358,18 +329,13 @@ fn a_new_answer_at_a_known_address_replaces_the_peer() {
     assert_eq!(records, vec![(addr(5483), peer(2)), (addr(443), peer(3))]);
 }
 
-/// Codex round-1 finding 2: open verdicts below the target are waited for,
-/// so a later refusal still leads to the phase fallback.
 #[test]
 fn settle_waits_for_open_verdicts_below_the_target() {
     let zero = Duration::ZERO;
     assert!(!settled(&plan(0, 3, 0), 3, zero));
     assert!(!settled(&plan(2, 1, 0), 3, zero));
-    // The refusals landed: nothing open, below the target. The join reads
-    // this as "fall back".
     assert!(settled(&plan(0, 0, 0), 3, zero));
     assert!(settled(&plan(3, 2, 0), 3, zero));
-    // A lost connection does not hold the phase decision.
     assert!(settled(&plan(0, 0, 2), 3, zero));
     assert!(settled(&plan(0, 3, 0), 3, JOIN_SEED_VERDICT_WAIT));
 }
@@ -388,7 +354,6 @@ async fn settle_ends_at_once_on_shutdown() {
     shutdown.cancel();
     let started = Instant::now();
     let plan = candidates.settle(fake.as_ref(), 3, &shutdown).await;
-    // A cancelled settlement reports no seed, and reads nothing.
     assert_eq!(plan, JoinSeedPlan::default());
     assert_eq!(started.elapsed(), Duration::ZERO);
 }
@@ -439,8 +404,6 @@ async fn no_candidate_means_no_join_attempt() {
     assert_eq!(outcome, JoinOutcome::NoSeed { attempts: 0 });
 }
 
-/// A suppressed candidate is dropped before any attempt (the #1321 fix: the
-/// old JOIN spent ten refused dials on it).
 #[tokio::test(start_paused = true)]
 async fn a_suppressed_candidate_gets_no_attempt() {
     let fake = fake();
@@ -459,8 +422,6 @@ async fn a_suppressed_candidate_gets_no_attempt() {
     assert!(candidates.refused.contains(&addr(1)));
 }
 
-/// Slow dials: nine dials take 5 s each and fail; the tenth answers. There
-/// is no time limit: the JOIN uses all ten attempts.
 #[tokio::test(start_paused = true)]
 async fn slow_dials_keep_the_old_attempt_budget() {
     let fake = fake();
@@ -491,8 +452,6 @@ async fn slow_dials_keep_the_old_attempt_budget() {
     assert!(tenth >= floor, "{tenth:?}");
 }
 
-/// A candidate that never answers uses exactly the old budget: ten dials
-/// and ten backoffs (81.1 s plus at most 10.128 s of jitter).
 #[tokio::test(start_paused = true)]
 async fn the_join_gives_up_after_the_old_budget() {
     let fake = fake();
@@ -525,11 +484,6 @@ async fn the_join_gives_up_after_the_old_budget() {
     );
 }
 
-/// Codex re-review of bf034a2, finding 1: only a failed dial grows the
-/// backoff. A is admitted, answers nine dials, but every JOIN send fails;
-/// its tenth dial fails. Before seed B, the JOIN waits the first backoff
-/// (100 ms plus at most 12 ms of jitter), as in saorsa-gossip's JOIN, not
-/// 30 s.
 #[tokio::test(start_paused = true)]
 async fn failed_sends_do_not_grow_the_backoff() {
     let fake = fake();
@@ -570,9 +524,6 @@ async fn failed_sends_do_not_grow_the_backoff() {
     );
 }
 
-/// An exhausted budget is not renewed. A never answers. B answers and is
-/// admitted, but every JOIN send through it fails. Each address gets one
-/// budget in total: ten attempts.
 #[tokio::test(start_paused = true)]
 async fn an_exhausted_budget_is_not_renewed_after_a_failed_join() {
     let fake = fake();
@@ -608,9 +559,6 @@ async fn an_exhausted_budget_is_not_renewed_after_a_failed_join() {
     assert_eq!(fake.sends_to(peer(2)), JOIN_MAX_ATTEMPTS);
 }
 
-/// The same, when B interrupts A: B becomes admitted by another path (the
-/// proactive reconnect) while A backs off. B gets its attempts; then A
-/// continues with the attempts it has left, not a new budget.
 #[tokio::test(start_paused = true)]
 async fn an_interrupted_budget_continues_where_it_stopped() {
     let fake = fake();
@@ -650,10 +598,6 @@ async fn an_interrupted_budget_continues_where_it_stopped() {
     assert!(first.iter().any(|at| *at > second[0]));
 }
 
-/// Codex re-review of 15e6192, finding 2: one budget across the recovery
-/// and the JOIN. Nine dials fail; the tenth answers and the peer is
-/// admitted; then the connection is lost at the JOIN send. There is no
-/// second budget.
 #[tokio::test(start_paused = true)]
 async fn a_seed_lost_at_the_join_handoff_keeps_one_budget() {
     let fake = fake();
@@ -687,8 +631,6 @@ async fn a_seed_lost_at_the_join_handoff_keeps_one_budget() {
     assert!(active(&membership).is_empty());
 }
 
-/// The handoff loss earlier: the first dial answers, the send loses the
-/// connection, and the later dials fail. Still ten attempts in total.
 #[tokio::test(start_paused = true)]
 async fn an_early_handoff_loss_keeps_one_budget() {
     let fake = fake();
@@ -716,8 +658,6 @@ async fn an_early_handoff_loss_keeps_one_budget() {
     assert_eq!(fake.sends_to(peer(1)), 1);
 }
 
-/// As in saorsa-gossip's JOIN, a failed send is retried at once, without
-/// backoff, within the same budget.
 #[tokio::test(start_paused = true)]
 async fn a_failed_send_is_retried_at_once() {
     let fake = fake();
@@ -744,8 +684,6 @@ async fn a_failed_send_is_retried_at_once() {
     assert_eq!(started.elapsed(), Duration::ZERO);
 }
 
-/// A candidate is dropped as soon as it is suppressed, and the next one gets
-/// its own budget.
 #[tokio::test(start_paused = true)]
 async fn a_candidate_is_dropped_as_soon_as_it_is_suppressed() {
     let fake = fake();
@@ -787,9 +725,6 @@ async fn a_candidate_is_dropped_as_soon_as_it_is_suppressed() {
     assert!(candidates.refused.contains(&addr(1)));
 }
 
-/// A connected candidate with an open verdict gets the JOIN frame only when
-/// the plane gate admits it (here after the 10 s legacy grace), in one
-/// attempt: the gate waits for the verdict.
 #[tokio::test(start_paused = true)]
 async fn an_open_verdict_gets_the_join_only_when_admitted() {
     let fake = fake();
@@ -824,8 +759,6 @@ async fn an_open_verdict_gets_the_join_only_when_admitted() {
     assert_eq!(fake.sends_to(peer(1)), 1);
 }
 
-/// A gate refusal (suppressed after the dial answered) sends no JOIN frame,
-/// stores no address and leaves the active view empty.
 #[tokio::test(start_paused = true)]
 async fn a_peer_refused_after_the_dial_gets_no_join_frame() {
     let fake = fake();
@@ -860,8 +793,6 @@ async fn a_peer_refused_after_the_dial_gets_no_join_frame() {
     assert!(candidates.refused.contains(&addr(1)));
 }
 
-/// Another path (the proactive reconnect, an inbound dial) restores a later
-/// candidate while the first one backs off: it goes first.
 #[tokio::test(start_paused = true)]
 async fn a_candidate_that_another_path_reconnected_goes_first() {
     let fake = fake();
@@ -896,7 +827,6 @@ async fn a_candidate_that_another_path_reconnected_goes_first() {
     assert!(fake.dials_to(addr(1)).len() < JOIN_MAX_ATTEMPTS);
 }
 
-/// Shutdown ends the JOIN during a backoff, with no further dial.
 #[tokio::test(start_paused = true)]
 async fn the_join_stops_on_shutdown_during_a_backoff() {
     let fake = fake();
@@ -922,7 +852,6 @@ async fn the_join_stops_on_shutdown_during_a_backoff() {
     assert!(fake.dials_to(addr(1)).iter().all(|at| *at <= cancelled_at));
 }
 
-/// Shutdown also ends a JOIN dial in flight.
 #[tokio::test(start_paused = true)]
 async fn the_join_stops_a_dial_in_flight_on_shutdown() {
     let fake = fake();
@@ -946,8 +875,6 @@ async fn the_join_stops_a_dial_in_flight_on_shutdown() {
     assert_eq!(started.elapsed(), Duration::from_secs(1));
 }
 
-/// Shutdown also ends a JOIN send in flight; the seed is not added to the
-/// active view.
 #[tokio::test(start_paused = true)]
 async fn the_join_stops_a_send_in_flight_on_shutdown() {
     let fake = fake();
@@ -977,12 +904,6 @@ async fn the_join_stops_a_send_in_flight_on_shutdown() {
     assert!(active(&membership).is_empty());
 }
 
-/// D252: a peer that answers the dial and then closes (it lost its
-/// connection before admission; for example the remote refused us first)
-/// is redialled only after the loss cooldown: 100 ms, doubled after each
-/// loss up to 30 s, plus at most 1/8 jitter. The cooldown does not reset
-/// when the peer answers again. The budget stays ten attempts, and no JOIN
-/// frame goes out.
 #[tokio::test(start_paused = true)]
 async fn a_peer_that_answers_and_closes_is_paced_by_the_loss_cooldown() {
     let fake = fake();
@@ -1026,8 +947,6 @@ async fn a_peer_that_answers_and_closes_is_paced_by_the_loss_cooldown() {
     }
 }
 
-/// D252: while a lost address waits for its cooldown, another address that
-/// becomes admitted goes first. The lost address is not redialled meanwhile.
 #[tokio::test(start_paused = true)]
 async fn another_admitted_address_goes_first_while_a_lost_one_waits() {
     let fake = fake();
@@ -1070,8 +989,6 @@ async fn another_admitted_address_goes_first_while_a_lost_one_waits() {
     );
 }
 
-/// Codex re-review of f3e28b3, finding 3: shutdown ends a slow admission
-/// read in the candidate scan.
 #[tokio::test(start_paused = true)]
 async fn the_join_stops_on_shutdown_during_a_slow_admission_read() {
     let fake = fake();
@@ -1101,8 +1018,6 @@ async fn the_join_stops_on_shutdown_during_a_slow_admission_read() {
     assert!(fake.dials_to(addr(1)).is_empty());
 }
 
-/// Codex re-review of f3e28b3, finding 3: shutdown ends a slow admission
-/// read in the gate after an answered dial, and no JOIN frame goes out.
 #[tokio::test(start_paused = true)]
 async fn the_join_stops_on_shutdown_during_the_gate_read() {
     let fake = fake();
@@ -1111,7 +1026,6 @@ async fn the_join_stops_on_shutdown_during_the_gate_read() {
         addr(1),
         vec![FakeDial::Answer(Duration::ZERO, peer(1), None)],
     );
-    // The candidate scan reads once; the gate read after the dial is slow.
     fake.slow_reads_after(1, Duration::from_secs(60));
     let shutdown = CancellationToken::new();
     let canceller = {
@@ -1134,8 +1048,6 @@ async fn the_join_stops_on_shutdown_during_the_gate_read() {
     assert_eq!(fake.sends_to(peer(1)), 0);
 }
 
-/// Codex re-review of f3e28b3, finding 3: shutdown ends a slow admission
-/// read in the seed settlement.
 #[tokio::test(start_paused = true)]
 async fn settle_stops_on_shutdown_during_a_slow_admission_read() {
     let fake = fake();
@@ -1158,11 +1070,6 @@ async fn settle_stops_on_shutdown_during_a_slow_admission_read() {
     assert_eq!(started.elapsed(), Duration::from_secs(1));
 }
 
-/// Codex re-review of bde6b2c, finding 1: a cooling admitted address does
-/// not block a ready admitted one. A answers and then loses its connection,
-/// so it waits its loss cooldown. Independent transport recovery admits A
-/// again during that cooldown. B is admitted and ready: B must go first,
-/// and A keeps its cooldown and its budget.
 #[tokio::test(start_paused = true)]
 async fn a_ready_admitted_address_goes_before_a_cooling_one() {
     let fake = fake();
@@ -1210,8 +1117,6 @@ async fn a_ready_admitted_address_goes_before_a_cooling_one() {
     );
 }
 
-/// Codex re-review of bde6b2c, finding 2: the phase count is `None` after
-/// shutdown began, even when there is no candidate to read.
 #[tokio::test(start_paused = true)]
 async fn the_phase_count_is_none_after_shutdown_with_no_candidates() {
     let fake = fake();

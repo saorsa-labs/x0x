@@ -61,8 +61,6 @@ pub const MAX_TAGS_PER_GROUP: usize = 16;
 /// Maximum number of name words a group may fan out on.
 pub const MAX_NAME_WORDS: usize = 8;
 
-// ────────────────────────── Shard computation ───────────────────────────
-
 /// Kind of directory shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -86,8 +84,6 @@ impl ShardKind {
             Self::Tag => TAG_DOMAIN,
             Self::Name => NAME_DOMAIN,
             Self::Id => ID_DOMAIN,
-            // #1604: matches no real shard. Directory decoders refuse an
-            // unknown kind before it is used.
             Self::Unknown => b"x0x-group-unknown",
         }
     }
@@ -180,7 +176,6 @@ pub fn shards_for_public(
 ) -> Vec<(ShardKind, u32, String)> {
     let mut out: Vec<(ShardKind, u32, String)> = Vec::new();
 
-    // Tag shards — cap at MAX_TAGS_PER_GROUP.
     let mut tag_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for raw in tags.iter().take(MAX_TAGS_PER_GROUP) {
         let t = normalize_tag(raw);
@@ -190,12 +185,10 @@ pub fn shards_for_public(
         out.push((ShardKind::Tag, shard_of(ShardKind::Tag, &t), t));
     }
 
-    // Name-word shards — cap at MAX_NAME_WORDS.
     for word in name_words(name) {
         out.push((ShardKind::Name, shard_of(ShardKind::Name, &word), word));
     }
 
-    // Exact-ID shard — exactly one entry.
     out.push((
         ShardKind::Id,
         shard_of(ShardKind::Id, group_id),
@@ -217,8 +210,6 @@ pub fn shards_for_public(
 pub fn may_publish_to_public_shards(discoverability: GroupDiscoverability) -> bool {
     matches!(discoverability, GroupDiscoverability::PublicDirectory)
 }
-
-// ────────────────────────── Wire messages ───────────────────────────────
 
 /// Anti-entropy digest for a single cached group entry. Minimum set of
 /// fields per design: `group_id`, `revision`, `state_hash`, `expires_at`.
@@ -288,8 +279,6 @@ impl DirectoryMessage {
     }
 }
 
-// ────────────────────────── Shard cache ─────────────────────────────────
-
 /// Bounded in-memory cache of signed cards keyed by `group_id`, keeping
 /// only the highest-revision valid card per id. Used by subscribed
 /// shards.
@@ -298,14 +287,8 @@ impl DirectoryMessage {
 /// cards cause immediate eviction regardless of revision ordering.
 #[derive(Debug)]
 pub struct DirectoryShardCache {
-    /// Max entries per shard before LRU eviction kicks in.
     capacity: usize,
-    /// Per-shard `group_id → card`.
-    ///
-    /// Key: `(kind, shard)`. Value: BTreeMap (ordered by group_id for
-    /// deterministic digest emission).
     shards: BTreeMap<(ShardKind, u32), BTreeMap<String, GroupCard>>,
-    /// Recency order per shard for LRU eviction.
     recency: BTreeMap<(ShardKind, u32), Vec<String>>,
 }
 
@@ -342,14 +325,12 @@ impl DirectoryShardCache {
         let slot = self.shards.entry(key).or_default();
         let recency = self.recency.entry(key).or_default();
 
-        // Withdrawal cards evict immediately regardless of prior state.
         if card.withdrawn {
             slot.remove(&card.group_id);
             recency.retain(|g| g != &card.group_id);
-            return true; // always accept withdrawal
+            return true;
         }
 
-        // Compare revisions.
         if let Some(existing) = slot.get(&card.group_id) {
             if !card.supersedes(existing) && card.revision <= existing.revision {
                 return false;
@@ -360,7 +341,6 @@ impl DirectoryShardCache {
         recency.retain(|g| g != &card.group_id);
         recency.push(card.group_id.clone());
 
-        // LRU eviction on overflow.
         while recency.len() > self.capacity {
             if let Some(oldest) = recency.drain(..1).next() {
                 slot.remove(&oldest);
@@ -420,9 +400,8 @@ impl DirectoryShardCache {
                 _ if expired => self.remove(kind, shard, &card.group_id),
                 CardReplacement::Replace => {
                     if !card.withdrawn {
-                        // An authority may replace a card that is not
-                        // older than its own; plain `insert` keeps only
-                        // revision order, so clear the slot first.
+                        // `insert` keeps only revision order: clear the slot so an authority
+                        // can replace a card that is not older than its own.
                         self.remove(kind, shard, &card.group_id);
                     }
                 }
@@ -537,8 +516,6 @@ impl DirectoryShardCache {
     }
 }
 
-// ────────────────────── ListedToContacts pairwise sync ───────────────────
-
 /// Contact-scoped digest carried over the existing direct-message
 /// channel. Never published to public topics.
 ///
@@ -570,8 +547,6 @@ pub struct ListedToContactsCard {
     pub issued_at: u64,
     pub card: Box<GroupCard>,
 }
-
-// ────────────────────── Subscription persistence ────────────────────────
 
 /// One subscribed shard. Persisted to disk so the daemon re-subscribes
 /// across restarts with staggered jitter (see
@@ -638,8 +613,6 @@ impl SubscriptionSet {
     }
 }
 
-// ─────────────────────────────── Tests ──────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -695,7 +668,6 @@ mod tests {
         let t = shard_of(ShardKind::Tag, "ai");
         let n = shard_of(ShardKind::Name, "ai");
         let i = shard_of(ShardKind::Id, "ai");
-        // With BLAKE3 these should almost certainly differ.
         assert!(t != n || n != i);
     }
 
@@ -801,7 +773,6 @@ mod tests {
         for i in 0..5 {
             cache.insert(ShardKind::Tag, 1, make_card(&format!("g{i}"), 1, false));
         }
-        // After inserting 5 with capacity 3, only the last 3 (g2, g3, g4) remain.
         assert!(cache.get("g0").is_none());
         assert!(cache.get("g1").is_none());
         assert!(cache.get("g2").is_some());
@@ -836,7 +807,6 @@ mod tests {
         }
         let d = cache.shard_digest(ShardKind::Tag, 7);
         let ids: Vec<&str> = d.iter().map(|e| e.group_id.as_str()).collect();
-        // BTreeMap preserves key order.
         assert_eq!(ids, vec!["gA", "gB", "gC"]);
     }
 
@@ -848,19 +818,19 @@ mod tests {
 
         let peer = vec![
             DigestEntry {
-                group_id: "g1".into(), // same revision — skip
+                group_id: "g1".into(),
                 revision: 5,
                 state_hash: "h5".into(),
                 expires_at: 100_000,
             },
             DigestEntry {
-                group_id: "g2".into(), // peer has newer — pull
+                group_id: "g2".into(),
                 revision: 7,
                 state_hash: "h7".into(),
                 expires_at: 100_000,
             },
             DigestEntry {
-                group_id: "g3".into(), // unknown locally — pull
+                group_id: "g3".into(),
                 revision: 1,
                 state_hash: "h1".into(),
                 expires_at: 100_000,
@@ -891,7 +861,7 @@ mod tests {
             subscribed_at: 1_000,
         };
         assert!(s.add(rec.clone()));
-        assert!(!s.add(rec.clone())); // idempotent
+        assert!(!s.add(rec.clone()));
         assert!(s.contains(ShardKind::Tag, 42));
         assert_eq!(s.len(), 1);
         assert!(s.remove(ShardKind::Tag, 42));

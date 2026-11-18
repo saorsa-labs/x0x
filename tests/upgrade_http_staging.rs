@@ -134,7 +134,7 @@ macro_rules! http_staging_regression_tests {
                 let counted = Arc::clone(&attempts);
                 let expected_install = install.clone();
                 let expected_data = data.clone();
-                let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |plan, manifest| {
+                let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |plan, manifest, _admission| {
                     assert_eq!(plan.executable, expected_install);
                     assert_eq!(plan.data_root, expected_data);
                     counted.fetch_add(1, Ordering::SeqCst);
@@ -180,7 +180,8 @@ macro_rules! http_staging_regression_tests {
                     // This is the helper called by the actual POST apply route.
                     // The GREEN helper carries the actual owned boot context
                     // and original release bytes through its production gate.
-                    let operation = apply_http_release(&runtime, &release, false);
+                    let permit = ReleasePermit::for_http(Arc::clone(&runtime.wait_slot));
+                    let operation = apply_http_release(&runtime, permit, &release, false);
                     tokio::pin!(operation);
                     for step in 0..2 {
                         if step == 1 {

@@ -485,6 +485,9 @@ struct RecoveryListEntry {
     answer: String,
     at: Instant,
     at_ms: u64,
+    /// The last `attested` answer to the requester, while no later answer
+    /// ended its relay grant ([`record_recovery_list`]).
+    attested_at: Option<Instant>,
 }
 
 /// The §11 responder limits.
@@ -3406,6 +3409,63 @@ async fn remember_reseat_bases(
     }
 }
 
+/// #2003 (ADR 0109 §2, A08 amendment of 17 Nov 2026): this node, an
+/// admin, answered `requester_hex`'s request for the group with a signed
+/// attestation less than [`s3::RECOVERY_LIST_TTL`] ago, and no later
+/// answer ended that grant ([`record_recovery_list`]). Only such a
+/// requester gets the state-only links that another admin signed on a
+/// catch-up page.
+pub(super) async fn attested_requester(
+    state: &AppState,
+    stable_group_id: &str,
+    requester_hex: &str,
+) -> bool {
+    let now = Instant::now();
+    state
+        .group_recovery
+        .inner
+        .lock()
+        .await
+        .recovery_lists
+        .get(stable_group_id)
+        .is_some_and(|list| {
+            list.iter().any(|entry| {
+                entry.requester.eq_ignore_ascii_case(requester_hex)
+                    && entry
+                        .attested_at
+                        .is_some_and(|at| now.saturating_duration_since(at) < s3::RECOVERY_LIST_TTL)
+            })
+        })
+}
+
+/// Test hook: record that this node attested `requester_hex` for the
+/// group, as an `attested` answer does.
+#[cfg(test)]
+pub(in crate::server) async fn note_attested_for_test(
+    state: &AppState,
+    stable_group_id: &str,
+    requester_hex: &str,
+) {
+    state
+        .group_recovery
+        .inner
+        .lock()
+        .await
+        .recovery_lists
+        .entry(stable_group_id.to_string())
+        .or_default()
+        .push(RecoveryListEntry {
+            requester: requester_hex.to_string(),
+            head_revision: 0,
+            head_state_hash: String::new(),
+            refs: Vec::new(),
+            answer: "attested".to_string(),
+            at: Instant::now(),
+            at_ms: now_ms(),
+            attested_at: Some(Instant::now()),
+        });
+}
+
 async fn record_recovery_list(
     state: &AppState,
     stable_group_id: &str,
@@ -3419,10 +3479,25 @@ async fn record_recovery_list(
         .recovery_lists
         .entry(stable_group_id.to_string())
         .or_default();
+    let earlier_grant = list
+        .iter()
+        .filter(|entry| entry.requester.eq_ignore_ascii_case(requester_hex))
+        .find_map(|entry| entry.attested_at);
     list.retain(|entry| {
-        entry.requester != requester_hex
+        !entry.requester.eq_ignore_ascii_case(requester_hex)
             && now.saturating_duration_since(entry.at) < s3::RECOVERY_LIST_TTL
     });
+    // `rate_limited` is about this node's signature budget: the gap and
+    // the requester's standing are as the grant found them. Every other
+    // answer says this node has no link ahead of the requester's head to
+    // relay, or that the requester or this node lost its standing.
+    let attested_at = if answer == "attested" {
+        Some(now)
+    } else if answer == AttestRefusalReason::RateLimited.as_str() {
+        earlier_grant
+    } else {
+        None
+    };
     list.push(RecoveryListEntry {
         requester: requester_hex.to_string(),
         head_revision: request.head_revision,
@@ -3431,6 +3506,7 @@ async fn record_recovery_list(
         answer: answer.to_string(),
         at: now,
         at_ms: now_ms(),
+        attested_at,
     });
     let excess = list.len().saturating_sub(s3::RECOVERY_LIST_CAP);
     list.drain(..excess);
@@ -4735,10 +4811,18 @@ async fn subject_tick(state: &Arc<AppState>) {
         retire_converged(state, &key).await;
         if refs.is_empty() && !unserved_seal_open(state, &info).await {
             let mut inner = state.group_recovery.inner.lock().await;
-            let drop_entry = inner
-                .subjects
-                .get(&stable)
-                .is_some_and(|subject| !matches!(subject.view, SubjectView::CatchingUp { .. }));
+            // A catch-up holds its view until its segment terminal is
+            // reached; then it has finished (#2003).
+            let drop_entry =
+                inner
+                    .subjects
+                    .get(&stable)
+                    .is_some_and(|subject| match &subject.view {
+                        SubjectView::CatchingUp {
+                            segment_terminal, ..
+                        } => info.state_revision >= *segment_terminal,
+                        _ => true,
+                    });
             if drop_entry {
                 inner.subjects.remove(&stable);
             }
@@ -5017,6 +5101,20 @@ async fn next_target(
     if subject.next_target >= targets.len() && !none_left {
         // Every target in this round refused: back off.
         subject.end_round(now);
+        return None;
+    }
+    if unserved && none_left && !targets.is_empty() {
+        // §2 "Unserved join seal" (#2003): every capable admin on the
+        // roster answered for this attempt, so nothing is left to ask. The
+        // round neither ends nor backs off: `attempts` stays as it is. The
+        // view is the answers' outcome when they set a sticky one
+        // (`readmission_required`, `reseat_required`); otherwise the node
+        // waits, typed, for an admin to attest unasked or for a new attempt.
+        if !subject.holds_view(now) {
+            subject.view = SubjectView::Awaiting {
+                reason: "admins_answered".to_string(),
+            };
+        }
         return None;
     }
     if none_left {
@@ -19635,12 +19733,31 @@ mod tests {
     /// join stub at the invite base, and the attempt's timeout removes a
     /// pending stub, so the joiner's `readmission_required` vanished (its
     /// API answered 404). Now the stub is persisted when the trigger arms,
-    /// so the timeout keeps it. A seal one link ahead arms nothing and
-    /// leaves the stub pending. RED on main: the stub stayed pending.
+    /// so the timeout keeps it: the finalize leaves the stub and its
+    /// `readmission_required` with D43's exit. A seal one link ahead arms
+    /// nothing and leaves the stub pending. RED before #2017: the stub
+    /// stayed pending, and the finalize removed it.
     #[tokio::test]
     async fn an_unserved_join_seal_keeps_the_joiner_stub() -> anyhow::Result<()> {
         let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
-        let (key, info, _admin) = unserved_fixture(&state, "attempt-1").await?;
+        // A joiner's stub: the group at the invite base, this node not
+        // seated (a seat would make the finalize a no-op).
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let mut info = GroupInfo::new(
+            "adr0109-unserved-stub".to_string(),
+            String::new(),
+            admin.agent_id(),
+            "5173".repeat(16),
+        );
+        info.seal_commit(&admin, 1_000)?;
+        let key = info.mls_group_id.clone();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), info.clone());
+        set_pending_attempt(&state, &info, "attempt-1");
+        assert!(!info.has_active_member(&local_hex(&state)), "no seat");
         let stable = info.stable_group_id().to_string();
         let pending = || {
             state
@@ -19666,6 +19783,36 @@ mod tests {
             state.named_groups.read().await.contains_key(&key),
             "the stub stays"
         );
+
+        // #2003 carry-over (review of #2017): the attempt's timeout
+        // finalize keeps the stub and its typed state.
+        set_view(
+            &state,
+            &stable,
+            info.state_revision,
+            SubjectView::Readmission {
+                cause: "base_beyond_retention",
+            },
+        )
+        .await;
+        super::super::finalize_join_attempt(
+            &state,
+            &key,
+            &stable,
+            &local_hex(&state),
+            "attempt-1",
+            super::super::JoinAttemptOutcome::TimedOut,
+            super::super::JoinFinalizeGuard::Unlocked,
+        )
+        .await;
+        let kept = state.named_groups.read().await.get(&key).cloned();
+        let kept = kept.context("the timeout finalize kept the stub")?;
+        let recovery = recovery_json(&state, &kept)
+            .await
+            .context("the typed state survives the timeout")?;
+        assert_eq!(recovery["state"], "readmission_required");
+        assert_eq!(recovery["cause"], "base_beyond_retention");
+        assert_eq!(recovery["exit"], "manual_remove_and_reinvite");
         Ok(())
     }
 
@@ -19884,6 +20031,147 @@ mod tests {
                 cause: "base_beyond_retention"
             })
         );
+        Ok(())
+    }
+
+    /// #2003 (carry-over from the review of #1993): once every capable
+    /// admin answered for the attempt and none set a sticky outcome, no
+    /// target is left. The node does not end a round on each tick, so
+    /// `attempts` and the back-off stay as they are, and it shows the typed
+    /// `awaiting_attestation {admins_answered}`, not `no_capable_peer`.
+    /// RED on main: each tick called `end_round` (the counter grew) and the
+    /// view fell to `no_capable_peer`.
+    #[tokio::test]
+    async fn an_unserved_seal_with_every_admin_answered_stops_counting() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let (key, info, admin) = unserved_fixture(&state, "attempt-1").await?;
+        let stable = info.stable_group_id().to_string();
+        advertise_attest(&state, &admin.agent_id())?;
+        let terminal = info.state_revision + 5;
+        note_unserved_join_seal(&state, &stable, "attempt-1", terminal).await;
+        assert_eq!(
+            next_target(&state, &key, &info, &local, &[], Instant::now()).await,
+            Some(admin.agent_id())
+        );
+        answer_from(
+            &state,
+            &info,
+            &admin,
+            AttestAnswer::Refused(AttestRefusalReason::AttesterBehind),
+        )
+        .await?;
+        let attempts = || async {
+            state
+                .group_recovery
+                .inner
+                .lock()
+                .await
+                .subjects
+                .get(&stable)
+                .map(|subject| (subject.attempts, subject.next_retry_at))
+        };
+        let before = attempts().await;
+        for step in 1..=3u64 {
+            let later = Instant::now() + Duration::from_secs(step * 600);
+            assert_eq!(
+                next_target(&state, &key, &info, &local, &[], later).await,
+                None,
+                "no admin is left to ask"
+            );
+        }
+        assert_eq!(attempts().await, before, "no round ends, no back-off grows");
+        assert_eq!(view_of(&state, &stable).await, awaiting("admins_answered"));
+        Ok(())
+    }
+
+    /// #2003: a finished catch-up does not stay `catching_up`. Once the
+    /// head reaches the view's segment terminal and nothing is left to
+    /// ask, the tick drops the subject, so the recovery object clears.
+    /// RED on main: a `catching_up` subject was never dropped (H-S3-r: J
+    /// showed `catching_up` at the terminal, Active with keys).
+    #[tokio::test]
+    async fn a_finished_catch_up_clears_the_recovery_object() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (_key, info, admin) = unserved_fixture(&state, "attempt-1").await?;
+        let stable = info.stable_group_id().to_string();
+        let catching_up = |terminal: u64| SubjectView::CatchingUp {
+            attested_by: hex::encode(admin.agent_id().as_bytes()),
+            verified: true,
+            segment_terminal: terminal,
+        };
+        // Still short of the terminal: the view holds.
+        set_view(
+            &state,
+            &stable,
+            info.state_revision,
+            catching_up(info.state_revision + 1),
+        )
+        .await;
+        subject_tick(&state).await;
+        assert_eq!(
+            view_of(&state, &stable).await,
+            Some(catching_up(info.state_revision + 1))
+        );
+        // At the terminal: dropped.
+        set_view(
+            &state,
+            &stable,
+            info.state_revision,
+            catching_up(info.state_revision),
+        )
+        .await;
+        subject_tick(&state).await;
+        assert_eq!(view_of(&state, &stable).await, None);
+        assert!(recovery_json(&state, &info).await.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn only_a_rate_limited_answer_keeps_the_relay_grant() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let requester = [0x2a; 32];
+        let requester_hex = hex::encode(requester);
+        let rate_limited = AttestRefusalReason::RateLimited.as_str();
+        let ending = [
+            "on_chain",
+            "not_on_chain",
+            "reseat",
+            AttestRefusalReason::AttesterQuarantined.as_str(),
+            AttestRefusalReason::AttesterBehind.as_str(),
+            AttestRefusalReason::NotAnAdmin.as_str(),
+            AttestRefusalReason::NotAMember.as_str(),
+            AttestRefusalReason::BannedOrRevoked.as_str(),
+            AttestRefusalReason::BaseBeyondRetention.as_str(),
+        ];
+        for (index, answer) in ending.into_iter().enumerate() {
+            let stable = format!("{index:064x}");
+            let request = GroupAttestRequestV1 {
+                group: stable.clone(),
+                requester,
+                head_revision: 3,
+                head_state_hash: "h3".to_string(),
+                refs: Vec::new(),
+            };
+            note_attested_for_test(&state, &stable, &requester_hex).await;
+            for _ in 0..2 {
+                record_recovery_list(&state, &stable, &requester_hex, &request, rate_limited).await;
+                assert!(
+                    attested_requester(&state, &stable, &requester_hex).await,
+                    "rate_limited keeps the grant"
+                );
+            }
+            record_recovery_list(&state, &stable, &requester_hex, &request, answer).await;
+            assert!(
+                !attested_requester(&state, &stable, &requester_hex).await,
+                "{answer} ends the grant"
+            );
+            record_recovery_list(&state, &stable, &requester_hex, &request, rate_limited).await;
+            assert!(
+                !attested_requester(&state, &stable, &requester_hex).await,
+                "rate_limited after {answer} grants nothing"
+            );
+        }
         Ok(())
     }
 }

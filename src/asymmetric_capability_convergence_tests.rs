@@ -526,7 +526,8 @@ async fn asymmetric_signed_capability_convergence_over_relay() {
         let frame = s.peer_relay().build_relayed_dm(&d.agent_id(), &s.agent_id(), signing.public_key_bytes.clone(), now, inner, false,
             |bytes| signing.sign(bytes).map_err(|e| e.to_string())).expect("fresh signed v1 negative");
         tokio::time::timeout(PHASE, s.network().unwrap().send_direct_typed(&ant_quic::PeerId(r.machine_id().0),
-            s.agent_id().as_bytes(), network::RELAYED_DM_STREAM_TYPE, &frame.to_postcard().expect("v1 wire")))
+            s.agent_id().as_bytes(), network::RELAYED_DM_STREAM_TYPE, &frame.to_postcard().expect("v1 wire"),
+            network::bandwidth::BandwidthKind::Relay))
             .await.expect("negative send deadline").expect("actual negative network send");
         let refusal = received_event(r, id).await;
         assert_eq!(refusal.hop, s.machine_id().0);

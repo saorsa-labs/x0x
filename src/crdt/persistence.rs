@@ -59,18 +59,10 @@ impl TaskListStorage {
         list_id: &TaskListId,
         task_list: &TaskList,
     ) -> crate::crdt::error::Result<()> {
-        // Ensure directory exists
         fs::create_dir_all(&self.storage_path).await?;
 
-        // Versioned envelope (see `SNAPSHOT_MAGIC`): the list plus its
-        // seq-counter ceiling, so a restore cannot re-mint task ids or
-        // OR-Set tags that were already used before a restart.
         let serialized = encode_snapshot(task_list)?;
 
-        // Durable atomic write (see `write_snapshot_atomic`): the same
-        // standard the kv-store snapshots hold — unique temp file, fsync,
-        // rename, parent-dir fsync — so a crash or a concurrent save can
-        // never leave a torn or half-renamed snapshot behind.
         write_snapshot_atomic(&self.list_file_path(list_id), &serialized)?;
 
         Ok(())
@@ -114,10 +106,7 @@ impl TaskListStorage {
             )));
         }
 
-        // Run the fail-closed admission gate on every task so a tampered or
-        // corrupted on-disk state cannot bypass provenance verification.
-        // Drops unauthenticated checkbox elements and restores attested
-        // elements censored by forged tombstones.
+        // Fail closed: tampered on-disk state cannot bypass provenance verification.
         let dropped = list.admit_all();
         if dropped > 0 {
             tracing::warn!(
@@ -153,10 +142,7 @@ impl TaskListStorage {
 
         let mut list = decode_snapshot(&serialized)?;
 
-        // Run the fail-closed admission gate on every task so a tampered or
-        // corrupted on-disk state cannot bypass provenance verification.
-        // Drops unauthenticated checkbox elements and restores attested
-        // elements censored by forged tombstones.
+        // Fail closed: tampered on-disk state cannot bypass provenance verification.
         let dropped = list.admit_all();
         if dropped > 0 {
             tracing::warn!(
@@ -177,7 +163,6 @@ impl TaskListStorage {
     ///
     /// Returns an error if directory reading fails.
     pub async fn list_task_lists(&self) -> crate::crdt::error::Result<Vec<String>> {
-        // Create directory if it doesn't exist yet (no task lists to list)
         if !self.storage_path.exists() {
             return Ok(Vec::new());
         }
@@ -189,8 +174,6 @@ impl TaskListStorage {
         while let Some(entry) = dir_entries.next_entry().await? {
             let path = entry.path();
 
-            // Skip temporary files (from failed/interrupted writes; the
-            // durable writer names them tmp.<pid>.<counter>).
             if path
                 .extension()
                 .and_then(|e| e.to_str())
@@ -199,7 +182,6 @@ impl TaskListStorage {
                 continue;
             }
 
-            // Only process .bin files
             if path.extension().is_some_and(|ext| ext == "bin") {
                 if let Some(file_name) = path.file_stem() {
                     if let Some(id_str) = file_name.to_str() {
@@ -229,87 +211,50 @@ impl TaskListStorage {
         Ok(())
     }
 
-    /// Get the file path for a task list by its ID.
     fn list_file_path(&self, list_id: &TaskListId) -> PathBuf {
         self.storage_path.join(format!("{}.bin", list_id))
     }
 }
 
-/// Magic prefix of the v1 task-list snapshot format.
+/// v1 format: `MAGIC(8) || bincode(SnapshotBody { list, seq_counter })`.
 ///
-/// Format: `MAGIC(8) || bincode(SnapshotBody { list, seq_counter })`.
-///
-/// The envelope exists so the OR-Set sequence-counter ceiling — `serde(skip)`
-/// on `TaskList`, because remote replicas correctly run their own counters
-/// keyed by their own `PeerId` — survives a restart exactly. Without it a
-/// restored list re-mints `(peer, seq)` OR-Set tags and
-/// `TaskId::new(title, agent, seq)` values that were already used before the
-/// restart: a re-added same-title task silently merges into the pre-restart
-/// task, and reused tags can be tombstone-filtered by remote replicas
-/// (issue #557).
-///
-/// `authorized_agents`, the only other `serde(skip)` field on `TaskList`, is
-/// deliberately NOT in the envelope: it is runtime authorization state
-/// re-derived from the live group service by the handle (see
-/// `TaskListHandle::set_authorized_agents`), not local-mutation state that
-/// must survive a restart.
-///
-/// The format is introduced unreleased — no shipped binary ever wrote a
-/// bare-`TaskList` snapshot — so there is no compat read path: a file
-/// without the magic is rejected (fail closed) rather than guessed at
-/// (mirrors `kv::sync::SNAPSHOT_MAGIC`).
+/// The envelope carries the OR-Set sequence counter, which is `serde(skip)` on
+/// `TaskList`. Without it a restored list re-mints `(peer, seq)` tags and
+/// `TaskId`s used before the restart. A file without the magic is rejected,
+/// not guessed at.
 const SNAPSHOT_MAGIC: &[u8; 8] = b"X0XTLS1\0";
 
-/// Magic prefix of the v2 task-list snapshot format (issue #643 round 2).
-///
-/// Format: `MAGIC(8) || bincode(SnapshotBodyV2 { list, seq_counter,
+/// v2 format: `MAGIC(8) || bincode(SnapshotBodyV2 { list, seq_counter,
 /// known_removed })`.
 ///
-/// v2 adds the raise-only observed-removed evidence set (`serde(skip)` on
-/// `TaskList`, exactly like `seq_counter`: inlining it into `TaskList`
-/// would break v1 snapshot decoding, because the bincode body is
-/// positional) so a restart does not forget the holder's deletions —
-/// without it, a restarted holder serves without removal evidence and
-/// stale replicas can never prune (and later re-serve deleted tasks with
-/// fresh tags, resurrecting them fleet-wide).
-///
-/// Readers accept BOTH magics: a v1 body decodes with an empty evidence
-/// set (degrades to "no evidence", the safe direction — the adopt gate
-/// prunes nothing). Writers emit v2 ONLY when the list actually carries
-/// evidence (`encode_snapshot`); an evidence-free list persists as v1, so
-/// a v0.42.0 downgrade never meets a v2 file unless the replica genuinely
-/// recorded a removal — in which case the fail-closed magic check (same
-/// policy as v1, "refuse to guess at a foreign file") is the price of
-/// having persisted evidence at all.
+/// Adds the observed-removed evidence so a restart does not forget the
+/// holder's deletions. It is not inlined into `TaskList` because the bincode
+/// body is positional and that would break v1 decoding. Readers accept both
+/// magics; writers emit v2 only when the list carries evidence, so an older
+/// binary meets a v2 file only on a replica that recorded a removal.
 const SNAPSHOT_MAGIC_V2: &[u8; 8] = b"X0XTLS2\0";
 
-/// Owned v1 snapshot body (decode side; no removal evidence).
 #[derive(serde::Deserialize)]
 struct SnapshotBody {
     list: TaskList,
     seq_counter: u64,
 }
 
-/// Owned v2 snapshot body (decode side; carries removal evidence).
 #[derive(serde::Deserialize)]
 struct SnapshotBodyV2 {
     list: TaskList,
     seq_counter: u64,
-    /// No `serde(default)`: bincode is positional (non-self-describing),
-    /// so the field is always read from the stream — a default could
-    /// never engage, and every v2 writer always serializes it. The v1/v2
-    /// split is the magic prefix, not a missing field.
+    /// No `serde(default)`: bincode is positional, so a default could never
+    /// engage. The v1/v2 split is the magic prefix, not a missing field.
     known_removed: std::collections::HashSet<TaskId>,
 }
 
-/// Borrowing v1 snapshot body (encode side — avoids cloning the list).
 #[derive(serde::Serialize)]
 struct SnapshotBodyRefV1<'a> {
     list: &'a TaskList,
     seq_counter: u64,
 }
 
-/// Borrowing v2 snapshot body (encode side — avoids cloning the list).
 #[derive(serde::Serialize)]
 struct SnapshotBodyRef<'a> {
     list: &'a TaskList,
@@ -317,22 +262,6 @@ struct SnapshotBodyRef<'a> {
     known_removed: &'a std::collections::HashSet<TaskId>,
 }
 
-/// Encode a task list into snapshot bytes, choosing the SMALLEST format
-/// that round-trips its state (round 3 review):
-///
-/// - no removal evidence ⇒ **v1** — byte-identical to what v0.42.0
-///   writes and reads, so a downgrade (the upgrade path has rollback)
-///   never hits an unreadable snapshot. This is the only shape produced
-///   in production today: no task-removal route exists, so
-///   `known_removed` is empty on every fleet replica.
-/// - evidence present ⇒ **v2** — a v0.42.0 reader fails the magic check
-///   fail-closed on it, but this only occurs on replicas that recorded an
-///   actual removal (crate-API consumers), the price of persisting
-///   evidence at all.
-///
-/// # Errors
-///
-/// Returns an error if bincode serialization of the envelope fails.
 fn encode_snapshot(list: &TaskList) -> crate::crdt::error::Result<Vec<u8>> {
     let seq_counter = list.seq_counter_value();
     let (magic, bytes) = if list.known_removed_ids().is_empty() {
@@ -358,19 +287,8 @@ fn encode_snapshot(list: &TaskList) -> crate::crdt::error::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Decode v1 or v2 snapshot bytes into a task list with its seq counter
-/// (v2: and removal evidence) restored.
-///
-/// Fails closed on anything that is not exactly one of the two formats
-/// (missing magic, undecodable body). The restored counter is floored by
-/// the list's `version` as defense in depth — remote merges bump `version`
-/// without minting local seq, so the version can legitimately run ahead of
-/// the persisted counter (mirrors `kv::sync::load_snapshot`).
-///
-/// # Errors
-///
-/// Returns a typed error if the magic is missing/unknown or the body does
-/// not decode; never panics.
+/// The restored counter is floored by the list's `version`: remote merges bump
+/// `version` without minting local seq, so it can run ahead of the counter.
 fn decode_snapshot(bytes: &[u8]) -> crate::crdt::error::Result<TaskList> {
     if let Some(body_bytes) = bytes.strip_prefix(SNAPSHOT_MAGIC_V2.as_slice()) {
         let body: SnapshotBodyV2 = bincode::deserialize(body_bytes)
@@ -399,9 +317,8 @@ fn decode_snapshot(bytes: &[u8]) -> crate::crdt::error::Result<TaskList> {
 /// directory so the rename itself survives power loss — the same standard
 /// as the kv-store snapshot writer (`kv::sync::write_snapshot_atomic`).
 ///
-/// A unique temp name (pid + counter) means two concurrent saves of the
-/// same list can never interleave writes into one torn temp file; the last
-/// rename wins and every intermediate file state is complete.
+/// The temp name is unique (pid + counter), so two concurrent saves of the
+/// same list cannot interleave writes into one temp file.
 ///
 /// Platform note: on non-Unix targets the parent-directory fsync is
 /// skipped (std cannot fsync a directory handle there); the rename is
@@ -480,7 +397,6 @@ mod tests {
         let list_id = test_list_id(0x12);
         let list = create_test_list(list_id, "trunc");
         storage.save_task_list(&list_id, &list).await.unwrap();
-        // Truncate the durable snapshot mid-file.
         let path = dir.path().join(format!("{list_id}.bin"));
         let bytes = std::fs::read(&path).unwrap();
         std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
@@ -491,9 +407,6 @@ mod tests {
     async fn load_opt_id_mismatch_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let storage = TaskListStorage::new(dir.path().to_path_buf());
-        // Save under id A's file name, then ask for id B: the inner list id
-        // must not silently pass as B's state. Written via the envelope so
-        // this test exercises the id check, not the magic check.
         let a = test_list_id(0x13);
         let b = test_list_id(0x14);
         let list = create_test_list(a, "imposter");
@@ -504,11 +417,6 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_roundtrip_restores_seq_counter_ceiling() {
-        // WHY: OR-Set tags and TaskIds are minted from the local seq
-        // counter. A restart that loses the ceiling re-mints colliding
-        // (peer, seq) tags, which remote replicas can tombstone-filter.
-        // The persisted counter — not a fresh 0 — must be the restore
-        // ceiling (mirrors the kv snapshot seq test).
         let dir = tempfile::tempdir().unwrap();
         let storage = TaskListStorage::new(dir.path().to_path_buf());
         let list_id = test_list_id(0x17);
@@ -532,11 +440,6 @@ mod tests {
 
     #[tokio::test]
     async fn post_restart_readd_same_title_yields_distinct_task_ids() {
-        // WHY: TaskId::new(title, agent, seq) — with the seq ceiling lost,
-        // re-adding the same title after a restart mints the SAME TaskId and
-        // the OR-Set add silently merges into the pre-restart task (REST
-        // returns the old id; the new content never appears). The envelope
-        // must keep them distinct and both present.
         use crate::crdt::{TaskId, TaskItem, TaskMetadata};
         use crate::identity::AgentId;
 
@@ -559,7 +462,6 @@ mod tests {
         let first = add_titled_task(&mut list, agent, peer);
         storage.save_task_list(&list_id, &list).await.unwrap();
 
-        // Restart: the only recovery path is persist → load.
         let mut restored = storage
             .load_task_list_opt(&list_id)
             .await
@@ -583,10 +485,6 @@ mod tests {
 
     #[tokio::test]
     async fn load_opt_missing_magic_fails_closed_leaving_memory_untouched() {
-        // WHY: a file without the v1 magic (bare bincode or foreign bytes)
-        // is not a snapshot this code wrote — guessing at it could install
-        // seq-counter amnesia or worse. The load must be a TYPED error and
-        // must leave the caller's in-memory replica exactly as it was.
         use crate::crdt::error::CrdtError;
         use crate::crdt::{TaskId, TaskItem, TaskMetadata};
         use crate::identity::AgentId;
@@ -605,7 +503,6 @@ mod tests {
         storage.save_task_list(&list_id, &list).await.unwrap();
 
         let path = dir.path().join(format!("{list_id}.bin"));
-        // Overwrite with a bare-bincode list (no envelope magic).
         std::fs::write(&path, bincode::serialize(&list).unwrap()).unwrap();
         let err = storage.load_task_list_opt(&list_id).await.unwrap_err();
         assert!(
@@ -613,11 +510,9 @@ mod tests {
             "missing magic must be a typed InvalidData error, got: {err:?}"
         );
 
-        // A file truncated inside the magic itself fails the same way.
         std::fs::write(&path, b"X0XTL").unwrap();
         assert!(storage.load_task_list_opt(&list_id).await.is_err());
 
-        // The in-memory replica the caller still holds is untouched.
         assert!(
             list.get_task(&task_id).is_some(),
             "failed load must not disturb the in-memory replica"
@@ -736,11 +631,6 @@ mod tests {
         assert_eq!(loaded.name(), "nested-test");
     }
 
-    /// WHY (issue #643 round 2): deletion evidence must survive a restart
-    /// or a restarted holder serves without it and stale replicas can
-    /// never prune its deletions (and later re-serve deleted tasks with
-    /// fresh tags). The v2 envelope carries the raise-only observed-removed
-    /// set.
     #[tokio::test]
     async fn v2_snapshot_roundtrips_removal_evidence() {
         use crate::crdt::{TaskId, TaskItem, TaskMetadata};
@@ -767,7 +657,6 @@ mod tests {
 
         storage.save_task_list(&list_id, &list).await.unwrap();
 
-        // Evidence present ⇒ the file MUST be v2 on disk.
         let raw = std::fs::read(dir.path().join(format!("{list_id}.bin"))).unwrap();
         assert!(
             raw.starts_with(SNAPSHOT_MAGIC_V2.as_slice()),
@@ -775,8 +664,6 @@ mod tests {
         );
         let loaded = storage.load_task_list(&list_id).await.unwrap();
 
-        // Observable through the public surface: the loaded list's full
-        // serve still names the deletion as empty-tag-set evidence.
         let serve = loaded.full_delta();
         assert!(serve.added_tasks.contains_key(&keeper));
         assert!(!serve.added_tasks.contains_key(&doomed));
@@ -787,19 +674,12 @@ mod tests {
         );
     }
 
-    /// WHY (issue #643 round 2): v0.42.0 wrote v1 envelopes (list + seq
-    /// counter, no evidence). A v1 file must still load — with an EMPTY
-    /// evidence set (degrades safe: the adopt gate prunes nothing without
-    /// evidence) — rather than failing the whole restore.
     #[tokio::test]
     async fn v1_snapshot_still_loads_with_empty_evidence() {
         let dir = tempfile::tempdir().unwrap();
         let list_id = test_list_id(0x22);
         let list = create_test_list(list_id, "v1-era");
 
-        // Hand-craft a v1 file: `MAGIC(8) || bincode({list, seq_counter})`.
-        // bincode encodes a two-field struct positionally, identically to
-        // the tuple written here.
         let body = bincode::serialize(&(list.clone(), 0u64)).unwrap();
         let mut bytes = SNAPSHOT_MAGIC.as_slice().to_vec();
         bytes.extend_from_slice(&body);
@@ -814,13 +694,6 @@ mod tests {
         );
     }
 
-    /// WHY (round 3 review): `encode_snapshot` must write the SMALLEST
-    /// format that round-trips the state. No production task-removal path
-    /// exists, so every fleet replica has empty `known_removed` — and
-    /// every fleet snapshot must therefore stay v1, byte-compatible with
-    /// the v0.42.0 reader (whose rollback/downgrade path re-reads these
-    /// files). Writing v2 unconditionally would have broken downgrades
-    /// fleet-wide for zero gain.
     #[tokio::test]
     async fn evidence_free_list_persists_as_v1_bytes() {
         use crate::crdt::{TaskId, TaskItem, TaskMetadata};
@@ -831,7 +704,6 @@ mod tests {
         let list_id = test_list_id(0x23);
         let mut list = create_test_list(list_id, "no-evidence");
 
-        // Ordinary production shape: tasks, claims, no removals.
         let agent = AgentId([1; 32]);
         let metadata = TaskMetadata::new("t".to_string(), "d".to_string(), 128, agent, 1000);
         list.add_task(
@@ -852,7 +724,6 @@ mod tests {
             "v2 must be reserved for snapshots that carry evidence"
         );
 
-        // And it still round-trips through the dual-magic reader.
         let loaded = storage.load_task_list(&list_id).await.unwrap();
         assert_eq!(loaded.task_count(), 1);
         assert!(loaded.full_delta().removed_tasks.is_empty());
@@ -867,32 +738,15 @@ mod tests {
 
         storage.save_task_list(&list_id, &list).await.unwrap();
 
-        // Write a .tmp file manually
         let tmp_path = dir.path().join(format!("{}.tmp", list_id));
         tokio::fs::write(&tmp_path, b"garbage").await.unwrap();
 
         let lists = storage.list_task_lists().await.unwrap();
-        assert_eq!(lists.len(), 1); // .tmp file should be skipped
+        assert_eq!(lists.len(), 1);
     }
 
     #[tokio::test]
     async fn attested_tasklist_roundtrips_through_disk() {
-        // On-disk path coverage: a TaskList carrying a genuinely self-attested
-        // task must survive save -> bincode -> load, INCLUDING the fail-closed
-        // admission gate `load_task_list` runs (`admit_all`). This pins that the
-        // trailing `attestations` field persists and resolves after a disk
-        // round-trip — the current-format guarantee.
-        //
-        // NOTE ON LEGACY BYTES: the trailing+tolerant field makes a *top-level*
-        // pre-attestations TaskItem decode (see task_item.rs
-        // `legacy_taskitem_without_attestations_decodes`). It does NOT recover a
-        // genuinely fieldless TaskItem nested mid-stream inside a TaskList,
-        // because bincode is positional: `task_data` is followed by `ordering`/
-        // `name`/`version`, so an absent trailing field is not at stream-EOF and
-        // the tolerant deserializer would consume the following struct's bytes.
-        // That case is intentionally out of scope (greenfield release, no
-        // pre-wave persisted lists exist); true nested-legacy compat would need
-        // a versioned/length-prefixed envelope, not EOF tolerance.
         use crate::crdt::{TaskId, TaskItem, TaskMetadata};
 
         let dir = tempfile::tempdir().unwrap();

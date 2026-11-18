@@ -1,9 +1,3 @@
-//! #901 follow-up coverage for the group roster to topic mapping.
-//!
-//! The #890 tests use an empty metadata topic. These tests use the real
-//! `x0x.group.<16 hex>.meta` metadata form, and the KV `state-sync` form,
-//! next to a second group and a Full pass-through topic.
-
 #![cfg(test)]
 
 use super::*;
@@ -39,7 +33,6 @@ async fn manager(reason: &str) -> PubSubManager {
     manager
 }
 
-/// Bind agent `[n - 30; 32]` to machine `[n; 32]` and connect every machine.
 async fn authorize_and_connect(manager: &PubSubManager, machines: &[u8]) {
     let bindings = Arc::new(RwLock::new(
         crate::dm_inbox::AuthenticatedMachineBindingCache::default(),
@@ -94,7 +87,6 @@ async fn issue901_metadata_topic_maps_by_exact_name_and_kv_shape_wins() {
     let meta_a = meta(&group_a[..16]);
     let chat_a = format!("x0x.group.{}.chat", &group_a[..16]);
     let kv_a = state_sync(&group_a, &"01".repeat(32));
-    // Subscribe before any roster loads.
     let _subs = [
         manager.subscribe(meta_a.clone()).await,
         manager.subscribe(chat_a.clone()).await,
@@ -104,8 +96,6 @@ async fn issue901_metadata_topic_maps_by_exact_name_and_kv_shape_wins() {
         assert!(preferred(&manager, name).await.is_empty(), "{name}");
     }
 
-    // Group B names group A's KV topic as its metadata topic. The KV shape
-    // must still map to group A, not to group B's roster.
     manager
         .replace_group_rosters(vec![
             (group_a.clone(), meta_a.clone(), vec![AgentId([40; 32])]),
@@ -151,7 +141,6 @@ async fn issue901_group_a_change_does_not_reapply_group_b_or_passthrough() {
         .await;
     manager.take_refreshed_topic_ids();
 
-    // Member change in group A.
     manager
         .replace_group_rosters(vec![
             (group_a.clone(), meta_a.clone(), vec![AgentId([41; 32])]),
@@ -165,7 +154,6 @@ async fn issue901_group_a_change_does_not_reapply_group_b_or_passthrough() {
         vec![PeerId::new([71; 32])]
     );
 
-    // Metadata topic move in group A: old and new topic, and A's KV topic.
     manager
         .replace_group_rosters(vec![
             (group_a, new_meta_a.clone(), vec![AgentId([41; 32])]),
@@ -204,7 +192,6 @@ async fn issue901_preference_returns_when_the_collision_ends() {
         ])
         .await;
     assert!(preferred(&manager, &shared).await.is_empty());
-    // Group A leaves the collision; group B is the sole claimant again.
     manager
         .replace_group_rosters(vec![(
             "cd".repeat(32),
@@ -224,10 +211,6 @@ async fn issue901_shared_metadata_topic_gives_no_roster_preference() {
     authorize_and_connect(&manager, &[70, 71]).await;
     let shared = meta("abababababababab");
     let _sub = manager.subscribe(shared.clone()).await;
-    // Each install builds a new roster map with a new hash seed, so a
-    // first-match lookup would pick group A or group B by chance. A card's
-    // group ID is a free string, so "the ID that derives the topic" is not
-    // a safe tie-break either: neither claim may win.
     for round in 0..32 {
         manager
             .replace_group_rosters(vec![
@@ -245,7 +228,6 @@ async fn issue901_shared_metadata_topic_gives_no_roster_preference() {
 
 type Bindings = crate::dm_inbox::AuthenticatedMachineBindings;
 
-/// Install `cache` as the group identity context and connect `machines`.
 fn install_bindings(
     manager: &PubSubManager,
     cache: crate::dm_inbox::AuthenticatedMachineBindingCache,
@@ -268,7 +250,6 @@ fn install_bindings(
     bindings
 }
 
-/// Bind agent `[n - 30; 32]` to machine `[n; 32]`.
 async fn bind(bindings: &Bindings, n: u8) {
     crate::dm_inbox::record_authenticated_machine_binding(
         bindings,
@@ -279,7 +260,6 @@ async fn bind(bindings: &Bindings, n: u8) {
     .await;
 }
 
-/// Subscribe to one KV topic of a new group whose roster is `agents`.
 async fn roster_topic(manager: &PubSubManager, agents: Vec<AgentId>) -> String {
     let group = "ab".repeat(32);
     let topic = state_sync(&group, &"01".repeat(32));
@@ -290,8 +270,6 @@ async fn roster_topic(manager: &PubSubManager, agents: Vec<AgentId>) -> String {
     topic
 }
 
-/// #901 item 4: one roster resolve takes the binding-cache write lock once,
-/// not once per member.
 #[tokio::test]
 async fn issue901_roster_resolve_takes_the_binding_lock_once() {
     let manager = manager("issue901_one_lock").await;
@@ -311,8 +289,6 @@ async fn issue901_roster_resolve_takes_the_binding_lock_once() {
     assert_eq!(takes, 1, "one write lock per roster resolve");
 }
 
-/// #901 item 4: the batch touches every resolved member in the LRU order.
-/// The next insert at capacity evicts the member that is not in the roster.
 #[tokio::test]
 async fn issue901_roster_resolve_touches_each_member_in_the_lru() {
     let manager = manager("issue901_lru_touch").await;
@@ -321,7 +297,6 @@ async fn issue901_roster_resolve_touches_each_member_in_the_lru() {
     for n in [70, 71, 72] {
         bind(&bindings, n).await;
     }
-    // Machine 72's agent is the newest entry and is not in the roster.
     let topic = roster_topic(&manager, vec![AgentId([40; 32]), AgentId([41; 32])]).await;
     assert_eq!(preferred(&manager, &topic).await.len(), 2);
     bind(&bindings, 73).await;
@@ -334,16 +309,10 @@ async fn issue901_roster_resolve_touches_each_member_in_the_lru() {
     );
 }
 
-/// #901 item 5: a member whose binding the cache bound evicted gets no
-/// preference, and the miss is counted as evicted. A member that never
-/// announced is counted as without binding only. The local agent is not
-/// counted.
 #[tokio::test]
 async fn issue901_evicted_member_gets_no_preference_and_is_counted() {
     let manager = manager("issue901_evicted").await;
     let cache = crate::dm_inbox::AuthenticatedMachineBindingCache::with_capacity(2);
-    // Machine 70 stays connected after its binding is evicted, and machine
-    // 73 is connected without any binding: reachability gives no preference.
     let bindings = install_bindings(&manager, cache, &[70, 71, 72, 73]);
     for n in [70, 71, 72] {
         bind(&bindings, n).await;
@@ -376,8 +345,6 @@ async fn issue901_evicted_member_gets_no_preference_and_is_counted() {
         "(without binding, of which evicted)"
     );
 
-    // A new announcement restores the preference. At capacity it evicts
-    // the least recently used member (machine 71), which is counted next.
     bind(&bindings, 70).await;
     let before = bindings.read().await.roster_binding_misses();
     let mut chosen = preferred(&manager, &topic).await;
@@ -387,9 +354,6 @@ async fn issue901_evicted_member_gets_no_preference_and_is_counted() {
     assert_eq!((after.0 - before.0, after.1 - before.1), (2, 1));
 }
 
-/// #901 item 4 measurement. Not a gate: run with `--run-ignored only`.
-/// One task resolves a 256-member roster 2,000 times. A second task
-/// resolves one sender's binding in a loop, as DM ingress does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "measurement only"]
 async fn issue901_measure_roster_resolve_against_dm_ingress() {

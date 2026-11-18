@@ -449,3 +449,20 @@ async fn a_new_durable_transaction_gets_its_own_retry_wait() {
     assert_eq!(task.await.unwrap(), Ok(Some(42)));
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }
+
+/// #1169 round 6: the claim guard's drop asks this read-only check instead
+/// of taking ownership. It must answer exactly what `claim_retry` enforces:
+/// owned while a retry holds the (install, version) key, free before and
+/// after, and keyed by version — a retry owning one version does not hold
+/// another.
+#[test]
+fn retry_is_owned_is_read_only_and_version_keyed() {
+    let install = install_key("owned");
+    let version = "9.9.9-owned".to_string();
+    assert!(!probe_retry::retry_is_owned(&install, &version));
+    let owner = claim_retry(install.clone(), version.clone()).unwrap();
+    assert!(probe_retry::retry_is_owned(&install, &version));
+    assert!(!probe_retry::retry_is_owned(&install, "9.9.9-other"));
+    drop(owner);
+    assert!(!probe_retry::retry_is_owned(&install, &version));
+}

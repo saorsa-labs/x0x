@@ -118,6 +118,31 @@ async fn probe_retry_delay_for_install(
     probe_retry_delay_owned(install, version, None).await
 }
 
+/// Whether the durable record holds an interrupted probe wait for
+/// `version` — the precheck that decides a probe retry will actually
+/// re-apply it (#1169: the HTTP route keeps its apply-route claim for
+/// exactly that hand-off). Read-only, unlike the inspection
+/// [`super::probe::inspect_admission`] performs: it acknowledges no probe-clock
+/// progress and resolves no staging identity, because it runs on an
+/// HTTP response path that must neither mutate retained records nor
+/// wait on readback subprocesses. The spawned retry loop still runs
+/// the full gated check before every attempt.
+#[cfg(unix)]
+pub(crate) async fn has_durable_probe_wait(install: PathBuf, version: String) -> bool {
+    tokio::task::spawn_blocking(move || {
+        crate::upgrade::probe::read_state(&install)
+            .map(|state| {
+                state.is_some_and(|state| {
+                    state.version == version
+                        && state.phase == super::probe::ProbePhase::InterruptedWait
+                })
+            })
+            .unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false)
+}
+
 #[cfg(unix)]
 async fn probe_retry_delay_owned(
     install: PathBuf,
@@ -396,6 +421,11 @@ struct PermitState {
     cancelled: bool,
     operation: Option<std::sync::Weak<AtomicBool>>,
     http_wait_slot: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+    /// Set once, atomically with the caller-liveness recheck, at the
+    /// replacement worker's admission. Read by the HTTP route's claim
+    /// guard: after admission the worker owns replacement and restart, so
+    /// a dropped handler must not release what the worker still owns.
+    admitted: bool,
 }
 
 impl ReleasePermit {
@@ -470,6 +500,48 @@ impl ReleasePermit {
             permit: self.clone(),
             flag: Arc::clone(flag),
         })
+    }
+
+    /// The replacement worker's admission decision. The liveness recheck
+    /// and the `admitted` set share this mutex, so a caller that drops
+    /// (`PermitOperation::drop` stores `false`, then the route's claim
+    /// guard reads `admitted` under the same lock) is ordered against the
+    /// decision: either the worker sees the caller gone and never admits,
+    /// or the claim guard sees `admitted` before it looks.
+    pub(crate) fn admit_if_alive(&self, caller_alive: &AtomicBool) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if caller_alive.load(Ordering::Acquire) {
+            state.admitted = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether the release this permit guards was ever admitted to the
+    /// destructive half.
+    pub(crate) fn admitted(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .admitted
+    }
+
+    /// Test-seam stand-in for [`ReleasePermit::admit_if_alive`]: an
+    /// injected apply attempt IS the destructive half, and it runs on the
+    /// caller's own task, so its liveness is the task running it.
+    /// Unix-gated tests are its only callers; without this attribute a
+    /// Windows test build warns it is dead code.
+    #[cfg(test)]
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn admit(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .admitted = true;
     }
 }
 
@@ -627,6 +699,9 @@ async fn apply_replacements_with_permit(
         .transpose()?;
     let worker_alive = Arc::clone(&caller_alive);
     let http_wait_slot = permit.and_then(ReleasePermit::http_wait_slot);
+    // Owned clone for the 'static worker: records admission inside the
+    // blocking closure. Shares state with the async caller's permit.
+    let admission_permit = permit.cloned();
     #[cfg(test)]
     let observer = permit.and_then(|permit| permit.observer.clone());
 
@@ -701,7 +776,11 @@ async fn apply_replacements_with_permit(
 
         // Admission: locks held + caller still alive. From here the worker
         // owns mutation through on_success — the async caller is only an
-        // observer and may be cancelled without orphaning restart.
+        // observer and may be cancelled without orphaning restart. The
+        // permit records that transfer atomically with the liveness
+        // recheck: an HTTP caller dropped at this exact boundary either
+        // sees the worker refuse, or keeps a claim it can no longer
+        // release.
         let mut flush_admission = if let Some(reservation) = &flush_reservation {
             reservation.activate().map_err(|error| {
                 UpgradeError::Other(format!("shutdown won upgrade admission: {error}"))
@@ -713,6 +792,13 @@ async fn apply_replacements_with_permit(
         } else {
             None
         };
+        if let Some(permit) = &admission_permit {
+            if !permit.admit_if_alive(&worker_alive) {
+                return Err(UpgradeError::Other(
+                    "upgrade cancelled at admission".to_string(),
+                ));
+            }
+        }
         // (target, fresh backup) pairs this transaction actually swapped.
         let mut companion_swapped: Vec<(PathBuf, PathBuf)> = Vec::new();
         if let Some((x0x_upgrader, extracted_x0x)) = companion {
@@ -864,7 +950,7 @@ impl AutoApplyUpgrader {
         self
     }
 
-    fn check_release(&self) -> Result<(), UpgradeError> {
+    pub(crate) fn check_release(&self) -> Result<(), UpgradeError> {
         self.release_permit
             .as_ref()
             .map_or(Ok(()), ReleasePermit::check)
@@ -1391,7 +1477,9 @@ impl AutoApplyUpgrader {
         // contract never reaches this hook. Compiled out entirely in
         // non-test builds; an uninstalled hook changes nothing.
         #[cfg(test)]
-        if let Some(result) = apply_attempt_seam::intercept(&restart_plan, manifest) {
+        if let Some(result) =
+            apply_attempt_seam::intercept(&restart_plan, manifest, self.release_permit.as_ref())
+        {
             return Ok(result);
         }
 
@@ -2011,35 +2099,62 @@ pub(crate) mod pre_probe_admission_seam {
 /// uninstalled hook changes nothing.
 #[cfg(test)]
 pub(crate) mod apply_attempt_seam {
-    use super::UpgradeResult;
+    use super::{ReleasePermit, UpgradeResult};
     use crate::upgrade::manifest::ReleaseManifest;
     use crate::upgrade::restart::RestartPlan;
     use std::sync::Mutex;
 
+    /// The injected attempt's stand-in for the replacement worker's
+    /// admission: an attempt that reaches the point where the real worker
+    /// would own mutation calls [`AttemptAdmission::admit`], and from
+    /// there a dropped caller must not release what the destructive half
+    /// owns.
+    pub(crate) struct AttemptAdmission<'a>(Option<&'a ReleasePermit>);
+
+    impl AttemptAdmission<'_> {
+        /// Unix-gated tests are its only callers; without this attribute
+        /// a Windows test build warns it is dead code.
+        #[cfg_attr(not(unix), allow(dead_code))]
+        pub(crate) fn admit(&self) {
+            if let Some(permit) = self.0 {
+                permit.admit();
+            }
+        }
+    }
+
     /// An installed apply attempt: sees the resolved restart plan and the
     /// manifest being applied, and answers as the destructive half would.
-    pub(crate) type Attempt =
-        Box<dyn Fn(&RestartPlan, &ReleaseManifest) -> UpgradeResult + Send + Sync>;
+    /// `None` permit (permitless callers) makes [`AttemptAdmission::admit`]
+    /// a no-op.
+    pub(crate) type Attempt = Box<
+        dyn Fn(&RestartPlan, &ReleaseManifest, &AttemptAdmission<'_>) -> UpgradeResult
+            + Send
+            + Sync,
+    >;
 
     static INSTALLED: Mutex<Option<Attempt>> = Mutex::new(None);
 
     /// Uninstalls the attempt on drop, so a test cannot leak its injection
-    /// into sibling tests in the same process.
+    /// into sibling tests in the same process. Poison-tolerant: a panicking
+    /// attempt poisons the lock on its way out, and the recovery read
+    /// still clears the slot.
     pub(crate) struct Guard {
         _private: (),
     }
 
     impl Drop for Guard {
         fn drop(&mut self) {
-            if let Ok(mut slot) = INSTALLED.lock() {
-                *slot = None;
-            }
+            *INSTALLED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         }
     }
 
     /// Install `attempt` for the guard's lifetime.
     pub(crate) fn install(attempt: Attempt) -> Guard {
-        let mut slot = INSTALLED.lock().expect("apply attempt seam poisoned");
+        let mut slot = INSTALLED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *slot = Some(attempt);
         Guard { _private: () }
     }
@@ -2049,9 +2164,13 @@ pub(crate) mod apply_attempt_seam {
     pub(crate) fn intercept(
         plan: &RestartPlan,
         manifest: &ReleaseManifest,
+        permit: Option<&ReleasePermit>,
     ) -> Option<UpgradeResult> {
-        let slot = INSTALLED.lock().expect("apply attempt seam poisoned");
-        slot.as_ref().map(|attempt| attempt(plan, manifest))
+        let slot = INSTALLED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slot.as_ref()
+            .map(|attempt| attempt(plan, manifest, &AttemptAdmission(permit)))
     }
 }
 
@@ -2451,6 +2570,25 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::TempDir;
+
+    /// #1169 review round 4 (Claude should-fix 3): the admission decision
+    /// refuses a dead caller without marking the permit — changing the
+    /// body to set `admitted` unconditionally fails the refusal arm here,
+    /// which no other test reached — and the live control admits and
+    /// marks.
+    #[test]
+    fn admit_if_alive_refuses_a_dead_caller_without_marking_the_permit() {
+        let permit = ReleasePermit::default();
+        let dead = AtomicBool::new(false);
+        assert!(!permit.admit_if_alive(&dead));
+        assert!(
+            !permit.admitted(),
+            "a refused admission must not mark the permit"
+        );
+        let live = AtomicBool::new(true);
+        assert!(permit.admit_if_alive(&live));
+        assert!(permit.admitted());
+    }
 
     #[cfg(unix)]
     async fn check_supervised_unused_reservation_after_replacement(rollback: bool) {

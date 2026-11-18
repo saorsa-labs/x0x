@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 ///
 /// TOML: `[gossip] byte_policy`. Shedding is opt-in because dropping gossip
 /// is a behaviour change that must be attributable to a deliberate operator
-/// decision, never to the side effect of setting a non-zero byte rate
-/// (#504 slice 2). A non-zero `leaf_egress_hard_bytes_per_sec` is a meter.
+/// decision, never to the side effect of setting a non-zero byte rate.
+/// A non-zero `leaf_egress_hard_bytes_per_sec` is a meter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LeafBytePolicy {
@@ -70,8 +70,7 @@ pub struct GossipConfig {
     pub deprecated_prwl: Option<usize>,
 
     /// Number of concurrent PubSub decode/verify/fanout workers draining the
-    /// inbound PubSub queue. Default stays 1 for one release cycle so rollback
-    /// is a config-only change; the adaptive supervisor may temporarily raise
+    /// inbound PubSub queue. The adaptive supervisor may temporarily raise
     /// the active worker target up to 32 during overload or restart bursts.
     #[serde(default = "default_dispatch_workers")]
     pub dispatch_workers: usize,
@@ -97,15 +96,15 @@ pub struct GossipConfig {
     #[serde(default = "default_leaf_egress_burst")]
     pub leaf_egress_burst_bytes: u64,
 
-    /// #504 slice 2: what an exhausted budget is allowed to *do*.
+    /// What an exhausted budget is allowed to *do*.
     ///
     /// Opt-in, and only on a Leaf — see [`LeafBytePolicy`].
     #[serde(default)]
     pub byte_policy: LeafBytePolicy,
 
-    /// #674 C3: per-topic budget for *eager* re-forwarding of relayed
+    /// Per-topic budget for *eager* re-forwarding of relayed
     /// messages on topics this node subscribes to. Within budget, verdicts
-    /// stay `ForwardAndDeliver` (today's behaviour); beyond it the topic
+    /// stay `ForwardAndDeliver`; beyond it the topic
     /// degrades to `LazyForward` — eager re-publish withheld, msg-ids
     /// announced via IHAVE, peers pull by IWANT — and recovers as the
     /// bucket refills. Topics with **zero local subscribers** are always
@@ -118,7 +117,7 @@ pub struct GossipConfig {
     ///
     /// TOML: `gossip.relay = true`. The `--relay` CLI flag sets the same
     /// intent. Seed / dual-listen / managed-binary detection still
-    /// fail-closes to Full when this is false (issue #380).
+    /// fail-closes to Full when this is false.
     #[serde(default)]
     pub relay: bool,
 
@@ -143,7 +142,6 @@ fn deserialize_leaf_degree<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<usize, D::Error> {
     let value = i64::deserialize(deserializer)?;
-    // Preserve out-of-range status until normalization can emit a warning.
     Ok(usize::try_from(value).unwrap_or(13))
 }
 
@@ -225,11 +223,8 @@ impl GossipConfig {
         {
             return Err("leaf egress hard threshold must be >= soft (or 0 to disable)".into());
         }
-        // #504 slice 2: saorsa-gossip refuses a budget whose burst cannot hold
-        // one maximum frame, and a refused budget means *no* accounting at
-        // all. Normalizing here (rather than failing startup) keeps the same
-        // promise the other budget typos make: a bad byte knob must never
-        // restart-loop a live daemon.
+        // saorsa-gossip refuses a budget whose burst cannot hold one maximum
+        // frame, and a refused budget means no accounting at all.
         if self.leaf_egress_hard_bytes_per_sec != 0
             && self.leaf_egress_burst_bytes < super::pubsub::MAX_LEAF_GOSSIP_FRAME_BYTES as u64
         {
@@ -253,10 +248,9 @@ impl GossipConfig {
 
     /// Operator warnings for deprecated `[gossip]` keys that are still set.
     ///
-    /// Why this warns instead of failing: live nodes already carry these keys
-    /// in their TOML and must keep starting. They were previously `> 0`
-    /// validated, so a stale `active_view_size = 0` could restart-loop a
-    /// daemon over a knob that had no effect at all.
+    /// Warns, does not fail: live nodes carry these keys and must keep starting.
+    /// A stale `active_view_size = 0` could restart-loop a daemon over a knob
+    /// that has no effect.
     #[must_use]
     pub fn deprecation_warnings(&self) -> Vec<String> {
         [
@@ -296,11 +290,6 @@ impl GossipConfig {
 mod tests {
     use super::*;
 
-    /// WHY: #504 slice 2 must not change what an existing operator's TOML
-    /// does. Every deployed `[gossip]` section predates `byte_policy`, so
-    /// omitting it has to mean "observe only" — if this ever defaulted to
-    /// `shed_normal`, every node in the fleet would start dropping forwarded
-    /// gossip on an upgrade nobody opted into.
     #[test]
     fn omitted_byte_policy_means_observe_only() {
         let parsed: GossipConfig = toml::from_str("leaf_max_eager_degree = 2").unwrap();
@@ -311,18 +300,12 @@ mod tests {
         let opted_in: GossipConfig = toml::from_str("byte_policy = \"shed_normal\"").unwrap();
         assert_eq!(opted_in.byte_policy, LeafBytePolicy::ShedNormal);
         assert_eq!(opted_in.byte_policy.as_str(), "shed_normal");
-        // Opting into shedding must not disturb the metered thresholds.
         assert_eq!(
             opted_in.leaf_egress_hard_bytes_per_sec,
             default_leaf_egress_hard()
         );
     }
 
-    /// WHY: saorsa-gossip refuses a budget whose burst cannot hold one
-    /// maximum frame, and a refused budget means *no* accounting at all. An
-    /// operator who mistypes the burst must get metering back with a warning,
-    /// not a daemon that silently stopped measuring — and not a restart loop,
-    /// which is the trap the deprecated view-size keys already sprang once.
     #[test]
     fn undersized_burst_normalizes_rather_than_disabling_accounting() {
         let mut config = GossipConfig {
@@ -334,7 +317,6 @@ mod tests {
         assert_eq!(config.leaf_egress_burst_bytes, default_leaf_egress_burst());
         assert!(config.validate().is_ok());
 
-        // A disabled budget has no frame to size a burst against.
         let disabled = GossipConfig {
             leaf_egress_hard_bytes_per_sec: 0,
             leaf_egress_burst_bytes: 1,
@@ -398,11 +380,6 @@ mod tests {
 
     #[test]
     fn partial_toml_section_falls_back_to_defaults() {
-        // Operators must be able to override a single field without repeating
-        // the rest of the struct. This guards against the regression that
-        // shipped briefly during the X0X-0005 soak rollout where a missing
-        // field in a partial `[gossip]` section caused x0xd to restart-loop on
-        // every node.
         let cfg: GossipConfig = toml::from_str("dispatch_workers = 4").expect("partial TOML");
         let defaults = GossipConfig::default();
         assert_eq!(cfg.dispatch_workers, 4);
@@ -414,11 +391,6 @@ mod tests {
 
     #[test]
     fn relay_fanout_budget_parses_partial_toml_and_defaults_to_50() {
-        // Why (#674 C3): the budget is the operator's only lever on eager
-        // re-forwarding of consumed topics; a partial TOML section must
-        // keep the 50 msg/s default (above the busiest measured fleet
-        // topic, ~19/s) and 0 must round-trip as "gate disabled" — not be
-        // silently normalized away.
         let cfg: GossipConfig = toml::from_str("dispatch_workers = 2").expect("partial TOML");
         assert_eq!(cfg.relay_fanout_budget_msgs_per_sec, 50);
         let cfg: GossipConfig =
@@ -431,11 +403,6 @@ mod tests {
 
     #[test]
     fn deprecated_view_knobs_still_parse_and_warn_instead_of_failing() {
-        // Why this matters: live nodes have `active_view_size` etc. in their
-        // deployed TOML. Removing the knobs must not stop a single daemon from
-        // starting, but an operator who believes they are tuning fan-out has
-        // to be told the key does nothing (docs/design/504-leaf-egress-budget.md
-        // section 2 — the values never reached HyParView membership).
         let cfg: GossipConfig =
             toml::from_str("active_view_size = 4\npassive_view_size = 12\narwl = 2\nprwl = 1\n")
                 .expect("deprecated keys must keep parsing");
@@ -461,8 +428,6 @@ mod tests {
 
     #[test]
     fn deprecated_zero_view_size_no_longer_restart_loops_the_daemon() {
-        // Regression guard: `active_view_size = 0` used to fail validate() and
-        // therefore crash-loop x0xd, for a knob with zero runtime effect.
         let cfg: GossipConfig =
             toml::from_str("active_view_size = 0").expect("zero must still parse");
         assert!(cfg.validate().is_ok());
@@ -471,8 +436,6 @@ mod tests {
 
     #[test]
     fn deprecated_keys_are_not_written_back_on_serialize() {
-        // They are ignored, so echoing them into a rendered config would keep
-        // telling operators the knob exists.
         let cfg: GossipConfig = toml::from_str("active_view_size = 4").expect("parses");
         let rendered = toml::to_string(&cfg).expect("serializes");
         assert!(!rendered.contains("active_view_size"));
@@ -496,9 +459,6 @@ mod tests {
         assert_eq!(cfg.resolved_participation(), ParticipationMode::Full);
         assert_eq!(cfg.resolved_participation_reason(), "operator_relay");
     }
-    /// ADR-0034: `gossip.relay = true` (TOML) must resolve Full — one operator
-    /// concept across CLI/env/TOML; the server startup normalises the env var
-    /// so the announcement side (#406) observes the same opt-in.
     #[test]
     fn toml_relay_resolves_full_participation() {
         let mut c = GossipConfig::default();

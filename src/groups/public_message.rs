@@ -345,11 +345,7 @@ pub fn verify_rider_provenance(
     if now_unix >= claim.not_after {
         return Err("delegation has expired".to_string());
     }
-    // Review r5 item 2: authorization lifetime at the RECEIVER. The
-    // certificate's own expiry (a signature-only `verify` says nothing
-    // about `not_after`) and the caller's ADR-0018 revocation view of
-    // the sub-agent are both enforced here, mirroring the sending
-    // daemon's middleware fence.
+    // A signature-only `verify` does not check `not_after`.
     if cert.is_expired(now_unix) {
         return Err("delegation certificate has expired".to_string());
     }
@@ -459,11 +455,6 @@ mod mls_attribution_tests {
 
     #[test]
     fn rider_mls_attribution_is_daemon_signed_and_binds_group_and_epoch() {
-        // WHY (review r4 item 2): Home/MLS attribution must be
-        // cryptographic — a daemon signature over bytes that bind the
-        // provenance (and its sub-agent-signed delegation), the group,
-        // AND the epoch, so the artifact cannot be replayed across
-        // groups or epochs unnoticed.
         let daemon_kp = AgentKeypair::generate().unwrap();
         let sub_kp = AgentKeypair::generate().unwrap();
         let daemon_hex = hex::encode(daemon_kp.agent_id().as_bytes());
@@ -476,15 +467,12 @@ mod mls_attribution_tests {
         };
         let bytes = rider_mls_attribution_bytes(&prov, "mls-group", 42, b"ciphertext");
         let sig = sign_with_ml_dsa(daemon_kp.secret_key(), &bytes).unwrap();
-        // The daemon's signature verifies over the exact bytes…
         assert!(ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
             daemon_kp.public_key(),
             &bytes,
             &sig
         )
         .is_ok());
-        // …and any (group, epoch) drift breaks verification — the
-        // artifact is bound, not a free-floating string.
         let tampered = rider_mls_attribution_bytes(&prov, "mls-group", 43, b"ciphertext");
         assert!(
             ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
@@ -505,8 +493,6 @@ mod mls_attribution_tests {
             .is_err(),
             "group drift must invalidate the attribution signature"
         );
-        // Review r5: ciphertext drift must also break the signature —
-        // the artifact authenticates the CONCRETE encrypted message.
         let tampered = rider_mls_attribution_bytes(&prov, "mls-group", 42, b"other-ciphertext");
         assert!(
             ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
@@ -521,11 +507,6 @@ mod mls_attribution_tests {
 
     #[test]
     fn rider_provenance_dies_with_cert_expiry_and_revocation() {
-        // WHY (review r5): a signature-valid delegation inside a
-        // signature-valid message must STILL be refused at receive time
-        // when the underlying certificate has expired or the sub-agent
-        // is ADR-0018-revoked — receivers enforce the authorization
-        // lifetime, not just the cryptography.
         let daemon_kp = AgentKeypair::generate().unwrap();
         let sub_kp = AgentKeypair::generate().unwrap();
         let daemon_hex = hex::encode(daemon_kp.agent_id().as_bytes());
@@ -536,8 +517,6 @@ mod mls_attribution_tests {
             scope: "mls-group".to_string(),
             delegation: delegation_for(&sub_kp, &daemon_hex),
         };
-        // Inside the delegation's validity window: the chain verifies;
-        // a revoked sub-agent is refused.
         let in_window = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -548,9 +527,6 @@ mod mls_attribution_tests {
             verify_rider_provenance(&prov, &daemon_hex, "mls-group", true, in_window).unwrap_err(),
             "sub-agent is revoked (ADR-0018)"
         );
-        // Delegation-expiry axis: a `now` past the capability's
-        // not_after must fail (the capability in `prov` expires at
-        // issuance + 3_600).
         let after_expiry = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -561,9 +537,6 @@ mod mls_attribution_tests {
             "delegation expiry must be enforced"
         );
 
-        // Expired CERTIFICATE with a still-valid delegation: refused —
-        // cert.verify() is signature-only; the not_after axis is
-        // enforced separately (review r5).
         use base64::Engine as _;
         let owner = crate::identity::UserKeypair::generate().unwrap();
         let now = std::time::SystemTime::now()
@@ -639,7 +612,6 @@ impl GroupPublicMessage {
             &mut buf,
             self.author_user_id.as_deref().unwrap_or("").as_bytes(),
         );
-        // Kind — serialise with bincode for a deterministic, brief tag.
         let kind_bytes = bincode::serialize(&self.kind).unwrap_or_default();
         push_len_prefixed(&mut buf, &kind_bytes);
         push_len_prefixed(&mut buf, self.body.as_bytes());
@@ -654,9 +626,6 @@ impl GroupPublicMessage {
                 self.thread_parent.as_deref().unwrap_or("").as_bytes(),
             );
         }
-        // v3 attribution suffix (ADR-0040): delegation digest then mentions.
-        // Only present when attributed — this is exactly what keeps v1/v2
-        // bytes identical for pre-0040 shapes.
         if attributed {
             push_len_prefixed(
                 &mut buf,
@@ -667,11 +636,6 @@ impl GroupPublicMessage {
                 push_len_prefixed(&mut buf, mention.as_bytes());
             }
         }
-        // ADR-0039: rider provenance rides INSIDE the signed bytes (absent
-        // ⇒ byte-identical legacy encoding, preserving the ADR-0029 rule
-        // above). Review r3: the delegation capability (cert, payload,
-        // signature) is part of those signed bytes too — the daemon's
-        // signature authenticates the exact capability it acted on.
         if let Some(prov) = &self.rider_provenance {
             push_len_prefixed(&mut buf, prov.sub_agent_id.as_bytes());
             buf.extend_from_slice(&prov.rider_token_id.to_le_bytes());
@@ -812,7 +776,6 @@ fn push_len_prefixed(buf: &mut Vec<u8>, bytes: &[u8]) {
     buf.extend_from_slice(bytes);
 }
 
-/// Validate that a thread field value is exactly 64 lowercase hex characters.
 fn validate_thread_hex(field: &'static str, value: &str) -> Result<(), IngestError> {
     if value.len() == 64
         && value
@@ -827,8 +790,6 @@ fn validate_thread_hex(field: &'static str, value: &str) -> Result<(), IngestErr
         })
     }
 }
-
-// ────────────────────────── Ingest validator ────────────────────────────
 
 /// Errors from public-message ingest validation.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
@@ -922,7 +883,6 @@ fn validate_public_message_inner(
     msg: &GroupPublicMessage,
     revoked_agents: &std::collections::BTreeSet<String>,
 ) -> Result<(), IngestError> {
-    // 1. group_id match
     if msg.group_id != ctx.group_id {
         return Err(IngestError::GroupIdMismatch {
             expected: ctx.group_id.to_string(),
@@ -930,12 +890,10 @@ fn validate_public_message_inner(
         });
     }
 
-    // 2. confidentiality — SignedPublic only
     if ctx.policy.confidentiality != GroupConfidentiality::SignedPublic {
         return Err(IngestError::ConfidentialityMismatch);
     }
 
-    // 3. bounded size
     if msg.body.len() > MAX_PUBLIC_MESSAGE_BYTES {
         return Err(IngestError::MessageTooLarge {
             size: msg.body.len(),
@@ -943,24 +901,15 @@ fn validate_public_message_inner(
         });
     }
 
-    // 4. threading field structural checks (cheap, no crypto — run before
-    //    signature verification so malformed gossip messages are rejected
-    //    without paying ML-DSA-65 verify cost). ADR-0029.
     if let Some(root) = &msg.thread_root {
         validate_thread_hex("thread_root", root)?;
     }
     if let Some(parent) = &msg.thread_parent {
         validate_thread_hex("thread_parent", parent)?;
-        // parent requires root
         if msg.thread_root.is_none() {
             return Err(IngestError::ThreadParentWithoutRoot);
         }
     }
-    // Self-reference: thread_root/thread_parent must not equal the message's
-    // own msg_id. Constructing a genuinely self-referential signed message
-    // requires a BLAKE3 hash fixed-point, so this check is reachable only
-    // for tampered messages whose signature would fail anyway — but it serves
-    // as a cheap early reject before the expensive ML-DSA-65 verify.
     let own_id = msg.msg_id();
     if msg.thread_root.as_deref() == Some(own_id.as_str()) {
         return Err(IngestError::ThreadSelfReference {
@@ -973,30 +922,19 @@ fn validate_public_message_inner(
         });
     }
 
-    // 4b. attribution structural checks (ADR-0040): mentions are hex
-    //     AgentIds (64 lowercase hex) and a delegation digest is 64
-    //     lowercase hex. Cheap rejects before ML-DSA verify.
     for mention in &msg.mentions {
         validate_thread_hex("mentions", mention)?;
     }
     if let Some(digest) = &msg.delegation_digest {
         validate_thread_hex("delegation_digest", digest)?;
     }
-    // Kind/field consistency: a delegation-kind message is the group-bus
-    // carrier for a SignedDelegation envelope; attribution (send-as) is a
-    // chat concern and must not ride a delegation grant.
     if matches!(msg.kind, GroupPublicMessageKind::Delegation) && msg.delegation_digest.is_some() {
         return Err(IngestError::DelegationKindMismatch);
     }
 
-    // 5. signature + author binding
     msg.verify_signature()
         .map_err(|e| IngestError::InvalidSignature(format!("{e}")))?;
 
-    // 5b. delegation-carrier body check (ADR-0040): the envelope inside a
-    //     delegation-kind message must verify against the DELEGATOR's own
-    //     key and bind to this group. The message signature alone only
-    //     proves the publisher; the envelope proves the authority.
     if matches!(msg.kind, GroupPublicMessageKind::Delegation) {
         let sd: crate::delegation::SignedDelegation =
             serde_json::from_str(&msg.body).map_err(|e| {
@@ -1012,11 +950,6 @@ fn validate_public_message_inner(
                 sd.delegation.group_id, msg.group_id
             )));
         }
-        // The delegator must be a current member: a removed delegator's
-        // grants auto-expire with their membership (ADR-0040). #1578
-        // rc11 (audit): the join's key-only marker row is not a seat —
-        // the pre-admission joiner is not a member, exactly main's
-        // roster.
         let delegator_hex = hex::encode(sd.delegation.from_agent.as_bytes());
         if !ctx.members_v2.contains_key(&delegator_hex)
             || ctx.join_seat_marker_agents.contains(&delegator_hex)
@@ -1026,12 +959,6 @@ fn validate_public_message_inner(
             ));
         }
     }
-    // Review r3 (CRITICAL): rider provenance is only trustworthy behind
-    // a SUB-AGENT-SIGNED delegation. Before treating the asserted
-    // sub_agent_id as the acting principal, verify the full chain —
-    // owner cert → sub-agent key → delegation → THIS message's signer —
-    // or reject: any daemon can otherwise claim any member identity by
-    // fabricating a provenance string.
     let acting_agent = match &msg.rider_provenance {
         None => msg.author_agent_id.as_str(),
         Some(prov) => {
@@ -1054,20 +981,16 @@ fn validate_public_message_inner(
                 now_unix,
             )
             .map_err(IngestError::InvalidSignature)?;
-            // `verify_rider_provenance` proved the certified subject
-            // equals the asserted id, so the assertion is now trusted.
             prov.sub_agent_id.as_str()
         }
     };
 
-    // 7. banned authors rejected
     if let Some(member) = ctx.members_v2.get(acting_agent) {
         if member.state == GroupMemberState::Banned {
             return Err(IngestError::AuthorBanned);
         }
     }
 
-    // 8. write-access policy enforcement
     let author_role = ctx
         .members_v2
         .get(acting_agent)
@@ -1082,10 +1005,7 @@ fn validate_public_message_inner(
                 });
             }
         }
-        GroupWriteAccess::ModeratedPublic => {
-            // Any non-banned author accepted at ingest; moderators
-            // remove inappropriate posts later (out of v1 scope).
-        }
+        GroupWriteAccess::ModeratedPublic => {}
         GroupWriteAccess::AdminOnly => match author_role {
             Some(r) if r.at_least(GroupRole::Admin) => {}
             _ => {
@@ -1094,7 +1014,6 @@ fn validate_public_message_inner(
                 });
             }
         },
-        // #1604: an unknown write policy admits no author.
         GroupWriteAccess::Unknown => {
             return Err(IngestError::WritePolicyViolation {
                 policy: ctx.policy.write_access,
@@ -1104,8 +1023,6 @@ fn validate_public_message_inner(
 
     Ok(())
 }
-
-// ─────────────────────────────── Tests ──────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -1327,7 +1244,7 @@ mod tests {
         let kp = make_kp();
         let hex_id = hex::encode(kp.agent_id().as_bytes());
         let msg = build_signed_msg(&kp, "g1", "x", GroupPublicMessageKind::Chat);
-        let policy = open_policy(); // MembersOnly write_access
+        let policy = open_policy();
         let mut members = BTreeMap::new();
         members.insert(hex_id.clone(), active_member(&hex_id, GroupRole::Member));
         let ctx = PublicIngestContext {
@@ -1344,7 +1261,7 @@ mod tests {
         let kp = make_kp();
         let msg = build_signed_msg(&kp, "g1", "x", GroupPublicMessageKind::Chat);
         let policy = open_policy();
-        let members = BTreeMap::new(); // author not present
+        let members = BTreeMap::new();
         let ctx = PublicIngestContext {
             group_id: "g1",
             policy: &policy,
@@ -1355,9 +1272,6 @@ mod tests {
         assert!(matches!(err, IngestError::WritePolicyViolation { .. }));
     }
 
-    /// Build a REAL sub-agent-signed delegation (the harness's job in
-    /// production): owner cert over the sub key, capability signed by
-    /// the sub key.
     fn make_delegation(
         sub_kp: &AgentKeypair,
         daemon_hex: &str,
@@ -1390,11 +1304,6 @@ mod tests {
 
     #[test]
     fn ingest_enforces_policy_against_rider_provenance_sub_agent() {
-        // WHY (review fix #1, receiver side): a daemon-signed rider
-        // message must be authorized by the SUB-AGENT named in the
-        // provenance envelope, never by the daemon author. The daemon
-        // here IS an active member; the provenance sub-agent is not —
-        // ingest must reject. With the sub-agent admitted, it passes.
         let daemon_kp = make_kp();
         let sub_kp = make_kp();
         let daemon_hex = hex::encode(daemon_kp.agent_id().as_bytes());
@@ -1420,9 +1329,8 @@ mod tests {
             }),
         )
         .unwrap();
-        let policy = open_policy(); // MembersOnly write_access
+        let policy = open_policy();
 
-        // Daemon is a member, provenance sub-agent is NOT → reject.
         let mut members = BTreeMap::new();
         members.insert(
             daemon_hex.clone(),
@@ -1439,7 +1347,6 @@ mod tests {
             Err(IngestError::WritePolicyViolation { .. })
         ));
 
-        // Admit the sub-agent as a plain member → accept.
         members.insert(sub_hex.clone(), active_member(&sub_hex, GroupRole::Member));
         let ctx = PublicIngestContext {
             group_id: "g1",
@@ -1452,9 +1359,6 @@ mod tests {
 
     #[test]
     fn ingest_admin_only_rider_provenance_needs_sub_agent_admin_role() {
-        // WHY: same principle under AdminOnly — the DAEMON author's
-        // admin role must not carry a rider whose sub-agent is a mere
-        // member.
         let daemon_kp = make_kp();
         let sub_kp = make_kp();
         let daemon_hex = hex::encode(daemon_kp.agent_id().as_bytes());
@@ -1502,16 +1406,9 @@ mod tests {
 
     #[test]
     fn ingest_rejects_unauthenticated_rider_provenance_forgery() {
-        // WHY (review r3, the CRITICAL): a validly daemon-signed message
-        // whose provenance CLAIMS a member sub-agent but is NOT backed
-        // by that sub-agent's cryptographic delegation must be rejected.
-        // Otherwise ANY daemon could impersonate any member/admin by
-        // fabricating the provenance string. Three forgery shapes:
-        // no delegation bytes at all, a delegation signed by a DIFFERENT
-        // sub-agent's key, and a delegation naming another daemon.
         let daemon_kp = make_kp();
-        let victim_kp = make_kp(); // the member identity being impersonated
-        let attacker_kp = make_kp(); // signs the delegation
+        let victim_kp = make_kp();
+        let attacker_kp = make_kp();
         let daemon_hex = hex::encode(daemon_kp.agent_id().as_bytes());
         let victim_hex = hex::encode(victim_kp.agent_id().as_bytes());
         let mut members = BTreeMap::new();
@@ -1525,8 +1422,6 @@ mod tests {
         );
         let policy = open_policy();
 
-        // Forge 1: provenance with a delegation signed by the ATTACKER's
-        // key while claiming the VICTIM sub-agent id.
         let attacker_delegation = make_delegation(&attacker_kp, &daemon_hex, &["g1"]);
         let forged = GroupPublicMessage::sign(
             "g1".into(),
@@ -1548,7 +1443,6 @@ mod tests {
             }),
         )
         .unwrap();
-        // The daemon signature is genuinely valid…
         forged.verify_signature().unwrap();
         let ctx = PublicIngestContext {
             group_id: "g1",
@@ -1556,14 +1450,11 @@ mod tests {
             members_v2: &members,
             join_seat_marker_agents: BTreeSet::new(),
         };
-        // …but ingest must reject the unauthenticated provenance.
         assert!(matches!(
             validate_public_message(&ctx, &forged),
             Err(IngestError::InvalidSignature(_))
         ));
 
-        // Forge 2: a legitimate victim-signed delegation that names a
-        // DIFFERENT daemon — this daemon is not the delegated signer.
         let other_daemon = make_kp();
         let other_daemon_hex = hex::encode(other_daemon.agent_id().as_bytes());
         let cross_delegation = make_delegation(&victim_kp, &other_daemon_hex, &["g1"]);
@@ -1592,7 +1483,6 @@ mod tests {
             Err(IngestError::InvalidSignature(_))
         ));
 
-        // Forge 3: victim-signed delegation scoped to a DIFFERENT group.
         let other_scope_delegation = make_delegation(&victim_kp, &daemon_hex, &["g-other"]);
         let forged = GroupPublicMessage::sign(
             "g1".into(),
@@ -1619,8 +1509,6 @@ mod tests {
             Err(IngestError::InvalidSignature(_))
         ));
 
-        // Control: a genuine victim-signed delegation to THIS daemon for
-        // THIS group passes ingest (victim is an admin member).
         let genuine = make_delegation(&victim_kp, &daemon_hex, &["g1"]);
         let legit = GroupPublicMessage::sign(
             "g1".into(),
@@ -1773,10 +1661,6 @@ mod tests {
         assert_eq!(p.read_access, GroupReadAccess::Public);
     }
 
-    // ── ADR-0029 threading tests ─────────────────────────────────────────
-
-    /// v1 byte-identity: a message without thread fields must produce
-    /// signable_bytes starting with the v1 domain — no v2 suffix.
     #[test]
     fn v1_byte_identity_no_thread_fields() {
         let kp = make_kp();
@@ -1788,11 +1672,9 @@ mod tests {
             bytes.starts_with(PUBLIC_MESSAGE_DOMAIN),
             "non-threaded message must use v1 domain"
         );
-        // Must NOT contain the v2 domain bytes anywhere in the prefix position
         assert!(!bytes.starts_with(PUBLIC_MESSAGE_DOMAIN_V2));
     }
 
-    /// v2 domain: a threaded message uses the v2 domain.
     #[test]
     fn threaded_message_uses_v2_domain() {
         let kp = make_kp();
@@ -1819,8 +1701,6 @@ mod tests {
         assert!(!bytes.starts_with(PUBLIC_MESSAGE_DOMAIN));
     }
 
-    /// Fail-closed: a threaded message verified with manually constructed
-    /// v1-style bytes must fail (old-node simulation).
     #[test]
     fn threaded_message_fails_v1_verification() {
         let kp = make_kp();
@@ -1839,23 +1719,19 @@ mod tests {
             None,
         )
         .unwrap();
-        // Simulate an old node by stripping thread fields AFTER signing —
-        // the signature was computed over v2 bytes but we now present v1 bytes.
         msg.thread_root = None;
         msg.thread_parent = None;
-        // verify_signature recomputes v1 bytes (both None) — should fail.
         assert!(
             msg.verify_signature().is_err(),
             "stripping thread fields from a v2-signed message must fail"
         );
     }
 
-    /// Tamper — adding thread fields to a v1-signed message fails.
     #[test]
     fn adding_thread_to_v1_message_fails() {
         let kp = make_kp();
         let mut msg = build_signed_msg(&kp, "g1", "original", GroupPublicMessageKind::Chat);
-        msg.verify_signature().unwrap(); // baseline passes
+        msg.verify_signature().unwrap();
         msg.thread_root = Some("c".repeat(64));
         assert!(
             msg.verify_signature().is_err(),
@@ -1863,7 +1739,6 @@ mod tests {
         );
     }
 
-    /// Tamper — clearing thread fields from a v2-signed message fails.
     #[test]
     fn clearing_thread_from_v2_message_fails() {
         let kp = make_kp();
@@ -1882,7 +1757,7 @@ mod tests {
             None,
         )
         .unwrap();
-        msg.verify_signature().unwrap(); // baseline passes
+        msg.verify_signature().unwrap();
         msg.thread_root = None;
         msg.thread_parent = None;
         assert!(
@@ -1891,7 +1766,6 @@ mod tests {
         );
     }
 
-    /// msg_id determinism: same inputs → same id.
     #[test]
     fn msg_id_is_deterministic() {
         let kp = make_kp();
@@ -1899,7 +1773,6 @@ mod tests {
         assert_eq!(msg.msg_id(), msg.msg_id(), "msg_id must be deterministic");
     }
 
-    /// msg_id differs when body differs.
     #[test]
     fn msg_id_differs_on_different_body() {
         let kp = make_kp();
@@ -1908,7 +1781,6 @@ mod tests {
         assert_ne!(msg1.msg_id(), msg2.msg_id());
     }
 
-    /// msg_id is exactly 64 lowercase hex chars.
     #[test]
     fn msg_id_format() {
         let kp = make_kp();
@@ -1920,16 +1792,12 @@ mod tests {
             .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
     }
 
-    /// Ingest: bad hex rejected.
     #[test]
     fn ingest_rejects_bad_thread_hex() {
         let kp = make_kp();
         let hex_id = hex::encode(kp.agent_id().as_bytes());
-        // Build a valid v1 message then manually inject a bad thread_root.
-        // Thread structural checks now run BEFORE signature verification, so
-        // InvalidThreadField fires first (cheap reject, no crypto cost).
         let mut msg = build_signed_msg(&kp, "g1", "x", GroupPublicMessageKind::Chat);
-        msg.thread_root = Some("not-hex".to_string()); // too short and not hex
+        msg.thread_root = Some("not-hex".to_string());
         let policy = open_policy();
         let mut members = BTreeMap::new();
         members.insert(hex_id.clone(), active_member(&hex_id, GroupRole::Member));
@@ -1945,12 +1813,10 @@ mod tests {
         ));
     }
 
-    /// Ingest: parent-without-root rejected (pre-signature structural check).
     #[test]
     fn ingest_rejects_parent_without_root() {
         let kp = make_kp();
         let hex_id = hex::encode(kp.agent_id().as_bytes());
-        // Sign with root+parent, then strip root after signing.
         let fake_root = "e".repeat(64);
         let mut msg = GroupPublicMessage::sign(
             "g1".into(),
@@ -1966,7 +1832,6 @@ mod tests {
             None,
         )
         .unwrap();
-        // Strip root — now parent is present without root.
         msg.thread_root = None;
         let policy = open_policy();
         let mut members = BTreeMap::new();
@@ -1977,16 +1842,12 @@ mod tests {
             members_v2: &members,
             join_seat_marker_agents: BTreeSet::new(),
         };
-        // Thread structural checks run BEFORE signature verification.
-        // ThreadParentWithoutRoot fires as a cheap early reject; the
-        // tampered signature is never computed.
         assert!(matches!(
             validate_public_message(&ctx, &msg).unwrap_err(),
             IngestError::ThreadParentWithoutRoot
         ));
     }
 
-    /// Ingest: orphan parent accepted (parent not known locally is fine).
     #[test]
     fn ingest_accepts_orphan_parent() {
         let kp = make_kp();
@@ -2016,27 +1877,15 @@ mod tests {
             members_v2: &members,
             join_seat_marker_agents: BTreeSet::new(),
         };
-        // Must succeed — the parent not being locally known is fine (ADR-0028).
         validate_public_message(&ctx, &msg).unwrap();
     }
 
-    /// Ingest: self-reference check is live pre-signature (after fix 2) and
-    /// serves as a cheap early reject. Because `msg_id()` = BLAKE3(signable_bytes)
-    /// and `signable_bytes` INCLUDES `thread_root`, a genuinely self-referential
-    /// message requires a BLAKE3 fixed point (x = BLAKE3(f(x))) — computationally
-    /// infeasible. When we set `thread_root = own_id` after signing, `msg_id()`
-    /// changes (different input bytes), so the self-reference check does NOT fire;
-    /// the tampered signature is what the validator rejects. This test verifies the
-    /// end-to-end rejection and documents the hash-circularity property.
     #[test]
     fn ingest_rejects_self_reference() {
         let kp = make_kp();
         let hex_id = hex::encode(kp.agent_id().as_bytes());
-        // Sign a non-threaded message first to get a stable msg_id.
         let base = build_signed_msg(&kp, "g1", "base", GroupPublicMessageKind::Chat);
         let base_id = base.msg_id();
-        // Sign a threaded message with root = base_id. Its own msg_id is the
-        // BLAKE3 of v2 signable bytes with thread_root=base_id.
         let mut msg = GroupPublicMessage::sign(
             "g1".into(),
             "state-hash-1".into(),
@@ -2051,9 +1900,6 @@ mod tests {
             None,
         )
         .unwrap();
-        // Capture own_id BEFORE tampering. After we set thread_root = own_id,
-        // msg_id() will recompute from the new (tampered) signable_bytes and
-        // produce a DIFFERENT value — the self-reference check passes; sig fails.
         let own_id = msg.msg_id();
         msg.thread_root = Some(own_id);
         let policy = open_policy();
@@ -2065,17 +1911,11 @@ mod tests {
             members_v2: &members,
             join_seat_marker_agents: BTreeSet::new(),
         };
-        // Self-reference check is reachable only for messages whose signature
-        // would fail anyway (BLAKE3 fixed-point property). Tampering thread_root
-        // changes signable_bytes, so msg_id() ≠ old own_id and the self-reference
-        // check does not fire; InvalidSignature is the actual early reject here.
         assert!(matches!(
             validate_public_message(&ctx, &msg).unwrap_err(),
             IngestError::InvalidSignature(_)
         ));
     }
-
-    // ── ADR-0040: structured mentions + send-as attribution ────────────────
 
     #[test]
     fn attribution_fields_preserve_v1_byte_identity() {
@@ -2120,8 +1960,6 @@ mod tests {
 
     #[test]
     fn threaded_message_still_uses_v2_domain_without_attribution() {
-        // WHY: attribution fields must not disturb the ADR-0029 thread
-        // shape either — v2 bytes for threaded messages stay identical.
         let kp = make_kp();
         let root = "a".repeat(64);
         let msg = GroupPublicMessage::sign(
@@ -2143,9 +1981,6 @@ mod tests {
 
     #[test]
     fn mentions_and_digest_select_v3_domain_and_verify() {
-        // WHY: tamper-evidence — mentions and the send-as reference are
-        // covered by the author's signature, so neither can be injected or
-        // stripped by a relay.
         let kp = make_kp();
         let mentioned = make_kp();
         let mention_hex = hex::encode(mentioned.agent_id().as_bytes());
@@ -2168,7 +2003,6 @@ mod tests {
         assert!(msg.signable_bytes().starts_with(PUBLIC_MESSAGE_DOMAIN_V3));
         assert!(msg.verify_signature().is_ok());
 
-        // Stripping the mentions changes the bytes ⇒ signature fails.
         let mut stripped = msg.clone();
         stripped.mentions = Vec::new();
         stripped.delegation_digest = None;
@@ -2177,7 +2011,6 @@ mod tests {
             "an attributed message cannot be downgraded to unattributed bytes"
         );
 
-        // Mutating a mention ⇒ signature fails.
         let mut tampered = msg.clone();
         tampered.mentions = vec![hex::encode([9u8; 32])];
         assert!(tampered.verify_signature().is_err());
@@ -2186,8 +2019,6 @@ mod tests {
 
     #[test]
     fn bad_mention_and_digest_shapes_are_rejected_before_crypto() {
-        // WHY: hex AgentIds and digests must be well-formed or the routing
-        // layer would match on garbage; cheap structural reject first.
         let kp = make_kp();
         let mut msg = build_signed_msg(&kp, "g1", "hi", GroupPublicMessageKind::Chat);
         msg.mentions = vec!["not-hex".into()];
@@ -2218,9 +2049,6 @@ mod tests {
 
     #[test]
     fn delegation_kind_body_must_be_valid_envelope() {
-        // WHY: the carrier's signature only proves who PUBLISHED it; the
-        // envelope inside must independently prove the delegator's own key
-        // signed the grant, and the grant must name this group.
         let delegator = make_kp();
         let delegate = make_kp();
         let members = BTreeMap::from([(
@@ -2270,9 +2098,6 @@ mod tests {
         .unwrap();
         assert!(validate_public_message(&ctx, &carrier).is_ok());
 
-        // Tampered envelope body inside a VALIDLY-SIGNED carrier (a relay
-        // can publish any bytes it likes; only the inner envelope check
-        // catches the forgery) ⇒ rejected.
         let mut bad = sd.clone();
         bad.delegation.expiry_ms = 90_000;
         let rej = GroupPublicMessage::sign(
@@ -2294,7 +2119,6 @@ mod tests {
             Err(IngestError::InvalidDelegationEnvelope(_))
         ));
 
-        // Envelope for a different group ⇒ rejected.
         let mut other = sd;
         other.delegation.group_id = "g2".into();
         let rej2 = GroupPublicMessage::sign(

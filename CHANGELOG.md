@@ -6,6 +6,19 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Relay serving follows participation mode (#1642; A06 amendment of
+  18 Nov 2026).** New `NetworkConfig.relay_service_enabled` (default `true`)
+  is passed to ant-quic. x0xd reads an optional TOML `relay_service_enabled`;
+  the new public `x0x::network::resolve_relay_service_enabled` gives the
+  value: an explicit key wins, and unset, a `Full` daemon serves MASQUE relay sessions and a `Leaf` daemon
+  refuses them with `403`. A default desktop daemon therefore stops serving
+  relay sessions after upgrade; it still uses relays.
+- **`GET /status` reports transport bandwidth (#1964 request 5; A06
+  amendment of 17 Nov 2026).** A new additive `bandwidth` object gives
+  process-lifetime `sent_bytes` and `received_bytes` and the `up_bps` and
+  `down_bps` rates, each split into `gossip`, `direct`, `relay` and `other`.
+  `x0x status` adds human-readable totals in text output; `--json` keeps the
+  raw numbers only. No limits change.
 - **launchd jobs that run the stable launcher are recognised (#1379 slice 2;
   A14 amendment of 17 Nov 2026).** `x0x autostart --repair` and the
   upgrade-time launchd readback look through `x0x-launcher`'s own arguments
@@ -400,6 +413,12 @@ All notable changes to this project will be documented in this file.
 
 ### Tests and tooling
 
+- **CI cancels superseded PR runs via concurrency groups.** Five workflows
+  (`adr-governance`, `build`, `integration`, `release-custody-check`,
+  `security`) now carry a `concurrency:` block; only `pull_request` runs are
+  grouped; push, tag, schedule and manual runs are never grouped, cancelled or
+  replaced.
+
 - **CI pins cargo-nextest 0.9.151 (was 0.9.144) in all 18 install steps.**
   0.9.151 is the first release with `future-queue` 0.4.1
   (nextest-rs/future-queue#603). Before it, a test queued behind a full
@@ -561,6 +580,16 @@ All notable changes to this project will be documented in this file.
   404. W3-H row H-S3-r also no longer passes or fails by gossip timing: J gets
   no gossip replay of the metadata messages published before it redeemed, so
   its head stays beyond A's retention.
+- **Launcher refusals that can clear by themselves no longer stop the job,
+  and `x0x doctor` shows why the launcher refuses (#2015 and #2016 reviews;
+  A14 amendment of 17 Nov 2026).** A prior child that still exists gets up
+  to 45 s to end before the start refuses (on macOS a refusal holds until a
+  stop). A missing plan path, for example a data root on a volume not yet
+  mounted, is retried (75) instead of refused (78); only typed refusals are
+  final. Each final refusal is recorded in the host root and reported by
+  `x0x doctor` while the daemon is down. The launchd classifiers detect the
+  launcher from `Program` when it is set, and check launcher arguments with
+  the launcher's own parser. The launcher stays dormant.
 
 - **The dormant launcher's issuer refuses fixed faults with 78 (#1378,
   review of #2014).** A plan path that is missing or not canonical, and a
@@ -579,6 +608,22 @@ All notable changes to this project will be documented in this file.
   Failed into Interrupted, and a last attempt ended by a peer's stop counts as
   Failed (A14 amendment of 17 Nov 2026). The coordinator lets Failed win, so
   the failed release is held instead of retried.
+- **Groups (#2003):** a joiner past its authority's retention that another
+  admin attests now catches up to the head and ends Active with keys; before,
+  it stayed `catching_up` at its head. An admin keeps the renames, role
+  changes and unbans it applies, whoever signed them, and serves them on a
+  catch-up page only to a joiner it attested. A pre-Welcome joiner applies
+  such a relayed link as its signer's only inside its armed attested sequence.
+  A joiner whose seal was not served stops counting rounds once every admin
+  has answered (`awaiting_attestation {admins_answered}`), and a finished
+  catch-up no longer stays `catching_up`. ADR A08 amendment of 17 Nov 2026.
+- **Groups (#2003, review of #2021):** an admin that attested a joiner keeps
+  relaying other admins' renames, role changes and unbans to it after a later
+  `rate_limited` answer; before, that answer ended the relay until the admin
+  attested again. Any other later answer still ends it. The relay goes only
+  to a requester that is an Active member when the page is served. A relayed
+  link's `actor` now matches its signer without regard to hex case. ADR A08
+  correction of 17 Nov 2026.
 - **A merge can no longer push a group store past the 16 MiB retained-image
   limit (#1970; A10 amendment of 16 Nov 2026).** An incoming group delta or
   retained-image merge that would grow the store's canonical retained image
@@ -648,6 +693,14 @@ pub/sub constructors now take `Arc<SigningContext>` instead of
 
 ### Dependencies
 
+- **ant-quic `=0.28.0`** (was `=0.27.62`) and **saorsa-gossip `=0.5.92`** for
+  all eleven `saorsa-gossip-*` crates (was `=0.5.91`; #1642). ant-quic 0.28.0
+  honours `relay_service_enabled` (ADR-019). The optional `voice` feature
+  moves to `saorsa-webrtc-core` and `saorsa-webrtc-codecs` `0.6.1` (was
+  `0.6.0`); `saorsa-webrtc-core` uses the same ant-quic and the codecs crate
+  does not depend on ant-quic. The `saorsa-gossip-pubsub` 0.5.92 sources are
+  byte-identical to 0.5.91, so the #501 controlled-load producer allowlist
+  moves to the crates.io 0.5.92 package (checksum `63b4b434…`).
 - **ant-quic `=0.27.62`** (was `=0.27.61`). It adds
   `SendStream`/`RecvStream::connection_generation()` only (ant-quic#327).
 - **saorsa-gossip `=0.5.91`** for all eleven `saorsa-gossip-*` crates (was

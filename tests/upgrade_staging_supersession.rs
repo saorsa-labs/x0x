@@ -80,7 +80,7 @@ macro_rules! staging_supersession_regression_tests {
             let attempts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
             let counted = Arc::clone(&attempts);
             let expected_install = install.clone();
-            let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |plan, manifest| {
+            let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |plan, manifest, _admission| {
                 assert_eq!(plan.executable, expected_install);
                 counted.lock().unwrap().push(manifest.version.clone());
                 // Observe admission only. This does not change installed bytes,
@@ -91,7 +91,7 @@ macro_rules! staging_supersession_regression_tests {
             config.update.rollout_window_minutes = 60;
 
             let older_injection = startup_release_seam::install(older_release);
-            let older = run_startup_update_check(&config, None, Some(older_runtime));
+            let older = run_startup_update_check(&config, Some(older_runtime));
             tokio::pin!(older);
             assert_eq!(staging_next_observation(older.as_mut(), &mut older_rx, deadline).await.unwrap(),
                 crate::upgrade::staging::Decision::Waiting(Duration::from_secs(3260)));
@@ -104,7 +104,7 @@ macro_rules! staging_supersession_regression_tests {
             assert_eq!(older_first.manifest_sha256, older_request.manifest_sha256);
 
             let newer_injection = startup_release_seam::install(newer_release);
-            let newer = run_startup_update_check(&config, None, Some(newer_runtime));
+            let newer = run_startup_update_check(&config, Some(newer_runtime));
             tokio::pin!(newer);
             assert_eq!(staging_next_observation(newer.as_mut(), &mut newer_rx, deadline).await.unwrap(),
                 crate::upgrade::staging::Decision::Waiting(Duration::from_secs(1276)));
@@ -246,7 +246,7 @@ macro_rules! staging_supersession_regression_tests {
                         .with_staging_clock(Some(Arc::new(|| Ok(clock()))));
                     let attempts = Arc::new(AtomicU64::new(0));
                     let counted = Arc::clone(&attempts);
-                    let apply = apply::apply_attempt_seam::install(Box::new(move |_, manifest| {
+                    let apply = apply::apply_attempt_seam::install(Box::new(move |_, manifest, _admission| {
                         counted.fetch_add(1, Ordering::SeqCst);
                         // Stop before download, candidate execution, swap or restart.
                         x0x::upgrade::UpgradeResult::Success { version: manifest.version.clone() }

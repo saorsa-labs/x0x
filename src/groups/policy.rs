@@ -322,10 +322,6 @@ mod tests {
         assert_eq!(GroupPolicyPreset::from_name("nonsense"), None);
     }
 
-    /// The pre-ADR-0038 admission axis, replicated exactly as an old node
-    /// knows it. Used to prove the forward-compat failure mode: an old node
-    /// receiving an `owner_certified` policy must ERROR (fail closed), not
-    /// silently fall back to a weaker axis.
     #[derive(Debug, serde::Serialize, serde::Deserialize)]
     #[serde(rename_all = "snake_case")]
     enum LegacyAdmission {
@@ -336,9 +332,6 @@ mod tests {
 
     #[test]
     fn legacy_admission_json_bytes_decode_unchanged() {
-        // WHY ADR-0038 compat: stored policies are JSON; every legacy value
-        // must round-trip byte-identically so an upgraded daemon reopening
-        // an old store observes exactly the policy it saved.
         for (json, expected) in [
             ("\"invite_only\"", GroupAdmission::InviteOnly),
             ("\"request_access\"", GroupAdmission::RequestAccess),
@@ -357,11 +350,6 @@ mod tests {
 
     #[test]
     fn legacy_admission_bincode_variant_indices_unchanged() {
-        // WHY ADR-0038 compat: positional formats (bincode) encode variants
-        // by declaration index. `OwnerCertified` is APPENDED, so the legacy
-        // indices 0/1/2 — and therefore every legacy bincode payload — must
-        // be exactly what they were before the new variant existed. New
-        // bytes for old variants would partition the fleet.
         assert_eq!(
             bincode::serialize(&GroupAdmission::InviteOnly).expect("bincode invite_only"),
             vec![0, 0, 0, 0]
@@ -378,9 +366,6 @@ mod tests {
 
     #[test]
     fn owner_certified_json_is_hex_and_round_trips() {
-        // WHY: the owner UserId rides in persisted policy JSON and the CLI;
-        // hex (not a 32-number array) keeps it readable and copy-pasteable,
-        // and the round-trip must preserve the exact bytes of the id.
         let owner = UserId([0xAB; 32]);
         let admission = GroupAdmission::OwnerCertified(owner);
         let json = serde_json::to_string(&admission).expect("serialize");
@@ -392,7 +377,6 @@ mod tests {
         assert_eq!(decoded, admission);
         assert_eq!(admission.owner_certified_user_id(), Some(&owner));
 
-        // Full policy round-trip (the actual stored shape).
         let policy = GroupPolicy {
             admission,
             ..GroupPolicy::default()
@@ -404,7 +388,6 @@ mod tests {
         );
         let back: GroupPolicy = serde_json::from_value(value).expect("policy from value");
         assert_eq!(back, policy);
-        // Summary (cards) carries the same axis losslessly.
         let summary = crate::groups::GroupPolicySummary::from(&policy);
         let restored: GroupPolicy = crate::groups::GroupPolicy::from(&summary);
         assert_eq!(restored.admission, admission);
@@ -412,11 +395,6 @@ mod tests {
 
     #[test]
     fn legacy_admission_rejects_unknown_owner_certified_variant() {
-        // WHY (documented old-node behavior): a pre-ADR-0038 node that
-        // receives a card/invite carrying `owner_certified` fails to decode
-        // the admission axis and drops the object — fail-closed. This test
-        // pins that the failure is a decode ERROR naming the unknown
-        // variant, never a silent downgrade to invite-only/open-join.
         let json = serde_json::to_string(&GroupAdmission::OwnerCertified(UserId([1; 32])))
             .expect("serialize");
         let err = serde_json::from_str::<LegacyAdmission>(&json)
@@ -429,11 +407,6 @@ mod tests {
 
     #[test]
     fn owner_certified_bincode_round_trips_and_old_decoder_rejects() {
-        // WHY (review item 9): pin the NEW variant's bincode shape — index 3
-        // (u32 LE) followed by the hex-string payload — so a future reorder
-        // cannot silently renumber it, and prove an old (3-variant) decoder
-        // rejects those bytes as an unknown variant index rather than
-        // misreading them as some legacy axis.
         let owner = UserId([0x5A; 32]);
         let bytes = bincode::serialize(&GroupAdmission::OwnerCertified(owner))
             .expect("bincode new variant");
@@ -450,9 +423,6 @@ mod tests {
 
     #[test]
     fn other_admission_axes_have_no_owner() {
-        // WHY: `owner_certified_user_id()` gates every enforcement site;
-        // a legacy axis returning Some() would wrongly drag cert checks
-        // into non-OwnerCertified groups (or worse, skip them).
         assert_eq!(GroupAdmission::InviteOnly.owner_certified_user_id(), None);
         assert_eq!(
             GroupAdmission::RequestAccess.owner_certified_user_id(),

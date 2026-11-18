@@ -324,6 +324,11 @@ test-group = "quic-localhost"
 threads-required = 4
 
 [[profile.default.overrides]]
+filter = "binary(issue2048_invite_join_existing_member)"
+test-group = "quic-localhost"
+threads-required = 4
+
+[[profile.default.overrides]]
 filter = "binary(threading_integration)"
 test-group = "quic-localhost"
 threads-required = 4

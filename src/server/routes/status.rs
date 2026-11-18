@@ -379,6 +379,12 @@ pub(in crate::server) struct StatusData {
     /// True while a corrupt revocation store still waits for a group resync.
     revocation_resync_required: bool,
     warnings: Vec<String>,
+    /// #1964 request 5: process-lifetime transport byte counters and rolling
+    /// up/down rates, split by the kinds the wire can tell apart (gossip /
+    /// direct / relay / other — see the `x0x::network::bandwidth` module
+    /// docs for what rides which kind). Additive field: clients must ignore
+    /// unknown fields. Zeros when this embedder runs without a network node.
+    bandwidth: x0x::network::bandwidth::BandwidthUsage,
 }
 
 // ---------------------------------------------------------------------------
@@ -533,6 +539,11 @@ pub(in crate::server) async fn status(
         None => 0,
     };
 
+    // #1964 request 5: what the node costs its network. `snapshot()` is one
+    // atomic load per counter plus a rate-window sample — no transport
+    // state is walked.
+    let bandwidth = state.agent.bandwidth_usage().unwrap_or_default();
+
     // Get external addresses: ant-quic observed + local IPv4/IPv6 discovery.
     let mut external_addrs = Vec::new();
     if let Some(network) = state.agent.network() {
@@ -624,6 +635,7 @@ pub(in crate::server) async fn status(
             send_ready_peers,
             revocation_resync_required,
             warnings,
+            bandwidth,
         },
     })
 }
@@ -820,6 +832,74 @@ mod tests {
                 "verdict input {input} missing its state badge"
             );
         }
+    }
+
+    /// WHY (#1964 request 5): the bandwidth field is additive JSON only.
+    /// Every legacy `/status` key must keep its exact name and semantics,
+    /// with `bandwidth` arriving as a new sibling that carries the kind
+    /// split in a stable shape for `x0x status` and fleet monitors.
+    #[test]
+    fn status_json_is_additive_with_bandwidth() {
+        let usage = x0x::network::bandwidth::BandwidthUsage {
+            sent_bytes: x0x::network::bandwidth::BandwidthTotals {
+                total: 11,
+                gossip: 5,
+                direct: 4,
+                relay: 2,
+                other: 0,
+            },
+            up_bps: x0x::network::bandwidth::BandwidthRates {
+                total: 88.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let data = super::StatusData {
+            status: "connected".to_string(),
+            version: x0x::VERSION.to_string(),
+            uptime_secs: 300,
+            api_address: "127.0.0.1:12701".to_string(),
+            external_addrs: Vec::new(),
+            agent_id: "00".repeat(32),
+            peers: 1,
+            send_ready_peers: 1,
+            revocation_resync_required: false,
+            warnings: Vec::new(),
+            bandwidth: usage,
+        };
+        let json =
+            serde_json::to_value(&super::ApiResponse { ok: true, data }).expect("serializes");
+        for legacy_key in [
+            "ok",
+            "status",
+            "version",
+            "uptime_secs",
+            "api_address",
+            "external_addrs",
+            "agent_id",
+            "peers",
+            "send_ready_peers",
+            "revocation_resync_required",
+            "warnings",
+        ] {
+            assert!(
+                json.get(legacy_key).is_some(),
+                "legacy key {legacy_key} gone"
+            );
+        }
+        let bandwidth = &json["bandwidth"];
+        for group in ["sent_bytes", "received_bytes"] {
+            for kind in ["total", "gossip", "direct", "relay", "other"] {
+                assert!(bandwidth[group][kind].is_u64(), "{group}.{kind}");
+            }
+        }
+        for group in ["up_bps", "down_bps"] {
+            for kind in ["total", "gossip", "direct", "relay", "other"] {
+                assert!(bandwidth[group][kind].is_f64(), "{group}.{kind}");
+            }
+        }
+        assert!(bandwidth["window_secs"].as_f64().unwrap() >= 0.0);
+        assert_eq!(bandwidth["sent_bytes"]["gossip"], 5);
     }
 
     /// #1380: the verdict sample is a faithful store/load pass-through, so
