@@ -2823,8 +2823,11 @@ function wsSend() {}
 // only a refresh that reports input moves lastActivity.
 let daemon = null;
 let refreshes = 0;
+// lineageRevoke: revoke with a token a refresh replaced ends the session,
+// as the daemon does. Off, only the GUI's own guard can end it.
+let lineageRevoke = true;
 function mint(token) {
-  daemon = { token, lastActivity: now, expiresAt: now + TTL };
+  daemon = { token, lastActivity: now, expiresAt: now + TTL, retired: new Set() };
   location.search = '?token=' + token;
 }
 function daemonActive() { return daemon && now - daemon.lastActivity < IDLE; }
@@ -2834,7 +2837,8 @@ async function apiWith(token, path, opt) {
   const known = daemon && token === daemon.token;
   if (path === '/auth/session/revoke') {
     revoked.push(token);
-    if (!known || !daemonActive()) return { _http_ok: false, _http_status: 401 };
+    const replaced = lineageRevoke && daemon && daemon.retired.has(token);
+    if (!(known || replaced) || !daemonActive()) return { _http_ok: false, _http_status: 401 };
     daemon = null;
     return { _http_ok: true, revoked: true };
   }
@@ -2849,6 +2853,7 @@ async function apiWith(token, path, opt) {
   if (typeof body.idle_ms === 'number') {
     daemon.lastActivity = Math.max(daemon.lastActivity, Math.min(now, now - body.idle_ms));
   }
+  daemon.retired.add(daemon.token);
   daemon.token = 'session-' + refreshes;
   daemon.expiresAt = now + TTL;
   return { _http_ok: true, session_token: daemon.token, expires_in: 600, idle_timeout_secs: IDLE / 1000 };
@@ -2940,6 +2945,24 @@ async function load(token) {
   await null; await null;
   if (revoked[revoked.length - 1] !== signedOut) fail('sign out did not revoke this tab token');
   if (daemon !== null) fail('sign out left the daemon session alive');
+
+  // Sign out while a refresh is in flight: the refresh wins the daemon,
+  // revoke presents the replaced token. Run with and without the daemon's
+  // lineage revoke; either way the session must end and nothing stays stored.
+  for (const lineage of [true, false]) {
+    lineageRevoke = lineage;
+    document.visibilityState = 'visible';
+    await load('minted-race-' + lineage);
+    now += 9 * MIN;
+    const inFlight = maybeRefreshSession();
+    signOut();
+    await inFlight;
+    for (let i = 0; i < 4; i += 1) await null;
+    if (daemon !== null) fail('a refresh that raced sign out kept the session (lineage ' + lineage + ')');
+    if (sessionStorage.getItem('x0x_session_token') !== null) fail('a raced refresh stored its token');
+    if (!sessionExpired || toasts !== 1) fail('a raced sign out must end the session once');
+  }
+  lineageRevoke = true;
   if (!sessionExpired || toasts !== 1) fail('sign out must end the session once');
   if (sessionStorage.getItem('x0x_session_token') !== null) fail('sign out left the token stored');
 })().catch((error) => { console.error(error); process.exit(1); });

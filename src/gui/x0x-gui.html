@@ -782,6 +782,9 @@ async function swapSessionToken(){
   const idle=Math.max(0,Date.now()-lastUserActivity);
   const r=await apiWith(SESSION_TOKEN,'/auth/session/refresh',{method:'POST',body:JSON.stringify({idle_ms:idle})});
   if(r&&r._http_ok&&r.session_token){
+    // Signed out or expired while the refresh was in flight: end the new
+    // token too, and do not store it.
+    if(sessionExpired){apiWith(r.session_token,'/auth/session/revoke',{method:'POST'});return}
     SESSION_TOKEN=r.session_token;
     sessionIssuedAt=Date.now();
     sessionClockKnown=true;

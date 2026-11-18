@@ -73,9 +73,14 @@ pub(super) fn authorize(
         }
     }
     // (5) A lapsed session token reaches refresh and revoke and nothing else.
-    if method == Method::POST && (path == SESSION_REFRESH_PATH || path == SESSION_REVOKE_PATH) {
+    // Revoke also takes a token a refresh just replaced, so a sign-out that
+    // lost the race to a refresh still ends the session.
+    if method == Method::POST {
         if let Some(token) = header_token {
-            if sessions.is_refreshable(token) {
+            if path == SESSION_REFRESH_PATH && sessions.is_refreshable(token) {
+                return Ok(());
+            }
+            if path == SESSION_REVOKE_PATH && sessions.is_revocable(token) {
                 return Ok(());
             }
         }
@@ -399,10 +404,12 @@ pub(super) async fn refresh_session(
 
 /// `POST /auth/session/revoke` — end the caller's own browser session.
 ///
-/// Accepts a session bearer that refresh would accept (live, or lapsed
-/// inside the idle timeout); the durable token is refused, since it is not
-/// a session. Open WebSocket and SSE streams of the session are not closed:
-/// they were authenticated at connect. The token stops working at once, and a pending GUI
+/// Ends the whole session the bearer belongs to, every token of its
+/// lineage. Accepts a session bearer that refresh would accept (live, or
+/// lapsed inside the idle timeout) or one a refresh just replaced; the
+/// durable token is refused, since it is not a session. Open WebSocket and
+/// SSE streams of the session are not closed: they were authenticated at
+/// connect. The token stops working at once, and a pending GUI
 /// show bound to it is dropped. No other session is touched.
 pub(super) async fn revoke_session(
     State(state): State<Arc<AppState>>,
@@ -742,6 +749,9 @@ pub fn gui_idle_timeout(minutes: u64) -> Result<Duration, String> {
 /// [`SystemTime::now`]; tests inject a manual clock.
 pub(super) type SessionClock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
 
+/// Replaced tokens remembered for revoke, at most this many.
+const MAX_RETIRED_TOKENS: usize = 4096;
+
 /// A single issued browser session token, stored as a SHA-256 digest.
 ///
 /// Only the digest is retained so a memory dump cannot recover live tokens;
@@ -751,10 +761,27 @@ pub(super) type SessionClock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
 /// while the machine is suspended, and a session must age during sleep.
 struct AuthSession {
     token_hash: [u8; 32],
+    /// One session from mint to end; refreshed tokens inherit it, and
+    /// revoke ends every token of it.
+    lineage: u64,
     expires_at: SystemTime,
-    /// Last user activity of this refresh chain. Refreshed tokens inherit
-    /// it; only a refresh that reports user input moves it.
+    /// Last user activity of this session. Refreshed tokens inherit it;
+    /// only a refresh that reports user input moves it.
     last_activity: SystemTime,
+}
+
+/// A token that a refresh replaced. It opens nothing, but it can still
+/// revoke its session: a sign-out that raced a refresh holds only this.
+struct RetiredToken {
+    token_hash: [u8; 32],
+    lineage: u64,
+    until: SystemTime,
+}
+
+#[derive(Default)]
+struct SessionTable {
+    live: Vec<AuthSession>,
+    retired: std::collections::VecDeque<RetiredToken>,
 }
 
 /// Why [`SessionStore::refresh`] refused.
@@ -763,8 +790,7 @@ pub(super) enum SessionRefreshError {
     /// Not a known session token (never issued, revoked, or already
     /// refreshed).
     Unknown,
-    /// The session had no user activity for the idle timeout, or the clock
-    /// went back past its last activity.
+    /// The session had no user activity for the idle timeout.
     IdleTimeout,
 }
 
@@ -778,10 +804,19 @@ pub(super) enum SessionRefreshError {
 /// A session ends when it has had no user activity for `idle_timeout`.
 /// There is no cap on total lifetime.
 pub(super) struct SessionStore {
-    sessions: StdMutex<Vec<AuthSession>>,
+    table: StdMutex<SessionTable>,
     ttl: Duration,
     idle_timeout: Duration,
     clock: SessionClock,
+    /// Latest time the store has seen. A wall clock stepped backward reads
+    /// as this until it catches up, so a step cannot extend a session.
+    high_water: StdMutex<SystemTime>,
+    next_lineage: std::sync::atomic::AtomicU64,
+}
+
+fn hash_matches(candidate: &[u8], stored: &[u8; 32]) -> bool {
+    use subtle::ConstantTimeEq;
+    bool::from(candidate.ct_eq(stored))
 }
 
 impl SessionStore {
@@ -791,10 +826,12 @@ impl SessionStore {
 
     pub(super) fn with_clock(ttl: Duration, idle_timeout: Duration, clock: SessionClock) -> Self {
         Self {
-            sessions: StdMutex::new(Vec::new()),
+            table: StdMutex::new(SessionTable::default()),
             ttl,
             idle_timeout,
             clock,
+            high_water: StdMutex::new(SystemTime::UNIX_EPOCH),
+            next_lineage: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
@@ -803,38 +840,57 @@ impl SessionStore {
     }
 
     fn now(&self) -> SystemTime {
-        (self.clock)()
+        let wall = (self.clock)();
+        let Ok(mut seen) = self.high_water.lock() else {
+            return wall;
+        };
+        if wall > *seen {
+            *seen = wall;
+        }
+        *seen
     }
 
-    /// Fails closed: a clock that went back past the last activity ends the
-    /// session, so a backward step cannot extend it.
     fn active_at(&self, session: &AuthSession, now: SystemTime) -> bool {
         now.duration_since(session.last_activity)
             .is_ok_and(|idle| idle < self.idle_timeout)
     }
 
+    fn prune(&self, table: &mut SessionTable, now: SystemTime) {
+        table.live.retain(|s| self.active_at(s, now));
+        table.retired.retain(|r| r.until > now);
+    }
+
     /// Issue a fresh session token, store its digest, and return the raw token
-    /// to hand to the client. A mint is user activity.
+    /// to hand to the client. A mint is user activity and starts a lineage.
     pub(super) fn issue(&self) -> String {
         let now = self.now();
-        let (token, session) = self.new_session(now, now);
-        if let Ok(mut guard) = self.sessions.lock() {
-            guard.push(session);
+        let lineage = self
+            .next_lineage
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (token, session) = self.new_session(now, now, lineage);
+        if let Ok(mut table) = self.table.lock() {
+            table.live.push(session);
             // Bound the store: lazy-prune idle entries on every issue so a
-            // flood of session mints cannot grow the vector without bound.
-            guard.retain(|s| self.active_at(s, now));
+            // flood of session mints cannot grow it without bound.
+            self.prune(&mut table, now);
         }
         token
     }
 
     /// Generate a raw token plus its stored entry, expiring `ttl` from `now`.
-    fn new_session(&self, now: SystemTime, last_activity: SystemTime) -> (String, AuthSession) {
+    fn new_session(
+        &self,
+        now: SystemTime,
+        last_activity: SystemTime,
+        lineage: u64,
+    ) -> (String, AuthSession) {
         use rand::RngCore;
         let mut bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut bytes);
         let token = hex::encode(bytes);
         let session = AuthSession {
             token_hash: Sha256::digest(token.as_bytes()).into(),
+            lineage,
             expires_at: now.checked_add(self.ttl).unwrap_or(now),
             last_activity,
         };
@@ -855,19 +911,19 @@ impl SessionStore {
         token: &str,
         idle: Option<Duration>,
     ) -> Result<String, SessionRefreshError> {
-        use subtle::ConstantTimeEq;
         let now = self.now();
         let candidate = Sha256::digest(token.as_bytes());
-        let mut guard = self
-            .sessions
+        let mut table = self
+            .table
             .lock()
             .map_err(|_| SessionRefreshError::Unknown)?;
-        let index = guard
+        let index = table
+            .live
             .iter()
-            .position(|s| bool::from(candidate.ct_eq(&s.token_hash)))
+            .position(|s| hash_matches(&candidate, &s.token_hash))
             .ok_or(SessionRefreshError::Unknown)?;
-        let session = guard.swap_remove(index);
-        guard.retain(|s| self.active_at(s, now));
+        let session = table.live.swap_remove(index);
+        self.prune(&mut table, now);
         if !self.active_at(&session, now) {
             return Err(SessionRefreshError::IdleTimeout);
         }
@@ -876,43 +932,66 @@ impl SessionStore {
             Some(at) if at > session.last_activity => at.min(now),
             _ => session.last_activity,
         };
-        let (fresh, session) = self.new_session(now, last_activity);
-        guard.push(session);
+        if table.retired.len() >= MAX_RETIRED_TOKENS {
+            table.retired.pop_front();
+        }
+        table.retired.push_back(RetiredToken {
+            token_hash: session.token_hash,
+            lineage: session.lineage,
+            until: now.checked_add(self.idle_timeout).unwrap_or(now),
+        });
+        let (fresh, session) = self.new_session(now, last_activity, session.lineage);
+        table.live.push(session);
         Ok(fresh)
     }
 
-    /// Remove one session token. Returns whether it was present.
-    ///
-    /// The lookup hashes the candidate and compares with
-    /// [`subtle::ConstantTimeEq`], the same way as [`Self::refresh`].
+    /// End the whole session `token` belongs to: every token of its
+    /// lineage stops working. `token` may be live, lapsed, or one a refresh
+    /// just replaced. Returns whether a live token was removed.
     pub(super) fn revoke(&self, token: &str) -> bool {
-        use subtle::ConstantTimeEq;
+        let now = self.now();
         let candidate = Sha256::digest(token.as_bytes());
-        let Ok(mut guard) = self.sessions.lock() else {
+        let Ok(mut table) = self.table.lock() else {
             return false;
         };
-        match guard
+        self.prune(&mut table, now);
+        let lineage = table
+            .live
             .iter()
-            .position(|s| bool::from(candidate.ct_eq(&s.token_hash)))
-        {
-            Some(index) => {
-                guard.swap_remove(index);
-                true
-            }
-            None => false,
-        }
+            .find(|s| hash_matches(&candidate, &s.token_hash))
+            .map(|s| s.lineage)
+            .or_else(|| {
+                table
+                    .retired
+                    .iter()
+                    .find(|r| hash_matches(&candidate, &r.token_hash))
+                    .map(|r| r.lineage)
+            });
+        let Some(lineage) = lineage else {
+            return false;
+        };
+        let before = table.live.len();
+        table.live.retain(|s| s.lineage != lineage);
+        table.retired.retain(|r| r.lineage != lineage);
+        table.live.len() < before
     }
 
-    /// Recorded last activity of a known token's chain (tests only).
+    /// Recorded last activity of a live token's session (tests only).
     #[cfg(test)]
     fn last_activity(&self, token: &str) -> Option<SystemTime> {
-        use subtle::ConstantTimeEq;
         let candidate = Sha256::digest(token.as_bytes());
-        let guard = self.sessions.lock().ok()?;
-        guard
+        let table = self.table.lock().ok()?;
+        table
+            .live
             .iter()
-            .find(|s| bool::from(candidate.ct_eq(&s.token_hash)))
+            .find(|s| hash_matches(&candidate, &s.token_hash))
             .map(|s| s.last_activity)
+    }
+
+    /// Number of stored live and lapsed tokens (tests only).
+    #[cfg(test)]
+    fn live_len(&self) -> usize {
+        self.table.lock().map(|t| t.live.len()).unwrap_or(0)
     }
 
     /// Validate a candidate token: constant-time compare against every active
@@ -923,32 +1002,56 @@ impl SessionStore {
     /// stays up after the token expires, and visibility alone is not a
     /// live GUI session.
     pub(super) fn is_valid(&self, token: &str) -> bool {
-        use subtle::ConstantTimeEq;
         let now = self.now();
         let candidate = Sha256::digest(token.as_bytes());
-        let Ok(mut guard) = self.sessions.lock() else {
+        let Ok(mut table) = self.table.lock() else {
             return false;
         };
-        guard.retain(|s| self.active_at(s, now));
-        guard
+        self.prune(&mut table, now);
+        table
+            .live
             .iter()
-            .any(|s| s.expires_at > now && bool::from(candidate.ct_eq(&s.token_hash)))
+            .any(|s| s.expires_at > now && hash_matches(&candidate, &s.token_hash))
     }
 
     /// Whether `token` belongs to a session inside the idle timeout, live
     /// or lapsed. Only `POST /auth/session/refresh` and
     /// `POST /auth/session/revoke` may use this.
     fn is_refreshable(&self, token: &str) -> bool {
-        use subtle::ConstantTimeEq;
         let now = self.now();
         let candidate = Sha256::digest(token.as_bytes());
-        let Ok(mut guard) = self.sessions.lock() else {
+        let Ok(mut table) = self.table.lock() else {
             return false;
         };
-        guard.retain(|s| self.active_at(s, now));
-        guard
+        self.prune(&mut table, now);
+        table
+            .live
             .iter()
-            .any(|s| bool::from(candidate.ct_eq(&s.token_hash)))
+            .any(|s| hash_matches(&candidate, &s.token_hash))
+    }
+
+    /// Whether `token` may call `POST /auth/session/revoke`: it is
+    /// refreshable, or a refresh replaced it and its session is still live.
+    fn is_revocable(&self, token: &str) -> bool {
+        let now = self.now();
+        let candidate = Sha256::digest(token.as_bytes());
+        let Ok(mut table) = self.table.lock() else {
+            return false;
+        };
+        self.prune(&mut table, now);
+        let lineage = table
+            .live
+            .iter()
+            .find(|s| hash_matches(&candidate, &s.token_hash))
+            .map(|s| s.lineage)
+            .or_else(|| {
+                table
+                    .retired
+                    .iter()
+                    .find(|r| hash_matches(&candidate, &r.token_hash))
+                    .map(|r| r.lineage)
+            });
+        lineage.is_some_and(|lineage| table.live.iter().any(|s| s.lineage == lineage))
     }
 
     /// Whether `token` is a live session.
@@ -960,14 +1063,13 @@ impl SessionStore {
     /// Lapse one session token. The session stays inside the idle timeout.
     #[cfg(test)]
     pub(super) fn expire_for_test(&self, token: &str) {
-        use subtle::ConstantTimeEq;
         let candidate = Sha256::digest(token.as_bytes());
         let past = self.now();
-        let Ok(mut guard) = self.sessions.lock() else {
+        let Ok(mut table) = self.table.lock() else {
             return;
         };
-        for session in guard.iter_mut() {
-            if bool::from(candidate.ct_eq(&session.token_hash)) {
+        for session in table.live.iter_mut() {
+            if hash_matches(&candidate, &session.token_hash) {
                 session.expires_at = past;
             }
         }
@@ -1495,11 +1597,7 @@ mod tests {
         assert!(!authorize_refresh(&store, &dead));
         let fresh = store.issue();
         assert!(store.is_valid(&fresh));
-        assert_eq!(
-            store.sessions.lock().unwrap().len(),
-            1,
-            "the idle entry is pruned"
-        );
+        assert_eq!(store.live_len(), 1, "the idle entry is pruned");
     }
 
     // -- #893 sliding refresh with an idle timeout.
@@ -1641,19 +1739,97 @@ mod tests {
     }
 
     #[test]
-    fn wall_clock_step_backward_expires_the_session() {
+    fn wall_clock_step_backward_freezes_store_time() {
+        // The store's time never goes back: a backward step freezes it
+        // until the wall clock catches up, so the step cannot buy time
+        // beyond its own size, and cannot be repeated to gain more.
         let clock = TestClock::new();
         let store = clock.store(IDLE);
+        let t0 = clock.now();
         let token = store.issue();
-        clock.advance(MIN);
-        let token = store
-            .refresh(&token, Some(Duration::ZERO))
-            .expect("refresh");
+        clock.advance(50 * MIN);
+        let token = store.refresh(&token, None).expect("inside idle");
         clock.back(2 * MIN);
-        assert!(!store.is_valid(&token), "fail closed on a backward step");
-        assert!(!authorize_agent(&store, &token));
+        assert!(
+            store.is_valid(&token),
+            "a small step back keeps the session"
+        );
+        clock.advance(MIN);
+        let token = store.refresh(&token, None).expect("still inside idle");
+        // Store time is still t0 + 50 min: the activity record is unchanged
+        // and the new token expires from that time, not from the wall.
+        assert_eq!(store.last_activity(&token), Some(t0));
+        clock.back(5 * MIN);
+        clock.set(t0 + IDLE - Duration::from_nanos(1));
+        assert!(store.is_valid(&token));
+        clock.set(t0 + IDLE);
+        assert!(!store.is_valid(&token), "expiry at the original wall time");
         assert!(!authorize_refresh(&store, &token));
-        assert!(store.refresh(&token, Some(Duration::ZERO)).is_err());
+    }
+
+    #[test]
+    fn revoke_with_a_replaced_token_ends_the_whole_session() {
+        // Sign out raced a refresh: the refresh won, and revoke presents
+        // the token it replaced.
+        let store = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
+        let old = store.issue();
+        let other = store.issue();
+        let new = store.refresh(&old, None).expect("refresh");
+        assert!(
+            !authorize_refresh(&store, &old),
+            "a replaced token cannot refresh"
+        );
+        assert!(
+            authorize_revoke(&store, &old),
+            "a replaced token can revoke"
+        );
+        assert!(store.revoke(&old));
+        assert!(!store.is_valid(&new), "the refresh winner is dead");
+        assert!(!authorize_refresh(&store, &new));
+        assert!(store.refresh(&new, None).is_err());
+        assert!(!authorize_revoke(&store, &old), "the session is gone");
+        assert!(store.is_valid(&other), "another session is untouched");
+        assert_eq!(store.live_len(), 1);
+    }
+
+    #[test]
+    fn revoke_then_refresh_leaves_no_live_token() {
+        let store = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
+        let old = store.issue();
+        let newer = store.refresh(&old, None).expect("refresh");
+        assert!(store.revoke(&newer));
+        assert_eq!(
+            store.refresh(&newer, None),
+            Err(SessionRefreshError::Unknown)
+        );
+        assert_eq!(store.refresh(&old, None), Err(SessionRefreshError::Unknown));
+        assert_eq!(store.live_len(), 0);
+    }
+
+    #[test]
+    fn concurrent_refresh_and_revoke_end_the_session_in_either_order() {
+        use std::sync::Barrier;
+        use std::thread;
+        for _ in 0..64 {
+            let store = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
+            let token = store.issue();
+            let barrier = Barrier::new(2);
+            let (refreshed, _) = thread::scope(|s| {
+                let h1 = s.spawn(|| {
+                    barrier.wait();
+                    store.refresh(&token, Some(Duration::ZERO))
+                });
+                let h2 = s.spawn(|| {
+                    barrier.wait();
+                    store.revoke(&token)
+                });
+                (h1.join().unwrap(), h2.join().unwrap())
+            });
+            if let Ok(new) = refreshed {
+                assert!(!store.is_valid(&new), "the refresh winner must be dead");
+            }
+            assert_eq!(store.live_len(), 0, "no live token in the lineage");
+        }
     }
 
     #[test]

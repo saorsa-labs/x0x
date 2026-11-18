@@ -16,10 +16,12 @@ All notable changes to this project will be documented in this file.
   change:** a client that refreshes without `idle_ms` (including
   `x0x auth refresh` without `--idle-ms`) now ends after the idle timeout,
   60 min by default, where it had 12 h. New `POST /auth/session/revoke`
-  (`x0x auth revoke`, GUI "Sign out") ends the caller's own session, live
-  or lapsed. `GET /status` adds `gui_idle_timeout_secs`; `x0xd --doctor`
-  prints the timeout. Open WebSocket/SSE streams are not closed on revoke
-  or idle expiry.
+  (`x0x auth revoke`, GUI "Sign out") ends the caller's own session, every
+  token of it, live or lapsed, even when a refresh raced the sign-out.
+  `GET /status` adds `gui_idle_timeout_secs`; `x0xd --doctor` prints the
+  timeout. Known limit: open WebSocket and SSE streams of a revoked or
+  idle-expired session are not closed; such a stream can outlive sign-out
+  until the client disconnects, with no time bound.
 - **Relay serving follows participation mode (#1642; A06 amendment of
   18 Nov 2026).** New `NetworkConfig.relay_service_enabled` (default `true`)
   is passed to ant-quic. x0xd reads an optional TOML `relay_service_enabled`;
