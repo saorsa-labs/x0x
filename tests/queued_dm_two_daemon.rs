@@ -10,15 +10,20 @@
 //!   `recipient_ack_semantics_unavailable`; a queued send is held with that
 //!   error. Bob comes online, his advert reaches alice, and the held send is
 //!   delivered once.
-//! - Lost ACK: bob is stopped (SIGSTOP), so a synchronous durable send
-//!   answers 504 `timeout` (`outcome: "ack_unknown"`) and the queued send's
-//!   first attempt times out and reads `queued`. Alice is killed (SIGKILL)
-//!   and bob continues (SIGCONT): bob commits the buffered queued send and
-//!   its ACK has no sender to reach. Alice restarts on the same data dir; the
-//!   send is still held, the ACK of the next attempt settles it as
-//!   `delivered`, and bob holds one copy.
+//! - Stopped peer (504): bob is stopped (SIGSTOP) while alice issues a
+//!   synchronous durable send. The send times out with 504 `timeout`
+//!   (`outcome: "ack_unknown"`). After bob resumes the late ACK arrives and
+//!   the receipt shows `delivered_late`.
+//! - Lost ACK / sender restart: on a fresh daemon pair, bob is stopped while
+//!   alice issues a queued send. The first attempt times out and the receipt
+//!   reads `queued`. Alice is killed (SIGKILL) and bob continues (SIGCONT):
+//!   bob commits the buffered queued send and its ACK has no sender to reach.
+//!   Alice restarts on the same data dir; the send is still held, the ACK of
+//!   the next attempt settles it as `delivered`, and bob holds one copy.
 //!
-//! Every wait is a bounded poll on an API answer. Daemons are killed on drop.
+//! Each scenario starts its own daemon pair so a degraded QUIC connection
+//! from one scenario cannot affect another. Every wait is a bounded poll on
+//! an API answer. Daemons are killed on drop.
 //! Run with
 //! `python3 scripts/dev/test-isolated.py nextest --all-features -- -E 'binary(queued_dm_two_daemon)'`.
 
@@ -111,18 +116,23 @@ async fn queued_send_to_cold_recipient_is_held_then_delivered_once() {
     );
 }
 
+/// Sync send to a stopped peer → 504 `timeout`; after resume the late ACK
+/// arrives and the receipt shows `delivered_late`.
+///
+/// This scenario runs on its own daemon pair so the degraded QUIC connection
+/// that results from a 24 s SIGSTOP does not affect the restart scenario.
 #[tokio::test]
-async fn lost_ack_then_sender_restart_settles_delivered_without_second_copy() {
-    let bob = DaemonFixture::start("qdm-ack-bob").await;
-    let mut alice = DaemonFixture::start_with_config(
-        "qdm-ack-alice",
+async fn sync_send_to_stopped_peer_settles_delivered_late() {
+    let bob = DaemonFixture::start("qdm-late-bob").await;
+    let alice = DaemonFixture::start_with_config(
+        "qdm-late-alice",
         &format!("bootstrap_peers = [\"{}\"]\n", quic_addr(&bob).await),
     )
     .await;
     import_card(&alice, &bob).await;
     import_card(&bob, &alice).await;
     let bob_id = agent_id(&bob).await;
-    let alice_id = agent_id(&alice).await;
+
     // Warm-up: one durable send round trip proves the path before the test
     // breaks it.
     poll_until(
@@ -175,6 +185,48 @@ async fn lost_ack_then_sender_restart_settles_delivered_without_second_copy() {
         Some(blake3::hash(b"sync-to-stopped-bob").to_hex().as_str()),
         "{late}"
     );
+}
+
+/// Queued send's first attempt is lost (bob stopped, ACK never reaches alice),
+/// alice is killed before the retry, alice restarts, the held send settles as
+/// `delivered`, and bob stores exactly one copy.
+///
+/// Runs on its own fresh daemon pair: a previous 24 s SIGSTOP (the 504
+/// scenario) would shrink the QUIC send window and make alice's queued DM
+/// miss the stop window before she is killed.  The warm-up below proves the
+/// connection before it is broken.
+#[tokio::test]
+async fn lost_ack_then_sender_restart_settles_delivered_without_second_copy() {
+    let bob = DaemonFixture::start("qdm-restart-bob").await;
+    let mut alice = DaemonFixture::start_with_config(
+        "qdm-restart-alice",
+        &format!("bootstrap_peers = [\"{}\"]\n", quic_addr(&bob).await),
+    )
+    .await;
+    import_card(&alice, &bob).await;
+    import_card(&bob, &alice).await;
+    let bob_id = agent_id(&bob).await;
+    let alice_id = agent_id(&alice).await;
+    // Warm-up: one durable send round trip proves the path before the test
+    // breaks it.
+    poll_until(
+        "a warm-up durable send is delivered",
+        Duration::from_secs(60),
+        || async {
+            let (status, body) = post(
+                &alice,
+                "/direct/send",
+                &send_body(&bob_id, b"warm-up", None),
+            )
+            .await;
+            if status == StatusCode::OK {
+                Ok(())
+            } else {
+                Err(format!("{status} {body}"))
+            }
+        },
+    )
+    .await;
 
     // Lost ACK of a queued send.
     signal(bob.pid(), "STOP");
@@ -196,6 +248,9 @@ async fn lost_ack_then_sender_restart_settles_delivered_without_second_copy() {
 
     // The sender dies; bob continues, commits the buffered send, and its
     // ACK has no sender to reach.
+    // `attempted_obligation` confirmed retry_count >= 1: alice's worker
+    // already timed out the first attempt, so the DM frame reached bob's
+    // QUIC receive buffer before alice is killed.
     alice.kill();
     signal(bob.pid(), "CONT");
     eprintln!("bob stopped for {:?} (queued send)", stopped_at.elapsed());
