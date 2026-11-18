@@ -5901,6 +5901,76 @@ mod startup_update_check_tests {
 }
 
 #[cfg(test)]
+mod relay_serving_wiring_tests {
+    use crate::server::{serve_with_options, DaemonConfig, ServeOptions};
+    use std::time::Duration;
+
+    async fn daemon_relay_enabled(toml_key: Option<bool>, cli_relay: bool) -> bool {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = DaemonConfig {
+            data_dir: dir.path().to_path_buf(),
+            identity_dir: Some(dir.path().join("identity")),
+            api_address: "127.0.0.1:0".parse().expect("loopback api address"),
+            bind_address: "127.0.0.1:0".parse().expect("loopback quic address"),
+            bootstrap_peers: Some(Vec::new()),
+            network_id: Some("issue-1642.relay-serving-wiring".to_string()),
+            mdns_enabled: false,
+            relay_service_enabled: toml_key,
+            ..DaemonConfig::default()
+        };
+        config.history.enabled = false;
+        let options = ServeOptions {
+            skip_update_check: true,
+            cli_no_port_mapping: true,
+            cli_disable_peer_cache: true,
+            cli_relay,
+            ..ServeOptions::default()
+        };
+        let handle =
+            tokio::time::timeout(Duration::from_secs(30), serve_with_options(config, options))
+                .await
+                .expect("serve within 30 s")
+                .expect("hermetic serve");
+        let token = std::fs::read_to_string(dir.path().join("api-token")).expect("api token");
+        let body: serde_json::Value = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("http client")
+            .get(format!(
+                "http://{}/diagnostics/connectivity",
+                handle.local_addr()
+            ))
+            .bearer_auth(token.trim())
+            .send()
+            .await
+            .expect("connectivity request")
+            .json()
+            .await
+            .expect("connectivity json");
+        tokio::time::timeout(Duration::from_secs(30), handle.shutdown_and_wait())
+            .await
+            .expect("shutdown within 30 s")
+            .expect("clean shutdown");
+        body["services"]["relay_enabled"]
+            .as_bool()
+            .expect("services.relay_enabled is a bool")
+    }
+
+    /// #1642: the value read back is the ant-quic node status, so this fails
+    /// when either the daemon resolution or the ant-quic builder call is lost.
+    #[tokio::test]
+    async fn daemon_relay_serving_follows_participation_and_explicit_key() {
+        assert!(!daemon_relay_enabled(None, false).await, "Leaf default");
+        assert!(daemon_relay_enabled(None, true).await, "Full default");
+        assert!(daemon_relay_enabled(Some(true), false).await, "Leaf opt-in");
+        assert!(
+            !daemon_relay_enabled(Some(false), true).await,
+            "Full opt-out"
+        );
+    }
+}
+
+#[cfg(test)]
 mod socks_startup_port_release_tests {
     use std::time::Duration;
 

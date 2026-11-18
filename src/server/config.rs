@@ -545,6 +545,24 @@ enabled = false
     }
 
     #[test]
+    fn relay_service_enabled_is_a_recognised_root_key() {
+        let (default_config, default_ignored) =
+            parse_with_ignored_keys("").expect("empty config parses");
+        assert_eq!(default_config.relay_service_enabled, None);
+        assert!(default_ignored.is_empty());
+
+        let (config, ignored) =
+            parse_with_ignored_keys("relay_service_enabled = false\n").expect("parses");
+        assert_eq!(config.relay_service_enabled, Some(false));
+        assert!(ignored.is_empty(), "got spurious ignored keys: {ignored:?}");
+
+        let findings =
+            diagnose_section_placement(&root("[gossip]\nrelay_service_enabled = false\n"));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].key, "relay_service_enabled");
+    }
+
+    #[test]
     fn data_dir_under_history_is_flagged() {
         let t = root("[history]\ndata_dir = \"/var/lib/x0x\"\nenabled = true\n");
         let findings = diagnose_section_placement(&t);

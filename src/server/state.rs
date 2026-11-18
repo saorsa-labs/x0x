@@ -2247,6 +2247,20 @@ mod tests {
     }
 
     #[test]
+    fn relay_service_enabled_is_unset_by_default_and_parses_both_values() {
+        let config: DaemonConfig = toml::from_str("").expect("empty config parses");
+        assert_eq!(config.relay_service_enabled, None);
+        assert_eq!(DaemonConfig::default().relay_service_enabled, None);
+
+        let config: DaemonConfig =
+            toml::from_str("relay_service_enabled = false").expect("opt-out parses");
+        assert_eq!(config.relay_service_enabled, Some(false));
+        let config: DaemonConfig =
+            toml::from_str("relay_service_enabled = true").expect("opt-in parses");
+        assert_eq!(config.relay_service_enabled, Some(true));
+    }
+
+    #[test]
     fn zero_peer_restart_defaults_off_and_parses_opt_in() {
         // Issue #262: the watchdog exits the PROCESS — it must be impossible
         // to arm by accident. Off in every construction path; only an

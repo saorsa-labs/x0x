@@ -124,7 +124,8 @@ mdns_enabled = true                   # ant-quic LAN discovery + auto-connect.
                                       # disable it. Test fixtures set false.
 observed_prefix_enabled = false       # masked origin prefix on DM surfaces
 # relay_service_enabled = false       # serve MASQUE relay sessions; unset = on for
-#                                     # Full (seed, UDP/443, managed, --relay), off for Leaf
+#                                     # Full (seed, UDP/443, managed, --relay or
+#                                     # gossip.relay = true), off for Leaf
 # identity_dir = "/srv/x0x/identity"  # keep ALL identity material (machine.key, agent.key, agent.cert,
 #                                     # and the opt-in user.key lookup) out of ~/.x0x — with this set the
 #                                     # daemon never falls back to ~/.x0x (the embedding storage boundary)
