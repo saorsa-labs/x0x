@@ -4091,7 +4091,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
         return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
     }
 
-    // ADR 0028: direction enforcement (Kimi blocker 3).
     let is_requester_offer = dm_sender_hex == v2_sender_hex;
     let is_authority_relay = !is_requester_offer && carrier_is_admin;
 
@@ -4107,8 +4106,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
         return Err("requester offer to non-authority; retry".to_string());
     }
     if is_authority_relay && is_local_authority {
-        // Authority relaying to itself — reject (authority already
-        // has the event from its own publish).
         tracing::warn!(
             carrier = %dm_sender_hex,
             "ADR 0028: authority→authority relay, rejecting"
@@ -4116,7 +4113,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
         return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
     }
     if !is_requester_offer && !is_authority_relay {
-        // Carrier is neither the requester nor an active admin — reject.
         tracing::warn!(
             carrier = %dm_sender_hex,
             "ADR 0028: predecessor relay carrier is neither requester nor active admin, rejecting"
@@ -4149,7 +4145,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
         let _membership_guard = membership_lock.lock().await;
 
         let mut replay_group_id: Option<String> = None;
-        // Watson item 5: pre-state classification.
         enum AdmissionState {
             Complete,
             New,
@@ -4158,8 +4153,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
             Inconsistent,
         }
 
-        // Only the authority (group creator) stores the relay
-        // obligation. A non-authority witness just applies.
         if !is_local_authority || !is_requester_offer {
             let apply_result = Box::pin(apply_named_group_metadata_event_inner_serialized(
                 relay_state,
@@ -4178,9 +4171,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
             ))
             .await;
             replay_after = replay_group_id;
-            // #942 r3 (B3): the witness tail ACKs only when its apply was
-            // accepted (durable); an unaccepted apply keeps the Err default
-            // so the peer re-offers later.
             if apply_result.accepted {
                 ack = Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Inserted);
             } else {
@@ -4216,9 +4206,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
             break 'admission false;
         }
 
-        // Watson item 5: classify durable state BEFORE any mutation.
-        // Extract request identity and check durable request+obligation
-        // existence without calling _inner_serialized.
         let (request_id, requester_agent_id) = match &event {
             NamedGroupMetadataEvent::JoinRequestCreated {
                 request_id,
@@ -4299,7 +4286,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
             }
         }
 
-        // Check durable request existence (non-mutating read).
         let request_info = {
             let groups = relay_state.named_groups.read().await;
             groups.get(&group_id_str).and_then(|info| {
@@ -4314,7 +4300,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
             })
         };
 
-        // Check durable obligation existence (non-mutating read).
         let obligation_first_seen_ms = {
             let outbox = relay_state.predecessor_relay_outbox.read().await;
             outbox.get(&group_id_str).and_then(|list| {
@@ -4342,7 +4327,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
         let predecessor_receipt_exists =
             obligation_first_seen_ms.is_some() || completion_receipt_first_seen_ms.is_some();
 
-        // Classify the state.
         let admission_state =
             if let Some((req_agent, stored_digest, stored_first_seen_ms, is_pending)) =
                 &request_info
@@ -4394,8 +4378,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
                     AdmissionState::Inconsistent
                 }
             } else if predecessor_receipt_exists {
-                // An obligation without its exact durable request is
-                // an inconsistent split, never an idempotent success.
                 AdmissionState::Inconsistent
             } else {
                 AdmissionState::New
@@ -4444,8 +4426,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
                         break 'admission true;
                     }
                 }
-                // Exact durable pair: idempotent success — durable by a
-                // PREVIOUS accepted delivery, so this is a replay ACK.
                 ack = Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Inserted);
                 replay_after = None;
                 break 'admission false;
@@ -4456,8 +4436,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
                     request_id = %request_id,
                     "ADR 0028: inconsistent durable state — request does not match this envelope binding"
                 );
-                // #942 r3 (B3): terminal — the durable request binding
-                // contradicts this envelope; re-offering can never fix it.
                 ack = Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
                 replay_after = None;
                 break 'admission false;
@@ -4497,8 +4475,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
                 true
             }
             AdmissionState::Repair(stored_first_seen_ms) => {
-                // Watson item 5: for repair, also write the marker
-                // DURABLE before creating the obligation.
                 admission_first_seen_ms = stored_first_seen_ms;
                 let admission = PendingListenerAdmission {
                     group_id: group_id_str.clone(),
@@ -4547,12 +4523,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
                 false
             }
             AdmissionState::PubsubFirst => {
-                // Compatibility path: the durable request has the
-                // byte-identical predecessor digest from an
-                // intermediate-build roster but no first-seen
-                // clock. The live apply path always writes both
-                // together, so this is migration-only. Backfill
-                // only the clock, then create the obligation.
                 admission_first_seen_ms = existing_admission
                     .as_ref()
                     .map_or(now_ms, |marker| marker.first_seen_ms);
@@ -4619,7 +4589,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
             }
         };
 
-        // Now apply the request (only for New; Repair skips apply).
         let group_snapshot = if is_new_request {
             let mut apply_result = Box::pin(apply_named_group_metadata_event_inner_serialized(
                 relay_state,
@@ -4661,9 +4630,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
                         outcome = "refused",
                         "ADR 0028: request refused by validation without mutation; admission journal released"
                     );
-                    // Issue #1840: a requester that sealed over a partial
-                    // or used head waits for its turn, in arrival order.
-                    // The queue needs no journal lock.
                     drop(_journal_guard);
                     // #1840 ask 4: tell the requester, once the release
                     // is durable. Had the marker stayed, the requester's
@@ -4712,17 +4678,10 @@ async fn handle_predecessor_relay_typed_payload_inner(
             }
             apply_result.pre_mutation_group.take()
         } else {
-            // Repair: request already applied, just create obligation.
             replay_after = None;
             None
         };
-        // The snapshot returned by apply (Finding B) is the state BEFORE
-        // the JoinRequestCreated was durably applied, so rollback
-        // actually undoes the request. The previous code read the
-        // post-apply state from named_groups, which already
-        // contained the applied request.
 
-        // Collect active witness targets (non-local active members).
         let relay_targets = {
             let groups = relay_state.named_groups.read().await;
             groups
@@ -4772,13 +4731,10 @@ async fn handle_predecessor_relay_typed_payload_inner(
             let combined_count = daemon_count + completed_count;
             let combined_bytes = daemon_bytes + completed_bytes;
             let group_outbox = outbox.entry(group_id_str.clone()).or_default();
-            // Dedup by digest: an already-admitted obligation is an
-            // idempotent replay of a durable record.
             if group_outbox.iter().any(|o| o.digest == obligation.digest) {
                 ack = Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Inserted);
                 break 'admission false;
             }
-            // Per-group combined count cap (live + completed).
             let group_completed_count = {
                 let tombstones = relay_state.completed_relay_tombstones.read().await;
                 tombstones.get(&group_id_str).map(|l| l.len()).unwrap_or(0)
@@ -4790,7 +4746,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
                 );
                 admission_failed = true;
             }
-            // Per-group combined byte cap (live + completed).
             if !admission_failed {
                 let group_live_bytes: usize = group_outbox.iter().map(|o| o.byte_size).sum();
                 let group_completed_bytes: usize = {
@@ -4810,21 +4765,18 @@ async fn handle_predecessor_relay_typed_payload_inner(
                     admission_failed = true;
                 }
             }
-            // Combined daemon-wide count cap (live + completed).
             if !admission_failed && combined_count >= CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP {
                 tracing::warn!(
                     "ADR 0028: combined relay state at daemon count capacity, rejecting"
                 );
                 admission_failed = true;
             }
-            // Combined daemon-wide byte cap (live + completed).
             if !admission_failed
                 && combined_bytes + byte_size > CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP
             {
                 tracing::warn!("ADR 0028: combined relay state at daemon byte capacity, rejecting");
                 admission_failed = true;
             }
-            // 4096 total relay-target cap.
             if !admission_failed
                 && total_targets + obligation.relay_targets.len()
                     > CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP
@@ -4923,8 +4875,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
             }
             break 'admission true;
         }
-        // Persist the relay outbox. Persistence lock is already
-        // held (P→Q). Roll back on failure.
         match save_predecessor_relay_outbox_unlocked(relay_state).await {
             Ok(AtomicWriteOutcome::Durable) => {}
             Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
@@ -4937,7 +4887,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
                     group_id = %group_id_str,
                     "ADR 0028: relay outbox replaced but not directory-durable after admission — keeping journal, not proceeding"
                 );
-                // Keep the marker — do NOT clear pending_listener_admission.
                 break 'admission true;
             }
             _ => {
@@ -4968,8 +4917,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
                             group_id = %group_id_str,
                             "ADR 0028: rolling back JoinRequestCreated after outbox save failure"
                         );
-                        // Finding 1 (Sam 4ea68a9): same persistence-lock-
-                        // held rollback as the admission-failure path.
                         let _roster_persistence_guard =
                             relay_state.named_groups_persistence_lock.lock().await;
                         store_named_group_info(relay_state, &group_id_str, snapshot).await;
@@ -5010,8 +4957,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
                         *relay_state.pending_listener_admission.lock().await = marker;
                     }
                 }
-                // #942 B2/M5: rolled back and staying unavailable — the
-                // sender must retry, so withhold the ACK.
                 ack = Err("predecessor admission rolled back (not durable); retry".to_string());
                 break 'admission true;
             }
@@ -5035,9 +4980,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
                     group_id = %group_id_str,
                     "ADR 0028: listener admission journal clear not durable — re-persisting marker, not proceeding"
                 );
-                // Re-persist the marker durably. If this also
-                // fails, keep the in-memory marker and stay
-                // unavailable — restart recovery will handle it.
                 let marker = PendingListenerAdmission {
                     group_id: group_id_str.clone(),
                     request_id: request_id.clone(),
@@ -5062,8 +5004,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
                         );
                     }
                 }
-                // #942 B2/M5: staying unavailable — withhold the ACK so the
-                // sender's retry schedule re-offers.
                 ack = Err("listener admission clear not durable; retry".to_string());
                 break 'admission true;
             }
@@ -5078,7 +5018,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
         ack = Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Inserted);
         break 'admission false;
     };
-    // Membership lock released here (dropped at end of labeled block).
 
     // Finding 1: replay deferred until after lock release. The
     // replay acquires its own membership lock via _inner_serialized.
@@ -5096,18 +5035,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
     ack
 }
 
-// ---------------------------------------------------------------------------
-// Invite-auth #468/#469 — member-certificate hydration bridge (F1)
-// ---------------------------------------------------------------------------
-
-/// F1 (design v7): idempotent sweep hydrating DIGEST-ONLY member seats
-/// (`certificate == None && certificate_digest.is_some()`) from the agent's
-/// authenticated certificate cache. Per group: under the group membership
-/// lock, [`x0x::groups::GroupInfo::hydrate_member_certificates`] installs
-/// ONLY bytes hashing to the seat's committed digest (mismatch is ignored
-/// inside the helper), and the normal roster mutation helper persists —
-/// ONLY when at least one member was hydrated, so a settled roster is never
-/// churned. Returns the number of members hydrated.
 async fn reconcile_member_certificates_from_cache(state: &AppState) -> usize {
     let cached: Vec<(String, x0x::identity::AgentCertificate)> = state
         .agent
@@ -5122,9 +5049,6 @@ async fn reconcile_member_certificates_from_cache(state: &AppState) -> usize {
     let group_ids: Vec<String> = state.named_groups.read().await.keys().cloned().collect();
     let mut hydrated_total = 0usize;
     for group_id in group_ids {
-        // Restrict the pairs to THIS group's digest-pending seats so the
-        // hydrate logs stay signal; the helper re-checks every digest
-        // regardless.
         let pending: Vec<(String, x0x::identity::AgentCertificate)> = {
             let groups = state.named_groups.read().await;
             let Some(info) = groups.get(&group_id) else {
@@ -5164,9 +5088,6 @@ async fn reconcile_member_certificates_from_cache(state: &AppState) -> usize {
     hydrated_total
 }
 
-/// F1: apply one [`VerifiedCertificate`] event — hydrate this agent's
-/// digest-only seats in every group that has one, under each group's
-/// membership lock, persisting only on change.
 async fn apply_verified_certificate_event(state: &AppState, event: &x0x::VerifiedCertificate) {
     let agent_hex = hex::encode(event.agent_id.as_bytes());
     let digest_hex = event.digest_hex();
@@ -5220,16 +5141,9 @@ async fn run_member_certificate_bridge(
     let mut shutdown = state.shutdown_notify.subscribe();
     loop {
         tokio::select! {
-            changed = shutdown.changed() => {
-                if changed.is_err() {
-                    // Watch sender dropped during teardown — nothing more
-                    // to consume for.
-                }
-                break;
-            }
+            _ = shutdown.changed() => break,
             received = events.recv() => match received {
                 Ok(event) => {
-                    // #1275: shielded, like the reconciles (see below).
                     let apply_state = Arc::clone(&state);
                     let applied = state
                         .run_shielded(Box::pin(async move {
@@ -5272,12 +5186,6 @@ async fn reconcile_member_certificates_shielded(state: &Arc<AppState>) -> bool {
         .is_some()
 }
 
-/// F1: supervise the bridge worker for the daemon's lifetime, following the
-/// server background-task pattern (handle collected in `bg_tasks`, aborted
-/// at shutdown). The worker should only return once shutdown was requested;
-/// if it exits or panics anyway it is re-spawned with backoff so a fault
-/// cannot hot-loop — and every (re)start re-runs the full reconcile, so a
-/// restart never leaves a member seat un-hydrated.
 async fn supervise_member_certificate_bridge(
     state: Arc<AppState>,
     initial_events: broadcast::Receiver<x0x::VerifiedCertificate>,
@@ -5301,8 +5209,6 @@ async fn supervise_member_certificate_bridge(
             }
             joined = &mut worker => {
                 if *state.shutdown_notify.borrow() {
-                    // Worker observed the same shutdown request this select
-                    // raced against — clean exit.
                     break;
                 }
                 if joined.is_ok() {
@@ -5327,10 +5233,6 @@ mod owner_singleton_tests {
 
     use super::*;
 
-    /// WHY (review P0): the default daemon runs with no explicit
-    /// `user_key_path` and no `identity_dir`; the owner record is the
-    /// sibling of the default `~/.x0x/user.key`. A `None` here silently
-    /// disabled enforcement for every default install.
     #[test]
     fn owner_profile_path_resolves_default_install() {
         let config = DaemonConfig {
@@ -5338,15 +5240,11 @@ mod owner_singleton_tests {
             ..DaemonConfig::default()
         };
         let path = owner_profile_path(&config, &None).expect("default install must resolve");
-        // Issue #456: the default routes through the storage resolver —
-        // `$X0X_HOME/owner.json` when overridden (the test harness sets
-        // X0X_HOME), `<home>/.x0x/owner.json` otherwise.
         let expected_home =
             crate::storage::x0x_home_dir().expect("default identity dir resolvable");
         assert!(path.starts_with(&expected_home));
         assert!(path.ends_with("owner.json"));
 
-        // Explicit user key path wins (sibling of that key).
         let custom = PathBuf::from("/custom/dir/user.key");
         let config = DaemonConfig {
             user_key_path: Some(custom.clone()),
@@ -5357,7 +5255,6 @@ mod owner_singleton_tests {
             Some(x0x::profile::OwnerProfile::path_for_key(&custom))
         );
 
-        // Identity dir (named instances) scopes the record into it.
         let dir = PathBuf::from("/instance/data");
         assert_eq!(
             owner_profile_path(&DaemonConfig::default(), &Some(dir.clone())),
@@ -5365,10 +5262,6 @@ mod owner_singleton_tests {
         );
     }
 
-    /// WHY (review R2 regression): enforcement must run BEFORE the builder —
-    /// a mismatched key must not re-issue/persist agent.cert nor spawn tasks.
-    /// Simulated at the unit level: adoption on first sight of an ownerless
-    /// key, refusal when the resident key later differs from the record.
     #[tokio::test]
     async fn prebuild_enforcement_adopts_then_refuses_mismatch_without_building() {
         use x0x::storage::{load_user_keypair_from, save_user_keypair_to};
@@ -5380,7 +5273,6 @@ mod owner_singleton_tests {
             ..DaemonConfig::default()
         };
 
-        // Resident key, no owner record: adopt on first check.
         let first = x0x::identity::UserKeypair::generate().unwrap();
         save_user_keypair_to(&first, &key_path).await.unwrap();
         enforce_owner_singleton_prebuild(&config, &None)
@@ -5402,8 +5294,6 @@ mod owner_singleton_tests {
             )
         );
 
-        // Swap the resident key (as an accidental overwrite would): refuse —
-        // the pre-build check rejects BEFORE any builder work.
         let second = x0x::identity::UserKeypair::generate().unwrap();
         save_user_keypair_to(&second, &key_path).await.unwrap();
         let err = enforce_owner_singleton_prebuild(&config, &None)
@@ -5415,10 +5305,6 @@ mod owner_singleton_tests {
         );
     }
 
-    /// WHY (R3 regression of the round-2 no-key refusal): a RECORDED owner
-    /// whose key file is MISSING must refuse startup — starting anonymously
-    /// would silently drop the install's authority. An unrecorded install
-    /// with no key stays a legitimate anonymous opt-in.
     #[tokio::test]
     async fn prebuild_enforcement_refuses_missing_key_for_recorded_owner() {
         use x0x::storage::save_user_keypair_to;
@@ -5429,7 +5315,6 @@ mod owner_singleton_tests {
             user_key_path: Some(key_path.clone()),
             ..DaemonConfig::default()
         };
-        // Record an owner (via create-style adoption), then LOSE the key.
         let key = x0x::identity::UserKeypair::generate().unwrap();
         save_user_keypair_to(&key, &key_path).await.unwrap();
         enforce_owner_singleton_prebuild(&config, &None)
@@ -5449,7 +5334,6 @@ mod owner_singleton_tests {
             "error names the escape hatch: {err}"
         );
 
-        // No owner recorded + no key: anonymous opt-in, no refusal.
         let clean_dir = tempfile::tempdir().unwrap();
         let clean = DaemonConfig {
             user_key_path: Some(clean_dir.path().join("user.key")),
@@ -5460,10 +5344,6 @@ mod owner_singleton_tests {
             .expect("unrecorded install with no key starts anonymously");
     }
 
-    /// WHY (review R2 regression): a CORRUPT user key must refuse BEFORE
-    /// build too — the builder would otherwise hard-fail later with a
-    /// different (persisted-state-adjacent) error, or worse, on legacy
-    /// paths silently degrade.
     #[tokio::test]
     async fn prebuild_enforcement_refuses_corrupt_user_key() {
         let dir = tempfile::tempdir().unwrap();
@@ -5485,10 +5365,6 @@ mod owner_singleton_tests {
     }
 }
 
-/// Invite-auth #468/#469 (design v6 E2d / v7 F1): the member-certificate
-/// hydration bridge — pre-populated cache ⇒ reconcile hydrates with no
-/// event; ring overflow (`Lagged`) ⇒ the full reconcile recovers; a second
-/// reconcile run hydrates nothing.
 #[cfg(test)]
 mod member_certificate_bridge_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -5529,8 +5405,6 @@ mod member_certificate_bridge_tests {
         }
     }
 
-    /// A group whose members are all DIGEST-ONLY seats:
-    /// `certificate == None && certificate_digest == Some(digest)`.
     fn group_with_digest_only_members(
         members: &[(x0x::identity::AgentId, x0x::identity::AgentCertificate)],
     ) -> (String, x0x::groups::GroupInfo) {
@@ -5572,11 +5446,6 @@ mod member_certificate_bridge_tests {
             .expect("member seat present")
     }
 
-    /// WHY (F1 (i)): certificates that landed in the discovery cache BEFORE
-    /// the bridge ever subscribed (restart, or a peer announced while the
-    /// daemon was starting) must still hydrate their digest-only seats —
-    /// the startup reconcile is cache-driven, not event-driven. No event
-    /// is delivered in this test at all.
     #[tokio::test]
     async fn prepopulated_cache_reconciles_without_any_event() {
         let user = x0x::identity::UserKeypair::generate().unwrap();
@@ -5593,8 +5462,6 @@ mod member_certificate_bridge_tests {
             .await
             .insert(group_id.clone(), info);
 
-        // No subscription exists — the fired event goes nowhere. The cache
-        // alone must drive hydration.
         state
             .agent
             .insert_discovered_agent_for_testing(cached_cert_entry(
@@ -5613,8 +5480,6 @@ mod member_certificate_bridge_tests {
             "hydration keeps the committed digest"
         );
 
-        // The normal mutation helper persisted the hydrated roster: the
-        // durable store carries the member.
         let on_disk = crate::w3h_inline::fs::read_to_string(state.named_groups_path.clone())
             .await
             .unwrap();
@@ -5652,14 +5517,9 @@ mod member_certificate_bridge_tests {
             .await
             .insert(group_id.clone(), info);
 
-        // The receiver the bridge will consume — created BEFORE any
-        // certificate lands, exactly like daemon startup (F1 order).
         let rx = state.agent.subscribe_verified_certificates();
         let worker = tokio::spawn(run_member_certificate_bridge(Arc::clone(&state), rx));
 
-        // Block the worker inside its first apply, then overflow the ring:
-        // A's event, 300 filler agents sharing one filler certificate, and
-        // finally B's event (guaranteed past the 256-slot tail).
         {
             let _roster_guard = state.named_groups.write().await;
             state
@@ -5691,9 +5551,6 @@ mod member_certificate_bridge_tests {
                 .await;
         }
 
-        // The worker unblocks: applies A, observes Lagged, re-runs the full
-        // reconcile (which is what must hydrate B — its event was dropped
-        // by the ring), then drains the surviving tail.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             let b = member_of(&state, &group_id, &hex_b).await;
@@ -5712,8 +5569,6 @@ mod member_certificate_bridge_tests {
         assert!(a.certificate.as_ref().is_some_and(|c| *c == cert_a));
         assert!(b.certificate.as_ref().is_some_and(|c| *c == cert_b));
 
-        // Clean shutdown: the worker exits when the daemon's shutdown
-        // watch fires.
         let _ = state.shutdown_notify.send(true);
         tokio::time::timeout(std::time::Duration::from_secs(10), worker)
             .await
@@ -5721,11 +5576,6 @@ mod member_certificate_bridge_tests {
             .expect("bridge worker exited cleanly");
     }
 
-    /// WHY (F1 (i) idempotence): a settled roster must not be churned — the
-    /// second reconcile run hydrates ZERO seats (byte-bearing seats are
-    /// skipped by `hydrate_member_certificates`), which the unchanged
-    /// `updated_at` stamp proves: a real hydration re-stamps it via
-    /// `set_member_certificate`.
     #[tokio::test]
     async fn second_reconcile_run_hydrates_nothing() {
         let user = x0x::identity::UserKeypair::generate().unwrap();
@@ -5766,12 +5616,6 @@ mod member_certificate_bridge_tests {
         assert_eq!(second.certificate, first.certificate);
     }
 
-    /// #1275: the supervisor aborts the bridge worker as soon as shutdown
-    /// is signalled, before the drain's grace even starts. A hydration the
-    /// worker has started persists the roster, so it must not be cut off in
-    /// the middle of that write: the drain waits for it, the write
-    /// completes, and no temp file is left. The write is parked after its
-    /// temp file is synced and before the rename (the #1269 write pause).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn issue1275_hydration_is_not_aborted_mid_write_at_shutdown() {
         use crate::server::routes::named_groups::atomic_write_test_seam;
@@ -5790,8 +5634,6 @@ mod member_certificate_bridge_tests {
             .write()
             .await
             .insert(group_id.clone(), info);
-        // Nothing is on disk yet: the file gets the group (and the member)
-        // only through the hydration's write.
         let path = state.named_groups_path.clone();
         let pause = atomic_write_test_seam::arm(&path);
         let rx = state.agent.subscribe_verified_certificates();
@@ -5812,7 +5654,6 @@ mod member_certificate_bridge_tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
 
-        // The supervisor sees shutdown and aborts its worker at once.
         let _ = state.shutdown_notify.send(true);
         let outcome = stop_while_write_parked(&state, vec![supervisor], &pause, &path, &agent_hex)
             .await
@@ -5825,18 +5666,6 @@ mod member_certificate_bridge_tests {
         assert!(member.certificate.as_ref().is_some_and(|c| *c == cert));
     }
 
-    /// WHY (r4 / addendum item 5): the supervisor must RESPAWN a bridge
-    /// worker that dies mid-stream, and every (re)start re-runs the FULL
-    /// cache reconcile — a digest-only seat created while the worker was
-    /// down hydrates after the restart with NO new event. The initial
-    /// worker is killed deterministically by feeding it a receiver whose
-    /// channel then CLOSES (`RecvError::Closed` → clean worker exit —
-    /// exactly the "worker died, shutdown was NOT requested" arm the
-    /// supervisor restarts on); the sentinel member A proves worker 1
-    /// was alive and past its initial reconcile (its certificate lives
-    /// ONLY in the synthetic event, never in the cache), and member B's
-    /// cache entry lands only after the death — only worker 2's
-    /// startup reconcile can hydrate it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn supervisor_respawns_worker_and_reconciles_after_death() {
         let user = x0x::identity::UserKeypair::generate().unwrap();
@@ -5848,8 +5677,6 @@ mod member_certificate_bridge_tests {
         let hex_b = hex::encode(b_kp.agent_id().as_bytes());
 
         let (state, _dir) = secure_endpoint_test_state().await.unwrap();
-        // Both members seat digest-only; A's cert rides ONLY the
-        // synthetic event channel, B's ONLY the discovery cache.
         let (group_id, info) = group_with_digest_only_members(&[
             (a_kp.agent_id(), cert_a.clone()),
             (b_kp.agent_id(), cert_b.clone()),
@@ -5860,16 +5687,12 @@ mod member_certificate_bridge_tests {
             .await
             .insert(group_id.clone(), info);
 
-        // The synthetic channel whose closure kills worker 1.
         let (event_tx, event_rx) = tokio::sync::broadcast::channel::<x0x::VerifiedCertificate>(8);
         let supervisor = tokio::spawn(supervise_member_certificate_bridge(
             std::sync::Arc::clone(&state),
             event_rx,
         ));
 
-        // Sentinel: A hydrates ONLY through the synthetic event, proving
-        // worker 1 subscribed to OUR channel and finished its initial
-        // reconcile (the cache holds no entry for A).
         let digest_a = *blake3::hash(bincode::serialize(&cert_a).unwrap().as_slice()).as_bytes();
         let _ = event_tx.send(x0x::VerifiedCertificate {
             agent_id: a_kp.agent_id(),
@@ -5892,23 +5715,12 @@ mod member_certificate_bridge_tests {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
 
-        // Kill worker 1 mid-stream: closing the channel exits its loop
-        // (Closed), which the supervisor treats as an early exit and
-        // respawns after backoff — subscription switches to the AGENT
-        // channel, whose startup reconcile is cache-driven.
         drop(event_tx);
-        // While the worker is down/upcoming, B's certificate lands ONLY
-        // in the discovery cache (a raw write that fires an event on the
-        // AGENT channel — missed if worker 2 has not subscribed yet; the
-        // reconcile covers it either way).
         state.agent.identity_discovery_cache().write().await.insert(
             b_kp.agent_id(),
             cached_cert_entry(b_kp.agent_id(), cert_b.clone()),
         );
 
-        // The fresh worker's full reconcile hydrates B — impossible
-        // without a respawn (worker 1 is dead and its only reconcile ran
-        // before B's entry existed).
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
         loop {
             if member_of(&state, &group_id, &hex_b)
@@ -5931,8 +5743,6 @@ mod member_certificate_bridge_tests {
             Some(x0x::groups::owner_cert::certificate_digest_hex(&cert_b).as_str())
         );
 
-        // Clean shutdown: the supervisor (still alive after the respawn)
-        // exits on the daemon's shutdown watch.
         let _ = state.shutdown_notify.send(true);
         tokio::time::timeout(std::time::Duration::from_secs(10), supervisor)
             .await
@@ -5946,11 +5756,6 @@ mod startup_update_check_tests {
     use crate::server::{serve_with_options, DaemonConfig, ServeOptions};
     use std::time::{Duration, Instant};
 
-    /// Points the test-only upgrade-monitor API base override
-    /// (`upgrade::monitor::TEST_API_BASE_OVERRIDE`) at `base` and restores
-    /// the prior value on drop, so the redirect cannot leak into sibling
-    /// tests in the same process. The seam is `cfg(test)`-only: release
-    /// builds have no configurable update source.
     struct ApiBaseOverrideGuard {
         previous: Option<String>,
     }
@@ -5994,17 +5799,12 @@ mod startup_update_check_tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
-        // Black-hole update endpoint: accepts the TCP connection and never
-        // answers — the update request then blocks until the monitor's 30 s
-        // client timeout, exactly the firewalled-egress shape from the
-        // issue. No external network is touched.
         let blackhole =
             std::net::TcpListener::bind("127.0.0.1:0").expect("bind black-hole listener");
         let blackhole_addr = blackhole.local_addr().expect("black-hole address");
         let accepted = Arc::new(AtomicUsize::new(0));
         let accepted_counter = Arc::clone(&accepted);
         std::thread::spawn(move || {
-            // Hold every accepted connection open without ever responding.
             let mut held = Vec::new();
             while let Ok((mut stream, _)) = blackhole.accept() {
                 let _ = stream.read(&mut [0u8; 1024]);
@@ -6013,7 +5813,6 @@ mod startup_update_check_tests {
             }
         });
 
-        // Aim every update fetch at the black hole BEFORE serving.
         let _api_base = ApiBaseOverrideGuard::set(format!("http://{blackhole_addr}"));
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6028,8 +5827,6 @@ mod startup_update_check_tests {
             ..DaemonConfig::default()
         };
         config.history.enabled = false;
-        // The daemon startup shape the issue describes: `[update] enabled`
-        // (the default) and self-update not skipped for this process.
         assert!(
             config.update.enabled,
             "`[update] enabled` must be the default for this test to mean anything"
@@ -6048,8 +5845,6 @@ mod startup_update_check_tests {
                 .expect("serve must not wait on the startup update check (20 s budget)")
                 .expect("hermetic serve");
 
-        // Readiness is an HTTP fact, not the handle: `/health` (auth-exempt)
-        // must answer while the update check is still hung on the black hole.
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
@@ -6082,8 +5877,6 @@ mod startup_update_check_tests {
              both be fetching from the update source"
         );
 
-        // Shutdown stays prompt: the supervisor's bounded drain aborts the
-        // hung fetch tasks instead of waiting out their HTTP timeout.
         tokio::time::timeout(Duration::from_secs(30), handle.shutdown_and_wait())
             .await
             .expect("shutdown must complete despite the hung update check")
@@ -6097,9 +5890,6 @@ mod socks_startup_port_release_tests {
 
     use crate::server::{serve_with_options, DaemonConfig, ServeOptions};
 
-    /// A startup failure after the SOCKS listener binds must drop that
-    /// listener. The old path returned from `finish_startup_error` without
-    /// cancelling SOCKS, so the accept task kept the port.
     #[tokio::test]
     async fn startup_failure_after_socks_bind_releases_the_port() {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind free port");
@@ -6183,8 +5973,6 @@ targets = [\"127.0.0.1:22\"]
 #[cfg(test)]
 mod identity_ingest_authority_tests;
 
-/// #1868 review round 4: the group case of #1863 through the check that
-/// `x0xd` installs and the heartbeat step, with the agent's own sources.
 #[cfg(test)]
 mod revocation_group_seen_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -6269,10 +6057,6 @@ mod revocation_group_seen_tests {
         );
     }
 
-    /// #1867: the local apply path marks while another task holds the
-    /// roster for write. The check waits for the lock, so the active
-    /// member's self-revocation is published. The wrapper tells the test
-    /// when the check starts; then the test releases the roster.
     #[tokio::test]
     async fn a_held_roster_lock_still_publishes_an_active_member_1867() {
         use std::sync::Arc;
@@ -6345,9 +6129,6 @@ mod revocation_group_seen_tests {
         );
     }
 
-    /// #1867: the heartbeat step asks the roster one time for all the held
-    /// strangers, not one time for each. A flood of strangers' records
-    /// then cannot hold the ingest behind every roster writer.
     #[tokio::test]
     async fn the_roster_is_read_one_time_for_all_held_strangers_1867() {
         use std::sync::atomic::{AtomicUsize, Ordering};
