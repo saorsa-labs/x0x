@@ -5,7 +5,8 @@
 //! bring the existing member to the new roster and epoch.
 //!
 //! ```text
-//! cargo nextest run --all-features --test issue2048_invite_join_existing_member --run-ignored all
+//! python3 scripts/dev/test-isolated.py nextest --all-features \
+//!   --test issue2048_invite_join_existing_member -- --run-ignored ignored-only
 //! ```
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
@@ -57,6 +58,7 @@ async fn start(client: &reqwest::Client, quic_port: u16, bootstrap: Vec<SocketAd
         "bind_address": format!("127.0.0.1:{quic_port}"),
         "bootstrap_peers": bootstrap,
         "mdns_enabled": false,
+        "port_mapping_enabled": false,
         "update": {"enabled": false},
         "data_dir": dir.path().join("data"),
         "identity_dir": dir.path().join("identity"),
