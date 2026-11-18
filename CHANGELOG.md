@@ -19,6 +19,16 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`x0x autostart --repair --launcher` and launchd acceptance (#1379;
+  A14 amendment of 18 Nov 2026).** The hidden, opt-in `--repair --launcher`
+  moves an existing x0xd launchd job onto the dormant stable launcher. It
+  keeps the job's label and keys, verifies the readback, and restores the
+  backup on failure. `x0x autostart --launcher` now checks the whole
+  launcher argv, uses the canonical `x0xd` and the stable launcher link,
+  refuses to replace another instance's job, and restores the previous job
+  when `bootout` or `bootstrap` fails. A new
+  `scripts/ci/macos-launchd-acceptance.sh` runs an isolated launchd job. It
+  measured that launchd's process-group cleanup sends SIGTERM only.
 - **Relay serving follows participation mode (#1642; A06 amendment of
   18 Nov 2026).** New `NetworkConfig.relay_service_enabled` (default `true`)
   is passed to ant-quic. x0xd reads an optional TOML `relay_service_enabled`;

@@ -89,7 +89,8 @@ enum Commands {
         repair: bool,
         /// Run the daemon through the stable launcher installed next to
         /// x0xd (launchd only; opt-in while the launcher is dormant). [dev]
-        #[arg(long, hide = true, conflicts_with_all = ["remove", "repair"])]
+        /// With `--repair`, move each existing x0xd job onto the launcher.
+        #[arg(long, hide = true, conflicts_with = "remove")]
         launcher: bool,
     },
     /// Health check.
@@ -2450,7 +2451,7 @@ async fn run(
             return if *remove {
                 commands::daemon::autostart_remove().await
             } else if *repair {
-                commands::daemon::autostart_repair().await
+                commands::daemon::autostart_repair(*launcher).await
             } else {
                 commands::daemon::autostart(name, *launcher).await
             };

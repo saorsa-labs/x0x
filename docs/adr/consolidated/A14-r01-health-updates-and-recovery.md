@@ -112,6 +112,15 @@ Launcher refusal classes and launchd detection (amendment of 17 Nov 2026, #2015 
 
 Refusal record identity and launcher-bound autostart (amendment of 18 Nov 2026, #2019 review, #1379). This amends the paragraph above. (1) A trial-form start removes the earlier refusal record before it starts, not when it returns, because a start that supervises the daemon returns only when the daemon ends. (2) The record also holds the launcher's process start time, and `x0x doctor` shows the launcher as holding only while a process with that pid and start time exists, so a pid reused after a Linux exit 78 is not read as a holding launcher. (3) `x0x autostart --launcher` (macOS, hidden and opt-in while the launcher is dormant) installs the launchd job in the trial form with the launcher next to `x0xd`, the canonical data directory as host root and the `--name` (else `default`) as instance, checked with the launcher's own parser before anything is written. Every macOS autostart plist is written in one step (temporary file, mode 0644, fsync, rename, directory fsync) and loaded with `launchctl bootstrap gui/<uid>`. Authority: Claude under David's delegation, 10 Nov 2026.
 
+Launchd migration and measured process-group limit (amendment of 18 Nov 2026, #1379, #2063 review). This amends the two paragraphs above.
+- **Launcher-bound autostart job.** It names the launcher by its absolute path next to `x0xd` as found, not resolved through symlinks, and the daemon by its canonical path. The whole launcher argv is checked with the launcher's parser before it is written.
+- **One label serves one instance.** Autostart refuses to replace another instance's job.
+- **Reloading.** A failed `bootout` or `bootstrap` restores the previous job file, and reloads it when it was loaded.
+- **`x0x autostart --repair --launcher`** moves a job the plain repair accepts onto the launcher's trial form. It keeps every key except the program, its arguments and `ExitTimeOut`, and verifies the readback, else it restores the backup. It refuses a job that passes `--config`, because the host root is then unknown.
+- **Measured on macOS 27.** launchd's process-group cleanup (bootout, or the job's main process dying) sends SIGTERM only, so a group member that ignores SIGTERM survives it. The earlier wording that the cleanup "removes a surviving child" is too strong. Safety then rests on the launcher: its next start waits up to 45 s for the prior child and then holds, so two daemons never share the data roots.
+
+Authority: Claude under David's delegation, 10 Nov 2026.
+
 ## Consequences
 
 Updates can be checked and recovered under owner policy. Independent rollback and exact artifact evidence add release work. A successful publication alone cannot prove that deployed devices are healthy.

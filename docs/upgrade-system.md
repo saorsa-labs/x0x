@@ -1036,15 +1036,68 @@ stopped instead of exiting. launchd then shows the job running with no
 daemon; `x0x doctor` shows the launcher's refusal reason.
 
 `x0x autostart --launcher` (hidden, macOS only, opt-in while the launcher
-is dormant) installs the job with the trial form: the `x0x-launcher`
-installed next to `x0xd`, `--host-root` the canonical data directory,
-`--instance` the `--name` or `default`, and `ExitTimeOut` 60 s. A name the
-launcher would refuse, or a missing launcher, fails before anything is
-written. Every `x0x autostart` on macOS writes the plist in one step (a
-new temporary file, mode 0644, fsync, rename, directory fsync) and loads
-it into the user's GUI domain with `launchctl bootout` and `launchctl
-bootstrap gui/<uid>`; `--remove` uses `bootout`. `--repair` does not move
-an existing job onto the launcher yet.
+is dormant) installs the job in the trial form:
+- the `x0x-launcher` next to `x0xd` as found, made absolute but not
+  resolved through symlinks, so a package manager's stable link is kept;
+- `--host-root` is the canonical data directory, and `--instance` is the
+  `--name`, or `default`;
+- the canonical `x0xd`, because the journal names the canonical install
+  path;
+- `ExitTimeOut` 60 s.
+
+The whole launcher argv is checked with the launcher's own parser before
+anything is written, so a job the launcher would refuse (a relative
+daemon, an invalid instance) is never installed. A package-manager
+upgrade that moves the canonical `x0xd` needs `x0x autostart --launcher`
+again.
+
+One label (`com.saorsalabs.x0xd`) serves one instance. `x0x autostart`
+refuses to replace a job under that label that starts another `--name`;
+remove it first with `x0x autostart --remove`.
+
+Every `x0x autostart` on macOS writes the plist in one step (a new
+temporary file, mode 0644, fsync, rename, directory fsync). It then loads
+the plist with `launchctl bootout` and `launchctl bootstrap gui/<uid>`.
+The previous plist is kept until the new job loads:
+- if `bootout` leaves the old job loaded, the old file is restored and
+  nothing changes;
+- if `bootstrap` fails, the old file is restored and loaded again, or,
+  when there was none, the new file is removed.
+
+`--remove` uses `bootout`.
+
+`x0x autostart --repair --launcher` moves each existing x0xd job onto the
+launcher. It moves only a job that the plain repair accepts (`KeepAlive`
+true, no `AbandonProcessGroup`), and keeps its label, environment, log
+paths and every other key. It writes the trial-form `ProgramArguments`
+(the launcher next to the job's daemon path, the instance's canonical
+default data directory, the canonical daemon, and the job's own
+arguments), removes `Program`, and sets `ExitTimeOut` to 60 s when it is
+absent or 45 s or less. It also adds the supervision marker if it is
+missing.
+
+The plist is backed up first, and the readback must be supervised,
+launcher-bound and carry exactly the planned arguments; otherwise the
+backup is restored. A job that passes `--config` is refused, because its
+data directory is not known from the job. The repair does not reload the
+job; it prints the `bootout` and `bootstrap` commands.
+
+`scripts/ci/macos-launchd-acceptance.sh /abs/x0x-launcher` is the isolated
+launchd acceptance. It loads a throwaway job (its own label and roots in
+a temporary directory) into the user's GUI domain, running the launcher
+in the trial form over a fake daemon. The run of 18 Nov 2026 (macOS 27,
+the dormant launcher) found:
+- a daemon that ends on SIGTERM stops at once on `bootout`;
+- a daemon that ignores SIGTERM is SIGKILLed at the job's `ExitTimeOut`
+  (25 s in the test, not launchd's 20 s default);
+- when the launcher is SIGKILLed, launchd ends the rest of its process
+  group.
+
+**Limit:** launchd's process-group cleanup sends SIGTERM only. A group
+member that ignores SIGTERM, or hangs in its shutdown, outlives both
+`bootout` and a crash of the launcher. The launcher's next start then
+finds the prior child still running, waits 45 s, and holds (a final
+refusal) instead of starting a second daemon.
 
 The handoff transaction (`upgrade::restart`):
 

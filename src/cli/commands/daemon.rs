@@ -724,10 +724,25 @@ fn render_launchd_plist_with(
         for value in [binding.launcher, binding.host_root, binding.instance] {
             validate_autostart_value(value)?;
         }
-        if !Path::new(binding.launcher).is_absolute() || !Path::new(binding.host_root).is_absolute()
-        {
-            anyhow::bail!("launcher and host root must be absolute paths");
+        if !Path::new(binding.launcher).is_absolute() {
+            anyhow::bail!("the launcher must be an absolute path");
         }
+        // The whole launcher argv, checked with the launcher's own parser
+        // (#2063 review): a job it would refuse (a relative daemon, an
+        // invalid instance) exits 64 under KeepAlive every 10 s.
+        let launcher_argv: Vec<&str> = [
+            "--host-root",
+            binding.host_root,
+            "--instance",
+            binding.instance,
+            "--",
+            executable,
+        ]
+        .into_iter()
+        .chain(args.iter().map(String::as_str))
+        .collect();
+        crate::upgrade::launcher_contract::parse_launcher_argv(&launcher_argv)
+            .map_err(|usage| anyhow::anyhow!("the launcher would refuse this job: {usage}"))?;
         program.extend([
             binding.launcher,
             "--host-root",
@@ -847,21 +862,22 @@ fn autostart_instance_id(name: Option<&str>) -> Result<String> {
     Ok(instance.to_owned())
 }
 
-/// The stable launcher installed next to `x0xd`, canonical.
+/// The stable launcher installed next to `x0xd` as it was found, made
+/// absolute but not resolved through symlinks (#2063 review): on a
+/// package-manager install the stable `bin/x0x-launcher` link survives an
+/// upgrade, while the versioned file it points to does not.
 #[cfg(target_os = "macos")]
 fn sibling_launcher(x0xd: &Path) -> Result<std::path::PathBuf> {
-    let launcher = x0xd
-        .parent()
-        .context("x0xd has no parent directory")?
-        .join(crate::upgrade::launcher_contract::LAUNCHER_BASENAME);
-    let launcher = launcher.canonicalize().with_context(|| {
-        format!(
+    let launcher = std::path::absolute(
+        x0xd.parent()
+            .context("x0xd has no parent directory")?
+            .join(crate::upgrade::launcher_contract::LAUNCHER_BASENAME),
+    )?;
+    if !launcher.is_file() {
+        anyhow::bail!(
             "--launcher needs {} installed next to x0xd",
             launcher.display()
-        )
-    })?;
-    if !launcher.is_file() {
-        anyhow::bail!("{} is not a file", launcher.display());
+        );
     }
     Ok(launcher)
 }
@@ -910,17 +926,114 @@ fn launchd_gui_domain() -> String {
     format!("gui/{}", unsafe { libc::getuid() })
 }
 
-/// Remove the autostart job from this user's GUI domain, if it is loaded.
+/// Whether the job `label` is loaded in `domain` (`launchctl print`).
 #[cfg(target_os = "macos")]
-fn launchd_bootout(domain: &str) {
-    let _ = std::process::Command::new("launchctl")
-        .args(["bootout", &format!("{domain}/{AUTOSTART_LAUNCHD_LABEL}")])
-        .output();
+fn launchd_job_loaded(domain: &str, label: &str) -> bool {
+    std::process::Command::new("launchctl")
+        .args(["print", &format!("{domain}/{label}")])
+        .output()
+        .is_ok_and(|out| out.status.success())
 }
 
-/// Label of the launchd job `x0x autostart` installs.
+/// Unload the job `label` from `domain`. `bootout` fails for a job that is
+/// not loaded, so its result is judged by whether the job is still loaded
+/// afterwards (#2063 review): an error only when it is.
 #[cfg(target_os = "macos")]
+fn launchd_bootout(domain: &str, label: &str) -> Result<()> {
+    let out = std::process::Command::new("launchctl")
+        .args(["bootout", &format!("{domain}/{label}")])
+        .output()
+        .context("failed to run launchctl bootout")?;
+    if launchd_job_loaded(domain, label) {
+        anyhow::bail!(
+            "launchctl bootout {domain}/{label} left the job loaded ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Load `plist` into `domain`.
+#[cfg(target_os = "macos")]
+fn launchd_bootstrap(domain: &str, plist: &Path) -> Result<()> {
+    let out = std::process::Command::new("launchctl")
+        .args(["bootstrap", domain])
+        .arg(plist)
+        .output()
+        .context("failed to run launchctl bootstrap")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "launchctl bootstrap {domain} {} failed ({}): {}",
+            plist.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Replace the job file at `plist` with `bytes` and reload it in `domain`
+/// (#2063 review). The previous file is kept until the new job loads:
+/// - a failed `bootout` (the old job stays loaded) restores the old file
+///   and changes nothing;
+/// - a failed `bootstrap` restores the old file and loads it again, or
+///   removes the new file when there was none, so the file on disk is
+///   never one that launchd did not load.
+#[cfg(target_os = "macos")]
+fn replace_launchd_job(domain: &str, label: &str, plist: &Path, bytes: &[u8]) -> Result<()> {
+    let previous = match std::fs::read(plist) {
+        Ok(previous) => Some(previous),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).with_context(|| format!("read {}", plist.display())),
+    };
+    let restore = || -> Result<()> {
+        match &previous {
+            Some(previous) => write_file_atomically(plist, previous, 0o644),
+            None => {
+                std::fs::remove_file(plist).with_context(|| format!("remove {}", plist.display()))
+            }
+        }
+    };
+    write_file_atomically(plist, bytes, 0o644)?;
+    if let Err(error) = launchd_bootout(domain, label) {
+        restore()?;
+        return Err(error.context("the previous job file was restored; nothing changed"));
+    }
+    if let Err(error) = launchd_bootstrap(domain, plist) {
+        restore()?;
+        let reloaded = previous.is_some() && launchd_bootstrap(domain, plist).is_ok();
+        let state = if reloaded {
+            "the previous job was restored and loaded again"
+        } else if previous.is_some() {
+            "the previous job file was restored but is not loaded; load it with launchctl \
+             bootstrap"
+        } else {
+            "the new job file was removed; no job is installed"
+        };
+        return Err(error.context(state.to_string()));
+    }
+    Ok(())
+}
+
+/// Label of the launchd job `x0x autostart` installs. One label serves
+/// every `--name`: a second instance's autostart is refused rather than
+/// replacing the first instance's job (`existing_job_conflict`).
+#[cfg(any(test, target_os = "macos"))]
 const AUTOSTART_LAUNCHD_LABEL: &str = "com.saorsalabs.x0xd";
+
+/// The default data directory of an instance (`x0x`, or `x0x-<name>`),
+/// created if missing, canonical (the launcher's host root, A14).
+#[cfg(target_os = "macos")]
+fn instance_data_dir(name: Option<&str>) -> Result<std::path::PathBuf> {
+    let base = dirs::data_dir().context("cannot determine data directory")?;
+    let data_dir = match name {
+        Some(n) => base.join(format!("x0x-{n}")),
+        None => base.join("x0x"),
+    };
+    std::fs::create_dir_all(&data_dir)?;
+    Ok(data_dir.canonicalize()?)
+}
 
 /// `x0x autostart` — configure daemon to start on boot. With `launcher`
 /// (macOS, opt-in while the launcher is dormant) the launchd job runs the
@@ -989,30 +1102,23 @@ pub async fn autostart(name: Option<&str>, launcher: bool) -> Result<()> {
         if let Some(n) = name {
             args.extend(["--name".to_string(), n.to_string()]);
         }
-        // Check the launcher binding before anything is written.
-        let instance = if launcher {
-            Some(autostart_instance_id(name)?)
+        // Refuse to take over another instance's job (one label).
+        existing_job_conflict(read_plist_as_json(&plist_path)?.as_ref(), name)?;
+        // Check the launcher binding before anything is written. The
+        // trial form needs the canonical daemon (A14: the participant's
+        // executable is the canonical install path); the launcher stays
+        // the stable path next to x0xd as found.
+        let (instance, launcher_path, x0xd) = if launcher {
+            (
+                Some(autostart_instance_id(name)?),
+                Some(sibling_launcher(&x0xd_path)?),
+                x0xd_path.canonicalize()?.to_string_lossy().into_owned(),
+            )
         } else {
-            None
-        };
-        let launcher_path = if launcher {
-            Some(sibling_launcher(&x0xd_path)?)
-        } else {
-            None
+            (None, None, x0xd.into_owned())
         };
 
-        let data_dir = if let Some(n) = name {
-            dirs::data_dir()
-                .context("cannot determine data directory")?
-                .join(format!("x0x-{n}"))
-        } else {
-            dirs::data_dir()
-                .context("cannot determine data directory")?
-                .join("x0x")
-        };
-        std::fs::create_dir_all(&data_dir)?;
-        // The launcher requires a canonical host root (A14).
-        let data_dir = data_dir.canonicalize()?;
+        let data_dir = instance_data_dir(name)?;
         let log_path = data_dir.join("x0xd.log");
 
         // The pure renderer used by tests is the only template path.
@@ -1027,21 +1133,15 @@ pub async fn autostart(name: Option<&str>, launcher: bool) -> Result<()> {
             _ => None,
         };
         let plist = render_launchd_plist_with(&x0xd, &args, &log_path, binding.as_ref())?;
-        // launchd refuses a job file that others can write: 0644.
-        write_file_atomically(&plist_path, plist.as_bytes(), 0o644)?;
-
-        // Replace any loaded job in this user's GUI domain, then load the
-        // new one so it starts now and at login.
-        let domain = launchd_gui_domain();
-        launchd_bootout(&domain);
-        let status = std::process::Command::new("launchctl")
-            .args(["bootstrap", &domain])
-            .arg(&plist_path)
-            .status()
-            .context("failed to run launchctl bootstrap")?;
-        if !status.success() {
-            anyhow::bail!("launchctl bootstrap {domain} failed (exit {status})");
-        }
+        // Replace any loaded job in this user's GUI domain and load the new
+        // one so it starts now and at login; on failure the previous job
+        // file is restored.
+        replace_launchd_job(
+            &launchd_gui_domain(),
+            AUTOSTART_LAUNCHD_LABEL,
+            &plist_path,
+            plist.as_bytes(),
+        )?;
 
         println!("Autostart enabled (launchd agent)");
         println!("  Plist:  {}", plist_path.display());
@@ -1279,6 +1379,159 @@ pub(crate) fn classify_launchd_job(plist: &serde_json::Value) -> RepairVerdict {
     }
 }
 
+/// The first `--name value` or `--name=value` in a daemon's arguments, as
+/// x0xd reads it (`cli_name_argument`).
+#[cfg(any(test, target_os = "macos"))]
+fn daemon_name_argument(args: &[String]) -> Option<String> {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--name" {
+            return args.next().cloned();
+        }
+        if let Some(value) = arg.strip_prefix("--name=") {
+            return Some(value.to_owned());
+        }
+    }
+    None
+}
+
+/// The arguments of a launchd job (`ProgramArguments`), if they are text.
+#[cfg(any(test, target_os = "macos"))]
+fn launchd_job_arguments(job: &serde_json::Value) -> Option<Vec<String>> {
+    job.get("ProgramArguments")?
+        .as_array()?
+        .iter()
+        .map(|value| value.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// The instance an x0xd launchd job starts: `Some(None)` for the default
+/// instance, `Some(Some(name))` for `--name name`, `None` when the job is
+/// not an x0xd job this can read.
+#[cfg(any(test, target_os = "macos"))]
+fn launchd_job_instance(job: &serde_json::Value) -> Option<Option<String>> {
+    let arguments = launchd_job_arguments(job)?;
+    let daemon = crate::upgrade::restart::launchd_job_daemon(
+        job.get("Program").and_then(|p| p.as_str()),
+        &arguments,
+    )?
+    .ok()?;
+    if program_basename(daemon.executable) != "x0xd" {
+        return None;
+    }
+    Some(daemon_name_argument(daemon.args))
+}
+
+/// One label serves every `--name` (#2063 review): refuse to replace the
+/// autostart job when it starts another instance, so a second instance's
+/// `x0x autostart` cannot silently take over the first one's job.
+#[cfg(any(test, target_os = "macos"))]
+fn existing_job_conflict(existing: Option<&serde_json::Value>, name: Option<&str>) -> Result<()> {
+    let Some(other) = existing.and_then(launchd_job_instance) else {
+        return Ok(());
+    };
+    if other.as_deref() == name {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "the autostart job {AUTOSTART_LAUNCHD_LABEL} already starts instance {}; one job \
+         serves one instance, so run `x0x autostart --remove` first to replace it",
+        other.as_deref().unwrap_or("default")
+    )
+}
+
+/// How `x0x autostart --repair --launcher` moves one x0xd job onto the
+/// stable launcher (#1379).
+#[cfg(any(test, target_os = "macos"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LauncherMigration {
+    /// The new `ProgramArguments`: the launcher's trial form, then the
+    /// daemon (canonical) and its unchanged arguments.
+    pub(crate) program_arguments: Vec<String>,
+    /// The job sets `Program`, which launchd would still run: remove it.
+    pub(crate) remove_program: bool,
+    /// `ExitTimeOut` is absent or not above the launcher's worst-case stop.
+    pub(crate) set_exit_timeout: bool,
+}
+
+/// What `plan_launcher_migration` reads from the host.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) struct MigrationHost<'a> {
+    /// The canonical daemon executable for the job's daemon path.
+    pub(crate) canonical_daemon: &'a dyn Fn(&str) -> Result<String>,
+    /// The stable launcher next to the job's daemon path.
+    pub(crate) launcher_for: &'a dyn Fn(&str) -> Result<String>,
+    /// The canonical data directory of an instance (`None`: default).
+    pub(crate) host_root: &'a dyn Fn(Option<&str>) -> Result<String>,
+}
+
+/// Plan the migration of one launchd job onto the launcher. `Ok(None)` when
+/// the job already runs the launcher. Only an x0xd job that the plain
+/// repair accepts (KeepAlive true, no AbandonProcessGroup) is moved. The
+/// label, environment, log paths, KeepAlive and every other key stay; only
+/// the program, its arguments and `ExitTimeOut` change. A job whose daemon
+/// arguments name a `--config` is refused, since its data directory (the
+/// host root) is not known from the job.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn plan_launcher_migration(
+    job: &serde_json::Value,
+    host: &MigrationHost<'_>,
+) -> Result<Option<LauncherMigration>> {
+    match classify_launchd_job(job) {
+        RepairVerdict::AlreadySupervised | RepairVerdict::Repairable { .. } => {}
+        RepairVerdict::Refused(reason) => anyhow::bail!(reason),
+        RepairVerdict::NotAnX0xdJob => anyhow::bail!("not an x0xd job"),
+    }
+    let arguments = launchd_job_arguments(job).context("job has no text ProgramArguments")?;
+    let daemon = crate::upgrade::restart::launchd_job_daemon(
+        job.get("Program").and_then(|p| p.as_str()),
+        &arguments,
+    )
+    .context("job names no executable")?
+    .map_err(|usage| anyhow::anyhow!(usage))?;
+    if daemon.via_launcher {
+        return Ok(None);
+    }
+    if !Path::new(daemon.executable).is_absolute() {
+        anyhow::bail!("the job's daemon path is relative; the launcher needs an absolute one");
+    }
+    if daemon.args.iter().any(|arg| arg == "--config") {
+        anyhow::bail!(
+            "the job passes --config, so its data directory (the launcher's host root) is not \
+             known from the job; migrate it by hand"
+        );
+    }
+    let name = daemon_name_argument(daemon.args);
+    let instance = autostart_instance_id(name.as_deref())?;
+    let root = (host.host_root)(name.as_deref())?;
+    let launcher = (host.launcher_for)(daemon.executable)?;
+    let executable = (host.canonical_daemon)(daemon.executable)?;
+    let program_arguments: Vec<String> = [
+        launcher.as_str(),
+        "--host-root",
+        root.as_str(),
+        "--instance",
+        instance.as_str(),
+        "--",
+        executable.as_str(),
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .chain(daemon.args.iter().cloned())
+    .collect();
+    crate::upgrade::launcher_contract::parse_launcher_argv(&program_arguments[1..])
+        .map_err(|usage| anyhow::anyhow!("the launcher would refuse the migrated job: {usage}"))?;
+    let set_exit_timeout = job
+        .get("ExitTimeOut")
+        .and_then(serde_json::Value::as_u64)
+        .is_none_or(|seconds| seconds <= LAUNCHER_STOP_WORST_CASE_SECS);
+    Ok(Some(LauncherMigration {
+        program_arguments,
+        remove_program: job.get("Program").is_some(),
+        set_exit_timeout,
+    }))
+}
+
 /// `x0x autostart --repair` — migrate an existing hand-written launchd job to
 /// the supervised-upgrade contract (ADR-0061, #493).
 ///
@@ -1287,7 +1540,9 @@ pub(crate) fn classify_launchd_job(plist: &serde_json::Value) -> RepairVerdict {
 /// executable, arguments, roots and every other key. The change takes effect
 /// on the job's next load; reloading is left to the operator because
 /// unload/load stops a running daemon.
-pub async fn autostart_repair() -> Result<()> {
+/// With `launcher` (#1379) it also moves each x0xd job onto the stable
+/// launcher (`plan_launcher_migration`), again without reloading it.
+pub async fn autostart_repair(launcher: bool) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         let plist_dir = dirs::home_dir()
@@ -1326,6 +1581,21 @@ pub async fn autostart_repair() -> Result<()> {
             println!("Job {label} ({})", path.display());
 
             match verdict {
+                RepairVerdict::Refused(reason) => {
+                    refused += 1;
+                    println!("  REFUSED: {reason}");
+                    println!("  Left unchanged.");
+                }
+                RepairVerdict::NotAnX0xdJob => unreachable!("skipped above"),
+                _ if launcher => match migrate_job_to_launcher(&path, &job) {
+                    Ok(true) => repaired += 1,
+                    Ok(false) => compliant += 1,
+                    Err(error) => {
+                        refused += 1;
+                        println!("  REFUSED: {error:#}");
+                        println!("  Left unchanged.");
+                    }
+                },
                 RepairVerdict::AlreadySupervised => {
                     compliant += 1;
                     println!(
@@ -1333,12 +1603,6 @@ pub async fn autostart_repair() -> Result<()> {
                         crate::upgrade::restart::SUPERVISED_ENV_VAR
                     );
                 }
-                RepairVerdict::Refused(reason) => {
-                    refused += 1;
-                    println!("  REFUSED: {reason}");
-                    println!("  Left unchanged.");
-                }
-                RepairVerdict::NotAnX0xdJob => unreachable!("skipped above"),
                 RepairVerdict::Repairable { has_env_dict } => {
                     let backup = path.with_extension("plist.x0x-backup");
                     std::fs::copy(&path, &backup)
@@ -1363,9 +1627,7 @@ pub async fn autostart_repair() -> Result<()> {
                         "  Added:    {}=1 (all other keys preserved)",
                         crate::upgrade::restart::SUPERVISED_ENV_VAR
                     );
-                    println!("  Takes effect on the job's next load. To apply now:");
-                    println!("    launchctl unload {}", path.display());
-                    println!("    launchctl load {}", path.display());
+                    print_reload_hint(&path, label);
                 }
             }
         }
@@ -1389,6 +1651,9 @@ pub async fn autostart_repair() -> Result<()> {
 
     #[cfg(not(target_os = "macos"))]
     {
+        if launcher {
+            anyhow::bail!("--launcher is supported only for launchd (macOS) so far");
+        }
         println!("`x0x autostart --repair` currently migrates macOS launchd jobs only.");
         println!("systemd units generated by `x0x autostart` already set Restart=always,");
         println!("and INVOCATION_ID makes them supervised without a marker.");
@@ -1399,6 +1664,124 @@ pub async fn autostart_repair() -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+/// How to apply a repaired job now: the repair never reloads a job, since
+/// that stops a running daemon.
+#[cfg(target_os = "macos")]
+fn print_reload_hint(path: &Path, label: &str) {
+    let domain = launchd_gui_domain();
+    println!("  Takes effect on the job's next load. To apply now:");
+    println!("    launchctl bootout {domain}/{label}");
+    println!("    launchctl bootstrap {domain} {}", path.display());
+}
+
+/// Move one x0xd job onto the stable launcher (#1379): back it up, apply
+/// the planned keys with `plutil`, add the supervision marker if missing,
+/// and verify the readback (supervised, launcher-bound, same daemon
+/// arguments); on any failure the backup is restored. `Ok(false)` when
+/// the job already runs the launcher.
+#[cfg(target_os = "macos")]
+fn migrate_job_to_launcher(path: &Path, job: &serde_json::Value) -> Result<bool> {
+    let host = MigrationHost {
+        canonical_daemon: &|daemon| {
+            Ok(Path::new(daemon)
+                .canonicalize()
+                .with_context(|| format!("canonicalize {daemon}"))?
+                .to_string_lossy()
+                .into_owned())
+        },
+        launcher_for: &|daemon| {
+            Ok(sibling_launcher(Path::new(daemon))?
+                .to_string_lossy()
+                .into_owned())
+        },
+        host_root: &|name| Ok(instance_data_dir(name)?.to_string_lossy().into_owned()),
+    };
+    let Some(migration) = plan_launcher_migration(job, &host)? else {
+        println!("  Already runs x0x-launcher; no change.");
+        return Ok(false);
+    };
+    let backup = path.with_extension("plist.x0x-backup");
+    std::fs::copy(path, &backup)
+        .with_context(|| format!("failed to back up {}", path.display()))?;
+    let applied = apply_launcher_migration(path, job, &migration);
+    let verified = applied.and_then(|()| {
+        let after = read_plist_as_json(path)?.context("migrated plist could not be read back")?;
+        let arguments = launchd_job_arguments(&after).unwrap_or_default();
+        let daemon_after = crate::upgrade::restart::launchd_job_daemon(
+            after.get("Program").and_then(|p| p.as_str()),
+            &arguments,
+        );
+        let bound = matches!(&daemon_after, Some(Ok(d)) if d.via_launcher);
+        if classify_launchd_job(&after) != RepairVerdict::AlreadySupervised
+            || !bound
+            || arguments != migration.program_arguments
+        {
+            anyhow::bail!("the migrated job does not read back as planned");
+        }
+        Ok(())
+    });
+    if let Err(error) = verified {
+        std::fs::copy(&backup, path)
+            .with_context(|| format!("failed to restore backup over {}", path.display()))?;
+        return Err(error.context("the backup was restored"));
+    }
+    println!("  Backup:   {}", backup.display());
+    println!(
+        "  Launcher: {}",
+        migration
+            .program_arguments
+            .first()
+            .map_or("", String::as_str)
+    );
+    let label = job
+        .get("Label")
+        .and_then(|l| l.as_str())
+        .unwrap_or("<unlabelled>");
+    print_reload_hint(path, label);
+    Ok(true)
+}
+
+/// Apply a planned launcher migration to the plist at `path`.
+#[cfg(target_os = "macos")]
+fn apply_launcher_migration(
+    path: &Path,
+    job: &serde_json::Value,
+    migration: &LauncherMigration,
+) -> Result<()> {
+    let plutil = |args: &[&str]| -> Result<()> {
+        let status = std::process::Command::new("plutil")
+            .args(args)
+            .arg("--")
+            .arg(path)
+            .status()
+            .context("failed to run plutil")?;
+        if !status.success() {
+            anyhow::bail!(
+                "plutil {args:?} could not update {} ({status})",
+                path.display()
+            );
+        }
+        Ok(())
+    };
+    let arguments = serde_json::to_string(&migration.program_arguments)?;
+    plutil(&["-replace", "ProgramArguments", "-json", &arguments])?;
+    if migration.remove_program {
+        plutil(&["-remove", "Program"])?;
+    }
+    if migration.set_exit_timeout {
+        plutil(&[
+            "-replace",
+            "ExitTimeOut",
+            "-integer",
+            &LAUNCHER_EXIT_TIMEOUT_SECS.to_string(),
+        ])?;
+    }
+    if let RepairVerdict::Repairable { has_env_dict } = classify_launchd_job(job) {
+        apply_supervised_marker(path, has_env_dict)?;
+    }
     Ok(())
 }
 
@@ -1471,7 +1854,7 @@ pub async fn autostart_remove() -> Result<()> {
                 "Library/LaunchAgents/{AUTOSTART_LAUNCHD_LABEL}.plist"
             ));
         if plist_path.exists() {
-            launchd_bootout(&launchd_gui_domain());
+            launchd_bootout(&launchd_gui_domain(), AUTOSTART_LAUNCHD_LABEL)?;
             std::fs::remove_file(&plist_path)?;
         }
         println!("Autostart removed (launchd)");
@@ -2061,6 +2444,143 @@ mod tests {
         };
         assert!(
             render_launchd_plist_with("/opt/x0x/bin/x0xd", &[], &log, Some(&relative)).is_err()
+        );
+    }
+
+    fn migration_host() -> MigrationHost<'static> {
+        MigrationHost {
+            canonical_daemon: &|daemon| Ok(daemon.replace("/link/", "/real/")),
+            launcher_for: &|daemon| {
+                Ok(Path::new(daemon)
+                    .with_file_name("x0x-launcher")
+                    .to_string_lossy()
+                    .into_owned())
+            },
+            host_root: &|name| {
+                Ok(match name {
+                    Some(n) => format!("/data/x0x-{n}"),
+                    None => "/data/x0x".to_string(),
+                })
+            },
+        }
+    }
+
+    /// #1379: `--repair --launcher` moves a KeepAlive x0xd job onto the
+    /// launcher's trial form, keeping the daemon's arguments; the daemon is
+    /// canonical, the launcher is next to the job's daemon path.
+    #[test]
+    fn repair_plans_the_launcher_migration() {
+        let job = serde_json::json!({
+            "Label": "com.example.x0xd",
+            "ProgramArguments": ["/opt/link/x0xd", "--name", "alice"],
+            "KeepAlive": true,
+            "EnvironmentVariables": { "HOME": "/Users/a" },
+        });
+        let plan = plan_launcher_migration(&job, &migration_host())
+            .expect("plan")
+            .expect("migration");
+        assert_eq!(
+            plan.program_arguments,
+            [
+                "/opt/link/x0x-launcher",
+                "--host-root",
+                "/data/x0x-alice",
+                "--instance",
+                "alice",
+                "--",
+                "/opt/real/x0xd",
+                "--name",
+                "alice",
+            ]
+        );
+        assert!(!plan.remove_program && plan.set_exit_timeout);
+        // `Program` is what launchd runs: it is removed.
+        let mut with_program = job.clone();
+        with_program["Program"] = serde_json::json!("/opt/link/x0xd");
+        with_program["ProgramArguments"] = serde_json::json!(["x0xd"]);
+        with_program["ExitTimeOut"] = serde_json::json!(120);
+        let plan = plan_launcher_migration(&with_program, &migration_host())
+            .expect("plan")
+            .expect("migration");
+        assert!(plan.remove_program && !plan.set_exit_timeout);
+        assert_eq!(plan.program_arguments[4], "default");
+        // A job that already runs the launcher needs no change.
+        let mut bound = job.clone();
+        bound["ProgramArguments"] = serde_json::json!(plan.program_arguments);
+        bound["ExitTimeOut"] = serde_json::json!(60);
+        assert_eq!(
+            plan_launcher_migration(&bound, &migration_host()).expect("plan"),
+            None
+        );
+    }
+
+    #[test]
+    fn repair_refuses_a_launcher_migration_it_cannot_prove() {
+        let base = serde_json::json!({
+            "Label": "com.example.x0xd",
+            "ProgramArguments": ["/opt/link/x0xd"],
+            "KeepAlive": true,
+        });
+        let mut cases = Vec::new();
+        let mut config = base.clone();
+        config["ProgramArguments"] = serde_json::json!(["/opt/link/x0xd", "--config", "/c"]);
+        cases.push(config);
+        let mut relative = base.clone();
+        relative["ProgramArguments"] = serde_json::json!(["x0xd"]);
+        cases.push(relative);
+        let mut no_keepalive = base.clone();
+        no_keepalive["KeepAlive"] = serde_json::json!(false);
+        cases.push(no_keepalive);
+        let mut bad_name = base.clone();
+        bad_name["ProgramArguments"] = serde_json::json!(["/opt/link/x0xd", "--name", "a b"]);
+        cases.push(bad_name);
+        for job in cases {
+            assert!(
+                plan_launcher_migration(&job, &migration_host()).is_err(),
+                "{job}"
+            );
+        }
+    }
+
+    /// #2063 review: one label serves every `--name`; autostart refuses to
+    /// replace another instance's job.
+    #[test]
+    fn autostart_refuses_to_replace_another_instances_job() {
+        let alice = serde_json::json!({
+            "ProgramArguments": ["/opt/x0xd", "--name=alice"],
+        });
+        let default = serde_json::json!({ "ProgramArguments": ["/opt/x0xd"] });
+        assert!(existing_job_conflict(None, Some("bob")).is_ok());
+        assert!(existing_job_conflict(Some(&alice), Some("alice")).is_ok());
+        assert!(existing_job_conflict(Some(&alice), Some("bob")).is_err());
+        assert!(existing_job_conflict(Some(&alice), None).is_err());
+        assert!(existing_job_conflict(Some(&default), None).is_ok());
+        assert!(existing_job_conflict(Some(&default), Some("bob")).is_err());
+        // A job file under our label that is not a readable x0xd job is
+        // replaced.
+        let other = serde_json::json!({ "ProgramArguments": ["/bin/sh"] });
+        assert!(existing_job_conflict(Some(&other), Some("bob")).is_ok());
+    }
+
+    /// #2063 review: the renderer checks the whole launcher argv with the
+    /// launcher's parser, so a relative daemon is refused before it is
+    /// written.
+    #[test]
+    fn the_launcher_bound_renderer_refuses_an_argv_the_launcher_refuses() {
+        let binding = LauncherBinding {
+            launcher: "/opt/x0x/bin/x0x-launcher",
+            host_root: "/data/x0x",
+            instance: "default",
+        };
+        let log = Path::new("/data/x0x/x0xd.log");
+        assert!(render_launchd_plist_with("/opt/x0x/bin/x0xd", &[], log, Some(&binding)).is_ok());
+        assert!(render_launchd_plist_with("x0xd", &[], log, Some(&binding)).is_err());
+        let bad_instance = LauncherBinding {
+            instance: "..",
+            ..binding
+        };
+        assert!(
+            render_launchd_plist_with("/opt/x0x/bin/x0xd", &[], log, Some(&bad_instance)).is_err()
         );
     }
 
