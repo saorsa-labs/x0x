@@ -675,6 +675,18 @@ All notable changes to this project will be documented in this file.
   the whole store under a lock. An image saved above 16 MiB loads whole as
   `over_limit` and serves again once entries are removed. Refusals are also
   counted in `GET /diagnostics/state-sync`.
+- **Groups (#2022):** a joiner that reaches its catch-up terminal without its
+  keys keeps its `catching_up` recovery object until it has them; if they do
+  not come within the Welcome's 10-minute lifetime it ends
+  `readmission_required {base_beyond_retention}`, which stays until it has
+  keys or joins again. On TreeKEM an Active seat alone no longer counts as
+  keys, here or in the #1661 lost-Welcome rule. Before, the recovery object
+  cleared at the terminal with no keys. With no capable peer at all, the
+  recovery loop no longer counts a round on each tick. Tests cover a relayed
+  link under an admin ATA (a member-signed one is refused), the authority's
+  decision for a head one below its oldest kept commit, and a decrypt at the
+  head epoch in W3-H H-S3-r. ADR A08 amendment of 18 Nov 2026.
+
 - **Granted-store CLI paths and serves (#1953 review).** `x0x grant data`
   (and `grant revoke|renew`) percent-encode each path segment, so a key with
   `#`, `?` or `/` reaches the exact key. A slow granted read or write now

@@ -986,6 +986,8 @@ const CAUSE_R_KEYS: &str = "after B attests J stays catching_up at its head, wit
 /// #2003: how long J's recovery object may stay after J caught up: a few
 /// worker ticks.
 const RECOVERY_CLEARS: Duration = Duration::from_secs(60);
+/// #2022: the plaintext A encrypts at its head epoch for J to decrypt.
+const R_PROBE: &[u8] = b"w3h-1356 H-S3-r probe";
 /// The H-S3-r replay variant (#2003 carry-over from the review of #2017).
 const FINAL_R_REPLAY: &str = "j_ends_active_with_keys_at_the_head_whichever_admin_attests";
 const CAUSE_R_REPLAY: &str = "with the pre-join metadata replay open, J did not end Active with \
@@ -1021,6 +1023,42 @@ async fn cap_log(sim: &Sim, label: &str, group: &str) -> Result<(usize, u64)> {
         .min()
         .unwrap_or(0);
     Ok((info.commit_log.len(), oldest))
+}
+
+/// #2022: A encrypts [`R_PROBE`] at its epoch and J decrypts it. This
+/// proves J holds the key at the head, not only the epoch its API shows.
+/// Returns whether J recovered the probe, with the replies.
+async fn j_decrypts_from_a(sim: &Sim, group: &str) -> Result<(bool, String)> {
+    use base64::Engine as _;
+    let base64 = base64::engine::general_purpose::STANDARD;
+    let (status, body) = sim
+        .api(
+            "A",
+            Method::POST,
+            &format!("/groups/{group}/secure/encrypt"),
+            Some(json!({"payload_b64": base64.encode(R_PROBE)})),
+        )
+        .await?;
+    let ciphertext = body["ciphertext_b64"]
+        .as_str()
+        .filter(|_| status.is_success() && body["ok"] != false);
+    let Some(ciphertext) = ciphertext else {
+        return Ok((false, format!("A encrypt: {status} {body}")));
+    };
+    let (status, reply) = sim
+        .api(
+            "J",
+            Method::POST,
+            &format!("/groups/{group}/secure/decrypt"),
+            Some(json!({"ciphertext_b64": ciphertext})),
+        )
+        .await?;
+    let ok = status.is_success()
+        && reply["payload_b64"]
+            .as_str()
+            .and_then(|payload| base64.decode(payload).ok())
+            .is_some_and(|payload| payload == R_PROBE);
+    Ok((ok, format!("J decrypt: {status} {reply}")))
 }
 
 /// H-S3-r: drops every write to `j` of a metadata-topic message first seen
@@ -1084,7 +1122,8 @@ async fn hold_pre_join_gossip(
 /// its API and has not caught up. Then the B–J messages pass: J asks B,
 /// which has not answered for this attempt, B attests, and J catches up
 /// through B: B relays the renames that A signed (A08 amendment of 17 Nov
-/// 2026, #2003), and J is Active with keys at A's head (r+7). Before
+/// 2026, #2003), and J is Active with keys at A's head (r+7): J decrypts
+/// a message that A encrypts at the head epoch (#2022). Before
 /// #1572 J sent no request and timed out with no typed state; before
 /// #2003 J stayed `catching_up` at its head with no keys.
 async fn beyond_retention(sim: &mut Sim, receipt: &mut Receipt, replay: bool) -> Result<()> {
@@ -1248,18 +1287,37 @@ async fn beyond_retention(sim: &mut Sim, receipt: &mut Receipt, replay: bool) ->
             .is_ok();
     let (_, cleared_text, _, _) = j_end(sim, &group, "A").await?;
     receipt.note(format!("after the recovery wait: {cleared_text}"));
+    // #2022: J holds the key at the head epoch, not only an API view of it.
+    let (decrypted, decrypt_text) = if caught {
+        j_decrypts_from_a(sim, &group).await?
+    } else {
+        (false, "not tried: J did not catch up".to_string())
+    };
+    receipt.evidence(
+        "j_decrypts_a_message_a_encrypts_at_the_head_epoch",
+        decrypted,
+        decrypt_text,
+        at(sim),
+    );
     // #2003: J is Active with keys at the head (`caught_up`), and its
     // recovery object is gone.
-    let passed = readmission && !caught_early && by_b && caught && cleared;
+    let passed = readmission && !caught_early && by_b && caught && cleared && decrypted;
     receipt.note(format!(
         "readmission={readmission} caught_early={caught_early} caught={caught} by_b={by_b} \
-         left_for_catching_up={left} cleared={cleared} J revision while held {j_rev:?}"
+         left_for_catching_up={left} cleared={cleared} decrypted={decrypted} J revision \
+         while held {j_rev:?}"
     ));
     if replay {
         // Whichever admin attests, and whenever the replay moved J's head,
         // J ends Active with keys at the head, never marked, its recovery
         // object cleared.
-        let benign = caught && cleared && first.marked.is_none() && second.marked.is_none();
+        let benign =
+            caught && cleared && decrypted && first.marked.is_none() && second.marked.is_none();
+        // #2022: which admin attested is a note, not a pass condition. The
+        // through-A path needs the real-time gossip replay to move J's head
+        // into A's retention before A answers, so the row does not force
+        // it (no VM run took it). A's decision for such a head is
+        // `recovery::tests::a_head_one_below_the_oldest_kept_commit_is_provable`.
         receipt.note(format!(
             "replay variant: attested by A {by_a}, by B {by_b}; readmission while held \
              {readmission}; caught while held {caught_early}"

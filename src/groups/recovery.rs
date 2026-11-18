@@ -2977,6 +2977,54 @@ mod tests {
         );
     }
 
+    /// #2022 (the through-A path of the H-S3-r replay row): an admin whose
+    /// log keeps only its newest commits still attests a head one below
+    /// its oldest kept commit, by that commit's `prev_state_hash`, and
+    /// names the whole sequence to its head. A head two below is beyond
+    /// retention. The row cannot force this path: it needs the real-time
+    /// gossip replay to move J's head there.
+    #[test]
+    fn a_head_one_below_the_oldest_kept_commit_is_provable() {
+        let admin = keypair();
+        let mut info = signed_group(&admin);
+        let mut heads = vec![(info.state_revision, info.state_hash.clone())];
+        for n in 1..=6u64 {
+            info.name = format!("rename {n}");
+            info.seal_commit(&admin, 1_000 + n * 1_000)
+                .expect("seal rename");
+            heads.push((info.state_revision, info.state_hash.clone()));
+        }
+        // Keep the newest 4 commits, as H-S3-r caps A's log.
+        let keep_from = info.state_revision - 3;
+        info.commit_log
+            .retain(|entry| entry.commit.revision >= keep_from);
+        let edge = heads
+            .iter()
+            .find(|(revision, _)| *revision == keep_from - 1)
+            .cloned()
+            .expect("edge head");
+        match chain_position(&info, edge.0, &edge.1) {
+            ChainPosition::Behind {
+                sequence,
+                terminal_revision,
+            } => {
+                assert_eq!(sequence.len(), 4);
+                assert_eq!(sequence.last(), Some(&info.state_hash));
+                assert_eq!(terminal_revision, info.state_revision);
+            }
+            other => panic!("expected Behind, got {other:?}"),
+        }
+        let beyond = heads
+            .iter()
+            .find(|(revision, _)| *revision == keep_from - 2)
+            .cloned()
+            .expect("beyond head");
+        assert_eq!(
+            chain_position(&info, beyond.0, &beyond.1),
+            ChainPosition::BeyondRetention
+        );
+    }
+
     #[test]
     fn provisional_path_verifies_only_the_applied_promotion_prefix() {
         let admin = keypair();
