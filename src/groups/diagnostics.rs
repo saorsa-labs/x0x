@@ -11,22 +11,13 @@
 //! ingest path bumps either `messages_received` (success) or one of the
 //! per-reason `messages_dropped_*` buckets, so an operator can see the
 //! drop fingerprint without flipping `RUST_LOG=debug` on the daemon.
-//!
-//! All mutator methods take `&self`; counters are guarded by a single
-//! `Mutex` because the contention is per-group and bounded by the
-//! gossip ingest rate (orders of magnitude below the lock's saturation
-//! point). If profiling later flags this lock, the inner table can be
-//! sharded without changing the public API.
 
 use crate::groups::GroupInfo;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
-/// #468 A5 (r3): the per-group rate-limit window for
-/// [`GroupsDiagnostics::record_conflict_unauthenticated`] — one
-/// increment per group per second. Unauthenticated conflict packets are
-/// freely replayable; the counter observes conflict PRESSURE, not the
-/// attacker's packet rate.
+/// Unauthenticated conflict packets are replayable, so the counter takes
+/// one increment per group per window.
 const CONFLICT_UNAUTHENTICATED_WINDOW_MS: u64 = 1_000;
 
 /// Per-group counters captured by the public-message and metadata ingest
@@ -115,7 +106,6 @@ pub struct GroupCounters {
     /// Number of `MemberAdded` commits rejected on a state-chain gap the
     /// joiner could neither validate nor adopt (#458).
     pub member_added_events_rejected_state_chain_gap: u64,
-    // ── ADR 0028 causal predecessor delivery counters ──
     /// Predecessor envelopes relayed to active witnesses.
     pub causal_relayed: u64,
     /// Drain retries attempted.
@@ -246,7 +236,6 @@ pub struct CausalGauges {
     pub relay_obligations: usize,
 }
 
-/// Public snapshot of all known groups, returned by `GET /diagnostics/groups`.
 fn is_zero(value: &u64) -> bool {
     *value == 0
 }
@@ -275,7 +264,6 @@ pub struct GroupDiagnostic {
     /// Inline counter projection.
     #[serde(flatten)]
     pub counters: GroupCounters,
-    // ── ADR 0028 causal predecessor delivery gauges ──
     /// Current causal approval queue depth for this group.
     pub causal_queue_entries: usize,
     /// Current causal approval queue serialized bytes for this group.
@@ -312,30 +300,14 @@ pub struct MandateCapabilityDiagnostic {
 #[derive(Debug, Default)]
 pub struct GroupsDiagnostics {
     inner: Mutex<HashMap<String, GroupCounters>>,
-    /// #468 A5 (r3): identities of fork-evidence records whose
-    /// first-observation diagnostics (warn + `adoption_fork_evidence`)
-    /// have already fired — post-first observations of the SAME
-    /// `(group, revision, state_hash, committed_by)` are silent, even
-    /// when the lineage record itself could not be (re)installed (e.g.
-    /// a failed persist rolled it back). In-memory only: after a
-    /// restart the durable lineage record's own identity dedupe takes
-    /// over (see `evaluate_fork_evidence_candidate`).
+    /// In-memory only: after a restart the durable lineage record dedupes.
     seen_fork_evidence: Mutex<HashSet<(String, u64, String, String)>>,
-    /// #468 A5 (r3): per-group wall-clock (ms) of the last
-    /// `conflict_unauthenticated` increment — unauthenticated conflict
-    /// packets are attacker-replayable, so the counter is rate-limited
-    /// to one increment per group per second.
     conflict_unauthenticated_last_ms: Mutex<HashMap<String, u64>>,
-    /// #1149: per-group count of `MemberJoined` events refused because
-    /// the joiner is banned. Internal only: it is not a `GroupCounters`
-    /// field, so the `/diagnostics/groups` response shape is unchanged.
+    /// Not a `GroupCounters` field, so the `/diagnostics/groups` response
+    /// shape is unchanged.
     member_joined_rejected_banned: Mutex<HashMap<String, u64>>,
 }
 
-/// Sum two counter tables field-by-field (saturating). Module-scoped so
-/// the round-2 regression test can drive EVERY field directly — a
-/// dropped line fails the test instead of silently under-counting
-/// `/diagnostics/groups` fleet aggregates.
 fn merge_counters(dst: &mut GroupCounters, src: &GroupCounters) {
     dst.messages_received = dst.messages_received.saturating_add(src.messages_received);
     dst.messages_dropped_decode_failed = dst
@@ -882,8 +854,6 @@ impl GroupsDiagnostics {
         });
     }
 
-    /// Record a `MemberJoined` refused because the joiner is banned
-    /// (#1149). Internal only; see the field doc.
     pub(crate) fn record_member_joined_rejected_banned(&self, group_id: &str) {
         let mut guard = match self.member_joined_rejected_banned.lock() {
             Ok(g) => g,
@@ -893,8 +863,6 @@ impl GroupsDiagnostics {
         *entry = entry.saturating_add(1);
     }
 
-    /// The number of `MemberJoined` events refused for `group_id` because
-    /// the joiner is banned (#1149). Read by tests only.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn member_joined_rejected_banned(&self, group_id: &str) -> u64 {
@@ -931,8 +899,6 @@ impl GroupsDiagnostics {
                 .saturating_add(1);
         });
     }
-
-    // ── ADR 0028 causal predecessor delivery counter methods ──
 
     /// Record a predecessor envelope relayed to active witnesses.
     pub fn record_causal_relayed(&self, group_id: &str) {
@@ -1057,10 +1023,6 @@ impl GroupsDiagnostics {
             std::collections::BTreeMap::new();
         for (key, info) in groups {
             let stable_id = info.stable_group_id().to_string();
-            // r3 (Codex 8): the #469 D2 gauge — active seats whose
-            // certificate is digest-only (committed
-            // `certificate_digest`, no bytes) are exactly the seats the
-            // F1 bridge / seat-time hydrate still owes bytes to.
             let awaiting_certificate = info
                 .members_v2
                 .values()
@@ -1121,8 +1083,6 @@ impl GroupsDiagnostics {
                     causal_queue_entries: 0,
                     causal_queue_bytes: 0,
                     causal_relay_obligations: 0,
-                    // Counters-only rows have no GroupInfo to derive
-                    // capability phases from (the map lives on the record).
                     mandate_capability: Vec::new(),
                 });
             merge_counters(&mut row.counters, counters);
@@ -1190,27 +1150,11 @@ mod tests {
         assert!(!g2.subscribed_public);
     }
 
-    /// Verify that the receiver-side ingest counter and the sender-side
-    /// rejection counter move independently.
-    ///
-    /// Before the fix the sender-side rejection incremented
-    /// `messages_dropped_write_policy_violation` (the same field as the
-    /// receiver-side ingest counter), destroying its meaning as the
-    /// join-roster-propagation canary. After the fix the two fields are
-    /// distinct: an ingest drop bumps `messages_dropped_write_policy_violation`
-    /// while a local send rejection bumps `sends_rejected_write_policy`.
-    ///
-    /// If the sender-side call is changed back to
-    /// `record_write_policy_violation`, the `sends_rejected_write_policy`
-    /// assertion fails (stays 0) and the `messages_dropped_write_policy_violation`
-    /// assertion also fails (becomes 2 instead of 1).
     #[test]
     fn sender_and_receiver_write_policy_counters_are_independent() {
         let diag = GroupsDiagnostics::new();
 
-        // Receiver-side: ingest path dropped an incoming message.
         diag.record_write_policy_violation("grp");
-        // Sender-side: this daemon's own outgoing send was rejected locally.
         diag.record_sender_write_policy_rejection("grp");
 
         let mut groups: HashMap<String, GroupInfo> = HashMap::new();
@@ -1234,11 +1178,6 @@ mod tests {
         );
     }
 
-    /// Why: a sequential unicast-then-gossip fan-out can still deliver, so a
-    /// delivery assertion alone cannot catch issue #310. The raced counter is
-    /// the signal that topic publish finished while DM unicast was still
-    /// outstanding — if this method is wired to the wrong field, the
-    /// two-daemon <5s test would pass for the wrong reason.
     #[test]
     fn gossip_raced_unicast_counter_is_independent() {
         let diag = GroupsDiagnostics::new();
@@ -1265,8 +1204,6 @@ mod tests {
 
     #[test]
     fn snapshot_includes_groups_without_known_info() {
-        // Audit case: counters recorded for a group that's no longer in
-        // state.named_groups (e.g. owner deleted while listener flushed).
         let diag = GroupsDiagnostics::new();
         diag.record_other_drop("ghost");
         let groups: HashMap<String, GroupInfo> = HashMap::new();
@@ -1283,21 +1220,13 @@ mod tests {
         assert_eq!(snap.groups[0].counters.messages_dropped_other, 1);
     }
 
-    /// r3 (#468 A5): `conflict_unauthenticated` is rate-limited to one
-    /// increment per group per second — unauthenticated conflict packets
-    /// are freely replayable, and the counter must observe pressure, not
-    /// the attacker's packet rate. The window is per-GROUP: another
-    /// group's conflicts still count.
     #[test]
     fn conflict_unauthenticated_is_rate_limited_per_group() {
         let diag = GroupsDiagnostics::new();
         diag.record_conflict_unauthenticated("grp", 1_000);
-        // Same group, inside the 1 s window: suppressed.
         diag.record_conflict_unauthenticated("grp", 1_500);
         diag.record_conflict_unauthenticated("grp", 1_999);
-        // Window boundary (1_000 + 1_000): counts again.
         diag.record_conflict_unauthenticated("grp", 2_000);
-        // A different group is independently rate-limited.
         diag.record_conflict_unauthenticated("other", 1_500);
 
         let mut groups: HashMap<String, GroupInfo> = HashMap::new();
@@ -1319,20 +1248,12 @@ mod tests {
         assert_eq!(other.counters.conflict_unauthenticated, 1);
     }
 
-    /// r3 (#468 A5): fork-evidence diagnostics fire exactly ONCE per
-    /// identity — a second identical conflict must not re-warn or
-    /// re-increment `adoption_fork_evidence`, while a DIFFERENT identity
-    /// for the same group still fires. `committed_by` is
-    /// case-insensitive, mirroring the lineage record's identity check.
     #[test]
     fn fork_evidence_once_fires_only_for_new_identities() {
         let diag = GroupsDiagnostics::new();
         assert!(diag.record_fork_evidence_once("grp", 7, "hash-a", &"AB".repeat(32)));
-        // Same identity, differently-cased committer: silent.
         assert!(!diag.record_fork_evidence_once("grp", 7, "hash-a", &"ab".repeat(32)));
-        // Same identity again: silent.
         assert!(!diag.record_fork_evidence_once("grp", 7, "hash-a", &"AB".repeat(32)));
-        // Different state hash at the same revision: a NEW conflict — fires.
         assert!(diag.record_fork_evidence_once("grp", 7, "hash-b", &"AB".repeat(32)));
 
         let mut groups: HashMap<String, GroupInfo> = HashMap::new();
@@ -1351,10 +1272,6 @@ mod tests {
         );
     }
 
-    /// r3 (#469 D2 / Codex 8): the snapshot's `members_awaiting_certificate`
-    /// gauge counts ACTIVE digest-only seats — a committed
-    /// `certificate_digest` without certificate bytes. Inactive seats and
-    /// fully-certified seats do not count.
     #[test]
     fn snapshot_counts_active_digest_only_members_as_awaiting_certificate() {
         let mut info = group("Grp", "grp");
@@ -1376,18 +1293,15 @@ mod tests {
             None,
             None,
         );
-        // Digest-only ACTIVE seat — awaiting hydration.
         info.members_v2
             .get_mut(&"aa".repeat(32))
             .unwrap()
             .certificate_digest = Some("00".repeat(32));
-        // Fully-certified ACTIVE seat — not awaiting.
         {
             let seat = info.members_v2.get_mut(&"bb".repeat(32)).unwrap();
             seat.certificate_digest = Some("11".repeat(32));
             seat.certificate = Some(certified_stub_certificate());
         }
-        // Digest-only but NOT active — not awaiting.
         {
             let seat = info.members_v2.get_mut(&"cc".repeat(32)).unwrap();
             seat.state = crate::groups::GroupMemberState::Removed;
@@ -1408,19 +1322,11 @@ mod tests {
         assert_eq!(g.counters.members_awaiting_certificate, 1);
     }
 
-    /// Minimal certificate value for the gauge test — the gauge only
-    /// inspects `certificate.is_some()`, never verifies the bytes.
     fn certified_stub_certificate() -> crate::identity::AgentCertificate {
         let owner = crate::identity::UserKeypair::generate().expect("user keypair");
         let agent = crate::identity::AgentKeypair::generate().expect("agent keypair");
         crate::identity::AgentCertificate::issue(&owner, &agent).expect("stub cert issue")
     }
-    /// ADR-0064 r2 / review item 1: the #635 merge hunk dropped the
-    /// `causal_applied` line, which no existing test caught. This test
-    /// drives EVERY merged field with distinct non-zero values on both
-    /// sides and asserts each sum, so any future dropped (or wrongly
-    /// doubled) merge line fails here instead of silently under-counting
-    /// `/diagnostics/groups` fleet aggregates.
     #[test]
     fn merge_counters_sums_every_field() {
         let counters_with = |base: u64| GroupCounters {
@@ -1445,8 +1351,6 @@ mod tests {
             join_refusal_signing_throttled: base + 16,
             adoption_fork_evidence: base + 17,
             conflict_unauthenticated: base + 18,
-            // Snapshot-time gauge, NOT a merged counter: set non-zero to
-            // pin that merge leaves it alone (snapshot recomputes it).
             members_awaiting_certificate: base + 19,
             member_joined_events_rejected_owner_cert_pending: base + 20,
             member_joined_events_rejected_treekem_unavailable: base + 21,
@@ -1488,8 +1392,6 @@ mod tests {
         let gauge_before = dst.members_awaiting_certificate;
         let mut merged = dst.clone();
         merge_counters(&mut merged, &src);
-        // Every merged counter must equal the exact per-field sum — a
-        // dropped merge line leaves dst's value; a doubled line over-sums.
         assert_eq!(
             merged.messages_received,
             dst.messages_received + src.messages_received
@@ -1649,7 +1551,6 @@ mod tests {
             merged.fork_quarantine_refusals,
             dst.fork_quarantine_refusals + src.fork_quarantine_refusals
         );
-        // The gauge is recomputed at snapshot time, never merged.
         assert_eq!(
             merged.owner_mandate_minted,
             dst.owner_mandate_minted + src.owner_mandate_minted

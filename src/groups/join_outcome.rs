@@ -361,8 +361,6 @@ mod tests {
         assert!(decoded.encode().is_err(), "Unknown is never sent");
         assert!(JoinRequestOutcome::decode(b"ordinary text").is_none());
 
-        // #1840: `head` is no longer an unknown field; a value that is not
-        // a head makes the outcome unreadable, not a headless outcome.
         let mut bad_head = JOIN_REQUEST_OUTCOME_DM_PREFIX.to_vec();
         bad_head.extend_from_slice(
             br#"{"group_id":"g","request_id":"r","envelope_digest":"00","reason":"stale","head":{"revision":7}}"#,
@@ -380,9 +378,6 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// An authority group with `extra` Active members, and a copy taken
-    /// BEFORE those members were added and sealed: the copy a requester
-    /// holds when its card or its old member view is behind.
     fn authority_and_stale_copy(extra: usize) -> (AgentKeypair, GroupInfo, GroupInfo) {
         let owner = AgentKeypair::generate().expect("owner key");
         let mut info = GroupInfo::with_policy(
@@ -420,10 +415,6 @@ mod tests {
         hex::encode(AgentKeypair::generate().expect("key").agent_id().as_bytes())
     }
 
-    /// WHY (#1840 routes 1–3): a requester whose copy misses members and an
-    /// edit installs the authority's checked head and then holds the
-    /// authority's exact state: same roster root, same state hash, same
-    /// metadata, so a request link it signs next chains to the head.
     #[test]
     fn issue1840_a_stale_copy_adopts_the_checked_head() {
         let (_owner, authority, stale) = authority_and_stale_copy(2);
@@ -443,11 +434,6 @@ mod tests {
         );
     }
 
-    /// WHY (#1840, review of #1927): the head carries certificate digests
-    /// only, and a fresh joiner holds none of the members' certificates.
-    /// The requester's plain seal over the adopted copy still works: a
-    /// request link changes no roster row and verifies no certificate, and
-    /// the link chains to the authority's head.
     #[test]
     fn issue1840_requester_seals_over_a_digest_only_head() {
         let (owner, mut authority, stale) = authority_and_stale_copy(2);
@@ -477,8 +463,6 @@ mod tests {
         assert_eq!(link.roster_root, head_of(&authority).commit.roster_root);
     }
 
-    /// WHY (#1840): every check refuses on its own, and a refused head
-    /// changes nothing.
     #[test]
     fn issue1840_a_head_that_fails_a_check_is_not_adopted() {
         let (owner, authority, stale) = authority_and_stale_copy(1);
@@ -498,8 +482,6 @@ mod tests {
             Err(JoinHeadError::Unverified(_))
         ));
 
-        // The newest link may be another requester's request link, signed
-        // by that requester: an intact commit is adopted whoever signed it.
         let other_requester = AgentKeypair::generate().expect("requester");
         let mut by_requester = authority.clone();
         by_requester
@@ -527,8 +509,6 @@ mod tests {
             Err(JoinHeadError::Policy)
         );
 
-        // Not ahead: the copy is past the head; the head is older than the
-        // copy; a head at the copy's revision with another hash (a fork).
         let mut ahead = stale.clone();
         ahead.state_revision = authority.state_revision + 2;
         assert_eq!(
@@ -546,9 +526,6 @@ mod tests {
         assert_eq!(fork.state_revision, stale.state_revision);
         assert_eq!(adopt(&head_of(&fork), &stale), Err(JoinHeadError::NotAhead));
 
-        // A copy whose newest link is the requester's own request link at
-        // the head's revision: its base is the link before, so the head
-        // (route 3: an edit crossed the request) is ahead.
         let me_key = AgentKeypair::generate().expect("requester key");
         let me_hex = hex::encode(me_key.agent_id().as_bytes());
         let mut asked = stale.clone();
@@ -558,7 +535,6 @@ mod tests {
         assert_eq!(asked.state_revision, authority.state_revision);
         assert!(adopt_join_head(&asked, &head_of(&authority), &me_hex).is_ok());
 
-        // A head whose roster drops the owner.
         let mut ownerless = authority.clone();
         let admin = ownerless
             .members_v2
@@ -597,7 +573,6 @@ mod tests {
             Err(JoinHeadError::Seated)
         );
 
-        // A withdrawn head refuses on its own (the copy is live).
         let mut head_withdrawn = authority.clone();
         head_withdrawn
             .seal_withdrawal(&owner, now_ms())
@@ -607,19 +582,14 @@ mod tests {
             Err(JoinHeadError::Withdrawn)
         );
 
-        // A requester that is Banned in the head counts as seated.
         let mut banned = authority.clone();
         banned.ban_member(&me, Some(owner_hex.clone()));
         banned.seal_commit(&owner, now_ms()).expect("ban seal");
         assert_eq!(adopt(&head_of(&banned), &stale), Err(JoinHeadError::Seated));
 
-        // The refused heads left the input copy as it was.
         assert_eq!(stale, stale_before);
     }
 
-    /// WHY (#1840): a copy whose own request link sits on the head itself
-    /// (local revision = head revision + 1) has the head as its base. The
-    /// same revision with the same hash is allowed, not `NotAhead`.
     #[test]
     fn issue1840_own_link_on_the_head_itself_is_not_behind() {
         let (_owner, authority, _stale) = authority_and_stale_copy(1);
@@ -631,10 +601,6 @@ mod tests {
         assert!(adopt_join_head(&asked, &head_of(&authority), &me_hex).is_ok());
     }
 
-    /// WHY (#1840, mixed versions): a head rides only on `stale`, a headed
-    /// outcome may exceed the first release's 1024-byte bound (so it is
-    /// sent only to a requester that advertises it can read one), and the
-    /// head bound holds.
     #[test]
     fn issue1840_headed_outcome_bounds_and_round_trip() {
         let (_owner, authority, _stale) = authority_and_stale_copy(3);
@@ -666,7 +632,6 @@ mod tests {
         oversized.resize(MAX_JOIN_REQUEST_HEAD_OUTCOME_BYTES + 1, b' ');
         assert!(JoinRequestOutcome::decode(&oversized).is_none());
 
-        // A headless outcome keeps the first release's bound.
         let mut padded = serde_json::to_value(JoinRequestOutcome {
             head: None,
             ..outcome

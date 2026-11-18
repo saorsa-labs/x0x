@@ -1,4 +1,3 @@
-//! Observe-only Leaf egress accounting and the PubSub transport seam.
 use super::config::GossipConfig;
 use crate::network::NetworkNode;
 use bytes::Bytes;
@@ -42,24 +41,14 @@ impl Drop for RepairScope {
 
 pub(super) struct PubSubTransport {
     pub network: Arc<NetworkNode>,
-    /// Eager sends matching an in-flight IWANT (peer, topic, message) — a
-    /// diagnostics-only subset of eager counters. Signature verification is
-    /// PlumTree's job on the inbound IWANT; the tracking keys are
-    /// unverified frame fields (#656), so a forged IWANT cannot inflate
-    /// these beyond the repair sends its own (rejected) frame would have
-    /// drawn.
     pub repair_msgs: AtomicU64,
-    /// Byte total accompanying [`Self::repair_msgs`].
     pub repair_bytes: AtomicU64,
     repair_requests: RepairRequests,
     pub repair_tracking_overflow: AtomicU64,
     #[cfg(test)]
     pub recorder: std::sync::Mutex<Option<Recorder>>,
-    /// Test stand-in for a live QUIC session. Production always asks the node.
     #[cfg(test)]
     session_override: Mutex<Option<AuthenticatedSession>>,
-    /// Pauses one Eager send whose header topic matches, then clears itself.
-    /// The caller holds only that topic's turn, so another topic proceeds.
     #[cfg(test)]
     pub remote_send_pause: Mutex<RemoteSendPause>,
 }
@@ -95,8 +84,6 @@ impl PubSubTransport {
         }
     }
 
-    /// Hold one matching Eager send. The mutex is released before the wait.
-    /// A later send on the same topic does not wait.
     #[cfg(test)]
     async fn wait_remote_send_pause(&self, data: &[u8]) {
         let gates = {
@@ -121,7 +108,6 @@ impl PubSubTransport {
         }
     }
 
-    /// Install the session token key-cache recovery tests present as provenance.
     #[cfg(test)]
     pub(super) fn set_session_override(&self, session: Option<AuthenticatedSession>) {
         *self
@@ -129,18 +115,13 @@ impl PubSubTransport {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = session;
     }
-    /// Track the message IDs an inbound IWANT frame requests, keyed by
-    /// (peer, topic, message). Returns the scope whose `Drop` retires the
-    /// entries, so classification covers exactly the repair sends PlumTree
-    /// issues while handling this frame.
-    ///
-    /// Deliberately does NOT verify the frame's ML-DSA signature (#656):
-    /// `plumtree.handle_message` verifies the same bytes immediately after
-    /// this call and ignores unauthenticated IWANTs, so a redundant verify
-    /// here cost one ML-DSA-65 verification per inbound IWANT (~106/s on
-    /// the profiled fleet) purely to gate a diagnostics counter. The cheap
-    /// structural gates stay: exact `GossipMessage` decode, `IWant` kind,
-    /// v2 header, payload-hash binding, and decodable id list.
+
+    /// Does not verify the frame's ML-DSA signature (#656):
+    /// `plumtree.handle_message` verifies the same bytes right after this call
+    /// and ignores unauthenticated IWANTs, so a forged IWANT cannot inflate
+    /// counters beyond what its own rejected frame would draw. The structural
+    /// gates remain: exact `GossipMessage` decode, `IWant` kind, v2 header,
+    /// payload-hash binding, and decodable id list.
     pub fn track_iwant(&self, peer: PeerId, data: &[u8]) -> Option<RepairScope> {
         let message: saorsa_gossip_pubsub::GossipMessage = postcard::from_bytes(data).ok()?;
         if message.header.kind != MessageKind::IWant {
@@ -252,19 +233,12 @@ impl GossipTransport for PubSubTransport {
     ) -> anyhow::Result<()> {
         #[cfg(test)]
         if let Some(recorder) = self.recorder.lock().expect("recorder").as_mut() {
-            // Test double mirrors the ordinary send intercept: a captured
-            // guarded frame never reaches the (socket-free) network.
-            let bytes = admit(
-                self.network
-                    .authenticated_session(peer)
-                    // Tests with the recorder installed have no live session;
-                    // mint a deterministic stand-in so SG's v3 egress still
-                    // produces observable bytes. Production never runs this.
-                    .unwrap_or(AuthenticatedSession {
-                        peer,
-                        generation: 0,
-                    }),
-            )
+            let bytes = admit(self.network.authenticated_session(peer).unwrap_or(
+                AuthenticatedSession {
+                    peer,
+                    generation: 0,
+                },
+            ))
             .map_err(|e| anyhow::anyhow!("test admit refused: {e}"))?;
             recorder.sends.push((peer, bytes));
             return Ok(());
@@ -295,8 +269,6 @@ pub(super) struct EgressMeter {
 }
 
 impl EgressMeter {
-    /// Runtime samples once per second. Counters count exceeded samples, not
-    /// API reads or packets. Warm-up treats the preceding unused window as idle.
     pub fn sample(
         &mut self,
         now: Instant,
@@ -444,8 +416,6 @@ mod tests {
         use saorsa_gossip_types::TopicId;
         use std::sync::Arc;
 
-        /// Explicit test-only network config (#417/#337): loopback bind, no
-        /// seeds, discovery/port-mapping off.
         fn test_network_config() -> NetworkConfig {
             NetworkConfig {
                 bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
@@ -465,8 +435,6 @@ mod tests {
             PubSubTransport::new(node)
         }
 
-        /// A structurally valid v2 IWANT frame: exact decode, IWant kind,
-        /// payload-hash binding, decodable id list — optionally signed.
         fn iwant_frame(topic: TopicId, ids: &[[u8; 32]], sign: bool) -> Vec<u8> {
             let payload = postcard::to_stdvec(&ids.to_vec()).expect("encode ids");
             let mut header = MessageHeader {
@@ -495,11 +463,6 @@ mod tests {
             postcard::to_stdvec(&message).expect("encode frame")
         }
 
-        /// #656: the counter path must not pay an ML-DSA verify per inbound
-        /// IWANT. PlumTree verifies the frame itself in `handle_message`;
-        /// here, a malformed (empty) signature must change NOTHING about
-        /// tracking — both frames are tracked identically. Under the old
-        /// verify-gated tracking the unsigned frame returned `None`.
         #[tokio::test]
         async fn malformed_signature_does_not_change_the_counter_path() {
             let transport = make_transport().await;
@@ -523,14 +486,9 @@ mod tests {
             );
         }
 
-        /// The classification itself still works end to end: while an
-        /// IWANT's scope is live, an Eager send matching its
-        /// (peer, topic, message) key is metered into the repair counters.
         #[tokio::test]
         async fn tracked_iwant_classifies_the_matching_repair_eager_send() {
             let transport = make_transport().await;
-            // Keep sends off the real socket; the metering happens before
-            // the recorder early-return.
             *transport
                 .recorder
                 .lock()

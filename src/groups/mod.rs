@@ -223,8 +223,6 @@ pub const MAX_LIVE_ISSUED_INVITES_PER_GROUP: usize = 64;
 
 /// Locally-issued invite record used to authenticate joiner-authored
 /// `MemberJoined` requests at the original inviter.
-/// #470: full equality (consumption state included) so `GroupInfo`'s
-/// derived `PartialEq` covers `issued_invites` completely.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssuedInviteRecord {
     /// Unix seconds when the invite was minted.
@@ -411,12 +409,6 @@ impl ForkQuarantine {
 /// detail derived from the same evidence, so it cannot differ between two
 /// markers whose identity fields agree, and carrying it would make every
 /// token clone a deep copy of two commit headers for no decision value.
-///
-/// **The destructuring in this type's `from_marker` constructor is exhaustive
-/// on purpose.** A field added to [`ForkQuarantine`] that this type should
-/// consider fails the BUILD there rather than silently widening the set of
-/// marker changes the epoch token cannot see. That is a stronger guarantee
-/// than a test, and it is why no `..` appears in that pattern.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForkQuarantineIdentity {
     revision: u64,
@@ -428,7 +420,6 @@ pub struct ForkQuarantineIdentity {
 
 impl ForkQuarantineIdentity {
     fn from_marker(marker: &ForkQuarantine) -> Self {
-        // Exhaustive — see the type doc. Do NOT add `..`.
         let ForkQuarantine {
             revision,
             state_hash,
@@ -456,25 +447,6 @@ impl ForkQuarantineIdentity {
 /// ADR-0067: the lifecycle epoch token, captured at an authorization check
 /// and re-validated inside the critical section that performs the
 /// irreversible act.
-///
-/// **Why this exists.** Every ADR-0066 gate (slices 1–6) consults the
-/// marker at the START of an operation. A marker installed — or cleared, or
-/// advanced to a new evidence revision — BETWEEN that check and the persist
-/// lets a contested write through, or wrongly refuses a permitted one.
-/// ADR-0066 §4 closes that window with a token; ADR-0067 settles what the
-/// token is.
-///
-/// **Why it is derived and not counted.** ADR-0066 §4 specified a
-/// `quarantine_generation` counter "on the group entry" while its own
-/// ratified R4 forbade "no new #470 full-equality participant" — and
-/// [`GroupInfo`] derives [`PartialEq`] with that full equality deliberately
-/// load-bearing for `persist_named_groups_mutation_unlocked`'s
-/// compare-and-restore rollback. The two cannot both hold. Worse, a census
-/// found three marker writers no process-local counter reaches: the on-disk
-/// recovery install, and the two clears that mutate the roster under a raw
-/// `named_groups.write()` without the persistence lock. A counter's
-/// completeness would rest on an enumeration whose failure mode is
-/// **fail-open**.
 ///
 /// So the token is DERIVED from the live record on demand:
 /// `(state_revision, marker identity)`. Nothing is stored, so nothing can go
@@ -540,7 +512,6 @@ impl LifecycleEpochToken {
     }
 }
 
-/// #732 r8: one symmetric fold contribution for [`LifecycleEpochToken::spanning_aliases`].
 /// splitmix64's finalizer, so structurally adjacent revisions (4 and 5)
 /// cannot compensate each other the way raw addition would (`4 + 9 == 5 + 8`
 /// would mask a real advance behind a rollback).
@@ -600,7 +571,6 @@ impl LifecycleEpochToken {
 /// #470 failure).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GroupInfo {
-    // ── v1 compat (read-only) ───────────────────────────────────────────
     #[serde(default, skip_serializing)]
     pub members: BTreeSet<String>,
     #[serde(default, skip_serializing)]
@@ -608,7 +578,6 @@ pub struct GroupInfo {
     #[serde(default, skip_serializing)]
     pub membership_revision: u64,
 
-    // ── v2 identity + topics ────────────────────────────────────────────
     pub name: String,
     pub description: String,
     pub creator: AgentId,
@@ -619,7 +588,6 @@ pub struct GroupInfo {
     pub metadata_topic: String,
     pub chat_topic_prefix: String,
 
-    // ── v2 policy + roster ──────────────────────────────────────────────
     #[serde(default)]
     pub policy: GroupPolicy,
     #[serde(default)]
@@ -633,14 +601,8 @@ pub struct GroupInfo {
     #[serde(default)]
     pub discovery_card_topic: Option<String>,
 
-    // ── Phase D.2: Group Shared Secret (GSS) for cross-daemon encrypted
-    //    content delivery. This is a symmetric-key layer distributed via
-    //    welcomes, NOT full MLS TreeKEM. It gives:
-    //      - cross-daemon encrypt/decrypt (proven from the correct peer)
-    //      - rekey-on-ban semantics (banned peer loses future access)
-    //    It does NOT give per-message forward secrecy within an epoch.
-    //    Full TreeKEM cross-daemon join is blocked on saorsa-mls upstream
-    //    providing a `from_welcome` constructor.
+    // The shared secret is a symmetric key sent in welcomes, not TreeKEM:
+    // rekey-on-ban, but no forward secrecy within an epoch.
     /// 32-byte random secret for MlsEncrypted groups. None for SignedPublic or
     /// for stub entries created via card import (importer isn't a member yet).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -657,7 +619,6 @@ pub struct GroupInfo {
     #[serde(default = "secure_plane_legacy_default")]
     pub secure_plane: SecureGroupPlane,
 
-    // ── Phase D.3: Stable identity + evolving validity ──────────────────
     /// Stable genesis record — establishes the group's permanent `group_id`.
     /// Reconstructed from `mls_group_id` + creator + created_at when
     /// migrating pre-D.3 blobs (see [`GroupInfo::migrate_from_v1`]).
@@ -921,15 +882,10 @@ pub fn sole_member_in_being_excluding_join_markers(
 
 /// The single self-leave routing predicate (#369): classify `leaver_hex`'s
 /// DELETE against the live roster and join-request view.
-///
-/// Replaces the former `last_admin_self_leave_precheck_error` hand-synced
-/// pair: the last-admin evaluation still runs on a clone so rejected leaves
-/// cannot mutate live group state.
 #[must_use]
 pub fn leave_disposition(info: &GroupInfo, leaver_hex: &str) -> LeaveDisposition {
-    // Pending comes from join_requests (authoritative), NOT the roster's
-    // seeded Pending entries: reject/cancel clear the roster mirror, and a
-    // KEM-less request never seeds one at all (PR #370 r2 blocker 1).
+    // `join_requests` is the authority for a pending joiner: a KEM-less
+    // request seeds no roster row, and reject/cancel clear the roster mirror.
     let has_pending_request = info.has_pending_join_request();
     if !has_pending_request && info.sole_member_in_being_excluding_join_markers(leaver_hex) {
         return LeaveDisposition::SoleMemberDelete;
@@ -940,10 +896,6 @@ pub fn leave_disposition(info: &GroupInfo, leaver_hex: &str) -> LeaveDisposition
     {
         return LeaveDisposition::Proceed;
     }
-    // Blocked. When the leaver is the only ACTIVE member and a join request
-    // is still pending, the actionable recovery is resolving the request
-    // (approve it, or reject/cancel it so the delete unlocks), not promoting
-    // a member that does not exist.
     let leaver_is_only_active =
         info.has_active_member(leaver_hex) && info.active_member_count() == 1;
     if leaver_is_only_active && has_pending_request {
@@ -976,10 +928,6 @@ impl std::fmt::Display for SetMemberCertificateError {
     }
 }
 impl GroupInfo {
-    /// ADR-0064 (Guard A): whether this node currently refuses
-    /// membership-gated routes for the group because authenticated fork
-    /// evidence is outstanding. ADR-0066 §2: true for ordinary groups too
-    /// (the marker then carries `no_anchor`).
     /// ADR-0067: this group's lifecycle epoch token, derived from the live
     /// record.
     ///
@@ -999,6 +947,10 @@ impl GroupInfo {
         }
     }
 
+    /// ADR-0064 (Guard A): whether this node currently refuses
+    /// membership-gated routes for the group because authenticated fork
+    /// evidence is outstanding. ADR-0066 §2: true for ordinary groups too
+    /// (the marker then carries `no_anchor`).
     #[must_use]
     pub fn is_fork_quarantined(&self) -> bool {
         self.fork_quarantine.is_some()
@@ -1085,8 +1037,6 @@ impl GroupInfo {
             GroupMember::new_admin(creator_hex.clone(), None, now),
         );
 
-        // Generate a fresh shared secret for MlsEncrypted groups. SignedPublic
-        // groups don't need one — their content is signed but not encrypted.
         let shared_secret = if policy.confidentiality == GroupConfidentiality::MlsEncrypted {
             use rand::RngCore;
             let mut secret = vec![0u8; 32];
@@ -1096,12 +1046,6 @@ impl GroupInfo {
             None
         };
 
-        // All groups are MLS groups — the MLS group id IS the stable group id.
-        // The genesis record is retained for audit (creator + creation timestamp),
-        // but its `group_id` is pinned to the MLS group id so every id surface
-        // (owner named_groups key, card.group_id, metadata_topic) converges on
-        // a single value. Prior to this, genesis.group_id was a separately
-        // derived BLAKE3 hash which caused cross-daemon lookup drift.
         let genesis = state_commit::GroupGenesis::with_existing_id(
             mls_group_id.clone(),
             creator_hex.clone(),
@@ -1133,11 +1077,8 @@ impl GroupInfo {
             commit_log: Vec::new(),
             shared_secret,
             secret_epoch: 0,
-            // Generic constructor stays on the legacy GSS plane (matching the
-            // shared_secret generated above). The secure-by-default TreeKEM
-            // routing is applied explicitly in the daemon's create-group path
-            // (ADR-0012 Phase 2), not here, so card-import stubs and other
-            // constructors are not silently relabelled.
+            // The generic constructor stays on the GSS plane. The daemon create
+            // path picks TreeKEM, so card-import stubs are not relabelled.
             secure_plane: SecureGroupPlane::Gss,
 
             genesis: Some(genesis),
@@ -1145,8 +1086,6 @@ impl GroupInfo {
             state_hash: String::new(),
             prev_state_hash: None,
             security_binding: match confidentiality {
-                // #1604: an unknown confidentiality is treated as the most
-                // restrictive (encrypted) plane.
                 GroupConfidentiality::MlsEncrypted | GroupConfidentiality::Unknown => {
                     Some("gss:epoch=0".into())
                 }
@@ -1189,8 +1128,6 @@ impl GroupInfo {
         (new_secret, self.secret_epoch)
     }
 
-    // ── Phase D.3: state-commit chain ──────────────────────────────────
-
     /// The stable `group_id` (Phase D.3). Falls back to `mls_group_id` for
     /// pre-D.3 groups where genesis has not yet been reconstructed.
     #[must_use]
@@ -1210,9 +1147,6 @@ impl GroupInfo {
             tags: self.tags.clone(),
             avatar_url: self.avatar_url.clone(),
             banner_url: self.banner_url.clone(),
-            // ADR-0038 review fix 1: the Home metadata commitment rides
-            // the signed state hash; forging `home` after the fact breaks
-            // state-hash validation.
             home_digest: self.home.as_ref().map(state_commit::compute_home_digest),
         }
     }
@@ -1353,32 +1287,18 @@ impl GroupInfo {
         ),
         state_commit::ApplyError,
     > {
-        // Round-4: consumes the CALLER'S verdict — no re-evaluation, no
-        // fresh clock read; the commit and the evaluation cannot disagree.
         let original = self.clone();
         let signer_hex = hex::encode(keypair.agent_id().as_bytes());
         let evicted = self.enforce_owner_certified_admission(&signer_hex, verdict);
         match self.seal_commit_inner(keypair, now_ms) {
             Ok(commit) => {
-                // Round-4 regression rule: the restore quarantine lifts
-                // ONLY on an all-clean verdict — a grace-admitted
-                // evidence-missing member must keep the group
-                // quarantined.
-                // ADR-0064 r2: this shared wrapper is what ~22 ROUTINE
-                // mutation sites (rename, policy, add/ban/promote, …)
-                // seal through, so it must NOT clear the fork-quarantine
-                // marker — the owner-anchored local clear is
-                // [`Self::clear_fork_quarantine_on_explicit_owner_seal`],
-                // called only from the explicit seal route.
+                // Only an all-clean verdict lifts the restore quarantine. Routine
+                // mutations seal through here, so the fork-quarantine marker stays.
                 if verdict.is_all_clean() {
                     self.owner_cert_reverify_required = false;
                 }
                 Ok((commit, evicted))
             }
-            // A failed seal leaves the group untouched: without this
-            // restore, the prune above would outlive the commit it was
-            // meant to be part of, and a retry (or the last-admin veto
-            // itself) would see a silently-amputated roster.
             Err(err) => {
                 *self = original;
                 Err(err)
@@ -1424,8 +1344,6 @@ impl GroupInfo {
             return;
         }
         self.fork_quarantine = None;
-        // Slice 4: the clear re-arms the evidence gate (see
-        // `reset_fork_evidence_after_quarantine_clear`).
         self.reset_fork_evidence_after_quarantine_clear();
     }
 
@@ -1461,28 +1379,15 @@ impl GroupInfo {
     ) -> Result<state_commit::GroupStateCommit, state_commit::ApplyError> {
         self.seal_commit_inner(keypair, now_ms)
     }
-    /// Shared sealing core: chain advance + signature. No admission logic —
-    /// the public entry points own that.
     fn seal_commit_inner(
         &mut self,
         keypair: &AgentKeypair,
         now_ms: u64,
     ) -> Result<state_commit::GroupStateCommit, state_commit::ApplyError> {
-        // #1604 G5: never sign a state that holds a variant this node does
-        // not know (its policy and roster hashes cannot be computed).
         self.refuse_unknown_variants()?;
-        // ADR-0016 R2: never author a commit whose post-mutation,
-        // non-withdrawn state has zero active admins. `self` already holds
-        // the caller's domain mutations, so this evaluates the proposed
-        // post-mutation roster before any chain field is touched.
         state_commit::enforce_last_admin_invariant(&self.members_v2, self.withdrawn)?;
         if self.withdrawn {
             let signer_hex = hex::encode(keypair.agent_id().as_bytes());
-            // #369: withdrawn commits are admin-authored, except by the sole
-            // member-in-being — their terminal exit IS the group's unanimous
-            // decision (see `seal_withdrawal`). #1578 rc11: the join's
-            // key-only marker row is not a seat, so it does not make the
-            // pre-admission joiner a sole member-in-being.
             let authorized =
                 state_commit::active_signer_is_admin_or_higher(&self.members_v2, &signer_hex)
                     || self.sole_member_in_being_excluding_join_markers(&signer_hex);
@@ -1493,25 +1398,18 @@ impl GroupInfo {
                 });
             }
         }
-        // Ensure the genesis record is present — callers may reach here via
-        // migrated paths that didn't set it yet.
         if self.genesis.is_none() {
             let creator_hex = hex::encode(self.creator.as_bytes());
             self.genesis = Some(state_commit::GroupGenesis::with_existing_id(
                 self.mls_group_id.clone(),
                 creator_hex,
                 self.created_at,
-                // Deterministic nonce from mls_group_id so migration is
-                // idempotent across daemon restarts.
+                // Derived from `mls_group_id`: the migration is idempotent across restarts.
                 hex::encode(blake3::hash(self.mls_group_id.as_bytes()).as_bytes()),
             ));
         }
-        // NOTE: do NOT recompute here. `self.state_hash` reflects the
-        // *last committed* state; that is what the new commit's
-        // `prev_state_hash` must link to. Mutations the caller made
-        // since the last commit are intentionally not yet reflected in
-        // `self.state_hash` — the recompute below folds them in under
-        // the new revision.
+        // `state_hash` is still the last committed state here; the new
+        // commit's `prev_state_hash` must link to it.
         let prev = self.state_hash.clone();
         self.state_revision = self.state_revision.saturating_add(1);
         self.prev_state_hash = Some(prev.clone());
@@ -1534,8 +1432,6 @@ impl GroupInfo {
             now_ms,
             keypair,
         )?;
-        // issue #111: retain the locally-authored commit + the roster it
-        // committed. `self` already reflects the committed state here.
         self.retain_commit(&commit);
         Ok(commit)
     }
@@ -1585,14 +1481,6 @@ impl GroupInfo {
                 {
                     return None;
                 }
-                // Digest-gated embedded fallback (round-3): the committed
-                // cert seats the member ONLY when the agent's latest
-                // announce does not contradict it. A known announce digest
-                // different from the embedded cert's digest means the owner
-                // re-keyed/re-issued — the embedded cert is STALE and must
-                // not seat. ADR 0108 §4: in Home scope an anonymous digest
-                // from the agent's bound machine is no announce at all,
-                // never a contradiction.
                 let embedded_is_stale = m.certificate.as_ref().is_some_and(|cert| {
                     evidence
                         .disclosed_digest_for(agent_hex, home_scope)
@@ -1612,9 +1500,6 @@ impl GroupInfo {
                     return None;
                 }
 
-                // Neither source verifies: report the informative failure
-                // kind — the resolved cert's own failure when one existed,
-                // otherwise "no certificate at all".
                 let failure = evidence
                     .cert_for(agent_hex)
                     .map(check)
@@ -1739,17 +1624,6 @@ impl GroupInfo {
                 );
                 continue;
             }
-            // Invite-auth #468/#469 (design v5 D2 / v6 E2): a DIGEST-ONLY
-            // seat — the signed roster root commits to this member's
-            // certificate digest but the bytes are not embedded
-            // (key-stripped invite/recovery state, a projection-materialized
-            // adoption member, or a restart before hydration). PENDING,
-            // never missing evidence: no grace-window stamping and no
-            // missing-evidence eviction can touch the seat, while every
-            // operation needing the certificate BYTES fails closed
-            // (`is_all_clean` stays false until
-            // `hydrate_member_certificates` installs them). Only revocation
-            // (checked above) outranks it.
             let digest_only = embedded.is_none()
                 && self
                     .members_v2
@@ -1761,10 +1635,6 @@ impl GroupInfo {
                 per_member.insert(agent_hex, owner_cert::MemberCertStatus::DigestPending);
                 continue;
             }
-            // ADR 0108 §4: in Home scope an anonymous digest from the
-            // agent's bound machine is no announce at all, so it can
-            // neither stale the embedded certificate nor leave a fetch in
-            // flight below.
             let embedded_is_stale = embedded.as_ref().is_some_and(|cert| {
                 evidence
                     .disclosed_digest_for(&agent_hex, home_scope)
@@ -1783,9 +1653,6 @@ impl GroupInfo {
                 per_member.insert(agent_hex, owner_cert::MemberCertStatus::Clean);
                 continue;
             }
-            // Evidence in flight: a warranted fetch outstanding means the
-            // member is mid-rotation (INCLUDING a stale/expired embedded
-            // cert awaiting its replacement). Grace applies.
             if evidence.disclosed_fetch_in_flight(&agent_hex, home_scope) {
                 match Self::apply_missing_evidence_grace(
                     &mut self.members_v2,
@@ -1800,11 +1667,6 @@ impl GroupInfo {
                         );
                     }
                     None => {
-                        // #1023 (Engineer ruling 1 Nov 2026 02:36 GMT): an
-                        // unfetchable renewal must not make the creator's
-                        // own expired certificate eviction-eligible through
-                        // the grace window either — the hold applies past
-                        // the window too.
                         if self.creator_expired_certificate_hold(&agent_hex, now) {
                             per_member
                                 .insert(agent_hex, owner_cert::MemberCertStatus::DigestPending);
@@ -1820,30 +1682,12 @@ impl GroupInfo {
                 }
                 continue;
             }
-            // A present-but-failing certificate is a definitive failure:
-            // no grace.
             if resolved.is_some() || embedded.is_some() {
                 clear_ts(&mut self.members_v2);
                 let reason = resolved
                     .and_then(|cert| check(cert).err())
                     .or_else(|| embedded.as_ref().and_then(|cert| check(cert).err()))
                     .unwrap_or(owner_cert::OwnerCertFailure::NoCertificate);
-                // Engineer ruling 1 Nov 2026 02:36 GMT: the creator seat
-                // never becomes eviction-eligible from its own EXPIRED
-                // certificate alone. The hold keys on the COMMITTED
-                // (embedded) certificate's failure — never an announced
-                // one — and an expired committed certificate on the
-                // creator holds like a digest-only seat: `DigestPending`
-                // is never in `OwnerCertVerdict::failed()`, so no
-                // ordinary-seal eviction set names the creator seat while
-                // its renewal is outstanding, while every operation that
-                // needs valid creator bytes still fails closed
-                // (`is_all_clean` stays false). The S4 eviction paths
-                // treat a held creator as non-blocking
-                // (`creator_expired_certificate_hold`), so revocation
-                // evictions of other members still seal. Any other
-                // failure (revocation is checked above; wrong owner or
-                // agent, a bad signature) stays `Failed`.
                 if self.creator_expired_certificate_hold(&agent_hex, now) {
                     per_member.insert(agent_hex, owner_cert::MemberCertStatus::DigestPending);
                     continue;
@@ -1851,7 +1695,6 @@ impl GroupInfo {
                 per_member.insert(agent_hex, owner_cert::MemberCertStatus::Failed { reason });
                 continue;
             }
-            // Totally missing evidence: grace window bookkeeping.
             match Self::apply_missing_evidence_grace(
                 &mut self.members_v2,
                 &agent_hex,
@@ -1880,11 +1723,6 @@ impl GroupInfo {
         }
     }
 
-    /// Grace-window bookkeeping shared by every missing-evidence path:
-    /// first observation stamps `certificate_missing_since_ms` and returns
-    /// `Some(now)`; inside the window returns `Some(window_start)`; past
-    /// the window returns `None` — the member is evictable as
-    /// `NoCertificate`.
     fn apply_missing_evidence_grace(
         members_v2: &mut BTreeMap<String, GroupMember>,
         agent_hex: &str,
@@ -1916,9 +1754,6 @@ impl GroupInfo {
         authority_hex: &str,
         verdict: &owner_cert::OwnerCertVerdict,
     ) -> Vec<(String, owner_cert::OwnerCertFailure)> {
-        // Round-4: enforcement consumes the verdict produced by
-        // [`Self::owner_cert_verdict`] — `Failed` members only; `InGrace`
-        // members are retained by construction.
         let failures = verdict.failed();
         for (agent_hex, failure) in &failures {
             tracing::warn!(
@@ -1983,10 +1818,6 @@ impl GroupInfo {
         &mut self,
         certificates: &[(String, crate::identity::AgentCertificate)],
     ) -> usize {
-        // #1023: collect the commit-log fallback before any mutation (the
-        // scan borrows `self` immutably). A seat the caller covers is left
-        // to the caller's entry — the shared loop below skips byte-bearing
-        // seats, so an overlap cannot double-install.
         let mut from_commit_log: Vec<(String, crate::identity::AgentCertificate)> = Vec::new();
         for (agent_hex, member) in &self.members_v2 {
             if member.certificate.is_some() {
@@ -2006,9 +1837,6 @@ impl GroupInfo {
                     from_commit_log.push((agent_hex.clone(), cert.clone()));
                     break;
                 }
-                // A byte-bearing snapshot for a DIFFERENT admission is not
-                // a verdict on this seat: keep looking — a record
-                // installed whole can hold byte-bearing older links.
             }
         }
         let mut hydrated = 0usize;
@@ -2017,13 +1845,9 @@ impl GroupInfo {
                 continue;
             };
             if member.certificate.is_some() {
-                // Bytes already seated — the committed entry is complete;
-                // hydration targets digest-only seats exclusively.
                 continue;
             }
             let Some(committed) = member.certificate_digest.clone() else {
-                // No committed digest: nothing binds this certificate to
-                // the seat — hydration is digest-anchored by design.
                 tracing::debug!(
                     group_id = %self.stable_group_id(),
                     member = %agent_hex,
@@ -2033,10 +1857,6 @@ impl GroupInfo {
             };
             let digest = owner_cert::certificate_digest_hex(cert);
             if digest != committed {
-                // Evidence for a DIFFERENT admission (e.g. the owner
-                // re-keyed while this roster still commits to the old
-                // digest): the seat stays pending; never rewrite the
-                // commitment.
                 tracing::debug!(
                     group_id = %self.stable_group_id(),
                     member = %agent_hex,
@@ -2068,8 +1888,6 @@ impl GroupInfo {
                 continue;
             };
             let actual = owner_cert::certificate_digest_hex(cert);
-            // Repair ONLY the both-present mismatch: a digest-less legacy
-            // entry stays digest-less (its root already covers the bytes).
             if member
                 .certificate_digest
                 .as_deref()
@@ -2086,9 +1904,6 @@ impl GroupInfo {
                 repaired += 1;
             }
         }
-        // #1023: age the certificate carry at load too — a record
-        // installed whole (a backup restore, a peer-built file) keeps old
-        // byte-bearing links until its next commit otherwise.
         self.age_certificate_carry();
         repaired
     }
@@ -2105,11 +1920,6 @@ impl GroupInfo {
             .and_then(|m| m.certificate.as_ref())
     }
 
-    /// Append a retained commit for the just-committed state and enforce
-    /// [`COMMIT_LOG_CAP`]. `self` must already reflect the committed roster
-    /// (callers mutate then seal/finalize, so this holds). The single
-    /// chokepoint both commit-production paths route through, so retention
-    /// cannot be forgotten at an individual apply site.
     fn retain_commit(&mut self, commit: &state_commit::GroupStateCommit) {
         self.commit_log.push(state_commit::RetainedCommit::capture(
             commit.clone(),
@@ -2170,9 +1980,6 @@ impl GroupInfo {
         now_ms: u64,
     ) -> Result<state_commit::GroupStateCommit, state_commit::ApplyError> {
         let signer_hex = hex::encode(keypair.agent_id().as_bytes());
-        // #1578 rc11: as in `seal_commit_inner`, the join's key-only
-        // marker row is not a seat — the pre-admission joiner is not a
-        // sole member-in-being.
         let authorized =
             state_commit::active_signer_is_admin_or_higher(&self.members_v2, &signer_hex)
                 || self.sole_member_in_being_excluding_join_markers(&signer_hex);
@@ -2185,10 +1992,8 @@ impl GroupInfo {
 
         let original = self.clone();
         self.withdrawn = true;
-        // Terminal withdrawal seals via the inner path: a withdrawn
-        // tombstone grants no access, so OwnerCertified re-verification is
-        // moot and must not be able to block tearing a group down
-        // (ADR-0038 enforcement targets LIVE admission, not exits).
+        // A withdrawal seals through the inner path: owner-certificate
+        // re-verification must not block the teardown of a group.
         match self.seal_commit_inner(keypair, now_ms) {
             Ok(commit) => {
                 self.shared_secret = None;
@@ -2235,8 +2040,6 @@ impl GroupInfo {
         commit: &state_commit::GroupStateCommit,
         allow_live_withdrawal: bool,
     ) -> Result<(), state_commit::ApplyError> {
-        // #1604 G5: never accept a state that holds a variant this node does
-        // not know.
         self.refuse_unknown_variants()?;
         if self.withdrawn && !commit.withdrawn {
             return Err(state_commit::ApplyError::Withdrawn);
@@ -2259,19 +2062,20 @@ impl GroupInfo {
                 got: self.state_hash.clone(),
             });
         }
-        // ADR-0016 R2: reject any applied commit whose post-mutation,
-        // non-withdrawn state has zero active admins. Runs after the hash
-        // check so the roster being validated is provably the roster the
-        // signed commit's `roster_root` committed to.
+        // After the hash check: the roster checked here is the roster the
+        // signed `roster_root` commits to.
         state_commit::enforce_last_admin_invariant(&self.members_v2, self.withdrawn)?;
         if live_to_withdrawn {
             self.shared_secret = None;
         }
-        // issue #111: retain the peer-authored commit only after it has
-        // validated and applied cleanly (post hash-match + invariants), so
-        // rejected commits never enter the history.
         self.retain_commit(commit);
         Ok(())
+    }
+
+    fn refuse_unknown_variants(&self) -> Result<(), state_commit::ApplyError> {
+        crate::wire_compat::reject_unknown("GroupInfo", self)
+            .map(|_| ())
+            .map_err(|e| state_commit::ApplyError::Invariant(e.to_string()))
     }
 
     /// Finalize a non-terminal commit **after** the caller has already performed
@@ -2285,15 +2089,6 @@ impl GroupInfo {
     /// finalizer deliberately rejects live -> withdrawn commits; use
     /// [`GroupInfo::finalize_applied_terminal_commit`] only from explicit
     /// terminal event handling.
-    /// #1604 G5: refuse a state that holds an `Unknown` variant before it is
-    /// hashed, signed or applied. `Unknown` is never encoded, so its policy
-    /// and roster hashes cannot be computed.
-    fn refuse_unknown_variants(&self) -> Result<(), state_commit::ApplyError> {
-        crate::wire_compat::reject_unknown("GroupInfo", self)
-            .map(|_| ())
-            .map_err(|e| state_commit::ApplyError::Invariant(e.to_string()))
-    }
-
     pub fn finalize_applied_commit(
         &mut self,
         commit: &state_commit::GroupStateCommit,
@@ -2301,28 +2096,6 @@ impl GroupInfo {
         self.finalize_applied_commit_with_terminal_mode(commit, false)
     }
 
-    /// #458 (review r2): finalize a commit a joiner stub ADOPTED across a
-    /// `prev_state_hash` gap, WITHOUT ever blind-copying the commit's
-    /// chain fields onto content they do not cover.
-    ///
-    /// Verified before anything mutates:
-    /// - the reconstructed roster's root equals the commit's SIGNED
-    ///   `roster_root` — the joiner's seat, role, state and committed
-    ///   certificate are exactly what the authority signed;
-    /// - the last-admin invariant holds on that roster.
-    ///
-    /// Then the joiner FORKS its local chain at its own frontier, keeping
-    /// internal consistency: `state_revision` advances to the commit's
-    /// revision and `security_binding` follows the commit (an epoch
-    /// input), but `prev_state_hash` chains from the LOCAL hash and
-    /// `state_hash` is RECOMPUTED from local content — never copied.
-    /// Copying the commit's hash would bind the joiner's stored hash to
-    /// intermediate metadata (e.g. a rename) the stub never saw, leaving
-    /// hash ≠ content; the next normal apply/seal would then recompute
-    /// and reject, wedging the very joiner this path exists to free.
-    /// A forked joiner converges on later authority commits through this
-    /// same roster-root-verified path until a full resync (restart,
-    /// catch-up) rebuilds the chain link.
     /// #458 r4: fold a VERIFIED roster projection (its root already
     /// re-derived the signed `roster_root`) into the live roster: entries
     /// adopt the projection's role/state, members absent from the
@@ -2342,7 +2115,6 @@ impl GroupInfo {
         &mut self,
         projection: &BTreeMap<String, state_commit::RosterMemberSnapshot>,
     ) {
-        // Remove entries the projection dropped (or made non-root-visible).
         let dropped: Vec<String> = self
             .members_v2
             .keys()
@@ -2353,15 +2125,6 @@ impl GroupInfo {
             self.members_v2.remove(&id);
         }
         for (id, snap) in projection {
-            // #1023: snapshot-carried certificate bytes install on
-            // adoption ONLY when they hash to the entry's committed
-            // `certificate_digest` — the same digest-anchored rule as
-            // [`Self::hydrate_member_certificates`]. Bytes without a
-            // committed digest, or hashing to a different one, are not
-            // evidence for this admission: the seat stays digest-only
-            // (`MemberCertStatus::DigestPending`). A byte-bearing seat
-            // hashes identically to its digest-only form, so the adopted
-            // root never moves.
             let snapshot_certificate = snap
                 .certificate
                 .as_ref()
@@ -2380,19 +2143,8 @@ impl GroupInfo {
                         .as_ref()
                         .map(owner_cert::certificate_digest_hex);
                     if local_digest.as_deref() != snap.certificate_digest.as_deref() {
-                        // The projection is authoritative for cert identity:
-                        // a local cert whose digest no longer matches is
-                        // STALE — drop the BYTES but KEEP the projection's
-                        // digest (assigned below), so the member stays
-                        // digest-seated instead of evidence-less.
                         member.certificate = None;
                     }
-                    // Invite-auth #468/#469 (design v5 D2): the projection's
-                    // digest rides onto the entry whether or not local bytes
-                    // survived, so `compute_roster_root` re-derives the
-                    // projection's signed root and a byte-less member
-                    // remains digest-committed
-                    // (`MemberCertStatus::DigestPending`).
                     member.certificate_digest = snap.certificate_digest.clone();
                     if member.certificate.is_none() {
                         member.certificate = snapshot_certificate;
@@ -2426,7 +2178,6 @@ impl GroupInfo {
         if self.withdrawn && !commit.withdrawn {
             return Err(state_commit::ApplyError::Withdrawn);
         }
-        // Fold the verified metadata so content matches the hash we adopt.
         self.name = meta.name.clone();
         self.description = meta.description.clone();
         self.tags = meta.tags.clone();
@@ -2456,15 +2207,8 @@ impl GroupInfo {
                 got: recomputed,
             });
         }
-        // #458 r5d — GSS/Legacy `security_binding`: for non-TreeKEM
-        // planes the binding string ("gss:epoch=N") is NOT tied to any
-        // key material a joiner can independently verify; adopting it from
-        // the verified terminal commit makes it HASH-CONSISTENT-ONLY (the
-        // full-hash equality above proves the authority committed to this
-        // exact string). TreeKEM planes bind epochs to the snapshot the
-        // rebind path verifies separately. Adoption itself is restricted
-        // to OwnerCertified groups anchored by the owner-signed head
-        // attestation, which is the real integrity bound here.
+        // On a non-TreeKEM plane the adopted binding is hash-consistent only:
+        // no key material lets a joiner verify it.
         self.security_binding = commit.security_binding.clone();
         self.state_revision = commit.revision;
         self.prev_state_hash = commit.prev_state_hash.clone();
@@ -2498,6 +2242,28 @@ impl GroupInfo {
         result
     }
 
+    /// #458 (review r2): finalize a commit a joiner stub ADOPTED across a
+    /// `prev_state_hash` gap, WITHOUT ever blind-copying the commit's
+    /// chain fields onto content they do not cover.
+    ///
+    /// Verified before anything mutates:
+    /// - the reconstructed roster's root equals the commit's SIGNED
+    ///   `roster_root` — the joiner's seat, role, state and committed
+    ///   certificate are exactly what the authority signed;
+    /// - the last-admin invariant holds on that roster.
+    ///
+    /// Then the joiner FORKS its local chain at its own frontier, keeping
+    /// internal consistency: `state_revision` advances to the commit's
+    /// revision and `security_binding` follows the commit (an epoch
+    /// input), but `prev_state_hash` chains from the LOCAL hash and
+    /// `state_hash` is RECOMPUTED from local content — never copied.
+    /// Copying the commit's hash would bind the joiner's stored hash to
+    /// intermediate metadata (e.g. a rename) the stub never saw, leaving
+    /// hash ≠ content; the next normal apply/seal would then recompute
+    /// and reject, wedging the very joiner this path exists to free.
+    /// A forked joiner converges on later authority commits through this
+    /// same roster-root-verified path until a full resync (restart,
+    /// catch-up) rebuilds the chain link.
     pub fn finalize_adopted_commit_roster_checked(
         &mut self,
         commit: &state_commit::GroupStateCommit,
@@ -2603,9 +2369,6 @@ impl GroupInfo {
                 self.updated_at = self.created_at;
             }
         }
-        // Phase D.3: backfill stable-genesis deterministically from the
-        // existing mls_group_id so migrated blobs carry the same
-        // `stable_group_id` across restarts.
         if self.genesis.is_none() {
             let creator_hex = hex::encode(self.creator.as_bytes());
             let nonce = hex::encode(blake3::hash(self.mls_group_id.as_bytes()).as_bytes());
@@ -2616,14 +2379,11 @@ impl GroupInfo {
                 nonce,
             ));
         }
-        // Phase D.3: if security_binding is unset on an MlsEncrypted group,
-        // derive it from the current secret_epoch.
         if self.security_binding.is_none()
             && self.policy.confidentiality == GroupConfidentiality::MlsEncrypted
         {
             self.security_binding = Some(format!("gss:epoch={}", self.secret_epoch));
         }
-        // Phase D.3: recompute state_hash if absent.
         if self.state_hash.is_empty() {
             self.recompute_state_hash();
         }
@@ -2807,14 +2567,8 @@ impl GroupInfo {
         self.members_v2
             .entry(agent_id_hex.clone())
             .and_modify(|m| {
-                // #1663 review round 4 (Claude, 30 Oct): a row returning
-                // to Active from Removed or Banned starts a fresh
-                // republication epoch — the re-joined member's own row is
-                // new, so a retained counter would refuse its every
-                // republication as stale. The reset rides the signed
-                // re-admission every peer applies alike; an already-Active
-                // row keeps its counter. The admission floor (David's
-                // ruling, 2 Nov) refuses a frame signed before it.
+                // A row that returns to Active starts a fresh republication epoch: a
+                // kept counter would refuse the member's every republication as stale.
                 if m.state != GroupMemberState::Active {
                     m.note_readmission(admission_revision);
                 }
@@ -2971,8 +2725,6 @@ impl GroupInfo {
     pub fn unban_member(&mut self, agent_id_hex: &str) {
         if let Some(m) = self.members_v2.get_mut(agent_id_hex) {
             if m.state == GroupMemberState::Banned {
-                // #1663: an unban is a re-admission — the same fresh
-                // republication epoch as `add_member_with_kem`.
                 m.note_readmission(self.state_revision);
                 m.state = GroupMemberState::Active;
                 m.updated_at = now_millis();
@@ -3014,15 +2766,9 @@ impl GroupInfo {
         self.join_requests.values().any(JoinRequest::is_pending)
     }
 
-    /// #1578 rc7/rc8, moved from the server layer (rc11): the local
-    /// join's own-key marker row. The join seats the joiner's own
-    /// published KEM key on a Pending row of its own stub (rc7); the
-    /// row carries no admission state — only the key — so every seat
-    /// check must treat it as absent, exactly main's roster, where the
-    /// joiner holds no row before its `MemberAdded` lands. A Pending
-    /// row with a live join request is a real seat marker (the
-    /// request/approve path seats the requester on the authority's
-    /// copy), not the join's key carrier, so it does not match.
+    /// The local join's own-key marker: a Pending row that carries only the
+    /// joiner's KEM key and has no live join request. Seat checks treat it
+    /// as absent.
     #[must_use]
     pub(crate) fn join_seat_key_marker_only(&self, joiner_hex: &str) -> bool {
         if self.join_requests.values().any(|req| {
@@ -3045,11 +2791,6 @@ impl GroupInfo {
         )
     }
 
-    /// #1578 rc11 (Claude blocking 1, audit): the agents whose only
-    /// roster row is the local join's key-only marker
-    /// ([`Self::join_seat_key_marker_only`]) — the rows every
-    /// seat-count lookup must treat as absent, exactly main's roster
-    /// before the joiner's `MemberAdded` lands.
     #[must_use]
     pub(crate) fn join_seat_key_marker_agents(&self) -> BTreeSet<String> {
         self.members_v2
@@ -3059,14 +2800,6 @@ impl GroupInfo {
             .collect()
     }
 
-    /// #1578 rc11 (Claude blocking 1, audit): [`sole_member_in_being`]
-    /// counting the local join's key-only marker row
-    /// ([`Self::join_seat_key_marker_only`]) diverges from main, where
-    /// the joiner holds no roster row before its `MemberAdded` lands. A
-    /// marker row must neither make its joiner the sole member-in-being
-    /// nor inflate the count and hide a real one (a real sole member's
-    /// terminal exit must not turn into a refusal because the joiner's
-    /// stub also carries its own key marker).
     #[must_use]
     pub(crate) fn sole_member_in_being_excluding_join_markers(&self, agent_hex: &str) -> bool {
         sole_member_in_being_excluding_join_markers(
@@ -3234,11 +2967,6 @@ impl GroupInfo {
     }
 }
 
-/// Whether `sender_hex` may reopen a corrupt revocation carrier (#1116).
-///
-/// The sender must be an Active owner or admin. The local agent must be
-/// Active in that same group. A withdrawn group does not qualify. A
-/// moderator, member, guest, outsider, or inactive seat does not qualify.
 pub(crate) fn sender_is_active_group_authority<'a>(
     groups: impl IntoIterator<Item = &'a GroupInfo>,
     local_agent_hex: &str,
@@ -3334,8 +3062,6 @@ mod tests {
 
     #[test]
     fn seal_commit_retains_verifiable_history() {
-        // issue #111: every locally-authored commit is retained in-struct,
-        // paired with a roster projection that re-derives its signed root.
         let mut info = GroupInfo::new("Test".into(), String::new(), agent(1), "aabb".repeat(8));
         let kp = crate::identity::AgentKeypair::generate().unwrap();
         assert!(
@@ -3469,14 +3195,10 @@ mod tests {
     fn leave_disposition_sole_member_requires_the_leaver() {
         let mut info = GroupInfo::new("T".into(), String::new(), agent(1), "aa".repeat(16));
         let creator_hex = hex::encode([1u8; 32]);
-        // #369: creator-only roster — the creator's self-leave routes to
-        // deletion instead of the last-admin 409.
         assert_eq!(
             leave_disposition(&info, &creator_hex),
             LeaveDisposition::SoleMemberDelete
         );
-        // A stranger is not the sole member even of a one-member roster:
-        // their "leave" of a healthy (admin-bearing) group proceeds.
         assert_eq!(
             leave_disposition(&info, &hex::encode([9u8; 32])),
             LeaveDisposition::Proceed
@@ -3501,10 +3223,6 @@ mod tests {
 
     #[test]
     fn leave_disposition_ignores_retained_inactive_entries() {
-        // Roster soft-delete keeps Removed/Banned entries for audit; the
-        // routing decision must count only non-terminal entries, or a group
-        // whose other members all departed would look undeletable again
-        // (#369).
         let mut info = GroupInfo::new("T".into(), String::new(), agent(1), "aa".repeat(16));
         let creator_hex = hex::encode([1u8; 32]);
         let bob_hex = hex::encode([2u8; 32]);
@@ -3531,16 +3249,12 @@ mod tests {
         let creator_hex = hex::encode([1u8; 32]);
         let bob_hex = hex::encode([2u8; 32]);
 
-        // Sole active member: the self-leave IS a deletion (#369).
         let sole = GroupInfo::new("T".into(), String::new(), agent(1), "aa".repeat(16));
         assert_eq!(
             leave_disposition(&sole, &creator_hex),
             LeaveDisposition::SoleMemberDelete
         );
 
-        // Two-member roster (creator Admin + bob Member): the MEMBER's leave
-        // proceeds (an admin remains), the sole ADMIN's leave is the
-        // ADR-0016 §3 409 — untouched by #369.
         let mut pair = sole.clone();
         pair.add_member(
             bob_hex.clone(),
@@ -3560,16 +3274,10 @@ mod tests {
 
     #[test]
     fn leave_disposition_pending_joiner_blocks_sole_member_delete() {
-        // PR #370 r2 blocker 1: pending is derived from join_requests (the
-        // authoritative view), never from the roster's seeded mirror — a
-        // KEM-less request seeds NO roster entry, and a stale mirror must
-        // not outlive its rejected/cancelled request.
         let mut info = GroupInfo::new("T".into(), String::new(), agent(1), "aa".repeat(16));
         let creator_hex = hex::encode([1u8; 32]);
         let joiner_hex = hex::encode([3u8; 32]);
 
-        // (b) KEM-less pending request: no roster entry at all, yet the
-        // delete is still blocked — the joiner is real in join_requests.
         info.join_requests.insert(
             "req-1".to_string(),
             JoinRequest::new("aa".repeat(16), joiner_hex.clone(), None, 1_000),
@@ -3583,8 +3291,6 @@ mod tests {
             LeaveDisposition::PendingJoinBlocked
         );
 
-        // Mirror-seeded request (roster Pending entry present too): same
-        // outcome.
         info.add_member(
             joiner_hex.clone(),
             GroupRole::Member,
@@ -3600,8 +3306,6 @@ mod tests {
             LeaveDisposition::PendingJoinBlocked
         );
 
-        // Pending joiner + another ACTIVE member: the actionable fix is
-        // promoting an admin, not resolving the pending request.
         let bob_hex = hex::encode([2u8; 32]);
         let mut pair = info.clone();
         pair.add_member(bob_hex, GroupRole::Member, Some(creator_hex.clone()), None);
@@ -3610,8 +3314,6 @@ mod tests {
             LeaveDisposition::LastAdminBlocked
         );
 
-        // (a) Rejected request with its mirror cleared: the sole admin's
-        // leave becomes the deletion again instead of a permanent 409.
         if let Some(req) = info.join_requests.get_mut("req-1") {
             req.status = JoinRequestStatus::Rejected;
         }
@@ -3624,8 +3326,6 @@ mod tests {
 
     #[test]
     fn clear_pending_joiner_never_touches_active_members() {
-        // The mirror cleanup is keyed on the Pending state — resolving a
-        // request must never remove a member that was since admitted.
         let mut info = GroupInfo::new("T".into(), String::new(), agent(1), "aa".repeat(16));
         let creator_hex = hex::encode([1u8; 32]);
         let bob_hex = hex::encode([2u8; 32]);
@@ -3648,9 +3348,6 @@ mod tests {
 
     #[test]
     fn seal_withdrawal_allows_sole_member_regardless_of_role() {
-        // PR #370 review item 3: a legacy roster whose only member is a plain
-        // Member must still be disposable — the sole member-in-being IS the
-        // entire group. A second member keeps the AdminOrHigher requirement.
         let admin = crate::identity::AgentKeypair::generate().unwrap();
         let mut info = GroupInfo::with_policy(
             "T".into(),
@@ -3707,7 +3404,6 @@ mod tests {
 
     #[test]
     fn test_migrate_from_v1() {
-        // Simulate a v1 blob missing v2 fields
         let bob_key = hex::encode([2u8; 32]);
         let charlie_key = hex::encode([3u8; 32]);
         let creator_bytes: Vec<u8> = vec![1u8; 32];
@@ -3726,7 +3422,6 @@ mod tests {
         let mut info: GroupInfo = serde_json::from_value(v1_json).unwrap();
         assert!(info.members_v2.is_empty());
         info.migrate_from_v1();
-        // creator + 2 members = 3 entries
         assert_eq!(info.members_v2.len(), 3);
         let creator_hex = hex::encode([1u8; 32]);
         let bob_hex = hex::encode([2u8; 32]);
@@ -3738,7 +3433,6 @@ mod tests {
         );
         assert_eq!(info.roster_revision, 5);
 
-        // Idempotent
         let count = info.members_v2.len();
         info.migrate_from_v1();
         assert_eq!(info.members_v2.len(), count);
@@ -3746,10 +3440,6 @@ mod tests {
 
     #[test]
     fn legacy_group_without_plane_field_grandfathers_to_gss() {
-        // ADR-0012: every group persisted before `secure_plane` existed was
-        // created on the GSS plane. A blob missing the field MUST load as Gss,
-        // never the enum's own TreeKem default — relabelling a grandfathered
-        // group as FS/PCS-capable when it has no TreeKEM state would be a lie.
         let json = serde_json::json!({
             "name": "Old",
             "description": "",
@@ -3771,9 +3461,6 @@ mod tests {
 
     #[test]
     fn with_policy_constructor_stays_on_gss_plane() {
-        // The generic constructor must not flip groups to TreeKem — that
-        // decision is made explicitly in the daemon's create path so stubs and
-        // other callers are not silently relabelled (ADR-0012 Phase 2).
         let info = GroupInfo::new("T".into(), "".into(), agent(1), "aa".repeat(16));
         assert_eq!(info.secure_plane, SecureGroupPlane::Gss);
     }
@@ -3822,9 +3509,6 @@ mod tests {
         assert_eq!(default_invite_max_role(), GroupRole::Member);
     }
 
-    // ── #468/#469 (design v5 D2 / v6 E2): digest-only roster seats ──────
-
-    /// Owner + freshly certified agent — the minimal admission fixture.
     fn certified_fixture() -> (
         crate::identity::UserKeypair,
         crate::identity::AgentKeypair,
@@ -3838,12 +3522,6 @@ mod tests {
 
     #[test]
     fn set_member_certificate_rejects_digest_mismatch_and_sets_both_on_match() {
-        // WHY: the committed `certificate_digest` is part of the signed
-        // roster root. Installing bytes that hash to a different digest
-        // would silently rewrite committed state under the chain, so the
-        // install must be refused without touching the entry; a matching
-        // install records BOTH the bytes and their digest so a later strip
-        // keeps the commitment (#468/#469 design v5 D2).
         let (user, agent_kp, cert) = certified_fixture();
         let other_agent = crate::identity::AgentKeypair::generate().unwrap();
         let other_cert =
@@ -3853,13 +3531,11 @@ mod tests {
 
         let mut info = GroupInfo::new("T".into(), String::new(), agent(1), "aabb".repeat(8));
         info.add_member(agent_hex.clone(), GroupRole::Member, None, None);
-        // Digest-only seat keyed to `cert`.
         info.members_v2
             .get_mut(&agent_hex)
             .unwrap()
             .certificate_digest = Some(committed.clone());
 
-        // Mismatching bytes: refused, entry untouched.
         let err = info
             .set_member_certificate(&agent_hex, other_cert)
             .expect_err("mismatching digest must be refused");
@@ -3871,14 +3547,12 @@ mod tests {
         );
         assert_eq!(m.certificate_digest.as_deref(), Some(committed.as_str()));
 
-        // Matching bytes: accepted, BOTH fields set.
         info.set_member_certificate(&agent_hex, cert.clone())
             .expect("matching digest installs");
         let m = info.members_v2.get(&agent_hex).unwrap();
         assert!(m.certificate.as_ref().is_some_and(|c| *c == cert));
         assert_eq!(m.certificate_digest.as_deref(), Some(committed.as_str()));
 
-        // Absent member entry: no-op success (callers seed entries first).
         info.set_member_certificate(&"ff".repeat(32), {
             let (u, a) = (
                 crate::identity::UserKeypair::generate().unwrap(),
@@ -3891,13 +3565,6 @@ mod tests {
 
     #[test]
     fn owner_cert_verdict_digest_pending_never_graced_nor_evicted() {
-        // WHY: a digest-only seat is PENDING evidence hydration, not
-        // MISSING evidence — the signed roster root already commits to the
-        // member's cert digest. Sending it down the missing-evidence path
-        // would let a cold cache evict a committed member after the grace
-        // window; instead it must be reported DigestPending (fail closed
-        // for clean-required operations) and never evictable (#468/#469
-        // design v5 D2 / v6 E2).
         let (user, _agent_kp, cert) = certified_fixture();
         let mut policy = GroupPolicyPreset::PublicRequestSecure.to_policy();
         policy.admission = GroupAdmission::OwnerCertified(user.user_id());
@@ -3912,13 +3579,9 @@ mod tests {
         {
             let m = info.members_v2.get_mut(&creator_hex).unwrap();
             m.certificate_digest = Some(owner_cert::certificate_digest_hex(&cert));
-            // An EXPIRED missing-evidence stamp from a pre-digest era: the
-            // pending branch must neither evict on it nor keep it.
             m.certificate_missing_since_ms = Some(1);
         }
 
-        // Cold-cache evidence: bytes unresolved. The old ladder would treat
-        // this as expired missing evidence → Failed(NoCertificate).
         let evidence = owner_cert::OwnerCertEvidence::new(10_000_000);
         let verdict = info.owner_cert_verdict(&evidence);
         assert_eq!(
@@ -3926,21 +3589,15 @@ mod tests {
             Some(&owner_cert::MemberCertStatus::DigestPending),
             "digest-only seat must be reported pending"
         );
-        // NEVER the grace/eviction path...
         assert!(verdict.in_grace().is_empty());
         assert!(verdict.failed().is_empty());
         assert_eq!(verdict.digest_pending(), vec![creator_hex.clone()]);
-        // ...and it fails closed for operations needing the certificate.
         assert!(!verdict.is_all_clean());
-        // The stale grace stamp was cleared: pending is not "missing since".
         assert_eq!(
             info.members_v2[&creator_hex].certificate_missing_since_ms,
             None
         );
 
-        // Contrast: a byte-less, digest-LESS member still takes the ordinary
-        // grace path (first observation stamps the window), proving the
-        // DigestPending branch captured exactly the digest-only shape.
         let plain_hex = hex::encode([7u8; 32]);
         info.add_member(plain_hex.clone(), GroupRole::Member, None, None);
         let verdict2 = info.owner_cert_verdict(&evidence);
@@ -3953,23 +3610,6 @@ mod tests {
 
     #[test]
     fn creator_seat_expired_certificate_never_becomes_eviction_eligible() {
-        // WHY (#1023, Engineer ruling 1 Nov 2026 02:36 GMT): with bytes
-        // arriving by chain, an expired committed certificate on the
-        // CREATOR seat would move it DigestPending → Failed(Expired) —
-        // eviction-eligible, so the ladder could remove the group's founder
-        // from its own expired certificate alone. The guard holds the
-        // creator seat at DigestPending: never in `failed()`, so no
-        // eviction path targets it, and never clean, so every operation
-        // needing valid creator bytes still fails closed until a renewal
-        // lands. An ordinary member's expired certificate stays Failed —
-        // still the eviction set — and a creator certificate failing for
-        // any other reason stays Failed too.
-        //
-        // Claude review (2 Nov 2026, finding 8): the expired bytes ARRIVE
-        // BY CHAIN — a byte-bearing projection folds through
-        // `apply_reconstructed_roster`, which installs them digest-anchored
-        // without an expiry check (the install is evidence-matching, the
-        // verdict is the check), and the verdict then really checks them.
         let (user, creator_kp, _cert) = certified_fixture();
         let creator_hex = hex::encode(creator_kp.agent_id().as_bytes());
         let expired_creator =
@@ -3981,8 +3621,6 @@ mod tests {
             crate::identity::AgentCertificate::issue_with_expiry(&user, &member_kp, Some(1))
                 .expect("expired member cert");
 
-        // The chain-carried projection: both seats byte-bearing with
-        // expired certificates.
         let mut source = GroupInfo::new(
             "S".into(),
             String::new(),
@@ -4018,7 +3656,6 @@ mod tests {
             "aabb".repeat(8),
             policy.clone(),
         );
-        // Digest-only local seats (the adopter's shape before the fold).
         info.members_v2
             .get_mut(&creator_hex)
             .unwrap()
@@ -4058,8 +3695,6 @@ mod tests {
             "an expired creator certificate still fails clean-required operations closed"
         );
 
-        // The enforcement path removes the failed member and keeps the
-        // creator seated.
         let failures = info.enforce_owner_certified_admission("authority", &verdict);
         assert!(
             failures.iter().all(|(hex, _)| hex != &creator_hex),
@@ -4075,9 +3710,6 @@ mod tests {
             "the ordinary member is removed"
         );
 
-        // The guard is expiry-ONLY: a creator certificate failing for
-        // another reason (issued by the wrong owner) is still a definitive
-        // failure.
         let other_user = crate::identity::UserKeypair::generate().unwrap();
         let wrong_owner =
             crate::identity::AgentCertificate::issue(&other_user, &creator_kp).unwrap();
@@ -4100,11 +3732,6 @@ mod tests {
             "a non-expiry creator failure is not held"
         );
 
-        // Claude review (2 Nov 2026 16:49, finding 3): the hold keys on the
-        // COMMITTED certificate. An announced certificate that is merely
-        // expired does not hold a creator whose committed certificate fails
-        // for another reason (red before: the reason came from the
-        // announced certificate first).
         let mut announced_expired = owner_cert::OwnerCertEvidence::new(10_000_000);
         announced_expired.insert_cert(creator_hex.clone(), expired_creator.clone());
         let announced_verdict = strict.owner_cert_verdict(&announced_expired);
@@ -4116,10 +3743,6 @@ mod tests {
             "an expired ANNOUNCED certificate does not hold a creator whose committed one fails otherwise"
         );
 
-        // Claude review (2 Nov 2026 16:49, finding 2): an announced renewal
-        // that cannot be fetched past the grace window does not make the
-        // held creator eviction-eligible (red before: `Failed {
-        // NoCertificate }`).
         let mut unfetchable = owner_cert::OwnerCertEvidence::new(10_000_000);
         unfetchable.observe_pending_digest(creator_hex.clone(), [9; 32]);
         info.members_v2
@@ -4136,13 +3759,6 @@ mod tests {
 
     #[test]
     fn apply_reconstructed_roster_copies_certificate_digest_across_gap() {
-        // WHY (#458 ac-gap + #468/#469 design v5 D2): a joiner adopting
-        // across a prev-hash gap materializes members from the VERIFIED
-        // projection. Digest-only projection entries must materialize with
-        // their committed digest so the adoption check mirrored from
-        // `finalize_adopted_commit_reconstructed` (recomputed roster root ==
-        // signed roster_root) holds — the digest IS the commitment the
-        // authority signed.
         let (_user, agent_kp, cert) = certified_fixture();
         let agent_hex = hex::encode(agent_kp.agent_id().as_bytes());
         let committed = owner_cert::certificate_digest_hex(&cert);
@@ -4152,7 +3768,6 @@ mod tests {
         source
             .set_member_certificate(&creator_hex, cert.clone())
             .expect("creator cert installs");
-        // A second member that exists ONLY digest-only at the source.
         source.add_member(agent_hex.clone(), GroupRole::Member, None, None);
         source
             .members_v2
@@ -4163,8 +3778,6 @@ mod tests {
         let projection = state_commit::roster_projection(&source.members_v2);
         let signed_root = state_commit::roster_root_of_projection(&projection);
 
-        // Fresh stub that knows NEITHER member (its own creator seat is
-        // dropped — the projection is authoritative).
         let mut adopted = GroupInfo::new("S".into(), String::new(), agent(9), "aabb".repeat(8));
         adopted.apply_reconstructed_roster(&projection);
 
@@ -4173,10 +3786,6 @@ mod tests {
             signed_root,
             "materialized roster must re-derive the projection's signed root"
         );
-        // #1023: a BYTE-BEARING source seat now materializes with its
-        // bytes (the snapshot carries them), while a digest-only source
-        // seat still materializes digest-only. Both hold the committed
-        // digest, so both re-derive the same signed root either way.
         let creator = adopted.members_v2.get(&creator_hex).unwrap();
         assert_eq!(
             creator.certificate.as_ref(),
@@ -4200,11 +3809,6 @@ mod tests {
 
     #[test]
     fn apply_reconstructed_roster_mismatched_local_cert_keeps_committed_digest() {
-        // WHY: when the local roster holds certificate bytes whose digest
-        // contradicts the (authoritative) projection digest, the BYTES are
-        // stale and must be dropped — but the committed digest is KEPT, so
-        // the member stays digest-seated (pending hydration) instead of
-        // losing its committed evidence entirely (#468/#469 design v5 D2).
         let (_user, agent_kp, cert) = certified_fixture();
         let agent_hex = hex::encode(agent_kp.agent_id().as_bytes());
         let committed = owner_cert::certificate_digest_hex(&cert);
@@ -4219,7 +3823,6 @@ mod tests {
         let projection = state_commit::roster_projection(&source.members_v2);
         let signed_root = state_commit::roster_root_of_projection(&projection);
 
-        // Local roster holds DIFFERENT bytes for the same seat.
         let (_user2, _agent2_kp, other_cert) = certified_fixture();
         let mut adopted = GroupInfo::new("S".into(), String::new(), agent(9), "aabb".repeat(8));
         adopted.add_member(agent_hex.clone(), GroupRole::Member, None, None);
@@ -4246,20 +3849,11 @@ mod tests {
         );
     }
 
-    /// #1023: a chain whose snapshots carry certificate bytes seats the
-    /// bytes at adoption (the new-member arm is pinned by the updated
-    /// `apply_reconstructed_roster_copies_certificate_digest_across_gap`)
-    /// — but ONLY after the bytes hash to the entry's committed digest,
-    /// for a digest-only local seat as for a materialized one. Mismatched
-    /// snapshot bytes are not evidence for this admission: the seat stays
-    /// digest-only.
     #[test]
     fn apply_reconstructed_roster_seats_snapshot_bytes_after_digest_check() {
         let (_user, _agent_kp, cert) = certified_fixture();
         let committed = owner_cert::certificate_digest_hex(&cert);
 
-        // A sealing authority's roster: the creator seat byte-bearing at
-        // capture, so its retained snapshots carry the bytes.
         let mut source = GroupInfo::new("S".into(), String::new(), agent(1), "aabb".repeat(8));
         let creator_hex = hex::encode([1u8; 32]);
         source
@@ -4274,7 +3868,6 @@ mod tests {
         );
         let signed_root = state_commit::roster_root_of_projection(&projection);
 
-        // Digest-only local seat (existing-member arm): the bytes install.
         let mut digest_only = GroupInfo::new("S".into(), String::new(), agent(8), "aabb".repeat(8));
         digest_only.add_member(creator_hex.clone(), GroupRole::Member, None, None);
         digest_only
@@ -4293,8 +3886,6 @@ mod tests {
             signed_root
         );
 
-        // Snapshot bytes hashing to a DIFFERENT digest never install: the
-        // seat stays digest-only and the root still re-derives.
         let (_user2, _agent2_kp, other_cert) = certified_fixture();
         let mut mismatched = projection.clone();
         mismatched.get_mut(&creator_hex).unwrap().certificate = Some(other_cert);
@@ -4322,8 +3913,6 @@ mod tests {
         );
     }
 
-    /// #1023 (review repro): a byte-bearing retained commit must round-trip
-    /// through the persisted JSON store form.
     #[test]
     fn groupinfo_json_round_trips_byte_bearing_retained_commit() {
         let (_user, agent_kp, cert) = certified_fixture();
@@ -4354,9 +3943,6 @@ mod tests {
         );
     }
 
-    /// #1023: only the newest RETAINED_CERT_CARRY_LINKS retained commits
-    /// keep their snapshot bytes; older links age to digest-only at
-    /// retention, so the persisted and served log carries a bounded amount.
     #[test]
     fn retain_commit_ages_certificate_carry_to_newest_links() {
         let (_user, agent_kp, cert) = certified_fixture();
@@ -4400,18 +3986,12 @@ mod tests {
         }
     }
 
-    /// #1023: `hydrate_member_certificates` falls back to the group's OWN
-    /// retained-commit snapshots for still-digest-only seats — the retained
-    /// chain is a certificate carrier, so a node holding it hydrates with
-    /// every other holder offline. The fallback keeps the digest-anchored
-    /// rule: snapshot bytes for a different admission never install.
     #[test]
     fn hydrate_member_certificates_falls_back_to_commit_log_snapshots() {
         let (_user, agent_kp, cert) = certified_fixture();
         let agent_hex = hex::encode(agent_kp.agent_id().as_bytes());
         let committed = owner_cert::certificate_digest_hex(&cert);
 
-        // The authority's captured link: the member byte-bearing at seal.
         let mut authority = GroupInfo::new("S".into(), String::new(), agent(1), "aabb".repeat(8));
         authority.add_member(agent_hex.clone(), GroupRole::Member, None, None);
         authority
@@ -4436,8 +4016,6 @@ mod tests {
             meta: Some(state_commit::GroupPublicMeta::default()),
         };
 
-        // A holder whose seat is digest-only but which holds the retained
-        // link: the fallback hydrates with NO caller-supplied pairs.
         let mut holder = GroupInfo::new("S".into(), String::new(), agent(2), "aabb".repeat(8));
         holder.add_member(agent_hex.clone(), GroupRole::Member, None, None);
         holder
@@ -4460,9 +4038,6 @@ mod tests {
             Some(committed.as_str())
         );
 
-        // The owner re-keyed while this holder kept the old chain: the
-        // snapshot bytes hash to the OLD digest, so they are evidence for
-        // a different admission and nothing installs.
         let (_user3, _agent3_kp, cert3) = certified_fixture();
         let re_keyed = owner_cert::certificate_digest_hex(&cert3);
         let mut stale_holder =
@@ -4484,10 +4059,6 @@ mod tests {
 
     #[test]
     fn hydrate_member_certificates_installs_only_digest_matching_bytes() {
-        // WHY: hydration is digest-anchored — only bytes hashing to a
-        // seat's COMMITTED digest may install. Evidence for a different
-        // admission (owner re-keyed) must be ignored, never allowed to
-        // rewrite the commitment (#468/#469 design v5 D2).
         let (_user, agent_kp, cert) = certified_fixture();
         let (_user2, agent2_kp, other_cert) = certified_fixture();
         let agent_hex = hex::encode(agent_kp.agent_id().as_bytes());
@@ -4504,7 +4075,6 @@ mod tests {
             info.members_v2.get_mut(&hex).unwrap().certificate_digest = Some(digest);
         }
 
-        // Wrong bytes for seat 1, right bytes for seat 2.
         let hydrated = info.hydrate_member_certificates(&[
             (agent_hex.clone(), other_cert.clone()),
             (other_hex.clone(), other_cert.clone()),
@@ -4528,7 +4098,6 @@ mod tests {
             Some(other_committed.as_str())
         );
 
-        // The right bytes now hydrate the first seat...
         assert_eq!(
             info.hydrate_member_certificates(&[(agent_hex.clone(), cert.clone())]),
             1
@@ -4537,7 +4106,6 @@ mod tests {
             .certificate
             .as_ref()
             .is_some_and(|c| *c == cert));
-        // ...and a byte-bearing member is never re-hydrated.
         assert_eq!(
             info.hydrate_member_certificates(&[(agent_hex.clone(), cert)]),
             0
@@ -4546,12 +4114,6 @@ mod tests {
 
     #[test]
     fn repair_member_certificate_digests_adopts_bytes_digest_on_mismatch() {
-        // WHY: at load, a persisted record carrying BOTH bytes and a
-        // mismatching stored digest is corruption-in-waiting — the stale
-        // digest goes live the moment the bytes are stripped. The bytes are
-        // the authority when present; digest-less legacy entries and
-        // digest-only entries are left exactly as persisted (#468/#469
-        // design v5 D2).
         let (_user, agent_kp, cert) = certified_fixture();
         let agent_hex = hex::encode(agent_kp.agent_id().as_bytes());
         let real = owner_cert::certificate_digest_hex(&cert);
@@ -4561,14 +4123,12 @@ mod tests {
         {
             let m = info.members_v2.get_mut(&agent_hex).unwrap();
             m.certificate = Some(cert.clone());
-            m.certificate_digest = Some("00".repeat(32)); // torn/stale write
+            m.certificate_digest = Some("00".repeat(32));
         }
-        // Legacy byte-bearing entry with NO digest: no backfill.
         let (_u3, _a3, legacy_cert) = certified_fixture();
         let legacy_hex = hex::encode([2u8; 32]);
         info.add_member(legacy_hex.clone(), GroupRole::Member, None, None);
         info.members_v2.get_mut(&legacy_hex).unwrap().certificate = Some(legacy_cert);
-        // Digest-only entry: no bytes to arbitrate.
         let digest_only_hex = hex::encode([3u8; 32]);
         let orphan_digest = "11".repeat(32);
         info.add_member(digest_only_hex.clone(), GroupRole::Member, None, None);
@@ -4595,14 +4155,9 @@ mod tests {
             Some(orphan_digest.as_str()),
             "digest-only entry is left alone"
         );
-        // Idempotent: a second sweep finds nothing to repair.
         assert_eq!(info.repair_member_certificate_digests(), 0);
     }
 
-    // ── ADR 0108 S2-1 (#1143): the Home verdict rule ───────────────────
-
-    /// A committed Home and its creator, whose seat embeds a valid owner
-    /// certificate.
     struct CommittedHome {
         owner: crate::identity::UserKeypair,
         creator_kp: crate::identity::AgentKeypair,
@@ -4611,8 +4166,6 @@ mod tests {
         now_unix: u64,
     }
 
-    /// A Home with the ADR-0038 policy and metadata, sealed once so its
-    /// newest retained commit covers that metadata: `is_home_scope()`.
     fn committed_home() -> CommittedHome {
         let (owner, creator_kp, cert) = certified_fixture();
         let creator_hex = hex::encode(creator_kp.agent_id().as_bytes());
@@ -4648,10 +4201,6 @@ mod tests {
         }
     }
 
-    /// Evidence holding the creator's canonical anonymous announce digest
-    /// WITHOUT the bound-machine mark: what the evidence builder records
-    /// for an anonymous announce that another machine signed (ADR 0108 §4's
-    /// premise does not hold for it).
     fn unbound_anonymous_evidence(home: &CommittedHome) -> owner_cert::OwnerCertEvidence {
         let mut evidence = owner_cert::OwnerCertEvidence::new(home.now_unix);
         evidence.observe_pending_digest(
@@ -4661,9 +4210,6 @@ mod tests {
         evidence
     }
 
-    /// Evidence holding the creator's canonical anonymous announce digest,
-    /// exactly as the evidence builder records an anonymous announce from
-    /// the creator's current authenticated bound machine.
     fn anonymous_evidence(home: &CommittedHome) -> owner_cert::OwnerCertEvidence {
         let mut evidence = unbound_anonymous_evidence(home);
         evidence.observe_bound_machine_anonymous(home.creator_hex.clone());
@@ -4671,9 +4217,6 @@ mod tests {
         evidence
     }
 
-    /// The creator's verdict, after checking that the pure check agrees
-    /// with it: `owner_cert_admission_failures` names the creator exactly
-    /// when the verdict is not `Clean`.
     fn creator_status(
         info: &mut GroupInfo,
         creator_hex: &str,
@@ -4701,8 +4244,6 @@ mod tests {
         info.members_v2[agent_hex].certificate_missing_since_ms
     }
 
-    /// Replace the creator's seat bytes (and their committed digest) with
-    /// `cert`, keeping the seat byte-bearing.
     fn seat_bytes(info: &mut GroupInfo, agent_hex: &str, cert: crate::identity::AgentCertificate) {
         let seat = info.members_v2.get_mut(agent_hex).expect("seat");
         seat.certificate_digest = Some(owner_cert::certificate_digest_hex(&cert));
@@ -4711,12 +4252,9 @@ mod tests {
 
     #[test]
     fn home_anonymous_digest_is_no_disclosure_for_a_valid_embedded_certificate() {
-        // WHY (ADR 0108 §4, #1143): an owner device that never consented
-        // announces anonymously. In a committed Home that is absence of
-        // public disclosure, not a contradiction of the committed
-        // certificate: the valid embedded bytes seat the member as Clean,
-        // with no warranted fetch and no grace. Before S2-1 this was
-        // InGrace and, once grace expired, an evictable Failed member.
+        // ADR 0108 §4: an owner device that never consented announces
+        // anonymously; in a committed Home that is absence of disclosure,
+        // not a contradiction of the committed certificate.
         let mut home = committed_home();
         let evidence = anonymous_evidence(&home);
         let creator = home.creator_hex.clone();
@@ -4730,7 +4268,6 @@ mod tests {
         );
         assert!(evidence.disclosed_fetch_in_flight(&creator, false));
 
-        // A grace stamp from an earlier evaluation is cleared...
         home.info
             .members_v2
             .get_mut(&creator)
@@ -4741,7 +4278,6 @@ mod tests {
             owner_cert::MemberCertStatus::Clean
         );
         assert_eq!(missing_since(&home.info, &creator), None);
-        // ...and none is started.
         assert_eq!(
             creator_status(&mut home.info, &creator, &evidence),
             owner_cert::MemberCertStatus::Clean
@@ -4752,11 +4288,6 @@ mod tests {
 
     #[test]
     fn ordinary_owner_certified_group_keeps_todays_anonymous_rule() {
-        // WHY (ADR 0108 §4: "Ordinary groups retain their current rules"):
-        // the identical seat and evidence in a committed ordinary
-        // OwnerCertified group still read the anonymous digest as stale
-        // evidence with a fetch in flight, so the member is InGrace and the
-        // grace window starts.
         let (owner, creator_kp, cert) = certified_fixture();
         let creator_hex = hex::encode(creator_kp.agent_id().as_bytes());
         let mut policy = GroupPolicyPreset::PublicRequestSecure.to_policy();
@@ -4778,8 +4309,6 @@ mod tests {
             .expect("seal");
         assert!(!info.is_home_scope());
 
-        // Even from the creator's own bound machine: outside a Home the
-        // anonymous digest keeps today's reading.
         let mut evidence = owner_cert::OwnerCertEvidence::new(now_unix);
         evidence.observe_pending_digest(
             creator_hex.clone(),
@@ -4795,14 +4324,6 @@ mod tests {
 
     #[test]
     fn home_anonymous_digest_from_another_machine_keeps_todays_rule() {
-        // WHY (ADR 0108 §4's premise, Codex P2 on #1247): "only the subject
-        // agent's authenticated bound machine can sign its announce". Any
-        // machine can sign a V3 announce naming any agent, so an anonymous
-        // digest the builder did not mark as the bound machine's is no
-        // absence signal. In a committed Home it reads exactly as today:
-        // stale against valid embedded bytes (InGrace, grace starts), and a
-        // fetch in flight for expired ones (InGrace, never the Failed that
-        // the next seal would evict).
         let mut home = committed_home();
         let creator = home.creator_hex.clone();
         let evidence = unbound_anonymous_evidence(&home);
@@ -4838,10 +4359,6 @@ mod tests {
 
     #[test]
     fn bound_machine_mark_follows_the_recorded_digest() {
-        // WHY: the mark vouches for one recorded anonymous digest. A newer
-        // digest or certificate for the agent replaces what the mark was
-        // about, so it clears the mark; the mark alone, without an
-        // anonymous digest, says nothing.
         let home = committed_home();
         let creator = home.creator_hex.clone();
         let anonymous = crate::announce_v3::anonymous_cert_digest();
@@ -4877,10 +4394,6 @@ mod tests {
 
     #[test]
     fn home_certificate_bearing_digest_still_stales_the_embedded_certificate() {
-        // WHY (ADR 0108 §4): only the ANONYMOUS digest is no disclosure. A
-        // different certificate-bearing digest is a re-issue the node has
-        // not fetched yet: S2 keeps today's stale handling (grace while the
-        // fetch is in flight) and decides no rotation policy.
         let mut home = committed_home();
         let creator = home.creator_hex.clone();
         let rotated = crate::identity::AgentCertificate::issue_with_expiry(
@@ -4904,11 +4417,6 @@ mod tests {
 
     #[test]
     fn home_anonymous_digest_never_cleans_invalid_embedded_evidence() {
-        // WHY (ADR 0108 §4): the relaxation removes only the false
-        // contradiction. Invalid, wrong-owner, wrong-agent, expired or
-        // revoked evidence never becomes Clean. With the anonymous digest
-        // read as no discovery entry, each is the definitive Failed that a
-        // member without any announce gets today.
         let base = committed_home();
         let creator = base.creator_hex.clone();
         let stranger = crate::identity::UserKeypair::generate().expect("stranger");
@@ -4922,11 +4430,6 @@ mod tests {
             serde_json::from_value::<crate::identity::AgentCertificate>(value)
                 .expect("tampered cert decodes")
         };
-        // Engineer ruling 1 Nov 2026 02:36 GMT: the creator's own EXPIRED
-        // certificate holds the seat at `DigestPending` (never
-        // eviction-eligible) instead of `Failed`. Every other invalid
-        // evidence — and revocation — still fails definitively, and no
-        // case is ever Clean.
         enum Expect {
             Failed,
             Held,
@@ -4999,9 +4502,6 @@ mod tests {
 
     #[test]
     fn home_digest_only_seat_stays_digest_pending() {
-        // WHY (ADR 0108 §4: "Absent bytes stay pending"): a seat that
-        // commits to a digest without bytes is DigestPending before any
-        // announce is read, so the Home rule cannot clean it.
         let mut home = committed_home();
         let creator = home.creator_hex.clone();
         home.info
@@ -5018,9 +4518,6 @@ mod tests {
 
     #[test]
     fn home_scope_needs_committed_home_metadata_policy_and_a_live_group() {
-        // WHY (ADR 0108 §1): the predicate is per group and exact. Each
-        // missing condition is not Home scope, so the anonymous digest keeps
-        // today's rule (InGrace) instead of the Home rule (Clean).
         let base = committed_home();
         let creator = base.creator_hex.clone();
         type Mutation = fn(&mut GroupInfo);
@@ -5057,11 +4554,6 @@ mod tests {
 
     #[test]
     fn home_scope_holds_on_the_seal_working_copy_and_the_serving_probe() {
-        // WHY (plan design point): the seal evaluates a working copy that
-        // already holds the seat write, and the ADR 0107 serving guard a
-        // clone trimmed to one seat. Neither matches its stored state hash,
-        // so a `state_hash_is_current()` predicate would silently drop the
-        // Home rule exactly where #1143 needs it. Both stay Home scope.
         let base = committed_home();
         let creator = base.creator_hex.clone();
         let evidence = anonymous_evidence(&base);
@@ -5084,7 +4576,6 @@ mod tests {
         assert!(next.state_hash_is_current());
         assert!(next.is_home_scope(), "the new head still covers the Home");
 
-        // The serving probe for the creator, from the two-seat head.
         let mut probe = next.clone();
         probe.members_v2.retain(|agent, _| *agent == creator);
         assert!(!probe.state_hash_is_current(), "the probe trims the roster");

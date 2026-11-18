@@ -20,21 +20,12 @@ pub(crate) struct DaemonCommand {
 /// absolute — the unit supplies it, and a relative path would be searched
 /// on `PATH` — and is never defaulted or resolved by this launcher.
 pub(crate) fn daemon_argv(argv: &[OsString]) -> io::Result<DaemonCommand> {
-    match argv.split_first() {
-        Some((executable, args)) => {
-            if !std::path::Path::new(executable).is_absolute() {
-                return Err(invalid(
-                    "daemon executable must be absolute: x0x-launcher /absolute/daemon [args]",
-                ));
-            }
-            Ok(DaemonCommand {
-                executable: executable.clone(),
-                args: args.to_vec(),
-            })
-        }
-        None => Err(invalid(
-            "usage: x0x-launcher /absolute/daemon-executable [daemon args]",
-        )),
+    match contract::daemon_argv(argv).map_err(invalid)? {
+        [executable, args @ ..] => Ok(DaemonCommand {
+            executable: executable.clone(),
+            args: args.to_vec(),
+        }),
+        [] => Err(invalid("usage: x0x-launcher /absolute/daemon-executable")),
     }
 }
 

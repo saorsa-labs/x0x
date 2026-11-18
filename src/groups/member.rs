@@ -30,8 +30,6 @@ impl GroupRole {
     pub const OWNER_ASSIGNMENT_ERROR: &'static str =
         "'owner' is a legacy role and cannot be assigned; valid roles: 'admin', 'member'";
 
-    /// Numeric rank: higher means more privileged. An unknown role (#1604)
-    /// ranks below `Guest`, so it satisfies no privilege check.
     fn rank(self) -> u8 {
         match self {
             Self::Owner => 5,
@@ -56,8 +54,6 @@ impl GroupRole {
             Self::Moderator => 2,
             Self::Member => 3,
             Self::Guest => 4,
-            // #1604: never signed. Decoders refuse an unknown role before
-            // any signature check.
             Self::Unknown => u8::MAX,
         }
     }
@@ -190,13 +186,6 @@ pub struct GroupMember {
     /// key-stripped invite state so recovery can authenticate the exact leaf.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub treekem_key_package_hash: Option<String>,
-    /// ADR-0038: the `AgentCertificate` this member was admitted under,
-    /// bound INTO the roster entry so the signed state-commit's roster root
-    /// covers it (verification against committed evidence, not a live
-    /// lookup alone — Codex design review constraint 2). Present only for
-    /// members of `OwnerCertified` groups; `None` for every legacy roster,
-    /// which keeps the v1 roster-root hash input byte-identical.
-
     /// ADR-0038 round-2 grace window: when evidence for this member was
     /// first observed MISSING (`NoCertificate`) at a seal-time
     /// re-verification, in unix ms. Transient bookkeeping — NOT part of the
@@ -204,6 +193,12 @@ pub struct GroupMember {
     /// restarts the window).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub certificate_missing_since_ms: Option<u64>,
+    /// ADR-0038: the `AgentCertificate` this member was admitted under,
+    /// bound INTO the roster entry so the signed state-commit's roster root
+    /// covers it (verification against committed evidence, not a live
+    /// lookup alone — Codex design review constraint 2). Present only for
+    /// members of `OwnerCertified` groups; `None` for every legacy roster,
+    /// which keeps the v1 roster-root hash input byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub certificate: Option<crate::identity::AgentCertificate>,
     /// BLAKE3-256 hex digest (`owner_cert::certificate_digest_hex`) of the
@@ -395,10 +390,6 @@ mod tests {
 
     #[test]
     fn role_assignment_is_exact_lowercase_vocabulary() {
-        // A mis-cased *valid* role name is right-intent/wrong-casing, so it must
-        // get a case-sensitivity hint rather than the generic "reserved" error
-        // that genuinely-unknown roles (e.g. "moderator") receive — otherwise a
-        // caller typing "ADMIN" is misdirected toward thinking admin is reserved.
         assert_eq!(
             GroupRole::assignable_from_name("ADMIN").unwrap_err(),
             "role names are case-sensitive; use 'admin'"
@@ -443,10 +434,6 @@ mod tests {
 
     #[test]
     fn certificate_digest_serializes_only_when_present() {
-        // WHY (#468/#469 design v5 D2): `certificate_digest` must be absent
-        // from persisted JSON while None — rosters written by every earlier
-        // build stay byte-identical — and blobs predating the field must
-        // deserialize with the digest defaulting to None.
         let mut m = GroupMember::new_member("aa".repeat(32), None, None, 1);
         let json = serde_json::to_string(&m).expect("serialize");
         assert!(!json.contains("certificate_digest"));

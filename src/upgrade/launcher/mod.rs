@@ -10,6 +10,8 @@
 
 mod child;
 mod commit;
+#[path = "../launcher_contract.rs"]
+pub(crate) mod contract;
 mod control;
 mod coordinator;
 mod filesystem;

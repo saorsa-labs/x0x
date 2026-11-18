@@ -19,10 +19,11 @@ exclude = ["proofs/**", "tests/proof-reports/**", "target/**"]
 
 [dependencies]
 anyhow = "1.0"
-# #1346: 0.27.62 ships the additive
-# SendStream/RecvStream::connection_generation() the evidence Hello
-# reply gate keys on (ant-quic#327, David's 3 Nov 2026 go).
-ant-quic = "=0.27.62"
+# 0.28.0 honours `relay_service_enabled` (ant-quic ADR-019, relay
+# serving opt-out). It keeps the SendStream/RecvStream::connection_generation()
+# that the evidence Hello reply gate keys on (#1346). saorsa-gossip 0.5.92
+# and saorsa-webrtc 0.6.1 pin the same ant-quic.
+ant-quic = "=0.28.0"
 # CI pin (2026-09-03): tinyvec 1.13.0 (published 2026-09-03) fails to compile on the
 # pinned rustc 1.95.0 ("cannot find macro `vec`"). Cargo.lock is now tracked, but
 # keep the bound so a `cargo update` or a downstream fresh resolve cannot pick it
@@ -48,17 +49,17 @@ hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 rand = "0.8"
-saorsa-gossip-coordinator = "=0.5.91"
-saorsa-gossip-crdt-sync = "=0.5.91"
-saorsa-gossip-groups = "=0.5.91"
-saorsa-gossip-identity = "=0.5.91"
-saorsa-gossip-membership = "=0.5.91"
-saorsa-gossip-presence = "=0.5.91"
-saorsa-gossip-pubsub = "=0.5.91"
-saorsa-gossip-rendezvous = "=0.5.91"
-saorsa-gossip-runtime = "=0.5.91"
-saorsa-gossip-transport = "=0.5.91"
-saorsa-gossip-types = "=0.5.91"
+saorsa-gossip-coordinator = "=0.5.92"
+saorsa-gossip-crdt-sync = "=0.5.92"
+saorsa-gossip-groups = "=0.5.92"
+saorsa-gossip-identity = "=0.5.92"
+saorsa-gossip-membership = "=0.5.92"
+saorsa-gossip-presence = "=0.5.92"
+saorsa-gossip-pubsub = "=0.5.92"
+saorsa-gossip-rendezvous = "=0.5.92"
+saorsa-gossip-runtime = "=0.5.92"
+saorsa-gossip-transport = "=0.5.92"
+saorsa-gossip-types = "=0.5.92"
 saorsa-pqc = "0.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -73,7 +74,7 @@ subtle = "2.6"
 flate2 = "1.0"
 fips204 = { version = "0.4.6", default-features = false, features = ["ml-dsa-65"] }
 tar = "0.4"
-zip = { version = "9.0.4", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 # Issue #600: stdout log writes must not run synchronously on tokio workers.
@@ -100,7 +101,7 @@ tikv-jemalloc-ctl = { version = "0.6", optional = true }
 # Voice adapters (saorsa-webrtc V1.1/V1.2): trait surfaces only — no
 # webrtc-rs, no codecs. `quic-native` matches x0x's transport philosophy.
 [dependencies.saorsa-webrtc-core]
-version = "0.6.0"
+version = "0.6.1"
 optional = true
 default-features = false
 features = ["quic-native"]
@@ -109,7 +110,7 @@ features = ["quic-native"]
 # apps get the codec matching the transport without a second dep to pin).
 # Default features = real Opus only; no video codecs.
 [dependencies.saorsa-webrtc-codecs]
-version = "0.6.0"
+version = "0.6.1"
 optional = true
 
 [features]

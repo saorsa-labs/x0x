@@ -1,4 +1,4 @@
-//! Per-message-kind gossip efficiency counters (#1170 / Track E M1).
+//! Per-message-kind gossip efficiency counters.
 //!
 //! This slice counts recv-pump bus pressure, local PlumTree delivery, and
 //! outbound publish. Counters are cumulative for the process lifetime.
@@ -8,10 +8,7 @@
 //! rotation replaces it.
 //!
 //! `delivered` and `published` are Eager PlumTree traffic only. Same-daemon
-//! `local:` hand-offs never enter PlumTree and are not counted. Per-kind
-//! verify CPU is not in this slice: the pinned saorsa-gossip 0.5.91 crate
-//! exposes a per-kind verify meter (`verify_by_kind_stats()`), but x0x does
-//! not read it yet (#1397) and does not sample `stage_stats()`.
+//! `local:` hand-offs never enter PlumTree and are not counted.
 //!
 //! The reporting clock starts when the meter is created, with a zero
 //! baseline taken at that same moment. `window_secs` is the elapsed seconds
@@ -66,12 +63,6 @@ fn unix_ms_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Elapsed seconds for a rate denominator.
-///
-/// Whole-second truncation made a non-empty sample inside the first second
-/// report `0`, so Δcount / `window_secs` was undefined. A non-empty sample
-/// uses sub-second precision and, if the clock delta is still zero, one
-/// nanosecond.
 fn reported_window_secs(elapsed: Duration, nonempty: bool) -> f64 {
     let secs = elapsed.as_secs_f64();
     if nonempty && secs == 0.0 {
@@ -81,8 +72,6 @@ fn reported_window_secs(elapsed: Duration, nonempty: bool) -> f64 {
     }
 }
 
-/// x0x-owned cumulative counters (bus / delivered / published). Never cleared
-/// on a diagnostics read.
 #[derive(Debug, Default)]
 struct KindSlot {
     bus_dispatched: AtomicU64,
@@ -110,9 +99,8 @@ struct LocalKindCumulative {
     published: u64,
 }
 
-/// Clock, baseline, and the last finished interval. One lock covers all three
-/// so two readers cannot both rotate, and neither reader consumes the
-/// finished interval.
+/// One lock covers the clock, the baseline and the last finished interval,
+/// so two readers cannot both rotate.
 #[derive(Debug)]
 struct WindowState {
     started: Instant,
@@ -280,8 +268,6 @@ impl PerKindGossipCounters {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Move the open interval's start into the past. Tests use this to
-    /// exercise a delayed first read and a slow poll without sleeping.
     #[cfg(test)]
     fn backdate(&self, by: Duration) {
         let mut state = self.lock_window();
@@ -292,10 +278,6 @@ impl PerKindGossipCounters {
         state.since_ts_ms = state.since_ts_ms.saturating_sub(millis).max(1);
     }
 
-    /// Re-baseline the open interval at the current local cumulatives.
-    ///
-    /// Does not clear process-lifetime counters and does not drop
-    /// `last_completed`.
     #[cfg(test)]
     fn rolling_reset(&self) {
         let local = self.load_local();
@@ -305,10 +287,6 @@ impl PerKindGossipCounters {
         state.started = Instant::now();
     }
 
-    /// Process-lifetime bus dispatches. Does not read or rotate the window.
-    ///
-    /// Test-only. A rolling-window snapshot can rotate between two reads
-    /// under plain `cargo test`.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn lifetime_bus_dispatched(&self, kind: MessageKind) -> u64 {
@@ -317,7 +295,6 @@ impl PerKindGossipCounters {
             .load(Ordering::Relaxed)
     }
 
-    /// Process-lifetime deliveries. Does not read or rotate the window.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn lifetime_delivered(&self, kind: MessageKind) -> u64 {
@@ -326,7 +303,6 @@ impl PerKindGossipCounters {
             .load(Ordering::Relaxed)
     }
 
-    /// Process-lifetime publishes. Does not read or rotate the window.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn lifetime_published(&self, kind: MessageKind) -> u64 {
@@ -426,7 +402,6 @@ fn health_verdict(
     }
 }
 
-/// Process-wide meter shared by the recv pump, pubsub delivery, and publish.
 static PER_KIND_COUNTERS: LazyLock<PerKindGossipCounters> =
     LazyLock::new(PerKindGossipCounters::new);
 
