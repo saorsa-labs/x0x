@@ -227,6 +227,10 @@ async fn lost_ack_then_sender_restart_settles_delivered_without_second_copy() {
         },
     )
     .await;
+    // Gossip sent after the warm-up must not still be in flight at the stop:
+    // with bob stopped, it would fill alice's QUIC send window and keep the
+    // queued DM in her send buffer until she is killed.
+    wait_until_link_quiet(&alice, &bob).await;
 
     // Lost ACK of a queued send.
     signal(bob.pid(), "STOP");
@@ -248,9 +252,10 @@ async fn lost_ack_then_sender_restart_settles_delivered_without_second_copy() {
 
     // The sender dies; bob continues, commits the buffered send, and its
     // ACK has no sender to reach.
-    // `attempted_obligation` confirmed retry_count >= 1: alice's worker
-    // already timed out the first attempt, so the DM frame reached bob's
-    // QUIC receive buffer before alice is killed.
+    // `attempted_obligation` (retry_count >= 1) only shows that QUIC
+    // accepted the DM bytes into alice's send buffer, not that bob has them.
+    // The quiet link at the stop leaves the send window open, so the DM
+    // goes on the wire before bob stops answering, and his socket buffers it.
     alice.kill();
     signal(bob.pid(), "CONT");
     eprintln!("bob stopped for {:?} (queued send)", stopped_at.elapsed());
@@ -297,6 +302,55 @@ where
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+/// Total UDP bytes in `field` over `daemon`'s QUIC connections, from
+/// `/diagnostics/connectivity`. `None` while a connection has no stats.
+async fn udp_bytes(daemon: &DaemonFixture, field: &str) -> Option<u64> {
+    let (_, body) = get(daemon, "/diagnostics/connectivity").await;
+    body["per_peer_transport"]
+        .as_array()?
+        .iter()
+        .map(|peer| peer[field].as_u64())
+        .sum()
+}
+
+/// Wait until no gossip frame is in flight from alice to bob: over 500 ms
+/// alice sent less than `QUIET_SLACK` UDP bytes, and bob has received all
+/// but `QUIET_SLACK` of what alice sent. The link is never silent (SWIM
+/// pings are about 100 bytes a second) and alice's count runs about one
+/// datagram ahead of bob's, so exact equality never holds. A gossip frame
+/// after the warm-up is 5 KB to 20 KB, well above the slack.
+async fn wait_until_link_quiet(alice: &DaemonFixture, bob: &DaemonFixture) {
+    const QUIET_SLACK: u64 = 2048;
+    async fn sample(alice: &DaemonFixture, bob: &DaemonFixture) -> Result<[u64; 2], String> {
+        match (
+            udp_bytes(alice, "udp_tx_bytes").await,
+            udp_bytes(bob, "udp_rx_bytes").await,
+        ) {
+            (Some(a_tx), Some(b_rx)) if a_tx > 0 => Ok([a_tx, b_rx]),
+            other => Err(format!("alice tx, bob rx: {other:?}")),
+        }
+    }
+    poll_until(
+        "the alice-bob link is quiet",
+        Duration::from_secs(30),
+        || async {
+            let first = sample(alice, bob).await?;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let [a_tx, b_rx] = sample(alice, bob).await?;
+            let sent = a_tx.saturating_sub(first[0]);
+            let in_flight = a_tx.saturating_sub(b_rx);
+            if sent < QUIET_SLACK && in_flight < QUIET_SLACK {
+                Ok(())
+            } else {
+                Err(format!(
+                    "alice sent {sent} bytes in 500 ms; {in_flight} not yet at bob"
+                ))
+            }
+        },
+    )
+    .await;
 }
 
 async fn get(daemon: &DaemonFixture, path: &str) -> (StatusCode, Value) {
