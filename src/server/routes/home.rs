@@ -3656,6 +3656,7 @@ pub(in crate::server::routes) mod tests {
                 50000,
             )))),
             axum::http::HeaderMap::new(),
+            axum::extract::Query(std::collections::HashMap::new()),
         )
         .await;
         let health_bytes = axum::body::to_bytes(health_response.into_body(), 1 << 20).await?;

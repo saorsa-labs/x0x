@@ -469,3 +469,11 @@ max-threads = 1
 filter = "test(remote_show_opens_on_the_other_owner_daemon)"
 test-group = "quic-localhost"
 threads-required = 4
+
+# #2008: each test stands up two loopback daemons and stops, kills and
+# restarts them (the queued-DM 504, restart and late-ACK path). That is
+# the multi-endpoint loopback shape this group serialises (#316, #1283).
+[[profile.default.overrides]]
+filter = "binary(queued_dm_two_daemon)"
+test-group = "quic-localhost"
+threads-required = 4

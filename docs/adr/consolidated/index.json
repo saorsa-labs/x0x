@@ -54,7 +54,7 @@
       "revision": 1,
       "path": "A07-r01-messages-receipts-history-and-retry.md",
       "title": "Messages Receipts History and Retry",
-      "sha256": "5dfaee3ba36513bf97a0667cea1864bfbc52db073233a37d9764dfa430185144"
+      "sha256": "1e050277e09f232b353a838ab51a0726796c8dd08f3a0890a1a34cb5cc8b59f1"
     },
     {
       "id": "A08",
@@ -68,7 +68,7 @@
       "revision": 1,
       "path": "A09-r01-group-encryption-and-key-changes.md",
       "title": "Group Encryption and Key Changes",
-      "sha256": "bbf7a7a5f1f0fbbdc08da18399839a9e67c5fb0f04a802348ad18d8dd17f64f1"
+      "sha256": "60d3a6afd627601dec83b833b1121b1dfeb6b1eec74618bf1c7e9d0e52183198"
     },
     {
       "id": "A10",
@@ -82,7 +82,7 @@
       "revision": 1,
       "path": "A11-r01-local-api-applications-and-human-interface.md",
       "title": "Local API Applications and Human Interface",
-      "sha256": "e06091ade8fa999608d266ab0bdf3cf606125fb24382ab20f52c711ba65b83d8"
+      "sha256": "488fb2657073ac5db16f8760a343a04dedc774eff51b83ecb6ae30fc5a6b2ea6"
     },
     {
       "id": "A12",
@@ -103,7 +103,7 @@
       "revision": 1,
       "path": "A14-r01-health-updates-and-recovery.md",
       "title": "Health Updates and Recovery",
-      "sha256": "55868a969603ed07eb59377a99a24e9966629601ecae183940eb29e522889c4c"
+      "sha256": "f9697b10457a66589a61262bc9a87ecdfeecc6a81e403a7e36a07d308b4528c3"
     },
     {
       "id": "A15",

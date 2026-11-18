@@ -59,7 +59,7 @@ Every endpoint except `GET /health` and `GET /constitution*` requires an
 | Class | Lifetime | Source | Can act as |
 |---|---|---|---|
 | **Durable API token** | until rotated | `<data_dir>/api-token` | the local owner (full control) |
-| **Session token** | 10 minutes; refreshable up to 12 h after the original mint | `POST /auth/session` (exchanged from the durable token); `POST /auth/session/refresh` (session token only, old token revoked) | browser/GUI surfaces |
+| **Session token** | 10 minutes; refreshable while live or for 4 h after it lapses, up to 12 h after the original mint | `POST /auth/session` (exchanged from the durable token); `POST /auth/session/refresh` (session token only, old token revoked) | browser/GUI surfaces |
 | **Rider token** | ≤ 90 days (default 7) | `POST /owner/riders` | a scoped sub-agent principal |
 
 Auth-class labels used throughout this reference:
@@ -259,7 +259,7 @@ daemon, so it shows the routes of the CLI build, not of a running `x0xd`.
 | GET | `/status` | `x0x status` | Runtime status, bound API address, connectivity, peers, warnings |
 | POST | `/shutdown` | `x0x stop` | Gracefully stop the daemon |
 | POST | `/auth/session` | `x0x auth session` | Exchange the durable API token for a short-lived browser session token (WS1.6) |
-| POST | `/auth/session/refresh` | `x0x auth refresh` | Swap a live **session** token for a fresh 10-minute one; the durable token gets `403`, the replaced token stops working at once, and refresh is refused (`401`) 12 h after the original `/auth/session` mint (#893) |
+| POST | `/auth/session/refresh` | `x0x auth refresh` | Swap a **session** token for a fresh 10-minute one. The token can be live, or lapsed for less than 4 h; a lapsed token is accepted on this route only. The durable token gets `403`, the replaced token stops working at once, and refresh is refused (`401`) 12 h after the original `/auth/session` mint (#893) |
 | GET | `/constitution` | `x0x constitution` | Display the x0x Constitution (Markdown) |
 | GET | `/constitution/json` | `x0x constitution --json` | Constitution with version metadata (JSON) |
 
@@ -412,6 +412,8 @@ On the default loopback bind only the local operator can read them; on a
 non-loopback `api_address` bind (which logs a loud startup warning) the
 gate itself withholds the detail from callers without a token, so
 loopback-by-default and the gate together hold the boundary.
+`GET /health?detail=redacted` lets any caller opt into the redacted
+body; the parameter can only remove detail, never grant it.
 
 Loopback is decided from the peer address of the connection itself, so
 proxy headers (`X-Forwarded-For` and similar) are never consulted, and a
@@ -421,6 +423,32 @@ peers (`::ffff:127.0.0.1`) count as non-loopback and fail closed — in
 particular, a dual-stack `[::]` bind receives local IPv4 probes as
 v4-mapped addresses, so they get the redacted payload; bind `127.0.0.1`
 (the default) or probe over IPv6 when the full detail is wanted.
+
+`x0x doctor --bundle [PATH]` (#1354) writes the owner-local diagnostic
+bundle: one JSON file whose `health` section is fetched as
+`GET /health?detail=redacted` — exactly the body a non-loopback caller
+without a token gets, reason sentences included (they name bounds, not
+measurements) — plus the four doctor checks (`connectivity`,
+`key_health`, `store_integrity`, `upgrade`) and a small envelope
+(`schema`, `version`, `created_unix`, `generator`). Against a daemon
+older than the parameter the writer fails closed: it strips the gated
+`verdict.inputs` fields itself (the same `redact_health_detail`) and
+drops the reason sentences rather than risk the full-audience numbers.
+The `doctor` section is the owner-local four-check report and, unlike
+the redacted health body, does carry identifiers: agent, machine and
+user ids, current and latest versions, and degraded store ids. The file
+is owner-local in this slice; before anything is sent anywhere
+(slice 2 of #1354) those fields must be redacted. The bundle holds no
+keys, tokens or message content: the writer embeds only the redacted
+`/health` body and the check summaries, never route bodies that carry
+store values, history or auth material (a daemon-seeded test checks
+this). A bare `--bundle` writes `x0x-doctor-bundle-<unix-secs>.json`
+in the current directory; `--bundle <path>` writes that path. Either
+way the file is created fresh, with mode 0600 set at open time on
+unix: an existing file or a symlink at the path is refused, never
+overwritten or followed. The file stays on the
+owner's machine: this slice adds no sending (`POST /report` and opt-in
+maintainer delivery are later slices of #1354).
 
 ### Example: status
 
@@ -1805,7 +1833,7 @@ GET /direct/receipts/order-42?agent_id=8a3f...
 | `expired` | A queued send reached `deliver_until_ms` without a delivery |
 | `failed` | A queued send got an error that a retry cannot repair, or its recipient was blocked. `error` has the `/direct/send` error code, for example `recipient_rejected`, or `recipient_blocked` |
 | `cancelled` | A queued send was cancelled with `DELETE /direct/receipts/:logical_id` |
-| `delivered_late` (queued) | A recipient ACK for the only bytes ever attempted arrived after the queued send ended as `expired`, `failed` or `cancelled` |
+| `delivered_late` (queued) | An ACK from the recipient agent, on a machine an attempt was sent to, for the only bytes ever attempted, arrived after the queued send ended as `expired`, `failed` or `cancelled` |
 
 The key is the pair (`logical_id`, `agent_id`), because a logical id is scoped to one recipient. Only sends that supplied `logical_id` can be queried. Records of a synchronous send are kept in memory for 10 minutes after the send resolved or gave up, at most 4,096, oldest dropped first; a restart forgets them. The outcomes of a [queued send](#queued-durable-send-1109) survive a restart (see there). Only an `Accepted` v2 ACK from the exact recipient agent and machine counts. A malformed `logical_id` or `agent_id` answers 400 `invalid_logical_id` or `invalid_agent_id`. Decision: [A07](adr/consolidated/A07-r01-messages-receipts-history-and-retry.md) (amendment of 14 Nov 2026).
 
@@ -1843,13 +1871,18 @@ Rules:
 - Payloads are stored unsealed (base64) in `direct_send_outbox.json`, a file with owner-only permissions (0600).
 - Caps: 64 sends or 4 MiB per recipient, 1,024 sends or 32 MiB per daemon. A full outbox answers 429 `outbox_full`. The daemon also remembers at most 4,096 attempted `logical_id`s for 24 hours (see the attempt record below). When held sends and attempt records together reach that number, a new queued send answers 429 `outbox_full`, so an attempt record is never dropped before its 24 hours.
 - Read the outcome with [`GET /direct/receipts/:logical_id`](#durable-send-receipts-1109). `queued` is read from the outbox and survives a restart. `delivered`, `expired`, `failed` (with `error`) and `cancelled`, each with its `payload_digest`, are written to `direct_send_outcomes.json` (owner-only, 0600) next to the outbox, kept 24 hours, at most 4,096, oldest dropped first, and loaded at start, so a receipt answers the same after a restart. A bad outcomes file is moved aside (`.corrupt-<ms>`) and the daemon still starts.
-- Before each attempt the daemon writes the digest of the bytes it is about to send under that `logical_id`. A late durable ACK after a restart (when the send's own record is gone) settles a held send as `delivered` without another send only when it comes from the send's recipient agent and exactly one digest was ever attempted under that key, equal to the held bytes. After `expired`, `failed` or `cancelled`, the same ACK turns the outcome into `delivered_late` (with that digest). Anything else changes nothing.
+- Before each attempt the daemon writes the digest of the bytes it is about to send under that `logical_id`. At the end of each pass it also writes the recipient machine each attempt was sent to (at most 4 machines per `logical_id`). A late durable ACK after a restart (when the send's own record is gone) settles a held send as `delivered` without another send only when all of these are true:
+  - It comes from the send's recipient agent.
+  - It comes from a machine written for that `logical_id`. An ACK from the same agent on another machine changes nothing.
+  - Exactly one digest was ever attempted under that key, equal to the held bytes.
+
+  After `expired`, `failed` or `cancelled`, the same ACK turns the outcome into `delivered_late` (with that digest). If no machine was written (the record is older than this rule, the write failed, or the daemon stopped before the end of the pass), no late ACK settles the send, and a held send is sent again. Anything else changes nothing.
 - Once bytes were attempted under a `logical_id`, other bytes under it answer 409 `idempotency_conflict` (for 24 hours): the earlier bytes may have arrived.
 - An outcome is written durably before the send leaves the outbox. If it cannot be written, the send stays held (a cancel answers 503 `outbox_not_durable`). The next pass writes that outcome again and makes no new attempt for those bytes. A restart forgets the unwritten outcome, and the send is then decided again.
 - When a recipient's durable-capable capability advert arrives, its held sends are tried at once instead of at the next retry time. One recipient is nudged at most once every 2 seconds, so a flood of adverts does not resend faster than the first retry interval.
 - A sidecar that fails its checks at startup is moved aside (`.corrupt-<ms>`), and the daemon starts with an empty outbox.
 
-Decision: [A07](adr/consolidated/A07-r01-messages-receipts-history-and-retry.md) (amendment of 16 Nov 2026).
+Decision: [A07](adr/consolidated/A07-r01-messages-receipts-history-and-retry.md) (amendments of 16 and 17 Nov 2026).
 
 ### `/direct/events` SSE message shape
 
@@ -2233,8 +2266,18 @@ every wait. A wait always names its cause; it does not stop silently.
     `promoted_member` is `{"state", "named", "parent_head"}`; `state` is
     `mandate_received`, `waiting_for_receiver_upgrade` (D76 hold, `named`
     lists each Active member whose current advert lacks bit 7),
-    `waiting_for_member_key_package` or `recovery_not_needed` (the named
-    revocation records have not arrived yet). After the commit,
+    `waiting_for_member_key_package`, `waiting_for_member_eviction`
+    (#1973: the recovery seal was refused) or `recovery_not_needed` (the
+    named revocation records have not arrived yet).
+    `waiting_for_member_eviction` appears only here, in
+    `promoted_member.state`; no obligation row emits it, and its only
+    producer is the recovery's own wait. `named` lists each seated
+    member that still needs its own eviction and rekey under the admin
+    the recovery seats. The recovery commit tolerates seated revoked
+    non-admin members; each keeps its own eviction. When an unrelated
+    seat's grace or digest-pending hold is what refuses the seal,
+    `named` still lists the failing seats, not the hold. The wait
+    clears when the hold ends. After the commit,
     `receiver_upgrade_members` lists the stranded members with
     `gap_revision`.
 

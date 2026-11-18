@@ -1770,6 +1770,7 @@ mod tests {
         LedgerReceipt {
             status: x0x::dm::DmReceiptStatus::Unknown,
             digest: None,
+            machine: None,
         }
     }
 

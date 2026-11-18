@@ -720,9 +720,12 @@ passthrough), and 78 (`EX_CONFIG`) when no automatic start is allowed
 plan or stopped, or a prior child that still runs after a 45 s wait for it
 to end). A unit that binds the owned launcher must also set
 `RestartPreventExitStatus=78`. A trial-form launcher records each final
-refusal in `<host-root>/launcher-refusal.json` (reason, launcher pid, time;
-mode 0600) and the next start that is not final removes it; `x0x doctor`
-reports it while the daemon is unreachable. A retired trial on a
+refusal in `<host-root>/launcher-refusal.json` (reason, launcher pid and
+process start time, time; mode 0600). Each trial-form start removes the
+earlier record before it starts, so a start that supervises the daemon
+leaves none. `x0x doctor` reports the record while the daemon is
+unreachable, and shows the launcher as holding only when a process with
+the recorded pid and start time still exists. A retired trial on a
 committed host is an ordinary start: the passthrough. The launcher strips a stray `X0X_M2_BOOT_FD` from the daemon's
 environment before the `exec`. While activation is held, `x0xd` ignores a
 stray `X0X_M2_BOOT_FD` with one warning. It refuses to start only for a
@@ -1095,8 +1098,18 @@ worst-case stop of a committed daemon); `--repair` refuses one without it.
 Under launchd an unconditional `KeepAlive` restarts every exit, so a
 launcher that reaches a final refusal (exit 78 elsewhere) holds until it is
 stopped instead of exiting. launchd then shows the job running with no
-daemon; `x0x doctor` shows the launcher's refusal reason. `x0x autostart` does not bind the launcher yet:
-it is dormant.
+daemon; `x0x doctor` shows the launcher's refusal reason.
+
+`x0x autostart --launcher` (hidden, macOS only, opt-in while the launcher
+is dormant) installs the job with the trial form: the `x0x-launcher`
+installed next to `x0xd`, `--host-root` the canonical data directory,
+`--instance` the `--name` or `default`, and `ExitTimeOut` 60 s. A name the
+launcher would refuse, or a missing launcher, fails before anything is
+written. Every `x0x autostart` on macOS writes the plist in one step (a
+new temporary file, mode 0644, fsync, rename, directory fsync) and loads
+it into the user's GUI domain with `launchctl bootout` and `launchctl
+bootstrap gui/<uid>`; `--remove` uses `bootout`. `--repair` does not move
+an existing job onto the launcher yet.
 
 The handoff transaction (`upgrade::restart`):
 
