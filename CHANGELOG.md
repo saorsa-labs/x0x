@@ -671,8 +671,8 @@ All notable changes to this project will be documented in this file.
   refused merge applies nothing. It is shown as `image.state: full_diverged`
   in `GET /stores` and warned by `x0x doctor`; this replica's pulls from the
   refused source back off until its image shrinks, and the refused content
-  returns through the next full-image repair. Merges and serves no longer copy
-  the whole store under a lock. An image saved above 16 MiB loads whole as
+  returns through the next full-image repair. Merges of deltas, retained images and adoption apply in place with no copy of the
+  store; legacy import still measures on a copy. An image saved above 16 MiB loads whole as
   `over_limit` and serves again once entries are removed. Refusals are also
   counted in `GET /diagnostics/state-sync`.
 - **Granted-store CLI paths and serves (#1953 review).** `x0x grant data`
