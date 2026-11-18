@@ -335,7 +335,7 @@ pub struct DaemonConfig {
     #[serde(default = "default_mdns_enabled")]
     pub(super) mdns_enabled: bool,
 
-    /// #1642: serve MASQUE relay sessions (TOML `relay_service_enabled`).
+    /// Serve MASQUE relay sessions (TOML `relay_service_enabled`).
     /// Unset follows the resolved participation mode: Full serves, Leaf
     /// refuses. See [`x0x::network::resolve_relay_service_enabled`].
     #[serde(default)]

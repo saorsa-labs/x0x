@@ -4730,6 +4730,7 @@ static DROP_INITIAL_VOLLEY_KINDS: std::sync::LazyLock<HashSet<&'static str>> =
     std::sync::LazyLock::new(|| {
         [
             ("X0X_TEST_DROP_INITIAL_MEMBER_JOINED", "member_joined"),
+            ("X0X_TEST_DROP_INITIAL_MEMBER_ADDED", "member_added"),
             ("X0X_TEST_DROP_INITIAL_MEMBER_REMOVED", "member_removed"),
             ("X0X_TEST_DROP_INITIAL_GROUP_DELETED", "group_deleted"),
             ("X0X_TEST_DROP_INITIAL_MEMBER_BANNED", "member_banned"),
@@ -21869,14 +21870,19 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 seated_attempt_id.as_deref(),
             )
             .await;
-            publish_named_group_metadata_event(state, &metadata_topic, &event).await;
+            let volley_dropped = drop_initial_volley(&event);
+            if !volley_dropped {
+                publish_named_group_metadata_event(state, &metadata_topic, &event).await;
+            }
             remember_treekem_membership_event(state, &event).await;
-            spawn_named_group_event_delivery_to_active_members(
-                state,
-                &next,
-                &event,
-                std::slice::from_ref(&member_agent_id),
-            );
+            if !volley_dropped {
+                spawn_named_group_event_delivery_to_active_members(
+                    state,
+                    &next,
+                    &event,
+                    std::slice::from_ref(&member_agent_id),
+                );
+            }
             if let Some(recovery) = member_joined_recovery.as_deref() {
                 spawn_named_group_event_delivery_to_active_members(state, &next, recovery, &[]);
             }
