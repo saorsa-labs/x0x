@@ -3252,9 +3252,6 @@ mod tests {
         let topic = "tasks-643-stale-serve-race";
         let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
 
-        // The holder's PRE-add state: a real, non-empty full serve
-        // (carrying the older task t0), snapshot and declaration captured
-        // together exactly as the responder loop does.
         let mut holder_list = TaskList::new(list_id(1), "Test List".to_string(), peer(1));
         holder_list
             .add_task(make_task(0, peer(1)), peer(1), 1)
@@ -3271,7 +3268,6 @@ mod tests {
             "no deletion evidence in flight — only absence"
         );
 
-        // The live add: T exists on the holder only as a published delta.
         let task = make_task(5, peer(1));
         let tid = *task.id();
         let add_seq = holder_list.next_seq();
@@ -3281,8 +3277,6 @@ mod tests {
         let add_delta =
             TaskListDelta::for_add(tid, task, (peer(1), add_seq), holder_list.current_version());
 
-        // The claimant: empty list, bootstrap requester armed (the adopt
-        // window this race lives in).
         let joiner_list = TaskList::new(list_id(1), "Test List".to_string(), peer(2));
         let joiner =
             TaskListSync::new(joiner_list, Arc::clone(&pubsub), topic.to_string(), peer(2))
@@ -3290,7 +3284,6 @@ mod tests {
         let mut probe = pubsub.subscribe(side.clone()).await;
         joiner.start().await.expect("start joiner");
 
-        // The add delta lands via live gossip — the visibility read sees T.
         let bytes = encode_delta(peer(1), &add_delta).expect("encode add");
         pubsub
             .publish(topic.to_string(), bytes::Bytes::from(bytes))
@@ -3306,9 +3299,6 @@ mod tests {
         }
         assert!(visible, "the add delta must make the task visible");
 
-        // The in-flight stale serve arrives next: declaration first (side
-        // topic), then the serve itself (main topic) — a broadcast answered
-        // before the holder ever merged the add.
         let marker = TaskListSyncMessage::StateServedV2 {
             responder: peer(1),
             digest: stale_digest,
@@ -3325,11 +3315,6 @@ mod tests {
             .await
             .expect("publish serve");
 
-        // Drive the bootstrap schedule well past delivery: request cycles
-        // observed AFTER the serve prove the listener had ample turns to
-        // process it. The joiner never converges here (local {T} vs
-        // declared empty), exactly like the live mesh before any holder
-        // declares the new content.
         let mut cycles = 0;
         for _ in 0..8 {
             tokio::time::sleep(Duration::from_secs(30)).await;
@@ -3340,7 +3325,6 @@ mod tests {
             "the unconverged joiner keeps asking; cycles={cycles}"
         );
 
-        // The claim must succeed against the same state the read saw.
         assert!(
             joiner.read().await.get_task(&tid).is_some(),
             "a stale serve must not prune a task the replica merged after \
@@ -3358,23 +3342,12 @@ mod tests {
         joiner.cancel_sync();
     }
 
-    /// WHY (issue #240, residual 3 — genuinely-empty chatter): the v1 rule
-    /// kept every empty list requesting forever (~1 side-topic message per
-    /// 5 minutes) because an empty holder had to stay silent (two empty
-    /// replicas must not talk each other into a FALSE converged-empty).
-    /// The v2 digest of the empty set is universally computable, so an
-    /// empty holder can now declare authoritative emptiness any empty
-    /// requester verifies locally — converging on empty is verifiably
-    /// CORRECT, and the chatter tail terminates.
     #[tokio::test(start_paused = true)]
     async fn empty_holder_v2_marker_terminates_empty_requester() {
-        // #1114: signed, or the probe (and both syncs) would hear nothing and
-        // `late == 0` below would hold trivially.
         let pubsub = signed_pubsub().await;
         let topic = "tasks-240-empty-silence";
         let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
 
-        // Both lists genuinely EMPTY.
         let joiner_list = TaskList::new(list_id(1), "Test List".to_string(), peer(2));
         let joiner =
             TaskListSync::new(joiner_list, Arc::clone(&pubsub), topic.to_string(), peer(2))
@@ -3387,12 +3360,8 @@ mod tests {
         holder.start().await.expect("start holder");
         let mut probe = pubsub.subscribe(side.clone()).await;
 
-        // Warm-up: the front burst fires and the empty holder's v2
-        // declarations arrive; convergence should follow within a few tail
-        // checks.
         tokio::time::sleep(Duration::from_secs(160)).await;
         let warm = drain_state_requests(&mut probe, peer(2)).await;
-        // Liveness: the front attempts always run, so the probe hears them.
         assert!(warm > 0, "the probe must hear the joiner's front requests");
         let mut late = 0;
         for _ in 0..20 {
@@ -3412,10 +3381,6 @@ mod tests {
     /// v2 markers to make progress against old peers.
     #[tokio::test(start_paused = true)]
     async fn v1_marker_from_old_peer_still_converges() {
-        // Signed pubsub (Layer A, issue #349): the full delta on the main
-        // topic must carry an envelope-verified writer; the v1/v2 question
-        // this test exercises is the SIDE-topic marker format, which stays
-        // a raw v1 StateServed below.
         let pubsub = signed_pubsub().await;
         let topic = "tasks-240-v1-compat";
         let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
@@ -3427,8 +3392,6 @@ mod tests {
         joiner.start().await.expect("start joiner");
         let mut probe = pubsub.subscribe(side.clone()).await;
 
-        // An "old peer" answers a request: full delta on the main topic,
-        // v1 StateServed marker on the side topic — never a v2 marker.
         tokio::time::sleep(Duration::from_secs(20)).await;
         let mut holder_list = TaskList::new(list_id(1), "Test List".to_string(), peer(1));
         holder_list
@@ -3458,7 +3421,6 @@ mod tests {
         }
         assert!(recovered, "the old peer's full delta must merge");
 
-        // Weak-evidence convergence: v1 marker + local state ⇒ the tail stops.
         tokio::time::sleep(Duration::from_secs(160)).await;
         drain_state_requests(&mut probe, peer(2)).await;
         let mut late = 0;
@@ -3472,17 +3434,8 @@ mod tests {
         );
     }
 
-    /// WHY: a v2 marker whose digest does not correspond to any state the
-    /// requester can hold (forged or corrupt) must NEVER converge it — the
-    /// digest is self-verifying, so a bad declaration can only delay, never
-    /// cause, convergence. Nor may it wedge later recovery: a genuine
-    /// holder's fresh declaration replaces the bad one (per-responder
-    /// latest-wins).
     #[tokio::test(start_paused = true)]
     async fn tampered_digest_is_rejected_and_does_not_wedge_recovery() {
-        // Signed pubsub (Layer A, issue #349): the genuine holder's serve
-        // must carry an envelope-verified writer; the tampered marker is
-        // still published as a raw side-topic payload.
         let pubsub = signed_pubsub().await;
         let topic = "tasks-240-tampered";
         let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
@@ -3494,7 +3447,6 @@ mod tests {
         joiner.start().await.expect("start joiner");
         let mut probe = pubsub.subscribe(side.clone()).await;
 
-        // The tampered marker: a random digest no real state can match.
         let marker = TaskListSyncMessage::StateServedV2 {
             responder: peer(1),
             digest: [0xAB; 32],
@@ -3506,8 +3458,6 @@ mod tests {
             .await
             .expect("publish tampered marker");
 
-        // The requester keeps asking: its (empty) local digest can never
-        // equal the forged declaration.
         let mut requests = 0;
         for _ in 0..8 {
             tokio::time::sleep(Duration::from_secs(30)).await;
@@ -3523,8 +3473,6 @@ mod tests {
             "no state can have been adopted from a forged declaration"
         );
 
-        // The genuine holder appears; its fresh declaration replaces the
-        // tampered one (per-responder latest-wins) and recovery completes.
         let mut holder_list = TaskList::new(list_id(1), "Test List".to_string(), peer(1));
         holder_list
             .add_task(make_task(1, peer(1)), peer(1), 1)
@@ -3549,11 +3497,6 @@ mod tests {
         );
     }
 
-    /// WHY (F3, fix-loop — tombstone + hardcoded-tag deadlock): the adopt's
-    /// prune is a local observe-remove, tombstoning the tags a previous
-    /// full delta used. With a hardcoded synthetic tag, a later serve
-    /// re-adding the same task would be silently rejected forever. Full
-    /// deltas now mint FRESH tags, so a re-served task is accepted.
     #[test]
     fn pruned_task_is_accepted_when_re_served_with_fresh_tags() {
         let mut holder = TaskList::new(list_id(1), "List".to_string(), peer(1));
@@ -3564,7 +3507,6 @@ mod tests {
             .add_task(make_task(2, peer(1)), peer(1), 2)
             .expect("add t2");
 
-        // The replica absorbs a first full serve (both tasks).
         let mut replica = TaskList::new(list_id(1), "List".to_string(), peer(2));
         let s1 = holder.full_delta();
         replica
@@ -3572,8 +3514,6 @@ mod tests {
             .expect("serve 1");
         assert_eq!(replica.task_count(), 2);
 
-        // The holder deletes the task; the next VERIFIED serve prunes it
-        // (tombstoning the first serve's synthetic tag locally).
         let doomed = TaskId::from_bytes([2; 32]);
         holder.remove_task(&doomed).expect("delete");
         let s2 = holder.full_delta();
@@ -3588,9 +3528,6 @@ mod tests {
         assert_eq!(replica.prune_to_served_set(&s2, Some(&agent(1))), 1);
         assert!(replica.get_task(&doomed).is_none());
 
-        // The holder RE-ADDS the task: a later serve must be accepted —
-        // pre-fix, its synthetic tag was tombstoned by the prune and the
-        // re-add silently dropped.
         holder
             .add_task(make_task(2, peer(1)), peer(1), 3)
             .expect("re-add");
@@ -3604,24 +3541,11 @@ mod tests {
         );
     }
 
-    /// WHY (issue #643 round 2, review case a): `reorder` rebuilds the
-    /// LWW ordering register from LIVE ids only, so after a delete any
-    /// reorder strips the deleted id from the ordering — the round-1
-    /// "ordering names deleted ids" evidence rule then failed to prune,
-    /// the stale replica kept the task with live tags, and its next full
-    /// serve re-served the deleted task with FRESH tags — fleet-wide
-    /// resurrection (#226 class). Deletion evidence must ride a MONOTONE
-    /// carrier: the raise-only observed-removed set, carried in the serve
-    /// as empty-tag-set `removed_tasks` entries. Delete → reorder → serve
-    /// must still prune, and the pruned replica must not re-serve the
-    /// task.
     #[test]
     fn delete_then_reorder_full_serve_still_prunes_without_resurrection() {
         let t1 = TaskId::from_bytes([1; 32]);
         let doomed = TaskId::from_bytes([2; 32]);
 
-        // Holder: {t1, doomed}, then DELETES doomed, then REORDERS to the
-        // live set — the register no longer names doomed.
         let mut holder = TaskList::new(list_id(1), "List".to_string(), peer(1));
         holder
             .add_task(make_task(1, peer(1)), peer(1), 1)
@@ -3634,7 +3558,6 @@ mod tests {
             .reorder(vec![t1], peer(1))
             .expect("reorder to live set");
 
-        // The serve is a REAL full serve from the post-reorder holder.
         let serve = holder.full_delta();
         assert!(
             !serve.added_tasks.contains_key(&doomed),
@@ -3653,9 +3576,6 @@ mod tests {
             "pin the hazard: the ordering register DID forget the deletion"
         );
 
-        // A stale replica still holding both tasks merges the serve (which
-        // must NOT delete on general merge) and then the digest-verified
-        // adopt prunes doomed on the explicit evidence.
         let mut replica = TaskList::new(list_id(1), "List".to_string(), peer(2));
         replica
             .add_task(make_task(1, peer(2)), peer(2), 1)
@@ -3678,8 +3598,6 @@ mod tests {
         assert!(replica.get_task(&doomed).is_none());
         assert!(replica.get_task(&t1).is_some(), "live task survives");
 
-        // No resurrection: the pruned replica's own serve carries doomed
-        // only as evidence — never as a fresh-tagged live entry.
         let re_serve = replica.full_delta();
         assert!(
             !re_serve.added_tasks.contains_key(&doomed),
@@ -3692,18 +3610,10 @@ mod tests {
         );
     }
 
-    /// WHY (issue #643 round 2, review case b): out-of-order delivery can
-    /// land a reorder delta whose ordering register names a task whose ADD
-    /// has not arrived yet (delta.rs documents this as expected). An
-    /// ordering mention is therefore not deletion evidence; under the
-    /// round-1 rule this shape false-pruned a task the holder never even
-    /// carried. Only explicit empty-tag-set removal evidence may prune.
     #[test]
     fn ordering_entry_without_add_or_evidence_is_not_pruned() {
         let phantom = TaskId::from_bytes([7; 32]);
 
-        // Holder: {t1} only; its serve's ordering register is grafted to
-        // ALSO name `phantom` — a reorder delta that outran phantom's add.
         let mut holder = TaskList::new(list_id(1), "List".to_string(), peer(1));
         holder
             .add_task(make_task(1, peer(1)), peer(1), 1)
@@ -3722,9 +3632,6 @@ mod tests {
             "no deletion evidence exists"
         );
 
-        // A replica holding phantom (its add landed separately) merges the
-        // serve and runs the adopt prune: the ordering mention must not
-        // remove phantom.
         let mut replica = TaskList::new(list_id(1), "List".to_string(), peer(2));
         replica
             .add_task(make_task(7, peer(2)), peer(2), 1)
@@ -3743,21 +3650,11 @@ mod tests {
         );
     }
 
-    /// WHY (issue #654): deletion is content. `merge_delta` drops removal
-    /// evidence from a writer the list's policy would not accept content
-    /// from (a removed member, an unverified envelope), but the adopt-gate
-    /// prune acted directly on the wire delta — so on a group-scoped list
-    /// a holder the policy just rejected could still DELETE tasks via
-    /// empty-tag removal evidence in its serve, and the pruned replica
-    /// would then forward that evidence fleet-wide. The prune must obey
-    /// the same authorization as the merge that surrounds it.
     #[test]
     fn unauthorized_holder_removal_evidence_cannot_prune_group_list() {
         let t1 = TaskId::from_bytes([1; 32]);
         let doomed = TaskId::from_bytes([2; 32]);
 
-        // Holder (member agent(1)) deletes `doomed`; its full serve
-        // carries the deletion as explicit evidence and `t1` live.
         let mut holder = TaskList::new(list_id(1), "Group".to_string(), peer(1));
         holder
             .add_task(make_task(1, peer(1)), peer(1), 1)
@@ -3773,7 +3670,6 @@ mod tests {
             "the serve carries explicit deletion evidence"
         );
 
-        // Group-scoped replica: only agent(1) may write content.
         let make_replica = || {
             let mut replica = TaskList::new(list_id(1), "Group".to_string(), peer(2));
             replica.set_authorized_agents(std::collections::HashSet::from([agent(1)]));
@@ -3786,8 +3682,6 @@ mod tests {
             replica
         };
 
-        // A non-member's serve: the merge drops its content, and the
-        // adopt prune must not act on its evidence either.
         let mut replica = make_replica();
         replica
             .merge_delta(&serve, peer(9), Some(&agent(9)))
@@ -3806,8 +3700,6 @@ mod tests {
             "the non-member's evidence must not even be recorded for forwarding"
         );
 
-        // An unverified envelope (writer None) is not a content writer
-        // either — `merge_delta` treats it the same way.
         let mut replica = make_replica();
         replica
             .merge_delta(&serve, peer(1), None)
@@ -3819,8 +3711,6 @@ mod tests {
         );
         assert!(replica.get_task(&doomed).is_some());
 
-        // The same evidence from the authorized member still prunes —
-        // the gate must not break legitimate deletion cold-sync.
         let mut replica = make_replica();
         replica
             .merge_delta(&serve, peer(1), Some(&agent(1)))
@@ -3834,22 +3724,9 @@ mod tests {
         assert!(replica.get_task(&t1).is_some(), "live task survives");
     }
 
-    // ------------------------------------------------------------------
-    // #732 findings 3 and 5 — the listener's gate ordering and its drain
-    // ------------------------------------------------------------------
-
-    /// A per-instance ADR-0068 D2 gate for the listener fixtures.
-    ///
-    /// Per-instance, never a `static`: these tests run in parallel with the rest
-    /// of the module and a process-global switch would couple them — the flake
-    /// class the `fork_quarantine` fault-injection refactor removed.
     #[derive(Debug, Default)]
     struct ListenerGate {
         suspended: std::sync::atomic::AtomicBool,
-        /// The roster the pinned refresh installs. Seeded with the pubsub's
-        /// signer, so the refresh authorizes exactly the writer these fixtures
-        /// publish as — anything else would deny its content and the assertions
-        /// would be about authorization rather than about ordering.
         roster: std::sync::Mutex<std::collections::HashSet<crate::identity::AgentId>>,
         buffered: std::sync::atomic::AtomicU64,
         dropped: std::sync::atomic::AtomicU64,
@@ -3857,7 +3734,6 @@ mod tests {
     }
 
     impl ListenerGate {
-        /// A gate whose pinned roster seats `signer`.
         fn seating(signer: AgentId) -> Self {
             let gate = Self::default();
             gate.roster
@@ -3876,8 +3752,6 @@ mod tests {
             counter.load(std::sync::atomic::Ordering::SeqCst)
         }
 
-        /// A stable ADR-0067 token with no marker half — "this group is not
-        /// quarantined right now", which is what the drain must see to proceed.
         fn marker_free_token() -> crate::groups::LifecycleEpochToken {
             crate::groups::GroupInfo::new(
                 "listener-gate".to_string(),
@@ -3905,9 +3779,6 @@ mod tests {
                     + '_,
             >,
         > {
-            // A stable token: these fixtures are about ordering and liveness,
-            // not about the ADR-0067 re-check (which has its own fixtures in
-            // `named_groups/tests/adr0068_task_buffer.rs`).
             Box::pin(async move { Some(Self::marker_free_token()) })
         }
 
@@ -3915,12 +3786,6 @@ mod tests {
             &'a self,
             apply: &'a mut (dyn FnMut(Option<&AuthorizedRoster>) + Send),
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
-            // These listener fixtures are about the gate's ORDERING (installed
-            // before the listener) and the drain's liveness. The pinning property
-            // itself — a roster writer blocked for the whole merge — is asserted in
-            // `named_groups/tests/adr0068_task_buffer.rs` against this same
-            // function. Here the roster simply seats the publisher and carries no
-            // marker, so the drain proceeds.
             Box::pin(async move {
                 let agents = self
                     .roster
@@ -3951,16 +3816,11 @@ mod tests {
         }
     }
 
-    /// A signed sync: publishes carry a V2-envelope-verified sender, so merged
-    /// content actually lands and "the task is present" is a real merge. The
-    /// returned `AgentId` is that sender.
     async fn make_signed_sync(topic: &str) -> (TaskListSync, AgentId) {
         let (sync, _pubsub, signer) = make_signed_sync_with_pubsub(topic).await;
         (sync, signer)
     }
 
-    /// As [`make_signed_sync`], handing back the shared pubsub so a test can put
-    /// arbitrary bytes on the same topic the listener reads.
     async fn make_signed_sync_with_pubsub(
         topic: &str,
     ) -> (TaskListSync, Arc<PubSubManager>, AgentId) {
@@ -3971,7 +3831,6 @@ mod tests {
         (sync, pubsub, signer)
     }
 
-    /// One inbound delta that adds a distinct task.
     fn add_delta(seq: u64, id_byte: u8, from: PeerId) -> TaskListDelta {
         let task = make_task(id_byte, from);
         let mut delta = TaskListDelta::new(seq);
@@ -3979,9 +3838,6 @@ mod tests {
         delta
     }
 
-    /// Wait for `check` to hold, or give up. Bounded polling rather than a fixed
-    /// sleep, so a slow machine cannot make the assertion flake in either
-    /// direction.
     async fn eventually<F, Fut>(within: Duration, mut check: F) -> bool
     where
         F: FnMut() -> Fut,
@@ -3999,32 +3855,16 @@ mod tests {
         .is_ok()
     }
 
-    /// #732 finding 3: a gate installed BEFORE `start` holds the first delta the
-    /// listener ever sees. The negative control is the pre-fix ordering — a
-    /// delta arriving while the slot is still empty MERGES, which is exactly
-    /// what a restart with a quarantined group used to do.
-    ///
-    /// **Why this test and its siblings do NOT use `tokio::time::pause()`**
-    /// (raised by both #756 reviewers, and a fair question). These four tests
-    /// drive the REAL listener, which means a real `PubSubManager` over a real
-    /// loopback QUIC node: gossip and transport keep their own timers, and under
-    /// paused time either they never fire (delivery stalls forever) or
-    /// auto-advance fires them in an order the test does not control — the test
-    /// would be less deterministic, not more. Determinism here comes from not
-    /// depending on elapsed time at all: the poll period is injected per instance
-    /// (`set_drain_poll_millis`), every wait is a bounded poll on observable
-    /// state rather than a fixed sleep, and no assertion mentions a duration. The
-    /// interleaving properties that DO need exact orderings — the ADR-0067
-    /// re-check, the #756 P1 roster race and the P2 clear-between-steps window —
-    /// are asserted with counting barriers and no clock at all, in
-    /// `named_groups/tests/adr0068_task_buffer.rs`, against the same functions
-    /// this listener calls.
+    // This test and its siblings do not use `tokio::time::pause()`: they drive
+    // a real `PubSubManager` over a loopback QUIC node, whose gossip and
+    // transport timers either never fire under paused time or fire in an order
+    // the test does not control. They depend on no elapsed time instead: the
+    // poll period is injected and every wait is a bounded poll on state.
     #[tokio::test]
     async fn quarantine_gate_installed_before_start_holds_the_first_delta() {
         let (sync, signer) = make_signed_sync("tasks/adr0068-before-start").await;
         let gate = Arc::new(ListenerGate::seating(signer));
         gate.suspend(true);
-        // The ordering the binding gives us: gate first, listener afterwards.
         assert!(sync
             .ingest_gate()
             .install(Arc::clone(&gate) as Arc<dyn TaskIngestGate>));
@@ -4051,8 +3891,6 @@ mod tests {
         assert!(sync.read().await.get_task(&task_id).is_none());
         assert_eq!(ListenerGate::count(&gate.buffered), 1);
 
-        // NEGATIVE CONTROL: the same delta on a list whose gate is installed
-        // only AFTER it arrives — the pre-fix order — merges.
         let (control, control_signer) = make_signed_sync("tasks/adr0068-after-start").await;
         control.start().await.expect("start control");
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -4081,11 +3919,6 @@ mod tests {
             .install(late as Arc<dyn TaskIngestGate>));
     }
 
-    /// #732 finding 5: a newly received delta drains the held ones BEFORE it is
-    /// admitted — so post-clear traffic never applies ahead of deltas that
-    /// arrived before it, and continuous traffic accelerates the catch-up
-    /// instead of starving it. No timer is involved: the drain rides the very
-    /// next message.
     #[tokio::test]
     async fn a_newer_delta_drains_the_buffer_before_it_is_admitted() {
         let (sync, signer) = make_signed_sync("tasks/adr0068-drain-first").await;
@@ -4094,8 +3927,6 @@ mod tests {
         assert!(sync
             .ingest_gate()
             .install(Arc::clone(&gate) as Arc<dyn TaskIngestGate>));
-        // A poll far longer than this test: the drain below must come from the
-        // inbound delta, never from the timer.
         sync.set_drain_poll_millis(600_000);
         sync.start().await.expect("start");
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -4113,9 +3944,6 @@ mod tests {
             "the first delta is held while the marker is live"
         );
 
-        // CONTROL: while the marker is still live a second delta is ALSO held,
-        // so the assertions below are about the clear and not about a listener
-        // that merges everything.
         let still_quarantined = add_delta(2, 9, peer(2));
         sync.publish_delta(peer(2), still_quarantined)
             .await
@@ -4129,8 +3957,6 @@ mod tests {
         );
         assert_eq!(sync.read().await.task_count(), 0);
 
-        // The marker clears. The next inbound delta must drain the two held
-        // ones first and then apply itself.
         gate.suspend(false);
         let after_clear = add_delta(3, 11, peer(2));
         let after_id = *after_clear.added_tasks.keys().next().expect("newer task");
@@ -4163,11 +3989,6 @@ mod tests {
         assert_eq!(ListenerGate::count(&gate.dropped), 0);
     }
 
-    /// #732 finding 5, idle half: with NO further traffic the poll still drains,
-    /// and once the buffer is empty it disarms (no further drains happen).
-    ///
-    /// The period is shortened through the per-instance `cfg(test)` hook, so this
-    /// is fast without a process-global knob.
     #[tokio::test]
     async fn an_idle_buffer_drains_on_the_poll_and_then_disarms() {
         let (sync, signer) = make_signed_sync("tasks/adr0068-idle-poll").await;
@@ -4193,8 +4014,6 @@ mod tests {
             "held while the marker is live"
         );
 
-        // CONTROL: the poll fires repeatedly and must NOT apply anything while
-        // the marker is live.
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(
             sync.quarantined_buffer_len(),
@@ -4203,7 +4022,6 @@ mod tests {
         );
         assert_eq!(ListenerGate::count(&gate.applied), 0);
 
-        // Cleared, with no traffic at all: the poll is the only trigger.
         gate.suspend(false);
         assert!(
             eventually(Duration::from_secs(5), || async {
@@ -4215,8 +4033,6 @@ mod tests {
         assert_eq!(sync.quarantined_buffer_len(), 0);
         let applied_once = ListenerGate::count(&gate.applied);
         assert_eq!(applied_once, 1);
-        // Disarmed: an empty buffer means the poll arm is not selected, so no
-        // further drain (and no further gate read) happens.
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(
             ListenerGate::count(&gate.applied),
@@ -4225,16 +4041,6 @@ mod tests {
         );
     }
 
-    /// #732 finding 5, timer half: traffic the listener CANNOT drain on must not
-    /// postpone the drain deadline either.
-    ///
-    /// Undecodable payloads are the discriminating case. They reach the listener,
-    /// so the old per-iteration `sleep` inside `select!` was cancelled and
-    /// re-created by every one of them — a peer publishing garbage faster than
-    /// the poll period starved the drain for as long as it kept publishing, and
-    /// the drain-before-admit path cannot help because such a message never gets
-    /// as far as admission. With the deadline pinned across receives the buffer
-    /// drains WHILE the garbage is still arriving.
     #[tokio::test]
     async fn undecodable_traffic_cannot_postpone_the_drain_deadline() {
         let (sync, pubsub, signer) =
@@ -4261,8 +4067,6 @@ mod tests {
             "held while the marker is live"
         );
 
-        // The marker clears, and a flood of undecodable payloads starts —
-        // faster than the poll period, and never reaching admission.
         gate.suspend(false);
         let flood = tokio::spawn({
             let pubsub = Arc::clone(&pubsub);
@@ -4297,24 +4101,10 @@ mod tests {
         assert_eq!(ListenerGate::count(&gate.applied), 1);
     }
 
-    // ------------------------------------------------------------------
-    // #759: the task-list lifecycle fence — a retired listener must not
-    // merge or persist, and a draining retire must wait out an in-flight
-    // merge+persist section
-    // ------------------------------------------------------------------
-
     use std::future::Future;
 
     type HeldLoops = Arc<std::sync::Mutex<Vec<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>>>>;
 
-    /// One #759 retire fixture: a persisted list whose background loops are
-    /// HELD by a gated spawner (never polled until the test drives them), so
-    /// publish-then-cancel orderings are decided by the test, not by the
-    /// runtime. The snapshot lives under `dir`; persistence is armed so a
-    /// merge's snapshot write is observable as file presence. The pubsub is
-    /// SIGNED (issue #349 Layer A): an unsigned envelope's content fails
-    /// closed, so the control below could not merge — the signer is the
-    /// envelope-verified writer the list's open (unset) admission accepts.
     async fn retire_list_fixture(
         topic: &str,
         dir: &tempfile::TempDir,
@@ -4328,9 +4118,6 @@ mod tests {
         (sync, pubsub, snapshot)
     }
 
-    /// Publish one admissible delta and wait (barrier, not oracle) until the
-    /// pub/sub layer reports it delivered to this topic's subscriber — i.e.
-    /// it sits in the listener's channel.
     async fn publish_queued_task_delta(
         sync: &TaskListSync,
         pubsub: &Arc<PubSubManager>,
@@ -4350,11 +4137,7 @@ mod tests {
         task_id
     }
 
-    /// Start the loops on the runtime, keeping their join handles so a test
-    /// can prove they have fully exited (the kv #757 fixture's shape).
     async fn start_list_joinable(sync: &TaskListSync) -> Vec<tokio::task::JoinHandle<()>> {
-        // The kv #757 fixture's joinable shape: the spawner spawns on the
-        // runtime and parks the JOIN HANDLES, not the futures.
         let handles: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = Arc::clone(&handles);
@@ -4380,35 +4163,11 @@ mod tests {
         }
     }
 
-    /// Control for the retire oracles: the identical queued delta IS merged
-    /// and snapshotted by a live listener, so the retired assertions below
-    /// cannot pass merely because the delta was undeliverable or
-    /// inadmissible.
-    ///
-    /// Oracle (#759 CI repair): the listener releases the TaskList write
-    /// guard BEFORE it persists, so observing the in-memory merge proves
-    /// nothing about the file — the old test did exactly that and raced the
-    /// snapshot write in CI. The wait below is the persist context's
-    /// per-instance commit notification, which `persist_snapshot` sends
-    /// strictly AFTER `save_task_list` succeeds; it is a real notification
-    /// (no polling, no yields) with a bounded failure path (the timeout),
-    /// and the version it carries must advance past the pre-publish durable
-    /// version, so a stale or merge-time signal cannot satisfy it.
-    ///
-    /// Mutation control: delete the listener's `persist_snapshot` call (or
-    /// make the write fail) and the notification never advances — the
-    /// bounded wait fails on its timeout, deterministically, regardless of
-    /// scheduling. Signalling at merge time instead would not help: the
-    /// reload assertion below reads the file the listener committed and
-    /// demands the queued delta's task in it, so an in-memory-only merge
-    /// cannot pass.
     #[tokio::test]
     async fn live_control_listener_merges_and_persists_a_queued_delta_759() {
         let dir = tempfile::tempdir().expect("dir");
         let (sync, pubsub, _snapshot) = retire_list_fixture("tasks/759-live-control", &dir).await;
         let loops = start_list_joinable(&sync).await;
-        // Subscribe BEFORE the delta exists so no commit can slip past the
-        // wait, and pin the durable version the commit must advance past.
         let ctx = sync.persist_ctx().expect("persist armed");
         let mut persisted = ctx.persisted.subscribe();
         let durable_before = *persisted.borrow();
@@ -4424,9 +4183,6 @@ mod tests {
             sync.read().await.get_task(&task_id).is_some(),
             "control: a live listener merges the queued delta"
         );
-        // File existence alone is not the claim — any snapshot write (even
-        // an empty list's) would satisfy it. Reload the exact bytes the
-        // listener committed and demand the queued delta's task in them.
         let reloaded = TaskListStorage::new(dir.path().to_path_buf())
             .load_task_list(&list_id(1))
             .await
@@ -4439,17 +4195,6 @@ mod tests {
         join_list_loops(loops).await;
     }
 
-    /// A delta still QUEUED in the channel when `cancel_sync` lands never
-    /// merges and never persists. The loop futures are driven to completion
-    /// AFTER the cancel, so both the cancel and the queued message are ready
-    /// in the same poll — the unbiased-select hazard — and the assertion is
-    /// about the exit, not about scheduling.
-    ///
-    /// Mutation control: the protection this exercises is the cancel arm's
-    /// priority PLUS the under-`lifecycle` cancel check — delete the check
-    /// (or move it before `recv`) and a fetched delta merges after the
-    /// cancel; un-`biased`-ing the select alone is NOT a reliable fail
-    /// condition for this oracle, because the check still guards the merge.
     #[tokio::test]
     async fn retired_listener_never_merges_or_persists_a_queued_delta_759() {
         let dir = tempfile::tempdir().expect("dir");
@@ -4484,16 +4229,6 @@ mod tests {
         assert!(!snapshot.exists(), "a retired listener wrote the snapshot");
     }
 
-    /// A delta already PULLED past `recv` when the cancel lands (parked on
-    /// the lifecycle lock) must not merge either — the check has to sit
-    /// under the lock, which is the fence `cancel_sync_and_drain` waits on.
-    /// Barrier by construction: the delta is in the channel and no cancel is
-    /// set, so ONE poll takes the listener through `recv` and leaves it
-    /// Pending on the lifecycle lock held by the test.
-    ///
-    /// Mutation control: remove the under-lock `is_cancelled` check in the
-    /// listener's receive arm and this fixture merges the pulled delta —
-    /// that check, not the select bias, is the protection exercised.
     #[tokio::test]
     async fn task_delta_pulled_before_cancel_is_dropped_under_the_lifecycle_lock_759() {
         let dir = tempfile::tempdir().expect("dir");
@@ -4534,18 +4269,11 @@ mod tests {
         assert!(!snapshot.exists(), "a retired listener wrote the snapshot");
     }
 
-    /// An already-admitted section still owes its merge AND its snapshot
-    /// write; here the write is parked on the persist gate while the section
-    /// holds the lifecycle lock, so `cancel_sync_and_drain` must stay
-    /// pending until the gate releases and the write finishes. "Retired"
-    /// means the section COMPLETED, not that it was cut in half.
     #[tokio::test]
     async fn draining_retire_waits_for_an_in_flight_task_merge_and_persist_759() {
         let dir = tempfile::tempdir().expect("dir");
         let (sync, pubsub, snapshot) = retire_list_fixture("tasks/759-inflight", &dir).await;
         let loops = start_list_joinable(&sync).await;
-        // Park the snapshot commit gate: a merged-in-memory delta cannot
-        // finish its persist while this guard is held.
         let ctx = sync.persist_ctx().expect("persist armed");
         let persist_gate = ctx.gate.lock().await;
         let task_id = publish_queued_task_delta(&sync, &pubsub, 0xB4).await;
@@ -4560,8 +4288,6 @@ mod tests {
             sync.receive_section_active_for_test(),
             "the listener is inside a receive section, parked on the persist gate"
         );
-        // Merged in memory, snapshot write parked on the gate: the section
-        // is in flight, so the drain cannot complete.
         let mut drain = Box::pin(sync.cancel_sync_and_drain());
         for _ in 0..64 {
             assert!(
@@ -4585,14 +4311,6 @@ mod tests {
         join_list_loops(loops).await;
     }
 
-    /// Route resume versus retire (#759): a resume that races a retire
-    /// applies nothing — the drain is itself a fenced section, so a retired
-    /// list's buffered deltas stay buffered (in order) for the next
-    /// incarnation; nothing is half-applied.
-    ///
-    /// Mutation control: remove the lifecycle fence (cancel check) from
-    /// `resume_quarantined_ingest` and this fixture applies the buffered
-    /// delta after the cancel.
     #[tokio::test]
     async fn resume_after_retire_applies_nothing_and_keeps_the_buffer_759() {
         let dir = tempfile::tempdir().expect("dir");
@@ -4603,8 +4321,6 @@ mod tests {
         assert!(sync
             .ingest_gate()
             .install(Arc::clone(&gate) as Arc<dyn TaskIngestGate>));
-        // Buffer one delta through the exact admission step the listener
-        // calls, with the writer the clearing roster will seat.
         let delta = add_delta(1, 0xB5, peer(2));
         let task_id = *delta.added_tasks.keys().next().expect("task id");
         match testing::admit_or_buffer(
@@ -4622,7 +4338,6 @@ mod tests {
             Admission::Apply(..) => panic!("a suspended gate must hold the delta"),
         }
         assert_eq!(sync.quarantined_buffer_len(), 1);
-        // The marker clears — then the list is retired BEFORE the resume.
         gate.suspend(false);
         sync.cancel_sync();
         let applied = sync.resume_quarantined_ingest().await;
@@ -4636,10 +4351,6 @@ mod tests {
         assert!(!snapshot.exists());
     }
 
-    /// Empty-buffer resume refreshes the captured authorized roster under
-    /// the pin (#756 review P4's arm, now reached through the #759-fenced
-    /// resume): a clear that finds nothing buffered must not leave the
-    /// cached roster stale for the deltas that arrive next.
     #[tokio::test]
     async fn empty_buffer_resume_refreshes_the_authorized_roster_759() {
         let dir = tempfile::tempdir().expect("dir");
@@ -4649,8 +4360,6 @@ mod tests {
         assert!(sync
             .ingest_gate()
             .install(Arc::clone(&gate) as Arc<dyn TaskIngestGate>));
-        // The stale captured set — the roster at subscription time, which
-        // the clearing commit is about to replace.
         sync.write()
             .await
             .set_authorized_agents(std::collections::HashSet::from([agent(5)]));
