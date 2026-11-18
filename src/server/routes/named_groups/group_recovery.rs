@@ -3466,6 +3466,20 @@ pub(in crate::server) async fn note_attested_for_test(
         });
 }
 
+/// Test hook: store `ata` as the group's active admin ATA, as an
+/// `attested` answer's arm does.
+#[cfg(test)]
+pub(in crate::server) async fn arm_admin_ata_for_test(
+    state: &AppState,
+    stable_group_id: &str,
+    ata: AdminTerminalAttestation,
+) -> bool {
+    update_sidecar(state, stable_group_id, move |body| {
+        body.active_ata = Some(ata);
+    })
+    .await
+}
+
 async fn record_recovery_list(
     state: &AppState,
     stable_group_id: &str,
@@ -4434,6 +4448,27 @@ async fn holds_keys(state: &AppState, group_key: &str, info: &GroupInfo) -> bool
         || state.treekem_groups.read().await.contains_key(group_key)
 }
 
+/// Whether this node is Active on its roster and holds the plane's keys:
+/// on the TreeKEM plane its TreeKEM group too. A finished catch-up needs
+/// both (#2022); an unknown plane is never keyed.
+async fn seated_with_keys(
+    state: &AppState,
+    group_key: &str,
+    info: &GroupInfo,
+    local: &str,
+) -> bool {
+    if !info.has_active_member(local) {
+        return false;
+    }
+    match info.secure_plane {
+        x0x::mls::SecureGroupPlane::TreeKem => {
+            state.treekem_groups.read().await.contains_key(group_key)
+        }
+        x0x::mls::SecureGroupPlane::Gss => true,
+        x0x::mls::SecureGroupPlane::Unknown => false,
+    }
+}
+
 /// Whether the attempt for `stable` ended on a lost Welcome
 /// ([`end_on_welcome_loss`]).
 async fn welcome_lost(state: &AppState, stable: &str) -> bool {
@@ -4810,21 +4845,30 @@ async fn subject_tick(state: &Arc<AppState>) {
         }
         retire_converged(state, &key).await;
         if refs.is_empty() && !unserved_seal_open(state, &info).await {
-            let mut inner = state.group_recovery.inner.lock().await;
-            // A catch-up holds its view until its segment terminal is
-            // reached; then it has finished (#2003).
-            let drop_entry =
-                inner
-                    .subjects
-                    .get(&stable)
-                    .is_some_and(|subject| match &subject.view {
-                        SubjectView::CatchingUp {
-                            segment_terminal, ..
-                        } => info.state_revision >= *segment_terminal,
-                        _ => true,
-                    });
-            if drop_entry {
-                inner.subjects.remove(&stable);
+            let keyed = seated_with_keys(state, &key, &info, &local).await;
+            let at_terminal_unkeyed = {
+                let mut inner = state.group_recovery.inner.lock().await;
+                // A catch-up holds its view until its segment terminal is
+                // reached (#2003) and this node is Active with its keys
+                // (#2022). At the terminal with no Welcome yet it keeps
+                // its typed state; the #1661 Welcome-loss path ends it.
+                let (drop_entry, unkeyed) = match inner.subjects.get(&stable).map(|s| &s.view) {
+                    Some(SubjectView::CatchingUp {
+                        segment_terminal, ..
+                    }) => {
+                        let at_terminal = info.state_revision >= *segment_terminal;
+                        (at_terminal && keyed, at_terminal && !keyed)
+                    }
+                    Some(_) => (true, false),
+                    None => (false, false),
+                };
+                if drop_entry {
+                    inner.subjects.remove(&stable);
+                }
+                unkeyed
+            };
+            if at_terminal_unkeyed {
+                end_on_welcome_loss(state, &key, &info, now).await;
             }
             continue;
         }
@@ -5123,7 +5167,11 @@ async fn next_target(
                 reason: "no_capable_peer".to_string(),
             };
         }
-        subject.end_round(now);
+        // Only an empty list reaches here (#2022): no capable peer at all.
+        // Nothing was asked, so no round ends and `attempts` does not grow;
+        // the node asks at once when a capable peer appears.
+        subject.next_target = 0;
+        subject.pending = None;
         return None;
     }
     let target = targets.get(subject.next_target).copied()?;
@@ -20093,7 +20141,7 @@ mod tests {
     #[tokio::test]
     async fn a_finished_catch_up_clears_the_recovery_object() -> anyhow::Result<()> {
         let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
-        let (_key, info, admin) = unserved_fixture(&state, "attempt-1").await?;
+        let (key, info, admin) = unserved_fixture(&state, "attempt-1").await?;
         let stable = info.stable_group_id().to_string();
         let catching_up = |terminal: u64| SubjectView::CatchingUp {
             attested_by: hex::encode(admin.agent_id().as_bytes()),
@@ -20113,7 +20161,8 @@ mod tests {
             view_of(&state, &stable).await,
             Some(catching_up(info.state_revision + 1))
         );
-        // At the terminal: dropped.
+        // At the terminal, Active with its TreeKEM group (#2022): dropped.
+        install_tree(&state, &key)?;
         set_view(
             &state,
             &stable,
@@ -20124,6 +20173,112 @@ mod tests {
         subject_tick(&state).await;
         assert_eq!(view_of(&state, &stable).await, None);
         assert!(recovery_json(&state, &info).await.is_none());
+        Ok(())
+    }
+
+    /// A TreeKEM group for `key`, so this node holds the plane's keys.
+    fn install_tree(state: &AppState, key: &str) -> anyhow::Result<()> {
+        let group_id = hex::decode(key)?;
+        let seed = super::super::agent_treekem_seed(state.agent.as_ref(), &group_id);
+        let tree = x0x::mls::TreeKemMlsGroup::create(group_id, state.agent.agent_id(), &seed)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        state
+            .treekem_groups
+            .try_write()
+            .map_err(|_| anyhow::anyhow!("treekem_groups is locked"))?
+            .insert(key.to_string(), Arc::new(tokio::sync::Mutex::new(tree)));
+        Ok(())
+    }
+
+    /// #2022 (from the review of #2021): a `catching_up` view at its
+    /// segment terminal is dropped only when this node is Active with its
+    /// keys. With no Welcome yet it keeps its typed state, and the #1661
+    /// Welcome-loss path ends it `readmission_required
+    /// {base_beyond_retention}` once the Welcome's lifetime passes. RED on
+    /// main: the tick dropped the view at the terminal, so the node showed
+    /// no recovery object and held no keys. Inert: an offline agent,
+    /// paused time.
+    #[tokio::test]
+    async fn a_catch_up_at_its_terminal_without_keys_keeps_its_typed_state() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, admin) = unserved_fixture(&state, "attempt-1").await?;
+        let stable = info.stable_group_id().to_string();
+        let held = SubjectView::CatchingUp {
+            attested_by: hex::encode(admin.agent_id().as_bytes()),
+            verified: true,
+            segment_terminal: info.state_revision,
+        };
+        // Neither case holds a TreeKEM group.
+        for (case, active) in [("pre-Welcome", false), ("Active, no tree", true)] {
+            let mut record = info.clone();
+            if !active {
+                record.remove_member(&local_hex(&state), None);
+            }
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(key.clone(), record.clone());
+            set_view(&state, &stable, record.state_revision, held.clone()).await;
+            subject_tick(&state).await;
+            assert_eq!(
+                view_of(&state, &stable).await,
+                Some(held.clone()),
+                "{case}: the view holds at the terminal"
+            );
+            assert!(
+                recovery_json(&state, &record).await.is_some(),
+                "{case}: the recovery object stays"
+            );
+        }
+        // The Welcome never comes: the #1661 path ends the attempt typed.
+        tokio::time::pause();
+        set_attempt(&state, &stable, true, Some(Instant::now()), false).await;
+        tokio::time::advance(super::super::PENDING_WELCOME_TTL).await;
+        subject_tick(&state).await;
+        assert_eq!(
+            view_of(&state, &stable).await,
+            Some(SubjectView::Readmission {
+                cause: "base_beyond_retention"
+            })
+        );
+        Ok(())
+    }
+
+    /// #2022 (from the review of #2021): with no capable peer at all the
+    /// target list is empty. Nothing is asked, so no round ends: `attempts`
+    /// and the back-off stay as they are, and the view is
+    /// `awaiting_attestation {no_capable_peer}`. RED on main: each tick
+    /// called `end_round`, so `attempts` grew. Inert: an offline agent.
+    #[tokio::test]
+    async fn no_capable_peer_ends_no_round() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let (key, info, _admin) = unserved_fixture(&state, "attempt-1").await?;
+        let stable = info.stable_group_id().to_string();
+        assert!(ordered_targets(&state, &info, &local).is_empty());
+        let start = Instant::now();
+        fresh_subject(&state, &info, start).await;
+        let attempts = || async {
+            state
+                .group_recovery
+                .inner
+                .lock()
+                .await
+                .subjects
+                .get(&stable)
+                .map(|subject| (subject.attempts, subject.next_retry_at))
+        };
+        let before = attempts().await;
+        for step in 1..=3u64 {
+            let later = start + s3::GATE_STALL + Duration::from_secs(step * 600);
+            assert_eq!(
+                next_target(&state, &key, &info, &local, &[], later).await,
+                None
+            );
+        }
+        assert_eq!(attempts().await, before, "no round ends");
+        assert_eq!(view_of(&state, &stable).await, awaiting("no_capable_peer"));
         Ok(())
     }
 

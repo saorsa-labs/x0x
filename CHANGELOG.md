@@ -624,6 +624,15 @@ All notable changes to this project will be documented in this file.
   to a requester that is an Active member when the page is served. A relayed
   link's `actor` now matches its signer without regard to hex case. ADR A08
   correction of 17 Nov 2026.
+- **Groups (#2022):** a joiner that reaches its catch-up terminal with no
+  Welcome yet keeps its `catching_up` recovery object until it is Active with
+  its keys; if the Welcome never comes it ends `readmission_required
+  {base_beyond_retention}`. Before, the recovery object cleared at the
+  terminal with no keys. With no capable peer at all, the recovery loop no
+  longer counts a round on each tick. Tests cover a relayed link under an
+  admin ATA (a member-signed one is refused), the authority's decision for a
+  head one below its oldest kept commit, and a decrypt at the head epoch in
+  W3-H H-S3-r. ADR A08 amendment of 18 Nov 2026.
 
 - **Granted-store CLI paths and serves (#1953 review).** `x0x grant data`
   (and `grant revoke|renew`) percent-encode each path segment, so a key with
