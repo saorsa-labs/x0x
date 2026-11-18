@@ -3013,82 +3013,75 @@ mod tests {
     /// (#1354 slice 1 takeover): a bundle written via `doctor_unreachable` while
     /// a launcher-refusal record is present must include the refusal evidence
     /// (reason, pid, holding flag — these are diagnostic, not secrets) and must
-    /// not include a secret planted beside the record on disk.
+    /// not include a secret planted beside the record on disk or leak any
+    /// absolute home-directory path.
     ///
     /// This is a pure unit test — no daemon, no network.
     #[test]
     fn doctor_bundle_contains_launcher_refusal_evidence_and_no_secrets() {
         use crate::upgrade::launcher_contract::{
-            LauncherRefusal, REFUSAL_FILE_NAME, REFUSAL_SCHEMA,
+            self, LauncherRefusal, REFUSAL_FILE_NAME, REFUSAL_SCHEMA,
         };
 
-        let dir = tempfile::tempdir().expect("tempdir for launcher-refusal bundle test");
+        // Create the instance directory where doctor_unreachable_with_output
+        // looks: {data_dir}/x0x-{name}.
+        let instance_name = format!("test-bundle-secret-{}", std::process::id());
+        let data_dir = dirs::data_dir().expect("data_dir must be resolvable in test");
+        let instance_dir = data_dir.join(format!("x0x-{instance_name}"));
+        std::fs::create_dir_all(&instance_dir).expect("create instance dir for test");
 
-        // Plant the refusal record. Use `std::process::id()` as the pid so
-        // `process_alive` returns `true` on every platform (we are running).
-        let reason = "unit-test-refusal-reason-do-not-send";
+        // Cleanup is at end of test; instance_dir is unique per pid.
+
+        // Plant the refusal record. Use std::process::id() as the pid and the
+        // real process_start for that pid so the holding flag is true
+        // (launcher_contract::process_start(pid) == record.process_start).
         let pid = std::process::id();
+        let proc_start = launcher_contract::process_start(pid)
+            .expect("process_start of the test process must succeed");
+        let reason = "unit-test-refusal-reason-do-not-send";
         let record = LauncherRefusal {
             schema: REFUSAL_SCHEMA,
             reason: reason.into(),
             pid,
+            process_start: proc_start,
             at_unix_ms: 1_000,
         };
         std::fs::write(
-            dir.path().join(REFUSAL_FILE_NAME),
+            instance_dir.join(REFUSAL_FILE_NAME),
             serde_json::to_vec(&record).expect("serialize refusal"),
         )
         .expect("write refusal file");
 
-        // Plant a secret canary beside the refusal file — simulates a key
-        // file that must never appear in the bundle.
-        let secret_canary = format!("secret-canary-{:016x}", 0xdeadbeef_cafebabe_u64);
-        std::fs::write(
-            dir.path().join("machine.key.canary"),
-            secret_canary.as_bytes(),
-        )
-        .expect("write secret canary");
+        // Plant a secret canary in a file that sits beside the refusal record
+        // in the instance dir. The bundle code reads only the refusal file
+        // through launcher_refusal_check; this proves it does not scan the
+        // whole directory.
+        let key_canary = format!("secret-machine-key-{:016x}", 0xdeadbeef_cafebabe_u64);
+        std::fs::write(instance_dir.join("machine.key"), key_canary.as_bytes())
+            .expect("write key canary");
 
-        // Build the report exactly as doctor_unreachable_with_output would.
-        let err_text = "named instance not found (unit test)";
-        let detail = format!("daemon not reachable: {err_text}");
-        let mut report = unreachable_doctor_report(detail.clone());
-        report.upgrade = down_upgrade_check(Some(dir.path()));
-
-        // Verify the upgrade check carries the refusal evidence.
-        assert_eq!(
-            report.upgrade.status,
-            DoctorCheckStatus::Fail,
-            "upgrade check must be fail when a refusal record is present"
-        );
-        let evidence = report
-            .upgrade
-            .evidence
-            .as_ref()
-            .expect("upgrade check must carry evidence when a refusal record is present");
-        let refusal_reason = evidence["launcher_refusal"]["reason"]
-            .as_str()
-            .expect("launcher_refusal.reason must be a string");
-        assert_eq!(
-            refusal_reason, reason,
-            "launcher_refusal.reason must equal the planted reason"
+        // Write the bundle by calling the real function. Use a fixed path
+        // inside the instance dir so it stays within the test's sandbox.
+        // The function returns Err("doctor detected failures") because all
+        // checks fail in the unreachable case — that is the expected exit
+        // status of `x0x doctor` when the daemon is down. The bundle and
+        // stdout are still written before that Err is returned.
+        let bundle_path = instance_dir.join("test-bundle.json");
+        let err = anyhow::anyhow!("named instance not found (unit test)");
+        let mut stdout_sink: Vec<u8> = Vec::new();
+        let result = doctor_unreachable_with_output(
+            crate::cli::OutputFormat::Text,
+            Some(&instance_name),
+            &err,
+            Some(Some(bundle_path.as_path())),
+            &mut stdout_sink,
         );
         assert!(
-            evidence["launcher_holding"].is_boolean(),
-            "launcher_holding must be a bool in the evidence"
+            result.is_err(),
+            "doctor_unreachable_with_output must exit non-zero (all checks fail)"
         );
 
-        // Write the bundle to a temp file.
-        let bundle_path = dir.path().join("test-bundle.json");
-        let target = DoctorBundleTarget {
-            path: bundle_path.clone(),
-            generated_name: false,
-        };
-        write_doctor_bundle(serde_json::json!({ "error": detail }), &report, &target)
-            .expect("bundle write must succeed");
-
-        // Parse and verify: reason in the bundle (allow-listed evidence),
-        // secret NOT in the bundle.
+        // Parse the bundle and run positive assertions.
         let bundle_bytes = std::fs::read(&bundle_path).expect("read bundle back");
         let bundle: serde_json::Value =
             serde_json::from_slice(&bundle_bytes).expect("bundle must parse as JSON");
@@ -3105,16 +3098,31 @@ mod tests {
             "bundle launcher_refusal.reason must match the planted record"
         );
         assert!(
-            bundle["doctor"]["upgrade"]["evidence"]["launcher_holding"].is_boolean(),
-            "bundle must carry launcher_holding"
+            bundle["doctor"]["upgrade"]["evidence"]["launcher_holding"]
+                .as_bool()
+                .unwrap_or(false),
+            "bundle must carry launcher_holding = true (pid is the live test process)"
         );
 
-        // The secret canary must not appear in any form in the bundle.
+        // Secret checks: none of the canaries or home-dir path may appear
+        // in the bundle text.
         let bundle_text = String::from_utf8_lossy(&bundle_bytes);
         assert!(
-            !bundle_text.contains(&secret_canary),
-            "bundle must not contain the secret canary planted beside the refusal file"
+            !bundle_text.contains(&key_canary),
+            "bundle must not contain the machine.key canary planted beside the refusal file"
         );
+        // The bundle must not reveal the system's home directory path
+        // (evidence fields carry ids, not filesystem paths).
+        if let Some(home) = dirs::home_dir() {
+            let home_str = home.display().to_string();
+            assert!(
+                !bundle_text.contains(&home_str),
+                "bundle must not contain the home-directory path: {home_str}"
+            );
+        }
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&instance_dir);
     }
 
     /// #1379: `AbandonProcessGroup` defeats launchd's process-group cleanup,
