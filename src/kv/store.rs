@@ -5914,11 +5914,14 @@ mod tests {
         for i in 0..40u64 {
             deltas.push(put_delta("k003", 10, b's', (peer(2), 100 + i), s.version));
         }
-        let mut removal = KvStoreDelta::new(s.version);
-        removal
-            .removed
-            .insert("k004".to_string(), std::collections::HashSet::new());
-        deltas.push(removal);
+        // Removals: the refreshed bound drops with the removed bytes.
+        for i in 4..20u32 {
+            let mut removal = KvStoreDelta::new(s.version);
+            removal
+                .removed
+                .insert(format!("k{i:03}"), std::collections::HashSet::new());
+            deltas.push(removal);
+        }
         let mut upsert = KvStoreDelta::new(s.version);
         upsert.updated.insert(
             "u000".to_string(),
