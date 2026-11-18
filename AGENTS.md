@@ -26,6 +26,12 @@ Docs are in `docs/` (start with `docs/api-reference.md`); test detail is in
   or `cargo nextest run` is only for a selector confirmed to open no network.
 - Linux cross-build: `cargo zigbuild --release --target x86_64-unknown-linux-gnu --bin x0xd`.
 
+## Comments
+- Write a comment only when code cannot express the reason: an external constraint,
+  a safety invariant, or a non-obvious why.
+- Do not narrate, restate code, or record history. Version control holds history.
+- Run `/no-comments` on the diff before opening a PR.
+
 ## Architecture
 Every ID is SHA-256 of an ML-DSA-65 public key:
 - **Machine** (`~/.x0x/machine.key`, auto-generated): the QUIC transport identity.
