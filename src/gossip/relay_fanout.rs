@@ -7,8 +7,12 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const TOKEN_UNITS_PER_MSG: u128 = 1_000_000_000;
 
+/// Upper bound on the configurable budget; guards against operator typos.
+/// 100k/s per topic is far above any measured fleet rate (busiest observed: ~19/s).
 pub const MAX_BUDGET_MSGS_PER_SEC: u64 = 100_000;
 
+/// #697: nothing reclaimed idle relay topics — measured ~7/hour, linear, no
+/// plateau over 6 h on the bootstraps (tag shards alone allow 65,536).
 pub(crate) const RELAY_TOPIC_IDLE_SECS: u64 = 3600;
 
 pub(crate) const RELAY_TOPIC_EVICT_POLL_SECS: u64 = 600;

@@ -1,3 +1,6 @@
+//! Shared wire codec for the `(PeerId, Delta)` envelope used by CRDT sync.
+//! Options live in one place so the wire format cannot silently fork between
+//! the task-list and kv-store stacks.
 use bincode::Options;
 use saorsa_gossip_types::PeerId;
 use serde::{de::DeserializeOwned, Serialize};
