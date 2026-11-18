@@ -13,6 +13,8 @@
 #      its group goes with it;
 #   3. when the job's main process (the launcher) is SIGKILLed, launchd
 #      ends the rest of its process group (a child that ends on SIGTERM).
+# It also reports how often launchd restarts the job when the daemon path
+# is missing.
 # It also reports a measured limit (18 Nov 2026, macOS 27): launchd's
 # process-group cleanup sends SIGTERM only, so a group member that ignores
 # SIGTERM outlives both `bootout` and a crash of the main process. The
@@ -54,7 +56,7 @@ while :; do sleep 1; done
 EOF
 chmod 755 "$daemon"
 
-write_job() { # main_ignores_term child_ignores_term exit_timeout
+write_job() { # main_ignores_term child_ignores_term exit_timeout [daemon]
     cat >"$plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -67,7 +69,7 @@ write_job() { # main_ignores_term child_ignores_term exit_timeout
         <string>--host-root</string><string>$work</string>
         <string>--instance</string><string>acceptance</string>
         <string>--</string>
-        <string>$daemon</string>
+        <string>${4:-$daemon}</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -164,4 +166,18 @@ else
     echo "LIMIT crash: not observed (the member was ended)"
 fi
 limit_case
+
+# A daemon path that no longer exists (a Homebrew upgrade removes the
+# versioned Cellar path the job pins). Measured, not a pass/fail case.
+missing_case() {
+    rm -f "$work/stderr.log"
+    write_job 0 0 25 "$work/missing/x0xd"
+    launchctl bootstrap "$domain" "$plist"
+    sleep 30
+    local starts
+    starts=$(grep -c 'cannot exec' "$work/stderr.log" 2>/dev/null || true)
+    launchctl bootout "$domain/$label" >/dev/null 2>&1 || true
+    echo "LIMIT missing-daemon: the launcher exited at once each time; launchd started it ${starts:-0} times in 30 s (KeepAlive restart loop)"
+}
+missing_case
 echo "PASS launchd acceptance ($label)"

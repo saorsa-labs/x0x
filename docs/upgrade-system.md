@@ -1114,8 +1114,11 @@ the plist with `launchctl bootout` and `launchctl bootstrap gui/<uid>`.
 The previous plist is kept until the new job loads:
 - if `bootout` leaves the old job loaded, the old file is restored and
   nothing changes;
-- if `bootstrap` fails, the old file is restored and loaded again, or,
-  when there was none, the new file is removed.
+- if `bootstrap` fails, the old file is restored, and it is loaded again
+  only if it was loaded before; when there was no old file, the new file
+  is removed.
+
+If the restore itself fails, the error reports both failures.
 
 `--remove` uses `bootout`.
 
@@ -1123,17 +1126,33 @@ The previous plist is kept until the new job loads:
 launcher. It moves only a job that the plain repair accepts (`KeepAlive`
 true, no `AbandonProcessGroup`), and keeps its label, environment, log
 paths and every other key. It writes the trial-form `ProgramArguments`
-(the launcher next to the job's daemon path, the instance's canonical
-default data directory, the canonical daemon, and the job's own
-arguments), removes `Program`, and sets `ExitTimeOut` to 60 s when it is
-absent or 45 s or less. It also adds the supervision marker if it is
-missing.
+(the launcher next to the job's daemon path, the host root, the canonical
+daemon, and the job's own arguments), removes `Program`, and sets
+`ExitTimeOut` to 60 s when it is absent or 45 s or less. It also adds the
+supervision marker if it is missing.
 
-The plist is backed up first, and the readback must be supervised,
-launcher-bound and carry exactly the planned arguments; otherwise the
-backup is restored. A job that passes `--config` is refused, because its
-data directory is not known from the job. The repair does not reload the
-job; it prints the `bootout` and `bootstrap` commands.
+The host root is the data directory that x0xd uses for that job, found
+the way x0xd finds it:
+- the home is the job's own `EnvironmentVariables.HOME`, else the home of
+  the user running the repair;
+- the instance's default config file
+  (`<home>/Library/Application Support/x0x[-<name>]/config.toml`) may set
+  `data_dir`; otherwise it is `<home>/Library/Application Support/x0x`,
+  or `x0x-<name>` for a named instance.
+
+The directory must exist: the planning step creates nothing. A job that
+passes `--config`, a config file that is not valid TOML, a relative
+`data_dir`, or a config `instance_name` that the job does not pass is
+refused, because the host root is then not known from the job.
+
+The repair builds the whole new job file first, checks that it converts
+back to exactly the planned job, and writes it in one atomic step (a
+temporary file, fsync, rename, directory fsync). A crash therefore leaves
+either the old job or the new one, never a mix. A copy of the old file is
+kept as `<plist>.x0x-backup`. If the readback is not the planned job, the
+old file is written back. The repair does not reload the job; it prints
+the `bootout` and `bootstrap` commands. It exits non-zero and names each
+job that it did not move.
 
 `scripts/ci/macos-launchd-acceptance.sh /abs/x0x-launcher` is the isolated
 launchd acceptance. It loads a throwaway job (its own label and roots in
@@ -1148,9 +1167,26 @@ the dormant launcher) found:
 
 **Limit:** launchd's process-group cleanup sends SIGTERM only. A group
 member that ignores SIGTERM, or hangs in its shutdown, outlives both
-`bootout` and a crash of the launcher. The launcher's next start then
-finds the prior child still running, waits 45 s, and holds (a final
-refusal) instead of starting a second daemon.
+`bootout` and a crash of the launcher. Once `ENABLED` is true, the
+launcher's next start finds the prior child still running, waits 45 s,
+and holds (a final refusal) instead of starting a second daemon. While the
+launcher is dormant it execs the daemon at once, so that wait and the
+hold are not yet measured through launchd. The launcher's unit tests
+cover them.
+
+**Missing daemon (measured).** The job names the canonical daemon. For a
+Homebrew install, that is a versioned Cellar path, which a `brew upgrade`
+removes. The dormant launcher then fails the `exec` and exits 75 at once.
+Under `KeepAlive`, launchd starts it again after each throttle interval
+(3 starts in 30 s on 18 Nov 2026): a restart loop until the job is repaired. The acceptance script reports
+how many starts it saw (`LIMIT missing-daemon`).
+
+**Not done yet (next #1379 slice):**
+- a missing daemon should hold or name a stable path, not loop;
+- the autostart commands do not refuse to run as root or under `sudo`,
+  and they do not check who owns the plist;
+- `--repair` has no dry run;
+- the acceptance script runs by hand only.
 
 The handoff transaction (`upgrade::restart`):
 

@@ -1254,9 +1254,11 @@ fn launchd_bootstrap(domain: &str, plist: &Path) -> Result<()> {
 /// (#2063 review). The previous file is kept until the new job loads:
 /// - a failed `bootout` (the old job stays loaded) restores the old file
 ///   and changes nothing;
-/// - a failed `bootstrap` restores the old file and loads it again, or
-///   removes the new file when there was none, so the file on disk is
-///   never one that launchd did not load.
+/// - a failed `bootstrap` restores the old file and, when the old job was
+///   loaded before, loads it again; with no old file it removes the new
+///   one.
+///
+/// A failed restore is reported together with the error that caused it.
 #[cfg(target_os = "macos")]
 fn replace_launchd_job(domain: &str, label: &str, plist: &Path, bytes: &[u8]) -> Result<()> {
     let previous = match std::fs::read(plist) {
@@ -1264,6 +1266,7 @@ fn replace_launchd_job(domain: &str, label: &str, plist: &Path, bytes: &[u8]) ->
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error).with_context(|| format!("read {}", plist.display())),
     };
+    let was_loaded = launchd_job_loaded(domain, label);
     let restore = || -> Result<()> {
         match &previous {
             Some(previous) => write_file_atomically(plist, previous, 0o644),
@@ -1272,23 +1275,36 @@ fn replace_launchd_job(domain: &str, label: &str, plist: &Path, bytes: &[u8]) ->
             }
         }
     };
+    let restore_failed = |error: anyhow::Error, restore_error: anyhow::Error| {
+        error.context(format!(
+            "restoring the previous job file also failed, so {} holds the new job: \
+             {restore_error:#}",
+            plist.display()
+        ))
+    };
     write_file_atomically(plist, bytes, 0o644)?;
     if let Err(error) = launchd_bootout(domain, label) {
-        restore()?;
-        return Err(error.context("the previous job file was restored; nothing changed"));
+        return Err(match restore() {
+            Ok(()) => error.context("the previous job file was restored; nothing changed"),
+            Err(restore_error) => restore_failed(error, restore_error),
+        });
     }
     if let Err(error) = launchd_bootstrap(domain, plist) {
-        restore()?;
-        let reloaded = previous.is_some() && launchd_bootstrap(domain, plist).is_ok();
-        let state = if reloaded {
-            "the previous job was restored and loaded again"
-        } else if previous.is_some() {
-            "the previous job file was restored but is not loaded; load it with launchctl \
-             bootstrap"
-        } else {
-            "the new job file was removed; no job is installed"
+        if let Err(restore_error) = restore() {
+            return Err(restore_failed(error, restore_error));
+        }
+        let state = match (&previous, was_loaded) {
+            (None, _) => "the new job file was removed; no job is installed",
+            (Some(_), false) => "the previous job file was restored; it was not loaded before",
+            (Some(_), true) if launchd_bootstrap(domain, plist).is_ok() => {
+                "the previous job was restored and loaded again"
+            }
+            (Some(_), true) => {
+                "the previous job file was restored but is not loaded; load it with launchctl \
+                 bootstrap"
+            }
         };
-        return Err(error.context(state.to_string()));
+        return Err(error.context(state));
     }
     Ok(())
 }
@@ -1299,17 +1315,83 @@ fn replace_launchd_job(domain: &str, label: &str, plist: &Path, bytes: &[u8]) ->
 #[cfg(any(test, target_os = "macos"))]
 const AUTOSTART_LAUNCHD_LABEL: &str = "com.saorsalabs.x0xd";
 
-/// The default data directory of an instance (`x0x`, or `x0x-<name>`),
-/// created if missing, canonical (the launcher's host root, A14).
+/// The config file x0xd started with `HOME=home` and no `--config` reads
+/// for instance `name`.
+#[cfg(any(test, target_os = "macos"))]
+fn instance_config_path(name: Option<&str>, home: &Path) -> std::path::PathBuf {
+    let dir = match name {
+        Some(n) => format!("x0x-{n}"),
+        None => "x0x".to_string(),
+    };
+    home.join("Library/Application Support")
+        .join(dir)
+        .join("config.toml")
+}
+
+/// A file's text, `None` when it does not exist.
+#[cfg(target_os = "macos")]
+fn read_optional(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+/// The data directory of an instance this CLI user's x0xd uses
+/// (`job_data_dir`), created if missing, canonical (the launcher's host
+/// root, A14). Only the install calls it, after the job is planned.
 #[cfg(target_os = "macos")]
 fn instance_data_dir(name: Option<&str>) -> Result<std::path::PathBuf> {
-    let base = dirs::data_dir().context("cannot determine data directory")?;
-    let data_dir = match name {
-        Some(n) => base.join(format!("x0x-{n}")),
-        None => base.join("x0x"),
-    };
+    let home = dirs::home_dir().context("cannot determine home directory")?;
+    let config = read_optional(&instance_config_path(name, &home))?;
+    let data_dir = job_data_dir(name, &home, config.as_deref())?;
     std::fs::create_dir_all(&data_dir)?;
     Ok(data_dir.canonicalize()?)
+}
+
+/// The data directory that x0xd started with `HOME=home`, no `--config` and
+/// instance `name` uses (the launcher's host root, A14), as x0xd derives
+/// it: the instance's default config file `config` (`<home>/Library/
+/// Application Support/x0x[-<name>]/config.toml`) may set `data_dir`, and a
+/// named instance that keeps the unnamed default gets `x0x-<name>`. A file
+/// x0xd would reject, a relative `data_dir`, or an `instance_name` other
+/// than the job's is refused: the host root is then not known from the job.
+#[cfg(any(test, target_os = "macos"))]
+fn job_data_dir(
+    name: Option<&str>,
+    home: &Path,
+    config: Option<&str>,
+) -> Result<std::path::PathBuf> {
+    let base = home.join("Library/Application Support");
+    let unnamed = base.join("x0x");
+    let table = config
+        .map(toml::from_str::<toml::Table>)
+        .transpose()
+        .context("the instance's config file is not valid TOML")?
+        .unwrap_or_default();
+    if let Some(configured) = table.get("instance_name") {
+        if configured.as_str() != name {
+            anyhow::bail!(
+                "the instance's config file sets instance_name {configured}, which the job does \
+                 not pass; migrate it by hand"
+            );
+        }
+    }
+    let data_dir = match table.get("data_dir") {
+        None => unnamed.clone(),
+        Some(value) => {
+            let path = Path::new(value.as_str().context("config data_dir is not text")?);
+            if !path.is_absolute() {
+                anyhow::bail!("the instance's config file sets a relative data_dir");
+            }
+            path.to_path_buf()
+        }
+    };
+    Ok(match name {
+        Some(n) if data_dir == unnamed => base.join(format!("x0x-{n}")),
+        _ => data_dir,
+    })
 }
 
 /// `x0x autostart` — configure daemon to start on boot. With `launcher`
@@ -1395,7 +1477,15 @@ pub async fn autostart(name: Option<&str>, launcher: bool) -> Result<()> {
             (None, None, x0xd.into_owned())
         };
 
-        let data_dir = instance_data_dir(name)?;
+        let data_dir = if launcher {
+            instance_data_dir(name)?
+        } else {
+            let base = dirs::data_dir().context("cannot determine data directory")?;
+            let data_dir =
+                base.join(name.map_or_else(|| "x0x".to_string(), |n| format!("x0x-{n}")));
+            std::fs::create_dir_all(&data_dir)?;
+            data_dir
+        };
         let log_path = data_dir.join("x0xd.log");
 
         // The pure renderer used by tests is the only template path.
@@ -1738,8 +1828,13 @@ pub(crate) struct MigrationHost<'a> {
     pub(crate) canonical_daemon: &'a dyn Fn(&str) -> Result<String>,
     /// The stable launcher next to the job's daemon path.
     pub(crate) launcher_for: &'a dyn Fn(&str) -> Result<String>,
-    /// The canonical data directory of an instance (`None`: default).
-    pub(crate) host_root: &'a dyn Fn(Option<&str>) -> Result<String>,
+    /// This CLI user's home, for a job that sets no `HOME`.
+    pub(crate) user_home: &'a dyn Fn() -> Result<std::path::PathBuf>,
+    /// A file's text, `None` when it does not exist.
+    pub(crate) read_file: &'a dyn Fn(&Path) -> Result<Option<String>>,
+    /// The canonical path of an existing directory. It never creates one:
+    /// planning changes nothing.
+    pub(crate) canonical_dir: &'a dyn Fn(&Path) -> Result<String>,
 }
 
 /// Plan the migration of one launchd job onto the launcher. `Ok(None)` when
@@ -1780,7 +1875,27 @@ pub(crate) fn plan_launcher_migration(
     }
     let name = daemon_name_argument(daemon.args);
     let instance = autostart_instance_id(name.as_deref())?;
-    let root = (host.host_root)(name.as_deref())?;
+    // x0xd finds its data directory from the job's own HOME (#2072 review).
+    let home = match job
+        .get("EnvironmentVariables")
+        .and_then(|env| env.get("HOME"))
+    {
+        Some(home) => {
+            std::path::PathBuf::from(home.as_str().context("the job's HOME is not text")?)
+        }
+        None => (host.user_home)()?,
+    };
+    if !home.is_absolute() {
+        anyhow::bail!("the job's HOME is not an absolute path");
+    }
+    let config = (host.read_file)(&instance_config_path(name.as_deref(), &home))?;
+    let data_dir = job_data_dir(name.as_deref(), &home, config.as_deref())?;
+    let root = (host.canonical_dir)(&data_dir).with_context(|| {
+        format!(
+            "the job's data directory {} must exist (start the daemon once)",
+            data_dir.display()
+        )
+    })?;
     let launcher = (host.launcher_for)(daemon.executable)?;
     let executable = (host.canonical_daemon)(daemon.executable)?;
     let program_arguments: Vec<String> = [
@@ -1833,7 +1948,7 @@ pub async fn autostart_repair(launcher: bool) -> Result<()> {
 
         let mut inspected = 0usize;
         let mut repaired = 0usize;
-        let mut refused = 0usize;
+        let mut refused: Vec<String> = Vec::new();
         let mut compliant = 0usize;
 
         for entry in std::fs::read_dir(&plist_dir)? {
@@ -1859,16 +1974,16 @@ pub async fn autostart_repair(launcher: bool) -> Result<()> {
 
             match verdict {
                 RepairVerdict::Refused(reason) => {
-                    refused += 1;
+                    refused.push(format!("{label} ({})", path.display()));
                     println!("  REFUSED: {reason}");
                     println!("  Left unchanged.");
                 }
-                RepairVerdict::NotAnX0xdJob => unreachable!("skipped above"),
+                RepairVerdict::NotAnX0xdJob => continue,
                 _ if launcher => match migrate_job_to_launcher(&path, &job) {
                     Ok(true) => repaired += 1,
                     Ok(false) => compliant += 1,
                     Err(error) => {
-                        refused += 1;
+                        refused.push(format!("{label} ({})", path.display()));
                         println!("  REFUSED: {error:#}");
                         println!("  Left unchanged.");
                     }
@@ -1916,12 +2031,22 @@ pub async fn autostart_repair(launcher: bool) -> Result<()> {
         }
         println!(
             "\nInspected {inspected} x0xd job(s): {repaired} repaired, {compliant} already \
-             compliant, {refused} refused."
+             compliant, {} refused.",
+            refused.len()
         );
         if repaired > 0 {
             println!(
                 "Also confirm `[update] stop_on_upgrade` is true (the default) in the daemon \
                  config: a supervised job with it set to false now refuses self-update."
+            );
+        }
+        // A launcher migration that left a job behind is a failure the
+        // caller must see (#2072 review): the exit code is not 0.
+        if launcher && !refused.is_empty() {
+            anyhow::bail!(
+                "{} x0xd job(s) were not moved onto the launcher: {}",
+                refused.len(),
+                refused.join(", ")
             );
         }
     }
@@ -1954,13 +2079,15 @@ fn print_reload_hint(path: &Path, label: &str) {
     println!("    launchctl bootstrap {domain} {}", path.display());
 }
 
-/// Move one x0xd job onto the stable launcher (#1379): back it up, apply
-/// the planned keys with `plutil`, add the supervision marker if missing,
-/// and verify the readback (supervised, launcher-bound, same daemon
-/// arguments); on any failure the backup is restored. `Ok(false)` when
-/// the job already runs the launcher.
+/// Move one x0xd job onto the stable launcher (#1379). The whole new job
+/// file is built first (`migrated_job`), converted to a plist and checked by
+/// converting it back, then written in one atomic step (#2072 review), so
+/// a crash leaves either the old job or the new one, never a mix. A copy of
+/// the old file is kept, and is put back if the readback does not match.
+/// `Ok(false)` when the job already runs the launcher.
 #[cfg(target_os = "macos")]
 fn migrate_job_to_launcher(path: &Path, job: &serde_json::Value) -> Result<bool> {
+    use std::os::unix::fs::PermissionsExt;
     let host = MigrationHost {
         canonical_daemon: &|daemon| {
             Ok(Path::new(daemon)
@@ -1974,36 +2101,38 @@ fn migrate_job_to_launcher(path: &Path, job: &serde_json::Value) -> Result<bool>
                 .to_string_lossy()
                 .into_owned())
         },
-        host_root: &|name| Ok(instance_data_dir(name)?.to_string_lossy().into_owned()),
+        user_home: &|| dirs::home_dir().context("cannot determine home directory"),
+        read_file: &read_optional,
+        canonical_dir: &|dir| {
+            let canonical = dir
+                .canonicalize()
+                .with_context(|| format!("canonicalize {}", dir.display()))?;
+            if !canonical.is_dir() {
+                anyhow::bail!("{} is not a directory", canonical.display());
+            }
+            Ok(canonical.to_string_lossy().into_owned())
+        },
     };
     let Some(migration) = plan_launcher_migration(job, &host)? else {
         println!("  Already runs x0x-launcher; no change.");
         return Ok(false);
     };
+    let planned = migrated_job(job, &migration)?;
+    let bytes = json_to_plist(&planned)?;
+    if plist_to_json(&bytes)? != planned {
+        anyhow::bail!("the migrated job does not convert back as planned; nothing changed");
+    }
+    let old = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
     let backup = path.with_extension("plist.x0x-backup");
-    std::fs::copy(path, &backup)
-        .with_context(|| format!("failed to back up {}", path.display()))?;
-    let applied = apply_launcher_migration(path, job, &migration);
-    let verified = applied.and_then(|()| {
-        let after = read_plist_as_json(path)?.context("migrated plist could not be read back")?;
-        let arguments = launchd_job_arguments(&after).unwrap_or_default();
-        let daemon_after = crate::upgrade::restart::launchd_job_daemon(
-            after.get("Program").and_then(|p| p.as_str()),
-            &arguments,
-        );
-        let bound = matches!(&daemon_after, Some(Ok(d)) if d.via_launcher);
-        if classify_launchd_job(&after) != RepairVerdict::AlreadySupervised
-            || !bound
-            || arguments != migration.program_arguments
-        {
-            anyhow::bail!("the migrated job does not read back as planned");
-        }
-        Ok(())
+    write_file_atomically(&backup, &old, mode)?;
+    write_file_atomically(path, &bytes, mode)?;
+    let verified = read_plist_as_json(path)?.is_some_and(|after| {
+        after == planned && classify_launchd_job(&after) == RepairVerdict::AlreadySupervised
     });
-    if let Err(error) = verified {
-        std::fs::copy(&backup, path)
-            .with_context(|| format!("failed to restore backup over {}", path.display()))?;
-        return Err(error.context("the backup was restored"));
+    if !verified {
+        write_file_atomically(path, &old, mode)?;
+        anyhow::bail!("the migrated job does not read back as planned; the old job was restored");
     }
     println!("  Backup:   {}", backup.display());
     println!(
@@ -2021,45 +2150,77 @@ fn migrate_job_to_launcher(path: &Path, job: &serde_json::Value) -> Result<bool>
     Ok(true)
 }
 
-/// Apply a planned launcher migration to the plist at `path`.
-#[cfg(target_os = "macos")]
-fn apply_launcher_migration(
-    path: &Path,
+/// `job` with a planned launcher migration applied: `ProgramArguments`
+/// replaced, `Program` removed and `ExitTimeOut` set when planned, and the
+/// supervision marker added. Every other key stays as it is.
+#[cfg(any(test, target_os = "macos"))]
+fn migrated_job(
     job: &serde_json::Value,
     migration: &LauncherMigration,
-) -> Result<()> {
-    let plutil = |args: &[&str]| -> Result<()> {
-        let status = std::process::Command::new("plutil")
-            .args(args)
-            .arg("--")
-            .arg(path)
-            .status()
-            .context("failed to run plutil")?;
-        if !status.success() {
-            anyhow::bail!(
-                "plutil {args:?} could not update {} ({status})",
-                path.display()
-            );
-        }
-        Ok(())
-    };
-    let arguments = serde_json::to_string(&migration.program_arguments)?;
-    plutil(&["-replace", "ProgramArguments", "-json", &arguments])?;
+) -> Result<serde_json::Value> {
+    let mut job = job.clone();
+    let keys = job.as_object_mut().context("the job is not a dictionary")?;
+    keys.insert(
+        "ProgramArguments".into(),
+        serde_json::json!(migration.program_arguments),
+    );
     if migration.remove_program {
-        plutil(&["-remove", "Program"])?;
+        keys.remove("Program");
     }
     if migration.set_exit_timeout {
-        plutil(&[
-            "-replace",
-            "ExitTimeOut",
-            "-integer",
-            &LAUNCHER_EXIT_TIMEOUT_SECS.to_string(),
-        ])?;
+        keys.insert(
+            "ExitTimeOut".into(),
+            serde_json::json!(LAUNCHER_EXIT_TIMEOUT_SECS),
+        );
     }
-    if let RepairVerdict::Repairable { has_env_dict } = classify_launchd_job(job) {
-        apply_supervised_marker(path, has_env_dict)?;
+    keys.entry("EnvironmentVariables")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("the job's EnvironmentVariables is not a dictionary")?
+        .insert(
+            crate::upgrade::restart::SUPERVISED_ENV_VAR.into(),
+            serde_json::json!("1"),
+        );
+    Ok(job)
+}
+
+/// Run `plutil -convert <format>` over `input` (stdin to stdout).
+#[cfg(target_os = "macos")]
+fn plutil_convert(format: &str, input: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Write as _;
+    let mut child = std::process::Command::new("plutil")
+        .args(["-convert", format, "-o", "-", "--", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("failed to run plutil")?;
+    child
+        .stdin
+        .take()
+        .context("plutil has no stdin")?
+        .write_all(input)?;
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "plutil -convert {format} failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
-    Ok(())
+    Ok(out.stdout)
+}
+
+/// An XML plist of `job`.
+#[cfg(target_os = "macos")]
+fn json_to_plist(job: &serde_json::Value) -> Result<Vec<u8>> {
+    plutil_convert("xml1", &serde_json::to_vec(job)?)
+}
+
+/// The JSON form of plist bytes.
+#[cfg(target_os = "macos")]
+fn plist_to_json(bytes: &[u8]) -> Result<serde_json::Value> {
+    Ok(serde_json::from_slice(&plutil_convert("json", bytes)?)?)
 }
 
 /// Convert a plist to JSON via `plutil`. `Ok(None)` when the file is not a
@@ -3293,14 +3454,13 @@ mod tests {
                     .to_string_lossy()
                     .into_owned())
             },
-            host_root: &|name| {
-                Ok(match name {
-                    Some(n) => format!("/data/x0x-{n}"),
-                    None => "/data/x0x".to_string(),
-                })
-            },
+            user_home: &|| Ok(std::path::PathBuf::from("/Users/cli")),
+            read_file: &|_| Ok(None),
+            canonical_dir: &|dir| Ok(dir.to_string_lossy().into_owned()),
         }
     }
+
+    const ALICE_ROOT: &str = "/Users/a/Library/Application Support/x0x-alice";
 
     /// #1379: `--repair --launcher` moves a KeepAlive x0xd job onto the
     /// launcher's trial form, keeping the daemon's arguments; the daemon is
@@ -3321,7 +3481,7 @@ mod tests {
             [
                 "/opt/link/x0x-launcher",
                 "--host-root",
-                "/data/x0x-alice",
+                ALICE_ROOT,
                 "--instance",
                 "alice",
                 "--",
@@ -3341,6 +3501,23 @@ mod tests {
             .expect("migration");
         assert!(plan.remove_program && !plan.set_exit_timeout);
         assert_eq!(plan.program_arguments[4], "default");
+        // The job's own HOME names the data directory, not the CLI user's.
+        assert_eq!(
+            plan.program_arguments[2],
+            "/Users/a/Library/Application Support/x0x"
+        );
+        let mut no_home = with_program.clone();
+        no_home
+            .as_object_mut()
+            .expect("dict")
+            .remove("EnvironmentVariables");
+        let plan_no_home = plan_launcher_migration(&no_home, &migration_host())
+            .expect("plan")
+            .expect("migration");
+        assert_eq!(
+            plan_no_home.program_arguments[2],
+            "/Users/cli/Library/Application Support/x0x"
+        );
         // A job that already runs the launcher needs no change.
         let mut bound = job.clone();
         bound["ProgramArguments"] = serde_json::json!(plan.program_arguments);
@@ -3377,6 +3554,132 @@ mod tests {
                 "{job}"
             );
         }
+    }
+
+    /// #2072 review: the host root follows x0xd's own data directory: the
+    /// instance's default config file may move it, a named instance that
+    /// keeps the default gets `x0x-<name>`, and what x0xd would not run is
+    /// refused.
+    #[test]
+    fn the_host_root_is_the_data_directory_x0xd_uses() {
+        let home = Path::new("/Users/a");
+        let support = home.join("Library/Application Support");
+        assert_eq!(
+            job_data_dir(None, home, None).expect("default"),
+            support.join("x0x")
+        );
+        assert_eq!(
+            job_data_dir(Some("alice"), home, None).expect("named"),
+            support.join("x0x-alice")
+        );
+        assert_eq!(
+            instance_config_path(Some("alice"), home),
+            support.join("x0x-alice/config.toml")
+        );
+        let moved = "data_dir = \"/srv/x0x\"\n";
+        assert_eq!(
+            job_data_dir(Some("alice"), home, Some(moved)).expect("moved"),
+            Path::new("/srv/x0x")
+        );
+        let unnamed_default = format!("data_dir = \"{}\"\n", support.join("x0x").display());
+        assert_eq!(
+            job_data_dir(Some("alice"), home, Some(&unnamed_default)).expect("default"),
+            support.join("x0x-alice")
+        );
+        assert_eq!(
+            job_data_dir(Some("alice"), home, Some("instance_name = \"alice\"\n"))
+                .expect("same name"),
+            support.join("x0x-alice")
+        );
+        for refused in [
+            "data_dir = \"relative/x0x\"\n",
+            "instance_name = \"bob\"\n",
+            "data_dir = [",
+        ] {
+            assert!(
+                job_data_dir(Some("alice"), home, Some(refused)).is_err(),
+                "{refused}"
+            );
+        }
+        assert!(job_data_dir(None, home, Some("instance_name = \"bob\"\n")).is_err());
+    }
+
+    /// #2072 review: planning creates nothing. A job whose data directory
+    /// does not exist is refused, and the directory is still missing.
+    #[test]
+    fn planning_a_migration_creates_nothing() {
+        let home = tempfile::tempdir().expect("home");
+        let job = serde_json::json!({
+            "Label": "com.example.x0xd",
+            "ProgramArguments": ["/opt/link/x0xd"],
+            "KeepAlive": true,
+            "EnvironmentVariables": { "HOME": home.path().to_string_lossy() },
+        });
+        let host = MigrationHost {
+            canonical_dir: &|dir| Ok(dir.canonicalize()?.to_string_lossy().into_owned()),
+            ..migration_host()
+        };
+        assert!(plan_launcher_migration(&job, &host).is_err());
+        let data_dir = home.path().join("Library/Application Support/x0x");
+        assert!(!data_dir.exists());
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let plan = plan_launcher_migration(&job, &host)
+            .expect("plan")
+            .expect("migration");
+        assert_eq!(
+            plan.program_arguments[2],
+            data_dir
+                .canonicalize()
+                .expect("canonical")
+                .to_string_lossy()
+        );
+    }
+
+    /// #2072 review: the migrated job is built whole, keeping every key it
+    /// does not change, so it can be written in one step.
+    #[test]
+    fn the_migrated_job_keeps_every_other_key() {
+        let job = serde_json::json!({
+            "Label": "com.example.x0xd",
+            "Program": "/opt/link/x0xd",
+            "ProgramArguments": ["x0xd"],
+            "KeepAlive": true,
+            "StandardErrorPath": "/tmp/x0xd.err",
+            "EnvironmentVariables": { "HOME": "/Users/a", "RUST_LOG": "info" },
+        });
+        let plan = plan_launcher_migration(&job, &migration_host())
+            .expect("plan")
+            .expect("migration");
+        let migrated = migrated_job(&job, &plan).expect("migrated");
+        assert_eq!(
+            migrated,
+            serde_json::json!({
+                "Label": "com.example.x0xd",
+                "ProgramArguments": plan.program_arguments,
+                "KeepAlive": true,
+                "StandardErrorPath": "/tmp/x0xd.err",
+                "ExitTimeOut": LAUNCHER_EXIT_TIMEOUT_SECS,
+                "EnvironmentVariables": {
+                    "HOME": "/Users/a",
+                    "RUST_LOG": "info",
+                    "X0X_SUPERVISED": "1",
+                },
+            })
+        );
+        assert_eq!(
+            classify_launchd_job(&migrated),
+            RepairVerdict::AlreadySupervised
+        );
+        // A job with no environment gets one holding only the marker.
+        let mut bare = job.clone();
+        bare.as_object_mut()
+            .expect("dict")
+            .remove("EnvironmentVariables");
+        let migrated = migrated_job(&bare, &plan).expect("migrated");
+        assert_eq!(
+            migrated["EnvironmentVariables"],
+            serde_json::json!({ "X0X_SUPERVISED": "1" })
+        );
     }
 
     /// #2063 review: one label serves every `--name`; autostart refuses to
@@ -3660,8 +3963,7 @@ mod tests {
             classify_launchd_job(&job),
             RepairVerdict::Refused(reason) if reason.contains("AbandonProcessGroup")
         ));
-        job["EnvironmentVariables"] =
-            serde_json::json!({ crate::upgrade::restart::SUPERVISED_ENV_VAR: "1" });
+        job["EnvironmentVariables"] = serde_json::json!({ "X0X_SUPERVISED": "1" });
         assert!(matches!(
             classify_launchd_job(&job),
             RepairVerdict::Refused(reason) if reason.contains("AbandonProcessGroup")
