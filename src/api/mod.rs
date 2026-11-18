@@ -287,7 +287,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Post,
         path: "/auth/session/refresh",
         cli_name: "auth refresh",
-        description: "Swap a live session token for a fresh one (12h cap from the original mint)",
+        description: "Swap a session token, live or lapsed under 4h, for a fresh one (12h cap from the original mint)",
         category: "status",
         request: RequestSpec::None,
     },

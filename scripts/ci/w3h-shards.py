@@ -36,6 +36,11 @@ from pathlib import Path
 # `w3h_1356_` cases.
 GROUPS = (
     ('long-1023', 'w3h_1023_'),
+    # #1973 receiver-side arm: a four-node Home run through the owner
+    # recovery and then E's own S4 row (two commits), like the 1581m arms
+    # that have their own shard. Its own shard, so `s4` does not grow; the
+    # budget is not raised (31 Oct ruling, #1733).
+    ('s4-1973', 'w3h_1357_s4_owner_recovery_revoked_member_1973$'),
     ('s4', 'w3h_1357_'),
     ('s3-c', 'w3h_1356_red_s3_c_promoted_admin_reseats_owner_axis_node$'),
     ('s3-c2', 'w3h_1356_red_s3_c2_reseat_retires_marker_and_gap$'),
