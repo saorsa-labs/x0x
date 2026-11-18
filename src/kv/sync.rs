@@ -398,24 +398,8 @@ const DIGEST_BEACON_INTERVAL: std::time::Duration = std::time::Duration::from_se
 const MAX_RETAINED_GROUP_IMAGE_BYTES: usize = crate::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES;
 
 fn serialize_retained_group_image(store: &KvStore) -> Result<Vec<u8>> {
-    // #1970: serve the canonical image — the complete image with the
-    // OR-Set's replica-local delta bookkeeping cleared — which is exactly
-    // what `KvStore::canonical_retained_image_len` measures on the merge
-    // side. Re-delivery history must neither push a servable store over
-    // the limit nor change what two holders of the same content serve.
-    let canonical = store.canonical_retained_wire_copy()?;
-    let bytes = bincode::serialize(&canonical)
-        .map_err(|e| KvError::Gossip(format!("retained group image serialization failed: {e}")))?;
-    if bytes.len() > MAX_RETAINED_GROUP_IMAGE_BYTES {
-        // #1970: typed, matching the put-time and merge-time bounds, so a
-        // holder over the limit surfaces as `StoreFull` instead of a
-        // stringly gossip error the responder can only log and drop.
-        return Err(KvError::StoreFull {
-            image: bytes.len() as u64,
-            max: MAX_RETAINED_GROUP_IMAGE_BYTES,
-        });
-    }
-    Ok(bytes)
+    // #1970: encoded in place, refused typed `StoreFull` above the hard limit.
+    store.encode_retained_image()
 }
 
 fn assemble_retained_group_image(
@@ -4501,8 +4485,18 @@ impl KvStoreSync {
                         // bounded re-request tail; the repair serve is
                         // itself verified, so a beacon can neither inject
                         // nor truncate state.
-                        let local_digest = responder_store.read().await.served_digest();
-                        if local_digest != digest
+                        let (local_digest, retry_due) = {
+                            let store = responder_store.read().await;
+                            (store.served_digest(), store.image_retry_due(&author))
+                        };
+                        // #1970: after this replica refused `author`'s merge
+                        // at the image limit, its pulls from `author` wait
+                        // for the retry window (a shrink re-opens it).
+                        if local_digest != digest && !retry_due {
+                            responder_counters
+                                .digest_beacon_wakes_deferred
+                                .fetch_add(1, Ordering::Relaxed);
+                        } else if local_digest != digest
                             && record_divergent_beacon(
                                 &mut beacon_wakes,
                                 responder_counters.as_ref(),
@@ -5741,7 +5735,7 @@ pub fn load_snapshot(path: &Path) -> Result<Option<KvStore>> {
 /// This is used by explicit import paths that must hash and validate the
 /// exact bytes they decode, without reopening a mutable filesystem path.
 pub(crate) fn load_snapshot_bytes(bytes: &[u8]) -> Result<KvStore> {
-    let (store, seq_counter) =
+    let (mut store, seq_counter) =
         if let Some(body_bytes) = bytes.strip_prefix(SNAPSHOT_MAGIC_V2.as_slice()) {
             use bincode::Options;
             let body: SnapshotBodyV2 = snapshot_bincode().deserialize(body_bytes)?;
@@ -5769,6 +5763,7 @@ pub(crate) fn load_snapshot_bytes(bytes: &[u8]) -> Result<KvStore> {
         );
     }
     store.restore_seq_counter(seq_counter.max(store.current_version()));
+    store.settle_loaded();
     // #1970: an image saved above the hard limit by an earlier version loads
     // whole; it reports `over_limit` and is not served until it shrinks.
     if let Some(status) = store.image_status() {
@@ -8929,7 +8924,7 @@ mod tests {
         }
         let hard = crate::kv::image_admission::HARD_IMAGE_LIMIT_BYTES as u64;
         let soft = crate::kv::image_admission::SOFT_IMAGE_LIMIT_BYTES as u64;
-        let saved = store.canonical_retained_image_len().expect("size");
+        let saved = store.retained_image_len().expect("size");
         assert!(saved > hard, "fixture is above the hard limit: {saved}");
 
         let mut loaded =
@@ -8945,7 +8940,7 @@ mod tests {
         assert!(loaded.check_image_room("new", 10, 10, true).is_err());
 
         let mut k = 0u32;
-        while loaded.canonical_retained_image_len().expect("size") > hard {
+        while loaded.retained_image_len().expect("size") > hard {
             loaded.remove(&format!("k{k:05}")).expect("remove");
             k += 1;
         }
@@ -8955,7 +8950,7 @@ mod tests {
         );
         serialize_retained_group_image(&loaded).expect("serves again under the hard limit");
         assert!(loaded.check_image_room("new", 10, 10, true).is_err());
-        while loaded.canonical_retained_image_len().expect("size") + 70_000 > soft {
+        while loaded.retained_image_len().expect("size") + 70_000 > soft {
             loaded.remove(&format!("k{k:05}")).expect("remove");
             k += 1;
         }
@@ -9408,7 +9403,8 @@ mod tests {
             .expect("probe put");
         let overhead = bincode::serialized_size(&probe).expect("size after probe") - before;
         let current = bincode::serialized_size(&s).expect("size");
-        let value_len = (max - 80 - current - overhead + 1) as usize;
+        let max_admitted = max - crate::kv::image_admission::LOCAL_IMAGE_ALLOWANCE;
+        let value_len = (max_admitted - 400 - current - overhead + 1) as usize;
         s.put(
             key,
             vec![b'l'; value_len],
@@ -9419,8 +9415,8 @@ mod tests {
         assert!(bincode::serialized_size(&s).expect("size") <= max);
 
         // A put-shaped delta for keys the store already holds; its
-        // re-deliveries append changelog bookkeeping until the RAW bytes
-        // pass the limit, while the canonical image does not move.
+        // re-deliveries retain nothing new (#1970: the OR-Set changelog is
+        // cleared), so the image does not move.
         let mut delta = KvStoreDelta::new(s.current_version());
         for i in 0..3u32 {
             let dk = format!("k{i:05}");
@@ -9432,8 +9428,8 @@ mod tests {
                 .expect("delivery and replays merge");
         }
         assert!(
-            bincode::serialized_size(&s).expect("raw size") > max,
-            "the replays pushed the raw bytes past the limit — bookkeeping only"
+            bincode::serialized_size(&s).expect("raw size") <= max,
+            "the replays retained no bookkeeping"
         );
         let image = serialize_retained_group_image(&s).expect("the store still serves its image");
         assert!(
@@ -9443,7 +9439,7 @@ mod tests {
         );
         assert_eq!(
             image.len() as u64,
-            s.canonical_retained_image_len().expect("canonical len"),
+            s.retained_image_len().expect("canonical len"),
             "serve and merge measure the same canonical bytes"
         );
     }

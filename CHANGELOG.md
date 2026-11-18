@@ -632,18 +632,21 @@ All notable changes to this project will be documented in this file.
   link's `actor` now matches its signer without regard to hex case. ADR A08
   correction of 17 Nov 2026.
 - **Group store images have a 12 MiB put limit and a 16 MiB merge limit
-  (#1970; A10 amendment of 18 Nov 2026).** A local put that would take a
-  group store's canonical retained image past 12 MiB is refused (HTTP 507).
-  A remote merge (delta, retained image, checkpoint adoption, legacy import)
-  is kept only when the merged image is at most 16 MiB. The rule looks at the
-  merged image only, so honest concurrent writes within the 4 MiB headroom
-  converge on every replica in any order. A refused merge applies nothing.
-  It is shown as `image.state: full_diverged` in `GET /stores` and as a
-  warning in `x0x doctor`, and is retried after a back-off that any removal
-  re-arms. Merges no longer copy the whole store under the write lock. An
-  image saved above 16 MiB loads whole as `over_limit` and serves again once
-  entries are removed. Refusals are also counted in
-  `GET /diagnostics/state-sync`.
+  (#1970; A10 amendment of 18 Nov 2026).** A group store now retains only
+  entries of live keys and no OR-Set changelog, so a removed key keeps no
+  value bytes and an image cannot plant dead entries. A local put that would
+  take the retained image past 12 MiB is refused (HTTP 507). Every remote
+  merge (delta, retained image, checkpoint adoption, legacy import) is
+  measured and kept only when the merged image (replicated part plus a 16 KiB
+  allowance for per-replica fields) is at most 16 MiB. Honest concurrent
+  writes within the 4 MiB headroom converge on every replica in any order. A
+  refused merge applies nothing. It is shown as `image.state: full_diverged`
+  in `GET /stores` and warned by `x0x doctor`; this replica's pulls from the
+  refused source back off until its image shrinks, and the refused content
+  returns through the next full-image repair. Merges and serves no longer copy
+  the whole store under a lock. An image saved above 16 MiB loads whole as
+  `over_limit` and serves again once entries are removed. Refusals are also
+  counted in `GET /diagnostics/state-sync`.
 - **Granted-store CLI paths and serves (#1953 review).** `x0x grant data`
   (and `grant revoke|renew`) percent-encode each path segment, so a key with
   `#`, `?` or `/` reaches the exact key. A slow granted read or write now

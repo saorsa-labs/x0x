@@ -503,7 +503,7 @@ fn a_put_past_the_image_limit_is_refused() {
             Err(other) => panic!("unexpected {other}"),
         }
     }
-    let size = s.canonical_retained_image_len().expect("size");
+    let size = s.retained_image_len().expect("size");
     assert!(
         size <= max,
         "the image stayed within the soft limit: {size}"

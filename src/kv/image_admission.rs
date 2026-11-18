@@ -23,6 +23,12 @@ pub const HARD_IMAGE_LIMIT_BYTES: usize = crate::kv::retained_paging::MAX_RETAIN
 /// (4 194 303 bytes), so one delta cannot by itself cross it.
 pub const SOFT_IMAGE_LIMIT_BYTES: usize = 12 * 1024 * 1024;
 
+/// Room the admission rule keeps for the per-replica fields (checkpoint,
+/// endorser, counters), so that replicas holding the same replicated state
+/// make the same decision. A replica whose local fields are larger counts
+/// their real size.
+pub const LOCAL_IMAGE_ALLOWANCE: u64 = 16 * 1024;
+
 /// First retry window after a refusal from one source.
 const BACKOFF_INITIAL_MS: u64 = 30_000;
 /// Longest retry window; every source is retried at least this often.
@@ -44,7 +50,7 @@ pub enum ImageState {
     Full,
     /// At least one remote merge was refused because the merged image would
     /// pass the hard limit. This replica can differ from the refused source
-    /// until a removal makes room and the retry merges.
+    /// until removals make room and a later merge from it fits.
     FullDiverged,
     /// The image itself is above the hard limit (only a store saved by an
     /// earlier version can be): it is not served and admits only a merge
@@ -63,7 +69,7 @@ pub struct ImageRefusal {
     pub image_bytes: u64,
     /// Unix milliseconds of the last refusal.
     pub at_ms: u64,
-    /// Unix milliseconds when a merge from this source is measured again.
+    /// Unix milliseconds when this replica pulls from this source again.
     pub retry_after_ms: u64,
 }
 
@@ -135,21 +141,12 @@ impl ImageAdmission {
         self.content = None;
     }
 
-    /// The last measured image of `source` while its retry window is open.
-    pub(crate) fn in_backoff(&self, source: &AgentId, now: u64) -> Option<u64> {
+    /// Whether a pull from `source` is due: no refusal of it is on record,
+    /// or its retry window has passed.
+    pub(crate) fn retry_due(&self, source: &AgentId, now: u64) -> bool {
         self.refusals
             .get(source)
-            .filter(|r| now < r.retry_after_ms)
-            .map(|r| r.last_image)
-    }
-
-    /// Count a refusal made inside the source's retry window, unmeasured.
-    pub(crate) fn note_suppressed(&mut self, source: &AgentId, now: u64) {
-        self.refused_total = self.refused_total.saturating_add(1);
-        if let Some(r) = self.refusals.get_mut(source) {
-            r.count = r.count.saturating_add(1);
-            r.last_at_ms = now;
-        }
+            .is_none_or(|r| now >= r.retry_after_ms)
     }
 
     /// Record a measured refusal and open (or widen) the source's retry
@@ -194,8 +191,8 @@ impl ImageAdmission {
         self.refusals.remove(source);
     }
 
-    /// A removal made room: retry every refused source now, from the first
-    /// window again.
+    /// The retained image shrank: retry every refused source now, from the
+    /// first window again.
     pub(crate) fn rearm(&mut self) {
         for r in self.refusals.values_mut() {
             r.retry_after_ms = 0;

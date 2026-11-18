@@ -32,7 +32,8 @@ use crate::identity::AgentId;
 use crate::kv::encrypted::KvSecureContext;
 use crate::kv::entry::MergePrior;
 use crate::kv::image_admission::{
-    now_ms, ImageAdmission, ImageStatus, HARD_IMAGE_LIMIT_BYTES, SOFT_IMAGE_LIMIT_BYTES,
+    now_ms, ImageAdmission, ImageStatus, HARD_IMAGE_LIMIT_BYTES, LOCAL_IMAGE_ALLOWANCE,
+    SOFT_IMAGE_LIMIT_BYTES,
 };
 use crate::kv::{KvEntry, KvError, KvStoreDelta, Result};
 use saorsa_gossip_crdt_sync::{DeltaCrdt, LwwRegister, OrSet};
@@ -602,8 +603,6 @@ fn validate_entry_integrity(outer_key: &str, entry: &KvEntry) -> Result<()> {
 struct EntryJournal {
     /// The first prior state of each changed key.
     priors: HashMap<String, EntryPrior>,
-    /// Whether the merge removed a live entry.
-    removed_any: bool,
 }
 
 enum EntryPrior {
@@ -2018,16 +2017,19 @@ impl KvStore {
             Some(writer) => self.enforce_self_keyed_live_set(&writer),
             None => Vec::new(),
         };
+        if self.serves_retained_group_image() {
+            self.keys.compact(0);
+        }
 
         self.version += 1;
         Ok(evicted)
     }
 
     /// #1094 P1 / #1970: refuse a local put of `key` that would take this
-    /// store's canonical retained image past the soft limit
+    /// store's retained image past the soft limit
     /// ([`SOFT_IMAGE_LIMIT_BYTES`]). `marked` adds a writer mark's bytes.
     /// The growth is an upper estimate: the new entry, its map key and a new
-    /// key tag, less the live entry it replaces.
+    /// key tag, less the entry it replaces.
     ///
     /// # Errors
     ///
@@ -2043,8 +2045,8 @@ impl KvStore {
         let mark = if marked { WRITER_MARK_BYTES } else { 0 };
         let entry = ENTRY_FIXED_BYTES + 2 * key.len() + value_len + content_type_len + mark;
         let tag = KEY_TAG_BYTES + key.len();
-        let replaced = self.live_entry_len(key);
-        let rest = self.rest_image_len()?;
+        let replaced = self.entry_len(key);
+        let rest = self.admission_rest_len()?;
         let image_with = |content: u64| {
             content
                 .saturating_add(rest)
@@ -2056,7 +2058,7 @@ impl KvStore {
                 return Ok(());
             }
         }
-        let image = image_with(self.content_image_len()?);
+        let image = image_with(self.content_len()?);
         if image > max as u64 {
             return Err(KvError::StoreFull { image, max });
         }
@@ -2075,98 +2077,100 @@ impl KvStore {
         )
     }
 
-    /// #1970: the size of this store's canonical retained image, the bytes
-    /// [`Self::canonical_retained_wire_copy`] serializes: every field but
-    /// the OR-Set and the entries as stored, the OR-Set in its canonical
-    /// retained form (no changelog), and only the entries of live keys.
-    /// It is a function of the retained state alone, not of the delivery
-    /// history. The test `the_measure_equals_the_served_image` pins it.
-    pub(crate) fn canonical_retained_image_len(&self) -> Result<u64> {
+    /// #1970: the bytes this store retains, in memory and on disk: its
+    /// bincode length, every entry and the OR-Set with its changelog
+    /// included. The test `the_retained_measure_is_the_stored_bytes` pins
+    /// it to `bincode::serialized_size`.
+    pub(crate) fn retained_image_len(&self) -> Result<u64> {
         Ok(self
-            .rest_image_len()?
-            .saturating_add(self.content_image_len()?))
+            .content_len()?
+            .saturating_add(self.replicated_rest_len()?)
+            .saturating_add(self.local_len()?))
     }
 
-    /// The canonical OR-Set and the live entries: the part of the image a
-    /// merge changes key by key. Walks every key but no value bytes.
-    fn content_image_len(&self) -> Result<u64> {
-        let keys = bincode::serialized_size(&self.keys.canonical_retained_wire())?;
-        let entries = self
-            .entries
-            .iter()
-            .filter(|(key, _)| self.keys.contains(key))
-            .fold(8u64, |sum, (key, entry)| {
-                sum.saturating_add(8 + key.len() as u64)
-                    .saturating_add(entry.wire_len())
-            });
+    /// #1970: the size the admission rule compares with the hard limit: the
+    /// replicated part of the retained image plus [`LOCAL_IMAGE_ALLOWANCE`]
+    /// for the per-replica fields (or their real size, if larger). It is at
+    /// least [`Self::retained_image_len`], and two replicas with the same
+    /// replicated state compute the same value.
+    #[cfg(test)]
+    pub(crate) fn admission_image_len(&self) -> Result<u64> {
+        Ok(self
+            .content_len()?
+            .saturating_add(self.admission_rest_len()?))
+    }
+
+    /// The OR-Set and the entries, walked by length: no value bytes are read
+    /// and nothing is allocated.
+    fn content_len(&self) -> Result<u64> {
+        let keys = bincode::serialized_size(&self.keys)?;
+        let entries = self.entries.iter().fold(8u64, |sum, (key, entry)| {
+            sum.saturating_add(8 + key.len() as u64)
+                .saturating_add(entry.wire_len())
+        });
         Ok(keys.saturating_add(entries))
     }
 
-    /// Every field of the image besides the OR-Set and the entries.
-    fn rest_image_len(&self) -> Result<u64> {
-        #[derive(Serialize)]
-        struct Rest<'a> {
-            id: &'a KvStoreId,
-            name: &'a LwwRegister<String>,
-            policy: &'a AccessPolicy,
-            owner: &'a Option<AgentId>,
-            allowed_writers: &'a HashSet<AgentId>,
-            version: u64,
-            latest_checkpoint: &'a Option<OwnerCheckpoint>,
-            highest_checkpoint_seq: u64,
-            anchor_channel: &'a AnchorChannel,
-            policy_version: u64,
-            ownership_conflict: &'a Option<(AgentId, AgentId)>,
-            last_history_endorser: &'a Option<AgentId>,
-        }
-        Ok(bincode::serialized_size(&Rest {
-            id: &self.id,
-            name: &self.name,
-            policy: &self.policy,
-            owner: &self.owner,
-            allowed_writers: &self.allowed_writers,
-            version: self.version,
-            latest_checkpoint: &self.latest_checkpoint,
-            highest_checkpoint_seq: self.highest_checkpoint_seq,
-            anchor_channel: &self.anchor_channel,
-            policy_version: self.policy_version,
-            ownership_conflict: &self.ownership_conflict,
-            last_history_endorser: &self.last_history_endorser,
-        })?)
+    /// Replicated fields besides the OR-Set and the entries.
+    fn replicated_rest_len(&self) -> Result<u64> {
+        Ok(bincode::serialized_size(&(
+            &self.id,
+            &self.name,
+            &self.policy,
+            &self.owner,
+            &self.allowed_writers,
+        ))?)
     }
 
-    /// The image bytes of `key`'s entry if the key is live, else 0.
-    fn live_entry_len(&self, key: &str) -> u64 {
-        if !self.keys.contains(&key.to_string()) {
-            return 0;
-        }
+    /// Per-replica fields: they can differ between replicas that hold the
+    /// same replicated state.
+    fn local_len(&self) -> Result<u64> {
+        Ok(bincode::serialized_size(&(
+            self.version,
+            &self.latest_checkpoint,
+            self.highest_checkpoint_seq,
+            &self.anchor_channel,
+            self.policy_version,
+            &self.ownership_conflict,
+            &self.last_history_endorser,
+        ))?)
+    }
+
+    fn admission_rest_len(&self) -> Result<u64> {
+        Ok(self
+            .replicated_rest_len()?
+            .saturating_add(self.local_len()?.max(LOCAL_IMAGE_ALLOWANCE)))
+    }
+
+    /// The bytes of `key`'s entry and its map key, or 0.
+    fn entry_len(&self, key: &str) -> u64 {
         self.entries
             .get(key)
             .map_or(0, |entry| 8 + key.len() as u64 + entry.wire_len())
     }
 
     /// An upper bound on the content part of the image: the cached bound
-    /// while no other mutation has happened, else the exact measure, which
+    /// while no other mutation has happened, else the exact length, which
     /// is then cached.
     fn content_bound(&mut self) -> Result<u64> {
         if let Some(bound) = self.image.cached_content(self.version, self.keys.version()) {
             return Ok(bound);
         }
-        let exact = self.content_image_len()?;
+        let exact = self.content_len()?;
         self.image
             .set_content(self.version, self.keys.version(), exact);
         Ok(exact)
     }
 
-    /// Upper bounds on how much `delta` can grow the content part and the
-    /// rest of the image. An OR-Set add costs at most one tag, plus the
-    /// key's map slot when the key is not live; a removal never grows the
-    /// OR-Set. A merged entry is one of the merged entries, so the live
-    /// entry after it is at most the larger of the two.
-    fn delta_growth_bound(&self, delta: &KvStoreDelta) -> Result<(u64, u64)> {
+    /// Upper bounds on how much `delta` can grow the OR-Set, the entries
+    /// and the replicated fields. An OR-Set add costs at most one tag, plus
+    /// the key's map slot when the key is not live; a removal never grows
+    /// it. A merged entry is one of the two entries merged.
+    fn delta_growth_bound(&self, delta: &KvStoreDelta) -> Result<(u64, u64, u64)> {
         let tag = bincode::serialized_size(&(PeerId::new([0; 32]), 0u64))?;
         let slot = |key: &str| 16 + key.len() as u64;
-        let mut content = 0u64;
+        let mut keys = 0u64;
+        let mut entries = 0u64;
         let incoming = delta
             .added
             .iter()
@@ -2185,31 +2189,115 @@ impl KvStore {
                     .map(|(key, entry)| (key, entry, slot(key) + tag)),
             );
         for (key, entry, add) in incoming {
+            keys = keys.saturating_add(add);
             let local = self.entries.get(key).map_or(0, KvEntry::wire_len);
             let after = 8 + key.len() as u64 + local.max(entry.wire_len());
-            content = content
-                .saturating_add(add)
-                .saturating_add(after.saturating_sub(self.live_entry_len(key)));
+            entries = entries.saturating_add(after.saturating_sub(self.entry_len(key)));
         }
         let rest = bincode::serialized_size(&delta.allowlist_additions)?
             .saturating_add(bincode::serialized_size(&delta.name_update)?)
             .saturating_add(bincode::serialized_size(&delta.owner_checkpoint)?);
-        Ok((content, rest))
+        Ok((keys, entries, rest))
     }
 
-    /// #1970: a copy of this store as a retained image serves it: the
-    /// OR-Set in its canonical retained wire form (live tags and
-    /// tombstones in deterministic order, changelog and version cleared,
-    /// bincode-layout-compatible with `OrSet`) and only the entries of live
-    /// keys. Its bytes depend only on retained state, never on the holder's
-    /// delta or re-delivery history.
-    pub(crate) fn canonical_retained_wire_copy(&self) -> Result<Self> {
-        let mut canonical = self.clone();
-        let wire = bincode::serialize(&canonical.keys.canonical_retained_wire())?;
-        canonical.keys = bincode::deserialize(&wire)?;
-        let keys = &canonical.keys;
-        canonical.entries.retain(|key, _| keys.contains(key));
-        Ok(canonical)
+    /// The exact change in entry bytes that `journal` recorded.
+    fn journal_entry_delta(&self, journal: &EntryJournal) -> i128 {
+        journal
+            .priors
+            .iter()
+            .map(|(key, prior)| {
+                let now = i128::from(self.entry_len(key));
+                let before = match prior {
+                    EntryPrior::Absent => 0,
+                    EntryPrior::Entry(entry) => i128::from(8 + key.len() as u64 + entry.wire_len()),
+                    EntryPrior::CreatedAt(_) => now,
+                };
+                now - before
+            })
+            .sum()
+    }
+
+    /// #1970: keep only retained state after a merge. An entry whose key is
+    /// not live is dropped (the OR-Set keeps its tombstones, which is all
+    /// convergence needs), and the OR-Set changelog is cleared: nothing
+    /// reads it, since store deltas are built from the entries. `keys`
+    /// limits the entry check to the keys a delta touched.
+    fn settle_retained(&mut self, keys: Option<Vec<String>>, journal: &mut EntryJournal) {
+        let candidates: Vec<String> = match keys {
+            Some(keys) => keys,
+            None => self.entries.keys().cloned().collect(),
+        };
+        for key in candidates {
+            if !self.keys.contains(&key) {
+                self.journal_remove_entry(&key, journal);
+            }
+        }
+        self.keys.compact(0);
+    }
+
+    /// #1970: drop dead entries and the OR-Set changelog of a group store
+    /// loaded from disk; an earlier version could leave both behind.
+    pub(crate) fn settle_loaded(&mut self) {
+        if self.serves_retained_group_image() {
+            self.settle_retained(None, &mut EntryJournal::default());
+        }
+    }
+
+    /// #1970: the retained image as a serve publishes it, encoded in place
+    /// (no copy of the store): the `KvStore` bincode layout with the OR-Set
+    /// in its canonical retained form.
+    ///
+    /// # Errors
+    ///
+    /// [`KvError::StoreFull`] when the image is above the hard limit;
+    /// [`KvError::Serialization`] if encoding fails.
+    pub(crate) fn encode_retained_image(&self) -> Result<Vec<u8>> {
+        let image = self.retained_image_len()?;
+        if image > HARD_IMAGE_LIMIT_BYTES as u64 {
+            return Err(KvError::StoreFull {
+                image,
+                max: HARD_IMAGE_LIMIT_BYTES,
+            });
+        }
+        #[derive(Serialize)]
+        struct View<'a> {
+            id: &'a KvStoreId,
+            keys: saorsa_gossip_crdt_sync::CanonicalRetainedOrSet<String>,
+            entries: &'a HashMap<String, KvEntry>,
+            name: &'a LwwRegister<String>,
+            policy: &'a AccessPolicy,
+            owner: &'a Option<AgentId>,
+            allowed_writers: &'a HashSet<AgentId>,
+            version: u64,
+            latest_checkpoint: &'a Option<OwnerCheckpoint>,
+            highest_checkpoint_seq: u64,
+            anchor_channel: &'a AnchorChannel,
+            policy_version: u64,
+            ownership_conflict: &'a Option<(AgentId, AgentId)>,
+            last_history_endorser: &'a Option<AgentId>,
+        }
+        Ok(bincode::serialize(&View {
+            id: &self.id,
+            keys: self.keys.canonical_retained_wire(),
+            entries: &self.entries,
+            name: &self.name,
+            policy: &self.policy,
+            owner: &self.owner,
+            allowed_writers: &self.allowed_writers,
+            version: self.version,
+            latest_checkpoint: &self.latest_checkpoint,
+            highest_checkpoint_seq: self.highest_checkpoint_seq,
+            anchor_channel: &self.anchor_channel,
+            policy_version: self.policy_version,
+            ownership_conflict: &self.ownership_conflict,
+            last_history_endorser: &self.last_history_endorser,
+        })?)
+    }
+
+    /// Test helper: the served image decoded back into a store.
+    #[cfg(test)]
+    pub(crate) fn served_image_for_test(&self) -> Self {
+        bincode::deserialize(&self.encode_retained_image().expect("encode")).expect("decode")
     }
 
     /// #1970: the retained-image status of a group store; `None` for a
@@ -2219,20 +2307,16 @@ impl KvStore {
         if !self.serves_retained_group_image() {
             return None;
         }
-        let image = self.canonical_retained_image_len().ok()?;
+        let image = self.retained_image_len().ok()?;
         Some(self.image.status(image, now_ms()))
     }
 
-    /// Refuse an unmeasured input from `source` while its retry window is
-    /// open.
-    fn refused_in_backoff(&mut self, source: &AgentId) -> Option<KvError> {
-        let now = now_ms();
-        let image = self.image.in_backoff(source, now)?;
-        self.image.note_suppressed(source, now);
-        Some(KvError::StoreFull {
-            image,
-            max: HARD_IMAGE_LIMIT_BYTES,
-        })
+    /// #1970: whether this replica should pull from `source` now. After a
+    /// refusal of `source`, pulls wait for its retry window unless the
+    /// image has shrunk since. Never consulted for admission.
+    #[must_use]
+    pub fn image_retry_due(&self, source: &AgentId) -> bool {
+        self.image.retry_due(source, now_ms())
     }
 
     /// A copy of this store without its entries, for [`Self::rollback`].
@@ -2267,19 +2351,26 @@ impl KvStore {
         self.entries = entries;
     }
 
-    /// #1970 admission rule: keep a merge applied in place only when the
-    /// merged canonical image is at most [`HARD_IMAGE_LIMIT_BYTES`]; else
-    /// roll it back and record the refusal against `source`.
+    /// #1970 admission rule, on a merge already applied in place and
+    /// settled: keep it when the measured admission image is at most
+    /// [`HARD_IMAGE_LIMIT_BYTES`]; else roll it back and record the refusal
+    /// against `source`. `before` is the retained size before the merge;
+    /// a kept merge that shrank the image re-opens every retry window.
     fn admit_or_rollback(
         &mut self,
         snapshot: Box<Self>,
         journal: EntryJournal,
         source: Option<AgentId>,
+        before: u64,
     ) -> Result<()> {
-        let measured = self
-            .content_image_len()
-            .and_then(|content| Ok((content, self.rest_image_len()?)));
-        let (content, rest) = match measured {
+        let measured = self.content_len().and_then(|content| {
+            Ok((
+                content,
+                self.admission_rest_len()?,
+                self.retained_image_len()?,
+            ))
+        });
+        let (content, rest, retained) = match measured {
             Ok(sizes) => sizes,
             Err(e) => {
                 self.rollback(snapshot, journal);
@@ -2309,6 +2400,9 @@ impl KvStore {
         }
         self.image
             .set_content(self.version, self.keys.version(), content);
+        if retained < before {
+            self.image.rearm();
+        }
         Ok(())
     }
 
@@ -2333,7 +2427,6 @@ impl KvStore {
     /// Remove `key`'s entry, recording it in `journal`.
     fn journal_remove_entry(&mut self, key: &str, journal: &mut EntryJournal) {
         if let Some(prior) = self.entries.remove(key) {
-            journal.removed_any = true;
             journal.record(key, EntryPrior::Entry(prior));
         }
     }
@@ -2407,6 +2500,9 @@ impl KvStore {
             .remove(&key.to_string())
             .map_err(|e| KvError::Merge(format!("OR-Set remove failed: {e}")))?;
         self.entries.remove(key);
+        if self.serves_retained_group_image() {
+            self.keys.compact(0);
+        }
         self.image.rearm();
 
         self.version += 1;
@@ -2867,16 +2963,17 @@ impl KvStore {
     }
 
     /// #1970: merge `delta` under the admission rule: it is kept only when
-    /// the merged canonical image is at most [`HARD_IMAGE_LIMIT_BYTES`].
-    /// The rule looks at the merged image only, so two replicas that reach
-    /// the same merged state make the same decision.
+    /// the measured merged image (replicated part plus the local allowance)
+    /// is at most
+    /// [`HARD_IMAGE_LIMIT_BYTES`]. Every delta is measured; nothing is
+    /// refused on a bound or a back-off alone.
     ///
-    /// A delta whose upper growth bound keeps the cached image bound under
-    /// the hard limit applies in place at O(delta) cost. Otherwise it
-    /// applies in place under an undo journal and the exact merged image is
-    /// measured (every key, no value bytes, no copy of the entries). While
-    /// the writer's retry window is open after a refusal, a delta that
-    /// removes nothing is refused without measuring.
+    /// The cheap measure: an upper growth bound on top of the cached bound.
+    /// When that fits, the delta applies at O(delta) cost and the cache is
+    /// refreshed with the exact change in entry bytes, so it stays within a
+    /// few tags of exact. When it does not fit, the delta applies in place
+    /// under an undo journal and the exact image is measured: a walk of the
+    /// keys and tags with no value bytes read and nothing allocated.
     ///
     /// # Errors
     ///
@@ -2889,30 +2986,34 @@ impl KvStore {
         peer_id: PeerId,
         writer: Option<&AgentId>,
     ) -> Result<MergeOutcome> {
-        let (content_growth, rest_growth) = self.delta_growth_bound(delta)?;
+        let (keys_growth, entries_growth, rest_growth) = self.delta_growth_bound(delta)?;
         let content = self.content_bound()?;
         let bound = content
-            .saturating_add(content_growth)
-            .saturating_add(self.rest_image_len()?)
+            .saturating_add(keys_growth)
+            .saturating_add(entries_growth)
+            .saturating_add(self.admission_rest_len()?)
             .saturating_add(rest_growth);
+        let touched: Vec<String> = delta
+            .added
+            .keys()
+            .chain(delta.removed.keys())
+            .chain(delta.updated.keys())
+            .cloned()
+            .collect();
         let mut journal = EntryJournal::default();
         if bound <= HARD_IMAGE_LIMIT_BYTES as u64 {
             let outcome = self.apply_delta_content(delta, peer_id, writer, &mut journal)?;
-            self.image.set_content(
-                self.version,
-                self.keys.version(),
-                content.saturating_add(content_growth),
-            );
-            if journal.removed_any {
+            self.settle_retained(Some(touched), &mut journal);
+            let change = i128::from(keys_growth) + self.journal_entry_delta(&journal);
+            let refreshed = (i128::from(content) + change).max(0) as u64;
+            self.image
+                .set_content(self.version, self.keys.version(), refreshed);
+            if change < 0 {
                 self.image.rearm();
             }
             return Ok(outcome);
         }
-        if delta.removed.is_empty() {
-            if let Some(refused) = writer.and_then(|w| self.refused_in_backoff(w)) {
-                return Err(refused);
-            }
-        }
+        let before = self.retained_image_len()?;
         let snapshot = self.snapshot_without_entries();
         let outcome = match self.apply_delta_content(delta, peer_id, writer, &mut journal) {
             Ok(outcome) => outcome,
@@ -2921,11 +3022,8 @@ impl KvStore {
                 return Err(e);
             }
         };
-        let removed_any = journal.removed_any;
-        self.admit_or_rollback(snapshot, journal, writer.copied())?;
-        if removed_any {
-            self.image.rearm();
-        }
+        self.settle_retained(Some(touched), &mut journal);
+        self.admit_or_rollback(snapshot, journal, writer.copied(), before)?;
         Ok(outcome)
     }
 
@@ -3079,13 +3177,11 @@ impl KvStore {
         }
         // #1970: adoption is a merge into the retained image, so it is under
         // the same admission rule as deltas and retained images.
-        let live_before = self.keys.len();
+        let before = self.retained_image_len()?;
         let snapshot = self.snapshot_without_entries();
         self.apply_full_snapshot(delta, peer_id, cp, &mut journal);
-        self.admit_or_rollback(snapshot, journal, self.owner)?;
-        if self.keys.len() < live_before {
-            self.image.rearm();
-        }
+        self.settle_retained(None, &mut journal);
+        self.admit_or_rollback(snapshot, journal, self.owner, before)?;
         Ok(true)
     }
 
@@ -3588,14 +3684,11 @@ impl KvStore {
             ));
         }
 
-        if let Some(refused) = self.refused_in_backoff(&endorser) {
-            return Err(refused);
-        }
         // #1970: merged in place under an undo journal and kept only when
         // the merged canonical image is at most the hard limit. A refused
         // merge leaves nothing applied and the shared sequence allocator
         // untouched.
-        let live_before = self.keys.len();
+        let before = self.retained_image_len()?;
         let keys_version = self.keys.version();
         let snapshot = self.snapshot_without_entries();
         let mut journal = EntryJournal::default();
@@ -3606,6 +3699,7 @@ impl KvStore {
         for (key, entry) in &other.entries {
             self.journal_merge_entry(key, entry, &mut journal);
         }
+        self.settle_retained(None, &mut journal);
         // Remote images contribute retained content only. Identity, policy,
         // checkpoint authority, allowlists, and local sequence state remain
         // locally anchored.
@@ -3620,14 +3714,11 @@ impl KvStore {
         if changed {
             self.version = self.version.saturating_add(1);
         }
-        self.admit_or_rollback(snapshot, journal, Some(endorser))?;
+        self.admit_or_rollback(snapshot, journal, Some(endorser), before)?;
         if let Some(floor) = retained_sequence_floor {
             self.restore_seq_counter(floor);
         }
         self.image.clear(&endorser);
-        if self.keys.len() < live_before {
-            self.image.rearm();
-        }
         Ok(())
     }
 
@@ -3667,6 +3758,7 @@ impl KvStore {
                 "legacy history leaves insufficient local sequence allocator capacity".to_string(),
             ));
         }
+        let before = self.retained_image_len()?;
         let keys_version = self.keys.version();
         let snapshot = self.snapshot_without_entries();
         let mut journal = EntryJournal::default();
@@ -3679,6 +3771,7 @@ impl KvStore {
         for (key, entry) in &source.entries {
             self.journal_merge_entry(key, entry, &mut journal);
         }
+        self.settle_retained(None, &mut journal);
         // `merge_state` records a new OR-Set version only when it retains a
         // previously unseen add or tombstone; the journal holds every entry
         // whose logical fields changed.
@@ -3690,7 +3783,7 @@ impl KvStore {
             self.version = self.version.saturating_add(1);
         }
         // #1970: legacy history merges into the retained image too.
-        self.admit_or_rollback(snapshot, journal, Some(endorser))?;
+        self.admit_or_rollback(snapshot, journal, Some(endorser), before)?;
         if let Some(floor) = retained_sequence_floor {
             self.restore_seq_counter(floor);
         }
@@ -5178,6 +5271,11 @@ mod tests {
         fn size_of(s: &KvStore) -> u64 {
             bincode::serialized_size(s).expect("size")
         }
+        while size_of(s) + 61_000 > target {
+            let mut keys: Vec<String> = s.entries.keys().cloned().collect();
+            keys.sort();
+            s.remove(&keys[0]).expect("make room");
+        }
         let mut sequence = 0u32;
         while target.saturating_sub(size_of(s)) > 60_000 {
             s.put(
@@ -5235,7 +5333,7 @@ mod tests {
     #[test]
     fn a_same_size_overwrite_at_the_limit_merges() {
         let (mut s, max) = store_within_two_entries_of_the_limit(9, None);
-        land_raw_image_at(&mut s, max - 80);
+        land_raw_image_at(&mut s, max - LOCAL_IMAGE_ALLOWANCE - 400);
         let (key, old) = s
             .entries
             .iter()
@@ -5260,7 +5358,7 @@ mod tests {
             "the newer same-size value won LWW"
         );
         assert!(
-            s.canonical_retained_image_len().expect("canonical size") <= max,
+            s.retained_image_len().expect("canonical size") <= max,
             "the merged canonical image stays servable"
         );
     }
@@ -5275,7 +5373,7 @@ mod tests {
     #[test]
     fn a_redelivered_entry_at_the_limit_merges() {
         let (mut s, max) = store_within_two_entries_of_the_limit(10, None);
-        land_raw_image_at(&mut s, max - 80);
+        land_raw_image_at(&mut s, max - LOCAL_IMAGE_ALLOWANCE - 400);
         let mut delta = KvStoreDelta::new(s.version);
         for (key, entry) in s.entries.iter().take(3) {
             delta
@@ -5284,7 +5382,7 @@ mod tests {
         }
         s.merge_delta(&delta, peer(2), Some(&agent(1)))
             .expect("the first delivery merges");
-        let canonical = s.canonical_retained_image_len().expect("canonical size");
+        let canonical = s.retained_image_len().expect("canonical size");
         assert!(
             canonical <= max,
             "the delivered image stays servable: {canonical}"
@@ -5295,13 +5393,14 @@ mod tests {
                 .expect("a gossip replay merges at the limit");
         }
         assert_eq!(
-            s.canonical_retained_image_len().expect("canonical size"),
+            s.retained_image_len().expect("canonical size"),
             canonical,
             "replays grow only bookkeeping, not the canonical image"
         );
-        assert!(
-            bincode::serialized_size(&s).expect("raw size") > raw_before_replays,
-            "the replays did append changelog bookkeeping — excluded by the measure"
+        assert_eq!(
+            bincode::serialized_size(&s).expect("raw size"),
+            raw_before_replays,
+            "#1970: the OR-Set changelog is cleared, so replays retain nothing"
         );
     }
 
@@ -5360,7 +5459,7 @@ mod tests {
                 )
                 .expect("put");
         }
-        let before = holder.canonical_retained_image_len().expect("size before");
+        let before = holder.retained_image_len().expect("size before");
         assert!(before > max, "fixture is past the limit: {before}");
         let owner = agent(1);
         let mut keys: Vec<String> = holder.entries.keys().cloned().collect();
@@ -5396,18 +5495,16 @@ mod tests {
             other => panic!("expected StoreFull, got {other:?}"),
         }
         assert_eq!(
-            holder.canonical_retained_image_len().expect("size"),
+            holder.retained_image_len().expect("size"),
             before,
             "nothing of the refused merge applied"
         );
-        // A local removal re-arms the retry window, so the next image is
-        // measured, not refused in back-off.
         holder.remove(&keys[keys.len() - 1]).expect("local remove");
         let large = shrink(60);
         holder
             .merge_group_retained_image(&large, agent(7), peer(2))
             .expect("a merge that brings the holder under the limit is admitted");
-        assert!(holder.canonical_retained_image_len().expect("size") <= max);
+        assert!(holder.retained_image_len().expect("size") <= max);
         assert_eq!(holder.get(&keys[0]).expect("entry").value.len(), 1_000);
     }
 
@@ -5430,7 +5527,7 @@ mod tests {
             .expect("put");
         }
         assert!(
-            s.canonical_retained_image_len().expect("canonical size") > max,
+            s.retained_image_len().expect("canonical size") > max,
             "fixture is past the limit"
         );
         let mut delta = KvStoreDelta::new(s.version);
@@ -5463,7 +5560,7 @@ mod tests {
             );
         }
         assert!(
-            s.canonical_retained_image_len().expect("canonical size") <= max,
+            s.retained_image_len().expect("canonical size") <= max,
             "the mixed delta recovered a servable image"
         );
     }
@@ -5486,7 +5583,7 @@ mod tests {
     /// stays at or below `target`.
     fn fill_canonical_to(s: &mut KvStore, target: u64, prefix: &str, writer_peer: PeerId) {
         for i in 0u32.. {
-            if s.canonical_retained_image_len().expect("size") + 61_000 > target {
+            if s.retained_image_len().expect("size") + 61_000 > target {
                 break;
             }
             s.put(
@@ -5577,14 +5674,14 @@ mod tests {
         deliver(&mut b, &da, peer(1), agent(1));
 
         let expected = visible(&ab);
-        let size = ab.canonical_retained_image_len().expect("size");
+        let size = ab.retained_image_len().expect("size");
         assert!(
             size > soft && size <= hard,
             "the union sits in the headroom: {size}"
         );
         for r in [&ba, &a, &b] {
             assert_eq!(visible(r), expected, "every replica converged");
-            assert_eq!(r.canonical_retained_image_len().expect("size"), size);
+            assert_eq!(r.retained_image_len().expect("size"), size);
             let status = r.image_status().expect("group store");
             assert_eq!(status.state, crate::kv::ImageState::Full);
             assert_eq!(status.refused_merges, 0);
@@ -5645,7 +5742,9 @@ mod tests {
             assert!(last.retry_after_ms > last.at_ms, "a retry window is open");
         }
 
-        // Inside the window a re-delivery is refused without measuring.
+        // A re-delivery is measured again and refused again; this replica's
+        // own pulls from the refused writer wait for the retry window.
+        assert!(!ab.image_retry_due(&agent(2)));
         let version = ab.version;
         assert!(matches!(
             ab.merge_delta(&db, peer(2), Some(&agent(2))),
@@ -5668,17 +5767,29 @@ mod tests {
         ba.merge_delta(&removal, peer(1), Some(&agent(1)))
             .expect("a removal is admitted");
 
-        // The repair serves each replica the other's retained image; the
-        // removal re-armed the window, so both merges are measured and fit.
-        let ab_image = ab.canonical_retained_wire_copy().expect("image");
-        let ba_image = ba.canonical_retained_wire_copy().expect("image");
+        // The removal shrank both images, which re-opens the pulls; the
+        // repair serves each replica the other's retained image, and the
+        // refused delta's content comes back with it.
+        assert!(ab.image_retry_due(&agent(2)) && ba.image_retry_due(&agent(1)));
+        let ab_image = ab.served_image_for_test();
+        let ba_image = ba.served_image_for_test();
         ab.merge_group_retained_image(&ba_image, agent(2), peer(1))
             .expect("the retry converges A-then-B");
         ba.merge_group_retained_image(&ab_image, agent(1), peer(2))
             .expect("the retry converges B-then-A");
         assert_eq!(visible(&ab), visible(&ba), "both orders converged");
-        let size = ab.canonical_retained_image_len().expect("size");
-        assert_eq!(ba.canonical_retained_image_len().expect("size"), size);
+        for i in 0..50u64 {
+            assert!(
+                ab.get(&format!("b{i:05}")).is_some(),
+                "B's refused delta recovered"
+            );
+            assert!(
+                ba.get(&format!("a{i:05}")).is_some(),
+                "A's refused delta recovered"
+            );
+        }
+        let size = ab.retained_image_len().expect("size");
+        assert_eq!(ba.retained_image_len().expect("size"), size);
         assert!(size <= hard);
         for r in [&ab, &ba] {
             let status = r.image_status().expect("status");
@@ -5710,7 +5821,7 @@ mod tests {
                 .expect("put");
         }
         let hard = HARD_IMAGE_LIMIT_BYTES as u64;
-        assert!(owner_store.canonical_retained_image_len().expect("size") > hard);
+        assert!(owner_store.retained_image_len().expect("size") > hard);
         let mut relay = owner_store.full_delta().expect("full delta");
         relay.owner_checkpoint = Some(checkpoint_for(&owner_store, topic, &kp, 1));
         let mut joiner =
@@ -5736,13 +5847,15 @@ mod tests {
         assert_eq!(joiner.len(), 250);
     }
 
-    /// #1970 points 1 and 5: the measure is exactly the served image (only
-    /// live entries, canonical OR-Set), and the cached bound the delta fast
-    /// path keeps never falls below the exact content size, through adds,
-    /// larger and smaller overwrites, removals, upserts and a lingering
-    /// entry that comes back to life.
+    /// #1970 points 1 and 5 (review of #2067, findings 1 and 2): the
+    /// measure is exactly what the store retains (`bincode` of the store,
+    /// the OR-Set changelog included) and what a serve publishes; a key
+    /// removed by an image tombstone keeps no value bytes; and the cached
+    /// bound the delta fast path keeps never falls below the exact size
+    /// and stays close to it through adds, larger and smaller overwrites,
+    /// removals, upserts and a removed key that comes back.
     #[test]
-    fn the_measure_is_the_served_image_and_the_cached_bound_covers_it() {
+    fn the_retained_measure_is_the_stored_bytes_and_the_cached_bound_tracks_it() {
         let mut s = two_writer_group(32);
         for i in 0..20u32 {
             s.put(
@@ -5753,20 +5866,21 @@ mod tests {
             )
             .expect("put");
         }
-        // A tombstone that arrives in a retained image leaves the local
-        // entry behind, dead: it is neither measured nor served.
         let mut other = s.clone();
         other.remove("k001").expect("remove");
-        let image = other.canonical_retained_wire_copy().expect("image");
+        let image = other.served_image_for_test();
         s.merge_group_retained_image(&image, agent(2), peer(1))
             .expect("merge");
-        assert!(s.entries.contains_key("k001") && s.get("k001").is_none());
+        assert!(
+            !s.entries.contains_key("k001"),
+            "the removed key's value bytes are gone after the removal merge"
+        );
         let check = |s: &KvStore| {
-            let copy = s.canonical_retained_wire_copy().expect("copy");
-            assert!(!copy.entries.contains_key("k001") || s.get("k001").is_some());
+            let retained = s.retained_image_len().expect("measure");
+            assert_eq!(retained, bincode::serialized_size(s).expect("stored"));
             assert_eq!(
-                s.canonical_retained_image_len().expect("measure"),
-                bincode::serialized_size(&copy).expect("served"),
+                retained,
+                s.encode_retained_image().expect("serve").len() as u64,
                 "the measure is the served image"
             );
             for entry in s.entries.values() {
@@ -5776,7 +5890,12 @@ mod tests {
                 );
             }
             if let Some(bound) = s.image.cached_content(s.version, s.keys.version()) {
-                assert!(bound >= s.content_image_len().expect("content"));
+                let exact = s.content_len().expect("content");
+                assert!(bound >= exact, "the bound covers the content");
+                assert!(
+                    bound - exact <= 4_096,
+                    "the bound tracks it: {bound} vs {exact}"
+                );
             }
         };
         check(&s);
@@ -5788,9 +5907,13 @@ mod tests {
         let mut deltas = vec![
             put_delta("n000", 900, b'n', (peer(2), 1), s.version),
             KvStoreDelta::for_put("k002".to_string(), marked, (peer(2), 2), s.version),
-            put_delta("k003", 10, b's', (peer(2), 3), s.version),
             put_delta("k001", 5, b'r', (peer(2), 4), s.version),
         ];
+        // Smaller overwrites: before review of #2067 each one raised the
+        // bound by the larger entry's size.
+        for i in 0..40u64 {
+            deltas.push(put_delta("k003", 10, b's', (peer(2), 100 + i), s.version));
+        }
         let mut removal = KvStoreDelta::new(s.version);
         removal
             .removed
@@ -5802,12 +5925,120 @@ mod tests {
             KvEntry::new("u000".to_string(), vec![b'u'; 40], "text/plain".to_string()),
         );
         deltas.push(upsert);
+        s.content_bound().expect("prime the cache");
         for (i, d) in deltas.iter().enumerate() {
             s.merge_delta(d, peer(2), Some(&agent(2)))
                 .unwrap_or_else(|e| panic!("delta {i}: {e}"));
             check(&s);
         }
-        assert!(s.get("k001").is_some(), "the dead key came back");
+        assert!(s.get("k001").is_some(), "the removed key came back");
+        assert!(!s.entries.contains_key("k004"));
+    }
+
+    /// #2067 review finding 1: an endorser's image whose entries sit under
+    /// keys its OR-Set does not hold (dead on arrival) adds nothing: the
+    /// entries are dropped, so neither memory nor the persisted bytes grow,
+    /// and the store stays `ok`.
+    #[test]
+    fn entries_of_dead_keys_in_an_image_are_dropped_not_retained() {
+        let mut s = two_writer_group(33);
+        s.put(
+            "live".to_string(),
+            vec![b'v'; 100],
+            "text/plain".to_string(),
+            peer(1),
+        )
+        .expect("put");
+        let clean = s.served_image_for_test();
+        s.merge_group_retained_image(&clean, agent(2), peer(1))
+            .expect("a clean image merges");
+        let before = s.retained_image_len().expect("size");
+        let mut attack = s.served_image_for_test();
+        for i in 0..200u32 {
+            let key = format!("ghost{i:04}");
+            attack.entries.insert(
+                key.clone(),
+                KvEntry::new(key, vec![b'g'; 60_000], "text/plain".to_string()),
+            );
+        }
+        s.merge_group_retained_image(&attack, agent(2), peer(1))
+            .expect("the image merges");
+        assert_eq!(s.entries.len(), 1, "no ghost entry is retained");
+        assert_eq!(s.retained_image_len().expect("size"), before);
+        assert_eq!(bincode::serialized_size(&s).expect("stored"), before);
+        assert_eq!(
+            s.image_status().expect("status").state,
+            crate::kv::ImageState::Ok
+        );
+    }
+
+    /// #2067 review finding 5: the per-replica fields (here a history
+    /// endorser) differ between two replicas that hold the same replicated
+    /// state, but the admission size does not, so their decisions agree.
+    #[test]
+    fn replicas_with_different_local_fields_measure_the_same_admission_size() {
+        let mut a = two_writer_group(34);
+        a.put(
+            "k".to_string(),
+            vec![b'v'; 100],
+            "text/plain".to_string(),
+            peer(1),
+        )
+        .expect("put");
+        let mut b = a.clone();
+        b.last_history_endorser = Some(agent(9));
+        b.ownership_conflict = Some((agent(1), agent(9)));
+        assert_ne!(
+            a.retained_image_len().expect("a"),
+            b.retained_image_len().expect("b"),
+            "the replicas retain different local bytes"
+        );
+        assert_eq!(
+            a.admission_image_len().expect("a"),
+            b.admission_image_len().expect("b"),
+            "and measure the same admission size"
+        );
+    }
+
+    /// #2067 review findings 2 and 4: a removal that only one replica holds
+    /// still lets the other replica take the shrunk image at once. A
+    /// back-off never refuses an incoming merge; it only delays this
+    /// replica's own pulls from the refused source, and any shrink of this
+    /// replica's image re-opens them.
+    #[test]
+    fn a_removal_known_to_one_replica_only_converges_without_waiting() {
+        let soft = SOFT_IMAGE_LIMIT_BYTES as u64;
+        let mut base = two_writer_group(35);
+        fill_canonical_to(&mut base, soft - 500_000, "base", peer(3));
+        let mut a = base.clone();
+        a.merge_delta(
+            &bulk_delta("a", 50, peer(1), a.version),
+            peer(1),
+            Some(&agent(1)),
+        )
+        .expect("A writes");
+        let mut b = base.clone();
+        b.merge_delta(
+            &bulk_delta("b", 50, peer(2), b.version),
+            peer(2),
+            Some(&agent(2)),
+        )
+        .expect("B writes");
+        assert!(matches!(
+            b.merge_group_retained_image(&a.served_image_for_test(), agent(1), peer(2)),
+            Err(KvError::StoreFull { .. })
+        ));
+        assert!(!b.image_retry_due(&agent(1)), "B's pulls from A back off");
+        // A removes its own keys, which B never held.
+        for i in 0..45u64 {
+            a.remove(&format!("a{i:05}")).expect("remove");
+        }
+        b.merge_group_retained_image(&a.served_image_for_test(), agent(1), peer(2))
+            .expect("B measures A's shrunk image and takes it at once");
+        assert!(b.image_retry_due(&agent(1)), "the record of A is cleared");
+        a.merge_group_retained_image(&b.served_image_for_test(), agent(2), peer(1))
+            .expect("A takes B's image");
+        assert_eq!(visible(&a), visible(&b), "both replicas converged");
     }
 
     /// #1970 review round 2 (nit): only stores that serve their complete
@@ -5889,17 +6120,17 @@ mod tests {
         }
         s.merge_delta(&replayed, peer(2), Some(&agent(1)))
             .expect("re-delivery");
-        let measured = s.canonical_retained_image_len().expect("measured");
-        let copy = s.canonical_retained_wire_copy().expect("canonical copy");
+        let measured = s.retained_image_len().expect("measured");
+        let copy = s.served_image_for_test();
         let copy_size = bincode::serialized_size(&copy).expect("copy size");
         assert_eq!(
             measured, copy_size,
             "the measure is exactly the canonical copy's size"
         );
         let raw = bincode::serialized_size(&s).expect("raw size");
-        assert!(
-            raw > measured,
-            "the changelog bookkeeping is excluded: {raw} vs {measured}"
+        assert_eq!(
+            raw, measured,
+            "#1970: the measure is what the store retains, changelog included"
         );
         let wire = bincode::serialize(&copy).expect("wire");
         let back: KvStore = bincode::deserialize(&wire).expect("round trip");

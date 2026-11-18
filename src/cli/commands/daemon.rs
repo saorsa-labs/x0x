@@ -321,55 +321,87 @@ async fn check_key_health(client: &DaemonClient) -> DoctorCheck {
 
 async fn check_store_integrity(client: &DaemonClient) -> DoctorCheck {
     match client.get("/stores").await {
-        Ok(val) => {
-            let stores = val
-                .get("stores")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let degraded: Vec<String> = stores
-                .iter()
-                .filter(|s| s.get("durability_degraded").and_then(|v| v.as_bool()) == Some(true))
-                .filter_map(|s| s.get("id").and_then(|v| v.as_str()).map(str::to_string))
-                .collect();
-            if !degraded.is_empty() {
-                return DoctorCheck::fail(format!(
-                    "{} store(s) durability_degraded: {}",
-                    degraded.len(),
-                    degraded.join(", ")
-                ));
-            }
-            // #1970: a group store that refused a merge at the image limit
-            // can differ from its peers until entries are removed.
-            let image_problems: Vec<String> = stores
-                .iter()
-                .filter_map(|s| {
-                    let state = s.get("image")?.get("state")?.as_str()?;
-                    matches!(state, "full_diverged" | "over_limit").then(|| {
-                        let id = s.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-                        format!("{id} ({state})")
-                    })
-                })
-                .collect();
-            if !image_problems.is_empty() {
-                return DoctorCheck::warn(
-                    format!(
-                        "{} group store(s) at the retained-image limit; remove entries to repair: {}",
-                        image_problems.len(),
-                        image_problems.join(", ")
-                    ),
-                    Some(serde_json::json!({
-                        "store_count": stores.len(),
-                        "image_limit": image_problems,
-                    })),
-                );
-            }
-            DoctorCheck::ok_with(
-                format!("{} store(s) readable", stores.len()),
-                serde_json::json!({ "store_count": stores.len() }),
-            )
-        }
+        Ok(val) => store_integrity_check(&val),
         Err(e) => DoctorCheck::fail(format!("/stores: {e:#}")),
+    }
+}
+
+/// The store-integrity verdict for a `GET /stores` body.
+fn store_integrity_check(val: &serde_json::Value) -> DoctorCheck {
+    let stores = val
+        .get("stores")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let degraded: Vec<String> = stores
+        .iter()
+        .filter(|s| s.get("durability_degraded").and_then(|v| v.as_bool()) == Some(true))
+        .filter_map(|s| s.get("id").and_then(|v| v.as_str()).map(str::to_string))
+        .collect();
+    if !degraded.is_empty() {
+        return DoctorCheck::fail(format!(
+            "{} store(s) durability_degraded: {}",
+            degraded.len(),
+            degraded.join(", ")
+        ));
+    }
+    // #1970: a group store that refused a merge at the image limit
+    // can differ from its peers until entries are removed.
+    let image_problems: Vec<String> = stores
+        .iter()
+        .filter_map(|s| {
+            let state = s.get("image")?.get("state")?.as_str()?;
+            matches!(state, "full_diverged" | "over_limit").then(|| {
+                let id = s.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                format!("{id} ({state})")
+            })
+        })
+        .collect();
+    if !image_problems.is_empty() {
+        return DoctorCheck::warn(
+            format!(
+                "{} group store(s) at the retained-image limit; remove entries to repair: {}",
+                image_problems.len(),
+                image_problems.join(", ")
+            ),
+            Some(serde_json::json!({
+                "store_count": stores.len(),
+                "image_limit": image_problems,
+            })),
+        );
+    }
+    DoctorCheck::ok_with(
+        format!("{} store(s) readable", stores.len()),
+        serde_json::json!({ "store_count": stores.len() }),
+    )
+}
+
+#[cfg(test)]
+mod store_integrity_tests {
+    use super::*;
+
+    /// #1970: a group store at the image limit makes the doctor warn and
+    /// name it; `ok` and `full` stores do not.
+    #[test]
+    fn the_doctor_warns_on_a_diverged_or_over_limit_group_store() {
+        let body = |state: &str| {
+            serde_json::json!({ "stores": [
+                { "id": "x0x/group/a", "durability_degraded": false, "image": { "state": state } },
+                { "id": "plain", "durability_degraded": false, "image": null },
+            ]})
+        };
+        for state in ["ok", "full"] {
+            assert_eq!(
+                store_integrity_check(&body(state)).status,
+                DoctorCheckStatus::Ok
+            );
+        }
+        for state in ["full_diverged", "over_limit"] {
+            let check = store_integrity_check(&body(state));
+            assert_eq!(check.status, DoctorCheckStatus::Warn);
+            assert!(check.detail.contains("x0x/group/a"), "{}", check.detail);
+            assert!(check.detail.contains(state), "{}", check.detail);
+        }
     }
 }
 
