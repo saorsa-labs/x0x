@@ -21,12 +21,16 @@ pub enum KvError {
         max: usize,
     },
 
-    /// #1094 P1 (review of #1963): the put would take the store's complete
+    /// #1094 P1 / #1970: the operation would take the store's complete
     /// image over the retained-image limit, so new and lagging members
-    /// could no longer get its history. The store is full.
+    /// could no longer get its history. Raised by a put (`check_image_room`
+    /// measures an upper estimate), by a group delta or retained-image
+    /// merge that would grow the image past the limit (measured exactly
+    /// from the merged trial), and by serving a retained image from a
+    /// holder already past the limit.
     #[error("store full: the store image would be {image} bytes, above the {max}-byte retained-image limit")]
     StoreFull {
-        /// The image size the put would reach (an upper estimate).
+        /// The complete-image size the operation would reach.
         image: u64,
         /// The limit.
         max: usize,

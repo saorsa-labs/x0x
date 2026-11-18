@@ -28187,6 +28187,12 @@ impl KvStoreHandle {
         }
     }
 
+    /// #1970: the retained-image status of a group store (`None` for any
+    /// other store): its state, exact size, limits and refusals.
+    pub async fn image_status(&self) -> Option<kv::ImageStatus> {
+        self.sync.read().await.image_status()
+    }
+
     /// Whether this is a group store (`x0x/group/...`): its entries are
     /// marked and its image is bounded (#1094 P1).
     fn is_group_store_topic(&self) -> bool {

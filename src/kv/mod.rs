@@ -26,6 +26,7 @@ pub mod delta;
 pub mod encrypted;
 pub mod entry;
 pub mod error;
+pub mod image_admission;
 pub mod provenance;
 pub(crate) mod retained_paging;
 pub(crate) mod snapshot_fence;
@@ -42,6 +43,7 @@ pub use encrypted::{
 };
 pub use entry::KvEntry;
 pub use error::{KvError, Result};
+pub use image_admission::{ImageRefusal, ImageState, ImageStatus};
 pub use store::{
     key_agent_prefix, AccessPolicy, AnchorChannel, KvStore, KvStoreId, OwnershipSource,
     OwnershipStatus, MAX_SELFKEYED_BYTES_PER_AGENT, MAX_SELFKEYED_KEYS_PER_AGENT,

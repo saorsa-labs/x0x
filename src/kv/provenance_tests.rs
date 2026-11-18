@@ -369,11 +369,12 @@ fn every_store_merge_path_uses_the_one_lww_rule() {
     }
     for path in [
         "fn merge_delta_self_keyed(",
-        "fn merge_delta_with_outcome_inner(",
-        "fn try_adopt_full_snapshot(",
+        "fn apply_delta_content(",
+        "fn apply_full_snapshot(",
         "fn merge_unchecked(",
         "pub fn merge_group_retained_image(",
         "pub fn merge_legacy_signed_history(",
+        "fn journal_merge_entry(",
     ] {
         let start = production.find(path).expect(path);
         let body = &production[start + path.len()..];
@@ -383,8 +384,13 @@ fn every_store_merge_path_uses_the_one_lww_rule() {
             .min()
             .unwrap_or(body.len());
         let body = &body[..end];
+        // #1970: the bounded paths merge through `journal_merge_entry`,
+        // which calls `KvEntry::merge_tracked`, the body of `KvEntry::merge`.
         assert!(
-            body.contains(".merge(entry)") || body.contains(".merge(other_entry)"),
+            body.contains(".merge(entry)")
+                || body.contains(".merge(other_entry)")
+                || body.contains(".merge_tracked(entry)")
+                || body.contains(".journal_merge_entry("),
             "{path} must merge entries with KvEntry::merge"
         );
     }
@@ -471,7 +477,7 @@ fn writer_mark_bytes_bound_the_mark() {
     assert!(mark_bytes > 4_000, "the signature dominates: {mark_bytes}");
 }
 
-/// MAJOR 3: a put that would take the store image over the retained-image
+/// MAJOR 3 / #1970: a put that would take the store image over the soft
 /// limit is refused with `StoreFull`; the image stays within the limit, and
 /// the refusal comes near it, not early.
 #[test]
@@ -480,7 +486,7 @@ fn a_put_past_the_image_limit_is_refused() {
     let mut s = signed_store(3, &writer);
     let peer = PeerId::new([7; 32]);
     let value = vec![b'v'; 60_000];
-    let max = crate::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES as u64;
+    let max = crate::kv::image_admission::SOFT_IMAGE_LIMIT_BYTES as u64;
     let mut i = 0u32;
     loop {
         let key = format!("k{i:05}");
@@ -497,8 +503,11 @@ fn a_put_past_the_image_limit_is_refused() {
             Err(other) => panic!("unexpected {other}"),
         }
     }
-    let size = bincode::serialized_size(&s).expect("size");
-    assert!(size <= max, "the image stayed within the limit: {size}");
+    let size = s.retained_image_len().expect("size");
+    assert!(
+        size <= max,
+        "the image stayed within the soft limit: {size}"
+    );
     assert!(
         size + 2 * 70_000 > max,
         "the refusal came near the limit, not early: {size}"

@@ -292,6 +292,8 @@ pub(in crate::server) struct StoreListEntry {
     /// True while snapshot persistence is failing (local writes refused
     /// until a snapshot succeeds).
     durability_degraded: bool,
+    /// #1970: retained-image status of a group store; `null` otherwise.
+    image: Option<x0x::kv::ImageStatus>,
 }
 
 /// GET /stores
@@ -319,6 +321,7 @@ pub(in crate::server) async fn list_kv_stores(
             policy_version: info.policy_version,
             ownership_status: info.ownership_status,
             durability_degraded: info.durability_degraded,
+            image: handle.image_status().await,
         });
     }
     Json(serde_json::json!({ "ok": true, "stores": entries }))
@@ -3142,11 +3145,14 @@ async fn legacy_import_retained_image_len(
     // A live destination's clone shares the sequence allocator. This
     // measurement must not `fetch_max` it when the import is later refused.
     trial.detach_seq_counter();
-    if trial
-        .merge_legacy_signed_history(source, source_owner, endorser, peer)
-        .is_err()
-    {
-        return Ok(None);
+    match trial.merge_legacy_signed_history(source, source_owner, endorser, peer) {
+        Ok(()) => {}
+        // #1970: the merge itself refuses an image past the hard limit; that
+        // is the measurement, so the route refuses before it opens anything.
+        Err(x0x::kv::KvError::StoreFull { image, .. }) => {
+            return Ok(Some(usize::try_from(image).unwrap_or(usize::MAX)));
+        }
+        Err(_) => return Ok(None),
     }
     let image = bincode::serialize(&trial).map_err(|error| {
         api_error(
@@ -3374,6 +3380,12 @@ async fn commit_legacy_import_under_cap(
         )
         .map_err(|error| match error {
             x0x::kv::KvError::Unauthorized(message) => forbidden(message),
+            x0x::kv::KvError::StoreFull { image, max } => api_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "legacy import would retain {image} bytes, above the {max} byte group image limit"
+                ),
+            ),
             other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         })?;
     let image = bincode::serialize(&trial).map_err(|error| {
@@ -4464,10 +4476,20 @@ mod tests {
                     state.agent.agent_id(),
                     dest_handle.peer_id(),
                 )
-                .expect("trial merge of the fixture");
-            bincode::serialize(&trial)
-                .expect("projected retained image")
-                .len()
+                .map(|()| {
+                    bincode::serialize(&trial)
+                        .expect("projected retained image")
+                        .len()
+                })
+                // #1970: the merge refuses past the hard limit and reports
+                // the image it would have retained.
+                .or_else(|error| match error {
+                    x0x::kv::KvError::StoreFull { image, .. } => {
+                        Ok::<usize, x0x::kv::KvError>(image as usize)
+                    }
+                    other => Err(other),
+                })
+                .expect("trial merge of the fixture")
         };
         assert!(
             projected > x0x::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES,
@@ -4617,10 +4639,20 @@ mod tests {
                     state.agent.agent_id(),
                     dest_handle.peer_id(),
                 )
-                .expect("trial merge of the fixture");
-            bincode::serialize(&trial)
-                .expect("projected retained image")
-                .len()
+                .map(|()| {
+                    bincode::serialize(&trial)
+                        .expect("projected retained image")
+                        .len()
+                })
+                // #1970: the merge refuses past the hard limit and reports
+                // the image it would have retained.
+                .or_else(|error| match error {
+                    x0x::kv::KvError::StoreFull { image, .. } => {
+                        Ok::<usize, x0x::kv::KvError>(image as usize)
+                    }
+                    other => Err(other),
+                })
+                .expect("trial merge of the fixture")
         };
         assert!(
             projected > x0x::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES,
