@@ -4030,6 +4030,54 @@ tokio::task_local! {
     /// other failing seats are open S4 work (see
     /// [`s4_eviction_seal_tolerates`]).
     static S4_EVICTION_SEAL: EvictionSealScope;
+
+    /// #1973 (ADR 0110 §4b(1)): set while the promoted member seals its
+    /// owner-recovery commit, so that seal tolerates the seated revoked
+    /// non-admin members (see [`s4_eviction_seal_tolerates`]).
+    static OWNER_RECOVERY_SEAL: RecoverySealScope;
+}
+
+/// The owner-recovery commit the current task seals (#1973).
+#[derive(Debug, Clone)]
+struct RecoverySealScope {
+    stable_group_id: String,
+    /// Lowercase hex of the Active, below-Admin seats of the working
+    /// copy whose verified agent revocations this node holds.
+    revoked_members: BTreeSet<String>,
+}
+
+/// #1973: the seats the owner-recovery seal tolerates. The recovery
+/// commit removes only the revoked admins (ADR 0110 §4b(1)); a seated
+/// revoked non-admin keeps its seat, and its own S4 row can only commit
+/// under the eligible admin this recovery seats, so an all-clean
+/// refusal would leave the two waits on each other forever. The
+/// promoted member is verified not revoked by the mandate
+/// (`recovery_member_ineligible`), and the mandate names every revoked
+/// admin, so neither class can appear in this set.
+async fn owner_recovery_seal_scope(state: &AppState, next: &GroupInfo) -> RecoverySealScope {
+    let revoked: BTreeSet<String> = {
+        let set = state.agent.revocation_set();
+        let revoked = set.read().await;
+        next.active_members()
+            .filter(|member| !member.role.at_least(GroupRole::Admin))
+            .filter_map(|member| hex::decode(&member.agent_id).ok())
+            .filter_map(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+            .filter(|id| revoked.is_agent_revoked(&x0x::identity::AgentId(*id)))
+            .map(hex::encode)
+            .collect()
+    };
+    RecoverySealScope {
+        stable_group_id: next.stable_group_id().to_string(),
+        revoked_members: revoked,
+    }
+}
+
+/// Seal `seal` inside the owner-recovery seal scope (#1973).
+async fn within_owner_recovery_seal_scope<R>(
+    scope: RecoverySealScope,
+    seal: impl std::future::Future<Output = R>,
+) -> R {
+    OWNER_RECOVERY_SEAL.scope(scope, seal).await
 }
 
 /// The S4 removal or ban that the current task runs.
@@ -4073,10 +4121,19 @@ fn eviction_seal_scope(store: &ObligationStore, key: &EvictionKey) -> EvictionSe
 /// the target of another open S4 row of the same group. Each of those
 /// rows then gets its own transition under its own designation and
 /// timing. Any other failing seat keeps the all-clean refusal.
+///
+/// #1973 (ADR 0110 §4b(1)): the same tolerance answers inside an
+/// owner-recovery commit for the failing seats that are Active,
+/// below-Admin members with a verified revocation — their own S4 rows
+/// can only commit under the admin the recovery seats, so the recovery
+/// is the one transition that ends the group's no-admin wait.
 pub(in crate::server) fn s4_eviction_seal_tolerates(info: &GroupInfo, failed: &[String]) -> bool {
     S4_EVICTION_SEAL
         .try_with(|scope| eviction_seal_tolerates(scope, info, failed))
         .unwrap_or(false)
+        || OWNER_RECOVERY_SEAL
+            .try_with(|scope| recovery_seal_tolerates(scope, info, failed))
+            .unwrap_or(false)
 }
 
 /// #1023 (Engineer ruling 1 Nov 2026 02:36 GMT): inside an S4 removal or
@@ -4113,6 +4170,16 @@ fn eviction_seal_tolerates(scope: &EvictionSealScope, info: &GroupInfo, failed: 
         && failed
             .iter()
             .all(|hex| scope.pending_targets.contains(&hex.to_ascii_lowercase()))
+}
+
+/// #1973: an owner-recovery seal of this group tolerates every failing
+/// seat that is one of its verified-revoked, below-Admin seats.
+fn recovery_seal_tolerates(scope: &RecoverySealScope, info: &GroupInfo, failed: &[String]) -> bool {
+    scope.stable_group_id == info.stable_group_id()
+        && !failed.is_empty()
+        && failed
+            .iter()
+            .all(|hex| scope.revoked_members.contains(&hex.to_ascii_lowercase()))
 }
 
 /// Whether the current task runs the worker's own removal or ban of the
@@ -6181,6 +6248,53 @@ pub(super) mod tests {
         // The second removal then needs no tolerance: its seal is clean.
         let second_scope = eviction_seal_scope(&store, &EvictionKey::new(stable, second));
         assert!(second_scope.pending_targets.contains(&hex::encode(first)));
+    }
+
+    /// #1973: the owner-recovery seal tolerates exactly this group's
+    /// verified-revoked, below-Admin seats — nothing else. The
+    /// below-Admin filter itself lives in the scope builder
+    /// ([`owner_recovery_seal_scope`]); the daemon tests of
+    /// `issue1973_revoked_member_seal` run it end to end.
+    #[test]
+    fn an_owner_recovery_seal_tolerates_only_its_revoked_member_seats() {
+        let (admin, member, revoked, expired) = ([1; 32], [2; 32], [3; 32], [4; 32]);
+        let mut info = group_with(admin, member);
+        info.add_member(hex::encode(revoked), GroupRole::Member, None, None);
+        info.add_member(hex::encode(expired), GroupRole::Member, None, None);
+        let scope = RecoverySealScope {
+            stable_group_id: info.stable_group_id().to_string(),
+            revoked_members: BTreeSet::from([hex::encode(revoked)]),
+        };
+        let failed_revoked = vec![hex::encode(revoked)];
+        // The scope's own revoked member seat is tolerated.
+        assert!(recovery_seal_tolerates(&scope, &info, &failed_revoked));
+        // A failing id is matched case-insensitively.
+        assert!(recovery_seal_tolerates(
+            &scope,
+            &info,
+            &[hex::encode(revoked).to_uppercase()]
+        ));
+        // An empty failing set keeps the refusal.
+        assert!(!recovery_seal_tolerates(&scope, &info, &[]));
+        // A mixed set — a tolerated revoked seat plus a merely expired
+        // one — keeps the all-clean refusal.
+        let mixed = vec![hex::encode(revoked), hex::encode(expired)];
+        assert!(!recovery_seal_tolerates(&scope, &info, &mixed));
+        // An Admin-or-higher seat the builder never collects keeps the
+        // refusal.
+        assert!(!recovery_seal_tolerates(
+            &scope,
+            &info,
+            &[hex::encode(admin)]
+        ));
+        // Another group's scope tolerates nothing here.
+        let other = RecoverySealScope {
+            stable_group_id: "other".into(),
+            revoked_members: BTreeSet::from([hex::encode(revoked)]),
+        };
+        assert!(!recovery_seal_tolerates(&other, &info, &failed_revoked));
+        // Outside an owner-recovery scope nothing is tolerated.
+        assert!(!s4_eviction_seal_tolerates(&info, &failed_revoked));
     }
 
     #[test]

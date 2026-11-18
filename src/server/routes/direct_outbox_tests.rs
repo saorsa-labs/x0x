@@ -42,6 +42,22 @@ fn no_record() -> LedgerReceipt {
     LedgerReceipt {
         status: DmReceiptStatus::Unknown,
         digest: None,
+        machine: None,
+    }
+}
+
+/// The machine every test attempt to a peer is pinned to (#2007).
+fn peer_machine() -> MachineId {
+    MachineId([0xa2; 32])
+}
+
+/// A ledger that names the machine an attempt was pinned to, as the DM
+/// receipt ledger does after a durable send gave up (#2007).
+fn pinned(_: &[u8; 16]) -> LedgerReceipt {
+    LedgerReceipt {
+        status: DmReceiptStatus::Pending,
+        digest: None,
+        machine: Some(peer_machine()),
     }
 }
 
@@ -137,6 +153,7 @@ async fn issue1109_late_ack_settles_delivered_with_zero_sends() {
             DmReceiptStatus::Unknown
         },
         digest: Some(digest_of(b"hello")),
+        machine: None,
     };
     outbox.step(at(NOW, 0), &late, &transport).await;
     assert_eq!(transport.calls(), 0, "a late ACK must not cause a resend");
@@ -160,6 +177,7 @@ async fn issue1109_receipt_for_other_bytes_does_not_settle() {
     let other = |_: &[u8; 16]| LedgerReceipt {
         status: DmReceiptStatus::Delivered,
         digest: Some(digest_of(b"other bytes")),
+        machine: None,
     };
     outbox.step(at(NOW, 0), &other, &transport).await;
     assert_eq!(transport.calls(), 1, "the bytes are sent, not settled");
@@ -179,6 +197,7 @@ async fn issue1109_enqueue_refuses_other_bytes_than_a_delivered_receipt() {
     let delivered_a = LedgerReceipt {
         status: DmReceiptStatus::Delivered,
         digest: Some(digest_of(b"payload A")),
+        machine: None,
     };
     let mut b = obligation("order-1c", peer, NOW + 60_000);
     b.payload = b"payload B".to_vec();
@@ -922,14 +941,14 @@ async fn issue1109_late_ack_after_restart_settles_with_zero_sends() {
         before
             .step(
                 at(NOW, 0),
-                &unknown,
+                &pinned,
                 &ScriptedTransport::with(vec![Err(timeout())]),
             )
             .await;
     }
     let after = outbox_in(&dir);
     after.load(NOW).await.expect("sidecar loads");
-    assert!(after.settle_late_ack(&rid, &peer).await);
+    assert!(after.settle_late_ack(&rid, &peer, &peer_machine()).await);
     assert!(after.snapshot().await.is_empty());
     let transport = ScriptedTransport::default();
     after.step(at(NOW, 0), &unknown, &transport).await;
@@ -950,8 +969,16 @@ async fn issue1109_late_ack_from_another_agent_changes_nothing() {
     outbox
         .enqueue(obligation("order-s", peer, NOW + 60_000), no_record())
         .await;
-    assert!(!outbox.settle_late_ack(&rid, &agent(9)).await);
-    assert!(!outbox.settle_late_ack(&[0x77; 16], &peer).await);
+    assert!(
+        !outbox
+            .settle_late_ack(&rid, &agent(9), &peer_machine())
+            .await
+    );
+    assert!(
+        !outbox
+            .settle_late_ack(&[0x77; 16], &peer, &peer_machine())
+            .await
+    );
     assert_eq!(outbox.snapshot().await.len(), 1);
     assert_eq!(status(&outbox, peer, &rid).await.status, "queued");
 }
@@ -1027,7 +1054,7 @@ fn timeout() -> DmError {
 /// One attempt whose ACK is lost (a retryable timeout).
 async fn attempt_once(outbox: &DirectSendOutbox, wall: u64, mono: u64) {
     let transport = ScriptedTransport::with(vec![Err(timeout())]);
-    outbox.step(at(wall, mono), &unknown, &transport).await;
+    outbox.step(at(wall, mono), &pinned, &transport).await;
     assert_eq!(transport.calls(), 1, "one attempt was made");
 }
 
@@ -1119,7 +1146,7 @@ async fn issue1109_late_ack_after_expiry_reads_delivered_late() {
         )
         .await;
     assert_eq!(status(&outbox, peer, &rid).await.status, "expired");
-    assert!(outbox.settle_late_ack(&rid, &peer).await);
+    assert!(outbox.settle_late_ack(&rid, &peer, &peer_machine()).await);
     let receipt = status(&outbox, peer, &rid).await;
     assert_eq!(receipt.status, "delivered_late");
     assert_eq!(receipt.payload_digest, Some(digest_of(b"hello")));
@@ -1139,10 +1166,12 @@ async fn issue1109_late_ack_after_cancel_reads_delivered_late() {
     attempt_once(&outbox, NOW, 0).await;
     assert_eq!(outbox.cancel(&peer, &rid).await, CancelOutcome::Cancelled);
     assert!(
-        !outbox.settle_late_ack(&rid, &agent(9)).await,
+        !outbox
+            .settle_late_ack(&rid, &agent(9), &peer_machine())
+            .await,
         "another agent"
     );
-    assert!(outbox.settle_late_ack(&rid, &peer).await);
+    assert!(outbox.settle_late_ack(&rid, &peer, &peer_machine()).await);
     assert_eq!(status(&outbox, peer, &rid).await.status, "delivered_late");
 }
 
@@ -1176,10 +1205,11 @@ async fn issue1109_late_ack_never_settles_bytes_that_were_not_attempted() {
             rid,
             hex::encode(peer.as_bytes()),
             digest_of(b"hello"),
+            peer_machine(),
         )])
         .await
         .expect("noted");
-    assert!(!other.settle_late_ack(&rid, &peer).await);
+    assert!(!other.settle_late_ack(&rid, &peer, &peer_machine()).await);
     assert_eq!(other.snapshot().await.len(), 1, "B is still held");
     let receipt = status(&other, peer, &rid).await;
     assert_eq!(receipt.status, "queued");
@@ -1202,11 +1232,12 @@ async fn issue1109_two_attempted_digests_make_a_late_ack_change_nothing() {
             rid,
             hex::encode(peer.as_bytes()),
             digest_of(b"other"),
+            peer_machine(),
         )])
         .await
         .expect("noted");
     attempt_once(&outbox, NOW, 0).await;
-    assert!(!outbox.settle_late_ack(&rid, &peer).await);
+    assert!(!outbox.settle_late_ack(&rid, &peer, &peer_machine()).await);
     assert_eq!(outbox.snapshot().await.len(), 1);
     assert_eq!(status(&outbox, peer, &rid).await.status, "queued");
 }
@@ -1459,4 +1490,172 @@ impl DirectSendTransport for BlockDuringSend {
         std::fs::create_dir(&self.blocker).expect("blocker dir");
         self.inner.send(recipient, payload, config, budget)
     }
+}
+
+/// WHY: #2007 after a restart only the machine the attempt was pinned to
+/// can settle a held send: an orphan ACK from the right agent on another
+/// machine changes nothing, and the pinned machine's ACK still settles it.
+#[tokio::test]
+async fn issue2007_late_ack_from_another_machine_after_restart_changes_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let peer = agent(2);
+    let rid = request_id_for("pin-held", peer);
+    {
+        let before = outbox_in(&dir);
+        before
+            .enqueue(obligation("pin-held", peer, NOW + 60_000), no_record())
+            .await;
+        attempt_once(&before, NOW, 0).await;
+    }
+    let after = outbox_in(&dir);
+    after.load(NOW).await.expect("sidecars load");
+    let other_machine = MachineId([0xb3; 32]);
+    assert!(
+        !after.settle_late_ack(&rid, &peer, &other_machine).await,
+        "an ACK from another machine settles nothing"
+    );
+    assert_eq!(after.snapshot().await.len(), 1, "still held");
+    assert_eq!(status(&after, peer, &rid).await.status, "queued");
+    assert!(after.settle_late_ack(&rid, &peer, &peer_machine()).await);
+    assert!(after.snapshot().await.is_empty());
+    assert_eq!(status(&after, peer, &rid).await.status, "delivered");
+}
+
+/// WHY: #2007 an ended send becomes `delivered_late` only on an ACK from
+/// the machine its attempt was pinned to, also after a restart.
+#[tokio::test]
+async fn issue2007_delivered_late_needs_the_pinned_machine_after_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let peer = agent(2);
+    let rid = request_id_for("pin-cancel", peer);
+    {
+        let before = outbox_in(&dir);
+        before
+            .enqueue(obligation("pin-cancel", peer, NOW + 60_000), no_record())
+            .await;
+        attempt_once(&before, NOW, 0).await;
+        assert_eq!(before.cancel(&peer, &rid).await, CancelOutcome::Cancelled);
+    }
+    let after = outbox_in(&dir);
+    after.load(NOW).await.expect("sidecars load");
+    assert!(
+        !after
+            .settle_late_ack(&rid, &peer, &MachineId([0xb3; 32]))
+            .await
+    );
+    assert_eq!(status(&after, peer, &rid).await.status, "cancelled");
+    assert!(after.settle_late_ack(&rid, &peer, &peer_machine()).await);
+    assert_eq!(status(&after, peer, &rid).await.status, "delivered_late");
+}
+
+/// WHY: #2007 an attempt record with no machine (written before #2007, or
+/// whose machine was never known) still loads, but no late ACK can settle
+/// it: the held send is sent again instead and the recipient re-ACKs.
+#[tokio::test]
+async fn issue2007_attempt_record_without_a_machine_loads_and_settles_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let peer = agent(2);
+    let rid = request_id_for("pin-legacy", peer);
+    {
+        let before = outbox_in(&dir);
+        before
+            .enqueue(obligation("pin-legacy", peer, NOW + 60_000), no_record())
+            .await;
+        // `unknown` names no machine: the record is what a pre-#2007
+        // daemon wrote.
+        let transport = ScriptedTransport::with(vec![Err(timeout())]);
+        before.step(at(NOW, 0), &unknown, &transport).await;
+        assert_eq!(transport.calls(), 1);
+    }
+    let sidecar = std::fs::read(dir.path().join(DIRECT_SEND_OUTCOMES_FILE)).expect("sidecar");
+    let json: serde_json::Value = serde_json::from_slice(&sidecar).expect("json");
+    let attempt = &json["attempts"][0];
+    assert!(attempt.get("digests").is_some(), "{json}");
+    assert!(attempt.get("machines").is_none(), "pre-#2007 shape: {json}");
+
+    let after = outbox_in(&dir);
+    after
+        .load(NOW)
+        .await
+        .expect("a record with no machine loads");
+    assert!(!after.settle_late_ack(&rid, &peer, &peer_machine()).await);
+    assert_eq!(after.snapshot().await.len(), 1, "still held");
+    let transport = ScriptedTransport::default();
+    after.step(at(NOW, 0), &unknown, &transport).await;
+    assert_eq!(transport.calls(), 1, "sent again, not settled by the ACK");
+    assert_eq!(status(&after, peer, &rid).await.status, "delivered");
+}
+
+/// WHY: #2007 the pinned machines survive the sidecar round trip, and a
+/// malformed machine fails the file like any malformed record.
+#[test]
+fn issue2007_attempt_machines_round_trip_the_sidecar() {
+    let rid = [0x5a; 16];
+    let recipient = hex::encode([2u8; 32]);
+    let mut ledger = TerminalLedger::default();
+    ledger.note_attempt(rid, &recipient, [7; 32], NOW);
+    ledger.note_machine(&rid, peer_machine());
+    let bytes = serde_json::to_vec(&ledger.to_file()).expect("encode");
+    let loaded = TerminalLedger::from_bytes(&bytes, NOW).expect("decode");
+    assert_eq!(
+        loaded.only_attempted(&rid, &recipient, &peer_machine()),
+        Some([7; 32])
+    );
+    assert_eq!(
+        loaded.only_attempted(&rid, &recipient, &MachineId([0xb3; 32])),
+        None
+    );
+
+    let bad = serde_json::json!({
+        "version": 1,
+        "attempts": [{
+            "request_id": hex::encode(rid),
+            "recipient": recipient,
+            "digests": [hex::encode([7u8; 32])],
+            "machines": ["not hex"],
+            "last_ms": NOW,
+        }],
+    });
+    let bad = serde_json::to_vec(&bad).expect("encode");
+    assert!(TerminalLedger::from_bytes(&bad, NOW).is_err());
+}
+
+/// WHY: #2007 each of the first `DIRECT_SEND_ATTEMPT_MACHINES_CAP` pinned
+/// machines can settle, a machine past the cap cannot, and a sidecar
+/// naming more machines than the cap fails to load.
+#[test]
+fn issue2007_attempt_machines_are_capped() {
+    let rid = [0x5b; 16];
+    let recipient = hex::encode([2u8; 32]);
+    let machines: Vec<MachineId> = (0..=DIRECT_SEND_ATTEMPT_MACHINES_CAP)
+        .map(|i| MachineId([0xc0 + i as u8; 32]))
+        .collect();
+    let mut ledger = TerminalLedger::default();
+    ledger.note_attempt(rid, &recipient, [7; 32], NOW);
+    for machine in &machines {
+        ledger.note_machine(&rid, *machine);
+    }
+    let bytes = serde_json::to_vec(&ledger.to_file()).expect("encode");
+    let loaded = TerminalLedger::from_bytes(&bytes, NOW).expect("decode");
+    let (kept, past_cap) = machines.split_at(DIRECT_SEND_ATTEMPT_MACHINES_CAP);
+    for machine in kept {
+        assert_eq!(
+            loaded.only_attempted(&rid, &recipient, machine),
+            Some([7; 32])
+        );
+    }
+    assert_eq!(loaded.only_attempted(&rid, &recipient, &past_cap[0]), None);
+
+    let over = serde_json::json!({
+        "version": 1,
+        "attempts": [{
+            "request_id": hex::encode(rid),
+            "recipient": recipient,
+            "digests": [hex::encode([7u8; 32])],
+            "machines": machines.iter().map(|m| hex::encode(m.0)).collect::<Vec<_>>(),
+            "last_ms": NOW,
+        }],
+    });
+    let over = serde_json::to_vec(&over).expect("encode");
+    assert!(TerminalLedger::from_bytes(&over, NOW).is_err());
 }
