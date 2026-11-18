@@ -117,6 +117,12 @@ M2 prepare producer (amendment of 18 Nov 2026, #2012). This applies the prepared
 
 It writes the journal only into a participant data root that passes the launcher issuer's root check. Staging and every later phase require the host lock (the CLI-then-daemon install locks) by type. Under it, staging refuses an in-flight journal, so of two concurrent runs the second is refused. Each later phase first re-reads the journal and refuses one that is not exactly the record the run last wrote. A swap phase is recorded only after the swapped target and backup hash to the planned candidate and previous release. The running daemon's own participant entry takes its canonical executable, pid, process start and boot from the same functions the arm handler compares against. The arm handler, not the producer, refuses another boot, pid or host. It compares the canonical running executable, so a daemon started through a symlink is not refused. A launcher-managed participant may use the `SupervisedExit` restart mode: the old daemon exits, the manager starts the launcher, and the launcher owns the trial from `SwappedCli`. The arm handler still refuses `LauncherChild`, so the producer does not use it. Wiring the producer into the apply path is separate work, coordinated with the apply-route owner. Authority: Claude under David's delegation, 10 Nov 2026.
 
+Host lock for the arm restore and lock adoption (amendment of 18 Nov 2026, #2065 review).
+- **The arm handler's restore.** It writes the journal and restores the swapped pair only under the host lock. It waits for the lock at most 5 s, because the arming caller may hold it while it waits for the reply. Past the wait it changes nothing, and the launcher's recovery restores the pair.
+- **The producer.** It adopts install locks that its caller already holds, after it checks that each file is the plan pair's lock file and holds its lock, instead of taking them again.
+
+Authority: Claude under David's delegation, 10 Nov 2026.
+
 ## Consequences
 
 Updates can be checked and recovered under owner policy. Independent rollback and exact artifact evidence add release work. A successful publication alone cannot prove that deployed devices are healthy.

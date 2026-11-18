@@ -581,6 +581,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **The arm handler's restore takes the host lock (#2012, #2065 review;
+  A14 amendment of 18 Nov 2026).** `restore_arm` now writes the journal
+  and restores the swapped pair under the host lock, with a bounded 5 s
+  wait. The prepare producer can adopt install locks its caller already
+  holds. The test profile builds `sha2` at opt-level 3.
 - **Groups (H-S3-r, studio1 train 60):** a joiner whose join seal was not
   served now keeps its group record and its `readmission_required
   {base_beyond_retention}` after the join attempt times out. Before, a stub

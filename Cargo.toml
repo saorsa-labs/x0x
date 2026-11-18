@@ -230,6 +230,12 @@ opt-level = 3
 [profile.test.package.ant-quic]
 opt-level = 3
 
+# The prepare round-trip tests (#2012) hash the test binary itself (the
+# running executable is the plan's daemon); unoptimised SHA-256 takes
+# minutes on a 500 MB debug binary.
+[profile.test.package.sha2]
+opt-level = 3
+
 # The #703 job uses a separate profile so its build-memory limits do not
 # affect ordinary tests or release binaries.
 [profile.signing-acceptance]

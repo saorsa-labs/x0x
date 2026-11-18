@@ -443,6 +443,18 @@ launcher's `Host::new` and the arm handler read. No apply path calls it yet.
   compares against. The entry also holds the process environment without
   `X0X_M2_BOOT_FD`, since the launcher starts the candidate with exactly
   that environment.
+- **Taking the host lock.** `HostLock::adopt` takes over the install
+  locks that a caller already holds, as the apply path takes them with
+  `acquire_host_upgrade_lock`, so the producer never waits on its own
+  caller. It checks that each file is the plan pair's lock file and that
+  it holds the lock. `HostLock::acquire_within` gives up after a bounded
+  wait and never holds one lock while it waits for the other.
+- **The arm handler's restore.** `restore_arm` (a refused or failed arm)
+  writes the journal and restores the swapped pair under the host lock.
+  It waits at most 5 s for it, because the arming caller may hold it
+  while it waits for the reply. Past the wait it changes nothing, and the
+  launcher's recovery, which takes the lock, restores the pair. A caller
+  that arms an old daemon should release the host lock first.
 - **Which side checks what.** The producer checks only that a running
   participant has a pid and a process start. The arm handler
   (`server::upgrade_flush::admit`) refuses a journal whose participant

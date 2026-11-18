@@ -612,6 +612,10 @@ fn arm(state: &ControlContext, root: &Path, bytes: &[u8]) -> Result<ArmedFlush, 
 
 /// This call owns admission until recovery finishes. Mark rollback before
 /// touching installed bytes, so a partial restore can never admit a retry.
+/// How long the arm handler's restore waits for the host lock.
+#[cfg(unix)]
+const RESTORE_LOCK_WAIT: Duration = Duration::from_secs(5);
+
 fn restore_arm(
     root: &Path,
     mut record: journal::JournalRecord,
@@ -621,6 +625,14 @@ fn restore_arm(
     cause: journal::Cause,
 ) -> io::Result<()> {
     let journal_path = root.join(journal::JOURNAL_FILE_NAME);
+    // The journal writes and the binary restore below are transaction
+    // changes, so they run under the host lock (#2065 review). The arming
+    // caller may still hold it while it waits for this reply, so the wait
+    // is bounded: past it, nothing is changed and the launcher's recovery
+    // (which takes the lock) restores the pair.
+    #[cfg(unix)]
+    let _host_lock =
+        crate::upgrade::prepare::HostLock::acquire_within(&record.plan, RESTORE_LOCK_WAIT)?;
     let journal::RecordRead::Journal(current) = journal::read_boot_records(root).journal else {
         return Err(io::Error::other("arm recovery journal unavailable"));
     };
@@ -1577,6 +1589,8 @@ mod prepare_round_trip {
         ] {
             prepared_journal.advance(&lock, phase).expect("advance");
         }
+        drop(lock);
+        remove_exe_lock();
         let request = serde_json::to_vec(&serde_json::json!({
             "token": TOKEN,
             "transaction_id": "tx-round-trip",
@@ -1586,6 +1600,19 @@ mod prepare_round_trip {
         }))
         .expect("request");
         (dir, root, identity, request)
+    }
+
+    /// The daemon target is this test binary, so taking the host lock
+    /// creates `<test binary>.upgrade.lock` beside it; remove it (#2065
+    /// review). Production never removes a lock file.
+    fn remove_exe_lock() {
+        let mut lock = crate::upgrade::apply::current_binary_path()
+            .expect("exe")
+            .canonicalize()
+            .expect("canonical")
+            .into_os_string();
+        lock.push(".upgrade.lock");
+        let _ = std::fs::remove_file(lock);
     }
 
     fn state(identity_root: PathBuf) -> ControlContext {
@@ -1616,5 +1643,42 @@ mod prepare_round_trip {
         let (dir, root, _identity, request) = prepared(|_| {});
         let other_host = dir.path().canonicalize().expect("canonical");
         assert!(admit(&state(other_host), &root, &request).is_err(), "host");
+    }
+
+    /// #2065 review: the arm handler's restore runs under the host lock. While
+    /// another holder (the arming caller) has it, the restore gives up after
+    /// its bounded wait and changes nothing; once it is free, the restore
+    /// completes and archives the journal.
+    #[test]
+    fn the_arm_restore_takes_the_host_lock() {
+        let (_dir, root, _identity, _request) = prepared(|_| {});
+        let journal::RecordRead::Journal(record) = journal::read_boot_records(&root).journal else {
+            panic!("no prepared journal");
+        };
+        let handoff = journal::M2HandoffRecord {
+            schema_version: journal::SCHEMA_VERSION,
+            record_kind: "handoff".into(),
+            transaction_id: record.transaction_id.clone(),
+            generation: record.generation,
+            instance_id: "alice".into(),
+            legacy: std::collections::BTreeMap::new(),
+        };
+        let cause = || journal::Cause {
+            class: journal::CauseClass::Interrupted,
+            reason: "test".into(),
+        };
+        let held = HostLock::acquire(&record.plan).expect("host lock");
+        let refused = restore_arm(&root, (*record).clone(), &handoff, false, &[], cause())
+            .expect_err("restore under another holder's lock");
+        assert_eq!(refused.kind(), io::ErrorKind::WouldBlock);
+        let journal::RecordRead::Journal(unchanged) = journal::read_boot_records(&root).journal
+        else {
+            panic!("the journal was moved");
+        };
+        assert_eq!(unchanged.phase, journal::Phase::SwappedCli);
+        drop(held);
+        restore_arm(&root, (*record).clone(), &handoff, false, &[], cause()).expect("restore");
+        assert!(!root.join(journal::JOURNAL_FILE_NAME).exists());
+        remove_exe_lock();
     }
 }

@@ -250,6 +250,66 @@ impl HostLock {
     /// Take the host lock for `plan`'s install pair; waits for a holder.
     #[cfg(unix)]
     pub(crate) fn acquire(plan: &FrozenPlan) -> io::Result<Self> {
+        let [cli, daemon] = Self::open(plan)?;
+        cli.lock()?;
+        daemon.lock()?;
+        Ok(Self::held(plan, cli, daemon))
+    }
+
+    /// As `acquire`, but give up after `wait` (#2065 review): a caller that
+    /// may run while another holder waits on it (the arm handler's
+    /// restore, while the arming caller waits for its reply) must not
+    /// block for ever. Never holds one lock while it waits for the other.
+    #[cfg(unix)]
+    pub(crate) fn acquire_within(plan: &FrozenPlan, wait: std::time::Duration) -> io::Result<Self> {
+        let deadline = std::time::Instant::now() + wait;
+        let [cli, daemon] = Self::open(plan)?;
+        loop {
+            if try_lock(&cli)? {
+                if try_lock(&daemon)? {
+                    return Ok(Self::held(plan, cli, daemon));
+                }
+                cli.unlock()?;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "the host lock is held by another holder",
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// Adopt the host lock that the caller already holds (#2065 review):
+    /// the two install lock files the apply path took with
+    /// `acquire_host_upgrade_lock`, so taking them again cannot deadlock
+    /// the caller. Each file must be the lock file of `plan`'s pair (same
+    /// file) and hold its lock (a `try_lock` on the caller's own open file
+    /// succeeds; another holder's lock makes it fail).
+    #[cfg(unix)]
+    pub(crate) fn adopt(
+        plan: &FrozenPlan,
+        cli: std::fs::File,
+        daemon: std::fs::File,
+    ) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let [expected_cli, expected_daemon] = Self::open(plan)?;
+        for (held, expected) in [(&cli, &expected_cli), (&daemon, &expected_daemon)] {
+            let (a, b) = (held.metadata()?, expected.metadata()?);
+            if a.dev() != b.dev() || a.ino() != b.ino() {
+                return Err(refused("an adopted lock is not this install pair's lock"));
+            }
+            if !try_lock(held)? {
+                return Err(refused("an adopted lock is held by another holder"));
+            }
+        }
+        Ok(Self::held(plan, cli, daemon))
+    }
+
+    /// The two install lock files of `plan`'s pair, opened, not locked.
+    #[cfg(unix)]
+    fn open(plan: &FrozenPlan) -> io::Result<[std::fs::File; 2]> {
         use std::os::unix::fs::MetadataExt;
         let cli = lock_file(&plan.cli.target_path)?;
         let daemon = lock_file(&plan.daemon.target_path)?;
@@ -257,13 +317,15 @@ impl HostLock {
         if a.dev() == b.dev() && a.ino() == b.ino() {
             return Err(refused("install locks alias"));
         }
-        cli.lock()?;
-        daemon.lock()?;
-        Ok(Self {
+        Ok([cli, daemon])
+    }
+
+    fn held(plan: &FrozenPlan, cli: std::fs::File, daemon: std::fs::File) -> Self {
+        Self {
             cli: plan.cli.target_path.clone(),
             daemon: plan.daemon.target_path.clone(),
             _files: [cli, daemon],
-        })
+        }
     }
 
     /// This lock is the host lock of `plan`'s install pair.
@@ -272,6 +334,16 @@ impl HostLock {
             return Err(refused("the host lock is for another install pair"));
         }
         Ok(())
+    }
+}
+
+/// `true` when this open file now holds its lock, `false` when another
+/// holder has it.
+fn try_lock(file: &std::fs::File) -> io::Result<bool> {
+    match file.try_lock() {
+        Ok(()) => Ok(true),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
     }
 }
 
@@ -643,6 +715,36 @@ pub(crate) mod tests {
             panic!("the journal does not read back");
         };
         assert_eq!(read.transaction_id, "tx-first");
+    }
+
+    /// #2065 review: a caller that already holds the install locks (as
+    /// the apply path takes them) adopts them instead of taking them again;
+    /// a lock another holder has, or another pair's file, is refused.
+    #[test]
+    fn a_held_host_lock_is_adopted_not_taken_again() {
+        let (_dir, root) = root();
+        let plan = freeze_plan(input_in(&root)).unwrap();
+        let [cli, daemon] = HostLock::open(&plan).unwrap();
+        cli.lock().unwrap();
+        daemon.lock().unwrap();
+        let adopted = HostLock::adopt(&plan, cli, daemon).unwrap();
+        Prepared::stage(&adopted, &root, "tx", plan.clone()).unwrap();
+        // While it is held, another holder's files cannot be adopted, and
+        // a bounded acquire gives up.
+        let [cli, daemon] = HostLock::open(&plan).unwrap();
+        assert!(HostLock::adopt(&plan, cli, daemon).is_err());
+        let waited = HostLock::acquire_within(&plan, std::time::Duration::from_millis(200));
+        assert_eq!(
+            waited.err().map(|error| error.kind()),
+            Some(io::ErrorKind::WouldBlock)
+        );
+        drop(adopted);
+        assert!(HostLock::acquire_within(&plan, std::time::Duration::from_millis(200)).is_ok());
+        // Another pair's lock file is not this pair's lock.
+        let (_other_dir, other_root) = super::tests::root();
+        let other = freeze_plan(input_in(&other_root)).unwrap();
+        let [cli, daemon] = HostLock::open(&other).unwrap();
+        assert!(HostLock::adopt(&plan, cli, daemon).is_err());
     }
 
     /// #2065 review: `advance` re-reads the journal under the lock and
