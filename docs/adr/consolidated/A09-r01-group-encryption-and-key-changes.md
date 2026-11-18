@@ -292,7 +292,11 @@ withholds delivery while this node holds the seat's verified
 revocation, so the seat gets neither the recovery frame nor the share
 that follows it. The seat's own S4 row performs the exclusion and the
 rekey: ADR 0110 §1 opens that row for every seated revoked target, and
-it commits under the admin the recovery seats. Every other failing seat
+it commits under the admin the recovery seats. Stated plainly: if the
+recovery commits at epoch e0+1, the revoked seat E keeps its leaf and a
+key envelope for e0+1 is built for it; only D60 egress withholding keeps
+E out, until E's own S4 row removes it and rekeys at e0+2. This is the
+same exposure as ADR-0038 B3. Every other failing seat
 keeps the all-clean refusal. A refused recovery seal that names failing
 members keeps a typed wait, `waiting_for_member_eviction`, naming them.
 A grace or digest-pending hold is not eviction work, so it never joins

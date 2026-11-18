@@ -805,7 +805,8 @@ jobs:
     # own group (`s3-rm2.1` and `s3-rm2.2`, 10 reruns each), H-S3-d2 has
     # `s3-d2`, H-S3-r has `s3-r` (its replay variant `s3-rr`), H-S3-q (1)
     # has `s3-q`, H-S3-q2 has `s3-q2`, and H-S3-q (3) has `s3-q3.1` and
-    # `s3-q3.2` (10 reruns each).
+    # `s3-q3.2` (10 reruns each). The #1973 S4 owner-recovery arm has
+    # `s4-1973`.
     # A group is omitted when the tree has no matching test.
     name: W3-H shard plan
     runs-on: ubuntu-latest
@@ -1243,7 +1244,7 @@ jobs:
           --require w3h_1581m_recovery_offline_promotee_commits_on_return
           --expect w3h_1581m_recovery_offline_promotee_commits_on_return=GREEN
           --require w3h_1581m_recovery_refuses_a_revoked_member
-          --expect w3h_1581m_recovery_refuses_a_revoked_member=RED
+          --expect w3h_1581m_recovery_refuses_a_revoked_member=GREEN
           --require w3h_1765_red_newer_file_revocation_waits_for_store_write
           --expect w3h_1765_red_newer_file_revocation_waits_for_store_write=GREEN
           --require w3h_1776_delayed_fresh_joiner_fetches_the_welcome
