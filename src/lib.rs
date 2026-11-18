@@ -4966,7 +4966,8 @@ impl AnnouncementAssistSnapshot {
         // #398 announcement honesty: relay/coordinator capability is only
         // advertised when OTHER nodes could plausibly reach us to use it.
         // `relay_service_enabled` merely says the local MASQUE server /
-        // coordination logic is running — every default daemon has that —
+        // coordination logic is running — only Full-mode daemons (or an
+        // explicit `relay_service_enabled = true`) do —
         // so gating on it alone made every NATed desktop advertise
         // is_coordinator=true / is_relay=true, and coordinator/relay
         // selection then picked nodes that cannot serve third parties.
