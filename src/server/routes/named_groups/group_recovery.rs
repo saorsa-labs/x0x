@@ -5194,10 +5194,15 @@ async fn next_target(
             };
         }
         // Only an empty list reaches here (#2022): no capable peer at all.
-        // Nothing was asked, so no round ends and `attempts` does not grow;
-        // the node asks at once when a capable peer appears. The round's
-        // state resets as `end_round` resets it, `cooled` included, since
-        // a `rate_limited` cooldown is for a target no longer listed.
+        // Nothing was asked, so no round ends and `attempts` does not grow.
+        // The node still waits one back-off at the current count before it
+        // looks again (it does not grow either): until then the tick stops
+        // at the retry check, so a typed wait set earlier in the tick
+        // (`segment_exhausted`, `renewal_due`) shows, as it did when this
+        // branch ended a round (H-S3-s). The round's state resets as
+        // `end_round` resets it, `cooled` included, since a `rate_limited`
+        // cooldown is for a target no longer listed.
+        subject.next_retry_at = now + s3::request_backoff(subject.attempts);
         subject.next_target = 0;
         subject.pending = None;
         subject.cooled = None;
@@ -20295,9 +20300,10 @@ mod tests {
 
     /// #2022 (from the review of #2021): with no capable peer at all the
     /// target list is empty. Nothing is asked, so no round ends: `attempts`
-    /// and the back-off stay as they are, and the view is
-    /// `awaiting_attestation {no_capable_peer}`. RED on main: each tick
-    /// called `end_round`, so `attempts` grew. Inert: an offline agent.
+    /// stays as it is, and each look waits the same back-off (it does not
+    /// grow); the view is `awaiting_attestation {no_capable_peer}`. RED on
+    /// main: each look called `end_round`, so `attempts` and the back-off
+    /// grew. Inert: an offline agent.
     #[tokio::test]
     async fn no_capable_peer_ends_no_round() -> anyhow::Result<()> {
         let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
@@ -20317,15 +20323,19 @@ mod tests {
                 .get(&stable)
                 .map(|subject| (subject.attempts, subject.next_retry_at))
         };
-        let before = attempts().await;
+        let attempts_before = attempts().await.map(|(count, _)| count);
         for step in 1..=3u64 {
             let later = start + s3::GATE_STALL + Duration::from_secs(step * 600);
             assert_eq!(
                 next_target(&state, &key, &info, &local, &[], later).await,
                 None
             );
+            assert_eq!(
+                attempts().await,
+                attempts_before.map(|count| (count, later + s3::request_backoff(count))),
+                "step {step}: no round ends and the back-off does not grow"
+            );
         }
-        assert_eq!(attempts().await, before, "no round ends");
         assert_eq!(view_of(&state, &stable).await, awaiting("no_capable_peer"));
         Ok(())
     }
