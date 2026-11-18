@@ -16,6 +16,17 @@ fn sorted_metadata(metadata: &HashMap<String, String>) -> Vec<(&String, &String)
     pairs
 }
 
+/// What [`KvEntry::merge_tracked`] changed.
+#[derive(Debug)]
+pub(crate) enum MergePrior {
+    /// Nothing changed.
+    Unchanged,
+    /// Only `created_at` moved; this is its earlier value.
+    CreatedAt(u64),
+    /// The other entry won; this is the entry as it was.
+    Replaced(KvEntry),
+}
+
 /// A single key-value entry in the store.
 ///
 /// Uses LWW (Last-Writer-Wins) semantics for conflict resolution:
@@ -107,20 +118,55 @@ impl KvEntry {
     /// the entry; a mark shows who signed the current bytes, and the
     /// absence of a valid mark shows nothing.
     pub fn merge(&mut self, other: &Self) {
+        let _ = self.merge_tracked(other);
+    }
+
+    /// [`Self::merge`], returning what it replaced so a caller can undo it
+    /// without copying the entry first.
+    pub(crate) fn merge_tracked(&mut self, other: &Self) -> MergePrior {
         let wins = other.lww_order() > self.lww_order();
-        if wins {
-            self.value = other.value.clone();
-            self.content_hash = other.content_hash;
-            self.content_type = other.content_type.clone();
-            self.metadata = other.metadata.clone();
-            self.updated_at = other.updated_at;
-        }
+        let created_at = self.created_at;
         // #1094 (review of #1974): `created_at` is the earliest of the two
         // whichever entry wins, so the merge is commutative on it too and
-        // every replica converges on the same value. Before, a losing
-        // entry's earlier `created_at` was dropped, so the result depended
-        // on arrival order.
-        self.created_at = self.created_at.min(other.created_at);
+        // every replica converges on the same value.
+        self.created_at = created_at.min(other.created_at);
+        if wins {
+            return MergePrior::Replaced(Self {
+                key: self.key.clone(),
+                value: std::mem::replace(&mut self.value, other.value.clone()),
+                content_hash: std::mem::replace(&mut self.content_hash, other.content_hash),
+                content_type: std::mem::replace(&mut self.content_type, other.content_type.clone()),
+                metadata: std::mem::replace(&mut self.metadata, other.metadata.clone()),
+                created_at,
+                updated_at: std::mem::replace(&mut self.updated_at, other.updated_at),
+            });
+        }
+        if self.created_at != created_at {
+            return MergePrior::CreatedAt(created_at);
+        }
+        MergePrior::Unchanged
+    }
+
+    /// The bincode length of this entry, computed from its field lengths
+    /// without walking the value bytes.
+    #[must_use]
+    pub(crate) fn wire_len(&self) -> u64 {
+        // String/Vec/map lengths are u64 prefixes; the hash is a fixed
+        // 32-byte array; the two timestamps are u64.
+        let metadata: usize = self
+            .metadata
+            .iter()
+            .map(|(k, v)| 16 + k.len() + v.len())
+            .sum();
+        (8 + self.key.len()
+            + 8
+            + self.value.len()
+            + 32
+            + 8
+            + self.content_type.len()
+            + 8
+            + metadata
+            + 16) as u64
     }
 
     /// The LWW order of this entry: `updated_at`, content hash, content

@@ -883,6 +883,8 @@ mod participation_diagnostics_tests {
                 "digest_beacons_sent",
                 "incoming_record_merges",
                 "incomplete_retained_images_pruned",
+                "refused_store_full_merges",
+                "refused_store_full_serves",
                 "rejected_authorization_version",
                 "rejected_cooldown",
                 "rejected_no_retained",

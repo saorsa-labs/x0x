@@ -34,7 +34,8 @@ HOME_PROVISIONING_PENDING = "provisioning_pending"
 # these names, and only integer values, ever enter a report.
 STATE_SYNC_COUNTERS = (
     "requests_sent", "request_seal_failed", "requests_received", "requests_answered",
-    "retained_pages_served", "incoming_record_merges", "rejected_verify",
+    "retained_pages_served", "refused_store_full_serves", "incoming_record_merges",
+    "refused_store_full_merges", "rejected_verify",
     "rejected_unauthorized_request", "rejected_unauthorized_control",
     "rejected_authorization_version", "rejected_cooldown", "rejected_no_retained",
     "rejected_other")
