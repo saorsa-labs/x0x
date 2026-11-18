@@ -110,11 +110,74 @@ pub struct LauncherRefusal {
     /// The refusing launcher's pid. On macOS it holds until a stop
     /// (launchd would restart an exit), so a live pid is a holding launcher.
     pub pid: u32,
+    /// The refusing launcher's start time ([`process_start`]). With `pid`
+    /// it names one process, so a reused pid is not read as a holding
+    /// launcher (#2019 review).
+    pub process_start: u64,
     /// When it refused, in milliseconds since the Unix epoch.
     pub at_unix_ms: u64,
 }
 
 pub const REFUSAL_SCHEMA: u32 = 1;
+
+/// The start time of process `pid`, fixed for the life of the process: on
+/// Linux the `starttime` field of `/proc/<pid>/stat` (clock ticks since
+/// boot), on macOS the libproc start time in microseconds since the epoch.
+/// With the pid and the boot it names one process.
+#[cfg(target_os = "linux")]
+pub fn process_start(pid: u32) -> std::io::Result<u64> {
+    let invalid = |what: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, what);
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    stat.rsplit_once(')')
+        .ok_or_else(|| invalid("bad process stat"))?
+        .1
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| invalid("missing process start"))?
+        .parse()
+        .map_err(|_| invalid("bad process start"))
+}
+
+/// See the Linux form. A zombie still has its start time.
+#[cfg(target_os = "macos")]
+pub fn process_start(pid: u32) -> std::io::Result<u64> {
+    let invalid = |what: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, what);
+    let raw_pid = i32::try_from(pid).map_err(|_| invalid("pid out of range"))?;
+    // SAFETY: proc_bsdinfo holds integers and fixed byte arrays; zero is a
+    // valid value for each field.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = i32::try_from(std::mem::size_of_val(&info)).map_err(|_| invalid("size"))?;
+    // SAFETY: proc_pidinfo writes at most `size` bytes into the owned,
+    // sized `info` buffer and reads only the arguments passed. The nonzero
+    // arg asks libproc for zombies too.
+    let received = unsafe {
+        libc::proc_pidinfo(
+            raw_pid,
+            libc::PROC_PIDTBSDINFO,
+            1,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if received == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if received != size || info.pbi_pid != pid {
+        return Err(invalid("incomplete process status"));
+    }
+    info.pbi_start_tvsec
+        .checked_mul(1_000_000)
+        .and_then(|micros| micros.checked_add(info.pbi_start_tvusec))
+        .ok_or_else(|| invalid("process start overflow"))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn process_start(_pid: u32) -> std::io::Result<u64> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "process start time requires Linux or macOS",
+    ))
+}
 
 #[cfg(test)]
 mod tests {
@@ -158,5 +221,21 @@ mod tests {
         ] {
             assert!(parse_launcher_argv(argv).is_err(), "{argv:?}");
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn process_start_names_one_process() {
+        let own = process_start(std::process::id()).unwrap();
+        assert_eq!(process_start(std::process::id()).unwrap(), own);
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let other = process_start(child.id()).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(process_start(child.id()).is_err());
+        assert!(other >= own);
     }
 }
