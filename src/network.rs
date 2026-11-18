@@ -6426,6 +6426,7 @@ impl NetworkNode {
         let plane_peers = Arc::clone(&self.plane_peers);
         let plane_cleared_at = Arc::clone(&self.plane_cleared_at);
         let node = Arc::clone(&self.node);
+        let bandwidth = Arc::clone(&self.bandwidth);
         let mut events = self.event_sender.subscribe();
 
         tokio::spawn(async move {
@@ -6459,7 +6460,12 @@ impl NetworkNode {
                             let node = node.read().await.as_ref().cloned();
                             if let Some(node) = node {
                                 for peer in pending {
-                                    let _ = node.send(&peer, &frame).await;
+                                    if node.send(&peer, &frame).await.is_ok() {
+                                        bandwidth.record_sent(
+                                            BandwidthKind::Other,
+                                            frame.len() as u64,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -6501,6 +6507,7 @@ impl NetworkNode {
                             &plane_peers,
                             &plane_cleared_at,
                             &node,
+                            &bandwidth,
                             peer_id,
                             false,
                         )
@@ -6518,6 +6525,7 @@ impl NetworkNode {
                             &plane_peers,
                             &plane_cleared_at,
                             &node,
+                            &bandwidth,
                             peer_id,
                             true,
                         )
@@ -8702,6 +8710,7 @@ async fn plane_note_connected(
     plane_peers: &Arc<Mutex<HashMap<AntPeerId, PlanePeerState>>>,
     plane_cleared_at: &Arc<Mutex<HashMap<AntPeerId, Instant>>>,
     node: &Arc<RwLock<Option<LinkNode>>>,
+    bandwidth: &Arc<BandwidthCounters>,
     peer_id: [u8; 32],
     reset: bool,
 ) {
@@ -8762,16 +8771,18 @@ async fn plane_note_connected(
     }
     let frame = build_plane_hello_frame(plane_id);
     let node = Arc::clone(node);
+    let bandwidth = Arc::clone(bandwidth);
     tokio::spawn(async move {
         let node = node.read().await.as_ref().cloned();
         if let Some(node) = node {
-            if let Err(e) = node.send(&peer, &frame).await {
-                tracing::debug!(
+            match node.send(&peer, &frame).await {
+                Ok(()) => bandwidth.record_sent(BandwidthKind::Other, frame.len() as u64),
+                Err(e) => tracing::debug!(
                     target: "x0x::connect",
                     peer_id_prefix = %hex_prefix(&peer.0, 4),
                     error = %e,
                     "plane hello send failed"
-                );
+                ),
             }
         }
     });
@@ -10010,7 +10021,7 @@ mod tests {
     /// both nodes' counters by the exact framed length, under the right
     /// kinds, with the receiving side metered at the wire edge no matter
     /// what the downstream parse does with the payload.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn bandwidth_counters_track_frames_over_the_sim_fabric() {
         let plane = "issue1964-bandwidth-meter";
         let fabric = sim::SimFabric::new(1964);
@@ -10096,7 +10107,7 @@ mod tests {
     /// only after the write succeeds. A refused admission sends no bytes
     /// and counts none; an admitted frame counts its framed length once on
     /// the sender and once at the receiver's demux.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn bandwidth_guarded_gossip_send_counts_only_written_frames() {
         let plane = "issue1964-bandwidth-guarded";
         let fabric = sim::SimFabric::new(19641);
@@ -10168,6 +10179,70 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn bandwidth_meters_sent_plane_hellos_as_other() {
+        let plane = "issue1964-bandwidth-hello";
+        let fabric = sim::SimFabric::new(19642);
+        sim::register(plane, &fabric);
+        let config = |host: u8| NetworkConfig {
+            bind_addr: Some(SocketAddr::from(([198, 18, 0, host], 5483))),
+            network_id: Some(plane.to_string()),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..NetworkConfig::default()
+        };
+        let a = NetworkNode::new(config(1), None, None).await.unwrap();
+        let b = NetworkNode::new(config(2), None, None).await.unwrap();
+        assert_eq!(a.bandwidth_usage().sent_bytes.other, 0);
+        a.connect_addr(SocketAddr::from(([198, 18, 0, 2], 5483)))
+            .await
+            .unwrap();
+
+        let hello = u64::try_from(build_plane_hello_frame(plane).len()).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let sent = a.bandwidth_usage().sent_bytes.other;
+            let received = b.bandwidth_usage().received_bytes.other;
+            if sent >= hello && received >= hello {
+                assert_eq!(sent % hello, 0, "only whole hello frames are counted");
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "plane hello not metered: a sent {sent} other bytes, b received {received}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[test]
+    fn bandwidth_kind_follows_the_frame_type_byte() {
+        for lane in [
+            saorsa_gossip_transport::GossipStreamType::PubSub,
+            saorsa_gossip_transport::GossipStreamType::Membership,
+            saorsa_gossip_transport::GossipStreamType::Bulk,
+        ] {
+            assert_eq!(
+                bandwidth_kind_from_type_byte(lane.to_byte()),
+                BandwidthKind::Gossip
+            );
+        }
+        assert_eq!(
+            bandwidth_kind_from_type_byte(DIRECT_MESSAGE_STREAM_TYPE),
+            BandwidthKind::Direct
+        );
+        assert_eq!(
+            bandwidth_kind_from_type_byte(RELAYED_DM_STREAM_TYPE),
+            BandwidthKind::Relay
+        );
+        assert_eq!(
+            bandwidth_kind_from_type_byte(PLANE_HELLO_STREAM_TYPE),
+            BandwidthKind::Other
+        );
+        assert_eq!(bandwidth_kind_from_type_byte(0xEE), BandwidthKind::Other);
     }
 
     // #1380 RC5 -----------------------------------------------------------
@@ -10568,6 +10643,7 @@ mod tests {
             &a.plane_peers,
             &a.plane_cleared_at,
             &a.node,
+            &a.bandwidth,
             peer_b.0,
             false,
         )
