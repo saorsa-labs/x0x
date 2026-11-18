@@ -470,21 +470,13 @@ fn check_permit(permit: &Permit, observed: &Observed, version: &str) -> io::Resu
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+/// One process: its pid, its start time (`contract::process_start`) and
+/// the boot.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) fn identity(pid: u32) -> io::Result<Identity> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
-    let start = stat
-        .rsplit_once(')')
-        .ok_or_else(|| invalid("bad process stat"))?
-        .1
-        .split_whitespace()
-        .nth(19)
-        .ok_or_else(|| invalid("missing process start"))?
-        .parse()
-        .map_err(invalid)?;
     Ok(Identity {
         pid,
-        start,
+        start: super::contract::process_start(pid)?,
         boot: Clock::now()?.boot,
     })
 }
@@ -517,24 +509,6 @@ fn bsd_info(pid: u32) -> io::Result<libc::proc_bsdinfo> {
         return Err(invalid("incomplete process status"));
     }
     Ok(info)
-}
-
-/// macOS (#1379): the process start time in microseconds since the epoch,
-/// from libproc. It stays fixed for the life of the process, zombie
-/// included, so with the PID and boot it names one process.
-#[cfg(target_os = "macos")]
-pub(super) fn identity(pid: u32) -> io::Result<Identity> {
-    let info = bsd_info(pid)?;
-    let start = info
-        .pbi_start_tvsec
-        .checked_mul(1_000_000)
-        .and_then(|micros| micros.checked_add(info.pbi_start_tvusec))
-        .ok_or_else(|| invalid("process start overflow"))?;
-    Ok(Identity {
-        pid,
-        start,
-        boot: Clock::now()?.boot,
-    })
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]

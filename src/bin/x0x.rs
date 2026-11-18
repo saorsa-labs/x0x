@@ -87,6 +87,10 @@ enum Commands {
         /// upgrade contract (ADR-0061) instead of installing a new job.
         #[arg(long)]
         repair: bool,
+        /// Run the daemon through the stable launcher installed next to
+        /// x0xd (launchd only; opt-in while the launcher is dormant). [dev]
+        #[arg(long, hide = true, conflicts_with_all = ["remove", "repair"])]
+        launcher: bool,
     },
     /// Health check.
     Health,
@@ -2438,13 +2442,17 @@ async fn run(
         Commands::Start { config, foreground } => {
             return commands::daemon::start(name, config.as_deref(), *foreground).await;
         }
-        Commands::Autostart { remove, repair } => {
+        Commands::Autostart {
+            remove,
+            repair,
+            launcher,
+        } => {
             return if *remove {
                 commands::daemon::autostart_remove().await
             } else if *repair {
                 commands::daemon::autostart_repair().await
             } else {
-                commands::daemon::autostart(name).await
+                commands::daemon::autostart(name, *launcher).await
             };
         }
         Commands::Identity {
