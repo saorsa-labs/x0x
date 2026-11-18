@@ -59,8 +59,10 @@ enum TaskListSyncMessage {
     StateRequest {
         requester: PeerId,
     },
-    /// Sent only by a non-empty holder: under this unverifiable marker two empty
-    /// replicas would talk each other into a false "converged empty".
+    /// Sent only by a non-empty holder: a delta arriving is not convergence
+    /// evidence — mere local non-emptiness must not silence recovery (#238).
+    /// Under this unverifiable marker two empty replicas would talk each other
+    /// into a false "converged empty".
     ///
     /// Wire compatibility: additive variant — older peers fail to
     /// deserialize it and skip the message (same precedent as the kv-store
@@ -68,6 +70,11 @@ enum TaskListSyncMessage {
     StateServed {
         responder: PeerId,
     },
+    /// #240: empty holders declare the empty-set digest; two empty replicas
+    /// can verify agreement on that digest, so converging on empty is
+    /// correct here — not the false convergence the v1 unverifiable marker
+    /// defended against.
+    ///
     /// Wire compatibility: additive variant, same precedent as the v1
     /// marker — older peers fail to deserialize it and skip the message;
     /// new peers treat v1 markers as weaker evidence when no v2 digest has
@@ -80,6 +87,7 @@ enum TaskListSyncMessage {
     },
 }
 
+/// #1604: main-era bytes of every `TaskListSyncMessage` variant still decode.
 #[cfg(test)]
 #[test]
 fn task_list_sync_message_wire_matches_main() {
@@ -916,6 +924,7 @@ pub(crate) async fn drain_quarantine_buffer(
 pub mod testing {
     use super::*;
 
+    /// Per-instance, never a `static`: a global would couple concurrently running tests.
     pub type Buffer = std::sync::Mutex<QuarantineDeltaBuffer>;
 
     pub async fn admit_or_buffer<'a>(

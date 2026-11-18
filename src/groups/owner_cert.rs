@@ -148,7 +148,8 @@ impl OwnerCertVerdict {
 pub struct OwnerCertEvidence {
     certs: HashMap<String, AgentCertificate>,
     /// The digest each agent's latest announce committed to. A digest with
-    /// no `certs` entry means a fetch is outstanding.
+    /// no `certs` entry means a fetch is outstanding; a stale embedded cert
+    /// whose digest differs from this must not seat the member.
     digests: HashMap<String, [u8; 32]>,
     revoked: HashSet<String>,
     /// ADR 0108 §4: agents whose anonymous digest came from their bound

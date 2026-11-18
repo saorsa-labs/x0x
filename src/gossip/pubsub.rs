@@ -33,6 +33,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 
+/// Matches the X0X-0073 cooling floor: one warn per group per cooldown (#296).
 pub(crate) const ZERO_FANOUT_WARN_WINDOW: Duration = Duration::from_secs(30);
 
 /// ant-quic accepts a 4 MiB application stream; x0x prepends one type byte.
