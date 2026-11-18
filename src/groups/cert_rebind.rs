@@ -446,12 +446,8 @@ pub fn validate_against_parent(
     if is_revoked(&body.signer) || (!signer_is_admin && body.signer != body.seat) {
         return Err(CertificateRebindRefusal::SignerIneligible);
     }
-    // "An eligible current admin" (§2, §4a): an admin that rebinds another
-    // seat must hold a selected certificate that is not expired on this
-    // node's clock (`not_after + τ`, §1a). The seat's own agent signs under
-    // the §4 named exception instead, which is how an expired admin renews
-    // itself (§4b(2)). Missing bytes do not refuse here, as for the local
-    // committer rule: the digest check below still binds the seat.
+    // Missing certificate bytes do not refuse here: the digest check below
+    // still binds the seat.
     if body.signer != body.seat
         && parent
             .members_v2
@@ -642,8 +638,6 @@ pub fn validate_sibling(
             .get(id)
             .and_then(committed_certificate)
             .filter(|cert| Some(&owner_cert::certificate_digest_hex(cert)) == digest)
-            // #1650: this node's own branch may have displaced the parent
-            // certificate; the retained copy verifies the sibling.
             .or_else(|| {
                 current
                     .displaced_certificates
@@ -755,11 +749,8 @@ pub struct RetainedCertificate {
     pub retained_seq: u64,
 }
 
-/// Retain `cert` as the parent evidence a later sibling rebind is checked
-/// against (#1650, ADR 0110 §4a), keyed by the digest the parent roster
-/// signed. The entry takes the newest `retained_seq`, so the cap
-/// enforcement below can never evict it — the next competing sibling
-/// needs exactly the certificate just displaced.
+/// The entry takes the newest `retained_seq`, so the cap cannot evict it:
+/// the next competing sibling needs this certificate.
 fn retain_displaced_certificate(info: &mut GroupInfo, cert: AgentCertificate) {
     let retained = owner_cert::certificate_digest_hex(&cert);
     let retained_seq = info
@@ -850,8 +841,6 @@ pub fn apply_to_parent(
         current_revision: parent.state_revision,
         current_withdrawn: parent.withdrawn,
         members_v2: &parent.members_v2,
-        // #1578 rc11 (Claude blocking 1, audit): the join's key-only
-        // marker row is not a seat for the authority check either.
         join_seat_marker_agents: parent.join_seat_key_marker_agents(),
         group_id: parent.stable_group_id(),
     };
@@ -922,13 +911,8 @@ pub fn is_self_rebind_link(
     link: &BTreeMap<String, RosterMemberSnapshot>,
     committer: &str,
 ) -> bool {
-    // #646 r5 blocker 2: a joiner seeded from a FETCHED (v6) base roster
-    // holds no `treekem_key_package_hash` anchors — the roster root does
-    // not cover them, so the fetch strips them. A local anchor of `None`
-    // therefore says "unknown", not "no package": the hash is compared
-    // only when the LOCAL (predecessor) side holds one, or a valid D129
-    // self-rebind from an anchored committer would be misread as an
-    // admin action and refused on every v6 joiner.
+    // A local anchor of `None` means unknown, not "no package": a fetched
+    // (v6) base roster carries no KeyPackage hashes.
     let anchor_matches = |before: &RosterMemberSnapshot, after: &RosterMemberSnapshot| {
         before.treekem_key_package_hash.is_none()
             || before.treekem_key_package_hash == after.treekem_key_package_hash
@@ -986,8 +970,6 @@ mod tests {
         hex::encode(agent.agent_id().as_bytes())
     }
 
-    /// An `OwnerCertified` group with admin `admin` and member `member`,
-    /// each seated with a committed certificate expiring at `NOW + 600`.
     fn fixture() -> Fixture {
         let owner = UserKeypair::generate().expect("user keypair");
         let admin = agent();
@@ -1061,7 +1043,6 @@ mod tests {
             validate_against_parent(&decoded.body, &f.info, NOW, |_| false).expect("valid");
         assert_eq!(signer, RebindSigner::Admin);
         let next = apply_to_parent(&f.info, &decoded.body, signer, cert).expect("apply");
-        // Only the seat's certificate and digest changed.
         let before = &f.info.members_v2[&hex_of(&f.member)];
         let after = &next.members_v2[&hex_of(&f.member)];
         assert_eq!(before.role, after.role);
@@ -1149,20 +1130,15 @@ mod tests {
         );
     }
 
-    /// §2/§4a "an eligible current admin": an admin whose own selected
-    /// certificate expired on the receiver's clock (`not_after + τ`) may not
-    /// rebind another seat. It may still rebind its own seat (§4b(2)).
     #[test]
     fn expired_admin_cannot_rebind_another_seat_but_can_rebind_itself() {
         let f = fixture();
-        // The fixture's admin certificate expires at NOW + 600.
         let after_expiry = NOW + 600 + EXPIRY_TOLERANCE_SECS + 1;
         let other = rebind(&f, &f.admin, &f.member, Some(NOW + 60_000));
         assert_eq!(
             validate_against_parent(&other.body, &f.info, after_expiry, |_| false).err(),
             Some(CertificateRebindRefusal::SignerIneligible)
         );
-        // Within τ of `not_after` the admin is still eligible.
         validate_against_parent(&other.body, &f.info, NOW + 600, |_| false)
             .expect("within tolerance");
         let own = rebind(&f, &f.admin, &f.admin, Some(NOW + 60_000));
@@ -1249,8 +1225,6 @@ mod tests {
     #[test]
     fn expired_renewal_is_invalid() {
         let f = fixture();
-        // A self-rebind: at `late` the admin's own certificate has expired
-        // too, which would refuse an admin signer first.
         let frame = rebind(&f, &f.member, &f.member, Some(NOW + 6000));
         let late = NOW + 6000 + EXPIRY_TOLERANCE_SECS + 1;
         assert_eq!(
@@ -1327,7 +1301,6 @@ mod tests {
     #[test]
     fn commit_that_changes_more_than_the_certificate_fails_apply() {
         let f = fixture();
-        // An admin seals a role change and presents it as a rebind.
         let renewal = cert(&f.owner, &f.member, Some(NOW + 6000));
         let mut next = f.info.clone();
         install_certificate(&mut next, &hex_of(&f.member), renewal.clone());
@@ -1428,27 +1401,19 @@ mod tests {
         let mut rebound = before.clone();
         rebound.insert("b".to_string(), snapshot(GroupRole::Member, Some("d2")));
         assert!(is_self_rebind_link(&before, &rebound, "b"));
-        // Another member's digest may not change.
         assert!(!is_self_rebind_link(&before, &rebound, "a"));
-        // A role change is not a rebind.
         let mut promoted = rebound.clone();
         promoted.insert("b".to_string(), snapshot(GroupRole::Admin, Some("d2")));
         assert!(!is_self_rebind_link(&before, &promoted, "b"));
-        // Nothing else may change.
         let mut other = rebound.clone();
         other.insert("a".to_string(), snapshot(GroupRole::Admin, Some("dx")));
         assert!(!is_self_rebind_link(&before, &other, "b"));
         let mut added = rebound.clone();
         added.insert("c".to_string(), snapshot(GroupRole::Member, None));
         assert!(!is_self_rebind_link(&before, &added, "b"));
-        // An unchanged digest is not a rebind.
         assert!(!is_self_rebind_link(&before, &before, "b"));
     }
 
-    /// A retained parent (the admin renews its own certificate) and this
-    /// node's head on it, where `own_seat`'s certificate was replaced by a
-    /// valid rebind (#1533 r11 Codex P1). The displaced parent certificate
-    /// is retained (#1650), so the sibling checks still read it.
     fn own_branch_replaced(f: &Fixture, own_seat: &AgentKeypair) -> (GroupInfo, GroupInfo) {
         let admin_renewal = cert(&f.owner, &f.admin, Some(NOW + 700));
         let (parent, _) = seal(
@@ -1478,11 +1443,6 @@ mod tests {
         (parent, current)
     }
 
-    /// #1650: two valid self-rebinds of one seat on one parent. A node
-    /// that applied either sibling retains the displaced parent
-    /// certificate, so the other sibling is fully verified: fork evidence
-    /// on every node (ADR 0110 §4a `waiting_for_fork_resolution`), not
-    /// `CertificateEvidenceMissing`.
     #[test]
     fn two_valid_same_seat_siblings_are_fork_evidence_whichever_installs() {
         let f = fixture();
@@ -1528,12 +1488,6 @@ mod tests {
         }
     }
 
-    /// #1650 review P2: a wholesale roster replacement (the SignedPublic
-    /// catch-up install) retains the parent bytes it displaces, and only
-    /// those — a seat whose committed digest is unchanged retains
-    /// nothing. The wired path is
-    /// `catchup_retains_displaced_parent_evidence_for_a_competing_sibling`
-    /// in the route tests.
     #[test]
     fn roster_replacement_retains_the_displaced_parent_bytes() {
         let f = fixture();
@@ -1544,9 +1498,6 @@ mod tests {
                 .as_ref()
                 .expect("the parent holds the member certificate"),
         );
-        // The winner's roster: the same seats, the member's certificate
-        // replaced, and no retained evidence of its own — a sanitized
-        // snapshot never carries the winner's local map.
         let winner_renewal = cert(&f.owner, &f.member, Some(NOW + 7000));
         let mut winner = parent.clone();
         winner.displaced_certificates.clear();
@@ -1568,12 +1519,6 @@ mod tests {
         );
     }
 
-    /// #1650: the retained displaced history stays bounded. Each further
-    /// renewal of one seat displaces the last; past
-    /// [`DISPLACED_CERTIFICATE_CAP`] the retained map stops growing at the
-    /// cap, holds only displaced digests (never the live certificate), and
-    /// eviction is by retention recency — exactly the oldest displacements
-    /// are gone and the newest displacement stays.
     #[test]
     fn displaced_certificate_retention_is_bounded() {
         let f = fixture();
@@ -1612,8 +1557,6 @@ mod tests {
             !info.displaced_certificates.contains_key(&live),
             "the live certificate is not retained evidence"
         );
-        // Retention recency decides: the oldest displacements are evicted,
-        // the newest [`DISPLACED_CERTIFICATE_CAP`] all survive.
         let evicted = &displacement_order[..displacement_order.len() - DISPLACED_CERTIFICATE_CAP];
         let retained = &displacement_order[displacement_order.len() - DISPLACED_CERTIFICATE_CAP..];
         for digest in evicted {
@@ -1630,12 +1573,6 @@ mod tests {
         }
     }
 
-    /// #1650 review P2: at the cap, eviction keeps the newest parent
-    /// evidence — by retention recency, not digest order. A full cache
-    /// whose digest-key order is the inverse of its recency (the newest
-    /// evidence at the lexicographically smallest digest, the oldest at
-    /// the largest) must still drop the oldest retention and keep the
-    /// newest, including the entry the same call just retained.
     #[test]
     fn cap_eviction_never_drops_the_newest_parent_evidence() {
         let f = fixture();
@@ -1693,12 +1630,6 @@ mod tests {
         );
     }
 
-    /// #1533 r11 Codex P1, kept by #1650: after a valid rebind replaced
-    /// the seat's parent certificate, a regular member signs a sibling
-    /// self-rebind with an older (but unexpired) certificate from the same
-    /// owner. The retained displaced bytes make the later-expiry check
-    /// run, and the older certificate is refused: not later, so no fork
-    /// evidence.
     #[test]
     fn sibling_with_an_older_certificate_is_refused_as_not_later() {
         let f = fixture();
@@ -1719,11 +1650,6 @@ mod tests {
         );
     }
 
-    /// #1533 r11's narrowing itself stays: a node that holds no bytes for
-    /// the parent's committed digest (neither live nor retained) refuses
-    /// the sibling and records nothing. An unverifiable sibling is never
-    /// accepted as evidence. This holds for the seat's certificate and
-    /// for an admin signer's.
     #[test]
     fn sibling_without_any_parent_certificate_bytes_is_no_fork_evidence() {
         let f = fixture();
@@ -1746,9 +1672,6 @@ mod tests {
             Some(CertificateRebindRefusal::CertificateEvidenceMissing)
         );
 
-        // The signer side: an admin whose parent certificate bytes are
-        // gone signs a valid rebind of another seat. The expiry check on
-        // the signer cannot run, so the sibling records nothing either.
         let (parent, mut current) = own_branch_replaced(&f, &f.admin);
         if let Some(admin) = current.members_v2.get_mut(&hex_of(&f.admin)) {
             admin.certificate = None;
@@ -1769,10 +1692,6 @@ mod tests {
         );
     }
 
-    /// #1650, the signer side: an admin signer's expiry check needs its
-    /// parent certificate. When this node's branch replaced it, the
-    /// retained displaced bytes keep the check running and a valid sibling
-    /// is fork evidence.
     #[test]
     fn sibling_after_the_admin_certificate_was_displaced_is_fork_evidence() {
         let f = fixture();
@@ -1792,12 +1711,9 @@ mod tests {
         );
     }
 
-    /// The control: with the parent bytes held, an older certificate is
-    /// refused as not later and a later one is a valid sibling.
     #[test]
     fn sibling_with_parent_certificates_checks_expiry() {
         let f = fixture();
-        // This node's branch changes another seat: the admin renews again.
         let (parent, current) = own_branch_replaced(&f, &f.admin);
         let sibling = |not_after| {
             let renewal = cert(&f.owner, &f.member, Some(not_after));

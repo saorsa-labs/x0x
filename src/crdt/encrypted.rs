@@ -15,13 +15,9 @@ use serde::{Deserialize, Serialize};
 /// group's current epoch key and includes authentication via AEAD.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptedTaskListDelta {
-    /// Group identifier for this encrypted delta.
     group_id: Vec<u8>,
-    /// Epoch when this delta was encrypted.
     epoch: u64,
-    /// Encrypted delta ciphertext (includes authentication tag).
     ciphertext: Vec<u8>,
-    /// Additional authenticated data (group_id + epoch).
     aad: Vec<u8>,
 }
 
@@ -53,17 +49,14 @@ impl EncryptedTaskListDelta {
         let group_id = context.group_id().to_vec();
         let epoch = context.epoch();
 
-        // Serialize the delta
         let plaintext = bincode::serialize(delta)
             .map_err(|e| MlsError::EncryptionError(format!("delta serialization failed: {}", e)))?;
 
-        // Build AAD: "EncryptedDelta" || group_id || epoch
         let mut aad = Vec::new();
         aad.extend_from_slice(b"EncryptedDelta");
         aad.extend_from_slice(&group_id);
         aad.extend_from_slice(&epoch.to_le_bytes());
 
-        // Encrypt with counter 0 (each delta is a single message)
         let ciphertext = cipher.encrypt(&plaintext, &aad, 0)?;
 
         Ok(Self {
@@ -96,10 +89,8 @@ impl EncryptedTaskListDelta {
     /// - Wrong epoch key is being used
     /// - The AAD doesn't match (wrong group or epoch)
     pub fn decrypt(&self, cipher: &MlsCipher) -> MlsResult<TaskListDelta> {
-        // Decrypt with counter 0
         let plaintext = cipher.decrypt(&self.ciphertext, &self.aad, 0)?;
 
-        // Deserialize the delta
         bincode::deserialize(&plaintext)
             .map_err(|e| MlsError::DecryptionError(format!("delta deserialization failed: {}", e)))
     }
@@ -146,7 +137,6 @@ impl EncryptedTaskListDelta {
     pub fn decrypt_with_group(&self, group: &MlsGroup) -> MlsResult<TaskListDelta> {
         let context = group.context();
 
-        // Verify epoch matches
         if context.epoch() != self.epoch {
             return Err(MlsError::EpochMismatch {
                 current: context.epoch(),
@@ -154,7 +144,6 @@ impl EncryptedTaskListDelta {
             });
         }
 
-        // Verify group_id matches
         if context.group_id() != self.group_id {
             return Err(MlsError::MlsOperation(format!(
                 "group ID mismatch: expected {:?}, got {:?}",
@@ -217,7 +206,6 @@ mod tests {
     fn create_test_delta() -> TaskListDelta {
         let mut delta = TaskListDelta::new(1);
 
-        // Add a task
         let identity = Identity::generate().expect("identity generation failed");
         let agent_id = identity.agent_id();
         let timestamp = 1000;
@@ -246,7 +234,6 @@ mod tests {
         let (group, _group_id) = create_test_group().await;
         let delta = create_test_delta();
 
-        // Encrypt
         let encrypted =
             EncryptedTaskListDelta::encrypt_with_group(&delta, &group).expect("encryption failed");
 
@@ -254,12 +241,10 @@ mod tests {
         assert_eq!(encrypted.epoch(), group.current_epoch());
         assert!(!encrypted.ciphertext().is_empty());
 
-        // Decrypt
         let decrypted = encrypted
             .decrypt_with_group(&group)
             .expect("decryption failed");
 
-        // Verify delta content matches
         assert_eq!(decrypted.version, delta.version);
         assert_eq!(decrypted.added_tasks.len(), delta.added_tasks.len());
     }
@@ -281,15 +266,12 @@ mod tests {
         let (mut group, _) = create_test_group().await;
         let delta = create_test_delta();
 
-        // Encrypt at epoch 0
         let encrypted =
             EncryptedTaskListDelta::encrypt_with_group(&delta, &group).expect("encryption failed");
 
-        // Simulate epoch change
         let commit = group.commit().expect("commit failed");
         group.apply_commit(&commit).expect("apply failed");
 
-        // Try to decrypt with new epoch
         let result = encrypted.decrypt_with_group(&group);
         assert!(result.is_err());
         assert!(matches!(
@@ -309,21 +291,18 @@ mod tests {
 
         let identity2 = Identity::generate().expect("identity generation failed");
         let agent_id2 = identity2.agent_id();
-        let group_id2 = b"test-group-2".to_vec(); // Different group ID
+        let group_id2 = b"test-group-2".to_vec();
         let group2 = MlsGroup::new(group_id2, agent_id2)
             .await
             .expect("group creation failed");
 
         let delta = create_test_delta();
 
-        // Encrypt with group1
         let encrypted =
             EncryptedTaskListDelta::encrypt_with_group(&delta, &group1).expect("encryption failed");
 
-        // Try to decrypt with group2 (different group_id)
         let result = encrypted.decrypt_with_group(&group2);
         assert!(result.is_err());
-        // Should be a group ID mismatch error
         match result.unwrap_err() {
             MlsError::MlsOperation(msg) => assert!(msg.contains("group ID mismatch")),
             _ => panic!("Expected MlsOperation error for group ID mismatch"),
@@ -338,10 +317,8 @@ mod tests {
         let mut encrypted =
             EncryptedTaskListDelta::encrypt_with_group(&delta, &group).expect("encryption failed");
 
-        // Tamper with ciphertext
         encrypted.ciphertext[0] ^= 1;
 
-        // Decryption should fail due to authentication failure
         let result = encrypted.decrypt_with_group(&group);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), MlsError::DecryptionError(_)));
@@ -352,19 +329,15 @@ mod tests {
         let (mut group, _) = create_test_group().await;
         let delta = create_test_delta();
 
-        // Encrypt at epoch 0
         let encrypted1 =
             EncryptedTaskListDelta::encrypt_with_group(&delta, &group).expect("encryption failed");
 
-        // Advance epoch
         let commit = group.commit().expect("commit failed");
         group.apply_commit(&commit).expect("apply failed");
 
-        // Encrypt same delta at epoch 1
         let encrypted2 =
             EncryptedTaskListDelta::encrypt_with_group(&delta, &group).expect("encryption failed");
 
-        // Ciphertexts should be different
         assert_ne!(encrypted1.ciphertext(), encrypted2.ciphertext());
         assert_ne!(encrypted1.epoch(), encrypted2.epoch());
     }
@@ -372,7 +345,7 @@ mod tests {
     #[tokio::test]
     async fn test_empty_delta_encryption() {
         let (group, _) = create_test_group().await;
-        let delta = TaskListDelta::new(1); // Empty delta
+        let delta = TaskListDelta::new(1);
 
         let encrypted =
             EncryptedTaskListDelta::encrypt_with_group(&delta, &group).expect("encryption failed");
@@ -394,7 +367,6 @@ mod tests {
         let agent_id = identity.agent_id();
         let peer_id = PeerId::new(*agent_id.as_bytes());
 
-        // Add many tasks
         for i in 0..100 {
             let task_id = TaskId::new(&format!("Task {}", i), &agent_id, 1000 + i);
 
@@ -431,7 +403,6 @@ mod tests {
         let encrypted =
             EncryptedTaskListDelta::encrypt_with_group(&delta, &group).expect("encryption failed");
 
-        // Serialize and deserialize (using bincode)
         let serialized = bincode::serialize(&encrypted).expect("serialization failed");
         let deserialized: EncryptedTaskListDelta =
             bincode::deserialize(&serialized).expect("deserialization failed");
@@ -451,10 +422,8 @@ mod tests {
 
         let aad = encrypted.aad();
 
-        // AAD should start with "EncryptedDelta"
         assert!(aad.starts_with(b"EncryptedDelta"));
 
-        // AAD should be longer than just the prefix (includes group_id and epoch)
         assert!(aad.len() > b"EncryptedDelta".len());
     }
 }

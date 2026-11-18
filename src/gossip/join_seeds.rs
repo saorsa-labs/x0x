@@ -1,82 +1,9 @@
 //! HyParView JOIN seeds come only from gossip-admitted peers (x0x#1321).
 //!
-//! [`crate::Agent::join_network`] dials peers in three phases (cached
-//! coordinators, cached peers, hard-coded bootstrap nodes) and then joins
-//! the HyParView overlay through them. It used to pass every address whose
-//! transport dial returned `Ok` to `membership().join(seeds)`.
-//!
-//! A dial that returned `Ok` is transport truth, not gossip admission. The
-//! gossip-plane gate (issue #206) decides a peer's plane only when the
-//! peer's plane hello arrives, after the dial has returned. A mismatched
-//! hello disconnects the peer with a `PolicyRejection` reconnect-suppression
-//! tombstone (issue #292). So a cached peer on another plane passed the
-//! dial, was refused a moment later, and still became a JOIN seed.
-//! saorsa-gossip's JOIN tries the seeds in order and dials one seed up to
-//! ten times with backoff, and the #292 gate refused each of those dials.
-//! The work after the JOIN in `join_network` (presence beacons, the first
-//! identity announcement) waited that long for each refused seed ahead of
-//! the first good one. saorsa-6 showed it at the v0.46.4 and v0.47.0
-//! rollouts.
-//!
-//! #292 invariant A names the predicate for every gossip-affecting decision:
-//! [`NetworkNode::peer_admission`], never transport truth. [`JoinCandidates`]
-//! keeps each dial result with the answered peer id, so the join can apply
-//! that predicate:
-//!
-//! - [`JoinCandidates::usable`] is the count for the phase decisions: only
-//!   distinct peers that are still connected and not suppressed. A peer
-//!   refused before the count does not fill the join's minimum-peer target,
-//!   and the bootstrap phase does not dial its address again.
-//! - [`JoinCandidates::settle`] waits while plane verdicts are open, until
-//!   enough peers are admitted (at most [`JOIN_SEED_VERDICT_WAIT`], which
-//!   covers the plane gate's own legacy grace). The join compares the
-//!   settled admitted count with its minimum. When peers that filled the
-//!   minimum on an open verdict were refused later, the join runs the
-//!   phases it skipped. This wait drops no candidate.
-//! - [`JoinCandidates::join_overlay`] is the JOIN. saorsa-gossip drives
-//!   each JOIN attempt and owns its retry policy, its frame and its
-//!   membership side effects, through its step API
-//!   (`HyParViewMembership::join_dial`, `join_send` and `JoinLedger`, added
-//!   for this fix; D248). x0x chooses the candidate and decides, between the
-//!   dial and the JOIN frame, whether the answered peer may get the frame:
-//!   - One `JoinLedger` covers the whole `join_network` call, so each
-//!     candidate address has one budget of saorsa-gossip's attempts, kept
-//!     when another candidate interrupts it and never renewed.
-//!   - The next attempt on an address waits for `JoinLedger::ready_at`:
-//!     the later of saorsa-gossip's dial backoff (it grows only after a
-//!     failed dial, as in its `join`) and its loss cooldown.
-//!   - After a dial that answered, the JOIN frame goes out only when the
-//!     peer is `Admitted`. The gate waits for an open plane verdict (at
-//!     most [`JOIN_SEED_VERDICT_WAIT`]).
-//!   - A peer that answered and then lost its connection before admission
-//!     (for example, the remote refused us first) is reported with
-//!     `JoinLedger::record_loss`: saorsa-gossip's loss cooldown (100 ms,
-//!     doubled after each loss up to 30 s, plus jitter; D252) paces the
-//!     next attempt on that address. Another admitted address can go
-//!     meanwhile.
-//!   - A failed send, or a verdict that stays open for the whole gate
-//!     wait, ends the attempt; the next attempt may start at once.
-//!   - A suppressed candidate is dropped at once, with no attempt.
-//!   - An admitted candidate goes first. Among the admitted candidates, a
-//!     ready one goes before one that waits for its backoff or loss
-//!     cooldown; when all of them wait, the one that is ready first goes.
-//!     So another admitted address goes while a lost one cools down
-//!     (D252). A candidate that is not admitted does not go while an
-//!     admitted one waits.
-//!   - When no candidate is admitted, the candidates are tried in dial
-//!     order, one after another, as the old JOIN tried its seeds.
-//!
-//! `join_network` awaits all of this, as it awaited the old JOIN. There is
-//! no new time limit for a candidate and no retry after its budget. The
-//! admission reads, the verdict waits, the JOIN dials, the backoffs and the
-//! JOIN send stop on the shutdown token; when the token and a result are
-//! both ready, cancellation goes first. After cancellation, the phase count
-//! is `None` even with no candidate. `join_network` checks the token
-//! before each phase and before the JOIN, and every phase's dial batch
-//! starts no dial after cancellation and stops at once on it.
-//!
-//! None of these steps weakens the plane gate or the #292 dial gates; they
-//! only read their verdicts.
+//! A dial that returned `Ok` is transport truth, not gossip admission: the
+//! plane gate decides when the peer's hello arrives, after the dial returned.
+//! saorsa-gossip's JOIN tries the seeds in order and dials one seed up to ten
+//! times with backoff, so a refused seed delays the work after the JOIN.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -88,27 +15,18 @@ use tokio_util::sync::CancellationToken;
 
 use crate::network::{NetworkNode, PeerAdmission, PLANE_HELLO_RETRY_INTERVAL, PLANE_LEGACY_GRACE};
 
-/// Longest time [`JoinCandidates::settle`] (and the JOIN gate) waits for an
-/// open plane verdict. After [`PLANE_LEGACY_GRACE`] the plane gate admits a
-/// connected peer that never sent a hello (pre-#206 code), so no verdict on
-/// a peer connected before the wait starts stays open longer than this; one
-/// hello retry interval is margin.
 pub(crate) const JOIN_SEED_VERDICT_WAIT: Duration =
     PLANE_LEGACY_GRACE.saturating_add(PLANE_HELLO_RETRY_INTERVAL);
 
-/// Poll interval while plane verdicts are open, and during a JOIN backoff.
 const JOIN_SEED_VERDICT_POLL: Duration = Duration::from_millis(50);
 
-/// The time left until `at`, or `None` when `at` has passed.
 fn remaining(at: Instant) -> Option<Duration> {
     at.checked_duration_since(Instant::now())
         .filter(|left| !left.is_zero())
 }
 
-/// The admission verdicts that the seed choice reads.
 #[async_trait::async_trait]
 pub(crate) trait SeedAdmission: Send + Sync {
-    /// The #292 admission verdict for `peer`.
     async fn admission(&self, peer: &ant_quic::PeerId) -> PeerAdmission;
 }
 
@@ -123,25 +41,15 @@ fn ant_peer(peer: saorsa_gossip_types::PeerId) -> ant_quic::PeerId {
     ant_quic::PeerId(peer.to_bytes())
 }
 
-/// The seeds the JOIN may use, and how many candidates were left out.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct JoinSeedPlan {
-    /// Admitted candidates, in dial order, each address once.
     pub(crate) seeds: Vec<SocketAddr>,
-    /// Distinct admitted peers. A peer dialled at two addresses counts once.
     pub(crate) admitted_peers: usize,
-    /// Left out: a live reconnect-suppression tombstone (cross-plane
-    /// refusal, policy rejection, eviction, revocation).
     pub(crate) suppressed: usize,
-    /// Left out: still connected, but the plane verdict was open when the
-    /// wait ended.
     pub(crate) plane_unresolved: usize,
-    /// Left out: no transport connection when the wait ended.
     pub(crate) not_connected: usize,
 }
 
-/// Keep the admitted candidates, in dial order and each address once.
-/// `verdicts[i]` is the admission verdict for `candidates[i]`.
 pub(crate) fn plan_join_seeds(
     candidates: &[(SocketAddr, ant_quic::PeerId)],
     verdicts: &[PeerAdmission],
@@ -167,55 +75,34 @@ pub(crate) fn plan_join_seeds(
     plan
 }
 
-/// `true` when more waiting for plane verdicts cannot raise the admitted
-/// count to `target`, or when the wait has used [`JOIN_SEED_VERDICT_WAIT`].
 pub(crate) fn settled(plan: &JoinSeedPlan, target: usize, waited: Duration) -> bool {
     plan.admitted_peers >= target || plan.plane_unresolved == 0 || waited >= JOIN_SEED_VERDICT_WAIT
 }
 
-/// How [`JoinCandidates::join_overlay`] ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum JoinOutcome {
-    /// The JOIN went through this seed.
     Joined(SocketAddr),
-    /// No candidate is left: each was dropped or used its budget.
-    /// `attempts` is the number of JOIN attempts made.
     NoSeed { attempts: usize },
-    /// The active-view update failed. saorsa-gossip's JOIN ends with this
-    /// error.
     Failed(String),
-    /// Shutdown began.
     Cancelled,
 }
 
-/// How one JOIN attempt ended.
 enum Attempt {
-    /// The attempt was used; choose the next attempt.
     Next,
-    /// saorsa-gossip refused an early dial (no attempt used).
     NotReady,
     Joined(SocketAddr),
     Failed(String),
     Cancelled,
 }
 
-/// What the JOIN gate decided for an answered peer.
 enum Gate {
-    /// Admitted: send the JOIN frame.
     Send,
-    /// The peer lost its connection before admission: end this attempt
-    /// without a frame and start saorsa-gossip's loss cooldown (D252).
     Lost,
-    /// The plane verdict stayed open for the whole gate wait: end this
-    /// attempt without a frame; the next attempt may start at once.
     Unresolved,
-    /// Suppressed: drop the candidate.
     Refused,
     Cancelled,
 }
 
-/// One admission read that ends early when shutdown begins. Cancellation
-/// goes first when both are ready.
 async fn read_admission<A: SeedAdmission + ?Sized>(
     admission: &A,
     peer: &ant_quic::PeerId,
@@ -228,8 +115,6 @@ async fn read_admission<A: SeedAdmission + ?Sized>(
     }
 }
 
-/// Sleep for `wait`, or until shutdown begins. Returns `false` on shutdown.
-/// Cancellation goes first when both are ready.
 async fn nap(wait: Duration, shutdown: &CancellationToken) -> bool {
     tokio::select! {
         biased;
@@ -238,32 +123,20 @@ async fn nap(wait: Duration, shutdown: &CancellationToken) -> bool {
     }
 }
 
-/// One candidate: a dial that returned `Ok`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Candidate {
     addr: SocketAddr,
-    /// The peer that answered at `addr` last.
     peer: ant_quic::PeerId,
 }
 
-/// Dial results of one `join_network` run, with the answered peer ids and
-/// the JOIN retry state of each address.
 #[derive(Debug, Default)]
 pub(crate) struct JoinCandidates {
-    /// Dials that returned `Ok` and are not known to be suppressed, one
-    /// record per address.
     connected: Vec<Candidate>,
-    /// Addresses whose answered peer was later found suppressed.
     refused: Vec<SocketAddr>,
-    /// saorsa-gossip's JOIN attempts, dial backoff and loss cooldown per
-    /// address, for the whole join.
     ledger: JoinLedger,
 }
 
 impl JoinCandidates {
-    /// Record dials that returned `Ok`, as `(address, answered peer id)`.
-    /// A new answer at a known address replaces the old peer id; the
-    /// address keeps its JOIN budget.
     pub(crate) fn extend(
         &mut self,
         dialled: impl IntoIterator<Item = (SocketAddr, ant_quic::PeerId)>,
@@ -276,34 +149,25 @@ impl JoinCandidates {
         }
     }
 
-    /// Number of dial records not known to be suppressed (for logs).
     pub(crate) fn len(&self) -> usize {
         self.connected.len()
     }
 
-    /// `true` if `addr` was already dialled in this join, connected or
-    /// refused, so a later phase must not dial it again.
     pub(crate) fn contains_addr(&self, addr: &SocketAddr) -> bool {
         self.refused.contains(addr) || self.connected.iter().any(|known| known.addr == *addr)
     }
 
-    /// Move `addr` to the refused set.
     fn drop_candidate(&mut self, addr: SocketAddr) {
         self.connected.retain(|known| known.addr != addr);
         self.refused.push(addr);
     }
 
-    /// Read the verdict of every record (only those with JOIN budget left
-    /// when `budgeted`). Suppressed records move to the refused set.
-    /// Returns the kept records' addresses with their verdicts, in dial
-    /// order, or `None` when shutdown began.
     async fn read_verdicts<A: SeedAdmission + ?Sized>(
         &mut self,
         admission: &A,
         budgeted: bool,
         shutdown: &CancellationToken,
     ) -> Option<Vec<(SocketAddr, ant_quic::PeerId, PeerAdmission)>> {
-        // Also with no record to read: the caller must see the shutdown.
         if shutdown.is_cancelled() {
             return None;
         }
@@ -323,10 +187,6 @@ impl JoinCandidates {
         Some(read)
     }
 
-    /// The count for the join's phase decisions: distinct peers that are
-    /// still connected and not suppressed (`Admitted` or `PlanePending`).
-    /// It reads the verdicts now and does not wait. Suppressed candidates
-    /// move to the refused set. `None` when shutdown began.
     pub(crate) async fn usable<A: SeedAdmission + ?Sized>(
         &mut self,
         admission: &A,
@@ -345,9 +205,6 @@ impl JoinCandidates {
         Some(usable.len())
     }
 
-    /// Read the verdicts until [`settled`] for `target`, then keep only the
-    /// admitted candidates. When shutdown begins, it returns at once with no
-    /// seed.
     pub(crate) async fn settle<A: SeedAdmission + ?Sized>(
         &self,
         admission: &A,
@@ -381,9 +238,6 @@ impl JoinCandidates {
         }
     }
 
-    /// The JOIN through `membership`, with saorsa-gossip's attempt budget,
-    /// dial backoff and loss cooldown per address, and x0x's admission gate
-    /// before each JOIN frame (see the module doc).
     pub(crate) async fn join_overlay<T, A>(
         &mut self,
         membership: &HyParViewMembership<T>,
@@ -394,10 +248,6 @@ impl JoinCandidates {
         T: GossipTransport + 'static,
         A: SeedAdmission + ?Sized,
     {
-        // The old JOIN tried its seeds one after another: after the last
-        // failed attempt on a seed it slept that attempt's backoff before
-        // the next seed. `gate` keeps that order for candidates that are
-        // not admitted.
         let mut gate = Instant::now();
         let mut attempts = 0;
         loop {
@@ -408,8 +258,6 @@ impl JoinCandidates {
                 return JoinOutcome::Cancelled;
             };
             let Some((addr, ready_at)) = self.choose(&live, gate) else {
-                // As in the old JOIN, the last failed attempt's backoff
-                // ends before the JOIN gives up.
                 if let Some(wait) = remaining(gate) {
                     if !nap(wait, shutdown).await {
                         return JoinOutcome::Cancelled;
@@ -418,8 +266,6 @@ impl JoinCandidates {
                 return JoinOutcome::NoSeed { attempts };
             };
             if let Some(wait) = ready_at.and_then(remaining) {
-                // Not yet: wait (a little at a time, so that a candidate
-                // that becomes admitted or ready can go first).
                 if !nap(wait.min(JOIN_SEED_VERDICT_POLL), shutdown).await {
                     return JoinOutcome::Cancelled;
                 }
@@ -438,16 +284,6 @@ impl JoinCandidates {
         }
     }
 
-    /// The next JOIN attempt among the `live` candidates (dial order), with
-    /// the earliest time it may start (`None`: at once). saorsa-gossip's
-    /// readiness for an address (`JoinLedger::ready_at`) is the later of its
-    /// dial backoff and its loss cooldown.
-    ///
-    /// - An admitted candidate goes first, and a ready one before one that
-    ///   waits; when every admitted candidate waits, the one that is ready
-    ///   first is chosen (D252: another admitted address goes meanwhile).
-    /// - With no admitted candidate, the first candidate goes, at the later
-    ///   of its own readiness and `gate` (the old JOIN's seed order).
     fn choose(
         &self,
         live: &[(SocketAddr, ant_quic::PeerId, PeerAdmission)],
@@ -472,8 +308,6 @@ impl JoinCandidates {
         })
     }
 
-    /// One JOIN attempt on `addr`: saorsa-gossip's dial, x0x's admission
-    /// gate, then saorsa-gossip's JOIN send.
     async fn attempt<T, A>(
         &mut self,
         membership: &HyParViewMembership<T>,
@@ -512,8 +346,6 @@ impl JoinCandidates {
         match self.gate(admission, addr, peer, shutdown).await {
             Gate::Send => {}
             Gate::Lost => {
-                // D252: saorsa-gossip's loss cooldown paces the next
-                // attempt on this address.
                 let _ready_at = self.ledger.record_loss(addr);
                 return Attempt::Next;
             }
@@ -541,8 +373,6 @@ impl JoinCandidates {
         }
     }
 
-    /// x0x#1321: the JOIN frame goes only to an admitted peer. Wait for an
-    /// open plane verdict, at most [`JOIN_SEED_VERDICT_WAIT`].
     async fn gate<A: SeedAdmission + ?Sized>(
         &self,
         admission: &A,
@@ -590,7 +420,6 @@ impl JoinCandidates {
         }
     }
 
-    /// Log the seed plan when it left candidates out.
     pub(crate) fn log_plan(&self, plan: &JoinSeedPlan) {
         let left_out = plan.suppressed + plan.plane_unresolved + plan.not_connected;
         if left_out > 0 || !self.refused.is_empty() {

@@ -41,7 +41,6 @@ pub mod task;
 pub mod task_item;
 pub mod task_list;
 
-// Re-export commonly used types
 pub use checkbox::{CheckboxError, CheckboxState};
 pub use delta::TaskListDelta;
 pub use encrypted::EncryptedTaskListDelta;

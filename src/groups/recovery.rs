@@ -32,8 +32,6 @@ use crate::groups::member::{GroupMemberState, GroupRole};
 use crate::groups::{ForkQuarantine, GroupInfo};
 use crate::identity::{AgentId, AgentKeypair};
 
-// ─── Domains and prefixes ──────────────────────────────────────────────────
-
 /// The ATA signature domain (§1). It ends with a NUL byte.
 pub const ATA_DOMAIN: &[u8] = b"x0x.admin-terminal-attest.v1\0";
 
@@ -49,17 +47,9 @@ pub const ADMIN_ATTESTED_GAP_REASON: &str = "admin_attested_stale_base_gap";
 /// The `AnchoredGapRefusal::reason` of an owner-armed gap record (#846).
 pub const OWNER_ATTESTED_GAP_REASON: &str = "owner_attested_stale_base_gap";
 
-// ─── Limits (§11, D83) ─────────────────────────────────────────────────────
-
 /// Links per ATA; a longer gap takes more than one segment.
 pub const ATA_MAX_LINKS: usize = 64;
 
-/// The links-per-ATA limit that this thread applies (§11). It is
-/// [`ATA_MAX_LINKS`], except in a test build where the thread holds an
-/// `AtaMaxLinksOverride`.
-///
-/// Every check of a segment's length uses this value: the issuer when it
-/// builds a segment, and the subject when it verifies one.
 #[must_use]
 pub(crate) fn ata_max_links() -> usize {
     #[cfg(test)]
@@ -75,16 +65,9 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Test builds only: sets [`ata_max_links`] for the current thread until
-/// the guard drops (ADR 0109 Validation table, rows H-S3-s and H-S3-q:
-/// "segment length set by test configuration").
-///
-/// The value is per thread, not per daemon. A W3-H case runs all of its
-/// daemons on the one test thread (`block_on_paused` builds a
-/// current-thread runtime), so every node in the case uses the same
-/// limit, as the issuer and the subject must. Other tests on other
-/// threads keep [`ATA_MAX_LINKS`]. Work on a blocking-pool thread also
-/// keeps [`ATA_MAX_LINKS`]; no segment check runs there.
+/// Sets [`ata_max_links`] for the current thread until the guard drops.
+/// A W3-H case runs all of its daemons on one test thread, so the issuer
+/// and the subject use the same limit.
 #[cfg(test)]
 #[must_use = "the limit returns to its earlier value when the guard drops"]
 pub(crate) struct AtaMaxLinksOverride {
@@ -93,7 +76,6 @@ pub(crate) struct AtaMaxLinksOverride {
 
 #[cfg(test)]
 impl AtaMaxLinksOverride {
-    /// Sets the limit to `links` (at least 1) on this thread.
     pub(crate) fn set(links: usize) -> Self {
         let links = links.max(1);
         let previous = ATA_MAX_LINKS_OVERRIDE.with(|cell| cell.replace(Some(links)));
@@ -144,8 +126,6 @@ pub fn request_backoff(attempts: u32) -> Duration {
         .saturating_mul(1_u32 << shift)
         .min(REQUEST_BACKOFF_MAX)
 }
-
-// ─── Refusals ──────────────────────────────────────────────────────────────
 
 /// Why a frame, an ATA or an authorisation is refused. The `snake_case`
 /// names are the typed reasons in logs and status.
@@ -202,10 +182,6 @@ impl std::fmt::Display for RecoveryRefusal {
 
 impl std::error::Error for RecoveryRefusal {}
 
-// ─── Preimage helpers ──────────────────────────────────────────────────────
-
-/// A length-prefixed (u32 LE) preimage builder, per the #818 hardening
-/// note.
 struct Preimage(Vec<u8>);
 
 impl Preimage {
@@ -248,8 +224,6 @@ impl Preimage {
     }
 }
 
-/// Verify an ML-DSA-65 signature by the agent whose ID is `signer_hex`,
-/// under the hex public key `public_key_hex`.
 fn verify_agent_signature(
     signer_hex: &str,
     public_key_hex: &str,
@@ -272,8 +246,6 @@ fn sign_agent(keypair: &AgentKeypair, message: &[u8]) -> Result<String, Recovery
         .map_err(|_| RecoveryRefusal::BadSignature)?;
     Ok(hex::encode(signature.as_bytes()))
 }
-
-// ─── §1 The admin terminal attestation ─────────────────────────────────────
 
 /// The unsigned fields of an ATA, in table order (§1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -318,8 +290,6 @@ impl AtaFields {
             .finish()
     }
 
-    /// The segment's shape: 1 to [`ata_max_links`] links, ending at
-    /// `from_revision + len`.
     fn segment_well_formed(&self) -> bool {
         let len = self.sequence.len();
         (1..=ata_max_links()).contains(&len)
@@ -486,8 +456,8 @@ pub fn conflict_gate_sequence(
     head_state_hash: &str,
 ) -> Option<Vec<String>> {
     let up_to_head = applied_prefix(active, head_state_hash)?;
-    // Two ATAs recorded as conflicting that turn out to agree still stop
-    // catch-up at the head: the record is never read as less containment.
+    // Two ATAs recorded as conflicting that agree still stop catch-up at
+    // the head.
     Some(active.divergence_from(conflict).unwrap_or(up_to_head))
 }
 
@@ -530,9 +500,6 @@ pub fn conflict_admits_link(
     })
 }
 
-/// The links of `active`'s sequence up to and including the head (empty at
-/// its `from`); `None` when the head is off its chain. As a gate sequence
-/// it admits nothing past the head.
 fn applied_prefix(active: &AdminTerminalAttestation, head_state_hash: &str) -> Option<Vec<String>> {
     let sequence = &active.fields.sequence;
     match sequence.iter().position(|hash| hash == head_state_hash) {
@@ -613,9 +580,8 @@ pub fn chain_position(
     let Some(oldest) = log.iter().map(|entry| entry.commit.revision).min() else {
         return ChainPosition::BeyondRetention;
     };
-    // The base itself must be in the log, or its successor must link from
-    // it (the log keeps commits, and a base one below the oldest kept
-    // commit is still provable by that commit's `prev_state_hash`).
+    // A base one below the oldest kept commit is still provable by that
+    // commit's `prev_state_hash`.
     let anchored = log.iter().any(|entry| {
         (entry.commit.revision == head_revision && entry.commit.state_hash == head_state_hash)
             || (entry.commit.revision == head_revision.saturating_add(1)
@@ -655,8 +621,6 @@ pub fn chain_position(
         terminal_revision,
     }
 }
-
-// ─── §3 Recovery token and basis ───────────────────────────────────────────
 
 /// A node's live containment (§3 "Recovery token and basis").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -923,8 +887,6 @@ pub fn role_before_removal(
         .map(|member| member.role)
 }
 
-// ─── §3 The re-seat authorisation ──────────────────────────────────────────
-
 /// The unsigned fields of a re-seat authorisation (§3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReseatAuthorisationFields {
@@ -1080,8 +1042,6 @@ pub fn reason_hash(reason: &str) -> String {
     blake3::hash(reason.as_bytes()).to_hex().to_string()
 }
 
-// ─── §5 Wire ───────────────────────────────────────────────────────────────
-
 /// `group_attest_request` (§5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupAttestRequestV1 {
@@ -1229,8 +1189,6 @@ pub fn decode_message(payload: &[u8]) -> Result<GroupRecoveryMessageV1, Recovery
     }
     Ok(message)
 }
-
-// ─── §3a The promoted-admin re-seat mandate ────────────────────────────────
 
 /// The promoted-admin re-seat mandate domain (§3a). Distinct from the
 /// invite-secret mandate domain, ADR 0114's repair-mandate domains and the
@@ -1457,7 +1415,6 @@ pub fn verify_reseat_mandate(
 ) -> Result<(), ReseatMandateCause> {
     let fields = &mandate.fields;
     let parent = check.parent;
-    // 1.
     if mandate
         .verify_signature(&check.commit.signer_public_key)
         .is_err()
@@ -1469,11 +1426,9 @@ pub fn verify_reseat_mandate(
     {
         return Err(ReseatMandateCause::Signature);
     }
-    // 2.
     if !signer_is_active_admin(parent, &fields.signer) {
         return Err(ReseatMandateCause::SignerNotAdmin);
     }
-    // 3.
     let owner = parent.policy.admission.owner_certified_user_id();
     if fields.policy_hash != crate::groups::compute_policy_hash(&parent.policy)
         || owner.map(|owner| hex::encode(owner.as_bytes())).as_deref()
@@ -1483,7 +1438,6 @@ pub fn verify_reseat_mandate(
     {
         return Err(ReseatMandateCause::PolicyMismatch);
     }
-    // 4.
     let log = &parent.commit_log;
     let seated_by = |entry: &crate::groups::state_commit::RetainedCommit| {
         entry
@@ -1504,7 +1458,6 @@ pub fn verify_reseat_mandate(
     if !seating_ok {
         return Err(ReseatMandateCause::NotPreviouslySeated);
     }
-    // 5.
     let Some(removal) = log
         .iter()
         .find(|entry| entry.commit.state_hash == fields.removal_commit_hash)
@@ -1529,26 +1482,17 @@ pub fn verify_reseat_mandate(
     if !removal_ok {
         return Err(ReseatMandateCause::RemovalMismatch);
     }
-    // 6.
     if check.certificate_digest != Some(fields.certificate_digest.as_str())
         || !check.certificate_valid
     {
         return Err(ReseatMandateCause::CertificateInvalid);
     }
-    // 7.
     let before = role_before_removal(parent, check.subject, removal.commit.revision);
     let raised = before.is_none_or(|before| !before.at_least(fields.role))
         || check.seated_role != fields.role;
     if raised {
         return Err(ReseatMandateCause::RoleRaised);
     }
-    // 8. The KeyPackage half of (8) follows the ordinary join's rule
-    // (#1680): a re-seat with no package (an empty bound hash) binds
-    // nothing on a non-package plane, a TreeKEM-plane re-seat always has
-    // a package so an empty bound hash fails outright, and the package
-    // must be the subject's own — the subject-signed `MemberJoined` the
-    // event carries (Engineer ruling 30 Oct 2026) must verify against
-    // the subject's agent key.
     if check.commit.prev_state_hash.as_deref() != Some(fields.parent_commit_hash.as_str())
         || parent.state_hash != fields.parent_commit_hash
         || check.key_package_hash != Some(fields.key_package_hash.as_str())
@@ -1562,13 +1506,6 @@ pub fn verify_reseat_mandate(
     Ok(())
 }
 
-/// §3a check 8, the carried-record group half (#1680, Engineer ruling
-/// 31 Oct 2026): the subject-signed `MemberJoined` a re-seat carries
-/// must name the parent group — the joiner signs the ids it knows (the
-/// local MLS id, the stable id, or both). A self-verifying record from
-/// another group is evidence about that group's seat, not this
-/// re-seat: the receiver refuses it with
-/// [`ReseatMandateCause::BindingMismatch`].
 pub(crate) fn carried_member_joined_binds_parent_group(
     record_group_id: &str,
     record_stable_group_id: Option<&str>,
@@ -1578,8 +1515,6 @@ pub(crate) fn carried_member_joined_binds_parent_group(
         || record_group_id == parent.stable_group_id()
         || record_stable_group_id == Some(parent.stable_group_id())
 }
-
-// ─── §4 The S3 sidecar ─────────────────────────────────────────────────────
 
 /// The sidecar directory under the data directory (§4).
 pub const GROUP_RECOVERY_DIR: &str = "group-recovery";
@@ -1671,8 +1606,6 @@ pub struct ReseatJournalV1 {
     pub started_at_ms: u64,
 }
 
-/// The domain tag of the canonical journal record digest (#1652), in the
-/// style of `x0x.policy-hash.v1` and `x0x.group-genesis-hash.v1`.
 const RESEAT_RECORD_DIGEST_DOMAIN: &[u8] = b"x0x.reseat-record-digest.v1";
 
 impl ReseatJournalV1 {
@@ -1762,20 +1695,16 @@ impl ReseatJournalV1 {
             && Self::group_key_installed(live, has_tree)
     }
 
-    /// §3 step 3 (#1533 rc13): the swap needs this node's installed group
-    /// key on either plane. A staged GSS join holds no shared secret until
-    /// its `SecureShareDelivered` installs one, so its `MemberAdded` alone
-    /// does not seat it. A `SignedPublic` group has no key to wait for.
+    /// A staged GSS join holds no shared secret until its
+    /// `SecureShareDelivered` installs one: `MemberAdded` alone does not
+    /// seat it.
     fn group_key_installed(live: &GroupInfo, has_tree: bool) -> bool {
         match live.secure_plane {
             crate::mls::SecureGroupPlane::TreeKem => has_tree,
             crate::mls::SecureGroupPlane::Gss => {
-                // #1604 G3: only a known `SignedPublic` group has no key to
-                // wait for; an unknown confidentiality needs one.
                 live.policy.confidentiality == crate::groups::GroupConfidentiality::SignedPublic
                     || live.shared_secret.is_some()
             }
-            // #1604 G3: an unknown plane seats nothing (fail closed).
             crate::mls::SecureGroupPlane::Unknown => false,
         }
     }
@@ -2068,8 +1997,6 @@ pub fn sidecar_file_name(stable_group_id: &str) -> String {
     format!("{stem}.{GROUP_RECOVERY_EXTENSION}")
 }
 
-// ─── §2 Pre-Welcome link apply (rule (b)) ──────────────────────────────────
-
 /// The TreeKEM epoch a commit's security binding names
 /// (`treekem:epoch=<n>[:...]`), if any.
 #[must_use]
@@ -2293,10 +2220,6 @@ mod format_fixture;
 mod tests {
     use super::*;
 
-    /// #1533 rc18 (#1604 ruling): `GroupRecoveryMessageV1` and the enums it
-    /// carries are `#[non_exhaustive]`. The codec is postcard, which has no
-    /// catch-all variant, so a variant this node does not know is a typed
-    /// [`RecoveryRefusal::Malformed`], never a panic or a silent default.
     #[test]
     fn an_unknown_message_variant_is_a_typed_refusal() {
         for variant in [0x40_u8, 0x7f] {
@@ -2390,9 +2313,6 @@ mod tests {
         assert!(!a.agrees_with(&["x5".to_string()]));
     }
 
-    /// §2 "Conflict" and the renewal rule: a later ATA from a head on the
-    /// active chain must agree with the remaining sequence, and the common
-    /// prefix is what may still apply.
     #[test]
     fn divergence_reports_the_common_prefix_from_any_head_on_the_chain() {
         let admin = keypair();
@@ -2400,12 +2320,10 @@ mod tests {
         long.sequence = vec!["h5".into(), "h6".into(), "h7".into()];
         long.segment_terminal_revision = 7;
         let active = AdminTerminalAttestation::sign(long, &admin).expect("sign");
-        // Same head, diverges at the second link: the prefix is [h5].
         let mut same_head = fields(&admin);
         same_head.sequence = vec!["h5".into(), "x6".into()];
         let same_head = AdminTerminalAttestation::sign(same_head, &admin).expect("sign");
         assert_eq!(active.divergence_from(&same_head), Some(vec!["h5".into()]));
-        // A renewal from h5 that agrees: no conflict.
         let mut renewal = fields(&admin);
         renewal.from_revision = 5;
         renewal.from_state_hash = "h5".into();
@@ -2413,7 +2331,6 @@ mod tests {
         renewal.segment_terminal_revision = 8;
         let renewal = AdminTerminalAttestation::sign(renewal, &admin).expect("sign");
         assert_eq!(active.divergence_from(&renewal), None);
-        // A renewal from h5 that disagrees at h7: the prefix is [h5, h6].
         let mut bad_renewal = fields(&admin);
         bad_renewal.from_revision = 5;
         bad_renewal.from_state_hash = "h5".into();
@@ -2425,16 +2342,12 @@ mod tests {
             Some(vec!["h5".into(), "h6".into()])
         );
         assert!(active.conflicts_with(&bad_renewal));
-        // An ATA whose head is off the active chain is not a conflict.
         let mut off = fields(&admin);
         off.from_state_hash = "elsewhere".into();
         let off = AdminTerminalAttestation::sign(off, &admin).expect("sign");
         assert_eq!(active.divergence_from(&off), None);
     }
 
-    /// §2 "Conflict": "Nothing past the common prefix applies". Before this
-    /// rule the gate kept the active ATA's full sequence (here h5..h7), so a
-    /// page reaching h6 or h7 still applied after the conflict.
     #[test]
     fn conflict_gate_admits_only_the_common_prefix() {
         let admin = keypair();
@@ -2448,21 +2361,15 @@ mod tests {
         let gate = conflict_gate_sequence(&active, &other, "h4").expect("armed at from");
         assert_eq!(gate, vec!["h5".to_string()]);
         assert!(!gate.contains(&"h6".to_string()));
-        // At the end of the prefix the gate admits nothing further.
         assert_eq!(
             conflict_gate_sequence(&active, &other, "h5"),
             Some(vec!["h5".to_string()])
         );
-        // Past the prefix (applied before the conflict was seen): still
-        // armed, and no next hash links from the head.
         assert_eq!(
             conflict_gate_sequence(&active, &other, "h6"),
             Some(vec!["h5".to_string()])
         );
-        // Off the chain (another record, e.g. after a re-seat): not armed.
         assert_eq!(conflict_gate_sequence(&active, &other, "z9"), None);
-        // #1533 rc18: an off-chain head under a recorded conflict admits
-        // nothing. Before the fix every next commit applied.
         for link in ["h5", "h6", "x6", "z10"] {
             assert!(
                 !conflict_admits_link(&active, &other, "z9", link),
@@ -2470,7 +2377,6 @@ mod tests {
             );
         }
         assert!(conflict_admits_link(&active, &other, "h4", "h5"));
-        // A recorded pair that agrees still stops at the head.
         let mut prefix = fields(&admin);
         prefix.sequence = vec!["h5".into()];
         prefix.segment_terminal_revision = 5;
@@ -2485,9 +2391,6 @@ mod tests {
         );
     }
 
-    /// §2 "If the signer stops being an active admin after an applied link,
-    /// the gate stops there." Before this rule the gate kept the full
-    /// sequence whatever the applied links did to the signer's seat.
     #[test]
     fn gate_stops_when_an_applied_link_demotes_the_signer() {
         let admin = keypair();
@@ -2508,7 +2411,6 @@ mod tests {
             armed_gate_sequence(&active, &current),
             Some(active.fields.sequence.clone())
         );
-        // The link to h5 removed the signer's admin seat.
         current.state_hash = "h5".to_string();
         current.remove_member(&admin_hex, None);
         assert!(!active.signer_verified_on(&current));
@@ -2517,14 +2419,10 @@ mod tests {
             Some(vec!["h5".to_string()]),
             "nothing past the head applies"
         );
-        // Off the chain: no gate from this ATA.
         current.state_hash = "z".to_string();
         assert_eq!(armed_gate_sequence(&active, &current), None);
     }
 
-    /// §11 `ATA_MAX_LINKS` = 64: a segment of 64 links signs; 65 (and 0)
-    /// does not. A 65-link gap is answered as a 64-link segment and then a
-    /// 1-link segment from the new head.
     #[test]
     fn ata_max_links_bounds_a_segment_and_a_65_link_gap_takes_two() {
         let admin = keypair();
@@ -2575,9 +2473,6 @@ mod tests {
         }
     }
 
-    /// The H-S3-s/H-S3-q test seam: an override of 2 bounds signing,
-    /// verification and `chain_position` on this thread only, and the
-    /// guard puts [`ATA_MAX_LINKS`] back when it drops.
     #[test]
     fn ata_max_links_override_is_per_thread_and_scoped() {
         let admin = keypair();
@@ -2630,9 +2525,6 @@ mod tests {
         assert!(three.verify_signature().is_ok());
     }
 
-    /// §4 "Placeholder": a non-empty, all-Removed roster, which released
-    /// binaries' `migrate_from_v1` leaves alone (an empty roster would
-    /// seat the creator as Admin).
     #[test]
     fn placeholder_roster_is_non_empty_and_seats_no_one() {
         let admin = keypair();
@@ -2664,7 +2556,6 @@ mod tests {
             .all(|member| member.state != GroupMemberState::Active));
         assert!(is_s3_placeholder(&placeholder));
         assert!(!is_s3_placeholder(&info));
-        // A record with no roster still gets one Removed entry.
         let mut empty = info.clone();
         empty.members_v2.clear();
         let roster = placeholder_roster(&empty);
@@ -2677,9 +2568,6 @@ mod tests {
             .all(|member| member.state == GroupMemberState::Removed));
     }
 
-    /// §4 "Crash reconciliation at load": `after` finalises, `before` (the
-    /// legacy write never landed) restores the earlier record, a real
-    /// legacy record is kept, and a placeholder matching neither is lost.
     #[test]
     fn load_reconciliation_chooses_by_the_binding() {
         let admin = keypair();
@@ -2726,9 +2614,6 @@ mod tests {
             choose_authoritative(&binding, &placeholder_of(&third)),
             AuthoritativeChoice::Lost
         );
-        // The arming write (no earlier authoritative record) that never
-        // landed leaves a real record, which is kept; a placeholder at the
-        // before head with nothing to restore is lost, never guessed.
         binding.before_record = None;
         assert_eq!(
             choose_authoritative(&binding, &placeholder_of(&info)),
@@ -2768,10 +2653,6 @@ mod tests {
         }
     }
 
-    /// §3 "A crash resumes from the journal's phase": a crash after the
-    /// journal leaves the ORIGINAL forked record live, and it shows this
-    /// node Active. Before the fix the swap checked
-    /// only "Active with a tree", so it closed the journal on the original.
     #[test]
     fn swap_binds_the_staged_result_to_the_journal_and_phase() {
         let admin = keypair();
@@ -2791,34 +2672,25 @@ mod tests {
         original.seal_commit(&admin, 1_000).expect("seal");
         let mut journal = journal_fixture(&admin, &original);
         assert!(original.has_active_member(&subject));
-        // Prepared: never a swap, even on an Active record.
         assert!(!journal.staged_result_ready(&original, &subject, true));
-        // Staging, but the live record is still the journalled original.
         journal.phase = ReseatPhase::Staging;
         assert!(!journal.staged_result_ready(&original, &subject, true));
-        // A staged result past the invite base, with this node Active.
         let mut staged = original.clone();
         staged.name = "staged".to_string();
         staged.seal_commit(&admin, 2_000).expect("seal");
         assert!(journal.staged_result_ready(&staged, &subject, true));
-        // Not past the invite base: not the re-seat's seal.
         let mut at_base = original.clone();
         at_base.description = "changed".to_string();
         assert!(!journal.staged_result_ready(&at_base, &subject, true));
-        // This node not Active: not seated yet.
         let mut unseated = staged.clone();
         unseated.remove_member(&subject, None);
         assert!(!journal.staged_result_ready(&unseated, &subject, true));
-        // Another group: never.
         let mut other_group = journal.clone();
         other_group.authorisation.fields.group = "other".to_string();
         assert!(!other_group.staged_result_ready(&staged, &subject, true));
-        // TreeKEM plane without keys installed: not seated.
         let mut treekem = staged.clone();
         treekem.secure_plane = crate::mls::SecureGroupPlane::TreeKem;
         assert!(!journal.staged_result_ready(&treekem, &subject, false));
-        // #1533 rc13: an encrypted GSS group whose share has not arrived
-        // (no shared secret yet) is not seated either, tree or not.
         assert_eq!(
             staged.policy.confidentiality,
             crate::groups::GroupConfidentiality::MlsEncrypted
@@ -2827,15 +2699,11 @@ mod tests {
         keyless.shared_secret = None;
         assert!(!journal.staged_result_ready(&keyless, &subject, true));
         assert!(!journal.staged_result_ready(&keyless, &subject, false));
-        // A signed-public GSS group has no key to wait for.
         let mut public = keyless.clone();
         public.policy.confidentiality = crate::groups::GroupConfidentiality::SignedPublic;
         assert!(journal.staged_result_ready(&public, &subject, false));
     }
 
-    /// A record with entries in both serialized hash-table fields
-    /// (`issued_invites`, `issued_invite_secrets`), whose JSON order is
-    /// per-process iteration order (#1652).
     fn invite_heavy_record(admin: &AgentKeypair) -> GroupInfo {
         let subject = "ab".repeat(32);
         let mut original = GroupInfo::new(
@@ -2873,13 +2741,6 @@ mod tests {
         original
     }
 
-    /// #1652: the journal digest is over a canonical encoding, pinned
-    /// here byte for byte — the domain tag, the record as a
-    /// `serde_json::Value` (every object's keys sorted) and the
-    /// invite-secrets array sorted. Before the fix the digest was BLAKE3
-    /// of plain `serde_json::to_vec(&GroupInfo)`, whose field order is
-    /// the struct's declaration order and whose hash-table fields follow
-    /// iteration order.
     #[test]
     fn reseat_record_digest_is_over_canonical_json() {
         let admin = keypair();
@@ -2897,11 +2758,6 @@ mod tests {
         assert_eq!(digest, *blake3::hash(&preimage).as_bytes());
     }
 
-    /// #1652: the digest of an unchanged record survives a JSON round
-    /// trip, which rebuilds both hash tables with fresh random seeds.
-    /// Before the fix the same record digested differently after a
-    /// restart, so the originality guard in `staged_result_ready` could
-    /// stop recognising the journalled original.
     #[test]
     fn reseat_record_digest_survives_a_json_round_trip() {
         let admin = keypair();
@@ -2915,16 +2771,6 @@ mod tests {
         );
     }
 
-    /// #1652: a journal an older binary wrote holds the pre-fix digest,
-    /// BLAKE3 of plain `serde_json::to_vec`. `staged_result_ready` still
-    /// recognises the journalled original against it (fail closed) and a
-    /// genuine staged result stays ready. The invite base sits one
-    /// revision under the original's head, so the original passes every
-    /// other readiness check: the legacy comparison alone refuses it,
-    /// and this test fails when that comparison is removed. The
-    /// JSON-reloaded original is the restart case: the fresh hash-table
-    /// order defeats the legacy digest (the #1652 defect), while the
-    /// canonical digest this binary journals still recognises it.
     #[test]
     fn staged_result_ready_still_matches_a_legacy_journal_digest() {
         let admin = keypair();
@@ -2934,18 +2780,8 @@ mod tests {
         let mut journal = journal_fixture(&admin, &original);
         journal.record_digest = legacy;
         journal.phase = ReseatPhase::Staging;
-        // One revision under the original's head, so the original is past
-        // the invite base like a staged result (the readiness check reads
-        // the fields, not the signature).
         journal.authorisation.fields.invite_base_revision = original.state_revision - 1;
         assert!(!journal.staged_result_ready(&original, &subject, true));
-        // A restart reloads the original from the journal's JSON, so both
-        // hash tables come back with fresh seeds. The legacy digest was
-        // over the writing process's iteration order and cannot match the
-        // reloaded record, so this guard alone does not refuse it: across
-        // a restart the caller refuses the original by head
-        // (`is_journalled_original`), and the canonical digest below is
-        // what keeps this guard itself restart-proof.
         let reloaded =
             serde_json::from_str::<GroupInfo>(&serde_json::to_string(&original).expect("json"))
                 .expect("round trip");
@@ -2954,7 +2790,6 @@ mod tests {
         canonical.phase = ReseatPhase::Staging;
         canonical.authorisation.fields.invite_base_revision = original.state_revision - 1;
         assert!(!canonical.staged_result_ready(&reloaded, &subject, true));
-        // A genuine staged result stays ready under either journal.
         let mut staged = original.clone();
         staged.name = "staged".to_string();
         staged.seal_commit(&admin, 2_000).expect("seal");
@@ -3027,9 +2862,6 @@ mod tests {
         let mut tampered = auth.clone();
         tampered.fields.expires_at_ms = 9_000;
         assert_eq!(check(&tampered, &subject, &live, 1_000), Err("signature"));
-        // The key comes from the paired invite. Another agent's key, even
-        // one named as the inviter, fails the signature; an invite from
-        // another inviter is refused before any signature check.
         let other = keypair();
         let other_id = hex::encode(other.agent_id().as_bytes());
         let other_key = hex::encode(other.public_key().as_bytes());
@@ -3041,7 +2873,6 @@ mod tests {
             auth.check_for_subject("g", &subject, &live, 1_000, (&other_id, &other_key)),
             Err("signer_not_inviter")
         );
-        // ADR 0109 §3 lists no public key in the preimage.
         assert!(!auth
             .fields
             .preimage()
@@ -3050,9 +2881,6 @@ mod tests {
         assert_ne!(auth.digest(), tampered.digest());
     }
 
-    /// A rebuilt sidecar keeps its loss record when everything else in it
-    /// is gone, so the admin's `issued_reseats_lost` survives a later
-    /// write.
     #[test]
     fn a_rebuilt_sidecar_is_never_empty() {
         let mut body = GroupRecoveryV1::default();
@@ -3163,7 +2991,6 @@ mod tests {
         );
         info.seal_commit(&admin, 1_500).expect("seal add");
         let base = info.clone();
-        // r+1: a rename; r+2: M1 promoted to admin; r+3: another rename.
         info.name = "one".to_string();
         info.seal_commit(&admin, 2_000).expect("seal rename");
         let after_rename = info.clone();
@@ -3197,11 +3024,9 @@ mod tests {
             provisional_path(&ata, &after_promotion),
             ProvisionalPath::Verified
         );
-        // A head that left the sequence is dropped.
         let mut off = after_rename.clone();
         off.state_hash = "sibling".to_string();
         assert_eq!(provisional_path(&ata, &off), ProvisionalPath::Unverified);
-        // The whole sequence applied, but the signer was demoted at its end.
         let mut demoted = info.clone();
         if let Some(member) = demoted.members_v2.get_mut(&m1) {
             member.role = GroupRole::Member;
@@ -3216,13 +3041,9 @@ mod tests {
     fn active_ata_at_load_keeps_only_an_applied_after() {
         let admin = keypair();
         let ata = AdminTerminalAttestation::sign(fields(&admin), &admin).expect("sign");
-        // `before`: the head is still the ATA's `from`.
         assert!(!keep_active_ata_at_load(&ata, 4, "h4"));
-        // `after`: a head on the sequence at its revision.
         assert!(keep_active_ata_at_load(&ata, 5, "h5"));
         assert!(keep_active_ata_at_load(&ata, 6, "h6"));
-        // Neither: an off-sequence head, or a sequence hash at the wrong
-        // revision.
         assert!(!keep_active_ata_at_load(&ata, 5, "sibling"));
         assert!(!keep_active_ata_at_load(&ata, 7, "h6"));
     }
@@ -3243,21 +3064,17 @@ mod tests {
             .cloned()
             .collect();
         assert_eq!(links.len(), 2);
-        // At the base: the whole chain is still to apply.
         let all = kept_chain_remainder(links.clone(), base.state_revision, &base.state_hash)
             .expect("from the base");
         assert_eq!(all.len(), 2);
-        // After the first segment: only the second link.
         let first = links[0].commit.clone();
         let rest = kept_chain_remainder(links.clone(), first.revision, &first.state_hash)
             .expect("from the first link");
         assert_eq!(rest.len(), 1);
         assert_eq!(rest[0].commit.state_hash, links[1].commit.state_hash);
-        // At the chain's end: nothing left, the terminal follows.
         let end = kept_chain_remainder(links.clone(), info.state_revision, &info.state_hash)
             .expect("from the end");
         assert!(end.is_empty());
-        // A head at a chain revision with another hash: not this chain.
         assert!(kept_chain_remainder(links, first.revision, "sibling").is_none());
     }
 
@@ -3298,13 +3115,6 @@ mod tests {
         ));
     }
 
-    /// #1533 rc13 (Codex P2 @c226d28e and @c4467dfc), S3 × S4: a served
-    /// chain that holds an ordinary member's certificate self-rebind (ADR
-    /// 0110 §4, D129) walks with `validate_alternate_chain`, so a
-    /// pre-Welcome joiner applies it state-only too. Before the fix the
-    /// state-only apply asked for an admin and refused the link that the
-    /// walk had accepted. A member's link that changes anything else still
-    /// needs an admin.
     #[test]
     fn a_self_rebind_link_applies_state_only_as_the_walk_accepts_it() {
         use crate::groups::state_commit as sc;
@@ -3331,11 +3141,8 @@ mod tests {
         set_digest(&mut info, "c1");
         info.seal_commit(&admin, 1_000).expect("seal base");
         let base = info.clone();
-        // The member renews its own certificate (S4 self-rebind) ...
         set_digest(&mut info, "c2");
         info.seal_commit(&member, 2_000).expect("seal self-rebind");
-        // ... then an admin seals the terminal (the walk takes a terminal
-        // with the reconstruction's metadata: a roster change).
         info.add_member(
             "m3".repeat(32),
             GroupRole::Member,
@@ -3365,7 +3172,6 @@ mod tests {
         let terminal = apply_link_state_only(&rebound, &links[1]).expect("terminal link");
         assert_eq!(terminal.state_hash, info.state_hash);
 
-        // The member's link that renames the group is not a self-rebind.
         let mut other = base.clone();
         other.name = "member rename".to_string();
         other
@@ -3459,7 +3265,6 @@ mod tests {
     }
     struct OwnerAxis {
         admin: AgentKeypair,
-        /// A second Active admin, seated with the subject.
         peer: AgentKeypair,
         certs: Vec<(String, crate::identity::AgentCertificate)>,
         subject_hex: String,
@@ -3487,14 +3292,10 @@ mod tests {
             .0
     }
 
-    /// How the fixture's revision-2 commit unseats the subject.
     #[derive(Clone, Copy)]
     enum Unseat {
-        /// `admin` removes the subject.
         RemovedByAdmin,
-        /// `peer`, another admin, removes the subject (D170).
         RemovedByPeer,
-        /// `admin` bans the subject: a ban is not a removal.
         BannedByAdmin,
     }
 
@@ -3583,8 +3384,6 @@ mod tests {
         mandate_by(fixture, commit, role, &fixture.admin, |_| {})
     }
 
-    /// A mandate signed by `signer` over the fixture, with `edit` applied
-    /// to the fields before the signature (so check 1 still passes).
     fn mandate_by(
         fixture: &OwnerAxis,
         commit: &crate::groups::state_commit::GroupStateCommit,
@@ -3624,8 +3423,6 @@ mod tests {
     #[test]
     fn reseat_mandate_accepts_a_bound_readmission_and_names_each_failure() {
         let fixture = owner_axis_group();
-        // The re-seat commit: the subject back as Member, sealed by the admin
-        // on a clone of the parent.
         let mut next = fixture.info.clone();
         next.add_member(
             fixture.subject_hex.clone(),
@@ -3689,7 +3486,6 @@ mod tests {
             verify_reseat_mandate(&mandate, &other_kp),
             Err(ReseatMandateCause::BindingMismatch)
         );
-        // A replay after the subject is seated again fails check 5.
         let mut reseated = fixture.info.clone();
         reseated
             .commit_log
@@ -3708,8 +3504,6 @@ mod tests {
         );
     }
 
-    /// The re-seat commit: the subject back as Member on a clone of the
-    /// fixture's record, sealed by `signer`.
     fn reseat_commit(
         fixture: &OwnerAxis,
         signer: &AgentKeypair,
@@ -3743,24 +3537,13 @@ mod tests {
         }
     }
 
-    /// #1680, ADR 0109 §3a check 8: the re-seat KeyPackage must verify
-    /// against the subject's agent key, exactly as an ordinary join's
-    /// does. A mandate whose package the receiver's evidence does not
-    /// bind to the subject — a package another key signed — is refused
-    /// `binding_mismatch`. A re-seat with no package at all (an empty
-    /// bound hash) keeps the ordinary join's symmetry on a non-package
-    /// plane; on the TreeKEM plane every re-seat has a package, so the
-    /// same mandate fails the binding outright.
     #[test]
     fn reseat_mandate_refuses_a_key_package_not_bound_to_the_subject() {
         let fixture = owner_axis_group();
         let commit = reseat_commit(&fixture, &fixture.admin);
         let mandate = mandate_for(&fixture, &commit, GroupRole::Member);
         let check = check_for(&fixture, &commit);
-        // Control: the subject's own package passes check 8.
         assert_eq!(verify_reseat_mandate(&mandate, &check), Ok(()));
-        // A package another key signed does not verify against the
-        // subject's agent key: §3a check 8's second clause refuses it.
         let other_signer = ReseatMandateCheck {
             key_package_bound_to_subject: false,
             ..check
@@ -3769,8 +3552,6 @@ mod tests {
             verify_reseat_mandate(&mandate, &other_signer),
             Err(ReseatMandateCause::BindingMismatch)
         );
-        // No package at all, off the TreeKEM plane: the ordinary join's
-        // rule has nothing to verify, so the binding is not required.
         let packageless = mandate_by(&fixture, &commit, GroupRole::Member, &fixture.admin, |f| {
             f.key_package_hash = String::new();
         });
@@ -3783,8 +3564,6 @@ mod tests {
             verify_reseat_mandate(&packageless, &packageless_check),
             Ok(())
         );
-        // The same packageless mandate on the TreeKEM plane: every re-seat
-        // there has a package, so the empty binding fails by itself.
         let treekem_check = ReseatMandateCheck {
             treekem_plane: true,
             ..packageless_check
@@ -3795,11 +3574,6 @@ mod tests {
         );
     }
 
-    /// #1533 review (ZCode), ADR 0109 §3a check 5 and D170: a promoted
-    /// admin re-seats only a removal it committed itself. A mandate whose
-    /// removal another admin committed is refused `removal_mismatch` by
-    /// every receiver, even when the signer is an admin and every other
-    /// binding holds. Control: the admin that committed the removal passes.
     #[test]
     fn reseat_mandate_refuses_a_removal_another_admin_committed() {
         let fixture = owner_axis_group_with(Unseat::RemovedByPeer);
@@ -3823,17 +3597,12 @@ mod tests {
         );
     }
 
-    /// ADR 0109 §3a checks 2, 3 and 4 each name their own cause. Each
-    /// mandate is signed after the edit, so check 1 passes and the named
-    /// check is the first that fails.
     #[test]
     fn reseat_mandate_names_signer_policy_and_seating_failures() {
         let fixture = owner_axis_group();
         let commit = reseat_commit(&fixture, &fixture.admin);
         let check = check_for(&fixture, &commit);
 
-        // (2) A signer with no Admin seat at the parent: an outsider, and
-        // the same admin demoted to Member in the parent.
         let outsider = keypair();
         let outsider_commit = reseat_commit(&fixture, &outsider);
         let by_outsider = mandate_by(
@@ -3864,8 +3633,6 @@ mod tests {
             Err(ReseatMandateCause::SignerNotAdmin)
         );
 
-        // (3) Each bound policy field: the policy hash, the owner, the
-        // group and the genesis.
         let other = "ee".repeat(32);
         type Edit = fn(&mut ReseatMandateFields, String);
         let edits: [(&str, Edit); 4] = [
@@ -3885,8 +3652,6 @@ mod tests {
             );
         }
 
-        // (4) The seating commit is not on the chain, or did not seat the
-        // subject (the removal commit unseats it).
         for seating in ["ff".repeat(32), fixture.removal_hash.clone()] {
             let edited = mandate_by(&fixture, &commit, GroupRole::Member, &fixture.admin, |f| {
                 f.seating_commit_hash = seating.clone();
@@ -3899,9 +3664,6 @@ mod tests {
         }
     }
 
-    /// ADR 0109 §3a check 5: the named removal must be on the chain, must
-    /// remove this subject (a ban is not a removal), and no later commit
-    /// may seat or ban the subject again. Each case breaks one clause only.
     #[test]
     fn reseat_mandate_refuses_a_basis_that_is_not_the_live_removal() {
         let fixture = owner_axis_group();
@@ -3911,7 +3673,6 @@ mod tests {
             verify_reseat_mandate(&mandate_for(&fixture, &commit, GroupRole::Member), &check),
             Ok(())
         );
-        // Not on the chain, and a commit that did not remove the subject.
         for removal in ["ff".repeat(32), fixture.seating_hash.clone()] {
             let edited = mandate_by(&fixture, &commit, GroupRole::Member, &fixture.admin, |f| {
                 f.removal_commit_hash = removal.clone();
@@ -3922,7 +3683,6 @@ mod tests {
                 "{removal}"
             );
         }
-        // A ban, by the signer, is not a removal.
         let banned = owner_axis_group_with(Unseat::BannedByAdmin);
         let banned_commit = reseat_commit(&banned, &banned.admin);
         assert_eq!(
@@ -3932,8 +3692,6 @@ mod tests {
             ),
             Err(ReseatMandateCause::RemovalMismatch)
         );
-        // A later commit bans the subject (the parent's own roster does
-        // not show it, so only the later-commit clause can see it).
         let mut later = fixture.info.clone();
         later.ban_member(
             &fixture.subject_hex,

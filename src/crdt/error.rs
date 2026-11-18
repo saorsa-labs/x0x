@@ -126,8 +126,6 @@ mod tests {
 
     #[test]
     fn test_error_from_bincode() {
-        // bincode::Error doesn't implement Clone, so we can't easily construct one
-        // Just verify the From impl exists by type checking
         fn _assert_from_impl(_: bincode::Error) -> CrdtError {
             CrdtError::Serialization(bincode::Error::new(bincode::ErrorKind::Custom(
                 "test".to_string(),

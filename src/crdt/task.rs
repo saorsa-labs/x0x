@@ -381,9 +381,7 @@ mod tests {
         let id = TaskId::new("Test", &agent, 1000);
         let display = format!("{}", id);
 
-        // Should be 64 hex characters (32 bytes * 2)
         assert_eq!(display.len(), 64);
-        // Should only contain hex characters
         assert!(display.chars().all(|c| c.is_ascii_hexdigit()));
     }
 

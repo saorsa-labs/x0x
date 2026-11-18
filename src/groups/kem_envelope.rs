@@ -2,10 +2,6 @@
 //!
 //! # What this gives (and does not give)
 //!
-//! This module replaces the earlier obfuscation-grade envelope (which derived
-//! the AEAD key from public values observable in gossip) with **true recipient
-//! confidentiality** via post-quantum ML-KEM-768 key encapsulation.
-//!
 //! - Sealer inputs: recipient's published ML-KEM-768 **public** key.
 //! - Sealer output: `(kem_ciphertext, aead_nonce, aead_ciphertext)`.
 //! - Opener inputs: recipient's own ML-KEM-768 **private** key.
@@ -85,7 +81,6 @@ impl AgentKemKeypair {
                 .map_err(IdentityError::from)?;
             let kp: AgentKemKeypair = bincode::deserialize(&bytes)
                 .map_err(|e| IdentityError::Serialization(format!("ML-KEM load: {e}")))?;
-            // Basic sanity: public length matches ML-KEM-768.
             if kp.public_bytes.len() != KEM_VARIANT.public_key_size() {
                 return Err(IdentityError::Serialization(format!(
                     "ML-KEM public-key size {} != expected {}",
@@ -294,15 +289,12 @@ mod tests {
 
     #[test]
     fn wrong_keypair_cannot_open() {
-        // Seal to kp_a; try to open with kp_b. Must fail.
         let kp_a = AgentKemKeypair::generate().unwrap();
         let kp_b = AgentKemKeypair::generate().unwrap();
         let secret = [7u8; 32];
         let aad = b"aad";
         let (kem_ct, nonce, aead_ct) =
             seal_group_secret_to_recipient(&kp_a.public_bytes, aad, &secret).unwrap();
-        // kp_b's decapsulation of ciphertext targeted at kp_a yields a
-        // different shared secret → AEAD auth-tag check fails.
         let res = open_group_secret(&kp_b, aad, &kem_ct, &nonce, &aead_ct);
         assert!(res.is_err(), "non-recipient must not open the envelope");
     }
@@ -406,9 +398,6 @@ mod tests {
     }
     #[test]
     fn roundtrip_seal_open_bytes() {
-        // ADR-0043 export envelope shape: 4032 B ML-DSA-65 secret + public
-        // half — far past the 32-byte group-secret limit. The byte-wise
-        // sibling must round-trip it exactly.
         let kp = AgentKemKeypair::generate().expect("generate");
         let payload: Vec<u8> = (0..4032u32).map(|i| (i % 251) as u8).collect();
         let aad = b"x0x-agent-move.v1\x00auth-bytes";
@@ -421,9 +410,6 @@ mod tests {
 
     #[test]
     fn bytes_wrong_aad_fails() {
-        // The export envelope's AAD is the MoveAuthorization canonical
-        // bytes; a different authorization (other move, other target)
-        // must fail the AEAD tag — cross-move replay is impossible.
         let kp = AgentKemKeypair::generate().expect("generate");
         let (kem_ct, nonce, aead_ct) =
             seal_bytes_to_recipient(&kp.public_bytes, b"auth-1", b"payload").expect("seal");

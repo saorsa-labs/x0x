@@ -3,14 +3,6 @@
 //! This module provides automatic synchronization of TaskLists across peers
 //! using saorsa-gossip's pub/sub delta propagation.
 //!
-//! ## Architecture
-//!
-//! - `TaskListSync` wraps a TaskList in Arc<RwLock<>> for concurrent access
-//! - Publishes deltas to a gossip topic when local changes occur
-//! - Subscribes to the topic to receive and apply remote deltas
-//! - Runs a `StateRequest` cold-start side channel so a first-time joiner
-//!   bootstraps tasks written before it subscribed (mirrors `KvStoreSync`)
-//!
 //! This provides eventual consistency across all peers sharing the same topic.
 
 use crate::crdt::persistence::TaskListStorage;
@@ -35,29 +27,16 @@ use tokio::sync::RwLock;
 /// channel simply never subscribe to it and are unaffected.
 const STATE_SYNC_TOPIC_SUFFIX: &str = "/state-sync";
 
-/// Delays between state-request retries for a first-time joiner whose task
-/// list is still empty. Spread out so a slow mesh still converges without
-/// flooding.
 const STATE_REQUEST_RETRY_SECS: [u64; 4] = [1, 5, 15, 30];
 
-/// First persistent-tail delay after the front-loaded schedule exhausts.
 const STATE_REQUEST_TAIL_START_SECS: u64 = 30;
 
-/// Ceiling for the persistent tail's exponential backoff. While a list is
-/// still empty it keeps requesting at most this often — the steady-state
-/// cost is one ~50-byte side-topic message per list per 5 minutes.
 const STATE_REQUEST_TAIL_CAP_SECS: u64 = 300;
 
-/// The complete state-request delay schedule: the front-loaded burst, then
-/// an infinite exponential tail (30s doubling to a 300s ceiling).
-///
-/// Infinite BY DESIGN (issue #238): holders answer state requests only
-/// reactively and never volunteer state to late subscribers, so a bounded
-/// schedule (the previous 20 × 30s ≈ 10 min hard cap) left a replica that
-/// rehydrated while every holder was offline permanently un-synced once the
-/// cap expired. Convergence — a `StateServed` marker plus local state — is
-/// the only legitimate stop condition, and the requester loop owns that
-/// check.
+/// Infinite by design: holders answer state requests only reactively and never
+/// volunteer state, so a bounded schedule leaves a replica that rehydrated
+/// while every holder was offline un-synced for good. Convergence is the only
+/// stop condition, and the requester loop owns that check.
 fn state_request_delays() -> impl Iterator<Item = u64> {
     let tail = std::iter::successors(Some(STATE_REQUEST_TAIL_START_SECS), |d| {
         Some(d.saturating_mul(2).min(STATE_REQUEST_TAIL_CAP_SECS))
@@ -65,81 +44,42 @@ fn state_request_delays() -> impl Iterator<Item = u64> {
     STATE_REQUEST_RETRY_SECS.into_iter().chain(tail)
 }
 
-/// Minimum spacing between full-state responses from ONE holder for ONE
-/// list — the same response-storm damping as `KvStoreSync` (issue #238
-/// review): the response is a broadcast on the main topic, so one response
-/// per window serves every concurrently-bootstrapping replica.
+/// The response is a broadcast on the main topic, so one per window serves
+/// every bootstrapping replica.
 const STATE_RESPONSE_COOLDOWN_SECS: u64 = 15;
 
-/// Sleep duration for a scheduled delay with ±20% jitter, so a fleet of
-/// replicas restarted together does not phase-lock its request (and thus
-/// full-state response) schedule. Mirrors the reconnect-backoff jitter in
-/// `lib.rs`.
 fn jittered_secs(secs: u64) -> std::time::Duration {
     let factor = 0.8 + rand::random::<f64>() * 0.4;
     std::time::Duration::from_secs_f64(secs as f64 * factor)
 }
 
-/// Message exchanged on the state-sync side topic.
 #[derive(Debug, Serialize, Deserialize)]
 #[non_exhaustive]
 enum TaskListSyncMessage {
-    /// A peer with no local state for the list asks holders to republish
-    /// their full state (as a regular delta) on the main topic.
-    StateRequest { requester: PeerId },
-    /// A NON-EMPTY holder's declaration that it has answered a
-    /// `StateRequest` (its full state was republished on the main topic,
-    /// possibly earlier within the response cooldown). Requesters exit their
-    /// bootstrap tail only after seeing a marker AND holding local state —
-    /// mere non-emptiness is not convergence evidence (a single incremental
-    /// delta must not silence recovery, round-2 review). Task lists have no
-    /// authoritative owner, so an empty holder NEVER declares (two empty
-    /// bootstrapping replicas must not talk each other into a false
-    /// "converged empty"); a genuinely-empty list keeps its capped-cadence
-    /// tail (~one tiny message per 5 minutes) until state exists.
+    StateRequest {
+        requester: PeerId,
+    },
+    /// Sent only by a non-empty holder: under this unverifiable marker two empty
+    /// replicas would talk each other into a false "converged empty".
     ///
     /// Wire compatibility: additive variant — older peers fail to
     /// deserialize it and skip the message (same precedent as the kv-store
     /// side channel).
     StateServed {
-        /// The declaring holder (receivers skip their own echo).
         responder: PeerId,
     },
-    /// A holder's digest-committed declaration that it has answered a
-    /// `StateRequest` (issue #240): `digest` commits to the FULL served
-    /// task set (see `TaskList::served_digest`), so a requester can verify
-    /// "served us, completely" against its OWN state instead of trusting
-    /// that the full delta and the marker both arrived (the v1 cross-topic
-    /// loss window). A requester stops only when its local digest matches a
-    /// declared digest — a lost full delta leaves the local digest
-    /// different, so it keeps asking.
-    ///
-    /// Empty holders declare the digest of the empty set, which any empty
-    /// requester can compute locally — two empty replicas verifiably agree
-    /// on the empty state, so converging on empty is now CORRECT (not the
-    /// false convergence the v1 silence rule defended against), and the
-    /// genuinely-empty chatter tail terminates. Because the digest is
-    /// self-verifying, an empty declaration needs no full-delta broadcast
-    /// to witness.
-    ///
     /// Wire compatibility: additive variant, same precedent as the v1
     /// marker — older peers fail to deserialize it and skip the message;
     /// new peers treat v1 markers as weaker evidence when no v2 digest has
     /// been seen. The marker rides along with the full-state broadcast
     /// (never separately) when there is state to serve.
     StateServedV2 {
-        /// The declaring holder (receivers skip their own echo).
         responder: PeerId,
-        /// Canonical BLAKE3 digest over the served task set.
         digest: [u8; 32],
-        /// Number of tasks in the served set — a cheap shape check for the
-        /// verified full-replace adopt path (and useful in logs).
         entry_count: u32,
     },
 }
 
-/// #1604: main-era wire bytes of every `TaskListSyncMessage` variant still
-/// match.
 #[cfg(test)]
 #[test]
 fn task_list_sync_message_wire_matches_main() {
@@ -153,37 +93,24 @@ fn task_list_sync_message_wire_matches_main() {
     );
 }
 
-/// One responder's latest v2 digest declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ServedState {
-    /// The declared content digest.
     digest: [u8; 32],
-    /// The declared number of tasks.
     entry_count: u32,
 }
 
-/// Aggregated `StateServed`/`StateServedV2` evidence observed by one
-/// replica's responder loop, consumed by its bootstrap requester to decide
-/// convergence.
 #[derive(Debug, Default)]
 struct TaskServedEvidence {
-    /// A v1 marker from some holder (weak evidence — old peers).
     saw_v1: bool,
-    /// Latest digest declaration per responder (bounded by mesh size — a
-    /// responder's newer declaration REPLACES its older one, so a replayed
-    /// stale serve can never roll a verified full-replace adopt backwards).
+    /// Keyed by responder: a newer declaration replaces the older one, so a
+    /// replayed stale serve cannot roll a verified adopt backwards.
     digests: std::collections::HashMap<PeerId, ServedState>,
 }
 
-/// Convergence rule for the bootstrap tail (pure for unit-testing).
-///
-/// When any v2 digest declarations exist, the local digest must match one
-/// of them — with the data-bearing-claim-wins rule: if any declaration is
-/// non-empty, only a non-empty match converges (an empty holder's
-/// declaration must not retire a requester while a full holder advertised
-/// content). Otherwise (only v1 markers seen — old peers) the legacy weak
-/// rule: a marker AND local non-emptiness. No evidence is NEVER
-/// convergence.
+/// If any declaration is non-empty, only a non-empty match converges: an empty
+/// holder must not retire a requester while a full holder advertised content.
+/// With only v1 markers the weak rule applies (a marker and local
+/// non-emptiness). No evidence is never convergence.
 fn tasklist_converged(ev: &TaskServedEvidence, task_count: usize, local_digest: [u8; 32]) -> bool {
     if !ev.digests.is_empty() {
         let any_nonempty = ev.digests.values().any(|d| d.entry_count > 0);
@@ -195,9 +122,9 @@ fn tasklist_converged(ev: &TaskServedEvidence, task_count: usize, local_digest: 
     ev.saw_v1 && task_count > 0
 }
 
-/// Disarms the bootstrap-active flag on ANY requester exit path (converged,
-/// silenced, cancelled, torn down) so the listener's digest-verified
-/// full-replace adopt can never fire outside the bootstrap window.
+/// Disarms the bootstrap-active flag on every requester exit path, so the
+/// listener's digest-verified full-replace adopt cannot fire outside the
+/// bootstrap window.
 struct BootstrapGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
 
 impl Drop for BootstrapGuard {
@@ -206,33 +133,18 @@ impl Drop for BootstrapGuard {
     }
 }
 
-/// #975: how many times a payload is re-sealed when the group's epoch moves
-/// between seal and publish before the publish is refused.
 const TASK_SEAL_ATTEMPTS: usize = 3;
 
-/// #975: bound on confirming a sealed record's epoch plus the publish call it
-/// guards. The protector's permit can hold the group's roster commits off, so
-/// a stalled pub/sub call must not hold it indefinitely (cancelling the
-/// publish future drops it before the permit).
+/// The protector's permit can hold the group's roster commits off, so a
+/// stalled publish must not hold it indefinitely.
 const TASK_SEALED_PUBLISH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn publish_err(e: impl std::fmt::Display) -> crate::crdt::CrdtError {
     crate::crdt::CrdtError::Gossip(format!("failed to publish delta: {e}"))
 }
 
-/// #895/#975/#1100: publish `plain` (an encoded `(PeerId, delta)`) on `topic`.
-///
-/// Without a protector, or for a signed-public group, `plain` is published
-/// as is — for a group, only under the plaintext publication permit, which
-/// re-checks the plane and holds the group's policy commits off through the
-/// publish (#1100), so a flip to `MlsEncrypted` that commits after the seal
-/// sends the payload back through the sealing path instead. Otherwise the
-/// payload is sealed, the protector confirms the seal is still under the
-/// group's CURRENT epoch, and the sealed record is published while the
-/// protector's permit holds that epoch fixed. A member removal that commits
-/// after the seal makes the confirmation `Stale` and the payload is sealed
-/// again, so a record under a pre-removal epoch is never published after the
-/// removal. Never falls back to plaintext on a seal error.
+/// Never falls back to plaintext on a seal error, and never publishes a record
+/// sealed under an epoch the group has since left.
 async fn seal_and_publish(
     protector: Option<&Arc<dyn TaskDeltaProtector>>,
     pubsub: &PubSubManager,
@@ -248,15 +160,10 @@ async fn seal_and_publish(
             .map_err(publish_err);
     };
     for _ in 0..TASK_SEAL_ATTEMPTS {
-        // The seal runs with no permit held: the protector's seal may take
-        // the same group locks the permit does (not re-entrant).
+        // The seal runs with no permit held: the protector's seal may take the
+        // same group locks the permit does, and they are not re-entrant.
         let sealed = protector.seal(kind, &plain).await?;
         let Some(body) = sealed else {
-            // #1100: the group was signed-public when sealed. Publish the
-            // plaintext only under the publication permit — if the plane has
-            // since left signed-public, that is `Stale` and the payload
-            // re-enters the loop to be sealed under the now-current key
-            // (the sealed branch's own refusal handling), never plaintext.
             let guarded = tokio::time::timeout(TASK_SEALED_PUBLISH_DEADLINE, async {
                 match protector.confirm_plaintext_publication().await? {
                     TaskPublication::Stale => Ok(false),
@@ -313,8 +220,6 @@ async fn seal_and_publish(
     )))
 }
 
-/// #895: whether a plaintext delta may be merged on a protected list — only
-/// for a signed-public group. Anything else is refused and counted.
 async fn admit_plaintext(protector: &Arc<dyn TaskDeltaProtector>) -> bool {
     if protector.admits_plaintext().await {
         return true;
@@ -327,9 +232,6 @@ async fn admit_plaintext(protector: &Arc<dyn TaskDeltaProtector>) -> bool {
     false
 }
 
-/// #895: the plaintext `(PeerId, delta)` bytes inside a sealed record, or
-/// `None` (refused and counted) when it cannot be opened with the group's
-/// current key or its sealed author is not the gossip-verified sender.
 async fn open_sealed(
     protector: &Arc<dyn TaskDeltaProtector>,
     body: &SealedTaskRecordBody,
@@ -373,24 +275,20 @@ pub struct TaskListChanged {
     pub origin: crate::kv::KvChangeOrigin,
 }
 
-/// Where a list sends its change notices; set once before the loops start.
 #[derive(Debug, Clone)]
 struct TaskChangeSink {
     tx: tokio::sync::broadcast::Sender<TaskListChanged>,
     topic: String,
 }
 
-/// The shared, set-once slot for a list's change sink.
 #[derive(Debug, Default)]
 struct TaskChangeSlot(std::sync::OnceLock<TaskChangeSink>);
 
 impl TaskChangeSlot {
-    /// Attach the sink once; a second call is ignored.
     fn set(&self, tx: tokio::sync::broadcast::Sender<TaskListChanged>, topic: String) {
         let _ = self.0.set(TaskChangeSink { tx, topic });
     }
 
-    /// Send a notice if a sink is attached; no subscriber is not an error.
     fn note(&self, origin: crate::kv::KvChangeOrigin) {
         if let Some(sink) = self.0.get() {
             let _ = sink.tx.send(TaskListChanged {
@@ -406,95 +304,53 @@ impl TaskChangeSlot {
 /// Manages automatic background synchronization of a TaskList using gossip
 /// pub/sub. Changes are propagated via deltas published to a gossip topic.
 pub struct TaskListSync {
-    /// The task list being synchronized (wrapped for concurrent access).
     task_list: Arc<RwLock<TaskList>>,
 
-    /// Pub/sub manager for topic-based messaging.
     pubsub: Arc<PubSubManager>,
 
-    /// Topic name for this task list.
     topic: String,
 
-    /// Optional persistence context. When armed (see
-    /// [`set_persistence`](Self::set_persistence)), the full list state is
-    /// snapshotted to disk after every local mutation and every merged
-    /// remote delta, so a restart restores task content — ids, titles,
-    /// claim/complete provenance, order and version material — instead of
-    /// coming back as an empty replica (issue #557). Mirrors
-    /// `KvStoreSync::persist`.
     persist: std::sync::Mutex<Option<Arc<TaskPersistCtx>>>,
 
-    /// #1094: where change notices go ([`Self::set_change_sink`]).
     change_sink: Arc<TaskChangeSlot>,
 
-    /// This node's gossip peer id — identifies our deltas and state
-    /// requests on the wire.
     local_peer_id: PeerId,
 
-    /// Set by [`silence_bootstrap`](Self::silence_bootstrap). The bootstrap
-    /// requester checks it every iteration: its schedule is infinite (issue
-    /// #238), so a sync that should stop generating traffic — but keep
-    /// serving — arms this without ending the listener/responder loops.
     stopped: Arc<std::sync::atomic::AtomicBool>,
 
-    /// Cancelled by [`cancel_sync`](Self::cancel_sync) / [`stop`](Self::stop).
-    /// ALL background loops (delta listener, responder, requester) select on
-    /// it, so a discarded sync tears down completely without the topic-wide
-    /// `unsubscribe` that would kill unrelated subscribers sharing the topic
-    /// string (round-4 review: flag-only teardown left ghost listeners and a
-    /// live responder until daemon shutdown).
+    /// All background loops select on it, so a discarded sync tears down without
+    /// the topic-wide `unsubscribe` that would kill unrelated subscribers of the
+    /// same topic string.
     cancel: tokio_util::sync::CancellationToken,
 
-    /// Receive-path lifecycle fence (#759, mirroring #757's KvStoreSync
-    /// fence). The listener holds it across one whole
-    /// `[cancel check -> (drain) -> admit -> merge -> snapshot persist]`
-    /// section, and the route-triggered resume
-    /// ([`resume_quarantined_ingest`](Self::resume_quarantined_ingest))
-    /// across its drain.
-    /// [`cancel_sync_and_drain`](Self::cancel_sync_and_drain) takes it once
-    /// AFTER cancelling, so when that returns none of those sections is in
-    /// flight or can start — a retired listener has merged and persisted its
-    /// last in-flight delta and will never merge another.
+    /// Receive-path lifecycle fence. The listener holds it across one whole
+    /// `[cancel check -> (drain) -> admit -> merge -> snapshot persist]` section,
+    /// and [`cancel_sync_and_drain`](Self::cancel_sync_and_drain) takes it once
+    /// after cancelling, so when that returns no section is in flight or can
+    /// start.
     ///
-    /// The cancel check sits UNDER the lock (not before it): a bare flag
-    /// check cannot fence a section that already pulled its message past
-    /// `recv` when the cancel lands — the pulled delta would still merge.
-    /// Once cancelled under the lock, no new section can start.
+    /// The cancel check sits under the lock: a bare flag check cannot fence a
+    /// section that already pulled its message past `recv` when the cancel lands.
     ///
-    /// Lock order — `lifecycle` is the OUTERMOST lock of a section:
+    /// Lock order — `lifecycle` is the outermost lock of a section:
     /// `lifecycle` -> quarantine buffer `Mutex` (leaf) -> `TaskList` write
-    /// (admission/merge; the ingest gate takes `named_groups` read inside
-    /// it, synchronously) -> guard released -> persist gate `Mutex` ->
-    /// `TaskList` read -> file I/O. Nothing may await
-    /// [`cancel_sync_and_drain`](Self::cancel_sync_and_drain) while holding
-    /// a `TaskList` guard, the persist gate, or a `named_groups` guard.
+    /// (admission/merge; the ingest gate takes `named_groups` read inside it,
+    /// synchronously) -> guard released -> persist gate `Mutex` -> `TaskList`
+    /// read -> file I/O. Nothing may await
+    /// [`cancel_sync_and_drain`](Self::cancel_sync_and_drain) while holding a
+    /// `TaskList` guard, the persist gate, or a `named_groups` guard.
     lifecycle: Arc<tokio::sync::Mutex<()>>,
 
-    /// ADR-0068 D2: set-once inbound-delta admission gate, installed by the
-    /// daemon for a task list bound to a named group. Shared with the listener
-    /// loop, which is already running by the time the daemon installs it.
     ingest_gate: Arc<TaskIngestGateSlot>,
 
-    /// ADR-0068 D2: deltas received while the gate reported the group
-    /// quarantined, held in arrival order until the marker clears.
     quarantine_buffer: Arc<std::sync::Mutex<QuarantineDeltaBuffer>>,
 
-    /// The drain poll period in milliseconds, [`TASK_QUARANTINE_DRAIN_POLL_SECS`]
-    /// in production. Per-instance and only ever changed by
-    /// [`set_drain_poll_millis`](Self::set_drain_poll_millis), a `cfg(test)`
-    /// hook: the poll fixtures must not sleep for whole seconds, and a
-    /// process-global knob would couple concurrently running tests.
     drain_poll_millis: Arc<std::sync::atomic::AtomicU64>,
 
-    /// #895: set-once group-key protector for a list bound to a named group.
-    /// Installed BEFORE [`start`](Self::start) (via `TaskListBinding`); with
-    /// it, every main-topic publish is sealed and plaintext is refused unless
-    /// the protector reports a signed-public group. Empty for a personal
-    /// list, whose wire format is unchanged.
+    /// Installed before [`start`](Self::start). Empty for a personal list, whose
+    /// wire format is unchanged.
     protector: std::sync::OnceLock<Arc<dyn TaskDeltaProtector>>,
 
-    /// #895: set-once gate on answering `StateRequest`s (see
-    /// [`StateServeGate`]). Installed before [`start`](Self::start).
     serve_gate: std::sync::OnceLock<StateServeGate>,
 }
 
@@ -506,39 +362,22 @@ pub const TASK_QUARANTINE_BUFFER_MAX_DELTAS: usize = 1024;
 /// of this and [`TASK_QUARANTINE_BUFFER_MAX_DELTAS`] is reached first drops
 /// the oldest buffered delta.
 ///
-/// The bound is ABSOLUTE, including for a single delta: one delta larger than
-/// this on its own is dropped rather than retained (review nit 4 — an
-/// "always keep at least one" rule would have let the transport's own 4 MiB
-/// frame cap set the real per-list worst case, five times what the ADR states).
-/// Dropping is safe: merges are idempotent and the state-sync side channel
-/// re-serves full state after the clear.
+/// The bound is absolute: a single delta larger than this is dropped, not
+/// retained. Dropping is safe because merges are idempotent and the state-sync
+/// side channel re-serves full state after the clear.
 pub const TASK_QUARANTINE_BUFFER_MAX_BYTES: usize = 1_048_576;
 
 /// ADR-0068 D2: how often a listener holding buffered deltas re-checks whether
 /// the marker has gone.
 ///
-/// The drain is driven by OBSERVING the marker's absence rather than by hooking
-/// each site that can clear it — `fork_quarantine` is cleared at the manual
-/// route, on the metadata-apply path, at an explicit owner seal and on rollback
-/// arms, and an enumeration of clear writers whose failure mode is "one clear
-/// forgot to drain" is the fail-open census ADR-0067 rejected. This poll arm is
-/// armed ONLY while the buffer is non-empty, so a healthy list adds no timer.
-///
-/// The deadline is a PINNED sleep that survives receives and is reset only once
-/// it has fired (#732 finding 5): re-creating it inside `select!` let every
-/// inbound message cancel it, so traffic arriving faster than this period
-/// starved the drain and this bound was not a bound at all. Inbound deltas also
-/// drain the buffer before they are admitted, so under traffic the catch-up
-/// happens on the next delta rather than on this timer.
+/// The drain observes the marker's absence instead of hooking each site that
+/// can clear it: an enumeration of clear writers fails open when one forgets
+/// to drain. The poll is armed only while the buffer is non-empty, and its
+/// deadline is a pinned sleep that receives do not reset, so traffic faster
+/// than this period cannot starve the drain.
 pub const TASK_QUARANTINE_DRAIN_POLL_SECS: u64 = 5;
 
 /// ADR-0068 D2: whether inbound task-CRDT deltas may be applied right now.
-///
-/// The CRDT layer knows nothing about fork quarantine, so the daemon installs
-/// this for a group-scoped task list (`x0x.group.<gid>.symphony.<lid>`) and
-/// resolves the marker through the one resolver, under both spellings. A list
-/// with no gate — any list not bound to a named group — behaves exactly as it
-/// did before ADR-0068.
 pub trait TaskIngestGate: Send + Sync + 'static {
     /// Is application suspended (a live fork-quarantine marker)? Consulted
     /// once per inbound delta and once per drain attempt.
@@ -564,17 +403,6 @@ pub trait TaskIngestGate: Send + Sync + 'static {
     /// Run `apply` while the group's roster is **pinned**, handing it the live
     /// active-member set and the lifecycle token derived from that same pinned
     /// read (`None` when this node holds no resolvable record for the group).
-    ///
-    /// This is the shape that makes re-authorization airtight (#756 review r2).
-    /// The implementation acquires its roster read guard, derives the
-    /// [`AuthorizedRoster`], calls `apply` **synchronously** while still holding
-    /// that guard, and only then releases it. The drain therefore installs the
-    /// refreshed set, filters the buffer and runs the whole merge loop with the
-    /// roster held still: a roster commit cannot land between the refresh and the
-    /// merge, because a writer cannot acquire the roster until `apply` returns.
-    /// The earlier design — derive, release, re-read the token and compare —
-    /// closed the same hole only probabilistically and could be starved by
-    /// sustained revision churn.
     ///
     /// **Contract for implementations.**
     /// - Acquire ONE roster guard; derive both the member set and the token from
@@ -607,15 +435,6 @@ pub trait TaskIngestGate: Send + Sync + 'static {
 
 /// A live active-member set and the lifecycle token it was derived at, both read
 /// from one pinned roster guard.
-///
-/// The pairing is the point (#756 review P1/P2). The drain must not authorize
-/// against one roster state and merge against another, and the two cannot be
-/// reconciled after the fact by comparing revisions: that is a probabilistic
-/// check, and sustained revision churn could make it fail forever. So the set and
-/// the token are derived together and handed to the drain
-/// [`TaskIngestGate::with_pinned_roster`] while the roster is still held, and the
-/// merge runs inside that window. `state_revision` and the marker identity
-/// therefore describe exactly the state the merge is authorized against.
 #[derive(Debug, Clone)]
 pub struct AuthorizedRoster {
     /// The group's active members, as CRDT writer identities.
@@ -626,10 +445,8 @@ pub struct AuthorizedRoster {
 
 /// Set-once slot for the [`TaskIngestGate`].
 ///
-/// Set-once because the daemon installs exactly one gate per handle, and it
-/// does so AFTER `start_with_spawner` has already spawned the listener — so the
-/// listener reads the gate through this slot on every delta rather than
-/// capturing it once.
+/// The daemon installs the gate after `start_with_spawner` has spawned the
+/// listener, so the listener reads it through this slot on every delta.
 #[derive(Default)]
 pub struct TaskIngestGateSlot(std::sync::OnceLock<Arc<dyn TaskIngestGate>>);
 
@@ -654,37 +471,23 @@ impl TaskIngestGateSlot {
     }
 }
 
-/// One inbound delta held while the group is quarantined, with everything the
-/// merge needs so the replay is the SAME call the listener would have made.
 #[derive(Debug, Clone)]
 struct BufferedDelta {
-    /// Arrival sequence number, assigned by [`QuarantineDeltaBuffer::push`].
-    /// Identifies a held SEALED entry across the unlocked open step (#895).
     seq: u64,
-    /// The held payload: a decoded delta, or a sealed record not yet opened.
     held: HeldDelta,
-    /// The V2-envelope-verified sender — the writer identity content policy
-    /// admits on. `None` for an unverified sender, exactly as the live path
-    /// passes it.
     writer: Option<crate::identity::AgentId>,
-    /// Encoded size, for the byte bound.
     bytes: usize,
 }
 
-/// What a held entry carries.
 #[derive(Debug, Clone)]
 enum HeldDelta {
-    /// A decoded delta, ready to merge.
     Open {
-        /// OR-Set tag identity from the payload (issue #349 I3).
         peer_id: PeerId,
-        /// The delta itself (boxed: it dwarfs the sealed variant).
         delta: Box<TaskListDelta>,
     },
-    /// #895: a group-sealed record held UNOPENED while the group is
-    /// quarantined — the TreeKEM protector refuses to open during quarantine,
-    /// so it is opened after the clear ([`open_held_sealed`]) and merged in
-    /// its arrival position. Never merged while still sealed.
+    /// A group-sealed record held unopened: the TreeKEM protector refuses to
+    /// open during quarantine, so it is opened after the clear and merged in
+    /// its arrival position.
     Sealed(SealedTaskRecordBody),
 }
 
@@ -694,8 +497,8 @@ enum HeldDelta {
 /// Process-local and never persisted: a restart loses it and the CRDT
 /// re-converges by anti-entropy, exactly as it does for any delta the node was
 /// offline for.
-/// Visibility: `pub` only because the `cfg(test)` `testing` surface names it;
-/// its fields and constructors stay private to this module.
+///
+/// `pub` only because the `cfg(test)` `testing` surface names it.
 #[derive(Debug, Default)]
 pub struct QuarantineDeltaBuffer {
     entries: std::collections::VecDeque<BufferedDelta>,
@@ -704,19 +507,10 @@ pub struct QuarantineDeltaBuffer {
 }
 
 impl QuarantineDeltaBuffer {
-    /// Append a delta, dropping the OLDEST entries until both bounds hold.
-    /// Returns how many were dropped.
-    ///
-    /// Oldest-first because the newest deltas carry the most recent state, and
-    /// anything dropped is recoverable: merges are idempotent and the
-    /// state-sync side channel re-serves full state after the clear.
     fn push(&mut self, mut entry: BufferedDelta) -> u64 {
         entry.seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
         let mut dropped = 0u64;
-        // A delta that cannot fit the byte bound on its own is dropped rather
-        // than retained (review nit 4): keeping it would let the transport's
-        // own frame cap — not this constant — decide the per-list worst case.
         if entry.bytes > TASK_QUARANTINE_BUFFER_MAX_BYTES {
             return 1;
         }
@@ -736,15 +530,11 @@ impl QuarantineDeltaBuffer {
         dropped
     }
 
-    /// Take everything, in arrival order.
     fn take(&mut self) -> Vec<BufferedDelta> {
         self.bytes = 0;
         self.entries.drain(..).collect()
     }
 
-    /// Put entries taken by [`take`](Self::take) back at the FRONT, in their
-    /// original order (#895: the drain stops at a still-sealed entry rather
-    /// than merge anything after it out of order).
     fn restore_front(&mut self, entries: Vec<BufferedDelta>) {
         for entry in entries.into_iter().rev() {
             self.bytes = self.bytes.saturating_add(entry.bytes);
@@ -752,7 +542,6 @@ impl QuarantineDeltaBuffer {
         }
     }
 
-    /// #895: the held sealed entries, oldest first, for the unlocked open step.
     fn sealed(&self) -> Vec<(u64, SealedTaskRecordBody, Option<AgentId>)> {
         self.entries
             .iter()
@@ -763,7 +552,6 @@ impl QuarantineDeltaBuffer {
             .collect()
     }
 
-    /// #895: replace held sealed entry `seq` with its opened delta, in place.
     fn resolve(&mut self, seq: u64, peer_id: PeerId, delta: TaskListDelta) {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.seq == seq) {
             entry.held = HeldDelta::Open {
@@ -773,8 +561,6 @@ impl QuarantineDeltaBuffer {
         }
     }
 
-    /// #895: remove held entry `seq` (it can never be opened). Returns whether
-    /// it was still held.
     fn remove(&mut self, seq: u64) -> bool {
         let Some(index) = self.entries.iter().position(|e| e.seq == seq) else {
             return false;
@@ -798,10 +584,7 @@ impl QuarantineDeltaBuffer {
     }
 }
 
-/// Lock the quarantine buffer, recovering a poisoned mutex.
-///
-/// Poison recovery rather than propagation: the buffer is a hold for deltas the
-/// node has decided not to apply, so a panic while it was locked must not wedge
+/// Recovers a poisoned mutex: a panic while the hold was locked must not wedge
 /// replication for the rest of the process's life.
 fn lock_buffer(
     buffer: &std::sync::Mutex<QuarantineDeltaBuffer>,
@@ -814,17 +597,9 @@ fn lock_buffer(
 /// ADR-0068 D2: the outcome of the admission step.
 ///
 /// `Apply` carries the list write guard the decision was taken under, so the
-/// caller's merge happens inside the SAME critical section as the decision — no
-/// other task-list writer can interleave, and no marker observed by this call can
-/// be raced (review nit 2). It does NOT mean the marker cannot change at all: the
-/// gate's roster read is released before the verdict, so one already-admitted
-/// delta per listener can still merge just after a marker installs — see the
-/// admission step's own documentation for why that residual is accepted and what
-/// bounds it.
-// `Apply` carries a delta and a lock guard while `Held` carries nothing, so the
-// variants differ in size by design: boxing the admitted delta to even them out
-// would put an allocation on the ingest hot path to save nothing (the value is
-// consumed immediately by the caller's merge, never stored or queued).
+/// caller's merge happens in the same critical section as the decision.
+// Boxing the admitted delta to even the variants out would put an allocation
+// on the ingest hot path.
 #[allow(clippy::large_enum_variant)]
 pub enum Admission<'a> {
     /// Merge this delta, using the guard the decision was taken under.
@@ -836,53 +611,26 @@ pub enum Admission<'a> {
 
 /// ADR-0068 D2: the admission step — apply this delta now, or hold it?
 ///
-/// **Decides under the list write lock and hands the guard back.** ADR-0068's
-/// "marker installed mid-apply" row asks that the decision and the effect share
-/// one critical section; an earlier draft decided first and let the caller lock
-/// afterwards, so a marker installing in that gap let one delta through — and
-/// worse, the list could be locked by someone else in between (review nit 2). It
-/// deliberately does NOT perform the merge itself: the
-/// listener's merge shares its critical section with the issue-#240
-/// digest-verified full-replace adopt, and splitting THAT would let an
-/// interleaved merge be pruned. So the guard travels instead of the merge.
+/// Decides under the list write lock and hands the guard back, so the decision
+/// and the caller's merge share one critical section. It does not merge
+/// itself: the listener's merge shares its critical section with the
+/// digest-verified full-replace adopt, and splitting that would let an
+/// interleaved merge be pruned.
 ///
 /// **Lock order: `TaskList` write → `named_groups` read** (the gate's own
 /// lookup). Nothing in the daemon holds a `named_groups` guard across a
-/// `TaskList` lock acquisition — `apply_group_authorization` drops its read
-/// guard before `set_authorized_agents`, and the clear route's resume runs after
-/// its write guard is released — so this order cannot cycle. A future caller
-/// that awaits a task list while holding `named_groups` would break it, which is
-/// why the order is stated here and at the resume helper.
+/// `TaskList` lock acquisition, so this order cannot cycle. A caller that
+/// awaits a task list while holding `named_groups` would break it.
 ///
-/// **Admission is coupled to the buffer, not just to the marker (#756 review
-/// P2).** A delta is admitted ONLY when the buffer is empty. Checking suspension
-/// alone left an overtaking window: the caller's drain attempt can observe a live
-/// marker (or abandon on the ADR-0067 re-check) and return without consuming the
-/// buffer, and if the marker clears before this function's own suspension read,
-/// the newer delta merged straight past deltas that arrived before it — and the
-/// LWW registers are order-sensitive. Both facts are now read under the same list
-/// write guard, so the decision cannot be split. The consequence, stated plainly:
-/// while a buffer cannot be drained (a group record that never comes back, so the
-/// ADR-0067 re-check keeps abandoning), newer deltas queue behind it under the
-/// same bounds and drop counter rather than applying out of order. That is
-/// bounded, counted, and cleared by a restart.
+/// A delta is admitted only when the buffer is empty, read under the same
+/// guard as the marker: the LWW registers are order-sensitive, so a newer
+/// delta must not overtake held ones. While a buffer cannot be drained, newer
+/// deltas queue behind it under the same bounds.
 ///
-/// **Accepted residual: one in-flight delta per listener (#756 review r3).** This
-/// is the LIVE path and it is deliberately NOT roster-pinned — pinning it would put
-/// a `named_groups` read on the ingest hot path, which ADR-0068's cost section
-/// rules out. `gate.suspended()` therefore releases the roster read before this
-/// function returns `Apply`, so a marker installing in that instant is not seen and
-/// the caller's merge proceeds: **at most one already-admitted delta per listener**
-/// can land immediately after a marker installs. Nothing accumulates — the next
-/// delta reads the new marker and is held — and the drain path, where a whole
-/// buffer is at stake, IS pinned. So the honest statement of ADR-0068 D2's freeze
-/// is "byte-identical from the first delta that observes the marker", not "from the
-/// instant the marker installs". Row 20's local refusals are unaffected, and the
-/// admitted delta is a normal authenticated delta, not an unauthorized one.
-///
-/// Hot path when no marker is live: one gate read (a resolver read behind the
-/// daemon's implementation), one buffer-empty check and a scalar compare, inside
-/// the lock the merge needed anyway.
+/// Accepted residual: the live path is not roster-pinned (that would put a
+/// `named_groups` read on the ingest hot path), so at most one already-admitted
+/// delta per listener can merge just after a marker installs. The drain path
+/// is pinned.
 pub(crate) async fn admit_or_buffer<'a>(
     gate: Option<&Arc<dyn TaskIngestGate>>,
     buffer: &std::sync::Mutex<QuarantineDeltaBuffer>,
@@ -893,22 +641,14 @@ pub(crate) async fn admit_or_buffer<'a>(
     encoded_bytes: usize,
 ) -> Admission<'a> {
     let Some(gate) = gate else {
-        // No group binding — pre-ADR-0068 behaviour, one lock, no gate read.
         return Admission::Apply(delta, task_list.write().await);
     };
     let list = task_list.write().await;
     let suspended = gate.suspended().await;
-    // The buffer cannot change while this guard is held: every path that
-    // consumes or appends to it (the drain, the resume entry point, this
-    // function) takes the list write lock first. So "suspended" and "anything
-    // pending" are read as ONE fact, and a newer delta cannot overtake older
-    // pending ones (#756 review P2).
     let pending = !lock_buffer(buffer).is_empty();
     if !suspended && !pending {
         return Admission::Apply(delta, list);
     }
-    // Still holding the write guard: a merge cannot slip between this verdict
-    // and the buffering below, and a concurrent drain cannot interleave.
     hold(
         gate,
         buffer,
@@ -923,8 +663,6 @@ pub(crate) async fn admit_or_buffer<'a>(
     Admission::Held
 }
 
-/// Append one entry to the hold and report it (buffered depth, overflow drops).
-/// Callers hold the list write guard.
 fn hold(
     gate: &Arc<dyn TaskIngestGate>,
     buffer: &std::sync::Mutex<QuarantineDeltaBuffer>,
@@ -955,23 +693,14 @@ fn hold(
     }
 }
 
-/// #895 + ADR-0068 D2: whether a SEALED inbound record was held unopened.
-///
-/// The same decision [`admit_or_buffer`] takes (marker live, or older deltas
-/// pending — read as one fact under the list write guard), taken BEFORE the
-/// record is opened: the TreeKEM protector refuses to open while the group is
-/// quarantined, so opening first would turn "buffer" into "drop".
-/// [`SealedHold::Proceed`] means not held — the caller opens it and admits it
-/// as usual.
+/// The [`admit_or_buffer`] decision, taken before a sealed record is opened:
+/// the TreeKEM protector refuses to open while the group is quarantined, so
+/// opening first would turn "buffer" into "drop".
 pub(crate) enum SealedHold {
-    /// Not held: open and admit.
     Proceed(SealedTaskRecordBody),
-    /// Held. `suspended` says whether the marker is live; when it is not, the
-    /// caller drains now (older pending deltas, then this one).
     Held { suspended: bool },
 }
 
-/// See [`SealedHold`].
 pub(crate) async fn hold_sealed_if_held(
     gate: Option<&Arc<dyn TaskIngestGate>>,
     buffer: &std::sync::Mutex<QuarantineDeltaBuffer>,
@@ -994,15 +723,9 @@ pub(crate) async fn hold_sealed_if_held(
     SealedHold::Held { suspended }
 }
 
-/// #895: open every held SEALED entry now that the marker has cleared,
-/// replacing each with its decoded delta in place (arrival order kept).
-///
-/// Runs with NO list guard held while opening — a TreeKEM open takes the
-/// group membership lock and `named_groups` — and mutates the hold under the
-/// list write guard afterwards, as every other buffer writer does. An entry
-/// that fails to open is removed and counted, UNLESS the gate reports the
-/// marker live again (the failure is then the quarantine, not the record):
-/// the pass stops and leaves it held for the next drain.
+/// Opens with no list guard held (a TreeKEM open takes the group membership
+/// lock and `named_groups`). An entry that fails to open is removed and
+/// counted, unless the marker is live again: then it stays held.
 async fn open_held_sealed(
     gate: Option<&Arc<dyn TaskIngestGate>>,
     protector: Option<&Arc<dyn TaskDeltaProtector>>,
@@ -1024,7 +747,6 @@ async fn open_held_sealed(
                 Err(TaskSealRejection::SenderMismatch)
             }
             Ok(opened) => decode_delta::<TaskListDelta>(&opened.payload).map_err(|e| {
-                // #1604: an unknown variant is counted and logged.
                 let _ = crate::wire_compat::classify_bincode("TaskListDelta", &e);
                 TaskSealRejection::OpenFailed
             }),
@@ -1055,55 +777,17 @@ async fn open_held_sealed(
 /// ADR-0068 D2: apply every buffered delta, in arrival order, once the marker
 /// is gone. Returns how many were applied.
 ///
-/// Arrival order matters even though CRDT merges are idempotent: the LWW
-/// registers are order-sensitive, so a replay out of order could pick a
-/// different winner than the live path would have.
+/// Arrival order matters: the LWW registers are order-sensitive.
 ///
-/// Takes the buffer's contents under the list write lock, so a concurrent
-/// inbound delta queues behind this batch rather than interleaving with it.
+/// The drain is one pinned critical section. Under the list write guard the
+/// gate pins the roster ([`TaskIngestGate::with_pinned_roster`]) and, with no
+/// await, the marker is re-checked against the captured token (no record is a
+/// mismatch, ADR-0067), the authorized-writer set is replaced by the pinned
+/// one, and the buffer is merged. A roster commit cannot land between the
+/// refresh and the merge. Abandoning leaves the buffer intact and in order.
 ///
-/// **One pinned critical section (ADR-0068's "marker installed mid-apply" row,
-/// ADR-0067's re-check, and #732 finding 4 — unified by #756 review r2).** The
-/// drain takes the task-list write guard and then asks the gate to pin the roster
-/// ([`TaskIngestGate::with_pinned_roster`]). Inside that pin, synchronously and
-/// with no await anywhere:
-///
-/// 1. the marker half is checked against the token captured when the drain
-///    decided to run — a marker that installed since abandons the drain, and a
-///    `None` roster (no record for the group) abandons it too, which is ADR-0067's
-///    rule that "no record" is a mismatch, never "unchanged";
-/// 2. the authorized-writer set is replaced with the pinned one, so authorization
-///    is the roster the CLEARING commit left behind rather than the contested one
-///    the subscription captured;
-/// 3. the buffer is taken and merged in arrival order, skipping (and counting) any
-///    entry whose writer that roster no longer seats.
-///
-/// Because the roster cannot be written while the pin is held, there is no window
-/// between this drain's refresh and its merge — the compare-and-retry loop this
-/// replaces was only a probabilistic version of the same property, and could be
-/// starved indefinitely by revision churn (review r2, P1+P2 together). That
-/// statement is about the DRAIN only: the live admission path is unpinned by
-/// design and carries its own one-delta residual, stated at the admission step. Abandoning
-/// leaves the buffer intact, in order, for the next observation; nothing is ever
-/// half-applied, because the buffer is only emptied after the checks pass.
-///
-/// **Lock order and hold time.** `TaskList` write → roster read is the documented
-/// order (see [`admit_or_buffer`]); acquiring the roster *after* the list guard is
-/// that order, not its inverse. The pin is held for one bounded synchronous batch:
-/// at most [`TASK_QUARANTINE_BUFFER_MAX_DELTAS`] deltas totalling at most
-/// [`TASK_QUARANTINE_BUFFER_MAX_BYTES`], CPU-only — no I/O, no network and no
-/// persistence (the snapshot write happens after the guard is released). It is NOT
-/// free per delta: `merge_delta` runs the ADR-0068/issue-#349 admission checks,
-/// which verify checkbox attestations, and brackets the merge with two
-/// `state_fingerprint` scans over the resolved list. So the honest bound is "that
-/// batch of merges, whatever they cost on this machine", not a wall-clock figure.
-/// Worst case a roster WRITER waits that batch out; roster readers are unaffected
-/// except behind a queued writer, and this path runs only while a group is or has
-/// just been fork-quarantined.
-///
-/// **Empty buffer (#756 review P4).** With nothing to drain the authorization is
-/// still refreshed under the same pin, so a clear that finds an empty buffer does
-/// not leave the cached roster stale for the deltas that arrive next.
+/// Lock order: `TaskList` write → roster read, as in [`admit_or_buffer`]. The
+/// pin is held for one bounded CPU-only batch; a roster writer waits it out.
 pub(crate) async fn drain_quarantine_buffer(
     gate: Option<&Arc<dyn TaskIngestGate>>,
     buffer: &std::sync::Mutex<QuarantineDeltaBuffer>,
@@ -1114,17 +798,12 @@ pub(crate) async fn drain_quarantine_buffer(
         held.is_empty()
     };
     if empty {
-        // #756 review P4: refresh the cached authorization even with nothing to
-        // apply, so the roster the NEXT deltas are admitted against is the one the
-        // clearing commit left behind. Reached from the explicit resume entry
-        // point; the poll and the pre-admission drain both run while the buffer is
-        // non-empty, so this costs nothing on the ingest path.
+        // Refresh the cached authorization even with nothing to apply, so the
+        // next deltas are admitted against the roster the clearing commit left.
         if let Some(gate) = gate {
             if !gate.suspended().await {
                 let mut list = task_list.write().await;
                 let mut refresh = |roster: Option<&AuthorizedRoster>| {
-                    // Under the pin, "no marker" is authoritative — the
-                    // `suspended()` read above was only the cheap pre-check.
                     if let Some(roster) = roster {
                         if roster.token.marker().is_none() {
                             list.set_authorized_agents(roster.agents.clone());
@@ -1136,16 +815,13 @@ pub(crate) async fn drain_quarantine_buffer(
         }
         return 0;
     }
-    // Cheap early-out before taking the list write lock. The authoritative check
-    // is the pinned one below; this only avoids locking when the answer is already
-    // "still quarantined".
     let captured = match gate {
         Some(gate) => {
             if gate.suspended().await {
-                return 0; // still quarantined — nothing to do
+                return 0;
             }
             let Some(token) = gate.epoch_token().await else {
-                // No record for the group at all ⇒ mismatch by ADR-0067's rule.
+                // No record for the group is a mismatch (ADR-0067).
                 return 0;
             };
             Some(token)
@@ -1158,48 +834,27 @@ pub(crate) async fn drain_quarantine_buffer(
         let mut list = task_list.write().await;
         match (gate, captured.as_ref()) {
             (Some(gate), Some(captured)) => {
-                // Everything from here to the last merge happens under the pinned
-                // roster, synchronously.
                 let mut merge = |roster: Option<&AuthorizedRoster>| {
                     let Some(roster) = roster else {
-                        // No resolvable record: abandon, buffer intact.
                         return;
                     };
+                    // Both clauses on purpose: "do not merge while a marker is live" must
+                    // not depend on `suspended()` and `epoch_token()` reading one record.
                     if roster.token.marker().is_some() || !roster.token.same_marker(captured) {
-                        // Under the pin, this is the whole ADR-0067 re-check: a
-                        // marker live right now, or an identity that is not the one
-                        // this drain decided against, abandons it — buffer intact,
-                        // in order, nothing merged. Both clauses are stated even
-                        // though a node whose `suspended()` and `epoch_token()`
-                        // come from one record makes the first imply the second:
-                        // "do not merge while a marker is live" must not depend on
-                        // that coincidence.
                         return;
                     }
                     list.set_authorized_agents(roster.agents.clone());
                     let mut pending = lock_buffer(buffer).take().into_iter();
                     while let Some(entry) = pending.next() {
-                        // #895: a still-sealed entry (it arrived after the
-                        // open step, or could not be opened yet) stops the
-                        // batch; it and everything after it stay held, in
-                        // order, for the next drain.
                         let HeldDelta::Open { peer_id, delta } = &entry.held else {
                             let mut rest = vec![entry];
                             rest.extend(pending);
                             lock_buffer(buffer).restore_front(rest);
                             break;
                         };
-                        // #732 finding 4: a writer the pinned roster no longer
-                        // seats is not merged at all, and the drop is counted.
-                        // `merge_delta` would already drop the delta's CONTENT for
-                        // such a writer, but it would return `Ok`, so the delta
-                        // would be counted as applied — the operator would read
-                        // "caught up" for work this node refused. Skipping the
-                        // whole entry also declines any checkbox element riding in
-                        // a removed member's envelope; that is the containment
-                        // this ADR asks for, and anything a still-seated third
-                        // party owes the list is refilled by anti-entropy, exactly
-                        // as for an overflow drop.
+                        // A writer the pinned roster no longer seats is skipped and counted.
+                        // `merge_delta` would drop its content but return `Ok`, and the delta
+                        // would be reported as applied.
                         if entry
                             .writer
                             .is_some_and(|writer| !list.is_authorized_content_writer(&writer))
@@ -1217,8 +872,6 @@ pub(crate) async fn drain_quarantine_buffer(
                 };
                 gate.with_pinned_roster(&mut merge).await;
             }
-            // No gate at all (a list with no group binding): no roster to pin and
-            // no authorization to refresh — merge the hold as it stands.
             _ => {
                 let mut pending = lock_buffer(buffer).take().into_iter();
                 while let Some(entry) = pending.next() {
@@ -1259,26 +912,12 @@ pub(crate) async fn drain_quarantine_buffer(
     applied
 }
 
-/// ADR-0068 D2: the admission step, the drain and the buffer type, exposed for
-/// in-process fixtures.
-///
-/// WHY a testing surface rather than tests in this module: the fixtures live
-/// beside the other ADR-0066/0068 quarantine fixtures, where a reviewer reads
-/// them as one family, and they drive the EXACT functions the listener calls —
-/// so a fixture cannot pass against a copy of the logic. `cfg(test)` only, so
-/// none of this is public API.
 #[cfg(test)]
 pub mod testing {
     use super::*;
 
-    /// The per-list hold. Per-instance, never a `static`: a global would couple
-    /// concurrently running tests, which is the flake class the `fork_quarantine`
-    /// fault-injection refactor removed.
     pub type Buffer = std::sync::Mutex<QuarantineDeltaBuffer>;
 
-    /// [`super::admit_or_buffer`], verbatim — including the fact that the
-    /// decision is taken under the list write lock and the guard travels with
-    /// the admitted delta, which is what the barrier fixtures exercise.
     pub async fn admit_or_buffer<'a>(
         gate: Option<&Arc<dyn TaskIngestGate>>,
         buffer: &Buffer,
@@ -1302,7 +941,6 @@ pub mod testing {
 
     pub use super::Admission;
 
-    /// [`super::drain_quarantine_buffer`], verbatim.
     pub async fn drain(
         gate: Option<&Arc<dyn TaskIngestGate>>,
         buffer: &Buffer,
@@ -1311,84 +949,51 @@ pub mod testing {
         super::drain_quarantine_buffer(gate, buffer, task_list).await
     }
 
-    /// How many deltas are held.
     #[must_use]
     pub fn len(buffer: &Buffer) -> usize {
         lock_buffer(buffer).len()
     }
 
-    /// Held bytes, for the byte-bound fixture.
     #[must_use]
     pub fn bytes(buffer: &Buffer) -> usize {
         lock_buffer(buffer).bytes()
     }
 }
 
-/// Structural teardown (parallel-review finding): the background loops hold
-/// clones of the token, the list, and the pubsub — never the sync itself —
-/// so when the last `TaskListSync` reference drops, every loop (including
-/// the INFINITE bootstrap requester, issue #238) is cancelled without any
-/// caller having to remember `cancel_sync()`. The explicit rollback calls
-/// remain as belt-and-braces.
+/// The background loops hold clones of the token, the list and the pubsub,
+/// never the sync itself, so dropping the last `TaskListSync` cancels every
+/// loop, including the infinite bootstrap requester.
 impl Drop for TaskListSync {
     fn drop(&mut self) {
         self.cancel.cancel();
     }
 }
 
-/// Shared persistence context for one task list's snapshot file (mirrors
-/// `kv::sync::PersistCtx`).
 struct TaskPersistCtx {
-    /// Storage backend (directory + per-list file naming).
     storage: TaskListStorage,
-    /// The list this context persists — the snapshot file name key.
     list_id: TaskListId,
-    /// Serializes snapshot commits AND records the last durably-persisted
-    /// list version. `(version, bytes)` are captured under this lock, so
-    /// commit order equals capture order — a concurrent persist burst can
-    /// never rename an older snapshot over a newer one — and the version
-    /// gate skips writes that would not advance durable state.
+    /// Serializes snapshot commits and holds the last durably-persisted version.
+    /// `(version, bytes)` are captured under this lock, so commit order equals
+    /// capture order: a persist burst cannot rename an older snapshot over a
+    /// newer one.
     gate: tokio::sync::Mutex<Option<u64>>,
-    /// True after a failed snapshot write; cleared by the next success.
-    /// While set, LOCAL mutations are refused (fail-closed for what this
-    /// node controls); remote-delta merges continue (replication is not
-    /// wedged).
+    /// While set, local mutations are refused; remote-delta merges continue so
+    /// replication is not wedged.
     degraded: std::sync::atomic::AtomicBool,
-    /// #759 CI repair, test-only: publishes the list version of every
-    /// snapshot commit as `save_task_list` SUCCEEDS — strictly after the
-    /// durable write, never at merge time — so a test awaiting it observes
-    /// persistence COMPLETION, not in-memory merge visibility (the listener
-    /// releases the TaskList write guard before it persists). Per-instance:
-    /// created with the context in `set_persistence`, never global. The
-    /// version-skip and failure paths of `persist_snapshot` send nothing, so
-    /// a received version means exactly those bytes were committed.
     #[cfg(test)]
     persisted: tokio::sync::watch::Sender<u64>,
 }
 
-/// Capture the list's `(version, bytes)` under the list read lock and the
-/// commit gate, then write atomically. The gate both serializes snapshot
-/// commits and records the last durably-persisted version, so commit order
-/// equals capture order — a concurrent persist burst can never rename an
-/// older snapshot over a newer one — and the version gate skips writes that
-/// would not advance durable state. Success clears the degraded flag;
-/// failure sets it and is error-logged here (callers decide whether to
-/// propagate — local mutations must, remote merges must not).
 async fn persist_snapshot(task_list: &RwLock<TaskList>, ctx: &TaskPersistCtx) -> Result<()> {
     let result = async {
         let mut last = ctx.gate.lock().await;
         let snapshot = task_list.read().await.clone();
         let version = snapshot.current_version();
         if last.is_some_and(|l| l >= version) {
-            // Durable state already at (or beyond) this version.
             return Ok(());
         }
         ctx.storage.save_task_list(&ctx.list_id, &snapshot).await?;
         *last = Some(version);
-        // Test-only durable-write notification (#759 CI repair): fires
-        // strictly after the snapshot bytes were committed, so a waiter
-        // attributes it to this persist — never to the in-memory merge,
-        // which is already visible here.
         #[cfg(test)]
         let _ = ctx.persisted.send(version);
         Ok(())
@@ -1405,13 +1010,6 @@ async fn persist_snapshot(task_list: &RwLock<TaskList>, ctx: &TaskPersistCtx) ->
     result
 }
 
-/// ADR-0068 D2: drain the held deltas and persist once if any applied.
-///
-/// One helper for BOTH places the listener drains — the poll and, since #732
-/// finding 5, the moment before a newly received delta is admitted — so the two
-/// cannot drift on the persist-once rule. Cheap when there is nothing to do:
-/// [`drain_quarantine_buffer`] returns immediately for an empty buffer and after
-/// a single gate read while the marker is still live.
 async fn drain_and_persist(
     gate: &TaskIngestGateSlot,
     protector: Option<&Arc<dyn TaskDeltaProtector>>,
@@ -1420,8 +1018,6 @@ async fn drain_and_persist(
     persist: Option<&Arc<TaskPersistCtx>>,
     changes: &TaskChangeSlot,
 ) -> usize {
-    // #895: sealed deltas held during the quarantine are opened first (no
-    // list guard held), so the pinned drain below merges them in order.
     open_held_sealed(gate.gate(), protector, buffer, task_list).await;
     let applied = drain_quarantine_buffer(gate.gate(), buffer, task_list).await;
     if applied > 0 {
@@ -1470,7 +1066,6 @@ impl TaskListSync {
         topic: String,
         local_peer_id: PeerId,
     ) -> Result<Self> {
-        // Wrap task list for concurrent access
         let task_list = Arc::new(RwLock::new(task_list));
 
         Ok(Self {
@@ -1508,10 +1103,6 @@ impl TaskListSync {
         self.protector.set(protector).is_ok()
     }
 
-    /// Shorten the ADR-0068 D2 drain poll for a fixture. `cfg(test)` only and
-    /// per-instance, so the poll fixtures are fast without a process-global knob
-    /// that would couple parallel tests. Must be called before
-    /// [`start_with_spawner`](Self::start_with_spawner).
     #[cfg(test)]
     pub(crate) fn set_drain_poll_millis(&self, millis: u64) {
         self.drain_poll_millis
@@ -1527,11 +1118,6 @@ impl TaskListSync {
 
     /// ADR-0068 D2: apply the deltas buffered under fork quarantine, in
     /// arrival order, and persist once. Returns how many were applied.
-    ///
-    /// The listener also drains on its own once it observes the marker gone;
-    /// this is the explicit entry point for the clear route (and, via the
-    /// #759 durable-clear notification, for the owner-anchored clear paths)
-    /// and for deterministic tests, so neither has to wait for a poll.
     ///
     /// #759: the drain is itself a mutation path, so it runs as a lifecycle
     /// section — it takes the same `lifecycle` lock the listener's
@@ -1556,14 +1142,6 @@ impl TaskListSync {
         .await
     }
 
-    /// #759 test-only: drive the EXACT production admission step
-    /// (`admit_or_buffer`) the listener calls, against this sync's real
-    /// gate/buffer/list. Returns `true` when the delta was HELD (buffered).
-    /// Fixtures must stage a live marker so that is the honest answer — an
-    /// admitted delta is dropped UNMERGED here (the guard would have to
-    /// merge it), so this panics instead of silently losing it. Used by the
-    /// server-layer behavioural fixtures, which cannot reach this module's
-    /// private buffer/list fields.
     #[cfg(test)]
     pub(crate) async fn admit_delta_for_testing(
         &self,
@@ -1597,7 +1175,6 @@ impl TaskListSync {
         lock_buffer(&self.quarantine_buffer).len()
     }
 
-    /// The state-sync side topic for this task list.
     fn state_sync_topic(&self) -> String {
         format!("{}{}", self.topic, STATE_SYNC_TOPIC_SUFFIX)
     }
@@ -1627,67 +1204,41 @@ impl TaskListSync {
     }
 
     /// Start background synchronization with a caller-supplied spawner.
-    ///
-    /// Identical to [`start`](Self::start), but routes the background loops
-    /// (delta-merge listener, state-request responder, and the bounded
-    /// bootstrap requester) through `spawn` instead of detaching them with
-    /// `tokio::spawn`. The `Agent` passes its tracked-task spawner so these
-    /// loops are registered with the `Agent::shutdown()` drain and aborted on
-    /// teardown (issue #126); callers without an `Agent` use
-    /// [`start`](Self::start), which detaches via `tokio::spawn` as before.
     pub async fn start_with_spawner<S>(&self, spawn: S) -> Result<()>
     where
         S: Fn(std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>)
             + Send
             + Sync,
     {
-        // Subscribe to topic — received messages will contain serialized deltas.
         let mut sub = self.pubsub.subscribe(self.topic.clone()).await;
         let task_list = Arc::clone(&self.task_list);
         let listener_cancel = self.cancel.clone();
-        // StateServed evidence: written by the responder loop (which owns
-        // the side-topic subscription), read by the listener (verified
-        // full-replace adopt, issue #240) and the bootstrap requester
-        // (convergence). Created BEFORE the loops so all three share it.
         let served_evidence = Arc::new(std::sync::Mutex::new(TaskServedEvidence::default()));
-        // Armed only while the bootstrap requester runs: the verified
-        // full-replace adopt fires exclusively in that window — a converged
-        // replica must never let a divergent holder's serve truncate state
-        // it legitimately holds.
+        // Armed only while the bootstrap requester runs: a converged replica must
+        // never let a divergent holder's serve truncate state it legitimately holds.
         let bootstrap_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let listener_served = Arc::clone(&served_evidence);
         let listener_bootstrap_active = Arc::clone(&bootstrap_active);
-        // #557: snapshot merged remote deltas when persistence is armed.
-        // Best-effort by design — a failing disk must never wedge
-        // replication (the degraded flag refuses LOCAL mutations instead).
         let listener_persist = self.persist_ctx();
         let listener_changes = Arc::clone(&self.change_sink);
-        // ADR-0068 D2: read through the slot on every delta — the daemon
-        // installs the gate after this loop is already running.
         let listener_gate = Arc::clone(&self.ingest_gate);
         let listener_buffer = Arc::clone(&self.quarantine_buffer);
         let listener_poll_millis = Arc::clone(&self.drain_poll_millis);
         let listener_lifecycle = Arc::clone(&self.lifecycle);
-        // #895: captured once — installed before start by contract.
+        // Captured once: the protector is installed before start by contract.
         let listener_protector = self.protector.get().cloned();
         let listener_local_peer = self.local_peer_id;
 
         spawn(Box::pin(async move {
-            // #732 finding 5: the drain deadline lives ACROSS receives. It used
-            // to be a fresh `sleep` created inside `select!` on every iteration,
-            // so every received message cancelled the timer and traffic arriving
-            // faster than the poll starved the drain indefinitely — the runbook's
-            // "picked up within five seconds" was false under load. The sleep is
-            // pinned here and reset only when it has FIRED, so a message
-            // postpones nothing.
+            // The drain deadline is pinned across receives and reset only once it has
+            // fired: a fresh `sleep` per `select!` iteration let every received message
+            // cancel it, so steady traffic starved the drain.
             let poll = tokio::time::sleep(std::time::Duration::from_millis(
                 listener_poll_millis.load(std::sync::atomic::Ordering::Relaxed),
             ));
             tokio::pin!(poll);
             let mut poll_armed = false;
             loop {
-                // ADR-0068 D2: the drain poll is armed ONLY while deltas are
-                // held, so a list that was never quarantined adds no timer.
                 let buffered = !lock_buffer(&listener_buffer).is_empty();
                 if !buffered {
                     poll_armed = false;
@@ -1701,31 +1252,20 @@ impl TaskListSync {
                     poll_armed = true;
                 }
                 let (poll_fired, msg) = tokio::select! {
-                    // Cancel-first (#759, mirroring #757): an unbiased select
-                    // picks at random when a queued message and the cancel are
-                    // both ready, so a retired listener could still run a whole
-                    // receive section. The authoritative fence is the
-                    // under-`lifecycle` cancel check below; this ordering
-                    // keeps a merely-queued delta from even being fetched.
+                    // Cancel first: an unbiased select could still fetch a queued delta for
+                    // a retired listener. The authoritative fence is the cancel check under
+                    // `lifecycle` below.
                     biased;
-                    // cancel_sync tears down every loop (round-4 review) —
-                    // recv alone would keep this listener alive until
-                    // daemon shutdown.
                     () = listener_cancel.cancelled() => return,
                     () = &mut poll, if poll_armed => {
-                        // Observed rather than hooked at each clear site: see
-                        // TASK_QUARANTINE_DRAIN_POLL_SECS for why. The drain
-                        // itself re-reads the marker, so there is no separate
-                        // suspension pre-check to disagree with it.
                         poll_armed = false;
                         (true, None)
                     }
                     msg = sub.recv() => (false, msg),
                 };
                 if poll_fired {
-                    // #759 lifecycle fence: the drain APPLIES held deltas, so
-                    // it is a mutation section like the admit/merge path and
-                    // takes the same fence — a retired listener never drains.
+                    // The drain applies held deltas, so it is a mutation section and takes
+                    // the fence: a retired listener never drains.
                     let _section = listener_lifecycle.lock().await;
                     if listener_cancel.is_cancelled() {
                         return;
@@ -1742,23 +1282,13 @@ impl TaskListSync {
                     continue;
                 }
                 let Some(msg) = msg else {
-                    // The main-topic subscription is gone: this sync can no
-                    // longer replicate, so it is half-dead — self-cancel so
-                    // the sibling loops (in particular the INFINITE
-                    // bootstrap requester) never outlive it (parallel-review
-                    // finding: a dead sibling must not leave the requester
-                    // chattering at capped cadence forever).
+                    // The subscription is gone, so this sync can no longer replicate: cancel
+                    // so the sibling loops (the infinite bootstrap requester) do not outlive it.
                     listener_cancel.cancel();
                     return;
                 };
-                // #895: a group-bound list opens sealed records with the
-                // group's current key and refuses plaintext (fail closed,
-                // counted) — before any lock, since opening a TreeKEM record
-                // takes the group membership lock.
-                //
-                // ADR-0068 D2 is kept: while the group is quarantined (or
-                // older deltas are still held) a sealed record is HELD
-                // unopened and opened after the clear, in arrival order.
+                // Sealed records are opened before any lock: a TreeKEM open takes the
+                // group membership lock. Plaintext on a group-bound list is refused.
                 let payload: std::borrow::Cow<'_, [u8]> = match &listener_protector {
                     None => std::borrow::Cow::Borrowed(&msg.payload[..]),
                     Some(protector) => match decode_sealed_task_record(&msg.payload) {
@@ -1773,13 +1303,9 @@ impl TaskListSync {
                                 && msg.sender.is_some()
                                 && msg.sender == protector.local_agent() =>
                         {
-                            // Our own echo: applied locally before it was
-                            // published, and a TreeKEM sender cannot open
-                            // its own ciphertext. The outer peer tag is NOT
-                            // authenticated, so the skip also requires the
-                            // gossip-verified sender to be this agent — a
-                            // peer re-tagging a captured record with our
-                            // peer id cannot make us drop it.
+                            // Our own echo: a TreeKEM sender cannot open its own ciphertext.
+                            // The outer peer tag is not authenticated, so the skip also
+                            // requires the gossip-verified sender to be this agent.
                             continue;
                         }
                         Some((_, body)) => match hold_sealed_if_held(
@@ -1794,8 +1320,6 @@ impl TaskListSync {
                         {
                             SealedHold::Held { suspended } => {
                                 if !suspended {
-                                    // Marker already cleared: drain the older
-                                    // held deltas and this one now.
                                     let _section = listener_lifecycle.lock().await;
                                     if listener_cancel.is_cancelled() {
                                         return;
@@ -1823,31 +1347,17 @@ impl TaskListSync {
                 };
                 match decode_delta::<TaskListDelta>(&payload) {
                     Ok((peer_id, delta)) => {
-                        // #759 lifecycle fence: held to the end of this
-                        // iteration, so the (optional) pre-admission drain,
-                        // the admission decision, the merge under the guard
-                        // it was taken under, AND the snapshot write after
-                        // the guard is released are ONE section a draining
-                        // retire waits out. The cancel check is under the
-                        // lock: a delta this listener already PULLED past
-                        // `recv` when the cancel lands must not merge either,
-                        // and a bare flag check before `recv` cannot fence
-                        // that. Nothing below is ever skipped for an
-                        // in-flight delta that already passed this check.
+                        // Held to the end of this iteration: drain, admission, merge and
+                        // the snapshot write are one section a draining retire waits out.
+                        // The cancel check sits under the lock because a delta already
+                        // pulled past `recv` when the cancel lands must not merge either.
                         let _section = listener_lifecycle.lock().await;
                         if listener_cancel.is_cancelled() {
                             return;
                         }
-                        // #732 finding 5: older HELD deltas drain before this
-                        // newer one is admitted. Two reasons. Ordering: applying
-                        // post-clear traffic first would put it ahead of deltas
-                        // that arrived before it, and the LWW registers are
-                        // order-sensitive. Liveness: the drain then happens on
-                        // the first delta after the clear instead of waiting on
-                        // a timer, which is what makes continuous traffic
-                        // accelerate the catch-up rather than starve it. Costs
-                        // one gate read per delta ONLY while the buffer is
-                        // non-empty, i.e. only during an incident.
+                        // Held deltas drain before this newer one is admitted: the LWW
+                        // registers are order-sensitive, and draining here lets traffic
+                        // speed the catch-up instead of waiting on the timer.
                         if !lock_buffer(&listener_buffer).is_empty() {
                             drain_and_persist(
                                 &listener_gate,
@@ -1859,14 +1369,6 @@ impl TaskListSync {
                             )
                             .await;
                         }
-                        // ADR-0068 D2: from the first delta that OBSERVES a live
-                        // fork-quarantine marker, deltas are HELD in arrival order
-                        // and the list is left byte-identical — the remote mirror
-                        // of row 20's local refusals, so a peer seated by the
-                        // disputed roster cannot move the CRDT winner during the
-                        // incident. One delta already admitted when the marker
-                        // installs may still merge; that residual is stated at
-                        // `admit_or_buffer` and is bounded to one per listener.
                         let (delta, admitted) = match admit_or_buffer(
                             listener_gate.gate(),
                             &listener_buffer,
@@ -1883,13 +1385,9 @@ impl TaskListSync {
                         };
                         let mut merged_ok = false;
                         {
-                            // The guard the admission decision was taken
-                            // under: decision and merge are one critical
-                            // section (ADR-0068 D2, review nit 2).
                             let mut list = admitted;
-                            // Layer A (issue #349): the V2-envelope-verified
-                            // sender is the writer identity; the payload
-                            // `peer_id` stays an OR-Set tag only (I3).
+                            // The V2-envelope-verified sender is the writer identity; the
+                            // payload `peer_id` is an OR-Set tag only.
                             let writer = msg.sender.as_ref();
                             if let Err(e) = list.merge_delta(&delta, peer_id, writer) {
                                 tracing::warn!("Failed to merge remote delta: {}", e);
@@ -1900,19 +1398,11 @@ impl TaskListSync {
                                 && listener_bootstrap_active
                                     .load(std::sync::atomic::Ordering::Relaxed)
                             {
-                                // Digest-verified full-replace adopt (issue
-                                // #240, deletion cold-sync): while
-                                // bootstrapping, when the sender's latest v2
-                                // declaration matches this delta's served
-                                // content (digest AND task count), the delta IS
-                                // that holder's complete state — prune local
-                                // tasks it does not carry. Without verification
-                                // any holder could truncate local state at
-                                // will. Which tasks may be pruned is decided
-                                // by `prune_to_served_set` on holder-carried
-                                // deletion evidence (issue #643), and only
-                                // for a writer the list's content policy
-                                // accepts (issue #654).
+                                // Digest-verified full-replace adopt: while bootstrapping,
+                                // a delta whose digest and task count match the sender's
+                                // latest v2 declaration is that holder's complete state, so
+                                // local tasks it does not carry are pruned. Without the
+                                // verification any holder could truncate local state.
                                 let declared = listener_served
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1937,7 +1427,7 @@ impl TaskListSync {
                                     }
                                 }
                             }
-                        } // write guard released before persisting
+                        }
                         if merged_ok {
                             listener_changes.note(crate::kv::KvChangeOrigin::Remote);
                             if let Some(ctx) = &listener_persist {
@@ -1948,8 +1438,6 @@ impl TaskListSync {
                         }
                     }
                     Err(e) => {
-                        // #1604: an unknown variant (for example a newer
-                        // `CheckboxState`) is counted as well as logged.
                         let e = crate::wire_compat::classify_bincode("TaskListDelta", &e);
                         tracing::warn!("Failed to deserialize delta from topic: {}", e);
                     }
@@ -1957,11 +1445,6 @@ impl TaskListSync {
             }
         }));
 
-        // Responder: holders with non-empty state answer StateRequests by
-        // republishing their full state as a regular delta on the main topic.
-        // CRDT merge makes duplicate responses from multiple holders harmless
-        // (idempotent), so no response suppression is needed at current mesh
-        // sizes.
         let mut sync_sub = self.pubsub.subscribe(self.state_sync_topic()).await;
         let responder_list = Arc::clone(&self.task_list);
         let responder_pubsub = Arc::clone(&self.pubsub);
@@ -1973,36 +1456,24 @@ impl TaskListSync {
         let responder_protector = self.protector.get().cloned();
         let responder_serve_gate = self.serve_gate.get().cloned();
         spawn(Box::pin(async move {
-            // Response-storm damping (issue #238 review): one full-state
-            // response per cooldown window — the response is a broadcast,
-            // so it serves every concurrently-bootstrapping replica. A
-            // request landing inside the window gets NOTHING (no response,
-            // no marker — markers must witness a real broadcast, round-3
-            // review); the requester is served by its next scheduled
-            // attempt.
+            // One full-state response per cooldown window. A request inside the
+            // window gets no response and no marker: a marker must witness a real
+            // broadcast, or a requester that never received the state stops asking.
             let mut last_full_response: Option<tokio::time::Instant> = None;
             loop {
                 let msg = tokio::select! {
-                    // Cancel-first (#759, as the listener above). This loop's
-                    // arms only PUBLISH (a full-state response and its served
-                    // markers) and never mutate the CRDT, so it takes no
-                    // lifecycle fence — the fence is scoped to mutation
-                    // sections, exactly as #757 scoped the KV responder's
-                    // fence to its mutating owner-announce arm.
+                    // This loop only publishes and never mutates the CRDT, so it takes
+                    // no lifecycle fence.
                     biased;
-                    // cancel_sync tears down every loop (round-4 review).
                     () = responder_cancel.cancelled() => return,
                     msg = sync_sub.recv() => msg,
                 };
                 let Some(msg) = msg else {
-                    // The side-topic subscription is gone: this sync can no
-                    // longer receive StateServed evidence, so the requester
-                    // could never legitimately stop — self-cancel so it
-                    // (and the sibling loops) never outlive the responder.
+                    // Without the side topic no `StateServed` evidence can arrive and
+                    // the requester could never stop: cancel the sibling loops.
                     responder_cancel.cancel();
                     return;
                 };
-                // #1604: an unknown variant is counted and logged.
                 let Ok(sync_msg) = crate::wire_compat::decode_bincode::<TaskListSyncMessage>(
                     "TaskListSyncMessage",
                     &msg.payload,
@@ -2014,8 +1485,6 @@ impl TaskListSync {
                         if requester == local_peer_id {
                             continue;
                         }
-                        // #895: a gated list answers only a sender the gate
-                        // admits — no broadcast and no marker otherwise.
                         if let Some(gate) = &responder_serve_gate {
                             if !gate(msg.sender).await {
                                 continue;
@@ -2023,16 +1492,10 @@ impl TaskListSync {
                         }
                         let mut markers: Vec<TaskListSyncMessage> = Vec::new();
                         if responder_list.read().await.task_count() == 0 {
-                            // Empty holder: the v2 digest of the empty set
-                            // is universally computable, so an empty
-                            // requester verifies it locally and stops
-                            // (issue #240; no broadcast to witness because
-                            // there is nothing to serve, and no cooldown —
-                            // damping exists to bound FULL-state storms).
-                            // v1 behavior is preserved for old peers:
-                            // silence (two empty replicas must not talk
-                            // each other into a false converged-empty under
-                            // the unverifiable v1 rule).
+                            // An empty holder declares only the v2 digest of the empty
+                            // set, which an empty requester verifies locally. No v1
+                            // marker: under that unverifiable rule two empty replicas
+                            // would agree on a false "converged empty".
                             let digest = responder_list.read().await.served_digest();
                             markers.push(TaskListSyncMessage::StateServedV2 {
                                 responder: local_peer_id,
@@ -2040,16 +1503,6 @@ impl TaskListSync {
                                 entry_count: 0,
                             });
                         } else {
-                            // The StateServed markers are published ONLY
-                            // alongside an actual full-delta publish: a
-                            // marker must witness a real broadcast — one
-                            // sent for a cooldown-suppressed response could
-                            // convince a requester that never received the
-                            // state to stop asking (round-3 review). A
-                            // requester inside the window is served by its
-                            // next scheduled attempt. Checked BEFORE
-                            // building the full delta — no point cloning
-                            // the whole list for a suppressed response.
                             let cooled_down = last_full_response.is_some_and(|t| {
                                 t.elapsed()
                                     < std::time::Duration::from_secs(STATE_RESPONSE_COOLDOWN_SECS)
@@ -2057,9 +1510,8 @@ impl TaskListSync {
                             if cooled_down {
                                 continue;
                             }
-                            // One snapshot for the full delta AND the v2
-                            // digest, so the declaration commits to exactly
-                            // what was broadcast.
+                            // One snapshot for the full delta and the digest, so the
+                            // declaration commits to exactly what was broadcast.
                             let (full, digest, count) = {
                                 let list = responder_list.read().await;
                                 (
@@ -2071,10 +1523,6 @@ impl TaskListSync {
                             let Ok(plain) = encode_delta(local_peer_id, &full) else {
                                 continue;
                             };
-                            // #895: the cold-start serve carries the whole
-                            // list, so it is sealed exactly like a delta —
-                            // and, #975, published only under the epoch it
-                            // was sealed with.
                             if let Err(e) = seal_and_publish(
                                 responder_protector.as_ref(),
                                 &responder_pubsub,
@@ -2092,9 +1540,6 @@ impl TaskListSync {
                             markers.push(TaskListSyncMessage::StateServed {
                                 responder: local_peer_id,
                             });
-                            // The v2 marker rides along with the broadcast
-                            // it commits to — never separately
-                            // (response-storm damping, issue #240).
                             markers.push(TaskListSyncMessage::StateServedV2 {
                                 responder: local_peer_id,
                                 digest,
@@ -2123,13 +1568,11 @@ impl TaskListSync {
                     }
                     TaskListSyncMessage::StateServed { responder } => {
                         if responder == local_peer_id {
-                            continue; // our own marker echoed back
+                            continue;
                         }
-                        // Trust note: the marker steers only WHEN the
-                        // requester stops asking, never list content, and
-                        // the requester still requires local non-emptiness
-                        // — a forged marker cannot inject state and stops
-                        // recovery no earlier than a real holder could.
+                        // A forged marker steers only when the requester stops
+                        // asking, never list content, and the requester still
+                        // requires local non-emptiness.
                         responder_served
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2141,13 +1584,10 @@ impl TaskListSync {
                         entry_count,
                     } => {
                         if responder == local_peer_id {
-                            continue; // our own marker echoed back
+                            continue;
                         }
-                        // Trust note: the digest is SELF-VERIFYING — a
-                        // forged declaration can only match local state
-                        // that actually equals the declared content, so a
-                        // forgery's worst case is the requester keeps
-                        // asking (the same bound as a forged v1 marker).
+                        // The digest is self-verifying: a forged declaration
+                        // matches only local state that equals the declared content.
                         responder_served
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2164,27 +1604,13 @@ impl TaskListSync {
             }
         }));
 
-        // Bootstrap requester: a first-time joiner starts with an empty list
-        // and has no other way to learn tasks written before it subscribed
-        // (the gossip message cache only replays recent deltas). Ask holders
-        // to republish. The schedule is front-loaded for a fast mesh, then
-        // runs an INFINITE backoff tail (issue #238): holders answer only
-        // reactively, so a hard-capped tail left a list that rehydrated
-        // while every holder was offline permanently un-synced once the cap
-        // expired. The FULL front burst always runs (aligned with
-        // `KvStoreSync`, round-1 review): a single incremental task arriving
-        // via live gossip before the first request must not cancel the
-        // request for the complete historical state. The tail then
-        // self-terminates the moment the local list is non-empty; until
-        // then a genuinely-new list costs one tiny side-topic message per
-        // backoff interval. Requests and the full-delta responses they
-        // trigger are idempotent CRDT merges, so the extra chatter is
-        // harmless.
+        // A first-time joiner has no other way to learn tasks written before it
+        // subscribed. The full front burst always runs: one incremental task
+        // arriving by live gossip must not cancel the request for the complete
+        // history. The tail is infinite (see `state_request_delays`).
         if self.task_list.read().await.task_count() == 0 {
             let requester_pubsub = Arc::clone(&self.pubsub);
             // Weak: the requester must not keep the list alive on its own.
-            // (Belt-and-braces — the sibling loops hold strong Arcs, so the
-            // authoritative kill switch is the `stopped` flag below.)
             let requester_list = Arc::downgrade(&self.task_list);
             let sync_topic = self.state_sync_topic();
             let stopped = Arc::clone(&self.stopped);
@@ -2193,37 +1619,19 @@ impl TaskListSync {
             let requester_bootstrap_active = Arc::clone(&bootstrap_active);
             bootstrap_active.store(true, std::sync::atomic::Ordering::Relaxed);
             spawn(Box::pin(async move {
-                // Disarms the adopt window on ANY exit (converged, silenced,
-                // cancelled, torn down) — the listener's verified
-                // full-replace adopt must never fire outside bootstrap.
                 let _guard = BootstrapGuard(requester_bootstrap_active);
                 for (attempt, delay_secs) in state_request_delays().enumerate() {
                     tokio::select! {
-                        // Cancel-first (#759): prompt teardown even mid-sleep.
-                        // Publish-only loop — no lifecycle fence (see the
-                        // responder's comment).
                         biased;
-                        // cancel_sync tears down every loop promptly, even
-                        // mid-sleep (round-4 review).
                         () = requester_cancel.cancelled() => return,
                         () = tokio::time::sleep(jittered_secs(delay_secs)) => {}
                     }
                     if stopped.load(std::sync::atomic::Ordering::Relaxed) {
-                        return; // silenced — never chatter for a dead sync
+                        return;
                     }
-                    // Tail attempts stop on convergence; front attempts
-                    // always run (see above). Convergence requires BOTH a
-                    // StateServed marker (a holder actually answered) AND
-                    // local state — mere non-emptiness can be faked by one
-                    // incremental delta while full history is still missing
-                    // (round-2 review). v2 digest evidence makes the check
-                    // exact (issue #240): the requester stops only when its
-                    // OWN content digest matches a holder's declaration —
-                    // including the universally-computable empty digest,
-                    // which lets a genuinely-empty list fall silent.
                     if attempt >= STATE_REQUEST_RETRY_SECS.len() {
                         let Some(list) = requester_list.upgrade() else {
-                            return; // sync torn down — nothing left to bootstrap
+                            return;
                         };
                         let (count, local_digest) = {
                             let l = list.read().await;
@@ -2236,7 +1644,7 @@ impl TaskListSync {
                             tasklist_converged(&ev, count, local_digest)
                         };
                         if converged {
-                            return; // a holder served us and local state matches
+                            return;
                         }
                     }
                     let request = TaskListSyncMessage::StateRequest {
@@ -2270,9 +1678,8 @@ impl TaskListSync {
     ///
     /// Returns an error if operations fail.
     pub async fn stop(&self) -> Result<()> {
-        // End the loops FIRST: the bootstrap requester's schedule is
-        // infinite while the list is empty (issue #238), and unsubscribing
-        // does not end that loop (it holds no subscription).
+        // Cancel first: unsubscribing does not end the bootstrap requester,
+        // which holds no subscription.
         self.cancel_sync();
         self.pubsub.unsubscribe(&self.topic).await;
         self.pubsub.unsubscribe(&self.state_sync_topic()).await;
@@ -2316,17 +1723,11 @@ impl TaskListSync {
     /// `named_groups` guard (the ingest gate reads it synchronously under
     /// the list write). The `task_lists` registry is NOT taken by a section,
     /// so it is safe — though pointlessly blocking — to hold it here.
-    ///
-    /// Mirrors [`crate::kv::KvStoreSync::cancel_sync_and_drain`] from #757; callers that
-    /// cannot drain keep [`cancel_sync`](Self::cancel_sync) and accept its
-    /// one-section residual.
     pub async fn cancel_sync_and_drain(&self) {
         self.cancel.cancel();
         drop(self.lifecycle.lock().await);
     }
 
-    /// True while a background receive section holds the lifecycle lock
-    /// (#759 test hook — the task-side twin of the KV fixture probe).
     #[cfg(test)]
     pub(crate) fn receive_section_active_for_test(&self) -> bool {
         self.lifecycle.try_lock().is_err()
@@ -2403,10 +1804,6 @@ impl TaskListSync {
         let plain = encode_delta(local_peer_id, &delta).map_err(|e| {
             crate::crdt::CrdtError::Gossip(format!("failed to serialize delta: {e}"))
         })?;
-        // #895: sealed under the group key when a protector is installed; a
-        // seal failure publishes nothing rather than falling back to plaintext.
-        // #975: a sealed record is published only under the epoch it was
-        // sealed with (re-sealed if a roster commit moved it).
         seal_and_publish(
             self.protector.get(),
             &self.pubsub,
@@ -2433,15 +1830,12 @@ impl TaskListSync {
                 list_id,
                 gate: tokio::sync::Mutex::new(None),
                 degraded: std::sync::atomic::AtomicBool::new(false),
-                // #759 CI repair: per-instance durable-commit
-                // notification — see `TaskPersistCtx::persisted`.
                 #[cfg(test)]
                 persisted: tokio::sync::watch::Sender::new(0),
             }));
         }
     }
 
-    /// Clone the armed persistence context, if any.
     fn persist_ctx(&self) -> Option<Arc<TaskPersistCtx>> {
         self.persist.lock().ok().and_then(|g| g.clone())
     }
@@ -2553,11 +1947,6 @@ mod tests {
         TaskItem::new(task_id, metadata, peer)
     }
 
-    /// Construct an isolated network node (mirrors the helper in
-    /// `src/gossip/pubsub.rs` tests). `PubSubManager` is fully constructable
-    /// in tests, so `TaskListSync` is testable end-to-end without a live mesh.
-    /// Explicit test-only network config (#417/#337): loopback bind, no
-    /// seeds, discovery/port-mapping off. Still a real socket constructor.
     fn test_network_config() -> NetworkConfig {
         NetworkConfig {
             bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
@@ -2576,8 +1965,6 @@ mod tests {
         )
     }
 
-    /// Build a `TaskListSync` around a fresh node + pubsub, with
-    /// `local_peer_id = peer(1)` and list id `list_id(1)`.
     async fn make_sync(topic: &str) -> TaskListSync {
         let node = make_node().await;
         let pubsub = Arc::new(
@@ -2588,17 +1975,10 @@ mod tests {
         TaskListSync::new(list, pubsub, topic.to_string(), peer(1)).expect("task list sync")
     }
 
-    /// Shared pubsub with a SIGNING context: local publishes carry a
-    /// V2-envelope-verified sender, so the delta-merge listener's Layer A
-    /// gate (issue #349) admits their content. The convergence tests below
-    /// need this — an unsigned pubsub would fail closed on every serve.
     async fn signed_pubsub() -> Arc<PubSubManager> {
         signed_pubsub_with_signer().await.0
     }
 
-    /// As [`signed_pubsub`], also returning the signer's `AgentId` — the writer
-    /// identity the listener will see on every publish, which the ADR-0068
-    /// fixtures need in order to script a roster that actually seats it.
     async fn signed_pubsub_with_signer() -> (Arc<PubSubManager>, AgentId) {
         let node = make_node().await;
         let kp = crate::identity::AgentKeypair::generate().expect("agent keygen");
@@ -2610,15 +1990,10 @@ mod tests {
         )
     }
 
-    /// Build a `TaskListSync` that shares its pubsub with the caller (so the
-    /// caller can subscribe before the sync publishes). The pubsub signs: since
-    /// #1114 nothing unsigned is delivered, its own subscribers included.
     async fn make_sync_with_pubsub(topic: &str) -> (TaskListSync, Arc<PubSubManager>) {
         sync_on_pubsub(topic, signed_pubsub().await)
     }
 
-    /// As [`make_sync_with_pubsub`], with the pubsub signed by `kp` — the
-    /// production shape for a group list whose protector seals as `kp`.
     async fn make_sync_with_pubsub_signed_by(
         topic: &str,
         kp: &crate::identity::AgentKeypair,
@@ -2642,37 +2017,30 @@ mod tests {
         let id = list_id(1);
         let task_list = TaskList::new(id, "Test List".to_string(), peer);
 
-        // We cannot create a real PubSubManager in a unit test without a NetworkNode
-        // For now, we just verify the types are correct
         let _list_for_sync = task_list;
     }
 
     #[tokio::test]
     async fn test_apply_delta() {
-        // Create a task list
         let peer1 = peer(1);
         let peer2 = peer(2);
         let id = list_id(1);
         let task_list = TaskList::new(id, "Test".to_string(), peer1);
 
-        // Wrap in Arc<RwLock<>>
         let task_list_arc = Arc::new(RwLock::new(task_list));
 
-        // Create a delta with a new task
         let mut delta = TaskListDelta::new(1);
         let task = make_task(1, peer2);
         let task_id = *task.id();
         let tag = (peer2, 1);
         delta.added_tasks.insert(task_id, (task, tag));
 
-        // Apply delta directly (simulating what TaskListSync::apply_remote_delta does)
         {
             let mut list = task_list_arc.write().await;
             let result = list.merge_delta(&delta, peer2, Some(&agent(2)));
             assert!(result.is_ok());
         }
 
-        // Verify task was added
         {
             let list = task_list_arc.read().await;
             assert_eq!(list.task_count(), 1);
@@ -2681,13 +2049,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_access() {
-        // Test that RwLock allows multiple readers
         let peer = peer(1);
         let id = list_id(1);
         let task_list = TaskList::new(id, "Test".to_string(), peer);
         let task_list_arc = Arc::new(RwLock::new(task_list));
 
-        // Multiple concurrent reads should work
         let list1 = task_list_arc.read().await;
         let list2 = task_list_arc.read().await;
 
@@ -2697,37 +2063,27 @@ mod tests {
         drop(list1);
         drop(list2);
 
-        // Write should work after readers drop
         {
             let mut list = task_list_arc.write().await;
             list.update_name("Updated".to_string(), peer);
         }
 
-        // Verify update
         let list = task_list_arc.read().await;
         assert_eq!(list.name(), "Updated");
     }
-
-    // ------------------------------------------------------------------
-    // new() / topic() / read() / write()
-    // ------------------------------------------------------------------
 
     #[tokio::test]
     async fn new_sets_topic_and_yields_accessible_guards() {
         let sync = make_sync("tasks/A").await;
 
-        // topic() reports exactly the topic handed to new().
         assert_eq!(sync.topic(), "tasks/A");
 
-        // read() exposes the underlying list unchanged.
         {
             let list = sync.read().await;
             assert_eq!(list.name(), "Test List");
             assert_eq!(list.task_count(), 0);
         }
 
-        // write() returns a mutable guard; verify it is usable by renaming
-        // the list, then observe the rename via read().
         {
             let mut list = sync.write().await;
             list.update_name("Renamed".to_string(), peer(1));
@@ -2736,47 +2092,32 @@ mod tests {
         assert_eq!(list.name(), "Renamed", "write-guard rename must be visible");
     }
 
-    // ------------------------------------------------------------------
-    // state_sync_topic() (private helper exercised from the test module)
-    // ------------------------------------------------------------------
-
     #[tokio::test]
     async fn state_sync_topic_appends_side_channel_suffix() {
         let sync = make_sync("tasks/B").await;
-        // The private helper forms the side channel by appending the suffix.
         assert_eq!(sync.state_sync_topic(), "tasks/B/state-sync");
 
-        // Suffix is appended exactly once, regardless of slashes in topic.
         let sync2 = make_sync("tasks/B/nested").await;
         assert_eq!(sync2.state_sync_topic(), "tasks/B/nested/state-sync");
     }
-
-    // ------------------------------------------------------------------
-    // apply_remote_delta(): direct (off-wire) merge into the local list
-    // ------------------------------------------------------------------
 
     #[tokio::test]
     async fn apply_remote_delta_merges_task_into_list() {
         let sync = make_sync("tasks/C").await;
 
-        // Start empty.
         assert_eq!(sync.read().await.task_count(), 0);
 
-        // Build a delta carrying one task authored by peer(2).
         let remote = peer(2);
         let task = make_task(7, remote);
         let task_id = *task.id();
         let mut delta = TaskListDelta::new(1);
         delta.added_tasks.insert(task_id, (task, (remote, 1)));
 
-        // Layer A (issue #349): the honest path needs an envelope-verified
-        // writer for content to apply.
         let alice = agent(1);
         sync.apply_remote_delta(remote, delta, Some(&alice))
             .await
             .expect("apply_remote_delta");
 
-        // The task must be present and retrievable by id.
         let list = sync.read().await;
         assert_eq!(list.task_count(), 1, "merged task must bump the count");
         assert!(
@@ -2785,16 +2126,10 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------
-    // publish_delta(): wire round-trip observed by a subscriber
-    // ------------------------------------------------------------------
-
     #[tokio::test]
     async fn publish_delta_delivers_encoded_pair_to_subscriber() {
         let (sync, pubsub) = make_sync_with_pubsub("tasks/D").await;
 
-        // Subscribe to the main topic BEFORE publishing so we observe the
-        // exact bytes TaskListSync places on the wire.
         let mut sub = pubsub.subscribe("tasks/D".to_string()).await;
 
         let sender = peer(7);
@@ -2812,8 +2147,6 @@ mod tests {
             .expect("timed out waiting for published delta")
             .expect("subscriber stream closed");
 
-        // The published payload must decode back to the (sender, delta) pair
-        // that publish_delta encoded — proving the wire format is correct.
         let (observed_sender, observed_delta) =
             decode_delta::<TaskListDelta>(&msg.payload).expect("wire decode");
         assert_eq!(observed_sender, sender);
@@ -2825,25 +2158,16 @@ mod tests {
         assert_eq!(msg.topic, "tasks/D");
     }
 
-    // ------------------------------------------------------------------
-    // #895: group-key sealing of group-scoped task lists
-    // ------------------------------------------------------------------
-
     const SEALED_TITLE: &str = "SEALED-TITLE-895";
     const SEALED_DESCRIPTION: &str = "SEALED-DESCRIPTION-895";
 
-    /// A GSS-plane protector over a fixed `GroupInfo` snapshot, built from the
-    /// same library seal/open functions the daemon's protector calls.
     struct GssFixtureProtector {
         info: crate::groups::GroupInfo,
         topic: String,
         signing: crate::kv::encrypted::AuthorSigning,
         public: bool,
         rejected: std::sync::atomic::AtomicU64,
-        /// Simulates the TreeKEM protector while the group is quarantined:
-        /// it refuses to open at all.
         refuse_open: std::sync::atomic::AtomicBool,
-        /// Simulates a seal failure (no group key, author not a writer).
         fail_seal: std::sync::atomic::AtomicBool,
     }
 
@@ -2933,7 +2257,6 @@ mod tests {
             Some(self.signing.agent_id)
         }
 
-        /// A fixed `GroupInfo` snapshot: its epoch can never move.
         fn confirm_publication<'a>(
             &'a self,
             _body: &'a crate::crdt::sealed::SealedTaskRecordBody,
@@ -2946,8 +2269,6 @@ mod tests {
         }
     }
 
-    /// An MlsEncrypted GSS group whose creator (and only active member) is
-    /// `member`, holding a rotated shared secret.
     fn gss_group(member: AgentId) -> crate::groups::GroupInfo {
         let mut info =
             crate::groups::GroupInfo::new("g895".to_string(), String::new(), member, "g895".into());
@@ -2974,16 +2295,11 @@ mod tests {
             .any(|w| w == needle.as_bytes())
     }
 
-    /// A pubsub whose publishes are signed by `kp`, so the listener sees
-    /// `kp`'s agent as the gossip-verified sender.
     async fn pubsub_signed_by(kp: &crate::identity::AgentKeypair) -> Arc<PubSubManager> {
         let signing = Arc::new(crate::gossip::SigningContext::from_keypair(kp));
         Arc::new(PubSubManager::new(make_node().await, signing).expect("pubsub"))
     }
 
-    /// Lead requirement 3 (WHY): the exact bytes handed to the gossip publish
-    /// call for a group task-list update must not carry the task's title or
-    /// description — a non-member who derives the topic learns nothing.
     #[tokio::test]
     async fn group_list_publish_hands_gossip_only_sealed_bytes() {
         let topic = "x0x.group.g895.symphony.wire";
@@ -3010,7 +2326,6 @@ mod tests {
                 .map_or(true, |(_, d)| !d.added_tasks.contains_key(&task_id)),
             "the published bytes must not decode as a plaintext delta"
         );
-        // Control: the sealed record is the member's delta, not noise.
         let (_, body) =
             crate::crdt::sealed::decode_sealed_task_record(&msg.payload).expect("sealed record");
         let opened = protector.open(&body).await.expect("member opens");
@@ -3018,8 +2333,6 @@ mod tests {
         assert!(inner.added_tasks.contains_key(&task_id));
     }
 
-    /// WHY: the `/state-sync` cold-start serve republishes the WHOLE list, so
-    /// it must be sealed too — otherwise a non-member could just ask for it.
     #[tokio::test]
     async fn group_list_state_serve_is_sealed() {
         let topic = "x0x.group.g895.symphony.serve";
@@ -3053,8 +2366,6 @@ mod tests {
         assert!(!carries(&msg.payload, SEALED_DESCRIPTION));
     }
 
-    /// WHY: sealing must not break replication — a current member opens the
-    /// record with the group key and the task lands.
     #[tokio::test]
     async fn member_opens_and_applies_sealed_delta() {
         let topic = "x0x.group.g895.symphony.member";
@@ -3091,9 +2402,6 @@ mod tests {
         assert_eq!(receiver_protector.rejected(), 0);
     }
 
-    /// Lead requirements 1 and 2 (WHY): a removed member still holding the
-    /// epoch-N key cannot apply a delta sealed at N+1, and a plaintext delta
-    /// (an un-upgraded peer) is refused and counted — neither is merged.
     #[tokio::test]
     async fn removed_member_and_plaintext_fail_closed() {
         let topic = "x0x.group.g895.symphony.removed";
@@ -3152,10 +2460,6 @@ mod tests {
         );
     }
 
-    /// ADR-0068 D2 (Accepted) WHY: a sealed delta that arrives while the
-    /// group is fork-quarantined must be BUFFERED, not dropped — even though
-    /// the protector cannot open it during the quarantine (the TreeKEM
-    /// protector refuses) — and applied once the marker clears.
     #[tokio::test]
     async fn sealed_delta_during_quarantine_is_buffered_then_applied() {
         let topic = "x0x.group.g895.symphony.quarantine";
@@ -3203,7 +2507,6 @@ mod tests {
         assert_eq!(protector.rejected(), 0, "held, not refused");
         assert!(receiver.read().await.get_task(&task_id).is_none());
 
-        // The marker clears; the protector can open again.
         gate.suspend(false);
         protector
             .refuse_open
@@ -3214,21 +2517,12 @@ mod tests {
         assert_eq!(protector.rejected(), 0);
     }
 
-    /// omp review finding 2(i) WHY: a sealed record must be merged only when
-    /// its sealed (signed) author IS the gossip-verified sender. Member A's
-    /// record re-broadcast under B's envelope is refused and counted.
-    ///
-    /// Mutation check: deleting the `SenderMismatch` refusal in `open_sealed`
-    /// lets the task merge (B is a signed writer and the list has no writer
-    /// allow-list), so the `get_task(..).is_none()` assertion fails, and the
-    /// `rejected() == 1` assertion fails too.
     #[tokio::test]
     async fn sealed_author_must_be_the_gossip_sender() {
         let topic = "x0x.group.g895.symphony.mismatch";
         let author = crate::identity::AgentKeypair::generate().expect("author");
         let relayer = crate::identity::AgentKeypair::generate().expect("relayer");
         let info = gss_group(author.agent_id());
-        // Every publish on this pubsub carries B's (the relayer's) envelope.
         let pubsub = pubsub_signed_by(&relayer).await;
         let sender = TaskListSync::new(
             TaskList::new(list_id(1), "L".to_string(), peer(1)),
@@ -3244,7 +2538,6 @@ mod tests {
             peer(2),
         )
         .expect("receiver");
-        // The record is sealed and signed as A.
         assert!(sender.install_protector(GssFixtureProtector::new(info.clone(), topic, &author)));
         let protector = GssFixtureProtector::new(info, topic, &author);
         assert!(receiver.install_protector(protector.clone()));
@@ -3267,15 +2560,6 @@ mod tests {
         );
     }
 
-    /// omp review finding 2(ii) WHY: when sealing fails there is NO plaintext
-    /// fallback — `publish_delta` returns the error and nothing reaches the
-    /// wire, and the state-sync responder serves nothing (no broadcast, no
-    /// marker).
-    ///
-    /// Mutation check: an `Err(_)` plaintext fallback in `seal_and_publish` makes
-    /// `publish_delta` return `Ok` (the `is_err()` assertion fails) and puts
-    /// the plaintext pair on the topic (the "nothing published" assertion
-    /// fails); the responder would broadcast the full list and its markers.
     #[tokio::test]
     async fn seal_failure_publishes_nothing() {
         let topic = "x0x.group.g895.symphony.sealfail";
@@ -3313,8 +2597,6 @@ mod tests {
                 .is_err(),
             "nothing may be published on the list topic when sealing fails"
         );
-        // The side topic also carries state REQUESTS (ours, and the sync's
-        // own bootstrap requester); only a served marker is a failure.
         let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
         let mut saw_our_request = false;
         while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, side.recv()).await {
@@ -3332,15 +2614,9 @@ mod tests {
                 "no served marker without a real (sealed) broadcast"
             );
         }
-        // Liveness (#1114): the side topic delivered our request, so the
-        // silence above is the responder's decision, not a dead topic.
         assert!(saw_our_request, "the side probe must see our StateRequest");
     }
 
-    /// omp review finding 1 WHY (crdt half): a list with a serve gate
-    /// answers a `StateRequest` only when the gate admits the requester — a
-    /// denied (non-member / retired) request produces no broadcast at all.
-    /// The control shows the same list DOES serve an admitted requester.
     #[tokio::test]
     async fn serve_gate_denies_state_requests_it_does_not_admit() {
         let topic = "x0x-board-servegate895";
@@ -3390,8 +2666,6 @@ mod tests {
         );
     }
 
-    /// WHY: personal (non-group) lists keep their plaintext wire format; the
-    /// fix must not change them. No protector ⇒ the bytes are the plain pair.
     #[tokio::test]
     async fn personal_list_wire_format_is_unchanged() {
         let (sync, pubsub) = make_sync_with_pubsub("tasks/personal-895").await;
@@ -3408,23 +2682,11 @@ mod tests {
         assert!(carries(&msg.payload, SEALED_TITLE));
     }
 
-    // ------------------------------------------------------------------
-    // start_with_spawner(): custom spawner path (documented smoke test)
-    // ------------------------------------------------------------------
-
+    // Smoke test of the custom-spawner path only: a drop-spawner makes the
+    // subscription unobservable, so nothing here proves a merge. The real
+    // subscribe->merge behaviour is `start_default_spawner_merges_remote_delta`.
     #[tokio::test]
     async fn start_with_spawner_accepts_custom_spawner_and_returns_ok() {
-        // Unique value vs `start_default_spawner_merges_remote_delta`: this
-        // routes the background futures through a *custom* (non-`tokio::spawn`)
-        // spawner closure — a drop-spawner — exercising that generic code path
-        // and asserting `start_with_spawner` returns `Ok` without panicking.
-        //
-        // It deliberately does NOT assert that a subscription or merge
-        // occurred: a drop-spawner makes subscription unobservable, so this
-        // would still pass against a no-op `Ok(())` impl. The real
-        // subscribe->merge behaviour is asserted end-to-end by
-        // `start_default_spawner_merges_remote_delta`, which drives
-        // `start_with_spawner(tokio::spawn)` and proves Layer A I2 (unsigned add does not land).
         let sync = make_sync("tasks/E").await;
         sync.start_with_spawner(|_fut| {
             // intentionally drop the future
@@ -3433,14 +2695,6 @@ mod tests {
         .expect("start_with_spawner");
     }
 
-    // ------------------------------------------------------------------
-    // start(): default spawner merges a remotely-published delta
-    // ------------------------------------------------------------------
-
-    /// WHY (#1094 `task:changed`): a remote delta that the listener merges
-    /// sends exactly one change notice with the list topic and origin
-    /// `Remote`; a direct `apply_remote_delta` sends one; `note_change`
-    /// sends a `Local` one.
     #[tokio::test]
     async fn issue1094_a_merged_remote_task_delta_sends_one_change_notice() {
         let (pubsub, publisher) = signed_pubsub_with_signer().await;
@@ -3495,18 +2749,6 @@ mod tests {
 
     #[tokio::test]
     async fn start_default_spawner_merges_remote_delta() {
-        // End-to-end exercise of the delta-merge listener through the Layer A
-        // gate (issue #349, I2/I8): a delta published on the topic is received
-        // by the background loop spawned by start() and merged with the
-        // V2-envelope-verified sender as the writer. The publisher signs
-        // (#1114: nothing unsigned is delivered at all) but is NOT in the
-        // list's authorized set, so the listener must fail closed on content:
-        // the delta's first-seen task add must NOT land, while a member's
-        // attested checkbox claim on a task the receiver already holds must
-        // still converge (checkbox admission is gated by OpAttestation and
-        // membership, not by the envelope writer). The anonymous-writer case
-        // is covered off-wire by
-        // `merge_delta_anonymous_writer_drops_content_but_admits_attested_claim`.
         let (pubsub, publisher) = signed_pubsub_with_signer().await;
         let (sync, _pubsub) = sync_on_pubsub("tasks/F", pubsub);
         let kp = crate::identity::AgentKeypair::generate().expect("agent keygen");
@@ -3519,11 +2761,8 @@ mod tests {
 
         sync.start().await.expect("start");
 
-        // Let the spawned subscribe-forwarder register before we publish.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Seed an existing local task (local mutators are the trusted path —
-        // they are not the untrusted apply route this test exercises).
         let remote = peer(2);
         let existing = make_task(5, remote);
         let existing_id = *existing.id();
@@ -3532,10 +2771,6 @@ mod tests {
             list.add_task(existing, remote, 1).expect("seed local task");
         }
 
-        // Non-member delta: a first-seen add PLUS a member's validly-attested
-        // claim on the existing task. The claim is the positive evidence that
-        // the listener processed the message, so "add did not land" below is
-        // a real gate decision, not a dead listener.
         let mut claimed = make_task(5, remote);
         claimed
             .claim(list_id(1), claimer, remote, 1, &signing)
@@ -3550,7 +2785,6 @@ mod tests {
         delta.task_updates.insert(existing_id, claimed);
         sync.publish_delta(remote, delta).await.expect("publish");
 
-        // The claim applies (checkbox path still runs for a non-member writer)…
         let claim_applied = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let claimed_landed = sync
@@ -3570,7 +2804,6 @@ mod tests {
             "a non-member's signed publish must still reach checkbox admission"
         );
 
-        // …but the non-member's content must NOT land (I2/I8).
         assert!(
             sync.read().await.get_task(&new_task_id).is_none(),
             "a non-member writer's publish must not create a task (I2/I8)"
@@ -3582,25 +2815,13 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------
-    // stop(): returns Ok and is idempotent
-    // ------------------------------------------------------------------
-
     #[tokio::test]
     async fn stop_returns_ok_and_is_idempotent() {
         let sync = make_sync("tasks/G").await;
         sync.stop().await.expect("first stop");
-        // stop() unsubscribes both the main and the state-sync topic;
-        // unsubscribe is infallible and tolerant of already-removed topics,
-        // so a second stop() must remain Ok.
         sync.stop().await.expect("second stop (idempotent)");
     }
 
-    /// WHY (rounds 1+4 review): the requester's schedule is INFINITE while
-    /// the list is empty, and the sibling loops hold strong `Arc`s to the
-    /// list — so the cancellation token (all loops) and the
-    /// silence_bootstrap flag (requester only) are the only things that end
-    /// a discarded sync's background work before daemon shutdown.
     #[tokio::test]
     async fn stop_and_silence_arm_their_kill_switches() {
         let sync = make_sync("tasks/stopflag").await;
@@ -3624,10 +2845,6 @@ mod tests {
         );
     }
 
-    /// WHY (parallel-review finding): teardown must be STRUCTURAL — a
-    /// caller that discards its last reference without remembering
-    /// cancel_sync() must still end all background loops (the requester is
-    /// infinite while unconverged), so Drop cancels the token.
     #[tokio::test]
     async fn dropping_the_sync_cancels_all_loops() {
         let sync = make_sync("tasks/dropcancel").await;
@@ -3640,16 +2857,6 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------
-    // Issue #238: the bootstrap requester must never give up while empty
-    // ------------------------------------------------------------------
-
-    /// WHY: holders answer state requests reactively and never volunteer
-    /// state to a late subscriber, so the request schedule is the only
-    /// recovery trigger. The previous hard cap (20 × 30s ≈ 10 min) left a
-    /// list that rehydrated while every holder was offline permanently
-    /// empty once the cap expired. The schedule must be front-loaded, then
-    /// an infinite capped tail — convergence is the only stop condition.
     #[test]
     fn state_request_schedule_never_terminates_while_unconverged() {
         let front: Vec<u64> = state_request_delays().take(4).collect();
@@ -3668,18 +2875,8 @@ mod tests {
         );
     }
 
-    /// WHY (round-2 review — P1: one incremental delta must not silence
-    /// recovery): a live task arriving before any holder has actually
-    /// SERVED full state makes the list non-empty, and the round-1 tail
-    /// exited on non-emptiness alone — permanently missing all older
-    /// tasks. Convergence now additionally requires a StateServed marker,
-    /// so the bait delta leaves the requester alive and a late full holder
-    /// still gets asked.
     #[tokio::test(start_paused = true)]
     async fn single_incremental_delta_does_not_stop_recovery() {
-        // Signed pubsub (Layer A, issue #349): the bait delta and the late
-        // holder's serves must carry an envelope-verified writer or the
-        // listener drops their content.
         let pubsub = signed_pubsub().await;
         let topic = "tasks-238-bait";
 
@@ -3689,11 +2886,8 @@ mod tests {
                 .expect("joiner sync");
         joiner.start().await.expect("start joiner");
 
-        // Past the front burst with nobody online.
         tokio::time::sleep(Duration::from_secs(70)).await;
 
-        // The bait: ONE live incremental delta (task 2) — no full response,
-        // no StateServed marker. The list becomes non-empty.
         let bait_task = make_task(2, peer(3));
         let bait_id = *bait_task.id();
         let mut bait = TaskListDelta::new(1);
@@ -3710,8 +2904,6 @@ mod tests {
             "bait delta merged — the false-convergence precondition holds"
         );
 
-        // A holder with the FULL history (task 1 and task 2) appears long
-        // after the bait. Only a still-alive requester can reach it.
         let mut holder_list = TaskList::new(list_id(1), "Test List".to_string(), peer(1));
         holder_list
             .add_task(make_task(1, peer(1)), peer(1), 1)
@@ -3740,28 +2932,17 @@ mod tests {
         );
     }
 
-    /// WHY (issue #238 — zombie subscription): a joiner whose every request
-    /// fired while all holders were offline must still converge when a
-    /// holder returns — even long after the OLD hard cap (front ~51s +
-    /// 20 × 30s ≈ 651s) would have silenced the requester forever. Paused
-    /// time drives the virtual clock, so the >10-minute scenario runs in
-    /// moments.
     #[tokio::test(start_paused = true)]
     async fn requester_recovers_when_holder_returns_after_old_hard_cap() {
-        // Signed pubsub (Layer A, issue #349): the holder's serve must carry
-        // an envelope-verified writer or the listener drops its content.
         let pubsub = signed_pubsub().await;
         let topic = "tasks-238-zombie";
 
-        // Empty joiner: subscribes and starts requesting into the void.
         let joiner_list = TaskList::new(list_id(1), "Test List".to_string(), peer(2));
         let joiner =
             TaskListSync::new(joiner_list, Arc::clone(&pubsub), topic.to_string(), peer(2))
                 .expect("joiner sync");
         joiner.start().await.expect("start joiner");
 
-        // Sail PAST the old hard cap with no holder online. The old code is
-        // permanently silent from here on — this is the zombie window.
         tokio::time::sleep(Duration::from_secs(700)).await;
         assert_eq!(
             joiner.read().await.task_count(),
@@ -3769,8 +2950,6 @@ mod tests {
             "nobody was online to answer"
         );
 
-        // A holder with state appears. It only answers when ASKED, so the
-        // joiner's tail must still be alive to ask.
         let mut holder_list = TaskList::new(list_id(1), "Test List".to_string(), peer(1));
         holder_list
             .add_task(make_task(1, peer(1)), peer(1), 1)
@@ -3780,7 +2959,6 @@ mod tests {
                 .expect("holder sync");
         holder.start().await.expect("start holder");
 
-        // The next tail request is at most STATE_REQUEST_TAIL_CAP_SECS away.
         let mut converged = false;
         for _ in 0..200 {
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -3796,13 +2974,6 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------
-    // Issue #240: digest-verified convergence evidence
-    // ------------------------------------------------------------------
-
-    /// Drain every side-topic `StateRequest` from `from` already queued on
-    /// `probe` without blocking (the 1ms virtual timeout yields immediately
-    /// under the paused clock when the queue is empty).
     async fn drain_state_requests(probe: &mut crate::gossip::Subscription, from: PeerId) -> usize {
         let mut n = 0;
         while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(1), probe.recv()).await
@@ -3818,9 +2989,6 @@ mod tests {
         n
     }
 
-    /// WHY (issue #240): the convergence rule must weigh v2 digest evidence
-    /// above the weak v1 rule, with the data-bearing-claim-wins tiebreak —
-    /// and NO evidence is NEVER convergence.
     #[test]
     fn tasklist_convergence_rule() {
         const D1: [u8; 32] = [1u8; 32];
@@ -3830,7 +2998,6 @@ mod tests {
         assert!(!tasklist_converged(&none, 0, D1));
         assert!(!tasklist_converged(&none, 5, D1));
 
-        // v1 weak rule: marker + local non-emptiness.
         let v1 = TaskServedEvidence {
             saw_v1: true,
             digests: std::collections::HashMap::new(),
@@ -3838,8 +3005,6 @@ mod tests {
         assert!(!tasklist_converged(&v1, 0, D1));
         assert!(tasklist_converged(&v1, 3, D1));
 
-        // v2 digest gate: match stops, mismatch keeps asking, and v2
-        // outranks the weak v1 rule.
         let mut ev = TaskServedEvidence::default();
         ev.digests.insert(
             peer(9),
@@ -3856,8 +3021,6 @@ mod tests {
             "v2 declarations outrank weak v1 evidence"
         );
 
-        // Empty-holder declarations converge an empty requester only when
-        // every declaration is empty (data-bearing claim wins).
         let mut ev_empty = TaskServedEvidence::default();
         ev_empty.digests.insert(
             peer(9),
@@ -3881,11 +3044,6 @@ mod tests {
         assert!(tasklist_converged(&ev_empty, 2, D1));
     }
 
-    /// WHY: the v2 digest commits to the served task set so a requester can
-    /// verify completeness LOCALLY. It must be deterministic across
-    /// replicas, sensitive to membership, insensitive to name/ordering
-    /// metadata, and bound to the list id; a full delta's carried digest
-    /// must equal the serving list's local digest.
     #[test]
     fn served_digest_is_deterministic_content_bound_and_metadata_independent() {
         let mut a = TaskList::new(list_id(1), "alpha".to_string(), peer(1));
@@ -3902,16 +3060,11 @@ mod tests {
             "the list id binds the digest (cross-list replay defense)"
         );
 
-        // The same task in both lists ⇒ the same digest, however it got
-        // there (OR-Set writer tags are transport, not content).
         let task = make_task(7, peer(3));
         a.add_task(task.clone(), peer(1), 1).expect("add a");
         b.add_task(task, peer(2), 1).expect("add b");
         assert_eq!(a.served_digest(), b.served_digest());
 
-        // A full delta's served digest equals the local digest; an
-        // incremental delta is not full-state-shaped and must not
-        // impersonate a serve.
         let full = a.full_delta();
         assert_eq!(full.served_digest(&list_id(1)), Some(a.served_digest()));
         let inc = TaskListDelta::for_add(
@@ -3922,29 +3075,17 @@ mod tests {
         );
         assert_eq!(inc.served_digest(&list_id(1)), None);
 
-        // Different membership ⇒ different digest.
         b.add_task(make_task(9, peer(2)), peer(2), 2)
             .expect("add b2");
         assert_ne!(a.served_digest(), b.served_digest());
     }
 
-    /// WHY (issue #240, residual 1 — the cross-topic loss window): the full
-    /// delta travels on the main topic, its marker on the side topic, with
-    /// no delivery coupling. If the delta is lost while the marker
-    /// survives, the v1 rule stopped a non-empty requester with incomplete
-    /// history. With the v2 digest the requester detects the mismatch
-    /// (local {t2} vs declared {t1,t2}) and keeps asking until the real
-    /// state arrives.
     #[tokio::test(start_paused = true)]
     async fn lost_full_delta_with_surviving_marker_keeps_requester_asking() {
-        // Signed pubsub (Layer A, issue #349): the holder's full serve must
-        // carry an envelope-verified writer or the listener drops its
-        // content.
         let pubsub = signed_pubsub().await;
         let topic = "tasks-240-lost-broadcast";
         let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
 
-        // The full holder state (offline for now): {t1, t2}.
         let mut holder_list = TaskList::new(list_id(1), "Test List".to_string(), peer(1));
         holder_list
             .add_task(make_task(1, peer(1)), peer(1), 1)
@@ -3953,8 +3094,6 @@ mod tests {
             .add_task(make_task(2, peer(1)), peer(1), 2)
             .expect("holder t2");
 
-        // The joiner starts EMPTY (a non-empty task list never bootstraps
-        // — only empty lists run the requester).
         let joiner_list = TaskList::new(list_id(1), "Test List".to_string(), peer(2));
         let joiner =
             TaskListSync::new(joiner_list, Arc::clone(&pubsub), topic.to_string(), peer(2))
@@ -3962,11 +3101,6 @@ mod tests {
         let mut probe = pubsub.subscribe(side.clone()).await;
         joiner.start().await.expect("start joiner");
 
-        // "One live incremental delta": the joiner ends up holding only t2,
-        // cloned out of the holder's own full delta so the resolved fields
-        // are byte-identical and the post-recovery digests can match
-        // exactly. Merged directly into the store — this is the state the
-        // live-gossip bait leaves behind.
         let t2_only = {
             let full = holder_list.full_delta();
             let (id, (task, tag)) = full
@@ -3984,7 +3118,6 @@ mod tests {
             .merge_delta(&t2_only, peer(1), Some(&agent(1)))
             .expect("seed t2");
 
-        // The loss window: the marker survives, the full delta does not.
         let marker = TaskListSyncMessage::StateServedV2 {
             responder: peer(1),
             digest: holder_list.served_digest(),
@@ -3996,8 +3129,6 @@ mod tests {
             .await
             .expect("publish marker");
 
-        // Well past the front burst the requester must STILL be asking —
-        // its local digest ({t2}) does not match the declaration ({t1,t2}).
         let mut requests = 0;
         for _ in 0..10 {
             tokio::time::sleep(Duration::from_secs(30)).await;
@@ -4013,8 +3144,6 @@ mod tests {
             "the lost broadcast never arrived"
         );
 
-        // The real holder returns: the next serve delivers {t1,t2}, the
-        // local digest then matches the declaration, and the tail stops.
         let holder =
             TaskListSync::new(holder_list, Arc::clone(&pubsub), topic.to_string(), peer(1))
                 .expect("holder sync");
@@ -4034,7 +3163,6 @@ mod tests {
             "the still-alive requester must recover the lost task"
         );
 
-        // Convergence is terminal: no further requests.
         tokio::time::sleep(Duration::from_secs(160)).await;
         drain_state_requests(&mut probe, peer(2)).await;
         let mut relapse = 0;
@@ -4045,25 +3173,12 @@ mod tests {
         assert_eq!(relapse, 0, "a digest-matched requester must fall silent");
     }
 
-    /// WHY (issue #240, residual 2 — deletion cold-sync): a full delta
-    /// carries only live tasks, so a plain merge could never delete a stale
-    /// replica's obsolete tasks. The digest-verified full-replace adopt
-    /// closes that: the serve's delta content is bound to the holder's
-    /// declared digest, and since #643 the prune additionally requires
-    /// holder-carried DELETION EVIDENCE. Since #654 the prune is also
-    /// gated by the list's content policy — an UNSIGNED serve (no
-    /// envelope-verified writer) fails closed exactly like its adds
-    /// would, which is why this test drives a signing pubsub (see
-    /// `stale_full_serve_after_live_add_must_not_prune_the_live_task`).
     #[tokio::test(start_paused = true)]
     async fn digest_verified_full_serve_prunes_stale_tasks() {
         let pubsub = signed_pubsub().await;
         let topic = "tasks-240-prune-stale";
         let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
 
-        // Holder: added t1 and t_stale, then DELETED t_stale — its serve
-        // carries the live set {t1} plus an ordering register that still
-        // names t_stale, the causal evidence of the deletion.
         let mut holder_list = TaskList::new(list_id(1), "Test List".to_string(), peer(1));
         holder_list
             .add_task(make_task(1, peer(1)), peer(1), 1)
@@ -4075,11 +3190,6 @@ mod tests {
             .remove_task(&TaskId::from_bytes([9; 32]))
             .expect("holder deletes t_stale");
 
-        // Stale joiner: starts EMPTY (only empty lists run the requester),
-        // then state lands the way it would in production — t1 (from the
-        // holder's full delta, byte-identical) and t_stale (an obsolete
-        // task the holder deleted while this replica was away) merge
-        // directly into the store before the holder ever comes online.
         let joiner_list = TaskList::new(list_id(1), "Test List".to_string(), peer(2));
         let joiner =
             TaskListSync::new(joiner_list, Arc::clone(&pubsub), topic.to_string(), peer(2))
@@ -4110,7 +3220,6 @@ mod tests {
                 .expect("holder sync");
         holder.start().await.expect("start holder");
 
-        // The verified adopt must remove the stale task while t1 stays.
         let stale = TaskId::from_bytes([9; 32]);
         let mut pruned = false;
         for _ in 0..200 {
@@ -4127,8 +3236,6 @@ mod tests {
              (deletion cold-sync)"
         );
 
-        // And convergence follows: local state now equals the declared
-        // digest, so the requester falls silent.
         tokio::time::sleep(Duration::from_secs(160)).await;
         drain_state_requests(&mut probe, peer(2)).await;
         let mut relapse = 0;
@@ -4139,32 +3246,12 @@ mod tests {
         assert_eq!(relapse, 0, "the requester must stop once the digests match");
     }
 
-    /// WHY (issue #643): a digest-verified full serve proves the delta
-    /// equals the holder's COMPLETE state at serve time — it does NOT prove
-    /// that state is fresh relative to this replica. A serve solicited
-    /// before the holder merged a live add delta can arrive AFTER this
-    /// replica already merged the add; pruning on absence observe-removes
-    /// the task, so a visibility read (GET) and a subsequent claim
-    /// disagree and the claim fails `task not found` (observed as HTTP 500
-    /// in the convergence soak, run 10 of 20260911-092818). The prune
-    /// fires ONLY on explicit holder-carried removal evidence
-    /// (empty-tag-set `removed_tasks` entries, #643 round 2) — a task the
-    /// serve merely lacks is newer knowledge than the serve and adds-win
-    /// keeps it.
-    ///
-    /// The stale holder here is NON-EMPTY (it carries an older task): that
-    /// is the only serve shape production emits — responders with empty
-    /// lists stay silent — and it makes the serve's digest and entry_count
-    /// exactly what a live mesh would declare.
     #[tokio::test(start_paused = true)]
     async fn stale_full_serve_after_live_add_must_not_prune_the_live_task() {
         let pubsub = signed_pubsub().await;
         let topic = "tasks-643-stale-serve-race";
         let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
 
-        // The holder's PRE-add state: a real, non-empty full serve
-        // (carrying the older task t0), snapshot and declaration captured
-        // together exactly as the responder loop does.
         let mut holder_list = TaskList::new(list_id(1), "Test List".to_string(), peer(1));
         holder_list
             .add_task(make_task(0, peer(1)), peer(1), 1)
@@ -4181,7 +3268,6 @@ mod tests {
             "no deletion evidence in flight — only absence"
         );
 
-        // The live add: T exists on the holder only as a published delta.
         let task = make_task(5, peer(1));
         let tid = *task.id();
         let add_seq = holder_list.next_seq();
@@ -4191,8 +3277,6 @@ mod tests {
         let add_delta =
             TaskListDelta::for_add(tid, task, (peer(1), add_seq), holder_list.current_version());
 
-        // The claimant: empty list, bootstrap requester armed (the adopt
-        // window this race lives in).
         let joiner_list = TaskList::new(list_id(1), "Test List".to_string(), peer(2));
         let joiner =
             TaskListSync::new(joiner_list, Arc::clone(&pubsub), topic.to_string(), peer(2))
@@ -4200,7 +3284,6 @@ mod tests {
         let mut probe = pubsub.subscribe(side.clone()).await;
         joiner.start().await.expect("start joiner");
 
-        // The add delta lands via live gossip — the visibility read sees T.
         let bytes = encode_delta(peer(1), &add_delta).expect("encode add");
         pubsub
             .publish(topic.to_string(), bytes::Bytes::from(bytes))
@@ -4216,9 +3299,6 @@ mod tests {
         }
         assert!(visible, "the add delta must make the task visible");
 
-        // The in-flight stale serve arrives next: declaration first (side
-        // topic), then the serve itself (main topic) — a broadcast answered
-        // before the holder ever merged the add.
         let marker = TaskListSyncMessage::StateServedV2 {
             responder: peer(1),
             digest: stale_digest,
@@ -4235,11 +3315,6 @@ mod tests {
             .await
             .expect("publish serve");
 
-        // Drive the bootstrap schedule well past delivery: request cycles
-        // observed AFTER the serve prove the listener had ample turns to
-        // process it. The joiner never converges here (local {T} vs
-        // declared empty), exactly like the live mesh before any holder
-        // declares the new content.
         let mut cycles = 0;
         for _ in 0..8 {
             tokio::time::sleep(Duration::from_secs(30)).await;
@@ -4250,7 +3325,6 @@ mod tests {
             "the unconverged joiner keeps asking; cycles={cycles}"
         );
 
-        // The claim must succeed against the same state the read saw.
         assert!(
             joiner.read().await.get_task(&tid).is_some(),
             "a stale serve must not prune a task the replica merged after \
@@ -4268,23 +3342,12 @@ mod tests {
         joiner.cancel_sync();
     }
 
-    /// WHY (issue #240, residual 3 — genuinely-empty chatter): the v1 rule
-    /// kept every empty list requesting forever (~1 side-topic message per
-    /// 5 minutes) because an empty holder had to stay silent (two empty
-    /// replicas must not talk each other into a FALSE converged-empty).
-    /// The v2 digest of the empty set is universally computable, so an
-    /// empty holder can now declare authoritative emptiness any empty
-    /// requester verifies locally — converging on empty is verifiably
-    /// CORRECT, and the chatter tail terminates.
     #[tokio::test(start_paused = true)]
     async fn empty_holder_v2_marker_terminates_empty_requester() {
-        // #1114: signed, or the probe (and both syncs) would hear nothing and
-        // `late == 0` below would hold trivially.
         let pubsub = signed_pubsub().await;
         let topic = "tasks-240-empty-silence";
         let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
 
-        // Both lists genuinely EMPTY.
         let joiner_list = TaskList::new(list_id(1), "Test List".to_string(), peer(2));
         let joiner =
             TaskListSync::new(joiner_list, Arc::clone(&pubsub), topic.to_string(), peer(2))
@@ -4297,12 +3360,8 @@ mod tests {
         holder.start().await.expect("start holder");
         let mut probe = pubsub.subscribe(side.clone()).await;
 
-        // Warm-up: the front burst fires and the empty holder's v2
-        // declarations arrive; convergence should follow within a few tail
-        // checks.
         tokio::time::sleep(Duration::from_secs(160)).await;
         let warm = drain_state_requests(&mut probe, peer(2)).await;
-        // Liveness: the front attempts always run, so the probe hears them.
         assert!(warm > 0, "the probe must hear the joiner's front requests");
         let mut late = 0;
         for _ in 0..20 {
@@ -4322,10 +3381,6 @@ mod tests {
     /// v2 markers to make progress against old peers.
     #[tokio::test(start_paused = true)]
     async fn v1_marker_from_old_peer_still_converges() {
-        // Signed pubsub (Layer A, issue #349): the full delta on the main
-        // topic must carry an envelope-verified writer; the v1/v2 question
-        // this test exercises is the SIDE-topic marker format, which stays
-        // a raw v1 StateServed below.
         let pubsub = signed_pubsub().await;
         let topic = "tasks-240-v1-compat";
         let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
@@ -4337,8 +3392,6 @@ mod tests {
         joiner.start().await.expect("start joiner");
         let mut probe = pubsub.subscribe(side.clone()).await;
 
-        // An "old peer" answers a request: full delta on the main topic,
-        // v1 StateServed marker on the side topic — never a v2 marker.
         tokio::time::sleep(Duration::from_secs(20)).await;
         let mut holder_list = TaskList::new(list_id(1), "Test List".to_string(), peer(1));
         holder_list
@@ -4368,7 +3421,6 @@ mod tests {
         }
         assert!(recovered, "the old peer's full delta must merge");
 
-        // Weak-evidence convergence: v1 marker + local state ⇒ the tail stops.
         tokio::time::sleep(Duration::from_secs(160)).await;
         drain_state_requests(&mut probe, peer(2)).await;
         let mut late = 0;
@@ -4382,17 +3434,8 @@ mod tests {
         );
     }
 
-    /// WHY: a v2 marker whose digest does not correspond to any state the
-    /// requester can hold (forged or corrupt) must NEVER converge it — the
-    /// digest is self-verifying, so a bad declaration can only delay, never
-    /// cause, convergence. Nor may it wedge later recovery: a genuine
-    /// holder's fresh declaration replaces the bad one (per-responder
-    /// latest-wins).
     #[tokio::test(start_paused = true)]
     async fn tampered_digest_is_rejected_and_does_not_wedge_recovery() {
-        // Signed pubsub (Layer A, issue #349): the genuine holder's serve
-        // must carry an envelope-verified writer; the tampered marker is
-        // still published as a raw side-topic payload.
         let pubsub = signed_pubsub().await;
         let topic = "tasks-240-tampered";
         let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
@@ -4404,7 +3447,6 @@ mod tests {
         joiner.start().await.expect("start joiner");
         let mut probe = pubsub.subscribe(side.clone()).await;
 
-        // The tampered marker: a random digest no real state can match.
         let marker = TaskListSyncMessage::StateServedV2 {
             responder: peer(1),
             digest: [0xAB; 32],
@@ -4416,8 +3458,6 @@ mod tests {
             .await
             .expect("publish tampered marker");
 
-        // The requester keeps asking: its (empty) local digest can never
-        // equal the forged declaration.
         let mut requests = 0;
         for _ in 0..8 {
             tokio::time::sleep(Duration::from_secs(30)).await;
@@ -4433,8 +3473,6 @@ mod tests {
             "no state can have been adopted from a forged declaration"
         );
 
-        // The genuine holder appears; its fresh declaration replaces the
-        // tampered one (per-responder latest-wins) and recovery completes.
         let mut holder_list = TaskList::new(list_id(1), "Test List".to_string(), peer(1));
         holder_list
             .add_task(make_task(1, peer(1)), peer(1), 1)
@@ -4459,11 +3497,6 @@ mod tests {
         );
     }
 
-    /// WHY (F3, fix-loop — tombstone + hardcoded-tag deadlock): the adopt's
-    /// prune is a local observe-remove, tombstoning the tags a previous
-    /// full delta used. With a hardcoded synthetic tag, a later serve
-    /// re-adding the same task would be silently rejected forever. Full
-    /// deltas now mint FRESH tags, so a re-served task is accepted.
     #[test]
     fn pruned_task_is_accepted_when_re_served_with_fresh_tags() {
         let mut holder = TaskList::new(list_id(1), "List".to_string(), peer(1));
@@ -4474,7 +3507,6 @@ mod tests {
             .add_task(make_task(2, peer(1)), peer(1), 2)
             .expect("add t2");
 
-        // The replica absorbs a first full serve (both tasks).
         let mut replica = TaskList::new(list_id(1), "List".to_string(), peer(2));
         let s1 = holder.full_delta();
         replica
@@ -4482,8 +3514,6 @@ mod tests {
             .expect("serve 1");
         assert_eq!(replica.task_count(), 2);
 
-        // The holder deletes the task; the next VERIFIED serve prunes it
-        // (tombstoning the first serve's synthetic tag locally).
         let doomed = TaskId::from_bytes([2; 32]);
         holder.remove_task(&doomed).expect("delete");
         let s2 = holder.full_delta();
@@ -4498,9 +3528,6 @@ mod tests {
         assert_eq!(replica.prune_to_served_set(&s2, Some(&agent(1))), 1);
         assert!(replica.get_task(&doomed).is_none());
 
-        // The holder RE-ADDS the task: a later serve must be accepted —
-        // pre-fix, its synthetic tag was tombstoned by the prune and the
-        // re-add silently dropped.
         holder
             .add_task(make_task(2, peer(1)), peer(1), 3)
             .expect("re-add");
@@ -4514,24 +3541,11 @@ mod tests {
         );
     }
 
-    /// WHY (issue #643 round 2, review case a): `reorder` rebuilds the
-    /// LWW ordering register from LIVE ids only, so after a delete any
-    /// reorder strips the deleted id from the ordering — the round-1
-    /// "ordering names deleted ids" evidence rule then failed to prune,
-    /// the stale replica kept the task with live tags, and its next full
-    /// serve re-served the deleted task with FRESH tags — fleet-wide
-    /// resurrection (#226 class). Deletion evidence must ride a MONOTONE
-    /// carrier: the raise-only observed-removed set, carried in the serve
-    /// as empty-tag-set `removed_tasks` entries. Delete → reorder → serve
-    /// must still prune, and the pruned replica must not re-serve the
-    /// task.
     #[test]
     fn delete_then_reorder_full_serve_still_prunes_without_resurrection() {
         let t1 = TaskId::from_bytes([1; 32]);
         let doomed = TaskId::from_bytes([2; 32]);
 
-        // Holder: {t1, doomed}, then DELETES doomed, then REORDERS to the
-        // live set — the register no longer names doomed.
         let mut holder = TaskList::new(list_id(1), "List".to_string(), peer(1));
         holder
             .add_task(make_task(1, peer(1)), peer(1), 1)
@@ -4544,7 +3558,6 @@ mod tests {
             .reorder(vec![t1], peer(1))
             .expect("reorder to live set");
 
-        // The serve is a REAL full serve from the post-reorder holder.
         let serve = holder.full_delta();
         assert!(
             !serve.added_tasks.contains_key(&doomed),
@@ -4563,9 +3576,6 @@ mod tests {
             "pin the hazard: the ordering register DID forget the deletion"
         );
 
-        // A stale replica still holding both tasks merges the serve (which
-        // must NOT delete on general merge) and then the digest-verified
-        // adopt prunes doomed on the explicit evidence.
         let mut replica = TaskList::new(list_id(1), "List".to_string(), peer(2));
         replica
             .add_task(make_task(1, peer(2)), peer(2), 1)
@@ -4588,8 +3598,6 @@ mod tests {
         assert!(replica.get_task(&doomed).is_none());
         assert!(replica.get_task(&t1).is_some(), "live task survives");
 
-        // No resurrection: the pruned replica's own serve carries doomed
-        // only as evidence — never as a fresh-tagged live entry.
         let re_serve = replica.full_delta();
         assert!(
             !re_serve.added_tasks.contains_key(&doomed),
@@ -4602,18 +3610,10 @@ mod tests {
         );
     }
 
-    /// WHY (issue #643 round 2, review case b): out-of-order delivery can
-    /// land a reorder delta whose ordering register names a task whose ADD
-    /// has not arrived yet (delta.rs documents this as expected). An
-    /// ordering mention is therefore not deletion evidence; under the
-    /// round-1 rule this shape false-pruned a task the holder never even
-    /// carried. Only explicit empty-tag-set removal evidence may prune.
     #[test]
     fn ordering_entry_without_add_or_evidence_is_not_pruned() {
         let phantom = TaskId::from_bytes([7; 32]);
 
-        // Holder: {t1} only; its serve's ordering register is grafted to
-        // ALSO name `phantom` — a reorder delta that outran phantom's add.
         let mut holder = TaskList::new(list_id(1), "List".to_string(), peer(1));
         holder
             .add_task(make_task(1, peer(1)), peer(1), 1)
@@ -4632,9 +3632,6 @@ mod tests {
             "no deletion evidence exists"
         );
 
-        // A replica holding phantom (its add landed separately) merges the
-        // serve and runs the adopt prune: the ordering mention must not
-        // remove phantom.
         let mut replica = TaskList::new(list_id(1), "List".to_string(), peer(2));
         replica
             .add_task(make_task(7, peer(2)), peer(2), 1)
@@ -4653,21 +3650,11 @@ mod tests {
         );
     }
 
-    /// WHY (issue #654): deletion is content. `merge_delta` drops removal
-    /// evidence from a writer the list's policy would not accept content
-    /// from (a removed member, an unverified envelope), but the adopt-gate
-    /// prune acted directly on the wire delta — so on a group-scoped list
-    /// a holder the policy just rejected could still DELETE tasks via
-    /// empty-tag removal evidence in its serve, and the pruned replica
-    /// would then forward that evidence fleet-wide. The prune must obey
-    /// the same authorization as the merge that surrounds it.
     #[test]
     fn unauthorized_holder_removal_evidence_cannot_prune_group_list() {
         let t1 = TaskId::from_bytes([1; 32]);
         let doomed = TaskId::from_bytes([2; 32]);
 
-        // Holder (member agent(1)) deletes `doomed`; its full serve
-        // carries the deletion as explicit evidence and `t1` live.
         let mut holder = TaskList::new(list_id(1), "Group".to_string(), peer(1));
         holder
             .add_task(make_task(1, peer(1)), peer(1), 1)
@@ -4683,7 +3670,6 @@ mod tests {
             "the serve carries explicit deletion evidence"
         );
 
-        // Group-scoped replica: only agent(1) may write content.
         let make_replica = || {
             let mut replica = TaskList::new(list_id(1), "Group".to_string(), peer(2));
             replica.set_authorized_agents(std::collections::HashSet::from([agent(1)]));
@@ -4696,8 +3682,6 @@ mod tests {
             replica
         };
 
-        // A non-member's serve: the merge drops its content, and the
-        // adopt prune must not act on its evidence either.
         let mut replica = make_replica();
         replica
             .merge_delta(&serve, peer(9), Some(&agent(9)))
@@ -4716,8 +3700,6 @@ mod tests {
             "the non-member's evidence must not even be recorded for forwarding"
         );
 
-        // An unverified envelope (writer None) is not a content writer
-        // either — `merge_delta` treats it the same way.
         let mut replica = make_replica();
         replica
             .merge_delta(&serve, peer(1), None)
@@ -4729,8 +3711,6 @@ mod tests {
         );
         assert!(replica.get_task(&doomed).is_some());
 
-        // The same evidence from the authorized member still prunes —
-        // the gate must not break legitimate deletion cold-sync.
         let mut replica = make_replica();
         replica
             .merge_delta(&serve, peer(1), Some(&agent(1)))
@@ -4744,22 +3724,9 @@ mod tests {
         assert!(replica.get_task(&t1).is_some(), "live task survives");
     }
 
-    // ------------------------------------------------------------------
-    // #732 findings 3 and 5 — the listener's gate ordering and its drain
-    // ------------------------------------------------------------------
-
-    /// A per-instance ADR-0068 D2 gate for the listener fixtures.
-    ///
-    /// Per-instance, never a `static`: these tests run in parallel with the rest
-    /// of the module and a process-global switch would couple them — the flake
-    /// class the `fork_quarantine` fault-injection refactor removed.
     #[derive(Debug, Default)]
     struct ListenerGate {
         suspended: std::sync::atomic::AtomicBool,
-        /// The roster the pinned refresh installs. Seeded with the pubsub's
-        /// signer, so the refresh authorizes exactly the writer these fixtures
-        /// publish as — anything else would deny its content and the assertions
-        /// would be about authorization rather than about ordering.
         roster: std::sync::Mutex<std::collections::HashSet<crate::identity::AgentId>>,
         buffered: std::sync::atomic::AtomicU64,
         dropped: std::sync::atomic::AtomicU64,
@@ -4767,7 +3734,6 @@ mod tests {
     }
 
     impl ListenerGate {
-        /// A gate whose pinned roster seats `signer`.
         fn seating(signer: AgentId) -> Self {
             let gate = Self::default();
             gate.roster
@@ -4786,8 +3752,6 @@ mod tests {
             counter.load(std::sync::atomic::Ordering::SeqCst)
         }
 
-        /// A stable ADR-0067 token with no marker half — "this group is not
-        /// quarantined right now", which is what the drain must see to proceed.
         fn marker_free_token() -> crate::groups::LifecycleEpochToken {
             crate::groups::GroupInfo::new(
                 "listener-gate".to_string(),
@@ -4815,9 +3779,6 @@ mod tests {
                     + '_,
             >,
         > {
-            // A stable token: these fixtures are about ordering and liveness,
-            // not about the ADR-0067 re-check (which has its own fixtures in
-            // `named_groups/tests/adr0068_task_buffer.rs`).
             Box::pin(async move { Some(Self::marker_free_token()) })
         }
 
@@ -4825,12 +3786,6 @@ mod tests {
             &'a self,
             apply: &'a mut (dyn FnMut(Option<&AuthorizedRoster>) + Send),
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
-            // These listener fixtures are about the gate's ORDERING (installed
-            // before the listener) and the drain's liveness. The pinning property
-            // itself — a roster writer blocked for the whole merge — is asserted in
-            // `named_groups/tests/adr0068_task_buffer.rs` against this same
-            // function. Here the roster simply seats the publisher and carries no
-            // marker, so the drain proceeds.
             Box::pin(async move {
                 let agents = self
                     .roster
@@ -4861,16 +3816,11 @@ mod tests {
         }
     }
 
-    /// A signed sync: publishes carry a V2-envelope-verified sender, so merged
-    /// content actually lands and "the task is present" is a real merge. The
-    /// returned `AgentId` is that sender.
     async fn make_signed_sync(topic: &str) -> (TaskListSync, AgentId) {
         let (sync, _pubsub, signer) = make_signed_sync_with_pubsub(topic).await;
         (sync, signer)
     }
 
-    /// As [`make_signed_sync`], handing back the shared pubsub so a test can put
-    /// arbitrary bytes on the same topic the listener reads.
     async fn make_signed_sync_with_pubsub(
         topic: &str,
     ) -> (TaskListSync, Arc<PubSubManager>, AgentId) {
@@ -4881,7 +3831,6 @@ mod tests {
         (sync, pubsub, signer)
     }
 
-    /// One inbound delta that adds a distinct task.
     fn add_delta(seq: u64, id_byte: u8, from: PeerId) -> TaskListDelta {
         let task = make_task(id_byte, from);
         let mut delta = TaskListDelta::new(seq);
@@ -4889,9 +3838,6 @@ mod tests {
         delta
     }
 
-    /// Wait for `check` to hold, or give up. Bounded polling rather than a fixed
-    /// sleep, so a slow machine cannot make the assertion flake in either
-    /// direction.
     async fn eventually<F, Fut>(within: Duration, mut check: F) -> bool
     where
         F: FnMut() -> Fut,
@@ -4909,32 +3855,16 @@ mod tests {
         .is_ok()
     }
 
-    /// #732 finding 3: a gate installed BEFORE `start` holds the first delta the
-    /// listener ever sees. The negative control is the pre-fix ordering — a
-    /// delta arriving while the slot is still empty MERGES, which is exactly
-    /// what a restart with a quarantined group used to do.
-    ///
-    /// **Why this test and its siblings do NOT use `tokio::time::pause()`**
-    /// (raised by both #756 reviewers, and a fair question). These four tests
-    /// drive the REAL listener, which means a real `PubSubManager` over a real
-    /// loopback QUIC node: gossip and transport keep their own timers, and under
-    /// paused time either they never fire (delivery stalls forever) or
-    /// auto-advance fires them in an order the test does not control — the test
-    /// would be less deterministic, not more. Determinism here comes from not
-    /// depending on elapsed time at all: the poll period is injected per instance
-    /// (`set_drain_poll_millis`), every wait is a bounded poll on observable
-    /// state rather than a fixed sleep, and no assertion mentions a duration. The
-    /// interleaving properties that DO need exact orderings — the ADR-0067
-    /// re-check, the #756 P1 roster race and the P2 clear-between-steps window —
-    /// are asserted with counting barriers and no clock at all, in
-    /// `named_groups/tests/adr0068_task_buffer.rs`, against the same functions
-    /// this listener calls.
+    // This test and its siblings do not use `tokio::time::pause()`: they drive
+    // a real `PubSubManager` over a loopback QUIC node, whose gossip and
+    // transport timers either never fire under paused time or fire in an order
+    // the test does not control. They depend on no elapsed time instead: the
+    // poll period is injected and every wait is a bounded poll on state.
     #[tokio::test]
     async fn quarantine_gate_installed_before_start_holds_the_first_delta() {
         let (sync, signer) = make_signed_sync("tasks/adr0068-before-start").await;
         let gate = Arc::new(ListenerGate::seating(signer));
         gate.suspend(true);
-        // The ordering the binding gives us: gate first, listener afterwards.
         assert!(sync
             .ingest_gate()
             .install(Arc::clone(&gate) as Arc<dyn TaskIngestGate>));
@@ -4961,8 +3891,6 @@ mod tests {
         assert!(sync.read().await.get_task(&task_id).is_none());
         assert_eq!(ListenerGate::count(&gate.buffered), 1);
 
-        // NEGATIVE CONTROL: the same delta on a list whose gate is installed
-        // only AFTER it arrives — the pre-fix order — merges.
         let (control, control_signer) = make_signed_sync("tasks/adr0068-after-start").await;
         control.start().await.expect("start control");
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -4991,11 +3919,6 @@ mod tests {
             .install(late as Arc<dyn TaskIngestGate>));
     }
 
-    /// #732 finding 5: a newly received delta drains the held ones BEFORE it is
-    /// admitted — so post-clear traffic never applies ahead of deltas that
-    /// arrived before it, and continuous traffic accelerates the catch-up
-    /// instead of starving it. No timer is involved: the drain rides the very
-    /// next message.
     #[tokio::test]
     async fn a_newer_delta_drains_the_buffer_before_it_is_admitted() {
         let (sync, signer) = make_signed_sync("tasks/adr0068-drain-first").await;
@@ -5004,8 +3927,6 @@ mod tests {
         assert!(sync
             .ingest_gate()
             .install(Arc::clone(&gate) as Arc<dyn TaskIngestGate>));
-        // A poll far longer than this test: the drain below must come from the
-        // inbound delta, never from the timer.
         sync.set_drain_poll_millis(600_000);
         sync.start().await.expect("start");
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -5023,9 +3944,6 @@ mod tests {
             "the first delta is held while the marker is live"
         );
 
-        // CONTROL: while the marker is still live a second delta is ALSO held,
-        // so the assertions below are about the clear and not about a listener
-        // that merges everything.
         let still_quarantined = add_delta(2, 9, peer(2));
         sync.publish_delta(peer(2), still_quarantined)
             .await
@@ -5039,8 +3957,6 @@ mod tests {
         );
         assert_eq!(sync.read().await.task_count(), 0);
 
-        // The marker clears. The next inbound delta must drain the two held
-        // ones first and then apply itself.
         gate.suspend(false);
         let after_clear = add_delta(3, 11, peer(2));
         let after_id = *after_clear.added_tasks.keys().next().expect("newer task");
@@ -5073,11 +3989,6 @@ mod tests {
         assert_eq!(ListenerGate::count(&gate.dropped), 0);
     }
 
-    /// #732 finding 5, idle half: with NO further traffic the poll still drains,
-    /// and once the buffer is empty it disarms (no further drains happen).
-    ///
-    /// The period is shortened through the per-instance `cfg(test)` hook, so this
-    /// is fast without a process-global knob.
     #[tokio::test]
     async fn an_idle_buffer_drains_on_the_poll_and_then_disarms() {
         let (sync, signer) = make_signed_sync("tasks/adr0068-idle-poll").await;
@@ -5103,8 +4014,6 @@ mod tests {
             "held while the marker is live"
         );
 
-        // CONTROL: the poll fires repeatedly and must NOT apply anything while
-        // the marker is live.
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(
             sync.quarantined_buffer_len(),
@@ -5113,7 +4022,6 @@ mod tests {
         );
         assert_eq!(ListenerGate::count(&gate.applied), 0);
 
-        // Cleared, with no traffic at all: the poll is the only trigger.
         gate.suspend(false);
         assert!(
             eventually(Duration::from_secs(5), || async {
@@ -5125,8 +4033,6 @@ mod tests {
         assert_eq!(sync.quarantined_buffer_len(), 0);
         let applied_once = ListenerGate::count(&gate.applied);
         assert_eq!(applied_once, 1);
-        // Disarmed: an empty buffer means the poll arm is not selected, so no
-        // further drain (and no further gate read) happens.
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(
             ListenerGate::count(&gate.applied),
@@ -5135,16 +4041,6 @@ mod tests {
         );
     }
 
-    /// #732 finding 5, timer half: traffic the listener CANNOT drain on must not
-    /// postpone the drain deadline either.
-    ///
-    /// Undecodable payloads are the discriminating case. They reach the listener,
-    /// so the old per-iteration `sleep` inside `select!` was cancelled and
-    /// re-created by every one of them — a peer publishing garbage faster than
-    /// the poll period starved the drain for as long as it kept publishing, and
-    /// the drain-before-admit path cannot help because such a message never gets
-    /// as far as admission. With the deadline pinned across receives the buffer
-    /// drains WHILE the garbage is still arriving.
     #[tokio::test]
     async fn undecodable_traffic_cannot_postpone_the_drain_deadline() {
         let (sync, pubsub, signer) =
@@ -5171,8 +4067,6 @@ mod tests {
             "held while the marker is live"
         );
 
-        // The marker clears, and a flood of undecodable payloads starts —
-        // faster than the poll period, and never reaching admission.
         gate.suspend(false);
         let flood = tokio::spawn({
             let pubsub = Arc::clone(&pubsub);
@@ -5207,24 +4101,10 @@ mod tests {
         assert_eq!(ListenerGate::count(&gate.applied), 1);
     }
 
-    // ------------------------------------------------------------------
-    // #759: the task-list lifecycle fence — a retired listener must not
-    // merge or persist, and a draining retire must wait out an in-flight
-    // merge+persist section
-    // ------------------------------------------------------------------
-
     use std::future::Future;
 
     type HeldLoops = Arc<std::sync::Mutex<Vec<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>>>>;
 
-    /// One #759 retire fixture: a persisted list whose background loops are
-    /// HELD by a gated spawner (never polled until the test drives them), so
-    /// publish-then-cancel orderings are decided by the test, not by the
-    /// runtime. The snapshot lives under `dir`; persistence is armed so a
-    /// merge's snapshot write is observable as file presence. The pubsub is
-    /// SIGNED (issue #349 Layer A): an unsigned envelope's content fails
-    /// closed, so the control below could not merge — the signer is the
-    /// envelope-verified writer the list's open (unset) admission accepts.
     async fn retire_list_fixture(
         topic: &str,
         dir: &tempfile::TempDir,
@@ -5238,9 +4118,6 @@ mod tests {
         (sync, pubsub, snapshot)
     }
 
-    /// Publish one admissible delta and wait (barrier, not oracle) until the
-    /// pub/sub layer reports it delivered to this topic's subscriber — i.e.
-    /// it sits in the listener's channel.
     async fn publish_queued_task_delta(
         sync: &TaskListSync,
         pubsub: &Arc<PubSubManager>,
@@ -5260,11 +4137,7 @@ mod tests {
         task_id
     }
 
-    /// Start the loops on the runtime, keeping their join handles so a test
-    /// can prove they have fully exited (the kv #757 fixture's shape).
     async fn start_list_joinable(sync: &TaskListSync) -> Vec<tokio::task::JoinHandle<()>> {
-        // The kv #757 fixture's joinable shape: the spawner spawns on the
-        // runtime and parks the JOIN HANDLES, not the futures.
         let handles: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = Arc::clone(&handles);
@@ -5290,35 +4163,11 @@ mod tests {
         }
     }
 
-    /// Control for the retire oracles: the identical queued delta IS merged
-    /// and snapshotted by a live listener, so the retired assertions below
-    /// cannot pass merely because the delta was undeliverable or
-    /// inadmissible.
-    ///
-    /// Oracle (#759 CI repair): the listener releases the TaskList write
-    /// guard BEFORE it persists, so observing the in-memory merge proves
-    /// nothing about the file — the old test did exactly that and raced the
-    /// snapshot write in CI. The wait below is the persist context's
-    /// per-instance commit notification, which `persist_snapshot` sends
-    /// strictly AFTER `save_task_list` succeeds; it is a real notification
-    /// (no polling, no yields) with a bounded failure path (the timeout),
-    /// and the version it carries must advance past the pre-publish durable
-    /// version, so a stale or merge-time signal cannot satisfy it.
-    ///
-    /// Mutation control: delete the listener's `persist_snapshot` call (or
-    /// make the write fail) and the notification never advances — the
-    /// bounded wait fails on its timeout, deterministically, regardless of
-    /// scheduling. Signalling at merge time instead would not help: the
-    /// reload assertion below reads the file the listener committed and
-    /// demands the queued delta's task in it, so an in-memory-only merge
-    /// cannot pass.
     #[tokio::test]
     async fn live_control_listener_merges_and_persists_a_queued_delta_759() {
         let dir = tempfile::tempdir().expect("dir");
         let (sync, pubsub, _snapshot) = retire_list_fixture("tasks/759-live-control", &dir).await;
         let loops = start_list_joinable(&sync).await;
-        // Subscribe BEFORE the delta exists so no commit can slip past the
-        // wait, and pin the durable version the commit must advance past.
         let ctx = sync.persist_ctx().expect("persist armed");
         let mut persisted = ctx.persisted.subscribe();
         let durable_before = *persisted.borrow();
@@ -5334,9 +4183,6 @@ mod tests {
             sync.read().await.get_task(&task_id).is_some(),
             "control: a live listener merges the queued delta"
         );
-        // File existence alone is not the claim — any snapshot write (even
-        // an empty list's) would satisfy it. Reload the exact bytes the
-        // listener committed and demand the queued delta's task in them.
         let reloaded = TaskListStorage::new(dir.path().to_path_buf())
             .load_task_list(&list_id(1))
             .await
@@ -5349,17 +4195,6 @@ mod tests {
         join_list_loops(loops).await;
     }
 
-    /// A delta still QUEUED in the channel when `cancel_sync` lands never
-    /// merges and never persists. The loop futures are driven to completion
-    /// AFTER the cancel, so both the cancel and the queued message are ready
-    /// in the same poll — the unbiased-select hazard — and the assertion is
-    /// about the exit, not about scheduling.
-    ///
-    /// Mutation control: the protection this exercises is the cancel arm's
-    /// priority PLUS the under-`lifecycle` cancel check — delete the check
-    /// (or move it before `recv`) and a fetched delta merges after the
-    /// cancel; un-`biased`-ing the select alone is NOT a reliable fail
-    /// condition for this oracle, because the check still guards the merge.
     #[tokio::test]
     async fn retired_listener_never_merges_or_persists_a_queued_delta_759() {
         let dir = tempfile::tempdir().expect("dir");
@@ -5394,16 +4229,6 @@ mod tests {
         assert!(!snapshot.exists(), "a retired listener wrote the snapshot");
     }
 
-    /// A delta already PULLED past `recv` when the cancel lands (parked on
-    /// the lifecycle lock) must not merge either — the check has to sit
-    /// under the lock, which is the fence `cancel_sync_and_drain` waits on.
-    /// Barrier by construction: the delta is in the channel and no cancel is
-    /// set, so ONE poll takes the listener through `recv` and leaves it
-    /// Pending on the lifecycle lock held by the test.
-    ///
-    /// Mutation control: remove the under-lock `is_cancelled` check in the
-    /// listener's receive arm and this fixture merges the pulled delta —
-    /// that check, not the select bias, is the protection exercised.
     #[tokio::test]
     async fn task_delta_pulled_before_cancel_is_dropped_under_the_lifecycle_lock_759() {
         let dir = tempfile::tempdir().expect("dir");
@@ -5444,18 +4269,11 @@ mod tests {
         assert!(!snapshot.exists(), "a retired listener wrote the snapshot");
     }
 
-    /// An already-admitted section still owes its merge AND its snapshot
-    /// write; here the write is parked on the persist gate while the section
-    /// holds the lifecycle lock, so `cancel_sync_and_drain` must stay
-    /// pending until the gate releases and the write finishes. "Retired"
-    /// means the section COMPLETED, not that it was cut in half.
     #[tokio::test]
     async fn draining_retire_waits_for_an_in_flight_task_merge_and_persist_759() {
         let dir = tempfile::tempdir().expect("dir");
         let (sync, pubsub, snapshot) = retire_list_fixture("tasks/759-inflight", &dir).await;
         let loops = start_list_joinable(&sync).await;
-        // Park the snapshot commit gate: a merged-in-memory delta cannot
-        // finish its persist while this guard is held.
         let ctx = sync.persist_ctx().expect("persist armed");
         let persist_gate = ctx.gate.lock().await;
         let task_id = publish_queued_task_delta(&sync, &pubsub, 0xB4).await;
@@ -5470,8 +4288,6 @@ mod tests {
             sync.receive_section_active_for_test(),
             "the listener is inside a receive section, parked on the persist gate"
         );
-        // Merged in memory, snapshot write parked on the gate: the section
-        // is in flight, so the drain cannot complete.
         let mut drain = Box::pin(sync.cancel_sync_and_drain());
         for _ in 0..64 {
             assert!(
@@ -5495,14 +4311,6 @@ mod tests {
         join_list_loops(loops).await;
     }
 
-    /// Route resume versus retire (#759): a resume that races a retire
-    /// applies nothing — the drain is itself a fenced section, so a retired
-    /// list's buffered deltas stay buffered (in order) for the next
-    /// incarnation; nothing is half-applied.
-    ///
-    /// Mutation control: remove the lifecycle fence (cancel check) from
-    /// `resume_quarantined_ingest` and this fixture applies the buffered
-    /// delta after the cancel.
     #[tokio::test]
     async fn resume_after_retire_applies_nothing_and_keeps_the_buffer_759() {
         let dir = tempfile::tempdir().expect("dir");
@@ -5513,8 +4321,6 @@ mod tests {
         assert!(sync
             .ingest_gate()
             .install(Arc::clone(&gate) as Arc<dyn TaskIngestGate>));
-        // Buffer one delta through the exact admission step the listener
-        // calls, with the writer the clearing roster will seat.
         let delta = add_delta(1, 0xB5, peer(2));
         let task_id = *delta.added_tasks.keys().next().expect("task id");
         match testing::admit_or_buffer(
@@ -5532,7 +4338,6 @@ mod tests {
             Admission::Apply(..) => panic!("a suspended gate must hold the delta"),
         }
         assert_eq!(sync.quarantined_buffer_len(), 1);
-        // The marker clears — then the list is retired BEFORE the resume.
         gate.suspend(false);
         sync.cancel_sync();
         let applied = sync.resume_quarantined_ingest().await;
@@ -5546,10 +4351,6 @@ mod tests {
         assert!(!snapshot.exists());
     }
 
-    /// Empty-buffer resume refreshes the captured authorized roster under
-    /// the pin (#756 review P4's arm, now reached through the #759-fenced
-    /// resume): a clear that finds nothing buffered must not leave the
-    /// cached roster stale for the deltas that arrive next.
     #[tokio::test]
     async fn empty_buffer_resume_refreshes_the_authorized_roster_759() {
         let dir = tempfile::tempdir().expect("dir");
@@ -5559,8 +4360,6 @@ mod tests {
         assert!(sync
             .ingest_gate()
             .install(Arc::clone(&gate) as Arc<dyn TaskIngestGate>));
-        // The stale captured set — the roster at subscription time, which
-        // the clearing commit is about to replace.
         sync.write()
             .await
             .set_authorized_agents(std::collections::HashSet::from([agent(5)]));

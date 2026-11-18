@@ -13,99 +13,28 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
-/// X0X-0009 prototype: how often the adaptive worker supervisor samples
-/// recv_pump telemetry and decides whether to scale workers up or down.
 const PUBSUB_WORKER_SUPERVISOR_INTERVAL: Duration = Duration::from_secs(5);
-/// X0X-0009 prototype: producer-rate-over-consumer-rate ratio above which
-/// the supervisor considers the dispatcher saturated and scales up.
 const PUBSUB_WORKER_SCALE_UP_RATIO: f64 = 1.10;
-/// X0X-0009 prototype: queue depth fraction above which scale-up fires
-/// regardless of producer/consumer ratio.
 const PUBSUB_WORKER_SCALE_UP_DEPTH_FRAC: f64 = 0.50;
-/// X0X-0009 prototype: queue depth fraction below which scale-down candidates
-/// accumulate. Workers scale back after this is sustained for several intervals.
 const PUBSUB_WORKER_SCALE_DOWN_DEPTH_FRAC: f64 = 0.05;
-/// X0X-0009 prototype: number of consecutive idle supervisor intervals required
-/// before a scale-down (hysteresis to prevent flapping). Kept at roughly
-/// five minutes even though the supervisor samples every five seconds.
 const PUBSUB_WORKER_SCALE_DOWN_INTERVALS: u64 = 60;
-/// X0X-0009 prototype: hard ceiling for adaptive scaling regardless of config.
 const PUBSUB_WORKER_MAX: usize = 32;
-/// X0X-0009 prototype: hard floor — at least one worker must always run.
 const PUBSUB_WORKER_MIN: usize = 1;
-/// X0X-0009: start above the configured rollback floor after a daemon restart
-/// so the coordinated bootstrap reconnect burst has immediate drain capacity
-/// without activating the whole ceiling and amplifying the restart storm.
 const PUBSUB_WORKER_STARTUP_TARGET: usize = 8;
-/// X0X-0009: when producer rate exceeds consumer rate, ask for enough workers
-/// to close the measured gap plus headroom instead of adding one worker per
-/// tick. Coordinated restarts can otherwise fill the recv pump before the
-/// supervisor reaches a sustainable target.
 const PUBSUB_WORKER_SCALE_UP_HEADROOM: f64 = 1.25;
-/// X0X-0009 prototype: parked worker slots also poll the target at this
-/// interval so a lost Notify wake cannot strand a reusable worker slot.
 const PUBSUB_WORKER_PARK_POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// X0X-0009 prototype: average per-message dispatch time (over the window)
-/// above which the dispatcher is "slow" and we should scale up — even if the
-/// queue has not filled yet. Catches the long-RTT case where each republish
-/// is bounded at 750 ms by the per-peer timeout but workers spend most of
-/// their time waiting on those timeouts.
 const PUBSUB_WORKER_SCALE_UP_AVG_DISPATCH_MS: f64 = 1_000.0;
-/// X0X-0009 prototype: dispatcher 30 s watchdog timeout rate above which we
-/// scale up immediately. Even one event per 10 s is operationally significant.
 const PUBSUB_WORKER_SCALE_UP_TIMEOUT_RATE: f64 = 0.10;
-/// X0X-0009 prototype: per-peer republish timeout rate above which an
-/// effective-worker calculation argues for more workers. Each timeout pins
-/// one worker for `PER_PEER_REPUBLISH_TIMEOUT` (750 ms). At 3/s on 4 workers
-/// that is ~56% of worker-time lost to timeouts.
 const PUBSUB_WORKER_PER_PEER_TIMEOUT_BUDGET: f64 = 0.30;
-/// X0X-0009 prototype: average per-message dispatch time below which the
-/// supervisor considers the dispatcher comfortable and accumulates idle
-/// intervals toward a scale-down.
 const PUBSUB_WORKER_SCALE_DOWN_AVG_DISPATCH_MS: f64 = 200.0;
 
-/// Maximum time to spend handling one inbound presence Bulk message.
-///
-/// Bulk has its own dispatcher, but a wedged presence handler must still be
-/// bounded so future Bulk presence beacons continue to drain from the dedicated
-/// Bulk receive queue.
 const PRESENCE_MESSAGE_HANDLE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Maximum time to spend handling one inbound PubSub message.
-///
-/// This is a watchdog against a wedged handler, not a per-message latency
-/// budget. The soak on 2026-04-30 (8h, 100 msg/s) produced ~5% of messages
-/// hitting the previous 10 s cap exactly (max_elapsed_ms = 10004 ms). Those
-/// are not stuck handlers — they are slow under cumulative load (ML-DSA-65
-/// verification + subscriber fan-out under scheduler pressure with 8 peers).
-/// `decode_to_delivery_drops` stayed at 0 across the soak, confirming the
-/// timeouts did not lose messages, only marked them late. Raising the cap to
-/// 30 s converts those false-positive watchdog fires into successful
-/// completions; a real wedged handler still gets cancelled, just later.
 pub(crate) const PUBSUB_MESSAGE_HANDLE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Maximum time to spend handling one inbound membership message.
 const MEMBERSHIP_MESSAGE_HANDLE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Fixed worker count for the HyParView/SWIM membership control stream.
-///
-/// Membership traffic is lower-volume than PubSub, so it does not need the
-/// full adaptive supervisor. It still must not be single-consumer in production:
-/// slow WAN SWIM exchanges can otherwise pin the lone dispatcher for the full
-/// watchdog timeout and leave the control-plane queue near capacity.
 const MEMBERSHIP_DISPATCH_WORKERS: usize = 4;
 
-/// Minimum gap between "Timed out handling gossip message" warn lines from one
-/// dispatcher worker (issue #600).
 const DISPATCH_TIMEOUT_WARN_WINDOW: Duration = Duration::from_secs(30);
 
-/// Rate limiter for a dispatcher's per-message timeout warn line (issue #600).
-///
-/// Under a gossip storm every worker times out on nearly every message, so this
-/// line alone produced ~152k WARN records on the mainnet node in #600. Each of
-/// those was a synchronous `write(2)` on a tokio worker, so the diagnostic was
-/// feeding the stall it was reporting. One line per window per worker keeps the
-/// signal (and reports how many it stood in for) without the amplification.
-///
-/// Deliberately worker-local and lock-free: shared state here would reintroduce
-/// exactly the kind of contention this fix removes.
 struct TimeoutWarnLimiter {
     window: Duration,
     last_emit: Option<Instant>,
@@ -121,11 +50,6 @@ impl TimeoutWarnLimiter {
         }
     }
 
-    /// Record a timeout. Returns `Some(suppressed_since_last_emit)` when the
-    /// caller should log, `None` when this occurrence is being suppressed.
-    ///
-    /// The FIRST timeout in a window always logs, so a single isolated timeout
-    /// is never hidden — only the tail of a burst is.
     fn observe(&mut self, now: Instant) -> Option<u64> {
         let due = match self.last_emit {
             None => true,
@@ -164,8 +88,7 @@ pub struct DispatchStreamStatsSnapshot {
     pub max_elapsed_ms: u64,
     /// Cumulative handler wall-clock time, in nanoseconds.
     pub total_elapsed_ns: u64,
-    /// Handler invocations that took at least 100 milliseconds (#288: tells a
-    /// lane that is slow across the board from one hitting a rare 5 s cliff).
+    /// Handler invocations that took at least 100 milliseconds.
     pub over_100ms_count: u64,
     /// Handler invocations that took at least 1 second.
     pub over_1s_count: u64,
@@ -224,7 +147,6 @@ impl DispatchStreamStats {
     }
 }
 
-/// Per-stream receive queue depth counters.
 #[derive(Debug, Default)]
 struct DispatchQueueStats {
     latest: AtomicU64,
@@ -375,11 +297,6 @@ async fn run_pubsub_dispatcher(
 ) {
     let mut timeout_warns = TimeoutWarnLimiter::new(DISPATCH_TIMEOUT_WARN_WINDOW);
     loop {
-        // X0X-0009: every worker slot is spawned once and tracked for
-        // shutdown. Slots above the current target park here, then wake when
-        // the supervisor changes the target. Keeping stable worker IDs avoids
-        // the scale-down/scale-up hole where a monotonic new id can be
-        // immediately outside the target again.
         let worker_count = target_count.load(Ordering::Relaxed);
         if worker_id >= worker_count {
             tracing::debug!(
@@ -395,9 +312,6 @@ async fn run_pubsub_dispatcher(
         }
         match network.receive_pubsub_message_with_session().await {
             Ok((peer, data, session)) => {
-                // A token whose peer differs from the dequeued frame's peer
-                // is not provenance for those bytes; refuse to dispatch it
-                // rather than relabel the frame.
                 let session = match session {
                     Some(session) if session.peer == peer => Some(session),
                     Some(mismatched) => {
@@ -448,10 +362,6 @@ async fn run_pubsub_dispatcher(
                     Err(_) => {
                         let elapsed = started.elapsed();
                         dispatch_stats.pubsub.record_timed_out(elapsed);
-                        // Rate-limited (#600): the unbounded form of this line
-                        // is a synchronous stdout write per timed-out message
-                        // on a tokio worker, and under a storm that is every
-                        // message. The counter above is the lossless record.
                         if let Some(suppressed) = timeout_warns.observe(Instant::now()) {
                             tracing::warn!(
                                 from = %crate::logging::LogPeerId::from(peer),
@@ -481,57 +391,18 @@ async fn run_pubsub_dispatcher(
     );
 }
 
-/// X0X-0009 prototype: a single sample of dispatcher health passed to the
-/// supervisor decision function. Combines the cumulative `recv_pump` /
-/// `dispatcher` / `pubsub_stages` snapshots into the windowed signals the
-/// policy actually needs: depth fraction, producer/consumer ratio, and the
-/// rates of slow-stage events over the supervisor interval (deltas computed
-/// by the supervisor task from one tick to the next).
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct SupervisorSample {
-    /// Producer rate over the supervisor interval (msg/s into the recv_pump).
     pub producer_per_sec: f64,
-    /// Consumer rate over the supervisor interval (msg/s drained by the dispatcher).
     pub consumer_per_sec: f64,
-    /// Most recent recv_pump queue depth.
     pub latest_depth: u64,
-    /// recv_pump queue capacity.
     pub capacity: u64,
-    /// Average per-message dispatch time over the supervisor interval (ms).
-    /// Computed as `delta(total_elapsed_ns) / max(delta(completed), 1)`.
     pub recent_avg_dispatch_ms: f64,
-    /// Dispatcher 30 s watchdog timeouts per second over the interval.
     pub recent_timeout_rate_per_sec: f64,
-    /// `pubsub_stages.republish_per_peer_timeout` events per second over the
-    /// interval. Each event represents one worker pinned for ~750 ms by a
-    /// slow remote peer. The supervisor treats this as effective-worker loss.
     pub recent_per_peer_timeout_rate_per_sec: f64,
-    /// PubSub recv-pump drops per second over the interval.
     pub recent_drop_rate_per_sec: f64,
 }
 
-/// X0X-0009 prototype: pure decision function (no I/O, no time) that the
-/// supervisor calls every interval. Returns `(next_target, next_idle_intervals)`.
-///
-/// Scale-up signals (any one triggers +1, capped at `PUBSUB_WORKER_MAX`):
-/// 1. Queue depth ≥ 50% of capacity.
-/// 2. Producer / consumer rate ≥ `PUBSUB_WORKER_SCALE_UP_RATIO` (1.10).
-/// 3. Average dispatch time ≥ `PUBSUB_WORKER_SCALE_UP_AVG_DISPATCH_MS` (1 s).
-/// 4. Dispatcher watchdog timeout rate ≥ `PUBSUB_WORKER_SCALE_UP_TIMEOUT_RATE`
-///    (0.10/s; one event per 10 s).
-/// 5. Effective-worker fraction lost to per-peer timeouts ≥
-///    `PUBSUB_WORKER_PER_PEER_TIMEOUT_BUDGET` (30%).
-///
-/// Scale-down requires ALL of:
-/// - depth < 5% of capacity
-/// - producer ≤ consumer (or zero traffic)
-/// - average dispatch time < `PUBSUB_WORKER_SCALE_DOWN_AVG_DISPATCH_MS` (200 ms)
-/// - no recent dispatcher or per-peer timeouts
-/// - sustained for `PUBSUB_WORKER_SCALE_DOWN_INTERVALS` (10) consecutive
-///   supervisor intervals
-///
-/// Caller is responsible for applying the target change and notifying parked
-/// worker slots. Worker tasks are stable and tracked for the runtime lifetime.
 fn supervisor_decide_target(
     sample: SupervisorSample,
     current_target: usize,
@@ -548,10 +419,6 @@ fn supervisor_decide_target(
     } else {
         0.0
     };
-    // Effective-worker fraction lost to per-peer timeouts. Each per-peer
-    // timeout pins one worker for `PER_PEER_REPUBLISH_TIMEOUT` (750 ms);
-    // dividing by current_target gives the fraction of total worker-time
-    // the slow-peer path is consuming.
     let per_peer_timeout_load = if current_target > 0 {
         sample.recent_per_peer_timeout_rate_per_sec * 0.75 / (current_target as f64)
     } else {
@@ -613,10 +480,6 @@ fn ceil_worker_count(value: f64) -> usize {
     value.ceil() as usize
 }
 
-/// X0X-0009 prototype: cumulative counters captured at the previous
-/// supervisor tick so the next tick can compute deltas. All values come
-/// from `network.recv_pump_diagnostics()`, `dispatch_stats.snapshot()`,
-/// and `pubsub.stage_stats()` — no direct counter access needed here.
 #[derive(Debug, Clone, Copy, Default)]
 struct SupervisorPrevious {
     produced: u64,
@@ -666,9 +529,6 @@ async fn run_pubsub_worker_supervisor(
         let delta_per_peer_timeout = cur_per_peer_timeout.saturating_sub(previous.per_peer_timeout);
         let delta_dropped_full = cur_dropped_full.saturating_sub(previous.dropped_full);
 
-        // Average dispatch time over the window: total elapsed ns divided by
-        // messages completed in the window. If nothing completed (idle), the
-        // metric is 0.0 — supervisor treats absence of work as healthy.
         let recent_avg_dispatch_ms = if delta_completed > 0 {
             (delta_total_elapsed_ns as f64 / delta_completed as f64) / 1_000_000.0
         } else {
@@ -788,8 +648,6 @@ async fn run_membership_dispatcher(
                     Err(_) => {
                         let elapsed = started.elapsed();
                         dispatch_stats.membership.record_timed_out(elapsed);
-                        // Rate-limited for the same reason as the PubSub arm
-                        // above (#600); the counter is the lossless record.
                         if let Some(suppressed) = timeout_warns.observe(Instant::now()) {
                             tracing::warn!(
                                 from = %crate::logging::LogPeerId::from(peer),
@@ -962,12 +820,6 @@ impl GossipRuntime {
             membership_config,
             Arc::clone(&network),
         ));
-        // X0X-0073b + X0X-0074 (reviewer P1.1, 2026-05-13): wire the
-        // HyParView-owned SWIM detector into PlumtreePubSub so the
-        // peer-health snapshot is populated. Without this wire,
-        // pub-sub's Suspect/Dead cooling branches and admission drops
-        // never engage in production — they silently fall through to
-        // the legacy/Alive path.
         let oracle: Arc<dyn saorsa_gossip_types::PeerHealthOracle> = membership.swim_arc();
         let mut pubsub = PubSubManager::new_with_participation(
             Arc::clone(&network),
@@ -978,12 +830,6 @@ impl GossipRuntime {
         )?;
         pubsub.configure_egress(&config).await?;
         let pubsub = Arc::new(pubsub);
-        // #810: hand the receive pump a TopicId→priority resolver so the
-        // >90% proactive control-frame shed exempts Critical topics (e.g.
-        // `x0x/dm/v1/*` IHAVE/IWANT lazy repair). Weak reference: the
-        // PubSubManager (via its transport) holds the network Arc, so a
-        // strong handle here would create a shutdown leak cycle. While the
-        // manager is gone the pump falls back to the pre-#810 shed behaviour.
         let weak_pubsub = Arc::downgrade(&pubsub);
         network.set_pubsub_topic_priority_resolver(PubsubTopicPriorityResolver::new(
             move |topic| {
@@ -1076,10 +922,6 @@ impl GossipRuntime {
         let presence = self.presence();
         let dispatch_stats = Arc::clone(&self.dispatch_stats);
 
-        // X0X-0009: spawn the full worker-slot ceiling once so every worker
-        // is tracked by `dispatcher_handles` and can be aborted on shutdown.
-        // `target_count` controls how many slots actively drain PubSub; the
-        // rest park until the supervisor raises the target.
         let pubsub_worker_count = self
             .config
             .dispatch_workers
@@ -1123,11 +965,6 @@ impl GossipRuntime {
             Arc::clone(&dispatch_stats),
         ));
 
-        // Periodically refresh PlumTree topic peers with current connections.
-        // This ensures newly connected peers (discovered via HyParView or
-        // direct connection) are added to the eager set for existing topics.
-        // Using 1-second interval to minimize the window where a newly-connected
-        // peer could miss a published message (e.g. release manifest broadcast).
         let pubsub_refresh = Arc::clone(&self.pubsub);
         let peer_sync_handle = tokio::spawn(async move {
             loop {
@@ -1141,21 +978,11 @@ impl GossipRuntime {
             *guard = Some(peer_sync_handle);
         }
 
-        // Keepalive: send a SWIM Ping to every connected plane-cleared peer
-        // every 15 seconds (issue #206: peers held at the plane gate get no
-        // keepalives — we want their QUIC to idle out, not stay warm).
-        // This prevents QUIC idle timeout (30s) from dropping direct connections
-        // that were established via auto-connect. Without this, connections with
-        // no application traffic are closed by QUIC after 30s of inactivity.
-        // See ADR-0002 for rationale.
         let keepalive_membership = Arc::clone(&self.membership);
         let keepalive_network = Arc::clone(&self.network);
         let keepalive_handle = tokio::spawn(async move {
-            // x0x#1036: the same 15 s pass keeps the HyParView active view
-            // bounded by transport connectivity. saorsa-gossip admits
-            // never-connected peers from JOIN/FORWARDJOIN random walks and
-            // never prunes them, so SWIM, shuffle and presence kept sending
-            // to them ("Peer not found") indefinitely.
+            // saorsa-gossip admits never-connected peers to the HyParView active
+            // view and never prunes them (x0x#1036).
             let mut stale_targets = super::stale_targets::StaleTargetTracker::default();
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
@@ -1260,11 +1087,6 @@ mod tests {
     use super::*;
     use crate::network::NetworkConfig;
 
-    /// WHY (issue #600): under a gossip storm every dispatched message times
-    /// out, so the unbounded warn emitted ~152k synchronous stdout writes from
-    /// tokio workers — the diagnostic feeding the stall it reported. But an
-    /// isolated timeout is a real signal and must never be swallowed, so the
-    /// FIRST occurrence always logs; only the tail of a burst is folded up.
     #[test]
     fn first_timeout_always_warns_and_the_burst_is_folded() {
         let window = Duration::from_secs(30);
@@ -1296,8 +1118,6 @@ mod tests {
         );
     }
 
-    /// Explicit test-only network config (#417/#337): loopback bind, no
-    /// seeds, discovery/port-mapping off. Still a real socket constructor.
     fn test_network_config() -> NetworkConfig {
         NetworkConfig {
             bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
@@ -1441,9 +1261,6 @@ mod tests {
 
         let snapshot = stats.snapshot();
         assert!(snapshot.pubsub.total_elapsed_ns >= 25_000_000);
-        // #288: 25 ms is healthy; the sub-second bucket must stay empty for it
-        // and fill for anything slower, or it cannot separate "slow across
-        // the board" from "rare 5 s cliff".
         assert_eq!(snapshot.pubsub.over_100ms_count, 0);
         assert_eq!(snapshot.membership.over_100ms_count, 2);
         assert_eq!(snapshot.bulk.over_100ms_count, 1);
@@ -1480,18 +1297,6 @@ mod tests {
         );
     }
 
-    // ── X0X-0009 supervisor decision tests ──────────────────────────────
-    // These exercise the pure decision function with synthetic telemetry
-    // so we can prove the scale-up / scale-down / hysteresis logic without
-    // spinning up a real network. The supervisor task itself only does
-    // (a) sample telemetry, (b) compute deltas, (c) call this function,
-    // (d) update the active-worker target and notify parked worker slots —
-    // all the policy is here.
-
-    /// Build a SupervisorSample with the given depth-related signals and
-    /// "stage signals all zero" defaults. Used by older tests written before
-    /// the per-stage windowed signals were added; the dispatch_avg/timeout
-    /// values are 0.0 so those gates never fire.
     fn sample_depth_only(
         producer: f64,
         consumer: f64,
@@ -1579,14 +1384,8 @@ mod tests {
         assert_eq!(idle, 0);
     }
 
-    // ── New per-stage windowed-signal tests (the X0X-0009 iteration b
-    //    additions: react to dispatcher slowness predictively, not just
-    //    after the queue fills) ────────────────────────────────────────
-
     #[test]
     fn supervisor_decide_target_scales_up_on_slow_average_dispatch() {
-        // Queue is empty, prod==cons — but each message is taking 1.2 s on
-        // average. That's a clear sign the dispatcher is sweating. Scale up.
         let sample = SupervisorSample {
             producer_per_sec: 50.0,
             consumer_per_sec: 50.0,
@@ -1604,7 +1403,6 @@ mod tests {
 
     #[test]
     fn supervisor_decide_target_scales_up_on_dispatcher_timeout_rate() {
-        // Even one watchdog timeout per 10 s is operationally significant.
         let sample = SupervisorSample {
             producer_per_sec: 30.0,
             consumer_per_sec: 30.0,
@@ -1622,11 +1420,6 @@ mod tests {
 
     #[test]
     fn supervisor_decide_target_scales_up_on_per_peer_timeout_load() {
-        // The long-RTT scenario: dispatcher looks fine on every other axis,
-        // but per-peer timeouts are draining ~30% of worker-time. The
-        // effective-worker calculation says we need more workers to keep
-        // up. With 4 workers and 1.6/s timeouts × 0.75 s = 1.2 s of
-        // worker-time per second = 30% load — exactly at the threshold.
         let sample = SupervisorSample {
             producer_per_sec: 50.0,
             consumer_per_sec: 50.0,
@@ -1644,13 +1437,6 @@ mod tests {
 
     #[test]
     fn supervisor_decide_target_low_per_peer_timeout_load_does_not_scale() {
-        // Same shape as the per_peer_timeout_load test but only 0.2/s on 4
-        // workers = ~3.75% effective load. Below the 30% scale-up budget.
-        // No scale-up. The idle counter does NOT advance either, because
-        // ANY per-peer timeout breaks the "healthy" predicate — the
-        // supervisor refuses to shrink while peers are even occasionally
-        // slow. This is the conservative default; users can lower it
-        // explicitly if they want eager scale-down.
         let sample = SupervisorSample {
             producer_per_sec: 50.0,
             consumer_per_sec: 50.0,
@@ -1671,9 +1457,6 @@ mod tests {
 
     #[test]
     fn supervisor_decide_target_scale_down_blocked_by_recent_per_peer_timeout() {
-        // Depth low, prod==cons, dispatch fast — but ANY per-peer timeout
-        // in the window is enough to block the scale-down. The supervisor
-        // refuses to lose a worker while peers are even occasionally slow.
         let sample = SupervisorSample {
             producer_per_sec: 50.0,
             consumer_per_sec: 50.0,
@@ -1685,16 +1468,12 @@ mod tests {
             recent_drop_rate_per_sec: 0.0,
         };
         let (next, idle) = supervisor_decide_target(sample, 4, 9);
-        // No scale-down; idle counter does NOT advance because the
-        // per-peer-timeout rate broke the "healthy" predicate.
         assert_eq!(next, 4);
         assert_eq!(idle, 9);
     }
 
     #[test]
     fn supervisor_decide_target_scale_down_blocked_by_slow_dispatch() {
-        // Depth low, no timeouts, but average dispatch time is 250 ms (above
-        // the 200 ms scale-down ceiling). Don't shrink — workers are working.
         let sample = SupervisorSample {
             producer_per_sec: 50.0,
             consumer_per_sec: 50.0,
@@ -1712,8 +1491,6 @@ mod tests {
 
     #[test]
     fn supervisor_decide_target_scale_down_after_sustained_full_health() {
-        // All four "healthy" conditions hold for 10 consecutive intervals →
-        // scale down by one. This is the precise inverse of the new gates.
         let sample = SupervisorSample {
             producer_per_sec: 30.0,
             consumer_per_sec: 30.0,
@@ -1748,21 +1525,9 @@ mod tests {
 
     #[test]
     fn supervisor_decide_target_long_rtt_simulation_converges() {
-        // Walk a 10-tick simulation that mimics the X0X-0008 sydney evidence:
-        // producer 80/s, dispatch ~150 ms, per-peer timeouts at 2/s (= 50%
-        // load on 4 workers, drops to 25% on 8). Start at 1, observe the
-        // supervisor scale up monotonically until per_peer_timeout_load
-        // falls below the 30% budget. Verifies the loop converges and does
-        // not over-shoot.
         let mut target = 1usize;
         let mut idle = 0u64;
         for _ in 0..10 {
-            // Per-peer timeout load = 2.0 * 0.75 / target = 1.5 / target.
-            // At target=1: 1.50 > 0.30 → scale up
-            // At target=2: 0.75 > 0.30 → scale up
-            // At target=4: 0.375 > 0.30 → scale up
-            // At target=5: 0.30 == 0.30 → scale up (>= threshold)
-            // At target=6: 0.25 < 0.30 → no further scale
             let sample = SupervisorSample {
                 producer_per_sec: 80.0,
                 consumer_per_sec: 80.0,
@@ -1785,9 +1550,6 @@ mod tests {
 
     #[tokio::test]
     async fn parked_worker_slot_reactivates_after_downscale_then_upscale() {
-        // Regression for the monotonic-id bug: workers are stable slots now,
-        // not disposable tasks. A slot above target parks, then the same slot
-        // must become active again when the target rises back above its id.
         let target = Arc::new(AtomicUsize::new(2));
         let target_clone = Arc::clone(&target);
         let notify = Arc::new(Notify::new());
@@ -1813,11 +1575,9 @@ mod tests {
             }
         });
 
-        // Worker starts at id=1, target=2 and records one active pass.
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert_eq!(active_count.load(Ordering::Relaxed), 1);
 
-        // Downscale to target=1 parks slot 1 instead of terminating it.
         target.store(1, Ordering::Relaxed);
         notify.notify_waiters();
         tokio::time::sleep(Duration::from_millis(30)).await;
@@ -1827,7 +1587,6 @@ mod tests {
             "parked worker slot should stay tracked"
         );
 
-        // Upscale to target=2 wakes and reuses slot 1.
         target.store(2, Ordering::Relaxed);
         notify.notify_waiters();
         let result = tokio::time::timeout(Duration::from_millis(200), handle).await;
@@ -1837,8 +1596,6 @@ mod tests {
         );
         assert_eq!(active_count.load(Ordering::Relaxed), 2);
     }
-
-    // ── Helper functions ───────────────────────────────────────────────
 
     #[test]
     fn duration_ms_converts_correctly() {
@@ -1890,46 +1647,9 @@ mod tests {
         assert_eq!(window_rate(50u64, 50u64, 10.0), 0.0);
     }
 
-    // ── #1395 / #288: the membership lane under a stalled remote ────────
-    //
-    // WHY (fleet evidence, #288): `Timed out handling gossip message
-    // stream_type="Membership" elapsed_ms=5001` on bytes=2 frames —
-    // "the remote peer is accepting the QUIC stream but not reading".
-    // Every membership handler answers an inbound frame with egress
-    // (SWIM Ping → Ack, Join → ForwardJoin fan-out, Neighbor →
-    // NeighborReply). That egress awaits `open_uni()`/`write_all()`,
-    // which park once the remote's transport stops returning
-    // uni-stream credit: the remote's QUIC stack still ACKs (so the
-    // connection stays "healthy") while its app no longer drains the
-    // recv queue, so ant-quic's reader task parks its accept budget —
-    // the ingest back-pressure valve. The send then parks for the
-    // connection's lifetime and the 5 s watchdog cancels the handler
-    // mid-protocol.
-    //
-    // This harness reproduces that remote WITHOUT CPU contention: a
-    // raw ant-quic node whose recv queue is small, which SWIM-pings
-    // the SUT and never reads its inbound streams. Issue #1395's ratio
-    // (`timed_out / received`) is measured over a fixed stall window.
-    //
-    // Inert by construction, same shape as `test_network_config`:
-    // loopback bind, no seeds, mDNS and port mapping off on both nodes.
-    //
-    // Set X0X_1395_MEASURE_ONLY=1 to print the measurements without the
-    // post-fix assertions (used to record the before/after evidence).
-
-    /// Recv-queue depth the synthetic stalled peer tolerates before its
-    /// ant-quic reader parks (queue 64 + accept budget + advertised uni
-    /// stream credit 8 ⇒ the stall engages after roughly a hundred
-    /// unread Acks). Production nodes use 50_000/256; the small values
-    /// only shrink how long the burst phase takes to reach the same
-    /// steady state.
     const STALL_PEER_DATA_CHANNEL_CAPACITY: usize = 64;
     const STALL_PEER_UNI_CREDIT: u32 = 8;
-    /// Pings sent before the window: comfortably above the ~100 the
-    /// stalled peer absorbs before its credit stops returning.
     const STALL_BURST_PINGS: usize = 400;
-    /// Measurement window: the ratio #1395 asks for is taken over this
-    /// many seconds of sustained stall.
     const STALL_WINDOW: Duration = Duration::from_secs(12);
 
     fn membership_swim_ping_frame() -> Vec<u8> {
@@ -1958,9 +1678,7 @@ mod tests {
             .expect("stalled peer node");
         let addr = node.local_addr().expect("stalled peer bound addr");
         // A raw ant-quic node registers inbound connections only when the
-        // application drives `accept()`. Drive it, and nothing else: the
-        // connection (and its reader task) comes up, but the app-facing
-        // recv queue is never drained — the stalled-remote condition.
+        // application drives `accept()`.
         let accept_driver = node.clone();
         tokio::spawn(async move { while accept_driver.accept().await.is_some() {} });
         (node, addr)
@@ -2003,8 +1721,6 @@ mod tests {
         let sut_peer_on_stalled = stalled_peer_view_of_sut(&stalled).await;
         let ping = membership_swim_ping_frame();
 
-        // Warm-up: the healthy path. The stalled peer reads nothing yet,
-        // but its queue is empty, so Acks complete and the lane is clean.
         for _ in 0..10 {
             let _ = stalled.send(&sut_peer_on_stalled, &ping).await;
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -2025,8 +1741,6 @@ mod tests {
             warm.received, warm.completed, warm.timed_out, warm.max_elapsed_ms
         );
 
-        // Burst: fill the stalled peer's recv queue, accept budget and
-        // uni-stream credit so every subsequent Ack send parks.
         for _ in 0..STALL_BURST_PINGS {
             let _ = stalled.send(&sut_peer_on_stalled, &ping).await;
         }
@@ -2040,8 +1754,6 @@ mod tests {
             window_start.max_elapsed_ms
         );
 
-        // Stall window: keep pinging while the remote stays unread, and
-        // sample the lane once per second.
         let started = Instant::now();
         let mut next_sample = started;
         let mut next_ping = started;
@@ -2059,7 +1771,6 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        // Let the last pings reach the dispatcher before the final read.
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let window_end = runtime.dispatch_stats().membership;
