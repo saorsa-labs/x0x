@@ -96,6 +96,12 @@ impl DaemonClient {
         self
     }
 
+    /// Whether `--dump-request` mode is on: no daemon is contacted, so
+    /// side-effectful outputs (like the #1354 doctor bundle) must not run.
+    pub(crate) fn dumping_requests(&self) -> bool {
+        self.dump
+    }
+
     /// Emit one dumped request and return the synthetic response.
     fn emit_dump(
         &self,

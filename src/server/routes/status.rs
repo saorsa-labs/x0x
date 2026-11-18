@@ -413,10 +413,19 @@ pub(in crate::server) struct StatusData {
 /// via [`x0x::connect::is_loopback`] — proxy headers such as
 /// `X-Forwarded-For` are never consulted, and IPv4-mapped IPv6 peers
 /// (`::ffff:127.0.0.1`) fail closed as non-loopback.
+///
+/// Opt-down selector (#1354 / PR #1997 review finding 1): any caller may
+/// request the redacted body with `?detail=redacted` — the `x0x doctor
+/// --bundle` writer uses it so the bundle's health section is the
+/// redacted-audience body even though it connects over loopback. The
+/// parameter only ever removes detail, never upgrades access: any other
+/// value (or no parameter) leaves the caller classified exactly as
+/// without it.
 pub(in crate::server) async fn health(
     State(state): State<Arc<AppState>>,
     connect_info: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     headers: axum::http::HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let (peers, send_ready_peers, one_sided_peers) = state.health_snapshot.load();
     let uptime_secs = state.start_time.elapsed().as_secs();
@@ -435,7 +444,14 @@ pub(in crate::server) async fn health(
     let loopback = connect_info
         .map(|peer| x0x::connect::is_loopback(peer.0.ip()))
         .unwrap_or(false);
-    let access = if loopback
+    // `?detail=redacted` is an opt-DOWN only: it forces the redacted
+    // body for a caller that would otherwise get full detail (the
+    // `x0x doctor --bundle` writer on loopback). No value can upgrade
+    // access — `?detail=full` from a remote caller falls through to the
+    // usual gate and stays redacted.
+    let access = if params.get("detail").map(String::as_str) == Some("redacted") {
+        super::super::health_verdict::DetailAccess::Redacted
+    } else if loopback
         || super::super::auth::has_valid_owner_bearer(&headers, &state.api_token, &state.sessions)
     {
         super::super::health_verdict::DetailAccess::Full
@@ -1424,8 +1440,20 @@ mod tests {
             bearer: Option<&str>,
             extra_headers: &[(&'static str, &str)],
         ) -> serde_json::Value {
+            get_health_uri(state, peer, "/health", bearer, extra_headers).await
+        }
+
+        /// The same request against an explicit URI, query string
+        /// included — the `?detail=` opt-down tests need it.
+        async fn get_health_uri(
+            state: &Arc<AppState>,
+            peer: IpAddr,
+            uri: &str,
+            bearer: Option<&str>,
+            extra_headers: &[(&'static str, &str)],
+        ) -> serde_json::Value {
             let mut builder =
-                Request::get("/health").extension(ConnectInfo(SocketAddr::new(peer, 51714)));
+                Request::get(uri).extension(ConnectInfo(SocketAddr::new(peer, 51714)));
             if let Some(token) = bearer {
                 builder = builder.header("authorization", format!("Bearer {token}"));
             }
@@ -1539,6 +1567,45 @@ mod tests {
                         "{path} must be present for a loopback caller ({loopback}): {payload}"
                     );
                 }
+            }
+        }
+
+        /// WHY (#1354 / PR #1997 review finding 1): the bundle writer
+        /// runs on loopback yet must embed the redacted-audience body, so
+        /// `?detail=redacted` is an explicit opt-down. A loopback caller
+        /// that uses it keeps the verdict and every ungated field but
+        /// loses exactly the gated detail.
+        #[tokio::test]
+        async fn loopback_detail_redacted_param_opts_down_to_the_redacted_body() {
+            let (state, _dir) = test_state().await;
+            let peer: IpAddr = "127.0.0.1".parse().expect("loopback address");
+            let payload = get_health_uri(&state, peer, "/health?detail=redacted", None, &[]).await;
+            for path in GATED_DETAIL {
+                assert!(
+                    payload.pointer(path).is_none(),
+                    "{path} must be absent when a loopback caller opts down: {payload}"
+                );
+            }
+            for path in UNGATED {
+                assert!(
+                    payload.pointer(path).is_some(),
+                    "{path} is not gated and must stay under ?detail=redacted: {payload}"
+                );
+            }
+        }
+
+        /// WHY (the selector can only remove detail, never grant it): a
+        /// remote caller passing `?detail=full` is an upgrade attempt and
+        /// stays redacted — classified exactly as without the parameter.
+        #[tokio::test]
+        async fn detail_full_param_does_not_upgrade_a_remote_caller() {
+            let (state, _dir) = test_state().await;
+            let payload = get_health_uri(&state, remote(), "/health?detail=full", None, &[]).await;
+            for path in GATED_DETAIL {
+                assert!(
+                    payload.pointer(path).is_none(),
+                    "{path} must stay gated: ?detail=full cannot upgrade a remote caller: {payload}"
+                );
             }
         }
 

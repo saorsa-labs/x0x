@@ -40,6 +40,13 @@ All notable changes to this project will be documented in this file.
   `down_bps` rates, each split into `gossip`, `direct`, `relay` and `other`.
   `x0x status` adds human-readable totals in text output; `--json` keeps the
   raw numbers only. No limits change.
+- **`x0x doctor --bundle [PATH]` writes an owner-local diagnostic bundle
+  (#1354 slice 1; A14 amendment of 17 Nov 2026).** One JSON file with the
+  redacted `/health` body and the four doctor checks; it holds no keys,
+  tokens or message content and is never sent anywhere. The file is
+  created new with mode 0600; an existing file or a symlink at the path is
+  refused. `GET /health?detail=redacted` lets any caller ask for the
+  redacted body; the parameter can only remove detail.
 - **launchd jobs that run the stable launcher are recognised (#1379 slice 2;
   A14 amendment of 17 Nov 2026).** `x0x autostart --repair` and the
   upgrade-time launchd readback look through `x0x-launcher`'s own arguments
