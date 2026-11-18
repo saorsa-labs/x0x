@@ -749,6 +749,12 @@ pub fn gui_idle_timeout(minutes: u64) -> Result<Duration, String> {
 /// [`SystemTime::now`]; tests inject a manual clock.
 pub(super) type SessionClock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
 
+/// Largest backward wall-clock step the store absorbs by freezing its time.
+/// A larger step (for example a forward jump that is later corrected) ends
+/// every session: freezing for that long would stop token expiry and idle
+/// timers for sessions minted after the step.
+const CLOCK_STEP_TOLERANCE: Duration = Duration::from_secs(60);
+
 /// Replaced tokens remembered for revoke, at most this many.
 const MAX_RETIRED_TOKENS: usize = 4096;
 
@@ -808,8 +814,9 @@ pub(super) struct SessionStore {
     ttl: Duration,
     idle_timeout: Duration,
     clock: SessionClock,
-    /// Latest time the store has seen. A wall clock stepped backward reads
-    /// as this until it catches up, so a step cannot extend a session.
+    /// Latest time the store has seen. A wall clock stepped back by up to
+    /// [`CLOCK_STEP_TOLERANCE`] reads as this until it catches up, so a
+    /// small step cannot extend a session.
     high_water: StdMutex<SystemTime>,
     next_lineage: std::sync::atomic::AtomicU64,
 }
@@ -839,13 +846,23 @@ impl SessionStore {
         self.idle_timeout
     }
 
+    /// Store time: the wall clock, never earlier than the time last seen.
+    /// Callers read it before taking the table lock; it may clear the table.
     fn now(&self) -> SystemTime {
         let wall = (self.clock)();
         let Ok(mut seen) = self.high_water.lock() else {
             return wall;
         };
-        if wall > *seen {
-            *seen = wall;
+        match seen.duration_since(wall) {
+            Ok(behind) if behind > CLOCK_STEP_TOLERANCE => {
+                if let Ok(mut table) = self.table.lock() {
+                    table.live.clear();
+                    table.retired.clear();
+                }
+                *seen = wall;
+            }
+            Ok(_) => {}
+            Err(_) => *seen = wall,
         }
         *seen
     }
@@ -1739,32 +1756,90 @@ mod tests {
     }
 
     #[test]
-    fn wall_clock_step_backward_freezes_store_time() {
-        // The store's time never goes back: a backward step freezes it
-        // until the wall clock catches up, so the step cannot buy time
-        // beyond its own size, and cannot be repeated to gain more.
+    fn wall_clock_step_back_within_tolerance_freezes_store_time() {
+        // A step back of up to 60 s freezes store time until the wall
+        // clock catches up: it delays expiry by at most the step, once.
         let clock = TestClock::new();
         let store = clock.store(IDLE);
         let t0 = clock.now();
         let token = store.issue();
         clock.advance(50 * MIN);
         let token = store.refresh(&token, None).expect("inside idle");
-        clock.back(2 * MIN);
-        assert!(
-            store.is_valid(&token),
-            "a small step back keeps the session"
-        );
-        clock.advance(MIN);
+        clock.back(Duration::from_secs(30));
+        assert!(store.is_valid(&token), "a 30 s step back keeps the session");
+        clock.advance(Duration::from_secs(10));
         let token = store.refresh(&token, None).expect("still inside idle");
-        // Store time is still t0 + 50 min: the activity record is unchanged
-        // and the new token expires from that time, not from the wall.
         assert_eq!(store.last_activity(&token), Some(t0));
-        clock.back(5 * MIN);
         clock.set(t0 + IDLE - Duration::from_nanos(1));
         assert!(store.is_valid(&token));
         clock.set(t0 + IDLE);
         assert!(!store.is_valid(&token), "expiry at the original wall time");
         assert!(!authorize_refresh(&store, &token));
+    }
+
+    #[test]
+    fn wall_clock_step_back_beyond_tolerance_ends_every_session() {
+        let clock = TestClock::new();
+        let store = clock.store(IDLE);
+        let a = store.issue();
+        let b = store.issue();
+        let replaced = store.refresh(&b, None).map(|_| b).expect("refresh");
+        clock.back(CLOCK_STEP_TOLERANCE + Duration::from_secs(1));
+        assert!(!store.is_valid(&a), "a 61 s step back ends sessions");
+        assert_eq!(store.live_len(), 0);
+        assert!(
+            !authorize_revoke(&store, &replaced),
+            "replaced tokens are forgotten"
+        );
+    }
+
+    #[test]
+    fn corrected_forward_jump_ends_sessions_and_new_ones_age_normally() {
+        // The wall clock jumps two days ahead, then NTP steps it back.
+        let clock = TestClock::new();
+        let store = clock.store(IDLE);
+        let before = store.issue();
+        clock.advance(Duration::from_secs(2 * 24 * 60 * 60));
+        let during = store.issue();
+        assert!(
+            !store.is_valid(&before),
+            "the jump ages the old session out"
+        );
+        clock.back(Duration::from_secs(2 * 24 * 60 * 60));
+        assert!(
+            !store.is_valid(&during),
+            "the correction ends every session"
+        );
+        assert_eq!(store.live_len(), 0);
+
+        let t1 = clock.now();
+        let fresh = store.issue();
+        assert_eq!(store.last_activity(&fresh), Some(t1));
+        clock.set(t1 + SESSION_TOKEN_TTL - Duration::from_nanos(1));
+        assert!(store.is_valid(&fresh));
+        clock.set(t1 + SESSION_TOKEN_TTL);
+        assert!(!store.is_valid(&fresh), "the 10 min token expires normally");
+        assert!(authorize_refresh(&store, &fresh), "lapsed, inside idle");
+        clock.set(t1 + IDLE);
+        assert!(!authorize_refresh(&store, &fresh), "the idle timer runs");
+    }
+
+    #[test]
+    fn replaced_token_opens_nothing() {
+        let store = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
+        let old = store.issue();
+        let new = store.refresh(&old, None).expect("refresh");
+        assert!(!authorize_agent(&store, &old), "normal route");
+        for path in ["/ws", "/ws/direct", "/events", "/direct/events", "/gui"] {
+            assert_eq!(
+                authorize(path, &Method::GET, None, Some(&old), TEST_API_TOKEN, &store),
+                Err(StatusCode::UNAUTHORIZED),
+                "{path}?token=<replaced>"
+            );
+        }
+        assert!(!authorize_refresh(&store, &old), "refresh");
+        assert_eq!(store.refresh(&old, None), Err(SessionRefreshError::Unknown));
+        assert!(store.is_valid(&new), "the successor is untouched");
     }
 
     #[test]
