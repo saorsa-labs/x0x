@@ -134,7 +134,7 @@ macro_rules! background_staging_regression_tests {
                 let counted = Arc::clone(&attempts);
                 let expected_install = install.clone();
                 let expected_data = data.clone();
-                let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |plan, manifest| {
+                let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |plan, manifest, _admission| {
                     assert_eq!(plan.executable, expected_install);
                     assert_eq!(plan.data_root, expected_data);
                     counted.fetch_add(1, Ordering::SeqCst);
@@ -308,10 +308,14 @@ macro_rules! background_permit_regression_tests {
                     assert_eq!(std::fs::read(&cli).unwrap(), b"new-cli");
                     assert_eq!(std::fs::read(cli.with_extension("backup")).unwrap(), b"old-cli");
                     assert_eq!(std::fs::read(daemon.with_extension("backup")).unwrap(), b"old-daemon");
+                    assert!(permit.admitted(),
+                        "the real worker marks the permit at admission");
                 } else {
                     assert_eq!(std::fs::read(&cli).unwrap(), b"old-cli");
                     assert!(!cli.with_extension("backup").exists());
                     assert!(!daemon.with_extension("backup").exists());
+                    assert!(!permit.admitted(),
+                        "a worker still waiting on the host lock has not admitted");
                 }
                 assert_eq!(std::fs::read(&daemon).unwrap(), b"old-daemon");
                 assert!(!marker.exists());
@@ -339,7 +343,80 @@ macro_rules! background_permit_regression_tests {
                     assert!(!cli.with_extension("backup").exists());
                 }
                 assert!(permit.check().is_err());
+                assert_eq!(permit.admitted(), after_admission,
+                    "the admission mark is permanent for the permit's lifetime");
                 drop(pause);
+            }
+
+            /// #1169 review round 3: admission marks the permit for the
+            /// route's claim guard, and the mark — not the handler —
+            /// decides the claim window. The real worker parks between
+            /// renames (post-admission); the async observer is then
+            /// dropped the way a client disconnect drops the handler
+            /// future. The worker still completes the replacement, and the
+            /// permit stays admitted, so the route's claim cannot release
+            /// what the worker owns.
+            #[tokio::test]
+            async fn post_admission_disconnect_keeps_the_permit_admitted() {
+                let base = std::env::var_os("X0X_UPGRADE_STAGING_EVIDENCE_DIR")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join(".planning/upgrade-staging-fixtures"));
+                std::fs::create_dir_all(&base).unwrap();
+                let root = tempfile::Builder::new().prefix("post-admission-disconnect-")
+                    .tempdir_in(base).unwrap();
+                let scratch = root.path().join("scratch");
+                std::fs::create_dir(&scratch).unwrap();
+                let daemon = root.path().join("x0xd");
+                std::fs::write(&daemon, b"old-daemon").unwrap();
+                let incoming = scratch.join("daemon");
+                std::fs::write(&incoming, b"new-daemon").unwrap();
+
+                REPLACE_HOOK_INIT.call_once(|| {
+                    tracing::subscriber::set_global_default(PauseAtReplacingBinary).unwrap();
+                });
+                let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                REPLACE_HOOKS.lock().unwrap().insert(daemon.clone(), ReplaceHook {
+                    entered: entered_tx, release: release_rx,
+                });
+                let _hook_guard = ReplaceHookGuard { target: daemon.clone() };
+
+                let permit = ReleasePermit::default();
+                // Box::pin owns the future, so `drop` below really drops it
+                // (a `tokio::pin!` shadow only borrows it).
+                let mut operation = Box::pin(apply_replacements_with_permit(
+                    Upgrader::new(daemon.clone(), semver::Version::new(1, 0, 0)), incoming,
+                    semver::Version::new(2, 0, 0),
+                    None,
+                    TempDirGuard { path: scratch.clone() },
+                    None,
+                    None, Some(&permit), None,
+                ));
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::select! {
+                        result = operation.as_mut() =>
+                            panic!("replacement ended before the daemon-rename pause: {result:?}"),
+                        entered = entered_rx => entered.unwrap(),
+                    }
+                }).await
+                    .expect("worker parked at the daemon replace, past admission");
+                assert!(permit.admitted(), "admission marks the permit");
+
+                // The disconnect: the async observer is dropped mid-worker.
+                drop(operation);
+                assert!(permit.check().is_ok(),
+                    "the observer drop must not cancel the admitted release");
+
+                release_tx.send(()).unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while std::fs::read(&daemon).unwrap() != b"new-daemon" || scratch.exists() {
+                    assert!(std::time::Instant::now() < deadline,
+                        "the worker must finish the replace and clean its custody after the disconnect");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert!(permit.check().is_ok(),
+                    "the worker completing must not cancel the admitted release");
             }
         }
     };
@@ -416,7 +493,7 @@ macro_rules! background_driver_regression_tests {
                     let counted = Arc::clone(&attempts);
                     let expected_install = install.clone();
                     let expected_data = data.clone();
-                    let apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |plan, manifest| {
+                    let apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |plan, manifest, _admission| {
                         assert_eq!(plan.executable, expected_install);
                         assert_eq!(plan.data_root, expected_data);
                         counted.lock().unwrap().push(manifest.version.clone());
@@ -468,7 +545,7 @@ macro_rules! background_driver_regression_tests {
                         receive.recv().await.map(|value| (value, receive))
                     });
                     let future = run_gossip_update_driver(releases, self.submit.clone(),
-                        Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
+                        Arc::new(StdMutex::new(SelfPublishedReleaseManifests::default())),
                         |_| async { Ok(()) }, self.shutdown_watch.clone());
                     (send, Box::pin(future))
                 }
@@ -487,7 +564,7 @@ macro_rules! background_driver_regression_tests {
                             checks.fetch_add(1, Ordering::SeqCst);
                             let release = queued.lock().unwrap().pop_front();
                             async move { Ok(release) }
-                        }, submit, Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
+                        }, submit, Arc::new(StdMutex::new(SelfPublishedReleaseManifests::default())),
                             |_| async { Ok(()) }, shutdown).await;
                     })
                 }
@@ -1098,7 +1175,7 @@ macro_rules! background_init_regression_tests {
                 // An apply owner cannot be constructed from this result.
                 let submit = boot.ok().map(|runtime| background_channel(runtime).0);
                 assert!(submit.is_none());
-                let published = Arc::new(Mutex::new(SelfPublishedReleaseManifests::default()));
+                let published = Arc::new(StdMutex::new(SelfPublishedReleaseManifests::default()));
                 let observations = Arc::new(StdMutex::new(Observations::default()));
                 let gossip_release = release("9.9.9");
                 let fallback_release = release("9.9.10");

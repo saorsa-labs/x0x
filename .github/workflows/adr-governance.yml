@@ -29,6 +29,10 @@ on:
       - 'scripts/test_adr_count.py'
       - '.github/workflows/adr-governance.yml'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   adr-governance:
     name: Validate ADRs and immutable Accepted status

@@ -2453,6 +2453,7 @@ async fn run(
                 Err(err) if name.is_some() && api.is_none() => {
                     commands::daemon::doctor_unreachable(
                         format,
+                        name,
                         &err,
                         bundle.as_ref().map(|inner| inner.as_deref()),
                     )

@@ -1,11 +1,5 @@
 //! Group-key sealing for task lists bound to an encrypted named group (#895).
 //!
-//! A task list whose id is group-scoped (`x0x.group.<gid>.symphony.<lid>`)
-//! used to publish its deltas — incremental and the `/state-sync` full-state
-//! serve — as plaintext `(PeerId, TaskListDelta)` on a topic any peer who
-//! knows the group id can derive. Group KV stores were already sealed, so a
-//! group's Wiki was confidential while its Board was not.
-//!
 //! This module reuses the group KV store envelopes rather than adding crypto:
 //!
 //! - GSS plane: [`EncryptedKvStoreRecordV1`] sealed by
@@ -43,9 +37,8 @@ use serde::{Deserialize, Serialize};
 /// not exactly this is not a sealed task record (it is plaintext, or garbage).
 pub const SEALED_TASK_RECORD_DOMAIN: &[u8] = b"x0x.tasks.sealed-record.v1";
 
-/// Domain for [`group_task_list_record_id`]. Distinct from the group KV store
-/// identity domain (`x0x.store.group.v1`), so the derived AEAD key of a task
-/// list never equals a store's.
+/// Distinct from the group KV store identity domain (`x0x.store.group.v1`), so
+/// the derived AEAD key of a task list never equals a store's.
 const TASK_RECORD_ID_DOMAIN: &[u8] = b"x0x.tasks.group-list-record.v1";
 
 /// The sealed body, one variant per group secure plane.
@@ -58,8 +51,6 @@ pub enum SealedTaskRecordBody {
     TreeKem(TreeKemKvStoreRecordV1),
 }
 
-/// Wire record published on a sealed task list's main topic, inside the usual
-/// `(PeerId, _)` envelope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SealedTaskRecord {
     domain: Vec<u8>,
@@ -160,12 +151,9 @@ pub trait TaskDeltaProtector: Send + Sync + 'static {
     /// withholds group ciphertext for a no-eligible-admin hold answers
     /// `Stale` here too (#1581).
     ///
-    /// Unlike [`confirm_publication`](Self::confirm_publication) this hook
-    /// carries a default: it post-dates every existing implementor, and the
-    /// default preserves each one's published behaviour exactly (publish the
-    /// already-plaintext payload, holding nothing). A protector that resolves
-    /// a LIVE group policy MUST override it and fail closed, for the same
-    /// reason `confirm_publication` refuses a default.
+    /// The default publishes the already-plaintext payload and holds nothing.
+    /// A protector that resolves a LIVE group policy MUST override it and fail
+    /// closed, for the same reason `confirm_publication` refuses a default.
     fn confirm_plaintext_publication<'a>(&'a self) -> TaskSealFuture<'a, TaskPublication> {
         Box::pin(async move { Ok(TaskPublication::Current(TaskPublicationPermit::none())) })
     }
@@ -247,9 +235,6 @@ pub fn decode_sealed_task_record(payload: &[u8]) -> Option<(PeerId, SealedTaskRe
     let (peer, record) = match crate::gossip::wire::decode_delta::<SealedTaskRecord>(payload) {
         Ok(decoded) => decoded,
         Err(e) => {
-            // #1604: a sealed record whose body variant this node does not
-            // know is counted and logged. Other payloads are not sealed
-            // records at all (the domain does not match), so they stay quiet.
             let sealed = crate::gossip::wire::decode_delta::<Vec<u8>>(payload)
                 .is_ok_and(|(_, domain)| domain == SEALED_TASK_RECORD_DOMAIN);
             if sealed {
@@ -377,8 +362,6 @@ mod tests {
             .any(|w| w == needle.as_bytes())
     }
 
-    /// WHY: the whole point of #895 — the bytes a group list puts on the wire
-    /// must not carry task content.
     #[test]
     fn sealed_wire_bytes_do_not_carry_title_or_description() {
         let kp = keypair();
@@ -408,15 +391,11 @@ mod tests {
         assert_eq!(opened.author, kp.agent_id());
     }
 
-    /// WHY: plaintext must never be mistaken for a sealed record, or the
-    /// plaintext-refusal rule would have nothing to key on.
     #[test]
     fn plaintext_delta_is_not_a_sealed_record() {
         assert!(decode_sealed_task_record(&secret_payload()).is_none());
     }
 
-    /// WHY (lead requirement 1): after a rotation a removed member still
-    /// holds the epoch-N secret; a record sealed at N+1 must not open with it.
     #[test]
     fn removed_member_with_old_epoch_key_cannot_open_new_epoch_record() {
         let owner = keypair();
@@ -440,9 +419,6 @@ mod tests {
         assert!(open_gss_task_record(&at_n1, TOPIC, &record).is_ok());
     }
 
-    /// WHY: a peer with no group secret at all (a non-member who derived the
-    /// topic) cannot open, and a record for one list cannot be replayed into
-    /// another list of the same group.
     #[test]
     fn non_member_and_foreign_list_fail_closed() {
         let owner = keypair();
@@ -466,8 +442,6 @@ mod tests {
         assert!(open_gss_task_record(&info, "x0x.group.g895.symphony.other", &record).is_err());
     }
 
-    /// WHY: sealing must refuse an author the group does not seat, so a
-    /// departed member's daemon cannot keep publishing under a cached key.
     #[test]
     fn non_member_cannot_seal() {
         let owner = keypair();
@@ -479,8 +453,6 @@ mod tests {
         );
     }
 
-    /// WHY: a task record id must not collide with the group KV store id of
-    /// the same name, or the two planes would share an AEAD key.
     #[test]
     fn record_id_is_domain_separated_from_kv_store_ids() {
         let (store_id, _) = crate::kv::encrypted::group_store_identity("g895", TOPIC);

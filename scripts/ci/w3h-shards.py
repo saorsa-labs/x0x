@@ -63,6 +63,9 @@ GROUPS = (
     # about 60 min for 20 reruns on a runner; its own shard, so `s3`
     # (about 90 min) does not grow.
     ('s3-r', 'w3h_1356_control_s3_r_beyond_retention$'),
+    # The H-S3-r replay variant (#2003): the same setup and time, so its
+    # own shard too.
+    ('s3-rr', 'w3h_1356_control_s3_r_replay_benign$'),
     ('s3', 'w3h_1356_'),
     # #1623 (refs #1356): about 11 s per rerun on macOS; `rest` already
     # takes about 104 of its 120 minutes (run 41624339394), so the row

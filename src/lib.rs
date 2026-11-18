@@ -4966,7 +4966,8 @@ impl AnnouncementAssistSnapshot {
         // #398 announcement honesty: relay/coordinator capability is only
         // advertised when OTHER nodes could plausibly reach us to use it.
         // `relay_service_enabled` merely says the local MASQUE server /
-        // coordination logic is running — every default daemon has that —
+        // coordination logic is running — only Full-mode daemons (or an
+        // explicit `relay_service_enabled = true`) do —
         // so gating on it alone made every NATed desktop advertise
         // is_coordinator=true / is_relay=true, and coordinator/relay
         // selection then picked nodes that cannot serve third parties.
@@ -8787,6 +8788,15 @@ impl Agent {
         self.network.as_ref()
     }
 
+    /// #1964 request 5: transport bandwidth snapshot — per-kind byte totals
+    /// for the process lifetime plus rolling up/down rates. `None` when
+    /// this agent was built without a network config. Surfaced additively
+    /// by `GET /status` so users can see what the node costs them.
+    #[must_use]
+    pub fn bandwidth_usage(&self) -> Option<network::bandwidth::BandwidthUsage> {
+        self.network.as_ref().map(|node| node.bandwidth_usage())
+    }
+
     /// Get the gossip cache adapter for coordinator discovery.
     ///
     /// Returns `None` if this agent was built without a network config.
@@ -12531,6 +12541,7 @@ impl Agent {
                 sender.as_bytes(),
                 network::RELAYED_DM_STREAM_TYPE,
                 &wire,
+                network::bandwidth::BandwidthKind::Relay,
             )
             .await
             .map_err(|e| dm::DmError::PublishFailed(format!("relay send: {e}")))?;
@@ -29320,6 +29331,9 @@ fn spawn_relay_dm_listener(
                             local_agent_id.as_bytes(),
                             network::DIRECT_MESSAGE_STREAM_TYPE,
                             &inner_wire,
+                            // #1964 request 5: the forward exits as a 0x10
+                            // frame, but it is relay work — meter it as such.
+                            network::bandwidth::BandwidthKind::Relay,
                         )
                         .await
                     {
@@ -47298,6 +47312,9 @@ mod peer_connected_handler_integration_tests {
 
 #[cfg(test)]
 mod asymmetric_capability_convergence_tests;
+
+#[cfg(test)]
+mod issue1964_relay_bandwidth_tests;
 
 #[cfg(test)]
 mod caps_unicast_504_tests;

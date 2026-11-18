@@ -59,8 +59,6 @@ pub const EVENT_SIGNATURE_DOMAIN: &[u8] = b"x0x.group.event.v1";
 /// immediately.
 pub const DEFAULT_CARD_TTL_SECS: u64 = 24 * 60 * 60;
 
-// ─────────────────────────── Hash primitives ────────────────────────────
-
 fn blake3_hex(input: &[u8]) -> String {
     hex::encode(blake3::hash(input).as_bytes())
 }
@@ -88,12 +86,8 @@ pub fn compute_roster_root(members_v2: &BTreeMap<String, GroupMember>) -> String
                 id.as_str(),
                 m.role,
                 m.state,
-                // #468/#469 (design v5 D2 / v6 E2): a digest-only member
-                // (bytes stripped / projection-materialized) contributes its
-                // stored `certificate_digest`; a byte-bearing member always
-                // contributes the bytes' own digest, so both forms of the
-                // SAME member hash identically and the stored digest can
-                // never rewrite a byte-bearing entry's root.
+                // A digest-only member and its byte-bearing form hash the same: the
+                // bytes' digest first, the stored digest otherwise.
                 m.certificate
                     .as_ref()
                     .map(crate::groups::owner_cert::certificate_digest_hex)
@@ -198,9 +192,6 @@ impl PartialEq for RosterMemberSnapshot {
 /// every seat's certificate into every commit forever.
 pub const RETAINED_CERT_CARRY_LINKS: usize = 2;
 
-/// #1023: serde codec for the snapshot `certificate` field — one base64
-/// string of the bincode form (the exact bytes the committed digest
-/// hashes), never a JSON array of numbers.
 mod certificate_b64 {
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -231,13 +222,7 @@ mod certificate_b64 {
         let Some(encoded) = Option::<String>::deserialize(deserializer)? else {
             return Ok(None);
         };
-        // Cap the STRING before any decode work: a certificate is under
-        // 8 KiB of bincode, so anything near the base64 of 64 KiB is not
-        // one. The check necessarily runs after serde has built the
-        // String (a `with` codec sees the field after deserialization);
-        // on every wire path the 48 KiB direct-message budget already
-        // bounds what can arrive, and the persisted store is local, so
-        // the late check is a depth bound, not a DoS surface.
+        // Cap the string before decode: a certificate is under 8 KiB of bincode.
         if encoded.len() > 90_000 {
             return Err(serde::de::Error::custom(
                 "snapshot certificate string exceeds the carry limit",
@@ -277,19 +262,11 @@ pub fn roster_projection(
                     role: m.role,
                     state: m.state,
                     treekem_key_package_hash: m.treekem_key_package_hash.clone(),
-                    // Mirrors `compute_roster_root`'s digest preference
-                    // exactly: bytes' digest when present, else the stored
-                    // digest-only commitment. A projection taken from a
-                    // digest-only roster must re-derive the same signed
-                    // root (`RetainedCommit::roster_root_consistent`).
                     certificate_digest: m
                         .certificate
                         .as_ref()
                         .map(crate::groups::owner_cert::certificate_digest_hex)
                         .or(m.certificate_digest.clone()),
-                    // #1023: byte-bearing seats contribute their bytes so
-                    // chain adopters can seat them with the authority
-                    // offline; digest-only seats contribute none.
                     certificate: m.certificate.clone(),
                 },
             )
@@ -382,7 +359,6 @@ impl RetainedCommit {
 /// Compute the canonical policy hash.
 #[must_use]
 pub fn compute_policy_hash(policy: &GroupPolicy) -> String {
-    // bincode is deterministic for simple enums/structs without maps.
     let bytes = bincode::serialize(policy).unwrap_or_default();
     let mut buf = Vec::with_capacity(bytes.len() + 32);
     buf.extend_from_slice(b"x0x.policy-hash.v1");
@@ -393,7 +369,6 @@ pub fn compute_policy_hash(policy: &GroupPolicy) -> String {
 /// Compute the canonical public-metadata hash.
 #[must_use]
 pub fn compute_public_meta_hash(meta: &GroupPublicMeta) -> String {
-    // Canonical encoding: length-prefixed UTF-8.
     let mut buf = Vec::with_capacity(256);
     buf.extend_from_slice(b"x0x.public-meta.v1");
     push_len_prefixed(&mut buf, meta.name.as_bytes());
@@ -413,8 +388,7 @@ pub fn compute_public_meta_hash(meta: &GroupPublicMeta) -> String {
         &mut buf,
         meta.banner_url.as_deref().unwrap_or("").as_bytes(),
     );
-    // ADR-0038 review fix 1: Home metadata commitment. Absent (legacy and
-    // non-Home groups) hashes byte-identically to the pre-0038 form.
+    // An absent Home digest hashes byte-identically to the pre-ADR-0038 form.
     if let Some(home_digest) = meta.home_digest.as_deref() {
         buf.push(b'#');
         push_len_prefixed(&mut buf, home_digest.as_bytes());
@@ -430,8 +404,6 @@ pub fn compute_home_digest(home: &super::HomeMetadata) -> String {
     let mut buf = Vec::with_capacity(128);
     buf.extend_from_slice(b"x0x.home-meta.v1");
     push_len_prefixed(&mut buf, home.primary_agent.as_bytes());
-    // Placements in BTreeMap (deterministic key order): agent, placement
-    // byte, all length-prefixed.
     buf.extend_from_slice(&(home.placements.len() as u32).to_le_bytes());
     for (agent, placement) in &home.placements {
         push_len_prefixed(&mut buf, agent.as_bytes());
@@ -479,7 +451,6 @@ fn role_byte(role: GroupRole) -> u8 {
         GroupRole::Moderator => 2,
         GroupRole::Member => 1,
         GroupRole::Guest => 0,
-        // #1604: never committed; decoders refuse an unknown role first.
         GroupRole::Unknown => u8::MAX,
     }
 }
@@ -490,12 +461,9 @@ fn state_byte(state: GroupMemberState) -> u8 {
         GroupMemberState::Banned => 2,
         GroupMemberState::Removed => 3,
         GroupMemberState::Pending => 4,
-        // #1604: never committed; decoders refuse an unknown state first.
         GroupMemberState::Unknown => u8::MAX,
     }
 }
-
-// ─────────────────────────── Core types ─────────────────────────────────
 
 /// Immutable genesis record for a group.
 ///
@@ -718,7 +686,6 @@ impl GroupStateCommit {
         let pubkey = MlDsaPublicKey::from_bytes(&pubkey_bytes)
             .map_err(|e| ApplyError::InvalidSignature(format!("bad pubkey: {e:?}")))?;
 
-        // Derived AgentId must match committed_by.
         let derived = hex::encode(ant_quic::derive_peer_id_from_public_key(&pubkey).0);
         if derived != self.committed_by {
             return Err(ApplyError::InvalidSignature(format!(
@@ -736,8 +703,6 @@ impl GroupStateCommit {
         Ok(())
     }
 }
-
-// ─────────────────── Join request reject binding (#1623) ─────────────────
 
 /// Domain separator of the signature that binds a `JoinRequestRejected`
 /// link to the join request that it rejects (#1623).
@@ -818,8 +783,6 @@ pub fn verify_join_request_reject(
     verify_with_ml_dsa(&pubkey, &bytes, &sig)
         .map_err(|e| ApplyError::InvalidSignature(format!("binding verify failed: {e:?}")))
 }
-
-// ─────────────────────────── Apply errors ───────────────────────────────
 
 /// Errors produced during apply-side validation.
 ///
@@ -911,8 +874,6 @@ pub enum ApplyError {
         members: Vec<String>,
     },
 }
-
-// ─────────────────────────── Apply checks ───────────────────────────────
 
 /// Classification of a privileged action, for authorisation checks.
 ///
@@ -1009,10 +970,8 @@ fn validate_live_to_withdrawn_authority(
         ));
     }
 
-    // NonMemberRequest is never withdrawal authority. Without this gate a
-    // Pending sole member-in-being (`active_signer_role` is `None`) would
-    // pass the sole-member carve-out below and then satisfy the ordinary
-    // `NonMemberRequest => signer_role.is_none()` arm, withdrawing the group.
+    // A non-member request is never withdrawal authority: a Pending sole
+    // member-in-being would otherwise pass the sole-member rule below.
     if action_kind == ActionKind::NonMemberRequest {
         return Err(ApplyError::Unauthorized {
             signer: commit.committed_by.clone(),
@@ -1020,10 +979,6 @@ fn validate_live_to_withdrawn_authority(
         });
     }
 
-    // #369 / PR #370 review item 3: the sole member-in-being may terminalize
-    // the group regardless of role — their withdrawal IS the entire (one
-    // person) membership's unanimous decision. Any second member-in-being
-    // keeps the AdminOrHigher requirement below.
     if signer_is_sole_member {
         return Ok(());
     }
@@ -1036,8 +991,6 @@ fn validate_live_to_withdrawn_authority(
 
     Err(ApplyError::Unauthorized {
         signer: commit.committed_by.clone(),
-        // Names the requirement the signer failed (terminal withdrawals are
-        // admin-or-sole-member acts), not the caller's action kind.
         action: ActionKind::AdminOrHigher.name(),
     })
 }
@@ -1050,7 +1003,6 @@ fn validate_live_to_withdrawn_authority(
 /// - the advertised `new_state_hash` matches the recomputed result.
 #[derive(Debug, Clone)]
 pub struct ApplyContext<'a> {
-    /// Hex agent_id currently holding `GroupInfo`.
     pub current_state_hash: &'a str,
     pub current_revision: u64,
     pub current_withdrawn: bool,
@@ -1074,7 +1026,6 @@ fn validate_apply_with_terminal_mode(
     action_kind: ActionKind,
     allow_live_withdrawal: bool,
 ) -> Result<(), ApplyError> {
-    // 1. group_id match
     if commit.group_id != ctx.group_id {
         return Err(ApplyError::GroupIdMismatch {
             expected: ctx.group_id.to_string(),
@@ -1082,10 +1033,8 @@ fn validate_apply_with_terminal_mode(
         });
     }
 
-    // 2. signature + state_hash consistency (structural)
     commit.verify_structure()?;
 
-    // 3. revision monotonicity
     if commit.revision <= ctx.current_revision {
         return Err(ApplyError::StaleRevision {
             got: commit.revision,
@@ -1093,11 +1042,6 @@ fn validate_apply_with_terminal_mode(
         });
     }
 
-    // 4. prev_state_hash chain. The current local `state_hash` (whether
-    //    it is the genesis-derived hash at revision 0 or the hash of the
-    //    last-applied commit at revision N) must equal the commit's
-    //    `prev_state_hash`. Callers must recompute `state_hash` before
-    //    apply so the chain check is meaningful.
     let expected_prev = Some(ctx.current_state_hash.to_string());
     if commit.prev_state_hash != expected_prev {
         return Err(ApplyError::PrevHashMismatch {
@@ -1106,12 +1050,10 @@ fn validate_apply_with_terminal_mode(
         });
     }
 
-    // 5. withdrawal terminality
     if ctx.current_withdrawn && !commit.withdrawn {
         return Err(ApplyError::Withdrawn);
     }
 
-    // 6. authority
     let signer_role = active_signer_role(ctx.members_v2, &commit.committed_by);
     let signer_is_sole_member = super::sole_member_in_being_excluding_join_markers(
         ctx.members_v2,
@@ -1119,9 +1061,6 @@ fn validate_apply_with_terminal_mode(
         &ctx.join_seat_marker_agents,
     );
 
-    // A live -> withdrawn transition is a terminal admin act. Already-withdrawn
-    // carry-forward commits are intentionally left to the ordinary action-kind
-    // authority below; un-withdrawal was rejected by the terminality check above.
     validate_live_to_withdrawn_authority(
         ctx.current_withdrawn,
         commit,
@@ -1133,10 +1072,6 @@ fn validate_apply_with_terminal_mode(
 
     let authorized = match action_kind {
         ActionKind::AdminOrHigher => {
-            // #369: the sole member-in-being's terminal withdrawal is
-            // authorized regardless of role (see
-            // `validate_live_to_withdrawn_authority`); ordinary admin acts
-            // still require Admin-or-higher.
             signer_role
                 .map(|r| r.at_least(GroupRole::Admin))
                 .unwrap_or(false)
@@ -1195,8 +1130,6 @@ pub fn validate_apply_terminal(
     validate_apply_with_terminal_mode(ctx, commit, action_kind, true)
 }
 
-// ─────────── ADR-0064 Decision §2: alternate-chain ancestor walk ───────────
-
 /// The known-good base a served alternate chain must fold from — the
 /// observing node's own retained head (joiner adoption) or a retained
 /// ancestor (fork classification). Every field is borrowed: the walk is
@@ -1238,17 +1171,12 @@ pub struct AlternateChainHead {
     pub revision: u64,
 }
 
-/// `committed_by` is an ACTIVE ADMIN in this roster projection (ADR-0016
-/// authority: role is decided on the committed PREDECESSOR roster, never
-/// the commit's self-asserted view).
 fn active_admin_in_projection(roster: &BTreeMap<String, RosterMemberSnapshot>, who: &str) -> bool {
     roster.get(who).is_some_and(|snap| {
         snap.state == GroupMemberState::Active && snap.role.at_least(GroupRole::Admin)
     })
 }
 
-/// #458 r5c: run `enforce_last_admin_invariant` over a folded roster
-/// projection by materializing the minimal members view it checks.
 fn projection_last_admin_invariant(
     projection: &BTreeMap<String, RosterMemberSnapshot>,
     withdrawn: bool,
@@ -1297,7 +1225,6 @@ pub fn validate_alternate_chain(
     chain: &[RetainedCommit],
     terminal: &GroupStateCommit,
 ) -> Result<AlternateChainHead, &'static str> {
-    // Reconstructed state, folded link by link.
     let mut roster = base.roster.clone();
     let mut meta = base.meta.clone();
     let mut previous_hash = base.base_state_hash.to_string();
@@ -1305,8 +1232,6 @@ pub fn validate_alternate_chain(
     let mut chain_withdrawn = false;
     for link in chain {
         if chain_withdrawn {
-            // #458 r5b: withdrawal is TERMINAL — a withdrawn link ends the
-            // group; nothing (link or terminal) may follow it.
             return Err("link follows a withdrawn (terminal) link in the chain");
         }
         if link.commit.withdrawn {
@@ -1322,7 +1247,7 @@ pub fn validate_alternate_chain(
         if commit_link.group_id != base.group_id || commit_link.verify_structure().is_err() {
             return Err("chain commit signature/group binding invalid");
         }
-        // Snapshot trust comes ONLY from re-deriving the signed root.
+        // A snapshot is trusted only by re-deriving the signed root.
         if roster_root_of_projection(&link.roster) != commit_link.roster_root {
             return Err("link roster snapshot does not re-derive its signed roster_root");
         }
@@ -1335,9 +1260,8 @@ pub fn validate_alternate_chain(
         if commit_link.policy_hash != base.policy_hash {
             return Err("policy changed inside the gap (unreconstructable without the event)");
         }
-        // ADR 0110 §4 named exception (D129): a self-rebind link, signed by
-        // the seat's own agent and changing only its certificate digest,
-        // is accepted under the same checks. It is never an owner anchor.
+        // ADR 0110 §4: a self-rebind link changes only the seat's own
+        // certificate digest. It is never an owner anchor.
         let self_rebind = compute_public_meta_hash(&meta) == commit_link.public_meta_hash
             && super::cert_rebind::is_self_rebind_link(
                 &roster,
@@ -1349,17 +1273,8 @@ pub fn validate_alternate_chain(
                 "link committer is not an active admin in the RECONSTRUCTED predecessor roster",
             );
         }
-        // #458 r5c/r6 — ROLE-CHANGE SMUGGLING (WONTFIX-with-justification):
-        // `GroupStateCommit` carries no action kind, so a role change
-        // sealed inside an internally consistent retained snapshot is
-        // indistinguishable here from any other admin-committed role
-        // change. That is NOT a new capability: an admin can change roles
-        // via ordinary commits anyway (ADR-0016 — role management IS
-        // admin authority), and the caller anchors the chain
-        // independently (owner head attestation / mandate), so any role
-        // delta inside the chain is the authority's own sealed history.
-        // The per-link last-admin invariant adds fail-closed coverage for
-        // deltas that strand the last admin.
+        // A commit carries no action kind, so a role change inside a link is
+        // not told apart here; the caller anchors the chain.
         if projection_last_admin_invariant(&link.roster, link.commit.withdrawn).is_err() {
             return Err("link folds to a roster that violates the last-admin invariant");
         }
@@ -1369,16 +1284,12 @@ pub fn validate_alternate_chain(
         previous_revision = commit_link.revision;
     }
 
-    // Terminal: chain from the reconstruction head and verify EVERYTHING
-    // against the reconstruction.
     if terminal.revision != previous_revision + 1
         || terminal.prev_state_hash.as_deref() != Some(previous_hash.as_str())
     {
         return Err("terminal commit does not chain from the reconstructed head");
     }
     if chain_withdrawn || terminal.withdrawn {
-        // #458 r5b: a MemberAdded on a withdrawn group is meaningless —
-        // refuse any withdrawn chain or terminal outright.
         return Err("chain or terminal is withdrawn (terminal group state)");
     }
     if terminal.group_id != base.group_id {
@@ -1402,8 +1313,6 @@ pub fn validate_alternate_chain(
         revision: previous_revision,
     })
 }
-
-// ─────────────────────────────── Tests ──────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -1433,15 +1342,10 @@ mod tests {
         m
     }
 
-    // ── ADR-0016 R2: last-admin invariant (choke-point unit tests) ──────
-
-    /// Why: rejecting a demotion that leaves zero admins is the entire point
-    /// of the invariant — a live group must never become unadministrable.
     #[test]
     fn last_admin_demote_sole_admin_rejected() {
         let mut m = BTreeMap::new();
         let mut admin = make_member(&"aa".repeat(32), GroupRole::Admin);
-        // Proposed post-mutation roster: the sole admin demoted to member.
         admin.role = GroupRole::Member;
         m.insert("aa".repeat(32), admin);
         m.insert(
@@ -1452,8 +1356,6 @@ mod tests {
         assert!(matches!(err, ApplyError::Invariant(_)));
     }
 
-    /// Why: a removal that strips the last admin must be rejected; Removed
-    /// entries are not active and must not count toward the admin set.
     #[test]
     fn last_admin_remove_sole_admin_rejected() {
         let mut m = BTreeMap::new();
@@ -1468,8 +1370,6 @@ mod tests {
         assert!(matches!(err, ApplyError::Invariant(_)));
     }
 
-    /// Why: a banned admin is not an active admin — ban of the last admin
-    /// must be rejected like removal.
     #[test]
     fn last_admin_ban_sole_admin_rejected() {
         let mut m = BTreeMap::new();
@@ -1484,8 +1384,6 @@ mod tests {
         assert!(matches!(err, ApplyError::Invariant(_)));
     }
 
-    /// Why: withdrawal is the last admin's exit valve (ADR-0016) — the
-    /// group-ending commit is exempt even when the roster has no admins.
     #[test]
     fn last_admin_withdrawal_exempt() {
         let mut m = BTreeMap::new();
@@ -1493,12 +1391,9 @@ mod tests {
         admin.state = GroupMemberState::Removed;
         m.insert("aa".repeat(32), admin);
         enforce_last_admin_invariant(&m, true).unwrap();
-        // Even an empty roster is fine once the state is withdrawn.
         enforce_last_admin_invariant(&BTreeMap::new(), true).unwrap();
     }
 
-    /// Why: a sole legacy Owner normalising itself to Admin keeps the admin
-    /// count at 1 — this ordinary normalization commit must pass.
     #[test]
     fn last_admin_owner_self_demote_to_admin_accepted() {
         let mut m = BTreeMap::new();
@@ -1509,8 +1404,6 @@ mod tests {
         enforce_last_admin_invariant(&m, false).unwrap();
     }
 
-    /// Why: a sole legacy Owner demoted to plain member leaves zero
-    /// admin-or-higher actives — Owner gets no special pass.
     #[test]
     fn last_admin_owner_demote_to_member_rejected() {
         let mut m = BTreeMap::new();
@@ -1522,9 +1415,6 @@ mod tests {
         assert!(matches!(err, ApplyError::Invariant(_)));
     }
 
-    /// Why: legacy `Owner` (rank 4) must count as Admin (rank 3) via
-    /// `at_least`, so a mixed roster whose only privileged active entry is
-    /// an Owner satisfies the invariant.
     #[test]
     fn last_admin_legacy_owner_counts_as_admin() {
         let mut m = BTreeMap::new();
@@ -1533,7 +1423,6 @@ mod tests {
             "bb".repeat(32),
             make_member(&"bb".repeat(32), GroupRole::Member),
         );
-        // A banned Admin alongside must not be needed for the pass.
         let mut banned_admin = make_member(&"cc".repeat(32), GroupRole::Admin);
         banned_admin.state = GroupMemberState::Banned;
         m.insert("cc".repeat(32), banned_admin);
@@ -1546,16 +1435,12 @@ mod tests {
         let reconstructed =
             GroupGenesis::derive_group_id(&g.creator_agent_id, g.created_at, &g.creation_nonce);
         assert_eq!(g.group_id, reconstructed);
-        // Different nonce => different id even with same creator/time.
         let g2 = GroupGenesis::new("aa".repeat(32), 1_000);
         assert_ne!(g.group_id, g2.group_id);
     }
 
     #[test]
     fn roster_projection_rederives_roster_root() {
-        // issue #111: a retained roster projection must hash to the exact root
-        // its commit signed — that is what makes a single retained entry
-        // independently verifiable without the prior chain.
         let mut m = BTreeMap::new();
         m.insert("aa".repeat(32), make_owner(&"aa".repeat(32)));
         m.insert(
@@ -1563,8 +1448,6 @@ mod tests {
             make_member(&"bb".repeat(32), GroupRole::Admin),
         );
         m.insert("cc".repeat(32), make_banned(&"cc".repeat(32)));
-        // Excluded from the root: Removed + Pending must not appear in the
-        // projection (mirrors compute_roster_root's filter exactly).
         m.insert("dd".repeat(32), make_removed(&"dd".repeat(32)));
 
         let projection = roster_projection(&m);
@@ -1617,8 +1500,6 @@ mod tests {
             "captured projection must re-derive the commit's signed roster_root"
         );
 
-        // A tampered projection must fail the consistency check (this is the
-        // on-disk-corruption guard the endpoint surfaces as roster_root_verified).
         let mut tampered = retained.clone();
         tampered.roster.get_mut(&"bb".repeat(32)).unwrap().role = GroupRole::Admin;
         assert!(
@@ -1908,9 +1789,6 @@ mod tests {
             &kp,
         )
         .unwrap();
-        // Tamper with state_hash (but keep signature): verify_structure
-        // recomputes state_hash first, so tampered state_hash is caught
-        // before we even hit the signature check.
         commit.state_hash = "deadbeef".into();
         assert!(matches!(
             commit.verify_structure(),
@@ -1935,11 +1813,6 @@ mod tests {
         )
         .unwrap();
         commit.committed_by = "aa".repeat(32);
-        // state_hash does not cover committed_by directly, but verify_structure
-        // re-derives from signer_public_key and compares.
-        // The signature over signable_bytes includes committed_by, so the sig
-        // won't verify either, but the pubkey-derived AgentId check fires
-        // first.
         assert!(matches!(
             commit.verify_structure(),
             Err(ApplyError::InvalidSignature(_))
@@ -1956,7 +1829,7 @@ mod tests {
 
         let commit = GroupStateCommit::sign(
             "g1".into(),
-            1, // stale: current_revision is already 1
+            1,
             Some("old".into()),
             "r".into(),
             "p".into(),
@@ -1978,7 +1851,7 @@ mod tests {
         };
         let err = validate_apply(&ctx, &commit, ActionKind::AdminOrHigher).unwrap_err();
         assert!(matches!(err, ApplyError::StaleRevision { got: 1, have: 1 }));
-        let _ = owner_hex; // silence unused
+        let _ = owner_hex;
     }
 
     #[test]
@@ -2167,9 +2040,6 @@ mod tests {
 
     #[test]
     fn validate_apply_terminal_allows_sole_member_in_being_non_admin() {
-        // #369 / PR #370 review item 3: the sole member-in-being's terminal
-        // withdrawal commits regardless of role — receivers with the same
-        // roster must apply the GroupDeleted, not reject it as non-admin.
         let kp = AgentKeypair::generate().unwrap();
         let signer_hex = hex::encode(kp.agent_id().as_bytes());
         let mut members = BTreeMap::new();
@@ -2201,8 +2071,6 @@ mod tests {
         };
 
         assert!(validate_apply_terminal(&ctx, &commit, ActionKind::AdminOrHigher).is_ok());
-        // The carve-out is terminal-only: an ordinary (non-withdrawn)
-        // AdminOrHigher commit from the same sole Member is still refused.
         let non_terminal = GroupStateCommit::sign(
             "g1".into(),
             2,
@@ -2225,10 +2093,6 @@ mod tests {
 
     #[test]
     fn validate_apply_terminal_rejects_nmr_withdrawal_from_sole_pending_member() {
-        // The #369 follow-on hole: a sole Pending member-in-being has
-        // `active_signer_role == None`, so the #370 carve-out used to
-        // authorize their NonMemberRequest live withdrawal (the #375
-        // shrink: a Pending sole Owner withdrew the whole group).
         let kp = AgentKeypair::generate().unwrap();
         let signer_hex = hex::encode(kp.agent_id().as_bytes());
         let mut members = BTreeMap::new();
@@ -2271,10 +2135,6 @@ mod tests {
 
     #[test]
     fn validate_apply_terminal_rejects_nmr_withdrawal_from_sole_active_member() {
-        // NMR is never a withdraw kind for ANY rostered sole member-in-being
-        // (the apply oracle's `NonMemberRequest => false` arm). An Active
-        // sole Member was already rejected at the ordinary arm; the explicit
-        // gate keeps it rejected before the carve-out.
         let kp = AgentKeypair::generate().unwrap();
         let signer_hex = hex::encode(kp.agent_id().as_bytes());
         let mut members = BTreeMap::new();
@@ -2314,9 +2174,6 @@ mod tests {
 
     #[test]
     fn validate_apply_allows_nmr_non_terminal_from_sole_pending_member() {
-        // Closing the hole must not ban NMR outright: a sole Pending
-        // signer's ordinary (non-withdrawn) join-request commits keep
-        // passing `NonMemberRequest => signer_role.is_none()`.
         let kp = AgentKeypair::generate().unwrap();
         let signer_hex = hex::encode(kp.agent_id().as_bytes());
         let mut members = BTreeMap::new();
@@ -2351,8 +2208,6 @@ mod tests {
 
     #[test]
     fn validate_apply_terminal_rejects_nmr_withdrawal_from_outsider() {
-        // The sole-member carve-out does not apply to signers outside the
-        // roster: their NonMemberRequest withdrawal is refused outright.
         let kp = AgentKeypair::generate().unwrap();
         let admin_hex = "ff".repeat(32);
         let mut members = BTreeMap::new();
@@ -2441,7 +2296,7 @@ mod tests {
             "p".into(),
             "m".into(),
             None,
-            false, // not a withdrawal
+            false,
             0,
             &kp,
         )
@@ -2490,13 +2345,6 @@ mod tests {
         assert!(matches!(err, ApplyError::GroupIdMismatch { .. }));
     }
 
-    // ── #468/#469 (design v5 D2): digest-only roster seats ──────────────
-
-    /// Why: a member whose certificate bytes were stripped (key-stripped
-    /// recovery / invite state) but whose digest was kept MUST hash
-    /// identically to its byte-bearing form — the signed roster root binds
-    /// the digest either way, so stripping bytes can never silently change
-    /// the committed root.
     #[test]
     fn digest_only_member_hashes_identically_to_byte_bearing() {
         let user = crate::identity::UserKeypair::generate().unwrap();
@@ -2510,8 +2358,6 @@ mod tests {
         byte_bearing.insert(agent_hex.clone(), m);
         let root_with_bytes = compute_roster_root(&byte_bearing);
 
-        // Strip the bytes, keep the digest (what set_member_certificate
-        // recorded at install time).
         let mut digest_only = byte_bearing.clone();
         let stripped = digest_only.get_mut(&agent_hex).unwrap();
         stripped.certificate = None;
@@ -2523,8 +2369,6 @@ mod tests {
             "digest-only and byte-bearing forms of the same member must share a roster root"
         );
 
-        // The projection path must agree for BOTH forms: a retained commit
-        // re-derives the same signed root after a byte strip.
         assert_eq!(
             roster_root_of_projection(&roster_projection(&digest_only)),
             root_with_bytes
@@ -2534,8 +2378,6 @@ mod tests {
             root_with_bytes
         );
 
-        // And a digest-only seat is still distinguishable from a member
-        // with NO certificate commitment at all.
         let mut no_commitment = digest_only.clone();
         no_commitment
             .get_mut(&agent_hex)
@@ -2548,11 +2390,6 @@ mod tests {
         );
     }
 
-    /// #1023: the snapshot `certificate` field is a wire ADDITION. A
-    /// payload from a pre-#1023 peer — no `certificate` key at all — must
-    /// decode, and the bytes must never move the signed root: a projection
-    /// with bytes, the same projection with the bytes stripped, and the
-    /// decoded legacy payload all re-derive ONE root.
     #[test]
     fn snapshot_certificate_field_is_wire_additive_with_unchanged_root() {
         let user = crate::identity::UserKeypair::generate().unwrap();
@@ -2576,9 +2413,6 @@ mod tests {
         let root_with_bytes = roster_root_of_projection(&with_bytes);
         assert_eq!(compute_roster_root(&members), root_with_bytes);
 
-        // The pre-#1023 wire form: the same snapshot without the bytes
-        // serializes WITHOUT the key (`skip_serializing_if`), so this is
-        // exactly what an old peer serves. It must decode back.
         let mut stripped = with_bytes.clone();
         stripped.get_mut(&agent_hex).unwrap().certificate = None;
         let legacy_payload =
@@ -2603,9 +2437,6 @@ mod tests {
             "the legacy form re-derives the same signed root"
         );
 
-        // A byte-bearing snapshot round-trips through the new field. The
-        // manual PartialEq ignores the carriage bytes, so the round trip
-        // pins them explicitly (Claude review 2 Nov 2026, finding 7).
         let round_trip: BTreeMap<String, RosterMemberSnapshot> =
             serde_json::from_value(serde_json::to_value(&with_bytes).expect("encodes"))
                 .expect("the byte-bearing payload decodes");
@@ -2617,11 +2448,6 @@ mod tests {
         assert_eq!(roster_root_of_projection(&round_trip), root_with_bytes);
     }
 
-    /// #1023: the digest-only projection variant (what the DM-budgeted
-    /// invite link embeds) strips every byte but keeps each committed
-    /// digest, so the root the invite recomputes is unchanged — and a
-    /// malformed snapshot certificate fails the WHOLE link decode
-    /// (fail-closed), never a partial seat.
     #[test]
     fn digest_only_projection_strips_bytes_and_bad_certificate_fails_closed() {
         let user = crate::identity::UserKeypair::generate().unwrap();
@@ -2647,9 +2473,6 @@ mod tests {
             roster_root_of_projection(&with_bytes)
         );
 
-        // A malformed certificate string is a whole-link decode failure —
-        // an adopter never sees a partially-decoded roster. An oversized
-        // string is refused before any decode work.
         let mut payload = serde_json::to_value(&with_bytes[&agent_hex]).expect("encodes");
         payload["certificate"] = serde_json::json!("not base64!");
         let decoded: Result<RosterMemberSnapshot, _> = serde_json::from_value(payload);
@@ -2660,17 +2483,12 @@ mod tests {
             serde_json::from_value::<RosterMemberSnapshot>(oversized).is_err(),
             "an oversized certificate string fails closed before decoding"
         );
-        // Claude review (2 Nov 2026, finding 8): valid base64 that is not
-        // valid bincode fails closed too.
         let mut not_bincode = serde_json::to_value(&with_bytes[&agent_hex]).expect("encodes");
         not_bincode["certificate"] = serde_json::json!("AAAAAAAA");
         assert!(
             serde_json::from_value::<RosterMemberSnapshot>(not_bincode).is_err(),
             "valid base64 that is not a certificate fails closed"
         );
-        // A string UNDER the 90,000-character cap that decodes to more
-        // than the 64 KiB bincode limit: the string cap alone does not
-        // bound the decode, the limit does.
         use base64::Engine as _;
         let big: Vec<u8> = vec![0u8; 65_536];
         let mut under_cap = serde_json::to_value(&with_bytes[&agent_hex]).expect("encodes");
@@ -2682,13 +2500,6 @@ mod tests {
         );
     }
 
-    /// #1023: snapshot equality is COMMITTED-STATE equality — the fields
-    /// the signed root covers. Carriage bytes never participate: a mixed
-    /// roster (one byte-bearing seat, one digest-only) equals its
-    /// byte-stripped form, because the self-rebind link check and the
-    /// bootstrap serving guard compare whole snapshots across nodes and
-    /// versions that hold different byte sets. A different committed
-    /// digest stays a different state.
     #[test]
     fn snapshot_equality_ignores_carriage_bytes() {
         let user = crate::identity::UserKeypair::generate().unwrap();
@@ -2727,8 +2538,6 @@ mod tests {
         );
     }
 
-    // ── ADR-0064 Decision §2 (slice 4): alternate-chain ancestor walk ──
-
     use crate::identity::AgentKeypair;
 
     fn snap(role: GroupRole, state: GroupMemberState) -> RosterMemberSnapshot {
@@ -2745,10 +2554,6 @@ mod tests {
         std::iter::repeat_n(format!("{byte:02x}"), 32).collect()
     }
 
-    /// Build one walk fixture: base roster `{A: admin, B: admin}` at
-    /// revision 1 with a deterministic state hash, plus the signer
-    /// keypairs for A and B. Call [`WalkFixture::with_real_ids`] before
-    /// signing so the roster keys are the DERIVED agent ids.
     struct WalkFixture {
         group_id: String,
         base_state_hash: String,
@@ -2792,9 +2597,6 @@ mod tests {
             hex::encode(self.b.agent_id().as_bytes())
         }
 
-        /// Swap the fixture's placeholder ids for the REAL derived agent
-        /// ids (the committer-authority check matches `committed_by`
-        /// against roster keys).
         fn with_real_ids(&mut self) {
             let a = self.base.remove(&hex_id(0xA1)).expect("A seat");
             let b = self.base.remove(&hex_id(0xB2)).expect("B seat");
@@ -2813,11 +2615,6 @@ mod tests {
             }
         }
 
-        /// One fully signed retained link with explicit withdrawn flag
-        /// and optional policy-hash override (re-signed, so the commit's
-        /// `state_hash` stays internally consistent — tampering a field
-        /// post-sign would fail `verify_structure` instead of the check
-        /// under test).
         #[allow(clippy::too_many_arguments)]
         fn link_signed(
             &self,
@@ -2875,27 +2672,18 @@ mod tests {
         }
     }
 
-    /// WHY (ADR-0064 attack matrix "promoted-after-base admin chain"):
-    /// the walk must see a promotion INSIDE the chain — B commits at
-    /// N+2 as a full admin even though the BASE roster seated B as a
-    /// plain member. Validating against the static base roster (G2's
-    /// wrongly-rejected shape) is the failure this pins out.
     #[test]
     fn alternate_walk_promoted_admin_accepted() {
         let mut f = walk_fixture();
         f.with_real_ids();
-        // B starts as a plain MEMBER at the base; A is the only admin.
         f.base
             .insert(f.b_id(), snap(GroupRole::Member, GroupMemberState::Active));
         let base_hash = f.base_state_hash.clone();
 
-        // Link N+1: A promotes B (the folded roster seats B as admin).
         let mut promoted = f.base.clone();
         promoted.insert(f.b_id(), snap(GroupRole::Admin, GroupMemberState::Active));
         let link = f.link(&f.a, 2, &base_hash, promoted.clone());
 
-        // Terminal N+2: signed by B — admin in the RECONSTRUCTED
-        // predecessor roster, member in the base.
         let terminal = f.terminal(&f.b, 3, &link.commit.state_hash);
         let head = validate_alternate_chain(
             &f.base(1, &base_hash),
@@ -2907,10 +2695,6 @@ mod tests {
         assert_eq!(head.roster, promoted);
         assert_eq!(head.state_hash, link.commit.state_hash);
 
-        // Negative control: the same B-signed commit evaluated against
-        // the STALE base roster (no promotion link) is refused — the
-        // committer-authority check uses the reconstructed predecessor
-        // roster, and a member signer never passes it.
         let direct = f.terminal(&f.b, 2, &base_hash);
         let err = validate_alternate_chain(&f.base(1, &base_hash), &[], &direct)
             .expect_err("member signer refused against the base roster");
@@ -2920,26 +2704,16 @@ mod tests {
         );
     }
 
-    /// WHY (#468 stale removal / ADR-0064 attack matrix "removed-admin
-    /// fork eviction attempt"): an admin removed by an earlier link of
-    /// the chain must lose committer authority for EVERY later link and
-    /// the terminal — the walk rejects exactly the stale-admin shape the
-    /// retained-base check used to admit.
     #[test]
     fn alternate_walk_removed_admin_refused() {
         let mut f = walk_fixture();
         f.with_real_ids();
         let base_hash = f.base_state_hash.clone();
 
-        // Link N+1: B removes A (roster keeps only B, an admin — the
-        // last-admin invariant holds).
         let mut without_a = f.base.clone();
         without_a.remove(&f.a_id());
         let removal = f.link(&f.b, 2, &base_hash, without_a.clone());
 
-        // Link N+2: signed by the REMOVED admin A — must be refused with
-        // the committer-authority reason (not a linkage or signature
-        // failure: A's signature and chain linkage are perfectly valid).
         let mut a_back = without_a.clone();
         a_back.insert(f.a_id(), snap(GroupRole::Admin, GroupMemberState::Active));
         let stale = f.link(&f.a, 3, &removal.commit.state_hash, a_back);
@@ -2954,7 +2728,6 @@ mod tests {
             "link committer is not an active admin in the RECONSTRUCTED predecessor roster"
         );
 
-        // Same refusal for the TERMINAL signed by the removed admin.
         let stale_terminal = f.terminal(&f.a, 3, &removal.commit.state_hash);
         let err = validate_alternate_chain(
             &f.base(1, &base_hash),
@@ -2968,10 +2741,6 @@ mod tests {
         );
     }
 
-    /// WHY (walk invariants): linkage, consecutiveness, policy stability
-    /// and withdrawal terminality each refuse with their exact reason —
-    /// the adoption path logs these verbatim, so the strings are
-    /// contract.
     #[test]
     fn alternate_walk_structural_refusals() {
         let mut f = walk_fixture();
@@ -2979,7 +2748,6 @@ mod tests {
         let base_hash = f.base_state_hash.clone();
         let chain_roster = f.base.clone();
 
-        // Non-consecutive revision.
         let skip = f.link(&f.a, 3, &base_hash, chain_roster.clone());
         let err = validate_alternate_chain(
             &f.base(1, &base_hash),
@@ -2989,7 +2757,6 @@ mod tests {
         .expect_err("non-consecutive refused");
         assert_eq!(err, "chain is not consecutive from the stub revision");
 
-        // Broken prev-hash linkage.
         let unlink = f.link(&f.a, 2, &"ee".repeat(32), chain_roster.clone());
         let err = validate_alternate_chain(
             &f.base(1, &base_hash),
@@ -3002,9 +2769,6 @@ mod tests {
             "chain prev_state_hash linkage broken (stale or forked chain)"
         );
 
-        // Policy changed inside the gap (re-signed under a different
-        // policy hash so the refusal is the policy check, not
-        // `verify_structure`).
         let policy_shift = f.link_signed(
             &f.a,
             2,
@@ -3024,8 +2788,6 @@ mod tests {
             "policy changed inside the gap (unreconstructable without the event)"
         );
 
-        // Withdrawal terminality: nothing follows a withdrawn link
-        // (re-signed with `withdrawn = true`).
         let withdrawn = f.link_signed(&f.a, 2, &base_hash, chain_roster.clone(), true, None);
         let after = f.link(&f.b, 3, &withdrawn.commit.state_hash, chain_roster);
         let err = validate_alternate_chain(
@@ -3036,8 +2798,6 @@ mod tests {
         .expect_err("post-withdrawal link refused");
         assert_eq!(err, "link follows a withdrawn (terminal) link in the chain");
     }
-
-    // ── #1623: the reject binding ───────────────────────────────────────
 
     fn reject_commit(keypair: &AgentKeypair) -> GroupStateCommit {
         GroupStateCommit::sign(
@@ -3098,8 +2858,6 @@ mod tests {
         );
     }
 
-    /// The binding verifies only for the commit, the request and the
-    /// requester that the commit signer named.
     #[test]
     fn join_request_reject_binding_names_one_request() {
         let signer = AgentKeypair::generate().expect("signer");
@@ -3121,7 +2879,6 @@ mod tests {
         assert!(refused(&commit, "req-1", "another", &binding));
         assert!(refused(&commit, "req-1", "requester", "not hex"));
         assert!(refused(&commit, "req-1", "requester", ""));
-        // The same request under another link of the same signer.
         let mut later = commit.clone();
         later.revision += 1;
         assert!(refused(&later, "req-1", "requester", &binding));
@@ -3131,8 +2888,6 @@ mod tests {
         let mut other_group = commit.clone();
         other_group.group_id = "g2".to_string();
         assert!(refused(&other_group, "req-1", "requester", &binding));
-        // Another key: it cannot sign for this commit, and its signature
-        // over the same bytes does not verify under the commit's key.
         assert!(sign_join_request_reject(&commit, "req-1", "requester", &other).is_err());
         let mut as_other = commit.clone();
         as_other.signer_public_key = hex::encode(other.public_key().as_bytes());

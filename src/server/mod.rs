@@ -1,12 +1,5 @@
 //! HTTP/WebSocket server for the x0x daemon.
-//!
-//! Phase 1 (Issue #110): the daemon's axum router, handlers, SSE/WS
-//! plumbing, auth middleware, and serving-side background tasks were
-//! relocated here verbatim from `src/bin/x0xd.rs` so the library can
-//! expose a serving entrypoint. Behavior is unchanged from the binary.
 
-// The moved handler bodies use thousands of `x0x::...` paths; alias the
-// crate to itself so those paths resolve unchanged inside the library.
 use crate as x0x;
 
 mod acl_admin;
@@ -43,8 +36,6 @@ mod update_check;
 mod upgrade_flush;
 mod upgrade_health_commit;
 pub use update_check::run_update_check_and_report;
-// W3-H (#1164): deterministic simulation harness (test builds only:
-// `#![cfg(test)]` inside the module).
 mod w3h;
 #[cfg(all(test, tokio_unstable))]
 pub(crate) use w3h::counted_spawn_blocking;
@@ -59,9 +50,6 @@ mod issue1288_ws_shutdown;
 #[cfg(test)]
 mod shutdown_regression;
 
-// Re-export the public server API surface so `x0x::server::*` paths are
-// unchanged after the #125 / WS1.4 extraction. Internal types (AppState,
-// DaemonUpdateConfig, CachedUpgradeCheck) stay private to the crate.
 pub use config::{diagnose_section_placement, warn_section_misplacements, SectionMisplacement};
 use routes::named_groups::CAUSAL_APPROVAL_RETENTION_MS;
 use routes::public_group_bootstrap_outbox::{
@@ -274,13 +262,6 @@ use x0x::identity::MachineId;
 use x0x::network::NetworkConfig;
 use x0x::Agent;
 
-// ---------------------------------------------------------------------------
-// Optional JSON body helper
-// ---------------------------------------------------------------------------
-
-/// Parse an optional JSON body: returns `Ok(T::default())` when the body is
-/// empty (no Content-Type or zero-length), but returns an axum 400 error if
-/// Content-Type is `application/json` and the body is malformed.
 fn parse_optional_json<T: serde::de::DeserializeOwned + Default>(
     headers: &HeaderMap,
     body: &Bytes,
@@ -294,7 +275,6 @@ fn parse_optional_json<T: serde::de::DeserializeOwned + Default>(
         .map(|ct| ct.starts_with("application/json"))
         .unwrap_or(false);
     if !is_json {
-        // Non-JSON content type with a body — reject
         return Err(api_error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "Content-Type must be application/json",
@@ -318,12 +298,6 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
     serve_with_options(config, options).await?.wait().await
 }
 
-/// Resolve where `x0x user-id create` recorded the install's owner.
-///
-/// Mirrors the CLI's write side exactly: the owner profile is a sibling of
-/// the user key file — the explicit `user_key_path` when configured, the
-/// daemon's identity dir otherwise (which is the instance data dir for
-/// named instances and `~/.x0x` for the default install).
 fn owner_profile_path(config: &DaemonConfig, identity_dir: &Option<PathBuf>) -> Option<PathBuf> {
     if let Some(ref key_path) = config.user_key_path {
         return Some(x0x::profile::OwnerProfile::path_for_key(key_path));
@@ -359,23 +333,16 @@ async fn enforce_owner_singleton_prebuild(
     let Some(owner_path) = owner_profile_path(config, identity_dir) else {
         return Ok(());
     };
-    // Mirror AgentBuilder's user-key precedence exactly (lib.rs resolve
-    // step): explicit path > identity dir > default ~/.x0x/user.key.
     let key_path = match (&config.user_key_path, identity_dir) {
         (Some(path), _) => Some(path.clone()),
         (None, Some(dir)) => Some(dir.join("user.key")),
         (None, None) => crate::storage::x0x_home_dir().map(|dir| dir.join("user.key")),
     };
-    // R3 fix: load the OWNER RECORD FIRST — a recorded owner demands a
-    // matching key, whatever the key slot looks like. Only an UNRECORDED
-    // install may start keyless (anonymous opt-in) or adopt.
     let owner = x0x::profile::OwnerProfile::load_from(&owner_path)
         .await
         .with_context(|| format!("failed to read owner profile at {}", owner_path.display()))?;
 
     let Some(key_path) = key_path else {
-        // No key path resolvable at all: refuse only when an owner is
-        // recorded (a keyless host cannot load the owner's key by design).
         return match owner {
             Some(owner) => Err(anyhow::anyhow!(
                 "install is owned by user {} but no user key path is resolvable; \
@@ -388,10 +355,6 @@ async fn enforce_owner_singleton_prebuild(
     match crate::w3h_inline::fs::try_exists(&key_path).await {
         Ok(true) => {}
         Ok(false) => {
-            // R3 fix (regression): a RECORDED owner whose key is absent
-            // must refuse — starting anonymously would silently drop the
-            // install's authority. No owner recorded + no key = legitimate
-            // anonymous opt-in.
             return match owner {
                 Some(owner) => Err(anyhow::anyhow!(
                     "install is owned by user {} but the user key is missing at {}; \
@@ -402,8 +365,6 @@ async fn enforce_owner_singleton_prebuild(
                 None => Ok(()),
             };
         }
-        // stat itself failed: we cannot prove the key present or absent —
-        // fail closed rather than guess.
         Err(e) => {
             if owner.is_some() {
                 return Err(anyhow::anyhow!(
@@ -413,8 +374,6 @@ async fn enforce_owner_singleton_prebuild(
             }
         }
     }
-    // Fail closed on an unreadable key — the same class of error the
-    // builder now refuses on; catch it here BEFORE anything persists.
     let key = x0x::storage::load_user_keypair_from(&key_path)
         .await
         .with_context(|| format!("user key at {} is unreadable", key_path.display()))?;
@@ -573,13 +532,7 @@ pub async fn serve_with_options(
         daemon_config_path,
         gui_show_write_path,
     } = options;
-    // `--skip-update-check` is process-scoped updater suppression. Compute one
-    // effective capability before any updater path is considered, then use it
-    // for startup checks, background gossip/poll workers, and `/upgrade/apply`.
-    // The config itself stays unchanged, so a later ordinary launch still
-    // participates in the normal release train.
     let self_update_enabled = effective_self_update_enabled(self_update_enabled, skip_update_check);
-    // Ensure data directory exists early so self-update has a working directory.
     crate::w3h_inline::fs::create_dir_all(&config.data_dir)
         .await
         .context("failed to create data directory")?;
@@ -595,23 +548,12 @@ pub async fn serve_with_options(
     // Drop).
     let instance_lock =
         instance_lock::InstanceLock::acquire(&config.data_dir).map_err(anyhow::Error::new)?;
-    // Startup banner
     tracing::info!(
         version = %x0x::VERSION,
         binary = "x0xd",
         pid = std::process::id(),
         "x0xd started"
     );
-
-    // Note: `--check-updates` is a CLI-only print-and-exit mode handled entirely
-    // by the binary (see `run_update_check_and_report`) before it ever calls
-    // `serve_with_options`; it is intentionally not a `ServeOptions` field.
-    //
-    // Startup GitHub check (fallback mechanism — gossip is primary) moved to a
-    // post-bind background task below (#1086): awaiting it here, before the
-    // API listener bound, stalled startup for the monitor's ~30 s HTTP
-    // timeout on hosts whose TCP 443 egress is firewalled. Startup must never
-    // wait on the network for update checks.
 
     tracing::info!("Starting x0xd v{}", x0x::VERSION);
     if let Some(ref name) = instance_name {
@@ -639,12 +581,6 @@ pub async fn serve_with_options(
         config.bind_address
     };
 
-    // Resolve the identity directory. Precedence:
-    //   1. `config.identity_dir` — explicit host-supplied directory. This is the
-    //      storage boundary for in-process embedding: when set, ALL identity
-    //      keys derive from it and `~/.x0x` is never touched.
-    //   2. `~/.x0x-<name>` — instance-scoped directory when `--name` is active.
-    //   3. `None` — default daemon behaviour (keys fall back to `~/.x0x`).
     let identity_dir = match (&config.identity_dir, &instance_name) {
         (Some(dir), _) => {
             crate::w3h_inline::fs::create_dir_all(dir)
@@ -654,8 +590,6 @@ pub async fn serve_with_options(
             Some(dir.clone())
         }
         (None, Some(name)) => {
-            // Issue #456: instance dirs are siblings of the default x0x
-            // home, so X0X_HOME relocates them too.
             let dir = crate::storage::x0x_instance_dir(name)
                 .context("home directory required for instance identity directory")?;
             crate::w3h_inline::fs::create_dir_all(&dir)
@@ -684,8 +618,6 @@ pub async fn serve_with_options(
         _ => None,
     };
 
-    // Create agent
-    //
     // Peer cache is strictly per-data-dir (issue #206): co-located daemons
     // must never share a bootstrap cache, or peers learned on one gossip
     // plane leak into another plane's restart redials (the #189
@@ -699,45 +631,12 @@ pub async fn serve_with_options(
         let _ = std::fs::create_dir_all(&dir);
         dir
     };
-    // Issue #206: resolve the effective gossip plane. Unset TOML
-    // `network_id` maps to the well-known prod plane so co-located daemons
-    // are isolated by default; an explicit empty string opts out (open).
     let network_id = config.resolved_network_id();
     match &network_id {
         Some(id) => tracing::info!(network_id = %id, "Gossip plane isolation enabled"),
         None => tracing::warn!(
             "Gossip plane isolation DISABLED (network_id = \"\") — this daemon will \n             exchange gossip with every plane, including cross-plane mDNS peers"
         ),
-    }
-    let network_config = NetworkConfig {
-        bind_addr: Some(bind_address),
-        bootstrap_nodes: config.resolved_bootstrap_peers(),
-        max_connections: 50,
-        connection_timeout: std::time::Duration::from_secs(30),
-        stats_interval: std::time::Duration::from_secs(60),
-        pinned_bootstrap_peers: std::collections::HashSet::new(),
-        inbound_allowlist: std::collections::HashSet::new(),
-        max_peers_per_ip: 3,
-        // CLI flag wins over config TOML so operators can override on a
-        // single invocation without editing the config file.
-        port_mapping_enabled: config.port_mapping_enabled && !cli_no_port_mapping,
-        // #417: operator-controlled via TOML `mdns_enabled`, defaulting to
-        // `true` so shipped daemons keep ant-quic's LAN discovery. The test
-        // harness sets it `false` so a fixture cannot discover and
-        // auto-connect to a live production daemon on the same machine.
-        mdns_enabled: config.mdns_enabled,
-        peer_relay: config.peer_relay.clone(),
-        network_id,
-        observed_prefix_enabled: config.observed_prefix_enabled,
-    };
-
-    let contacts_path = config.data_dir.join("contacts.json");
-    // ADR-0023: the daemon passes its `[history]` config through (default-on;
-    // `enabled = false` is the escape hatch). Named instances resolve to a
-    // per-instance `history.db` because `data_dir` is per-instance.
-    let mut history_config = config.history.clone();
-    if history_config.db_path.is_none() {
-        history_config.db_path = Some(config.data_dir.join("history.db"));
     }
     let exe = std::env::current_exe().ok();
     // ADR-0034: `--relay` is ONE operator concept — "be a relay node". Any of
@@ -769,6 +668,37 @@ pub async fn serve_with_options(
     let mut gossip_config = config.gossip.clone();
     gossip_config.participation = participation.mode;
     gossip_config.participation_reason = participation.reason.to_string();
+    let relay_service_enabled = x0x::network::resolve_relay_service_enabled(
+        config.relay_service_enabled,
+        participation.mode,
+    );
+    tracing::info!(
+        relay_service_enabled,
+        explicit = config.relay_service_enabled.is_some(),
+        "resolved relay serving"
+    );
+    let network_config = NetworkConfig {
+        bind_addr: Some(bind_address),
+        bootstrap_nodes: config.resolved_bootstrap_peers(),
+        max_connections: 50,
+        connection_timeout: std::time::Duration::from_secs(30),
+        stats_interval: std::time::Duration::from_secs(60),
+        pinned_bootstrap_peers: std::collections::HashSet::new(),
+        inbound_allowlist: std::collections::HashSet::new(),
+        max_peers_per_ip: 3,
+        port_mapping_enabled: config.port_mapping_enabled && !cli_no_port_mapping,
+        mdns_enabled: config.mdns_enabled,
+        peer_relay: config.peer_relay.clone(),
+        network_id,
+        observed_prefix_enabled: config.observed_prefix_enabled,
+        relay_service_enabled,
+    };
+
+    let contacts_path = config.data_dir.join("contacts.json");
+    let mut history_config = config.history.clone();
+    if history_config.db_path.is_none() {
+        history_config.db_path = Some(config.data_dir.join("history.db"));
+    }
 
     let mut builder = Agent::builder()
         .with_network_config(network_config)
@@ -795,19 +725,6 @@ pub async fn serve_with_options(
         tracing::info!("Peer cache disabled by --disable-peer-cache");
         builder = builder.with_peer_cache_disabled();
     }
-
-    // NOTE: --no-hard-coded-bootstrap clears only the *embedded* global
-    // bootstrap network; an explicit `bootstrap_peers` list in the config
-    // file is honored verbatim (see DaemonConfig::resolved_bootstrap_peers).
-    // ant-quic's first-party mDNS LAN discovery and the peer cache remain
-    // active by design so that:
-    //   - Local mesh (two laptops on WiFi) still works via mDNS
-    //   - FOAF presence discovery still finds peers
-    //   - Previously-seen peers can reconnect via cache
-    // mDNS-discovered co-located daemons can no longer bridge gossip
-    // planes, though: every connection exchanges a plane hello, and peers
-    // on a different `network_id` plane are refused at the gossip layer
-    // (issue #206).
 
     if let Some(ref id_dir) = identity_dir {
         builder = builder
@@ -841,10 +758,7 @@ pub async fn serve_with_options(
     let mls_groups_path = config.data_dir.join("mls_groups.bin");
     let mls_groups: HashMap<String, x0x::mls::MlsGroup> = HashMap::new();
 
-    // Load named groups from disk (if any)
     let named_groups_path = config.data_dir.join("named_groups.json");
-    // Issue #451: Home-Suite groups (owner-certified admission) persist in
-    // a sidecar old binaries never read; named_groups.json carries only
     let home_suite_groups_path = config.data_dir.join(HOME_SUITE_GROUPS_FILE);
     let causal_approval_queue_path = config.data_dir.join("causal_approval_queue.json");
     let predecessor_relay_outbox_path = config.data_dir.join("predecessor_relay_outbox.json");
@@ -870,8 +784,6 @@ pub async fn serve_with_options(
     let mut named_groups = load_named_groups_merged(&named_groups_path, &home_suite_groups_path)
         .await
         .map_err(|e| anyhow::anyhow!("failed to load named groups: {e}"))?;
-    // #1650 (ADR 0110 §5): retained displaced rebind certificates reload
-    // from their S4 sidecar — the legacy JSON never carries them.
     routes::named_groups::load_displaced_certs_sidecar(&mut named_groups, &config.data_dir).await;
     let treekem_member_key_packages = load_treekem_member_key_packages(
         &treekem_dir.join("member-key-packages.json"),
@@ -879,21 +791,13 @@ pub async fn serve_with_options(
     )
     .await?;
 
-    // Load or generate API bearer token for local authentication.
     let api_token = auth::load_or_generate_api_token(&config.data_dir).await?;
 
-    // Bind the API listener early so the daemon can report the actual bound
-    // address even when configured with an ephemeral port. Done before the agent
-    // is built so a bind failure (port in use) returns Err with nothing running.
     let listener = tokio::net::TcpListener::bind(config.api_address)
         .await
         .context("failed to bind API address")?;
     let actual_api_addr = listener.local_addr()?;
 
-    // #195: warn loudly when the control plane is bound off-loopback — the
-    // API is bearer-token-only with no auth rate-limiting, so a non-loopback
-    // bind exposes it off-host. --api-port only changes the port and stays
-    // loopback-safe; only a TOML `api_address = "0.0.0.0:…"` reaches here.
     if !actual_api_addr.ip().is_loopback() {
         tracing::warn!(
             target: "x0x::startup",
@@ -905,10 +809,8 @@ pub async fn serve_with_options(
     }
 
     let (broadcast_tx, _) = broadcast::channel::<SseEvent>(256);
-    // Load or generate the per-daemon ML-KEM-768 keypair. Persisted under
-    // `<data_dir>/agent_kem.key` with mode 0600. This keypair is the root of
-    // trust for `SecureShareDelivered` — only the holder of the secret half
-    // can open group-shared-secret envelopes addressed to this agent.
+    // This keypair is the root of trust for `SecureShareDelivered`: only the
+    // holder of the secret half can open group-shared-secret envelopes.
     let agent_kem_path = config.data_dir.join("agent_kem.key");
     let agent_kem_keypair = Arc::new(
         x0x::groups::kem_envelope::AgentKemKeypair::load_or_generate(&agent_kem_path)
@@ -920,22 +822,10 @@ pub async fn serve_with_options(
         agent_kem_keypair.public_bytes.len()
     );
 
-    // ADR-0036 (review R2 regression fix): enforce the owner singleton
-    // BEFORE the builder runs — a mismatched user key must not re-issue and
-    // persist agent.cert, and no network/exec task may exist for a key the
-    // install refuses to adopt.
-    //
-    // ACCEPTED side effects of earlier startup steps (data-dir creation,
-    // API token, KEM keypair — review R3): none of them grants identity or
-    // authority; they are inert files/keys without an adopted agent, so
-    // creating them before this check is harmless and no restructure is
-    // needed.
+    // ADR-0036: enforce the owner singleton BEFORE the builder runs — a
+    // mismatched key must not re-issue and persist agent.cert.
     enforce_owner_singleton_prebuild(&config, &identity_dir).await?;
 
-    // ADR-0070 §3: compose the API-managed ACL overlay (daemon data dir)
-    // over the operator TOML floors. A malformed overlay only ever withholds
-    // added access: the daemon starts on the floor alone and reports it.
-    // Everything below consumes the effective (floor ∪ overlay) policies.
     let acl_admin =
         Arc::new(acl_admin::AclAdmin::load(&config.data_dir, connect_policy, exec_policy).await);
     let exec_policy = (*acl_admin.effective_exec().await).clone();
@@ -954,9 +844,6 @@ pub async fn serve_with_options(
         tracing::info!("User ID: {}", uid);
     }
 
-    // Attach the agent-owned contact store to gossip and API state so the
-    // DM inbox trust evaluator observes the same mutations made by REST
-    // contact/card endpoints.
     let contacts = Arc::clone(agent.contacts());
     agent.set_contacts(Arc::clone(&contacts));
     tracing::info!("Contact store loaded from {}", contacts_path.display());
@@ -979,39 +866,21 @@ pub async fn serve_with_options(
         mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(1024);
     let (predecessor_relay_dm_tx, mut predecessor_relay_dm_rx) =
         mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(1024);
-    // ADR-0070 §2: durable typed route for share-grant deliveries.
     let (share_grant_dm_tx, mut share_grant_dm_rx) =
         mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(256);
-    // ADR 0083 slice 3: one channel, three prefixes. No validator — a
-    // validator would parse the body before owner trust.
     let (gui_show_dm_tx, mut gui_show_dm_rx) = mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(256);
-    // #1003 (ADR 0080 archived, slot A03): plain typed route — the sender
-    // waits for no ACK; the record carries its own authority.
     let (revocation_push_dm_tx, mut revocation_push_dm_rx) =
         mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(256);
-    // #1094 D1: data-read requests and replies. Plain typed routes, one
-    // attempt: the grantee's HTTP call waits for the reply or times out.
     let (data_read_dm_tx, data_read_dm_rx) = mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(256);
     let exec_service = x0x::exec::ExecService::spawn(Arc::clone(&agent), exec_policy, exec_dm_rx);
-    // Tasks started before AppState exists still need owned cancellation on a
-    // later startup rejection. They are folded into the supervisor's normal
-    // task registry once startup reaches that boundary.
     let mut startup_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-    // Zero-peer watchdog (issue #262): opt-in supervised self-heal for the
-    // wedged-transport state (process alive, API healthy, socket silent,
-    // peers pinned at 0). Samples every 30s; after `window` seconds of
-    // CONTINUOUS zero peers (plus the same startup grace) it attempts a
-    // graceful shutdown and hard-exits 30s later so the known shutdown hang
-    // cannot defeat the restart. Only meaningful under a supervisor
-    // (systemd Restart=always) — off by default.
     if let Some(window) = config.zero_peer_restart_secs {
         let watchdog_agent = Arc::clone(&agent);
         let watchdog_shutdown = shutdown_tx.clone();
         startup_tasks.push(tokio::spawn(async move {
             let window = std::time::Duration::from_secs(window.max(60));
             let mut zero_since: Option<std::time::Instant> = None;
-            // Startup grace: give bootstrap the same window before arming.
             tokio::time::sleep(window).await;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -1059,14 +928,6 @@ pub async fn serve_with_options(
         );
     }
 
-    // Tailnet streams + forwarder (#131 × #132): install the loaded connect
-    // policy on the agent so the inbound byte-stream accept loop refuses
-    // streams from ACL-unlisted peers (default-closed when the policy is
-    // Enabled; no ACL constraint when Disabled). Then build the connect-ACL
-    // diagnostics + the ForwardService, whose inbound consumers are the
-    // registered acceptors for the ForwardV1/ForwardV2 stream protocols and
-    // gate each stream at `evaluate_connect_gate` before any local connect.
-    // Only spawn the forwarder when connect is enabled by policy.
     agent.set_connect_policy(Arc::new(connect_policy.clone()));
     let connect_diagnostics = Arc::new(x0x::connect::ConnectDiagnostics::new(
         connect_policy.summary(),
@@ -1100,8 +961,6 @@ pub async fn serve_with_options(
         None
     };
 
-    // ADR-0074 §3: optional loopback SOCKS5 listener. Needs ForwardService
-    // (CONNECT opens ForwardV2). Non-loopback listen was refused at config load.
     let socks_cancel = tokio_util::sync::CancellationToken::new();
     let socks_service = if config.socks.enabled() {
         match &forward_service {
@@ -1151,16 +1010,8 @@ pub async fn serve_with_options(
         None
     };
 
-    // ADR-0012 Phase 4: restore live TreeKEM groups from on-disk snapshots.
-    // Must happen before the AppState is built so secure endpoints see the
-    // groups immediately. Done with `named_groups` still owned (it is moved
-    // into the RwLock below).
     let treekem_groups = restore_treekem_groups(&named_groups, agent.as_ref(), &treekem_dir).await;
 
-    // ADR-0036: load the daemon self-profile (names) and enforce the owner
-    // singleton — an install whose recorded owner differs from the user key
-    // the daemon just loaded refuses to start. Rotation is an explicit,
-    // deliberate act (`x0x user-id create --rotate-owner`).
     let profile_path = x0x::profile::SelfProfile::path_in(&config.data_dir);
     let profile = match x0x::profile::SelfProfile::load_from(&profile_path)
         .await
@@ -1182,11 +1033,6 @@ pub async fn serve_with_options(
     };
     agent.set_self_name(profile.display_name.clone());
 
-    // ADR-0041 Tier-1: cross-machine owner-state sync. Only an install
-    // with an owner key can own or receive Tier-1 state; ownerless
-    // installs register no SyncV1 acceptor and answer 409 on the sync
-    // routes. The acceptor registration follows the single-acceptor rule
-    // (a conflict aborts startup).
     let owner_sync = if agent.identity().user_keypair().is_some() {
         let service =
             match x0x::owner_sync::OwnerSyncService::new(Arc::clone(&agent), &config.data_dir)
@@ -1207,15 +1053,12 @@ pub async fn serve_with_options(
                     .await);
                 }
             };
-        // ADR-0070 §1: enrolled owner machines become owner-trusted.
         agent.install_owner_device_store(Arc::clone(service.store()));
         Some(service)
     } else {
         None
     };
 
-    // ADR-0070 §2: the share-grant store (issued + received grants). An
-    // unreadable file holds no grants and refuses writes (fail closed).
     agent.install_share_grant_store(Arc::new(
         x0x::share_grant::ShareGrantStore::load(
             config
@@ -1226,9 +1069,6 @@ pub async fn serve_with_options(
         )
         .await,
     ));
-    // #926: the owner-side grant redelivery outbox (deliveries whose durable
-    // DM attempts failed). An unreadable file queues nothing and refuses
-    // writes, like the store; the grants themselves are unaffected.
     agent.install_share_grant_outbox(Arc::new(
         x0x::share_grant::outbox::GrantRedeliveryOutbox::load(
             config
@@ -1243,8 +1083,6 @@ pub async fn serve_with_options(
         .await,
     ));
 
-    // ADR-0070 §3: from here on ACL edits and reloads swap the policies the
-    // agent (connect accept + forwarder) and the exec service consult.
     acl_admin
         .attach(acl_admin::AclSink {
             agent: Arc::clone(&agent),
@@ -1449,7 +1287,7 @@ pub async fn serve_with_options(
         upgrade_check_cache: Mutex::new(None),
         upgrade_apply_lock: Arc::new(Mutex::new(())),
         http_upgrade_wait_lock: Arc::new(Mutex::new(())),
-        self_published_release_manifests: Arc::new(Mutex::new(
+        self_published_release_manifests: Arc::new(std::sync::Mutex::new(
             SelfPublishedReleaseManifests::default(),
         )),
         upgrade_observations: Default::default(),
@@ -1506,21 +1344,10 @@ pub async fn serve_with_options(
 
     install_revocation_snapshot_authority(&state).await;
 
-    // ADR-0068 D1: teach the history retention reaper which scopes are
-    // fork-quarantined. Installed HERE because this is the first point at
-    // which an `Arc<AppState>` exists — the reaper is spawned by the Agent,
-    // which knows nothing about named groups — and the source holds only a
-    // `Weak`, so it cannot form a cycle with the Agent that owns the store
-    // (#661 drop ordering). Absent when history is disabled, in which case
-    // there is no reaper to inform.
     if routes::history::ReaperQuarantinePins::install(&state) {
         tracing::debug!("[history] fork-quarantine pin source installed (ADR-0068 D1)");
     }
 
-    // Review r2 (#451): a store written by a pre-#451 Home-Suite binary
-    // still holds owner-certified entries in named_groups.json — v0.40.x
-    // would crash-loop on it. Migrate to the split layout immediately so
-    // the data dir is downgrade-safe from this start onward.
     if let Err(error) = migrate_unsplit_home_suite_store_if_needed(&state).await {
         let primary = anyhow::anyhow!("failed to migrate unsplit Home-Suite store: {error}");
         return Err(finish_startup_error(
@@ -1550,8 +1377,6 @@ pub async fn serve_with_options(
     #[cfg(any(unix, windows))]
     crate::upgrade::shutdown_flush::clear_stale_records(&config.data_dir);
 
-    // The control listener survives the HTTP drain, so a peer can receive
-    // its durable receipt after every normal request and producer has stopped.
     #[cfg(any(unix, windows))]
     let upgrade_flush = if self_update_enabled {
         let setup = async {
@@ -1578,20 +1403,8 @@ pub async fn serve_with_options(
 
     let port_file = config.data_dir.join("api.port");
 
-    // Fix C (Issue #110 Phase 2): collect every server-owned background-task
-    // `JoinHandle` spawned in the startup path so the shutdown tail can
-    // grace-await then abort any straggler. (Agent-internal and ExecService tasks
-    // are owned by the Agent/ExecService and stopped by their own `shutdown()`
-    // calls in the shutdown tail — issue #116 — not collected here.)
     let mut bg_tasks = startup_tasks;
 
-    // ADR-0074 §2: bring persisted forwards back. Each named forward is
-    // re-resolved through the name store (its pin applies) and comes up
-    // only on exactly its pinned ids; anything else stays down with a
-    // reason in `GET /forwards`. Local work only — it never blocks startup
-    // on the network. Names of peers not yet discovered resolve later, so
-    // transient failures use a bounded backoff. Permanent failures stay down
-    // until owner action; retries can only bring up the pinned ids.
     if state.forward_service.is_some() {
         let restore_state = Arc::clone(&state);
         let mut shutdown_rx = state.shutdown_notify.subscribe();
@@ -1630,14 +1443,9 @@ pub async fn serve_with_options(
     {
         let snapshot_state = Arc::clone(&state);
         let mut shutdown_rx = state.shutdown_notify.subscribe();
-        // The effective plane is fixed for the process lifetime; capture it
-        // here rather than reaching back into the config from the task.
         let resolved_plane = config.resolved_network_id();
         let mut verdict_windows = health_verdict::VerdictWindows::default();
-        // #1351: verdict and upgrade-input changes become `system.*` events.
         let mut system_events = system_events::SystemEventTracker::default();
-        // #1377: a launcher trial candidate writes its health commit. Read
-        // once; an ordinary daemon is `None` and does nothing per tick.
         let health_candidate = upgrade_health_commit::detect(
             &state.data_dir,
             identity_dir.clone().or_else(crate::storage::x0x_home_dir),
@@ -1664,11 +1472,6 @@ pub async fn serve_with_options(
                     .unwrap_or(0);
                 match snapshot_state.agent.network() {
                     Some(network) => {
-                        // #1419: sample off the /health path and store the
-                        // degraded set. The repair is spawned and is not
-                        // awaited, so this tick can store peer counts again
-                        // on the next interval. The handler stays a lock-free
-                        // snapshot read (#600).
                         routes::status::publish_one_sided_health(
                             network,
                             &snapshot_state.health_snapshot,
@@ -1697,7 +1500,6 @@ pub async fn serve_with_options(
                         ),
                         send_ready_peers: send_ready,
                     };
-                    // A failed write is retried at the next tick.
                     if let Err(error) =
                         health_tracker.commit(candidate, observation, std::time::Instant::now())
                     {
@@ -1710,12 +1512,6 @@ pub async fn serve_with_options(
         }));
     }
 
-    // #1380: the M1 delivery probe, local-only (RC5 review): every 30 s
-    // (first at ~10 s) it signs/verifies a probe envelope in-process and
-    // publishes a nonce on a `local:` topic that must come back through
-    // this daemon's own subscription within 5 s — no frame leaves the
-    // node. Results land on the health snapshot; the handler merges them
-    // live at serve time, alongside the peer counts and uptime.
     {
         let probe_agent = Arc::clone(&state.agent);
         let probe_snapshot = Arc::clone(&state.health_snapshot);
@@ -1725,11 +1521,8 @@ pub async fn serve_with_options(
         }));
     }
 
-    // #1863: a self-revocation of a group member is published again; one
-    // of a stranger is not.
     agent.set_revocation_group_seen(revocation_group_seen_check(&state));
 
-    // ADR 0089: relationship sources are installed before load verification.
     let context_state = Arc::downgrade(&state);
     agent
         .peer_evidence()
@@ -1860,8 +1653,6 @@ pub async fn serve_with_options(
         cache.reclassify_attribution(|peer| protected.contains(&peer));
     }
 
-    // ADR-0041 Tier-1: bridge the sync service to live daemon state and
-    // start the periodic + on-change pass loop (shuts down with the watch).
     if let Some(sync) = state.owner_sync.as_ref() {
         routes::DaemonView::attach(sync, &state).await;
         let service = Arc::clone(sync);
@@ -1948,15 +1739,9 @@ pub async fn serve_with_options(
         )
         .await);
     }
-    // #908: the requester offer outbox loads fail-VISIBLE, never blocking:
-    // a malformed store logs an error and starts empty (the pending join
-    // requests remain in the durable group state; the authority can still
-    // observe the metadata event, and the operator can inspect the file).
     if let Err(error) = load_requester_offer_outbox(&state).await {
         tracing::error!("#908 startup: requester offer outbox not loaded: {error}");
     }
-    // #1109: queued direct sends load fail-visible like the requester
-    // offers: a bad sidecar is moved aside and the outbox starts empty.
     if let Err(error) = state
         .direct_send_outbox
         .load(routes::direct_outbox::now_unix_ms())
@@ -1964,9 +1749,6 @@ pub async fn serve_with_options(
     {
         tracing::error!("#1109 startup: direct send outbox not loaded: {error}");
     }
-    // ADR 0030 §5 fail-closed: a malformed or over-cap bootstrap outbox aborts
-    // startup rather than silently dropping delivery obligations the authority
-    // has already promised.
     if let Err(error) = load_public_group_bootstrap_outbox(&state).await {
         let primary = anyhow::anyhow!("public-group bootstrap outbox startup: {error}");
         return Err(finish_startup_error(
@@ -1981,11 +1763,6 @@ pub async fn serve_with_options(
         .await);
     }
 
-    // ADR 0110 S4 (#1597 item 5c): read the obligation store and the kept
-    // expiry hand-offs before the API serves or the worker runs. The load
-    // is fail-visible (a damaged file is quarantined, a newer one runs
-    // memory-only), never fatal; until it ends no writer replaces either
-    // file.
     routes::named_groups::load_revocation_eviction_store(&state).await;
     // #1427: the catch-up commits this node held before the restart. After
     // the S4 store, so a commit S4 still delivers is not served from it.
@@ -2023,12 +1800,6 @@ pub async fn serve_with_options(
         }
     }));
 
-    // The metadata + public-message listeners spawned here self-register in
-    // `state.group_metadata_tasks` / `state.public_message_tasks`; the
-    // shutdown tail drains and aborts those maps directly (Fix C), so there
-    // is nothing to collect into `bg_tasks` from this call. #1366: the
-    // restore applies `metadata_listener_wanted` (only a withdrawn record
-    // gets no listener; a Banned seat keeps it to receive an unban).
     routes::named_groups::restore_named_group_listeners(Arc::clone(&state)).await;
 
     // ADR-0038: auto-provision the Home space for an owned install. Runs
@@ -2043,17 +1814,6 @@ pub async fn serve_with_options(
         bg_tasks.push(task);
     }
 
-    // #449 P4: automatic retirement of duplicate Homes is DELIBERATELY NOT
-    // wired here. Independent review found this call site ran before
-    // `crdt_subscriptions::load`, so a duplicate carrying a durable
-    // `x0x.group.<id>.symphony.*` manifest entry could pass an "empty" probe
-    // and be terminally withdrawn before its own evidence was loaded — and
-    // the emptiness proof is not held across the withdrawal in any case.
-    // Duplicates are reported read-only by `GET /home` until a proven
-    // retirement fence exists. See docs/design/449-p4-retirement-fence.md.
-
-    // ADR 0028: post-restore queue drain — any queued approvals whose
-    // predecessors arrived during downtime can now be drained (Kimi blocker 9).
     {
         let queue_groups: Vec<String> = {
             let queue = state.causal_approval_queue.read().await;
@@ -2074,63 +1834,23 @@ pub async fn serve_with_options(
         }
     }
 
-    // P0-1: subscribe to the global group discovery topic so remote public
-    // groups populate the local card cache without manual import.
     bg_tasks.extend(spawn_global_discovery_listener(Arc::clone(&state)).await);
-    // Phase C.2: load persisted shard subscriptions and re-subscribe with
-    // staggered jitter to avoid anti-entropy storms.
     bg_tasks.extend(spawn_directory_resubscribe(Arc::clone(&state)).await);
-    // Restart-amnesia fix: load the persisted task-list/kv-store subscription
-    // manifest now (before REST handlers can mutate it) — the actual
-    // re-create/re-join runs after `join_network` in the join task below.
     crdt_subscriptions::load(&state).await;
-    // Phase C.2: subscribe inbound direct messages for the
-    // ListedToContacts pairwise sync channel.
     bg_tasks.extend(spawn_listed_to_contacts_listener(Arc::clone(&state)).await);
-    // Phase E: subscribe to a stable global SignedPublic message fallback so
-    // first messages are not dependent on a brand-new per-group topic tree.
     bg_tasks.extend(spawn_global_public_message_listener(Arc::clone(&state)).await);
-    // #1094: `kv:changed` / `task:changed` SSE events from the agent's
-    // KV and task-list change notices.
     bg_tasks.extend(kv_change_events::spawn(Arc::clone(&state)));
 
-    // Invite-auth #468/#469 (design v6 E2d / v7 F1): the member-certificate
-    // bridge. `cert_events_rx` was subscribed before the AppState groups
-    // existed; the supervised worker reconciles the full discovery cache on
-    // every (re)start, then hydrates digest-only member seats per event
-    // (Lagged falls back to another full reconcile — no landing is ever
-    // lost to backpressure).
     bg_tasks.push(tokio::spawn(supervise_member_certificate_bridge(
         Arc::clone(&state),
         cert_events_rx,
     )));
 
-    // ADR-0040 (review r5): reconstruct the global delegation-id
-    // registry from ALL groups' durable history at boot — cross-group
-    // id-replay rejection is deterministic from the first query.
     delegations::rebuild_global_delegation_registry(&state).await;
-    // Re-publish our own discoverable group cards after startup so late joiners
-    // pick them up.
-    let discoverable_ids: Vec<String> = {
-        let groups = state.named_groups.read().await;
-        groups
-            .iter()
-            .filter(|(_, info)| {
-                info.policy.discoverability != x0x::groups::GroupDiscoverability::Hidden
-            })
-            .map(|(id, _)| id.clone())
-            .collect()
-    };
-    // Default matches IDENTITY_HEARTBEAT_INTERVAL_SECS: group cards are
-    // discovery anti-entropy, and idle broadcast cost scales with cadence.
     let republish_interval_secs = config.group_card_republish_interval_secs.unwrap_or(600);
     if republish_interval_secs > 0 {
         let state_for_republish = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
-            // First publish after a short warmup so the gossip mesh has a chance
-            // to form. Then republish periodically so late joiners also see cards.
-            // Without this, a peer that starts after another daemon published
-            // would miss the initial card.
             tokio::time::sleep(Duration::from_secs(2)).await;
             let mut shutdown = state_for_republish.shutdown_notify.subscribe();
             loop {
@@ -2154,18 +1874,11 @@ pub async fn serve_with_options(
             }
         }));
     }
-    // Consume the pre-computed list to avoid the dead-warning.
-    let _ = discoverable_ids;
 
-    // Join network in background — API is available immediately
     let join_agent = Arc::clone(&agent);
     let rendezvous_enabled = config.rendezvous_enabled;
     let rendezvous_validity_ms = config.rendezvous_validity_ms;
 
-    // Start the DM inbox as soon as join_network has created the gossip
-    // runtime. join_network may keep working through slow bootstrap/cache
-    // peers for a long time; the daemon must still be able to receive gossip
-    // DMs once `/agent/card` advertises a KEM key.
     let dm_inbox_agent = Arc::clone(&agent);
     let dm_inbox_kem = Arc::clone(&agent_kem_keypair);
     let dm_inbox_exec_route_tx = exec_dm_tx.clone();
@@ -2226,9 +1939,6 @@ pub async fn serve_with_options(
                 tracing::error!("Failed to join network: {e}");
             }
         }
-        // #1427: a start catch-up that ran during a slow bootstrap asks
-        // again now that the join has ended, whether it registered before
-        // or after this point.
         routes::named_groups::retry_treekem_start_catchup(&join_rekey_state);
     }));
 
@@ -2258,18 +1968,8 @@ pub async fn serve_with_options(
         }
     }));
 
-    // Startup GitHub check (fallback mechanism — gossip is primary), the
-    // same check the daemon used to await before anything else. #1086: it
-    // now runs as a background task spawned only after the API listener is
-    // bound, so a firewalled update endpoint blocks for the monitor's ~30 s
-    // HTTP timeout in the background instead of delaying API readiness.
-    // Gates unchanged: `self_update_enabled` (embedders /
-    // `--skip-update-check`) AND `[update] enabled`.
     if self_update_enabled && config.update.enabled {
         let startup_check_config = config.clone();
-        // #261: the apply's restart planner needs the bound API address
-        // (health commit) and the graceful-shutdown hook (bounded cancel) —
-        // both exist only now, post-bind.
         let startup_api_addr = state.api_address;
         let startup_shutdown = daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx);
         let startup_apply_lock = Arc::clone(&state.upgrade_apply_lock);
@@ -2307,7 +2007,6 @@ pub async fn serve_with_options(
             };
             if let Err(e) = run_startup_update_check(
                 &startup_check_config,
-                None,
                 Some(StartupUpdateCheckRuntime {
                     restart_context: listener_restart_context(
                         &data_dir,
@@ -2328,8 +2027,6 @@ pub async fn serve_with_options(
         }));
     }
 
-    // One background apply owner serves both discovery paths. Actual boot
-    // identity is carried into receipts; neither source invents a participant.
     let background_submit = if self_update_enabled
         && config.update.enabled
         && (config.update.gossip_updates || config.update.fallback_check_interval_minutes > 0)
@@ -2351,7 +2048,6 @@ pub async fn serve_with_options(
         match runtime {
             Ok(runtime) => {
                 let (submit, owner) = routes::background_channel(runtime);
-                // #1381: `/diagnostics/upgrade` reports the owner's release.
                 let _ = state.background_submit.set(submit.clone());
                 bg_tasks.push(tokio::spawn(owner.run()));
                 Some(submit)
@@ -2375,8 +2071,6 @@ pub async fn serve_with_options(
             let agent_for_gossip = Arc::clone(&state.agent);
             let self_published_for_gossip = Arc::clone(&self_published_release_manifests);
             let observations_for_gossip = Arc::clone(&state.upgrade_observations);
-            // Restart context stays with the shared owner; this source only
-            // discovers verified releases and observes daemon shutdown.
             let gossip_shutdown_watch = state.shutdown_notify.subscribe();
             async move {
                 run_gossip_update_listener(
@@ -2391,13 +2085,6 @@ pub async fn serve_with_options(
         },
     ));
 
-    // Broadcast current manifest to gossip after joining the network.
-    // Ensures nodes that missed the initial gossip window can still receive it.
-    // Also syncs SKILL.md with the current manifest.
-    // Fix D (Issue #110 Phase 2): gated on `self_update_enabled` — this fetches a
-    // GitHub release manifest and writes SKILL.md, both updater side-effects an
-    // embedder with self-update off must not perform. The daemon keeps it on
-    // Ordinary daemon launches keep it on; process-scoped skip launches do not.
     if self_update_enabled && config.update.enabled {
         let agent_for_broadcast = Arc::clone(&state.agent);
         let update_config = config.update.clone();
@@ -2415,8 +2102,6 @@ pub async fn serve_with_options(
         }));
     }
 
-    // GitHub fallback poll (safety net, default every 48h). Install/restart
-    // capable, so gated on `self_update_enabled` (embedders opt out).
     bg_tasks.extend(routes::BackgroundRuntime::spawn_source(
         self_update_enabled
             && config.update.enabled
@@ -2442,7 +2127,6 @@ pub async fn serve_with_options(
         },
     ));
 
-    // Background rendezvous re-advertisement (re-advertise every validity_ms / 2)
     if config.rendezvous_enabled && config.rendezvous_validity_ms > 0 {
         let rendezvous_agent = Arc::clone(&state.agent);
         let validity_ms = config.rendezvous_validity_ms;
@@ -2450,10 +2134,8 @@ pub async fn serve_with_options(
         bg_tasks.push(tokio::spawn(async move {
             let interval_secs = (validity_ms / 2).max(60_000) / 1000;
             let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
-            ticker.tick().await; // skip immediate tick (already advertised at startup)
+            ticker.tick().await;
             loop {
-                // Watch shutdown so teardown is prompt (Fix C): without this the
-                // loop would only stop when aborted at the end of the grace window.
                 tokio::select! {
                     _ = shutdown_rx.changed() => break,
                     _ = ticker.tick() => {}
@@ -2467,20 +2149,13 @@ pub async fn serve_with_options(
         }));
     }
 
-    // Background connectivity snapshot logger — writes an ant-quic NodeStatus
-    // summary line every 60 seconds at target "x0x::diag::connectivity". This
-    // gives journalctl a tick-by-tick record of UPnP state, external address
-    // observations, direct vs relayed counts, and hole-punch success rate so
-    // long-running deployments have a time series to diagnose from without
-    // polling the HTTP diagnostics endpoint.
     {
         let diag_state = Arc::clone(&state);
         let mut shutdown_rx = state.shutdown_notify.subscribe();
         bg_tasks.push(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(60));
-            ticker.tick().await; // skip the immediate tick — node is still warming up
+            ticker.tick().await;
             loop {
-                // Watch shutdown so teardown is prompt (Fix C).
                 tokio::select! {
                     _ = shutdown_rx.changed() => break,
                     _ = ticker.tick() => {}
@@ -2514,7 +2189,6 @@ pub async fn serve_with_options(
         }));
     }
 
-    // Background file-message listener — processes FileMessage on the direct channel
     {
         let file_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
@@ -2525,14 +2199,13 @@ pub async fn serve_with_options(
             loop {
                 let Some(msg) = rx.recv().await else { break };
                 let Some((sender, file_msg)) = routes::decode_file_message(&msg) else {
-                    continue; // unverified sender or not a file message
+                    continue;
                 };
                 handle_file_message(&file_state, sender, file_msg).await;
             }
         }));
     }
 
-    // ADR-0073 call lifecycle: inbound x0x_call_* frames + missed-call sweeper
     bg_tasks.push(tokio::spawn(routes::calls::run_call_listener(Arc::clone(
         &state,
     ))));
@@ -2540,8 +2213,6 @@ pub async fn serve_with_options(
         &state,
     ))));
 
-    // Background join-result listener — joiner-initiated recovery path for
-    // fresh TreeKEM members that miss the anchor's opportunistic MemberAdded push.
     {
         let join_result_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
@@ -2551,7 +2222,6 @@ pub async fn serve_with_options(
                 let Ok(join_msg) = serde_json::from_slice::<JoinResultMessage>(&msg.payload) else {
                     continue;
                 };
-                // #1604 G5: refuse a held unknown variant before any check.
                 let Ok(join_msg) =
                     crate::wire_compat::reject_unknown("JoinResultMessage", join_msg)
                 else {
@@ -2564,8 +2234,6 @@ pub async fn serve_with_options(
                     len = msg.payload.len(),
                     verified = msg.verified,
                 );
-                // #1275: the dispatch runs a result's apply shielded and
-                // awaits it, so results still apply in arrival order.
                 if !dispatch_join_result_message(
                     &join_result_state,
                     &msg.sender,
@@ -2580,8 +2248,6 @@ pub async fn serve_with_options(
         }));
     }
 
-    // Background TreeKEM Welcome blob listener — pull-based bulk delivery for
-    // oversized Welcome payloads referenced by named-group metadata events.
     {
         let welcome_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
@@ -2633,9 +2299,6 @@ pub async fn serve_with_options(
         }));
     }
 
-    // Background TreeKEM catch-up listener — explicit anti-entropy for
-    // order-sensitive membership events that arrive before local readiness or
-    // ahead of the local epoch/state frontier.
     {
         let catchup_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
@@ -2657,10 +2320,6 @@ pub async fn serve_with_options(
         }));
     }
 
-    // Background signed-public group bootstrap listener. A newly-added member
-    // may have no local group/card state yet, so the adding authority sends a
-    // complete public roster snapshot with its signed head commit. The handler
-    // validates that commit and the direct sender binding before persistence.
     {
         let bootstrap_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
@@ -2687,10 +2346,6 @@ pub async fn serve_with_options(
                     verified = msg.verified,
                     "direct classified signed-public group bootstrap"
                 );
-                // The legacy unprefixed wire form carries no durable
-                // receipt, so the admission outcome has nowhere to go.
-                // #1275: the admission installs and persists the group, so
-                // it runs shielded and is awaited in arrival order.
                 let apply_state = Arc::clone(&bootstrap_state);
                 let sender = msg.sender;
                 let machine_id = msg.machine_id;
@@ -2712,16 +2367,6 @@ pub async fn serve_with_options(
         }));
     }
 
-    // Background named-group metadata listener on the direct channel — applies
-    // authority-authored review commits (approve / reject) that are
-    // direct-delivered to a requester before they are grafted into the
-    // metadata topic's gossip mesh (see `spawn_named_group_event_delivery`).
-    // This mirrors the per-group metadata topic-subscription apply loop; the
-    // shared apply handler re-validates the signed commit, enforces the same
-    // authorization checks, and is idempotent, so applying via both the direct
-    // and gossip channels is safe. #1238: each group's events apply in a
-    // bounded lane of their own, in arrival order, so one slow apply (a
-    // Welcome fetch) does not hold the events of the other groups.
     // Install startup self-leave gates before this listener can schedule a
     // rekey. `startup_self_leave_rekey` clears the hold after the gates exist.
     routes::named_groups::self_leave_startup_hold_for_gate_install(&state);
@@ -2748,24 +2393,13 @@ pub async fn serve_with_options(
         }));
     }
 
-    // #1427: a TreeKEM member that was down past the last metadata resend
-    // asks for the commits it missed after its start, with no later
-    // traffic needed.
     bg_tasks.push(tokio::spawn(
         routes::named_groups::run_treekem_start_catchup(Arc::clone(&state)),
     ));
-    // #1427: a TreeKEM member that stays up through a network outage past
-    // the last metadata resend asks for the commits it missed when it
-    // connects again.
     bg_tasks.push(tokio::spawn(
         routes::named_groups::run_treekem_reconnect_catchup(Arc::clone(&state)),
     ));
 
-    // #1663: a member of an encrypted GSS group whose own seat carries no
-    // KEM key republishes the key at boot. The keyless-install hook covers
-    // the live discovery; this pass covers a node that restarted into the
-    // keyless state (the hold and the head disclaimer persist across a
-    // restart until the seat is keyed again).
     {
         let republish_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
@@ -2773,20 +2407,14 @@ pub async fn serve_with_options(
         }));
     }
 
-    // ADR 0110 S4: revocation eviction, designated first.
     bg_tasks.push(tokio::spawn(
         routes::named_groups::run_revocation_eviction_worker(Arc::clone(&state)),
     ));
 
-    // ADR 0109 S3: ownerless attestation and manual re-seat.
     bg_tasks.push(tokio::spawn(
         routes::named_groups::run_group_recovery_worker(Arc::clone(&state)),
     ));
 
-    // Background signed public-message listener for typed gossip-DM fallback
-    // delivery. Per-group pubsub is still the primary fan-out path; this route
-    // handles the same signed message when the sender additionally direct-
-    // delivers it to active members.
     {
         let public_dm_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
@@ -2826,25 +2454,11 @@ pub async fn serve_with_options(
         }));
     }
 
-    // ADR 0028: predecessor relay listener. When a requester offers their signed
-    // V2 JoinRequestCreated envelope to the authority via typed DM, the
-    // authority decodes the V2 envelope, independently verifies the requester's
-    // signature, extracts the NamedGroupMetadataEvent, applies it through the
-    // normal apply path, and stores the obligation for relay to active
-    // witnesses. The relay is a courier — it forwards the exact V2 bytes
-    // unchanged; the requester's ML-DSA-65 signature is preserved.
-    //
-    // When a witness receives the relayed envelope from the authority, it
-    // decodes and applies the JoinRequestCreated through the normal apply path
-    // but does NOT re-relay (only the authority relays, preventing storms).
     {
         let relay_state = Arc::clone(&state);
         let local_agent_hex = hex::encode(relay_state.agent.agent_id().as_bytes());
         bg_tasks.push(tokio::spawn(async move {
             while let Some(typed) = predecessor_relay_dm_rx.recv().await {
-                // #1275: the handler applies the event and persists the
-                // roster and the relay obligation, so it runs shielded and
-                // is awaited in arrival order.
                 let apply_state = Arc::clone(&relay_state);
                 let local_agent_hex = local_agent_hex.clone();
                 let handled = relay_state
@@ -2864,10 +2478,6 @@ pub async fn serve_with_options(
         }));
     }
 
-    // Background KvStore delta listener for typed gossip-DM fallback delivery.
-    // Store pub/sub remains the primary path; this side channel gives joined
-    // peers a reliable replay of the same CRDT delta when the topic mesh is
-    // late or congested. Peers that have not joined the store simply ignore it.
     {
         let kv_delta_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
@@ -2891,8 +2501,6 @@ pub async fn serve_with_options(
                     );
                     continue;
                 };
-                // #1275: the merge persists the store's snapshot, so it runs
-                // shielded and is awaited in arrival order.
                 let apply_state = Arc::clone(&kv_delta_state);
                 let sender = typed.sender;
                 let applied = kv_delta_state
@@ -2907,18 +2515,11 @@ pub async fn serve_with_options(
         }));
     }
 
-    // ADR 0028 B6: background relay retry timer. Instead of a fixed 30-second
-    // interval that collapses the 0/1/2/4/8/16-second retry schedule, this
-    // timer computes the sleep duration from the earliest next_retry_at_ms
-    // across all outbox obligations. When no obligations are due, it sleeps
-    // until the nearest deadline (capped at 30s for safety). This preserves
-    // the actual retry offsets (B6 sub-property 1).
     {
         let relay_step_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
             let mut shutdown_rx = relay_step_state.shutdown_notify.subscribe();
             loop {
-                // Compute the earliest deadline across all obligations.
                 let now_ms = now_millis_u64();
                 let next_deadline_ms = {
                     let outbox = relay_step_state.predecessor_relay_outbox.read().await;
@@ -2933,9 +2534,6 @@ pub async fn serve_with_options(
                     Some(deadline) if deadline > now_ms => {
                         std::time::Duration::from_millis((deadline - now_ms).min(30_000))
                     }
-                    // A deadline has already passed or no obligations — short
-                    // poll so newly-admitted obligations (next_retry_at_ms =
-                    // now) are picked up immediately.
                     _ => std::time::Duration::from_millis(500),
                 };
                 tokio::select! {
@@ -2948,16 +2546,10 @@ pub async fn serve_with_options(
         }));
     }
 
-    // #908: durable requester→authority predecessor-offer retry worker.
-    // A short poll picks up a newly-admitted obligation immediately (its
-    // first attempt is `next_retry_at_ms = now`), and each pass persists
-    // the exact retry/completion state before counting anything.
     {
         let offer_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
             let mut shutdown_rx = offer_state.shutdown_notify.subscribe();
-            // #1158: an offer held for an unknown capability is retried
-            // as soon as the authority's verified advert arrives.
             let mut adverts = offer_state
                 .agent
                 .capability_store()
@@ -2975,8 +2567,6 @@ pub async fn serve_with_options(
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                        // The store outlives this worker; if the signal
-                        // ever closes, the 500 ms poll still retries.
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             adverts = offer_state
                                 .agent
@@ -2990,13 +2580,6 @@ pub async fn serve_with_options(
         }));
     }
 
-    // #1109: durable direct-send worker. Each pass settles obligations the
-    // receipt ledger shows delivered, drops expired ones and sends the
-    // rest once under their logical id. S2: a late v2 ACK with no waiter
-    // (after a restart) can settle a held obligation without a send, and a
-    // recipient's durable-capable advert makes its held sends due at once.
-    // The wake-ups reach the worker through one channel; its own interval
-    // keeps the scheduled passes whatever the wake-up rate.
     {
         use routes::direct_outbox::{
             run_direct_send_worker, AgentDirectSendTransport, DirectSendNow, DirectSendWake,
@@ -3057,18 +2640,10 @@ pub async fn serve_with_options(
         }));
     }
 
-    // ADR 0030 §5: strict v2 signed-public bootstrap listener. Unlike the
-    // legacy unprefixed fan-out, this route resolves the authenticated DM
-    // completion only after the consent gate and a directory-durable install,
-    // and that completion is what releases the sender's v2 ACK.
     {
         let bootstrap_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
             while let Some(typed) = public_group_bootstrap_dm_rx.recv().await {
-                // #1275: the admission installs and persists the group
-                // before it completes the ACK, so it runs shielded and is
-                // awaited in arrival order. A refused payload is dropped
-                // with its completion: no ACK, so the sender re-offers.
                 let apply_state = Arc::clone(&bootstrap_state);
                 let admitted = bootstrap_state
                     .run_shielded(Box::pin(async move {
@@ -3082,12 +2657,6 @@ pub async fn serve_with_options(
         }));
     }
 
-    // ADR-0070 §2: share-grant deliveries. The handler verifies and stores
-    // the grant before completing, so the v2 ACK means "stored"; every
-    // refusal withholds it. An ADR 0079 names-carrying envelope (the
-    // `x0x-sharegrant-v2\0` prefix on the same channel) additionally puts
-    // the owner-signed names into the name store as ADR-0074 §1 defaults,
-    // gated on the owner being a Known or Trusted contact.
     {
         let grant_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
@@ -3097,9 +2666,6 @@ pub async fn serve_with_options(
         }));
     }
 
-    // #1003: grant-revocation pushes. The handler drops before any verify
-    // (decode/subject/stale/duplicate/rate limit), then ingests through
-    // the same v3 revocation path as gossip. Best-effort: no ACK is owed.
     {
         let push_agent = Arc::clone(&agent);
         bg_tasks.push(tokio::spawn(async move {
@@ -3112,16 +2678,10 @@ pub async fn serve_with_options(
         }));
     }
 
-    // #1094 D1/D2: data reads and writes. Replies complete their waiter in
-    // the consumer; request serves and reply sends run on detached tasks,
-    // so a slow write does not hold the next reply (#1953 review).
     bg_tasks.push(tokio::spawn(
         crate::server::data_read::run_data_read_consumer(Arc::clone(&state), data_read_dm_rx),
     ));
 
-    // ADR 0083 slice 3: remote GUI show. Trust runs in the handler, before
-    // the body is decoded. Displays and reply sends run on detached tasks,
-    // so one opener wait does not hold the next result or activity message.
     {
         let gui_show_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
@@ -3131,15 +2691,10 @@ pub async fn serve_with_options(
         }));
     }
 
-    // #926: grant redelivery worker. Each pass drops revoked/expired entries
-    // and sends at most a bounded batch of due ones on the #924 durable DM
-    // route; a newly queued or nudged entry wakes it early.
     if let Some(grant_outbox) = agent.share_grant_outbox() {
         let grant_agent = Arc::clone(&agent);
         let mut shutdown_rx = state.shutdown_notify.subscribe();
         bg_tasks.push(tokio::spawn(async move {
-            // #1158: a grant held for an unknown capability is retried as
-            // soon as the recipient's verified advert arrives.
             let mut adverts = grant_agent
                 .capability_store()
                 .subscribe_obligation_adverts();
@@ -3153,8 +2708,6 @@ pub async fn serve_with_options(
                             grant_agent.nudge_share_grant_outbox_for_agent(&recipient);
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                        // The store outlives this worker; if the signal
-                        // ever closes, the 5 s poll still retries.
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             adverts = grant_agent
                                 .capability_store()
@@ -3166,7 +2719,6 @@ pub async fn serve_with_options(
                 let _ = grant_agent.share_grant_outbox_step().await;
             }
         }));
-        // Retry promptly when a recipient's machine connects again.
         if let Some(network) = agent.network() {
             let mut events = network.subscribe();
             let nudge_agent = Arc::clone(&agent);
@@ -3189,10 +2741,6 @@ pub async fn serve_with_options(
         }
     }
 
-    // ADR 0030 §5: durable bootstrap retry worker. The outbox was loaded and
-    // reconciled before listener startup; each step sends at most one due
-    // obligation and persists its backoff, so a disconnected peer cannot
-    // create a hot loop and a restart resumes the exact canonical payload.
     {
         let bootstrap_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
@@ -3220,7 +2768,6 @@ pub async fn serve_with_options(
         }));
     }
 
-    // Build router
     let app = Router::new()
         .route("/health", get(health))
         .route("/status", get(status))
@@ -3257,7 +2804,6 @@ pub async fn serve_with_options(
         .route("/agent/sign", post(agent_sign))
         .route("/agent/verify", post(agent_verify))
         .route("/identity/revoke", post(identity_revoke))
-        // ADR-0043 agent key-move ceremony + placement ledger.
         .route("/agent/move", post(routes::agent_move_authorize))
         .route("/agent/move/export", post(routes::agent_move_export))
         .route("/agent/move/import", post(routes::agent_move_import))
@@ -3311,12 +2857,9 @@ pub async fn serve_with_options(
         .route("/task-lists/:id/tasks", get(list_tasks))
         .route("/task-lists/:id/tasks", post(add_task))
         .route("/task-lists/:id/tasks/:tid", patch(update_task))
-        // Named group endpoints
         .route("/groups", post(create_named_group))
         .route("/groups", get(list_named_groups))
-        // Static-prefix routes BEFORE /groups/:id so axum matches them first.
         .route("/groups/discover", get(discover_groups))
-        // Phase C.2: shard discovery + nearby + subscription management.
         .route("/groups/discover/nearby", get(discover_groups_nearby))
         .route(
             "/groups/discover/subscriptions",
@@ -3376,7 +2919,6 @@ pub async fn serve_with_options(
             "/groups/:id/requests/:request_id",
             delete(cancel_join_request),
         )
-        // Phase D.2 — cross-daemon secure encrypt/decrypt.
         .route("/groups/:id/secure/encrypt", post(secure_group_encrypt))
         .route("/groups/:id/secure/decrypt", post(secure_group_decrypt))
         .route("/groups/:id/secure/reseal", post(secure_group_reseal))
@@ -3384,10 +2926,8 @@ pub async fn serve_with_options(
             "/groups/secure/open-envelope",
             post(secure_open_envelope_adversarial),
         )
-        // Phase E: public-group messaging.
         .route("/groups/:id/send", post(send_group_public_message))
         .route("/groups/:id/messages", get(get_group_public_messages))
-        // ADR-0040 — agent-to-agent delegation.
         .route(
             "/groups/:id/delegate",
             post(delegations::delegate_group_authority),
@@ -3398,13 +2938,11 @@ pub async fn serve_with_options(
         )
         .route("/groups/:id/invite", post(create_group_invite))
         .route("/groups/:id/display-name", put(set_group_display_name))
-        // Phase D.3 — state-commit chain endpoints.
         .route("/groups/:id/state", get(get_group_state))
         .route("/groups/:id/state/commits", get(get_group_state_commits))
         .route("/groups/:id/state/seal", post(seal_group_state))
         .route("/groups/:id/state/withdraw", post(withdraw_group_state))
         .route("/groups/:id", delete(leave_group))
-        // Group-scoped encrypted KvStore (#341 Phase B)
         .route("/groups/:id/stores", post(create_group_kv_store))
         .route(
             "/groups/:id/stores/:app/legacy-imports",
@@ -3415,7 +2953,6 @@ pub async fn serve_with_options(
             get(routes::stores::download_legacy_page_import)
                 .post(routes::stores::import_legacy_page_store),
         )
-        // KvStore endpoints
         .route("/stores", get(list_kv_stores))
         .route("/stores", post(create_kv_store))
         .route("/stores/:id/join", post(join_kv_store))
@@ -3423,7 +2960,6 @@ pub async fn serve_with_options(
         .route("/stores/:id/:key", get(get_kv_value))
         .route("/stores/:id/:key", put(put_kv_value))
         .route("/stores/:id/:key", delete(delete_kv_value))
-        // Direct messaging endpoints
         .route("/agents/connect", post(connect_agent))
         .route("/direct/send", post(direct_send))
         .route("/direct/connections", get(direct_connections))
@@ -3432,7 +2968,6 @@ pub async fn serve_with_options(
             get(direct_receipt).delete(direct_cancel),
         )
         .route("/direct/events", get(direct_events_sse))
-        // MLS group encryption endpoints
         .route("/mls/groups", post(create_mls_group))
         .route("/mls/groups", get(list_mls_groups))
         .route("/mls/groups/:id", get(get_mls_group))
@@ -3443,39 +2978,28 @@ pub async fn serve_with_options(
         )
         .route("/mls/groups/:id/encrypt", post(mls_encrypt))
         .route("/mls/groups/:id/decrypt", post(mls_decrypt))
-        // Agent discovery & connectivity
         .route("/agents/find/:agent_id", post(find_agent))
         .route("/agents/reachability/:agent_id", get(agent_reachability))
-        // Contact trust extensions
         .route("/contacts/:agent_id/revoke", post(revoke_contact))
         .route("/contacts/:agent_id/revocations", get(list_revocations))
         .route(
             "/contacts/:agent_id/machines/:machine_id/pin",
             post(pin_machine).delete(unpin_machine),
         )
-        // Trust evaluation
         .route("/trust/evaluate", post(evaluate_trust))
-        // MLS welcome
         .route("/mls/groups/:id/welcome", post(create_mls_welcome))
-        // Upgrade
         .route("/upgrade", get(check_upgrade))
         .route("/upgrade/apply", post(apply_upgrade))
         .route("/upgrade/clear-hold", post(routes::clear_upgrade_hold))
-        // Network diagnostics
         .route("/network/bootstrap-cache", get(bootstrap_cache_stats))
         .route("/diagnostics/connectivity", get(connectivity_diagnostics))
         .route("/diagnostics/history", get(history_diagnostics))
-        // ADR-0023 durable-history read surface
         .route("/history", get(history_list).delete(history_purge))
         .route("/history/message/:msg_id", get(history_message))
         .route("/history/scopes", get(history_scopes))
         .route("/history/search", get(history_search))
         .route("/history/stats", get(history_stats))
-        // ADR 0116 §3: owner-only policy read (durable token, see auth.rs).
         .route("/history/policy", get(history_policy))
-        // ADR 0116 §4: the bounded runtime trim (durable token, see auth.rs).
-        // Its 1 KiB body limit sits inside the router-wide 1 MiB one and
-        // overrides it for this route (larger bodies are 413).
         .route(
             "/history/retain",
             post(history_retain).layer(axum::extract::DefaultBodyLimit::max(
@@ -3493,7 +3017,6 @@ pub async fn serve_with_options(
         .route("/diagnostics/exec", get(exec_diagnostics))
         .route("/diagnostics/connect", get(connect_diagnostics_handler))
         .route("/diagnostics/ws", get(ws_diagnostics))
-        // D148: read-only list of ADR 0108 §5a quarantined sidecar copies.
         .route(
             "/diagnostics/sidecar-quarantine",
             get(sidecar_quarantine_diagnostics),
@@ -3501,7 +3024,6 @@ pub async fn serve_with_options(
         .route("/exec/run", post(exec_run))
         .route("/exec/cancel", post(exec_cancel))
         .route("/exec/sessions", get(exec_sessions))
-        // ADR-0073 slice 1: call lifecycle (no media yet)
         .route(
             "/calls",
             post(routes::calls::call_create).get(routes::calls::call_list),
@@ -3510,17 +3032,14 @@ pub async fn serve_with_options(
         .route("/calls/:id/accept", post(routes::calls::call_accept))
         .route("/calls/:id/reject", post(routes::calls::call_reject))
         .route("/calls/:id/hangup", post(routes::calls::call_hangup))
-        // Tailnet forwarding (#132 T6)
         .route("/forwards", post(forward_add).get(forward_list))
         .route("/forwards/:local_addr", delete(forward_remove))
         .route("/streams", get(streams_diagnostics))
-        // ADR-0070 §3: connect/exec ACL management + hot reload
         .route("/acl/connect", get(acl_connect_list).post(acl_connect_add))
         .route("/acl/connect/:id", delete(acl_connect_remove))
         .route("/acl/exec", get(acl_exec_list).post(acl_exec_add))
         .route("/acl/exec/:id", delete(acl_exec_remove))
         .route("/acl/reload", post(acl_reload))
-        // ADR-0070 §2: share grants (issue/list/revoke; received list)
         .route(
             "/grants",
             get(routes::grants_list).post(routes::grants_issue),
@@ -3528,7 +3047,6 @@ pub async fn serve_with_options(
         .route("/grants/received", get(routes::grants_received))
         .route("/grants/:id", delete(routes::grants_revoke))
         .route("/grants/:id/renew", post(routes::grants_renew))
-        // #1094 D1: read a store through a received ShareCap::Data grant.
         .route(
             "/grants/data/:agent/:group/:store",
             get(data_read::get_granted_store_keys),
@@ -3537,7 +3055,6 @@ pub async fn serve_with_options(
             "/grants/data/:agent/:group/:store/:key",
             get(data_read::get_granted_store_value),
         )
-        // #1094 D2: write a store through a received `rw` ShareCap::Data grant.
         .route(
             "/grants/data/:agent/:group/:store/:key",
             put(data_read::put_granted_store_value),
@@ -3546,7 +3063,6 @@ pub async fn serve_with_options(
             "/grants/data/:agent/:group/:store/:key",
             delete(data_read::delete_granted_store_value),
         )
-        // ADR-0074 §1: names (owner petnames, TOFU pins, resolution)
         .route("/names", get(routes::names_list))
         .route("/names/resolve", post(routes::names_resolve))
         .route("/names/owners", post(routes::names_owner_bind))
@@ -3555,34 +3071,26 @@ pub async fn serve_with_options(
         .route("/names/pins/:name", delete(routes::names_unpin))
         .route("/names/accept", post(routes::names_accept))
         .route("/names/suggestions/:label", delete(routes::names_dismiss))
-        // Peer observability (ant-quic 0.27.1/0.27.2 surface)
         .route("/peers/:peer_id/probe", post(probe_peer_handler))
         .route("/peers/:peer_id/health", get(peer_health_handler))
         .route("/peers/events", get(peer_events_handler))
-        // WebSocket endpoints
         .route("/ws", get(ws_handler))
         .route("/ws/direct", get(ws_direct_handler))
         .route("/ws/sessions", get(ws_sessions))
         .route("/shutdown", post(shutdown_handler))
-        // File transfer endpoints
         .route("/files/send", post(file_send_handler))
         .route("/files/transfers", get(file_transfers_handler))
         .route("/files/transfers/:id", get(file_transfer_status_handler))
         .route("/files/accept/:id", post(file_accept_handler))
         .route("/files/reject/:id", post(file_reject_handler))
-        // Constitution
         .route("/constitution", get(get_constitution))
         .route("/constitution/json", get(get_constitution_json))
-        // Embedded GUI
         .route("/gui", get(serve_gui))
         .route("/gui/", get(serve_gui))
-        // ADR 0083 slice 1: local show (no remote target).
         .route("/gui/show", post(routes::gui_show))
-        // Session-token exchange (#127 / WS1.6): durable bearer → short-lived
-        // browser session token, the only kind valid in ?token= query strings.
         .route("/auth/session", post(auth::create_session))
         .route("/auth/session/refresh", post(auth::refresh_session))
-        .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)) // 1 MB
+        .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
         .layer({
             // Restrict CORS to exact loopback origins only.
             // The daemon API is a local control plane — external origins must not access it.
@@ -3594,16 +3102,11 @@ pub async fn serve_with_options(
                 .allow_methods(AllowMethods::any())
                 .allow_headers(AllowHeaders::any())
         })
-        // Bearer-token authentication: all control-plane endpoints.
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             auth::auth_middleware,
         ))
         .with_state(Arc::clone(&state));
-
-    // The `api.port` advertisement is written only after causal-state loading
-    // succeeds. Startup failures before that point explicitly tear down the
-    // agent and exec service and leave no advertised API endpoint.
 
     // Lifecycle: a CancellationToken drives library-initiated shutdown
     // (ServerHandle::shutdown / Drop). The mpsc `/shutdown` HTTP path still
@@ -3645,14 +3148,6 @@ pub async fn serve_with_options(
             .await
         });
 
-        // Fix B (Issue #110 Phase 2): include the axum server `JoinHandle` in the
-        // select so that if the HTTP task ends on its own (panic / bind loss /
-        // Err) the supervisor wakes immediately instead of waiting for an external
-        // shutdown signal. The result is still drained and propagated below.
-        // When the select observes the axum task ending on its own, capture its
-        // result here so it can be propagated out of the supervisor — an Err or a
-        // panic (JoinError) must surface from `wait()`/`shutdown_and_wait()`. A
-        // clean self-requested graceful stop stays `Ok(())`.
         let mut server_result: Option<anyhow::Result<()>> = None;
         tokio::select! {
             _ = supervisor_cancel.cancelled() => {
@@ -3679,15 +3174,8 @@ pub async fn serve_with_options(
             }
         }
 
-        // Tell every `shutdown_notify`-watching loop (and the axum graceful
-        // shutdown future) to stop.
         let _ = state.shutdown_notify.send(true);
 
-        // Drain the axum server result and propagate any failure. If the select
-        // already observed it ending, `server` was consumed there and its result
-        // captured above; otherwise await it (with a bound) and propagate. The
-        // drain flag records whether every HTTP producer finished on its own;
-        // it feeds only the flush receipt below, never the exit code.
         let (server_result, _http_drained) = match server_result {
             Some(res) => (res, true),
             None => drain_http_server(server).await,
@@ -3704,8 +3192,6 @@ pub async fn serve_with_options(
         //    still alive, so in-flight sessions can cancel cleanly before the
         //    network goes away.
         state.exec_service.shutdown().await;
-        // 0b. Forwarder listeners + inbound consumer (issue #132): stop
-        //     accepting/bridging while the Agent transport is still alive.
         if let Some(forwarder) = &state.forward_service {
             // Drain add/remove/restore before cancelling listeners. A
             // transaction still inside bind publishes its accept loop
@@ -3715,8 +3201,6 @@ pub async fn serve_with_options(
             forwarder.shutdown_and_release().await;
         }
         if let Some(socks) = &state.socks_service {
-            // Join the accept loop so the listen port is free before the
-            // process continues. Handshake sessions observe the same token.
             socks.shutdown_and_wait().await;
         }
         // 1. `Agent::begin_shutdown()` (issue #116 Codex finding 1): cancel the
@@ -3762,8 +3246,6 @@ pub async fn serve_with_options(
             .history()
             .is_some_and(|history| history.writer_shutdown_incomplete());
 
-        // Clean up port file on shutdown (kept after task teardown so the
-        // existing ordering — port advertisement removed last — is preserved).
         let _ = crate::w3h_inline::fs::remove_file(&port_file).await;
 
         // #661 r2: drop the captured AppState NOW, as the last statement,
@@ -3809,9 +3291,6 @@ pub async fn serve_with_options(
         let result = combine_server_shutdown_results(server_result, agent_shutdown_result);
         #[cfg(any(unix, windows))]
         if let Some(owner) = &upgrade_flush {
-            // An HTTP producer aborted at the drain bound is as unfinished as
-            // an aborted background task (ADR 0094 §4): the receipt refuses,
-            // while the ordinary-shutdown exit above stays 0 (#261/#363).
             owner
                 .finish(
                     &result,
@@ -3835,16 +3314,10 @@ pub async fn serve_with_options(
     })
 }
 
-/// #1269 r2: how long the shutdown tail waits for admitted group-state
-/// applies (see [`drain_server_tasks`]) before it leaves them to finish.
 const SHIELDED_APPLY_DRAIN_BOUND: Duration = Duration::from_secs(10);
 
-/// The single grace window the shutdown tail gives every abortable server
-/// task (see [`drain_server_tasks`]) before it aborts the stragglers.
 const SERVER_TASK_GRACE: Duration = Duration::from_secs(2);
 
-/// #1274: how long the shutdown tail waits for aborted join-artifact egress
-/// tasks to end (an abort takes effect at the task's next await point).
 const JOIN_ARTIFACT_EGRESS_ABORT_BOUND: Duration = Duration::from_secs(5);
 
 /// Step 2 of the serve supervisor's shutdown: grace-await, then abort, every
@@ -3857,8 +3330,6 @@ async fn drain_server_tasks(
     mut bg_tasks: Vec<tokio::task::JoinHandle<()>>,
 ) -> bool {
     let mut complete = true;
-    // #1269 r2: end the network waits of applies in progress first (they
-    // fail as on a lost peer), so the shielded wait below stays short.
     state.shutdown_started.cancel();
     // Browser launches sit on the blocking pool, which abort does not stop.
     // Tell them to return before the join below. The launch task does not
@@ -4067,7 +3538,6 @@ fn same_directory(a: &std::path::Path, b: &std::path::Path) -> bool {
 pub async fn list_instances() -> Result<()> {
     let data_base = dirs::data_dir().context("cannot determine data directory")?;
 
-    // Collect candidate directories: x0x and x0x-*
     let mut instances: Vec<(String, PathBuf)> = Vec::new();
 
     let default_port_file = data_base.join("x0x").join("api.port");
@@ -4268,10 +3738,6 @@ async fn start_dm_inbox_when_gossip_ready(
                 x0x::share_grant::SHARE_GRANT_DM_PREFIX,
                 share_grant_route_tx.clone(),
             )
-            // ADR 0079 §1: the names-carrying v2 envelope shares the v1
-            // route channel (one consumer, two prefixes); the handler
-            // branches on the prefix. Durable for the same reason as v1:
-            // the v2 ACK must mean "grant stored and names durable".
             .with_durable_typed_payload_route(
                 x0x::share_grant::names::SHARE_GRANT_V2_DM_PREFIX,
                 share_grant_route_tx.clone(),
@@ -4301,7 +3767,6 @@ async fn start_dm_inbox_when_gossip_ready(
                 x0x::revocation_push::GRANT_REVOCATION_PUSH_PREFIX,
                 revocation_push_route_tx.clone(),
             )
-            // #1094 D1: plain routes, no ACK owed (one attempt each way).
             .with_typed_payload_route(
                 x0x::share_grant::data_read::DATA_READ_REQUEST_DM_PREFIX,
                 data_read_route_tx.clone(),
@@ -4310,7 +3775,6 @@ async fn start_dm_inbox_when_gossip_ready(
                 x0x::share_grant::data_read::DATA_READ_REPLY_DM_PREFIX,
                 data_read_route_tx.clone(),
             )
-            // #1094 D2: a grantee's write; the reply uses the read reply route.
             .with_typed_payload_route(
                 x0x::share_grant::data_read::DATA_WRITE_REQUEST_DM_PREFIX,
                 data_read_route_tx.clone(),
@@ -4347,7 +3811,6 @@ async fn start_dm_inbox_when_gossip_ready(
     }
 }
 
-/// Parse a 64-character hex string into an AgentId.
 fn parse_agent_id_hex(hex_str: &str) -> Result<AgentId, String> {
     let bytes = hex::decode(hex_str).map_err(|e| format!("invalid hex: {e}"))?;
     if bytes.len() != 32 {
@@ -4361,7 +3824,6 @@ fn parse_agent_id_hex(hex_str: &str) -> Result<AgentId, String> {
     Ok(AgentId(arr))
 }
 
-/// Parse a 64-character hex string into a MachineId.
 fn parse_machine_id_hex(hex_str: &str) -> Result<MachineId, String> {
     let bytes = hex::decode(hex_str).map_err(|e| format!("invalid hex: {e}"))?;
     if bytes.len() != 32 {
@@ -4375,37 +3837,9 @@ fn parse_machine_id_hex(hex_str: &str) -> Result<MachineId, String> {
     Ok(MachineId(arr))
 }
 
-/// ADR-0066/ADR-0067: resolve one named-group record under **both
-/// spellings**, over a borrowed roster map.
-///
-/// The roster map is keyed by whichever alias this daemon learned the group
-/// under, while callers routinely arrive with the STABLE id (a delegation
-/// envelope signs `info.stable_group_id()`; an epoch token is captured
-/// against it). A bare `groups.get(id)` therefore misses the record whenever
-/// key ≠ stable id — and for a quarantine gate that does not degrade
-/// gracefully, it serves the contested roster. Direct key hit first, then a
-/// scan by `stable_group_id()`, exactly as the metadata apply path
-/// (`resolved_group_key`, `named_groups.rs:9124`) does.
-///
-/// **Synchronous and map-level on purpose.** ADR-0067's re-check runs INSIDE
-/// the `state.named_groups` write critical section that performs the
-/// mutation, so it cannot await a lock it is already holding. The async,
-/// `&AppState`-taking `delegations::fork_quarantine_marker` is now a thin
-/// wrapper over this, so the two cannot drift.
-///
-/// **The single resolver (#732).** Slices 3, 4, 6 and 7 each grew their own
-/// copy of this two-line rule and cross-model review found the same
-/// single-spelling defect three times independently, so the copies are now
-/// gone: `delegations::fork_quarantine_marker`, `history`'s scope markers and
-/// purge gate, `ws`'s frame annotation, the public-group bootstrap install
-/// check, `stores`' TreeKEM protector and the manual clear route all resolve
-/// here. A quarantine-relevant lookup that spells this rule out again is a
-/// defect the `adr0066_lookup_guard` fixture is there to catch.
 /// #732 both-spellings resolution for a MUTABLE roster entry (the mut
 /// sibling of [`resolve_group_entry_locked`]): the exact map key first,
-/// else the entry whose STABLE id matches. Quarantine-clear closures use
-/// this so a clear requested under either spelling reaches the record the
-/// map actually holds (N19-B).
+/// else the entry whose STABLE id matches.
 pub(in crate::server) fn resolve_group_entry_mut_locked<'a>(
     groups: &'a mut HashMap<String, x0x::groups::GroupInfo>,
     group_id: &str,
@@ -4421,6 +3855,8 @@ pub(in crate::server) fn resolve_group_entry_mut_locked<'a>(
     groups.get_mut(&key)
 }
 
+/// ADR-0066/ADR-0067: resolve under both spellings — exact map key first,
+/// then stable-id scan, so callers with a stable id never miss the record.
 pub(in crate::server) fn resolve_group_entry_locked<'a>(
     groups: &'a HashMap<String, x0x::groups::GroupInfo>,
     group_id: &str,
@@ -4469,8 +3905,6 @@ pub(in crate::server) fn lifecycle_epoch_token_locked(
     x0x::groups::LifecycleEpochToken::spanning_aliases(tokens.into_values())
 }
 
-/// Build a uniform `{ "ok": false, "error": <msg> }` JSON error response paired
-/// with the given status code. Used by handlers in place of hand-rolled literals.
 fn api_error(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
     (
         status,
@@ -4478,10 +3912,6 @@ fn api_error(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<se
     )
 }
 
-/// Like [`api_error`], but adds a machine-readable `reason` field to the
-/// response body. Use when two responses share an HTTP status yet must stay
-/// machine-separable (e.g. two distinct 409 CONFLICT conditions). Existing
-/// `api_error` callers keep their `{ "ok": false, "error": <msg> }` body.
 fn api_error_with_reason(
     status: StatusCode,
     msg: impl Into<String>,
@@ -4493,22 +3923,18 @@ fn api_error_with_reason(
     )
 }
 
-/// `400 Bad Request` error response.
 fn bad_request(msg: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
     api_error(StatusCode::BAD_REQUEST, msg)
 }
 
-/// `404 Not Found` error response.
 fn not_found(msg: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
     api_error(StatusCode::NOT_FOUND, msg)
 }
 
-/// `403 Forbidden` error response.
 fn forbidden(msg: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
     api_error(StatusCode::FORBIDDEN, msg)
 }
 
-/// Decode a base64-encoded payload from a request field.
 fn decode_base64_payload(encoded: &str) -> Result<Vec<u8>, (StatusCode, Json<serde_json::Value>)> {
     BASE64
         .decode(encoded)
@@ -4518,11 +3944,6 @@ fn decode_base64_payload(encoded: &str) -> Result<Vec<u8>, (StatusCode, Json<ser
 /// Handle a single predecessor-relay typed-DM payload: decode/authenticate
 /// the signed V2 envelope, enforce carrier/direction, classify admission,
 /// persist the journal/roster/obligation, and clear the marker on success.
-///
-/// Extracted verbatim from the typed-DM receiver loop so that in-process
-/// tests can drive the real production admission path (ADR 0028). The loop
-/// calls this once per received payload; `return` here is equivalent to the
-/// original `continue` (proceed to the next message).
 pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
     relay_state: &Arc<AppState>,
     local_agent_hex: &str,
@@ -4538,8 +3959,6 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
     // unavailable on purpose (indurable journal transitions) — the
     // sender's retry schedule re-offers.
     let completion = typed.completion.take();
-    // #1840: the requester-side outcome of a refused offer arrives on the
-    // same channel under its own prefix.
     let outcome = if typed
         .payload
         .starts_with(x0x::groups::join_outcome::JOIN_REQUEST_OUTCOME_DM_PREFIX)
@@ -4574,7 +3993,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
     else {
         return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
     };
-    // Size check: reject oversized envelopes (ADR 0028 bound).
     if envelope_bytes.len() > CAUSAL_ENVELOPE_MAX_BYTES {
         tracing::warn!(
             sender = %hex::encode(typed.sender.as_bytes()),
@@ -4583,8 +4001,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
         );
         return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
     }
-    // Decode the V2 envelope to verify the requester's signature
-    // and extract the NamedGroupMetadataEvent payload.
     let Ok(msg) = x0x::gossip::pubsub::decode_auto(Bytes::copy_from_slice(envelope_bytes)) else {
         tracing::warn!(
             sender = %hex::encode(typed.sender.as_bytes()),
@@ -4610,8 +4026,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
         return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
     };
 
-    // ADR 0028: reject non-JoinRequestCreated before apply
-    // (Kimi blocker 3 — carrier authorization).
     if !matches!(event, NamedGroupMetadataEvent::JoinRequestCreated { .. }) {
         tracing::warn!(
             sender = %hex::encode(typed.sender.as_bytes()),
@@ -4649,8 +4063,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
         return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
     }
 
-    // Load group info once to determine: local authority status,
-    // metadata topic, group exists/active, carrier role.
     let (is_local_authority, metadata_topic, carrier_is_admin, group_exists_active) = {
         let groups = relay_state.named_groups.read().await;
         groups
@@ -4695,7 +4107,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
         return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
     }
 
-    // ADR 0028: direction enforcement (Kimi blocker 3).
     let is_requester_offer = dm_sender_hex == v2_sender_hex;
     let is_authority_relay = !is_requester_offer && carrier_is_admin;
 
@@ -4711,8 +4122,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
         return Err("requester offer to non-authority; retry".to_string());
     }
     if is_authority_relay && is_local_authority {
-        // Authority relaying to itself — reject (authority already
-        // has the event from its own publish).
         tracing::warn!(
             carrier = %dm_sender_hex,
             "ADR 0028: authority→authority relay, rejecting"
@@ -4720,7 +4129,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
         return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
     }
     if !is_requester_offer && !is_authority_relay {
-        // Carrier is neither the requester nor an active admin — reject.
         tracing::warn!(
             carrier = %dm_sender_hex,
             "ADR 0028: predecessor relay carrier is neither requester nor active admin, rejecting"
@@ -4753,7 +4161,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
         let _membership_guard = membership_lock.lock().await;
 
         let mut replay_group_id: Option<String> = None;
-        // Watson item 5: pre-state classification.
         enum AdmissionState {
             Complete,
             New,
@@ -4762,8 +4169,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
             Inconsistent,
         }
 
-        // Only the authority (group creator) stores the relay
-        // obligation. A non-authority witness just applies.
         if !is_local_authority || !is_requester_offer {
             let apply_result = Box::pin(apply_named_group_metadata_event_inner_serialized(
                 relay_state,
@@ -4782,9 +4187,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
             ))
             .await;
             replay_after = replay_group_id;
-            // #942 r3 (B3): the witness tail ACKs only when its apply was
-            // accepted (durable); an unaccepted apply keeps the Err default
-            // so the peer re-offers later.
             if apply_result.accepted {
                 ack = Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Inserted);
             } else {
@@ -4820,9 +4222,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
             break 'admission false;
         }
 
-        // Watson item 5: classify durable state BEFORE any mutation.
-        // Extract request identity and check durable request+obligation
-        // existence without calling _inner_serialized.
         let (request_id, requester_agent_id) = match &event {
             NamedGroupMetadataEvent::JoinRequestCreated {
                 request_id,
@@ -4903,7 +4302,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
             }
         }
 
-        // Check durable request existence (non-mutating read).
         let request_info = {
             let groups = relay_state.named_groups.read().await;
             groups.get(&group_id_str).and_then(|info| {
@@ -4918,7 +4316,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
             })
         };
 
-        // Check durable obligation existence (non-mutating read).
         let obligation_first_seen_ms = {
             let outbox = relay_state.predecessor_relay_outbox.read().await;
             outbox.get(&group_id_str).and_then(|list| {
@@ -4946,7 +4343,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
         let predecessor_receipt_exists =
             obligation_first_seen_ms.is_some() || completion_receipt_first_seen_ms.is_some();
 
-        // Classify the state.
         let admission_state =
             if let Some((req_agent, stored_digest, stored_first_seen_ms, is_pending)) =
                 &request_info
@@ -4998,8 +4394,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
                     AdmissionState::Inconsistent
                 }
             } else if predecessor_receipt_exists {
-                // An obligation without its exact durable request is
-                // an inconsistent split, never an idempotent success.
                 AdmissionState::Inconsistent
             } else {
                 AdmissionState::New
@@ -5048,8 +4442,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
                         break 'admission true;
                     }
                 }
-                // Exact durable pair: idempotent success — durable by a
-                // PREVIOUS accepted delivery, so this is a replay ACK.
                 ack = Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Inserted);
                 replay_after = None;
                 break 'admission false;
@@ -5060,8 +4452,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
                     request_id = %request_id,
                     "ADR 0028: inconsistent durable state — request does not match this envelope binding"
                 );
-                // #942 r3 (B3): terminal — the durable request binding
-                // contradicts this envelope; re-offering can never fix it.
                 ack = Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
                 replay_after = None;
                 break 'admission false;
@@ -5101,8 +4491,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
                 true
             }
             AdmissionState::Repair(stored_first_seen_ms) => {
-                // Watson item 5: for repair, also write the marker
-                // DURABLE before creating the obligation.
                 admission_first_seen_ms = stored_first_seen_ms;
                 let admission = PendingListenerAdmission {
                     group_id: group_id_str.clone(),
@@ -5151,12 +4539,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
                 false
             }
             AdmissionState::PubsubFirst => {
-                // Compatibility path: the durable request has the
-                // byte-identical predecessor digest from an
-                // intermediate-build roster but no first-seen
-                // clock. The live apply path always writes both
-                // together, so this is migration-only. Backfill
-                // only the clock, then create the obligation.
                 admission_first_seen_ms = existing_admission
                     .as_ref()
                     .map_or(now_ms, |marker| marker.first_seen_ms);
@@ -5223,7 +4605,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
             }
         };
 
-        // Now apply the request (only for New; Repair skips apply).
         let group_snapshot = if is_new_request {
             let mut apply_result = Box::pin(apply_named_group_metadata_event_inner_serialized(
                 relay_state,
@@ -5265,9 +4646,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
                         outcome = "refused",
                         "ADR 0028: request refused by validation without mutation; admission journal released"
                     );
-                    // Issue #1840: a requester that sealed over a partial
-                    // or used head waits for its turn, in arrival order.
-                    // The queue needs no journal lock.
                     drop(_journal_guard);
                     // #1840 ask 4: tell the requester, once the release
                     // is durable. Had the marker stayed, the requester's
@@ -5316,17 +4694,10 @@ async fn handle_predecessor_relay_typed_payload_inner(
             }
             apply_result.pre_mutation_group.take()
         } else {
-            // Repair: request already applied, just create obligation.
             replay_after = None;
             None
         };
-        // The snapshot returned by apply (Finding B) is the state BEFORE
-        // the JoinRequestCreated was durably applied, so rollback
-        // actually undoes the request. The previous code read the
-        // post-apply state from named_groups, which already
-        // contained the applied request.
 
-        // Collect active witness targets (non-local active members).
         let relay_targets = {
             let groups = relay_state.named_groups.read().await;
             groups
@@ -5376,13 +4747,10 @@ async fn handle_predecessor_relay_typed_payload_inner(
             let combined_count = daemon_count + completed_count;
             let combined_bytes = daemon_bytes + completed_bytes;
             let group_outbox = outbox.entry(group_id_str.clone()).or_default();
-            // Dedup by digest: an already-admitted obligation is an
-            // idempotent replay of a durable record.
             if group_outbox.iter().any(|o| o.digest == obligation.digest) {
                 ack = Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Inserted);
                 break 'admission false;
             }
-            // Per-group combined count cap (live + completed).
             let group_completed_count = {
                 let tombstones = relay_state.completed_relay_tombstones.read().await;
                 tombstones.get(&group_id_str).map(|l| l.len()).unwrap_or(0)
@@ -5394,7 +4762,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
                 );
                 admission_failed = true;
             }
-            // Per-group combined byte cap (live + completed).
             if !admission_failed {
                 let group_live_bytes: usize = group_outbox.iter().map(|o| o.byte_size).sum();
                 let group_completed_bytes: usize = {
@@ -5414,21 +4781,18 @@ async fn handle_predecessor_relay_typed_payload_inner(
                     admission_failed = true;
                 }
             }
-            // Combined daemon-wide count cap (live + completed).
             if !admission_failed && combined_count >= CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP {
                 tracing::warn!(
                     "ADR 0028: combined relay state at daemon count capacity, rejecting"
                 );
                 admission_failed = true;
             }
-            // Combined daemon-wide byte cap (live + completed).
             if !admission_failed
                 && combined_bytes + byte_size > CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP
             {
                 tracing::warn!("ADR 0028: combined relay state at daemon byte capacity, rejecting");
                 admission_failed = true;
             }
-            // 4096 total relay-target cap.
             if !admission_failed
                 && total_targets + obligation.relay_targets.len()
                     > CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP
@@ -5527,8 +4891,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
             }
             break 'admission true;
         }
-        // Persist the relay outbox. Persistence lock is already
-        // held (P→Q). Roll back on failure.
         match save_predecessor_relay_outbox_unlocked(relay_state).await {
             Ok(AtomicWriteOutcome::Durable) => {}
             Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
@@ -5541,7 +4903,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
                     group_id = %group_id_str,
                     "ADR 0028: relay outbox replaced but not directory-durable after admission — keeping journal, not proceeding"
                 );
-                // Keep the marker — do NOT clear pending_listener_admission.
                 break 'admission true;
             }
             _ => {
@@ -5572,8 +4933,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
                             group_id = %group_id_str,
                             "ADR 0028: rolling back JoinRequestCreated after outbox save failure"
                         );
-                        // Finding 1 (Sam 4ea68a9): same persistence-lock-
-                        // held rollback as the admission-failure path.
                         let _roster_persistence_guard =
                             relay_state.named_groups_persistence_lock.lock().await;
                         store_named_group_info(relay_state, &group_id_str, snapshot).await;
@@ -5614,8 +4973,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
                         *relay_state.pending_listener_admission.lock().await = marker;
                     }
                 }
-                // #942 B2/M5: rolled back and staying unavailable — the
-                // sender must retry, so withhold the ACK.
                 ack = Err("predecessor admission rolled back (not durable); retry".to_string());
                 break 'admission true;
             }
@@ -5639,9 +4996,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
                     group_id = %group_id_str,
                     "ADR 0028: listener admission journal clear not durable — re-persisting marker, not proceeding"
                 );
-                // Re-persist the marker durably. If this also
-                // fails, keep the in-memory marker and stay
-                // unavailable — restart recovery will handle it.
                 let marker = PendingListenerAdmission {
                     group_id: group_id_str.clone(),
                     request_id: request_id.clone(),
@@ -5666,8 +5020,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
                         );
                     }
                 }
-                // #942 B2/M5: staying unavailable — withhold the ACK so the
-                // sender's retry schedule re-offers.
                 ack = Err("listener admission clear not durable; retry".to_string());
                 break 'admission true;
             }
@@ -5682,7 +5034,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
         ack = Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Inserted);
         break 'admission false;
     };
-    // Membership lock released here (dropped at end of labeled block).
 
     // Finding 1: replay deferred until after lock release. The
     // replay acquires its own membership lock via _inner_serialized.
@@ -5700,18 +5051,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
     ack
 }
 
-// ---------------------------------------------------------------------------
-// Invite-auth #468/#469 — member-certificate hydration bridge (F1)
-// ---------------------------------------------------------------------------
-
-/// F1 (design v7): idempotent sweep hydrating DIGEST-ONLY member seats
-/// (`certificate == None && certificate_digest.is_some()`) from the agent's
-/// authenticated certificate cache. Per group: under the group membership
-/// lock, [`x0x::groups::GroupInfo::hydrate_member_certificates`] installs
-/// ONLY bytes hashing to the seat's committed digest (mismatch is ignored
-/// inside the helper), and the normal roster mutation helper persists —
-/// ONLY when at least one member was hydrated, so a settled roster is never
-/// churned. Returns the number of members hydrated.
 async fn reconcile_member_certificates_from_cache(state: &AppState) -> usize {
     let cached: Vec<(String, x0x::identity::AgentCertificate)> = state
         .agent
@@ -5726,9 +5065,6 @@ async fn reconcile_member_certificates_from_cache(state: &AppState) -> usize {
     let group_ids: Vec<String> = state.named_groups.read().await.keys().cloned().collect();
     let mut hydrated_total = 0usize;
     for group_id in group_ids {
-        // Restrict the pairs to THIS group's digest-pending seats so the
-        // hydrate logs stay signal; the helper re-checks every digest
-        // regardless.
         let pending: Vec<(String, x0x::identity::AgentCertificate)> = {
             let groups = state.named_groups.read().await;
             let Some(info) = groups.get(&group_id) else {
@@ -5768,9 +5104,6 @@ async fn reconcile_member_certificates_from_cache(state: &AppState) -> usize {
     hydrated_total
 }
 
-/// F1: apply one [`VerifiedCertificate`] event — hydrate this agent's
-/// digest-only seats in every group that has one, under each group's
-/// membership lock, persisting only on change.
 async fn apply_verified_certificate_event(state: &AppState, event: &x0x::VerifiedCertificate) {
     let agent_hex = hex::encode(event.agent_id.as_bytes());
     let digest_hex = event.digest_hex();
@@ -5824,16 +5157,9 @@ async fn run_member_certificate_bridge(
     let mut shutdown = state.shutdown_notify.subscribe();
     loop {
         tokio::select! {
-            changed = shutdown.changed() => {
-                if changed.is_err() {
-                    // Watch sender dropped during teardown — nothing more
-                    // to consume for.
-                }
-                break;
-            }
+            _ = shutdown.changed() => break,
             received = events.recv() => match received {
                 Ok(event) => {
-                    // #1275: shielded, like the reconciles (see below).
                     let apply_state = Arc::clone(&state);
                     let applied = state
                         .run_shielded(Box::pin(async move {
@@ -5876,12 +5202,6 @@ async fn reconcile_member_certificates_shielded(state: &Arc<AppState>) -> bool {
         .is_some()
 }
 
-/// F1: supervise the bridge worker for the daemon's lifetime, following the
-/// server background-task pattern (handle collected in `bg_tasks`, aborted
-/// at shutdown). The worker should only return once shutdown was requested;
-/// if it exits or panics anyway it is re-spawned with backoff so a fault
-/// cannot hot-loop — and every (re)start re-runs the full reconcile, so a
-/// restart never leaves a member seat un-hydrated.
 async fn supervise_member_certificate_bridge(
     state: Arc<AppState>,
     initial_events: broadcast::Receiver<x0x::VerifiedCertificate>,
@@ -5905,8 +5225,6 @@ async fn supervise_member_certificate_bridge(
             }
             joined = &mut worker => {
                 if *state.shutdown_notify.borrow() {
-                    // Worker observed the same shutdown request this select
-                    // raced against — clean exit.
                     break;
                 }
                 if joined.is_ok() {
@@ -5931,10 +5249,6 @@ mod owner_singleton_tests {
 
     use super::*;
 
-    /// WHY (review P0): the default daemon runs with no explicit
-    /// `user_key_path` and no `identity_dir`; the owner record is the
-    /// sibling of the default `~/.x0x/user.key`. A `None` here silently
-    /// disabled enforcement for every default install.
     #[test]
     fn owner_profile_path_resolves_default_install() {
         let config = DaemonConfig {
@@ -5942,15 +5256,11 @@ mod owner_singleton_tests {
             ..DaemonConfig::default()
         };
         let path = owner_profile_path(&config, &None).expect("default install must resolve");
-        // Issue #456: the default routes through the storage resolver —
-        // `$X0X_HOME/owner.json` when overridden (the test harness sets
-        // X0X_HOME), `<home>/.x0x/owner.json` otherwise.
         let expected_home =
             crate::storage::x0x_home_dir().expect("default identity dir resolvable");
         assert!(path.starts_with(&expected_home));
         assert!(path.ends_with("owner.json"));
 
-        // Explicit user key path wins (sibling of that key).
         let custom = PathBuf::from("/custom/dir/user.key");
         let config = DaemonConfig {
             user_key_path: Some(custom.clone()),
@@ -5961,7 +5271,6 @@ mod owner_singleton_tests {
             Some(x0x::profile::OwnerProfile::path_for_key(&custom))
         );
 
-        // Identity dir (named instances) scopes the record into it.
         let dir = PathBuf::from("/instance/data");
         assert_eq!(
             owner_profile_path(&DaemonConfig::default(), &Some(dir.clone())),
@@ -5969,10 +5278,6 @@ mod owner_singleton_tests {
         );
     }
 
-    /// WHY (review R2 regression): enforcement must run BEFORE the builder —
-    /// a mismatched key must not re-issue/persist agent.cert nor spawn tasks.
-    /// Simulated at the unit level: adoption on first sight of an ownerless
-    /// key, refusal when the resident key later differs from the record.
     #[tokio::test]
     async fn prebuild_enforcement_adopts_then_refuses_mismatch_without_building() {
         use x0x::storage::{load_user_keypair_from, save_user_keypair_to};
@@ -5984,7 +5289,6 @@ mod owner_singleton_tests {
             ..DaemonConfig::default()
         };
 
-        // Resident key, no owner record: adopt on first check.
         let first = x0x::identity::UserKeypair::generate().unwrap();
         save_user_keypair_to(&first, &key_path).await.unwrap();
         enforce_owner_singleton_prebuild(&config, &None)
@@ -6006,8 +5310,6 @@ mod owner_singleton_tests {
             )
         );
 
-        // Swap the resident key (as an accidental overwrite would): refuse —
-        // the pre-build check rejects BEFORE any builder work.
         let second = x0x::identity::UserKeypair::generate().unwrap();
         save_user_keypair_to(&second, &key_path).await.unwrap();
         let err = enforce_owner_singleton_prebuild(&config, &None)
@@ -6019,10 +5321,6 @@ mod owner_singleton_tests {
         );
     }
 
-    /// WHY (R3 regression of the round-2 no-key refusal): a RECORDED owner
-    /// whose key file is MISSING must refuse startup — starting anonymously
-    /// would silently drop the install's authority. An unrecorded install
-    /// with no key stays a legitimate anonymous opt-in.
     #[tokio::test]
     async fn prebuild_enforcement_refuses_missing_key_for_recorded_owner() {
         use x0x::storage::save_user_keypair_to;
@@ -6033,7 +5331,6 @@ mod owner_singleton_tests {
             user_key_path: Some(key_path.clone()),
             ..DaemonConfig::default()
         };
-        // Record an owner (via create-style adoption), then LOSE the key.
         let key = x0x::identity::UserKeypair::generate().unwrap();
         save_user_keypair_to(&key, &key_path).await.unwrap();
         enforce_owner_singleton_prebuild(&config, &None)
@@ -6053,7 +5350,6 @@ mod owner_singleton_tests {
             "error names the escape hatch: {err}"
         );
 
-        // No owner recorded + no key: anonymous opt-in, no refusal.
         let clean_dir = tempfile::tempdir().unwrap();
         let clean = DaemonConfig {
             user_key_path: Some(clean_dir.path().join("user.key")),
@@ -6064,10 +5360,6 @@ mod owner_singleton_tests {
             .expect("unrecorded install with no key starts anonymously");
     }
 
-    /// WHY (review R2 regression): a CORRUPT user key must refuse BEFORE
-    /// build too — the builder would otherwise hard-fail later with a
-    /// different (persisted-state-adjacent) error, or worse, on legacy
-    /// paths silently degrade.
     #[tokio::test]
     async fn prebuild_enforcement_refuses_corrupt_user_key() {
         let dir = tempfile::tempdir().unwrap();
@@ -6089,10 +5381,6 @@ mod owner_singleton_tests {
     }
 }
 
-/// Invite-auth #468/#469 (design v6 E2d / v7 F1): the member-certificate
-/// hydration bridge — pre-populated cache ⇒ reconcile hydrates with no
-/// event; ring overflow (`Lagged`) ⇒ the full reconcile recovers; a second
-/// reconcile run hydrates nothing.
 #[cfg(test)]
 mod member_certificate_bridge_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -6133,8 +5421,6 @@ mod member_certificate_bridge_tests {
         }
     }
 
-    /// A group whose members are all DIGEST-ONLY seats:
-    /// `certificate == None && certificate_digest == Some(digest)`.
     fn group_with_digest_only_members(
         members: &[(x0x::identity::AgentId, x0x::identity::AgentCertificate)],
     ) -> (String, x0x::groups::GroupInfo) {
@@ -6176,11 +5462,6 @@ mod member_certificate_bridge_tests {
             .expect("member seat present")
     }
 
-    /// WHY (F1 (i)): certificates that landed in the discovery cache BEFORE
-    /// the bridge ever subscribed (restart, or a peer announced while the
-    /// daemon was starting) must still hydrate their digest-only seats —
-    /// the startup reconcile is cache-driven, not event-driven. No event
-    /// is delivered in this test at all.
     #[tokio::test]
     async fn prepopulated_cache_reconciles_without_any_event() {
         let user = x0x::identity::UserKeypair::generate().unwrap();
@@ -6197,8 +5478,6 @@ mod member_certificate_bridge_tests {
             .await
             .insert(group_id.clone(), info);
 
-        // No subscription exists — the fired event goes nowhere. The cache
-        // alone must drive hydration.
         state
             .agent
             .insert_discovered_agent_for_testing(cached_cert_entry(
@@ -6217,8 +5496,6 @@ mod member_certificate_bridge_tests {
             "hydration keeps the committed digest"
         );
 
-        // The normal mutation helper persisted the hydrated roster: the
-        // durable store carries the member.
         let on_disk = crate::w3h_inline::fs::read_to_string(state.named_groups_path.clone())
             .await
             .unwrap();
@@ -6256,14 +5533,9 @@ mod member_certificate_bridge_tests {
             .await
             .insert(group_id.clone(), info);
 
-        // The receiver the bridge will consume — created BEFORE any
-        // certificate lands, exactly like daemon startup (F1 order).
         let rx = state.agent.subscribe_verified_certificates();
         let worker = tokio::spawn(run_member_certificate_bridge(Arc::clone(&state), rx));
 
-        // Block the worker inside its first apply, then overflow the ring:
-        // A's event, 300 filler agents sharing one filler certificate, and
-        // finally B's event (guaranteed past the 256-slot tail).
         {
             let _roster_guard = state.named_groups.write().await;
             state
@@ -6295,9 +5567,6 @@ mod member_certificate_bridge_tests {
                 .await;
         }
 
-        // The worker unblocks: applies A, observes Lagged, re-runs the full
-        // reconcile (which is what must hydrate B — its event was dropped
-        // by the ring), then drains the surviving tail.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             let b = member_of(&state, &group_id, &hex_b).await;
@@ -6316,8 +5585,6 @@ mod member_certificate_bridge_tests {
         assert!(a.certificate.as_ref().is_some_and(|c| *c == cert_a));
         assert!(b.certificate.as_ref().is_some_and(|c| *c == cert_b));
 
-        // Clean shutdown: the worker exits when the daemon's shutdown
-        // watch fires.
         let _ = state.shutdown_notify.send(true);
         tokio::time::timeout(std::time::Duration::from_secs(10), worker)
             .await
@@ -6325,11 +5592,6 @@ mod member_certificate_bridge_tests {
             .expect("bridge worker exited cleanly");
     }
 
-    /// WHY (F1 (i) idempotence): a settled roster must not be churned — the
-    /// second reconcile run hydrates ZERO seats (byte-bearing seats are
-    /// skipped by `hydrate_member_certificates`), which the unchanged
-    /// `updated_at` stamp proves: a real hydration re-stamps it via
-    /// `set_member_certificate`.
     #[tokio::test]
     async fn second_reconcile_run_hydrates_nothing() {
         let user = x0x::identity::UserKeypair::generate().unwrap();
@@ -6370,12 +5632,6 @@ mod member_certificate_bridge_tests {
         assert_eq!(second.certificate, first.certificate);
     }
 
-    /// #1275: the supervisor aborts the bridge worker as soon as shutdown
-    /// is signalled, before the drain's grace even starts. A hydration the
-    /// worker has started persists the roster, so it must not be cut off in
-    /// the middle of that write: the drain waits for it, the write
-    /// completes, and no temp file is left. The write is parked after its
-    /// temp file is synced and before the rename (the #1269 write pause).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn issue1275_hydration_is_not_aborted_mid_write_at_shutdown() {
         use crate::server::routes::named_groups::atomic_write_test_seam;
@@ -6394,8 +5650,6 @@ mod member_certificate_bridge_tests {
             .write()
             .await
             .insert(group_id.clone(), info);
-        // Nothing is on disk yet: the file gets the group (and the member)
-        // only through the hydration's write.
         let path = state.named_groups_path.clone();
         let pause = atomic_write_test_seam::arm(&path);
         let rx = state.agent.subscribe_verified_certificates();
@@ -6416,7 +5670,6 @@ mod member_certificate_bridge_tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
 
-        // The supervisor sees shutdown and aborts its worker at once.
         let _ = state.shutdown_notify.send(true);
         let outcome = stop_while_write_parked(&state, vec![supervisor], &pause, &path, &agent_hex)
             .await
@@ -6429,18 +5682,6 @@ mod member_certificate_bridge_tests {
         assert!(member.certificate.as_ref().is_some_and(|c| *c == cert));
     }
 
-    /// WHY (r4 / addendum item 5): the supervisor must RESPAWN a bridge
-    /// worker that dies mid-stream, and every (re)start re-runs the FULL
-    /// cache reconcile — a digest-only seat created while the worker was
-    /// down hydrates after the restart with NO new event. The initial
-    /// worker is killed deterministically by feeding it a receiver whose
-    /// channel then CLOSES (`RecvError::Closed` → clean worker exit —
-    /// exactly the "worker died, shutdown was NOT requested" arm the
-    /// supervisor restarts on); the sentinel member A proves worker 1
-    /// was alive and past its initial reconcile (its certificate lives
-    /// ONLY in the synthetic event, never in the cache), and member B's
-    /// cache entry lands only after the death — only worker 2's
-    /// startup reconcile can hydrate it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn supervisor_respawns_worker_and_reconciles_after_death() {
         let user = x0x::identity::UserKeypair::generate().unwrap();
@@ -6452,8 +5693,6 @@ mod member_certificate_bridge_tests {
         let hex_b = hex::encode(b_kp.agent_id().as_bytes());
 
         let (state, _dir) = secure_endpoint_test_state().await.unwrap();
-        // Both members seat digest-only; A's cert rides ONLY the
-        // synthetic event channel, B's ONLY the discovery cache.
         let (group_id, info) = group_with_digest_only_members(&[
             (a_kp.agent_id(), cert_a.clone()),
             (b_kp.agent_id(), cert_b.clone()),
@@ -6464,16 +5703,12 @@ mod member_certificate_bridge_tests {
             .await
             .insert(group_id.clone(), info);
 
-        // The synthetic channel whose closure kills worker 1.
         let (event_tx, event_rx) = tokio::sync::broadcast::channel::<x0x::VerifiedCertificate>(8);
         let supervisor = tokio::spawn(supervise_member_certificate_bridge(
             std::sync::Arc::clone(&state),
             event_rx,
         ));
 
-        // Sentinel: A hydrates ONLY through the synthetic event, proving
-        // worker 1 subscribed to OUR channel and finished its initial
-        // reconcile (the cache holds no entry for A).
         let digest_a = *blake3::hash(bincode::serialize(&cert_a).unwrap().as_slice()).as_bytes();
         let _ = event_tx.send(x0x::VerifiedCertificate {
             agent_id: a_kp.agent_id(),
@@ -6496,23 +5731,12 @@ mod member_certificate_bridge_tests {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
 
-        // Kill worker 1 mid-stream: closing the channel exits its loop
-        // (Closed), which the supervisor treats as an early exit and
-        // respawns after backoff — subscription switches to the AGENT
-        // channel, whose startup reconcile is cache-driven.
         drop(event_tx);
-        // While the worker is down/upcoming, B's certificate lands ONLY
-        // in the discovery cache (a raw write that fires an event on the
-        // AGENT channel — missed if worker 2 has not subscribed yet; the
-        // reconcile covers it either way).
         state.agent.identity_discovery_cache().write().await.insert(
             b_kp.agent_id(),
             cached_cert_entry(b_kp.agent_id(), cert_b.clone()),
         );
 
-        // The fresh worker's full reconcile hydrates B — impossible
-        // without a respawn (worker 1 is dead and its only reconcile ran
-        // before B's entry existed).
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
         loop {
             if member_of(&state, &group_id, &hex_b)
@@ -6535,8 +5759,6 @@ mod member_certificate_bridge_tests {
             Some(x0x::groups::owner_cert::certificate_digest_hex(&cert_b).as_str())
         );
 
-        // Clean shutdown: the supervisor (still alive after the respawn)
-        // exits on the daemon's shutdown watch.
         let _ = state.shutdown_notify.send(true);
         tokio::time::timeout(std::time::Duration::from_secs(10), supervisor)
             .await
@@ -6550,11 +5772,6 @@ mod startup_update_check_tests {
     use crate::server::{serve_with_options, DaemonConfig, ServeOptions};
     use std::time::{Duration, Instant};
 
-    /// Points the test-only upgrade-monitor API base override
-    /// (`upgrade::monitor::TEST_API_BASE_OVERRIDE`) at `base` and restores
-    /// the prior value on drop, so the redirect cannot leak into sibling
-    /// tests in the same process. The seam is `cfg(test)`-only: release
-    /// builds have no configurable update source.
     struct ApiBaseOverrideGuard {
         previous: Option<String>,
     }
@@ -6598,17 +5815,12 @@ mod startup_update_check_tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
-        // Black-hole update endpoint: accepts the TCP connection and never
-        // answers — the update request then blocks until the monitor's 30 s
-        // client timeout, exactly the firewalled-egress shape from the
-        // issue. No external network is touched.
         let blackhole =
             std::net::TcpListener::bind("127.0.0.1:0").expect("bind black-hole listener");
         let blackhole_addr = blackhole.local_addr().expect("black-hole address");
         let accepted = Arc::new(AtomicUsize::new(0));
         let accepted_counter = Arc::clone(&accepted);
         std::thread::spawn(move || {
-            // Hold every accepted connection open without ever responding.
             let mut held = Vec::new();
             while let Ok((mut stream, _)) = blackhole.accept() {
                 let _ = stream.read(&mut [0u8; 1024]);
@@ -6617,7 +5829,6 @@ mod startup_update_check_tests {
             }
         });
 
-        // Aim every update fetch at the black hole BEFORE serving.
         let _api_base = ApiBaseOverrideGuard::set(format!("http://{blackhole_addr}"));
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6632,8 +5843,6 @@ mod startup_update_check_tests {
             ..DaemonConfig::default()
         };
         config.history.enabled = false;
-        // The daemon startup shape the issue describes: `[update] enabled`
-        // (the default) and self-update not skipped for this process.
         assert!(
             config.update.enabled,
             "`[update] enabled` must be the default for this test to mean anything"
@@ -6652,8 +5861,6 @@ mod startup_update_check_tests {
                 .expect("serve must not wait on the startup update check (20 s budget)")
                 .expect("hermetic serve");
 
-        // Readiness is an HTTP fact, not the handle: `/health` (auth-exempt)
-        // must answer while the update check is still hung on the black hole.
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
@@ -6686,12 +5893,127 @@ mod startup_update_check_tests {
              both be fetching from the update source"
         );
 
-        // Shutdown stays prompt: the supervisor's bounded drain aborts the
-        // hung fetch tasks instead of waiting out their HTTP timeout.
         tokio::time::timeout(Duration::from_secs(30), handle.shutdown_and_wait())
             .await
             .expect("shutdown must complete despite the hung update check")
             .expect("clean shutdown");
+    }
+}
+
+#[cfg(test)]
+mod relay_serving_wiring_tests {
+    use crate::server::{serve_with_options, DaemonConfig, ServeOptions};
+    use std::time::Duration;
+
+    /// RAII guard: removes `X0X_RELAY_OPT_IN` on construction and on drop so
+    /// a daemon run that sets the flag cannot leak it into a later case in the
+    /// same test.
+    struct RelayOptInEnvGuard;
+    impl RelayOptInEnvGuard {
+        fn arm() -> Self {
+            // SAFETY: test-only env mutation; Drop restores a clean state.
+            std::env::remove_var("X0X_RELAY_OPT_IN");
+            Self
+        }
+    }
+    impl Drop for RelayOptInEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: paired with [`RelayOptInEnvGuard::arm`].
+            std::env::remove_var("X0X_RELAY_OPT_IN");
+        }
+    }
+
+    /// Returns `(relay_service_enabled, gossip_participation_mode)`.
+    ///
+    /// Clears `X0X_RELAY_OPT_IN` before and after the daemon run so each
+    /// test case starts from a clean process environment regardless of what
+    /// a previous case may have set via the startup normalisation at
+    /// `serve_with_options`.
+    async fn daemon_relay_state(toml_key: Option<bool>, cli_relay: bool) -> (bool, String) {
+        let _guard = RelayOptInEnvGuard::arm();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = DaemonConfig {
+            data_dir: dir.path().to_path_buf(),
+            identity_dir: Some(dir.path().join("identity")),
+            api_address: "127.0.0.1:0".parse().expect("loopback api address"),
+            bind_address: "127.0.0.1:0".parse().expect("loopback quic address"),
+            bootstrap_peers: Some(Vec::new()),
+            network_id: Some("issue-1642.relay-serving-wiring".to_string()),
+            mdns_enabled: false,
+            relay_service_enabled: toml_key,
+            ..DaemonConfig::default()
+        };
+        config.history.enabled = false;
+        let options = ServeOptions {
+            skip_update_check: true,
+            cli_no_port_mapping: true,
+            cli_disable_peer_cache: true,
+            cli_relay,
+            ..ServeOptions::default()
+        };
+        let handle =
+            tokio::time::timeout(Duration::from_secs(30), serve_with_options(config, options))
+                .await
+                .expect("serve within 30 s")
+                .expect("hermetic serve");
+        let token = std::fs::read_to_string(dir.path().join("api-token")).expect("api token");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("http client");
+        let addr = handle.local_addr();
+        let connectivity: serde_json::Value = client
+            .get(format!("http://{addr}/diagnostics/connectivity"))
+            .bearer_auth(token.trim())
+            .send()
+            .await
+            .expect("connectivity request")
+            .json()
+            .await
+            .expect("connectivity json");
+        let gossip: serde_json::Value = client
+            .get(format!("http://{addr}/diagnostics/gossip"))
+            .bearer_auth(token.trim())
+            .send()
+            .await
+            .expect("gossip request")
+            .json()
+            .await
+            .expect("gossip json");
+        tokio::time::timeout(Duration::from_secs(30), handle.shutdown_and_wait())
+            .await
+            .expect("shutdown within 30 s")
+            .expect("clean shutdown");
+        let relay_enabled = connectivity["services"]["relay_enabled"]
+            .as_bool()
+            .expect("services.relay_enabled is a bool");
+        let mode = gossip["participation"]["mode"]
+            .as_str()
+            .expect("participation.mode is a string")
+            .to_owned();
+        (relay_enabled, mode)
+    }
+
+    /// #1642: the value read back is the ant-quic node status, so this fails
+    /// when either the daemon resolution or the ant-quic builder call is lost.
+    #[tokio::test]
+    async fn daemon_relay_serving_follows_participation_and_explicit_key() {
+        let (relay, _) = daemon_relay_state(None, false).await;
+        assert!(!relay, "Leaf default");
+
+        let (relay, _) = daemon_relay_state(None, true).await;
+        assert!(relay, "Full default");
+
+        let (relay, mode) = daemon_relay_state(Some(true), false).await;
+        assert!(relay, "Leaf opt-in");
+        assert_eq!(
+            mode, "leaf",
+            "Leaf opt-in: participation must be Leaf, not Full \
+             (a Full result means X0X_RELAY_OPT_IN leaked from a prior case)"
+        );
+
+        let (relay, _) = daemon_relay_state(Some(false), true).await;
+        assert!(!relay, "Full opt-out");
     }
 }
 
@@ -6701,9 +6023,6 @@ mod socks_startup_port_release_tests {
 
     use crate::server::{serve_with_options, DaemonConfig, ServeOptions};
 
-    /// A startup failure after the SOCKS listener binds must drop that
-    /// listener. The old path returned from `finish_startup_error` without
-    /// cancelling SOCKS, so the accept task kept the port.
     #[tokio::test]
     async fn startup_failure_after_socks_bind_releases_the_port() {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind free port");
@@ -6787,8 +6106,6 @@ targets = [\"127.0.0.1:22\"]
 #[cfg(test)]
 mod identity_ingest_authority_tests;
 
-/// #1868 review round 4: the group case of #1863 through the check that
-/// `x0xd` installs and the heartbeat step, with the agent's own sources.
 #[cfg(test)]
 mod revocation_group_seen_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -6873,10 +6190,6 @@ mod revocation_group_seen_tests {
         );
     }
 
-    /// #1867: the local apply path marks while another task holds the
-    /// roster for write. The check waits for the lock, so the active
-    /// member's self-revocation is published. The wrapper tells the test
-    /// when the check starts; then the test releases the roster.
     #[tokio::test]
     async fn a_held_roster_lock_still_publishes_an_active_member_1867() {
         use std::sync::Arc;
@@ -6949,9 +6262,6 @@ mod revocation_group_seen_tests {
         );
     }
 
-    /// #1867: the heartbeat step asks the roster one time for all the held
-    /// strangers, not one time for each. A flood of strangers' records
-    /// then cannot hold the ingest behind every roster writer.
     #[tokio::test]
     async fn the_roster_is_read_one_time_for_all_held_strangers_1867() {
         use std::sync::atomic::{AtomicUsize, Ordering};

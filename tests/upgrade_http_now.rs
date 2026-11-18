@@ -73,7 +73,7 @@ macro_rules! http_now_regression_tests {
                     let readback = restart::systemd_readback_seam::install(scenario);
                     let attempts = Arc::new(AtomicU64::new(0)); let counted = Arc::clone(&attempts);
                     let expected_install = install.clone(); let expected_data = data.clone();
-                    let apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |plan, manifest| {
+                    let apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |plan, manifest, _admission| {
                         assert_eq!(plan.executable, expected_install); assert_eq!(plan.data_root, expected_data);
                         counted.fetch_add(1, Ordering::SeqCst);
                         x0x::upgrade::UpgradeResult::Success { version: manifest.version.clone() }
@@ -161,7 +161,7 @@ macro_rules! http_now_regression_tests {
             async fn http_now_skips_delay_but_keeps_the_frozen_receipt_and_raw_release_binding() {
                 let f = Fixture::new(60, false); let release = f.release("9.9.9"); let request = f.request(&release);
                 let before = tokio::time::Instant::now();
-                let operation = apply_http_release(&f.runtime, &release, true); tokio::pin!(operation);
+                let operation = apply_http_release(&f.runtime, ReleasePermit::for_http(Arc::clone(&f.runtime.wait_slot)), &release, true); tokio::pin!(operation);
                 assert!(matches!(finish(operation.as_mut()).await, Ok(x0x::upgrade::UpgradeResult::Success { .. })));
                 assert_eq!(before.elapsed(), Duration::ZERO); assert_eq!(f.attempts.load(Ordering::SeqCst), 1);
                 let receipt = staging::read_receipt(&request).unwrap().unwrap();
@@ -180,7 +180,7 @@ macro_rules! http_now_regression_tests {
                 { let _lock = crate::upgrade::acquire_host_upgrade_lock(&f.install).unwrap();
                   assert_eq!(staging::observe(&request, &probe::ProbeClock { boot_id:"startup-fixture".into(), monotonic_ms:1000 }).unwrap(), staging::Decision::Due); }
                 let before = bytes(f._root.path());
-                let operation = apply_http_release(&f.runtime, &release, true); tokio::pin!(operation);
+                let operation = apply_http_release(&f.runtime, ReleasePermit::for_http(Arc::clone(&f.runtime.wait_slot)), &release, true); tokio::pin!(operation);
                 assert!(finish(operation.as_mut()).await.is_err());
                 assert_eq!(bytes(f._root.path()), before); assert_eq!(f.attempts.load(Ordering::SeqCst), 0);
             }
@@ -193,7 +193,7 @@ macro_rules! http_now_regression_tests {
                         "platform" => release.manifest.assets.clear(), _ => release.manifest.version="invalid-version".into() }
                     release.manifest_json=serde_json::to_vec(&release.manifest).unwrap();
                     let before=bytes(f._root.path());
-                    let operation=apply_http_release(&f.runtime,&release,true); tokio::pin!(operation);
+                    let operation=apply_http_release(&f.runtime,ReleasePermit::for_http(Arc::clone(&f.runtime.wait_slot)),&release,true); tokio::pin!(operation);
                     let result=finish(operation.as_mut()).await;
                     assert!(!matches!(result,Ok(x0x::upgrade::UpgradeResult::Success{..})), "{fault}: {result:?}");
                     assert_eq!(f.attempts.load(Ordering::SeqCst),0,"{fault}"); assert_eq!(bytes(f._root.path()),before,"{fault}");
@@ -216,7 +216,7 @@ macro_rules! http_now_regression_tests {
                     };
                     if !path.exists() { std::fs::write(&path,b"{unknown or torn record").unwrap(); }
                     let before=bytes(f._root.path());
-                    let operation=apply_http_release(&f.runtime,&release,true); tokio::pin!(operation);
+                    let operation=apply_http_release(&f.runtime,ReleasePermit::for_http(Arc::clone(&f.runtime.wait_slot)),&release,true); tokio::pin!(operation);
                     assert!(finish(operation.as_mut()).await.is_err(),"{kind}");
                     assert_eq!(f.attempts.load(Ordering::SeqCst),0,"{kind}"); assert_eq!(bytes(f._root.path()),before,"{kind}");
                 }
@@ -226,7 +226,7 @@ macro_rules! http_now_regression_tests {
             async fn http_now_keeps_probe_retry_wait_and_releases_apply_mutex() {
                 let mut f=Fixture::new(60,false); let release=f.release("9.9.9"); let request=f.request(&release);
                 f.seed_probe(&release,probe::ProbePhase::InterruptedWait);
-                let operation=apply_http_release(&f.runtime,&release,true); tokio::pin!(operation);
+                let operation=apply_http_release(&f.runtime,ReleasePermit::for_http(Arc::clone(&f.runtime.wait_slot)),&release,true); tokio::pin!(operation);
                 let decision=event(operation.as_mut(),&mut f.observed).await;
                 let staging::Decision::Waiting(wait)=decision else { panic!("now bypassed probe retry"); };
                 assert!(wait>Duration::from_secs(1700) && wait<=Duration::from_secs(1800));
@@ -252,7 +252,7 @@ macro_rules! http_now_regression_tests {
                     f.seed_probe(&old,probe::ProbePhase::InterruptedWait);
                     let before=bytes(f._root.path());
                     for release in if pending { vec![&old,&newer] } else { vec![&old] } {
-                        let operation=apply_http_release(&f.runtime,release,true); tokio::pin!(operation);
+                        let operation=apply_http_release(&f.runtime,ReleasePermit::for_http(Arc::clone(&f.runtime.wait_slot)),release,true); tokio::pin!(operation);
                         assert!(finish(operation.as_mut()).await.is_err()); assert_eq!(bytes(f._root.path()),before);
                     }
                     assert_eq!(f.attempts.load(Ordering::SeqCst),0);
@@ -265,7 +265,7 @@ macro_rules! http_now_regression_tests {
                 for superseded in [false,true] {
                     let mut f=Fixture::new(60,false); let old=f.release("9.9.9");
                     let held=Arc::clone(&f.runtime.apply_lock).lock_owned().await;
-                    let operation=apply_http_release(&f.runtime,&old,true); tokio::pin!(operation);
+                    let operation=apply_http_release(&f.runtime,ReleasePermit::for_http(Arc::clone(&f.runtime.wait_slot)),&old,true); tokio::pin!(operation);
                     assert_eq!(event(operation.as_mut(),&mut f.observed).await,staging::Decision::Due);
                     assert_eq!(f.attempts.load(Ordering::SeqCst),0);
                     { let _lock=crate::upgrade::acquire_host_upgrade_lock(&f.install).unwrap();
@@ -285,7 +285,7 @@ macro_rules! http_now_regression_tests {
             async fn http_wait_cancellation_preserves_acknowledged_receipt_bytes() {
                 for closed in [false,true] {
                     let mut f=Fixture::new(60,false); let release=f.release("9.9.9");
-                    let operation=apply_http_release(&f.runtime,&release,false); tokio::pin!(operation);
+                    let operation=apply_http_release(&f.runtime,ReleasePermit::for_http(Arc::clone(&f.runtime.wait_slot)),&release,false); tokio::pin!(operation);
                     assert!(matches!(event(operation.as_mut(),&mut f.observed).await,staging::Decision::Waiting(_)));
                     let before=bytes(f._root.path());
                     if closed { drop(f.shutdown.take()); } else { f.shutdown.as_ref().unwrap().send(true).unwrap(); }
@@ -314,7 +314,7 @@ macro_rules! http_now_regression_tests {
                     let before=bytes(f._root.path());
                     let mut drain=QueuedDrain {held:Some(held),done:f.drained};
                     let entered; let mut cancellation_refused=true;
-                    { let mut operation=Box::pin(apply_http_release(&f.runtime,&release,false));
+                    { let mut operation=Box::pin(apply_http_release(&f.runtime,ReleasePermit::for_http(Arc::clone(&f.runtime.wait_slot)),&release,false));
                       entered=event(operation.as_mut(),&mut f.operations).await;
                       if !drop_request { f.shutdown.as_ref().unwrap().send(true).unwrap(); cancellation_refused=finish(operation.as_mut()).await.is_err(); }
                     }

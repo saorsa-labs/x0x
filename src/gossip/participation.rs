@@ -1,9 +1,9 @@
-//! Gossip participation mode (issue #380 / designs/380.md).
+//! Gossip participation mode.
 //!
 //! Ordinary desktop/client daemons default to [`ParticipationMode::Leaf`]:
 //! they refresh PlumTree eager sets only for topics they subscribe to and
 //! refuse inbound GRAFT-equivalent / eager / IHAVE / IWANT work on topics
-//! they do not subscribe to (issue #380 Phase C0).
+//! they do not subscribe to.
 //! Backbone processes (seed, dual-listen `:443`, managed `/opt/x0x/x0xd*`,
 //! or explicit `--relay` / `gossip.relay`) stay [`ParticipationMode::Full`]
 //! and keep today's pass-through refresh so they forward unsubscribed topics.
@@ -20,10 +20,8 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// ADR-0011 dual-listen port. Clients never bind this; `x0xd-443` does.
 const DUAL_LISTEN_PORT: u16 = 443;
 
-/// ADR-0026 managed-host binary prefix (`authority-inventory.json`).
 const MANAGED_BINARY_PREFIX: &str = "/opt/x0x/x0xd";
 
 /// How this process participates in PlumTree topic-peer refresh.
@@ -67,7 +65,7 @@ pub fn is_passthrough_wire_kind(kind: MessageKind) -> bool {
 
 /// True when a Leaf must drop this inbound frame before `handle_message`.
 ///
-/// Full nodes always return false (today's behaviour). Subscribed topics
+/// Full nodes always return false. Subscribed topics
 /// always return false so epidemic publish/subscribe still works.
 #[must_use]
 pub fn leaf_refuses_unsubscribed_passthrough(
@@ -89,21 +87,8 @@ const SG_MESSAGE_CACHE_AGE: Duration = Duration::from_secs(60);
 /// without the C0 gate.
 const SG_KEY_CACHE_REPLAY_DELAY: Duration = Duration::from_millis(5_250);
 
-/// How long a Leaf publish keeps the IWANT exemption for its topic (#731):
-/// the sg message-cache age limit, after which the cache has no copy.
 pub(crate) const PUBLISHER_IWANT_WINDOW: Duration = SG_MESSAGE_CACHE_AGE;
 
-/// How long the IWANT exemption stays off after a topic stops being
-/// subscribed (#731). While subscribed, the sg cache also holds other peers'
-/// messages, and a subscription drop does not empty it. After the mark, a
-/// foreign entry can still enter the cache: a queued key-cache frame is
-/// replayed up to [`SG_KEY_CACHE_REPLAY_DELAY`] later, under a fresh receive
-/// handler timeout (`PUBSUB_MESSAGE_HANDLE_TIMEOUT`, 30 s), and the entry then
-/// lives [`SG_MESSAGE_CACHE_AGE`]. That sum is 95.25 s; 120 s adds a margin.
-/// The assertion below keeps the bound when a part changes. The replay delay
-/// is best effort: sg `take_pending` does not check a queued frame's age, so
-/// a peer that stalls the replay can still add one stale foreign entry. That
-/// replay already bypassed the C0 gate before #731.
 pub(crate) const UNSUBSCRIBE_QUIET: Duration = Duration::from_secs(120);
 
 const _: () = assert!(
@@ -114,30 +99,15 @@ const _: () = assert!(
             .as_millis()
 );
 
-/// Maximum number of topics in each [`PublisherTopics`] map (#731).
 pub(crate) const PUBLISHER_TOPICS_CAP: usize = 1024;
 
 #[derive(Debug, Default)]
 struct PublisherTopicsInner {
-    /// Last local publish per topic.
     published: HashMap<TopicId, Instant>,
-    /// Last time each topic stopped being subscribed.
     unsubscribed: HashMap<TopicId, Instant>,
-    /// Set when `unsubscribed` was full of live marks: no exemption for
-    /// [`UNSUBSCRIBE_QUIET`] after it.
     blocked_at: Option<Instant>,
 }
 
-/// Topics that this Leaf node published to recently (#731).
-///
-/// A Leaf that publishes on an unsubscribed topic must still answer IWANT
-/// for its own messages, or the #380 C0 gate closes its only path to a lazy
-/// subscriber. Only IWANT is exempt: EAGER, IHAVE and anti-entropy carry or
-/// pull other peers' messages. The exemption is off for [`UNSUBSCRIBE_QUIET`]
-/// after the topic was last subscribed. Both maps hold at most
-/// [`PUBLISHER_TOPICS_CAP`] topics and fail closed: a full publish map drops
-/// its oldest entry; a full unsubscribe map blocks every topic for
-/// [`UNSUBSCRIBE_QUIET`].
 #[derive(Debug, Default)]
 pub(crate) struct PublisherTopics {
     inner: Mutex<PublisherTopicsInner>,
@@ -150,7 +120,6 @@ impl PublisherTopics {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Record a local publish on `topic` at `now`.
     pub(crate) fn record(&self, topic: TopicId, now: Instant) {
         let mut inner = self.lock();
         let map = &mut inner.published;
@@ -166,8 +135,6 @@ impl PublisherTopics {
         map.insert(topic, now);
     }
 
-    /// Record that `topic` stops being subscribed at `now`.
-    ///
     /// Call this before the topic leaves the subscribed set, so the gate
     /// never sees an unsubscribed topic without this mark.
     pub(crate) fn note_unsubscribed(&self, topic: TopicId, now: Instant) {
@@ -184,7 +151,6 @@ impl PublisherTopics {
         map.insert(topic, now);
     }
 
-    /// True when a Leaf may serve IWANT on unsubscribed `topic` at `now`.
     #[must_use]
     pub(crate) fn allows_iwant(&self, topic: &TopicId, now: Instant) -> bool {
         let inner = self.lock();
@@ -200,7 +166,6 @@ impl PublisherTopics {
             .is_some_and(|at| now.saturating_duration_since(*at) < PUBLISHER_IWANT_WINDOW)
     }
 
-    /// Number of publish entries, including expired ones not yet removed.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.lock().published.len()
@@ -326,7 +291,7 @@ pub struct ParticipationSnapshot {
     /// Non-subscribed outbound forward (C0 meaning of `relay_bytes`).
     pub relay_bytes: u64,
     pub relay_msgs: u64,
-    /// Subscribed-topic epidemic forward, previously lumped into sg relay.
+    /// Subscribed-topic epidemic forward.
     pub epidemic_forward_bytes: u64,
     pub epidemic_forward_msgs: u64,
     pub relay_bytes_semantics: &'static str,
@@ -418,7 +383,6 @@ mod tests {
 
     #[test]
     fn ordinary_client_defaults_to_leaf() {
-        // Why: desktops must stop acting as full-mesh pass-through relays.
         let selection = resolve_participation(ParticipationInputs {
             operator_relay: false,
             bind_addr: ephemeral(),
@@ -445,7 +409,6 @@ mod tests {
 
     #[test]
     fn dual_listen_port_fail_closes_to_full() {
-        // Why: ADR-0011 x0xd-443 is backbone. Never silent Leaf there.
         let selection = resolve_participation(ParticipationInputs {
             operator_relay: false,
             bind_addr: SocketAddr::from(([0, 0, 0, 0], DUAL_LISTEN_PORT)),
@@ -471,8 +434,6 @@ mod tests {
 
     #[test]
     fn managed_binary_fail_closes_to_full() {
-        // Why: ADR-0026 fleet binaries live under /opt/x0x/x0xd*. A Leaf
-        // default on those hosts would drop backbone forwarding silently.
         for path in ["/opt/x0x/x0xd", "/opt/x0x/x0xd-testnet"] {
             let selection = resolve_participation(ParticipationInputs {
                 operator_relay: false,
@@ -491,7 +452,6 @@ mod tests {
 
     #[test]
     fn backbone_signals_override_missing_operator_opt_in() {
-        // Why: fail-closed. `gossip.relay = false` on a seed must not Leaf.
         let seed: SocketAddr = "142.93.199.50:5483".parse().expect("nyc seed");
         let selection = resolve_participation(ParticipationInputs {
             operator_relay: false,
@@ -505,7 +465,6 @@ mod tests {
 
     #[test]
     fn desktop_5483_without_seed_ip_stays_leaf() {
-        // Why: default desktop bind is :5483; port alone is not backbone.
         let selection = resolve_participation(ParticipationInputs {
             operator_relay: false,
             bind_addr: SocketAddr::from(([192, 168, 1, 10], CLIENT_QUIC_PORT)),
@@ -530,8 +489,6 @@ mod tests {
 
     #[test]
     fn leaf_refuses_graft_equivalent_and_eager_for_unsubscribed_topics() {
-        // Why (#380 C0): skipping set_topic_peers is not enough — inbound
-        // EAGER/IHAVE/IWANT still create pass-through state and GRAFT.
         for kind in [
             MessageKind::Eager,
             MessageKind::IHave,
@@ -569,9 +526,6 @@ mod tests {
 
     #[test]
     fn classify_outbound_relay_splits_unsubscribed_from_subscribed_epidemic() {
-        // Why (#380 C0): sg origin.relay_bytes counts every non-local
-        // forward, including subscribed epidemic. Soak gate must use the
-        // unsubscribed slice only.
         let outbound = serde_json::json!({
             "aaaaaaaa": {
                 "eager": { "msgs": 10, "bytes": 1_000_000 },
@@ -589,12 +543,6 @@ mod tests {
         assert_eq!(metering.epidemic_forward_msgs, 3);
         assert_eq!(metering.relay_bytes_semantics, RELAY_BYTES_SEMANTICS);
     }
-    /// #397 review condition: the unsubscribe→resubscribe cycle. While
-    /// unsubscribed a Leaf refuses every pass-through frame (including
-    /// anti-entropy — that is the point), so rejoin correctness depends on
-    /// the subscribe path triggering its own catch-up (subscribe_topic_id
-    /// fires trigger_anti_entropy). This test pins the predicate half: the
-    /// refusal must flip off the moment the topic is subscribed again.
     #[test]
     fn refusal_flips_across_unsubscribe_resubscribe_cycle() {
         use saorsa_gossip_types::MessageKind;
@@ -604,25 +552,21 @@ mod tests {
             MessageKind::IWant,
             MessageKind::AntiEntropy,
         ] {
-            // subscribed: accepted
             assert!(!leaf_refuses_unsubscribed_passthrough(
                 ParticipationMode::Leaf,
                 true,
                 kind
             ));
-            // unsubscribed: refused on Leaf...
             assert!(leaf_refuses_unsubscribed_passthrough(
                 ParticipationMode::Leaf,
                 false,
                 kind
             ));
-            // ...but never on Full
             assert!(!leaf_refuses_unsubscribed_passthrough(
                 ParticipationMode::Full,
                 false,
                 kind
             ));
-            // resubscribed: accepted again
             assert!(!leaf_refuses_unsubscribed_passthrough(
                 ParticipationMode::Leaf,
                 true,
