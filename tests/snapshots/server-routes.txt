@@ -4,7 +4,7 @@ GET  /health                                             health                 
 GET  /status                                             status                                                  Runtime status with uptime
 POST  /shutdown                                           stop                                                    Gracefully stop the daemon
 POST  /auth/session                                       auth session                                            Exchange the durable API token for a short-lived browser session token
-POST  /auth/session/refresh                               auth refresh                                            Swap a live session token for a fresh one (12h cap from the original mint)
+POST  /auth/session/refresh                               auth refresh                                            Swap a session token, live or lapsed under 4h, for a fresh one (12h cap from the original mint)
 GET  /constitution                                       constitution                                            Display the x0x Constitution (Markdown)
 GET  /constitution/json                                  constitution --json                                     Constitution with version metadata (JSON)
 GET  /groups/:id/stores/:app/legacy-imports/:source_id   group store legacy download  query: idempotency_key        Download the exact reviewed legacy Wiki/Web snapshot without changing it

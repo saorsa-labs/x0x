@@ -34,6 +34,8 @@ Protect local browser access against unauthorized origins and credential disclos
 
 Credentials and private keys must not appear in ordinary logs, diagnostics, copied links or event payloads.
 
+A lapsed GUI session token may be exchanged at `POST /auth/session/refresh` only, for `SESSION_REFRESH_GRACE` = 4 h after expiry, single use; the original mint time is carried over so the 12 h cap (`SESSION_MAX_LIFETIME`) from the `x0x gui` mint is unchanged; a lapsed token receives 401 on every other route; lapsed entries are retained for the grace and pruned on every operation. Trade-off accepted (decided under A15 by the orchestrator, 18 Nov 2026): a session token that was never rotated can be swapped for up to 4 h 10 min after issue instead of 10 min (`SESSION_REFRESH_GRACE` + `SESSION_TOKEN_TTL`), and session tokens have no logout or revoke route.
+
 ## API behavior
 
 Return typed failures that tell the caller what happened and whether a retry is valid. Use stable request identities for operations whose outcome can be uncertain.

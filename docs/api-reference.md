@@ -59,7 +59,7 @@ Every endpoint except `GET /health` and `GET /constitution*` requires an
 | Class | Lifetime | Source | Can act as |
 |---|---|---|---|
 | **Durable API token** | until rotated | `<data_dir>/api-token` | the local owner (full control) |
-| **Session token** | 10 minutes; refreshable up to 12 h after the original mint | `POST /auth/session` (exchanged from the durable token); `POST /auth/session/refresh` (session token only, old token revoked) | browser/GUI surfaces |
+| **Session token** | 10 minutes; refreshable while live or for 4 h after it lapses, up to 12 h after the original mint | `POST /auth/session` (exchanged from the durable token); `POST /auth/session/refresh` (session token only, old token revoked) | browser/GUI surfaces |
 | **Rider token** | ≤ 90 days (default 7) | `POST /owner/riders` | a scoped sub-agent principal |
 
 Auth-class labels used throughout this reference:
@@ -259,7 +259,7 @@ daemon, so it shows the routes of the CLI build, not of a running `x0xd`.
 | GET | `/status` | `x0x status` | Runtime status, bound API address, connectivity, peers, warnings |
 | POST | `/shutdown` | `x0x stop` | Gracefully stop the daemon |
 | POST | `/auth/session` | `x0x auth session` | Exchange the durable API token for a short-lived browser session token (WS1.6) |
-| POST | `/auth/session/refresh` | `x0x auth refresh` | Swap a live **session** token for a fresh 10-minute one; the durable token gets `403`, the replaced token stops working at once, and refresh is refused (`401`) 12 h after the original `/auth/session` mint (#893) |
+| POST | `/auth/session/refresh` | `x0x auth refresh` | Swap a **session** token for a fresh 10-minute one. The token can be live, or lapsed for less than 4 h; a lapsed token is accepted on this route only. The durable token gets `403`, the replaced token stops working at once, and refresh is refused (`401`) 12 h after the original `/auth/session` mint (#893) |
 | GET | `/constitution` | `x0x constitution` | Display the x0x Constitution (Markdown) |
 | GET | `/constitution/json` | `x0x constitution --json` | Constitution with version metadata (JSON) |
 

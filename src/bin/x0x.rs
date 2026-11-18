@@ -1207,7 +1207,7 @@ enum HistorySub {
 enum AuthSub {
     /// Exchange the durable API token for a short-lived browser session token.
     Session,
-    /// Swap a live session token (passed via `X0X_API_TOKEN`) for a fresh one.
+    /// Swap a session token (passed via `X0X_API_TOKEN`) for a fresh one.
     Refresh,
 }
 

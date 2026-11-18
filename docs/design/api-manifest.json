@@ -62,7 +62,7 @@
     {
       "category": "status",
       "cli_name": "auth refresh",
-      "description": "Swap a live session token for a fresh one (12h cap from the original mint)",
+      "description": "Swap a session token, live or lapsed under 4h, for a fresh one (12h cap from the original mint)",
       "method": "POST",
       "path": "/auth/session/refresh",
       "request": {
