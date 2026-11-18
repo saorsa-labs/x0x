@@ -541,6 +541,56 @@ async fn skew_scenario(sim: &mut Sim, run: SkewRun, receipt: &mut Receipt) -> Re
     Ok(())
 }
 
+/// How often the stall watchdog reads the daemons' wall clock.
+const STALL_POLL: Duration = Duration::from_secs(5);
+
+/// A stall watchdog for one run of these arms. [`real_time_watchdog`] ends
+/// a case that is still running [`REAL_TIME_STALL`] after its start,
+/// whatever the case is doing. One arm here is about 900 virtual seconds:
+/// 105-125 s of real time in the 12-CPU VM and 172-185 s on the 4-vCPU CI
+/// runner when it passes, so that limit also ended healthy runs on a slower
+/// runner (main CI run 43891524690, each arm at 200 s in rerun 1). This one
+/// ends the run only when virtual time has not moved for
+/// [`REAL_TIME_STALL`] of real time, which is what a stall in a barrier
+/// does. The shim's wall clock is base + virtual time on every thread, so
+/// the watchdog thread reads it with [`wall_ms`]; nextest's kill for these
+/// arms (the `w3h-gate` override) stays the limit on a run that moves.
+fn stall_watchdog(case: &str, fabric: Arc<SimFabric>) -> Watchdog {
+    let disarmed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&disarmed);
+    let case = case.to_string();
+    std::thread::spawn(move || {
+        let mut last_ms = wall_ms();
+        let mut still = Duration::ZERO;
+        loop {
+            std::thread::sleep(STALL_POLL);
+            if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            let now_ms = wall_ms();
+            if now_ms != last_ms {
+                last_ms = now_ms;
+                still = Duration::ZERO;
+                continue;
+            }
+            still += STALL_POLL;
+            if still >= REAL_TIME_STALL {
+                break;
+            }
+        }
+        let trace = fabric.canonical_trace();
+        println!(
+            "W3H-STALL {case}: virtual time has not moved for {REAL_TIME_STALL:?} of real time \
+             (wall {last_ms} ms); last trace lines (newest first):"
+        );
+        for line in trace.lines().rev().take(60) {
+            println!("W3H-STALL {line}");
+        }
+        std::process::exit(101);
+    });
+    Watchdog { disarmed }
+}
+
 async fn run_skew(case: &str, seed: u64, run: SkewRun) -> Receipt {
     let mut receipt = Receipt::new(case, seed);
     receipt.note(format!(
@@ -551,7 +601,7 @@ async fn run_skew(case: &str, seed: u64, run: SkewRun) -> Receipt {
     match Sim::empty(case, seed, FIVE_SKEW) {
         Ok(mut sim) => {
             let fabric = Arc::clone(sim.fabric());
-            let watchdog = real_time_watchdog(case, fabric);
+            let watchdog = stall_watchdog(case, fabric);
             let outcome = skew_scenario(&mut sim, run, &mut receipt).await;
             watchdog.disarm();
             if let Err(error) = outcome {

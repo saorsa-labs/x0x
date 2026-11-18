@@ -367,9 +367,10 @@ applies that rule to the boot marker by analogy: fail closed means "start
 the configured binary normally and report degraded", never brick startup.
 The degraded report in the code is one warning line on stderr. The refusal
 covers only a permit present on descriptor 3: one that fails its checks,
-or one the process cannot verify. On a non-Linux Unix host, every well-formed
-permit refuses the boot today, because the process-custody identity check
-needs Linux `/proc`. When activation turns the engine on, the full boot
+or one the process cannot verify. On Linux and macOS the process-custody
+identity is observed (`/proc` on Linux, libproc on macOS, #1379), so a
+permit reaches its field checks. On any other Unix host, every well-formed
+permit refuses the boot today, because no identity can be observed. When activation turns the engine on, the full boot
 barrier applies as specified: permit checks, boot record write, then the
 barrier ack.
 
@@ -622,7 +623,42 @@ direct unit. `Restart=always` also restarts on exit 64, so a unit that
 binds the launcher must set `RestartPreventExitStatus=64`: a wrong
 `ExecStart` then stops the job and does not restart it every 5 s. The
 argv contract and the exit codes are provisional and dormant. They are
-frozen before `ENABLED = true`, like the fd 3 boot contract. The launcher strips a stray `X0X_M2_BOOT_FD` from the daemon's
+frozen before `ENABLED = true`, like the fd 3 boot contract. The main
+loop (`start.rs`, #1378) owns the trial only when the engine is enabled
+and the issuer gives it a host. Only the trial form of the argv,
+`x0x-launcher --host-root /abs/data-root --instance ID -- /abs/x0xd [args]`,
+consults the issuer (`issuer.rs`): it opens `<host-root>/upgrade-journal.json`
+once without following a symlink and requires, on that descriptor, a
+regular file of the launcher's account with mode exactly 0600, in a
+canonical root that no other account can write. No journal, or one before
+the swap or settled (`staged`, `probed`, `prepared`, `idle`, `superseded`),
+is an ordinary start, unless an unfinished trial (not Committed or
+Restored) is on disk, which refuses the start. An in-flight journal must
+name the instance, with that participant's data root equal to the host
+root, its executable equal to the daemon path and its arguments
+(`argv[1..]`) equal to the daemon's. A refusal no restart can change
+(mismatch, mixed pair, wrong owner, mode or type, corrupt journal, unknown
+schema, unfinished trial, a non-canonical plan path, a symlinked,
+non-regular or oversized trial record) exits 78; a failed read exits 75,
+and so does a plan path that is missing, since it may appear by itself (a
+volume not yet mounted at boot). Only the issuer's typed refusal exits 78;
+an untyped I/O error is a failed read. The journal
+has no hash or signature: anything that runs as the launcher's account,
+the candidate daemon included, is trusted to write it, until the producer
+(#2012) adds an integrity binding. The writer of that journal is the M2
+prepare producer (#2012), which does not exist yet, so with the engine
+held every start is still the passthrough. An owned start installs its SIGTERM and
+SIGINT handler only then, and exits 0 after a stop, 75 when the daemon
+exits or a step can be retried (an issuer error never falls back to the
+passthrough), and 78 (`EX_CONFIG`) when no automatic start is allowed
+(`RecoveryFailed`, a final host phase, a participant missing from the
+plan or stopped, or a prior child that still runs after a 45 s wait for it
+to end). A unit that binds the owned launcher must also set
+`RestartPreventExitStatus=78`. A trial-form launcher records each final
+refusal in `<host-root>/launcher-refusal.json` (reason, launcher pid, time;
+mode 0600) and the next start that is not final removes it; `x0x doctor`
+reports it while the daemon is unreachable. A retired trial on a
+committed host is an ordinary start: the passthrough. The launcher strips a stray `X0X_M2_BOOT_FD` from the daemon's
 environment before the `exec`. While activation is held, `x0xd` ignores a
 stray `X0X_M2_BOOT_FD` with one warning. It refuses to start only for a
 permit present on descriptor 3 that fails its checks or cannot be
@@ -982,6 +1018,21 @@ apply re-verifies the **loaded** job policy (#615 above), so a `KeepAlive`
 removed after repair refuses further upgrades instead of exiting into a job
 that will not restart.
 
+A job whose program is the stable launcher (`x0x-launcher /abs/x0xd ...`,
+or the trial form `x0x-launcher --host-root R --instance I -- /abs/x0xd ...`)
+is treated as the x0xd job it runs: `--repair` and the upgrade-time
+readback both look through the launcher's own arguments to the daemon
+(#1379). The program is the executable launchd runs: `Program` when the
+job sets it, else `ProgramArguments[0]`. The launcher's arguments are
+checked with the launcher's own parser, so `--repair` refuses a relative
+host root or an invalid instance that the launcher would refuse. Such a job also needs `ExitTimeOut` above 45 s (the launcher's
+worst-case stop of a committed daemon); `--repair` refuses one without it.
+Under launchd an unconditional `KeepAlive` restarts every exit, so a
+launcher that reaches a final refusal (exit 78 elsewhere) holds until it is
+stopped instead of exiting. launchd then shows the job running with no
+daemon; `x0x doctor` shows the launcher's refusal reason. `x0x autostart` does not bind the launcher yet:
+it is dormant.
+
 The handoff transaction (`upgrade::restart`):
 
 1. The old daemon writes `data_dir/upgrade-handoff.json` (from/to versions,
@@ -1020,33 +1071,108 @@ no gossip, binds nothing, and takes no instance lock.
 
 ## Update Flow (for x0xd)
 
-1. **Startup (background, post-bind)**: after the API listener is bound — and as a non-blocking background task, so an unreachable GitHub never delays API readiness (#1086) — check GitHub for a new release and apply it if found (the startup manifest broadcast is a separate task, run by `broadcast_current_manifest`)
+1. **Startup (background, post-bind)**: after the API listener is bound,
+   check GitHub for a new release and apply it if found. This check runs
+   as a non-blocking background task, so an unreachable GitHub never
+   delays API readiness (#1086). The check itself announces nothing
+   (#1169). A boot-time discovery is announced by the separate
+   every-launch manifest broadcast task, `broadcast_current_manifest`.
+   That broadcast runs under the same gates and with the byte-identical
+   payload; both paths build it through the same monitor funnel. It is
+   best effort: the broadcast task does its own fetch, and a failed
+   fetch announces nothing — such a discovery is announced only when a
+   later publish point (fallback poll, gossip relay) sees the release.
 2. **Gossip listener**: Receive manifests on `x0x/release` topic, verify signature, rebroadcast, apply if newer
 3. **GitHub poller**: Periodic fallback poll, broadcast discovered manifests to gossip
-4. **Announce on first observation** (#1169): the publish points that
-   predate #1169 are the startup manifest broadcast
-   (`broadcast_current_manifest`, on every launch; the startup check's own
-   publish site is dormant because the daemon runs it with no agent), the
-   fallback poll and the gossip relay. #1169 adds the one that stayed
-   silent: a manual `/upgrade/apply` announces the signed manifest on the
-   release topic before its apply work, so subscribed peers start their
-   update check from the announcement instead of their own fallback poll.
+4. **Announce on first observation** (#1169): a node announces a release
+   at four publish points:
+
+   - the startup manifest broadcast (`broadcast_current_manifest`, on
+     every launch)
+   - the fallback poll
+   - the gossip relay
+   - a manual `/upgrade/apply`
+
+   The startup check and the read-only `/upgrade` check announce
+   nothing. The startup check's discovery is covered by the manifest
+   broadcast on a best-effort basis: the broadcast fetches independently,
+   and a failed broadcast fetch announces nothing. For the read-only
+   check, gossip self-delivery would feed this node's own apply owner —
+   a background install triggered by a read (Engineer ruling 3 Nov 2026
+   17:40 GMT).
+
+   `/upgrade/apply` applies the release it announces. It records its
+   payload as apply-route-owned in the shared self-published tracker
+   before publishing. While the tracker holds that claim, any gossip
+   copy of those bytes — the announcing node's own echo or a peer's —
+   neither rebroadcasts nor queues a second apply on the background
+   owner.
+
+   Echoes of the node's non-apply-route publishes — the boot broadcast,
+   the fallback poll, the gossip relay — are not rebroadcast either.
+   They still reach the owner, and the owner's version dedup absorbs
+   them.
+
+   The tracker entry that holds the claim expires 30 minutes after its
+   latest record. A later record of the same bytes — the boot
+   broadcast, a fallback publish or a repeat `/upgrade/apply` of those
+   bytes — restarts that clock; a gossip driver rebroadcast never does,
+   because self-published bytes are skipped before any record is
+   written. The default rollout window is 60 minutes, so the entry
+   can expire while the apply still waits. A gossip copy of the payload
+   is then treated like a peer's copy and can queue a background apply
+   again.
+
+   The handler's drop releases the claim only when the apply was never
+   admitted and nothing will resume the install. These drops release
+   it, and gossip copies reach the owner again:
+
+   - a failed apply that leaves no live probe retry owning the install
+     — including a failure before any attempt (staging wait, identity
+     readback, permit or manifest-timestamp checks): its cancelled
+     release permit disqualifies it from the hand-off, so it schedules
+     no retry
+   - a no-op apply
+   - a client disconnect during the apply wait — unless a live probe
+     retry owns the install for that version
+   - a panic — same unless
+
+   A failed apply that leaves a live probe retry owning the install
+   keeps the claim. It keeps the claim whether this request scheduled
+   the retry or an earlier failed apply in the same process already
+   left it in place. A second failed `/upgrade/apply` of the same bytes
+   must not release the first failure's live retry claim — and neither
+   may a later request that is dropped before admission (disconnect or
+   panic) or fails without scheduling anything: such a request's guard
+   kept nothing, but its drop checks the process-local retry ownership
+   first and clears a claim only when no live retry is left. A poisoned
+   ownership map counts as owned, so it keeps the claim too.
+
+   Every admitted apply keeps the claim. Once the apply's blocking
+   worker is admitted — host locks held, replacement and restart owned
+   by the worker — no handler exit releases the claim. A dropped
+   handler keeps it: the install still runs. `RolledBack` keeps it: a
+   real rollback runs after admission, so a rolled-back apply is always
+   on this post-admission side. `NoUpgrade` keeps it, and so do errors
+   that resume nothing. A successful apply keeps it as well.
+
+   The motivating case is a gossip copy arriving in the seconds before
+   the restart. Such a copy must not queue a second apply of that
+   install. That case is not the whole rule. The keep is bounded by the
+   tracker TTL — a sliding bound, because every later record of the
+   same bytes restarts it: the claim ages out with the entry even when
+   the worker has finished and the handler is alive, but fresh echoes
+   keep extending it.
+
+   After a fast failure, the node's own gossip echo can still arrive
+   after the claim is released and queue a background-owner attempt of
+   the same release. The owner's 30-minute `failed_at` backoff bounds
+   the rate of those attempts, not their count: at most one new attempt
+   per 30 minutes.
+
    The GitHub poll cadence does not change (A14 / ADR 0045): gossip is
    the fast path. The announcement is bounded (10 s) and best effort;
    peer rebroadcast limiting and the apply owner's dedup handle repeats.
-   The read-only `/upgrade` check announces nothing (Engineer ruling
-   3 Nov 2026 17:40 GMT): a check-path announce self-delivers through
-   gossip and feeds this node's own apply owner — a background install
-   triggered by a read, which no credential gate on a GET can justify.
-   Self-delivery also applies to the apply-path announcement: the
-   applying node's own gossip listener receives it back. The route
-   records its payload as published by `/upgrade/apply` in the shared
-   self-published tracker on the daemon state before it publishes, so
-   the gossip driver neither rebroadcasts that echo nor submits it to the
-   background apply owner: the route already applies that release
-   (#1169). Echoes of the driver's own rebroadcasts, fallback-poll
-   publishes and the start-up broadcast are not rebroadcast again but are
-   still submitted; the owner's version dedup absorbs them.
 5. **Authenticated HTTP apply**: Verify the release and wait for staging, then
    recheck admission under the install lock before replacement. The CLI
    `upgrade --apply` uses this route; `--now` skips only the staging delay.

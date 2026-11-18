@@ -14,9 +14,6 @@
 //! - H-S3-t (5) holds the staged Welcome. Its fetch is an encrypted direct
 //!   message the fabric cannot tell apart, and here it runs before the
 //!   attested catch-up, so holding it holds the whole join.
-//! - H-S3-r: with A's log capped, A serves no chain and no join carry, so
-//!   J holds no marker or gap record and §2 sends no request. It is kept
-//!   as the probe `probe_w3h_1356_s3_r_beyond_retention`, not a gate case.
 //!
 //! **"On the previous release".** The harness runs one in-process build,
 //! so it cannot run a released binary. A node that the ADR puts "on the
@@ -981,8 +978,18 @@ pub(super) fn keys(sim: &Sim, labels: &[&str]) -> Result<Vec<Key>> {
 // ─── H-S3-r: beyond retention (D97, D119) ─────────────────────────────────
 
 const R_LABELS: &[&str] = &["A", "M1", "M2", "B", "J"];
-const FINAL_R: &str = "j_readmission_required_then_b_attests_and_j_catches_up";
+const FINAL_R: &str = "j_readmission_required_then_b_attests_and_j_holds_keys_at_the_head";
 const CAUSE_R: &str = "J is marked or its join times out, with no typed state in the window";
+/// #2003: the cause on the base, where B's catch-up page could not serve
+/// the renames that A signed.
+const CAUSE_R_KEYS: &str = "after B attests J stays catching_up at its head, with no keys";
+/// #2003: how long J's recovery object may stay after J caught up: a few
+/// worker ticks.
+const RECOVERY_CLEARS: Duration = Duration::from_secs(60);
+/// The H-S3-r replay variant (#2003 carry-over from the review of #2017).
+const FINAL_R_REPLAY: &str = "j_ends_active_with_keys_at_the_head_whichever_admin_attests";
+const CAUSE_R_REPLAY: &str = "with the pre-join metadata replay open, J did not end Active with \
+                              keys at the head, unmarked, its recovery object cleared";
 /// H-S3-r: "A's commit-log cap set to 4 by test configuration".
 const R_CAP: usize = 4;
 
@@ -1016,16 +1023,71 @@ async fn cap_log(sim: &Sim, label: &str, group: &str) -> Result<(usize, u64)> {
     Ok((info.commit_log.len(), oldest))
 }
 
+/// H-S3-r: drops every write to `j` of a metadata-topic message first seen
+/// while the returned flag is set (the row clears it when J redeems). Every
+/// copy of a gossip message has one message ID, so no later replay of such
+/// a message reaches J either. The second value counts the writes it
+/// dropped.
+async fn hold_pre_join_gossip(
+    sim: &Sim,
+    group: &str,
+    j: Key,
+) -> Result<(
+    Arc<std::sync::atomic::AtomicBool>,
+    Arc<std::sync::atomic::AtomicUsize>,
+)> {
+    use crate::network::sim::{Fault, LaneClass};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let topic = super::sidecar_q_member::meta_topic(sim, group).await?;
+    let recording = Arc::new(AtomicBool::new(true));
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let seen: Mutex<std::collections::HashSet<[u8; 32]>> = Mutex::new(Default::default());
+    let (flag, count) = (Arc::clone(&recording), Arc::clone(&dropped));
+    sim.fabric().add_rule(move |write| {
+        if write.lane.class != LaneClass::PubSub {
+            return Fault::Pass;
+        }
+        let Some((on, msg_id)) = pubsub_header(&write.bytes) else {
+            return Fault::Pass;
+        };
+        if on != topic {
+            return Fault::Pass;
+        }
+        let Ok(mut seen) = seen.lock() else {
+            return Fault::Drop;
+        };
+        if flag.load(Ordering::SeqCst) {
+            seen.insert(msg_id);
+        }
+        if write.lane.dst == j && seen.contains(&msg_id) {
+            count.fetch_add(1, Ordering::SeqCst);
+            Fault::Drop
+        } else {
+            Fault::Pass
+        }
+    });
+    sim.fabric()
+        .mark("fault: H-S3-r holds J's copies of pre-join metadata gossip");
+    Ok((recording, dropped))
+}
+
 /// H-S3-r: S0 with A's commit log capped at 4 and admin B (default cap)
-/// seated after step 2. Every message between B and J is held. After the
+/// seated after step 2. Every message between B and J is held, and so is
+/// every gossip copy to J of a metadata message published before J
+/// redeems. After the
 /// mint A renames 6 times (r+1 to r+6) and seals J (r+7); B applies them.
-/// Advance 130 s and one request interval. Desired: A answers
-/// `base_beyond_retention`; J shows `readmission_required
-/// {base_beyond_retention}` with an `exit`, applies no link and keeps its
-/// containment. Then the B–J messages pass: B's ATA arms, J leaves the
-/// state, catches up and holds keys. Main: J is marked or times out with
-/// no typed state.
-async fn beyond_retention(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
+/// Advance 130 s and one request interval. A serves J's seal with no chain
+/// and no join carry, so J holds no marker and no gap record; the §2
+/// "Unserved join seal" trigger (A08 amendment of 16 Nov 2026) asks the
+/// admins on J's roster. Desired: A answers `base_beyond_retention`; J
+/// shows `readmission_required {base_beyond_retention}` with an `exit` on
+/// its API and has not caught up. Then the B–J messages pass: J asks B,
+/// which has not answered for this attempt, B attests, and J catches up
+/// through B: B relays the renames that A signed (A08 amendment of 17 Nov
+/// 2026, #2003), and J is Active with keys at A's head (r+7). Before
+/// #1572 J sent no request and timed out with no typed state; before
+/// #2003 J stayed `catching_up` at its head with no keys.
+async fn beyond_retention(sim: &mut Sim, receipt: &mut Receipt, replay: bool) -> Result<()> {
     mesh(sim, R_LABELS).await?;
     let group = create_group(sim, "A").await?;
     for member in ["M1", "M2", "B"] {
@@ -1055,6 +1117,19 @@ async fn beyond_retention(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     hold.set(sim, "holding every message between B and J", move |f| {
         (f.origin == b && f.dst == j) || (f.origin == j && f.dst == b)
     });
+    // No gossip copy of a metadata message published before J redeems
+    // reaches J. A replay of A's renames from the gossip message cache
+    // (which ages in real time) could otherwise move J's head to r+3: A
+    // keeps r+4 to r+7, and a head one below its oldest kept commit is
+    // still provable (`chain_position`), so A attests J and J catches up
+    // through A while B is held. J's own join traffic passes.
+    // The replay variant (#2003 carry-over) leaves this path open and
+    // checks that it stays benign.
+    let pre_join = if replay {
+        None
+    } else {
+        Some(hold_pre_join_gossip(sim, &group, j).await?)
+    };
     let minted = view(sim, "A", &group).await?;
     let link = invite(sim, "A", &group).await?;
     for n in 1..=6 {
@@ -1066,6 +1141,9 @@ async fn beyond_retention(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         tokio::time::sleep(RESENDS_DONE).await;
     })
     .await?;
+    if let Some((recording, _)) = &pre_join {
+        recording.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
     let joined_at = sim.fabric().mark_indexed("case: J redeems invite I");
     let sealed = seal_j(sim, &link, &group).await?;
     let (kept_after, _) = cap_log(sim, "A", &group).await?;
@@ -1103,14 +1181,24 @@ async fn beyond_retention(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         "j_reached_a",
         to_a > 0,
         format!(
-            "frames J->A since the join: {to_a}; held B<->J writes {}",
-            hold.dropped()
+            "frames J->A since the join: {to_a}; held B<->J writes {}; held pre-join \
+             metadata writes to J {}",
+            hold.dropped(),
+            pre_join.as_ref().map_or_else(
+                || "none (replay variant)".to_string(),
+                |(_, dropped)| dropped
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .to_string()
+            )
         ),
         at(sim),
     );
+    let a_route = sim
+        .at_instant("read A's recovery", recovery_route(sim, "A", &group))
+        .await??;
     receipt.note(format!(
-        "after the held window: {held_text}; states {:?}; first marked {:?}",
-        first.recovery_states, first.marked
+        "after the held window: {held_text}; states {:?}; first marked {:?}; A requesters {}",
+        first.recovery_states, first.marked, a_route["requesters"]
     ));
     hold.set(sim, "passing everything", |_| false);
     let mut second = JWindow::default();
@@ -1130,16 +1218,71 @@ async fn beyond_retention(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         .at_instant("read B's recovery", recovery_route(sim, "B", &group))
         .await??;
     let by_b = answered(&b_route, &j_hex, "attested");
+    let by_a = answered(&a_route, &j_hex, "attested");
     receipt.note(format!(
         "after the release: {end_text}; states {:?}; B requesters {}",
         second.recovery_states, b_route["requesters"]
     ));
-    let passed = readmission && !caught_early && caught && by_b;
+    // J's recovery state left `readmission_required` for `catching_up`
+    // (B's attestation armed the catch-up).
+    let left = second
+        .recovery_states
+        .iter()
+        .any(|state| state.starts_with("catching_up"));
+    // #2003: once caught up, J's recovery object clears: the finished
+    // catch-up does not stay `catching_up`.
+    let cleared = caught
+        && sim
+            .until(
+                "J's recovery object clears",
+                RECOVERY_CLEARS,
+                async |s: &Sim| {
+                    status_now(s, "J", &group)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|st| st.recovery.is_null())
+                },
+            )
+            .await
+            .is_ok();
+    let (_, cleared_text, _, _) = j_end(sim, &group, "A").await?;
+    receipt.note(format!("after the recovery wait: {cleared_text}"));
+    // #2003: J is Active with keys at the head (`caught_up`), and its
+    // recovery object is gone.
+    let passed = readmission && !caught_early && by_b && caught && cleared;
     receipt.note(format!(
         "readmission={readmission} caught_early={caught_early} caught={caught} by_b={by_b} \
-         J revision while held {j_rev:?}"
+         left_for_catching_up={left} cleared={cleared} J revision while held {j_rev:?}"
     ));
-    if !passed {
+    if replay {
+        // Whichever admin attests, and whenever the replay moved J's head,
+        // J ends Active with keys at the head, never marked, its recovery
+        // object cleared.
+        let benign = caught && cleared && first.marked.is_none() && second.marked.is_none();
+        receipt.note(format!(
+            "replay variant: attested by A {by_a}, by B {by_b}; readmission while held \
+             {readmission}; caught while held {caught_early}"
+        ));
+        if !benign {
+            receipt.cause(
+                CAUSE_R_REPLAY,
+                Some(format!("{held_text}; then {end_text}")),
+                true,
+                at(sim),
+            );
+        }
+        receipt.finish(FINAL_R_REPLAY, benign, at(sim));
+        return Ok(());
+    }
+    if !passed && readmission && by_b && left && !caught {
+        receipt.cause(
+            CAUSE_R_KEYS,
+            Some(format!("{held_text}; then {end_text}")),
+            true,
+            at(sim),
+        );
+    } else if !passed {
         let typed = first
             .recovery_states
             .iter()
@@ -1148,7 +1291,7 @@ async fn beyond_retention(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         receipt.cause(
             CAUSE_R,
             Some(format!("{held_text}; then {end_text}")),
-            !typed && (first.marked.is_some() || j_held.is_none() || !caught),
+            !typed && (first.marked.is_some() || j_held.is_none() || !left),
             at(sim),
         );
     }
@@ -1690,6 +1833,8 @@ enum Row {
     HostCommit,
     /// H-S3-r.
     Retention,
+    /// H-S3-r with the pre-join metadata replay left open (#2003).
+    RetentionReplay,
     /// #1661: the staged Welcome is lost after readmission.
     WelcomeLost,
     /// H-S3-d5.
@@ -1701,7 +1846,7 @@ impl Row {
         match self {
             Self::Provisional => B_LABELS,
             Self::TypedWaits | Self::HostCommit => T_LABELS,
-            Self::Retention | Self::WelcomeLost => R_LABELS,
+            Self::Retention | Self::RetentionReplay | Self::WelcomeLost => R_LABELS,
             Self::Sibling => D5_LABELS,
         }
     }
@@ -1712,6 +1857,7 @@ impl Row {
             Self::TypedWaits => FINAL_T,
             Self::HostCommit => FINAL_T4,
             Self::Retention => FINAL_R,
+            Self::RetentionReplay => FINAL_R_REPLAY,
             Self::WelcomeLost => FINAL_W,
             Self::Sibling => FINAL_D5,
         }
@@ -1735,7 +1881,8 @@ async fn run_row(case: &str, seed: u64, row: Row) -> Receipt {
                 Row::Provisional => provisional_promotion(&mut sim, &mut receipt).await,
                 Row::TypedWaits => typed_waits(&mut sim, &mut receipt, false).await,
                 Row::HostCommit => typed_waits(&mut sim, &mut receipt, true).await,
-                Row::Retention => beyond_retention(&mut sim, &mut receipt).await,
+                Row::Retention => beyond_retention(&mut sim, &mut receipt, false).await,
+                Row::RetentionReplay => beyond_retention(&mut sim, &mut receipt, true).await,
                 Row::WelcomeLost => welcome_lost(&mut sim, &mut receipt).await,
                 Row::Sibling => sibling_marker(&mut sim, &mut receipt).await,
             };
@@ -1819,24 +1966,54 @@ fn w3h_1356_red_s3_t_deferred_until_host_commit() -> Result<()> {
     })
 }
 
-/// H-S3-r (D97, D119) as ADR 0109 writes it. Not a gate case: it cannot
-/// reach its candidate state on this build (#1572). With A's log capped
-/// at 4, A serves no chain and no join carry, so J holds no marker, no gap
-/// record and no exhausted segment; §2 sends a request only for one of
-/// those, so J never asks A and never sees `base_beyond_retention`. Run it
-/// by hand (`--run-ignored all`): this test.
+/// H-S3-r (D97, D119), a control since the "Unserved join seal" trigger
+/// (ADR 0109 §2, A08 amendment of 16 Nov 2026, #1572). With A's log
+/// capped at 4, A serves J no chain and no join carry, so J holds no
+/// marker and no gap record. J's seal did not apply, so §2 asks the admins
+/// on J's roster: A answers `base_beyond_retention`, and J shows
+/// `readmission_required` with D43's exit. Then B attests and J catches
+/// up through B's relayed links (#2003): J is Active with keys at A's
+/// head. Before the trigger J sent no request and timed out with no
+/// reason; before #2003 J stayed `catching_up` with no keys.
 #[test]
-#[ignore = "ADR 0109 H-S3-r cannot reach its candidate state under §2's request triggers (#1572); a probe, not a gate case"]
-fn probe_w3h_1356_s3_r_beyond_retention() -> Result<()> {
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+fn w3h_1356_control_s3_r_beyond_retention() -> Result<()> {
     super::super::block_on_paused(async move {
-        let receipt = run_row(
-            "probe_w3h_1356_s3_r_beyond_retention",
+        expect_row(
+            "w3h_1356_control_s3_r_beyond_retention",
             0x1356_0104,
             Row::Retention,
+            Verdict::Green,
         )
-        .await;
-        ensure!(receipt.verdict().is_some(), "no verdict");
-        Ok(())
+        .await
+    })
+}
+
+/// H-S3-r replay variant (#2003; carry-over from the review of #2017): the
+/// same setup with the pre-join metadata replay left open. A gossip
+/// replay of A's renames from the message cache (which ages in real time)
+/// may or may not move J's head into A's retained log before J asks.
+/// Either way J ends Active with keys at the head, never marked, its
+/// recovery object cleared: through A when A can prove J's head, or
+/// through B's relayed links after A's `base_beyond_retention`. The
+/// receipt names the path.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+fn w3h_1356_control_s3_r_replay_benign() -> Result<()> {
+    super::super::block_on_paused(async move {
+        expect_row(
+            "w3h_1356_control_s3_r_replay_benign",
+            0x1356_0158,
+            Row::RetentionReplay,
+            Verdict::Green,
+        )
+        .await
     })
 }
 

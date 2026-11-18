@@ -505,16 +505,9 @@ fn is_removed(info: &GroupInfo, target_hex: &str) -> bool {
         .is_some_and(|member| member.state == GroupMemberState::Removed)
 }
 
-/// Whether the Removed `target_hex` of a GSS `MlsEncrypted` group holds
-/// the current secret: `Some(true)` retained, `Some(false)` a rotation
-/// followed its departure, `None` the retained commits cannot tell.
-///
-/// The newest retained commit that seats the target as Active decides:
-/// its secret epoch is the newest secret the target received. When no
-/// retained commit seats it, a retained commit below the current epoch
-/// still proves a later rotation, because the target was not seated at
-/// that commit. Otherwise the commit that seated it was trimmed or never
-/// witnessed (`None`).
+/// Whether the Removed target of a GSS group holds the current secret:
+/// `Some(true)` retained, `Some(false)` a rotation followed its
+/// departure, `None` the retained commits cannot tell.
 fn gss_secret_hold(info: &GroupInfo, target_hex: &str) -> Option<bool> {
     if !is_gss_encrypted(info) || info.withdrawn || !is_removed(info, target_hex) {
         return Some(false);
@@ -568,9 +561,6 @@ pub fn check_ahead(
     {
         return Err(CryptoExclusionRefusal::ActorIneligible);
     }
-    // #1578 rc11 (audit): the join's key-only marker row is not a seat
-    // — the target reads as absent, exactly main's roster, where the
-    // pre-admission joiner holds no row.
     let target_hex = hex::encode(body.target);
     if !latest.members_v2.contains_key(&target_hex) || latest.join_seat_key_marker_only(&target_hex)
     {
@@ -880,8 +870,6 @@ mod tests {
         );
     }
 
-    /// A GSS group in which `target` was seated at secret epoch 0 (a
-    /// retained commit holds that roster) and then self-left.
     fn gss_group(admin: &AgentKeypair, target: [u8; 32]) -> GroupInfo {
         let mut info = GroupInfo::new(
             "g".to_string(),
@@ -926,10 +914,6 @@ mod tests {
         }
     }
 
-    /// #1508 review P1 (GSS self-leave): the GSS form of §4 is accepted on
-    /// a GSS group for an already-Removed target when the next secret
-    /// epoch is exactly the committed epoch + 1 and the signed binding
-    /// names it. Each violation is refused with its typed reason.
     #[test]
     fn gss_frame_is_accepted_and_each_violation_refused() {
         let admin = keypair();
@@ -940,7 +924,6 @@ mod tests {
         let frame = sign(good.clone(), &admin).expect("sign");
         let decoded = decode_frame(&encode_frame(&frame).expect("encode")).expect("decode");
         verify_signatures(&decoded).expect("signatures");
-        // The next epoch is not the committed epoch + 1.
         assert_eq!(
             validate_against_parent(&good, &info, 1, |_| false),
             Err(CryptoExclusionRefusal::EpochMismatch)
@@ -950,7 +933,6 @@ mod tests {
             validate_against_parent(&skipped, &info, 0, |_| false),
             Err(CryptoExclusionRefusal::EpochMismatch)
         );
-        // The signed binding does not name the next epoch.
         let mut unbound = good.clone();
         unbound.crypto = CryptoExclusionCryptoV1::Gss {
             next_secret_epoch: 1,
@@ -960,7 +942,6 @@ mod tests {
             validate_against_parent(&unbound, &info, 0, |_| false),
             Err(CryptoExclusionRefusal::EpochMismatch)
         );
-        // The target is seated on the parent.
         let mut seated = info.clone();
         if let Some(member) = seated.members_v2.get_mut(&hex::encode(target)) {
             member.state = GroupMemberState::Active;
@@ -969,7 +950,6 @@ mod tests {
             validate_against_parent(&good, &seated, 0, |_| false),
             Err(CryptoExclusionRefusal::TargetNotRemoved)
         );
-        // A GSS transition on a TreeKEM group, and on a SignedPublic group.
         let mut treekem = info.clone();
         treekem.secure_plane = crate::mls::SecureGroupPlane::TreeKem;
         assert_eq!(
@@ -984,9 +964,6 @@ mod tests {
         );
     }
 
-    /// #1508 review P1: the GSS "retained leaf". A self-leaver keeps the
-    /// secret until a later commit rotates it; a removal that rotated in
-    /// its own commit never retains it.
     #[test]
     fn gss_self_leaver_retains_the_secret_until_a_rotation() {
         let admin = keypair();
@@ -996,7 +973,6 @@ mod tests {
         info.seal_commit(&admin, 600).expect("leave");
         assert!(gss_secret_retained(&info, &target_hex));
         assert_eq!(committed_secret_epoch(&info), 0);
-        // A share raises the local epoch before its commit: still retained.
         info.secret_epoch = 1;
         assert_eq!(committed_secret_epoch(&info), 0);
         assert!(gss_secret_retained(&info, &target_hex));
@@ -1006,7 +982,6 @@ mod tests {
         assert_eq!(committed_secret_epoch(&info), 1);
         assert!(!gss_secret_retained(&info, &target_hex));
 
-        // An admin removal that rotates in its own commit.
         let other = [8u8; 32];
         let other_hex = hex::encode(other);
         info.add_member(other_hex.clone(), GroupRole::Member, None, None);
@@ -1015,16 +990,11 @@ mod tests {
         let _ = info.rotate_shared_secret();
         info.seal_commit(&admin, 900).expect("remove");
         assert!(!gss_secret_retained(&info, &other_hex));
-        // TreeKEM groups use their tree, not this rule.
         let mut treekem = gss_group(&admin, target);
         treekem.secure_plane = crate::mls::SecureGroupPlane::TreeKem;
         assert!(!gss_secret_retained(&treekem, &target_hex));
     }
 
-    /// #1508 review (Codex P1 on 50b6531): bounded history is not a
-    /// rotation. Once later commits without a rotation trim the seat of a
-    /// self-leaver, the node can prove neither that it holds the secret
-    /// nor that a rotation excluded it. A rotation after that is proof.
     #[test]
     fn gss_trimmed_seat_is_not_proof_of_exclusion() {
         let admin = keypair();
@@ -1047,7 +1017,6 @@ mod tests {
         info.seal_commit(&admin, 10_000).expect("rotate");
         assert!(!gss_secret_retained(&info, &target_hex));
         assert!(gss_secret_excluded(&info, &target_hex));
-        // A seated target is outside this rule: the seat decides first.
         let mut seated = info.clone();
         if let Some(member) = seated.members_v2.get_mut(&target_hex) {
             member.state = GroupMemberState::Active;

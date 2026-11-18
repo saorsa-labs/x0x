@@ -105,7 +105,7 @@ mod tests {
         assert!(r.is_pending());
         assert_eq!(r.created_at, 100);
         assert_eq!(r.requested_role, GroupRole::Member);
-        assert_eq!(r.request_id.len(), 32); // simple UUID = 32 hex chars
+        assert_eq!(r.request_id.len(), 32);
     }
 
     #[test]

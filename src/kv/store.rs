@@ -2899,16 +2899,30 @@ impl KvStore {
         //     Belt-and-braces: AppendOnly is terminal — the 6b gate already
         //     rejected any checkpoint that would downgrade it, so this branch
         //     can only keep or adopt AppendOnly, never leave it.
+        //     Step 7 MERGES (one LWW rule, A10): a local entry or name later
+        //     than the signed one wins, so the local state can differ from
+        //     the checkpoint. The checkpoint is cached only when the root over
+        //     the local state still matches it; otherwise no checkpoint is
+        //     cached, so `full_delta` never relays a checkpoint that does not
+        //     match the entries beside it (a receiver then takes the
+        //     sender-auth path). The high-water mark still advances: the
+        //     signed set was adopted.
         let downgrades_terminal_policy = matches!(self.policy, AccessPolicy::AppendOnly)
             && !matches!(cp.policy, AccessPolicy::AppendOnly);
         if cp.policy_version >= self.policy_version && !downgrades_terminal_policy {
             self.policy = cp.policy.clone();
             self.policy_version = cp.policy_version;
         }
-        self.latest_checkpoint = Some(cp.clone());
+        self.latest_checkpoint = self.local_root_matches(cp).then(|| cp.clone());
         self.highest_checkpoint_seq = cp.checkpoint_seq;
         self.version += 1;
         true
+    }
+
+    /// Does the content root over this replica's complete state (entries
+    /// and name) equal `cp`'s?
+    fn local_root_matches(&self, cp: &OwnerCheckpoint) -> bool {
+        content_root(&self.id, self.name(), &self.checkpoint_pairs()) == cp.content_root
     }
 
     /// True when `cp` is a genuine checkpoint for this store's anchored owner
@@ -2983,11 +2997,7 @@ impl KvStore {
             return;
         }
         // Cache only if the resulting complete state matches the checkpoint.
-        let matches = {
-            let pairs = self.checkpoint_pairs();
-            content_root(&self.id, self.name(), &pairs) == cp.content_root
-        };
-        if matches {
+        if self.local_root_matches(cp) {
             self.latest_checkpoint = Some(cp.clone());
             self.highest_checkpoint_seq = cp.checkpoint_seq;
         }
@@ -5413,10 +5423,13 @@ mod tests {
         let mut delta = owner_store.full_delta().expect("full delta");
         delta.owner_checkpoint = Some(cp);
 
-        // Fresh member replica: empty, anchored on the group creator.
+        // Fresh member replica: empty, anchored on the group creator, opened
+        // under the store's name as `lib.rs` opens a member's group store
+        // (a stamped empty name would win the name LWW, and the local root
+        // would then not match the checkpoint, so it would not be cached).
         let mut joiner = KvStore::new_encrypted(
             id,
-            String::new(),
+            "S".to_string(),
             owner,
             group_id,
             Arc::clone(&ctx) as Arc<dyn KvSecureContext>,
@@ -5629,6 +5642,79 @@ mod tests {
             .expect("checkpoint-gated merge");
         assert!(joiner.get("k").is_some(), "adopted relayed owner content");
         assert_eq!(joiner.highest_checkpoint_seq, 1);
+    }
+
+    #[test]
+    fn adoption_does_not_cache_a_checkpoint_the_merge_no_longer_matches() {
+        // WHY (#1987 review): adoption MERGES the signed entries, so a local
+        // entry later than the signed one wins. The replica must then not
+        // cache (and later relay) the checkpoint: its root no longer matches
+        // the replica's entries.
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner = kp.agent_id();
+        let topic = "store/adopt-merge";
+        let id = KvStoreId::for_topic_owner(topic, &owner);
+        let mut owner_store =
+            KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed).expect("kv store");
+        owner_store
+            .put(
+                "k".to_string(),
+                b"signed".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+        let cp1 = checkpoint_for(&owner_store, topic, &kp, 1);
+        let mut first = owner_store.full_delta().expect("full delta");
+        first.owner_checkpoint = Some(cp1);
+        let mut replica =
+            KvStore::new_replica(id, String::new(), Some(owner), AnchorChannel::RestParam);
+        replica
+            .merge_delta(&first, peer(9), Some(&agent(9)))
+            .expect("adopt checkpoint 1");
+        assert!(replica.latest_checkpoint.is_some(), "matching: cached");
+
+        // The replica now holds a later value under `k`.
+        let local = replica.entries_mut_for_test().get_mut("k").expect("k");
+        local.value = b"later".to_vec();
+        local.content_hash = *blake3::hash(b"later").as_bytes();
+        local.updated_at = local.updated_at.saturating_add(1_000);
+
+        // Checkpoint 2 signs `k` unchanged plus a new key.
+        owner_store
+            .put(
+                "k2".to_string(),
+                b"two".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put k2");
+        let cp2 = checkpoint_for(&owner_store, topic, &kp, 2);
+        let mut second = owner_store.full_delta().expect("full delta");
+        second.owner_checkpoint = Some(cp2);
+        replica
+            .merge_delta(&second, peer(9), Some(&agent(9)))
+            .expect("adopt checkpoint 2");
+
+        assert_eq!(
+            replica.get("k").map(|e| e.value.clone()),
+            Some(b"later".to_vec()),
+            "the later local entry wins the merge"
+        );
+        assert!(replica.get("k2").is_some(), "the new signed key is adopted");
+        assert_eq!(replica.highest_checkpoint_seq, 2, "high-water advances");
+        assert!(
+            replica.latest_checkpoint.is_none(),
+            "a checkpoint that no longer matches the entries is not cached"
+        );
+        assert!(
+            replica
+                .full_delta()
+                .expect("full delta")
+                .owner_checkpoint
+                .is_none(),
+            "and it is never relayed"
+        );
     }
 
     #[test]

@@ -35,7 +35,9 @@ impl Host {
             if artifact.target_path.canonicalize()? != artifact.target_path
                 || artifact.backup_path.canonicalize()? != artifact.backup_path
             {
-                return Err(invalid("non-canonical independently approved install"));
+                return Err(start::refused(
+                    "non-canonical independently approved install",
+                ));
             }
         }
         // `data_root` decides where the flush token is sent and where the
@@ -47,7 +49,7 @@ impl Host {
                 || participant.cwd.canonicalize()? != participant.cwd
                 || participant.executable != expected.plan.daemon.target_path
             {
-                return Err(invalid("non-canonical participant paths"));
+                return Err(start::refused("non-canonical participant paths"));
             }
         }
         Ok(Self { root, expected })
@@ -114,6 +116,24 @@ impl Host {
             }
             record.phase = journal::Phase::RecoveryFailed;
             self.save(record)
+        })
+    }
+
+    /// As `mark_recovery_failed`, for one launcher's failed coordinator pass
+    /// (#1991 review): a host that a peer has already restored is also left
+    /// alone. Its pair is back, and a RecoveryFailed mark would block every
+    /// participant's restored start. Returns the phase found under the lock.
+    pub(super) fn mark_unrestored_recovery_failed(&self) -> io::Result<journal::Phase> {
+        self.locked(|record| match record.phase {
+            journal::Phase::HostCommitted => {
+                Err(invalid("a committed host is never marked failed"))
+            }
+            journal::Phase::Restored => Ok(journal::Phase::Restored),
+            found => {
+                record.phase = journal::Phase::RecoveryFailed;
+                self.save(record)?;
+                Ok(found)
+            }
         })
     }
 
@@ -517,7 +537,7 @@ mod tests {
     }
 
     /// Restore never runs while an OLD or candidate process still exists.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn restore_refuses_while_an_old_or_candidate_process_lives() {
         let mut live = std::process::Command::new("sleep")

@@ -1,37 +1,12 @@
 //! Authenticated operation provenance for task claims/completions.
 //!
-//! Without this module, the inner `TaskItem` claimant `AgentId` carried in a
-//! [`crate::crdt::TaskListDelta`] is self-asserted data: any mesh peer that can
-//! publish to the task-list topic can inject a `Claimed{victim, ts=1}` element
-//! and, under earliest-timestamp-wins resolution, steal every claim by
-//! impersonation. The signed outer transport sender is discarded at the merge
-//! boundary and may be a relay (not the author), so it cannot be the trust root.
+//! The claimant `AgentId` inside a `TaskItem` is self-asserted data, and the
+//! signed transport sender may be a relay, so neither can be the trust root.
 //!
 //! This module supplies the trust root: every `Claimed`/`Done` element that
 //! enters a `TaskItem`'s checkbox OR-Set must carry an [`OpAttestation`] signed
 //! by the ML-DSA-65 secret key whose public key hashes to the element's
-//! `agent_id` (`AgentId::from_public_key`). This is the exact "derived ==
-//! claimed" binding already used for forward attestations, group cards, and
-//! revocations elsewhere in the crate — no new cryptography.
-//!
-//! ## Layout
-//!
-//! - [`OpAttestation`] / [`OpKind`]: the attestation data carried alongside the
-//!   element (serialized within `TaskItem`, so it survives `full_delta`
-//!   historical state sync).
-//! - [`canonical_op_bytes`]: the deterministic, fixed-width byte layout that is
-//!   both signed and verified. Both ends MUST agree byte-for-byte.
-//! - [`sign_attestation`]: produce an attestation using a [`SigningContext`]
-//!   (the local agent's key material). Called by the handle on claim/complete.
-//! - [`verify_attestation`]: self-contained verification — parse the public key,
-//!   require `from_public_key == author_agent_id == element agent_id`, and
-//!   verify the signature over [`canonical_op_bytes`]. Used by the admission
-//!   gate.
-//! - [`purge_unattested_elements`]: the admission gate. Drops every checkbox
-//!   element whose attestation is missing or fails verification, so the OR-Set
-//!   is kept invariant-pure (every element is authenticated) and resolution
-//!   (`current_state` / `claim_record` / `completion_record`) operates only over
-//!   authenticated state.
+//! `agent_id` (`AgentId::from_public_key`).
 //!
 //! ## Non-goals (documented, not silently "fixed")
 //!
@@ -156,7 +131,6 @@ pub fn sign_attestation(
     agent_id: &AgentId,
     timestamp_ms: u64,
 ) -> Result<OpAttestation> {
-    // Claims/completions are self-signed: only attest as the key holder.
     if *agent_id != signing.agent_id {
         return Err(CrdtError::Gossip(format!(
             "attestation agent_id mismatch: element claims {} but signing context is {}",
@@ -197,9 +171,6 @@ pub fn verify_attestation(
     let Ok(pubkey) = MlDsaPublicKey::from_bytes(&att.author_public_key) else {
         return false;
     };
-    // Binding: the key must hash to BOTH the attestation's claimed author and
-    // the element's claimant agent_id. If either differs, the operation is
-    // forged (impersonation) and is rejected.
     let derived = AgentId::from_public_key(&pubkey);
     if derived != att.author_agent_id || derived != *agent_id {
         return false;
@@ -211,9 +182,6 @@ pub fn verify_attestation(
     verify_with_ml_dsa(&pubkey, &msg, &sig).is_ok()
 }
 
-/// If `state` is a Claimed/Done element, return its `(kind, agent_id, ts)` so
-/// the gate can look up and verify its attestation. `Empty` is never added to
-/// the OR-Set, so it maps to `None`.
 #[must_use]
 fn provenance_fields(state: &CheckboxState) -> Option<(OpKind, AgentId, u64)> {
     match state {
@@ -232,30 +200,11 @@ fn provenance_fields(state: &CheckboxState) -> Option<(OpKind, AgentId, u64)> {
 /// The admission gate: drop every checkbox element and attestation entry that
 /// lacks a valid attestation for `scope`.
 ///
-/// # Authentication (two passes)
-///
-/// 1. **Visible-element pass:** for each `Claimed`/`Done` element currently
-///    visible in `checkbox`, require a matching attestation that
-///    [`verify_attestation`]s. Drop forged/unattested elements from both the
-///    OR-Set and the attestation map.
-///
-/// 2. **Attestation-map pass:** for every entry in `attestations` (including
-///    those hidden by forged tombstones), verify the attestation. Drop entries
-///    that fail verification. This ensures the attestation map — which is the
-///    **authoritative source** for checkbox resolution (see
-///    [`crate::crdt::TaskItem::current_state`]) — contains only authenticated
-///    operations.
-///
-/// # Tombstone defense (no tag synthesis)
-///
-/// Checkbox elements (`Claimed`/`Done`) are append-only — no legitimate code
-/// path removes one. The attestation map is the source of truth for resolution;
-/// read methods derive state from `attestations.keys()`, NOT from
-/// `checkbox.elements()`. A forged tombstone may hide an element from the
-/// OR-Set, but the element remains in the attestation map and is still visible
-/// to resolution. No per-replica tag is synthesized — the signed
-/// `CheckboxState` (agent + timestamp + kind) IS the stable operation ID,
-/// preserved verbatim on relay and immune to tombstone censorship.
+/// Verifies two sets: every `Claimed`/`Done` element visible in `checkbox`,
+/// and every entry in `attestations`, including those a forged tombstone hides
+/// from the OR-Set. The attestation map is the authoritative source for
+/// resolution (see [`crate::crdt::TaskItem::current_state`]), so a tombstone
+/// cannot censor an attested operation.
 ///
 /// Returns the number of unauthenticated elements/entries dropped.
 #[must_use]
@@ -267,7 +216,6 @@ pub fn purge_unattested_elements(
 ) -> usize {
     let mut dropped = 0usize;
 
-    // Pass 1: drop visible OR-Set elements without valid attestations.
     let elements: Vec<CheckboxState> = checkbox.elements().into_iter().cloned().collect();
     for state in elements {
         let Some((kind, agent_id, ts)) = provenance_fields(&state) else {
@@ -283,9 +231,6 @@ pub fn purge_unattested_elements(
         }
     }
 
-    // Pass 2: verify every attestation entry (including tombstone-hidden ones).
-    // The attestation map is authoritative for resolution; every entry must be
-    // cryptographically valid for this scope.
     let attested: Vec<CheckboxState> = attestations.keys().cloned().collect();
     for state in attested {
         let Some((kind, agent_id, ts)) = provenance_fields(&state) else {
@@ -320,13 +265,9 @@ mod tests {
         TaskId::new("provenance-test", agent, 1)
     }
 
-    /// Fixed list scope for provenance unit tests (the v2 canonical bytes bind
-    /// a `TaskListId`; the value is irrelevant to these crypto-level checks).
     fn scope() -> TaskListId {
         TaskListId::new([0x5c; 32])
     }
-
-    // ── canonical_op_bytes: determinism & separation ─────────────────────────
 
     #[test]
     fn canonical_bytes_are_deterministic() {
@@ -373,8 +314,6 @@ mod tests {
         );
     }
 
-    // ── sign / verify roundtrip ──────────────────────────────────────────────
-
     #[test]
     fn sign_then_verify_roundtrips_true() {
         let (signing, aid) = fresh_signing();
@@ -386,28 +325,22 @@ mod tests {
         );
     }
 
-    // ── impersonation: forged agent_id ───────────────────────────────────────
-
     #[test]
     fn forged_claimant_agent_id_is_rejected() {
-        // Attacker signs the victim's canonical bytes with the attacker's own
-        // key, but tags the attestation as the victim. The derived agent
-        // (attacker) must not equal the claimed victim agent_id → rejected.
         let (attacker_signing, attacker) = fresh_signing();
         let (_, victim) = fresh_signing();
         let tid = task_id_for(&victim);
         let msg = canonical_op_bytes(OpKind::Claim, &scope(), &tid, &victim, 1);
         let signature = attacker_signing.sign(&msg).unwrap();
         let forged = OpAttestation {
-            author_agent_id: victim, // self-asserted victim
-            author_public_key: attacker_signing.public_key_bytes.clone(), // attacker's key
+            author_agent_id: victim,
+            author_public_key: attacker_signing.public_key_bytes.clone(),
             signature,
         };
         assert!(
             !verify_attestation(&forged, OpKind::Claim, &scope(), &tid, &victim, 1),
             "an attacker's key must not verify against a victim agent_id"
         );
-        // Sanity: the attacker's key DOES hash to the attacker, not the victim.
         assert_ne!(attacker, victim);
     }
 
@@ -423,14 +356,11 @@ mod tests {
         );
     }
 
-    // ── forged signature / wrong key ─────────────────────────────────────────
-
     #[test]
     fn forged_signature_is_rejected() {
         let (signing, aid) = fresh_signing();
         let tid = task_id_for(&aid);
         let mut att = sign_attestation(&signing, OpKind::Claim, &scope(), &tid, &aid, 7).unwrap();
-        // Flip a signature byte.
         att.signature[0] ^= 0xff;
         assert!(
             !verify_attestation(&att, OpKind::Claim, &scope(), &tid, &aid, 7),
@@ -444,7 +374,7 @@ mod tests {
         let tid = task_id_for(&aid);
         let mut att =
             sign_attestation(&signing, OpKind::Complete, &scope(), &tid, &aid, 9).unwrap();
-        att.author_public_key = vec![0u8; 7]; // garbage
+        att.author_public_key = vec![0u8; 7];
         assert!(
             !verify_attestation(&att, OpKind::Complete, &scope(), &tid, &aid, 9),
             "a malformed public key must not verify"
@@ -453,8 +383,6 @@ mod tests {
 
     #[test]
     fn wrong_task_id_does_not_verify() {
-        // A valid attestation for task A must not verify against task B
-        // (no cross-task signature replay).
         let (signing, aid) = fresh_signing();
         let tid_a = TaskId::new("task-a", &aid, 1);
         let tid_b = TaskId::new("task-b", &aid, 1);
@@ -480,8 +408,6 @@ mod tests {
         );
     }
 
-    // ── purge_unattested_elements: the admission gate ────────────────────────
-
     fn claimed(agent: &AgentId, ts: u64) -> CheckboxState {
         CheckboxState::Claimed {
             agent_id: *agent,
@@ -499,12 +425,9 @@ mod tests {
         let tid = task_id_for(&aid);
         let (_, rogue) = fresh_signing();
 
-        // A legitimately-attested claim by `aid`.
         let good = claimed(&aid, 10);
         let good_att = sign_attestation(&signing, OpKind::Claim, &scope(), &tid, &aid, 10).unwrap();
 
-        // A claim element with NO attestation at all (simulates a legacy /
-        // unattested remote element that must be dropped under strict cutover).
         let unattested = claimed(&rogue, 5);
 
         let mut checkbox = OrSet::<CheckboxState>::new();
@@ -513,7 +436,6 @@ mod tests {
 
         let mut attestations = BTreeMap::new();
         attestations.insert(good.clone(), good_att);
-        // No entry for `unattested`.
 
         let dropped = purge_unattested_elements(&scope(), &tid, &mut checkbox, &mut attestations);
 
@@ -533,9 +455,6 @@ mod tests {
 
     #[test]
     fn purge_drops_element_whose_attestation_fails_verification() {
-        // Element claims `victim`, but the attestation was produced by an
-        // attacker's key (impersonation): derived(attacker key) != victim →
-        // the gate drops it even though an attestation entry exists.
         let (attacker_signing, _) = fresh_signing();
         let (_, victim) = fresh_signing();
         let tid = task_id_for(&victim);
@@ -562,18 +481,8 @@ mod tests {
         );
     }
 
-    // ── P1: scope binding prevents cross-list replay ───────────────────────
-    //
-    // WHY: without the list scope in the signed bytes, a validly-attested
-    // claim for list A could be replayed into list B (which happens to share
-    // the same TaskId) and verify there — letting a participant of one list
-    // inject state into another. The v2 canonical bytes mix the TaskListId in,
-    // so an attestation verifies only in its home list.
-
     #[test]
     fn scope_is_bound_into_canonical_bytes() {
-        // The canonical bytes differ when only the scope differs — the
-        // TaskListId is mixed into the signed payload, not just the domain.
         let (_, aid) = fresh_signing();
         let tid = task_id_for(&aid);
         let scope_a = TaskListId::new([0xAA; 32]);
@@ -587,10 +496,6 @@ mod tests {
 
     #[test]
     fn cross_list_replay_of_a_valid_claim_is_rejected() {
-        // A claim validly attested for list A verifies in A but NOT in list B,
-        // so it cannot be replayed into a different task list sharing the same
-        // TaskId. The scope mismatch fails verification before the element can
-        // influence resolution.
         let (signing, aid) = fresh_signing();
         let tid = task_id_for(&aid);
         let scope_a = TaskListId::new([0xAA; 32]);
@@ -609,9 +514,6 @@ mod tests {
 
     #[test]
     fn purge_drops_element_attested_for_a_different_scope() {
-        // End-to-end at the admission gate: an element whose attestation is
-        // valid for scope_A, checked under scope_B, is purged — cross-list
-        // replay is rejected at admission, not only at the crypto predicate.
         let (signing, aid) = fresh_signing();
         let tid = task_id_for(&aid);
         let scope_a = TaskListId::new([0xAA; 32]);
@@ -625,9 +527,6 @@ mod tests {
         let mut attestations = BTreeMap::new();
         attestations.insert(elem.clone(), att);
 
-        // Purge under scope_B: the scope-A attestation fails verification AND
-        // its attestation entry is removed, so the tombstone defense does not
-        // restore it.
         let dropped = purge_unattested_elements(&scope_b, &tid, &mut checkbox, &mut attestations);
         assert_eq!(dropped, 1, "cross-scope element is purged at admission");
         assert!(

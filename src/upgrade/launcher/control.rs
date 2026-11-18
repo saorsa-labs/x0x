@@ -257,7 +257,7 @@ mod tests {
 
     /// The OLD identity in the plan is a live process here, so a receipt
     /// that names it cannot prove the reap.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn authorize_refuses_while_the_old_child_is_alive() {
         let mut old = std::process::Command::new("sleep")
@@ -313,7 +313,7 @@ mod tests {
 
     /// Without /proc the launcher cannot prove custody of the OLD child, so
     /// it refuses before it persists the budget or sends the token.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn flush_and_reap_refuses_without_linux_process_custody() {
         let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
@@ -332,7 +332,7 @@ mod tests {
     }
 
     /// A real OLD child whose identity the frozen plan names.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     mod custody {
         use super::super::super::testkit::fixture_with;
         use super::*;

@@ -47,21 +47,21 @@
       "revision": 1,
       "path": "A06-r01-gossip-relay-roles-and-resource-limits.md",
       "title": "Gossip Relay Roles and Resource Limits",
-      "sha256": "3042fd52fbea77cf3b49374d7d8f2beebfc06cdd55d38fc1f27f16d8443beebb"
+      "sha256": "8de13d595e3032cfc1a61d58700c46ef31964dcc427032e706d344c6d7f4bd22"
     },
     {
       "id": "A07",
       "revision": 1,
       "path": "A07-r01-messages-receipts-history-and-retry.md",
       "title": "Messages Receipts History and Retry",
-      "sha256": "cef0446cc48ddb2db7c5fa505dc4ecce650c09fa3c4501ac9ddb1e1cd9f5b500"
+      "sha256": "5dfaee3ba36513bf97a0667cea1864bfbc52db073233a37d9764dfa430185144"
     },
     {
       "id": "A08",
       "revision": 1,
       "path": "A08-r01-groups-home-membership-and-repair.md",
       "title": "Groups Home Membership and Repair",
-      "sha256": "deb31092cf05ef38ed6d3d986919e82c6b0dbdb265d2e1a619db3693e062eae6"
+      "sha256": "75a40212d50f87d4970559869827236cd6bdcb8f43341ebbece3373251ca7820"
     },
     {
       "id": "A09",
@@ -75,7 +75,7 @@
       "revision": 1,
       "path": "A10-r01-shared-data-files-and-synchronization.md",
       "title": "Shared Data Files and Synchronization",
-      "sha256": "0f4481c3412b59e5760280fd3f7e932186a9e63916ece3880b5157d356fce83c"
+      "sha256": "1972d0c6c0bc8f0924a6e48b7f026b19a4753bc40a3a9138b2f9cb4db3551e8e"
     },
     {
       "id": "A11",
@@ -103,7 +103,7 @@
       "revision": 1,
       "path": "A14-r01-health-updates-and-recovery.md",
       "title": "Health Updates and Recovery",
-      "sha256": "7a439fdf38227c68b4c661b4623d7c6073c00a08d38445dec4cdc49321d8d947"
+      "sha256": "b1a12f798fb9463601ebe880f77b8b0fb4b253ad5408f80006d4904adebda47e"
     },
     {
       "id": "A15",

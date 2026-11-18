@@ -10,7 +10,7 @@ macro_rules! upgrade_now_timeout_regression_tests {
                 DaemonClient {
                     client: reqwest::Client::builder().timeout(Duration::from_secs(30)).build().unwrap(),
                     base_url, format: OutputFormat::Json,
-                    api_token: Some("owned-builder-token".into()), dump: false,
+                    api_token: Some("owned-builder-token".into()), dump: false, instance_dir: None,
                 }
             }
 

@@ -6,7 +6,7 @@
 //!
 //! Three wire formats coexist during the transition period:
 //! - **V1** (legacy): `[topic_len: u16_be | topic | payload]` — unsigned;
-//!   decoded but never published or delivered to a subscriber (#1114, #1225)
+//!   decoded but never published or delivered to a subscriber
 //! - **V3** (Signed KV pairing): same fields as V2, with signed topic length
 //! - **V2** (signed): `[0x02 | agent_id | pubkey | signature | topic | payload]`
 
@@ -33,32 +33,12 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 
-/// Rate-limit window for `fan_out == 0` warnings (issue #296).
-///
-/// Matches the X0X-0073 cooling floor so a send storm produces one warn
-/// per group per cooldown, not one warn per message.
+/// Matches the X0X-0073 cooling floor: one warn per group per cooldown (#296).
 pub(crate) const ZERO_FANOUT_WARN_WINDOW: Duration = Duration::from_secs(30);
 
 /// ant-quic accepts a 4 MiB application stream; x0x prepends one type byte.
 pub(crate) const MAX_LEAF_GOSSIP_FRAME_BYTES: usize = 4 * 1024 * 1024 - 1;
 
-/// Map a validated x0x `[gossip]` section onto saorsa-gossip's Leaf egress
-/// contract, or `None` for "no byte accounting at all".
-///
-/// Two independent gates, both of which must be deliberate:
-///
-/// * **Accounting** is off unless this is a Leaf with a non-zero hard rate.
-///   Full/relay nodes are pass-through forwarders; budgeting their egress
-///   would starve the plane they exist to serve, so sg is handed `None`.
-/// * **Shedding** is off unless the operator wrote `byte_policy =
-///   "shed_normal"`. A non-zero hard rate must never start dropping gossip by
-///   itself — that would make a behaviour change an accident of configuration
-///   rather than a decision (#504 slice 2).
-///
-/// A `shed_normal` request on a Full/relay node is therefore ignored, not
-/// honoured and not fatal: participation is resolved at runtime (dual listen,
-/// seed address, managed binary), so a node that becomes Full for reasons the
-/// operator never wrote must keep starting. The caller warns.
 fn leaf_egress_config(config: &GossipConfig) -> Option<LeafEgressConfig> {
     (config.resolved_participation() == ParticipationMode::Leaf
         && config.leaf_egress_hard_bytes_per_sec != 0)
@@ -74,9 +54,6 @@ fn leaf_egress_config(config: &GossipConfig) -> Option<LeafEgressConfig> {
         })
 }
 
-/// The policy x0x will report: what sg actually accepted, never what the
-/// operator asked for. `None` (no accounting) sheds nothing, so it reports
-/// `observe_only` just as an accepted ObserveOnly budget does.
 fn effective_byte_policy(accepted: Option<LeafEgressConfig>) -> LeafBytePolicy {
     match accepted.map(|config| config.policy) {
         Some(BytePolicy::ShedNormal) => LeafBytePolicy::ShedNormal,
@@ -84,7 +61,7 @@ fn effective_byte_policy(accepted: Option<LeafEgressConfig>) -> LeafBytePolicy {
     }
 }
 
-/// Cumulative cost of x0x inner-envelope ML-DSA-65 verifies (#288, #656).
+/// Cumulative cost of x0x inner-envelope ML-DSA-65 verifies.
 ///
 /// Lets soak acceptance use verifies/s and ns/verify instead of host %CPU,
 /// which is invalid evidence on co-tenant hosts. One observation is recorded
@@ -142,8 +119,6 @@ impl InnerVerifyStats {
     }
 }
 
-/// Process-wide counters: the decode entry points are free functions shared
-/// by every caller in the daemon, and a daemon is one process.
 static INNER_VERIFY_STATS: InnerVerifyStats = InnerVerifyStats::new();
 
 /// Snapshot of this process's inner-envelope verify counters.
@@ -159,8 +134,6 @@ pub fn inner_verify_stats() -> InnerVerifyStatsSnapshot {
 /// lost. Exposed via `GET /diagnostics/gossip`.
 #[derive(Debug, Default)]
 pub struct PubSubStats {
-    /// Test-only: (subscription topic, sender) of each payload refused for a
-    /// revoked or blocked sender, so a test can tie a refusal to a message.
     #[cfg(test)]
     pub(crate) refused_senders: std::sync::Mutex<Vec<(String, AgentId)>>,
     /// Successful `publish()` calls (encoded + handed to PlumTree).
@@ -172,8 +145,8 @@ pub struct PubSubStats {
     /// Messages that decoded successfully + passed trust filter.
     pub incoming_decoded: AtomicU64,
     /// Messages that failed decode (malformed, unsupported version) or were
-    /// dropped by the identity guard: unsigned (V1) or unverified sender
-    /// (#1114). A revoked or Blocked sender is `incoming_sender_refused`,
+    /// dropped by the identity guard: unsigned (V1) or unverified sender.
+    /// A revoked or Blocked sender is `incoming_sender_refused`,
     /// not a decode failure.
     pub incoming_decode_failed: AtomicU64,
     /// Verified payloads dropped because the sender is revoked or Blocked.
@@ -181,9 +154,8 @@ pub struct PubSubStats {
     /// Not a decode failure. The subscriber task logs the first refusal in
     /// each 30s window at debug.
     pub incoming_sender_refused: AtomicU64,
-    /// Millis since the unix epoch of the last sender-refusal debug log.
     sender_refusal_logged_at_ms: AtomicU64,
-    /// Messages dropped during a revocation resync (#1116). Not a decode
+    /// Messages dropped during a revocation resync. Not a decode
     /// failure: the frame was valid. It is not queued for later delivery.
     pub incoming_withheld: AtomicU64,
     /// Messages successfully handed to a local subscriber channel.
@@ -197,10 +169,7 @@ pub struct PubSubStats {
     /// Every increment here is paired with an `incoming_decoded` increment,
     /// which is what makes it valid to subtract from `incoming_decoded` in
     /// `decode_to_delivery_drops`. Ending a subscription is NOT counted here —
-    /// that is `subscriber_task_ended` (issue #600 / H3: it used to be counted
-    /// here, which drove the drop metric to −1 per discarded subscription and
-    /// made the one signal that should read "messages were lost" instead read
-    /// "subscribers went away").
+    /// that is `subscriber_task_ended`.
     pub subscriber_channel_closed: AtomicU64,
     /// Subscription forwarding tasks that ended because the receiver was
     /// dropped while no message was in flight (the `tx.closed()` arm).
@@ -223,13 +192,13 @@ pub struct PubSubStatsSnapshot {
     pub incoming_decode_failed: u64,
     /// Verified payloads dropped because the sender is revoked or Blocked.
     pub incoming_sender_refused: u64,
-    /// Messages dropped during a revocation resync (#1116). Not queued.
+    /// Messages dropped during a revocation resync. Not queued.
     pub incoming_withheld: u64,
     pub delivered_to_subscriber: u64,
     pub slow_subscriber_dropped: u64,
     pub subscriber_channel_closed: u64,
     /// Subscription forwarding tasks that ended on a dropped receiver. A
-    /// lifecycle count, never a message loss count (issue #600 / H3).
+    /// lifecycle count, never a message loss count.
     pub subscriber_task_ended: u64,
     /// Local publishes whose eager-peer fan-out was zero.
     pub publish_zero_fanout: u64,
@@ -242,8 +211,7 @@ pub struct PubSubStatsSnapshot {
     /// — messages decoded but never handed off (drop signal).
     ///
     /// Every term is per-message, so this cannot go negative: subscription
-    /// lifecycle events land in `subscriber_task_ended` and are excluded here
-    /// (issue #600 / H3).
+    /// lifecycle events land in `subscriber_task_ended` and are excluded here.
     pub decode_to_delivery_drops: i64,
 }
 
@@ -291,15 +259,13 @@ impl PubSubStats {
 
 /// Inbound frames and bytes per (topic class, PlumTree message kind),
 /// counted off the already-decoded [`saorsa_gossip_pubsub::InspectedMessageHeader`] before any signature
-/// work (#674): `/diagnostics/gossip` could not previously attribute
-/// inbound cost to a topic, forcing eviction-rate inference. Exposed as
+/// work. Exposed as
 /// `inbound_by_topic` on the `GET /diagnostics/gossip` snapshot.
 ///
 /// Frames whose header does not decode are unclassifiable and are not
 /// counted (PlumTree still rejects them and warns).
 #[derive(Debug)]
 pub struct InboundByTopicStats {
-    /// One frames/bytes pair per `class * INBOUND_KIND_COUNT + kind` slot.
     slots: [InboundSlot; INBOUND_CLASS_NAMES.len() * INBOUND_KIND_NAMES.len()],
 }
 
@@ -309,13 +275,8 @@ struct InboundSlot {
     bytes: AtomicU64,
 }
 
-/// Stable `inbound_by_topic` class key names (#674): the four caps topics
-/// are one class, the identity blob-fetch topic is its own, plus the DM bus
-/// and presence beacons. Everything else lands in `other`.
 const INBOUND_CLASS_NAMES: [&str; 5] = ["announce_blob", "caps", "dm_bus", "presence", "other"];
 
-/// Stable `inbound_by_topic` kind key names, matching the lowercase naming
-/// sg uses for `outbound_by_kind`.
 const INBOUND_KIND_NAMES: [&str; 9] = [
     "eager",
     "ihave",
@@ -328,7 +289,6 @@ const INBOUND_KIND_NAMES: [&str; 9] = [
     "shuffle",
 ];
 
-/// Topic ids of the named classes, keyed for O(1) classification.
 static KNOWN_INBOUND_CLASSES: LazyLock<HashMap<TopicId, usize>> = LazyLock::new(|| {
     let mut map = HashMap::new();
     let mut add = |name: &str, class: usize| {
@@ -393,7 +353,6 @@ impl Default for InboundByTopicStats {
 }
 
 impl InboundByTopicStats {
-    /// Attribute one inbound frame. `frame_len` is the full wire length.
     fn record(&self, inspected: &saorsa_gossip_pubsub::InspectedMessageHeader, frame_len: u64) {
         let slot = &self.slots[inbound_topic_class(&inspected.topic) * INBOUND_KIND_NAMES.len()
             + inbound_kind_index(inspected.kind)];
@@ -401,7 +360,6 @@ impl InboundByTopicStats {
         slot.bytes.fetch_add(frame_len, Ordering::Relaxed);
     }
 
-    /// Take an atomic snapshot, omitting untouched class/kind pairs.
     fn snapshot(&self) -> InboundByTopicSnapshot {
         let mut classes: BTreeMap<&'static str, BTreeMap<&'static str, InboundKindCounters>> =
             BTreeMap::new();
@@ -424,11 +382,6 @@ impl InboundByTopicStats {
     }
 }
 
-/// Decide whether a zero-fanout publish should emit `tracing::warn!`.
-///
-/// Always increments `publish_zero_fanout` when `fan_out == 0`. Skips the
-/// warn when `peer_count == 0` (solo / first-node is expected). Otherwise
-/// rate-limits to once per `(group_id, window)`.
 #[must_use]
 pub(crate) fn observe_zero_fanout_publish(
     stats: &PubSubStats,
@@ -449,7 +402,6 @@ pub(crate) fn observe_zero_fanout_publish(
     should_emit_zero_fanout_warn(last_warn_by_group, group_id, now, window)
 }
 
-/// True when this group has not warned inside `window`.
 #[must_use]
 pub(crate) fn should_emit_zero_fanout_warn(
     last_warn_by_group: &mut HashMap<String, Instant>,
@@ -466,22 +418,15 @@ pub(crate) fn should_emit_zero_fanout_warn(
     true
 }
 
-/// Domain separation prefix for signed message payloads.
 const MSG_V2_PREFIX: &[u8] = b"x0x-msg-v2";
 
-/// Version byte for signed messages.
 const VERSION_V2: u8 = 0x02;
 
-/// Reserved exclusively for the topic-bound signed inner envelope (ADR-0063).
 const VERSION_V3: u8 = 0x03;
 
-/// Domain and bounds of gossip #48's Signed KV inner verifier (ADR-0063).
 const MSG_V3_PREFIX: &[u8] = b"x0x-msg-v3";
 const MAX_V3_ENVELOPE_BYTES: usize = 1024 * 1024;
 
-/// Largest application payload that fits a signed V3 envelope for `topic`.
-/// Callers that create indivisible state images use this to fail explicitly
-/// before publication rather than relying on a transport rejection.
 pub(crate) fn max_signed_v3_payload_bytes(topic: &str) -> Option<usize> {
     let header = 1usize
         .checked_add(32)?
@@ -541,7 +486,6 @@ pub struct SigningContext {
     pub agent_id: AgentId,
     /// The agent's ML-DSA-65 public key bytes (for embedding in messages).
     pub public_key_bytes: Vec<u8>,
-    /// The agent's ML-DSA-65 secret key bytes (for signing).
     secret_key_bytes: Vec<u8>,
 }
 
@@ -585,7 +529,7 @@ impl SigningContext {
 ///
 /// Messages may be signed (v2 or v3) or unsigned (v1 legacy). The `sender` and
 /// `verified` fields indicate the authentication state. A subscription only
-/// yields gossip messages with a `sender` whose signature verified (#1114).
+/// yields gossip messages with a `sender` whose signature verified.
 ///
 /// The gossip transport id is not a field of this struct. Subscription
 /// delivery carries it beside the message so it stays distinct from this
@@ -613,16 +557,8 @@ pub struct PubSubMessage {
     pub raw_envelope: Option<Bytes>,
 }
 
-/// SG key-cache v3 marker. Those frames are not a legacy `GossipMessage`.
-/// This path cannot check their signature, so it does not treat their header
-/// id as authenticated metadata.
 const SG_KEY_CACHE_V3_MARKER: &[u8] = b"\xffSGKC\x03";
 
-/// Authenticated gossip `MessageHeader.msg_id` for one subscriber delivery.
-///
-/// This is not `HistoryRecord.msg_id` and not the ADR 0029 application id.
-/// x0x copies it from a signature-checked header. It does not hash the payload
-/// to fill the field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TransportMsgId(pub(crate) [u8; 32]);
 
@@ -637,12 +573,9 @@ impl TransportMsgId {
     }
 }
 
-/// One subscriber delivery, plus the validated transport id when it is known.
 #[derive(Debug, Clone)]
 pub(crate) struct PubSubNotification {
     pub message: PubSubMessage,
-    /// Present only when a validated `MessageHeader.msg_id` was joined to
-    /// this delivery. `None` when that metadata is absent or ambiguous.
     pub transport_msg_id: Option<TransportMsgId>,
 }
 
@@ -665,10 +598,6 @@ impl PubSubNotification {
     }
 }
 
-/// One PlumTree local delivery plus the id of the frame that produced it.
-///
-/// The id is copied from that frame after PlumTree has already admitted it.
-/// It is not recovered later by matching peer and payload bytes.
 struct StampedDelivery {
     encoded_payload: Bytes,
     transport_msg_id: Option<TransportMsgId>,
@@ -702,13 +631,9 @@ fn live_slot(deliveries: &TopicDeliveryMap, topic_id: TopicId) -> Option<Arc<Top
     slot.alive.load(Ordering::Acquire).then_some(slot)
 }
 
-/// One local subscriber of a shared topic delivery.
 struct LiveSender {
     id: u64,
     tx: mpsc::Sender<PubSubNotification>,
-    /// Set for a subscriber that joined after the PlumTree receiver already
-    /// existed. Payloads already queued were published before this subscribe
-    /// and must not be copied to it.
     skip_buffered: bool,
     admitted: Arc<AtomicBool>,
     admit_notify: Arc<tokio::sync::Notify>,
@@ -730,26 +655,15 @@ impl SenderAdmission {
     }
 }
 
-/// One PlumTree receiver for a topic, fanned out to every local subscriber.
-///
-/// A completed plain delivery stamps the validated header id onto the one
-/// payload that call queued, and only when that call is the sole producer
-/// for the topic. Recovery, cancellation, a failed verification, and a
-/// dispatch that queues nothing leave the id absent. The id is not looked
-/// up again by peer and payload, and it is not inferred from a diagnostic
-/// counter (#869).
 struct TopicDelivery {
     senders: Mutex<Vec<LiveSender>>,
     next_sender_id: AtomicU64,
     changed: tokio::sync::Notify,
     ready: tokio::sync::watch::Sender<bool>,
     alive: AtomicBool,
-    /// Set when the forwarder task returns, including forced shutdown.
     #[cfg(test)]
     forwarder_stopped: AtomicBool,
     stats: Arc<PubSubStats>,
-    /// Held only while this slot drains `plumtree_rx`. A remote send does
-    /// not hold it, so one topic cannot park every receive worker.
     drain: Mutex<()>,
     plumtree_rx: Mutex<Option<mpsc::UnboundedReceiver<(PeerId, Bytes)>>>,
     stamped_tx: mpsc::UnboundedSender<StampedDelivery>,
@@ -795,15 +709,12 @@ impl TopicDelivery {
         });
     }
 
-    /// Move payloads already sitting on the PlumTree receiver onto the
-    /// fan-out queue. They have no inbound frame to bind, so the id is absent.
     fn pump_unstamped(&self) {
         for encoded_payload in self.drain_admitted() {
             self.enqueue_stamped(encoded_payload, None);
         }
     }
 
-    /// Payloads PlumTree has queued and this task has not yet stamped.
     fn drain_admitted(&self) -> Vec<Bytes> {
         let mut rx = lock_std(&self.plumtree_rx);
         let Some(rx) = rx.as_mut() else {
@@ -839,8 +750,6 @@ impl TopicDelivery {
         (id, admission)
     }
 
-    /// Drop this subscriber's sender now, so the forwarder does not keep the
-    /// PlumTree receiver alive until the next payload (#238).
     fn detach_sender(&self, id: u64) {
         let mut senders = lock_std(&self.senders);
         let before = senders.len();
@@ -866,18 +775,10 @@ type TopicDeliveryMap = Mutex<HashMap<TopicId, Arc<TopicDelivery>>>;
 struct ClaimedDelivery {
     slot: Arc<TopicDelivery>,
     sender_id: u64,
-    /// `true` when this caller must open the PlumTree receiver and run the
-    /// single forwarder. Joiners wait until buffered payloads from before
-    /// they subscribed have been kept off their channel.
     own: bool,
     admission: SenderAdmission,
 }
 
-/// Cancels an owner that never started the forwarder.
-///
-/// A sender that already joined this slot keeps its channel. This drop
-/// starts the forwarder for those senders. It closes the topic only when
-/// this owner is the last sender.
 struct OwnerSetup {
     deliveries: Arc<TopicDeliveryMap>,
     topic_id: TopicId,
@@ -885,14 +786,11 @@ struct OwnerSetup {
     sender_id: u64,
     started: bool,
     plumtree: Arc<PlumtreePubSub<PubSubTransport>>,
-    /// Live handles. Delivery reads them per payload (#1230).
     contacts: Arc<std::sync::OnceLock<Arc<RwLock<ContactStore>>>>,
     revocation_set: Arc<std::sync::OnceLock<Arc<RwLock<crate::revocation::RevocationSet>>>>,
     group_identity: Arc<std::sync::OnceLock<GroupIdentityContext>>,
     stats: Arc<PubSubStats>,
     sub_topic: String,
-    /// This node's agent, captured at subscribe. A snapshot this node
-    /// published must not arm its own carrier (#1116).
     local_agent: Option<AgentId>,
 }
 
@@ -918,9 +816,6 @@ impl Drop for OwnerSetup {
         let stats = Arc::clone(&self.stats);
         let sub_topic = self.sub_topic.clone();
         let local_agent = self.local_agent;
-        // The owner task is gone. Joiners already on the slot still need
-        // a reader. `subscribe_ready` runs only when this task did not
-        // install one.
         tokio::spawn(async move {
             if !slot.plumtree_rx_installed() {
                 let plumtree_rx = plumtree.subscribe_ready(topic_id).await;
@@ -950,8 +845,6 @@ impl Drop for OwnerSetup {
     }
 }
 
-/// Marks the forwarder task finished, including the path that returns
-/// because `force_close_topic_delivery` woke it.
 #[cfg(test)]
 struct ForwarderDone(Arc<TopicDelivery>);
 
@@ -991,10 +884,6 @@ async fn run_delivery_forwarder(
         }
         tokio::select! {
             biased;
-            // A joiner is not a recipient of payloads already
-            // queued: those were published before it subscribed.
-            // Drain them first, then admit the joiner. Otherwise
-            // a later subscribe observes an earlier publish.
             _ = slot.changed.notified() => {
                 if !slot.alive.load(Ordering::Acquire) {
                     return;
@@ -1057,13 +946,10 @@ fn force_close_topic_delivery(deliveries: &TopicDeliveryMap, topic_id: TopicId) 
             return;
         };
         slot.alive.store(false, Ordering::Release);
-        // The forwarder parks on `changed` or `stamped_rx`. Dropping the
-        // downstream senders does not wake it: this slot owns `stamped_tx`.
         slot.changed.notify_one();
         slot
     };
     let senders = std::mem::take(&mut *lock_std(&slot.senders));
-    // A joiner blocked in `SenderAdmission::wait` must observe shutdown.
     for sender in &senders {
         sender.admitted.store(true, Ordering::Release);
         sender.admit_notify.notify_one();
@@ -1091,7 +977,6 @@ fn established_recipient_ids(slot: &TopicDelivery) -> Vec<u64> {
         .collect()
 }
 
-/// `true` when this slot has no local subscribers and was removed.
 fn shutdown_delivery_if_idle(
     deliveries: &TopicDeliveryMap,
     topic_id: TopicId,
@@ -1142,26 +1027,18 @@ async fn forward_plumtree_payload(
     encoded_payload: Bytes,
     transport_msg_id: Option<TransportMsgId>,
 ) {
-    // The id was bound to this delivery at admission. Recipients are the
-    // subscribers already past the pre-subscribe buffer. A joiner added
-    // during decode does not receive this payload.
     let recipients = established_recipient_ids(slot);
     tracing::debug!(
         topic = %env.sub_topic,
         payload_len = encoded_payload.len(),
         "[4/6 pubsub] received from PlumTree, decoding"
     );
-    // #1230: read the stores now. `set_revocation_set` wins when it has run.
-    // Otherwise delivery uses the revocation set `AgentBuilder::build` stored
-    // on group identity. A subscribe-time snapshot would miss both.
     let installed = env.revocation_set.get();
     let identity = env.group_identity.get();
     let from_builder = identity.map(|ctx| &ctx.revoked);
     let revocation = installed.or(from_builder);
     match decode_for_delivery(encoded_payload, env.contacts.get(), revocation).await {
         DeliveryVerdict::Delivered(message) => {
-            // #1116: a carrier snapshot is armed from the set delivery just
-            // read, before the frame is copied to subscribers.
             if let Some(set) = revocation {
                 crate::revocation::arm_incoming_revocation_snapshot(
                     set,
@@ -1182,9 +1059,6 @@ async fn forward_plumtree_payload(
             count_refused_deliveries(env.stats, env.sub_topic, &sender, recipients.len() as u64);
         }
         DeliveryVerdict::Withheld => {
-            // #1116: a valid frame is dropped. It is not queued for delivery
-            // after resync. Count it with the other per-recipient decisions
-            // so the in-flight balance still closes.
             count_withheld_deliveries(env.stats, env.sub_topic, recipients.len() as u64);
         }
     }
@@ -1251,8 +1125,6 @@ fn deliver_copied_notification(
                 stats
                     .delivered_to_subscriber
                     .fetch_add(1, Ordering::Relaxed);
-                // PlumTree delivered an Eager payload to a subscriber (#1170).
-                // `local:` topics do not use this path.
                 crate::gossip::per_kind::per_kind_counters().record_delivered(MessageKind::Eager);
                 index += 1;
             }
@@ -1286,28 +1158,17 @@ fn deliver_copied_notification(
 /// The subscription is canceled when dropped, automatically decrementing
 /// topic subscriber counts in the PubSubManager.
 pub struct Subscription {
-    /// The topic this subscription is for.
     topic: String,
-    /// Transport id recorded at subscribe time (DM inboxes use a
-    /// domain-separated id, not `TopicId::from_entity(name)`).
     topic_id: Option<TopicId>,
-    /// Channel receiver for messages on this topic.
     receiver: mpsc::Receiver<PubSubNotification>,
-    /// Reference to per-topic subscriber counts for cleanup on drop.
     topic_ref_counts: Arc<RwLock<HashMap<String, TopicSubscriptionCount>>>,
     generation: u64,
-    /// Name → transport id, dropped with the last local subscriber.
     topic_id_by_name: Arc<std::sync::RwLock<HashMap<String, TopicId>>>,
-    /// Live subscribed transport ids used by the Leaf C0 refuse gate.
     subscribed_topic_ids: Arc<std::sync::RwLock<HashSet<TopicId>>>,
-    /// #731: marked before the last subscriber leaves the subscribed set.
     publisher_topics: Arc<super::participation::PublisherTopics>,
-    /// Group classification and SG preference cleared with the last subscriber.
     group_topic_by_id: Arc<RwLock<HashMap<TopicId, GroupTopicBinding>>>,
     plumtree: Arc<PlumtreePubSub<PubSubTransport>>,
     group_preference_apply_locks: Arc<GroupTopicApplyLocks>,
-    /// Shared per-topic fan-out. `None` for `local:` topics and canceled
-    /// generations. Drop detaches this receiver before the next payload.
     topic_delivery: Option<Arc<TopicDelivery>>,
     sender_id: u64,
     #[cfg(test)]
@@ -1320,9 +1181,6 @@ struct TopicSubscriptionCount {
     generation: u64,
 }
 
-/// A fixed number of topic shards keeps the hot path bounded without
-/// serializing unrelated topics. Roster writers serialize with each other
-/// and reconcile one shard at a time after publishing the new roster.
 struct GroupTopicApplyLocks {
     roster_update: tokio::sync::Mutex<()>,
     names: [tokio::sync::Mutex<()>; 64],
@@ -1364,12 +1222,10 @@ impl Subscription {
         self.recv_notification().await.map(|note| note.message)
     }
 
-    /// Next delivery, including a validated transport id when one was joined.
     pub(crate) async fn recv_notification(&mut self) -> Option<PubSubNotification> {
         self.receiver.recv().await
     }
 
-    /// Receive from either subscription until both are closed and drained.
     pub(crate) async fn recv_from_either(&mut self, other: &mut Self) -> Option<PubSubMessage> {
         recv_from_either(&mut self.receiver, &mut other.receiver)
             .await
@@ -1377,7 +1233,6 @@ impl Subscription {
     }
 }
 
-/// A closed carrier must not terminate or repeatedly wake a live carrier's wait.
 async fn recv_from_either<T>(
     first: &mut mpsc::Receiver<T>,
     second: &mut mpsc::Receiver<T>,
@@ -1407,8 +1262,6 @@ impl Drop for Subscription {
         #[cfg(test)]
         let drop_completed = self.drop_completed.clone();
 
-        // Spawn a task to decrement the refcount for this topic.
-        // This avoids blocking on synchronous locks in drop.
         tokio::spawn(async move {
             let _name_guard = group_preference_apply_locks.name_shard(&topic).lock().await;
             let _apply_guard = if let Some(topic_id) = topic_id {
@@ -1433,8 +1286,6 @@ impl Drop for Subscription {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .remove(&topic);
                     if let Some(topic_id) = topic_id {
-                        // #731: this path keeps the sg cache, which still
-                        // holds other peers' messages.
                         publisher_topics.note_unsubscribed(topic_id, Instant::now());
                         subscribed_topic_ids
                             .write()
@@ -1456,35 +1307,12 @@ impl Drop for Subscription {
     }
 }
 
-/// Pub/Sub manager using PlumTree dissemination with x0x payload signing.
-///
-/// # Architecture
-///
-/// ```text
-/// Publisher → PubSubManager.publish()
-///     ├─> Sign with ML-DSA-65
-///     └─> Publish encoded payload via PlumTree (saorsa-gossip-pubsub)
-///
-/// Peer message → PubSubManager.handle_incoming()
-///     └─> Dispatch to PlumTree handler (EAGER/IHAVE/IWANT/AntiEntropy)
-///
-/// Local subscription delivery path:
-///     A completed plain delivery stamps one exclusive payload with the
-///     frame's validated `MessageHeader.msg_id` → one forwarder copies the
-///     notification. Recovery, cancellation, and a failed verification
-///     deliver the payload with the id absent. A remote send does not take
-///     a daemon-wide lock, so one stalled send does not park every receive
-///     worker (ADR 0009).
-/// ```
 #[derive(Clone, PartialEq, Eq)]
 struct GroupEagerRoster {
     metadata_topic: String,
     active_agents: Vec<AgentId>,
 }
 
-/// Coherent per-topic classification and active roster. A roster writer may
-/// publish a new global snapshot before it reaches this topic's shard; hot
-/// paths then use this complete old binding until that shard is reconciled.
 #[derive(Clone)]
 struct GroupTopicBinding {
     name: String,
@@ -1498,85 +1326,35 @@ struct GroupIdentityContext {
 }
 
 pub struct PubSubManager {
-    /// Network node used by PlumTree transport and topic peer initialization.
     network: Arc<NetworkNode>,
-    /// PlumTree pub/sub engine from saorsa-gossip-pubsub.
     plumtree: Arc<PlumtreePubSub<PubSubTransport>>,
     transport: Arc<PubSubTransport>,
     egress_config: GossipConfig,
-    /// #504 slice 2: the policy saorsa-gossip accepted, which is what
-    /// diagnostics report. Not the policy the operator requested.
     effective_byte_policy: LeafBytePolicy,
     egress_meter: Mutex<EgressMeter>,
     eager_ceiling_initialized: tokio::sync::OnceCell<()>,
-    /// Local topic subscription ref-counts (for stats and cleanup).
     topic_ref_counts: Arc<RwLock<HashMap<String, TopicSubscriptionCount>>>,
     next_subscription_generation: AtomicU64,
-    /// Signing context for authenticating published messages.
     signing: Arc<SigningContext>,
-    /// Contact store for trust-based message filtering.
-    /// Set via `set_contacts()` after construction. Shared with each
-    /// subscriber task so delivery reads the store when a payload arrives,
-    /// including when subscribe ran first (#1230).
     contacts: Arc<std::sync::OnceLock<Arc<tokio::sync::RwLock<ContactStore>>>>,
-    /// Authoritative gossiped revocation set (issue #130 / #191). Runtime-
-    /// injected via `set_revocation_set()` after construction (mirrors
-    /// `contacts`). Delivery consults this BEFORE the operator-local
-    /// ContactStore so a gossiped issuer/agent revocation closes the path
-    /// even before the eviction loop sets `trust = Blocked`. The task reads
-    /// the lock at delivery time (#1230).
     revocation_set:
         Arc<std::sync::OnceLock<Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>>>,
-    /// Drop-detection counters exposed at `GET /diagnostics/gossip`.
     stats: Arc<PubSubStats>,
-    /// Inbound frames/bytes per (topic class, kind) — `inbound_by_topic` on
-    /// `GET /diagnostics/gossip` (#674).
     inbound_by_topic: InboundByTopicStats,
-    /// Subscriber channels for `local:` topics (issue #89). These topics
-    /// are same-daemon IPC: delivered only to local subscribers, never
-    /// handed to PlumTree, never gossipped to remote peers.
     local_topics: Arc<RwLock<HashMap<String, Vec<mpsc::Sender<PubSubNotification>>>>>,
-    /// One PlumTree receiver per topic. A completed plain delivery stamps a
-    /// validated transport id, then the forwarder copies that notification.
     topic_deliveries: Arc<TopicDeliveryMap>,
-    /// Producers inside PlumTree, including a call that has not yet seen a
-    /// local receiver. A plain delivery stamps only when this count is one.
-    /// The lock is not held across the PlumTree call.
     topic_producers: Arc<Mutex<HashMap<TopicId, Arc<AtomicUsize>>>>,
-    /// Hop-local key-cache recovery is inside PlumTree. Plain admission omits
-    /// the transport id while this is non-zero. Recovery raises it before
-    /// dispatch and lowers it after the unstamped drain. This is not a lock
-    /// and it is not held across a remote send.
     recovery_producers: Arc<AtomicUsize>,
-    /// Times a delivered frame was read for its transport id. The read
-    /// happens only after PlumTree has delivered that frame.
     #[cfg(test)]
     admitted_transport_id_reads: Arc<AtomicU64>,
-    /// Long-lived membership holds so Direct-connect pre-subscribe of a
-    /// peer inbox (#380 C4) stays on the subscribed-topic path. The owned
-    /// task drains the receiver so a quiet hold cannot fill the channel
-    /// and drop the PlumTree registration.
     membership_holds: Arc<RwLock<HashMap<String, tokio::task::JoinHandle<()>>>>,
-    /// #1455: DM inbox topic id → the machine that owns (subscribes to)
-    /// that inbox. The durable send path records the capability-resolved
-    /// recipient machine so Leaf membership promotes the actual subscriber
-    /// into the bounded EAGER set. See [`Self::note_dm_inbox_owner`].
     dm_inbox_owners: Mutex<DmInboxOwnerRegistry>,
-    /// Issue #380: Leaf skips pass-through eager-set refresh.
     participation: ParticipationMode,
-    /// Why this process selected Leaf or Full (diagnostics / startup log).
     participation_reason: String,
-    /// Times the Full pass-through loop actually ran.
     passthrough_refresh_runs: AtomicU64,
-    /// Name → actual PlumTree topic id (DM inboxes are not `from_entity(name)`).
     topic_id_by_name: Arc<std::sync::RwLock<HashMap<String, TopicId>>>,
-    /// Authoritative active group rosters supplied by the daemon after commit.
     group_rosters: RwLock<HashMap<String, GroupEagerRoster>>,
-    /// Locally named group topics. Unknown Full pass-through ids stay ordinary relays.
     group_topic_by_id: Arc<RwLock<HashMap<TopicId, GroupTopicBinding>>>,
-    /// Shared so a subscriber task can read the builder's revocation set at
-    /// delivery time (#1230). `AgentBuilder::build` fills this and does not
-    /// call `set_revocation_set`.
     group_identity: Arc<std::sync::OnceLock<GroupIdentityContext>>,
     group_preference_apply_locks: Arc<GroupTopicApplyLocks>,
     #[cfg(test)]
@@ -1584,28 +1362,18 @@ pub struct PubSubManager {
     #[cfg(test)]
     subscribe_after_registration_pause:
         std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
-    /// Pauses after the generation check has passed and before the receiver
-    /// is claimed, so a test can unsubscribe and resubscribe in that gap.
     #[cfg(test)]
     subscribe_before_claim_pause:
         std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
-    /// Pauses after this task owns the slot and before `subscribe_ready`.
-    /// A test can attach another sender and cancel the owner in that gap.
     #[cfg(test)]
     after_claim_pause:
         std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
-    /// Pauses after a local publish has captured its receiver and before
-    /// PlumTree admission. A test can replace that receiver in this gap.
     #[cfg(test)]
     before_admission_pause:
         std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
-    /// Pauses after a local publish has queued its payload and before the
-    /// drain. Cancelling here still delivers that payload.
     #[cfg(test)]
     after_publish_pause:
         std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
-    /// Pauses after PlumTree has returned and before this task drains.
-    /// Cancelling here delivers the queued payload with no transport id.
     #[cfg(test)]
     after_producer_pause:
         std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
@@ -1615,44 +1383,25 @@ pub struct PubSubManager {
     #[cfg(test)]
     register_after_roster_read_pause:
         std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
-    /// Live subscribed transport ids for the Leaf C0 refuse gate AND the
-    /// #674 C2 zero-subscriber test (shared handle).
     subscribed_topic_ids: Arc<std::sync::RwLock<HashSet<TopicId>>>,
-    /// #674 C2/C3 relay fan-out policy: composite per-topic validators
-    /// (storm-control base + lazy-for-unconsumed + budgeted eager).
     relay_fanout: Arc<super::relay_fanout::RelayFanout>,
-    /// Whether the DM inbox opted out of the compatibility bus.  This is
-    /// installed by `AgentBuilder` before network listeners can run so a
-    /// trusted connect event cannot undo the opt-out with an ACK pre-warm.
     skip_legacy_dm_bus: AtomicBool,
-    /// Inbound unsubscribed pass-through frames this Leaf refused.
     unsubscribed_refused_frames: AtomicU64,
     unsubscribed_refused_bytes: AtomicU64,
     unsubscribed_refused_graft_equiv: AtomicU64,
-    /// #731: topics this Leaf published to recently. The C0 gate still
-    /// lets IWANT through on them so the node serves its own messages.
     publisher_topics: Arc<super::participation::PublisherTopics>,
-    /// Last `fan_out == 0` warn per group, used to rate-limit issue #296.
     zero_fanout_warns: Mutex<HashMap<String, Instant>>,
-    /// Test-only: topic ids last passed to `set_topic_peers`.
     #[cfg(test)]
     refreshed_topic_ids: std::sync::Mutex<Vec<TopicId>>,
-    /// Test-only: inject PlumTree-known topics without a live mesh.
     #[cfg(test)]
     known_topic_override: std::sync::Mutex<Option<Vec<TopicId>>>,
-    /// Test-only: report this fan-out after a successful publish so HTTP
-    /// tests can simulate an empty eager set without disabling cooling.
     #[cfg(test)]
     fanout_report_override: Mutex<Option<u32>>,
 }
 
-/// Outcome of a PlumTree (or local-topic) publish.
 struct PublishFanoutOutcome {
-    /// Eager-peer publish count at `publish_local`. `0` is the black-hole.
     fan_out: u32,
-    /// Signed envelope bytes when signing is enabled.
     envelope: Option<Bytes>,
-    /// Exact awaited send-stage counts, not remote receipt or forwarding proof.
     #[cfg(test)]
     observed_counts: Option<saorsa_gossip_pubsub::FanoutCounts>,
 }
@@ -1709,7 +1458,7 @@ mod observed_fanout_controls {
     }
 }
 
-/// Topic-name prefix marking a topic as local-only (issue #89).
+/// Topic-name prefix marking a topic as local-only.
 ///
 /// Topics starting with this prefix are delivered exclusively to
 /// subscribers on the same daemon — they never enter the PlumTree EAGER
@@ -1718,16 +1467,12 @@ mod observed_fanout_controls {
 /// referencing one has no subscription to deliver into and is dropped.
 pub const LOCAL_TOPIC_PREFIX: &str = "local:";
 
-/// True when `topic` is a same-daemon-only topic (issue #89).
+/// True when `topic` is a same-daemon-only topic.
 #[must_use]
 pub fn is_local_topic(topic: &str) -> bool {
     topic.starts_with(LOCAL_TOPIC_PREFIX)
 }
 
-/// Peek the PlumTree header of a serialized `GossipMessage` without verifying
-/// the signature. Test assertions on captured legacy egress frames; the
-/// production inbound gates use SG's structural `inspect_message_header`,
-/// which also recognizes v3 frames and enforces exact ML-DSA sizes.
 #[cfg(test)]
 fn peek_pubsub_header(frame: &[u8]) -> Option<MessageHeader> {
     postcard::take_from_bytes::<MessageHeader>(frame)
@@ -1745,17 +1490,6 @@ impl std::fmt::Debug for PubSubManager {
     }
 }
 
-/// Eager degree ceiling for Full-participation nodes (#674 design C1).
-///
-/// Was `0` — sg's sentinel for its stock `MAX_EAGER_DEGREE = 12`. sg promotes
-/// eager peers up to `MIN_EAGER_DEGREE.min(ceiling)` and `MIN_EAGER_DEGREE` is
-/// 6, so in steady state a ceiling of 12 and a ceiling of 6 yield the SAME
-/// eager degree: this constant changes no steady-state send rate. What it
-/// bounds is the all-cooled publish rescue path, where sg grows the eager set
-/// toward the ceiling instead of swapping members — with 12 that growth is the
-/// send amplification the #380/#656 storms ride on; with 6 the set swaps.
-/// Delivery robustness is unchanged: PlumTree's lazy half (IHAVE/IWANT)
-/// still repairs peers outside the eager tree.
 const FULL_EAGER_DEGREE_CEILING: usize = 6;
 // Compile-time pin (#674 design C1): the ceiling must equal sg's promotion
 // floor so the all-cooled rescue path swaps eager members instead of growing
@@ -1770,7 +1504,6 @@ const _: () = assert!(
     "FULL_EAGER_DEGREE_CEILING must equal sg's MIN_EAGER_DEGREE (6); see #674 design C1"
 );
 
-/// Move every live receiver's queued payloads onto the fan-out with no id.
 fn drain_all_unstamped(deliveries: &TopicDeliveryMap) {
     let mut slots: Vec<(TopicId, Arc<TopicDelivery>)> = lock_std(deliveries)
         .iter()
@@ -1784,10 +1517,6 @@ fn drain_all_unstamped(deliveries: &TopicDeliveryMap) {
     }
 }
 
-/// One in-flight PlumTree call for a topic.
-///
-/// The count includes a call that started before a local receiver existed.
-/// Drop lowers the count. The map lock is not held across the PlumTree call.
 struct ProducerFlight {
     map: Arc<Mutex<HashMap<TopicId, Arc<AtomicUsize>>>>,
     topic: TopicId,
@@ -1809,23 +1538,13 @@ impl Drop for ProducerFlight {
     }
 }
 
-/// Drains what one producer call queued.
-///
-/// A completed plain delivery stamps one exclusive payload on the same
-/// receiver it started with, and only when no other producer is inside
-/// PlumTree for that topic. A receiver change, a cached frame, a replay,
-/// a forged frame, recovery, and cancellation deliver the payload with
-/// the id absent. The drain lock is not held across the PlumTree call.
 struct ProducerDrain {
     armed: bool,
     topic: TopicId,
     deliveries: Arc<TopicDeliveryMap>,
     slot: Option<Arc<TopicDelivery>>,
-    /// `Some` for an ordinary inbound frame. Local publish leaves this empty
-    /// and never stamps.
     frame: Option<Bytes>,
     recovery: Arc<AtomicUsize>,
-    /// Kept until after the drain so the count still includes this call.
     flight: Option<ProducerFlight>,
     #[cfg(test)]
     reads: Arc<AtomicU64>,
@@ -1843,9 +1562,6 @@ impl ProducerDrain {
             (None, None) => true,
             _ => false,
         };
-        // The accepted payload may sit on the receiver installed while this
-        // call was in PlumTree. Drain that receiver too. Do not stamp when
-        // it is not the receiver this call started with.
         let mut targets = Vec::new();
         if let Some(old) = &self.slot {
             targets.push(Arc::clone(old));
@@ -1866,9 +1582,6 @@ impl ProducerDrain {
                 .is_some_and(|old| Arc::ptr_eq(old, &slot));
             let _drain = lock_std(&slot.drain);
             let mut produced = slot.drain_admitted();
-            // Read after the drain. A producer that queued one of these
-            // payloads incremented the same count before that send, including
-            // a call that started before this receiver existed.
             let alone = self
                 .flight
                 .as_ref()
@@ -1896,8 +1609,6 @@ impl ProducerDrain {
                 }
             }
         }
-        // Lower the count only after the drain. A peer still inside
-        // PlumTree remains visible to the check above.
         self.flight.take();
     }
 }
@@ -1909,8 +1620,6 @@ impl Drop for ProducerDrain {
     }
 }
 
-/// Hop-local recovery omits the id on every live receiver. Drop still drains
-/// and lowers the counter when the future is cancelled.
 struct RecoveryOmit {
     armed: bool,
     deliveries: Arc<TopicDeliveryMap>,
@@ -1935,8 +1644,6 @@ impl Drop for RecoveryOmit {
 }
 
 impl PubSubManager {
-    /// Stop membership-hold receivers and PlumTree's background senders before
-    /// the gossip runtime hands transport ownership to network shutdown.
     pub(crate) async fn shutdown(&self) {
         let handles: Vec<_> = self.membership_holds.write().await.drain().collect();
         for (_, handle) in &handles {
@@ -1958,8 +1665,8 @@ impl PubSubManager {
     /// `AgentBuilder::build` passes the agent's revocation set here and does
     /// not call `set_revocation_set`. It does call `set_contacts` with the
     /// agent's contact store. Delivery uses this revocation set when the
-    /// delivery lock is empty, so a bare agent drops a revoked sender
-    /// (#1230). `set_revocation_set` wins once it has run. A later
+    /// delivery lock is empty, so a bare agent drops a revoked sender.
+    /// `set_revocation_set` wins once it has run. A later
     /// `set_contacts` with a different contact store has no effect (first
     /// caller wins). x0xd passes the same revocation `Arc` and the same
     /// contact store.
@@ -2056,9 +1763,6 @@ impl PubSubManager {
                 affected_topics.insert(topic_id);
             }
         }
-        // Publish-only topics are absent from the local name map. Sweep all
-        // remaining bindings, and re-read each under its own ID stripe so a
-        // concurrent Drop cannot be resurrected from this snapshot.
         let existing: Vec<TopicId> = self
             .group_topic_by_id
             .read()
@@ -2143,9 +1847,6 @@ impl PubSubManager {
                 release.wait().await;
             }
         }
-        // Keep the roster read guard through classification publication.
-        // A writer then either sees this binding in its sweep or this
-        // registrar sees the writer's new roster; it cannot miss both.
         if let Some(active_agents) = binding {
             self.group_topic_by_id.write().await.insert(
                 topic_id,
@@ -2160,13 +1861,6 @@ impl PubSubManager {
         drop(rosters);
     }
 
-    /// The active roster of the one group whose metadata topic is `name`.
-    ///
-    /// A group card or invite sets the metadata topic, so two local group
-    /// records can name the same topic. A first-match lookup then follows
-    /// the roster map's random hash order, and the winner changes between
-    /// installs (#901). When more than one roster claims `name`, no roster
-    /// gets a preference. The topic keeps its ordinary eager membership.
     fn sole_metadata_roster(
         rosters: &HashMap<String, GroupEagerRoster>,
         name: &str,
@@ -2208,7 +1902,6 @@ impl PubSubManager {
         let local = self.transport.local_peer_id();
         let mut ranked = Vec::new();
         let mut seen = HashSet::new();
-        // #901: one cache write lock for the whole roster, not one per member.
         let machines = crate::dm_inbox::authenticated_roster_machine_bindings(
             &identity.bindings,
             &agents,
@@ -2217,9 +1910,6 @@ impl PubSubManager {
         .await;
         for (agent, machine) in agents.into_iter().zip(machines) {
             if let Some(machine) = machine {
-                // Raw Direct frames carry an untrusted AgentId prefix and can
-                // overwrite the reachability map. Only an independently
-                // authenticated binding may authorize a roster preference.
                 if !Self::group_pairing_allowed(identity, &agent, &machine).await {
                     continue;
                 }
@@ -2266,7 +1956,7 @@ impl PubSubManager {
     ///
     /// A new `PubSubManager` instance.
     ///
-    /// An absent signing context is a compile-time error (#1225):
+    /// An absent signing context is a compile-time error:
     ///
     /// ```compile_fail,E0308
     /// # use std::sync::Arc;
@@ -2332,7 +2022,6 @@ impl PubSubManager {
         let transport = Arc::new(PubSubTransport::new(Arc::clone(&network)));
         let plumtree_inner =
             PlumtreePubSub::new(peer_id, Arc::clone(&transport), plumtree_signing_key);
-        // ADR-014 modern-only: reject outer v1 (header-only-signed) frames.
         plumtree_inner.set_signature_policy(SignaturePolicy::RejectV1);
         if plumtree_inner.signature_policy() != SignaturePolicy::RejectV1 {
             return Err(NetworkError::NodeCreation(
@@ -2357,15 +2046,6 @@ impl PubSubManager {
         let relay_fanout = super::relay_fanout::RelayFanout::new(Arc::clone(&subscribed_topic_ids));
         crate::storm_control::register_announce_validators(plumtree.as_ref(), &relay_fanout);
 
-        // #697: relay topic lifecycle. Relay topics enter via inbound frames
-        // (ensure_registered on the inbound path) and nothing reclaimed
-        // their validator/bucket state — measured ~7 topics/hour, linear,
-        // no plateau. One slow sweep evicts idle, unsubscribed topics and
-        // drops their sg composites; a sighted-again topic re-registers on
-        // its next inbound frame. The task holds only Weak handles and
-        // exits at the first tick after the manager (and with it the
-        // fanout and plumtree) drops — a strong capture would pin both
-        // Arcs forever.
         {
             let sweep_fanout = Arc::downgrade(&relay_fanout);
             let sweep_plumtree = Arc::downgrade(&plumtree);
@@ -2378,7 +2058,7 @@ impl PubSubManager {
                     let (Some(fanout), Some(plumtree)) =
                         (sweep_fanout.upgrade(), sweep_plumtree.upgrade())
                     else {
-                        break; // manager dropped — stop sweeping
+                        break;
                     };
                     fanout.evict_idle_topics(plumtree.as_ref());
                 }
@@ -2474,8 +2154,6 @@ impl PubSubManager {
         if let Some(warning) = self.egress_config.normalize_egress_budget() {
             tracing::warn!("{warning}");
         }
-        // #674 C3: the eager-forward budget rides the same pre-traffic
-        // config pass as the Leaf egress thresholds.
         self.relay_fanout
             .set_budget(config.relay_fanout_budget_msgs_per_sec);
         let accepted = leaf_egress_config(&self.egress_config);
@@ -2497,8 +2175,6 @@ impl PubSubManager {
         Ok(())
     }
 
-    /// Configure before any topic creation or inbound handling, including
-    /// standalone managers made with the synchronous public constructors.
     async fn ensure_eager_ceiling(&self) {
         self.eager_ceiling_initialized
             .get_or_init(|| async {
@@ -2512,7 +2188,6 @@ impl PubSubManager {
             .await;
     }
 
-    /// Sample independently of HTTP reads, once per runtime peer-refresh tick.
     pub(crate) fn sample_egress(&self) {
         let outbound_by_topic = self.plumtree.outbound_by_topic_stats();
         let mut config = self.egress_config.clone();
@@ -2599,18 +2274,12 @@ impl PubSubManager {
                     "semantics": "subset of eager counters matching v2 in-flight IWANT peer/topic/message IDs (unverified frame fields; PlumTree verifies the IWANT itself, #656); includes coincident same-message forwards, not confirmed delivery; anti_entropy stays separate"
                 }
             },
-            // SG76 key-cache runtime witness: cumulative outer-key wire
-            // accounting (Full vs Ref frames/bytes in and out), cache
-            // hits/misses/evictions, control batches emitted, pending
-            // high-water/timeouts/limit drops, and replay outcomes —
-            // serialized straight from the pinned producer's snapshot.
-            // Additive only; no policy input.
             "key_cache": serde_json::to_value(self.plumtree.key_cache_stats())
                 .unwrap_or_default(),
         })
     }
 
-    /// #674 C2/C3 relay fan-out snapshot for `GET /diagnostics/gossip`,
+    /// Relay fan-out snapshot for `GET /diagnostics/gossip`,
     /// beside `pubsub_stages` / `inbound_by_topic`.
     ///
     /// `lazy_msgs` and `withheld_eager_peers` mirror sg's meters
@@ -2714,8 +2383,6 @@ impl PubSubManager {
         self.stats.snapshot()
     }
 
-    /// Test-only: the (subscription topic, sender) pairs refused for a
-    /// revoked or blocked sender so far.
     #[cfg(test)]
     pub(crate) fn refused_senders_for_test(&self) -> Vec<(String, AgentId)> {
         self.stats
@@ -2747,7 +2414,6 @@ impl PubSubManager {
         )
     }
 
-    /// Test hook: report `fan_out` instead of the PlumTree eager-peer count.
     #[cfg(test)]
     pub fn set_fanout_report_override(&self, fan_out: Option<u32>) {
         *self
@@ -2774,7 +2440,7 @@ impl PubSubManager {
 
     /// Snapshot of inbound frames/bytes per (topic class, PlumTree kind).
     ///
-    /// Surfaced at `GET /diagnostics/gossip` as `inbound_by_topic` (#674)
+    /// Surfaced at `GET /diagnostics/gossip` as `inbound_by_topic`
     /// so inbound cost can be attributed to a topic class directly instead
     /// of being inferred from message-cache eviction rates.
     #[must_use]
@@ -2793,11 +2459,11 @@ impl PubSubManager {
     /// `AgentBuilder::build` calls this with the agent's contact store when
     /// a gossip runtime exists. Delivery reads the store when it decodes
     /// each payload, so a subscription opened before this call still drops
-    /// `Blocked` senders (#1230).
+    /// `Blocked` senders.
     pub fn set_contacts(&self, store: Arc<tokio::sync::RwLock<ContactStore>>) {
         let _ = self.contacts.set(store);
     }
-    /// Attach the authoritative gossiped revocation set (issue #191).
+    /// Attach the authoritative gossiped revocation set.
     ///
     /// When set, payloads delivered via the subscribe path whose sender is in
     /// the revocation set are dropped before reaching subscribers — closing
@@ -2808,8 +2474,7 @@ impl PubSubManager {
     /// `set_group_identity_context` instead. That is the set
     /// `AgentBuilder::build` installs. A later call here replaces that
     /// fallback. Delivery reads the chosen set when it decodes each payload,
-    /// so a subscription opened before this call still drops revoked senders
-    /// (#1230).
+    /// so a subscription opened before this call still drops revoked senders.
     pub fn set_revocation_set(
         &self,
         set: Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>,
@@ -2855,8 +2520,6 @@ impl PubSubManager {
     /// domain-separated `TopicId`s, while still carrying a stable string topic
     /// name inside the signed x0x payload.
     pub async fn subscribe_topic_id(&self, topic: String, topic_id: TopicId) -> Subscription {
-        // `local:` topics never touch PlumTree — same-daemon delivery only
-        // (issue #89).
         if is_local_topic(&topic) {
             let (tx, rx) = mpsc::channel(10_000);
             let _name_guard = self
@@ -2902,8 +2565,6 @@ impl PubSubManager {
                 .shard(topic_id)
                 .lock()
                 .await;
-            // Count and classification share the same lock as Drop and
-            // unsubscribe. A prior generation cannot erase this hold.
             let generation = self.retain_topic_subscription(&topic).await;
             self.topic_id_by_name
                 .write()
@@ -2926,9 +2587,6 @@ impl PubSubManager {
         }
         self.initialize_topic_peers(topic_id).await;
 
-        // The channel exists before the generation check so a canceled
-        // generation returns a closed handle and does not join a newer
-        // generation's PlumTree receiver.
         let (tx, rx) = mpsc::channel(10_000);
 
         let active_generation = {
@@ -2955,9 +2613,6 @@ impl PubSubManager {
                     .insert(topic_id);
                 true
             } else if current_generation.is_none() {
-                // Unsubscribe won while initialization was in flight.
-                // Remove any late SG topic and preference before returning
-                // the canceled generation's handle.
                 self.plumtree
                     .set_topic_preferred_eager_set(topic_id, &[])
                     .await;
@@ -2965,14 +2620,12 @@ impl PubSubManager {
                 let _ = self.plumtree.unsubscribe(topic_id).await;
                 false
             } else {
-                // A newer subscription owns this topic. Its SG receiver and
-                // preference must not be removed by this stale generation.
+                // A newer subscription owns this topic. This stale generation
+                // must not remove its SG receiver and preference.
                 false
             }
         };
         if !active_generation {
-            // A newer generation owns this topic, or unsubscribe won.
-            // This handle must not join that generation's fan-out.
             drop(tx);
             return Subscription {
                 topic,
@@ -2992,19 +2645,8 @@ impl PubSubManager {
                 drop_completed: Arc::clone(&self.drop_completed),
             };
         }
-        // #674 C2/C3: every subscribed topic carries the composite
-        // validator (C3 budget applies to consumed topics; the verdict
-        // reads the live subscriber set above, so this is once per topic,
-        // not per subscription).
         self.relay_fanout
             .ensure_registered(self.plumtree.as_ref(), topic_id);
-        // ADR-0034 / #397 (Leaf C0): a Leaf node REFUSES inbound frames —
-        // including anti-entropy — for unsubscribed topics, so a topic that
-        // was unsubscribed for a while has no passively-repaired state to
-        // rejoin. Trigger an explicit anti-entropy round on (re)subscribe so
-        // catch-up is a property of the subscribe path itself, not a hope
-        // that background repair happens to run. Best-effort: failure only
-        // delays convergence to the next periodic round.
         {
             let plumtree = Arc::clone(&self.plumtree);
             tokio::spawn(async move {
@@ -3014,10 +2656,6 @@ impl PubSubManager {
             });
         }
 
-        // The check above released these locks. Unsubscribe and a newer
-        // subscribe can finish before the claim. Revalidate under the same
-        // locks and keep them until `subscribe_ready` has registered this
-        // generation's receiver (#869).
         #[cfg(test)]
         Self::wait_test_pause(&self.subscribe_before_claim_pause).await;
         let _claim_name = self
@@ -3060,15 +2698,6 @@ impl PubSubManager {
         }
         let claimed = Self::claim_topic_delivery(&self.topic_deliveries, &self.stats, topic_id, tx);
         if claimed.own {
-            // One receiver per topic. Returning this owner is the barrier
-            // after which an immediate publish cannot miss the fan-out.
-            // Joiners wait on the same barrier. The id is attached once,
-            // then the notification is copied (#869). Dropping the last
-            // sender ends this task promptly so the PlumTree registration
-            // is not pinned on a quiet topic (#238).
-            // #1230: the task holds the locks, not a subscribe-time snapshot.
-            // `set_revocation_set` wins when it has run. Otherwise delivery uses
-            // the revocation set `AgentBuilder::build` stored on group identity.
             let contacts = Arc::clone(&self.contacts);
             let revocation_set = Arc::clone(&self.revocation_set);
             let group_identity = Arc::clone(&self.group_identity);
@@ -3087,17 +2716,10 @@ impl PubSubManager {
                 sub_topic: topic.clone(),
                 local_agent,
             };
-            // A joiner can attach to the slot while this task is still
-            // inside `subscribe_ready` only if it already holds a sender.
-            // Cancelling here must not close that sender. The pause is
-            // the test hook for that drop.
             #[cfg(test)]
             Self::wait_test_pause(&self.after_claim_pause).await;
             let plumtree_rx = self.plumtree.subscribe_ready(topic_id).await;
             claimed.slot.install_plumtree_rx(plumtree_rx);
-            // A publish that overlapped registration is already in the
-            // receiver. Move it before any joiner can be admitted. It has
-            // no inbound frame, so the id stays absent.
             {
                 let _drain = lock_std(&claimed.slot.drain);
                 claimed.slot.pump_unstamped();
@@ -3179,7 +2801,6 @@ impl PubSubManager {
             .fan_out)
     }
 
-    /// Retain the same awaited send-stage result for the controlled test load.
     #[cfg(test)]
     pub(crate) async fn publish_with_observed_fanout(
         &self,
@@ -3224,7 +2845,6 @@ impl PubSubManager {
             .map(|_| ())
     }
 
-    /// Retain the explicit-topic publish fan-out for targeted-delivery tests.
     #[cfg(test)]
     pub(crate) async fn publish_topic_id_with_fanout_for_test(
         &self,
@@ -3278,8 +2898,6 @@ impl PubSubManager {
             .ok_or_else(|| NetworkError::SerializationError("Missing V3 envelope".to_string()))
     }
 
-    /// Publish and return both the signed network envelope and the
-    /// eager-peer fan-out count from PlumTree `publish_local`.
     async fn publish_topic_id_with_fanout_and_envelope(
         &self,
         topic: String,
@@ -3287,8 +2905,6 @@ impl PubSubManager {
         payload: Bytes,
         version: SignedVersion,
     ) -> NetworkResult<PublishFanoutOutcome> {
-        // `local:` topics fan out to same-daemon subscribers only — the
-        // payload never reaches PlumTree or any remote peer (issue #89).
         if is_local_topic(&topic) {
             self.publish_local(topic, payload).await?;
             return Ok(PublishFanoutOutcome {
@@ -3299,9 +2915,6 @@ impl PubSubManager {
             });
         }
 
-        // W3-H (#1164): every remote publish attempt is recorded on the
-        // simulated fabric's trace before mesh fan-out, including attempts
-        // that reach no peer.
         #[cfg(test)]
         self.network.sim_note_publish(&topic, &payload);
 
@@ -3329,21 +2942,15 @@ impl PubSubManager {
         let envelope_bytes = Some(Bytes::clone(&encoded));
 
         self.register_dynamic_topic_priority(&topic, topic_id);
-        // #731: record before PlumTree sends the first IHAVE, so a lazy
-        // subscriber's IWANT for this publish cannot meet the C0 gate first.
         if !self.participation.forwards_passthrough() {
             self.publisher_topics.record(topic_id, Instant::now());
         }
-        // Classification linearizes here. A roster commit overlapping this
-        // publish may affect the next send; a completed writer reconciles
-        // every still-known group binding before it returns.
         self.register_group_topic(&topic, topic_id).await;
         self.initialize_topic_peers(topic_id).await;
 
         match self.publish_plumtree_and_pump(topic_id, encoded).await {
             Ok(counts) => {
                 self.stats.publish_total.fetch_add(1, Ordering::Relaxed);
-                // Local publish onto the mesh is an Eager wire frame (#1170).
                 crate::gossip::per_kind::per_kind_counters().record_published(MessageKind::Eager);
                 let attempted = counts.map(|c| c.attempted).unwrap_or(0);
                 let fan_out = u32::try_from(attempted).unwrap_or(u32::MAX);
@@ -3365,26 +2972,16 @@ impl PubSubManager {
         }
     }
 
-    /// Fan out a `local:` publish to same-daemon subscribers only.
-    ///
-    /// The payload never reaches PlumTree or any remote peer (issue #89). The
-    /// `Full` vs `Closed` arms encode the slow-subscriber-drop behaviour:
-    /// `Full` keeps the subscriber (the message is dropped, not the queue),
-    /// `Closed` evicts it.
     async fn publish_local(&self, topic: String, payload: Bytes) -> NetworkResult<()> {
         let message = PubSubMessage {
             topic: topic.clone(),
             payload,
             sender: Some(self.signing.agent_id),
             sender_public_key: Some(self.signing.public_key_bytes.clone()),
-            // Local publishes come from a bearer-token-authenticated
-            // API caller on this daemon — trusted by construction.
             verified: true,
             trust_level: None,
             raw_envelope: None,
         };
-        // `local:` publishes never enter PlumTree, so they have no
-        // `MessageHeader`. The notification omits the transport id.
         let notification = PubSubNotification::bare(message);
         let mut topics = self.local_topics.write().await;
         if let Some(senders) = topics.get_mut(&topic) {
@@ -3393,8 +2990,6 @@ impl PubSubManager {
                     self.stats
                         .delivered_to_subscriber
                         .fetch_add(1, Ordering::Relaxed);
-                    // `local:` hand-offs never enter PlumTree. Do not count
-                    // them as Eager deliveries (#1170).
                     true
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -3413,7 +3008,7 @@ impl PubSubManager {
     /// Handle an incoming message from a peer, optionally with SG session
     /// provenance stamped from the frame's source connection.
     ///
-    /// Leaf (#380 C0): refuse GRAFT-equivalent / eager / IHAVE / IWANT /
+    /// Leaf: refuse GRAFT-equivalent / eager / IHAVE / IWANT /
     /// anti-entropy frames for topics this node does not subscribe to, so
     /// PlumTree never creates pass-through state or eager-forwards them.
     /// Full nodes keep today's `handle_message` behaviour.
@@ -3435,13 +3030,7 @@ impl PubSubManager {
         data: Bytes,
     ) {
         self.ensure_eager_ceiling().await;
-        // One structural header inspection serves the inbound-by-topic
-        // counters (#674), the Leaf refuse gate, and the IWANT repair
-        // tracker — no crypto.
         let inspected = saorsa_gossip_pubsub::inspect_message_header(&data);
-        // #1170: the worker already inspected this header for routing. Count
-        // the frame as bus-dispatched here so the receive pump can keep ADR
-        // 0013's steady-state path free of a kind peek.
         if let Some(header) = inspected.as_ref() {
             crate::gossip::per_kind::per_kind_counters().record_bus_dispatched(header.kind);
         }
@@ -3473,25 +3062,12 @@ impl PubSubManager {
             } else {
                 None
             };
-        // A remote send does not take a daemon-wide lock and does not park
-        // the other receive workers (ADR 0009). A completed plain delivery
-        // stamps one exclusive payload when it is the sole producer.
-        // Recovery, cancellation, a replay, and a failed verification drain
-        // with the id absent.
-        //
-        // Outer ML-DSA verify stays inside saorsa-gossip. Do not call
-        // `stage_stats()` or re-count verifies on this hot path. This slice
-        // does not publish per-kind verify CPU: the pinned crate has no
-        // per-kind verify meter.
         let hop_local = inspected
             .as_ref()
             .is_some_and(|header| header.hop_local_control);
         let dispatch_result = if hop_local {
             self.dispatch_and_drain_recovered(peer, session, data).await
         } else if let Some(topic) = ordinary_frame.map(|header| header.topic) {
-            // Copy the frame only when a local receiver already exists.
-            // The producer count still covers a receiver installed during
-            // this call, so a relay with no subscriber does not decode an id.
             let frame = self.live_topic_delivery(topic).map(|_| Bytes::clone(&data));
             let mut drain = self.producer_drain(topic, frame);
             let result = self.dispatch_inbound(peer, session, data).await;
@@ -3534,10 +3110,6 @@ impl PubSubManager {
         }
     }
 
-    /// Hop-local key-cache control can replay onto any topic. It does not
-    /// hold a lock across that call. Afterwards every live receiver is
-    /// drained with no transport id. While the call is in progress, a plain
-    /// delivery also omits the id. Cancelling the future still drains.
     async fn dispatch_and_drain_recovered(
         &self,
         peer: PeerId,
@@ -3568,9 +3140,6 @@ impl PubSubManager {
         live_slot(&self.topic_deliveries, topic_id)
     }
 
-    /// Count this producer before PlumTree runs, including when no receiver
-    /// exists yet. Move any payload already queued out with no id. The
-    /// returned guard drains again if the future is cancelled.
     fn producer_drain(&self, topic: TopicId, frame: Option<Bytes>) -> ProducerDrain {
         let counter = {
             let mut map = lock_std(&self.topic_producers);
@@ -3617,10 +3186,6 @@ impl PubSubManager {
         topic_id: TopicId,
         encoded: Bytes,
     ) -> Result<Option<saorsa_gossip_pubsub::FanoutCounts>, anyhow::Error> {
-        // Local publish has no inbound header. The id stays absent.
-        // The remote send holds no daemon-wide lock. Cancelling after
-        // PlumTree enqueues still drains, including when a new receiver
-        // was installed during the call.
         let mut drain = self.producer_drain(topic_id, None);
         #[cfg(test)]
         Self::wait_test_pause(&self.before_admission_pause).await;
@@ -3679,16 +3244,6 @@ impl PubSubManager {
         if !leaf_refuses_unsubscribed_passthrough(self.participation, subscribed, header.kind) {
             return false;
         }
-        // #731: a publisher serves IWANT for its own messages on a topic it
-        // does not subscribe to. `allows_iwant` is false for
-        // `UNSUBSCRIBE_QUIET` (120 s, which covers the bounded sg key-cache
-        // replay) after the topic was last subscribed. After that the cache
-        // normally holds only this node's publishes, because this gate
-        // refuses every frame that could add another peer's message. sg
-        // replays a queued key-cache frame without an age check, so a peer
-        // that stalls the replay can still add one stale entry; that replay
-        // already bypassed C0 before #731. The lock runs only on this refuse
-        // path.
         if header.kind == MessageKind::IWant
             && self
                 .publisher_topics
@@ -3750,8 +3305,6 @@ impl PubSubManager {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(topic);
-        // #731: mark first, so an IWANT that sees the topic unsubscribed
-        // before `plumtree.unsubscribe` empties the cache is still refused.
         self.publisher_topics
             .note_unsubscribed(topic_id, Instant::now());
         self.subscribed_topic_ids
@@ -3773,11 +3326,8 @@ impl PubSubManager {
     /// for existing topics. Without this, a peer that connects after a topic
     /// is subscribed would never receive messages on that topic from this node.
     pub async fn refresh_topic_peers(&self) {
-        // Issue #206: plane-gated peer view — only plane-cleared peers may
-        // enter PlumTree eager sets.
         let peers: Vec<PeerId> = self.transport.connected_peer_ids().await;
 
-        // Refresh locally subscribed topics.
         let subscribed: Vec<String> = self.topic_ref_counts.read().await.keys().cloned().collect();
         if !peers.is_empty() && !subscribed.is_empty() {
             tracing::debug!(
@@ -3799,10 +3349,6 @@ impl PubSubManager {
                 .await;
         }
 
-        // Full (bootstrap / relay / `--relay`): also refresh pass-through
-        // topics (known to PlumTree but without local subscribers) so this
-        // node forwards. Leaf (ordinary desktop): skip — unsubscribed topics
-        // must not expand eager sets here (issue #380).
         if !self.participation.forwards_passthrough() {
             return;
         }
@@ -3872,22 +3418,11 @@ impl PubSubManager {
         *self.known_topic_override.lock().expect("topic override") = Some(topics);
     }
 
-    /// Test hook: seed PlumTree eager peers so a publish fans out on the wire.
     #[cfg(test)]
     async fn set_topic_peers_for_test(&self, topic_id: TopicId, peers: Vec<PeerId>) {
         self.plumtree.set_topic_peers(topic_id, peers).await;
     }
 
-    /// X0X-0074: classify a dynamic topic name and register it with the
-    /// admission control registry. Idempotent — re-registering with the
-    /// same priority is a no-op; re-registering with a different priority
-    /// overwrites (the runtime should never do that for production
-    /// topics, but the registry handles it gracefully).
-    ///
-    /// Called on subscribe + publish entry points. The static x0x topic
-    /// set is seeded at construction; this path covers sharded topics
-    /// (`x0x.identity.shard.v2.<u16>`), DM-inbox topics (per-recipient
-    /// hashes), release manifests, and any custom application topic.
     fn register_dynamic_topic_priority(&self, topic_name: &str, topic_id: TopicId) {
         let priority = classify_x0x_topic(topic_name);
         self.plumtree
@@ -3896,38 +3431,22 @@ impl PubSubManager {
             .register(topic_id, priority);
     }
 
-    /// #810: the admission priority for a topic, read from the same registry
-    /// the substrate admission uses. Consumed by the receive pump's
-    /// proactive control-frame shed exemption so Critical topics (e.g.
-    /// `x0x/dm/v1/*` lazy repair) are never shed before classification.
-    /// Unregistered topics read as `TopicPriority::Normal`.
     pub(crate) fn topic_priority_for(&self, topic: &TopicId) -> TopicPriority {
         self.plumtree.admission().registry().priority_for(topic)
     }
 
-    /// Initialize PlumTree peers for a topic from currently connected peers.
     async fn initialize_topic_peers(&self, topic: TopicId) {
-        // #674 C2/C3: the pre-subscribe warm path also creates the topic,
-        // so the composite must exist before any inbound frame can admit.
+        // This path also creates the topic, so the composite must exist
+        // before any inbound frame can admit.
         self.relay_fanout
             .ensure_registered(self.plumtree.as_ref(), topic);
         self.ensure_eager_ceiling().await;
-        // Issue #206: plane-gated peer view (see refresh_topic_peers).
         let peers: Vec<PeerId> = self.transport.connected_peer_ids().await;
-        // #774: one atomic membership pass — the FULL connected plane as
-        // membership (the eager ceiling, not x0x, caps fanout) with the
-        // actual preferred Full/bootstrap peer promoted eager when
-        // graft-eligible. The old degree-capped seed truncated the plane
-        // before saorsa-gossip ever saw it, so the discarded peers were in
-        // neither the eager nor the lazy set: no fanout, no IHAVE/IWANT
-        // repair (the G5→D5 acceptance arm). Re-running per publish is
-        // safe: an already-eager preference is idempotent and
-        // still-connected peers keep their roles and cooling/score state.
         let membership = self.topic_membership(peers).await;
         if self.participation.forwards_passthrough() {
             let _topic_guard = self.group_preference_apply_locks.shard(topic).lock().await;
-            // Full: #807 is Leaf-only. Keep the pre-#807 add-only seed so a
-            // publish never prunes members or their IWANT/cooling state.
+            // Add-only seed: a publish never prunes members or their
+            // IWANT/cooling state.
             self.plumtree
                 .initialize_topic_peers(topic, membership.into_pre_807_order())
                 .await;
@@ -3937,12 +3456,6 @@ impl PubSubManager {
         self.apply_topic_membership(topic, membership).await;
     }
 
-    /// Refresh PlumTree eager-set peers for one topic id via the
-    /// subscribed-topic path (`initialize_topic_peers` + `set_topic_peers`).
-    ///
-    /// Leaf-safe: does not walk unsubscribed pass-through topics and does
-    /// not change [`Self::refresh_topic_peers`]. Used to pre-warm reverse
-    /// ACK topics so the first durable send is not the join event (#380 C2).
     pub(crate) async fn refresh_subscribed_topic_id(&self, topic: &str, topic_id: TopicId) {
         self.register_dynamic_topic_priority(topic, topic_id);
         self.initialize_topic_peers(topic_id).await;
@@ -3950,11 +3463,11 @@ impl PubSubManager {
         self.apply_topic_peers(topic_id, peers).await;
     }
 
-    /// C5b: prefer one connected Full/bootstrap peer at the front of the
+    /// Prefer one connected Full/bootstrap peer at the front of the
     /// eager set for the given topics (durable ACK inbox + bus only).
     ///
     /// Does not walk unsubscribed pass-through topics and does not re-enable
-    /// GRAFT piggyback on topics the node is not subscribed to (C0).
+    /// GRAFT piggyback on topics the node is not subscribed to.
     pub async fn prefer_one_full_bootstrap_eager(&self, topic_ids: &[TopicId]) {
         if topic_ids.is_empty() {
             return;
@@ -3969,61 +3482,24 @@ impl PubSubManager {
         self.apply_preferred_eager_peer(plane, topic_ids).await;
     }
 
-    /// #1455: record the machine that owns `topic_id` — the recipient of a
-    /// direct message owns their own inbox topic. A Leaf publisher's bounded
-    /// EAGER set is chosen without any subscription signal (the gossip wire
-    /// has no SUBSCRIBE message; tied PeerScores resolve by hash order), so
-    /// on a plane with bystander daemons the single EAGER inbox frame can
-    /// land on a Leaf that refuses unsubscribed pass-through and never reach
-    /// the subscriber — the durable send then pays the 250 ms legacy bus
-    /// fallback. The recorded owner outranks the C5b Full/bootstrap
-    /// preference while it stays on the connected plane.
     pub(crate) fn note_dm_inbox_owner(&self, topic_id: TopicId, owner: MachineId) {
         lock_std(&self.dm_inbox_owners).note(topic_id, PeerId::new(owner.0));
     }
 
-    /// #1455: the recorded inbox owner, but only while it is a member of
-    /// `plane`. A recipient that moved machines or went offline must not
-    /// pin eager selection; the caller falls back to the stock choice.
     fn dm_inbox_owner_on_plane(&self, topic_id: TopicId, plane: &[PeerId]) -> Option<PeerId> {
         let owner = lock_std(&self.dm_inbox_owners).get(&topic_id)?;
         plane.contains(&owner).then_some(owner)
     }
 
-    /// Pre-subscribe a topic id (C4) so the first later `publish_topic_id`
-    /// is not the PlumTree join. Idempotent. Leaf-safe: uses
-    /// [`Self::subscribe_topic_id`] (subscribed path) and does not walk
-    /// pass-through topics.
-    ///
-    /// #396 race fix: the original check-then-insert ran the refcount READ,
-    /// the subscribe, and the holds INSERT under separate lock acquisitions.
-    /// Two concurrent warmers (outbound `maybe_warm_reverse_ack_topics` on
-    /// Direct connect vs inbound `PeerConnected`) could both observe "no
-    /// refcount", both `subscribe_topic_id`, and both spawn a permanent
-    /// drain hold — a leaked duplicate subscription plus a duplicate drain
-    /// task per topic, forever. The refcount write inside
-    /// `subscribe_topic_id` is the linearization point: we take the holds
-    /// WRITE lock FIRST and re-check the refcount while holding it, so
-    /// exactly one warmer ever creates a hold per topic; the loser sees the
-    /// winner's refcount and only refreshes. (The write guard is held
-    /// across `subscribe_topic_id`'s awaits — acceptable because warmers
-    /// target three topics, the map is tiny, and readers
-    /// (`shutdown`/drop-abort) tolerate brief writer hold.)
     pub(crate) async fn ensure_subscribed_topic_id(&self, topic: &str, topic_id: TopicId) {
-        // Serialize hold creation per manager: the guard is released on
-        // return, and the double-check below makes duplicate concurrent
-        // calls converge to one hold.
+        // #396: take the holds write lock first and re-check the refcount
+        // under it, so exactly one warmer creates a hold per topic.
         let mut holds = self.membership_holds.write().await;
         if self.topic_ref_counts.read().await.contains_key(topic) {
             drop(holds);
             self.refresh_subscribed_topic_id(topic, topic_id).await;
             return;
         }
-        // Re-check under the same guard ordering used by the fast path:
-        // another warmer may have inserted between our lock acquisition
-        // and here is impossible (we hold the write lock), but the
-        // refcount read above may have raced the winner's subscribe —
-        // the definitive check is the holds map itself.
         if holds.contains_key(topic) {
             drop(holds);
             self.refresh_subscribed_topic_id(topic, topic_id).await;
@@ -4036,47 +3512,29 @@ impl PubSubManager {
         self.refresh_subscribed_topic_id(topic, topic_id).await;
     }
 
-    /// Set the compatibility DM-bus policy before network listeners start.
-    /// The manager owns this immutable-at-runtime choice because reverse-ACK
-    /// pre-warming receives only a pub/sub handle.
     pub(crate) fn set_skip_legacy_dm_bus(&self, skip: bool) {
         self.skip_legacy_dm_bus.store(skip, Ordering::Release);
     }
 
-    /// Whether this manager's DM inbox opted out of the compatibility bus.
     pub(crate) fn skip_legacy_dm_bus(&self) -> bool {
         self.skip_legacy_dm_bus.load(Ordering::Acquire)
     }
 
-    /// Topic ids currently known to PlumTree. Test helper for proving a
-    /// warm joined the real inbox ids, not name-derived pass-through ids.
     #[cfg(test)]
     pub(crate) async fn plumtree_topic_ids(&self) -> Vec<TopicId> {
         self.plumtree.all_topic_ids().await
     }
 
-    /// Whether `topic` currently has a local subscriber (C4 pre-join).
     #[cfg(test)]
     pub(crate) async fn is_topic_subscribed(&self, topic: &str) -> bool {
         self.topic_ref_counts.read().await.contains_key(topic)
     }
 
-    /// Number of live membership-hold drain tasks (C4). Test helper for the
-    /// #396 concurrent-warmer race: exactly one hold may exist per topic.
     #[cfg(test)]
     pub(crate) async fn membership_hold_count(&self) -> usize {
         self.membership_holds.read().await.len()
     }
 
-    /// C5b continuation: apply the preferred-eager policy to the ACK topics
-    /// only (called by [`Self::prefer_one_full_bootstrap_eager`]).
-    ///
-    /// #774: identical to the periodic refresh — one atomic full-membership
-    /// call carrying the actual preferred peer. The upstream reconciliation
-    /// is idempotent for an already-eager preference and preserves connected
-    /// cooling/score/IWANT state, so the per-durable-ACK cadence adds no
-    /// membership churn; a late-connected preferred peer is promoted by the
-    /// same call.
     async fn apply_preferred_eager_peer(&self, plane: Vec<[u8; 32]>, topic_ids: &[TopicId]) {
         let peers = plane.into_iter().map(PeerId::new).collect::<Vec<_>>();
         for topic_id in topic_ids {
@@ -4084,14 +3542,6 @@ impl PubSubManager {
         }
     }
 
-    /// One policy for every initializer/overwrite. Keep the full transport plane
-    /// as the source on each refresh so disconnected selected peers are replaced.
-    ///
-    /// #774: the full deduplicated connected plane is topic MEMBERSHIP —
-    /// only the installed eager ceiling caps fanout, so peers beyond the
-    /// Leaf degree stay lazy and IHAVE/IWANT-repair-eligible instead of
-    /// being truncated away. `preferred` is the ACTUAL selected
-    /// Full/bootstrap peer (or `None`), never a seed-head stand-in.
     async fn topic_membership(&self, peers: Vec<PeerId>) -> TopicMembership {
         let mut coordinators = Vec::new();
         let mut relays = Vec::new();
@@ -4133,14 +3583,8 @@ impl PubSubManager {
         }
     }
 
-    /// #774: the single atomic membership pass used by initialization, the
-    /// periodic refresh, and the per-durable-ACK preferred path. The full
-    /// connected plane stays represented eager-or-lazy with connected
-    /// cooling/score/IWANT state preserved, and the preferred peer is
-    /// promoted eager only when saorsa-gossip finds it graft-eligible. A
-    /// `false` return means the preferred peer is cooled or otherwise
-    /// ineligible: saorsa-gossip's health and cooling choices win, and x0x
-    /// must never retry the preference destructively.
+    /// saorsa-gossip's health and cooling choices win: x0x must never retry
+    /// the preferred peer destructively.
     async fn apply_topic_membership(&self, topic_id: TopicId, membership: TopicMembership) {
         let _topic_guard = self
             .group_preference_apply_locks
@@ -4148,8 +3592,6 @@ impl PubSubManager {
             .lock()
             .await;
         if self.participation.forwards_passthrough() {
-            // Full: #807 is Leaf-only. Pre-#807 Full replaced membership with
-            // the untruncated plane and never forced a preferred eager peer.
             self.plumtree
                 .set_topic_peers(topic_id, membership.into_pre_807_order())
                 .await;
@@ -4157,11 +3599,6 @@ impl PubSubManager {
             return;
         }
         let preferred = membership.preferred;
-        // #1455: on a Leaf writer an inbox owner recorded by the durable
-        // send path outranks the C5b Full/bootstrap pick — the owner is the
-        // one peer known to subscribe to this topic. #807 stays intact: the
-        // Full arm above returned already, so Full never forces a preferred
-        // eager peer.
         let preferred = self
             .dm_inbox_owner_on_plane(topic_id, &membership.full)
             .or(preferred);
@@ -4195,10 +3632,6 @@ impl PubSubManager {
         }
         let connected = self.transport.connected_peer_ids().await;
         let roster = self.preferred_roster_peers(topic_id, &connected).await;
-        // Leaf retains its #774 Full/bootstrap fallback. Reserve one of the
-        // bounded eight preference slots for it, including when the roster is
-        // empty or its members are cooling/score-vetoed. Full gives all eight
-        // slots to the roster.
         let mut preferred = Vec::with_capacity(8);
         if let Some(bootstrap) = bootstrap.filter(|peer| connected.contains(peer)) {
             preferred.push(bootstrap);
@@ -4217,20 +3650,12 @@ impl PubSubManager {
     }
 }
 
-/// #774: one connected-plane view for the atomic membership pass. See
-/// [`PubSubManager::topic_membership`].
 #[derive(Clone)]
 struct TopicMembership {
-    /// Full deduplicated connected plane — topic membership.
     full: Vec<PeerId>,
-    /// The actual selected Full/bootstrap peer for C5b, when connected.
     preferred: Option<PeerId>,
 }
 
-/// #1455: bounded inbox-owner registry for the durable DM send path.
-/// FIFO eviction keeps a long-lived daemon at O(CAP) entries; an evicted or
-/// stale owner is inert because the preference applies only while the owner
-/// is on the current connected plane.
 #[derive(Default)]
 struct DmInboxOwnerRegistry {
     owners: HashMap<TopicId, PeerId>,
@@ -4258,8 +3683,6 @@ impl DmInboxOwnerRegistry {
 }
 
 impl TopicMembership {
-    /// The exact pre-#807 untruncated order: preferred first, then the
-    /// sorted plane. Full nodes hand this to the pre-#807 sg writers.
     fn into_pre_807_order(self) -> Vec<PeerId> {
         let mut peers = self.full;
         if let Some(preferred) = self.preferred {
@@ -4290,11 +3713,6 @@ where
     }
 }
 
-/// Pick at most one connected Full/bootstrap peer for ACK-topic eager.
-///
-/// Order: coordinators, then relays, then pinned bootstrap IDs. Returns
-/// `None` when the plane has no such peer; the Leaf policy then uses the
-/// sorted eligible plane without a preferred slot. Ties use the full PeerId.
 pub(crate) fn select_one_full_bootstrap_eager_peer(
     plane: &[[u8; 32]],
     coordinators: &[[u8; 32]],

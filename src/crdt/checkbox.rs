@@ -339,12 +339,10 @@ mod tests {
         let agent2 = agent(2);
         let claimed = CheckboxState::claim(agent1, 1000).ok().unwrap();
 
-        // Same agent can complete
         let done1 = claimed.transition_to_done(agent1, 2000).ok().unwrap();
         assert!(done1.is_done());
         assert_eq!(done1.claimed_by(), Some(&agent1));
 
-        // Different agent can also complete (task reassignment scenario)
         let done2 = claimed.transition_to_done(agent2, 2000).ok().unwrap();
         assert!(done2.is_done());
         assert_eq!(done2.claimed_by(), Some(&agent2));
@@ -366,10 +364,6 @@ mod tests {
         let agent2 = agent(2);
         let claimed = CheckboxState::claim(agent1, 1000).ok().unwrap();
 
-        // Advisory (non-exclusive) claims: re-claiming a claimed task
-        // succeeds. The OR-Set accumulates candidates and resolves a
-        // deterministic winner; this single-value helper returns the new
-        // Claimed state.
         let reclaimed = claimed.transition_to_claimed(agent2, 2000).ok().unwrap();
         assert!(reclaimed.is_claimed());
         assert_eq!(reclaimed.claimed_by(), Some(&agent2));
@@ -382,12 +376,10 @@ mod tests {
         let agent2 = agent(2);
         let done = CheckboxState::complete(agent1, 1000).ok().unwrap();
 
-        // Cannot claim after done
         let result = done.transition_to_claimed(agent2, 2000);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), CheckboxError::AlreadyDone);
 
-        // Cannot complete again
         let result = done.transition_to_done(agent2, 2000);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), CheckboxError::AlreadyDone);
@@ -399,7 +391,6 @@ mod tests {
         let claimed = CheckboxState::claim(agent(1), 1000).ok().unwrap();
         let done = CheckboxState::complete(agent(1), 2000).ok().unwrap();
 
-        // Empty < Claimed < Done
         assert!(empty < claimed);
         assert!(claimed < done);
         assert!(empty < done);
@@ -428,7 +419,6 @@ mod tests {
         let claimed1 = CheckboxState::claim(agent1, timestamp).ok().unwrap();
         let claimed2 = CheckboxState::claim(agent2, timestamp).ok().unwrap();
 
-        // When timestamps are equal, compare agent IDs lexicographically
         assert!(claimed1 < claimed2);
 
         let done1 = CheckboxState::complete(agent1, timestamp).ok().unwrap();
@@ -453,20 +443,17 @@ mod tests {
 
     #[test]
     fn test_concurrent_claims_resolution() {
-        // Simulate concurrent claims from two agents at different times
         let agent1 = agent(1);
         let agent2 = agent(2);
 
         let claim1 = CheckboxState::claim(agent1, 1000).ok().unwrap();
         let claim2 = CheckboxState::claim(agent2, 1100).ok().unwrap();
 
-        // Earlier claim wins via Ord
         assert!(claim1 < claim2);
 
-        // Same timestamp - agent ID tiebreaker
         let claim3 = CheckboxState::claim(agent1, 1000).ok().unwrap();
         let claim4 = CheckboxState::claim(agent2, 1000).ok().unwrap();
-        assert!(claim3 < claim4); // agent1 < agent2 lexicographically
+        assert!(claim3 < claim4);
     }
 
     #[test]

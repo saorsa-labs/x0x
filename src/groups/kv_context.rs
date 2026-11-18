@@ -41,7 +41,6 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use std::collections::HashSet;
 use std::sync::Arc;
 
-/// Snapshot of the security-relevant `GroupInfo` fields.
 #[derive(Debug, Clone)]
 struct GssState {
     stable_group_id: String,
@@ -84,7 +83,6 @@ impl GssState {
                 .member_roles
                 .get(agent)
                 .is_some_and(|role| role.at_least(GroupRole::Admin)),
-            // #1604: an unknown write policy authorizes no writer.
             GroupWriteAccess::ModeratedPublic | GroupWriteAccess::Unknown => false,
         }
     }
@@ -145,7 +143,6 @@ impl PublicState {
                 .writers
                 .get(agent)
                 .is_some_and(|role| role.at_least(GroupRole::Admin)),
-            // #1604: an unknown write policy authorizes no writer.
             GroupWriteAccess::ModeratedPublic | GroupWriteAccess::Unknown => false,
         }
     }
@@ -155,7 +152,6 @@ impl PublicState {
             && match self.read_access {
                 GroupReadAccess::Public => true,
                 GroupReadAccess::MembersOnly => self.writers.contains_key(agent),
-                // #1604: an unknown read policy authorizes no reader.
                 GroupReadAccess::Unknown => false,
             }
     }
@@ -202,8 +198,7 @@ struct SkewNotice {
     at: std::time::Instant,
 }
 
-/// Live skew notices. A full cache refuses a new author. It does not evict
-/// a notice that is still inside the two-second window.
+/// A full cache refuses a new author; it never evicts a live notice.
 const SKEW_NOTICE_LIMIT: usize = 32;
 const SKEW_NOTICE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -216,8 +211,6 @@ pub struct PublicGroupKvContext {
     skew_notices: Arc<std::sync::Mutex<Vec<SkewNotice>>>,
 }
 
-/// Test probe for the roster snapshot. `alive` is false once every owner,
-/// including a skew hook, has dropped it.
 #[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct PublicAuthorizationWeak(std::sync::Weak<std::sync::RwLock<PublicState>>);
@@ -274,8 +267,6 @@ impl PublicGroupKvContext {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
     }
 
-    /// Weak handle on the roster snapshot. A hook that captures this context
-    /// keeps the snapshot alive after the last owner drops.
     #[cfg(test)]
     pub(crate) fn authorization_weak(&self) -> PublicAuthorizationWeak {
         PublicAuthorizationWeak(std::sync::Arc::downgrade(&self.state))
@@ -356,9 +347,6 @@ impl KvSecureContext for PublicGroupKvContext {
             if signed_revision == state.state_revision {
                 return;
             }
-            // Catch-up is only the next revision, and only for an active
-            // member of a valid SignedPublic context. Any other verified
-            // skew stays rejected and does not enter the notice cache.
             if !state.valid
                 || signed_revision.saturating_add(1) != state.state_revision
                 || !state.writers.contains_key(author)
@@ -456,9 +444,8 @@ impl KvSecureContext for PublicGroupKvContext {
             .state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // update_from_group publishes the generation while holding its state
-        // write guard, so this read guard keeps the version and writer policy
-        // stable until the retained image has been applied.
+        // `update_from_group` publishes the generation under its state write
+        // guard, so this read guard holds the version and writer policy stable.
         if *self.changes.borrow() != verified
             || state.state_revision != verified.revision
             || state.authorization_binding() != verified.binding
@@ -558,9 +545,8 @@ impl KvSecureContext for PublicGroupKvContext {
 pub struct GssKvSecureContext {
     state: Arc<std::sync::RwLock<GssState>>,
     changes: tokio::sync::watch::Sender<u64>,
-    /// The daemon's group ciphertext hold (ADR 0110 §4, #1573) and its
-    /// refusal text. While set, every seal fails; opens are unchanged.
-    /// Clones share it.
+    /// The group ciphertext hold: while set, every seal fails; opens are
+    /// unchanged.
     seal_withheld: Arc<std::sync::Mutex<Option<&'static str>>>,
 }
 
@@ -672,11 +658,6 @@ impl GssKvSecureContext {
         })
     }
 
-    /// Set (`Some(reason)`) or clear the group ciphertext hold. The
-    /// daemon's refresh hook sets it from its async boundary check (ADR
-    /// 0110 §4: no eligible admin; #1573: a pending GSS removal) before
-    /// every seal, because the seal itself is synchronous. A refused seal
-    /// carries `reason`. Crate-internal: it adds no public API.
     pub(crate) fn set_seal_withheld(&self, reason: Option<&'static str>) {
         *self
             .seal_withheld
@@ -733,26 +714,8 @@ impl GssKvSecureContext {
             self.changes.send_replace(state.generation);
             return;
         }
-        // ADR-0066 §4 / ADR-0067 — make a marker a REFRESH TRIGGER for this
-        // cached context, closing the bind-time gap in §1 rows 10–12 for the
-        // GSS plane.
-        //
-        // This was the one cached KV context blind to the marker.
-        // `PublicState::from_group` folds `!is_fork_quarantined()` into
-        // `valid`, and `TreeKemKvAuthorizationContext::update_from_group`
-        // clears its roster while quarantined — but `GssState` had no notion
-        // of quarantine at all, and neither did the refresh that feeds it. So
-        // a marker installed AFTER a GSS store bound was invisible to work
-        // already in flight: the cached roster kept authorizing writers on an
-        // authorization taken before the fork was observed. That is exactly
-        // the bind-time gap §4 exists to close, and the reason §4 asks for the
-        // install to be a refresh trigger "from both ends".
-        //
-        // The shape deliberately matches the TreeKEM context's: empty the
-        // roster and drop the secret so sealing, opening and membership all
-        // fail closed. It is NOT terminal like `withdrawn` — a later refresh
-        // after a manual clear re-arms the context from live state, because a
-        // quarantine is recoverable and a withdrawal is not.
+        // Not terminal like `withdrawn`: a refresh after the marker clears
+        // re-arms the context from live state.
         if info.is_fork_quarantined() {
             tracing::warn!(
                 target: "x0x::kv",
@@ -809,8 +772,6 @@ impl GssKvSecureContext {
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Option<GroupInfo>> + Send + 'static,
     {
-        // Shared with each invocation: the async block moves its own Arc
-        // clone, so the outer closure stays `Fn` (callable many times).
         let fetch_group = Arc::new(fetch_group);
         Arc::new(move || {
             let ctx = Arc::clone(&ctx);
@@ -830,7 +791,6 @@ impl GssKvSecureContext {
         })
     }
 
-    /// Seal bytes using one already-held GSS snapshot.
     fn seal_snapshot(
         state: &GssState,
         store_id: &KvStoreId,
@@ -967,8 +927,7 @@ impl KvSecureContext for GssKvSecureContext {
             .state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // GSS holds only the CURRENT epoch secret: past epochs are gone (a
-        // late joiner never needs them) and future epochs have not arrived.
+        // GSS holds only the current epoch secret.
         if epoch != state.secret_epoch {
             return Err(KvError::SecureRecord(format!(
                 "no group secret for epoch {epoch} (local epoch is {})",
@@ -1035,9 +994,6 @@ impl KvSecureContext for GssKvSecureContext {
 mod tests {
     use super::*;
 
-    /// Build a minimal MlsEncrypted GroupInfo (default policy is
-    /// PrivateSecure / MlsEncrypted) whose creator is Active and which holds
-    /// a rotated shared secret (epoch >= 1).
     fn group(unique_id: &str, member: AgentId) -> GroupInfo {
         let mut info = GroupInfo::new(
             unique_id.to_string(),
@@ -1113,7 +1069,6 @@ mod tests {
         let peer = AgentId([3; 32]);
         let mut info = group("rot-g", member);
         let creator_hex = hex::encode(member.as_bytes());
-        // Add a second active member (new_member seeds Active).
         info.members_v2.insert(
             hex::encode(peer.as_bytes()),
             crate::groups::GroupMember::new_member(
@@ -1129,8 +1084,6 @@ mod tests {
         let (epoch0, nonce0, ct0) = ctx.seal(&store_id, b"pre-rekey").expect("seal");
         assert!(ctx.is_active_member(&peer));
 
-        // Rekey + remove the peer (ban flow): new secret, new epoch, roster
-        // without the peer.
         let (_, epoch1) = info.rotate_shared_secret();
         info.remove_member(&hex::encode(peer.as_bytes()), Some(creator_hex));
         ctx.update_from_group(&info);
@@ -1139,7 +1092,6 @@ mod tests {
         assert!(epoch1 > epoch0);
         assert!(!ctx.is_active_member(&peer));
 
-        // Old-epoch record no longer opens; new-epoch records do.
         assert!(ctx.open(&store_id, epoch0, &nonce0, &ct0).is_err());
         let (epoch, _, _) = ctx.seal(&store_id, b"post-rekey").expect("seal");
         assert_eq!(epoch, epoch1);
@@ -1155,20 +1107,16 @@ mod tests {
         assert!(ctx.is_active_member(&member));
 
         ctx.invalidate();
-        // No key: seal and open refuse...
         assert!(ctx.seal(&store_id, b"x").is_err());
         let (_, nonce, ct) = {
-            // A pre-invalidation record can no longer be opened either.
             let pre = GssKvSecureContext::from_group(&info).expect("context");
             let (e, n, c) = pre.seal(&store_id, b"old").expect("seal");
             assert!(ctx.open(&store_id, e, &n, &c).is_err());
             (e, n, c)
         };
         let _ = (nonce, ct);
-        // ...and the roster is gone: the v1 write rule admits nobody.
         assert!(!ctx.is_active_member(&member));
 
-        // A later refresh from a REJOINED group state re-arms the context.
         let rejoined = group("inv-g", member);
         ctx.update_from_group(&rejoined);
         assert!(ctx.seal(&store_id, b"x").is_ok());
@@ -1177,11 +1125,6 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_hook_invalidates_when_group_disappears() {
-        // Regression (PR #508 review r2 P1): the exported helper used to
-        // treat `None` from the authoritative source as a no-op, retaining
-        // the stale secret and roster after the group vanished (leave or
-        // removal). `None` is lifecycle: the context must fail closed on
-        // sealing, opening, AND membership until a re-armed refresh.
         let member = AgentId([1; 32]);
         let info = group("gone-g", member);
         let ctx = Arc::new(GssKvSecureContext::from_group(&info).expect("context"));
@@ -1189,7 +1132,6 @@ mod tests {
         let (epoch, nonce, ciphertext) = ctx.seal(&store_id, b"before leave").expect("seal");
         assert!(ctx.is_active_member(&member));
 
-        // The authoritative state is gone: fetch returns None.
         let hook = GssKvSecureContext::refresh_hook(Arc::clone(&ctx), || async { None });
         hook().await;
 
@@ -1206,7 +1148,6 @@ mod tests {
             "old-epoch records must not open after a missing-group refresh"
         );
 
-        // Re-arm ONLY from a live, matching, non-withdrawn group state.
         let rejoined = group("gone-g", member);
         let rearm = GssKvSecureContext::refresh_hook(Arc::clone(&ctx), move || {
             let rejoined = rejoined.clone();
@@ -1219,17 +1160,10 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_hook_never_rearms_from_withdrawn_tombstone() {
-        // Regression (PR #508 review r2 P1): a withdrawn GroupInfo passed
-        // through the helper used to RESTORE the secret and roster — even
-        // on an already-invalidated context. A tombstone is terminal
-        // lifecycle: it must deepen the invalidation, never re-arm it.
         let member = AgentId([1; 32]);
         let mut info = group("wd-g", member);
         let ctx = Arc::new(GssKvSecureContext::from_group(&info).expect("context"));
-        // Retired context (e.g. the leave path already invalidated it).
         ctx.invalidate();
-        // The tombstone still carries a secret + roster (as retained
-        // withdrawn state can); refreshing from it must NOT re-arm.
         info.withdrawn = true;
         let hook = GssKvSecureContext::refresh_hook(Arc::clone(&ctx), move || {
             let info = info.clone();
@@ -1250,16 +1184,12 @@ mod tests {
 
     #[tokio::test]
     async fn update_from_group_withdrawn_invalidates_armed_context() {
-        // Direct boundary coverage: update_from_group itself (not only the
-        // helper) invalidates an ARMED context on withdrawn state — and a
-        // FOREIGN group's tombstone still does nothing (guard ordering).
         let member = AgentId([1; 32]);
         let info = group("arm-g", member);
         let ctx = GssKvSecureContext::from_group(&info).expect("context");
         let store_id = KvStoreId::new([4; 32]);
         assert!(ctx.seal(&store_id, b"armed").is_ok());
 
-        // Foreign tombstone: ignored entirely, context stays armed.
         let mut foreign = group("other-g", member);
         foreign.withdrawn = true;
         ctx.update_from_group(&foreign);
@@ -1268,7 +1198,6 @@ mod tests {
             "a foreign tombstone must not touch this context"
         );
 
-        // Matching tombstone: invalidates.
         let mut withdrawn = group("arm-g", member);
         withdrawn.withdrawn = true;
         ctx.update_from_group(&withdrawn);
@@ -1283,7 +1212,6 @@ mod tests {
         let ctx = GssKvSecureContext::from_group(&info).expect("context");
         let other = group("g-two", member);
         ctx.update_from_group(&other);
-        // Still bound to the original group.
         assert_eq!(ctx.group_id(), b"g-one".to_vec());
     }
 
@@ -1317,8 +1245,6 @@ mod tests {
 
         let before = ctx.authorization_binding().expect("binding");
         info.members_v2.remove(&hex::encode(member.as_bytes()));
-        // Same numeric revision with a different roster must not share a
-        // public-store authorization identity.
         ctx.update_from_group(&info);
         assert_eq!(ctx.current_epoch(), 7);
         assert_ne!(ctx.authorization_binding().expect("binding"), before);
@@ -1372,8 +1298,6 @@ mod tests {
         assert_ne!(revised.binding, initial.binding);
         assert!(revised.valid);
 
-        // Even at the same numeric revision, a roster change is a distinct
-        // authorization and must wake a parked requester.
         info.add_member(
             hex::encode(AgentId([2; 32]).as_bytes()),
             GroupRole::Member,
@@ -1394,7 +1318,6 @@ mod tests {
         assert!(!changes.has_changed().expect("watch open"));
     }
 
-    /// An authenticated-evidence marker, minimal but well-formed.
     fn quarantine_marker(info: &GroupInfo, revision: u64) -> crate::groups::ForkQuarantine {
         crate::groups::ForkQuarantine {
             revision,
@@ -1410,17 +1333,6 @@ mod tests {
         }
     }
 
-    /// ADR-0066 §4 / ADR-0067 — the bind-time gap, GSS plane (§1 rows 10–12).
-    ///
-    /// This was the ONE cached KV context blind to the marker: `PublicState`
-    /// folds `!is_fork_quarantined()` into `valid` and the TreeKEM context
-    /// clears its roster, but `GssState` had no notion of quarantine at all.
-    /// So a marker installed AFTER a GSS store bound was invisible to work
-    /// already in flight — the cached roster kept authorizing writers on an
-    /// authorization taken before the fork was observed.
-    ///
-    /// The claim defended here: a refresh that SEES the marker suspends the
-    /// context, so sealing, opening and membership all fail closed.
     #[test]
     fn gss_context_suspends_when_a_marker_appears_after_the_bind() {
         let keypair = crate::identity::AgentKeypair::generate().expect("keypair");
@@ -1429,11 +1341,9 @@ mod tests {
         let ctx = GssKvSecureContext::from_group(&info).expect("context");
         let store_id = KvStoreId::new([21; 32]);
 
-        // Bound on a healthy group: the member is authorized and can seal.
         assert!(ctx.is_active_member(&member));
         assert!(ctx.seal(&store_id, b"before").is_ok());
 
-        // A fork observation lands.
         info.fork_quarantine = Some(quarantine_marker(&info, 7));
         ctx.update_from_group(&info);
 
@@ -1451,10 +1361,6 @@ mod tests {
         );
     }
 
-    /// ...and a quarantine is RECOVERABLE, unlike a withdrawal. After a manual
-    /// clear the next refresh re-arms the context from live state. Getting this
-    /// wrong would turn every quarantine into a permanently dead store, which
-    /// is why it is a separate assertion rather than a footnote.
     #[test]
     fn gss_context_re_arms_after_the_marker_is_cleared() {
         let keypair = crate::identity::AgentKeypair::generate().expect("keypair");
@@ -1534,8 +1440,6 @@ mod tests {
         );
     }
 
-    /// The crate-internal ciphertext hold (ADR 0110 §4) blocks every GSS
-    /// seal and leaves opens alone; clearing it restores sealing.
     #[test]
     fn gss_seal_hold_blocks_seals_and_keeps_opens() {
         let owner = crate::identity::AgentKeypair::generate().expect("keypair");

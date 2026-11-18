@@ -100,7 +100,6 @@ pub struct GroupCard {
     #[serde(default)]
     pub metadata_topic: Option<String>,
 
-    // ── Phase D.3: state-commit binding and authority signature ─────────
     /// Monotonic revision of the signed state commit this card represents.
     /// Higher revisions supersede lower ones immediately.
     #[serde(default)]
@@ -213,8 +212,6 @@ impl GroupCard {
     /// against the local roster view, and by
     /// [`GroupCard::replacement_verdict`] for cached cards.
     pub fn verify_signature(&self) -> Result<(), ApplyError> {
-        // #1604 G5: a policy variant this node does not know can never
-        // re-encode to the signed bytes. Refuse it before any signature work.
         crate::wire_compat::reject_unknown("GroupCard", self)
             .map_err(|e| ApplyError::InvalidSignature(e.to_string()))?;
         if self.signature.is_empty() || self.authority_public_key.is_empty() {
@@ -476,7 +473,6 @@ mod tests {
         let kp2 = AgentKeypair::generate().unwrap();
         let mut c = sample_card();
         c.sign(&kp1).unwrap();
-        // Swap the claimed agent_id to kp2 — mismatch must be detected.
         c.authority_agent_id = hex::encode(kp2.agent_id().as_bytes());
         assert!(c.verify_signature().is_err());
     }

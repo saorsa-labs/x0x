@@ -2086,8 +2086,10 @@ fn prepare_measurement() -> MeasurementPreparation {
 }
 
 fn reviewed_pubsub_producer(package: &toml::Value) -> bool {
-    // crates.io 0.5.91 retains the reviewed outbound meter, per-peer wire
-    // lengths and key-cache accounting. Against 0.5.90 it adds per-kind
+    // crates.io 0.5.92 retains the reviewed outbound meter, per-peer wire
+    // lengths and key-cache accounting. Its pubsub sources are
+    // byte-identical to 0.5.91; 0.5.92 only moves the family and ant-quic
+    // pins (ant-quic =0.28.0). Against 0.5.90, 0.5.91 added per-kind
     // verify counters, msg_id-carrying subscriptions, the Critical Data
     // cooling exemption at claim time, V3 recovery-intent keying, no send
     // attempts for a stale eager-reply claim (pruned or token mismatch), no
@@ -2097,10 +2099,10 @@ fn reviewed_pubsub_producer(package: &toml::Value) -> bool {
     // byte-identical to 0.5.89, which changed only payload replay refusal
     // relative to 0.5.88. Refused replays and claim changes can move
     // attempt counts without changing the meter.
-    const REGISTRY_PUBSUB_VERSION: &str = "0.5.91";
+    const REGISTRY_PUBSUB_VERSION: &str = "0.5.92";
     const REGISTRY_PUBSUB_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
     const REGISTRY_PUBSUB_SHA: &str =
-        "f69989fc3f21060f6294a359eb1ca15e0ccede5065bb8f92d75ed8fa703867e6";
+        "63b4b434fcce9f2cd5efb0d502dca6a6b75987c170f93ede8dafa7db3c4fea62";
     const GIT_PUBSUB_VERSION: &str = "0.5.85";
     // SG 997abc75 supplies the reviewed meter accounting. Its descendant
     // 9258cee9 adds local delivery, cold-relay ID offers, the ant-quic
@@ -2124,7 +2126,7 @@ fn reviewed_pubsub_producer(package: &toml::Value) -> bool {
 #[test]
 fn controlled_load_producer_allowlist_is_exact() {
     let registry: toml::Value = toml::from_str(
-        "version = '0.5.91'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = 'f69989fc3f21060f6294a359eb1ca15e0ccede5065bb8f92d75ed8fa703867e6'",
+        "version = '0.5.92'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '63b4b434fcce9f2cd5efb0d502dca6a6b75987c170f93ede8dafa7db3c4fea62'",
     )
     .expect("registry fixture");
     let git_accounting: toml::Value = toml::from_str(
@@ -2180,6 +2182,12 @@ fn controlled_load_producer_allowlist_is_exact() {
     )
     .expect("replaced registry fixture");
     assert!(!reviewed_pubsub_producer(&replaced_registry));
+    // 0.5.91 has the same pubsub sources as 0.5.92 but is superseded.
+    let last_registry: toml::Value = toml::from_str(
+        "version = '0.5.91'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = 'f69989fc3f21060f6294a359eb1ca15e0ccede5065bb8f92d75ed8fa703867e6'",
+    )
+    .expect("last registry fixture");
+    assert!(!reviewed_pubsub_producer(&last_registry));
     let mut wrong_registry = registry.clone();
     wrong_registry["source"] = toml::Value::String("registry+https://example.invalid".into());
     assert!(!reviewed_pubsub_producer(&wrong_registry));

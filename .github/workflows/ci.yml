@@ -206,7 +206,9 @@ jobs:
       # the run with tests "not run" and no failure (scripts/ci/
       # check-nextest-groups.py, .config/nextest.toml quic-localhost).
       - name: Check nextest test-group weights
-        run: python3 -B scripts/ci/check-nextest-groups.py
+        run: |
+          python3 -B scripts/ci/test_check_nextest_groups.py -v
+          python3 -B scripts/ci/check-nextest-groups.py
 
       - name: Record disk before Run tests
         run: |
@@ -801,9 +803,10 @@ jobs:
     # group too (`s3-1661.1` and `s3-1661.2`, 10 reruns each), the
     # H-S3-rm4 variants share `s3-rm4.1` to `s3-rm4.5`, H-S3-rm2 has its
     # own group (`s3-rm2.1` and `s3-rm2.2`, 10 reruns each), H-S3-d2 has
-    # `s3-d2`, H-S3-q (1) has `s3-q`, H-S3-q2 has `s3-q2`, and H-S3-q (3)
-    # has `s3-q3.1` and `s3-q3.2` (10 reruns each). A group is omitted
-    # when the tree has no matching test.
+    # `s3-d2`, H-S3-r has `s3-r` (its replay variant `s3-rr`), H-S3-q (1)
+    # has `s3-q`, H-S3-q2 has `s3-q2`, and H-S3-q (3) has `s3-q3.1` and
+    # `s3-q3.2` (10 reruns each).
+    # A group is omitted when the tree has no matching test.
     name: W3-H shard plan
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -1145,6 +1148,10 @@ jobs:
           --expect w3h_1356_control_s3_q3_issuer_unreadable_sidecar=GREEN
           --require w3h_1356_control_s3_q2_sidecar_fault_cases
           --expect w3h_1356_control_s3_q2_sidecar_fault_cases=GREEN
+          --require w3h_1356_control_s3_r_beyond_retention
+          --expect w3h_1356_control_s3_r_beyond_retention=GREEN
+          --require w3h_1356_control_s3_r_replay_benign
+          --expect w3h_1356_control_s3_r_replay_benign=GREEN
           --require w3h_1356_red_s3_forked_node_shows_reseat_required
           --expect w3h_1356_red_s3_forked_node_shows_reseat_required=GREEN
           --require w3h_1356_control_s3_forked_node_not_auto_recovered
@@ -1231,6 +1238,12 @@ jobs:
           --expect w3h_1581k_staged_join_agent_revoked_gets_no_key=GREEN
           --require w3h_1581k_control_staged_join_unrevoked_gets_its_key
           --expect w3h_1581k_control_staged_join_unrevoked_gets_its_key=GREEN
+          --require w3h_1581m_recovery_not_needed_while_d_is_eligible
+          --expect w3h_1581m_recovery_not_needed_while_d_is_eligible=GREEN
+          --require w3h_1581m_recovery_offline_promotee_commits_on_return
+          --expect w3h_1581m_recovery_offline_promotee_commits_on_return=GREEN
+          --require w3h_1581m_recovery_refuses_a_revoked_member
+          --expect w3h_1581m_recovery_refuses_a_revoked_member=RED
           --require w3h_1765_red_newer_file_revocation_waits_for_store_write
           --expect w3h_1765_red_newer_file_revocation_waits_for_store_write=GREEN
           --require w3h_1776_delayed_fresh_joiner_fetches_the_welcome

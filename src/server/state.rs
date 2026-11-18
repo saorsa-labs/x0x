@@ -335,6 +335,12 @@ pub struct DaemonConfig {
     #[serde(default = "default_mdns_enabled")]
     pub(super) mdns_enabled: bool,
 
+    /// Serve MASQUE relay sessions (TOML `relay_service_enabled`).
+    /// Unset follows the resolved participation mode: Full serves, Leaf
+    /// refuses. See [`x0x::network::resolve_relay_service_enabled`].
+    #[serde(default)]
+    pub(super) relay_service_enabled: Option<bool>,
+
     /// X0X-0070b: peer-relay fallback configuration (TOML `[peer_relay]`).
     /// Defaults to disabled — opt in by setting `peer_relay.enabled = true`
     /// and listing relay-candidate hex agent IDs under
@@ -813,6 +819,7 @@ impl Default for DaemonConfig {
             bootstrap_peers: None,
             port_mapping_enabled: default_port_mapping_enabled(),
             mdns_enabled: default_mdns_enabled(),
+            relay_service_enabled: None,
             peer_relay: x0x::network::PeerRelayConfig::default(),
             observed_prefix_enabled: false,
             skip_legacy_dm_bus: false,
@@ -1437,10 +1444,16 @@ pub(super) struct AppState {
     /// Bounds HTTP staging waits without holding the shared replacement lock.
     pub(super) http_upgrade_wait_lock: Arc<Mutex<()>>,
     /// Release-topic payloads this daemon published itself. Shared by
-    /// `/upgrade/apply` and the gossip/fallback/startup publishers so the
-    /// gossip driver neither rebroadcasts nor re-submits its own
-    /// self-delivered announcement (#1169).
-    pub(super) self_published_release_manifests: Arc<Mutex<SelfPublishedReleaseManifests>>,
+    /// `/upgrade/apply` and the gossip/fallback publishers plus the boot
+    /// manifest broadcast so the gossip driver never rebroadcasts its own
+    /// self-delivered announcement (#1169). Only a payload claimed by
+    /// `/upgrade/apply` also skips the submit to the background owner;
+    /// echoes of the driver's own publishes still reach the owner, whose
+    /// version dedup absorbs them. A plain mutex: no caller
+    /// holds it across an await, and `/upgrade/apply`'s claim guard
+    /// decides its claim synchronously from `Drop` — release before
+    /// admission with nothing resuming the install, keep otherwise.
+    pub(super) self_published_release_manifests: Arc<StdMutex<SelfPublishedReleaseManifests>>,
     /// Releases seen on the topic and the last release check (#1381),
     /// reported by `GET /diagnostics/upgrade`. Memory only.
     pub(super) upgrade_observations: Arc<std::sync::Mutex<super::routes::UpgradeObservations>>,
@@ -2231,6 +2244,20 @@ mod tests {
         // production daemon on the same machine (the #417 defect).
         let config: DaemonConfig = toml::from_str("mdns_enabled = false").expect("opt-out parses");
         assert!(!config.mdns_enabled);
+    }
+
+    #[test]
+    fn relay_service_enabled_is_unset_by_default_and_parses_both_values() {
+        let config: DaemonConfig = toml::from_str("").expect("empty config parses");
+        assert_eq!(config.relay_service_enabled, None);
+        assert_eq!(DaemonConfig::default().relay_service_enabled, None);
+
+        let config: DaemonConfig =
+            toml::from_str("relay_service_enabled = false").expect("opt-out parses");
+        assert_eq!(config.relay_service_enabled, Some(false));
+        let config: DaemonConfig =
+            toml::from_str("relay_service_enabled = true").expect("opt-in parses");
+        assert_eq!(config.relay_service_enabled, Some(true));
     }
 
     #[test]

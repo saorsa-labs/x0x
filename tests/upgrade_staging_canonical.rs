@@ -133,13 +133,14 @@ macro_rules! staging_canonical_regression_tests {
                     );
                     let attempts = Arc::new(StdMutex::new(Vec::new()));
                     let observed = Arc::clone(&attempts);
-                    let apply =
-                        apply::apply_attempt_seam::install(Box::new(move |plan, manifest| {
+                    let apply = apply::apply_attempt_seam::install(Box::new(
+                        move |plan, manifest, _admission| {
                             observed.lock().unwrap().push(plan.executable.clone());
                             x0x::upgrade::UpgradeResult::Success {
                                 version: manifest.version.clone(),
                             }
-                        }));
+                        },
+                    ));
                     Self {
                         install,
                         alias,

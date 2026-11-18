@@ -7,6 +7,10 @@ on:
   schedule:
     - cron: '0 3 * * 1'  # Weekly Monday 3am UTC (soak)
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   # CMake 4 (ubuntu-26.04 runners) rejects the bundled opus in audiopus_sys
@@ -345,6 +349,8 @@ jobs:
         run: python3 scripts/ci/test_issue321_custody_routing.py
       - name: Run named group integration tests
         run: bash scripts/ci/nextest-isolated.sh --all-features --test named_group_integration -- --run-ignored ignored-only
+      - name: 'Run issue #2048 invite join recovery test'
+        run: bash scripts/ci/nextest-isolated.sh --all-features --test issue2048_invite_join_existing_member -- --run-ignored ignored-only --no-tests=fail
       # The existing isolated nextest invocation resolves Cargo.lock and warms
       # the locked dependency graph before this offline daemon build.
       - name: 'Build and pin x0xd for issue #321'

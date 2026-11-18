@@ -4730,6 +4730,7 @@ static DROP_INITIAL_VOLLEY_KINDS: std::sync::LazyLock<HashSet<&'static str>> =
     std::sync::LazyLock::new(|| {
         [
             ("X0X_TEST_DROP_INITIAL_MEMBER_JOINED", "member_joined"),
+            ("X0X_TEST_DROP_INITIAL_MEMBER_ADDED", "member_added"),
             ("X0X_TEST_DROP_INITIAL_MEMBER_REMOVED", "member_removed"),
             ("X0X_TEST_DROP_INITIAL_GROUP_DELETED", "group_deleted"),
             ("X0X_TEST_DROP_INITIAL_MEMBER_BANNED", "member_banned"),
@@ -9456,6 +9457,24 @@ fn treekem_state_only_link(
     }
 }
 
+/// #2003 (ADR 0109 §2 rule (b), A08 amendment of 17 Nov 2026): a
+/// state-only link that a node other than its signer may log and serve, and
+/// that a pre-Welcome node may apply from such a relay: a rename, a role
+/// change or an unban whose `actor` signed its commit. The ordinary apply
+/// recomputes the state hash, which covers all of their content, and
+/// checks it against the signed commit. A join-request rejection is not
+/// one: it changes only the join requests, which no state-hash input
+/// covers, so its signed commit verifies for any request it names.
+fn relayable_state_only_link(
+    event: &NamedGroupMetadataEvent,
+) -> Option<(&x0x::groups::GroupStateCommit, &str)> {
+    if matches!(event, NamedGroupMetadataEvent::JoinRequestRejected { .. }) {
+        return None;
+    }
+    treekem_state_only_link(event)
+        .filter(|(commit, actor)| actor.eq_ignore_ascii_case(&commit.committed_by))
+}
+
 /// #1623: the catch-up cursor of a logged link, `(revision, TreeKEM
 /// epoch)`, compared with the requester's `(from_revision,
 /// from_treekem_epoch)`. A membership link keeps its frontier values, so
@@ -9744,11 +9763,15 @@ async fn should_queue_treekem_membership_event(
 /// (`AppState::treekem_event_log`), which `handle_treekem_catchup_request`
 /// serves. It keeps the membership links and (#1623, ADR 0109 §7 (b)) the
 /// state-only links of [`treekem_state_only_link`]. A state-only link is
-/// kept only when this node signed it. The receiver applies a rename, a
-/// role change, an unban or a rejection only when the page sender is the
-/// event's `actor` and an Active admin. So a copy relayed by another node
-/// would be refused, and a released receiver with no #1685 stop would ask
-/// for the same page again. Each class has its own
+/// kept when this node signed it, or when it may be relayed
+/// ([`relayable_state_only_link`], #2003). The receiver applies a rename,
+/// a role change, an unban or a rejection only when the page sender is the
+/// event's `actor` and an Active admin, except on a pre-Welcome node whose
+/// armed attested sequence admits the link
+/// ([`pre_welcome_relayed_link_author`]). So the responder serves a link it
+/// did not sign only to a requester it attested: an ordinary receiver
+/// would refuse the relayed copy, and a released receiver with no #1685
+/// stop would ask for the same page again. Each class has its own
 /// [`TREEKEM_EVENT_LOG_PER_GROUP_CAP`], oldest out first, so state-only
 /// links never evict a membership link that key catch-up needs.
 ///
@@ -9770,9 +9793,14 @@ async fn log_treekem_membership_event(state: &AppState, event: &NamedGroupMetada
         treekem_state_only_link(event),
     ) {
         (Some(_), _) => false,
+        // A state-only link is kept when this node signed it, or (#2003)
+        // when it may be relayed ([`relayable_state_only_link`]). The
+        // responder serves a link it did not sign only to a requester it
+        // attested (see `handle_treekem_catchup_request`).
         (None, Some((commit, actor))) => {
             let local_hex = hex::encode(state.agent.agent_id().as_bytes());
-            if actor != local_hex || commit.committed_by != local_hex {
+            let own = actor == local_hex && commit.committed_by == local_hex;
+            if !own && relayable_state_only_link(event).is_none() {
                 return false;
             }
             true
@@ -13661,6 +13689,27 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
             })
             .collect::<Vec<_>>()
     };
+    // #2003 (ADR 0109 §2, A08 amendment of 17 Nov 2026): a state-only
+    // link that another admin signed goes only to a requester this node
+    // attested and that is an Active member now; it applies there under
+    // the armed attested sequence. A requester served only as the target
+    // of a cached add gets none. `log_keys` holds every name of the
+    // group, its stable id included.
+    let mut relay = false;
+    if authorized {
+        for key in &log_keys {
+            if group_recovery::attested_requester(state, key, &sender_hex).await {
+                relay = true;
+                break;
+            }
+        }
+    }
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    events.retain(|event| match treekem_state_only_link(event) {
+        None => true,
+        Some((_, actor)) if actor == local_hex => true,
+        Some(_) => relay && relayable_state_only_link(event).is_some(),
+    });
     events.sort_by_key(treekem_catchup_link_sort_key);
     let truncated = events.len() > request.limit.min(TREEKEM_CATCHUP_RESPONSE_EVENT_CAP);
     events.truncate(request.limit.min(TREEKEM_CATCHUP_RESPONSE_EVENT_CAP));
@@ -14126,6 +14175,13 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                 let apply_sender = verified_catchup_member_removed_author(&event)
                     .filter(|author| catchup_may_apply_removed_as_author(&event, sender, author))
                     .unwrap_or(*sender);
+                // #2003: a state-only link that another admin signed and
+                // the armed attested sequence admits applies as its actor's.
+                let apply_sender =
+                    match pre_welcome_relayed_link_author(state, &response_key, &event).await {
+                        Some(author) => author,
+                        None => apply_sender,
+                    };
                 // #1623: rule (b) gates a pre-Welcome page link (see
                 // `refuse_unarmed_pre_welcome_page_link`).
                 let page_link = named_group_metadata_event_commit(&event)
@@ -19682,6 +19738,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
+            // #2003: keep the applied state-only link, so this node can serve it.
+            remember_treekem_membership_event(state, &event_for_log).await;
             *replay_group_id = Some(resolved_group_key.clone());
             ApplyMetadataResult::ACCEPTED_CONTINUE
         }
@@ -19986,6 +20044,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
+            // #2003: keep the applied state-only link, so this node can serve it.
+            remember_treekem_membership_event(state, &event_for_log).await;
             *replay_group_id = Some(resolved_group_key.clone());
             ApplyMetadataResult::ACCEPTED_CONTINUE
         }
@@ -20656,6 +20716,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
+            // #2003: keep the applied state-only link, so this node can serve it.
+            remember_treekem_membership_event(state, &event_for_log).await;
             *replay_group_id = Some(resolved_group_key.clone());
             ApplyMetadataResult::ACCEPTED_CONTINUE
         }
@@ -21808,14 +21870,19 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 seated_attempt_id.as_deref(),
             )
             .await;
-            publish_named_group_metadata_event(state, &metadata_topic, &event).await;
+            let volley_dropped = drop_initial_volley(&event);
+            if !volley_dropped {
+                publish_named_group_metadata_event(state, &metadata_topic, &event).await;
+            }
             remember_treekem_membership_event(state, &event).await;
-            spawn_named_group_event_delivery_to_active_members(
-                state,
-                &next,
-                &event,
-                std::slice::from_ref(&member_agent_id),
-            );
+            if !volley_dropped {
+                spawn_named_group_event_delivery_to_active_members(
+                    state,
+                    &next,
+                    &event,
+                    std::slice::from_ref(&member_agent_id),
+                );
+            }
             if let Some(recovery) = member_joined_recovery.as_deref() {
                 spawn_named_group_event_delivery_to_active_members(state, &next, recovery, &[]);
             }
@@ -22092,6 +22159,43 @@ pub(in crate::server) async fn apply_listener_metadata_event(
         reconcile_public_message_listener(state, &group_id_for_rearm).await;
     }
     applied
+}
+
+/// #1366: whether a stored group record needs its metadata listener after a
+/// restart. Only a withdrawn group needs none. Every local seat keeps it:
+/// - an Active member;
+/// - a Pending request-access applicant, which waits for the approval event;
+/// - a record with no local seat (a card-import or join stub), which waits
+///   for its `MemberAdded`;
+/// - a Removed seat, which an ADR 0109 re-seat or an ordinary re-add can
+///   still follow on this topic (W3-H H-S3-q (3) needs it);
+/// - a Banned seat: an admin lifts a ban with a `MemberUnbanned` event that
+///   [`unban_group_member`] publishes only on this topic. Without the
+///   listener the agent keeps its stored ban and its request-access stays
+///   refused as `banned`.
+pub(in crate::server) fn metadata_listener_wanted(info: &x0x::groups::GroupInfo) -> bool {
+    !info.withdrawn
+}
+
+/// #1366: the listeners a restart installs for the stored groups. A record
+/// that [`metadata_listener_wanted`] accepts gets
+/// [`ensure_named_group_listeners`]: the metadata listener, and the
+/// public-message listener when the group is SignedPublic. A withdrawn
+/// record gets neither. This is the same set as before #1366, when the
+/// restart called [`ensure_named_group_listeners`] for every record and
+/// both of its halves skipped a withdrawn group.
+pub(in crate::server) async fn restore_named_group_listeners(state: Arc<AppState>) {
+    let wanted: Vec<String> = {
+        let groups = state.named_groups.read().await;
+        groups
+            .iter()
+            .filter(|(_, info)| metadata_listener_wanted(info))
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    for group_id in wanted {
+        ensure_named_group_listeners(Arc::clone(&state), &group_id).await;
+    }
 }
 
 /// Spawn every gossip listener a member needs for a named group.
@@ -29994,6 +30098,37 @@ async fn refuse_unarmed_pre_welcome_page_link(
 ) -> bool {
     is_pre_welcome_page_link(state, group_key, info, event, local_agent_hex).await
         && refuse_unadmitted_pre_welcome_link(state, info, event, local_agent_hex).await
+}
+
+/// #2003 (ADR 0109 §2 rule (b), A08 amendment of 17 Nov 2026): the author
+/// under whose authority a pre-Welcome node applies a relayed state-only
+/// page link. The page sender may be any admin that attested this node;
+/// the link's authority is its actor, who signed its commit, and the
+/// node's armed attested sequence, whose next hash the commit must be
+/// ([`admit_pre_welcome_state_only_link`]). The ordinary apply then checks
+/// that the actor is an Active admin, the commit signature and the
+/// recomputed state hash. `None`: not such a link (the page sender stays
+/// the authority, as before).
+async fn pre_welcome_relayed_link_author(
+    state: &AppState,
+    group_key: &str,
+    event: &NamedGroupMetadataEvent,
+) -> Option<AgentId> {
+    let (_, actor) = relayable_state_only_link(event)?;
+    let author = AgentId(hex::decode(actor).ok()?.try_into().ok()?);
+    let info = state.named_groups.read().await.get(group_key).cloned()?;
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let pre_welcome = info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+        && !info.has_active_member(&local_agent_hex)
+        && !state.treekem_groups.read().await.contains_key(group_key);
+    if !pre_welcome {
+        return None;
+    }
+    let mut scratch = info.clone();
+    admit_pre_welcome_state_only_link(state, &info, &mut scratch, event, &local_agent_hex)
+        .await
+        .ok()?;
+    Some(author)
 }
 
 /// #1623: the admission half of [`refuse_unarmed_pre_welcome_page_link`],
@@ -52848,6 +52983,14 @@ async fn handle_join_result_message_bound(
                 intervening_events,
             ))
             .await;
+            // ADR 0109 §2 "Unserved join seal" (H-S3-r): what the
+            // authority served, read before the chain moves below.
+            let unserved = verified
+                && chain.is_empty()
+                && admin_attestation.is_none()
+                && head_attestation
+                    .as_deref()
+                    .is_none_or(|attestation| attestation.terminal_signature_b64.is_none());
             // ADR 0109 §2: with a verified join-carry ATA, apply the
             // attested served links state-only (rule (b)) so `event`
             // chains from the new head.
@@ -52916,6 +53059,31 @@ async fn handle_join_result_message_bound(
                 &roster_certificates_b64,
             )
             .await;
+            // ADR 0109 §2 "Unserved join seal" (H-S3-r, #1572): the seal
+            // did not apply and nothing was served to reach it, so §2 asks
+            // the admins (`note_unserved_join_seal` checks the gap).
+            if unserved && !applied {
+                // An unbound result (a poll) is for the attempt pending
+                // for this joiner; a bound one was checked current above.
+                let attempt_id = bound_join_attempt.map(str::to_string).or_else(|| {
+                    state
+                        .pending_join_attempts
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .get(&expected_key)
+                        .map(|attempt| attempt.attempt_id.clone())
+                });
+                if let (Some(attempt_id), Some(terminal_revision)) = (attempt_id, terminal_revision)
+                {
+                    group_recovery::note_unserved_join_seal(
+                        state,
+                        &group_id,
+                        &attempt_id,
+                        terminal_revision,
+                    )
+                    .await;
+                }
+            }
             if attested {
                 group_recovery::retire_converged(state, &group_id).await;
             }
@@ -54965,6 +55133,7 @@ pub(in crate::server) mod tests {
     pub(in crate::server) mod issue1275_listener_apply_shield;
     mod issue1288_bootstrap_outbox_shutdown;
     mod issue1347_join_request_token_class;
+    mod issue1366_metadata_listener;
     pub(in crate::server) mod issue1366_public_listener;
     pub(in crate::server) mod issue1368_crash_matrix;
     mod issue1427_start_catchup;
@@ -55656,6 +55825,28 @@ pub(in crate::server) mod tests {
         agent: Arc<Agent>,
         self_update_enabled: bool,
     ) -> Result<Arc<AppState>> {
+        secure_endpoint_test_state_with_upgrade_options(
+            data_dir,
+            agent,
+            self_update_enabled,
+            #[cfg(unix)]
+            None,
+            DaemonUpdateConfig::default(),
+        )
+        .await
+    }
+
+    /// #1169 review round 2: route tests that drive `/upgrade/apply` past
+    /// its fast staging refusal need the state to carry a staging identity
+    /// (and, for applies that must complete, a zero rollout window). The
+    /// shared fixture above keeps neither; everything else stays identical.
+    pub(in crate::server) async fn secure_endpoint_test_state_with_upgrade_options(
+        data_dir: &FsPath,
+        agent: Arc<Agent>,
+        self_update_enabled: bool,
+        #[cfg(unix)] upgrade_staging: Option<crate::server::routes::StartupStagingContext>,
+        update_config: crate::server::state::DaemonUpdateConfig,
+    ) -> Result<Arc<AppState>> {
         let treekem_dir = data_dir.join("treekem");
         tokio::fs::create_dir_all(&treekem_dir).await?;
         let named_groups_path = data_dir.join("named_groups.json");
@@ -55868,7 +56059,7 @@ pub(in crate::server) mod tests {
             transfers_dir: data_dir.join("transfers"),
             shutdown_tx,
             shutdown_notify,
-            update_config: DaemonUpdateConfig::default(),
+            update_config,
             self_update_enabled,
             upgrade_check_cache: Mutex::new(None),
             upgrade_apply_lock: Arc::new(Mutex::new(())),
@@ -55877,7 +56068,7 @@ pub(in crate::server) mod tests {
             upgrade_observations: Default::default(),
             background_submit: std::sync::OnceLock::new(),
             #[cfg(unix)]
-            upgrade_staging: None,
+            upgrade_staging,
             api_token: "test-token".to_string(),
             sessions: auth::SessionStore::new(auth::SESSION_TOKEN_TTL),
             rider_tokens: tokio::sync::Mutex::new(

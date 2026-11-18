@@ -30,13 +30,10 @@ use serde::{Deserialize, Serialize};
 /// domain string to `v2`; there is no v1 on the wire).
 pub const OWNER_MANDATE_VERSION: u8 = 2;
 
-/// Domain prefix for the canonical mandate preimage.
 const OWNER_MANDATE_DOMAIN: &[u8] = b"x0x.owner-mandate.v2\0";
 
 const B64_STD: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
-/// ADR-0064 §1a: the owner signs the BLAKE3 digest of the canonical
-/// preimage (domain-separated, length-stable per field class).
 fn mandate_digest(canonical: &[u8]) -> [u8; 32] {
     *blake3::hash(canonical).as_bytes()
 }
@@ -143,9 +140,6 @@ pub enum OwnerMandateError {
 }
 
 impl OwnerMandate {
-    /// Canonical, domain-separated preimage bytes — every bound field in a
-    /// fixed order with NUL separators between variable-length fields
-    /// (same style as the `HeadAttestation` canonical bytes).
     fn canonical_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(512);
         buf.extend_from_slice(OWNER_MANDATE_DOMAIN);
@@ -256,8 +250,8 @@ impl OwnerMandate {
         {
             return Err(OwnerMandateError::GroupBindingMismatch);
         }
-        // R2 triple-equality: the receiver re-derives the candidate root
-        // on its own clone and requires mandate == candidate == terminal.
+        // The receiver re-derives the candidate root on its own clone:
+        // mandate == candidate == terminal.
         let candidate_root =
             crate::groups::state_commit::compute_roster_root(&candidate.members_v2);
         if self.roster_root_after_add != candidate_root || candidate_root != terminal.roster_root {
@@ -342,7 +336,6 @@ impl OwnerMandate {
         if self.stable_group_id != group_stable_id || commit.group_id != group_stable_id {
             return false;
         }
-        // The authority the mandate blesses must be the commit's signer.
         if !self
             .authority_agent_id
             .eq_ignore_ascii_case(&commit.committed_by)
@@ -357,9 +350,6 @@ impl OwnerMandate {
             && self.signature_verifies(owner_public_key)
     }
 
-    /// The raw owner-USER-key signature check over this mandate's
-    /// canonical preimage (shared by the full verify and the
-    /// anchors-commit predicate).
     fn signature_verifies(&self, owner_public_key: &MlDsaPublicKey) -> bool {
         let Ok(sig_bytes) = B64_STD.decode(&self.signature_b64) else {
             return false;
@@ -451,9 +441,6 @@ mod tests {
 
     #[test]
     fn canonical_bytes_are_deterministic_and_field_sensitive() {
-        // WHY: every bound field must feed the signed preimage — a field
-        // that does not influence the bytes cannot influence the
-        // signature, and flipping it would be unobservable.
         let a = mandate_fixture();
         let b = mandate_fixture();
         assert_eq!(a.canonical_bytes(), b.canonical_bytes());
@@ -468,9 +455,6 @@ mod tests {
 
     #[test]
     fn serde_defaults_decode_an_empty_object() {
-        // WHY (#451 mixed-fleet hazard): an old/new record that omits
-        // every field must still decode — unknown or absent keys can
-        // never brick a peer.
         let decoded: OwnerMandate = serde_json::from_str("{}").expect("empty object decodes");
         assert_eq!(decoded, OwnerMandate::default_like());
         let round: OwnerMandate =
@@ -497,12 +481,6 @@ mod tests {
         }
     }
 
-    /// One flip per BOUND PREIMAGE field (keeps the tamper matrix in
-    /// lockstep with the struct definition — a new preimage field must be
-    /// added here or the field-sensitivity test fails). The
-    /// `signature_b64` OUTPUT is not a preimage member by construction
-    /// (it cannot sign itself); flipping it is covered by the
-    /// verify-tamper suite in the server tests.
     fn mandate_field_flips(m: &OwnerMandate) -> Vec<OwnerMandate> {
         let mut out = Vec::new();
         let mut flip_version = m.clone();
