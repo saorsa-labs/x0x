@@ -394,8 +394,7 @@ fn admit(state: &ControlContext, root: &Path, bytes: &[u8]) -> io::Result<Admitt
         || participant.process_start != Some(process_start()?)
         || participant.old_pid != Some(std::process::id())
         || participant.boot_id != shutdown_flush::boot_identity()?
-        || participant.executable
-            != crate::upgrade::apply::current_binary_path().map_err(io::Error::other)?
+        || participant.executable != current_executable()?
     {
         return Err(io::Error::other(
             "arm request names a different old participant",
@@ -769,6 +768,15 @@ fn sync_tree_with(
         }
     }
     Ok(())
+}
+
+/// The running executable, canonical, as the prepare producer records it
+/// (`upgrade::prepare_live`, #2065 review): a daemon started through a
+/// symlink is compared by the file it runs, not refused.
+fn current_executable() -> io::Result<PathBuf> {
+    crate::upgrade::apply::current_binary_path()
+        .map_err(io::Error::other)?
+        .canonicalize()
 }
 
 // Native start identity: Linux /proc start ticks, Darwin start microseconds,
@@ -1489,5 +1497,124 @@ mod windows_exec_regressions {
             windows_pipe::process_creation_time().expect("creation time")
         );
         assert_eq!(first, process_start().expect("process start"));
+    }
+}
+
+/// #2065 review: the arm handler accepts a journal the prepare producer
+/// (#2012) wrote for this process, and refuses the same journal for another
+/// boot, another pid or another host (identity root). Those refusals live
+/// in `admit`; the producer checks only that a running participant has a
+/// pid and a process start.
+#[cfg(test)]
+#[cfg(unix)]
+mod prepare_round_trip {
+    use super::*;
+    use crate::upgrade::prepare::{freeze_plan, HostLock, PlanInput, Prepared};
+    use std::os::unix::fs::PermissionsExt;
+
+    const TOKEN: &str = "owned fixture credential";
+
+    fn sha256(path: &Path) -> [u8; 32] {
+        Sha256::digest(std::fs::read(path).expect("read")).into()
+    }
+
+    /// Prepare a journal for this process as participant `alice` (after
+    /// `edit`) up to `SwappedCli`, and return its root, its identity root
+    /// and the arm request for it. The daemon target is this test binary,
+    /// as `admit` compares the running executable.
+    fn prepared(
+        edit: impl FnOnce(&mut journal::Participant),
+    ) -> (tempfile::TempDir, PathBuf, PathBuf, Vec<u8>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonical");
+        let root = base.join("data");
+        let identity = base.join("identity");
+        for path in [&root, &identity] {
+            std::fs::create_dir(path).expect("mkdir");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        }
+        let restart = journal::RestartBinding {
+            mode: journal::RestartOwner::SupervisedExit,
+            supervised_exit_code: None,
+            supervision_signal: None,
+            launchd_verified: None,
+            systemd_verified: None,
+            launcher: None,
+        };
+        let mut alice =
+            crate::upgrade::prepare_live::observe_this_daemon("alice", &root, &identity, restart)
+                .expect("observe");
+        edit(&mut alice);
+        let artifact = |target: PathBuf, name: &str| {
+            let backup = base.join(format!("{name}.backup"));
+            std::fs::write(&backup, format!("previous-{name}")).expect("backup");
+            journal::ArtifactPlan {
+                previous_sha256: sha256(&backup),
+                candidate_sha256: sha256(&target),
+                staged_path: base.join(format!("{name}.staged")),
+                target_path: target,
+                backup_path: backup,
+            }
+        };
+        let cli_target = base.join("x0x");
+        std::fs::write(&cli_target, "candidate-cli").expect("cli");
+        let plan = freeze_plan(PlanInput {
+            previous_version: "0.0.1".into(),
+            candidate_version: "9.9.9".into(),
+            manifest_sha256: [7; 32],
+            daemon: artifact(alice.executable.clone(), "daemon"),
+            cli: artifact(cli_target, "cli"),
+            participants: vec![alice],
+        })
+        .expect("freeze");
+        let lock = HostLock::acquire(&plan).expect("host lock");
+        let mut prepared_journal =
+            Prepared::stage(&lock, &root, "tx-round-trip", plan).expect("stage");
+        for phase in [
+            journal::Phase::Prepared,
+            journal::Phase::SwappedDaemon,
+            journal::Phase::SwappedCli,
+        ] {
+            prepared_journal.advance(&lock, phase).expect("advance");
+        }
+        let request = serde_json::to_vec(&serde_json::json!({
+            "token": TOKEN,
+            "transaction_id": "tx-round-trip",
+            "generation": prepared_journal.record().generation,
+            "instance_id": "alice",
+            "plan": prepared_journal.record().plan.clone(),
+        }))
+        .expect("request");
+        (dir, root, identity, request)
+    }
+
+    fn state(identity_root: PathBuf) -> ControlContext {
+        ControlContext {
+            api_token: TOKEN.into(),
+            api_address: std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
+            identity_root,
+            health_snapshot: Arc::default(),
+        }
+    }
+
+    #[test]
+    fn the_arm_handler_accepts_a_producer_journal_for_this_process() {
+        let (_dir, root, identity, request) = prepared(|_| {});
+        if let Err(error) = admit(&state(identity), &root, &request) {
+            panic!("admit refused the producer's journal: {error}");
+        }
+    }
+
+    #[test]
+    fn the_arm_handler_refuses_it_for_another_boot_pid_or_host() {
+        let (_dir, root, identity, request) =
+            prepared(|alice| alice.boot_id = "another-boot".into());
+        assert!(admit(&state(identity), &root, &request).is_err(), "boot");
+        let (_dir, root, identity, request) =
+            prepared(|alice| alice.old_pid = alice.old_pid.map(|pid| pid + 1));
+        assert!(admit(&state(identity), &root, &request).is_err(), "pid");
+        let (dir, root, _identity, request) = prepared(|_| {});
+        let other_host = dir.path().canonicalize().expect("canonical");
+        assert!(admit(&state(other_host), &root, &request).is_err(), "host");
     }
 }

@@ -1,7 +1,7 @@
 //! The running daemon's own participant entry for the prepare producer
 //! (#2012), read from the live process so that the arm handler
 //! (`server::upgrade_flush::admit`) accepts it: the executable it compares
-//! (`apply::current_binary_path`), its pid, its process start
+//! (`apply::current_binary_path`, canonical), its pid, its process start
 //! (`upgrade_flush::process_start`) and the boot (`boot_identity`), each
 //! from the same function the handler uses.
 //!
@@ -35,7 +35,11 @@ pub(crate) fn observe_this_daemon(
     identity_root: &Path,
     restart: RestartBinding,
 ) -> io::Result<Participant> {
-    let executable = super::apply::current_binary_path().map_err(io::Error::other)?;
+    // Canonical, as the arm handler compares it (#2065 review): a daemon
+    // started through a symlink is recorded by the file it runs.
+    let executable = super::apply::current_binary_path()
+        .map_err(io::Error::other)?
+        .canonicalize()?;
     let executable_text = executable
         .to_str()
         .ok_or_else(|| refused("the daemon executable path is not UTF-8"))?
@@ -101,7 +105,10 @@ mod tests {
         );
         assert_eq!(
             observed.executable,
-            crate::upgrade::apply::current_binary_path().unwrap()
+            crate::upgrade::apply::current_binary_path()
+                .unwrap()
+                .canonicalize()
+                .unwrap()
         );
         assert_eq!(observed.argv[0], observed.executable.to_str().unwrap());
         assert_eq!(observed.data_root, dir.path().canonicalize().unwrap());

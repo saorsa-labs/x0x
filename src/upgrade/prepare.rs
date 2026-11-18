@@ -213,6 +213,68 @@ fn sha256_of(path: &Path) -> io::Result<[u8; 32]> {
     }
 }
 
+/// The host lock (#2012 review): the advisory locks on
+/// `<cli target>.upgrade.lock`, then `<daemon target>.upgrade.lock`, in the
+/// order the pair writer and the launcher's `Host::locked` take them.
+/// `journal::write_record` requires it for every transaction change, so
+/// `stage` and `advance` take it by type: a caller cannot forget it. It is
+/// held until dropped.
+pub(crate) struct HostLock {
+    cli: PathBuf,
+    daemon: PathBuf,
+    _files: [std::fs::File; 2],
+}
+
+/// Open (create) one install lock file: no symlink followed, mode 0600,
+/// and a regular file.
+#[cfg(unix)]
+fn lock_file(target: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut name = target.as_os_str().to_os_string();
+    name.push(".upgrade.lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(name)?;
+    if !file.metadata()?.is_file() {
+        return Err(refused("invalid install lock"));
+    }
+    Ok(file)
+}
+
+impl HostLock {
+    /// Take the host lock for `plan`'s install pair; waits for a holder.
+    #[cfg(unix)]
+    pub(crate) fn acquire(plan: &FrozenPlan) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let cli = lock_file(&plan.cli.target_path)?;
+        let daemon = lock_file(&plan.daemon.target_path)?;
+        let (a, b) = (cli.metadata()?, daemon.metadata()?);
+        if a.dev() == b.dev() && a.ino() == b.ino() {
+            return Err(refused("install locks alias"));
+        }
+        cli.lock()?;
+        daemon.lock()?;
+        Ok(Self {
+            cli: plan.cli.target_path.clone(),
+            daemon: plan.daemon.target_path.clone(),
+            _files: [cli, daemon],
+        })
+    }
+
+    /// This lock is the host lock of `plan`'s install pair.
+    fn covers(&self, plan: &FrozenPlan) -> io::Result<()> {
+        if self.cli != plan.cli.target_path || self.daemon != plan.daemon.target_path {
+            return Err(refused("the host lock is for another install pair"));
+        }
+        Ok(())
+    }
+}
+
 /// The forward phases the producer writes, in order. `Probed` may be
 /// skipped; the two swaps may not.
 const FORWARD: [Phase; 5] = [
@@ -234,13 +296,17 @@ impl Prepared {
     /// Write the journal for `plan` in `data_root`, in `Staged`. The data
     /// root must be one participant's data root and pass the issuer's root
     /// check. An earlier journal is replaced only when it is settled; an
-    /// in-flight or unreadable one is refused.
+    /// in-flight or unreadable one is refused. The check and the write are
+    /// both under `lock`, so of two concurrent runs the second sees the
+    /// first's journal in flight and is refused.
     #[cfg(unix)]
     pub(crate) fn stage(
+        lock: &HostLock,
         data_root: &Path,
         transaction_id: &str,
         plan: FrozenPlan,
     ) -> io::Result<Self> {
+        lock.covers(&plan)?;
         check_root(data_root)?;
         if !plan.participants.iter().any(|p| p.data_root == data_root) {
             return Err(refused(format!(
@@ -286,8 +352,25 @@ impl Prepared {
     /// Move the journal forward to `phase`, after the step it names is
     /// done. A swap phase is written only after the swapped file is
     /// checked: the target holds the candidate and the backup the previous
-    /// release (their planned sha256).
-    pub(crate) fn advance(&mut self, phase: Phase) -> io::Result<()> {
+    /// release (their planned sha256). Under `lock`, the journal on disk
+    /// must still be exactly the one this run last wrote (transaction,
+    /// sequence and every field); a journal that changed underneath is
+    /// refused and left as it is.
+    pub(crate) fn advance(&mut self, lock: &HostLock, phase: Phase) -> io::Result<()> {
+        lock.covers(&self.record.plan)?;
+        let on_disk = journal::read_auxiliary_record(&self.path)?;
+        let unchanged = match journal::classify_record(&on_disk, "journal") {
+            journal::RecordRead::Journal(current) => {
+                current.transaction_id == self.record.transaction_id
+                    && current.sequence == self.record.sequence
+                    && serde_json::to_vec(&current).map_err(io::Error::other)?
+                        == serde_json::to_vec(&self.record).map_err(io::Error::other)?
+            }
+            _ => false,
+        };
+        if !unchanged {
+            return Err(refused("the host journal changed since this run wrote it"));
+        }
         let position = |phase| FORWARD.iter().position(|p| *p == phase);
         let (Some(from), Some(to)) = (position(self.record.phase), position(phase)) else {
             return Err(refused(format!(
@@ -414,14 +497,15 @@ pub(crate) mod tests {
     /// Stage, then move through every forward phase to `SwappedCli`.
     pub(crate) fn prepared_in(root: &Path, input: PlanInput) -> Prepared {
         let plan = freeze_plan(input).unwrap();
-        let mut prepared = Prepared::stage(root, "tx-2012", plan).unwrap();
+        let lock = HostLock::acquire(&plan).unwrap();
+        let mut prepared = Prepared::stage(&lock, root, "tx-2012", plan).unwrap();
         for phase in [
             Phase::Probed,
             Phase::Prepared,
             Phase::SwappedDaemon,
             Phase::SwappedCli,
         ] {
-            prepared.advance(phase).unwrap();
+            prepared.advance(&lock, phase).unwrap();
         }
         prepared
     }
@@ -495,16 +579,22 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn staging_needs_a_participant_root_of_this_account() {
+    fn staging_needs_a_participant_root_of_this_account_and_its_lock() {
         let (_dir, root) = root();
         let plan = freeze_plan(input_in(&root)).unwrap();
+        let lock = HostLock::acquire(&plan).unwrap();
         let other = root.join("other");
         std::fs::create_dir(&other).unwrap();
-        assert!(Prepared::stage(&other, "tx", plan.clone()).is_err());
+        assert!(Prepared::stage(&lock, &other, "tx", plan.clone()).is_err());
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o770)).unwrap();
-        assert!(Prepared::stage(&root, "tx", plan.clone()).is_err());
+        assert!(Prepared::stage(&lock, &root, "tx", plan.clone()).is_err());
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(Prepared::stage(&root, " ", plan).is_err());
+        assert!(Prepared::stage(&lock, &root, " ", plan.clone()).is_err());
+        // The host lock of another install pair does not cover this plan.
+        let (_other_dir, other_root) = super::tests::root();
+        let other_plan = freeze_plan(input_in(&other_root)).unwrap();
+        let other_lock = HostLock::acquire(&other_plan).unwrap();
+        assert!(Prepared::stage(&other_lock, &root, "tx", plan).is_err());
     }
 
     #[test]
@@ -512,32 +602,102 @@ pub(crate) mod tests {
         let (_dir, root) = root();
         let prepared = prepared_in(&root, input_in(&root));
         let plan = prepared.record().plan.clone();
-        assert!(Prepared::stage(&root, "tx-next", plan.clone()).is_err());
+        let lock = HostLock::acquire(&plan).unwrap();
+        assert!(Prepared::stage(&lock, &root, "tx-next", plan.clone()).is_err());
         // A settled journal may be replaced.
         let mut settled = prepared.record().clone();
         settled.phase = Phase::HostCommitted;
         settled.sequence += 1;
         journal::write_record(prepared.path(), &settled).unwrap();
-        assert!(Prepared::stage(&root, "tx-next", plan).is_ok());
+        assert!(Prepared::stage(&lock, &root, "tx-next", plan).is_ok());
+    }
+
+    /// #2065 review: two concurrent runs. The second waits for the host
+    /// lock, then finds the first's journal in flight and is refused; the
+    /// first's journal stands.
+    #[test]
+    fn a_concurrent_stage_waits_for_the_lock_and_is_refused() {
+        let (_dir, root) = root();
+        let plan = freeze_plan(input_in(&root)).unwrap();
+        let held = HostLock::acquire(&plan).unwrap();
+        let (acquired, waiting) = std::sync::mpsc::channel();
+        let (racer_root, racer_plan) = (root.clone(), plan.clone());
+        let racer = std::thread::spawn(move || {
+            let lock = HostLock::acquire(&racer_plan).unwrap();
+            acquired.send(()).unwrap();
+            Prepared::stage(&lock, &racer_root, "tx-racer", racer_plan).map(|_| ())
+        });
+        let wait = std::time::Duration::from_millis(300);
+        assert!(
+            waiting.recv_timeout(wait).is_err(),
+            "the racer did not wait"
+        );
+        let first = Prepared::stage(&held, &root, "tx-first", plan).unwrap();
+        drop(held);
+        waiting
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert!(racer.join().unwrap().is_err());
+        let bytes = std::fs::read(first.path()).unwrap();
+        let journal::RecordRead::Journal(read) = journal::classify_record(&bytes, "journal") else {
+            panic!("the journal does not read back");
+        };
+        assert_eq!(read.transaction_id, "tx-first");
+    }
+
+    /// #2065 review: `advance` re-reads the journal under the lock and
+    /// refuses one that changed since this run wrote it.
+    #[test]
+    fn advance_refuses_a_journal_that_changed_underneath() {
+        let (_dir, root) = root();
+        let plan = freeze_plan(input_in(&root)).unwrap();
+        let lock = HostLock::acquire(&plan).unwrap();
+        let mut prepared = Prepared::stage(&lock, &root, "tx", plan).unwrap();
+        let edits: [fn(&mut JournalRecord); 3] = [
+            |r: &mut JournalRecord| r.transaction_id = "tx-other".into(),
+            |r: &mut JournalRecord| r.phase = Phase::Probed,
+            |r: &mut JournalRecord| r.plan.participants[0].boot_id = "other-boot".into(),
+        ];
+        for edit in edits {
+            let mut changed = prepared.record().clone();
+            edit(&mut changed);
+            changed.sequence += 1;
+            journal::write_record(prepared.path(), &changed).unwrap();
+            assert!(prepared.advance(&lock, Phase::Prepared).is_err());
+            // The changed journal is left as it is.
+            let bytes = std::fs::read(prepared.path()).unwrap();
+            let journal::RecordRead::Journal(read) = journal::classify_record(&bytes, "journal")
+            else {
+                panic!("the changed journal does not read back");
+            };
+            assert_eq!(
+                serde_json::to_vec(&read).unwrap(),
+                serde_json::to_vec(&changed).unwrap()
+            );
+            // Put this run's journal back for the next case.
+            journal::write_record(prepared.path(), prepared.record()).unwrap();
+        }
+        prepared.advance(&lock, Phase::Prepared).unwrap();
     }
 
     #[test]
     fn the_swaps_are_ordered_and_checked() {
         let (_dir, root) = root();
         let plan = freeze_plan(input_in(&root)).unwrap();
-        let mut prepared = Prepared::stage(&root, "tx", plan).unwrap();
+        let lock = HostLock::acquire(&plan).unwrap();
+        let mut prepared = Prepared::stage(&lock, &root, "tx", plan).unwrap();
         // No swap before Prepared, and no CLI swap before the daemon's.
-        assert!(prepared.advance(Phase::SwappedDaemon).is_err());
-        prepared.advance(Phase::Prepared).unwrap();
-        assert!(prepared.advance(Phase::SwappedCli).is_err());
-        assert!(prepared.advance(Phase::Booting).is_err());
+        assert!(prepared.advance(&lock, Phase::SwappedDaemon).is_err());
+        prepared.advance(&lock, Phase::Prepared).unwrap();
+        assert!(prepared.advance(&lock, Phase::SwappedCli).is_err());
+        assert!(prepared.advance(&lock, Phase::Booting).is_err());
         // A daemon target that is not the candidate is not a swap.
         let target = prepared.record().plan.daemon.target_path.clone();
         std::fs::write(&target, b"something else").unwrap();
-        assert!(prepared.advance(Phase::SwappedDaemon).is_err());
+        assert!(prepared.advance(&lock, Phase::SwappedDaemon).is_err());
         assert_eq!(prepared.record().phase, Phase::Prepared);
         std::fs::write(&target, b"candidate-daemon").unwrap();
-        prepared.advance(Phase::SwappedDaemon).unwrap();
-        assert!(prepared.advance(Phase::Prepared).is_err());
+        prepared.advance(&lock, Phase::SwappedDaemon).unwrap();
+        assert!(prepared.advance(&lock, Phase::Prepared).is_err());
     }
 }
