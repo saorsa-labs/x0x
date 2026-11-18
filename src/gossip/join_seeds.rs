@@ -4,6 +4,9 @@
 //! plane gate decides when the peer's hello arrives, after the dial returned.
 //! saorsa-gossip's JOIN tries the seeds in order and dials one seed up to ten
 //! times with backoff, so a refused seed delays the work after the JOIN.
+//!
+//! #292 invariant A: [`crate::network::NetworkNode::peer_admission`] is the
+//! predicate for every gossip-affecting decision, never transport truth.
 
 use std::net::SocketAddr;
 use std::time::Duration;

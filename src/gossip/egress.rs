@@ -117,8 +117,11 @@ impl PubSubTransport {
     }
 
     /// Does not verify the frame's ML-DSA signature (#656):
-    /// `plumtree.handle_message` verifies the same bytes right after this
-    /// call and ignores unauthenticated IWANTs.
+    /// `plumtree.handle_message` verifies the same bytes right after this call
+    /// and ignores unauthenticated IWANTs, so a forged IWANT cannot inflate
+    /// counters beyond what its own rejected frame would draw. The structural
+    /// gates remain: exact `GossipMessage` decode, `IWant` kind, v2 header,
+    /// payload-hash binding, and decodable id list.
     pub fn track_iwant(&self, peer: PeerId, data: &[u8]) -> Option<RepairScope> {
         let message: saorsa_gossip_pubsub::GossipMessage = postcard::from_bytes(data).ok()?;
         if message.header.kind != MessageKind::IWant {

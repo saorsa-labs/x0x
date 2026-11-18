@@ -1647,6 +1647,9 @@ mod tests {
         assert_eq!(window_rate(50u64, 50u64, 10.0), 0.0);
     }
 
+    // #1395 / #288: a remote that stops reading parks the egress `open_uni()`
+    // await on the ingest back-pressure valve; the 5 s watchdog then cancels
+    // the membership handler mid-protocol.
     const STALL_PEER_DATA_CHANNEL_CAPACITY: usize = 64;
     const STALL_PEER_UNI_CREDIT: u32 = 8;
     const STALL_BURST_PINGS: usize = 400;

@@ -3552,6 +3552,7 @@ mod tests {
             verify_reseat_mandate(&mandate, &other_signer),
             Err(ReseatMandateCause::BindingMismatch)
         );
+        // No package: the ordinary join's rule has nothing to verify, so the binding is not required.
         let packageless = mandate_by(&fixture, &commit, GroupRole::Member, &fixture.admin, |f| {
             f.key_package_hash = String::new();
         });

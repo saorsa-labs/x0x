@@ -247,6 +247,10 @@ impl GossipConfig {
     }
 
     /// Operator warnings for deprecated `[gossip]` keys that are still set.
+    ///
+    /// Warns, does not fail: live nodes carry these keys and must keep starting.
+    /// A stale `active_view_size = 0` could restart-loop a daemon over a knob
+    /// that has no effect.
     #[must_use]
     pub fn deprecation_warnings(&self) -> Vec<String> {
         [
