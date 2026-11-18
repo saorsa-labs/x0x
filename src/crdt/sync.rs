@@ -1947,11 +1947,6 @@ mod tests {
         TaskItem::new(task_id, metadata, peer)
     }
 
-    /// Construct an isolated network node (mirrors the helper in
-    /// `src/gossip/pubsub.rs` tests). `PubSubManager` is fully constructable
-    /// in tests, so `TaskListSync` is testable end-to-end without a live mesh.
-    /// Explicit test-only network config (#417/#337): loopback bind, no
-    /// seeds, discovery/port-mapping off. Still a real socket constructor.
     fn test_network_config() -> NetworkConfig {
         NetworkConfig {
             bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
@@ -1970,8 +1965,6 @@ mod tests {
         )
     }
 
-    /// Build a `TaskListSync` around a fresh node + pubsub, with
-    /// `local_peer_id = peer(1)` and list id `list_id(1)`.
     async fn make_sync(topic: &str) -> TaskListSync {
         let node = make_node().await;
         let pubsub = Arc::new(
@@ -1982,17 +1975,10 @@ mod tests {
         TaskListSync::new(list, pubsub, topic.to_string(), peer(1)).expect("task list sync")
     }
 
-    /// Shared pubsub with a SIGNING context: local publishes carry a
-    /// V2-envelope-verified sender, so the delta-merge listener's Layer A
-    /// gate (issue #349) admits their content. The convergence tests below
-    /// need this — an unsigned pubsub would fail closed on every serve.
     async fn signed_pubsub() -> Arc<PubSubManager> {
         signed_pubsub_with_signer().await.0
     }
 
-    /// As [`signed_pubsub`], also returning the signer's `AgentId` — the writer
-    /// identity the listener will see on every publish, which the ADR-0068
-    /// fixtures need in order to script a roster that actually seats it.
     async fn signed_pubsub_with_signer() -> (Arc<PubSubManager>, AgentId) {
         let node = make_node().await;
         let kp = crate::identity::AgentKeypair::generate().expect("agent keygen");
@@ -2004,15 +1990,10 @@ mod tests {
         )
     }
 
-    /// Build a `TaskListSync` that shares its pubsub with the caller (so the
-    /// caller can subscribe before the sync publishes). The pubsub signs: since
-    /// #1114 nothing unsigned is delivered, its own subscribers included.
     async fn make_sync_with_pubsub(topic: &str) -> (TaskListSync, Arc<PubSubManager>) {
         sync_on_pubsub(topic, signed_pubsub().await)
     }
 
-    /// As [`make_sync_with_pubsub`], with the pubsub signed by `kp` — the
-    /// production shape for a group list whose protector seals as `kp`.
     async fn make_sync_with_pubsub_signed_by(
         topic: &str,
         kp: &crate::identity::AgentKeypair,
@@ -2036,37 +2017,30 @@ mod tests {
         let id = list_id(1);
         let task_list = TaskList::new(id, "Test List".to_string(), peer);
 
-        // We cannot create a real PubSubManager in a unit test without a NetworkNode
-        // For now, we just verify the types are correct
         let _list_for_sync = task_list;
     }
 
     #[tokio::test]
     async fn test_apply_delta() {
-        // Create a task list
         let peer1 = peer(1);
         let peer2 = peer(2);
         let id = list_id(1);
         let task_list = TaskList::new(id, "Test".to_string(), peer1);
 
-        // Wrap in Arc<RwLock<>>
         let task_list_arc = Arc::new(RwLock::new(task_list));
 
-        // Create a delta with a new task
         let mut delta = TaskListDelta::new(1);
         let task = make_task(1, peer2);
         let task_id = *task.id();
         let tag = (peer2, 1);
         delta.added_tasks.insert(task_id, (task, tag));
 
-        // Apply delta directly (simulating what TaskListSync::apply_remote_delta does)
         {
             let mut list = task_list_arc.write().await;
             let result = list.merge_delta(&delta, peer2, Some(&agent(2)));
             assert!(result.is_ok());
         }
 
-        // Verify task was added
         {
             let list = task_list_arc.read().await;
             assert_eq!(list.task_count(), 1);
@@ -2075,13 +2049,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_access() {
-        // Test that RwLock allows multiple readers
         let peer = peer(1);
         let id = list_id(1);
         let task_list = TaskList::new(id, "Test".to_string(), peer);
         let task_list_arc = Arc::new(RwLock::new(task_list));
 
-        // Multiple concurrent reads should work
         let list1 = task_list_arc.read().await;
         let list2 = task_list_arc.read().await;
 
@@ -2091,37 +2063,27 @@ mod tests {
         drop(list1);
         drop(list2);
 
-        // Write should work after readers drop
         {
             let mut list = task_list_arc.write().await;
             list.update_name("Updated".to_string(), peer);
         }
 
-        // Verify update
         let list = task_list_arc.read().await;
         assert_eq!(list.name(), "Updated");
     }
-
-    // ------------------------------------------------------------------
-    // new() / topic() / read() / write()
-    // ------------------------------------------------------------------
 
     #[tokio::test]
     async fn new_sets_topic_and_yields_accessible_guards() {
         let sync = make_sync("tasks/A").await;
 
-        // topic() reports exactly the topic handed to new().
         assert_eq!(sync.topic(), "tasks/A");
 
-        // read() exposes the underlying list unchanged.
         {
             let list = sync.read().await;
             assert_eq!(list.name(), "Test List");
             assert_eq!(list.task_count(), 0);
         }
 
-        // write() returns a mutable guard; verify it is usable by renaming
-        // the list, then observe the rename via read().
         {
             let mut list = sync.write().await;
             list.update_name("Renamed".to_string(), peer(1));
@@ -2130,47 +2092,32 @@ mod tests {
         assert_eq!(list.name(), "Renamed", "write-guard rename must be visible");
     }
 
-    // ------------------------------------------------------------------
-    // state_sync_topic() (private helper exercised from the test module)
-    // ------------------------------------------------------------------
-
     #[tokio::test]
     async fn state_sync_topic_appends_side_channel_suffix() {
         let sync = make_sync("tasks/B").await;
-        // The private helper forms the side channel by appending the suffix.
         assert_eq!(sync.state_sync_topic(), "tasks/B/state-sync");
 
-        // Suffix is appended exactly once, regardless of slashes in topic.
         let sync2 = make_sync("tasks/B/nested").await;
         assert_eq!(sync2.state_sync_topic(), "tasks/B/nested/state-sync");
     }
-
-    // ------------------------------------------------------------------
-    // apply_remote_delta(): direct (off-wire) merge into the local list
-    // ------------------------------------------------------------------
 
     #[tokio::test]
     async fn apply_remote_delta_merges_task_into_list() {
         let sync = make_sync("tasks/C").await;
 
-        // Start empty.
         assert_eq!(sync.read().await.task_count(), 0);
 
-        // Build a delta carrying one task authored by peer(2).
         let remote = peer(2);
         let task = make_task(7, remote);
         let task_id = *task.id();
         let mut delta = TaskListDelta::new(1);
         delta.added_tasks.insert(task_id, (task, (remote, 1)));
 
-        // Layer A (issue #349): the honest path needs an envelope-verified
-        // writer for content to apply.
         let alice = agent(1);
         sync.apply_remote_delta(remote, delta, Some(&alice))
             .await
             .expect("apply_remote_delta");
 
-        // The task must be present and retrievable by id.
         let list = sync.read().await;
         assert_eq!(list.task_count(), 1, "merged task must bump the count");
         assert!(
@@ -2179,16 +2126,10 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------
-    // publish_delta(): wire round-trip observed by a subscriber
-    // ------------------------------------------------------------------
-
     #[tokio::test]
     async fn publish_delta_delivers_encoded_pair_to_subscriber() {
         let (sync, pubsub) = make_sync_with_pubsub("tasks/D").await;
 
-        // Subscribe to the main topic BEFORE publishing so we observe the
-        // exact bytes TaskListSync places on the wire.
         let mut sub = pubsub.subscribe("tasks/D".to_string()).await;
 
         let sender = peer(7);
@@ -2206,8 +2147,6 @@ mod tests {
             .expect("timed out waiting for published delta")
             .expect("subscriber stream closed");
 
-        // The published payload must decode back to the (sender, delta) pair
-        // that publish_delta encoded — proving the wire format is correct.
         let (observed_sender, observed_delta) =
             decode_delta::<TaskListDelta>(&msg.payload).expect("wire decode");
         assert_eq!(observed_sender, sender);
@@ -2219,25 +2158,16 @@ mod tests {
         assert_eq!(msg.topic, "tasks/D");
     }
 
-    // ------------------------------------------------------------------
-    // #895: group-key sealing of group-scoped task lists
-    // ------------------------------------------------------------------
-
     const SEALED_TITLE: &str = "SEALED-TITLE-895";
     const SEALED_DESCRIPTION: &str = "SEALED-DESCRIPTION-895";
 
-    /// A GSS-plane protector over a fixed `GroupInfo` snapshot, built from the
-    /// same library seal/open functions the daemon's protector calls.
     struct GssFixtureProtector {
         info: crate::groups::GroupInfo,
         topic: String,
         signing: crate::kv::encrypted::AuthorSigning,
         public: bool,
         rejected: std::sync::atomic::AtomicU64,
-        /// Simulates the TreeKEM protector while the group is quarantined:
-        /// it refuses to open at all.
         refuse_open: std::sync::atomic::AtomicBool,
-        /// Simulates a seal failure (no group key, author not a writer).
         fail_seal: std::sync::atomic::AtomicBool,
     }
 
@@ -2327,7 +2257,6 @@ mod tests {
             Some(self.signing.agent_id)
         }
 
-        /// A fixed `GroupInfo` snapshot: its epoch can never move.
         fn confirm_publication<'a>(
             &'a self,
             _body: &'a crate::crdt::sealed::SealedTaskRecordBody,
@@ -2340,8 +2269,6 @@ mod tests {
         }
     }
 
-    /// An MlsEncrypted GSS group whose creator (and only active member) is
-    /// `member`, holding a rotated shared secret.
     fn gss_group(member: AgentId) -> crate::groups::GroupInfo {
         let mut info =
             crate::groups::GroupInfo::new("g895".to_string(), String::new(), member, "g895".into());
@@ -2368,16 +2295,11 @@ mod tests {
             .any(|w| w == needle.as_bytes())
     }
 
-    /// A pubsub whose publishes are signed by `kp`, so the listener sees
-    /// `kp`'s agent as the gossip-verified sender.
     async fn pubsub_signed_by(kp: &crate::identity::AgentKeypair) -> Arc<PubSubManager> {
         let signing = Arc::new(crate::gossip::SigningContext::from_keypair(kp));
         Arc::new(PubSubManager::new(make_node().await, signing).expect("pubsub"))
     }
 
-    /// Lead requirement 3 (WHY): the exact bytes handed to the gossip publish
-    /// call for a group task-list update must not carry the task's title or
-    /// description — a non-member who derives the topic learns nothing.
     #[tokio::test]
     async fn group_list_publish_hands_gossip_only_sealed_bytes() {
         let topic = "x0x.group.g895.symphony.wire";
@@ -2404,7 +2326,6 @@ mod tests {
                 .map_or(true, |(_, d)| !d.added_tasks.contains_key(&task_id)),
             "the published bytes must not decode as a plaintext delta"
         );
-        // Control: the sealed record is the member's delta, not noise.
         let (_, body) =
             crate::crdt::sealed::decode_sealed_task_record(&msg.payload).expect("sealed record");
         let opened = protector.open(&body).await.expect("member opens");
@@ -2412,8 +2333,6 @@ mod tests {
         assert!(inner.added_tasks.contains_key(&task_id));
     }
 
-    /// WHY: the `/state-sync` cold-start serve republishes the WHOLE list, so
-    /// it must be sealed too — otherwise a non-member could just ask for it.
     #[tokio::test]
     async fn group_list_state_serve_is_sealed() {
         let topic = "x0x.group.g895.symphony.serve";
@@ -2447,8 +2366,6 @@ mod tests {
         assert!(!carries(&msg.payload, SEALED_DESCRIPTION));
     }
 
-    /// WHY: sealing must not break replication — a current member opens the
-    /// record with the group key and the task lands.
     #[tokio::test]
     async fn member_opens_and_applies_sealed_delta() {
         let topic = "x0x.group.g895.symphony.member";
@@ -2485,9 +2402,6 @@ mod tests {
         assert_eq!(receiver_protector.rejected(), 0);
     }
 
-    /// Lead requirements 1 and 2 (WHY): a removed member still holding the
-    /// epoch-N key cannot apply a delta sealed at N+1, and a plaintext delta
-    /// (an un-upgraded peer) is refused and counted — neither is merged.
     #[tokio::test]
     async fn removed_member_and_plaintext_fail_closed() {
         let topic = "x0x.group.g895.symphony.removed";
@@ -2546,10 +2460,6 @@ mod tests {
         );
     }
 
-    /// ADR-0068 D2 (Accepted) WHY: a sealed delta that arrives while the
-    /// group is fork-quarantined must be BUFFERED, not dropped — even though
-    /// the protector cannot open it during the quarantine (the TreeKEM
-    /// protector refuses) — and applied once the marker clears.
     #[tokio::test]
     async fn sealed_delta_during_quarantine_is_buffered_then_applied() {
         let topic = "x0x.group.g895.symphony.quarantine";
@@ -2597,7 +2507,6 @@ mod tests {
         assert_eq!(protector.rejected(), 0, "held, not refused");
         assert!(receiver.read().await.get_task(&task_id).is_none());
 
-        // The marker clears; the protector can open again.
         gate.suspend(false);
         protector
             .refuse_open
@@ -2608,21 +2517,12 @@ mod tests {
         assert_eq!(protector.rejected(), 0);
     }
 
-    /// omp review finding 2(i) WHY: a sealed record must be merged only when
-    /// its sealed (signed) author IS the gossip-verified sender. Member A's
-    /// record re-broadcast under B's envelope is refused and counted.
-    ///
-    /// Mutation check: deleting the `SenderMismatch` refusal in `open_sealed`
-    /// lets the task merge (B is a signed writer and the list has no writer
-    /// allow-list), so the `get_task(..).is_none()` assertion fails, and the
-    /// `rejected() == 1` assertion fails too.
     #[tokio::test]
     async fn sealed_author_must_be_the_gossip_sender() {
         let topic = "x0x.group.g895.symphony.mismatch";
         let author = crate::identity::AgentKeypair::generate().expect("author");
         let relayer = crate::identity::AgentKeypair::generate().expect("relayer");
         let info = gss_group(author.agent_id());
-        // Every publish on this pubsub carries B's (the relayer's) envelope.
         let pubsub = pubsub_signed_by(&relayer).await;
         let sender = TaskListSync::new(
             TaskList::new(list_id(1), "L".to_string(), peer(1)),
@@ -2638,7 +2538,6 @@ mod tests {
             peer(2),
         )
         .expect("receiver");
-        // The record is sealed and signed as A.
         assert!(sender.install_protector(GssFixtureProtector::new(info.clone(), topic, &author)));
         let protector = GssFixtureProtector::new(info, topic, &author);
         assert!(receiver.install_protector(protector.clone()));
@@ -2661,15 +2560,6 @@ mod tests {
         );
     }
 
-    /// omp review finding 2(ii) WHY: when sealing fails there is NO plaintext
-    /// fallback — `publish_delta` returns the error and nothing reaches the
-    /// wire, and the state-sync responder serves nothing (no broadcast, no
-    /// marker).
-    ///
-    /// Mutation check: an `Err(_)` plaintext fallback in `seal_and_publish` makes
-    /// `publish_delta` return `Ok` (the `is_err()` assertion fails) and puts
-    /// the plaintext pair on the topic (the "nothing published" assertion
-    /// fails); the responder would broadcast the full list and its markers.
     #[tokio::test]
     async fn seal_failure_publishes_nothing() {
         let topic = "x0x.group.g895.symphony.sealfail";
@@ -2707,8 +2597,6 @@ mod tests {
                 .is_err(),
             "nothing may be published on the list topic when sealing fails"
         );
-        // The side topic also carries state REQUESTS (ours, and the sync's
-        // own bootstrap requester); only a served marker is a failure.
         let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
         let mut saw_our_request = false;
         while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, side.recv()).await {
@@ -2726,15 +2614,9 @@ mod tests {
                 "no served marker without a real (sealed) broadcast"
             );
         }
-        // Liveness (#1114): the side topic delivered our request, so the
-        // silence above is the responder's decision, not a dead topic.
         assert!(saw_our_request, "the side probe must see our StateRequest");
     }
 
-    /// omp review finding 1 WHY (crdt half): a list with a serve gate
-    /// answers a `StateRequest` only when the gate admits the requester — a
-    /// denied (non-member / retired) request produces no broadcast at all.
-    /// The control shows the same list DOES serve an admitted requester.
     #[tokio::test]
     async fn serve_gate_denies_state_requests_it_does_not_admit() {
         let topic = "x0x-board-servegate895";
@@ -2784,8 +2666,6 @@ mod tests {
         );
     }
 
-    /// WHY: personal (non-group) lists keep their plaintext wire format; the
-    /// fix must not change them. No protector ⇒ the bytes are the plain pair.
     #[tokio::test]
     async fn personal_list_wire_format_is_unchanged() {
         let (sync, pubsub) = make_sync_with_pubsub("tasks/personal-895").await;
@@ -2802,23 +2682,11 @@ mod tests {
         assert!(carries(&msg.payload, SEALED_TITLE));
     }
 
-    // ------------------------------------------------------------------
-    // start_with_spawner(): custom spawner path (documented smoke test)
-    // ------------------------------------------------------------------
-
+    // Smoke test of the custom-spawner path only: a drop-spawner makes the
+    // subscription unobservable, so nothing here proves a merge. The real
+    // subscribe->merge behaviour is `start_default_spawner_merges_remote_delta`.
     #[tokio::test]
     async fn start_with_spawner_accepts_custom_spawner_and_returns_ok() {
-        // Unique value vs `start_default_spawner_merges_remote_delta`: this
-        // routes the background futures through a *custom* (non-`tokio::spawn`)
-        // spawner closure — a drop-spawner — exercising that generic code path
-        // and asserting `start_with_spawner` returns `Ok` without panicking.
-        //
-        // It deliberately does NOT assert that a subscription or merge
-        // occurred: a drop-spawner makes subscription unobservable, so this
-        // would still pass against a no-op `Ok(())` impl. The real
-        // subscribe->merge behaviour is asserted end-to-end by
-        // `start_default_spawner_merges_remote_delta`, which drives
-        // `start_with_spawner(tokio::spawn)` and proves Layer A I2 (unsigned add does not land).
         let sync = make_sync("tasks/E").await;
         sync.start_with_spawner(|_fut| {
             // intentionally drop the future
@@ -2827,14 +2695,6 @@ mod tests {
         .expect("start_with_spawner");
     }
 
-    // ------------------------------------------------------------------
-    // start(): default spawner merges a remotely-published delta
-    // ------------------------------------------------------------------
-
-    /// WHY (#1094 `task:changed`): a remote delta that the listener merges
-    /// sends exactly one change notice with the list topic and origin
-    /// `Remote`; a direct `apply_remote_delta` sends one; `note_change`
-    /// sends a `Local` one.
     #[tokio::test]
     async fn issue1094_a_merged_remote_task_delta_sends_one_change_notice() {
         let (pubsub, publisher) = signed_pubsub_with_signer().await;
@@ -2889,18 +2749,6 @@ mod tests {
 
     #[tokio::test]
     async fn start_default_spawner_merges_remote_delta() {
-        // End-to-end exercise of the delta-merge listener through the Layer A
-        // gate (issue #349, I2/I8): a delta published on the topic is received
-        // by the background loop spawned by start() and merged with the
-        // V2-envelope-verified sender as the writer. The publisher signs
-        // (#1114: nothing unsigned is delivered at all) but is NOT in the
-        // list's authorized set, so the listener must fail closed on content:
-        // the delta's first-seen task add must NOT land, while a member's
-        // attested checkbox claim on a task the receiver already holds must
-        // still converge (checkbox admission is gated by OpAttestation and
-        // membership, not by the envelope writer). The anonymous-writer case
-        // is covered off-wire by
-        // `merge_delta_anonymous_writer_drops_content_but_admits_attested_claim`.
         let (pubsub, publisher) = signed_pubsub_with_signer().await;
         let (sync, _pubsub) = sync_on_pubsub("tasks/F", pubsub);
         let kp = crate::identity::AgentKeypair::generate().expect("agent keygen");
@@ -2913,11 +2761,8 @@ mod tests {
 
         sync.start().await.expect("start");
 
-        // Let the spawned subscribe-forwarder register before we publish.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Seed an existing local task (local mutators are the trusted path —
-        // they are not the untrusted apply route this test exercises).
         let remote = peer(2);
         let existing = make_task(5, remote);
         let existing_id = *existing.id();
@@ -2926,10 +2771,6 @@ mod tests {
             list.add_task(existing, remote, 1).expect("seed local task");
         }
 
-        // Non-member delta: a first-seen add PLUS a member's validly-attested
-        // claim on the existing task. The claim is the positive evidence that
-        // the listener processed the message, so "add did not land" below is
-        // a real gate decision, not a dead listener.
         let mut claimed = make_task(5, remote);
         claimed
             .claim(list_id(1), claimer, remote, 1, &signing)
@@ -2944,7 +2785,6 @@ mod tests {
         delta.task_updates.insert(existing_id, claimed);
         sync.publish_delta(remote, delta).await.expect("publish");
 
-        // The claim applies (checkbox path still runs for a non-member writer)…
         let claim_applied = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let claimed_landed = sync
@@ -2964,7 +2804,6 @@ mod tests {
             "a non-member's signed publish must still reach checkbox admission"
         );
 
-        // …but the non-member's content must NOT land (I2/I8).
         assert!(
             sync.read().await.get_task(&new_task_id).is_none(),
             "a non-member writer's publish must not create a task (I2/I8)"
@@ -2976,25 +2815,13 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------
-    // stop(): returns Ok and is idempotent
-    // ------------------------------------------------------------------
-
     #[tokio::test]
     async fn stop_returns_ok_and_is_idempotent() {
         let sync = make_sync("tasks/G").await;
         sync.stop().await.expect("first stop");
-        // stop() unsubscribes both the main and the state-sync topic;
-        // unsubscribe is infallible and tolerant of already-removed topics,
-        // so a second stop() must remain Ok.
         sync.stop().await.expect("second stop (idempotent)");
     }
 
-    /// WHY (rounds 1+4 review): the requester's schedule is INFINITE while
-    /// the list is empty, and the sibling loops hold strong `Arc`s to the
-    /// list — so the cancellation token (all loops) and the
-    /// silence_bootstrap flag (requester only) are the only things that end
-    /// a discarded sync's background work before daemon shutdown.
     #[tokio::test]
     async fn stop_and_silence_arm_their_kill_switches() {
         let sync = make_sync("tasks/stopflag").await;
@@ -3018,10 +2845,6 @@ mod tests {
         );
     }
 
-    /// WHY (parallel-review finding): teardown must be STRUCTURAL — a
-    /// caller that discards its last reference without remembering
-    /// cancel_sync() must still end all background loops (the requester is
-    /// infinite while unconverged), so Drop cancels the token.
     #[tokio::test]
     async fn dropping_the_sync_cancels_all_loops() {
         let sync = make_sync("tasks/dropcancel").await;
@@ -3034,16 +2857,6 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------
-    // Issue #238: the bootstrap requester must never give up while empty
-    // ------------------------------------------------------------------
-
-    /// WHY: holders answer state requests reactively and never volunteer
-    /// state to a late subscriber, so the request schedule is the only
-    /// recovery trigger. The previous hard cap (20 × 30s ≈ 10 min) left a
-    /// list that rehydrated while every holder was offline permanently
-    /// empty once the cap expired. The schedule must be front-loaded, then
-    /// an infinite capped tail — convergence is the only stop condition.
     #[test]
     fn state_request_schedule_never_terminates_while_unconverged() {
         let front: Vec<u64> = state_request_delays().take(4).collect();
@@ -3062,18 +2875,8 @@ mod tests {
         );
     }
 
-    /// WHY (round-2 review — P1: one incremental delta must not silence
-    /// recovery): a live task arriving before any holder has actually
-    /// SERVED full state makes the list non-empty, and the round-1 tail
-    /// exited on non-emptiness alone — permanently missing all older
-    /// tasks. Convergence now additionally requires a StateServed marker,
-    /// so the bait delta leaves the requester alive and a late full holder
-    /// still gets asked.
     #[tokio::test(start_paused = true)]
     async fn single_incremental_delta_does_not_stop_recovery() {
-        // Signed pubsub (Layer A, issue #349): the bait delta and the late
-        // holder's serves must carry an envelope-verified writer or the
-        // listener drops their content.
         let pubsub = signed_pubsub().await;
         let topic = "tasks-238-bait";
 
@@ -3083,11 +2886,8 @@ mod tests {
                 .expect("joiner sync");
         joiner.start().await.expect("start joiner");
 
-        // Past the front burst with nobody online.
         tokio::time::sleep(Duration::from_secs(70)).await;
 
-        // The bait: ONE live incremental delta (task 2) — no full response,
-        // no StateServed marker. The list becomes non-empty.
         let bait_task = make_task(2, peer(3));
         let bait_id = *bait_task.id();
         let mut bait = TaskListDelta::new(1);
@@ -3104,8 +2904,6 @@ mod tests {
             "bait delta merged — the false-convergence precondition holds"
         );
 
-        // A holder with the FULL history (task 1 and task 2) appears long
-        // after the bait. Only a still-alive requester can reach it.
         let mut holder_list = TaskList::new(list_id(1), "Test List".to_string(), peer(1));
         holder_list
             .add_task(make_task(1, peer(1)), peer(1), 1)
@@ -3134,28 +2932,17 @@ mod tests {
         );
     }
 
-    /// WHY (issue #238 — zombie subscription): a joiner whose every request
-    /// fired while all holders were offline must still converge when a
-    /// holder returns — even long after the OLD hard cap (front ~51s +
-    /// 20 × 30s ≈ 651s) would have silenced the requester forever. Paused
-    /// time drives the virtual clock, so the >10-minute scenario runs in
-    /// moments.
     #[tokio::test(start_paused = true)]
     async fn requester_recovers_when_holder_returns_after_old_hard_cap() {
-        // Signed pubsub (Layer A, issue #349): the holder's serve must carry
-        // an envelope-verified writer or the listener drops its content.
         let pubsub = signed_pubsub().await;
         let topic = "tasks-238-zombie";
 
-        // Empty joiner: subscribes and starts requesting into the void.
         let joiner_list = TaskList::new(list_id(1), "Test List".to_string(), peer(2));
         let joiner =
             TaskListSync::new(joiner_list, Arc::clone(&pubsub), topic.to_string(), peer(2))
                 .expect("joiner sync");
         joiner.start().await.expect("start joiner");
 
-        // Sail PAST the old hard cap with no holder online. The old code is
-        // permanently silent from here on — this is the zombie window.
         tokio::time::sleep(Duration::from_secs(700)).await;
         assert_eq!(
             joiner.read().await.task_count(),
@@ -3163,8 +2950,6 @@ mod tests {
             "nobody was online to answer"
         );
 
-        // A holder with state appears. It only answers when ASKED, so the
-        // joiner's tail must still be alive to ask.
         let mut holder_list = TaskList::new(list_id(1), "Test List".to_string(), peer(1));
         holder_list
             .add_task(make_task(1, peer(1)), peer(1), 1)
@@ -3174,7 +2959,6 @@ mod tests {
                 .expect("holder sync");
         holder.start().await.expect("start holder");
 
-        // The next tail request is at most STATE_REQUEST_TAIL_CAP_SECS away.
         let mut converged = false;
         for _ in 0..200 {
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -3190,13 +2974,6 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------
-    // Issue #240: digest-verified convergence evidence
-    // ------------------------------------------------------------------
-
-    /// Drain every side-topic `StateRequest` from `from` already queued on
-    /// `probe` without blocking (the 1ms virtual timeout yields immediately
-    /// under the paused clock when the queue is empty).
     async fn drain_state_requests(probe: &mut crate::gossip::Subscription, from: PeerId) -> usize {
         let mut n = 0;
         while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(1), probe.recv()).await
@@ -3212,9 +2989,6 @@ mod tests {
         n
     }
 
-    /// WHY (issue #240): the convergence rule must weigh v2 digest evidence
-    /// above the weak v1 rule, with the data-bearing-claim-wins tiebreak —
-    /// and NO evidence is NEVER convergence.
     #[test]
     fn tasklist_convergence_rule() {
         const D1: [u8; 32] = [1u8; 32];
@@ -3224,7 +2998,6 @@ mod tests {
         assert!(!tasklist_converged(&none, 0, D1));
         assert!(!tasklist_converged(&none, 5, D1));
 
-        // v1 weak rule: marker + local non-emptiness.
         let v1 = TaskServedEvidence {
             saw_v1: true,
             digests: std::collections::HashMap::new(),
@@ -3232,8 +3005,6 @@ mod tests {
         assert!(!tasklist_converged(&v1, 0, D1));
         assert!(tasklist_converged(&v1, 3, D1));
 
-        // v2 digest gate: match stops, mismatch keeps asking, and v2
-        // outranks the weak v1 rule.
         let mut ev = TaskServedEvidence::default();
         ev.digests.insert(
             peer(9),
@@ -3250,8 +3021,6 @@ mod tests {
             "v2 declarations outrank weak v1 evidence"
         );
 
-        // Empty-holder declarations converge an empty requester only when
-        // every declaration is empty (data-bearing claim wins).
         let mut ev_empty = TaskServedEvidence::default();
         ev_empty.digests.insert(
             peer(9),
@@ -3275,11 +3044,6 @@ mod tests {
         assert!(tasklist_converged(&ev_empty, 2, D1));
     }
 
-    /// WHY: the v2 digest commits to the served task set so a requester can
-    /// verify completeness LOCALLY. It must be deterministic across
-    /// replicas, sensitive to membership, insensitive to name/ordering
-    /// metadata, and bound to the list id; a full delta's carried digest
-    /// must equal the serving list's local digest.
     #[test]
     fn served_digest_is_deterministic_content_bound_and_metadata_independent() {
         let mut a = TaskList::new(list_id(1), "alpha".to_string(), peer(1));
@@ -3296,16 +3060,11 @@ mod tests {
             "the list id binds the digest (cross-list replay defense)"
         );
 
-        // The same task in both lists ⇒ the same digest, however it got
-        // there (OR-Set writer tags are transport, not content).
         let task = make_task(7, peer(3));
         a.add_task(task.clone(), peer(1), 1).expect("add a");
         b.add_task(task, peer(2), 1).expect("add b");
         assert_eq!(a.served_digest(), b.served_digest());
 
-        // A full delta's served digest equals the local digest; an
-        // incremental delta is not full-state-shaped and must not
-        // impersonate a serve.
         let full = a.full_delta();
         assert_eq!(full.served_digest(&list_id(1)), Some(a.served_digest()));
         let inc = TaskListDelta::for_add(
@@ -3316,29 +3075,17 @@ mod tests {
         );
         assert_eq!(inc.served_digest(&list_id(1)), None);
 
-        // Different membership ⇒ different digest.
         b.add_task(make_task(9, peer(2)), peer(2), 2)
             .expect("add b2");
         assert_ne!(a.served_digest(), b.served_digest());
     }
 
-    /// WHY (issue #240, residual 1 — the cross-topic loss window): the full
-    /// delta travels on the main topic, its marker on the side topic, with
-    /// no delivery coupling. If the delta is lost while the marker
-    /// survives, the v1 rule stopped a non-empty requester with incomplete
-    /// history. With the v2 digest the requester detects the mismatch
-    /// (local {t2} vs declared {t1,t2}) and keeps asking until the real
-    /// state arrives.
     #[tokio::test(start_paused = true)]
     async fn lost_full_delta_with_surviving_marker_keeps_requester_asking() {
-        // Signed pubsub (Layer A, issue #349): the holder's full serve must
-        // carry an envelope-verified writer or the listener drops its
-        // content.
         let pubsub = signed_pubsub().await;
         let topic = "tasks-240-lost-broadcast";
         let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
 
-        // The full holder state (offline for now): {t1, t2}.
         let mut holder_list = TaskList::new(list_id(1), "Test List".to_string(), peer(1));
         holder_list
             .add_task(make_task(1, peer(1)), peer(1), 1)
@@ -3347,8 +3094,6 @@ mod tests {
             .add_task(make_task(2, peer(1)), peer(1), 2)
             .expect("holder t2");
 
-        // The joiner starts EMPTY (a non-empty task list never bootstraps
-        // — only empty lists run the requester).
         let joiner_list = TaskList::new(list_id(1), "Test List".to_string(), peer(2));
         let joiner =
             TaskListSync::new(joiner_list, Arc::clone(&pubsub), topic.to_string(), peer(2))
@@ -3356,11 +3101,6 @@ mod tests {
         let mut probe = pubsub.subscribe(side.clone()).await;
         joiner.start().await.expect("start joiner");
 
-        // "One live incremental delta": the joiner ends up holding only t2,
-        // cloned out of the holder's own full delta so the resolved fields
-        // are byte-identical and the post-recovery digests can match
-        // exactly. Merged directly into the store — this is the state the
-        // live-gossip bait leaves behind.
         let t2_only = {
             let full = holder_list.full_delta();
             let (id, (task, tag)) = full
@@ -3378,7 +3118,6 @@ mod tests {
             .merge_delta(&t2_only, peer(1), Some(&agent(1)))
             .expect("seed t2");
 
-        // The loss window: the marker survives, the full delta does not.
         let marker = TaskListSyncMessage::StateServedV2 {
             responder: peer(1),
             digest: holder_list.served_digest(),
@@ -3390,8 +3129,6 @@ mod tests {
             .await
             .expect("publish marker");
 
-        // Well past the front burst the requester must STILL be asking —
-        // its local digest ({t2}) does not match the declaration ({t1,t2}).
         let mut requests = 0;
         for _ in 0..10 {
             tokio::time::sleep(Duration::from_secs(30)).await;
@@ -3407,8 +3144,6 @@ mod tests {
             "the lost broadcast never arrived"
         );
 
-        // The real holder returns: the next serve delivers {t1,t2}, the
-        // local digest then matches the declaration, and the tail stops.
         let holder =
             TaskListSync::new(holder_list, Arc::clone(&pubsub), topic.to_string(), peer(1))
                 .expect("holder sync");
@@ -3428,7 +3163,6 @@ mod tests {
             "the still-alive requester must recover the lost task"
         );
 
-        // Convergence is terminal: no further requests.
         tokio::time::sleep(Duration::from_secs(160)).await;
         drain_state_requests(&mut probe, peer(2)).await;
         let mut relapse = 0;
@@ -3439,25 +3173,12 @@ mod tests {
         assert_eq!(relapse, 0, "a digest-matched requester must fall silent");
     }
 
-    /// WHY (issue #240, residual 2 — deletion cold-sync): a full delta
-    /// carries only live tasks, so a plain merge could never delete a stale
-    /// replica's obsolete tasks. The digest-verified full-replace adopt
-    /// closes that: the serve's delta content is bound to the holder's
-    /// declared digest, and since #643 the prune additionally requires
-    /// holder-carried DELETION EVIDENCE. Since #654 the prune is also
-    /// gated by the list's content policy — an UNSIGNED serve (no
-    /// envelope-verified writer) fails closed exactly like its adds
-    /// would, which is why this test drives a signing pubsub (see
-    /// `stale_full_serve_after_live_add_must_not_prune_the_live_task`).
     #[tokio::test(start_paused = true)]
     async fn digest_verified_full_serve_prunes_stale_tasks() {
         let pubsub = signed_pubsub().await;
         let topic = "tasks-240-prune-stale";
         let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
 
-        // Holder: added t1 and t_stale, then DELETED t_stale — its serve
-        // carries the live set {t1} plus an ordering register that still
-        // names t_stale, the causal evidence of the deletion.
         let mut holder_list = TaskList::new(list_id(1), "Test List".to_string(), peer(1));
         holder_list
             .add_task(make_task(1, peer(1)), peer(1), 1)
@@ -3469,11 +3190,6 @@ mod tests {
             .remove_task(&TaskId::from_bytes([9; 32]))
             .expect("holder deletes t_stale");
 
-        // Stale joiner: starts EMPTY (only empty lists run the requester),
-        // then state lands the way it would in production — t1 (from the
-        // holder's full delta, byte-identical) and t_stale (an obsolete
-        // task the holder deleted while this replica was away) merge
-        // directly into the store before the holder ever comes online.
         let joiner_list = TaskList::new(list_id(1), "Test List".to_string(), peer(2));
         let joiner =
             TaskListSync::new(joiner_list, Arc::clone(&pubsub), topic.to_string(), peer(2))
@@ -3504,7 +3220,6 @@ mod tests {
                 .expect("holder sync");
         holder.start().await.expect("start holder");
 
-        // The verified adopt must remove the stale task while t1 stays.
         let stale = TaskId::from_bytes([9; 32]);
         let mut pruned = false;
         for _ in 0..200 {
@@ -3521,8 +3236,6 @@ mod tests {
              (deletion cold-sync)"
         );
 
-        // And convergence follows: local state now equals the declared
-        // digest, so the requester falls silent.
         tokio::time::sleep(Duration::from_secs(160)).await;
         drain_state_requests(&mut probe, peer(2)).await;
         let mut relapse = 0;
@@ -3533,23 +3246,6 @@ mod tests {
         assert_eq!(relapse, 0, "the requester must stop once the digests match");
     }
 
-    /// WHY (issue #643): a digest-verified full serve proves the delta
-    /// equals the holder's COMPLETE state at serve time — it does NOT prove
-    /// that state is fresh relative to this replica. A serve solicited
-    /// before the holder merged a live add delta can arrive AFTER this
-    /// replica already merged the add; pruning on absence observe-removes
-    /// the task, so a visibility read (GET) and a subsequent claim
-    /// disagree and the claim fails `task not found` (observed as HTTP 500
-    /// in the convergence soak, run 10 of 20260911-092818). The prune
-    /// fires ONLY on explicit holder-carried removal evidence
-    /// (empty-tag-set `removed_tasks` entries, #643 round 2) — a task the
-    /// serve merely lacks is newer knowledge than the serve and adds-win
-    /// keeps it.
-    ///
-    /// The stale holder here is NON-EMPTY (it carries an older task): that
-    /// is the only serve shape production emits — responders with empty
-    /// lists stay silent — and it makes the serve's digest and entry_count
-    /// exactly what a live mesh would declare.
     #[tokio::test(start_paused = true)]
     async fn stale_full_serve_after_live_add_must_not_prune_the_live_task() {
         let pubsub = signed_pubsub().await;
