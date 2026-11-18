@@ -799,6 +799,8 @@ pub async fn serve_with_options(
     }
 
     let (broadcast_tx, _) = broadcast::channel::<SseEvent>(256);
+    // This keypair is the root of trust for `SecureShareDelivered`: only the
+    // holder of the secret half can open group-shared-secret envelopes.
     let agent_kem_path = config.data_dir.join("agent_kem.key");
     let agent_kem_keypair = Arc::new(
         x0x::groups::kem_envelope::AgentKemKeypair::load_or_generate(&agent_kem_path)
@@ -810,6 +812,8 @@ pub async fn serve_with_options(
         agent_kem_keypair.public_bytes.len()
     );
 
+    // ADR-0036: enforce the owner singleton BEFORE the builder runs — a
+    // mismatched key must not re-issue and persist agent.cert.
     enforce_owner_singleton_prebuild(&config, &identity_dir).await?;
 
     let acl_admin =
@@ -3841,6 +3845,8 @@ pub(in crate::server) fn resolve_group_entry_mut_locked<'a>(
     groups.get_mut(&key)
 }
 
+/// ADR-0066/ADR-0067: resolve under both spellings — exact map key first,
+/// then stable-id scan, so callers with a stable id never miss the record.
 pub(in crate::server) fn resolve_group_entry_locked<'a>(
     groups: &'a HashMap<String, x0x::groups::GroupInfo>,
     group_id: &str,

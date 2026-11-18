@@ -4252,6 +4252,9 @@ mod tests {
 
     #[test]
     fn home_anonymous_digest_is_no_disclosure_for_a_valid_embedded_certificate() {
+        // ADR 0108 §4: an owner device that never consented announces
+        // anonymously; in a committed Home that is absence of disclosure,
+        // not a contradiction of the committed certificate.
         let mut home = committed_home();
         let evidence = anonymous_evidence(&home);
         let creator = home.creator_hex.clone();

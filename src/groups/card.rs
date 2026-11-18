@@ -29,7 +29,8 @@ pub const AGENT_CARD_SIGNATURE_SCHEME_V2: &str = "x0x.agent-card.v2.ml-dsa-65";
 /// A shareable identity card for an x0x agent.
 ///
 /// Pre-ADR-0036 peers verify v1 only and reject owner-named (v2) cards;
-/// ownerless cards interoperate both ways.
+/// this is the ADR-0029 fail-closed posture for unknown versions.
+/// Ownerless cards interoperate both ways.
 ///
 /// Contains everything someone needs to find and trust you on the network.
 #[derive(Debug, Clone, Serialize, Deserialize)]
