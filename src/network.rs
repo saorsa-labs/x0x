@@ -1305,6 +1305,30 @@ pub struct NetworkConfig {
     /// `/peers`.
     #[serde(default)]
     pub observed_prefix_enabled: bool,
+
+    /// Serve MASQUE relay sessions for other peers (ant-quic ADR-019).
+    ///
+    /// When `false`, ant-quic builds no relay server and refuses relay
+    /// requests with `403`; the node still uses relays, coordinates hole
+    /// punching and observes addresses. The x0xd daemon sets this from
+    /// [`resolve_relay_service_enabled`].
+    #[serde(default = "default_relay_service_enabled")]
+    pub relay_service_enabled: bool,
+}
+
+/// Effective relay-serving setting for a node (#1642).
+///
+/// An explicit operator value wins. Otherwise a [`ParticipationMode::Full`]
+/// node serves relay sessions and a [`ParticipationMode::Leaf`] node does not.
+///
+/// [`ParticipationMode::Full`]: crate::gossip::ParticipationMode::Full
+/// [`ParticipationMode::Leaf`]: crate::gossip::ParticipationMode::Leaf
+#[must_use]
+pub fn resolve_relay_service_enabled(
+    explicit: Option<bool>,
+    mode: crate::gossip::ParticipationMode,
+) -> bool {
+    explicit.unwrap_or(matches!(mode, crate::gossip::ParticipationMode::Full))
 }
 
 /// X0X-0070b: TOML-shaped configuration for the peer-relay fallback
@@ -1522,6 +1546,10 @@ fn default_mdns_enabled() -> bool {
     true
 }
 
+fn default_relay_service_enabled() -> bool {
+    true
+}
+
 fn default_connection_timeout() -> Duration {
     DEFAULT_CONNECTION_TIMEOUT
 }
@@ -1568,6 +1596,7 @@ impl Default for NetworkConfig {
             peer_relay: PeerRelayConfig::default(),
             network_id: None,
             observed_prefix_enabled: false,
+            relay_service_enabled: true,
         }
     }
 }
@@ -3304,6 +3333,7 @@ impl NetworkNode {
         // shared mDNS service and auto-connecting beneath x0x's policy
         // gates.
         builder = builder.mdns_enabled(config.mdns_enabled);
+        builder = builder.relay_service_enabled(config.relay_service_enabled);
 
         // Single-cache architecture: the endpoint owns the bootstrap cache;
         // x0x borrows the same instance below instead of opening a second
@@ -15030,6 +15060,7 @@ async fn test_mesh_connections_are_bidirectional() {
             peer_relay: PeerRelayConfig::default(),
             network_id: None,
             observed_prefix_enabled: false,
+            relay_service_enabled: true,
         };
 
         let node = NetworkNode::new(config, None, None).await.unwrap();
@@ -16310,6 +16341,31 @@ mod message_tests {
     #[test]
     fn default_mdns_enabled_value() {
         assert!(default_mdns_enabled());
+    }
+
+    #[test]
+    fn relay_service_defaults_on_for_library_config() {
+        assert!(default_relay_service_enabled());
+        assert!(NetworkConfig::default().relay_service_enabled);
+    }
+
+    #[test]
+    fn relay_service_default_follows_participation_mode() {
+        use crate::gossip::ParticipationMode;
+        assert!(resolve_relay_service_enabled(None, ParticipationMode::Full));
+        assert!(!resolve_relay_service_enabled(
+            None,
+            ParticipationMode::Leaf
+        ));
+    }
+
+    #[test]
+    fn relay_service_explicit_value_wins_over_mode() {
+        use crate::gossip::ParticipationMode;
+        for mode in [ParticipationMode::Leaf, ParticipationMode::Full] {
+            assert!(resolve_relay_service_enabled(Some(true), mode));
+            assert!(!resolve_relay_service_enabled(Some(false), mode));
+        }
     }
 
     #[test]

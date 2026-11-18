@@ -55,6 +55,7 @@ const ROOT_OWNED_KEYS: &[&str] = &[
     "presence_beacon_interval_secs",
     "presence_event_poll_interval_secs",
     "presence_offline_timeout_secs",
+    "relay_service_enabled",
     "rendezvous_enabled",
     "rendezvous_validity_ms",
     "skip_legacy_dm_bus",
@@ -541,6 +542,24 @@ enabled = false
         let findings = diagnose_section_placement(&root("[gossip]\nskip_legacy_dm_bus = true\n"));
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].key, "skip_legacy_dm_bus");
+    }
+
+    #[test]
+    fn relay_service_enabled_is_a_recognised_root_key() {
+        let (default_config, default_ignored) =
+            parse_with_ignored_keys("").expect("empty config parses");
+        assert_eq!(default_config.relay_service_enabled, None);
+        assert!(default_ignored.is_empty());
+
+        let (config, ignored) =
+            parse_with_ignored_keys("relay_service_enabled = false\n").expect("parses");
+        assert_eq!(config.relay_service_enabled, Some(false));
+        assert!(ignored.is_empty(), "got spurious ignored keys: {ignored:?}");
+
+        let findings =
+            diagnose_section_placement(&root("[gossip]\nrelay_service_enabled = false\n"));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].key, "relay_service_enabled");
     }
 
     #[test]

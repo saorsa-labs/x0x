@@ -638,27 +638,6 @@ pub async fn serve_with_options(
             "Gossip plane isolation DISABLED (network_id = \"\") — this daemon will \n             exchange gossip with every plane, including cross-plane mDNS peers"
         ),
     }
-    let network_config = NetworkConfig {
-        bind_addr: Some(bind_address),
-        bootstrap_nodes: config.resolved_bootstrap_peers(),
-        max_connections: 50,
-        connection_timeout: std::time::Duration::from_secs(30),
-        stats_interval: std::time::Duration::from_secs(60),
-        pinned_bootstrap_peers: std::collections::HashSet::new(),
-        inbound_allowlist: std::collections::HashSet::new(),
-        max_peers_per_ip: 3,
-        port_mapping_enabled: config.port_mapping_enabled && !cli_no_port_mapping,
-        mdns_enabled: config.mdns_enabled,
-        peer_relay: config.peer_relay.clone(),
-        network_id,
-        observed_prefix_enabled: config.observed_prefix_enabled,
-    };
-
-    let contacts_path = config.data_dir.join("contacts.json");
-    let mut history_config = config.history.clone();
-    if history_config.db_path.is_none() {
-        history_config.db_path = Some(config.data_dir.join("history.db"));
-    }
     let exe = std::env::current_exe().ok();
     // ADR-0034: `--relay` is ONE operator concept — "be a relay node". Any of
     // the three sources (CLI flag, `X0X_RELAY_OPT_IN=1`, TOML `gossip.relay`)
@@ -689,6 +668,37 @@ pub async fn serve_with_options(
     let mut gossip_config = config.gossip.clone();
     gossip_config.participation = participation.mode;
     gossip_config.participation_reason = participation.reason.to_string();
+    let relay_service_enabled = x0x::network::resolve_relay_service_enabled(
+        config.relay_service_enabled,
+        participation.mode,
+    );
+    tracing::info!(
+        relay_service_enabled,
+        explicit = config.relay_service_enabled.is_some(),
+        "resolved relay serving"
+    );
+    let network_config = NetworkConfig {
+        bind_addr: Some(bind_address),
+        bootstrap_nodes: config.resolved_bootstrap_peers(),
+        max_connections: 50,
+        connection_timeout: std::time::Duration::from_secs(30),
+        stats_interval: std::time::Duration::from_secs(60),
+        pinned_bootstrap_peers: std::collections::HashSet::new(),
+        inbound_allowlist: std::collections::HashSet::new(),
+        max_peers_per_ip: 3,
+        port_mapping_enabled: config.port_mapping_enabled && !cli_no_port_mapping,
+        mdns_enabled: config.mdns_enabled,
+        peer_relay: config.peer_relay.clone(),
+        network_id,
+        observed_prefix_enabled: config.observed_prefix_enabled,
+        relay_service_enabled,
+    };
+
+    let contacts_path = config.data_dir.join("contacts.json");
+    let mut history_config = config.history.clone();
+    if history_config.db_path.is_none() {
+        history_config.db_path = Some(config.data_dir.join("history.db"));
+    }
 
     let mut builder = Agent::builder()
         .with_network_config(network_config)
@@ -5887,6 +5897,76 @@ mod startup_update_check_tests {
             .await
             .expect("shutdown must complete despite the hung update check")
             .expect("clean shutdown");
+    }
+}
+
+#[cfg(test)]
+mod relay_serving_wiring_tests {
+    use crate::server::{serve_with_options, DaemonConfig, ServeOptions};
+    use std::time::Duration;
+
+    async fn daemon_relay_enabled(toml_key: Option<bool>, cli_relay: bool) -> bool {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = DaemonConfig {
+            data_dir: dir.path().to_path_buf(),
+            identity_dir: Some(dir.path().join("identity")),
+            api_address: "127.0.0.1:0".parse().expect("loopback api address"),
+            bind_address: "127.0.0.1:0".parse().expect("loopback quic address"),
+            bootstrap_peers: Some(Vec::new()),
+            network_id: Some("issue-1642.relay-serving-wiring".to_string()),
+            mdns_enabled: false,
+            relay_service_enabled: toml_key,
+            ..DaemonConfig::default()
+        };
+        config.history.enabled = false;
+        let options = ServeOptions {
+            skip_update_check: true,
+            cli_no_port_mapping: true,
+            cli_disable_peer_cache: true,
+            cli_relay,
+            ..ServeOptions::default()
+        };
+        let handle =
+            tokio::time::timeout(Duration::from_secs(30), serve_with_options(config, options))
+                .await
+                .expect("serve within 30 s")
+                .expect("hermetic serve");
+        let token = std::fs::read_to_string(dir.path().join("api-token")).expect("api token");
+        let body: serde_json::Value = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("http client")
+            .get(format!(
+                "http://{}/diagnostics/connectivity",
+                handle.local_addr()
+            ))
+            .bearer_auth(token.trim())
+            .send()
+            .await
+            .expect("connectivity request")
+            .json()
+            .await
+            .expect("connectivity json");
+        tokio::time::timeout(Duration::from_secs(30), handle.shutdown_and_wait())
+            .await
+            .expect("shutdown within 30 s")
+            .expect("clean shutdown");
+        body["services"]["relay_enabled"]
+            .as_bool()
+            .expect("services.relay_enabled is a bool")
+    }
+
+    /// #1642: the value read back is the ant-quic node status, so this fails
+    /// when either the daemon resolution or the ant-quic builder call is lost.
+    #[tokio::test]
+    async fn daemon_relay_serving_follows_participation_and_explicit_key() {
+        assert!(!daemon_relay_enabled(None, false).await, "Leaf default");
+        assert!(daemon_relay_enabled(None, true).await, "Full default");
+        assert!(daemon_relay_enabled(Some(true), false).await, "Leaf opt-in");
+        assert!(
+            !daemon_relay_enabled(Some(false), true).await,
+            "Full opt-out"
+        );
     }
 }
 
