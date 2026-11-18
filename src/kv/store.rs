@@ -6003,13 +6003,12 @@ mod tests {
         );
     }
 
-    /// #2067 review findings 2 and 4: a removal that only one replica holds
-    /// still lets the other replica take the shrunk image at once. A
-    /// back-off never refuses an incoming merge; it only delays this
-    /// replica's own pulls from the refused source, and any shrink of this
-    /// replica's image re-opens them.
+    /// #2067 review findings 2 and 4: after a removal that only one replica
+    /// holds, the other replica admits the shrunk image as soon as it is
+    /// offered. A back-off never refuses an incoming merge; it only delays
+    /// this replica's own pulls (see the pull-gate test below).
     #[test]
-    fn a_removal_known_to_one_replica_only_converges_without_waiting() {
+    fn a_removal_known_to_one_replica_only_is_admitted_once_offered() {
         let soft = SOFT_IMAGE_LIMIT_BYTES as u64;
         let mut base = two_writer_group(35);
         fill_canonical_to(&mut base, soft - 500_000, "base", peer(3));
@@ -6042,6 +6041,54 @@ mod tests {
         a.merge_group_retained_image(&b.served_image_for_test(), agent(2), peer(1))
             .expect("A takes B's image");
         assert_eq!(visible(&a), visible(&b), "both replicas converged");
+    }
+
+    /// #2067 re-review: the pull gate. After B refuses A's image, B's pulls
+    /// from A are deferred (`image_retry_due` is false, so the digest-beacon
+    /// wake is not granted). A's removal of keys only A held does not shrink
+    /// B's image, so B waits for the window; once it has passed the pull is
+    /// due, and the merge of A's shrunk image converges.
+    #[test]
+    fn the_pull_gate_defers_a_refused_source_until_its_window_passes() {
+        let soft = SOFT_IMAGE_LIMIT_BYTES as u64;
+        let mut base = two_writer_group(36);
+        fill_canonical_to(&mut base, soft - 500_000, "base", peer(3));
+        let mut a = base.clone();
+        a.merge_delta(
+            &bulk_delta("a", 50, peer(1), a.version),
+            peer(1),
+            Some(&agent(1)),
+        )
+        .expect("A writes");
+        let mut b = base.clone();
+        b.merge_delta(
+            &bulk_delta("b", 50, peer(2), b.version),
+            peer(2),
+            Some(&agent(2)),
+        )
+        .expect("B writes");
+        assert!(matches!(
+            b.merge_group_retained_image(&a.served_image_for_test(), agent(1), peer(2)),
+            Err(KvError::StoreFull { .. })
+        ));
+        for i in 0..45u64 {
+            a.remove(&format!("a{i:05}")).expect("remove");
+        }
+        let now = now_ms();
+        assert!(!b.image_retry_due(&agent(1)), "the pull from A is deferred");
+        assert!(
+            !b.image.retry_due(&agent(1), now + 29_000),
+            "still deferred inside the first 30 s window"
+        );
+        assert!(
+            b.image.retry_due(&agent(1), now + 31_000),
+            "due once the window has passed"
+        );
+        b.merge_group_retained_image(&a.served_image_for_test(), agent(1), peer(2))
+            .expect("the due pull converges");
+        a.merge_group_retained_image(&b.served_image_for_test(), agent(2), peer(1))
+            .expect("A takes B's image");
+        assert_eq!(visible(&a), visible(&b));
     }
 
     /// #1970 review round 2 (nit): only stores that serve their complete
