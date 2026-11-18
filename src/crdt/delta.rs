@@ -1,16 +1,4 @@
 //! Delta-CRDT implementation for bandwidth-efficient TaskList synchronization.
-//!
-//! This module provides delta-based CRDT operations for TaskList, allowing
-//! efficient incremental synchronization between peers.
-//!
-//! ## Delta Strategy
-//!
-//! Instead of sending the entire TaskList on every sync, we:
-//! 1. Track version numbers for each change
-//! 2. Generate deltas containing only changes since a given version
-//! 3. Apply deltas incrementally
-//!
-//! This significantly reduces bandwidth usage in collaborative scenarios.
 
 use crate::crdt::{Result, TaskId, TaskItem, TaskList, TaskListId};
 use crate::identity::AgentId;
@@ -31,8 +19,7 @@ pub struct TaskListDelta {
     /// Tasks that were added (task_id -> (task, unique_tag))
     pub added_tasks: HashMap<TaskId, (TaskItem, UniqueTag)>,
 
-    /// Tasks that were removed. Two encodings share this map (issue #643
-    /// round 2):
+    /// Tasks that were removed. Two encodings share this map:
     ///
     /// - **Non-empty tag set** — a removal delta: observe-remove these
     ///   exact tags; `merge_delta` force-removes the id.
@@ -45,9 +32,6 @@ pub struct TaskListDelta {
     pub removed_tasks: HashMap<TaskId, HashSet<UniqueTag>>,
 
     /// Updates to existing tasks (task_id -> full task state)
-    ///
-    /// Note: For simplicity, we currently send the full TaskItem state.
-    /// A future optimization could implement TaskItemDelta for finer-grained updates.
     pub task_updates: HashMap<TaskId, TaskItem>,
 
     /// Update to task ordering, carried as the full LWW register (value +
@@ -117,19 +101,10 @@ impl TaskListDelta {
             && self.name_update.is_none()
     }
 
-    /// Digest over the full-state content this delta serves, when the delta
-    /// is full-state-shaped (issue #240).
-    ///
-    /// A `TaskList::full_delta` always carries BOTH the ordering and name
-    /// registers; incremental deltas carry at most one of them, so `None`
-    /// cleanly excludes non-full-state shapes. Callers MUST additionally
-    /// require the added-task count to equal the holder's declared
-    /// `entry_count` before treating a digest match as a verified full
-    /// serve. The digest commits to the carried tasks' RESOLVED observable
-    /// fields in sorted task-id order (see
-    /// [`TaskItem::hash_resolved_fields`]) — identical to what
-    /// [`TaskList::served_digest`] computes over local state, so a receiver
-    /// holding exactly the served content produces the same digest.
+    /// Digest over the full-state content this delta serves, or `None` when the
+    /// delta is not full-state-shaped (a full delta carries both registers).
+    /// Callers must also require the added-task count to equal the holder's
+    /// declared `entry_count` before treating a match as a verified full serve.
     pub(crate) fn served_digest(&self, list_id: &TaskListId) -> Option<[u8; 32]> {
         self.ordering_update.as_ref()?;
         self.name_update.as_ref()?;
@@ -146,18 +121,10 @@ impl TaskListDelta {
     }
 }
 
-/// Extension to TaskList to support delta-based synchronization.
-///
-/// This implementation adds version tracking and delta generation/merging
-/// capabilities to TaskList.
 impl TaskList {
     /// Get the current version of this TaskList.
     ///
-    /// The version is incremented on each modification. This enables
-    /// delta-based synchronization.
-    ///
-    /// Note: This is a placeholder implementation. A production version
-    /// would track the actual version in TaskList's state.
+    /// The version is incremented on each modification.
     #[must_use]
     pub fn version(&self) -> u64 {
         self.current_version()
@@ -169,15 +136,10 @@ impl TaskList {
     /// "added" entry plus the current ordering and name. Receivers apply it
     /// with `merge_delta`, whose upsert/LWW semantics make a full snapshot a
     /// safe superset of any incremental change — this is the producer used to
-    /// answer cold-start state requests (see `TaskListSync`). The OR-Set tags
-    /// are synthetic because the receiver re-derives membership on merge —
-    /// but they must be FRESH per entry (F3, fix-loop): after a prune the
-    /// receiver's OR-Set carries tombstones for the previously served
-    /// tags, and a hardcoded tag would couple every re-serve to that
-    /// tombstone state. (crdt-sync's `OrSet::add` un-tombstones the very
-    /// tag it re-adds, so a same-tag re-serve is typically accepted
-    /// anyway — fresh tags keep serves self-contained regardless of the
-    /// receiver's tombstone state, which is the only portable guarantee.)
+    /// answer cold-start state requests (see `TaskListSync`).
+    /// The OR-Set tags are synthetic but fresh per entry: after a prune the
+    /// receiver holds tombstones for previously served tags, and a fixed tag
+    /// would couple every re-serve to that tombstone state.
     #[must_use]
     pub fn full_delta(&self) -> TaskListDelta {
         let mut delta = TaskListDelta::new(self.version());
@@ -189,13 +151,10 @@ impl TaskList {
             delta.added_tasks.insert(task_id, ((*task).clone(), tag));
         }
 
-        // Carry the raise-only observed-removed evidence (issue #643
-        // round 2) as empty-tag-set `removed_tasks` entries. This is the
-        // ONLY thing that lets a digest-verified full serve distinguish
-        // "holder deleted T" from "holder's snapshot merely predates T's
-        // add": the adopt gate prunes on this explicit evidence, never on
-        // absence (see `TaskList::prune_to_served_set`). Ids the serve
-        // still carries live are re-adds and are excluded.
+        // Empty-tag-set `removed_tasks` entries are the only thing that lets a
+        // digest-verified full serve tell "holder deleted T" from "holder's
+        // snapshot predates T's add": the adopt gate prunes on this evidence,
+        // never on absence.
         let live: std::collections::HashSet<&TaskId> = delta.added_tasks.keys().collect();
         for id in self.known_removed_ids() {
             if !live.contains(id) {
@@ -205,9 +164,8 @@ impl TaskList {
             }
         }
 
-        // Carry the registers themselves (value + clock) so a cold-start
-        // snapshot merges by causality and cannot clobber a newer local
-        // ordering/name on an already-populated peer.
+        // Carry the registers with their clocks so a cold-start snapshot merges
+        // by causality and cannot clobber a newer local ordering or name.
         delta.ordering_update = Some(self.ordering_register().clone());
         delta.name_update = Some(self.name_register().clone());
 
@@ -223,7 +181,7 @@ impl TaskList {
     /// - Ordering uses LWW semantics
     /// - Name uses LWW semantics
     ///
-    /// # Authorship gate (issue #349, Layer A)
+    /// # Authorship gate
     ///
     /// Unauthenticated content fields (added tasks, metadata LWW on
     /// TaskItem, list name, ordering, removes) apply only when `writer` —
@@ -253,30 +211,16 @@ impl TaskList {
     pub fn merge_delta(
         &mut self,
         delta: &TaskListDelta,
-        peer_id: PeerId,          // tag only, not identity
-        writer: Option<&AgentId>, // envelope-verified sender
+        peer_id: PeerId,
+        writer: Option<&AgentId>,
     ) -> Result<()> {
-        // Capture the resolved observable fingerprint BEFORE applying the
-        // delta so the local version advances exactly once iff this merge
-        // effectively changes the local snapshot. (Remote claim/complete
-        // merges must invalidate a caller's stale local token.)
-        //
-        // The body uses delta_* helpers that do NOT bump version internally;
-        // only commit_revision_if_changed advances it. This ensures an
-        // idempotent redelivery (same resolved state) does NOT advance the
-        // fence, while a real remote change advances it exactly once.
-        //
-        // NOTE (composition with the provenance gate): any unauthenticated or
-        // forged Claimed/Done element is dropped by the admission gate inside
-        // delta_upsert_task / TaskItem::merge — before it can influence
-        // resolution. Because this fingerprint wraps the entire merge body, it
-        // is computed over post-gate (authenticated) state by construction.
+        // The delta_* helpers below do not bump the version; only
+        // `commit_revision_if_changed` does, so an idempotent redelivery leaves
+        // it alone and a real change advances it exactly once.
         let before = self.state_fingerprint();
 
-        // Layer A authorship gate (issue #349, I2 + membership): decide ONCE
-        // whether unauthenticated content fields may apply. Identity is the
-        // envelope-verified `writer` (AgentId) only; `peer_id` and every
-        // UniqueTag in the delta are OR-Set tags, never authors (I3).
+        // Identity is the envelope-verified `writer` only; `peer_id` and every
+        // tag in the delta are OR-Set tags, never authors.
         let content_allowed = match writer {
             None => false,
             Some(w) => self.is_authorized_content_writer(w),
@@ -290,33 +234,23 @@ impl TaskList {
         }
 
         for (task_id, (task, tag)) in &delta.added_tasks {
-            // If task doesn't exist, add it (admit runs inside delta_upsert_task).
-            // If it exists, merge + filter (admit + membership run inside
-            // delta_merge_task / delta_merge_checkbox_only).
             if self.get_task(task_id).is_none() {
                 if content_allowed {
                     self.delta_upsert_task(task.clone(), tag.0, tag.1)?;
                 }
-                // A first-seen task from an unauthenticated add is NOT
-                // created: there is no local task to run checkbox admission
-                // against, and `created_by` is self-declared payload.
+                // A first-seen task from an unauthenticated add is not created:
+                // there is no local task to run checkbox admission against.
             } else if content_allowed {
                 self.delta_merge_task(task_id, task)?;
             } else {
-                // Existing task: checkbox + attestations still merge and run
-                // the admission gate even when content is dropped.
+                // Checkbox and attestations still merge when content is dropped.
                 self.delta_merge_checkbox_only(task_id, task)?;
             }
         }
 
-        // Apply removed tasks (no version bump; deferred to commit_revision).
-        // Two encodings (see `removed_tasks`): a NON-EMPTY tag set is a
-        // removal delta — force-remove. An EMPTY tag set is deletion
-        // cold-sync evidence carried by a full serve — record it
-        // (raise-only) so this replica's own serves forward it, but do
-        // NOT remove here: general merge must never delete on a stale
-        // holder's snapshot (only the digest-verified adopt gate may,
-        // issue #643 round 2).
+        // A non-empty tag set is a removal delta: force-remove. An empty tag set
+        // is deletion evidence carried by a full serve: record it but do not
+        // remove here. Only the digest-verified adopt gate may delete on it.
         if content_allowed {
             let mut evidence: Vec<TaskId> = Vec::new();
             for (task_id, tags) in &delta.removed_tasks {
@@ -329,12 +263,8 @@ impl TaskList {
             self.record_removed_evidence(evidence);
         }
 
-        // Apply task updates (upsert: merge if exists, insert if missing).
-        // The upsert is critical for out-of-order delivery — a claim/complete
-        // delta may arrive before the corresponding add delta. Since the
-        // TaskItem in task_updates contains full state, inserting it directly
-        // is safe and preserves the state change. The admission gate runs
-        // inside delta_upsert_task / merge.
+        // Upsert: a claim or complete delta may arrive before its add delta, and
+        // `task_updates` carries full task state.
         for (task_id, updated_task) in &delta.task_updates {
             if self.get_task(task_id).is_some() {
                 if content_allowed {
@@ -343,53 +273,41 @@ impl TaskList {
                     self.delta_merge_checkbox_only(task_id, updated_task)?;
                 }
             } else if content_allowed {
-                // Task not yet known — insert it (admit runs inside).
                 self.delta_upsert_task(updated_task.clone(), peer_id, 0)?;
             }
         }
 
-        // Apply ordering update via LWW (vector-clock) merge. The merged
-        // ordering may reference task IDs not yet present (out-of-order
-        // delivery); tasks_ordered filters those at read time.
+        // The merged ordering may name tasks not yet present; `tasks_ordered`
+        // filters those at read time.
         if content_allowed {
             if let Some(order_register) = &delta.ordering_update {
                 self.delta_merge_ordering(order_register);
             }
 
-            // Apply name update via LWW (vector-clock) merge.
             if let Some(name_register) = &delta.name_update {
                 self.delta_merge_name(name_register);
             }
         }
 
-        // Advance the local revision exactly once iff the resolved observable
-        // snapshot changed. Idempotent re-merges (same resolutions) ⇒ no bump.
         self.commit_revision_if_changed(before);
         Ok(())
     }
 }
 
-/// Implement DeltaCrdt trait for TaskList.
-///
-/// This enables TaskList to participate in saorsa-gossip's delta-based
-/// synchronization infrastructure.
 impl DeltaCrdt for TaskList {
     type Delta = TaskListDelta;
 
     fn merge(&mut self, delta: &Self::Delta) -> anyhow::Result<()> {
-        // No writer identity here — DeltaCrdt::merge is NOT a production
-        // untrusted-apply path (issue #349). Pass `None` so no unsigned
-        // content applies; the trusted gossip route is TaskListSync, which
-        // threads the envelope-verified sender into merge_delta.
+        // Not a production untrusted-apply path: `None` so no unsigned content
+        // applies. The trusted route is `TaskListSync`.
         let peer_id = PeerId::new([0u8; 32]);
         self.merge_delta(delta, peer_id, None)
             .map_err(|e| anyhow::anyhow!("Failed to merge delta: {}", e))
     }
 
     fn delta(&self, since_version: u64) -> Option<Self::Delta> {
-        // A full-state delta is a sound conservative answer to "changes since
-        // version N": merge_delta is idempotent and LWW/upsert-based, so the
-        // receiver converges regardless of how much extra state we include.
+        // A full-state delta is a sound answer to "changes since N":
+        // `merge_delta` is idempotent.
         if since_version >= self.version() {
             None
         } else {
@@ -462,7 +380,6 @@ mod tests {
 
         let initial_version = list.version();
 
-        // Add a task
         let task = make_task(1, peer);
         list.add_task(task, peer, 1).ok().unwrap();
 
@@ -476,11 +393,9 @@ mod tests {
         let id = list_id(1);
         let mut list = TaskList::new(id, "Test".to_string(), peer);
 
-        // Add a task
         let task = make_task(1, peer);
         list.add_task(task, peer, 1).ok().unwrap();
 
-        // A full-state delta carries every active task.
         let delta = list.full_delta();
         assert!(!delta.is_empty());
         assert!(!delta.added_tasks.is_empty());
@@ -494,8 +409,6 @@ mod tests {
 
         let current_version = list.version();
 
-        // Asking the DeltaCrdt trait for changes since the current version
-        // yields nothing.
         let delta = DeltaCrdt::delta(&list, current_version);
         assert!(delta.is_none());
     }
@@ -509,29 +422,19 @@ mod tests {
         let mut list1 = TaskList::new(id, "List 1".to_string(), peer1);
         let mut list2 = TaskList::new(id, "List 2".to_string(), peer2);
 
-        // list2 adds a task
         let task = make_task(1, peer2);
         list2.add_task(task, peer2, 1).ok().unwrap();
 
-        // Generate a full-state delta from list2
         let delta = list2.full_delta();
 
-        // Merge delta into list1 (envelope-verified writer; the payload tag
-        // PeerId stays tag-only).
         let result = list1.merge_delta(&delta, peer1, Some(&agent(2)));
         assert!(result.is_ok());
 
-        // list1 should now have the task
         assert_eq!(list1.task_count(), 1);
     }
 
     #[test]
     fn full_delta_lets_a_late_joiner_converge() {
-        // WHY: a peer that subscribes after tasks were already added has no
-        // organic deltas to replay. The cold-start path (TaskListSync's
-        // StateRequest) answers with `full_delta()`; merging it must reproduce
-        // the holder's complete state — every task, the ordering, and the name
-        // — or a late joiner would converge to a partial list.
         let holder_peer = peer(1);
         let joiner_peer = peer(2);
         let id = list_id(1);
@@ -549,7 +452,6 @@ mod tests {
             .expect("reorder");
         holder.update_name("Sprint Backlog".to_string(), holder_peer);
 
-        // Fresh joiner with an empty list applies only the cold-start snapshot.
         let mut joiner = TaskList::new(id, String::new(), joiner_peer);
         let snapshot = holder.full_delta();
         joiner
@@ -565,10 +467,6 @@ mod tests {
 
     #[test]
     fn test_delta_crdt_trait_merge() {
-        // Layer A (issue #349): DeltaCrdt::merge carries no writer identity,
-        // so it is NOT an untrusted-apply path — it passes `None` and must
-        // apply no unsigned content. The task from list2's delta must NOT
-        // land, and the version must not advance on dropped content.
         let peer1 = peer(1);
         let peer2 = peer(2);
         let id = list_id(1);
@@ -576,16 +474,13 @@ mod tests {
         let mut list1 = TaskList::new(id, "List".to_string(), peer1);
         let mut list2 = TaskList::new(id, "List".to_string(), peer2);
 
-        // list2 adds a task
         let task = make_task(1, peer2);
         list2.add_task(task, peer2, 1).ok().unwrap();
 
-        // Use DeltaCrdt trait
         let delta = DeltaCrdt::delta(&list2, 0).unwrap();
         let result = DeltaCrdt::merge(&mut list1, &delta);
         assert!(result.is_ok());
 
-        // Unsigned content must not apply: no task, no version advance.
         assert_eq!(
             list1.task_count(),
             0,
@@ -615,7 +510,6 @@ mod tests {
         let id = list_id(1);
         let mut list = TaskList::new(id, "Test".to_string(), peer);
 
-        // Add tasks
         let task1 = make_task(1, peer);
         let task2 = make_task(2, peer);
         let id1 = *task1.id();
@@ -624,20 +518,15 @@ mod tests {
         list.add_task(task1, peer, 1).ok().unwrap();
         list.add_task(task2, peer, 2).ok().unwrap();
 
-        // Build an ordering register that causally dominates the local one
-        // (a peer that reversed the order on top of the shared history), so
-        // the LWW merge adopts it.
         let mut order_register = list.ordering_register().clone();
-        order_register.set(vec![id2, id1], peer); // Reversed order, newer clock
+        order_register.set(vec![id2, id1], peer);
         let mut delta = TaskListDelta::new(10);
         delta.ordering_update = Some(order_register);
 
-        // Merge delta
         list.merge_delta(&delta, peer, Some(&agent(1)))
             .ok()
             .unwrap();
 
-        // Verify ordering changed
         let tasks = list.tasks_ordered();
         assert_eq!(tasks[0].id(), &id2);
         assert_eq!(tasks[1].id(), &id1);
@@ -645,21 +534,14 @@ mod tests {
 
     #[test]
     fn stale_name_delta_does_not_clobber_newer_local_name() {
-        // WHY: a cold-start responder broadcasts its full state on the main
-        // topic, reaching established peers. A peer that renamed the list more
-        // recently must not have its name reverted by an older holder's
-        // snapshot — the register's vector clock decides the winner.
         let local = peer(1);
         let remote = peer(2);
         let id = list_id(1);
         let mut list = TaskList::new(id, "Original".to_string(), local);
 
-        // `remote` renames the list; capture that register as the "stale" one.
         list.update_name("FromRemote".to_string(), remote);
         let stale = list.name_register().clone();
 
-        // `local` then renames on top — causally newer (its clock includes the
-        // remote rename), so a later redelivery of the stale register loses.
         list.update_name("Newest".to_string(), local);
 
         let mut delta = TaskListDelta::new(7);
@@ -677,31 +559,20 @@ mod tests {
         let id = list_id(1);
         let mut list = TaskList::new(id, "Original".to_string(), peer);
 
-        // A peer renames on top of the shared initial state; its register
-        // causally dominates ours, so the LWW merge adopts it.
         let mut other = TaskList::new(id, "Original".to_string(), peer);
         other.update_name("Updated".to_string(), peer);
         let mut delta = TaskListDelta::new(5);
         delta.name_update = Some(other.name_register().clone());
 
-        // Merge delta
         list.merge_delta(&delta, peer, Some(&agent(1)))
             .ok()
             .unwrap();
 
-        // Verify name changed
         assert_eq!(list.name(), "Updated");
     }
 
     #[test]
     fn duplicate_merge_delta_advances_version_once_then_is_idempotent() {
-        // P1 fence: the TaskList version IS the local-replica fence token. A
-        // real remote change must advance it exactly once; an idempotent
-        // re-delivery of an already-resolved delta must NOT advance it (else
-        // revision churn would spuriously invalidate callers and satisfy
-        // "fence changed" gates with no real change). merge_delta must not
-        // bump version inside its sub-operations; only commit_revision_if_changed
-        // advances it, iff the resolved snapshot changed.
         let peer = peer(1);
         let id = list_id(1);
         let mut list = TaskList::new(id, "L".to_string(), peer);
@@ -712,8 +583,6 @@ mod tests {
         list.add_task(t1, peer, 1).unwrap();
         list.add_task(t2, peer, 2).unwrap();
 
-        // A remote peer reverses the order on top of the shared history; its
-        // register causally dominates ours, so the first merge is a real change.
         let mut order_register = list.ordering_register().clone();
         order_register.set(vec![id2, id1], peer);
         let mut delta = TaskListDelta::new(10);
@@ -727,21 +596,14 @@ mod tests {
             "a real remote ordering change must advance the version/fence once"
         );
 
-        // Second identical merge: the ordering is already resolved identically
-        // ⇒ the fingerprint is unchanged ⇒ the version MUST NOT advance again.
         list.merge_delta(&delta, peer, Some(&agent(1))).unwrap();
         assert_eq!(
             list.version(),
             v1,
             "duplicate delta must not advance the version/fence again"
         );
-        // The two real tasks are still present (no spurious removal).
         assert_eq!(list.task_count(), 2);
     }
-
-    // ------------------------------------------------------------------
-    // Layer A authorship gate (issue #349)
-    // ------------------------------------------------------------------
 
     fn signing_for(_n: u8) -> (AgentId, crate::gossip::SigningContext) {
         let kp = crate::identity::AgentKeypair::generate().expect("agent keygen");
@@ -751,8 +613,6 @@ mod tests {
         )
     }
 
-    /// Seed a receiver exactly like [`forged_content_delta_template`]'s base
-    /// so the delta's LWW registers causally dominate on merge.
     fn seeded_receiver(id: TaskListId, members: Option<AgentId>) -> (TaskList, TaskId, TaskId) {
         let mut list = TaskList::new(id, "Sprint".to_string(), peer(3));
         if let Some(m) = members {
@@ -764,25 +624,18 @@ mod tests {
         (list, t0_id, TaskId::from_bytes([2; 32]))
     }
 
-    /// A delta whose every payload PeerId component equals the victim's
-    /// AgentId bytes: an attacker tries to borrow the victim's identity
-    /// through the OR-Set tag / LWW-clock namespace.
     fn forged_content_delta(id: TaskListId, t0_id: TaskId) -> TaskListDelta {
         let spoofed = PeerId::new(agent(1).0);
-        // Template constructed identically to seeded_receiver so registers
-        // cloned from it dominate the receiver's.
         let mut template = TaskList::new(id, "Sprint".to_string(), peer(3));
         template
             .add_task(make_task(1, peer(3)), peer(3), 1)
             .expect("seed t0");
 
-        // New task attributed to the victim (`created_by` = agent(1)).
         let t1 = make_task(2, spoofed);
         let t1_id = *t1.id();
         let mut delta = TaskListDelta::new(5);
         delta.added_tasks.insert(t1_id, (t1, (spoofed, 1)));
 
-        // Forged rename + reorder, clocked by the spoofed peer.
         let mut name_reg = template.name_register().clone();
         name_reg.set("Pwned".to_string(), spoofed);
         delta.name_update = Some(name_reg);
@@ -790,7 +643,6 @@ mod tests {
         order_reg.set(vec![t1_id, t0_id], spoofed);
         delta.ordering_update = Some(order_reg);
 
-        // Forged remove of the existing task.
         delta
             .removed_tasks
             .insert(t0_id, HashSet::from([(spoofed, 1)]));
@@ -799,24 +651,15 @@ mod tests {
 
     #[test]
     fn merge_delta_spoofed_payload_peer_id_is_not_identity() {
-        // WHY (issue #349, invariant I3): the payload PeerId is an OR-Set
-        // uniqueness tag, never an author. A member (attacker) forging a
-        // delta whose payload PeerId EQUALS the victim's AgentId bytes must
-        // not borrow the victim's authority: content admission is gated by
-        // the envelope-verified writer (AgentId) against the
-        // authorized-agents set, never by comparing PeerId bytes to AgentId
-        // bytes.
         let id = list_id(1);
         let victim = agent(1);
         let attacker = agent(99);
-        let spoofed = PeerId::new(victim.0); // same bytes — must NOT grant identity
+        let spoofed = PeerId::new(victim.0);
 
         let (mut list, t0_id, t1_id) = seeded_receiver(id, Some(victim));
         let order_before: Vec<_> = list.tasks_ordered().iter().map(|t| *t.id()).collect();
         let delta = forged_content_delta(id, t0_id);
 
-        // The ATTACKER is the verified envelope sender: every content field
-        // must be silently dropped (Ok, no error — KV-style reject).
         list.merge_delta(&delta, spoofed, Some(&attacker))
             .expect("silent reject, not an error");
         assert_eq!(list.task_count(), 1, "spoofed add must not create a task");
@@ -832,9 +675,6 @@ mod tests {
         let order_after: Vec<_> = list.tasks_ordered().iter().map(|t| *t.id()).collect();
         assert_eq!(order_after, order_before, "spoofed reorder must not apply");
 
-        // The VICTIM as the verified writer, with a DIFFERENT payload
-        // PeerId: the same delta applies — proving the writer AgentId (not
-        // the payload PeerId) is the gate.
         let (mut honest, t0_id, t1_id) = seeded_receiver(id, Some(victim));
         honest
             .merge_delta(&delta, peer(7), Some(&victim))
@@ -852,18 +692,11 @@ mod tests {
 
     #[test]
     fn merge_delta_anonymous_writer_drops_content_but_admits_attested_claim() {
-        // WHY (issue #349, I2): an unsigned (anonymous-sender) delta must
-        // not apply ANY unauthenticated content field — add, metadata LWW,
-        // name, order, remove — while checkbox admission (gated by
-        // OpAttestation, not by the envelope writer) still admits a validly
-        // attested claim on a task the receiver already holds.
         let id = list_id(1);
         let p = peer(4);
         let (mut list, t0_id, t1_id) = seeded_receiver(id, None);
         let order_before: Vec<_> = list.tasks_ordered().iter().map(|t| *t.id()).collect();
 
-        // A source task carrying BOTH a validly-attested claim AND a forged
-        // title change (no content attestation exists — Layer B is HOLD).
         let (claimer, signing) = signing_for(5);
         let mut claimed = make_task(1, p);
         claimed.claim(id, claimer, p, 42, &signing).expect("attest");
@@ -875,8 +708,6 @@ mod tests {
         list.merge_delta(&delta, peer(9), None)
             .expect("silent reject, not an error");
 
-        // Content dropped: no new task, no remove, no rename, no reorder,
-        // no metadata LWW.
         assert_eq!(
             list.task_count(),
             1,
@@ -893,8 +724,6 @@ mod tests {
             "anonymous metadata LWW dropped"
         );
 
-        // Checkbox admission still ran for the existing task: the attested
-        // claim survives even though every content field was dropped.
         assert!(
             list.get_task(&t0_id)
                 .expect("t0")
@@ -906,10 +735,6 @@ mod tests {
 
     #[test]
     fn merge_delta_honest_writer_content_applies() {
-        // WHY (issue #349): a verified envelope writer must keep today's
-        // apply path — add / name / order / remove all land when the list
-        // has no authorized set (Layer A needs no new attestations; Layer B
-        // is HOLD).
         let id = list_id(1);
         let (mut list, t0_id, t1_id) = seeded_receiver(id, None);
         let delta = forged_content_delta(id, t0_id);
@@ -932,9 +757,6 @@ mod tests {
 
     #[test]
     fn merge_delta_membership_gates_unauthorized_writer_content() {
-        // WHY (issue #349, I8): with an authorized-member set, content from
-        // a writer OUTSIDE the set is dropped — "member may edit" — while
-        // the same delta from a member applies.
         let id = list_id(1);
         let alice = agent(1);
         let bob = agent(2);
@@ -959,19 +781,8 @@ mod tests {
         assert_eq!(member_list.name(), "Pwned", "member rename applies");
     }
 
-    // ── wire byte-compatibility pin (ADR-0040 review chain) ──────────────
-
-    /// TaskItem and TaskListDelta wire shapes are byte-identical to main
-    /// (the signed owner-transfer experiment was descoped — review r7,
-    /// Option B). Pin that a main-shaped (PeerId, TaskListDelta) blob
-    /// decodes unchanged under this branch's codec, so mixed-version
-    /// fleets interoperate exactly as before.
     #[test]
     fn legacy_delta_bytes_decode_unchanged() {
-        // Option B descope (review r7): signed owner-transfer removed —
-        // TaskItem and TaskListDelta wire shapes are byte-identical to
-        // main. Pin that a main-shaped (PeerId, TaskListDelta) blob decodes
-        // unchanged under this branch's codec.
         #[derive(serde::Serialize)]
         struct MainTaskItem {
             id: TaskId,
