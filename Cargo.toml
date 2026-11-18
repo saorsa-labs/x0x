@@ -19,7 +19,7 @@ exclude = ["proofs/**", "tests/proof-reports/**", "target/**"]
 
 [dependencies]
 anyhow = "1.0"
-# #1642: 0.28.0 honours `relay_service_enabled` (ant-quic ADR-019, relay
+# 0.28.0 honours `relay_service_enabled` (ant-quic ADR-019, relay
 # serving opt-out). It keeps the SendStream/RecvStream::connection_generation()
 # that the evidence Hello reply gate keys on (#1346). saorsa-gossip 0.5.92
 # and saorsa-webrtc 0.6.1 pin the same ant-quic.

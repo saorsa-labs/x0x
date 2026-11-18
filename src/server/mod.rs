@@ -5905,7 +5905,32 @@ mod relay_serving_wiring_tests {
     use crate::server::{serve_with_options, DaemonConfig, ServeOptions};
     use std::time::Duration;
 
-    async fn daemon_relay_enabled(toml_key: Option<bool>, cli_relay: bool) -> bool {
+    /// RAII guard: removes `X0X_RELAY_OPT_IN` on construction and on drop so
+    /// a daemon run that sets the flag cannot leak it into a later case in the
+    /// same test.
+    struct RelayOptInEnvGuard;
+    impl RelayOptInEnvGuard {
+        fn arm() -> Self {
+            // SAFETY: test-only env mutation; Drop restores a clean state.
+            std::env::remove_var("X0X_RELAY_OPT_IN");
+            Self
+        }
+    }
+    impl Drop for RelayOptInEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: paired with [`RelayOptInEnvGuard::arm`].
+            std::env::remove_var("X0X_RELAY_OPT_IN");
+        }
+    }
+
+    /// Returns `(relay_service_enabled, gossip_participation_mode)`.
+    ///
+    /// Clears `X0X_RELAY_OPT_IN` before and after the daemon run so each
+    /// test case starts from a clean process environment regardless of what
+    /// a previous case may have set via the startup normalisation at
+    /// `serve_with_options`.
+    async fn daemon_relay_state(toml_key: Option<bool>, cli_relay: bool) -> (bool, String) {
+        let _guard = RelayOptInEnvGuard::arm();
         let dir = tempfile::tempdir().expect("tempdir");
         let mut config = DaemonConfig {
             data_dir: dir.path().to_path_buf(),
@@ -5932,14 +5957,13 @@ mod relay_serving_wiring_tests {
                 .expect("serve within 30 s")
                 .expect("hermetic serve");
         let token = std::fs::read_to_string(dir.path().join("api-token")).expect("api token");
-        let body: serde_json::Value = reqwest::Client::builder()
+        let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
-            .expect("http client")
-            .get(format!(
-                "http://{}/diagnostics/connectivity",
-                handle.local_addr()
-            ))
+            .expect("http client");
+        let addr = handle.local_addr();
+        let connectivity: serde_json::Value = client
+            .get(format!("http://{addr}/diagnostics/connectivity"))
             .bearer_auth(token.trim())
             .send()
             .await
@@ -5947,26 +5971,49 @@ mod relay_serving_wiring_tests {
             .json()
             .await
             .expect("connectivity json");
+        let gossip: serde_json::Value = client
+            .get(format!("http://{addr}/diagnostics/gossip"))
+            .bearer_auth(token.trim())
+            .send()
+            .await
+            .expect("gossip request")
+            .json()
+            .await
+            .expect("gossip json");
         tokio::time::timeout(Duration::from_secs(30), handle.shutdown_and_wait())
             .await
             .expect("shutdown within 30 s")
             .expect("clean shutdown");
-        body["services"]["relay_enabled"]
+        let relay_enabled = connectivity["services"]["relay_enabled"]
             .as_bool()
-            .expect("services.relay_enabled is a bool")
+            .expect("services.relay_enabled is a bool");
+        let mode = gossip["participation"]["mode"]
+            .as_str()
+            .expect("participation.mode is a string")
+            .to_owned();
+        (relay_enabled, mode)
     }
 
     /// #1642: the value read back is the ant-quic node status, so this fails
     /// when either the daemon resolution or the ant-quic builder call is lost.
     #[tokio::test]
     async fn daemon_relay_serving_follows_participation_and_explicit_key() {
-        assert!(!daemon_relay_enabled(None, false).await, "Leaf default");
-        assert!(daemon_relay_enabled(None, true).await, "Full default");
-        assert!(daemon_relay_enabled(Some(true), false).await, "Leaf opt-in");
-        assert!(
-            !daemon_relay_enabled(Some(false), true).await,
-            "Full opt-out"
+        let (relay, _) = daemon_relay_state(None, false).await;
+        assert!(!relay, "Leaf default");
+
+        let (relay, _) = daemon_relay_state(None, true).await;
+        assert!(relay, "Full default");
+
+        let (relay, mode) = daemon_relay_state(Some(true), false).await;
+        assert!(relay, "Leaf opt-in");
+        assert_eq!(
+            mode, "leaf",
+            "Leaf opt-in: participation must be Leaf, not Full \
+             (a Full result means X0X_RELAY_OPT_IN leaked from a prior case)"
         );
+
+        let (relay, _) = daemon_relay_state(Some(false), true).await;
+        assert!(!relay, "Full opt-out");
     }
 }
 
