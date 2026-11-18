@@ -1805,7 +1805,7 @@ GET /direct/receipts/order-42?agent_id=8a3f...
 | `expired` | A queued send reached `deliver_until_ms` without a delivery |
 | `failed` | A queued send got an error that a retry cannot repair, or its recipient was blocked. `error` has the `/direct/send` error code, for example `recipient_rejected`, or `recipient_blocked` |
 | `cancelled` | A queued send was cancelled with `DELETE /direct/receipts/:logical_id` |
-| `delivered_late` (queued) | A recipient ACK for the only bytes ever attempted arrived after the queued send ended as `expired`, `failed` or `cancelled` |
+| `delivered_late` (queued) | An ACK from the recipient agent, on a machine an attempt was sent to, for the only bytes ever attempted, arrived after the queued send ended as `expired`, `failed` or `cancelled` |
 
 The key is the pair (`logical_id`, `agent_id`), because a logical id is scoped to one recipient. Only sends that supplied `logical_id` can be queried. Records of a synchronous send are kept in memory for 10 minutes after the send resolved or gave up, at most 4,096, oldest dropped first; a restart forgets them. The outcomes of a [queued send](#queued-durable-send-1109) survive a restart (see there). Only an `Accepted` v2 ACK from the exact recipient agent and machine counts. A malformed `logical_id` or `agent_id` answers 400 `invalid_logical_id` or `invalid_agent_id`. Decision: [A07](adr/consolidated/A07-r01-messages-receipts-history-and-retry.md) (amendment of 14 Nov 2026).
 
@@ -1843,13 +1843,18 @@ Rules:
 - Payloads are stored unsealed (base64) in `direct_send_outbox.json`, a file with owner-only permissions (0600).
 - Caps: 64 sends or 4 MiB per recipient, 1,024 sends or 32 MiB per daemon. A full outbox answers 429 `outbox_full`. The daemon also remembers at most 4,096 attempted `logical_id`s for 24 hours (see the attempt record below). When held sends and attempt records together reach that number, a new queued send answers 429 `outbox_full`, so an attempt record is never dropped before its 24 hours.
 - Read the outcome with [`GET /direct/receipts/:logical_id`](#durable-send-receipts-1109). `queued` is read from the outbox and survives a restart. `delivered`, `expired`, `failed` (with `error`) and `cancelled`, each with its `payload_digest`, are written to `direct_send_outcomes.json` (owner-only, 0600) next to the outbox, kept 24 hours, at most 4,096, oldest dropped first, and loaded at start, so a receipt answers the same after a restart. A bad outcomes file is moved aside (`.corrupt-<ms>`) and the daemon still starts.
-- Before each attempt the daemon writes the digest of the bytes it is about to send under that `logical_id`. A late durable ACK after a restart (when the send's own record is gone) settles a held send as `delivered` without another send only when it comes from the send's recipient agent and exactly one digest was ever attempted under that key, equal to the held bytes. After `expired`, `failed` or `cancelled`, the same ACK turns the outcome into `delivered_late` (with that digest). Anything else changes nothing.
+- Before each attempt the daemon writes the digest of the bytes it is about to send under that `logical_id`. At the end of each pass it also writes the recipient machine each attempt was sent to (at most 4 machines per `logical_id`). A late durable ACK after a restart (when the send's own record is gone) settles a held send as `delivered` without another send only when all of these are true:
+  - It comes from the send's recipient agent.
+  - It comes from a machine written for that `logical_id`. An ACK from the same agent on another machine changes nothing.
+  - Exactly one digest was ever attempted under that key, equal to the held bytes.
+
+  After `expired`, `failed` or `cancelled`, the same ACK turns the outcome into `delivered_late` (with that digest). If no machine was written (the record is older than this rule, the write failed, or the daemon stopped before the end of the pass), no late ACK settles the send, and a held send is sent again. Anything else changes nothing.
 - Once bytes were attempted under a `logical_id`, other bytes under it answer 409 `idempotency_conflict` (for 24 hours): the earlier bytes may have arrived.
 - An outcome is written durably before the send leaves the outbox. If it cannot be written, the send stays held (a cancel answers 503 `outbox_not_durable`). The next pass writes that outcome again and makes no new attempt for those bytes. A restart forgets the unwritten outcome, and the send is then decided again.
 - When a recipient's durable-capable capability advert arrives, its held sends are tried at once instead of at the next retry time. One recipient is nudged at most once every 2 seconds, so a flood of adverts does not resend faster than the first retry interval.
 - A sidecar that fails its checks at startup is moved aside (`.corrupt-<ms>`), and the daemon starts with an empty outbox.
 
-Decision: [A07](adr/consolidated/A07-r01-messages-receipts-history-and-retry.md) (amendment of 16 Nov 2026).
+Decision: [A07](adr/consolidated/A07-r01-messages-receipts-history-and-retry.md) (amendments of 16 and 17 Nov 2026).
 
 ### `/direct/events` SSE message shape
 
