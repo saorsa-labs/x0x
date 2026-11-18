@@ -71,6 +71,7 @@ class ShardPlanTest(unittest.TestCase):
             's3-q2': 'w3h_1356_control_s3_q2_sidecar_fault_cases',
             's3-r': 'w3h_1356_control_s3_r_beyond_retention',
             's3-rr': 'w3h_1356_control_s3_r_replay_benign',
+            's4-1973': 'w3h_1357_s4_owner_recovery_revoked_member_1973',
         }
         assigned = SHARDS.assign(self.names)
         for group, name in rows.items():

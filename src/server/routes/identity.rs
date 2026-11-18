@@ -2083,6 +2083,53 @@ mod owner_act_tests {
         (status, serde_json::from_slice(&bytes).unwrap_or_default())
     }
 
+    #[tokio::test]
+    async fn lapsed_session_reaches_only_refresh_and_recovers() -> anyhow::Result<()> {
+        use crate::server::auth::{auth_middleware, refresh_session};
+        use axum::routing::get;
+        let (state, _dir) = matrix_state().await?;
+        let app = axum::Router::new()
+            .route("/auth/session/refresh", post(refresh_session))
+            .route("/agent", get(echo_actor))
+            .route("/ws/direct", get(echo_actor))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                auth_middleware,
+            ))
+            .with_state(Arc::clone(&state));
+
+        let lapsed = session_token(&state).await;
+        state.sessions.expire_for_test(&lapsed);
+
+        let (status, _) = get_status(&app, "/agent", Some(&lapsed)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "REST on a lapsed token");
+        let (status, _) = get_status(&app, &format!("/ws/direct?token={lapsed}"), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "WS on a lapsed token");
+
+        let empty = serde_json::json!({});
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/auth/session/refresh",
+            &lapsed,
+            empty.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "refresh within grace: {json}");
+        let fresh = json["session_token"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(!fresh.is_empty() && fresh != lapsed);
+
+        let (status, json) = get_status(&app, "/agent", Some(&fresh)).await;
+        assert_eq!(status, StatusCode::OK, "recovered session: {json}");
+        assert_eq!(json["session_actor"], true);
+        let (status, json) = call(&app, "POST", "/auth/session/refresh", &lapsed, empty).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "swapped token: {json}");
+        Ok(())
+    }
+
     // #893: after a refresh the replaced token must fail on EVERY route
     // class — REST (bearer), WS connect and SSE connect (`?token=`) — and the
     // fresh token must pass all three as the SAME session actor, so the
