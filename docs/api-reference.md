@@ -2238,8 +2238,18 @@ every wait. A wait always names its cause; it does not stop silently.
     `promoted_member` is `{"state", "named", "parent_head"}`; `state` is
     `mandate_received`, `waiting_for_receiver_upgrade` (D76 hold, `named`
     lists each Active member whose current advert lacks bit 7),
-    `waiting_for_member_key_package` or `recovery_not_needed` (the named
-    revocation records have not arrived yet). After the commit,
+    `waiting_for_member_key_package`, `waiting_for_member_eviction`
+    (#1973: the recovery seal was refused) or `recovery_not_needed` (the
+    named revocation records have not arrived yet).
+    `waiting_for_member_eviction` appears only here, in
+    `promoted_member.state`; no obligation row emits it, and its only
+    producer is the recovery's own wait. `named` lists each seated
+    member that still needs its own eviction and rekey under the admin
+    the recovery seats. The recovery commit tolerates seated revoked
+    non-admin members; each keeps its own eviction. When an unrelated
+    seat's grace or digest-pending hold is what refuses the seal,
+    `named` still lists the failing seats, not the hold. The wait
+    clears when the hold ends. After the commit,
     `receiver_upgrade_members` lists the stranded members with
     `gap_revision`.
 

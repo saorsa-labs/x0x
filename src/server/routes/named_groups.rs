@@ -34847,6 +34847,10 @@ async fn seal_owner_certified_unbounded(
             {
                 return info.seal_commit_evicting(signing_kp, now_ms);
             }
+            // #1973: a grace or digest-pending hold that refuses this
+            // seal is not eviction work, so it never joins `members` —
+            // a tolerated revoked seat can stay named (and the typed
+            // wait with it) until that hold ends.
             return Err(
                 x0x::groups::state_commit::ApplyError::OwnerCertifiedEvictionRequired {
                     group_id,

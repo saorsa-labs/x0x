@@ -16,12 +16,13 @@
 //!   hold both records and show the owner-recovery wait. C's mandate
 //!   naming the revoked member E is refused with
 //!   `recovery_member_ineligible`; C's mandate naming B answers `202
-//!   waiting_for_recovery_member`. Desired: B commits the recovery (on C,
-//!   B is an Admin and A is Removed). RED today, pinned
-//!   ([`CAUSE_REVOKED_SEAT_BLOCKS_SEAL`], #1973): B's seal fails the
-//!   ADR-0038 check because revoked E is still seated, and E's own
-//!   eviction waits for an eligible admin, so the two wait on each other.
-//!   B's status shows `mandate_received` with no cause.
+//!   waiting_for_recovery_member`. B commits the recovery (on C, B is an
+//!   Admin and A is Removed): GREEN since the #1973 fix, where the
+//!   owner-recovery seal tolerates the seated revoked member E (E's own
+//!   S4 row removes it one epoch later). This arm was pinned RED for
+//!   #1973 until then. A regression (B's seal refused for E, so the
+//!   recovery never commits) records [`CAUSE_REVOKED_SEAT_BLOCKS_SEAL`]
+//!   and ends RED, which fails the GREEN expectation.
 //! - `w3h_1581m_recovery_offline_promotee_commits_on_return` (nodes A, B,
 //!   C, E; A the only admin, only A revoked). B stops (the ADR's "B is
 //!   offline until t = 10 s"), and C's mandate naming B answers `202
@@ -47,7 +48,8 @@ const FINAL_NOT_NEEDED: &str = "a_mandate_while_a_second_admin_is_eligible_is_re
 const FINAL_INELIGIBLE: &str =
     "a_mandate_naming_a_revoked_member_is_refused_and_one_naming_b_is_committed";
 const FINAL_OFFLINE: &str = "an_offline_promotee_commits_the_recovery_on_its_return";
-/// #1973: the recovery seal refuses while another revoked member is seated.
+/// The #1973 regression: the recovery seal refuses while another revoked
+/// member is seated.
 const CAUSE_REVOKED_SEAT_BLOCKS_SEAL: &str = "B's owner-recovery seal is refused (ADR-0038 \
      explicit eviction+rekey) for revoked member E, which is still seated, so the recovery never \
      commits";
@@ -56,7 +58,7 @@ const CAUSE_REVOKED_SEAT_BLOCKS_SEAL: &str = "B's owner-recovery seal is refused
 enum Variant {
     NotNeeded,
     /// A and E revoked; the mandate naming E is refused; the one naming
-    /// B (online) should be committed (#1973: it is not).
+    /// B (online) is committed while E is still seated (#1973).
     IneligibleMember,
     /// Only A revoked; B is offline when the mandate names it.
     OfflinePromotee,
@@ -341,7 +343,7 @@ async fn mandate_variants(sim: &mut Sim, receipt: &mut Receipt, variant: Variant
         committed,
     };
     if !committed && variant.revokes_e() {
-        // #1973: the seal refusal that names E is the pinned gap.
+        // A #1973 regression: B's seal refusal that names E.
         let refusals = sim.logs_containing(&[
             "owner recovery deferred: seal failed",
             "explicit eviction+rekey",
@@ -384,11 +386,11 @@ impl Outcome {
     }
 }
 
-/// Records the #1973 cause. It classifies (so the expected RED pin holds)
-/// only when B's seal refusal naming E was seen AND every step before the
-/// commit holds: a wrong reply to the mandate naming E or B, a missing
-/// owner-recovery wait, or B an admin early leaves the cause unmet and
-/// the arm INFRA, so the pin cannot hide those regressions.
+/// Records the #1973 cause when the recovery did not commit. It classifies
+/// (the arm ends RED, a named #1973 regression) only when B's seal refusal
+/// naming E was seen AND every step before the commit holds: a wrong reply
+/// to the mandate naming E or B, a missing owner-recovery wait, or B an
+/// admin early leaves the cause unmet and the arm INFRA.
 fn pin_1973(receipt: &mut Receipt, outcome: Outcome, refusal: Option<String>, at_us: u128) {
     let ok = refusal.is_some() && outcome.before_commit();
     receipt.cause(CAUSE_REVOKED_SEAT_BLOCKS_SEAL, refusal, ok, at_us);
@@ -470,9 +472,9 @@ fn w3h_1581m_recovery_not_needed_while_d_is_eligible() -> Result<()> {
     })
 }
 
-/// ADR 0110 `s4_owner_recovery`, the revoked-member variant. The refusal
-/// of the mandate naming E holds; pinned RED for #1973 because B's
-/// recovery never commits while E is seated. Flip to GREEN with the fix.
+/// ADR 0110 `s4_owner_recovery`, the revoked-member variant. The mandate
+/// naming E is refused, and B's recovery commits while E is still seated:
+/// GREEN with the #1973 fix (was pinned RED before it).
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -484,7 +486,7 @@ fn w3h_1581m_recovery_refuses_a_revoked_member() -> Result<()> {
             "w3h_1581m_recovery_refuses_a_revoked_member",
             0x1581_0051,
             Variant::IneligibleMember,
-            Verdict::Red,
+            Verdict::Green,
         )
         .await
     })
