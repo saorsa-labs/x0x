@@ -230,14 +230,16 @@ fn down_upgrade_check(instance_dir: Option<&std::path::Path>) -> DoctorCheck {
 /// another `data_dir` is not found here.
 fn launcher_refusal_check(dir: &std::path::Path) -> Option<DoctorCheck> {
     use crate::upgrade::launcher_contract::{
-        LauncherRefusal, MAX_REFUSAL_BYTES, REFUSAL_FILE_NAME,
+        self, LauncherRefusal, MAX_REFUSAL_BYTES, REFUSAL_FILE_NAME,
     };
     use std::io::Read;
     let file = std::fs::File::open(dir.join(REFUSAL_FILE_NAME)).ok()?;
     let mut bytes = Vec::new();
     file.take(MAX_REFUSAL_BYTES).read_to_end(&mut bytes).ok()?;
     let record: LauncherRefusal = serde_json::from_slice(&bytes).ok()?;
-    let holding = process_alive(record.pid);
+    // The pid and its start time name the launcher: a pid reused after the
+    // launcher exited is not a holding launcher (#2019 review).
+    let holding = launcher_contract::process_start(record.pid).ok() == Some(record.process_start);
     let state = if holding {
         "holding until the job is stopped"
     } else {
@@ -255,20 +257,6 @@ fn launcher_refusal_check(dir: &std::path::Path) -> Option<DoctorCheck> {
             "launcher_holding": holding,
         })),
     })
-}
-
-#[cfg(unix)]
-fn process_alive(pid: u32) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return false;
-    };
-    // SAFETY: signal 0 only checks that the process exists.
-    pid > 0 && unsafe { libc::kill(pid, 0) } == 0
-}
-
-#[cfg(not(unix))]
-fn process_alive(_pid: u32) -> bool {
-    false
 }
 
 async fn check_connectivity(client: &DaemonClient) -> DoctorCheck {
@@ -690,7 +678,7 @@ fn render_systemd_unit(executable: &str, args: &[String]) -> Result<String> {
     ))
 }
 
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(test)]
 fn render_launchd_plist(executable: &str, args: &[String], log_path: &Path) -> Result<String> {
     render_launchd_plist_with(executable, args, log_path, None)
 }
@@ -716,8 +704,8 @@ pub(crate) struct LauncherBinding<'a> {
 
 /// As `render_launchd_plist`; with a launcher binding the job runs
 /// `x0x-launcher --host-root R --instance I -- x0xd args...` and sets
-/// `ExitTimeOut` above the launcher's worst-case stop. Not wired into
-/// `x0x autostart` yet: the launcher is dormant.
+/// `ExitTimeOut` above the launcher's worst-case stop. `x0x autostart
+/// --launcher` uses it (opt-in while the launcher is dormant).
 #[cfg(any(test, target_os = "macos"))]
 fn render_launchd_plist_with(
     executable: &str,
@@ -839,10 +827,111 @@ fn render_windows_wrapper(executable: &str, args: &[String]) -> Result<String> {
         .replace("__X0X_ARGUMENTS__", &arguments))
 }
 
-/// `x0x autostart` — configure daemon to start on boot.
-pub async fn autostart(name: Option<&str>) -> Result<()> {
+/// The launcher `--instance` for an autostart job: the `--name`, else
+/// `default`. It must pass the launcher's own instance check, so a name the
+/// launcher would refuse fails here, before anything is written.
+#[cfg(any(test, target_os = "macos"))]
+fn autostart_instance_id(name: Option<&str>) -> Result<String> {
+    let instance = name.unwrap_or("default");
+    crate::upgrade::launcher_contract::parse_launcher_argv(&[
+        "--host-root",
+        "/",
+        "--instance",
+        instance,
+        "--",
+        "/x0xd",
+    ])
+    .map_err(|usage| {
+        anyhow::anyhow!("--launcher needs an instance name the launcher accepts: {usage}")
+    })?;
+    Ok(instance.to_owned())
+}
+
+/// The stable launcher installed next to `x0xd`, canonical.
+#[cfg(target_os = "macos")]
+fn sibling_launcher(x0xd: &Path) -> Result<std::path::PathBuf> {
+    let launcher = x0xd
+        .parent()
+        .context("x0xd has no parent directory")?
+        .join(crate::upgrade::launcher_contract::LAUNCHER_BASENAME);
+    let launcher = launcher.canonicalize().with_context(|| {
+        format!(
+            "--launcher needs {} installed next to x0xd",
+            launcher.display()
+        )
+    })?;
+    if !launcher.is_file() {
+        anyhow::bail!("{} is not a file", launcher.display());
+    }
+    Ok(launcher)
+}
+
+/// Replace `path` with `bytes` in one step (#1379): a new temporary file
+/// in the same directory (created new, `mode`, no symlink followed), file
+/// fsync, rename over `path`, then a directory fsync. A reader (launchd, the
+/// upgrade-time readback) sees the old file or the new one, never a part.
+#[cfg(all(unix, any(test, target_os = "macos")))]
+fn write_file_atomically(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = path.parent().context("path has no parent directory")?;
+    let file_name = path.file_name().context("path has no file name")?;
+    let temporary = dir.join(format!(".{}.tmp", file_name.to_string_lossy()));
+    match std::fs::remove_file(&temporary) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(error).with_context(|| format!("remove {}", temporary.display()));
+        }
+        _ => {}
+    }
+    let written = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temporary)?;
+        // The umask may have cleared bits of `mode`; set it exactly.
+        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        std::fs::File::open(dir)?.sync_all()
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    written.with_context(|| format!("write {}", path.display()))
+}
+
+/// The launchd domain of this user's GUI session: `gui/<uid>`.
+#[cfg(target_os = "macos")]
+fn launchd_gui_domain() -> String {
+    // SAFETY: getuid has no preconditions and cannot fail.
+    format!("gui/{}", unsafe { libc::getuid() })
+}
+
+/// Remove the autostart job from this user's GUI domain, if it is loaded.
+#[cfg(target_os = "macos")]
+fn launchd_bootout(domain: &str) {
+    let _ = std::process::Command::new("launchctl")
+        .args(["bootout", &format!("{domain}/{AUTOSTART_LAUNCHD_LABEL}")])
+        .output();
+}
+
+/// Label of the launchd job `x0x autostart` installs.
+#[cfg(target_os = "macos")]
+const AUTOSTART_LAUNCHD_LABEL: &str = "com.saorsalabs.x0xd";
+
+/// `x0x autostart` — configure daemon to start on boot. With `launcher`
+/// (macOS, opt-in while the launcher is dormant) the launchd job runs the
+/// stable launcher installed next to x0xd, with its trial authority (#1379).
+pub async fn autostart(name: Option<&str>, launcher: bool) -> Result<()> {
     let x0xd_path = find_x0xd()?;
     let x0xd = x0xd_path.to_string_lossy();
+    #[cfg(not(target_os = "macos"))]
+    if launcher {
+        anyhow::bail!("--launcher is supported only for launchd (macOS) so far");
+    }
 
     #[cfg(target_os = "linux")]
     {
@@ -893,13 +982,24 @@ pub async fn autostart(name: Option<&str>) -> Result<()> {
             .join("Library/LaunchAgents");
         std::fs::create_dir_all(&plist_dir)?;
 
-        let plist_path = plist_dir.join("com.saorsalabs.x0xd.plist");
+        let plist_path = plist_dir.join(format!("{AUTOSTART_LAUNCHD_LABEL}.plist"));
         // #690: XML-escape every rendered argument and stamp the template
         // version so upgrade-time drift detection identifies the generation.
         let mut args = Vec::new();
         if let Some(n) = name {
             args.extend(["--name".to_string(), n.to_string()]);
         }
+        // Check the launcher binding before anything is written.
+        let instance = if launcher {
+            Some(autostart_instance_id(name)?)
+        } else {
+            None
+        };
+        let launcher_path = if launcher {
+            Some(sibling_launcher(&x0xd_path)?)
+        } else {
+            None
+        };
 
         let data_dir = if let Some(n) = name {
             dirs::data_dir()
@@ -911,29 +1011,47 @@ pub async fn autostart(name: Option<&str>) -> Result<()> {
                 .join("x0x")
         };
         std::fs::create_dir_all(&data_dir)?;
+        // The launcher requires a canonical host root (A14).
+        let data_dir = data_dir.canonicalize()?;
         let log_path = data_dir.join("x0xd.log");
 
         // The pure renderer used by tests is the only template path.
-        let plist = render_launchd_plist(&x0xd, &args, &log_path)?;
-        std::fs::write(&plist_path, plist)?;
+        let host_root = data_dir.to_string_lossy();
+        let launcher_str = launcher_path.as_ref().map(|path| path.to_string_lossy());
+        let binding = match (&launcher_str, &instance) {
+            (Some(launcher), Some(instance)) => Some(LauncherBinding {
+                launcher,
+                host_root: &host_root,
+                instance,
+            }),
+            _ => None,
+        };
+        let plist = render_launchd_plist_with(&x0xd, &args, &log_path, binding.as_ref())?;
+        // launchd refuses a job file that others can write: 0644.
+        write_file_atomically(&plist_path, plist.as_bytes(), 0o644)?;
 
-        // Unload any existing agent first (ignore errors if not loaded).
-        let _ = std::process::Command::new("launchctl")
-            .args(["unload", &plist_path.to_string_lossy()])
-            .output();
-
-        // Load the agent so it starts now and on boot.
+        // Replace any loaded job in this user's GUI domain, then load the
+        // new one so it starts now and at login.
+        let domain = launchd_gui_domain();
+        launchd_bootout(&domain);
         let status = std::process::Command::new("launchctl")
-            .args(["load", &plist_path.to_string_lossy()])
+            .args(["bootstrap", &domain])
+            .arg(&plist_path)
             .status()
-            .context("failed to run launchctl load")?;
+            .context("failed to run launchctl bootstrap")?;
         if !status.success() {
-            anyhow::bail!("launchctl load failed (exit {})", status);
+            anyhow::bail!("launchctl bootstrap {domain} failed (exit {status})");
         }
 
         println!("Autostart enabled (launchd agent)");
         println!("  Plist:  {}", plist_path.display());
-        println!("  Status: launchctl list | grep x0xd");
+        if let Some(launcher) = &launcher_path {
+            println!("  Launcher: {}", launcher.display());
+        }
+        println!(
+            "  Status: launchctl print {}/{AUTOSTART_LAUNCHD_LABEL}",
+            launchd_gui_domain()
+        );
         println!("  Remove: x0x autostart --remove");
     }
 
@@ -1349,11 +1467,11 @@ pub async fn autostart_remove() -> Result<()> {
     {
         let plist_path = dirs::home_dir()
             .context("cannot determine home directory")?
-            .join("Library/LaunchAgents/com.saorsalabs.x0xd.plist");
+            .join(format!(
+                "Library/LaunchAgents/{AUTOSTART_LAUNCHD_LABEL}.plist"
+            ));
         if plist_path.exists() {
-            let _ = std::process::Command::new("launchctl")
-                .args(["unload", &plist_path.to_string_lossy()])
-                .status();
+            launchd_bootout(&launchd_gui_domain());
             std::fs::remove_file(&plist_path)?;
         }
         println!("Autostart removed (launchd)");
@@ -1946,8 +2064,54 @@ mod tests {
         );
     }
 
+    /// #1379: `x0x autostart --launcher` names the instance the launcher
+    /// accepts, and refuses a name the launcher would refuse before it
+    /// writes anything.
+    #[test]
+    fn autostart_instance_id_is_one_the_launcher_accepts() {
+        assert_eq!(autostart_instance_id(None).expect("default"), "default");
+        assert_eq!(
+            autostart_instance_id(Some("alice")).expect("alice"),
+            "alice"
+        );
+        for bad in ["..", "a b", "a/b", ""] {
+            assert!(autostart_instance_id(Some(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    /// #1379: the plist is replaced in one step with the exact mode, and no
+    /// temporary file is left; a symlink at the temporary path is not
+    /// followed.
+    #[cfg(unix)]
+    #[test]
+    fn autostart_job_file_is_replaced_atomically() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("job.plist");
+        std::fs::write(&path, b"old").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).expect("chmod");
+        write_file_atomically(&path, b"new", 0o644).expect("replace");
+        assert_eq!(std::fs::read(&path).expect("read"), b"new");
+        let mode = std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, ["job.plist"]);
+        // A stale temporary file (or a symlink planted there) is removed,
+        // never written through.
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"keep").expect("write");
+        std::os::unix::fs::symlink(&target, dir.path().join(".job.plist.tmp")).expect("symlink");
+        write_file_atomically(&path, b"newer", 0o644).expect("replace");
+        assert_eq!(std::fs::read(&target).expect("read"), b"keep");
+        assert_eq!(std::fs::read(&path).expect("read"), b"newer");
+    }
+
     /// #2016 review item 1: while the daemon is down, doctor shows the
     /// launcher's refusal reason and whether the launcher still holds.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn doctor_shows_a_launcher_refusal_while_the_daemon_is_down() {
         use crate::upgrade::launcher_contract::*;
@@ -1960,6 +2124,7 @@ mod tests {
             schema: REFUSAL_SCHEMA,
             reason: "prior child still exists".into(),
             pid: std::process::id(),
+            process_start: process_start(std::process::id()).expect("start"),
             at_unix_ms: 1,
         };
         std::fs::write(
@@ -1978,6 +2143,27 @@ mod tests {
         assert_eq!(
             check.evidence.expect("evidence")["launcher_holding"],
             serde_json::json!(true)
+        );
+        // #2019 review: the same pid with another start time is a reused
+        // pid, not the launcher that refused.
+        let reused = LauncherRefusal {
+            process_start: record.process_start.wrapping_add(1),
+            ..record
+        };
+        std::fs::write(
+            dir.path().join(REFUSAL_FILE_NAME),
+            serde_json::to_vec(&reused).expect("json"),
+        )
+        .expect("write");
+        let check = down_upgrade_check(Some(dir.path()));
+        assert!(
+            check.detail.contains("no longer running"),
+            "{}",
+            check.detail
+        );
+        assert_eq!(
+            check.evidence.expect("evidence")["launcher_holding"],
+            serde_json::json!(false)
         );
         std::fs::write(dir.path().join(REFUSAL_FILE_NAME), b"not json").expect("write");
         assert_eq!(

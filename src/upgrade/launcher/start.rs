@@ -119,37 +119,54 @@ pub(crate) fn start(
     let pause = || std::thread::sleep(std::time::Duration::from_millis(100));
     match &args.trial {
         None => start_with(&NoIssuer, &args.command, arm, Clock::now, stop, pause),
-        Some(trial) => {
-            let started = start_with(
+        Some(trial) => with_refusal_record(&trial.host_root, || {
+            start_with(
                 &issuer::JournalIssuer(trial),
                 &args.command,
                 arm,
                 Clock::now,
                 stop,
                 pause,
-            );
-            settle_refusal_record(&trial.host_root, &started);
-            started
-        }
+            )
+        }),
     }
 }
 
-/// Leave the refusal record in the host root after a final refusal, and
-/// remove an earlier one after any other start, so `x0x doctor` shows only
-/// the refusal that holds now. The record is written only into a host root
-/// that passes the issuer's root check, through a 0600 temporary file and a
-/// rename; a failure only loses the report.
-fn settle_refusal_record(root: &Path, started: &Start) {
+/// Run one trial-form start between the two refusal-record steps: remove
+/// the record an earlier start left before the start, since a start that
+/// supervises the daemon returns only when the daemon ends (#2019 review);
+/// leave a new one after a final refusal. `x0x doctor` then shows only a
+/// refusal that holds now.
+fn with_refusal_record(root: &Path, start: impl FnOnce() -> Start) -> Start {
+    clear_refusal_record(root);
+    let started = start();
+    if let Start::Final(reason) = &started {
+        record_refusal(root, reason);
+    }
+    started
+}
+
+/// Remove the refusal record an earlier start left. A failure only leaves
+/// a stale report.
+fn clear_refusal_record(root: &Path) {
     let path = root.join(contract::REFUSAL_FILE_NAME);
-    let result = match started {
-        Start::Final(reason) => issuer::check_root(root, issuer::effective_uid())
-            .and_then(|()| write_refusal_record(&path, reason)),
-        _ => match std::fs::remove_file(&path) {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
-            _ => Ok(()),
-        },
-    };
-    if let Err(error) = result {
+    match std::fs::remove_file(&path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            eprintln!("x0x-launcher: refusal record {}: {error}", path.display());
+        }
+        _ => {}
+    }
+}
+
+/// Leave the refusal record in the host root after a final refusal. It is
+/// written only into a host root that passes the issuer's root check,
+/// through a 0600 temporary file and a rename; a failure only loses the
+/// report.
+fn record_refusal(root: &Path, reason: &str) {
+    let path = root.join(contract::REFUSAL_FILE_NAME);
+    if let Err(error) = issuer::check_root(root, issuer::effective_uid())
+        .and_then(|()| write_refusal_record(&path, reason))
+    {
         eprintln!("x0x-launcher: refusal record {}: {error}", path.display());
     }
 }
@@ -161,6 +178,7 @@ fn write_refusal_record(path: &Path, reason: &str) -> io::Result<()> {
         schema: contract::REFUSAL_SCHEMA,
         reason: reason.to_owned(),
         pid: std::process::id(),
+        process_start: contract::process_start(std::process::id())?,
         at_unix_ms: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(io::Error::other)?
@@ -732,11 +750,19 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = root.join(contract::REFUSAL_FILE_NAME);
-        settle_refusal_record(&root, &Start::Final("prior child still exists".into()));
+        let refused = || Start::Final("prior child still exists".into());
+        assert!(matches!(
+            with_refusal_record(&root, refused),
+            Start::Final(_)
+        ));
         let record: contract::LauncherRefusal =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(record.reason, "prior child still exists");
         assert_eq!(record.pid, std::process::id());
+        assert_eq!(
+            record.process_start,
+            contract::process_start(std::process::id()).unwrap()
+        );
         assert_eq!(record.schema, contract::REFUSAL_SCHEMA);
         assert_eq!(
             std::fs::symlink_metadata(&path)
@@ -746,11 +772,17 @@ mod tests {
                 & 0o777,
             0o600
         );
-        settle_refusal_record(&root, &Start::Exit(EXIT_TEMPFAIL));
+        // The next start removes the record before it starts (and so
+        // before it supervises a daemon), not when it returns.
+        let started = with_refusal_record(&root, || {
+            assert!(!path.exists(), "stale record while the daemon runs");
+            Start::Exit(EXIT_TEMPFAIL)
+        });
+        assert!(matches!(started, Start::Exit(EXIT_TEMPFAIL)));
         assert!(!path.exists());
         // A root another account could write gets no record.
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o772)).unwrap();
-        settle_refusal_record(&root, &Start::Final("x".into()));
+        with_refusal_record(&root, || Start::Final("x".into()));
         assert!(!path.exists());
     }
 

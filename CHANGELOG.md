@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Launcher refusal record and launcher-bound autostart (#1379, #2019
+  review; A14 amendment of 18 Nov 2026).** A trial-form launcher start now
+  removes an earlier `launcher-refusal.json` before it starts, so a start
+  that supervises the daemon leaves no stale record. The record holds the
+  launcher's process start time, and `x0x doctor` shows "holding" only
+  while that exact process exists, not a reused pid. `x0x autostart` on
+  macOS writes the plist in one step (mode 0644) and loads it with
+  `launchctl bootstrap gui/<uid>`; `--remove` uses `bootout`. A hidden,
+  opt-in `x0x autostart --launcher` installs the job through the dormant
+  stable launcher.
+
 ### Added
 
 - **Relay serving follows participation mode (#1642; A06 amendment of
