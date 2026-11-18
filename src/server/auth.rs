@@ -33,7 +33,9 @@ use super::state::AppState;
 ///    [`SessionStore::is_valid`] → `Ok`
 /// 4. [`accepts_query_token`] paths: **session** token in `?token=` only —
 ///    the durable token is **never** accepted in a query string (#127/WS1.6).
-/// 5. otherwise → `Err(UNAUTHORIZED)`
+/// 5. `POST /auth/session/refresh` only: a bearer **session** token that
+///    lapsed less than [`SESSION_REFRESH_GRACE`] ago → `Ok`
+/// 6. otherwise → `Err(UNAUTHORIZED)`
 pub(super) fn authorize(
     path: &str,
     method: &Method,
@@ -66,6 +68,14 @@ pub(super) fn authorize(
     if accepts_query_token(path) {
         if let Some(token) = query_token {
             if sessions.is_valid(token, now) {
+                return Ok(());
+            }
+        }
+    }
+    // (5) A lapsed session token reaches the refresh handler and nothing else.
+    if method == Method::POST && path == SESSION_REFRESH_PATH {
+        if let Some(token) = header_token {
+            if sessions.is_refreshable(token, now) {
                 return Ok(());
             }
         }
@@ -303,10 +313,11 @@ pub(super) async fn create_session(
         .into_response()
 }
 
-/// `POST /auth/session/refresh` — swap a still-valid browser session token
-/// for a fresh one (#893, sliding refresh with a hard cap).
+/// `POST /auth/session/refresh` — swap a browser session token for a fresh
+/// one (#893, sliding refresh with a hard cap).
 ///
-/// Accepts **only** a live session bearer. The durable token is refused
+/// Accepts **only** a session bearer that is live or lapsed less than
+/// [`SESSION_REFRESH_GRACE`] ago. The durable token is refused
 /// (it keeps using `POST /auth/session`), and rider tokens never reach this
 /// handler (ADR-0039 deny-by-default route set). The new token is an
 /// ordinary session token, with the same authority as the one it replaces,
@@ -648,6 +659,11 @@ const SESSION_TOKEN_TTL_SECS: u64 = 10 * 60;
 /// this long has passed since the ORIGINAL `POST /auth/session` mint. A
 /// chain can therefore live at most this plus one [`SESSION_TOKEN_TTL`].
 pub(super) const SESSION_MAX_LIFETIME: Duration = Duration::from_secs(12 * 60 * 60);
+/// How long after it lapses a session token can still be swapped by
+/// `POST /auth/session/refresh`. A lapsed token authorizes no other route,
+/// and [`SESSION_MAX_LIFETIME`] still applies.
+pub(super) const SESSION_REFRESH_GRACE: Duration = Duration::from_secs(4 * 60 * 60);
+const SESSION_REFRESH_PATH: &str = "/auth/session/refresh";
 
 /// A single issued browser session token, stored as a SHA-256 digest.
 ///
@@ -661,10 +677,17 @@ struct AuthSession {
     minted_at: Instant,
 }
 
+impl AuthSession {
+    fn refreshable_at(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.expires_at) < SESSION_REFRESH_GRACE
+    }
+}
+
 /// Why [`SessionStore::refresh`] refused.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum SessionRefreshError {
-    /// Not a live session token (unknown, expired, or already refreshed).
+    /// Not a refreshable session token (unknown, lapsed for longer than
+    /// [`SESSION_REFRESH_GRACE`], or already refreshed).
     Unknown,
     /// The chain is older than [`SESSION_MAX_LIFETIME`].
     LifetimeCapReached,
@@ -698,7 +721,7 @@ impl SessionStore {
             guard.push(session);
             // Bound the store: lazy-prune expired entries on every issue so a
             // flood of session mints cannot grow the vector without bound.
-            guard.retain(|s| s.expires_at > now);
+            guard.retain(|s| s.refreshable_at(now));
         }
         token
     }
@@ -718,7 +741,8 @@ impl SessionStore {
         (token, session)
     }
 
-    /// Replace a live session token with a fresh one (#893).
+    /// Replace a session token with a fresh one (#893). The token may have
+    /// lapsed up to [`SESSION_REFRESH_GRACE`] ago.
     ///
     /// The new entry keeps the original `minted_at`; the presented token is
     /// removed in the same critical section, so it stops working at once.
@@ -730,7 +754,7 @@ impl SessionStore {
             .sessions
             .lock()
             .map_err(|_| SessionRefreshError::Unknown)?;
-        guard.retain(|s| s.expires_at > now);
+        guard.retain(|s| s.refreshable_at(now));
         let index = guard
             .iter()
             .position(|s| bool::from(candidate.ct_eq(&s.token_hash)))
@@ -791,9 +815,24 @@ impl SessionStore {
         let Ok(mut guard) = self.sessions.lock() else {
             return false;
         };
-        // Prune expired first (fail-closed: an expired token is never valid).
-        guard.retain(|s| s.expires_at > now);
-        guard.iter().any(|s| candidate.ct_eq(&s.token_hash).into())
+        guard.retain(|s| s.refreshable_at(now));
+        guard
+            .iter()
+            .any(|s| s.expires_at > now && bool::from(candidate.ct_eq(&s.token_hash)))
+    }
+
+    /// Whether `token` is live or lapsed less than [`SESSION_REFRESH_GRACE`]
+    /// ago. Only `POST /auth/session/refresh` may use this.
+    fn is_refreshable(&self, token: &str, now: Instant) -> bool {
+        use subtle::ConstantTimeEq;
+        let candidate = Sha256::digest(token.as_bytes());
+        let Ok(mut guard) = self.sessions.lock() else {
+            return false;
+        };
+        guard.retain(|s| s.refreshable_at(now));
+        guard
+            .iter()
+            .any(|s| bool::from(candidate.ct_eq(&s.token_hash)))
     }
 
     /// Whether `token` is a live session.
@@ -802,7 +841,7 @@ impl SessionStore {
         self.is_valid(token, now)
     }
 
-    /// Mark one session expired. The next [`Self::is_valid`] drops it.
+    /// Lapse one session. It stays inside [`SESSION_REFRESH_GRACE`].
     #[cfg(test)]
     pub(super) fn expire_for_test(&self, token: &str) {
         use subtle::ConstantTimeEq;
@@ -1384,12 +1423,109 @@ mod tests {
             store.refresh(TEST_API_TOKEN, t0),
             Err(SessionRefreshError::Unknown)
         );
-        // An expired session cannot be revived by refresh.
-        let after = t0 + SESSION_TOKEN_TTL + Duration::from_nanos(1);
+        let after = t0 + SESSION_TOKEN_TTL + SESSION_REFRESH_GRACE;
         assert_eq!(
             store.refresh(&token, after),
             Err(SessionRefreshError::Unknown)
         );
+    }
+
+    fn authorize_refresh(store: &SessionStore, token: &str, now: Instant) -> bool {
+        authorize(
+            SESSION_REFRESH_PATH,
+            &Method::POST,
+            Some(token),
+            None,
+            TEST_API_TOKEN,
+            store,
+            now,
+        )
+        .is_ok()
+    }
+
+    #[test]
+    fn lapsed_session_recovers_by_refresh_within_grace() {
+        let store = SessionStore::new(SESSION_TOKEN_TTL);
+        let t0 = Instant::now();
+        let hidden = store.issue(t0);
+        let back = t0 + SESSION_TOKEN_TTL + SESSION_REFRESH_GRACE - Duration::from_nanos(1);
+
+        assert!(!store.is_valid(&hidden, back), "a lapsed token is not live");
+        for (method, path, header, query) in [
+            (Method::GET, "/agent", Some(hidden.as_str()), None),
+            (Method::POST, "/auth/session", Some(hidden.as_str()), None),
+            (
+                Method::GET,
+                SESSION_REFRESH_PATH,
+                Some(hidden.as_str()),
+                None,
+            ),
+            (Method::GET, "/ws/direct", None, Some(hidden.as_str())),
+            (
+                Method::POST,
+                SESSION_REFRESH_PATH,
+                None,
+                Some(hidden.as_str()),
+            ),
+        ] {
+            assert_eq!(
+                authorize(path, &method, header, query, TEST_API_TOKEN, &store, back),
+                Err(StatusCode::UNAUTHORIZED),
+                "{method} {path}: a lapsed token must open nothing but refresh"
+            );
+        }
+        assert!(authorize_refresh(&store, &hidden, back));
+
+        let fresh = store.refresh(&hidden, back).expect("refresh within grace");
+        assert!(store.is_valid(&fresh, back));
+        assert_eq!(store.minted_at(&fresh, back), Some(t0));
+        assert!(!authorize_refresh(&store, &hidden, back));
+        assert_eq!(
+            store.refresh(&hidden, back),
+            Err(SessionRefreshError::Unknown),
+            "a lapsed token is swapped once"
+        );
+    }
+
+    #[test]
+    fn lapsed_session_is_refused_after_grace() {
+        let store = SessionStore::new(SESSION_TOKEN_TTL);
+        let t0 = Instant::now();
+        let hidden = store.issue(t0);
+        let late = t0 + SESSION_TOKEN_TTL + SESSION_REFRESH_GRACE;
+        assert!(late - t0 < SESSION_MAX_LIFETIME, "the refusal is the grace");
+
+        assert!(!authorize_refresh(&store, &hidden, late));
+        assert_eq!(
+            store.refresh(&hidden, late),
+            Err(SessionRefreshError::Unknown)
+        );
+    }
+
+    #[test]
+    fn lapsed_session_is_refused_past_the_hard_cap() {
+        let store = SessionStore::new(SESSION_TOKEN_TTL);
+        let t0 = Instant::now();
+        let last_refresh = t0 + SESSION_MAX_LIFETIME - Duration::from_secs(30 * 60);
+        let mut token = store.issue(t0);
+        let mut now = t0;
+        while now + SESSION_REFRESH_GRACE < last_refresh {
+            now += SESSION_REFRESH_GRACE;
+            token = store.refresh(&token, now).expect("within grace and cap");
+        }
+        token = store.refresh(&token, last_refresh).expect("before the cap");
+
+        let past_cap = t0 + SESSION_MAX_LIFETIME + Duration::from_secs(1);
+        assert!(
+            past_cap - (last_refresh + SESSION_TOKEN_TTL) < SESSION_REFRESH_GRACE,
+            "the token is inside its grace window"
+        );
+        assert!(!store.is_valid(&token, past_cap));
+        assert_eq!(
+            store.refresh(&token, past_cap),
+            Err(SessionRefreshError::LifetimeCapReached)
+        );
+        assert!(!store.is_valid(&token, past_cap));
     }
 
     #[test]
