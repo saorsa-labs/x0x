@@ -653,6 +653,11 @@ struct SubjectState {
     /// apply, and its authority served no chain and no join carry. The
     /// node asks without a marker or gap record ([`note_unserved_join_seal`]).
     unserved_seal: Option<UnservedSeal>,
+    /// #2022: when this node's head first reached a `catching_up` view's
+    /// segment terminal without its keys ([`holds_keys`]). After
+    /// [`super::PENDING_WELCOME_TTL`] the Welcome counts as lost
+    /// ([`end_on_welcome_loss`]).
+    terminal_unkeyed_at: Option<Instant>,
 }
 
 impl SubjectState {
@@ -677,6 +682,7 @@ impl SubjectState {
             welcome_unfetched_at: None,
             welcome_lost: false,
             unserved_seal: None,
+            terminal_unkeyed_at: None,
         }
     }
 
@@ -687,6 +693,7 @@ impl SubjectState {
         self.welcome_unfetched_at = None;
         self.welcome_lost = false;
         self.unserved_seal = None;
+        self.terminal_unkeyed_at = None;
     }
 
     fn end_round(&mut self, now: Instant) {
@@ -4349,11 +4356,14 @@ async fn end_on_welcome_loss(
     let stable = info.stable_group_id();
     let local = local_hex(state);
     let keyed = holds_keys(state, group_key, info).await;
+    let expired = |at: Option<Instant>| {
+        at.is_some_and(|at| now.saturating_duration_since(at) >= super::PENDING_WELCOME_TTL)
+    };
+    // #1661: the Welcome after readmission could not be fetched. #2022: or
+    // the head reached a catch-up's terminal and no Welcome came.
     let due = |subject: &SubjectState| {
-        subject.readmitted
-            && subject
-                .welcome_unfetched_at
-                .is_some_and(|at| now.saturating_duration_since(at) >= super::PENDING_WELCOME_TTL)
+        (subject.readmitted && expired(subject.welcome_unfetched_at))
+            || expired(subject.terminal_unkeyed_at)
     };
     {
         let mut inner = state.group_recovery.inner.lock().await;
@@ -4441,32 +4451,17 @@ async fn end_on_welcome_loss(
     true
 }
 
-/// Whether this node holds its keys for the group: an active seat in
-/// `info`, or a TreeKEM group ([`end_on_welcome_loss`]).
+/// Whether this node holds its keys for the group, the one definition per
+/// plane (#2022): on every plane, a TreeKEM group for it; on the GSS plane
+/// also an Active seat, which carries the shared secret. On the TreeKEM
+/// plane an Active seat alone is not keys: the tree comes only from the
+/// node's Welcome. An unknown plane has no other keys.
 async fn holds_keys(state: &AppState, group_key: &str, info: &GroupInfo) -> bool {
-    info.has_active_member(&local_hex(state))
-        || state.treekem_groups.read().await.contains_key(group_key)
-}
-
-/// Whether this node is Active on its roster and holds the plane's keys:
-/// on the TreeKEM plane its TreeKEM group too. A finished catch-up needs
-/// both (#2022); an unknown plane is never keyed.
-async fn seated_with_keys(
-    state: &AppState,
-    group_key: &str,
-    info: &GroupInfo,
-    local: &str,
-) -> bool {
-    if !info.has_active_member(local) {
-        return false;
+    if state.treekem_groups.read().await.contains_key(group_key) {
+        return true;
     }
-    match info.secure_plane {
-        x0x::mls::SecureGroupPlane::TreeKem => {
-            state.treekem_groups.read().await.contains_key(group_key)
-        }
-        x0x::mls::SecureGroupPlane::Gss => true,
-        x0x::mls::SecureGroupPlane::Unknown => false,
-    }
+    info.secure_plane == x0x::mls::SecureGroupPlane::Gss
+        && info.has_active_member(&local_hex(state))
 }
 
 /// Whether the attempt for `stable` ended on a lost Welcome
@@ -4845,21 +4840,32 @@ async fn subject_tick(state: &Arc<AppState>) {
         }
         retire_converged(state, &key).await;
         if refs.is_empty() && !unserved_seal_open(state, &info).await {
-            let keyed = seated_with_keys(state, &key, &info, &local).await;
+            let keyed = holds_keys(state, &key, &info).await;
             let at_terminal_unkeyed = {
                 let mut inner = state.group_recovery.inner.lock().await;
                 // A catch-up holds its view until its segment terminal is
-                // reached (#2003) and this node is Active with its keys
-                // (#2022). At the terminal with no Welcome yet it keeps
-                // its typed state; the #1661 Welcome-loss path ends it.
-                let (drop_entry, unkeyed) = match inner.subjects.get(&stable).map(|s| &s.view) {
-                    Some(SubjectView::CatchingUp {
-                        segment_terminal, ..
-                    }) => {
-                        let at_terminal = info.state_revision >= *segment_terminal;
-                        (at_terminal && keyed, at_terminal && !keyed)
-                    }
-                    Some(_) => (true, false),
+                // reached (#2003) and this node holds its keys (#2022). At
+                // the terminal with no keys it keeps its typed state, for
+                // at most the Welcome's lifetime: then
+                // `end_on_welcome_loss` ends the attempt typed.
+                let (drop_entry, unkeyed) = match inner.subjects.get_mut(&stable) {
+                    Some(subject) => match &subject.view {
+                        SubjectView::CatchingUp {
+                            segment_terminal, ..
+                        } if info.state_revision >= *segment_terminal => {
+                            if !keyed {
+                                subject.terminal_unkeyed_at =
+                                    subject.terminal_unkeyed_at.or(Some(now));
+                            }
+                            (keyed, !keyed)
+                        }
+                        SubjectView::CatchingUp { .. } => {
+                            // Short of the terminal: the Welcome is not due.
+                            subject.terminal_unkeyed_at = None;
+                            (false, false)
+                        }
+                        _ => (true, false),
+                    },
                     None => (false, false),
                 };
                 if drop_entry {
@@ -5169,9 +5175,12 @@ async fn next_target(
         }
         // Only an empty list reaches here (#2022): no capable peer at all.
         // Nothing was asked, so no round ends and `attempts` does not grow;
-        // the node asks at once when a capable peer appears.
+        // the node asks at once when a capable peer appears. The round's
+        // state resets as `end_round` resets it, `cooled` included, since
+        // a `rate_limited` cooldown is for a target no longer listed.
         subject.next_target = 0;
         subject.pending = None;
+        subject.cooled = None;
         return None;
     }
     let target = targets.get(subject.next_target).copied()?;
@@ -20141,7 +20150,7 @@ mod tests {
     #[tokio::test]
     async fn a_finished_catch_up_clears_the_recovery_object() -> anyhow::Result<()> {
         let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
-        let (key, info, admin) = unserved_fixture(&state, "attempt-1").await?;
+        let (_key, info, admin) = unserved_fixture(&state, "attempt-1").await?;
         let stable = info.stable_group_id().to_string();
         let catching_up = |terminal: u64| SubjectView::CatchingUp {
             attested_by: hex::encode(admin.agent_id().as_bytes()),
@@ -20161,8 +20170,8 @@ mod tests {
             view_of(&state, &stable).await,
             Some(catching_up(info.state_revision + 1))
         );
-        // At the terminal, Active with its TreeKEM group (#2022): dropped.
-        install_tree(&state, &key)?;
+        // At the terminal, with its keys (a GSS group: the Active seat):
+        // dropped.
         set_view(
             &state,
             &stable,
@@ -20177,38 +20186,42 @@ mod tests {
     }
 
     /// A TreeKEM group for `key`, so this node holds the plane's keys.
-    fn install_tree(state: &AppState, key: &str) -> anyhow::Result<()> {
+    async fn install_tree(state: &AppState, key: &str) -> anyhow::Result<()> {
         let group_id = hex::decode(key)?;
         let seed = super::super::agent_treekem_seed(state.agent.as_ref(), &group_id);
         let tree = x0x::mls::TreeKemMlsGroup::create(group_id, state.agent.agent_id(), &seed)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
         state
             .treekem_groups
-            .try_write()
-            .map_err(|_| anyhow::anyhow!("treekem_groups is locked"))?
+            .write()
+            .await
             .insert(key.to_string(), Arc::new(tokio::sync::Mutex::new(tree)));
         Ok(())
     }
 
-    /// #2022 (from the review of #2021): a `catching_up` view at its
-    /// segment terminal is dropped only when this node is Active with its
-    /// keys. With no Welcome yet it keeps its typed state, and the #1661
-    /// Welcome-loss path ends it `readmission_required
-    /// {base_beyond_retention}` once the Welcome's lifetime passes. RED on
-    /// main: the tick dropped the view at the terminal, so the node showed
-    /// no recovery object and held no keys. Inert: an offline agent,
-    /// paused time.
+    /// #2022 (from the review of #2021): on the TreeKEM plane a
+    /// `catching_up` view at its segment terminal is dropped only when this
+    /// node holds its TreeKEM group. Pre-Welcome, or Active with no tree,
+    /// it keeps its typed state, and once the Welcome's lifetime has passed
+    /// since the head reached the terminal, `end_on_welcome_loss` ends the
+    /// attempt `readmission_required {base_beyond_retention}`. Control: with
+    /// the tree the view is dropped. RED on main: the tick dropped the view
+    /// at the terminal, so the node showed no recovery object and held no
+    /// keys. Inert: an offline agent, paused time.
     #[tokio::test]
     async fn a_catch_up_at_its_terminal_without_keys_keeps_its_typed_state() -> anyhow::Result<()> {
         let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
-        let (key, info, admin) = unserved_fixture(&state, "attempt-1").await?;
+        tokio::time::pause();
+        let (key, mut info, admin) = unserved_fixture(&state, "attempt-1").await?;
+        info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
         let stable = info.stable_group_id().to_string();
         let held = SubjectView::CatchingUp {
             attested_by: hex::encode(admin.agent_id().as_bytes()),
             verified: true,
             segment_terminal: info.state_revision,
         };
-        // Neither case holds a TreeKEM group.
+        // Neither case holds a TreeKEM group. The Active case is the last,
+        // so its record stays installed.
         for (case, active) in [("pre-Welcome", false), ("Active, no tree", true)] {
             let mut record = info.clone();
             if !active {
@@ -20231,9 +20244,7 @@ mod tests {
                 "{case}: the recovery object stays"
             );
         }
-        // The Welcome never comes: the #1661 path ends the attempt typed.
-        tokio::time::pause();
-        set_attempt(&state, &stable, true, Some(Instant::now()), false).await;
+        // No Welcome within its lifetime: the attempt ends typed.
         tokio::time::advance(super::super::PENDING_WELCOME_TTL).await;
         subject_tick(&state).await;
         assert_eq!(
@@ -20242,6 +20253,12 @@ mod tests {
                 cause: "base_beyond_retention"
             })
         );
+        // Control: with its TreeKEM group the node is keyed and a
+        // `catching_up` view at the terminal is dropped.
+        install_tree(&state, &key).await?;
+        set_view(&state, &stable, info.state_revision, held.clone()).await;
+        subject_tick(&state).await;
+        assert_eq!(view_of(&state, &stable).await, None);
         Ok(())
     }
 
