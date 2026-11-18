@@ -33,7 +33,7 @@ mod state;
 mod system_events;
 mod update_check;
 #[cfg(any(unix, windows))]
-mod upgrade_flush;
+pub(crate) mod upgrade_flush;
 mod upgrade_health_commit;
 pub use update_check::run_update_check_and_report;
 mod w3h;

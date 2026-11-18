@@ -2568,7 +2568,7 @@ const BASE = 'http://127.0.0.1:9';
 let SESSION_TOKEN = 'tok';
 const SESSION_REFRESH_MS = 8*60*1000;
 let sessionExpired = false;
-let sessionRefreshing = false;
+let sessionRefreshing = null;
 let sessionIssuedAt = 0;
 let sessionClockKnown = true;
 "#,
@@ -2708,11 +2708,12 @@ const document = {
 };
 let daemonToken = 'minted-token';
 let daemonExpiry = 10 * 60 * 1000;
+const GRACE = 4 * 60 * 60 * 1000;
 const sent = [];
 function wsSend(obj) { sent.push(obj); }
 async function apiWith(token, path) {
   if (path !== '/auth/session/refresh') return null;
-  if (token !== daemonToken || now >= daemonExpiry) {
+  if (token !== daemonToken || now >= daemonExpiry + GRACE) {
     return { _http_ok: false, _http_status: 401 };
   }
   daemonToken = 'refreshed-' + now;
@@ -2747,14 +2748,22 @@ async function apiWith(token, path) {
   if (wsUrl().indexOf('gui=1') < 0) {
     throw new Error('a live tab omitted gui=1: ' + wsUrl());
   }
-  // Mint at 0, load at 11. The token is already dead. This tab must not
-  // suppress a browser open.
+  // Mint at 0, load at 11. The token lapsed, and the daemon still swaps it.
   now = 11 * 60 * 1000;
   daemonToken = 'late-token';
   daemonExpiry = 10 * 60 * 1000;
   location.search = '?token=late-token';
-  sessionExpired = false;
-  sessionRefreshing = false;
+  SESSION_TOKEN = readSessionToken();
+  noteSessionClock();
+  await bootstrapGuiSession();
+  if (!liveGuiTab()) {
+    throw new Error('a load inside the refresh grace must recover the session');
+  }
+  // Load after the grace. This tab must not suppress a browser open.
+  now = 10 * 60 * 1000 + GRACE;
+  daemonToken = 'stale-token';
+  daemonExpiry = 10 * 60 * 1000;
+  location.search = '?token=stale-token';
   SESSION_TOKEN = readSessionToken();
   noteSessionClock();
   await bootstrapGuiSession();
@@ -2777,6 +2786,136 @@ async function apiWith(token, path) {
         assert!(
             output.status.success(),
             "a delayed GUI load advertised an expired token\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn hidden_tab_session_recovers_within_grace_and_expires_after() {
+        let html = include_str!("x0x-gui.html");
+        let source = format!(
+            "{}\n{}\n{}",
+            r#"
+const MIN = 60 * 1000;
+const TTL = 10 * MIN, GRACE = 240 * MIN, CAP = 720 * MIN;
+let now = 0;
+Date.now = () => now;
+const store = {};
+const sessionStorage = {
+  getItem(k) { return Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null; },
+  setItem(k, v) { store[k] = String(v); },
+  removeItem(k) { delete store[k]; }
+};
+const location = { origin: 'http://127.0.0.1:9', pathname: '/gui', search: '', hash: '' };
+const history = { replaceState() { location.search = ''; } };
+const BASE = location.origin;
+let toasts = 0;
+const document = {
+  visibilityState: 'visible',
+  createElement() { return {}; },
+  getElementById() { return { appendChild() { toasts += 1; } }; }
+};
+function wsSend() {}
+let daemon = null;
+let refreshes = 0;
+function mint(token) {
+  daemon = { token, mintedAt: now, expiresAt: now + TTL };
+  location.search = '?token=' + token;
+}
+async function apiWith(token, path) {
+  await null;
+  const known = daemon && token === daemon.token;
+  if (path !== '/auth/session/refresh') {
+    return known && now < daemon.expiresAt
+      ? { _http_ok: true, _http_status: 200 }
+      : { _http_ok: false, _http_status: 401 };
+  }
+  refreshes += 1;
+  if (!known || now >= daemon.expiresAt + GRACE || now - daemon.mintedAt > CAP) {
+    return { _http_ok: false, _http_status: 401 };
+  }
+  daemon.token = 'session-' + refreshes;
+  daemon.expiresAt = now + TTL;
+  return { _http_ok: true, session_token: daemon.token, expires_in: 600 };
+}
+"#,
+            fn_source(
+                html,
+                "function readSessionToken()",
+                "function readOwnerToken()"
+            ),
+            r#"
+function fail(message) { throw new Error(message + ' at ' + now / MIN + ' min'); }
+async function away(minutes) {
+  document.visibilityState = 'hidden';
+  const before = refreshes;
+  for (let i = 0; i < minutes; i += 1) {
+    now += MIN;
+    await maybeRefreshSession();
+  }
+  if (refreshes !== before) fail('a hidden tab refreshed the session');
+  const r = await api('/agent');
+  if (refreshes !== before) fail('a hidden request refreshed the session');
+  if (minutes > 10 && r._http_ok) fail('the fixture token did not lapse while hidden');
+  if (sessionExpired) fail('a hidden lapse must not end the session');
+  document.visibilityState = 'visible';
+}
+async function load(token) {
+  mint(token);
+  sessionExpired = false;
+  toasts = 0;
+  SESSION_TOKEN = readSessionToken();
+  noteSessionClock();
+  await bootstrapGuiSession();
+  if (!liveGuiTab()) fail('the fixture did not start with a live tab');
+}
+(async () => {
+  await load('minted-a');
+  await away(180);
+  let before = refreshes;
+  const answers = await Promise.all([api('/agent'), api('/contacts'), api('/groups')]);
+  if (refreshes !== before + 1) fail('a reveal must refresh once, saw ' + (refreshes - before));
+  if (!answers.every((r) => r && r._http_ok)) {
+    fail('requests after a reveal must use the refreshed token: ' + JSON.stringify(answers));
+  }
+  if (sessionExpired || toasts !== 0) fail('a lapse inside grace must not end the session');
+  if (!liveGuiTab()) fail('a recovered session must be a live tab');
+
+  await away(251);
+  let r = await api('/agent');
+  if (r._http_ok) fail('a request succeeded after the grace');
+  if (!sessionExpired || toasts !== 1) fail('a lapse past grace must end the session');
+  if (liveGuiTab()) fail('an ended session is not a live tab');
+  before = refreshes;
+  await api('/agent');
+  if (refreshes !== before || toasts !== 1) fail('an ended session must not retry refresh');
+
+  await load('minted-b');
+  for (let i = 0; i < 3; i += 1) {
+    await away(239);
+    r = await api('/agent');
+    if (!r._http_ok || sessionExpired) fail('a lapse inside grace and cap must recover');
+  }
+  await away(10);
+  if (now - daemon.mintedAt <= CAP) fail('the fixture did not pass the cap');
+  if (now >= daemon.expiresAt + GRACE) fail('the fixture left the grace');
+  r = await api('/agent');
+  if (r._http_ok) fail('a request succeeded past the 12 h cap');
+  if (!sessionExpired || toasts !== 1) fail('the 12 h cap must end the session');
+})().catch((error) => { console.error(error); process.exit(1); });
+"#
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("hidden-lapse.js");
+        std::fs::write(&script, source).expect("write script");
+        let output = std::process::Command::new("node")
+            .arg(&script)
+            .output()
+            .expect("node runs the hidden lapse");
+        assert!(
+            output.status.success(),
+            "a session that lapsed while hidden did not follow the grace and cap\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );

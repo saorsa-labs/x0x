@@ -398,6 +398,59 @@ SKILL remains unchanged. A later installer must enforce the applicable gate:
 host commit on protected paths, or matching candidate bytes and stable local
 health on unprotected paths under D195. It must retain the prior guide.
 
+#### Prepare producer (#2012, dormant)
+
+`upgrade::prepare` writes the prepared host journal
+(`<data_root>/upgrade-journal.json`) that the launcher-side issuer, the
+launcher's `Host::new` and the arm handler read. No apply path calls it yet.
+
+- `freeze_plan` checks the plan before anything is written:
+  - the daemon's and the CLI's target and backup paths exist and are
+    canonical;
+  - each participant has a valid, unique instance id (the launcher's
+    rule);
+  - each participant's executable and `argv[0]` are the plan's daemon
+    target;
+  - each participant's data root, identity root and working directory are
+    canonical;
+  - a running participant carries its pid and process start;
+  - the journal's own validation accepts the record.
+- `Prepared::stage` and `Prepared::advance` require a `HostLock`, by
+  type. `HostLock` holds the advisory locks on
+  `<cli target>.upgrade.lock`, then `<daemon target>.upgrade.lock`, in
+  the order the pair writer and the launcher take them, and it must be
+  the lock of the plan's install pair.
+  - **Two runs at once.** The check of an earlier journal and the write
+    are both under the lock. So of two concurrent runs, the second waits,
+    then finds the first's journal in flight and is refused.
+- `Prepared::stage` writes the journal in `Staged` with
+  `journal::write_record` (mode 0600, owned by the writing account,
+  atomic, file and directory fsync). It writes only into a participant's
+  data root that passes the issuer's root check (canonical, this
+  account's, no group or other write). An earlier journal is replaced
+  only when it is settled (`HostCommitted`, `Restored`, `Idle`,
+  `Superseded`).
+- `Prepared::advance` moves the journal through `Probed` (optional),
+  `Prepared`, `SwappedDaemon` and `SwappedCli`.
+  - It first re-reads the journal under the lock and refuses one that is
+    not exactly the record this run last wrote: same transaction, same
+    sequence, same fields.
+  - A swap phase is written only after its target hashes to the planned
+    candidate and its backup to the planned previous release.
+- `upgrade::prepare_live::observe_this_daemon` reads the running daemon's
+  own participant entry. The executable is canonical, and the pid,
+  process start and boot ID come from the same functions the arm handler
+  compares against. The entry also holds the process environment without
+  `X0X_M2_BOOT_FD`, since the launcher starts the candidate with exactly
+  that environment.
+- **Which side checks what.** The producer checks only that a running
+  participant has a pid and a process start. The arm handler
+  (`server::upgrade_flush::admit`) refuses a journal whose participant
+  names another boot, another pid, another process start, another
+  identity root (another host) or another executable. It compares the
+  canonical running executable, so a daemon started through a symlink is
+  compared by the file it runs.
+
 ## Restart ownership is resolved before mutation (ADR-0061, #493)
 
 The daemon resolves and validates the whole restart contract **before it

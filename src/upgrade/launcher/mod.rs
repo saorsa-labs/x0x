@@ -48,6 +48,12 @@ impl Clock {
 #[cfg(all(test, unix))]
 mod testkit;
 
+/// The prepare producer (#2012), so the tests read what it writes with
+/// this launcher's own issuer.
+#[cfg(all(test, unix))]
+#[path = "../prepare.rs"]
+mod prepare;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
