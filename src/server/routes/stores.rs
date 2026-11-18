@@ -292,6 +292,8 @@ pub(in crate::server) struct StoreListEntry {
     /// True while snapshot persistence is failing (local writes refused
     /// until a snapshot succeeds).
     durability_degraded: bool,
+    /// #1970: retained-image status of a group store; `null` otherwise.
+    image: Option<x0x::kv::ImageStatus>,
 }
 
 /// GET /stores
@@ -319,6 +321,7 @@ pub(in crate::server) async fn list_kv_stores(
             policy_version: info.policy_version,
             ownership_status: info.ownership_status,
             durability_degraded: info.durability_degraded,
+            image: handle.image_status().await,
         });
     }
     Json(serde_json::json!({ "ok": true, "stores": entries }))

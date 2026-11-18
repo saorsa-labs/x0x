@@ -5769,6 +5769,19 @@ pub(crate) fn load_snapshot_bytes(bytes: &[u8]) -> Result<KvStore> {
         );
     }
     store.restore_seq_counter(seq_counter.max(store.current_version()));
+    // #1970: an image saved above the hard limit by an earlier version loads
+    // whole; it reports `over_limit` and is not served until it shrinks.
+    if let Some(status) = store.image_status() {
+        if status.state == crate::kv::ImageState::OverLimit {
+            tracing::warn!(
+                target: "x0x::kv",
+                store = %store.id(),
+                image = status.image_bytes,
+                max = status.hard_limit_bytes,
+                "opened a group store whose retained image is above the hard limit; remove entries to serve it again"
+            );
+        }
+    }
     Ok(store)
 }
 
@@ -8874,6 +8887,81 @@ mod tests {
             Err(KvError::StoreFull { image, .. }) => assert!(image > max),
             other => panic!("expected a typed StoreFull refusal, got {other:?}"),
         }
+    }
+
+    /// #1970 point 6 (load from disk): a group image saved above the hard
+    /// limit by an earlier version loads whole and reports `over_limit`; it
+    /// refuses puts and serves, and admits only merges whose result fits.
+    /// Removing entries brings it back: it serves again at or below the
+    /// hard limit and takes puts again at or below the soft limit.
+    #[test]
+    fn an_over_limit_group_image_loads_whole_and_heals_by_removal() {
+        let owner = agent(1);
+        let mut group = crate::groups::GroupInfo::new(
+            "public".to_string(),
+            String::new(),
+            owner,
+            "fb".repeat(16),
+        );
+        group.migrate_from_v1();
+        group.policy.confidentiality = crate::groups::GroupConfidentiality::SignedPublic;
+        group.policy.read_access = crate::groups::GroupReadAccess::Public;
+        let ctx = Arc::new(
+            crate::groups::PublicGroupKvContext::from_group(&group).expect("public context"),
+        );
+        let mut store = KvStore::new_group_signed(
+            store_id(5),
+            "Wiki".to_string(),
+            owner,
+            group.stable_group_id().as_bytes().to_vec(),
+            ctx,
+        )
+        .expect("store");
+        for i in 0..300u32 {
+            store
+                .put(
+                    format!("k{i:05}"),
+                    vec![b'v'; 60_000],
+                    "text/plain".to_string(),
+                    peer(1),
+                )
+                .expect("put");
+        }
+        let hard = crate::kv::image_admission::HARD_IMAGE_LIMIT_BYTES as u64;
+        let soft = crate::kv::image_admission::SOFT_IMAGE_LIMIT_BYTES as u64;
+        let saved = store.canonical_retained_image_len().expect("size");
+        assert!(saved > hard, "fixture is above the hard limit: {saved}");
+
+        let mut loaded =
+            load_snapshot_bytes(&encode_snapshot(&store).expect("encode")).expect("load");
+        assert_eq!(loaded.len(), 300, "the image loads whole");
+        let status = loaded.image_status().expect("group store");
+        assert_eq!(status.state, crate::kv::ImageState::OverLimit);
+        assert_eq!(status.image_bytes, saved);
+        assert!(matches!(
+            serialize_retained_group_image(&loaded),
+            Err(KvError::StoreFull { .. })
+        ));
+        assert!(loaded.check_image_room("new", 10, 10, true).is_err());
+
+        let mut k = 0u32;
+        while loaded.canonical_retained_image_len().expect("size") > hard {
+            loaded.remove(&format!("k{k:05}")).expect("remove");
+            k += 1;
+        }
+        assert_eq!(
+            loaded.image_status().expect("status").state,
+            crate::kv::ImageState::Full
+        );
+        serialize_retained_group_image(&loaded).expect("serves again under the hard limit");
+        assert!(loaded.check_image_room("new", 10, 10, true).is_err());
+        while loaded.canonical_retained_image_len().expect("size") + 70_000 > soft {
+            loaded.remove(&format!("k{k:05}")).expect("remove");
+            k += 1;
+        }
+        loaded
+            .check_image_room("new", 10, 10, true)
+            .expect("takes puts again under the soft limit");
     }
 
     /// #1970: the over-cap refusals must surface, not just log and drop —

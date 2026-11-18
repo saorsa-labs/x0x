@@ -339,6 +339,31 @@ async fn check_store_integrity(client: &DaemonClient) -> DoctorCheck {
                     degraded.join(", ")
                 ));
             }
+            // #1970: a group store that refused a merge at the image limit
+            // can differ from its peers until entries are removed.
+            let image_problems: Vec<String> = stores
+                .iter()
+                .filter_map(|s| {
+                    let state = s.get("image")?.get("state")?.as_str()?;
+                    matches!(state, "full_diverged" | "over_limit").then(|| {
+                        let id = s.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                        format!("{id} ({state})")
+                    })
+                })
+                .collect();
+            if !image_problems.is_empty() {
+                return DoctorCheck::warn(
+                    format!(
+                        "{} group store(s) at the retained-image limit; remove entries to repair: {}",
+                        image_problems.len(),
+                        image_problems.join(", ")
+                    ),
+                    Some(serde_json::json!({
+                        "store_count": stores.len(),
+                        "image_limit": image_problems,
+                    })),
+                );
+            }
             DoctorCheck::ok_with(
                 format!("{} store(s) readable", stores.len()),
                 serde_json::json!({ "store_count": stores.len() }),
