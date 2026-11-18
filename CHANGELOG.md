@@ -19,6 +19,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **M2 prepare producer, dormant (#2012; A14 amendment of 18 Nov 2026).**
+  New crate-private `upgrade::prepare` freezes the host plan and writes the
+  prepared host journal through `Staged` … `SwappedCli`, under the host
+  lock, which the API requires by type. Before it writes anything, it
+  checks what the launcher issuer, `Host::new` and the arm handler check.
+  The arm handler now compares the canonical running executable, so a
+  daemon started through a symlink is no longer refused. `upgrade::prepare_live` reads the running daemon's own
+  participant entry. No apply path calls either yet.
 - **Relay serving follows participation mode (#1642; A06 amendment of
   18 Nov 2026).** New `NetworkConfig.relay_service_enabled` (default `true`)
   is passed to ant-quic. x0xd reads an optional TOML `relay_service_enabled`;

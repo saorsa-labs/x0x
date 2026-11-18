@@ -341,6 +341,29 @@ mod tests {
         assert_eq!(issued.host.root(), root);
     }
 
+    /// #2012: a journal the prepare producer writes is one this issuer
+    /// issues, and `Host::new` binds; an instance it did not write is a
+    /// fixed refusal.
+    #[test]
+    fn a_journal_from_the_prepare_producer_is_issued() {
+        use super::super::prepare::tests as producer;
+        let (_dir, root) = producer::root();
+        let prepared = producer::prepared_in(&root, producer::input_in(&root));
+        let (args, command) = matching(prepared.record());
+        let issued = issue_as(&args, &command, effective_uid())
+            .unwrap()
+            .expect("issued");
+        assert_eq!(issued.host.root(), root);
+        let other = TrialArgs {
+            instance: "bob".into(),
+            ..args
+        };
+        let error = issue_as(&other, &command, effective_uid())
+            .err()
+            .expect("refused");
+        assert!(start::is_refusal(&error), "{error}");
+    }
+
     #[test]
     fn no_journal_or_a_settled_one_is_an_ordinary_start() {
         let (_dir, root, record) = rooted(journal::Phase::SwappedCli);
