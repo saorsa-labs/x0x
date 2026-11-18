@@ -1036,6 +1036,18 @@ pub(in crate::server) fn classify_with_detail(
     }
 }
 
+/// The gated `verdict.inputs` fields (#1480 Finding 3): each input object
+/// name with the keys [`redact_health_detail`] removes from it. The one
+/// list both the server redaction and the `x0x doctor --bundle`
+/// full-detail detection read (#1354).
+pub(crate) const GATED_HEALTH_DETAIL: &[(&str, &[&str])] = &[
+    ("disk", &["free_bytes", "total_bytes"]),
+    ("upgrade", &["latest_version"]),
+    ("identity", &["user_present"]),
+    ("log", &["errors"]),
+    ("send_failure_rate", &["attempts", "failed", "rate"]),
+];
+
 /// Remove the gated detail fields from a serialized `/health` payload
 /// (David's ruling of 20 Oct 2026 on #1480 Finding 3).
 ///
@@ -1048,7 +1060,11 @@ pub(in crate::server) fn classify_with_detail(
 ///
 /// The publish-failure `rate` goes with its `attempts`/`failed` counts:
 /// it is the same windowed measurement in ratio form.
-pub(in crate::server) fn redact_health_detail(payload: &mut serde_json::Value) {
+///
+/// The `x0x doctor --bundle` writer applies the same function to the
+/// loopback `/health` body before embedding it in the owner-local
+/// diagnostic bundle (#1354).
+pub(crate) fn redact_health_detail(payload: &mut serde_json::Value) {
     let Some(inputs) = payload
         .get_mut("verdict")
         .and_then(|verdict| verdict.get_mut("inputs"))
@@ -1056,14 +1072,7 @@ pub(in crate::server) fn redact_health_detail(payload: &mut serde_json::Value) {
     else {
         return;
     };
-    let gated: &[(&str, &[&str])] = &[
-        ("disk", &["free_bytes", "total_bytes"]),
-        ("upgrade", &["latest_version"]),
-        ("identity", &["user_present"]),
-        ("log", &["errors"]),
-        ("send_failure_rate", &["attempts", "failed", "rate"]),
-    ];
-    for (input, keys) in gated {
+    for (input, keys) in GATED_HEALTH_DETAIL {
         if let Some(object) = inputs
             .get_mut(*input)
             .and_then(serde_json::Value::as_object_mut)

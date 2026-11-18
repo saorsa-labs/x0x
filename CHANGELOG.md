@@ -4,8 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Launcher refusal record and launcher-bound autostart (#1379, #2019
+  review; A14 amendment of 18 Nov 2026).** A trial-form launcher start now
+  removes an earlier `launcher-refusal.json` before it starts, so a start
+  that supervises the daemon leaves no stale record. The record holds the
+  launcher's process start time, and `x0x doctor` shows "holding" only
+  while that exact process exists, not a reused pid. `x0x autostart` on
+  macOS writes the plist in one step (mode 0644) and loads it with
+  `launchctl bootstrap gui/<uid>`; `--remove` uses `bootout`. A hidden,
+  opt-in `x0x autostart --launcher` installs the job through the dormant
+  stable launcher.
+
 ### Added
 
+- **M2 prepare producer, dormant (#2012; A14 amendment of 18 Nov 2026).**
+  New crate-private `upgrade::prepare` freezes the host plan and writes the
+  prepared host journal through `Staged` … `SwappedCli`, under the host
+  lock, which the API requires by type. Before it writes anything, it
+  checks what the launcher issuer, `Host::new` and the arm handler check.
+  The arm handler now compares the canonical running executable, so a
+  daemon started through a symlink is no longer refused. `upgrade::prepare_live` reads the running daemon's own
+  participant entry. No apply path calls either yet.
 - **Relay serving follows participation mode (#1642; A06 amendment of
   18 Nov 2026).** New `NetworkConfig.relay_service_enabled` (default `true`)
   is passed to ant-quic. x0xd reads an optional TOML `relay_service_enabled`;
@@ -19,6 +40,13 @@ All notable changes to this project will be documented in this file.
   `down_bps` rates, each split into `gossip`, `direct`, `relay` and `other`.
   `x0x status` adds human-readable totals in text output; `--json` keeps the
   raw numbers only. No limits change.
+- **`x0x doctor --bundle [PATH]` writes an owner-local diagnostic bundle
+  (#1354 slice 1; A14 amendment of 17 Nov 2026).** One JSON file with the
+  redacted `/health` body and the four doctor checks; it holds no keys,
+  tokens or message content and is never sent anywhere. The file is
+  created new with mode 0600; an existing file or a symlink at the path is
+  refused. `GET /health?detail=redacted` lets any caller ask for the
+  redacted body; the parameter can only remove detail.
 - **launchd jobs that run the stable launcher are recognised (#1379 slice 2;
   A14 amendment of 17 Nov 2026).** `x0x autostart --repair` and the
   upgrade-time launchd readback look through `x0x-launcher`'s own arguments

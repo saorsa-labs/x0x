@@ -77,7 +77,18 @@ enum Commands {
     Instances,
     /// Pre-flight diagnostics. [dev]
     #[command(hide = true)]
-    Doctor,
+    Doctor {
+        /// Write a redacted diagnostic bundle (owner-local, #1354) to this
+        /// file. Optional value; a bare --bundle writes
+        /// ./x0x-doctor-bundle-<unix-secs>.json. The file must not exist
+        /// yet (an existing file or symlink is refused).
+        //
+        // No `default_missing_value`: clap's PathBuf parser rejects the
+        // empty sentinel, and plain `num_args = 0..=1` already yields the
+        // tri-state — absent → None, bare → Some(None), value → Some(path).
+        #[arg(long, num_args = 0..=1)]
+        bundle: Option<Option<PathBuf>>,
+    },
     /// Configure daemon to start on boot (systemd/launchd).
     Autostart {
         /// Remove autostart configuration.
@@ -87,6 +98,10 @@ enum Commands {
         /// upgrade contract (ADR-0061) instead of installing a new job.
         #[arg(long)]
         repair: bool,
+        /// Run the daemon through the stable launcher installed next to
+        /// x0xd (launchd only; opt-in while the launcher is dormant). [dev]
+        #[arg(long, hide = true, conflicts_with_all = ["remove", "repair"])]
+        launcher: bool,
     },
     /// Health check.
     Health,
@@ -2422,15 +2437,30 @@ async fn run(
             return commands::upgrade::run(*check, *force, name, api).await;
         }
         Commands::Instances => return commands::daemon::instances().await,
-        Commands::Doctor => {
+        Commands::Doctor { bundle } => {
             // Doctor must still emit its summary when a named instance has no
             // api.port. Do not fall through to DaemonClient::new(?) — that
             // leaves --json with empty stdout. Keep the named-instance
             // boundary: never silently target the default daemon.
+            //
+            // The raw `--bundle` flag value (bare vs explicit) travels to
+            // the lib (#1354): it resolves the path there; every target is
+            // created fresh and never overwritten.
             return match DaemonClient::new(name, api, format) {
-                Ok(client) => commands::daemon::doctor(&client.dump_requests(dump_request)).await,
+                Ok(client) => {
+                    commands::daemon::doctor(
+                        &client.dump_requests(dump_request),
+                        bundle.as_ref().map(|inner| inner.as_deref()),
+                    )
+                    .await
+                }
                 Err(err) if name.is_some() && api.is_none() => {
-                    commands::daemon::doctor_unreachable(format, name, &err)
+                    commands::daemon::doctor_unreachable(
+                        format,
+                        name,
+                        &err,
+                        bundle.as_ref().map(|inner| inner.as_deref()),
+                    )
                 }
                 Err(err) => Err(err),
             };
@@ -2438,13 +2468,17 @@ async fn run(
         Commands::Start { config, foreground } => {
             return commands::daemon::start(name, config.as_deref(), *foreground).await;
         }
-        Commands::Autostart { remove, repair } => {
+        Commands::Autostart {
+            remove,
+            repair,
+            launcher,
+        } => {
             return if *remove {
                 commands::daemon::autostart_remove().await
             } else if *repair {
                 commands::daemon::autostart_repair().await
             } else {
-                commands::daemon::autostart(name).await
+                commands::daemon::autostart(name, *launcher).await
             };
         }
         Commands::Identity {
@@ -3559,7 +3593,7 @@ async fn run(
             Some(WsSub::Direct { backfill }) => commands::ws::direct(&client, backfill).await,
         },
         Commands::Stop => commands::daemon::stop(&client).await,
-        Commands::Doctor => {
+        Commands::Doctor { .. } => {
             anyhow::bail!("command dispatched earlier — dispatch table out of sync")
         }
         Commands::SendFile { agent_id, path } => {
@@ -4192,6 +4226,34 @@ mod tests {
             Commands::Presence { sub: None } => Ok(()),
             _ => anyhow::bail!("expected bare presence to parse without nested subcommand"),
         }
+    }
+
+    // #1354: `--bundle` is an optional-value flag with three parse states —
+    // absent, bare (generated default name) and explicit path. Verified
+    // against clap 4.6.7: `num_args = 0..=1` alone maps a bare flag to
+    // `Some(None)`, the resolver's generate-default signal.
+    #[test]
+    fn doctor_bundle_flag_three_parse_states() -> anyhow::Result<()> {
+        match Cli::try_parse_from(["x0x", "doctor"])?.command {
+            Commands::Doctor { bundle: None } => {}
+            _ => anyhow::bail!("absent --bundle must parse to None"),
+        }
+        match Cli::try_parse_from(["x0x", "doctor", "--bundle"])?.command {
+            Commands::Doctor { bundle: Some(None) } => {}
+            _ => anyhow::bail!("bare --bundle must parse to Some(None)"),
+        }
+        for argv in [
+            vec!["x0x", "doctor", "--bundle", "diag.json"],
+            vec!["x0x", "doctor", "--bundle=diag.json"],
+        ] {
+            match Cli::try_parse_from(argv)?.command {
+                Commands::Doctor {
+                    bundle: Some(Some(path)),
+                } => assert_eq!(path, PathBuf::from("diag.json")),
+                _ => anyhow::bail!("--bundle <path> must parse to Some(Some(path))"),
+            }
+        }
+        Ok(())
     }
 
     // #893: `--view` becomes the GUI hash route; anything that could escape
