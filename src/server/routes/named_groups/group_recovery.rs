@@ -4641,14 +4641,31 @@ pub(super) async fn retire_converged(state: &Arc<AppState>, group_id: &str) {
     if retired != SidecarWrite::Written {
         return;
     }
-    state
-        .group_recovery
-        .inner
-        .lock()
-        .await
-        .subjects
-        .remove(&stable);
-    tracing::info!(group_id = %LogHexId::group(&group_key), "ADR 0109 S3: attested catch-up reached its terminal; the armed ATA is retired");
+    // #2022: the catch-up has finished only when this node holds its keys
+    // ([`holds_keys`]). A keyless node (on TreeKEM, no tree yet) keeps a
+    // typed `catching_up` view at the retired ATA's terminal; with the ATA
+    // gone its refs are empty, so the next tick bounds that view by the
+    // Welcome's lifetime (`terminal_unkeyed_at`).
+    let keyed = holds_keys(state, &group_key, &info).await;
+    let now = Instant::now();
+    let mut inner = state.group_recovery.inner.lock().await;
+    if keyed {
+        inner.subjects.remove(&stable);
+    } else {
+        let subject = inner
+            .subjects
+            .entry(stable.clone())
+            .or_insert_with(|| SubjectState::new(now, info.state_revision));
+        if !subject.view.sticky() {
+            subject.view = SubjectView::CatchingUp {
+                attested_by: ata.fields.attested_by.clone(),
+                verified: true,
+                segment_terminal: ata.fields.segment_terminal_revision,
+            };
+        }
+    }
+    drop(inner);
+    tracing::info!(group_id = %LogHexId::group(&group_key), keyed, "ADR 0109 S3: attested catch-up reached its terminal; the armed ATA is retired");
 }
 
 async fn set_view(state: &AppState, stable_group_id: &str, revision: u64, view: SubjectView) {
@@ -4865,11 +4882,22 @@ async fn subject_tick(state: &Arc<AppState>) {
                             (false, false)
                         }
                         // #2022: the attempt ended typed on a lost Welcome
-                        // (`end_on_welcome_loss`). The sticky outcome and
+                        // (`end_on_welcome_loss`). The outcome and
                         // `welcome_lost` stay while the node has no keys,
                         // so its recovery object keeps D43's exit; a new
-                        // attempt or the keys clear them.
-                        view if subject.welcome_lost && view.sticky() && !keyed => (false, false),
+                        // attempt or the keys clear them. A wait set over
+                        // it on a tick with live refs (`Deferred` by the
+                        // home gate or the host commit) gives way to the
+                        // outcome again, as `end_on_welcome_loss` restores
+                        // it.
+                        _ if subject.welcome_lost && !keyed => {
+                            if !subject.view.sticky() {
+                                subject.view = SubjectView::Readmission {
+                                    cause: "base_beyond_retention",
+                                };
+                            }
+                            (false, false)
+                        }
                         _ => (true, false),
                     },
                     None => (false, false),
@@ -20289,12 +20317,164 @@ mod tests {
                 "{tick}: the recovery object stays"
             );
         }
+        // A wait set over the outcome on a tick with live refs (the home
+        // gate's `Deferred`) gives way to it again (ZCode on ca632d65).
+        set_view(
+            &state,
+            &stable,
+            info.state_revision,
+            SubjectView::Deferred {
+                cause: "home_gate_closed",
+            },
+        )
+        .await;
+        subject_tick(&state).await;
+        assert_eq!(
+            view_of(&state, &stable).await,
+            Some(SubjectView::Readmission {
+                cause: "base_beyond_retention"
+            }),
+            "the outcome is restored over a Deferred wait"
+        );
+        assert!(welcome_lost(&state, &stable).await);
         // Control: with its TreeKEM group the node is keyed and a
         // `catching_up` view at the terminal is dropped.
         install_tree(&state, &key).await?;
         set_view(&state, &stable, info.state_revision, held.clone()).await;
         subject_tick(&state).await;
         assert_eq!(view_of(&state, &stable).await, None);
+        Ok(())
+    }
+
+    /// A TreeKEM record on which this node is Active with no tree, and a
+    /// verified one-link ATA from `base` to a rename. With `at_terminal`
+    /// the live record is the rename (the ATA has converged); otherwise it
+    /// is `base` (the ATA is armed).
+    async fn treekem_ata_fixture(
+        state: &Arc<AppState>,
+        at_terminal: bool,
+    ) -> anyhow::Result<(String, GroupInfo, AdminTerminalAttestation)> {
+        let local = local_hex(state);
+        let signer = x0x::identity::AgentKeypair::generate()?;
+        let signer_hex = hex::encode(signer.agent_id().as_bytes());
+        let mut base = GroupInfo::new(
+            "adr0109-keyless-terminal".to_string(),
+            String::new(),
+            signer.agent_id(),
+            "7110".repeat(16),
+        );
+        base.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        base.add_member(
+            local.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(signer_hex),
+            None,
+        );
+        base.seal_commit(&signer, 1_000)?;
+        let mut ahead = base.clone();
+        ahead.name = "renamed".to_string();
+        ahead.seal_commit(&signer, 2_000)?;
+        let links = links_after(&base, &ahead);
+        let ata = sign_ata(&signer, &local, &base, &links)?;
+        let live = if at_terminal { ahead } else { base };
+        let key = live.mls_group_id.clone();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), live.clone());
+        let kept = ata.clone();
+        assert!(
+            update_sidecar(state, live.stable_group_id(), move |body| body.active_ata =
+                Some(kept))
+            .await
+        );
+        Ok((key, live, ata))
+    }
+
+    /// #2022 (ZCode on ca632d65): an admin-armed catch-up that reaches its
+    /// terminal while this node has no keys (TreeKEM, Active, no tree)
+    /// retires the ATA but keeps a typed `catching_up` view at the
+    /// terminal, so the next tick's empty-refs branch bounds it by the
+    /// Welcome's lifetime. Control: with the tree the subject is dropped.
+    /// RED on ca632d65: `retire_converged` removed the subject with no
+    /// keys check, so the keyless node lost its recovery object. Inert.
+    #[tokio::test]
+    async fn a_keyless_converged_ata_keeps_a_typed_terminal_view() -> anyhow::Result<()> {
+        for keyed in [false, true] {
+            let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+            let (key, info, ata) = treekem_ata_fixture(&state, true).await?;
+            let stable = info.stable_group_id().to_string();
+            if keyed {
+                install_tree(&state, &key).await?;
+            }
+            fresh_subject(&state, &info, Instant::now()).await;
+            retire_converged(&state, &key).await;
+            assert!(
+                sidecar_snapshot(&state, &stable)
+                    .await
+                    .is_none_or(|body| body.active_ata.is_none()),
+                "keyed {keyed}: the ATA is retired"
+            );
+            let expected = (!keyed).then(|| SubjectView::CatchingUp {
+                attested_by: ata.fields.attested_by.clone(),
+                verified: true,
+                segment_terminal: ata.fields.segment_terminal_revision,
+            });
+            assert_eq!(view_of(&state, &stable).await, expected, "keyed {keyed}");
+            if !keyed {
+                // The next tick takes the bounded terminal-unkeyed path.
+                subject_tick(&state).await;
+                assert_eq!(view_of(&state, &stable).await, expected);
+                let stamped = state
+                    .group_recovery
+                    .inner
+                    .lock()
+                    .await
+                    .subjects
+                    .get(&stable)
+                    .is_some_and(|subject| subject.terminal_unkeyed_at.is_some());
+                assert!(stamped, "the Welcome's clock runs");
+            }
+        }
+        Ok(())
+    }
+
+    /// #2022 (ZCode on ca632d65): `terminal_unkeyed_at` belongs to the
+    /// empty-refs terminal view. Once refs are live (an armed ATA), the
+    /// tick clears a stale stamp, so the lost-Welcome check cannot end the
+    /// new catch-up on it. RED without the clearing block in
+    /// `subject_tick`. Inert.
+    #[tokio::test]
+    async fn live_refs_clear_a_stale_terminal_stamp() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (_key, info, _ata) = treekem_ata_fixture(&state, false).await?;
+        let stable = info.stable_group_id().to_string();
+        assert!(
+            !live_refs(&state, &info).await.is_empty(),
+            "the ATA is armed"
+        );
+        fresh_subject(&state, &info, Instant::now()).await;
+        if let Some(subject) = state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .subjects
+            .get_mut(&stable)
+        {
+            subject.terminal_unkeyed_at = Some(Instant::now());
+        }
+        subject_tick(&state).await;
+        let stamp = state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .subjects
+            .get(&stable)
+            .map(|subject| subject.terminal_unkeyed_at);
+        assert_eq!(stamp, Some(None), "the stale stamp is cleared");
         Ok(())
     }
 
