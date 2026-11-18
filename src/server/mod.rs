@@ -1,12 +1,5 @@
 //! HTTP/WebSocket server for the x0x daemon.
-//!
-//! Phase 1 (Issue #110): the daemon's axum router, handlers, SSE/WS
-//! plumbing, auth middleware, and serving-side background tasks were
-//! relocated here verbatim from `src/bin/x0xd.rs` so the library can
-//! expose a serving entrypoint. Behavior is unchanged from the binary.
 
-// The moved handler bodies use thousands of `x0x::...` paths; alias the
-// crate to itself so those paths resolve unchanged inside the library.
 use crate as x0x;
 
 mod acl_admin;
@@ -43,8 +36,6 @@ mod update_check;
 mod upgrade_flush;
 mod upgrade_health_commit;
 pub use update_check::run_update_check_and_report;
-// W3-H (#1164): deterministic simulation harness (test builds only:
-// `#![cfg(test)]` inside the module).
 mod w3h;
 #[cfg(all(test, tokio_unstable))]
 pub(crate) use w3h::counted_spawn_blocking;
@@ -59,9 +50,6 @@ mod issue1288_ws_shutdown;
 #[cfg(test)]
 mod shutdown_regression;
 
-// Re-export the public server API surface so `x0x::server::*` paths are
-// unchanged after the #125 / WS1.4 extraction. Internal types (AppState,
-// DaemonUpdateConfig, CachedUpgradeCheck) stay private to the crate.
 pub use config::{diagnose_section_placement, warn_section_misplacements, SectionMisplacement};
 use routes::named_groups::CAUSAL_APPROVAL_RETENTION_MS;
 use routes::public_group_bootstrap_outbox::{
@@ -274,13 +262,6 @@ use x0x::identity::MachineId;
 use x0x::network::NetworkConfig;
 use x0x::Agent;
 
-// ---------------------------------------------------------------------------
-// Optional JSON body helper
-// ---------------------------------------------------------------------------
-
-/// Parse an optional JSON body: returns `Ok(T::default())` when the body is
-/// empty (no Content-Type or zero-length), but returns an axum 400 error if
-/// Content-Type is `application/json` and the body is malformed.
 fn parse_optional_json<T: serde::de::DeserializeOwned + Default>(
     headers: &HeaderMap,
     body: &Bytes,
@@ -294,7 +275,6 @@ fn parse_optional_json<T: serde::de::DeserializeOwned + Default>(
         .map(|ct| ct.starts_with("application/json"))
         .unwrap_or(false);
     if !is_json {
-        // Non-JSON content type with a body — reject
         return Err(api_error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "Content-Type must be application/json",
@@ -318,12 +298,6 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
     serve_with_options(config, options).await?.wait().await
 }
 
-/// Resolve where `x0x user-id create` recorded the install's owner.
-///
-/// Mirrors the CLI's write side exactly: the owner profile is a sibling of
-/// the user key file — the explicit `user_key_path` when configured, the
-/// daemon's identity dir otherwise (which is the instance data dir for
-/// named instances and `~/.x0x` for the default install).
 fn owner_profile_path(config: &DaemonConfig, identity_dir: &Option<PathBuf>) -> Option<PathBuf> {
     if let Some(ref key_path) = config.user_key_path {
         return Some(x0x::profile::OwnerProfile::path_for_key(key_path));
@@ -359,23 +333,16 @@ async fn enforce_owner_singleton_prebuild(
     let Some(owner_path) = owner_profile_path(config, identity_dir) else {
         return Ok(());
     };
-    // Mirror AgentBuilder's user-key precedence exactly (lib.rs resolve
-    // step): explicit path > identity dir > default ~/.x0x/user.key.
     let key_path = match (&config.user_key_path, identity_dir) {
         (Some(path), _) => Some(path.clone()),
         (None, Some(dir)) => Some(dir.join("user.key")),
         (None, None) => crate::storage::x0x_home_dir().map(|dir| dir.join("user.key")),
     };
-    // R3 fix: load the OWNER RECORD FIRST — a recorded owner demands a
-    // matching key, whatever the key slot looks like. Only an UNRECORDED
-    // install may start keyless (anonymous opt-in) or adopt.
     let owner = x0x::profile::OwnerProfile::load_from(&owner_path)
         .await
         .with_context(|| format!("failed to read owner profile at {}", owner_path.display()))?;
 
     let Some(key_path) = key_path else {
-        // No key path resolvable at all: refuse only when an owner is
-        // recorded (a keyless host cannot load the owner's key by design).
         return match owner {
             Some(owner) => Err(anyhow::anyhow!(
                 "install is owned by user {} but no user key path is resolvable; \
@@ -388,10 +355,6 @@ async fn enforce_owner_singleton_prebuild(
     match crate::w3h_inline::fs::try_exists(&key_path).await {
         Ok(true) => {}
         Ok(false) => {
-            // R3 fix (regression): a RECORDED owner whose key is absent
-            // must refuse — starting anonymously would silently drop the
-            // install's authority. No owner recorded + no key = legitimate
-            // anonymous opt-in.
             return match owner {
                 Some(owner) => Err(anyhow::anyhow!(
                     "install is owned by user {} but the user key is missing at {}; \
@@ -402,8 +365,6 @@ async fn enforce_owner_singleton_prebuild(
                 None => Ok(()),
             };
         }
-        // stat itself failed: we cannot prove the key present or absent —
-        // fail closed rather than guess.
         Err(e) => {
             if owner.is_some() {
                 return Err(anyhow::anyhow!(
@@ -413,8 +374,6 @@ async fn enforce_owner_singleton_prebuild(
             }
         }
     }
-    // Fail closed on an unreadable key — the same class of error the
-    // builder now refuses on; catch it here BEFORE anything persists.
     let key = x0x::storage::load_user_keypair_from(&key_path)
         .await
         .with_context(|| format!("user key at {} is unreadable", key_path.display()))?;
@@ -573,13 +532,7 @@ pub async fn serve_with_options(
         daemon_config_path,
         gui_show_write_path,
     } = options;
-    // `--skip-update-check` is process-scoped updater suppression. Compute one
-    // effective capability before any updater path is considered, then use it
-    // for startup checks, background gossip/poll workers, and `/upgrade/apply`.
-    // The config itself stays unchanged, so a later ordinary launch still
-    // participates in the normal release train.
     let self_update_enabled = effective_self_update_enabled(self_update_enabled, skip_update_check);
-    // Ensure data directory exists early so self-update has a working directory.
     crate::w3h_inline::fs::create_dir_all(&config.data_dir)
         .await
         .context("failed to create data directory")?;
@@ -595,23 +548,12 @@ pub async fn serve_with_options(
     // Drop).
     let instance_lock =
         instance_lock::InstanceLock::acquire(&config.data_dir).map_err(anyhow::Error::new)?;
-    // Startup banner
     tracing::info!(
         version = %x0x::VERSION,
         binary = "x0xd",
         pid = std::process::id(),
         "x0xd started"
     );
-
-    // Note: `--check-updates` is a CLI-only print-and-exit mode handled entirely
-    // by the binary (see `run_update_check_and_report`) before it ever calls
-    // `serve_with_options`; it is intentionally not a `ServeOptions` field.
-    //
-    // Startup GitHub check (fallback mechanism — gossip is primary) moved to a
-    // post-bind background task below (#1086): awaiting it here, before the
-    // API listener bound, stalled startup for the monitor's ~30 s HTTP
-    // timeout on hosts whose TCP 443 egress is firewalled. Startup must never
-    // wait on the network for update checks.
 
     tracing::info!("Starting x0xd v{}", x0x::VERSION);
     if let Some(ref name) = instance_name {
@@ -639,12 +581,6 @@ pub async fn serve_with_options(
         config.bind_address
     };
 
-    // Resolve the identity directory. Precedence:
-    //   1. `config.identity_dir` — explicit host-supplied directory. This is the
-    //      storage boundary for in-process embedding: when set, ALL identity
-    //      keys derive from it and `~/.x0x` is never touched.
-    //   2. `~/.x0x-<name>` — instance-scoped directory when `--name` is active.
-    //   3. `None` — default daemon behaviour (keys fall back to `~/.x0x`).
     let identity_dir = match (&config.identity_dir, &instance_name) {
         (Some(dir), _) => {
             crate::w3h_inline::fs::create_dir_all(dir)
@@ -654,8 +590,6 @@ pub async fn serve_with_options(
             Some(dir.clone())
         }
         (None, Some(name)) => {
-            // Issue #456: instance dirs are siblings of the default x0x
-            // home, so X0X_HOME relocates them too.
             let dir = crate::storage::x0x_instance_dir(name)
                 .context("home directory required for instance identity directory")?;
             crate::w3h_inline::fs::create_dir_all(&dir)
@@ -684,8 +618,6 @@ pub async fn serve_with_options(
         _ => None,
     };
 
-    // Create agent
-    //
     // Peer cache is strictly per-data-dir (issue #206): co-located daemons
     // must never share a bootstrap cache, or peers learned on one gossip
     // plane leak into another plane's restart redials (the #189
@@ -699,9 +631,6 @@ pub async fn serve_with_options(
         let _ = std::fs::create_dir_all(&dir);
         dir
     };
-    // Issue #206: resolve the effective gossip plane. Unset TOML
-    // `network_id` maps to the well-known prod plane so co-located daemons
-    // are isolated by default; an explicit empty string opts out (open).
     let network_id = config.resolved_network_id();
     match &network_id {
         Some(id) => tracing::info!(network_id = %id, "Gossip plane isolation enabled"),
@@ -718,13 +647,7 @@ pub async fn serve_with_options(
         pinned_bootstrap_peers: std::collections::HashSet::new(),
         inbound_allowlist: std::collections::HashSet::new(),
         max_peers_per_ip: 3,
-        // CLI flag wins over config TOML so operators can override on a
-        // single invocation without editing the config file.
         port_mapping_enabled: config.port_mapping_enabled && !cli_no_port_mapping,
-        // #417: operator-controlled via TOML `mdns_enabled`, defaulting to
-        // `true` so shipped daemons keep ant-quic's LAN discovery. The test
-        // harness sets it `false` so a fixture cannot discover and
-        // auto-connect to a live production daemon on the same machine.
         mdns_enabled: config.mdns_enabled,
         peer_relay: config.peer_relay.clone(),
         network_id,
@@ -732,9 +655,6 @@ pub async fn serve_with_options(
     };
 
     let contacts_path = config.data_dir.join("contacts.json");
-    // ADR-0023: the daemon passes its `[history]` config through (default-on;
-    // `enabled = false` is the escape hatch). Named instances resolve to a
-    // per-instance `history.db` because `data_dir` is per-instance.
     let mut history_config = config.history.clone();
     if history_config.db_path.is_none() {
         history_config.db_path = Some(config.data_dir.join("history.db"));
@@ -796,19 +716,6 @@ pub async fn serve_with_options(
         builder = builder.with_peer_cache_disabled();
     }
 
-    // NOTE: --no-hard-coded-bootstrap clears only the *embedded* global
-    // bootstrap network; an explicit `bootstrap_peers` list in the config
-    // file is honored verbatim (see DaemonConfig::resolved_bootstrap_peers).
-    // ant-quic's first-party mDNS LAN discovery and the peer cache remain
-    // active by design so that:
-    //   - Local mesh (two laptops on WiFi) still works via mDNS
-    //   - FOAF presence discovery still finds peers
-    //   - Previously-seen peers can reconnect via cache
-    // mDNS-discovered co-located daemons can no longer bridge gossip
-    // planes, though: every connection exchanges a plane hello, and peers
-    // on a different `network_id` plane are refused at the gossip layer
-    // (issue #206).
-
     if let Some(ref id_dir) = identity_dir {
         builder = builder
             .with_machine_key(id_dir.join("machine.key"))
@@ -841,10 +748,7 @@ pub async fn serve_with_options(
     let mls_groups_path = config.data_dir.join("mls_groups.bin");
     let mls_groups: HashMap<String, x0x::mls::MlsGroup> = HashMap::new();
 
-    // Load named groups from disk (if any)
     let named_groups_path = config.data_dir.join("named_groups.json");
-    // Issue #451: Home-Suite groups (owner-certified admission) persist in
-    // a sidecar old binaries never read; named_groups.json carries only
     let home_suite_groups_path = config.data_dir.join(HOME_SUITE_GROUPS_FILE);
     let causal_approval_queue_path = config.data_dir.join("causal_approval_queue.json");
     let predecessor_relay_outbox_path = config.data_dir.join("predecessor_relay_outbox.json");
@@ -870,8 +774,6 @@ pub async fn serve_with_options(
     let mut named_groups = load_named_groups_merged(&named_groups_path, &home_suite_groups_path)
         .await
         .map_err(|e| anyhow::anyhow!("failed to load named groups: {e}"))?;
-    // #1650 (ADR 0110 §5): retained displaced rebind certificates reload
-    // from their S4 sidecar — the legacy JSON never carries them.
     routes::named_groups::load_displaced_certs_sidecar(&mut named_groups, &config.data_dir).await;
     let treekem_member_key_packages = load_treekem_member_key_packages(
         &treekem_dir.join("member-key-packages.json"),
@@ -879,21 +781,13 @@ pub async fn serve_with_options(
     )
     .await?;
 
-    // Load or generate API bearer token for local authentication.
     let api_token = auth::load_or_generate_api_token(&config.data_dir).await?;
 
-    // Bind the API listener early so the daemon can report the actual bound
-    // address even when configured with an ephemeral port. Done before the agent
-    // is built so a bind failure (port in use) returns Err with nothing running.
     let listener = tokio::net::TcpListener::bind(config.api_address)
         .await
         .context("failed to bind API address")?;
     let actual_api_addr = listener.local_addr()?;
 
-    // #195: warn loudly when the control plane is bound off-loopback — the
-    // API is bearer-token-only with no auth rate-limiting, so a non-loopback
-    // bind exposes it off-host. --api-port only changes the port and stays
-    // loopback-safe; only a TOML `api_address = "0.0.0.0:…"` reaches here.
     if !actual_api_addr.ip().is_loopback() {
         tracing::warn!(
             target: "x0x::startup",
@@ -905,10 +799,6 @@ pub async fn serve_with_options(
     }
 
     let (broadcast_tx, _) = broadcast::channel::<SseEvent>(256);
-    // Load or generate the per-daemon ML-KEM-768 keypair. Persisted under
-    // `<data_dir>/agent_kem.key` with mode 0600. This keypair is the root of
-    // trust for `SecureShareDelivered` — only the holder of the secret half
-    // can open group-shared-secret envelopes addressed to this agent.
     let agent_kem_path = config.data_dir.join("agent_kem.key");
     let agent_kem_keypair = Arc::new(
         x0x::groups::kem_envelope::AgentKemKeypair::load_or_generate(&agent_kem_path)
@@ -920,22 +810,8 @@ pub async fn serve_with_options(
         agent_kem_keypair.public_bytes.len()
     );
 
-    // ADR-0036 (review R2 regression fix): enforce the owner singleton
-    // BEFORE the builder runs — a mismatched user key must not re-issue and
-    // persist agent.cert, and no network/exec task may exist for a key the
-    // install refuses to adopt.
-    //
-    // ACCEPTED side effects of earlier startup steps (data-dir creation,
-    // API token, KEM keypair — review R3): none of them grants identity or
-    // authority; they are inert files/keys without an adopted agent, so
-    // creating them before this check is harmless and no restructure is
-    // needed.
     enforce_owner_singleton_prebuild(&config, &identity_dir).await?;
 
-    // ADR-0070 §3: compose the API-managed ACL overlay (daemon data dir)
-    // over the operator TOML floors. A malformed overlay only ever withholds
-    // added access: the daemon starts on the floor alone and reports it.
-    // Everything below consumes the effective (floor ∪ overlay) policies.
     let acl_admin =
         Arc::new(acl_admin::AclAdmin::load(&config.data_dir, connect_policy, exec_policy).await);
     let exec_policy = (*acl_admin.effective_exec().await).clone();
@@ -954,9 +830,6 @@ pub async fn serve_with_options(
         tracing::info!("User ID: {}", uid);
     }
 
-    // Attach the agent-owned contact store to gossip and API state so the
-    // DM inbox trust evaluator observes the same mutations made by REST
-    // contact/card endpoints.
     let contacts = Arc::clone(agent.contacts());
     agent.set_contacts(Arc::clone(&contacts));
     tracing::info!("Contact store loaded from {}", contacts_path.display());
@@ -979,39 +852,21 @@ pub async fn serve_with_options(
         mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(1024);
     let (predecessor_relay_dm_tx, mut predecessor_relay_dm_rx) =
         mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(1024);
-    // ADR-0070 §2: durable typed route for share-grant deliveries.
     let (share_grant_dm_tx, mut share_grant_dm_rx) =
         mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(256);
-    // ADR 0083 slice 3: one channel, three prefixes. No validator — a
-    // validator would parse the body before owner trust.
     let (gui_show_dm_tx, mut gui_show_dm_rx) = mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(256);
-    // #1003 (ADR 0080 archived, slot A03): plain typed route — the sender
-    // waits for no ACK; the record carries its own authority.
     let (revocation_push_dm_tx, mut revocation_push_dm_rx) =
         mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(256);
-    // #1094 D1: data-read requests and replies. Plain typed routes, one
-    // attempt: the grantee's HTTP call waits for the reply or times out.
     let (data_read_dm_tx, data_read_dm_rx) = mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(256);
     let exec_service = x0x::exec::ExecService::spawn(Arc::clone(&agent), exec_policy, exec_dm_rx);
-    // Tasks started before AppState exists still need owned cancellation on a
-    // later startup rejection. They are folded into the supervisor's normal
-    // task registry once startup reaches that boundary.
     let mut startup_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-    // Zero-peer watchdog (issue #262): opt-in supervised self-heal for the
-    // wedged-transport state (process alive, API healthy, socket silent,
-    // peers pinned at 0). Samples every 30s; after `window` seconds of
-    // CONTINUOUS zero peers (plus the same startup grace) it attempts a
-    // graceful shutdown and hard-exits 30s later so the known shutdown hang
-    // cannot defeat the restart. Only meaningful under a supervisor
-    // (systemd Restart=always) — off by default.
     if let Some(window) = config.zero_peer_restart_secs {
         let watchdog_agent = Arc::clone(&agent);
         let watchdog_shutdown = shutdown_tx.clone();
         startup_tasks.push(tokio::spawn(async move {
             let window = std::time::Duration::from_secs(window.max(60));
             let mut zero_since: Option<std::time::Instant> = None;
-            // Startup grace: give bootstrap the same window before arming.
             tokio::time::sleep(window).await;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -1059,14 +914,6 @@ pub async fn serve_with_options(
         );
     }
 
-    // Tailnet streams + forwarder (#131 × #132): install the loaded connect
-    // policy on the agent so the inbound byte-stream accept loop refuses
-    // streams from ACL-unlisted peers (default-closed when the policy is
-    // Enabled; no ACL constraint when Disabled). Then build the connect-ACL
-    // diagnostics + the ForwardService, whose inbound consumers are the
-    // registered acceptors for the ForwardV1/ForwardV2 stream protocols and
-    // gate each stream at `evaluate_connect_gate` before any local connect.
-    // Only spawn the forwarder when connect is enabled by policy.
     agent.set_connect_policy(Arc::new(connect_policy.clone()));
     let connect_diagnostics = Arc::new(x0x::connect::ConnectDiagnostics::new(
         connect_policy.summary(),
@@ -1100,8 +947,6 @@ pub async fn serve_with_options(
         None
     };
 
-    // ADR-0074 §3: optional loopback SOCKS5 listener. Needs ForwardService
-    // (CONNECT opens ForwardV2). Non-loopback listen was refused at config load.
     let socks_cancel = tokio_util::sync::CancellationToken::new();
     let socks_service = if config.socks.enabled() {
         match &forward_service {
@@ -1151,16 +996,8 @@ pub async fn serve_with_options(
         None
     };
 
-    // ADR-0012 Phase 4: restore live TreeKEM groups from on-disk snapshots.
-    // Must happen before the AppState is built so secure endpoints see the
-    // groups immediately. Done with `named_groups` still owned (it is moved
-    // into the RwLock below).
     let treekem_groups = restore_treekem_groups(&named_groups, agent.as_ref(), &treekem_dir).await;
 
-    // ADR-0036: load the daemon self-profile (names) and enforce the owner
-    // singleton — an install whose recorded owner differs from the user key
-    // the daemon just loaded refuses to start. Rotation is an explicit,
-    // deliberate act (`x0x user-id create --rotate-owner`).
     let profile_path = x0x::profile::SelfProfile::path_in(&config.data_dir);
     let profile = match x0x::profile::SelfProfile::load_from(&profile_path)
         .await
@@ -1182,11 +1019,6 @@ pub async fn serve_with_options(
     };
     agent.set_self_name(profile.display_name.clone());
 
-    // ADR-0041 Tier-1: cross-machine owner-state sync. Only an install
-    // with an owner key can own or receive Tier-1 state; ownerless
-    // installs register no SyncV1 acceptor and answer 409 on the sync
-    // routes. The acceptor registration follows the single-acceptor rule
-    // (a conflict aborts startup).
     let owner_sync = if agent.identity().user_keypair().is_some() {
         let service =
             match x0x::owner_sync::OwnerSyncService::new(Arc::clone(&agent), &config.data_dir)
@@ -1207,15 +1039,12 @@ pub async fn serve_with_options(
                     .await);
                 }
             };
-        // ADR-0070 §1: enrolled owner machines become owner-trusted.
         agent.install_owner_device_store(Arc::clone(service.store()));
         Some(service)
     } else {
         None
     };
 
-    // ADR-0070 §2: the share-grant store (issued + received grants). An
-    // unreadable file holds no grants and refuses writes (fail closed).
     agent.install_share_grant_store(Arc::new(
         x0x::share_grant::ShareGrantStore::load(
             config
@@ -1226,9 +1055,6 @@ pub async fn serve_with_options(
         )
         .await,
     ));
-    // #926: the owner-side grant redelivery outbox (deliveries whose durable
-    // DM attempts failed). An unreadable file queues nothing and refuses
-    // writes, like the store; the grants themselves are unaffected.
     agent.install_share_grant_outbox(Arc::new(
         x0x::share_grant::outbox::GrantRedeliveryOutbox::load(
             config
@@ -1243,8 +1069,6 @@ pub async fn serve_with_options(
         .await,
     ));
 
-    // ADR-0070 §3: from here on ACL edits and reloads swap the policies the
-    // agent (connect accept + forwarder) and the exec service consult.
     acl_admin
         .attach(acl_admin::AclSink {
             agent: Arc::clone(&agent),
@@ -1506,21 +1330,10 @@ pub async fn serve_with_options(
 
     install_revocation_snapshot_authority(&state).await;
 
-    // ADR-0068 D1: teach the history retention reaper which scopes are
-    // fork-quarantined. Installed HERE because this is the first point at
-    // which an `Arc<AppState>` exists — the reaper is spawned by the Agent,
-    // which knows nothing about named groups — and the source holds only a
-    // `Weak`, so it cannot form a cycle with the Agent that owns the store
-    // (#661 drop ordering). Absent when history is disabled, in which case
-    // there is no reaper to inform.
     if routes::history::ReaperQuarantinePins::install(&state) {
         tracing::debug!("[history] fork-quarantine pin source installed (ADR-0068 D1)");
     }
 
-    // Review r2 (#451): a store written by a pre-#451 Home-Suite binary
-    // still holds owner-certified entries in named_groups.json — v0.40.x
-    // would crash-loop on it. Migrate to the split layout immediately so
-    // the data dir is downgrade-safe from this start onward.
     if let Err(error) = migrate_unsplit_home_suite_store_if_needed(&state).await {
         let primary = anyhow::anyhow!("failed to migrate unsplit Home-Suite store: {error}");
         return Err(finish_startup_error(
@@ -1550,8 +1363,6 @@ pub async fn serve_with_options(
     #[cfg(any(unix, windows))]
     crate::upgrade::shutdown_flush::clear_stale_records(&config.data_dir);
 
-    // The control listener survives the HTTP drain, so a peer can receive
-    // its durable receipt after every normal request and producer has stopped.
     #[cfg(any(unix, windows))]
     let upgrade_flush = if self_update_enabled {
         let setup = async {
@@ -1578,20 +1389,8 @@ pub async fn serve_with_options(
 
     let port_file = config.data_dir.join("api.port");
 
-    // Fix C (Issue #110 Phase 2): collect every server-owned background-task
-    // `JoinHandle` spawned in the startup path so the shutdown tail can
-    // grace-await then abort any straggler. (Agent-internal and ExecService tasks
-    // are owned by the Agent/ExecService and stopped by their own `shutdown()`
-    // calls in the shutdown tail — issue #116 — not collected here.)
     let mut bg_tasks = startup_tasks;
 
-    // ADR-0074 §2: bring persisted forwards back. Each named forward is
-    // re-resolved through the name store (its pin applies) and comes up
-    // only on exactly its pinned ids; anything else stays down with a
-    // reason in `GET /forwards`. Local work only — it never blocks startup
-    // on the network. Names of peers not yet discovered resolve later, so
-    // transient failures use a bounded backoff. Permanent failures stay down
-    // until owner action; retries can only bring up the pinned ids.
     if state.forward_service.is_some() {
         let restore_state = Arc::clone(&state);
         let mut shutdown_rx = state.shutdown_notify.subscribe();
@@ -1630,14 +1429,9 @@ pub async fn serve_with_options(
     {
         let snapshot_state = Arc::clone(&state);
         let mut shutdown_rx = state.shutdown_notify.subscribe();
-        // The effective plane is fixed for the process lifetime; capture it
-        // here rather than reaching back into the config from the task.
         let resolved_plane = config.resolved_network_id();
         let mut verdict_windows = health_verdict::VerdictWindows::default();
-        // #1351: verdict and upgrade-input changes become `system.*` events.
         let mut system_events = system_events::SystemEventTracker::default();
-        // #1377: a launcher trial candidate writes its health commit. Read
-        // once; an ordinary daemon is `None` and does nothing per tick.
         let health_candidate = upgrade_health_commit::detect(
             &state.data_dir,
             identity_dir.clone().or_else(crate::storage::x0x_home_dir),
@@ -1664,11 +1458,6 @@ pub async fn serve_with_options(
                     .unwrap_or(0);
                 match snapshot_state.agent.network() {
                     Some(network) => {
-                        // #1419: sample off the /health path and store the
-                        // degraded set. The repair is spawned and is not
-                        // awaited, so this tick can store peer counts again
-                        // on the next interval. The handler stays a lock-free
-                        // snapshot read (#600).
                         routes::status::publish_one_sided_health(
                             network,
                             &snapshot_state.health_snapshot,
@@ -1697,7 +1486,6 @@ pub async fn serve_with_options(
                         ),
                         send_ready_peers: send_ready,
                     };
-                    // A failed write is retried at the next tick.
                     if let Err(error) =
                         health_tracker.commit(candidate, observation, std::time::Instant::now())
                     {
@@ -1710,12 +1498,6 @@ pub async fn serve_with_options(
         }));
     }
 
-    // #1380: the M1 delivery probe, local-only (RC5 review): every 30 s
-    // (first at ~10 s) it signs/verifies a probe envelope in-process and
-    // publishes a nonce on a `local:` topic that must come back through
-    // this daemon's own subscription within 5 s — no frame leaves the
-    // node. Results land on the health snapshot; the handler merges them
-    // live at serve time, alongside the peer counts and uptime.
     {
         let probe_agent = Arc::clone(&state.agent);
         let probe_snapshot = Arc::clone(&state.health_snapshot);
@@ -1725,11 +1507,8 @@ pub async fn serve_with_options(
         }));
     }
 
-    // #1863: a self-revocation of a group member is published again; one
-    // of a stranger is not.
     agent.set_revocation_group_seen(revocation_group_seen_check(&state));
 
-    // ADR 0089: relationship sources are installed before load verification.
     let context_state = Arc::downgrade(&state);
     agent
         .peer_evidence()
@@ -1860,8 +1639,6 @@ pub async fn serve_with_options(
         cache.reclassify_attribution(|peer| protected.contains(&peer));
     }
 
-    // ADR-0041 Tier-1: bridge the sync service to live daemon state and
-    // start the periodic + on-change pass loop (shuts down with the watch).
     if let Some(sync) = state.owner_sync.as_ref() {
         routes::DaemonView::attach(sync, &state).await;
         let service = Arc::clone(sync);
@@ -1948,15 +1725,9 @@ pub async fn serve_with_options(
         )
         .await);
     }
-    // #908: the requester offer outbox loads fail-VISIBLE, never blocking:
-    // a malformed store logs an error and starts empty (the pending join
-    // requests remain in the durable group state; the authority can still
-    // observe the metadata event, and the operator can inspect the file).
     if let Err(error) = load_requester_offer_outbox(&state).await {
         tracing::error!("#908 startup: requester offer outbox not loaded: {error}");
     }
-    // #1109: queued direct sends load fail-visible like the requester
-    // offers: a bad sidecar is moved aside and the outbox starts empty.
     if let Err(error) = state
         .direct_send_outbox
         .load(routes::direct_outbox::now_unix_ms())
@@ -1964,9 +1735,6 @@ pub async fn serve_with_options(
     {
         tracing::error!("#1109 startup: direct send outbox not loaded: {error}");
     }
-    // ADR 0030 §5 fail-closed: a malformed or over-cap bootstrap outbox aborts
-    // startup rather than silently dropping delivery obligations the authority
-    // has already promised.
     if let Err(error) = load_public_group_bootstrap_outbox(&state).await {
         let primary = anyhow::anyhow!("public-group bootstrap outbox startup: {error}");
         return Err(finish_startup_error(
@@ -1981,11 +1749,6 @@ pub async fn serve_with_options(
         .await);
     }
 
-    // ADR 0110 S4 (#1597 item 5c): read the obligation store and the kept
-    // expiry hand-offs before the API serves or the worker runs. The load
-    // is fail-visible (a damaged file is quarantined, a newer one runs
-    // memory-only), never fatal; until it ends no writer replaces either
-    // file.
     routes::named_groups::load_revocation_eviction_store(&state).await;
     // #1427: the catch-up commits this node held before the restart. After
     // the S4 store, so a commit S4 still delivers is not served from it.
@@ -2023,12 +1786,6 @@ pub async fn serve_with_options(
         }
     }));
 
-    // The metadata + public-message listeners spawned here self-register in
-    // `state.group_metadata_tasks` / `state.public_message_tasks`; the
-    // shutdown tail drains and aborts those maps directly (Fix C), so there
-    // is nothing to collect into `bg_tasks` from this call. #1366: the
-    // restore applies `metadata_listener_wanted` (only a withdrawn record
-    // gets no listener; a Banned seat keeps it to receive an unban).
     routes::named_groups::restore_named_group_listeners(Arc::clone(&state)).await;
 
     // ADR-0038: auto-provision the Home space for an owned install. Runs
@@ -2043,17 +1800,6 @@ pub async fn serve_with_options(
         bg_tasks.push(task);
     }
 
-    // #449 P4: automatic retirement of duplicate Homes is DELIBERATELY NOT
-    // wired here. Independent review found this call site ran before
-    // `crdt_subscriptions::load`, so a duplicate carrying a durable
-    // `x0x.group.<id>.symphony.*` manifest entry could pass an "empty" probe
-    // and be terminally withdrawn before its own evidence was loaded — and
-    // the emptiness proof is not held across the withdrawal in any case.
-    // Duplicates are reported read-only by `GET /home` until a proven
-    // retirement fence exists. See docs/design/449-p4-retirement-fence.md.
-
-    // ADR 0028: post-restore queue drain — any queued approvals whose
-    // predecessors arrived during downtime can now be drained (Kimi blocker 9).
     {
         let queue_groups: Vec<String> = {
             let queue = state.causal_approval_queue.read().await;
@@ -2074,63 +1820,23 @@ pub async fn serve_with_options(
         }
     }
 
-    // P0-1: subscribe to the global group discovery topic so remote public
-    // groups populate the local card cache without manual import.
     bg_tasks.extend(spawn_global_discovery_listener(Arc::clone(&state)).await);
-    // Phase C.2: load persisted shard subscriptions and re-subscribe with
-    // staggered jitter to avoid anti-entropy storms.
     bg_tasks.extend(spawn_directory_resubscribe(Arc::clone(&state)).await);
-    // Restart-amnesia fix: load the persisted task-list/kv-store subscription
-    // manifest now (before REST handlers can mutate it) — the actual
-    // re-create/re-join runs after `join_network` in the join task below.
     crdt_subscriptions::load(&state).await;
-    // Phase C.2: subscribe inbound direct messages for the
-    // ListedToContacts pairwise sync channel.
     bg_tasks.extend(spawn_listed_to_contacts_listener(Arc::clone(&state)).await);
-    // Phase E: subscribe to a stable global SignedPublic message fallback so
-    // first messages are not dependent on a brand-new per-group topic tree.
     bg_tasks.extend(spawn_global_public_message_listener(Arc::clone(&state)).await);
-    // #1094: `kv:changed` / `task:changed` SSE events from the agent's
-    // KV and task-list change notices.
     bg_tasks.extend(kv_change_events::spawn(Arc::clone(&state)));
 
-    // Invite-auth #468/#469 (design v6 E2d / v7 F1): the member-certificate
-    // bridge. `cert_events_rx` was subscribed before the AppState groups
-    // existed; the supervised worker reconciles the full discovery cache on
-    // every (re)start, then hydrates digest-only member seats per event
-    // (Lagged falls back to another full reconcile — no landing is ever
-    // lost to backpressure).
     bg_tasks.push(tokio::spawn(supervise_member_certificate_bridge(
         Arc::clone(&state),
         cert_events_rx,
     )));
 
-    // ADR-0040 (review r5): reconstruct the global delegation-id
-    // registry from ALL groups' durable history at boot — cross-group
-    // id-replay rejection is deterministic from the first query.
     delegations::rebuild_global_delegation_registry(&state).await;
-    // Re-publish our own discoverable group cards after startup so late joiners
-    // pick them up.
-    let discoverable_ids: Vec<String> = {
-        let groups = state.named_groups.read().await;
-        groups
-            .iter()
-            .filter(|(_, info)| {
-                info.policy.discoverability != x0x::groups::GroupDiscoverability::Hidden
-            })
-            .map(|(id, _)| id.clone())
-            .collect()
-    };
-    // Default matches IDENTITY_HEARTBEAT_INTERVAL_SECS: group cards are
-    // discovery anti-entropy, and idle broadcast cost scales with cadence.
     let republish_interval_secs = config.group_card_republish_interval_secs.unwrap_or(600);
     if republish_interval_secs > 0 {
         let state_for_republish = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
-            // First publish after a short warmup so the gossip mesh has a chance
-            // to form. Then republish periodically so late joiners also see cards.
-            // Without this, a peer that starts after another daemon published
-            // would miss the initial card.
             tokio::time::sleep(Duration::from_secs(2)).await;
             let mut shutdown = state_for_republish.shutdown_notify.subscribe();
             loop {
@@ -2154,18 +1860,11 @@ pub async fn serve_with_options(
             }
         }));
     }
-    // Consume the pre-computed list to avoid the dead-warning.
-    let _ = discoverable_ids;
 
-    // Join network in background — API is available immediately
     let join_agent = Arc::clone(&agent);
     let rendezvous_enabled = config.rendezvous_enabled;
     let rendezvous_validity_ms = config.rendezvous_validity_ms;
 
-    // Start the DM inbox as soon as join_network has created the gossip
-    // runtime. join_network may keep working through slow bootstrap/cache
-    // peers for a long time; the daemon must still be able to receive gossip
-    // DMs once `/agent/card` advertises a KEM key.
     let dm_inbox_agent = Arc::clone(&agent);
     let dm_inbox_kem = Arc::clone(&agent_kem_keypair);
     let dm_inbox_exec_route_tx = exec_dm_tx.clone();
@@ -2226,9 +1925,6 @@ pub async fn serve_with_options(
                 tracing::error!("Failed to join network: {e}");
             }
         }
-        // #1427: a start catch-up that ran during a slow bootstrap asks
-        // again now that the join has ended, whether it registered before
-        // or after this point.
         routes::named_groups::retry_treekem_start_catchup(&join_rekey_state);
     }));
 
@@ -2258,23 +1954,8 @@ pub async fn serve_with_options(
         }
     }));
 
-    // Startup GitHub check (fallback mechanism — gossip is primary), the
-    // same check the daemon used to await before anything else. #1086: it
-    // now runs as a background task spawned only after the API listener is
-    // bound, so a firewalled update endpoint blocks for the monitor's ~30 s
-    // HTTP timeout in the background instead of delaying API readiness.
-    // Gates unchanged: `self_update_enabled` (embedders /
-    // `--skip-update-check`) AND `[update] enabled`. #1169: the check
-    // itself announces nothing; a boot-time discovery is announced by the
-    // every-launch manifest broadcast task below (same gates, same
-    // payload), so an announce here would only duplicate those bytes —
-    // best effort: that task does its own fetch and a failed fetch
-    // announces nothing, leaving the discovery to a later publish point.
     if self_update_enabled && config.update.enabled {
         let startup_check_config = config.clone();
-        // #261: the apply's restart planner needs the bound API address
-        // (health commit) and the graceful-shutdown hook (bounded cancel) —
-        // both exist only now, post-bind.
         let startup_api_addr = state.api_address;
         let startup_shutdown = daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx);
         let startup_apply_lock = Arc::clone(&state.upgrade_apply_lock);
@@ -2332,8 +2013,6 @@ pub async fn serve_with_options(
         }));
     }
 
-    // One background apply owner serves both discovery paths. Actual boot
-    // identity is carried into receipts; neither source invents a participant.
     let background_submit = if self_update_enabled
         && config.update.enabled
         && (config.update.gossip_updates || config.update.fallback_check_interval_minutes > 0)
@@ -2355,7 +2034,6 @@ pub async fn serve_with_options(
         match runtime {
             Ok(runtime) => {
                 let (submit, owner) = routes::background_channel(runtime);
-                // #1381: `/diagnostics/upgrade` reports the owner's release.
                 let _ = state.background_submit.set(submit.clone());
                 bg_tasks.push(tokio::spawn(owner.run()));
                 Some(submit)
@@ -2379,8 +2057,6 @@ pub async fn serve_with_options(
             let agent_for_gossip = Arc::clone(&state.agent);
             let self_published_for_gossip = Arc::clone(&self_published_release_manifests);
             let observations_for_gossip = Arc::clone(&state.upgrade_observations);
-            // Restart context stays with the shared owner; this source only
-            // discovers verified releases and observes daemon shutdown.
             let gossip_shutdown_watch = state.shutdown_notify.subscribe();
             async move {
                 run_gossip_update_listener(
@@ -2395,13 +2071,6 @@ pub async fn serve_with_options(
         },
     ));
 
-    // Broadcast current manifest to gossip after joining the network.
-    // Ensures nodes that missed the initial gossip window can still receive it.
-    // Also syncs SKILL.md with the current manifest.
-    // Fix D (Issue #110 Phase 2): gated on `self_update_enabled` — this fetches a
-    // GitHub release manifest and writes SKILL.md, both updater side-effects an
-    // embedder with self-update off must not perform. The daemon keeps it on
-    // Ordinary daemon launches keep it on; process-scoped skip launches do not.
     if self_update_enabled && config.update.enabled {
         let agent_for_broadcast = Arc::clone(&state.agent);
         let update_config = config.update.clone();
@@ -2419,8 +2088,6 @@ pub async fn serve_with_options(
         }));
     }
 
-    // GitHub fallback poll (safety net, default every 48h). Install/restart
-    // capable, so gated on `self_update_enabled` (embedders opt out).
     bg_tasks.extend(routes::BackgroundRuntime::spawn_source(
         self_update_enabled
             && config.update.enabled
