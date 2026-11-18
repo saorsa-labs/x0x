@@ -1529,6 +1529,37 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_lapsed_refresh_one_wins() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let store = SessionStore::new(SESSION_TOKEN_TTL);
+        let token = store.issue(Instant::now());
+        store.expire_for_test(&token);
+        let now = Instant::now();
+        let barrier = Barrier::new(2);
+
+        let (r1, r2) = thread::scope(|s| {
+            let h1 = s.spawn(|| {
+                barrier.wait();
+                store.refresh(&token, now)
+            });
+            let h2 = s.spawn(|| {
+                barrier.wait();
+                store.refresh(&token, now)
+            });
+            (h1.join().unwrap(), h2.join().unwrap())
+        });
+
+        let winner = match (r1, r2) {
+            (Ok(tok), Err(SessionRefreshError::Unknown)) => tok,
+            (Err(SessionRefreshError::Unknown), Ok(tok)) => tok,
+            (a, b) => panic!("expected one Ok and one Unknown, got {a:?} and {b:?}"),
+        };
+        assert!(store.is_valid(&winner, Instant::now()));
+    }
+
+    #[test]
     fn refreshed_session_has_the_same_authority_as_the_original() {
         // A refreshed token is an ordinary session bearer: accepted on
         // protected routes and browser query-token routes, still classified
