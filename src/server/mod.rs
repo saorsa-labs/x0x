@@ -2113,7 +2113,6 @@ pub async fn serve_with_options(
         },
     ));
 
-    // Background rendezvous re-advertisement (re-advertise every validity_ms / 2)
     if config.rendezvous_enabled && config.rendezvous_validity_ms > 0 {
         let rendezvous_agent = Arc::clone(&state.agent);
         let validity_ms = config.rendezvous_validity_ms;
@@ -2121,10 +2120,8 @@ pub async fn serve_with_options(
         bg_tasks.push(tokio::spawn(async move {
             let interval_secs = (validity_ms / 2).max(60_000) / 1000;
             let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
-            ticker.tick().await; // skip immediate tick (already advertised at startup)
+            ticker.tick().await;
             loop {
-                // Watch shutdown so teardown is prompt (Fix C): without this the
-                // loop would only stop when aborted at the end of the grace window.
                 tokio::select! {
                     _ = shutdown_rx.changed() => break,
                     _ = ticker.tick() => {}
@@ -2138,20 +2135,13 @@ pub async fn serve_with_options(
         }));
     }
 
-    // Background connectivity snapshot logger — writes an ant-quic NodeStatus
-    // summary line every 60 seconds at target "x0x::diag::connectivity". This
-    // gives journalctl a tick-by-tick record of UPnP state, external address
-    // observations, direct vs relayed counts, and hole-punch success rate so
-    // long-running deployments have a time series to diagnose from without
-    // polling the HTTP diagnostics endpoint.
     {
         let diag_state = Arc::clone(&state);
         let mut shutdown_rx = state.shutdown_notify.subscribe();
         bg_tasks.push(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(60));
-            ticker.tick().await; // skip the immediate tick — node is still warming up
+            ticker.tick().await;
             loop {
-                // Watch shutdown so teardown is prompt (Fix C).
                 tokio::select! {
                     _ = shutdown_rx.changed() => break,
                     _ = ticker.tick() => {}
@@ -2185,7 +2175,6 @@ pub async fn serve_with_options(
         }));
     }
 
-    // Background file-message listener — processes FileMessage on the direct channel
     {
         let file_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
@@ -2196,14 +2185,13 @@ pub async fn serve_with_options(
             loop {
                 let Some(msg) = rx.recv().await else { break };
                 let Some((sender, file_msg)) = routes::decode_file_message(&msg) else {
-                    continue; // unverified sender or not a file message
+                    continue;
                 };
                 handle_file_message(&file_state, sender, file_msg).await;
             }
         }));
     }
 
-    // ADR-0073 call lifecycle: inbound x0x_call_* frames + missed-call sweeper
     bg_tasks.push(tokio::spawn(routes::calls::run_call_listener(Arc::clone(
         &state,
     ))));
@@ -2211,8 +2199,6 @@ pub async fn serve_with_options(
         &state,
     ))));
 
-    // Background join-result listener — joiner-initiated recovery path for
-    // fresh TreeKEM members that miss the anchor's opportunistic MemberAdded push.
     {
         let join_result_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
@@ -2222,7 +2208,6 @@ pub async fn serve_with_options(
                 let Ok(join_msg) = serde_json::from_slice::<JoinResultMessage>(&msg.payload) else {
                     continue;
                 };
-                // #1604 G5: refuse a held unknown variant before any check.
                 let Ok(join_msg) =
                     crate::wire_compat::reject_unknown("JoinResultMessage", join_msg)
                 else {
@@ -2235,8 +2220,6 @@ pub async fn serve_with_options(
                     len = msg.payload.len(),
                     verified = msg.verified,
                 );
-                // #1275: the dispatch runs a result's apply shielded and
-                // awaits it, so results still apply in arrival order.
                 if !dispatch_join_result_message(
                     &join_result_state,
                     &msg.sender,
@@ -2251,8 +2234,6 @@ pub async fn serve_with_options(
         }));
     }
 
-    // Background TreeKEM Welcome blob listener — pull-based bulk delivery for
-    // oversized Welcome payloads referenced by named-group metadata events.
     {
         let welcome_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
@@ -2304,9 +2285,6 @@ pub async fn serve_with_options(
         }));
     }
 
-    // Background TreeKEM catch-up listener — explicit anti-entropy for
-    // order-sensitive membership events that arrive before local readiness or
-    // ahead of the local epoch/state frontier.
     {
         let catchup_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
@@ -2328,10 +2306,6 @@ pub async fn serve_with_options(
         }));
     }
 
-    // Background signed-public group bootstrap listener. A newly-added member
-    // may have no local group/card state yet, so the adding authority sends a
-    // complete public roster snapshot with its signed head commit. The handler
-    // validates that commit and the direct sender binding before persistence.
     {
         let bootstrap_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
@@ -2358,10 +2332,6 @@ pub async fn serve_with_options(
                     verified = msg.verified,
                     "direct classified signed-public group bootstrap"
                 );
-                // The legacy unprefixed wire form carries no durable
-                // receipt, so the admission outcome has nowhere to go.
-                // #1275: the admission installs and persists the group, so
-                // it runs shielded and is awaited in arrival order.
                 let apply_state = Arc::clone(&bootstrap_state);
                 let sender = msg.sender;
                 let machine_id = msg.machine_id;
@@ -2383,16 +2353,6 @@ pub async fn serve_with_options(
         }));
     }
 
-    // Background named-group metadata listener on the direct channel — applies
-    // authority-authored review commits (approve / reject) that are
-    // direct-delivered to a requester before they are grafted into the
-    // metadata topic's gossip mesh (see `spawn_named_group_event_delivery`).
-    // This mirrors the per-group metadata topic-subscription apply loop; the
-    // shared apply handler re-validates the signed commit, enforces the same
-    // authorization checks, and is idempotent, so applying via both the direct
-    // and gossip channels is safe. #1238: each group's events apply in a
-    // bounded lane of their own, in arrival order, so one slow apply (a
-    // Welcome fetch) does not hold the events of the other groups.
     // Install startup self-leave gates before this listener can schedule a
     // rekey. `startup_self_leave_rekey` clears the hold after the gates exist.
     routes::named_groups::self_leave_startup_hold_for_gate_install(&state);
@@ -2419,24 +2379,13 @@ pub async fn serve_with_options(
         }));
     }
 
-    // #1427: a TreeKEM member that was down past the last metadata resend
-    // asks for the commits it missed after its start, with no later
-    // traffic needed.
     bg_tasks.push(tokio::spawn(
         routes::named_groups::run_treekem_start_catchup(Arc::clone(&state)),
     ));
-    // #1427: a TreeKEM member that stays up through a network outage past
-    // the last metadata resend asks for the commits it missed when it
-    // connects again.
     bg_tasks.push(tokio::spawn(
         routes::named_groups::run_treekem_reconnect_catchup(Arc::clone(&state)),
     ));
 
-    // #1663: a member of an encrypted GSS group whose own seat carries no
-    // KEM key republishes the key at boot. The keyless-install hook covers
-    // the live discovery; this pass covers a node that restarted into the
-    // keyless state (the hold and the head disclaimer persist across a
-    // restart until the seat is keyed again).
     {
         let republish_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
@@ -2444,20 +2393,14 @@ pub async fn serve_with_options(
         }));
     }
 
-    // ADR 0110 S4: revocation eviction, designated first.
     bg_tasks.push(tokio::spawn(
         routes::named_groups::run_revocation_eviction_worker(Arc::clone(&state)),
     ));
 
-    // ADR 0109 S3: ownerless attestation and manual re-seat.
     bg_tasks.push(tokio::spawn(
         routes::named_groups::run_group_recovery_worker(Arc::clone(&state)),
     ));
 
-    // Background signed public-message listener for typed gossip-DM fallback
-    // delivery. Per-group pubsub is still the primary fan-out path; this route
-    // handles the same signed message when the sender additionally direct-
-    // delivers it to active members.
     {
         let public_dm_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
@@ -2497,25 +2440,11 @@ pub async fn serve_with_options(
         }));
     }
 
-    // ADR 0028: predecessor relay listener. When a requester offers their signed
-    // V2 JoinRequestCreated envelope to the authority via typed DM, the
-    // authority decodes the V2 envelope, independently verifies the requester's
-    // signature, extracts the NamedGroupMetadataEvent, applies it through the
-    // normal apply path, and stores the obligation for relay to active
-    // witnesses. The relay is a courier — it forwards the exact V2 bytes
-    // unchanged; the requester's ML-DSA-65 signature is preserved.
-    //
-    // When a witness receives the relayed envelope from the authority, it
-    // decodes and applies the JoinRequestCreated through the normal apply path
-    // but does NOT re-relay (only the authority relays, preventing storms).
     {
         let relay_state = Arc::clone(&state);
         let local_agent_hex = hex::encode(relay_state.agent.agent_id().as_bytes());
         bg_tasks.push(tokio::spawn(async move {
             while let Some(typed) = predecessor_relay_dm_rx.recv().await {
-                // #1275: the handler applies the event and persists the
-                // roster and the relay obligation, so it runs shielded and
-                // is awaited in arrival order.
                 let apply_state = Arc::clone(&relay_state);
                 let local_agent_hex = local_agent_hex.clone();
                 let handled = relay_state
@@ -2535,10 +2464,6 @@ pub async fn serve_with_options(
         }));
     }
 
-    // Background KvStore delta listener for typed gossip-DM fallback delivery.
-    // Store pub/sub remains the primary path; this side channel gives joined
-    // peers a reliable replay of the same CRDT delta when the topic mesh is
-    // late or congested. Peers that have not joined the store simply ignore it.
     {
         let kv_delta_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
@@ -2562,8 +2487,6 @@ pub async fn serve_with_options(
                     );
                     continue;
                 };
-                // #1275: the merge persists the store's snapshot, so it runs
-                // shielded and is awaited in arrival order.
                 let apply_state = Arc::clone(&kv_delta_state);
                 let sender = typed.sender;
                 let applied = kv_delta_state
@@ -2578,18 +2501,11 @@ pub async fn serve_with_options(
         }));
     }
 
-    // ADR 0028 B6: background relay retry timer. Instead of a fixed 30-second
-    // interval that collapses the 0/1/2/4/8/16-second retry schedule, this
-    // timer computes the sleep duration from the earliest next_retry_at_ms
-    // across all outbox obligations. When no obligations are due, it sleeps
-    // until the nearest deadline (capped at 30s for safety). This preserves
-    // the actual retry offsets (B6 sub-property 1).
     {
         let relay_step_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
             let mut shutdown_rx = relay_step_state.shutdown_notify.subscribe();
             loop {
-                // Compute the earliest deadline across all obligations.
                 let now_ms = now_millis_u64();
                 let next_deadline_ms = {
                     let outbox = relay_step_state.predecessor_relay_outbox.read().await;
@@ -2604,9 +2520,6 @@ pub async fn serve_with_options(
                     Some(deadline) if deadline > now_ms => {
                         std::time::Duration::from_millis((deadline - now_ms).min(30_000))
                     }
-                    // A deadline has already passed or no obligations — short
-                    // poll so newly-admitted obligations (next_retry_at_ms =
-                    // now) are picked up immediately.
                     _ => std::time::Duration::from_millis(500),
                 };
                 tokio::select! {
@@ -2619,16 +2532,10 @@ pub async fn serve_with_options(
         }));
     }
 
-    // #908: durable requester→authority predecessor-offer retry worker.
-    // A short poll picks up a newly-admitted obligation immediately (its
-    // first attempt is `next_retry_at_ms = now`), and each pass persists
-    // the exact retry/completion state before counting anything.
     {
         let offer_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
             let mut shutdown_rx = offer_state.shutdown_notify.subscribe();
-            // #1158: an offer held for an unknown capability is retried
-            // as soon as the authority's verified advert arrives.
             let mut adverts = offer_state
                 .agent
                 .capability_store()
@@ -2646,8 +2553,6 @@ pub async fn serve_with_options(
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                        // The store outlives this worker; if the signal
-                        // ever closes, the 500 ms poll still retries.
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             adverts = offer_state
                                 .agent
@@ -2661,13 +2566,6 @@ pub async fn serve_with_options(
         }));
     }
 
-    // #1109: durable direct-send worker. Each pass settles obligations the
-    // receipt ledger shows delivered, drops expired ones and sends the
-    // rest once under their logical id. S2: a late v2 ACK with no waiter
-    // (after a restart) can settle a held obligation without a send, and a
-    // recipient's durable-capable advert makes its held sends due at once.
-    // The wake-ups reach the worker through one channel; its own interval
-    // keeps the scheduled passes whatever the wake-up rate.
     {
         use routes::direct_outbox::{
             run_direct_send_worker, AgentDirectSendTransport, DirectSendNow, DirectSendWake,
@@ -2728,18 +2626,10 @@ pub async fn serve_with_options(
         }));
     }
 
-    // ADR 0030 §5: strict v2 signed-public bootstrap listener. Unlike the
-    // legacy unprefixed fan-out, this route resolves the authenticated DM
-    // completion only after the consent gate and a directory-durable install,
-    // and that completion is what releases the sender's v2 ACK.
     {
         let bootstrap_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
             while let Some(typed) = public_group_bootstrap_dm_rx.recv().await {
-                // #1275: the admission installs and persists the group
-                // before it completes the ACK, so it runs shielded and is
-                // awaited in arrival order. A refused payload is dropped
-                // with its completion: no ACK, so the sender re-offers.
                 let apply_state = Arc::clone(&bootstrap_state);
                 let admitted = bootstrap_state
                     .run_shielded(Box::pin(async move {
@@ -2753,12 +2643,6 @@ pub async fn serve_with_options(
         }));
     }
 
-    // ADR-0070 §2: share-grant deliveries. The handler verifies and stores
-    // the grant before completing, so the v2 ACK means "stored"; every
-    // refusal withholds it. An ADR 0079 names-carrying envelope (the
-    // `x0x-sharegrant-v2\0` prefix on the same channel) additionally puts
-    // the owner-signed names into the name store as ADR-0074 §1 defaults,
-    // gated on the owner being a Known or Trusted contact.
     {
         let grant_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
@@ -2768,9 +2652,6 @@ pub async fn serve_with_options(
         }));
     }
 
-    // #1003: grant-revocation pushes. The handler drops before any verify
-    // (decode/subject/stale/duplicate/rate limit), then ingests through
-    // the same v3 revocation path as gossip. Best-effort: no ACK is owed.
     {
         let push_agent = Arc::clone(&agent);
         bg_tasks.push(tokio::spawn(async move {
@@ -2783,16 +2664,10 @@ pub async fn serve_with_options(
         }));
     }
 
-    // #1094 D1/D2: data reads and writes. Replies complete their waiter in
-    // the consumer; request serves and reply sends run on detached tasks,
-    // so a slow write does not hold the next reply (#1953 review).
     bg_tasks.push(tokio::spawn(
         crate::server::data_read::run_data_read_consumer(Arc::clone(&state), data_read_dm_rx),
     ));
 
-    // ADR 0083 slice 3: remote GUI show. Trust runs in the handler, before
-    // the body is decoded. Displays and reply sends run on detached tasks,
-    // so one opener wait does not hold the next result or activity message.
     {
         let gui_show_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
@@ -2802,15 +2677,10 @@ pub async fn serve_with_options(
         }));
     }
 
-    // #926: grant redelivery worker. Each pass drops revoked/expired entries
-    // and sends at most a bounded batch of due ones on the #924 durable DM
-    // route; a newly queued or nudged entry wakes it early.
     if let Some(grant_outbox) = agent.share_grant_outbox() {
         let grant_agent = Arc::clone(&agent);
         let mut shutdown_rx = state.shutdown_notify.subscribe();
         bg_tasks.push(tokio::spawn(async move {
-            // #1158: a grant held for an unknown capability is retried as
-            // soon as the recipient's verified advert arrives.
             let mut adverts = grant_agent
                 .capability_store()
                 .subscribe_obligation_adverts();
@@ -2824,8 +2694,6 @@ pub async fn serve_with_options(
                             grant_agent.nudge_share_grant_outbox_for_agent(&recipient);
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                        // The store outlives this worker; if the signal
-                        // ever closes, the 5 s poll still retries.
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             adverts = grant_agent
                                 .capability_store()
@@ -2837,7 +2705,6 @@ pub async fn serve_with_options(
                 let _ = grant_agent.share_grant_outbox_step().await;
             }
         }));
-        // Retry promptly when a recipient's machine connects again.
         if let Some(network) = agent.network() {
             let mut events = network.subscribe();
             let nudge_agent = Arc::clone(&agent);
@@ -2860,10 +2727,6 @@ pub async fn serve_with_options(
         }
     }
 
-    // ADR 0030 §5: durable bootstrap retry worker. The outbox was loaded and
-    // reconciled before listener startup; each step sends at most one due
-    // obligation and persists its backoff, so a disconnected peer cannot
-    // create a hot loop and a restart resumes the exact canonical payload.
     {
         let bootstrap_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
@@ -2891,7 +2754,6 @@ pub async fn serve_with_options(
         }));
     }
 
-    // Build router
     let app = Router::new()
         .route("/health", get(health))
         .route("/status", get(status))
@@ -2928,7 +2790,6 @@ pub async fn serve_with_options(
         .route("/agent/sign", post(agent_sign))
         .route("/agent/verify", post(agent_verify))
         .route("/identity/revoke", post(identity_revoke))
-        // ADR-0043 agent key-move ceremony + placement ledger.
         .route("/agent/move", post(routes::agent_move_authorize))
         .route("/agent/move/export", post(routes::agent_move_export))
         .route("/agent/move/import", post(routes::agent_move_import))
@@ -2982,12 +2843,9 @@ pub async fn serve_with_options(
         .route("/task-lists/:id/tasks", get(list_tasks))
         .route("/task-lists/:id/tasks", post(add_task))
         .route("/task-lists/:id/tasks/:tid", patch(update_task))
-        // Named group endpoints
         .route("/groups", post(create_named_group))
         .route("/groups", get(list_named_groups))
-        // Static-prefix routes BEFORE /groups/:id so axum matches them first.
         .route("/groups/discover", get(discover_groups))
-        // Phase C.2: shard discovery + nearby + subscription management.
         .route("/groups/discover/nearby", get(discover_groups_nearby))
         .route(
             "/groups/discover/subscriptions",
@@ -3047,7 +2905,6 @@ pub async fn serve_with_options(
             "/groups/:id/requests/:request_id",
             delete(cancel_join_request),
         )
-        // Phase D.2 — cross-daemon secure encrypt/decrypt.
         .route("/groups/:id/secure/encrypt", post(secure_group_encrypt))
         .route("/groups/:id/secure/decrypt", post(secure_group_decrypt))
         .route("/groups/:id/secure/reseal", post(secure_group_reseal))
@@ -3055,10 +2912,8 @@ pub async fn serve_with_options(
             "/groups/secure/open-envelope",
             post(secure_open_envelope_adversarial),
         )
-        // Phase E: public-group messaging.
         .route("/groups/:id/send", post(send_group_public_message))
         .route("/groups/:id/messages", get(get_group_public_messages))
-        // ADR-0040 — agent-to-agent delegation.
         .route(
             "/groups/:id/delegate",
             post(delegations::delegate_group_authority),
@@ -3069,13 +2924,11 @@ pub async fn serve_with_options(
         )
         .route("/groups/:id/invite", post(create_group_invite))
         .route("/groups/:id/display-name", put(set_group_display_name))
-        // Phase D.3 — state-commit chain endpoints.
         .route("/groups/:id/state", get(get_group_state))
         .route("/groups/:id/state/commits", get(get_group_state_commits))
         .route("/groups/:id/state/seal", post(seal_group_state))
         .route("/groups/:id/state/withdraw", post(withdraw_group_state))
         .route("/groups/:id", delete(leave_group))
-        // Group-scoped encrypted KvStore (#341 Phase B)
         .route("/groups/:id/stores", post(create_group_kv_store))
         .route(
             "/groups/:id/stores/:app/legacy-imports",
@@ -3086,7 +2939,6 @@ pub async fn serve_with_options(
             get(routes::stores::download_legacy_page_import)
                 .post(routes::stores::import_legacy_page_store),
         )
-        // KvStore endpoints
         .route("/stores", get(list_kv_stores))
         .route("/stores", post(create_kv_store))
         .route("/stores/:id/join", post(join_kv_store))
@@ -3094,7 +2946,6 @@ pub async fn serve_with_options(
         .route("/stores/:id/:key", get(get_kv_value))
         .route("/stores/:id/:key", put(put_kv_value))
         .route("/stores/:id/:key", delete(delete_kv_value))
-        // Direct messaging endpoints
         .route("/agents/connect", post(connect_agent))
         .route("/direct/send", post(direct_send))
         .route("/direct/connections", get(direct_connections))
@@ -3103,7 +2954,6 @@ pub async fn serve_with_options(
             get(direct_receipt).delete(direct_cancel),
         )
         .route("/direct/events", get(direct_events_sse))
-        // MLS group encryption endpoints
         .route("/mls/groups", post(create_mls_group))
         .route("/mls/groups", get(list_mls_groups))
         .route("/mls/groups/:id", get(get_mls_group))
@@ -3114,39 +2964,28 @@ pub async fn serve_with_options(
         )
         .route("/mls/groups/:id/encrypt", post(mls_encrypt))
         .route("/mls/groups/:id/decrypt", post(mls_decrypt))
-        // Agent discovery & connectivity
         .route("/agents/find/:agent_id", post(find_agent))
         .route("/agents/reachability/:agent_id", get(agent_reachability))
-        // Contact trust extensions
         .route("/contacts/:agent_id/revoke", post(revoke_contact))
         .route("/contacts/:agent_id/revocations", get(list_revocations))
         .route(
             "/contacts/:agent_id/machines/:machine_id/pin",
             post(pin_machine).delete(unpin_machine),
         )
-        // Trust evaluation
         .route("/trust/evaluate", post(evaluate_trust))
-        // MLS welcome
         .route("/mls/groups/:id/welcome", post(create_mls_welcome))
-        // Upgrade
         .route("/upgrade", get(check_upgrade))
         .route("/upgrade/apply", post(apply_upgrade))
         .route("/upgrade/clear-hold", post(routes::clear_upgrade_hold))
-        // Network diagnostics
         .route("/network/bootstrap-cache", get(bootstrap_cache_stats))
         .route("/diagnostics/connectivity", get(connectivity_diagnostics))
         .route("/diagnostics/history", get(history_diagnostics))
-        // ADR-0023 durable-history read surface
         .route("/history", get(history_list).delete(history_purge))
         .route("/history/message/:msg_id", get(history_message))
         .route("/history/scopes", get(history_scopes))
         .route("/history/search", get(history_search))
         .route("/history/stats", get(history_stats))
-        // ADR 0116 §3: owner-only policy read (durable token, see auth.rs).
         .route("/history/policy", get(history_policy))
-        // ADR 0116 §4: the bounded runtime trim (durable token, see auth.rs).
-        // Its 1 KiB body limit sits inside the router-wide 1 MiB one and
-        // overrides it for this route (larger bodies are 413).
         .route(
             "/history/retain",
             post(history_retain).layer(axum::extract::DefaultBodyLimit::max(
@@ -3164,7 +3003,6 @@ pub async fn serve_with_options(
         .route("/diagnostics/exec", get(exec_diagnostics))
         .route("/diagnostics/connect", get(connect_diagnostics_handler))
         .route("/diagnostics/ws", get(ws_diagnostics))
-        // D148: read-only list of ADR 0108 §5a quarantined sidecar copies.
         .route(
             "/diagnostics/sidecar-quarantine",
             get(sidecar_quarantine_diagnostics),
@@ -3172,7 +3010,6 @@ pub async fn serve_with_options(
         .route("/exec/run", post(exec_run))
         .route("/exec/cancel", post(exec_cancel))
         .route("/exec/sessions", get(exec_sessions))
-        // ADR-0073 slice 1: call lifecycle (no media yet)
         .route(
             "/calls",
             post(routes::calls::call_create).get(routes::calls::call_list),
@@ -3181,17 +3018,14 @@ pub async fn serve_with_options(
         .route("/calls/:id/accept", post(routes::calls::call_accept))
         .route("/calls/:id/reject", post(routes::calls::call_reject))
         .route("/calls/:id/hangup", post(routes::calls::call_hangup))
-        // Tailnet forwarding (#132 T6)
         .route("/forwards", post(forward_add).get(forward_list))
         .route("/forwards/:local_addr", delete(forward_remove))
         .route("/streams", get(streams_diagnostics))
-        // ADR-0070 §3: connect/exec ACL management + hot reload
         .route("/acl/connect", get(acl_connect_list).post(acl_connect_add))
         .route("/acl/connect/:id", delete(acl_connect_remove))
         .route("/acl/exec", get(acl_exec_list).post(acl_exec_add))
         .route("/acl/exec/:id", delete(acl_exec_remove))
         .route("/acl/reload", post(acl_reload))
-        // ADR-0070 §2: share grants (issue/list/revoke; received list)
         .route(
             "/grants",
             get(routes::grants_list).post(routes::grants_issue),
@@ -3199,7 +3033,6 @@ pub async fn serve_with_options(
         .route("/grants/received", get(routes::grants_received))
         .route("/grants/:id", delete(routes::grants_revoke))
         .route("/grants/:id/renew", post(routes::grants_renew))
-        // #1094 D1: read a store through a received ShareCap::Data grant.
         .route(
             "/grants/data/:agent/:group/:store",
             get(data_read::get_granted_store_keys),
@@ -3208,7 +3041,6 @@ pub async fn serve_with_options(
             "/grants/data/:agent/:group/:store/:key",
             get(data_read::get_granted_store_value),
         )
-        // #1094 D2: write a store through a received `rw` ShareCap::Data grant.
         .route(
             "/grants/data/:agent/:group/:store/:key",
             put(data_read::put_granted_store_value),
@@ -3217,7 +3049,6 @@ pub async fn serve_with_options(
             "/grants/data/:agent/:group/:store/:key",
             delete(data_read::delete_granted_store_value),
         )
-        // ADR-0074 §1: names (owner petnames, TOFU pins, resolution)
         .route("/names", get(routes::names_list))
         .route("/names/resolve", post(routes::names_resolve))
         .route("/names/owners", post(routes::names_owner_bind))
@@ -3226,34 +3057,26 @@ pub async fn serve_with_options(
         .route("/names/pins/:name", delete(routes::names_unpin))
         .route("/names/accept", post(routes::names_accept))
         .route("/names/suggestions/:label", delete(routes::names_dismiss))
-        // Peer observability (ant-quic 0.27.1/0.27.2 surface)
         .route("/peers/:peer_id/probe", post(probe_peer_handler))
         .route("/peers/:peer_id/health", get(peer_health_handler))
         .route("/peers/events", get(peer_events_handler))
-        // WebSocket endpoints
         .route("/ws", get(ws_handler))
         .route("/ws/direct", get(ws_direct_handler))
         .route("/ws/sessions", get(ws_sessions))
         .route("/shutdown", post(shutdown_handler))
-        // File transfer endpoints
         .route("/files/send", post(file_send_handler))
         .route("/files/transfers", get(file_transfers_handler))
         .route("/files/transfers/:id", get(file_transfer_status_handler))
         .route("/files/accept/:id", post(file_accept_handler))
         .route("/files/reject/:id", post(file_reject_handler))
-        // Constitution
         .route("/constitution", get(get_constitution))
         .route("/constitution/json", get(get_constitution_json))
-        // Embedded GUI
         .route("/gui", get(serve_gui))
         .route("/gui/", get(serve_gui))
-        // ADR 0083 slice 1: local show (no remote target).
         .route("/gui/show", post(routes::gui_show))
-        // Session-token exchange (#127 / WS1.6): durable bearer → short-lived
-        // browser session token, the only kind valid in ?token= query strings.
         .route("/auth/session", post(auth::create_session))
         .route("/auth/session/refresh", post(auth::refresh_session))
-        .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)) // 1 MB
+        .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
         .layer({
             // Restrict CORS to exact loopback origins only.
             // The daemon API is a local control plane — external origins must not access it.
@@ -3265,16 +3088,11 @@ pub async fn serve_with_options(
                 .allow_methods(AllowMethods::any())
                 .allow_headers(AllowHeaders::any())
         })
-        // Bearer-token authentication: all control-plane endpoints.
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             auth::auth_middleware,
         ))
         .with_state(Arc::clone(&state));
-
-    // The `api.port` advertisement is written only after causal-state loading
-    // succeeds. Startup failures before that point explicitly tear down the
-    // agent and exec service and leave no advertised API endpoint.
 
     // Lifecycle: a CancellationToken drives library-initiated shutdown
     // (ServerHandle::shutdown / Drop). The mpsc `/shutdown` HTTP path still
@@ -3316,14 +3134,6 @@ pub async fn serve_with_options(
             .await
         });
 
-        // Fix B (Issue #110 Phase 2): include the axum server `JoinHandle` in the
-        // select so that if the HTTP task ends on its own (panic / bind loss /
-        // Err) the supervisor wakes immediately instead of waiting for an external
-        // shutdown signal. The result is still drained and propagated below.
-        // When the select observes the axum task ending on its own, capture its
-        // result here so it can be propagated out of the supervisor — an Err or a
-        // panic (JoinError) must surface from `wait()`/`shutdown_and_wait()`. A
-        // clean self-requested graceful stop stays `Ok(())`.
         let mut server_result: Option<anyhow::Result<()>> = None;
         tokio::select! {
             _ = supervisor_cancel.cancelled() => {
@@ -3350,15 +3160,8 @@ pub async fn serve_with_options(
             }
         }
 
-        // Tell every `shutdown_notify`-watching loop (and the axum graceful
-        // shutdown future) to stop.
         let _ = state.shutdown_notify.send(true);
 
-        // Drain the axum server result and propagate any failure. If the select
-        // already observed it ending, `server` was consumed there and its result
-        // captured above; otherwise await it (with a bound) and propagate. The
-        // drain flag records whether every HTTP producer finished on its own;
-        // it feeds only the flush receipt below, never the exit code.
         let (server_result, _http_drained) = match server_result {
             Some(res) => (res, true),
             None => drain_http_server(server).await,
@@ -3375,8 +3178,6 @@ pub async fn serve_with_options(
         //    still alive, so in-flight sessions can cancel cleanly before the
         //    network goes away.
         state.exec_service.shutdown().await;
-        // 0b. Forwarder listeners + inbound consumer (issue #132): stop
-        //     accepting/bridging while the Agent transport is still alive.
         if let Some(forwarder) = &state.forward_service {
             // Drain add/remove/restore before cancelling listeners. A
             // transaction still inside bind publishes its accept loop
@@ -3386,8 +3187,6 @@ pub async fn serve_with_options(
             forwarder.shutdown_and_release().await;
         }
         if let Some(socks) = &state.socks_service {
-            // Join the accept loop so the listen port is free before the
-            // process continues. Handshake sessions observe the same token.
             socks.shutdown_and_wait().await;
         }
         // 1. `Agent::begin_shutdown()` (issue #116 Codex finding 1): cancel the
@@ -3433,8 +3232,6 @@ pub async fn serve_with_options(
             .history()
             .is_some_and(|history| history.writer_shutdown_incomplete());
 
-        // Clean up port file on shutdown (kept after task teardown so the
-        // existing ordering — port advertisement removed last — is preserved).
         let _ = crate::w3h_inline::fs::remove_file(&port_file).await;
 
         // #661 r2: drop the captured AppState NOW, as the last statement,
@@ -3480,9 +3277,6 @@ pub async fn serve_with_options(
         let result = combine_server_shutdown_results(server_result, agent_shutdown_result);
         #[cfg(any(unix, windows))]
         if let Some(owner) = &upgrade_flush {
-            // An HTTP producer aborted at the drain bound is as unfinished as
-            // an aborted background task (ADR 0094 §4): the receipt refuses,
-            // while the ordinary-shutdown exit above stays 0 (#261/#363).
             owner
                 .finish(
                     &result,
@@ -3506,16 +3300,10 @@ pub async fn serve_with_options(
     })
 }
 
-/// #1269 r2: how long the shutdown tail waits for admitted group-state
-/// applies (see [`drain_server_tasks`]) before it leaves them to finish.
 const SHIELDED_APPLY_DRAIN_BOUND: Duration = Duration::from_secs(10);
 
-/// The single grace window the shutdown tail gives every abortable server
-/// task (see [`drain_server_tasks`]) before it aborts the stragglers.
 const SERVER_TASK_GRACE: Duration = Duration::from_secs(2);
 
-/// #1274: how long the shutdown tail waits for aborted join-artifact egress
-/// tasks to end (an abort takes effect at the task's next await point).
 const JOIN_ARTIFACT_EGRESS_ABORT_BOUND: Duration = Duration::from_secs(5);
 
 /// Step 2 of the serve supervisor's shutdown: grace-await, then abort, every
@@ -3528,8 +3316,6 @@ async fn drain_server_tasks(
     mut bg_tasks: Vec<tokio::task::JoinHandle<()>>,
 ) -> bool {
     let mut complete = true;
-    // #1269 r2: end the network waits of applies in progress first (they
-    // fail as on a lost peer), so the shielded wait below stays short.
     state.shutdown_started.cancel();
     // Browser launches sit on the blocking pool, which abort does not stop.
     // Tell them to return before the join below. The launch task does not
@@ -3738,7 +3524,6 @@ fn same_directory(a: &std::path::Path, b: &std::path::Path) -> bool {
 pub async fn list_instances() -> Result<()> {
     let data_base = dirs::data_dir().context("cannot determine data directory")?;
 
-    // Collect candidate directories: x0x and x0x-*
     let mut instances: Vec<(String, PathBuf)> = Vec::new();
 
     let default_port_file = data_base.join("x0x").join("api.port");
@@ -3939,10 +3724,6 @@ async fn start_dm_inbox_when_gossip_ready(
                 x0x::share_grant::SHARE_GRANT_DM_PREFIX,
                 share_grant_route_tx.clone(),
             )
-            // ADR 0079 §1: the names-carrying v2 envelope shares the v1
-            // route channel (one consumer, two prefixes); the handler
-            // branches on the prefix. Durable for the same reason as v1:
-            // the v2 ACK must mean "grant stored and names durable".
             .with_durable_typed_payload_route(
                 x0x::share_grant::names::SHARE_GRANT_V2_DM_PREFIX,
                 share_grant_route_tx.clone(),
@@ -3972,7 +3753,6 @@ async fn start_dm_inbox_when_gossip_ready(
                 x0x::revocation_push::GRANT_REVOCATION_PUSH_PREFIX,
                 revocation_push_route_tx.clone(),
             )
-            // #1094 D1: plain routes, no ACK owed (one attempt each way).
             .with_typed_payload_route(
                 x0x::share_grant::data_read::DATA_READ_REQUEST_DM_PREFIX,
                 data_read_route_tx.clone(),
@@ -3981,7 +3761,6 @@ async fn start_dm_inbox_when_gossip_ready(
                 x0x::share_grant::data_read::DATA_READ_REPLY_DM_PREFIX,
                 data_read_route_tx.clone(),
             )
-            // #1094 D2: a grantee's write; the reply uses the read reply route.
             .with_typed_payload_route(
                 x0x::share_grant::data_read::DATA_WRITE_REQUEST_DM_PREFIX,
                 data_read_route_tx.clone(),
@@ -4018,7 +3797,6 @@ async fn start_dm_inbox_when_gossip_ready(
     }
 }
 
-/// Parse a 64-character hex string into an AgentId.
 fn parse_agent_id_hex(hex_str: &str) -> Result<AgentId, String> {
     let bytes = hex::decode(hex_str).map_err(|e| format!("invalid hex: {e}"))?;
     if bytes.len() != 32 {
@@ -4032,7 +3810,6 @@ fn parse_agent_id_hex(hex_str: &str) -> Result<AgentId, String> {
     Ok(AgentId(arr))
 }
 
-/// Parse a 64-character hex string into a MachineId.
 fn parse_machine_id_hex(hex_str: &str) -> Result<MachineId, String> {
     let bytes = hex::decode(hex_str).map_err(|e| format!("invalid hex: {e}"))?;
     if bytes.len() != 32 {
@@ -4046,37 +3823,9 @@ fn parse_machine_id_hex(hex_str: &str) -> Result<MachineId, String> {
     Ok(MachineId(arr))
 }
 
-/// ADR-0066/ADR-0067: resolve one named-group record under **both
-/// spellings**, over a borrowed roster map.
-///
-/// The roster map is keyed by whichever alias this daemon learned the group
-/// under, while callers routinely arrive with the STABLE id (a delegation
-/// envelope signs `info.stable_group_id()`; an epoch token is captured
-/// against it). A bare `groups.get(id)` therefore misses the record whenever
-/// key ≠ stable id — and for a quarantine gate that does not degrade
-/// gracefully, it serves the contested roster. Direct key hit first, then a
-/// scan by `stable_group_id()`, exactly as the metadata apply path
-/// (`resolved_group_key`, `named_groups.rs:9124`) does.
-///
-/// **Synchronous and map-level on purpose.** ADR-0067's re-check runs INSIDE
-/// the `state.named_groups` write critical section that performs the
-/// mutation, so it cannot await a lock it is already holding. The async,
-/// `&AppState`-taking `delegations::fork_quarantine_marker` is now a thin
-/// wrapper over this, so the two cannot drift.
-///
-/// **The single resolver (#732).** Slices 3, 4, 6 and 7 each grew their own
-/// copy of this two-line rule and cross-model review found the same
-/// single-spelling defect three times independently, so the copies are now
-/// gone: `delegations::fork_quarantine_marker`, `history`'s scope markers and
-/// purge gate, `ws`'s frame annotation, the public-group bootstrap install
-/// check, `stores`' TreeKEM protector and the manual clear route all resolve
-/// here. A quarantine-relevant lookup that spells this rule out again is a
-/// defect the `adr0066_lookup_guard` fixture is there to catch.
 /// #732 both-spellings resolution for a MUTABLE roster entry (the mut
 /// sibling of [`resolve_group_entry_locked`]): the exact map key first,
-/// else the entry whose STABLE id matches. Quarantine-clear closures use
-/// this so a clear requested under either spelling reaches the record the
-/// map actually holds (N19-B).
+/// else the entry whose STABLE id matches.
 pub(in crate::server) fn resolve_group_entry_mut_locked<'a>(
     groups: &'a mut HashMap<String, x0x::groups::GroupInfo>,
     group_id: &str,
@@ -4140,8 +3889,6 @@ pub(in crate::server) fn lifecycle_epoch_token_locked(
     x0x::groups::LifecycleEpochToken::spanning_aliases(tokens.into_values())
 }
 
-/// Build a uniform `{ "ok": false, "error": <msg> }` JSON error response paired
-/// with the given status code. Used by handlers in place of hand-rolled literals.
 fn api_error(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
     (
         status,
@@ -4149,10 +3896,6 @@ fn api_error(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<se
     )
 }
 
-/// Like [`api_error`], but adds a machine-readable `reason` field to the
-/// response body. Use when two responses share an HTTP status yet must stay
-/// machine-separable (e.g. two distinct 409 CONFLICT conditions). Existing
-/// `api_error` callers keep their `{ "ok": false, "error": <msg> }` body.
 fn api_error_with_reason(
     status: StatusCode,
     msg: impl Into<String>,
@@ -4164,22 +3907,18 @@ fn api_error_with_reason(
     )
 }
 
-/// `400 Bad Request` error response.
 fn bad_request(msg: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
     api_error(StatusCode::BAD_REQUEST, msg)
 }
 
-/// `404 Not Found` error response.
 fn not_found(msg: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
     api_error(StatusCode::NOT_FOUND, msg)
 }
 
-/// `403 Forbidden` error response.
 fn forbidden(msg: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
     api_error(StatusCode::FORBIDDEN, msg)
 }
 
-/// Decode a base64-encoded payload from a request field.
 fn decode_base64_payload(encoded: &str) -> Result<Vec<u8>, (StatusCode, Json<serde_json::Value>)> {
     BASE64
         .decode(encoded)
@@ -4189,11 +3928,6 @@ fn decode_base64_payload(encoded: &str) -> Result<Vec<u8>, (StatusCode, Json<ser
 /// Handle a single predecessor-relay typed-DM payload: decode/authenticate
 /// the signed V2 envelope, enforce carrier/direction, classify admission,
 /// persist the journal/roster/obligation, and clear the marker on success.
-///
-/// Extracted verbatim from the typed-DM receiver loop so that in-process
-/// tests can drive the real production admission path (ADR 0028). The loop
-/// calls this once per received payload; `return` here is equivalent to the
-/// original `continue` (proceed to the next message).
 pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
     relay_state: &Arc<AppState>,
     local_agent_hex: &str,
@@ -4209,8 +3943,6 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
     // unavailable on purpose (indurable journal transitions) — the
     // sender's retry schedule re-offers.
     let completion = typed.completion.take();
-    // #1840: the requester-side outcome of a refused offer arrives on the
-    // same channel under its own prefix.
     let outcome = if typed
         .payload
         .starts_with(x0x::groups::join_outcome::JOIN_REQUEST_OUTCOME_DM_PREFIX)
@@ -4245,7 +3977,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
     else {
         return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
     };
-    // Size check: reject oversized envelopes (ADR 0028 bound).
     if envelope_bytes.len() > CAUSAL_ENVELOPE_MAX_BYTES {
         tracing::warn!(
             sender = %hex::encode(typed.sender.as_bytes()),
@@ -4254,8 +3985,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
         );
         return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
     }
-    // Decode the V2 envelope to verify the requester's signature
-    // and extract the NamedGroupMetadataEvent payload.
     let Ok(msg) = x0x::gossip::pubsub::decode_auto(Bytes::copy_from_slice(envelope_bytes)) else {
         tracing::warn!(
             sender = %hex::encode(typed.sender.as_bytes()),
@@ -4281,8 +4010,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
         return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
     };
 
-    // ADR 0028: reject non-JoinRequestCreated before apply
-    // (Kimi blocker 3 — carrier authorization).
     if !matches!(event, NamedGroupMetadataEvent::JoinRequestCreated { .. }) {
         tracing::warn!(
             sender = %hex::encode(typed.sender.as_bytes()),
@@ -4320,8 +4047,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
         return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
     }
 
-    // Load group info once to determine: local authority status,
-    // metadata topic, group exists/active, carrier role.
     let (is_local_authority, metadata_topic, carrier_is_admin, group_exists_active) = {
         let groups = relay_state.named_groups.read().await;
         groups
