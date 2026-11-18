@@ -348,7 +348,9 @@ jobs:
       - name: 'Check issue #321 custody routing (inert)'
         run: python3 scripts/ci/test_issue321_custody_routing.py
       - name: Run named group integration tests
-        run: bash scripts/ci/nextest-isolated.sh --all-features --test named_group_integration --test issue2048_invite_join_existing_member -- --run-ignored ignored-only
+        run: bash scripts/ci/nextest-isolated.sh --all-features --test named_group_integration -- --run-ignored ignored-only
+      - name: 'Run issue #2048 invite join recovery test'
+        run: bash scripts/ci/nextest-isolated.sh --all-features --test issue2048_invite_join_existing_member -- --run-ignored ignored-only --no-tests=fail
       # The existing isolated nextest invocation resolves Cargo.lock and warms
       # the locked dependency graph before this offline daemon build.
       - name: 'Build and pin x0xd for issue #321'
