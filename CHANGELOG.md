@@ -189,10 +189,9 @@ All notable changes to this project will be documented in this file.
   `recovery_not_needed`, and no member shows the owner-recovery wait. A
   promoted member B that is offline when the mandate is signed commits the
   recovery when it starts again. A mandate naming a revoked member E is
-  refused with `recovery_member_ineligible`; this arm is pinned RED for a
-  known gap (#1973): while E is still seated, B's recovery seal fails the
-  ADR-0038 eviction check and never commits. The row has its own W3-H
-  shard (`1581m`).
+  refused with `recovery_member_ineligible`, and the mandate naming B
+  commits while E is still seated (GREEN since the #1973 fix; the arm was
+  pinned RED before it). The row has its own W3-H shard (`1581m`).
 - **W3-H row `s4_certificate_rebind` run (7) (#1581).** After B revokes
   its own agent and A and C hold the record, B's self-rebind of a later
   renewal is refused with `rebind_signer_ineligible`, and no node binds
@@ -573,6 +572,15 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **A late ACK after a restart must come from the recipient machine (#2007;
+  A07 amendment of 17 Nov 2026).** Each queued-send attempt record in
+  `direct_send_outcomes.json` now also keeps the recipient machine IDs the
+  attempts were sent to (`machines`, hex). An orphan v2 ACK settles a held
+  send, or records `delivered_late`, only when the machine it came from is
+  in that list. An ACK from the right agent on another machine changes
+  nothing. A record without `machines` (written before this change, or whose
+  machine was never known) still loads, but no orphan ACK settles it; the
+  send is sent again.
 - **Groups (H-S3-r, studio1 train 60):** a joiner whose join seal was not
   served now keeps its group record and its `readmission_required
   {base_beyond_retention}` after the join attempt times out. Before, a stub
@@ -590,7 +598,6 @@ All notable changes to this project will be documented in this file.
   `x0x doctor` while the daemon is down. The launchd classifiers detect the
   launcher from `Program` when it is set, and check launcher arguments with
   the launcher's own parser. The launcher stays dormant.
-
 - **The dormant launcher's issuer refuses fixed faults with 78 (#1378,
   review of #2014).** A plan path that is missing or not canonical, and a
   symlinked or non-regular trial record, now exit 78 instead of 75. The tests
@@ -669,6 +676,23 @@ All notable changes to this project will be documented in this file.
   row now marks the row `local_committer_ineligible` naming the next
   admin, as ADR 0110 §4 wants. Before, the row showed
   `waiting_for_designated_admin`.
+- **Owner recovery no longer deadlocks while another revoked member is
+  seated (#1973; A09 amendment of 16 Nov 2026).** In an `OwnerCertified`
+  group whose admins are all revoked, the promoted member's recovery seal
+  now tolerates seated below-Admin members whose verified revocation the
+  node holds. The recovery commits; each tolerated seat keeps its leaf in
+  the recovery epoch, D60 egress withholding keeps it out, and its own S4
+  row removes it and rekeys one epoch later under the new admin. Before,
+  the seal refused with the ADR-0038 eviction check and that member's
+  eviction waited for the admin the recovery would seat, so the group
+  stayed without an admin. A refused recovery seal that names failing
+  members now shows the typed wait `waiting_for_member_eviction` with
+  those members in `named`. An expired (not revoked) below-Admin seat
+  still refuses the seal (#2004). No wire format changes. W3-H: the
+  1581m arm `w3h_1581m_recovery_refuses_a_revoked_member` flips from RED
+  to GREEN, and the new receiver-side arm
+  `w3h_1357_s4_owner_recovery_revoked_member_1973` (own shard `s4-1973`)
+  checks that E cannot decrypt after its own S4 row commits at e0+2.
 
 ## [v0.48.1] - 2026-10-17
 

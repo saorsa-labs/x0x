@@ -277,6 +277,47 @@ mixed-version rule forbids a rebind, the seat is evicted, as run (3) of
 `s4_certificate_rebind` states. No code, wire format or API changes. ADR
 0110 stays Accepted and its text is unchanged.
 
+On 16 Nov 2026 Claude decided what a seated revoked non-admin member
+means for the owner-recovery seal, under David's delegation of design
+decisions of 10 Nov 2026
+([#1973](https://github.com/saorsa-labs/x0x/issues/1973); ADR 0110
+§4b(1), ADR-0038 review B3). The recovery commit removes only the named
+revoked admins and promotes one member. A revoked below-Admin seat that
+is still seated no longer refuses the recovery seal: the seal tolerates
+it, as an S4 removal seal tolerates the group's other open S4 targets
+(ADR 0110 §3, ADR-0038 B3). The tolerated seat keeps its seat, and the
+recovery does not exclude it cryptographically: the commit keeps its
+TreeKEM leaf and builds its GSS envelope for it. D60 guarded egress
+withholds delivery while this node holds the seat's verified
+revocation, so the seat gets neither the recovery frame nor the share
+that follows it. The seat's own S4 row performs the exclusion and the
+rekey: ADR 0110 §1 opens that row for every seated revoked target, and
+it commits under the admin the recovery seats. Stated plainly: if the
+recovery commits at epoch e0+1, the revoked seat E keeps its leaf and a
+key envelope for e0+1 is built for it; only D60 egress withholding keeps
+E out, until E's own S4 row removes it and rekeys at e0+2. This is the
+same exposure as ADR-0038 B3. Every other failing seat
+keeps the all-clean refusal. A refused recovery seal that names failing
+members keeps a typed wait, `waiting_for_member_eviction`, naming them.
+A grace or digest-pending hold is not eviction work, so it never joins
+`named`. When failing members stand beside the hold, they stay named
+until the hold ends. When a hold refuses the seal alone, the refusal is
+`OwnerCertMemberPending`, and the promoted member's status stays at the
+bare `mandate_received` until the hold ends. A tolerated seat can still
+stall the recovery after the seal: it reaches the D76 receiver-upgrade
+hold and the "survivor has no roster KEM key" deferral like any other
+member, and those holds are not new in this change. The tolerance
+covers verified revocations only. An expired below-Admin seat keeps the
+refusal, so when every admin is revoked the recovery and that seat's
+expiry row still wait on each other; the exit is the owner
+re-certifying the expired seat, not the recovery. Before this, the
+recovery could never commit while a revoked member was seated, and that
+member's eviction waited for the admin the recovery would seat, so the
+group stayed without an admin (#1973). The `OwnerRecoveryV1` body still
+removes exactly the named admins; no wire format changes. The local
+status of a promoted member can name the new wait cause. ADR 0110 stays
+Accepted and its text is unchanged.
+
 [A08](A08-r01-groups-home-membership-and-repair.md) defines valid group-state and fork recovery. A09 must not bypass that authority to obtain keys faster.
 
 ## Security claims

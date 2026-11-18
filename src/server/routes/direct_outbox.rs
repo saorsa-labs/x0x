@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::dm::{DmError, DmReceiptStatus, DmSendConfig, RECEIPT_LEDGER_CAP};
-use crate::identity::AgentId;
+use crate::identity::{AgentId, MachineId};
 use crate::storage::outbox::{Outbox, OutboxCaps, OutboxMap, OutboxRecord, Settled};
 
 /// Sidecar file name in the daemon data dir.
@@ -117,6 +117,9 @@ pub(in crate::server) struct LedgerReceipt {
     pub(in crate::server) status: DmReceiptStatus,
     /// BLAKE3 of the bytes the recorded send carried, when known.
     pub(in crate::server) digest: Option<[u8; 32]>,
+    /// #2007: the recipient machine the recorded send was pinned to, when
+    /// known.
+    pub(in crate::server) machine: Option<MachineId>,
 }
 
 impl LedgerReceipt {
@@ -125,6 +128,7 @@ impl LedgerReceipt {
         Self {
             status: acks.receipt_status(request_id),
             digest: acks.receipt_digest(request_id),
+            machine: acks.receipt_machine(request_id),
         }
     }
 
@@ -379,6 +383,11 @@ pub(in crate::server) const DIRECT_SEND_OUTCOMES_CAP: usize = RECEIPT_LEDGER_CAP
 /// enqueue rules keep it at one; more only means "not exactly one".
 const DIRECT_SEND_ATTEMPT_DIGESTS_CAP: usize = 4;
 
+/// #2007: the most distinct recipient machines remembered for one request
+/// id. An attempt pinned to a machine past the cap is not remembered, so a
+/// late ACK from that machine changes nothing.
+const DIRECT_SEND_ATTEMPT_MACHINES_CAP: usize = 4;
+
 /// A sidecar over this size is corrupt (an entry is well under 300 bytes).
 const DIRECT_SEND_OUTCOMES_MAX_BYTES: usize = 8 * 1024 * 1024;
 
@@ -401,6 +410,10 @@ struct AttemptEntry {
     recipient: String,
     /// Distinct payload digests attempted, oldest first.
     digests: Vec<[u8; 32]>,
+    /// #2007: distinct recipient machines the attempts were pinned to,
+    /// oldest first. Written after each attempt from the DM receipt
+    /// ledger; empty means no machine is known.
+    machines: Vec<MachineId>,
     /// Unix ms of the latest attempt.
     last_ms: u64,
 }
@@ -422,6 +435,9 @@ struct AttemptRecord {
     request_id: String,
     recipient: String,
     digests: Vec<String>,
+    /// #2007: absent in records written before #2007; read as empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    machines: Vec<String>,
     last_ms: u64,
 }
 
@@ -515,6 +531,7 @@ impl TerminalLedger {
             .or_insert_with(|| AttemptEntry {
                 recipient: recipient.to_string(),
                 digests: Vec::new(),
+                machines: Vec::new(),
                 last_ms: now_ms,
             });
         entry.last_ms = now_ms;
@@ -537,13 +554,32 @@ impl TerminalLedger {
         }
     }
 
-    /// The single digest ever attempted under `request_id` to `recipient`,
-    /// or `None` when there is no record, another recipient, or more than
-    /// one digest.
-    fn only_attempted(&self, request_id: &[u8; 16], recipient: &str) -> Option<[u8; 32]> {
+    /// #2007: note that an attempt under `request_id` was pinned to
+    /// `machine`. Changes nothing when no attempt is recorded.
+    fn note_machine(&mut self, request_id: &[u8; 16], machine: MachineId) {
+        if let Some(entry) = self.attempts.get_mut(request_id) {
+            if !entry.machines.contains(&machine)
+                && entry.machines.len() < DIRECT_SEND_ATTEMPT_MACHINES_CAP
+            {
+                entry.machines.push(machine);
+            }
+        }
+    }
+
+    /// The single digest ever attempted under `request_id` to `recipient`
+    /// on `machine`, or `None` when there is no record, another recipient,
+    /// more than one digest, or no attempt pinned to `machine` (#2007).
+    fn only_attempted(
+        &self,
+        request_id: &[u8; 16],
+        recipient: &str,
+        machine: &MachineId,
+    ) -> Option<[u8; 32]> {
         let entry = self.attempts.get(request_id)?;
         match entry.digests.as_slice() {
-            [digest] if entry.recipient == recipient => Some(*digest),
+            [digest] if entry.recipient == recipient && entry.machines.contains(machine) => {
+                Some(*digest)
+            }
             _ => None,
         }
     }
@@ -595,6 +631,7 @@ impl TerminalLedger {
                 request_id: hex::encode(id),
                 recipient: a.recipient.clone(),
                 digests: a.digests.iter().map(hex::encode).collect(),
+                machines: a.machines.iter().map(|m| hex::encode(m.0)).collect(),
                 last_ms: a.last_ms,
             })
             .collect();
@@ -658,12 +695,20 @@ impl TerminalLedger {
             if digests.is_empty() || digests.len() > DIRECT_SEND_ATTEMPT_DIGESTS_CAP {
                 return Err(format!("invalid attempt digests on {}", record.request_id));
             }
+            let machines = record
+                .machines
+                .iter()
+                .map(|m| decode_hex_array::<32>(m).map(MachineId))
+                .collect::<Option<Vec<_>>>()
+                .filter(|m| m.len() <= DIRECT_SEND_ATTEMPT_MACHINES_CAP)
+                .ok_or_else(|| format!("invalid attempt machines on {}", record.request_id))?;
             if kept(record.last_ms, now_ms) {
                 ledger.attempts.insert(
                     request_id,
                     AttemptEntry {
                         recipient: record.recipient,
                         digests,
+                        machines,
                         last_ms: record.last_ms,
                     },
                 );
@@ -944,6 +989,27 @@ impl DirectSendOutbox {
         .await
     }
 
+    /// Write a pass's `outcomes` and the machines its attempts were pinned
+    /// to (#2007) in one durable write. See [`Self::commit_ledger`].
+    async fn record_pass(
+        &self,
+        outcomes: Vec<Outcome>,
+        pinned: Vec<([u8; 16], MachineId)>,
+    ) -> Result<(), String> {
+        if outcomes.is_empty() && pinned.is_empty() {
+            return Ok(());
+        }
+        self.commit_ledger(|ledger, now_ms| {
+            for (request_id, machine) in pinned {
+                ledger.note_machine(&request_id, machine);
+            }
+            for (request_id, outcome, digest) in outcomes {
+                ledger.record(request_id, outcome, digest, now_ms);
+            }
+        })
+        .await
+    }
+
     /// Test seam: write outcomes durably without touching the outbox (a
     /// crash between the two writes).
     #[cfg(test)]
@@ -954,15 +1020,17 @@ impl DirectSendOutbox {
         self.record_terminal(outcomes).await
     }
 
-    /// Test seam: note attempted digests durably.
+    /// Test seam: note attempted digests, and the machine each attempt was
+    /// pinned to, durably.
     #[cfg(test)]
     pub(in crate::server) async fn note_attempts(
         &self,
-        attempts: Vec<([u8; 16], String, [u8; 32])>,
+        attempts: Vec<([u8; 16], String, [u8; 32], MachineId)>,
     ) -> Result<(), String> {
         self.commit_ledger(|ledger, now_ms| {
-            for (request_id, recipient, digest) in attempts {
+            for (request_id, recipient, digest, machine) in attempts {
                 ledger.note_attempt(request_id, &recipient, digest, now_ms);
+                ledger.note_machine(&request_id, machine);
             }
         })
         .await
@@ -1043,9 +1111,12 @@ impl DirectSendOutbox {
     }
 
     /// #1109 S2: an accepted v2 ACK for `request_id` arrived from `sender`
-    /// with no waiter and no tombstone (for example after a restart). It
-    /// proves delivery only of the bytes ever attempted under that id, so it
-    /// counts only when exactly one digest was attempted, to `sender`:
+    /// on `machine` with no waiter and no tombstone (for example after a
+    /// restart). It proves delivery only of the bytes ever attempted under
+    /// that id, so it counts only when exactly one digest was attempted, to
+    /// `sender`, and an attempt was pinned to `machine` (#2007; an attempt
+    /// record with no machine, such as one written before #2007, matches no
+    /// ACK):
     ///
     /// - a held obligation with that digest is settled `delivered` (no
     ///   further send);
@@ -1057,6 +1128,7 @@ impl DirectSendOutbox {
         &self,
         request_id: &[u8; 16],
         sender: &AgentId,
+        machine: &MachineId,
     ) -> bool {
         let _admission = self.admission.lock().await;
         if self.is_in_flight(Some(*request_id)) {
@@ -1064,10 +1136,13 @@ impl DirectSendOutbox {
             return false;
         }
         let sender_hex = hex::encode(sender.as_bytes());
-        let Some(attempted) = self.terminal().only_attempted(request_id, &sender_hex) else {
+        let attempted = self
+            .terminal()
+            .only_attempted(request_id, &sender_hex, machine);
+        let Some(attempted) = attempted else {
             tracing::info!(
                 request_id = %hex::encode(request_id),
-                "#1109: late ACK ignored: no single attempted payload to this sender"
+                "#1109: late ACK ignored: no single attempted payload to this sender and machine"
             );
             return false;
         };
@@ -1635,8 +1710,16 @@ impl DirectSendOutbox {
         // outcomes are kept in memory: the next pass writes them again and
         // sends none of those bytes.
         let outcomes: Vec<Outcome> = ending.iter().map(|(_, outcome)| outcome.clone()).collect();
+        // #2007: the machine each attempt was pinned to, as the DM receipt
+        // ledger names it, is written with the outcomes. A late ACK after a
+        // restart is matched against it. If this write fails the machine
+        // stays unknown, and a late ACK changes nothing (fail closed).
+        let pinned: Vec<([u8; 16], MachineId)> = sent_ids
+            .iter()
+            .filter_map(|id| ledger(id).machine.map(|machine| (*id, machine)))
+            .collect();
         let mut resolved = finished;
-        match self.record_terminal(outcomes.clone()).await {
+        match self.record_pass(outcomes.clone(), pinned).await {
             Ok(()) => {
                 {
                     let mut unwritten = self.unwritten();
@@ -1712,7 +1795,9 @@ pub(in crate::server) async fn run_direct_send_worker(
             }
             wake = wakes.recv(), if wakes_open => match wake {
                 Some(DirectSendWake::LateAck(ack)) => {
-                    outbox.settle_late_ack(&ack.request_id, &ack.sender).await;
+                    outbox
+                        .settle_late_ack(&ack.request_id, &ack.sender, &ack.machine)
+                        .await;
                 }
                 Some(DirectSendWake::Advert(recipient)) => {
                     let now = clock();
