@@ -481,6 +481,17 @@ All notable changes to this project will be documented in this file.
 
 ### Tests and tooling
 
+- **W3-H: the q3 sidecar row proves O refused J, and every J listener
+  took the re-seat answer (#1581, follow-up to #2080).**
+  `w3h_1356_control_s3_q3_issuer_unreadable_sidecar` now requires J's new
+  join outcome to be `refused`, which only a receipt signed by O gives; a
+  timed-out join rolls J back the same way and no longer passes. The gate
+  `o_reached_j_with_the_lost_authorisation` is renamed `j_inbound_path_holds_the_lost_authorisation`
+  and also requires every J direct-message listener to take the injected
+  frame. Controls: with J's writes held until its join ends, the row reads
+  RED with J `timed_out`; with only the row's receiver taking the frame, the
+  gate fails.
+
 - **W3-H: revoked E receives nothing at the first owner-recovery epoch
   (#1581, follow-up to #1973).** `w3h_1357_s4_owner_recovery_revoked_member_1973`
   now reads E's own direct-message stream and E's own TreeKEM epoch from before
