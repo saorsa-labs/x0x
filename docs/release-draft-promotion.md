@@ -34,6 +34,11 @@ For the tagged workflow run:
    automatically resumes the preserved crates.io and ClawHub publication jobs
    after promotion. Require that workflow to finish successfully; the jobs are
    absent from draft creation only so they cannot expose the candidate early.
+   The same workflow's `announce-release` job announces the release on the
+   x0x network from a short-lived node (see `docs/upgrade-system.md`,
+   "The promotion job"). If that job fails, run `x0x upgrade --announce` on
+   a node that can reach the network and check that the answer's `version`
+   is the promoted version.
 
 If any asset changes, discard the draft and repeat the complete build, signing,
 testnet, and custody sequence. A version string or health response is not a

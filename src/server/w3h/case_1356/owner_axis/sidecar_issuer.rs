@@ -9,7 +9,9 @@
 //! upgrade journal, so the host commit gate is open. Last, every hold is
 //! released and J receives from O the authorisation O issued before the
 //! stop, so J starts its staged join. The row hands that frame to J's
-//! inbound direct-message path rather than sending it over the fabric:
+//! inbound direct-message path rather than sending it over the fabric
+//! (the delivery gate needs J's stream to hold it and every one of J's
+//! own listeners to take it):
 //! after O's restart a send depends on gossip discovery timing that mixes
 //! virtual and real time (see [`send_reseat`]).
 //!
@@ -18,8 +20,10 @@
 //!   and a fresh `.grecov` exists that names one rebuild.
 //! - No node commits because of the rebuild: O's head after the restart
 //!   is its head before the stop.
-//! - O's guard refuses J's staged join. J shows `reseat_required
-//!   {reseat_failed}`, and its live record is unchanged.
+//! - O's guard refuses J's staged join: J's join ends `refused`, which
+//!   only a refusal receipt signed by O gives (a join that never reached
+//!   O ends `timed_out`, and J rolls back the same way). J shows
+//!   `reseat_required {reseat_failed}`, and its live record is unchanged.
 //! - O's `GET /groups/:id/recovery` shows `issued_reseats_lost`.
 //! - O calls the re-seat route again, and J is Active with keys at r+4.
 //!
@@ -56,7 +60,8 @@ const CAUSE_ADMITTED: &str = "O's rebuilt sidecar shows issued_reseats_lost, but
                               second re-seat call answers 409 subject_active (#1941)";
 /// The checks #1941 fails, sorted. [`CAUSE_ADMITTED`] applies only when
 /// the failing checks are exactly these.
-const ADMITTED_FAILING: [&str; 3] = [
+const ADMITTED_FAILING: [&str; 4] = [
+    "j_join_refused_by_o",
     "j_live_record_unchanged_after_the_refusal",
     "j_reseat_required_reseat_failed",
     "second_reseat_route_accepts",
@@ -115,7 +120,8 @@ fn reseat_received(
 /// path (`DirectMessaging::handle_incoming`, the entry point the network
 /// receive path calls) as a verified message from O's agent and machine,
 /// so J's own handlers process it. Returns whether J's direct-message
-/// stream then holds it, and how many of J's consumers took it.
+/// stream then holds it, and whether every one of J's own listeners (at
+/// least one, counted before the row subscribes) took it, with the counts.
 ///
 /// Why not `send_direct` from O: after O's restart O has no discovery
 /// entry or capability advert for J, so a send reaches J only once J's
@@ -128,7 +134,11 @@ fn reseat_received(
 /// others. Delivering the lost authorisation is set-up for this row, not
 /// what it tests (O's guard refusing J's staged join), so it no longer
 /// depends on that timing.
-async fn send_reseat(sim: &Sim, group: &str, issued: &IssuedReseatV1) -> Result<(bool, u64)> {
+async fn send_reseat(
+    sim: &Sim,
+    group: &str,
+    issued: &IssuedReseatV1,
+) -> Result<(bool, bool, String)> {
     let (j, _) = sim.ids("J")?;
     let (o, o_machine) = sim.ids("O")?;
     let payload = encode_message(&GroupRecoveryMessageV1::Response(GroupAttestResponseV1 {
@@ -141,6 +151,7 @@ async fn send_reseat(sim: &Sim, group: &str, issued: &IssuedReseatV1) -> Result<
         },
     }))?;
     let digest = issued.authorisation.digest();
+    let listeners = sim.state("J")?.agent.direct_messaging().subscriber_count() as u64;
     let mut rx = sim.state("J")?.agent.subscribe_direct();
     sim.fabric()
         .mark("case: J receives from O the authorisation issued before its stop");
@@ -161,7 +172,35 @@ async fn send_reseat(sim: &Sim, group: &str, issued: &IssuedReseatV1) -> Result<
             },
         )
         .await;
-    Ok((received, consumers))
+    let listeners_took_it = listeners > 0 && consumers == listeners + 1;
+    let counts =
+        format!("{consumers} consumers took it; J's own listeners {listeners}, plus the row's");
+    Ok((received, listeners_took_it, counts))
+}
+
+/// A terminal join outcome: outcome, reason, finish time.
+type JoinOutcome = (String, Option<String>, u64);
+
+/// J's terminal join outcomes, keyed by group key.
+fn join_outcomes(sim: &Sim) -> Result<std::collections::HashMap<String, JoinOutcome>> {
+    let state = sim.state("J")?;
+    let outcomes = state
+        .last_join_outcomes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    Ok(outcomes
+        .iter()
+        .map(|(key, o)| {
+            (
+                key.clone(),
+                (
+                    o.outcome.to_string(),
+                    o.reason.map(str::to_string),
+                    o.finished_at_ms,
+                ),
+            )
+        })
+        .collect())
 }
 
 /// O's sidecar directory and its file names (O is stopped).
@@ -299,7 +338,8 @@ async fn issuer_rebuild(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     o_to_j.store(false, Ordering::SeqCst);
     p.j_out_held.store(false, Ordering::SeqCst);
     sim.fabric().mark("fault: O->J and J's writes released");
-    let (received, consumers) = send_reseat(sim, &group, &issued).await?;
+    let outcomes_before = join_outcomes(sim)?;
+    let (received, listeners_took_it, counts) = send_reseat(sim, &group, &issued).await?;
     let mut st = None;
     let waited = sim
         .until(
@@ -325,6 +365,16 @@ async fn issuer_rebuild(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
             && st.recovery_cause() == Some("reseat_failed")
     });
     let unchanged = same_record(jv.as_ref(), Some(&base));
+    // J rolls back on any end of its staged join; only a refusal receipt
+    // signed by the inviter it pinned from the invite (O) ends it as
+    // `refused`. A join that never reached O ends `timed_out`.
+    let new_outcomes: Vec<(String, Option<String>)> = join_outcomes(sim)?
+        .into_iter()
+        .filter(|(key, outcome)| outcomes_before.get(key) != Some(outcome))
+        .map(|(_, (outcome, reason, _))| (outcome, reason))
+        .collect();
+    let refused_by_o =
+        !new_outcomes.is_empty() && new_outcomes.iter().all(|(outcome, _)| outcome == "refused");
     let o_now = view(sim, "O", &group).await?;
     let membership_now_j = sim
         .at_instant("read J's membership", membership_now(sim, "J", &group))
@@ -337,14 +387,16 @@ async fn issuer_rebuild(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         .as_ref()
         .map_or_else(|| "404".to_string(), Status::describe);
     receipt.note(format!(
-        "J received the lost authorisation {received}; J then {j_text}"
+        "J's stream holds the lost authorisation {received}; J then {j_text}; J's new join \
+         outcomes {new_outcomes:?}"
     ));
+    let delivered = received && listeners_took_it;
     receipt.request_delivered(
-        "o_reached_j_with_the_lost_authorisation",
-        received,
+        "j_inbound_path_holds_the_lost_authorisation",
+        delivered,
         format!(
-            "J's direct-message stream holds O's re-seat answer: {received}; J's consumers \
-             {consumers}"
+            "J's direct-message stream holds O's re-seat answer: {received}; every J listener \
+             took it: {listeners_took_it} ({counts})"
         ),
         at(sim),
     );
@@ -405,6 +457,7 @@ async fn issuer_rebuild(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         ),
         ("o_recovery_route_shows_issued_reseats_lost", lost),
         ("j_reseat_required_reseat_failed", failed),
+        ("j_join_refused_by_o", refused_by_o),
         ("j_live_record_unchanged_after_the_refusal", unchanged),
         ("second_reseat_route_accepts", again_code.is_success()),
         (
@@ -428,7 +481,7 @@ async fn issuer_rebuild(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         base.describe(),
         head.describe()
     );
-    let red = received && !after_ok;
+    let red = delivered && !after_ok;
     // The pin needs exactly the known set of failing checks. Any other
     // failing check gives the unpinned cause, so a new regression is red.
     let mut failing_set = failing.clone();

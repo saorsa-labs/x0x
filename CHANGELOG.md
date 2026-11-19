@@ -28,6 +28,15 @@ All notable changes to this project will be documented in this file.
   `bus_fallback_publish_*`, `bus_ack_publish_*` and
   `bus_ack_skipped_direct_sent` counters. No wire change; earlier versions
   still exchange DMs and ACKs with this one.
+- **Flaky test `a_second_failed_apply_keeps_a_live_retry_claim` (#2090).**
+  The probe retry spawned by request A ran its first check after the
+  test had switched the process-global readback seam to request B's
+  world, so the retry always died. The test passed only when B and the
+  final assertions ran before the retry's death; on a cold first run they
+  did not. The test now waits until the retry has parked on its durable
+  wait (a test-only record of parked retries) before switching the world.
+  No production behaviour change: the retry's check closure only gains
+  a `cfg(test)` record.
 
 - **Launcher refusal record and launcher-bound autostart (#1379, #2019
   review; A14 amendment of 18 Nov 2026).** A trial-form launcher start now
@@ -41,6 +50,14 @@ All notable changes to this project will be documented in this file.
   stable launcher.
 
 ### Added
+
+- **Release announced by the promotion workflow (#1169 PR 2; A14 amendment
+  of 19 Nov 2026).** A new `announce-release` job in `Publish promoted
+  release` runs the promoted `x0xd` as a short-lived node with a fresh
+  identity and calls `POST /upgrade/announce`. It passes only when the
+  answer's `version` is the promoted version, retries after the 300 s
+  refusal window, and names `x0x upgrade --announce` as the fallback when
+  the runner finds no send-ready peers. It needs no secret.
 
 - **`POST /upgrade/announce` and `x0x upgrade --announce` (#1169; A14
   amendment of 19 Nov 2026).** A node fetches the latest release
@@ -503,6 +520,17 @@ All notable changes to this project will be documented in this file.
   alone do not install updates.
 
 ### Tests and tooling
+
+- **W3-H: the q3 sidecar row proves O refused J, and every J listener
+  took the re-seat answer (#1581, follow-up to #2080).**
+  `w3h_1356_control_s3_q3_issuer_unreadable_sidecar` now requires J's new
+  join outcome to be `refused`, which only a receipt signed by O gives; a
+  timed-out join rolls J back the same way and no longer passes. The gate
+  `o_reached_j_with_the_lost_authorisation` is renamed `j_inbound_path_holds_the_lost_authorisation`
+  and also requires every J direct-message listener to take the injected
+  frame. Controls: with J's writes held until its join ends, the row reads
+  RED with J `timed_out`; with only the row's receiver taking the frame, the
+  gate fails.
 
 - **W3-H: revoked E receives nothing at the first owner-recovery epoch
   (#1581, follow-up to #1973).** `w3h_1357_s4_owner_recovery_revoked_member_1973`

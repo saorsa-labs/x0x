@@ -697,7 +697,14 @@ async fn schedule_probe_retry(
         let result = x0x::upgrade::probe_retry::run_retry_loop(
             &apply_lock,
             &mut shutdown,
-            || upgrader.probe_retry_delay(&manifest.version),
+            || async {
+                let wait = upgrader.probe_retry_delay(&manifest.version).await;
+                #[cfg(test)]
+                if matches!(wait, Ok(Some(_))) {
+                    retry_parked_seam::note(&install, &manifest.version);
+                }
+                wait
+            },
             || async {
                 // A long backoff does not extend a signed manifest's lifetime.
                 x0x::upgrade::monitor::validate_manifest_timestamp(&manifest)?;
@@ -2258,6 +2265,36 @@ mod upgrade_check_feed_seam {
     /// (fall through to the real monitor fetch).
     pub(super) fn take() -> Option<Answer> {
         INJECTED.with(|slot| slot.borrow_mut().take())
+    }
+}
+
+/// Probe retries whose durable check returned a wait, by install and
+/// version. A test that changes the process-global readback world after a
+/// failed apply waits here first: a retry that reads the changed world on
+/// its first check dies, and the hand-off under test is gone (#2090).
+#[cfg(test)]
+mod retry_parked_seam {
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static PARKED: Mutex<Option<HashSet<(PathBuf, String)>>> = Mutex::new(None);
+
+    pub(super) fn note(install: &Path, version: &str) {
+        let mut parked = PARKED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        parked
+            .get_or_insert_with(HashSet::new)
+            .insert((install.to_path_buf(), version.to_string()));
+    }
+
+    pub(super) fn parked(install: &Path, version: &str) -> bool {
+        PARKED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|parked| parked.contains(&(install.to_path_buf(), version.to_string())))
     }
 }
 
@@ -4509,6 +4546,17 @@ mod tests {
             assert!(
                 std::time::Instant::now() < owner_deadline,
                 "the first failure's probe retry never owned the install"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // A's retry reads the same readback world as request B. It must
+        // park on its first check under this world before the swap below,
+        // or it reads B's world, dies, and B's exit releases the claim.
+        let parked_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !retry_parked_seam::parked(&install, &verified.manifest.version) {
+            assert!(
+                std::time::Instant::now() < parked_deadline,
+                "the first failure's probe retry never parked on its durable wait"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
