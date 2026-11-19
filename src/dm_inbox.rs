@@ -2568,12 +2568,15 @@ pub struct DmInboxService {
     pipeline: InboxPipeline,
 }
 
-/// One durable (v2) ACK envelope awaiting publication on both routes.
+/// One durable (v2) ACK envelope awaiting publication.
 struct AckPublishJob {
     recipient: AgentId,
     acked_request_id: [u8; 16],
     protocol_version: u16,
     encoded: Bytes,
+    /// #1964: the DM being acknowledged arrived on the compatibility bus,
+    /// so the ACK must go back there too.
+    arrived_on_bus: bool,
 }
 
 #[derive(Clone)]
@@ -2963,72 +2966,63 @@ async fn publish_durable_ack_job(
     let encoded_legacy = Bytes::clone(&job.encoded);
     let primary_pubsub = Arc::clone(&pubsub);
     let legacy_pubsub = Arc::clone(&pubsub);
-    // Owned clones so each route can be spawned independently. First-success
-    // must detach the sibling, not cancel it — otherwise a healthy second
-    // publish is dropped before it delivers.
     let primary = async move {
         primary_pubsub
             .publish_topic_id(topic, topic_id, encoded_primary)
             .await
     };
-    // The default durable path hedges onto the compatibility bus, even when
-    // the payload did not arrive there. A v2 sender has already been promised
-    // a committed row; a second route costs one small publish and removes a
-    // whole class of "committed but never acked" outcomes. Opt-out keeps only
-    // the targeted route here so this node does not rejoin the bus.
-    let legacy = async move {
+    // #1964: the compatibility bus is no longer an unconditional hedge. It
+    // is published only when the DM arrived there, or when Direct cannot
+    // carry this ACK (no path, failed, or slower than the grace period).
+    // Opt-out never publishes on the bus.
+    let legacy = move || async move {
         legacy_pubsub
             .publish(DM_BUS_TOPIC.to_string(), encoded_legacy)
             .await
     };
-    // C5: same v2 ACK envelope on live Direct/typed as a third hedge.
-    // Detached from gossip: missing Direct is fail-open, and Direct send-ok
-    // is not a sender receipt. Do not abort sibling gossip routes.
-    // `direct_hedge_was_sent` distinguishes Sent from SkippedNoDirect for
-    // the (c) outcome counters.
-    let direct_hedge_was_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // C5: same v2 ACK envelope on live Direct/typed. Missing Direct is
+    // fail-open, and Direct send-ok is not a sender receipt.
     let direct = {
-        let sent_flag = Arc::clone(&direct_hedge_was_sent);
         let hedge = direct_hedge.clone();
         let recipient = job.recipient;
         let encoded = Bytes::clone(&job.encoded);
         async move {
-            let Some(hedge) = hedge else {
-                return Ok(());
-            };
-            match hedge.hedge(recipient, encoded).await {
-                DirectAckHedgeOutcome::Sent => {
-                    sent_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                    Ok(())
-                }
-                DirectAckHedgeOutcome::SkippedNoDirect => Ok(()),
-                DirectAckHedgeOutcome::Failed => Err(NetworkError::ConnectionFailed(
-                    "direct ACK hedge failed".to_string(),
-                )),
+            match hedge {
+                Some(hedge) => hedge.hedge(recipient, encoded).await,
+                None => DirectAckHedgeOutcome::SkippedNoDirect,
             }
         }
     };
     let publish_started = Instant::now();
-    let gossip_routes = async {
-        if skip_legacy_bus {
-            publish_ack_route_with_timeout("targeted", DURABLE_ACK_ROUTE_TIMEOUT, primary).await
-        } else {
-            publish_durable_ack_routes(DURABLE_ACK_ROUTE_TIMEOUT, primary, legacy).await
-        }
-    };
-    let (gossip, direct_outcome) = tokio::join!(
-        gossip_routes,
-        publish_ack_route_with_timeout("direct-typed", DURABLE_ACK_ROUTE_TIMEOUT, direct),
-    );
+    let routes = publish_durable_ack_routes(
+        DurableAckRoutePlan {
+            route_timeout: DURABLE_ACK_ROUTE_TIMEOUT,
+            direct_grace: DURABLE_ACK_BUS_DIRECT_GRACE,
+            arrived_on_bus: job.arrived_on_bus,
+            skip_legacy_bus,
+        },
+        primary,
+        direct,
+        legacy,
+    )
+    .await;
     dm.record_ack_publish_ms(crate::dm::millis_since(publish_started));
+    match routes.bus {
+        AckBusRoute::OptedOut => {}
+        AckBusRoute::SkippedDirectSent => dm.record_bus_ack_skipped_direct_sent(),
+        AckBusRoute::Published(reason) => dm.record_bus_ack_publish(reason),
+    }
+    let gossip = routes.gossip;
     // #380 leaf-reverse-ACK fix (c): count gossip and Direct hedge outcomes
     // SEPARATELY so /diagnostics/dm distinguishes "gossip routes dead,
-    // Direct saved it" from "all dead". The old code incremented the same
-    // ack_publish_route_failed counter for gossip failure AND direct
-    // failure, and warned "ACK never left" even when Direct had Sent —
-    // the 3/3 fleet reading was ambiguous.
-    let direct_sent = matches!(direct_outcome, Ok(()))
-        && direct_hedge_was_sent.load(std::sync::atomic::Ordering::Relaxed);
+    // Direct saved it" from "all dead".
+    let direct_sent = routes.direct == DirectAckHedgeOutcome::Sent;
+    let direct_outcome: NetworkResult<()> = match routes.direct {
+        DirectAckHedgeOutcome::Sent | DirectAckHedgeOutcome::SkippedNoDirect => Ok(()),
+        DirectAckHedgeOutcome::Failed => Err(NetworkError::ConnectionFailed(
+            "direct ACK hedge failed".to_string(),
+        )),
+    };
     match (gossip, direct_outcome) {
         (Ok(()), _) => {
             dm.record_ack_gossip_route_succeeded();
@@ -3138,29 +3132,137 @@ pub(crate) fn should_warm_reverse_ack(trusted: bool, self_agent: &AgentId, peer:
     trusted && self_agent != peer
 }
 
-async fn publish_durable_ack_routes<Primary, Legacy>(
+/// #1964: how long the bus waits for the Direct ACK send before it is
+/// published anyway. A Direct send on a live connection returns in
+/// milliseconds; one that has not returned by now is treated as slow.
+const DURABLE_ACK_BUS_DIRECT_GRACE: Duration = Duration::from_secs(1);
+
+/// #1964: what the compatibility-bus route did for one durable ACK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AckBusRoute {
+    /// The node opted out of the bus (`skip_legacy_dm_bus`).
+    OptedOut,
+    /// Direct sent the ACK and the DM did not arrive on the bus.
+    SkippedDirectSent,
+    /// The ACK was published on the bus, for this reason.
+    Published(crate::direct::AckBusHedgeReason),
+}
+
+/// #1964: whether a durable ACK also goes on the compatibility bus.
+///
+/// `direct` is the Direct hedge outcome, or `None` when it had not finished
+/// within [`DURABLE_ACK_BUS_DIRECT_GRACE`]. Only a Direct send that
+/// succeeded, for a DM that did not arrive on the bus, keeps the ACK off it.
+fn ack_bus_hedge_reason(
+    arrived_on_bus: bool,
+    direct: Option<DirectAckHedgeOutcome>,
+) -> Option<crate::direct::AckBusHedgeReason> {
+    use crate::direct::AckBusHedgeReason;
+    if arrived_on_bus {
+        return Some(AckBusHedgeReason::ArrivedOnBus);
+    }
+    match direct {
+        Some(DirectAckHedgeOutcome::Sent) => None,
+        Some(DirectAckHedgeOutcome::SkippedNoDirect) => Some(AckBusHedgeReason::NoDirectPath),
+        Some(DirectAckHedgeOutcome::Failed) => Some(AckBusHedgeReason::DirectFailed),
+        None => Some(AckBusHedgeReason::DirectSlow),
+    }
+}
+
+/// #1964: timing and inputs for [`publish_durable_ack_routes`].
+#[derive(Debug, Clone, Copy)]
+struct DurableAckRoutePlan {
     route_timeout: Duration,
+    direct_grace: Duration,
+    arrived_on_bus: bool,
+    skip_legacy_bus: bool,
+}
+
+/// #1964: result of [`publish_durable_ack_routes`].
+#[derive(Debug)]
+struct DurableAckRoutes {
+    /// Targeted inbox result, joined with the bus result when the bus ran.
+    gossip: NetworkResult<()>,
+    /// Direct hedge outcome; a Direct send past the route timeout is `Failed`.
+    direct: DirectAckHedgeOutcome,
+    bus: AckBusRoute,
+}
+
+/// Publish one durable ACK on the targeted inbox, on Direct and, when
+/// [`ack_bus_hedge_reason`] says so, on the compatibility bus.
+///
+/// The targeted inbox and Direct always start at once. The bus starts at
+/// once when the DM arrived on the bus; otherwise it waits for the Direct
+/// outcome for at most `direct_grace`. Each route keeps its own
+/// `route_timeout`, and a wedged route fails at its deadline instead of
+/// pinning the worker. As before #1964, a bus route that ran and failed
+/// fails the gossip result.
+async fn publish_durable_ack_routes<Primary, Direct, Legacy, LegacyFuture>(
+    plan: DurableAckRoutePlan,
     primary: Primary,
+    direct: Direct,
     legacy: Legacy,
-) -> NetworkResult<()>
+) -> DurableAckRoutes
 where
     Primary: std::future::Future<Output = NetworkResult<()>>,
-    Legacy: std::future::Future<Output = NetworkResult<()>>,
+    Direct: std::future::Future<Output = DirectAckHedgeOutcome>,
+    Legacy: FnOnce() -> LegacyFuture,
+    LegacyFuture: std::future::Future<Output = NetworkResult<()>>,
 {
-    // #396 rework: C1 (first-success hedge) was removed — the joint review
-    // decided the post-commit Direct/typed hedge (C5, PR #408) supersedes
-    // it. This restores main's join!-both semantics unchanged: a targeted
-    // inbox publish can deliver remotely yet remain pending under
-    // per-topic fan-out backpressure, so both routes are polled with their
-    // own deadlines and BOTH must succeed (a wedged sibling fails at its
-    // deadline instead of pinning this serial inbox loop). The residual
-    // 504 `budget_stage=ack_wait_ms` pressure is addressed by C2/C4
-    // pre-warm (below) plus the C5 direct hedge in #408.
-    let (primary, legacy) = tokio::join!(
-        publish_ack_route_with_timeout("targeted", route_timeout, primary),
-        publish_ack_route_with_timeout("legacy-bus", route_timeout, legacy),
-    );
-    primary.and(legacy)
+    let primary = publish_ack_route_with_timeout("targeted", plan.route_timeout, primary);
+    let direct_and_bus = async {
+        let direct = async {
+            tokio::time::timeout(plan.route_timeout, direct)
+                .await
+                .unwrap_or(DirectAckHedgeOutcome::Failed)
+        };
+        let mut direct = std::pin::pin!(direct);
+        let (bus_reason, early_direct) = if plan.skip_legacy_bus {
+            (None, None)
+        } else if plan.arrived_on_bus {
+            (ack_bus_hedge_reason(true, None), None)
+        } else {
+            match tokio::time::timeout(plan.direct_grace, &mut direct).await {
+                Ok(outcome) => (ack_bus_hedge_reason(false, Some(outcome)), Some(outcome)),
+                Err(_) => (ack_bus_hedge_reason(false, None), None),
+            }
+        };
+        let bus = async {
+            match bus_reason {
+                Some(_) => Some(
+                    publish_ack_route_with_timeout("legacy-bus", plan.route_timeout, legacy())
+                        .await,
+                ),
+                None => None,
+            }
+        };
+        let direct = async {
+            match early_direct {
+                Some(outcome) => outcome,
+                None => direct.await,
+            }
+        };
+        let (bus_result, direct_outcome) = tokio::join!(bus, direct);
+        let bus_route = if plan.skip_legacy_bus {
+            AckBusRoute::OptedOut
+        } else {
+            match bus_reason {
+                Some(reason) => AckBusRoute::Published(reason),
+                None => AckBusRoute::SkippedDirectSent,
+            }
+        };
+        (bus_result, direct_outcome, bus_route)
+    };
+    let (primary_result, (bus_result, direct, bus)) = tokio::join!(primary, direct_and_bus);
+    let gossip = match bus_result {
+        Some(bus_result) => primary_result.and(bus_result),
+        None => primary_result,
+    };
+    DurableAckRoutes {
+        gossip,
+        direct,
+        bus,
+    }
 }
 
 async fn publish_ack_route_with_timeout<Route>(
@@ -4964,6 +5066,7 @@ impl InboxPipeline {
                 acked_request_id: acks_request_id,
                 protocol_version,
                 encoded: Bytes::from(encoded),
+                arrived_on_bus: ack_legacy_bus,
             })
         } else {
             // Preserve v1 exactly: target first, and only publish back on the
@@ -4975,6 +5078,8 @@ impl InboxPipeline {
                 .publish_topic_id(topic, dm_inbox_topic(&to), Bytes::from(encoded.clone()))
                 .await;
             let legacy = if ack_legacy_bus {
+                self.dm
+                    .record_bus_ack_publish(crate::direct::AckBusHedgeReason::ArrivedOnBus);
                 self.pubsub
                     .publish(DM_BUS_TOPIC.to_string(), Bytes::from(encoded))
                     .await
@@ -6601,6 +6706,7 @@ pub(crate) mod tests {
             acked_request_id: [1; 16],
             protocol_version: DM_PROTOCOL_DURABLE_ACK,
             encoded: Bytes::from_static(b"ack"),
+            arrived_on_bus: false,
         };
 
         for _ in 0..DURABLE_ACK_QUEUE_CAPACITY {
@@ -6627,17 +6733,187 @@ pub(crate) mod tests {
         );
     }
 
-    /// Both routes failing is still an error; the caller records
+    fn route_plan(arrived_on_bus: bool, skip_legacy_bus: bool) -> DurableAckRoutePlan {
+        DurableAckRoutePlan {
+            route_timeout: DURABLE_ACK_ROUTE_TIMEOUT,
+            direct_grace: DURABLE_ACK_BUS_DIRECT_GRACE,
+            arrived_on_bus,
+            skip_legacy_bus,
+        }
+    }
+
+    /// Both gossip routes failing is still an error; the caller records
     /// `ack_publish_route_failed` so gates can tell ACK never left.
     #[tokio::test]
     async fn both_failed_ack_routes_are_an_error() {
         let primary = async { Err(NetworkError::BroadcastError("targeted".into())) };
-        let legacy = async { Err(NetworkError::BroadcastError("legacy-bus".into())) };
-        let result = publish_durable_ack_routes(DURABLE_ACK_ROUTE_TIMEOUT, primary, legacy).await;
+        let legacy = || async { Err(NetworkError::BroadcastError("legacy-bus".into())) };
+        let direct = async { DirectAckHedgeOutcome::SkippedNoDirect };
+        let routes =
+            publish_durable_ack_routes(route_plan(false, false), primary, direct, legacy).await;
         assert!(
-            matches!(result, Err(NetworkError::BroadcastError(_))),
-            "both-fail must remain Err + ack_publish_route_failed at the caller: {result:?}"
+            matches!(routes.gossip, Err(NetworkError::BroadcastError(_))),
+            "both-fail must remain Err + ack_publish_route_failed at the caller: {:?}",
+            routes.gossip
         );
+    }
+
+    /// #1964 decision table. RED before #1964: the bus was an unconditional
+    /// hedge, so a Direct `Sent` for a DM that came on the inbox still
+    /// published on the bus.
+    #[test]
+    fn ack_bus_hedge_reason_follows_the_1964_table() {
+        use crate::direct::AckBusHedgeReason as R;
+        assert_eq!(
+            ack_bus_hedge_reason(false, Some(DirectAckHedgeOutcome::Sent)),
+            None,
+            "healthy Direct path and an inbox DM: the ACK stays off the bus"
+        );
+        assert_eq!(
+            ack_bus_hedge_reason(true, Some(DirectAckHedgeOutcome::Sent)),
+            Some(R::ArrivedOnBus),
+            "a DM that came on the bus is answered on the bus"
+        );
+        assert_eq!(
+            ack_bus_hedge_reason(false, Some(DirectAckHedgeOutcome::SkippedNoDirect)),
+            Some(R::NoDirectPath)
+        );
+        assert_eq!(
+            ack_bus_hedge_reason(false, Some(DirectAckHedgeOutcome::Failed)),
+            Some(R::DirectFailed)
+        );
+        assert_eq!(ack_bus_hedge_reason(false, None), Some(R::DirectSlow));
+    }
+
+    /// Counts calls of the bus route factory, so a test can prove the bus
+    /// was or was not published.
+    fn counting_bus(
+        calls: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> impl FnOnce() -> std::future::Ready<NetworkResult<()>> {
+        let calls = Arc::clone(calls);
+        move || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Ok(()))
+        }
+    }
+
+    /// #1964: a durable ACK on a healthy Direct path, for a DM that came on
+    /// the inbox, is not published on the bus. RED before #1964 (the bus
+    /// route always ran).
+    #[tokio::test(start_paused = true)]
+    async fn durable_ack_is_not_hedged_on_the_bus_when_direct_sent() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let routes = publish_durable_ack_routes(
+            route_plan(false, false),
+            async { Ok(()) },
+            async { DirectAckHedgeOutcome::Sent },
+            counting_bus(&calls),
+        )
+        .await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(routes.bus, AckBusRoute::SkippedDirectSent);
+        assert_eq!(routes.direct, DirectAckHedgeOutcome::Sent);
+        assert!(routes.gossip.is_ok());
+    }
+
+    /// #1964: every case that still needs the bus publishes on it.
+    #[tokio::test(start_paused = true)]
+    async fn durable_ack_is_hedged_on_the_bus_in_each_needed_case() {
+        use crate::direct::AckBusHedgeReason as R;
+        for (arrived_on_bus, direct, want) in [
+            (true, DirectAckHedgeOutcome::Sent, R::ArrivedOnBus),
+            (
+                false,
+                DirectAckHedgeOutcome::SkippedNoDirect,
+                R::NoDirectPath,
+            ),
+            (false, DirectAckHedgeOutcome::Failed, R::DirectFailed),
+        ] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let routes = publish_durable_ack_routes(
+                route_plan(arrived_on_bus, false),
+                async { Ok(()) },
+                async move { direct },
+                counting_bus(&calls),
+            )
+            .await;
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{want:?}: the bus must be published"
+            );
+            assert_eq!(routes.bus, AckBusRoute::Published(want));
+            assert_eq!(routes.direct, direct);
+        }
+    }
+
+    /// #1964: a Direct send that has not finished within the grace period
+    /// does not hold the bus back; the bus goes at the grace, and the Direct
+    /// outcome is still collected.
+    #[tokio::test(start_paused = true)]
+    async fn durable_ack_bus_goes_at_the_grace_when_direct_is_slow() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let bus_calls = Arc::clone(&calls);
+        let started = tokio::time::Instant::now();
+        let bus_at = Arc::new(std::sync::Mutex::new(None));
+        let bus_at_set = Arc::clone(&bus_at);
+        let routes = publish_durable_ack_routes(
+            route_plan(false, false),
+            async { Ok(()) },
+            async {
+                tokio::time::sleep(DURABLE_ACK_BUS_DIRECT_GRACE * 3).await;
+                DirectAckHedgeOutcome::Sent
+            },
+            move || {
+                bus_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Ok(mut at) = bus_at_set.lock() {
+                    *at = Some(started.elapsed());
+                }
+                std::future::ready(Ok(()))
+            },
+        )
+        .await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            routes.bus,
+            AckBusRoute::Published(crate::direct::AckBusHedgeReason::DirectSlow)
+        );
+        assert_eq!(routes.direct, DirectAckHedgeOutcome::Sent);
+        let at = bus_at.lock().ok().and_then(|at| *at);
+        assert_eq!(at, Some(DURABLE_ACK_BUS_DIRECT_GRACE));
+    }
+
+    /// #1964: a node that opted out of the bus never publishes there, even
+    /// for the cases that would otherwise need it.
+    #[tokio::test(start_paused = true)]
+    async fn durable_ack_never_uses_the_bus_when_opted_out() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let routes = publish_durable_ack_routes(
+            route_plan(true, true),
+            async { Ok(()) },
+            async { DirectAckHedgeOutcome::SkippedNoDirect },
+            counting_bus(&calls),
+        )
+        .await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(routes.bus, AckBusRoute::OptedOut);
+    }
+
+    /// #1964: a bus route that ran and failed still fails the gossip
+    /// result, as before (the existing gossip-route counters keep meaning).
+    #[tokio::test(start_paused = true)]
+    async fn durable_ack_bus_failure_still_fails_the_gossip_result() {
+        let routes = publish_durable_ack_routes(
+            route_plan(false, false),
+            async { Ok(()) },
+            async { DirectAckHedgeOutcome::SkippedNoDirect },
+            || async { Err(NetworkError::BroadcastError("legacy-bus".into())) },
+        )
+        .await;
+        assert!(matches!(
+            routes.gossip,
+            Err(NetworkError::BroadcastError(_))
+        ));
     }
 
     #[test]
@@ -6870,12 +7146,12 @@ pub(crate) mod tests {
 
     /// The other half of the hedge contract: a durable v2 ACK reaches the
     /// compatibility bus even when the payload itself never arrived there
-    /// (`ack_legacy_bus = false`). The bus route is what rescues a sender
-    /// whose targeted-topic delivery is wedged — the "committed but never
-    /// acked" 504 — so if v2 ever stops hedging onto the bus, the failure
-    /// this worker exists to remove comes back silently.
+    /// (`ack_legacy_bus = false`) when no Direct path exists (this harness
+    /// has no Direct hedge). The bus route is what rescues a sender whose
+    /// targeted-topic delivery is wedged — the "committed but never acked"
+    /// 504. #1964 removed the bus only when Direct sent the ACK.
     #[tokio::test]
-    async fn a_v2_ack_is_always_hedged_onto_the_compatibility_bus() {
+    async fn a_v2_ack_is_hedged_onto_the_compatibility_bus_without_direct() {
         let sender = test_keypair();
         let machine = MachineId([0xD9; 32]);
         let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
@@ -6900,7 +7176,7 @@ pub(crate) mod tests {
 
         let message = tokio::time::timeout(Duration::from_secs(5), bus.recv())
             .await
-            .expect("a v2 ACK must reach the shared bus even with ack_legacy_bus=false")
+            .expect("a v2 ACK with no Direct path must reach the shared bus")
             .expect("bus subscription stays open");
         let envelope = DmEnvelope::from_wire_bytes(&message.payload)
             .expect("bus payload decodes as a DM envelope");

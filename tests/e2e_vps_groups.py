@@ -51,6 +51,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from e2e_tunnel import start_ssh_tunnel, stop_ssh_tunnel
 from result_framing import RESULT_PREFIX_V2, ResultReassembler
+from x0x_network import refuse_removed_host_ips
 
 DISCOVER_TOPIC = "x0x.test.discover.v1"
 LEGACY_RESULTS_TOPIC = "x0x.test.results.v1"
@@ -114,7 +115,9 @@ def load_tokens(path: str, var_prefix: str = "") -> Dict[str, Tuple[str, str]]:
                 ips[n] = value
             else:
                 toks[n] = value
-    return {n: (ips[n], toks[n]) for n in ips if n in toks}
+    out = {n: (ips[n], toks[n]) for n in ips if n in toks}
+    refuse_removed_host_ips(out, path)
+    return out
 
 
 # ─── HTTP / SSE plumbing ──────────────────────────────────────────────

@@ -18,15 +18,32 @@
 #     #      x0x_ip_for nyc              # → echoes the IP
 
 # Fleet (same IPs both networks; only ports + tokens + service differ)
-X0X_NODES_NAMES="nyc sfo helsinki nuremberg singapore sydney"
+X0X_NODES_NAMES="nyc sfo singapore sydney"
 declare -A X0X_NODE_IPS=(
     [nyc]="142.93.199.50"
     [sfo]="147.182.234.192"
-    [helsinki]="65.21.157.229"
-    [nuremberg]="116.203.101.172"
     [singapore]="152.42.210.67"
     [sydney]="170.64.176.102"
 )
+
+# #2094: the closed Hetzner hosts. Their addresses may now belong to other
+# people. A tokens file that still names one is stale: refuse it, so no
+# script aims SSH or API calls at those addresses.
+X0X_REMOVED_HOST_IPS="65.21.157.229 116.203.101.172 2a01:4f9:c012:684b::1 2a01:4f8:1c1a:31e6::1"
+
+x0x_refuse_removed_host_ips() {
+    # Usage: x0x_refuse_removed_host_ips <file>. Exits the calling script
+    # (this file is sourced) when <file> names a removed address.
+    local file="$1" ip
+    [ -f "$file" ] || return 0
+    for ip in $X0X_REMOVED_HOST_IPS; do
+        if grep -Fqi -- "$ip" "$file"; then
+            echo "ERROR: $file names $ip, a closed host (#2094)." >&2
+            echo "       Regenerate it with tests/e2e_deploy.sh before running tests." >&2
+            exit 3
+        fi
+    done
+}
 
 x0x_ip_for() {
     local node="$1"
@@ -95,6 +112,7 @@ x0x_network_select() {
         export X0X_TOKEN_FILE="$(dirname "${BASH_SOURCE[0]}")/.vps-tokens-test.env"
         export X0X_TOKEN_VAR_PREFIX="TEST"
     fi
+    x0x_refuse_removed_host_ips "$X0X_TOKEN_FILE"
     export X0X_NODES_IPS=""
     for n in $X0X_NODES_NAMES; do
         X0X_NODES_IPS+="${X0X_NODE_IPS[$n]} "

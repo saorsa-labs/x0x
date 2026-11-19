@@ -4,14 +4,13 @@ This directory contains configuration files and deployment scripts for running x
 
 ## Bootstrap Network Topology
 
-6 nodes in a fully-connected mesh:
+4 nodes in a fully-connected mesh (the Helsinki and Nuremberg Hetzner
+hosts were removed on 19 Nov 2026, #2094):
 
 | Node | Location | Provider | IP Address | Config File |
 |------|----------|----------|------------|-------------|
 | saorsa-2 | NYC, US | DigitalOcean | 142.93.199.50 | bootstrap-nyc.toml |
 | saorsa-3 | SFO, US | DigitalOcean | 147.182.234.192 | bootstrap-sfo.toml |
-| saorsa-6 | Helsinki, FI | Hetzner | 65.21.157.229 | bootstrap-helsinki.toml |
-| saorsa-7 | Nuremberg, DE | Hetzner | 116.203.101.172 | bootstrap-nuremberg.toml |
 | saorsa-8 | Singapore, SG | DigitalOcean | 152.42.210.67 | bootstrap-singapore.toml |
 | saorsa-9 | Sydney, AU | DigitalOcean | 170.64.176.102 | bootstrap-sydney.toml |
 
@@ -84,7 +83,7 @@ NODE            IP                STATUS
 ----            --                ------
 nyc             142.93.199.50     OK - healthy
 sfo             147.182.234.192   OK - healthy
-helsinki        65.21.157.229     OK - healthy
+singapore       152.42.210.67     OK - healthy
 ```
 
 ### scripts/check-mesh.sh
@@ -96,8 +95,8 @@ Verify full mesh connectivity across all bootstrap nodes.
 ```
 
 **What it does:**
-1. Queries health endpoint on all 6 nodes
-2. Verifies each node reports correct peer count (5 peers each)
+1. Queries health endpoint on all 4 nodes
+2. Verifies each node reports correct peer count (3 peers each)
 3. Checks service status if unhealthy
 4. Shows recent logs for troubleshooting
 5. Returns exit code 0 if all healthy, 1 if any issues
@@ -108,18 +107,16 @@ Verify full mesh connectivity across all bootstrap nodes.
 x0x Bootstrap Mesh Health Check
 =========================================
 
-Checking saorsa-2 (142.93.199.50)... HEALTHY (peers: 5)
-Checking saorsa-3 (147.182.234.192)... HEALTHY (peers: 5)
-Checking saorsa-6 (65.21.157.229)... HEALTHY (peers: 5)
-Checking saorsa-7 (116.203.101.172)... HEALTHY (peers: 5)
-Checking saorsa-8 (152.42.210.67)... HEALTHY (peers: 5)
-Checking saorsa-9 (170.64.176.102)... HEALTHY (peers: 5)
+Checking saorsa-2 (142.93.199.50)... HEALTHY (peers: 3)
+Checking saorsa-3 (147.182.234.192)... HEALTHY (peers: 3)
+Checking saorsa-8 (152.42.210.67)... HEALTHY (peers: 3)
+Checking saorsa-9 (170.64.176.102)... HEALTHY (peers: 3)
 
 =========================================
 Summary
 =========================================
-Total nodes: 6
-Healthy: 6
+Total nodes: 4
+Healthy: 4
 Unhealthy: 0
 
 ✓ All bootstrap nodes are healthy!
@@ -130,7 +127,7 @@ View logs from a node.
 
 ```bash
 # View last 50 lines (default)
-./logs.sh helsinki
+./logs.sh nyc
 
 # View last 200 lines
 ./logs.sh singapore 200

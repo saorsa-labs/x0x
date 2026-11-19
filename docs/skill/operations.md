@@ -13,7 +13,7 @@ x0xd --relay                        # offer relay service (needs Full participat
 curl "http://$API/diagnostics/relay" -H "Authorization: Bearer $TOKEN"   # advert census + dialer evidence
 ```
 
-Bootstrap peers: 6 global nodes by default; override with `bootstrap_peers = [...]` in the config TOML (`[]` = none) or `--no-hard-coded-bootstrap` to drop only the embedded list. `x0x network status` / `network cache` cover connectivity and the peer cache.
+Bootstrap peers: 4 global nodes by default; override with `bootstrap_peers = [...]` in the config TOML (`[]` = none) or `--no-hard-coded-bootstrap` to drop only the embedded list. `x0x network status` / `network cache` cover connectivity and the peer cache.
 
 ### 7.2 Self-update
 
@@ -109,7 +109,7 @@ bind_address = "0.0.0.0:0"           # QUIC port (0 = random)
 api_address = "127.0.0.1:12700"      # REST API (loopback by default — see [SKILL.md](../../SKILL.md) §1.3 before binding wider)
 log_level = "info"                    # trace|debug|info|warn|error
 log_format = "text"                   # text|json
-bootstrap_peers = []                  # unset = the 6 global bootstraps; [] = none
+bootstrap_peers = []                  # unset = the 4 global bootstraps; [] = none
 heartbeat_interval_secs = 300         # re-announce identity
 identity_ttl_secs = 900               # expire stale discoveries
 rendezvous_enabled = true             # global findability

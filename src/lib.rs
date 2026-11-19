@@ -47,8 +47,8 @@
 //!
 //! Agents configured with [`network::NetworkConfig`]`::default()` connect to
 //! Saorsa Labs' global bootstrap network:
-//! - NYC, US · SFO, US · Helsinki, FI
-//! - Nuremberg, DE · Singapore, SG · Sydney, JP
+//! - NYC, US · SFO, US
+//! - Singapore, SG · Sydney, AU
 //!
 //! These nodes provide initial peer discovery and NAT traversal.
 
@@ -12340,6 +12340,10 @@ impl Agent {
                         payload,
                         &config,
                         lifecycle_hint,
+                        dm_send::BusFallbackContext {
+                            peer_rtt_ms: rtt_hint_ms,
+                            diagnostics: Some(&self.direct_messaging),
+                        },
                     )
                     .await
                 }
@@ -46688,9 +46692,9 @@ mod peer_connected_handler_integration_tests {
                 network::SEED_PEER_ID_PINS,
                 "142.93.199.50:5483".parse().unwrap(),
             )[0];
-            let hel_5483 = *network::pinned_peer_ids_in(
+            let sfo_5483 = *network::pinned_peer_ids_in(
                 network::SEED_PEER_ID_PINS,
-                "65.21.157.229:5483".parse().unwrap(),
+                "147.182.234.192:5483".parse().unwrap(),
             )[0];
             let seed_host = identity::MachineId(nyc_5483);
             let own = identity::MachineId([0x99; 32]);
@@ -46715,7 +46719,7 @@ mod peer_connected_handler_integration_tests {
                     issue1112_origin([0x99; 32], "142.93.199.50:443", true),
                     // Same seed host seen v4-mapped on a dual-stack socket
                     // (review round 2): normalization must keep it a hint.
-                    issue1112_origin(hel_5483, "[::ffff:65.21.157.229]:5483", true),
+                    issue1112_origin(sfo_5483, "[::ffff:147.182.234.192]:5483", true),
                 ],
                 &cache,
                 own,
@@ -46731,7 +46735,7 @@ mod peer_connected_handler_integration_tests {
             // bootstrap-classified choice: seed_host twice (its cache
             // entry classifies) + the mapped peer twice (the no-cache
             // operator branch). None for the self-entry.
-            let mapped_seed = identity::MachineId(hel_5483);
+            let mapped_seed = identity::MachineId(sfo_5483);
             assert!(
                 coordinators.contains(&mapped_seed) && relays.contains(&mapped_seed),
                 "a v4-mapped observed seed address must stay an operator-tier hint"

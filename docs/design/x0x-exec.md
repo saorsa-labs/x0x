@@ -396,7 +396,7 @@ x0x exec <agent> -- x0x diagnostics exec   # remote daemon's exec stats
                                           # (requires that argv to be allowlisted)
 ```
 
-Agent identifier accepts: full hex `agent_id`, contact short-name (existing contact-store lookup), or VPS host short-name (e.g. `saorsa-7` → resolved via existing contact-name mapping).
+Agent identifier accepts: full hex `agent_id`, contact short-name (existing contact-store lookup), or VPS host short-name (e.g. `saorsa-2` → resolved via existing contact-name mapping).
 
 ## 12. REST API
 
@@ -517,7 +517,7 @@ Tier 1 ships when **all** of these hold:
 5. A request that breaches `max_stdout_bytes` is reflected in `/diagnostics/exec` `cap_breaches.stdout` counter on the *remote* node.
 6. Killing the local CLI mid-exec causes the remote child process to receive SIGTERM within 5 s (verified by inspecting `ps` on the remote).
 7. CRDT TaskList audit mirroring is either implemented or explicitly waived to v1.1. For v1 this document records the waiver and JSONL remains authoritative.
-8. `docs/exec.md` exists with a working "deploy this ACL on saorsa-7, run this command from your laptop" example using real but redacted IDs.
+8. `docs/exec.md` exists with a working "deploy this ACL on saorsa-2, run this command from your laptop" example using real but redacted IDs.
 
 ## 18. Non-goals (explicit)
 

@@ -29,7 +29,7 @@
 #   ./deploy-443.sh --resolve         # print the resolved values this script
 #                                    # would ship, then exit (no fleet contact)
 #
-#   <node> ∈ nyc sfo helsinki nuremberg singapore sydney all
+#   <node> ∈ nyc sfo singapore sydney all
 #
 # Idempotent. Safe to re-run. Roll ONE node, verify, then the rest.
 # =============================================================================
@@ -43,8 +43,6 @@ SSH="ssh -o ConnectTimeout=10 -o ControlMaster=no -o ControlPath=none -o BatchMo
 declare -A NODES=(
   ["nyc"]="142.93.199.50"
   ["sfo"]="147.182.234.192"
-  ["helsinki"]="65.21.157.229"
-  ["nuremberg"]="116.203.101.172"
   ["singapore"]="152.42.210.67"
   ["sydney"]="170.64.176.102"
 )
@@ -237,7 +235,7 @@ fi
 do_run "systemctl daemon-reload"
 do_run "systemctl enable x0xd-443.service"
 
-# Open UDP/443 if a host firewall is active. Cloud firewalls (DO/Hetzner)
+# Open UDP/443 if a host firewall is active. Cloud firewalls (DO)
 # are managed out-of-band and must also allow UDP/443 — verified separately.
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
   do_run "ufw allow 443/udp"
@@ -287,7 +285,7 @@ deploy_node() {
 }
 
 if [ "$TARGET" = "all" ]; then
-  for n in nyc sfo helsinki nuremberg singapore sydney; do deploy_node "$n"; done
+  for n in nyc sfo singapore sydney; do deploy_node "$n"; done
 else
   [ -n "${NODES[$TARGET]:-}" ] || { err "unknown node: $TARGET"; exit 2; }
   deploy_node "$TARGET"

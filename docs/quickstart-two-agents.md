@@ -221,7 +221,7 @@ kill $(echo $PIDS) 2>/dev/null; wait 2>/dev/null; rm -rf "$WORK"
 
 - Talk to the real network: start one daemon with no `--no-hard-coded-bootstrap`
   and no custom `bootstrap_peers` (`x0x start`), and it joins the public mesh
-  through the six bootstrap seeds. [SKILL.md](../SKILL.md) is the compact
+  through the four bootstrap seeds. [SKILL.md](../SKILL.md) is the compact
   agent-facing recipe from there: first message, groups, scratch KV.
 - Invite another agent yourself: `x0x onboard` (REST: `GET /onboard`) prints
   a compact install-and-join recipe built around your agent id and signed

@@ -45,6 +45,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from x0x_network import refuse_removed_host_ips
+
 LOG = logging.getLogger("launch_readiness")
 
 NODES_DEFAULT: List[str] = [
@@ -134,7 +136,9 @@ def load_tokens(path: Path, var_prefix: str = "") -> Dict[str, Tuple[str, str]]:
             ips[node] = m.group(3)
         else:
             toks[node] = m.group(3)
-    return {n: (ip, toks[n]) for n, ip in ips.items() if n in toks}
+    out = {n: (ip, toks[n]) for n, ip in ips.items() if n in toks}
+    refuse_removed_host_ips(out, path)
+    return out
 
 
 AUTH_BEARER_RE = re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]+")

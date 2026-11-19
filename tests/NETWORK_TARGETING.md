@@ -18,8 +18,8 @@ selector so the wrong network can never be hit by accident.
 
 ## Architecture
 
-Two fleets share the same 6 VPS hosts (nyc / sfo / helsinki / nuremberg /
-singapore / sydney); only ports + services + data dirs differ:
+Two fleets share the same 4 VPS hosts (nyc / sfo / singapore / sydney;
+Helsinki and Nuremberg were removed on 19 Nov 2026, #2094); only ports + services + data dirs differ:
 
 | | TESTNET (default) | PROD |
 |---|---|---|

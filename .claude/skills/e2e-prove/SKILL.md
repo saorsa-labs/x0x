@@ -11,7 +11,7 @@ Run x0x E2E tests, evaluate results, fix issues, and generate proof reports.
 
 ```bash
 /e2e-prove              # Interactive — asks which suite to run
-/e2e-prove vps          # VPS all-pairs matrix (6 bootstrap nodes)
+/e2e-prove vps          # VPS all-pairs matrix (4 bootstrap nodes)
 /e2e-prove lan          # LAN suite (studio1 + LAN_PEER_HOST, e.g. the MacBook)
 /e2e-prove local        # Local loopback (alice + bob)
 /e2e-prove all          # Run all suites sequentially
@@ -146,13 +146,13 @@ Agent(model: sonnet, description: "Evaluate E2E test results"):
     | GUI (/gui + /ws/direct) | Yes/No | Yes/No | line numbers |
 
     ## All-Pairs Matrix (VPS only)
-    Create a 6x6 matrix showing connect + send + receive status:
+    Create a 4x4 matrix showing connect + send + receive status:
 
-    |          | NYC | SFO | Helsinki | Nuremberg | Singapore | Tokyo |
-    |----------|-----|-----|----------|-----------|-----------|-------|
-    | NYC      | -   | ... | ...      | ...       | ...       | ...   |
-    | SFO      | ... | -   | ...      | ...       | ...       | ...   |
-    | ...      |     |     |          |           |           |       |
+    |           | NYC | SFO | Singapore | Sydney |
+    |-----------|-----|-----|-----------|--------|
+    | NYC       | -   | ... | ...       | ...    |
+    | SFO       | ... | -   | ...       | ...    |
+    | ...       |     |     |           |        |
 
     Use: OK (connected+sent), SEND (sent but unverified receipt), FAIL (connection failed), SKIP (not attempted)
 
@@ -272,7 +272,7 @@ Use `-v` for verbose (shows which suites cover each route), `--test-endpoints` t
 
 | Suite | Script | Scope |
 |-------|--------|-------|
-| VPS | tests/e2e_vps.sh | 6 bootstrap nodes, all-pairs matrix |
+| VPS | tests/e2e_vps.sh | 4 bootstrap nodes, all-pairs matrix |
 | LAN | tests/e2e_lan.sh | studio1 + LAN_PEER_HOST (second LAN node) |
 | Local | tests/e2e_full_audit.sh | Self-contained local loopback proof: 83 endpoints + CLI + GUI + SSE + WS + file transfer + shutdown + swarm |
 | Local (alt) | tests/e2e_comprehensive.sh | Local loopback (older) |

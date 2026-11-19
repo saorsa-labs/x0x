@@ -6329,7 +6329,7 @@ mod tests {
     /// PeerScores resolve in per-process-randomised hash order, so the
     /// single inbox EAGER frame can land on Leaves that refuse unsubscribed
     /// pass-through and never reach the recipient; the durable send then
-    /// pays the 250 ms legacy bus fallback. The send path records the
+    /// pays the legacy bus fallback (#1964: 2 s or more). The send path records the
     /// recipient machine as the inbox owner, and Leaf membership promotes
     /// that owner eager ahead of the C5b Full/bootstrap choice while it
     /// stays connected. With the pin the owner seat is deterministic; the
