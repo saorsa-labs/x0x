@@ -258,10 +258,74 @@ impl GossipTransport for PubSubTransport {
     }
 }
 
+/// How long the Leaf hard egress budget must stay exceeded, sample after
+/// sample, before `/status` and `x0x status` warn about it (#1964).
+pub const SUSTAINED_EGRESS_EXCEED_SECS: u64 = 60;
+
+/// Rate window of [`EgressMeter`], in seconds.
+const EGRESS_WINDOW_SECS: u64 = 60;
+
+/// Topics named in [`EgressBudgetWarning::top_topics`].
+const WARNING_TOP_TOPICS: usize = 3;
+
+/// The wire kinds the meter counts, in [`KindBytes`] index order.
+const KIND_LABELS: [&str; 4] = ["eager", "ihave", "iwant", "anti_entropy"];
+
+/// Per-kind byte counts, indexed like [`KIND_LABELS`].
+type KindBytes = [u64; 4];
+
+/// One subscribed topic's share of the 60 s egress window.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EgressTopicUsage {
+    /// Subscribed topic name, or `unknown-hex` when no name is stored.
+    pub name: String,
+    /// Display form of the topic ID (first 8 bytes, hex).
+    pub topic_id_hex8: String,
+    /// x0x admission class of the name: `critical`, `normal`, `bulk`, or
+    /// `unknown` for an unnamed topic.
+    pub priority: String,
+    /// Average bytes per second over the window, all kinds.
+    pub bytes_per_sec: f64,
+    /// Average bytes per second over the window, per wire kind.
+    pub by_kind: BTreeMap<String, f64>,
+}
+
+/// Present while the Leaf hard egress budget has been exceeded on every
+/// sample for at least [`SUSTAINED_EGRESS_EXCEED_SECS`] (#1964).
+///
+/// It is observation only. Nothing is capped because of it: under
+/// `byte_policy = "shed_normal"` saorsa-gossip defers only forwarded
+/// Normal/Bulk EAGER sends, so local publishes, Critical topics, targeted
+/// sends and IWANT/anti-entropy serves are never held back by this budget.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EgressBudgetWarning {
+    /// Seconds since the first sample of the current over-budget run.
+    pub exceeded_for_secs: u64,
+    /// [`SUSTAINED_EGRESS_EXCEED_SECS`].
+    pub threshold_secs: u64,
+    /// Subscribed-topic egress, 60 s average, bytes per second.
+    pub rate_bytes_per_sec_60s: f64,
+    /// Configured `leaf_egress_hard_bytes_per_sec`.
+    pub hard_bytes_per_sec: u64,
+    /// Effective byte policy (`observe_only` or `shed_normal`).
+    pub byte_policy: String,
+    /// The heaviest subscribed topics in the window, largest first.
+    pub top_topics: Vec<EgressTopicUsage>,
+    /// Bytes per second per wire kind over the window, all subscribed topics.
+    pub by_kind: BTreeMap<String, f64>,
+    /// The one-line warning that `/status` also puts in `warnings`.
+    pub message: String,
+}
+
 #[derive(Default)]
 pub(super) struct EgressMeter {
-    previous: HashMap<String, u64>,
+    previous: HashMap<String, KindBytes>,
     samples: VecDeque<(Instant, u64)>,
+    /// Per-topic, per-kind deltas of subscribed topics that moved bytes,
+    /// with the same 60 s expiry as `samples`.
+    topic_samples: VecDeque<(Instant, Vec<(String, KindBytes)>)>,
+    /// First sample of the current unbroken run above the hard budget.
+    hard_exceeded_since: Option<Instant>,
     pub rate: f64,
     pub soft_exceeded: u64,
     pub hard_exceeded: u64,
@@ -277,33 +341,57 @@ impl EgressMeter {
         config: &GossipConfig,
     ) {
         let mut delta = 0u64;
+        let mut topic_deltas = Vec::new();
         for (topic, kinds) in rows {
-            let bytes = kinds
-                .eager
-                .bytes
-                .saturating_add(kinds.ihave.bytes)
-                .saturating_add(kinds.iwant.bytes)
-                .saturating_add(kinds.anti_entropy.bytes);
-            let old = self.previous.insert(topic.clone(), bytes).unwrap_or(0);
+            let bytes: KindBytes = [
+                kinds.eager.bytes,
+                kinds.ihave.bytes,
+                kinds.iwant.bytes,
+                kinds.anti_entropy.bytes,
+            ];
+            let old = self
+                .previous
+                .insert(topic.clone(), bytes)
+                .unwrap_or_default();
             if subscribed.contains(topic) {
-                delta = delta.saturating_add(bytes.saturating_sub(old));
+                let mut kind_delta = KindBytes::default();
+                for (slot, (new, old)) in kind_delta.iter_mut().zip(bytes.iter().zip(old.iter())) {
+                    *slot = new.saturating_sub(*old);
+                }
+                let topic_delta = kind_delta
+                    .iter()
+                    .fold(0u64, |sum, b| sum.saturating_add(*b));
+                delta = delta.saturating_add(topic_delta);
+                if topic_delta > 0 {
+                    topic_deltas.push((topic.clone(), kind_delta));
+                }
             }
         }
+        let window = Duration::from_secs(EGRESS_WINDOW_SECS);
         self.samples.push_back((now, delta));
         while self
             .samples
             .front()
-            .is_some_and(|(at, _)| now.duration_since(*at) >= Duration::from_secs(60))
+            .is_some_and(|(at, _)| now.duration_since(*at) >= window)
         {
             self.samples.pop_front();
+        }
+        self.topic_samples.push_back((now, topic_deltas));
+        while self
+            .topic_samples
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) >= window)
+        {
+            self.topic_samples.pop_front();
         }
         self.rate = self
             .samples
             .iter()
             .map(|(_, bytes)| *bytes as f64)
             .sum::<f64>()
-            / 60.0;
+            / EGRESS_WINDOW_SECS as f64;
         self.sampled_at = Some(now);
+        let mut hard_over = false;
         if !config.resolved_participation().forwards_passthrough() {
             if config.leaf_egress_soft_bytes_per_sec > 0
                 && self.rate > config.leaf_egress_soft_bytes_per_sec as f64
@@ -314,8 +402,143 @@ impl EgressMeter {
                 && self.rate > config.leaf_egress_hard_bytes_per_sec as f64
             {
                 self.hard_exceeded = self.hard_exceeded.saturating_add(1);
+                hard_over = true;
             }
         }
+        if hard_over {
+            self.hard_exceeded_since.get_or_insert(now);
+        } else {
+            self.hard_exceeded_since = None;
+        }
+    }
+
+    /// How long the hard budget has been exceeded on every sample, once
+    /// that run has lasted [`SUSTAINED_EGRESS_EXCEED_SECS`]; `None` before
+    /// that and as soon as one sample is back under the budget.
+    pub fn sustained_hard_exceed(&self, now: Instant) -> Option<Duration> {
+        let since = self.hard_exceeded_since?;
+        let run = now.saturating_duration_since(since);
+        (run >= Duration::from_secs(SUSTAINED_EGRESS_EXCEED_SECS)).then_some(run)
+    }
+
+    /// The sustained-exceed warning, or `None` while the run is shorter
+    /// than [`SUSTAINED_EGRESS_EXCEED_SECS`] or there is no run.
+    ///
+    /// `names` maps a topic ID display string to its subscribed name.
+    pub fn warning(
+        &self,
+        now: Instant,
+        hard_bytes_per_sec: u64,
+        byte_policy: &str,
+        names: &HashMap<String, String>,
+    ) -> Option<EgressBudgetWarning> {
+        let run = self.sustained_hard_exceed(now)?;
+        let window = EGRESS_WINDOW_SECS as f64;
+        let mut per_topic: BTreeMap<&str, KindBytes> = BTreeMap::new();
+        for (_, rows) in &self.topic_samples {
+            for (topic, kinds) in rows {
+                let sum = per_topic.entry(topic.as_str()).or_default();
+                for (slot, add) in sum.iter_mut().zip(kinds.iter()) {
+                    *slot = slot.saturating_add(*add);
+                }
+            }
+        }
+        let mut totals = KindBytes::default();
+        for kinds in per_topic.values() {
+            for (slot, add) in totals.iter_mut().zip(kinds.iter()) {
+                *slot = slot.saturating_add(*add);
+            }
+        }
+        let by_kind_of = |kinds: &KindBytes| {
+            KIND_LABELS
+                .iter()
+                .zip(kinds.iter())
+                .map(|(label, bytes)| ((*label).to_string(), *bytes as f64 / window))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let mut ranked = per_topic.into_iter().collect::<Vec<_>>();
+        ranked.sort_by(|(a_id, a), (b_id, b)| {
+            let a_sum = a.iter().fold(0u64, |s, x| s.saturating_add(*x));
+            let b_sum = b.iter().fold(0u64, |s, x| s.saturating_add(*x));
+            b_sum.cmp(&a_sum).then_with(|| a_id.cmp(b_id))
+        });
+        let top_topics = ranked
+            .into_iter()
+            .take(WARNING_TOP_TOPICS)
+            .map(|(id, kinds)| {
+                let name = names.get(id).cloned();
+                let priority = name
+                    .as_deref()
+                    .map(|name| {
+                        match super::pubsub::classify_x0x_topic(name) {
+                            saorsa_gossip_types::TopicPriority::Critical => "critical",
+                            saorsa_gossip_types::TopicPriority::Normal => "normal",
+                            saorsa_gossip_types::TopicPriority::Bulk => "bulk",
+                        }
+                        .to_string()
+                    })
+                    .unwrap_or_else(|| "unknown".to_string());
+                EgressTopicUsage {
+                    name: name.unwrap_or_else(|| "unknown-hex".to_string()),
+                    topic_id_hex8: id.to_string(),
+                    priority,
+                    bytes_per_sec: kinds.iter().fold(0u64, |s, x| s.saturating_add(*x)) as f64
+                        / window,
+                    by_kind: by_kind_of(&kinds),
+                }
+            })
+            .collect::<Vec<_>>();
+        let tops = top_topics
+            .iter()
+            .map(|topic| {
+                let kind = topic
+                    .by_kind
+                    .iter()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .map(|(kind, _)| kind.as_str())
+                    .unwrap_or("eager");
+                format!(
+                    "{} ({}, mostly {kind}) {}",
+                    topic.name,
+                    topic.priority,
+                    human_bits_per_sec(topic.bytes_per_sec)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let message = format!(
+            "gossip egress has exceeded the Leaf hard budget for {} s: {} (60 s average of \
+             subscribed topics) against {}; top topics: {}. byte_policy \"{byte_policy}\" \
+             can defer only forwarded Normal/Bulk EAGER sends; local publishes, Critical \
+             topics, targeted sends and IWANT/anti-entropy serves are never held back, so \
+             this traffic is not capped (#1964)",
+            run.as_secs(),
+            human_bits_per_sec(self.rate),
+            human_bits_per_sec(hard_bytes_per_sec as f64),
+            if tops.is_empty() { "none" } else { &tops },
+        );
+        Some(EgressBudgetWarning {
+            exceeded_for_secs: run.as_secs(),
+            threshold_secs: SUSTAINED_EGRESS_EXCEED_SECS,
+            rate_bytes_per_sec_60s: self.rate,
+            hard_bytes_per_sec,
+            byte_policy: byte_policy.to_string(),
+            top_topics,
+            by_kind: by_kind_of(&totals),
+            message,
+        })
+    }
+}
+
+/// Bytes per second as a short bits-per-second string (`2.1 Mbps`).
+fn human_bits_per_sec(bytes_per_sec: f64) -> String {
+    let bits = (bytes_per_sec * 8.0).max(0.0);
+    if bits >= 1_000_000.0 {
+        format!("{:.1} Mbps", bits / 1_000_000.0)
+    } else if bits >= 1_000.0 {
+        format!("{:.1} kbps", bits / 1_000.0)
+    } else {
+        format!("{} bps", bits as u64)
     }
 }
 
@@ -407,6 +630,126 @@ mod tests {
         let later = BTreeMap::from([("bus".to_string(), topic_meter(105, 22, 4, 8))]);
         meter.sample(now + Duration::from_secs(2), &later, &subscribed, &config);
         assert_eq!(meter.rate, 9.0 / 60.0, "all four new wire-kind bytes count");
+    }
+
+    fn sustained_config() -> GossipConfig {
+        GossipConfig {
+            leaf_egress_soft_bytes_per_sec: 1,
+            leaf_egress_hard_bytes_per_sec: 50,
+            ..Default::default()
+        }
+    }
+
+    /// Feeds `per_sec` eager bytes on `bus` as one sample per second over
+    /// `secs` (offsets from `start`), advancing the cumulative `total`.
+    fn feed(
+        meter: &mut EgressMeter,
+        start: Instant,
+        secs: std::ops::Range<u64>,
+        total: &mut u64,
+        per_sec: u64,
+        config: &GossipConfig,
+    ) {
+        let subscribed = HashSet::from(["bus".to_string()]);
+        for sec in secs {
+            *total += per_sec;
+            let rows = BTreeMap::from([("bus".to_string(), topic_meter(*total, 0, 0, 0))]);
+            meter.sample(start + Duration::from_secs(sec), &rows, &subscribed, config);
+        }
+    }
+
+    /// WHY (#1964): a warning must mean "over the hard budget on every
+    /// sample for 60 s", not one burst; it must appear at 60 s, not before.
+    #[test]
+    fn sustained_exceed_enters_after_60s_and_not_before() {
+        let config = sustained_config();
+        let mut meter = EgressMeter::default();
+        let start = Instant::now();
+        let mut total = 0;
+        let names = HashMap::from([("bus".to_string(), "x0x.identity.announce.v2".to_string())]);
+        // 60 s window: 6_000 B/s once warm; the first sample alone is
+        // already 6_000 / 60 = 100 B/s, over the 50 B/s hard budget.
+        feed(&mut meter, start, 0..60, &mut total, 6_000, &config);
+        let last = start + Duration::from_secs(59);
+        assert!(
+            meter.sustained_hard_exceed(last).is_none(),
+            "59 s is not sustained"
+        );
+        assert!(meter.warning(last, 50, "observe_only", &names).is_none());
+
+        feed(&mut meter, start, 60..61, &mut total, 6_000, &config);
+        let at = start + Duration::from_secs(60);
+        assert_eq!(
+            meter.sustained_hard_exceed(at),
+            Some(Duration::from_secs(SUSTAINED_EGRESS_EXCEED_SECS))
+        );
+        let warning = meter
+            .warning(at, 50, "shed_normal", &names)
+            .expect("60 s over budget warns");
+        assert_eq!(warning.exceeded_for_secs, 60);
+        assert_eq!(warning.threshold_secs, SUSTAINED_EGRESS_EXCEED_SECS);
+        assert_eq!(warning.top_topics.len(), 1);
+        let top = &warning.top_topics[0];
+        assert_eq!(top.name, "x0x.identity.announce.v2");
+        assert_eq!(top.priority, "critical");
+        assert_eq!(top.by_kind["eager"], 6_000.0);
+        assert_eq!(warning.by_kind["eager"], 6_000.0);
+        assert!(warning
+            .message
+            .contains("x0x.identity.announce.v2 (critical, mostly eager)"));
+        assert!(warning.message.contains("Critical topics"));
+    }
+
+    /// WHY (#1964): one sample back under the budget ends the run, so the
+    /// warning clears when the rate drops and the next run starts at zero.
+    #[test]
+    fn sustained_exceed_clears_on_recovery_and_restarts_the_run() {
+        let config = sustained_config();
+        let mut meter = EgressMeter::default();
+        let start = Instant::now();
+        let mut total = 0;
+        feed(&mut meter, start, 0..90, &mut total, 6_000, &config);
+        assert!(meter
+            .sustained_hard_exceed(start + Duration::from_secs(89))
+            .is_some());
+        // Idle traffic: the 60 s average is back under 50 B/s once the
+        // last 6_000 B sample (t = 89 s) has left the window at t = 149 s.
+        feed(&mut meter, start, 90..150, &mut total, 0, &config);
+        let idle = start + Duration::from_secs(149);
+        assert!(meter.rate <= 50.0, "rate {} must be back under", meter.rate);
+        assert!(meter.sustained_hard_exceed(idle).is_none());
+        assert!(meter
+            .warning(idle, 50, "observe_only", &HashMap::new())
+            .is_none());
+        // A fresh burst must wait a full 60 s again.
+        feed(&mut meter, start, 150..170, &mut total, 60_000, &config);
+        assert!(meter
+            .sustained_hard_exceed(start + Duration::from_secs(169))
+            .is_none());
+    }
+
+    /// WHY: Full nodes and a zero hard budget have no Leaf budget to exceed.
+    #[test]
+    fn sustained_exceed_never_starts_without_a_leaf_hard_budget() {
+        let start = Instant::now();
+        for config in [
+            GossipConfig {
+                leaf_egress_hard_bytes_per_sec: 0,
+                leaf_egress_soft_bytes_per_sec: 0,
+                ..Default::default()
+            },
+            GossipConfig {
+                relay: true,
+                ..sustained_config()
+            },
+        ] {
+            let mut meter = EgressMeter::default();
+            let mut total = 0;
+            feed(&mut meter, start, 0..120, &mut total, 60_000, &config);
+            assert!(meter
+                .sustained_hard_exceed(start + Duration::from_secs(119))
+                .is_none());
+        }
     }
 
     mod track_iwant {
