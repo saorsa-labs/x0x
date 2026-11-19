@@ -446,6 +446,20 @@ fn admit(state: &ControlContext, root: &Path, bytes: &[u8]) -> io::Result<Admitt
         legacy: serde_json::from_value(legacy)?,
     };
     let plan = request.plan.clone();
+    // A14 (#2074 review): the arming caller releases the host lock before
+    // it arms. A held lock is refused here, before this call owns
+    // anything, because the refusal restore below could not take it.
+    #[cfg(unix)]
+    crate::upgrade::prepare::HostLock::acquire_within(&plan, Duration::ZERO).map_err(|error| {
+        if error.kind() == io::ErrorKind::WouldBlock {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "the host lock is held: release it before arming",
+            )
+        } else {
+            error
+        }
+    })?;
     let binding = shutdown_flush::Binding::new(
         request.transaction_id,
         request.generation,
@@ -610,12 +624,14 @@ fn arm(state: &ControlContext, root: &Path, bytes: &[u8]) -> Result<ArmedFlush, 
     }
 }
 
-/// This call owns admission until recovery finishes. Mark rollback before
-/// touching installed bytes, so a partial restore can never admit a retry.
-/// How long the arm handler's restore waits for the host lock.
+/// How long the arm handler's restore waits for the host lock. The
+/// launcher, the arming caller, waits 30 s for the arm reply
+/// (`launcher::control::flush_and_reap`), so this wait fits inside it.
 #[cfg(unix)]
 const RESTORE_LOCK_WAIT: Duration = Duration::from_secs(5);
 
+/// This call owns admission until recovery finishes. Mark rollback before
+/// touching installed bytes, so a partial restore can never admit a retry.
 fn restore_arm(
     root: &Path,
     mut record: journal::JournalRecord,
@@ -627,9 +643,10 @@ fn restore_arm(
     let journal_path = root.join(journal::JOURNAL_FILE_NAME);
     // The journal writes and the binary restore below are transaction
     // changes, so they run under the host lock (#2065 review). The arming
-    // caller may still hold it while it waits for this reply, so the wait
-    // is bounded: past it, nothing is changed and the launcher's recovery
-    // (which takes the lock) restores the pair.
+    // caller has released it (A14; `admit` refuses otherwise), but another
+    // holder may have it, so the wait is bounded: past it, nothing is
+    // changed and the launcher's recovery (which takes the lock) restores
+    // the pair.
     #[cfg(unix)]
     let _host_lock =
         crate::upgrade::prepare::HostLock::acquire_within(&record.plan, RESTORE_LOCK_WAIT)?;
@@ -1590,7 +1607,6 @@ mod prepare_round_trip {
             prepared_journal.advance(&lock, phase).expect("advance");
         }
         drop(lock);
-        remove_exe_lock();
         let request = serde_json::to_vec(&serde_json::json!({
             "token": TOKEN,
             "transaction_id": "tx-round-trip",
@@ -1600,19 +1616,6 @@ mod prepare_round_trip {
         }))
         .expect("request");
         (dir, root, identity, request)
-    }
-
-    /// The daemon target is this test binary, so taking the host lock
-    /// creates `<test binary>.upgrade.lock` beside it; remove it (#2065
-    /// review). Production never removes a lock file.
-    fn remove_exe_lock() {
-        let mut lock = crate::upgrade::apply::current_binary_path()
-            .expect("exe")
-            .canonicalize()
-            .expect("canonical")
-            .into_os_string();
-        lock.push(".upgrade.lock");
-        let _ = std::fs::remove_file(lock);
     }
 
     fn state(identity_root: PathBuf) -> ControlContext {
@@ -1679,6 +1682,57 @@ mod prepare_round_trip {
         drop(held);
         restore_arm(&root, (*record).clone(), &handoff, false, &[], cause()).expect("restore");
         assert!(!root.join(journal::JOURNAL_FILE_NAME).exists());
-        remove_exe_lock();
+    }
+
+    /// #2074 review: the arming caller releases the host lock before it
+    /// arms. An arm while the lock is held is refused at admission, typed,
+    /// before the handler owns anything; the journal is unchanged. Each
+    /// test keeps its daemon lock in its own temporary directory.
+    #[test]
+    fn an_arm_while_the_host_lock_is_held_is_refused_at_admission() {
+        let (dir, root, identity, request) = prepared(|_| {});
+        let journal::RecordRead::Journal(record) = journal::read_boot_records(&root).journal else {
+            panic!("no prepared journal");
+        };
+        let mut daemon_lock = record.plan.cli.target_path.clone().into_os_string();
+        daemon_lock.push(".test-daemon.upgrade.lock");
+        assert!(Path::new(&daemon_lock).starts_with(dir.path().canonicalize().expect("dir")));
+        assert!(Path::new(&daemon_lock).exists());
+        let held = HostLock::acquire(&record.plan).expect("host lock");
+        let refused = admit(&state(identity.clone()), &root, &request)
+            .err()
+            .expect("an arm under a held host lock");
+        assert_eq!(refused.kind(), io::ErrorKind::WouldBlock);
+        let journal::RecordRead::Journal(unchanged) = journal::read_boot_records(&root).journal
+        else {
+            panic!("the journal was moved");
+        };
+        assert_eq!(unchanged.phase, journal::Phase::SwappedCli);
+        drop(held);
+        assert!(admit(&state(identity), &root, &request).is_ok());
+    }
+
+    /// #2074 review: the producer adopts the guards that the apply path's
+    /// lock function returns (`acquire_install_lock`, the body of
+    /// `acquire_host_upgrade_lock`).
+    #[test]
+    fn the_apply_paths_own_install_locks_are_adopted() {
+        let (_dir, root) = crate::upgrade::prepare::tests::root();
+        let plan = freeze_plan(crate::upgrade::prepare::tests::input_in(&root)).expect("plan");
+        let cli = crate::upgrade::acquire_install_lock(&plan.cli.target_path).expect("cli");
+        let daemon =
+            crate::upgrade::acquire_install_lock(&plan.daemon.target_path).expect("daemon");
+        let Ok(lock) = HostLock::adopt(&plan, cli, daemon) else {
+            panic!("the apply path's own locks were refused");
+        };
+        Prepared::stage(&lock, &root, "tx", plan.clone()).expect("stage");
+        assert_eq!(
+            HostLock::acquire_within(&plan, Duration::from_millis(100))
+                .err()
+                .map(|error| error.kind()),
+            Some(io::ErrorKind::WouldBlock)
+        );
+        drop(lock);
+        assert!(HostLock::acquire_within(&plan, Duration::from_millis(100)).is_ok());
     }
 }

@@ -446,15 +446,29 @@ launcher's `Host::new` and the arm handler read. No apply path calls it yet.
 - **Taking the host lock.** `HostLock::adopt` takes over the install
   locks that a caller already holds, as the apply path takes them with
   `acquire_host_upgrade_lock`, so the producer never waits on its own
-  caller. It checks that each file is the plan pair's lock file and that
-  it holds the lock. `HostLock::acquire_within` gives up after a bounded
+  caller. It takes `InstallLock` guards, which `acquire_install_lock`
+  returns (`acquire_host_upgrade_lock` is the same lock as a plain file,
+  for the existing callers). A guard exists only once its lock
+  was taken, so the type proves the caller holds it. `adopt` checks that
+  each guard is on the plan pair's lock file. A refusal hands both guards
+  back, still held. `HostLock::acquire_within` gives up after a bounded
   wait and never holds one lock while it waits for the other.
+- **Arming (MUST).** The caller that arms an old daemon MUST release the
+  host lock before it sends the arm request, and MUST NOT take it again
+  until the reply arrives. The arm handler (`admit`) checks this: while
+  the host lock is held, it refuses the arm with `WouldBlock`, before it
+  owns anything, so nothing is restored and the journal is unchanged. The
+  launcher, the only arming caller today, releases the lock after it
+  saves the trial and before it connects.
 - **The arm handler's restore.** `restore_arm` (a refused or failed arm)
   writes the journal and restores the swapped pair under the host lock.
-  It waits at most 5 s for it, because the arming caller may hold it
-  while it waits for the reply. Past the wait it changes nothing, and the
-  launcher's recovery, which takes the lock, restores the pair. A caller
-  that arms an old daemon should release the host lock first.
+  Another holder may still have the lock, so it waits at most 5 s. Past
+  the wait it changes nothing, and the launcher's recovery, which takes
+  the lock, restores the pair. The launcher waits 30 s for the arm reply,
+  so the 5 s wait fits inside it.
+- **Unix only.** The host lock is taken on Unix only. On Windows (the
+  named-pipe arm) the admission check and the restore's lock are absent:
+  the restore writes without the host lock. This is an open gap (#2012).
 - **Which side checks what.** The producer checks only that a running
   participant has a pid and a process start. The arm handler
   (`server::upgrade_flush::admit`) refuses a journal whose participant
