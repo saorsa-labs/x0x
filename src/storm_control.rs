@@ -1533,6 +1533,36 @@ mod tests {
         );
     }
 
+    /// Machine clock stepped back: after a forwarded announce dated T, an
+    /// announce dated T-100 is `NotNewer` (delivered, not forwarded); an
+    /// announce dated T+1 in a later window forwards. The delay is
+    /// bounded: a forwarded announce is at most 300 s
+    /// (`MAX_FUTURE_SKEW_SECS`) ahead of the relay clock, so a machine
+    /// whose clock was stepped back to the correct time is newer again
+    /// after at most 300 s.
+    #[test]
+    fn v3_clock_stepped_back_is_not_newer_until_past_t_1964() {
+        let m = V3Fixture1964::new();
+        let mut g = MachineAnnounceV3Guard::default();
+        let stats = MachineAnnounceV3Stats::default();
+        let t = NOW;
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &m.wire(5483, t), NOW),
+            Verdict::Forward
+        );
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &m.wire(5483, t - 100), NOW + 61),
+            Verdict::DeliverOnly,
+            "an announce dated T-100 is not newer"
+        );
+        assert_eq!(stats.snapshot().deliver_only_not_newer, 1);
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &m.wire(5483, t + 1), NOW + 62),
+            Verdict::Forward,
+            "an announce dated T+1 in a later window forwards"
+        );
+    }
+
     /// Honest out-of-order arrival: an older copy that arrives after a
     /// newer announce is delivered only and does not take the change slot.
     #[test]
