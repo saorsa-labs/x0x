@@ -644,6 +644,10 @@ pub(in crate::server) async fn gossip_diagnostics(
                 "relay_fanout": state.agent.gossip_relay_fanout().unwrap_or_default(),
                 "dispatcher": state.agent.gossip_dispatch_stats(),
                 "inner_envelope_verify": x0x::gossip::inner_verify_stats(),
+                // #1964: relay verdicts of the machine announce v3 guard.
+                "storm_control": {
+                    "machine_announce_v3": x0x::storm_control::machine_announce_v3_stats(),
+                },
                 // #1170 / Track E M1: per-MessageKind bus, delivered, and
                 // published counters. `current` is the open interval.
                 // `last_completed` is the previous finished interval, returned
