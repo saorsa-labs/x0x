@@ -1280,6 +1280,14 @@ jobs:
   test-windows:
     name: Test Suite (Windows)
     runs-on: windows-latest
+    # Every other test lane gives libtest threads 16 MiB (.config/nextest.toml,
+    # scripts/ci/isolated-runtime.py). This job runs plain `cargo test`, so its
+    # test threads had the 2 MiB default: after #2056 (ant-quic 0.28.0)
+    # `reserve_during_drain_is_refused_until_the_supervisor_finishes`, which
+    # awaits `serve_with_options` three times, overflowed it
+    # (STATUS_STACK_OVERFLOW, job 134966531122).
+    env:
+      RUST_MIN_STACK: "16777216"
     steps:
       - uses: actions/checkout@v5
 
