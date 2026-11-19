@@ -316,7 +316,8 @@ const MACHINE_V3_CONTENT_TAG: &[u8] = b"x0x-storm-machine-announce-v3-content-v1
 /// `last_announced_at` can still be fresh: up to
 /// [`STALE_ANNOUNCE_TTL_SECS`] (900 s) after that time. Each machine
 /// announces every 600 s, so the live table is about the number of
-/// announcing machines. 32,768 entries is about 3-4 MB and covers the
+/// announcing machines. 32,768 entries is about 6 MB allocated at the cap
+/// (65,536 hash buckets) and covers the
 /// 10,000-node planning target with a wide margin. When the table is full
 /// after expiry, a new machine's announce is forwarded without an entry
 /// (fail open, counted as `table_full`), so a full table never blocks a
@@ -501,12 +502,13 @@ pub fn machine_announce_v3_stats() -> MachineAnnounceV3StatsSnapshot {
     MACHINE_ANNOUNCE_V3_STATS.snapshot()
 }
 
-/// Decode a bare V3 machine announce exactly as the receiver does
+/// Decode a bare V3 machine announce as the receiver does
 /// (`bincode::deserialize` in the discovery listener): fixint encoding,
 /// trailing bytes accepted. If the guard refused bytes that receivers
 /// accept, an appended byte would make a genuine announce "undecodable"
-/// and forwarded without limit (review of #2101). The size limit only
-/// bounds allocation; gossip frames are far below it.
+/// and forwarded without limit (review of #2101). The guard adds a 4 MiB
+/// limit that the receiver does not have; a payload over it fails open
+/// (forwarded as undecodable). Gossip frames are far below it.
 fn decode_machine_announce_v3(bare: &[u8]) -> Option<crate::MachineAnnouncementV3> {
     use bincode::Options;
     bincode::DefaultOptions::new()
@@ -1207,6 +1209,18 @@ mod tests {
         port: u16,
         announced_at: u64,
     ) -> Vec<u8> {
+        let bare = bytes::Bytes::from(machine_v3_bare_1964(machine, port, announced_at, |_| {}));
+        crate::gossip::pubsub::test_support::signed_inner_v2(signer, topic, &bare).to_vec()
+    }
+
+    /// The bare bincode bytes of a signed V3 machine announce. `v3_fields`
+    /// sets the V3-only fields (KEM key, placement digests) before signing.
+    pub(super) fn machine_v3_bare_1964(
+        machine: &crate::identity::MachineKeypair,
+        port: u16,
+        announced_at: u64,
+        v3_fields: impl FnOnce(&mut crate::MachineAnnouncementV3),
+    ) -> Vec<u8> {
         use ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa;
         let mut base = crate::MachineAnnouncement {
             machine_id: machine.machine_id(),
@@ -1233,14 +1247,14 @@ mod tests {
             move_protocol: 1,
             machine_signature_v3: Vec::new(),
         };
+        v3_fields(&mut v3);
         let v3_body = bincode::serialize(&v3.to_unsigned()).unwrap();
         v3.machine_signature_v3 = sign_with_ml_dsa(machine.secret_key(), &v3_body)
             .unwrap()
             .as_bytes()
             .to_vec();
         assert!(v3.verify().is_ok(), "fixture announce verifies");
-        let bare = bytes::Bytes::from(bincode::serialize(&v3).unwrap());
-        crate::gossip::pubsub::test_support::signed_inner_v2(signer, topic, &bare).to_vec()
+        bincode::serialize(&v3).unwrap()
     }
 
     struct V3Fixture1964 {
@@ -1560,6 +1574,83 @@ mod tests {
             v3_verdict_1964(&mut g, &stats, &m.wire(5483, t + 1), NOW + 62),
             Verdict::Forward,
             "an announce dated T+1 in a later window forwards"
+        );
+    }
+
+    /// An inner envelope on the right topic whose signature does not
+    /// verify (`verified == false`) is dropped and uses no slot; the
+    /// genuine announce forwards afterwards.
+    #[test]
+    fn v3_unverified_envelope_is_dropped_without_slot_1964() {
+        let m = V3Fixture1964::new();
+        let genuine = m.wire(5483, NOW);
+        let unverified = forged_copy_1877(&genuine);
+        let decoded = crate::gossip::pubsub::decode_v2(&unverified).unwrap();
+        assert_eq!(decoded.topic, crate::MACHINE_ANNOUNCE_V3_TOPIC);
+        let mut g = MachineAnnounceV3Guard::default();
+        let stats = MachineAnnounceV3Stats::default();
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &unverified, NOW),
+            Verdict::Drop
+        );
+        assert!(g.machines.is_empty(), "no slot from an unverified envelope");
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &genuine, NOW + 1),
+            Verdict::Forward
+        );
+        assert_eq!(stats.snapshot().dropped_forged, 1);
+    }
+
+    /// A content change in a V3-only field (KEM key, placement digests)
+    /// is a content change too: it takes the one change slot.
+    #[test]
+    fn v3_change_in_v3_only_fields_is_a_content_change_1964() {
+        let m = V3Fixture1964::new();
+        let wrap = |bare: Vec<u8>| {
+            crate::gossip::pubsub::test_support::signed_inner_v2(
+                &m.signer,
+                crate::MACHINE_ANNOUNCE_V3_TOPIC,
+                &bytes::Bytes::from(bare),
+            )
+            .to_vec()
+        };
+        let kem_len = crate::groups::kem_envelope::KEM_VARIANT.public_key_size();
+        let with_kem = wrap(machine_v3_bare_1964(&m.machine, 5483, NOW + 1, |v3| {
+            v3.machine_kem_public_key = vec![7u8; kem_len];
+        }));
+        let with_digest = wrap(machine_v3_bare_1964(&m.machine, 5483, NOW + 2, |v3| {
+            v3.machine_kem_public_key = vec![7u8; kem_len];
+            v3.placement_digests = vec![(crate::identity::AgentId([1u8; 32]), [2u8; 32])];
+        }));
+        let mut g = MachineAnnounceV3Guard::default();
+        let stats = MachineAnnounceV3Stats::default();
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &m.wire(5483, NOW), NOW),
+            Verdict::Forward
+        );
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &with_kem, NOW + 1),
+            Verdict::Forward,
+            "a new KEM key is the one content change of the window"
+        );
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &with_digest, NOW + 2),
+            Verdict::DeliverOnly,
+            "a second change (placement digests) in the window is not forwarded"
+        );
+        let snap = stats.snapshot();
+        assert_eq!(snap.forwarded_content_change, 1);
+        assert_eq!(snap.deliver_only_rate_limited, 1);
+        // In a fresh guard the digest change alone is also detected.
+        let mut g = MachineAnnounceV3Guard::default();
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &with_kem, NOW + 1),
+            Verdict::Forward
+        );
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &with_digest, NOW + 2),
+            Verdict::Forward,
+            "placement digests alone change the content"
         );
     }
 
@@ -1895,6 +1986,139 @@ mod wiring_tests {
                 m.payload.as_ref(),
                 stale_bytes.as_slice(),
                 "stale announce must not be delivered"
+            );
+        }
+    }
+
+    /// Two loopback agents (no seeds, no mDNS), Alice connected to Bob.
+    async fn connected_pair_1964(dir: &std::path::Path) -> (crate::Agent, crate::Agent) {
+        let mk = |n: &str| {
+            crate::Agent::builder()
+                .with_machine_key(dir.join(format!("{n}-machine.key")))
+                .with_agent_key_path(dir.join(format!("{n}-agent.key")))
+                .with_contact_store_path(dir.join(format!("{n}-contacts.json")))
+                .with_peer_cache_dir(dir.join(format!("{n}-peers")))
+                .with_network_config(crate::network::NetworkConfig {
+                    bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+                    bootstrap_nodes: Vec::new(),
+                    mdns_enabled: false,
+                    ..crate::network::NetworkConfig::default()
+                })
+        };
+        let alice = mk("alice").build().await.expect("alice");
+        let bob = mk("bob").build().await.expect("bob");
+        alice.join_network().await.expect("alice join");
+        bob.join_network().await.expect("bob join");
+        let alice_net = alice.network().expect("alice net");
+        let bob_net = bob.network().expect("bob net");
+        let mut bob_addr = bob_net.bound_addr().await.expect("bob bound");
+        if bob_addr.ip().is_unspecified() {
+            bob_addr.set_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        }
+        alice_net.connect_addr(bob_addr).await.expect("connect");
+        let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            if alice_net.is_connected(&bob_peer).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(alice_net.is_connected(&bob_peer).await, "transport connect");
+        (alice, bob)
+    }
+
+    /// #1964 wiring proof for `x0x.machine.announce.v3`: the guard is
+    /// registered on the receiver and active. A V3 announce with a bad
+    /// machine signature is dropped (never delivered; sg validator drop
+    /// counter and `dropped_forged` move), and a stale but valid V3
+    /// announce is delivered locally (deliver-only; `deliver_only_stale`
+    /// moves). If registration regresses, the forged bytes are delivered
+    /// and the counters stay still.
+    #[tokio::test]
+    async fn machine_announce_v3_guard_is_registered_and_active_1964() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (alice, bob) = connected_pair_1964(dir.path()).await;
+        let topic = crate::MACHINE_ANNOUNCE_V3_TOPIC;
+        let _sub_a = alice.subscribe(topic).await.unwrap();
+        let mut sub_b = bob.subscribe(topic).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        // Mesh-proving control: undecodable bytes fail open and arrive.
+        alice
+            .publish(topic, b"not-a-v3-announce".to_vec())
+            .await
+            .expect("control publish");
+        let control_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match tokio::time::timeout_at(control_deadline, sub_b.recv()).await {
+                Ok(Some(m)) if m.payload.as_ref() == b"not-a-v3-announce" => break,
+                Ok(Some(_)) => continue,
+                _ => panic!("control payload never delivered — mesh not formed"),
+            }
+        }
+
+        let now = now_unix_test();
+        let machine = crate::identity::MachineKeypair::generate().unwrap();
+        let forged = {
+            let bare = super::tests::machine_v3_bare_1964(&machine, 5483, now, |_| {});
+            let mut v3: crate::MachineAnnouncementV3 = bincode::deserialize(&bare).unwrap();
+            v3.machine_signature_v3[0] ^= 0x01;
+            assert!(v3.verify().is_err());
+            bincode::serialize(&v3).unwrap()
+        };
+        let stale_machine = crate::identity::MachineKeypair::generate().unwrap();
+        let stale = super::tests::machine_v3_bare_1964(
+            &stale_machine,
+            5483,
+            now - super::STALE_ANNOUNCE_TTL_SECS - 600,
+            |_| {},
+        );
+
+        let bob_pubsub = bob.gossip_runtime.as_ref().expect("bob runtime").pubsub();
+        let sg_dropped_before = bob_pubsub.stage_stats().validator.dropped;
+        let before = super::machine_announce_v3_stats();
+
+        alice.publish(topic, forged.clone()).await.expect("forged");
+        alice.publish(topic, stale.clone()).await.expect("stale");
+
+        // The stale announce is delivered (deliver-only, not dropped).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match tokio::time::timeout_at(deadline, sub_b.recv()).await {
+                Ok(Some(m)) if m.payload.as_ref() == stale.as_slice() => break,
+                Ok(Some(m)) => assert_ne!(
+                    m.payload.as_ref(),
+                    forged.as_slice(),
+                    "a forged V3 announce must not be delivered"
+                ),
+                _ => panic!("stale V3 announce was not delivered locally"),
+            }
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            let after = super::machine_announce_v3_stats();
+            let sg_dropped = bob_pubsub.stage_stats().validator.dropped;
+            if after.dropped_forged > before.dropped_forged
+                && after.deliver_only_stale > before.deliver_only_stale
+                && sg_dropped > sg_dropped_before
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "v3 guard counters did not move: before {before:?}, after {after:?}, \
+                 sg dropped {sg_dropped_before} -> {sg_dropped}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        // The forged bytes never reach Bob's subscribers.
+        let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(400);
+        while let Ok(Some(m)) = tokio::time::timeout_at(drain_deadline, sub_b.recv()).await {
+            assert_ne!(
+                m.payload.as_ref(),
+                forged.as_slice(),
+                "a forged V3 announce must not be delivered"
             );
         }
     }
