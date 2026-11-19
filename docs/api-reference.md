@@ -4592,6 +4592,23 @@ reaper counters:
 
 ### `GET /diagnostics/dm`
 
+**Compatibility-bus counters (#1964).** These cumulative `stats` fields
+count every publish on the shared DM bus `x0x/dm/v1/bus`, by reason, so
+an operator can see how much DM traffic still reaches the whole mesh:
+
+| Field | Counts |
+|---|---|
+| `bus_fallback_publish_no_ack` | DMs this node sent that were also published on the bus because no ACK arrived on the inbox path within the fallback wait: `max(2 s, 3 × known RTT)`, at most 10 s and at most ¾ of the per-attempt budget (never below 250 ms). |
+| `bus_fallback_publish_primary_failed` | DMs published on the bus at once because the inbox publish failed. |
+| `bus_ack_publish_arrived_on_bus` | ACKs (v1 or v2) published on the bus because the DM arrived on the bus. |
+| `bus_ack_publish_no_direct` | Durable ACKs published on the bus because no Direct path to the sender existed. |
+| `bus_ack_publish_direct_failed` | Durable ACKs published on the bus because the Direct send failed or timed out. |
+| `bus_ack_publish_direct_slow` | Durable ACKs published on the bus because the Direct send had not finished within 1 s. |
+| `bus_ack_skipped_direct_sent` | Durable ACKs kept off the bus because the Direct send succeeded (the saving). |
+
+A node with `skip_legacy_dm_bus = true` never publishes ACKs on the bus and
+does not count them. All fields default to 0 when absent.
+
 `stats.incoming_dropped_revoked` counts every DM or ACK the inbox drops
 for one of these reasons:
 

@@ -17,6 +17,17 @@ All notable changes to this project will be documented in this file.
   card, docs, deployment configs and fleet test scripts no longer name
   those hosts. Released versions keep the old list and still dial the old
   addresses at start (see `docs/trust-and-connectivity.md`).
+- **DM compatibility bus only when needed (#1964; A07 amendment of 19 Nov
+  2026).** The live fleet carried ~9 Mbps per node of 47 KB DM frames on
+  `x0x/dm/v1/bus`. A gossip DM send now waits `max(2 s, 3 × known RTT)`
+  (at most 10 s and ¾ of the attempt budget) for an inbox ACK before it
+  also publishes the DM on the bus, instead of a fixed 250 ms that was
+  below cross-region RTTs. A durable (v2) ACK goes on the bus only when the
+  DM arrived there, or when Direct has no path, fails or is slower than
+  1 s; it no longer goes there on every ACK. `GET /diagnostics/dm` adds
+  `bus_fallback_publish_*`, `bus_ack_publish_*` and
+  `bus_ack_skipped_direct_sent` counters. No wire change; earlier versions
+  still exchange DMs and ACKs with this one.
 
 - **Launcher refusal record and launcher-bound autostart (#1379, #2019
   review; A14 amendment of 18 Nov 2026).** A trial-form launcher start now

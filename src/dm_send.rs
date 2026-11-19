@@ -36,7 +36,43 @@ pub const DEFAULT_ENVELOPE_LIFETIME_MS: u64 = 120_000;
 /// Sleep between publish-only attempts; a stage of an ordinary send's
 /// absolute budget ([`crate::dm_evidence::ordinary_send_budget`]).
 pub(crate) const PUBLISH_ONLY_REDUNDANT_REPUBLISH_DELAY: Duration = Duration::from_millis(250);
-const ACK_LEGACY_BUS_FALLBACK_DELAY: Duration = Duration::from_millis(250);
+/// #1964: the shortest wait for an ACK on the inbox path before the DM is
+/// also published on the whole-mesh compatibility bus. Fleet path RTTs are
+/// 250–590 ms, so the old fixed 250 ms broadcast nearly every cross-region DM.
+pub(crate) const LEGACY_BUS_FALLBACK_MIN_DELAY: Duration = Duration::from_secs(2);
+/// #1964: the longest bus fallback wait, whatever the peer RTT.
+pub(crate) const LEGACY_BUS_FALLBACK_MAX_DELAY: Duration = Duration::from_secs(10);
+/// #1964: a known RTT is multiplied by this to give the inbox round trip
+/// (DM out, ACK back, plus queueing) a fair chance before the bus.
+const LEGACY_BUS_FALLBACK_RTT_MULTIPLIER: u64 = 3;
+/// The fixed delay used before #1964. Kept as the floor of the per-attempt
+/// cap, so a very short attempt budget behaves as it did before.
+const LEGACY_BUS_FALLBACK_PRE_1964_DELAY: Duration = Duration::from_millis(250);
+
+/// #1964: how long a send waits for an ACK on the inbox path before it also
+/// publishes the DM on the compatibility bus.
+///
+/// `max(2 s, 3 × RTT)` when the RTT to the recipient machine is known, else
+/// 2 s, capped at 10 s. The result is also capped at three quarters of the
+/// per-attempt budget (never below the old 250 ms), so the bus copy and its
+/// ACK still fit inside the attempt that published it.
+pub(crate) fn legacy_bus_fallback_delay(
+    peer_rtt_ms: Option<u32>,
+    timeout_per_attempt: Duration,
+) -> Duration {
+    let rtt_based = peer_rtt_ms
+        .filter(|rtt| *rtt > 0)
+        .map(|rtt| {
+            Duration::from_millis(u64::from(rtt).saturating_mul(LEGACY_BUS_FALLBACK_RTT_MULTIPLIER))
+        })
+        .unwrap_or(Duration::ZERO);
+    let wanted = rtt_based
+        .max(LEGACY_BUS_FALLBACK_MIN_DELAY)
+        .min(LEGACY_BUS_FALLBACK_MAX_DELAY);
+    let attempt_cap =
+        (timeout_per_attempt.saturating_mul(3) / 4).max(LEGACY_BUS_FALLBACK_PRE_1964_DELAY);
+    wanted.min(attempt_cap)
+}
 
 /// Stable per-sender context for [`send_via_gossip`].
 ///
@@ -158,9 +194,19 @@ pub async fn send_via_gossip(
         payload,
         config,
         lifecycle_hint,
+        BusFallbackContext::default(),
     )
     .await
     .map(|(receipt, _ingress)| receipt)
+}
+
+/// #1964: what the gossip send needs to time and count its bus fallback.
+#[derive(Default)]
+pub(crate) struct BusFallbackContext<'a> {
+    /// Known transport RTT to the recipient machine, if any.
+    pub peer_rtt_ms: Option<u32>,
+    /// Where the bus fallback publishes are counted (`/diagnostics/dm`).
+    pub diagnostics: Option<&'a crate::direct::DirectMessaging>,
 }
 
 /// #461: internal provenance variant. Returns the unchanged public
@@ -168,6 +214,7 @@ pub async fn send_via_gossip(
 /// (`None` when unstamped — unknown/publish-only). The public struct and
 /// all public signatures are unchanged; in-crate callers (the direct-send
 /// HTTP route) read the ingress from this tuple.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_via_gossip_with_provenance(
     ctx: DmSendContext<'_>,
     recipient_agent_id: AgentId,
@@ -176,6 +223,7 @@ pub(crate) async fn send_via_gossip_with_provenance(
     payload: Vec<u8>,
     config: &DmSendConfig,
     lifecycle_hint: Option<DmLifecycleHint>,
+    bus_fallback: BusFallbackContext<'_>,
 ) -> Result<(DmReceipt, Option<DmAckIngress>), DmError> {
     let DmSendContext {
         pubsub,
@@ -283,6 +331,10 @@ pub(crate) async fn send_via_gossip_with_provenance(
     // backoff on a `Replaced` for the target peer.
     let mut lifecycle_hint = lifecycle_hint;
 
+    let bus_fallback_delay =
+        legacy_bus_fallback_delay(bus_fallback.peer_rtt_ms, config.timeout_per_attempt);
+    let bus_diagnostics = bus_fallback.diagnostics;
+
     let start = Instant::now();
     for attempt in 0..=config.max_retries {
         if attempt > 0 {
@@ -350,9 +402,7 @@ pub(crate) async fn send_via_gossip_with_provenance(
 
             attempt_tracker.switch(StageTracker::ACK_WAIT);
             if primary_publish_ok {
-                if let Some(outcome) =
-                    wait_for_ack_or_backoff(&mut rx, ACK_LEGACY_BUS_FALLBACK_DELAY).await?
-                {
+                if let Some(outcome) = wait_for_ack_or_backoff(&mut rx, bus_fallback_delay).await? {
                     return Ok(Some(outcome));
                 }
             }
@@ -364,8 +414,16 @@ pub(crate) async fn send_via_gossip_with_provenance(
                 recipient = %hex::encode(recipient_agent_id.as_bytes()),
                 attempt,
                 primary_publish_ok,
+                bus_fallback_delay_ms = bus_fallback_delay.as_millis() as u64,
                 bus_topic = DM_BUS_TOPIC,
             );
+            if let Some(diagnostics) = bus_diagnostics {
+                diagnostics.record_bus_fallback_publish(if primary_publish_ok {
+                    crate::direct::BusFallbackReason::NoAckInTime
+                } else {
+                    crate::direct::BusFallbackReason::PrimaryPublishFailed
+                });
+            }
             attempt_tracker.switch(StageTracker::PUBLISH);
             if let Err(e) = pubsub
                 .publish(DM_BUS_TOPIC.to_string(), Bytes::from(wire.clone()))
@@ -718,6 +776,60 @@ fn receipt_for_path(path: DmPath) -> DmReceipt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1964 delay rule. RED before #1964: the delay was a fixed 250 ms,
+    /// below the 250–590 ms fleet RTTs, so every row here failed.
+    #[test]
+    fn legacy_bus_fallback_delay_waits_for_the_direct_path() {
+        let default_attempt = crate::dm::dm_attempt_timeout(None);
+        let roomy = Duration::from_secs(30);
+        // Unknown RTT: the 2 s floor.
+        assert_eq!(
+            legacy_bus_fallback_delay(None, roomy),
+            LEGACY_BUS_FALLBACK_MIN_DELAY
+        );
+        assert_eq!(
+            legacy_bus_fallback_delay(Some(0), roomy),
+            LEGACY_BUS_FALLBACK_MIN_DELAY
+        );
+        // Fast and measured fleet RTTs: still the 2 s floor.
+        assert_eq!(
+            legacy_bus_fallback_delay(Some(250), roomy),
+            LEGACY_BUS_FALLBACK_MIN_DELAY
+        );
+        // A slow peer: 3 x RTT.
+        assert_eq!(
+            legacy_bus_fallback_delay(Some(1_000), roomy),
+            Duration::from_secs(3)
+        );
+        // A very slow peer: the 10 s cap.
+        assert_eq!(
+            legacy_bus_fallback_delay(Some(9_000), roomy),
+            LEGACY_BUS_FALLBACK_MAX_DELAY
+        );
+        assert_eq!(
+            legacy_bus_fallback_delay(Some(u32::MAX), roomy),
+            LEGACY_BUS_FALLBACK_MAX_DELAY
+        );
+        // The default 4 s attempt: the bus still fires inside the attempt.
+        assert_eq!(
+            legacy_bus_fallback_delay(Some(250), default_attempt),
+            LEGACY_BUS_FALLBACK_MIN_DELAY
+        );
+        assert_eq!(
+            legacy_bus_fallback_delay(Some(2_000), default_attempt),
+            default_attempt * 3 / 4
+        );
+        // A short attempt: three quarters of it, never below the old 250 ms.
+        assert_eq!(
+            legacy_bus_fallback_delay(None, Duration::from_secs(2)),
+            Duration::from_millis(1_500)
+        );
+        assert_eq!(
+            legacy_bus_fallback_delay(None, Duration::from_millis(10)),
+            Duration::from_millis(250)
+        );
+    }
 
     #[tokio::test]
     async fn backoff_wait_zero_delay_returns_none_without_consuming_ack() {

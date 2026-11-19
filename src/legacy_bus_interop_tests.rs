@@ -4473,7 +4473,7 @@ async fn build_1455_plane(
 
 /// One durable (v2) send through the production gossip helper, returning
 /// the count of `legacy_bus_fallback_publish` events for this request id.
-/// The 250 ms fallback itself stays untouched — the assertion target is
+/// The bus fallback delay itself is not asserted — the assertion target is
 /// that the inbox EAGER path delivers before it ever fires.
 async fn durable_send_1455(
     sender: &Agent,
@@ -4573,13 +4573,13 @@ async fn wait_pair_quiet(alice: &Agent, bob: &Agent) {
 /// the Leaf's bounded EAGER fan-out for the recipient's inbox topic —
 /// membership carries no subscription signal, so the single inbox EAGER
 /// frame can land on bystanders that refuse unsubscribed pass-through, and
-/// the durable send pays the 250 ms legacy bus fallback (measured ~45% of
+/// the durable send pays the legacy bus fallback (then 250 ms; measured ~45% of
 /// sends on main). The send path now records the recipient machine as the
 /// inbox owner, so the recipient holds the eager seat for its own inbox
 /// topic on the sender. Asserted: that seat, typed delivery and receipt;
 /// the per-send `legacy_bus_fallback_publish` count (and whether local
 /// saturation shed a frame) is reported evidence — under this fixture the
-/// ACK leg alone can exceed the 250 ms window, so a wall-clock assert
+/// ACK leg alone can exceed the fallback window, so a wall-clock assert
 /// would flake for reasons the eager target does not control. On main
 /// the seat is a per-process-random hash-order draw that missed the
 /// recipient in 5/5 measured runs. The simulated-fabric twin
@@ -4672,7 +4672,7 @@ async fn dm_1455_bystander_plane_durable_send_stays_on_inbox_eager() {
             assert_eq!(actual.payload, payload);
             assert!(actual.verified);
             // The user-visible symptom is reported, not asserted: under
-            // this fixture the ACK leg alone can exceed the 250 ms window
+            // this fixture the ACK leg alone can exceed the fallback window
             // (ack-job startup, first-publish topic joins, direct-hedge
             // setup, or an sg local-saturation shed — `shed` below covers
             // the byte-budget and per-peer-permit paths on both ends), so a
