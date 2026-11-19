@@ -14,13 +14,15 @@ x0x_export_legacy_token_vars
 
 # =============================================================================
 # x0x VPS End-to-End Test — All-Pairs Matrix
-# Tests across ALL 6 bootstrap nodes (NYC, SFO, Helsinki, Nuremberg, Singapore, Sydney)
+# Tests across ALL 4 bootstrap nodes (NYC, SFO, Singapore, Sydney)
+# (#2094, 19 Nov 2026: the Singapore and Sydney hosts are gone; their
+# peer roles in this suite moved to Singapore and Sydney.)
 #
 # PROOF POINTS: Every assertion either echoes actual API data or verifies a
 # round-trip with a unique PROOF_TOKEN — no hallucinated test results.
 #
 # Coverage:
-#   - Health, identity, mesh on all 6 nodes
+#   - Health, identity, mesh on all 4 nodes
 #   - All-pairs direct messaging matrix (30 directed pairs)
 #   - Three interface proofs: REST API, CLI, GUI (WebSocket path)
 #   - MLS group encryption (multi-continent)
@@ -79,18 +81,15 @@ check_connect_outcome() {
 }
 
 # ── Node configuration ──────────────────────────────────────────────────
-NODES=(nyc sfo helsinki nuremberg singapore sydney)
+NODES=(nyc sfo singapore sydney)
 declare -A NODE_IPS=(
     [nyc]="142.93.199.50"
     [sfo]="147.182.234.192"
-    [helsinki]="65.21.157.229"
-    [nuremberg]="116.203.101.172"
     [singapore]="152.42.210.67"
     [sydney]="170.64.176.102"
 )
 declare -A NODE_LABELS=(
-    [nyc]="NYC" [sfo]="SFO" [helsinki]="Helsinki"
-    [nuremberg]="Nuremberg" [singapore]="Singapore" [sydney]="Sydney"
+    [nyc]="NYC" [sfo]="SFO" [singapore]="Singapore" [sydney]="Sydney"
 )
 declare -A NODE_TOKENS=()
 declare -A NODE_AIDS=()
@@ -120,8 +119,6 @@ fi
 echo "Loading tokens from $(basename "$X0X_TOKEN_FILE") (network: $X0X_NETWORK)..."
 [ -n "${NYC_TK:-}" ] && NODE_TOKENS[nyc]="$NYC_TK"
 [ -n "${SFO_TK:-}" ] && NODE_TOKENS[sfo]="$SFO_TK"
-[ -n "${HELSINKI_TK:-}" ] && NODE_TOKENS[helsinki]="$HELSINKI_TK"
-[ -n "${NUREMBERG_TK:-}" ] && NODE_TOKENS[nuremberg]="$NUREMBERG_TK"
 [ -n "${SINGAPORE_TK:-}" ] && NODE_TOKENS[singapore]="$SINGAPORE_TK"
 [ -n "${SYDNEY_TK:-}" ] && NODE_TOKENS[sydney]="$SYDNEY_TK"
 
@@ -209,7 +206,7 @@ json_transfer_output_path() {
 
 echo -e "${YELLOW}═══════════════════════════════════════════════════════════════${NC}"
 echo -e "${YELLOW}   x0x v$VERSION VPS E2E Test — All-Pairs Matrix${NC}"
-echo -e "${YELLOW}   NYC · SFO · Helsinki · Nuremberg · Singapore · Sydney${NC}"
+echo -e "${YELLOW}   NYC · SFO · Singapore · Sydney${NC}"
 echo -e "${YELLOW}   Proof: ${PROOF_TOKEN}${NC}"
 echo -e "${YELLOW}═══════════════════════════════════════════════════════════════${NC}"
 
@@ -218,10 +215,10 @@ TMPDIR=$(mktemp -d /tmp/x0x-vps-e2e.XXXXXX)
 trap "rm -rf $TMPDIR" EXIT
 
 # ═════════════════════════════════════════════════════════════════════════
-# 1. HEALTH & VERSION — All 6 nodes
+# 1. HEALTH & VERSION — All 4 nodes
 # ═════════════════════════════════════════════════════════════════════════
 echo -e "
-${CYAN}[1/20] Health & Version (6 nodes)${NC}"
+${CYAN}[1/20] Health & Version (4 nodes)${NC}"
 LIVE_NODES=()
 for node in "${NODES[@]}"; do
     ip="${NODE_IPS[$node]}"; tk="${NODE_TOKENS[$node]:-}"
@@ -322,14 +319,14 @@ for node in "${LIVE_NODES[@]}"; do
 done
 
 # Specific agent discovery, reachability, find
-HEL_AID="${NODE_AIDS[helsinki]:-}"
-if a_is_live nyc && a_is_live helsinki && [ -n "$HEL_AID" ] && [ -n "$NYC_TK" ]; then
-    R=$(vps_get "$NYC_IP" "$NYC_TK" "/agents/discovered/$HEL_AID")
-    check_json "NYC discovered Helsinki by ID" "$R" "agent"
-    R=$(vps_get "$NYC_IP" "$NYC_TK" "/agents/reachability/$HEL_AID")
-    check_not_error "NYC reachability Helsinki" "$R"
-    R=$(vps_post "$NYC_IP" "$NYC_TK" "/agents/find/$HEL_AID")
-    check_not_error "NYC find Helsinki" "$R"
+SGP_AID="${NODE_AIDS[singapore]:-}"
+if a_is_live nyc && a_is_live singapore && [ -n "$SGP_AID" ] && [ -n "$NYC_TK" ]; then
+    R=$(vps_get "$NYC_IP" "$NYC_TK" "/agents/discovered/$SGP_AID")
+    check_json "NYC discovered Singapore by ID" "$R" "agent"
+    R=$(vps_get "$NYC_IP" "$NYC_TK" "/agents/reachability/$SGP_AID")
+    check_not_error "NYC reachability Singapore" "$R"
+    R=$(vps_post "$NYC_IP" "$NYC_TK" "/agents/find/$SGP_AID")
+    check_not_error "NYC find Singapore" "$R"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -490,8 +487,8 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 echo -e "
 ${CYAN}[9/20] CLI Interface Proof (x0x direct send)${NC}"
-# Use NYC→Helsinki and Sydney→SFO as CLI proof pairs with recipient-side evidence.
-CLI_PAIRS=("nyc:helsinki" "sydney:sfo")
+# Use NYC→Singapore and Sydney→SFO as CLI proof pairs with recipient-side evidence.
+CLI_PAIRS=("nyc:singapore" "sydney:sfo")
 for pair in "${CLI_PAIRS[@]}"; do
     src="${pair%%:*}"; dst="${pair##*:}"
     src_ip="${NODE_IPS[$src]}"; src_tk="${NODE_TOKENS[$src]:-}"
@@ -528,8 +525,8 @@ ${CYAN}[10/20] GUI Interface Proof${NC}"
 
 # Test on NYC node via a local SSH tunnel + real headless browser.
 NYC_IP="${NODE_IPS[nyc]}"; NYC_TK="${NODE_TOKENS[nyc]:-}"
-HEL_IP="${NODE_IPS[helsinki]}"; HEL_TK="${NODE_TOKENS[helsinki]:-}"
-HEL_AID="${NODE_AIDS[helsinki]:-}"
+SGP_IP="${NODE_IPS[singapore]}"; SGP_TK="${NODE_TOKENS[singapore]:-}"
+SGP_AID="${NODE_AIDS[singapore]:-}"
 # #480 H3: the browser proof needs node + playwright-core (pinned in the
 # root package.json; `npm ci` there installs it). Preflight so a missing
 # module is an explicit SKIP with the reason, not two FAILs whose
@@ -542,7 +539,7 @@ elif ! (cd "$(dirname "$GUI_PROOF")" && node -e "require.resolve('playwright-cor
 fi
 if [ -n "$GUI_PROOF_SKIP_REASON" ]; then
     skip "GUI proof" "$GUI_PROOF_SKIP_REASON"
-elif [ -n "$NYC_TK" ] && [ -n "$HEL_AID" ] && [ -n "${PAIR_CONNECTED[nyc_helsinki]:-}" ]; then
+elif [ -n "$NYC_TK" ] && [ -n "$SGP_AID" ] && [ -n "${PAIR_CONNECTED[nyc_singapore]:-}" ]; then
     # Clawpatch 7fc6183 (critical security): /gui no longer injects the API
     # token into the served HTML. The GUI contract is now: unauthenticated
     # /gui answers 401; /gui?token=<SESSION> serves the chat UI with no token
@@ -568,12 +565,12 @@ elif [ -n "$NYC_TK" ] && [ -n "$HEL_AID" ] && [ -n "${PAIR_CONNECTED[nyc_helsink
 
     GUI_TUNNEL_PID=$(start_tunnel "$NYC_IP" 22600)
     sleep 2
-    HEL_CARD=$(vps_get "$HEL_IP" "$HEL_TK" /agent/card)
-    HEL_LINK=$(jq_field "$HEL_CARD" "link")
-    GUI_RECV_OUT="/tmp/x0x-vps-${PROOF_TOKEN}-gui-helsinki.sse"
-    GUI_RECV_PID=$(start_remote_direct_listener "$HEL_IP" "$HEL_TK" "$GUI_RECV_OUT")
-    GUI_MSG="GUI-${PROOF_TOKEN}-nyc-to-helsinki"
-    GUI_JSON=$(GUI_SESSION_TOKEN="$GUI_SESSION" node "$GUI_PROOF" send-dm "http://127.0.0.1:22600" "$HEL_LINK" "$HEL_AID" "$GUI_MSG" 2>"$TMPDIR/gui_proof.stderr" || echo '{"ok":false}')
+    SGP_CARD=$(vps_get "$SGP_IP" "$SGP_TK" /agent/card)
+    SGP_LINK=$(jq_field "$SGP_CARD" "link")
+    GUI_RECV_OUT="/tmp/x0x-vps-${PROOF_TOKEN}-gui-singapore.sse"
+    GUI_RECV_PID=$(start_remote_direct_listener "$SGP_IP" "$SGP_TK" "$GUI_RECV_OUT")
+    GUI_MSG="GUI-${PROOF_TOKEN}-nyc-to-singapore"
+    GUI_JSON=$(GUI_SESSION_TOKEN="$GUI_SESSION" node "$GUI_PROOF" send-dm "http://127.0.0.1:22600" "$SGP_LINK" "$SGP_AID" "$GUI_MSG" 2>"$TMPDIR/gui_proof.stderr" || echo '{"ok":false}')
     if [ -s "$TMPDIR/gui_proof.stderr" ]; then
         echo -e "        ${YELLOW}gui_proof.mjs stderr:${NC}"
         # Review r1: Playwright navigation errors serialize the full URL,
@@ -584,17 +581,17 @@ elif [ -n "$NYC_TK" ] && [ -n "$HEL_AID" ] && [ -n "${PAIR_CONNECTED[nyc_helsink
     check_contains "real GUI browser send visible locally" "$GUI_JSON" '"messageVisible":true'
     GUI_PAYLOAD_B64=$(jq_field "$GUI_JSON" "payloadB64")
     sleep 8
-    stop_remote_pid "$HEL_IP" "$GUI_RECV_PID" >/dev/null
-    fetch_remote_file "$HEL_IP" "$GUI_RECV_OUT" > "$TMPDIR/gui_helsinki.out"
+    stop_remote_pid "$SGP_IP" "$GUI_RECV_PID" >/dev/null
+    fetch_remote_file "$SGP_IP" "$GUI_RECV_OUT" > "$TMPDIR/gui_singapore.out"
     TOTAL=$((TOTAL+1))
-    if [ -n "$GUI_PAYLOAD_B64" ] && grep -q "$GUI_PAYLOAD_B64" "$TMPDIR/gui_helsinki.out" 2>/dev/null; then
-        PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} GUI direct message reached Helsinki /direct/events"
+    if [ -n "$GUI_PAYLOAD_B64" ] && grep -q "$GUI_PAYLOAD_B64" "$TMPDIR/gui_singapore.out" 2>/dev/null; then
+        PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} GUI direct message reached Singapore /direct/events"
     else
-        FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} GUI direct message missing on Helsinki recipient side"
+        FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} GUI direct message missing on Singapore recipient side"
     fi
     kill "$GUI_TUNNEL_PID" 2>/dev/null || true
 else
-    skip "GUI proof" "NYC/Helsinki not fully available for real browser proof"
+    skip "GUI proof" "NYC/Singapore not fully available for real browser proof"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -616,21 +613,21 @@ done
 echo -e "
 ${CYAN}[12/20] Contacts & Trust${NC}"
 
-# NYC trusts Helsinki, Helsinki trusts NYC (should already be done via card import)
+# NYC trusts Singapore, Singapore trusts NYC (should already be done via card import)
 NYC_IP="${NODE_IPS[nyc]}"; NYC_TK="${NODE_TOKENS[nyc]:-}"
-HEL_IP="${NODE_IPS[helsinki]}"; HEL_TK="${NODE_TOKENS[helsinki]:-}"
-HEL_AID="${NODE_AIDS[helsinki]:-}"
+SGP_IP="${NODE_IPS[singapore]}"; SGP_TK="${NODE_TOKENS[singapore]:-}"
+SGP_AID="${NODE_AIDS[singapore]:-}"
 NYC_AID="${NODE_AIDS[nyc]:-}"
 
-if a_is_live nyc && a_is_live helsinki && [ -n "$NYC_TK" ] && [ -n "$HEL_TK" ]; then
+if a_is_live nyc && a_is_live singapore && [ -n "$NYC_TK" ] && [ -n "$SGP_TK" ]; then
     # Verify contacts list includes imported cards
     R=$(vps_get "$NYC_IP" "$NYC_TK" /contacts)
-    check_contains "NYC contacts has Helsinki" "$R" "$HEL_AID"
+    check_contains "NYC contacts has Singapore" "$R" "$SGP_AID"
 
     # Trust evaluate — Trusted agent
-    HEL_MID="${NODE_MIDS[helsinki]:-}"
-    R=$(vps_post "$NYC_IP" "$NYC_TK" /trust/evaluate "{\"agent_id\":\"$HEL_AID\",\"machine_id\":\"$HEL_MID\"}")
-    check_contains "NYC trust eval Helsinki → Accept" "$R" "Accept"
+    SGP_MID="${NODE_MIDS[singapore]:-}"
+    R=$(vps_post "$NYC_IP" "$NYC_TK" /trust/evaluate "{\"agent_id\":\"$SGP_AID\",\"machine_id\":\"$SGP_MID\"}")
+    check_contains "NYC trust eval Singapore → Accept" "$R" "Accept"
 
     # Block Singapore, verify, unblock
     SGP_AID="${NODE_AIDS[singapore]:-}"
@@ -647,23 +644,23 @@ if a_is_live nyc && a_is_live helsinki && [ -n "$NYC_TK" ] && [ -n "$HEL_TK" ]; 
     fi
 
     # Contact lifecycle: quick trust, machines, revocations, delete, re-add
-    NUR_AID="${NODE_AIDS[nuremberg]:-}"
-    NUR_MID="${NODE_MIDS[nuremberg]:-}"
-    if a_is_live nuremberg && [ -n "$NUR_AID" ]; then
-        R=$(vps_post "$NYC_IP" "$NYC_TK" /contacts/trust "{\"agent_id\":\"$NUR_AID\",\"level\":\"trusted\"}")
-        check_not_error "NYC quick trust Nuremberg" "$R"
-        R=$(vps_get "$NYC_IP" "$NYC_TK" "/contacts/$NUR_AID/machines")
-        check_not_error "NYC list Nuremberg machines" "$R"
-        if [ -n "$NUR_MID" ]; then
-            R=$(vps_post "$NYC_IP" "$NYC_TK" "/contacts/$NUR_AID/machines" "{\"machine_id\":\"$NUR_MID\"}")
-            check_not_error "NYC add Nuremberg machine" "$R"
+    SYD_AID="${NODE_AIDS[sydney]:-}"
+    SYD_MID="${NODE_MIDS[sydney]:-}"
+    if a_is_live sydney && [ -n "$SYD_AID" ]; then
+        R=$(vps_post "$NYC_IP" "$NYC_TK" /contacts/trust "{\"agent_id\":\"$SYD_AID\",\"level\":\"trusted\"}")
+        check_not_error "NYC quick trust Sydney" "$R"
+        R=$(vps_get "$NYC_IP" "$NYC_TK" "/contacts/$SYD_AID/machines")
+        check_not_error "NYC list Sydney machines" "$R"
+        if [ -n "$SYD_MID" ]; then
+            R=$(vps_post "$NYC_IP" "$NYC_TK" "/contacts/$SYD_AID/machines" "{\"machine_id\":\"$SYD_MID\"}")
+            check_not_error "NYC add Sydney machine" "$R"
         fi
-        R=$(vps_get "$NYC_IP" "$NYC_TK" "/contacts/$NUR_AID/revocations")
-        check_not_error "NYC Nuremberg revocations" "$R"
-        R=$(vps_del "$NYC_IP" "$NYC_TK" "/contacts/$NUR_AID")
-        check_not_error "NYC delete Nuremberg contact" "$R"
-        R=$(vps_post "$NYC_IP" "$NYC_TK" /contacts "{\"agent_id\":\"$NUR_AID\",\"trust_level\":\"Trusted\",\"label\":\"Nuremberg\"}")
-        check_not_error "NYC re-add Nuremberg" "$R"
+        R=$(vps_get "$NYC_IP" "$NYC_TK" "/contacts/$SYD_AID/revocations")
+        check_not_error "NYC Sydney revocations" "$R"
+        R=$(vps_del "$NYC_IP" "$NYC_TK" "/contacts/$SYD_AID")
+        check_not_error "NYC delete Sydney contact" "$R"
+        R=$(vps_post "$NYC_IP" "$NYC_TK" /contacts "{\"agent_id\":\"$SYD_AID\",\"trust_level\":\"Trusted\",\"label\":\"Sydney\"}")
+        check_not_error "NYC re-add Sydney" "$R"
     fi
 fi
 
@@ -674,8 +671,8 @@ echo -e "
 ${CYAN}[13/20] Pub/Sub (global gossip)${NC}"
 PUBSUB_TOPIC="vps-e2e-${PROOF_TOKEN}"
 
-# Subscribe on Helsinki and Sydney
-for node in helsinki sydney; do
+# Subscribe on Singapore and Sydney
+for node in singapore sydney; do
     a_is_live "$node" || continue
     ip="${NODE_IPS[$node]}"; tk="${NODE_TOKENS[$node]:-}"
     [ -z "$tk" ] && continue
@@ -710,8 +707,8 @@ if [ -n "$NYC_TK" ]; then
     fi
 
     if [ -n "$MG" ]; then
-        # Add Helsinki, Singapore, Sydney
-        for node in helsinki singapore sydney; do
+        # Add Singapore, Sydney
+        for node in singapore sydney; do
             a_is_live "$node" || continue
             aid="${NODE_AIDS[$node]:-}"
             [ -z "$aid" ] && continue
@@ -734,11 +731,11 @@ if [ -n "$NYC_TK" ]; then
             check_eq "MLS decrypt round-trip" "$DECRYPTED" "$MLS_PROOF"
         fi
 
-        # Remove Helsinki (lifecycle test)
-        HEL_AID="${NODE_AIDS[helsinki]:-}"
-        if a_is_live helsinki && [ -n "$HEL_AID" ]; then
-            R=$(vps_del "$NYC_IP" "$NYC_TK" "/mls/groups/$MG/members/$HEL_AID")
-            check_not_error "remove Helsinki from MLS" "$R"
+        # Remove Singapore (lifecycle test)
+        SGP_AID="${NODE_AIDS[singapore]:-}"
+        if a_is_live singapore && [ -n "$SGP_AID" ]; then
+            R=$(vps_del "$NYC_IP" "$NYC_TK" "/mls/groups/$MG/members/$SGP_AID")
+            check_not_error "remove Singapore from MLS" "$R"
         fi
     fi
 fi
@@ -880,8 +877,7 @@ echo -e "
 ${CYAN}[16/20] KV Stores (cross-continent)${NC}"
 
 KV_NODE=""
-a_is_live nuremberg && KV_NODE="nuremberg"
-[ -z "$KV_NODE" ] && a_is_live singapore && KV_NODE="singapore"
+a_is_live singapore && KV_NODE="singapore"
 [ -z "$KV_NODE" ] && a_is_live sydney && KV_NODE="sydney"
 KV_IP="${NODE_IPS[$KV_NODE]:-}"; KV_TK="${NODE_TOKENS[$KV_NODE]:-}"
 if [ -n "$KV_NODE" ] && [ -n "$KV_TK" ]; then
@@ -1101,12 +1097,12 @@ if [ -n "$NYC_TK" ]; then
     R=$(vps_get "$NYC_IP" "$NYC_TK" /presence/foaf)
     check_not_error "NYC FOAF" "$R"
 
-    # Find Helsinki by agent ID
-    if [ -n "$HEL_AID" ]; then
-        R=$(vps_get "$NYC_IP" "$NYC_TK" "/presence/find/$HEL_AID")
-        check_not_error "NYC find Helsinki presence" "$R"
-        R=$(vps_get "$NYC_IP" "$NYC_TK" "/presence/status/$HEL_AID")
-        check_not_error "NYC Helsinki status" "$R"
+    # Find Singapore by agent ID
+    if [ -n "$SGP_AID" ]; then
+        R=$(vps_get "$NYC_IP" "$NYC_TK" "/presence/find/$SGP_AID")
+        check_not_error "NYC find Singapore presence" "$R"
+        R=$(vps_get "$NYC_IP" "$NYC_TK" "/presence/status/$SGP_AID")
+        check_not_error "NYC Singapore status" "$R"
     fi
 fi
 

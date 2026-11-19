@@ -33,13 +33,12 @@ from typing import Dict, List, Optional
 
 TESTS_DIR = Path(__file__).resolve().parent
 
-# Node identity (the 6 VPS bootstrap hosts — same IPs for both networks; only
+# Node identity (the 4 VPS bootstrap hosts; #2094 removed Helsinki and
+# Nuremberg on 19 Nov 2026 — same IPs for both networks; only
 # the ports + tokens differ).
 NODES_BY_NAME: Dict[str, str] = {
     "nyc":       "142.93.199.50",
     "sfo":       "147.182.234.192",
-    "helsinki":  "65.21.157.229",
-    "nuremberg": "116.203.101.172",
     "singapore": "152.42.210.67",
     "sydney":    "170.64.176.102",
 }

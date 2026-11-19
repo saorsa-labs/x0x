@@ -88,18 +88,6 @@
         "description": "US West bootstrap node"
       },
       {
-        "url": "quic://65.21.157.229:5483",
-        "location": "Helsinki, FI",
-        "protocol": "quic",
-        "description": "EU North bootstrap node"
-      },
-      {
-        "url": "quic://116.203.101.172:5483",
-        "location": "Nuremberg, DE",
-        "protocol": "quic",
-        "description": "EU Central bootstrap node"
-      },
-      {
         "url": "quic://152.42.210.67:5483",
         "location": "Singapore, SG",
         "protocol": "quic",

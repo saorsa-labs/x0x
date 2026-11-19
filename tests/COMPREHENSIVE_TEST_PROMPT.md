@@ -2,7 +2,7 @@
 
 ## Mission
 
-Certify that **100% of x0x functionality** works correctly across **all 5 interfaces** (CLI, curl/REST, embedded GUI, communitas Dioxus, communitas Swift) and **all 6 VPS bootstrap nodes**, with every function tested a **minimum of 5 times** across different contexts. This is a full-stack, cross-interface, cross-network certification.
+Certify that **100% of x0x functionality** works correctly across **all 5 interfaces** (CLI, curl/REST, embedded GUI, communitas Dioxus, communitas Swift) and **all 4 VPS bootstrap nodes**, with every function tested a **minimum of 5 times** across different contexts. This is a full-stack, cross-interface, cross-network certification.
 
 ---
 
@@ -24,10 +24,14 @@ Certify that **100% of x0x functionality** works correctly across **all 5 interf
 |------|----|---------|----|
 | saorsa-2 | 142.93.199.50 | NYC, US | `ssh root@142.93.199.50` |
 | saorsa-3 | 147.182.234.192 | SFO, US | `ssh root@147.182.234.192` |
-| saorsa-6 | 65.21.157.229 | Helsinki, FI | `ssh root@65.21.157.229` |
-| saorsa-7 | 116.203.101.172 | Nuremberg, DE | `ssh root@116.203.101.172` |
 | saorsa-8 | 152.42.210.67 | Singapore, SG | `ssh root@152.42.210.67` |
 | saorsa-9 | 170.64.176.102 | Sydney, AU | `ssh root@170.64.176.102` |
+
+The Helsinki (saorsa-6) and Nuremberg (saorsa-7) hosts were removed on
+19 Nov 2026 (#2094): that hosting account is closed and the addresses may
+now belong to other people. Never SSH to them. Where a step below names
+Helsinki or Nuremberg, use Singapore or Sydney; where it names Tokyo, use
+Sydney.
 
 VPS API: port 12600 (localhost only, SSH tunnel required). Token: `/root/.local/share/x0x/api-token`
 
@@ -65,8 +69,8 @@ CHARLIE_TOKEN=$(cat ~/Library/Application\ Support/x0x-charlie/api-token 2>/dev/
 - [ ] Release binary exists and runs: `./target/release/x0x --version`
 - [ ] Release daemon exists: `./target/release/x0xd --version`
 
-### 0.2 VPS Health (all 6 nodes)
-For EACH of the 6 VPS nodes:
+### 0.2 VPS Health (all 4 nodes)
+For EACH of the 4 VPS nodes:
 - [ ] SSH accessible: `ssh -o ConnectTimeout=5 root@$IP 'hostname'`
 - [ ] Service running: `ssh root@$IP 'systemctl is-active x0x-bootstrap'`
 - [ ] Health endpoint: `ssh root@$IP 'curl -s http://127.0.0.1:12600/health'` returns `{"ok":true}`
@@ -1141,8 +1145,8 @@ The most critical phase — verify that actions in ONE interface are visible in 
 
 ## Phase 17: VPS Cross-Region Testing (60 assertions)
 
-### 17.1 All 6 Nodes Health (6 assertions, one per node)
-For EACH node (NYC, SFO, Helsinki, Nuremberg, Singapore, Tokyo):
+### 17.1 All 4 Nodes Health (4 assertions, one per node)
+For EACH node (NYC, SFO, Singapore, Sydney):
 - [ ] Health returns `ok: true`
 
 ### 17.2 Cross-Region Direct Messaging (6×)

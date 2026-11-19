@@ -2,7 +2,7 @@
 # =============================================================================
 # x0x Build, Deploy & Verify Bootstrap Nodes
 #
-# Cross-compiles for Linux, deploys to all 6 VPS nodes, verifies health + mesh.
+# Cross-compiles for Linux, deploys to all 4 VPS nodes, verifies health + mesh.
 # Writes API tokens to tests/.vps-tokens-<network>.env.
 #
 # DEFAULT NETWORK = TESTNET. Pass --network prod to target the production
@@ -95,12 +95,10 @@ check() {
 }
 
 # ── Node definitions ────────────────────────────────────────────────────
-declare -a NODE_NAMES=(nyc sfo helsinki nuremberg singapore sydney)
+declare -a NODE_NAMES=(nyc sfo singapore sydney)
 declare -A NODE_IPS=(
     [nyc]="142.93.199.50"
     [sfo]="147.182.234.192"
-    [helsinki]="65.21.157.229"
-    [nuremberg]="116.203.101.172"
     [singapore]="152.42.210.67"
     [sydney]="170.64.176.102"
 )
@@ -138,7 +136,7 @@ else
 fi
 
 # ═════════════════════════════════════════════════════════════════════════
-# 2. DEPLOY TO ALL 6 NODES
+# 2. DEPLOY TO ALL 4 NODES
 # ═════════════════════════════════════════════════════════════════════════
 echo -e "\n${CYAN}[2/4] Deploy to 6 VPS bootstrap nodes${NC}"
 
@@ -417,6 +415,7 @@ if [ "$MESH_VERIFY" = "1" ] && [ $FAIL -eq 0 ] && [ "$DEPLOY_FAILURES" -eq 0 ]; 
         --anchor "$MESH_ANCHOR" \
         --discover-secs "$MESH_DISCOVER_SECS" \
         --settle-secs "$MESH_SETTLE_SECS" \
+        --nodes "${NODE_NAMES[@]}" \
         --local-port 22720; then
         echo -e "  ${GREEN}PASS${NC} mesh DM matrix"
     else
@@ -429,6 +428,7 @@ if [ "$MESH_VERIFY" = "1" ] && [ $FAIL -eq 0 ] && [ "$DEPLOY_FAILURES" -eq 0 ]; 
     if python3 "$SCRIPT_DIR/e2e_vps_groups.py" \
         --anchor "$MESH_ANCHOR" \
         --discover-secs "$MESH_DISCOVER_SECS" \
+        --nodes "${NODE_NAMES[@]}" \
         --local-port 22721; then
         echo -e "  ${GREEN}PASS${NC} mesh groups + contacts dogfood"
     else

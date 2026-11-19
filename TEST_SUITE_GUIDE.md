@@ -315,21 +315,20 @@ covering identity / trust / KV wire-shape decoding.
 ## 8. Multi-Region VPS Test — `e2e_vps.sh`
 
 **Path:** `tests/e2e_vps.sh`
-**Scope:** 6 production bootstrap nodes, all-pairs matrix.
+**Scope:** 4 production bootstrap nodes, all-pairs matrix (the Helsinki and
+Nuremberg hosts were removed on 19 Nov 2026, #2094).
 
 | Node | IP | Location | Provider | saorsa- |
 |------|-------------|----------|----------|--------|
 | NYC | 142.93.199.50 | New York, US | DigitalOcean | saorsa-2 |
 | SFO | 147.182.234.192 | San Francisco, US | DigitalOcean | saorsa-3 |
-| Helsinki | 65.21.157.229 | Helsinki, FI | Hetzner | saorsa-6 |
-| Nuremberg | 116.203.101.172 | Nuremberg, DE | Hetzner | saorsa-7 |
 | Singapore | 152.42.210.67 | Singapore, SG | DigitalOcean | saorsa-8 |
 | Sydney | 170.64.176.102 | Sydney, AU | DigitalOcean | saorsa-9 |
 
 What it asserts (~102 assertions):
 
-- Health, identity, mesh state on all 6 nodes
-- All-pairs direct messaging matrix (**30 directed pairs**)
+- Health, identity, mesh state on all 4 nodes
+- All-pairs direct messaging matrix (**12 directed pairs**)
 - Three independent surface proofs per pair: REST API, CLI, GUI (WebSocket)
 - MLS group encryption across continents
 - Named groups, KV stores, task lists, file transfer
@@ -396,7 +395,7 @@ remote action through x0x's own pubsub instead of through SSH.
 ### Architecture
 
 ```
-Mac orchestrator ──── 1 SSH tunnel ───► NYC daemon ──── QUIC mesh ────► all 6 nodes
+Mac orchestrator ──── 1 SSH tunnel ───► NYC daemon ──── QUIC mesh ────► all 4 nodes
        │                                    │
        │ /publish        x0x.test.control.v1│
        │ /events SSE     x0x.test.results.v1│
@@ -473,8 +472,7 @@ bash tests/e2e_deploy.sh                           # also pushes:
 Confirm the runner is healthy on every node:
 
 ```bash
-for ip in 142.93.199.50 147.182.234.192 65.21.157.229 \
-          116.203.101.172 152.42.210.67 170.64.176.102; do
+for ip in 142.93.199.50 147.182.234.192 152.42.210.67 170.64.176.102; do
   out=$(ssh -o BatchMode=yes root@$ip \
     "systemctl is-active x0x-test-runner; cat /etc/x0x-test-runner.env" \
     | tr '\n' ' ')
@@ -595,8 +593,10 @@ each member's reply in `/groups/:id/messages`.
 # Local 3-instance smoke (alice + bob + charlie)
 bash tests/e2e_dogfood_groups.sh                   # ~5 s
 
-# Live 6-VPS fleet (after e2e_deploy.sh has installed the runner)
-python3 tests/e2e_vps_groups.py --anchor nyc --discover-secs 45
+# Live 4-VPS fleet (after e2e_deploy.sh has installed the runner). The
+# default --nodes list carries the six ephemeral-testnet slot labels.
+python3 tests/e2e_vps_groups.py --anchor nyc --discover-secs 45 \
+  --nodes nyc sfo singapore sydney
 ```
 
 ### Resilience
@@ -637,7 +637,7 @@ bash tests/e2e_deploy.sh
 
 ### What this gives you
 
-- Reduces the deploy verification surface from `4 metrics × 6 nodes = 24
+- Reduces the deploy verification surface from `4 metrics × 4 nodes = 16
   SSH+curl pairs` to **one** SSH tunnel + protocol DMs
 - Turns deploy verification into a real cross-protocol round-trip — DMs,
   named-group create/invite/join/post, contacts CRUD — exercised on the
@@ -928,7 +928,7 @@ for per-surface status.
 - Machine pinning enforcement on every announcement
 
 **Bootstrap**
-- 6 hardcoded global nodes (port 5483)
+- 4 hardcoded global nodes (UDP/443 and UDP/5483)
 - 3-round retry with exponential backoff
 - Bootstrap cache enrichment from connections + presence beacons
 - Quality-scored cache persistence

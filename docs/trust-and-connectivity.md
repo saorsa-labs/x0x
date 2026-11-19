@@ -144,10 +144,10 @@ the success record, and the `PeerConnected` event — so every address dial
 (manual connects, join dials in every phase, HyParView bootstrap dials)
 refuses a mismatched answer instead of admitting it:
 
-- **No pin row**: trust-on-first-use, exactly as before #1112. Two
-  addresses are unpinned today — the Hetzner IPv4 rows
-  `65.21.157.229:443` and `116.203.101.172:5483`, whose PeerIds rest on
-  the local bootstrap cache only.
+- **No pin row**: trust-on-first-use, exactly as before #1112. Since
+  #2094 (19 Nov 2026) every compiled-in seed address has a pin row, so
+  this case applies only to non-seed addresses (operator-configured
+  peers, manual connects).
 - **Answer inside the pin set**: the dial proceeds, and a match at this
   address clears any live rejection recorded for THIS address.
 - **Answer outside the pin set**: the dial returns an error — the hint is
@@ -233,18 +233,27 @@ listeners on one seed host are separate `x0xd` instances with separate
 machine keys (`.deployment/deploy-443.sh`), so each address needs its own
 pin. Pin lookups normalize v4-mapped forms on both sides.
 
-The table was filled on 23 Oct 2026 from live production keys: 22 of the
-24 seed addresses are pinned. Sixteen ids came from a fresh ephemeral
-handshake probe on 22 Oct (ant-quic 0.27.61, `peer_connected` PeerId);
-six from a live direct session on a production daemon at that exact
-address (22–23 Oct). The six `:5483` ids also match the repo's April
-2026 v0.19.0 sustained-watch captures (`proofs/v0.19.0-validation-*`):
-stable for six months. The two Hetzner IPv4 rows above stay unpinned
-until a handshake at that exact address verifies them — fresh probes to
-the Hetzner hosts time out from this network (three attempts, 22–23
-Oct) — because a pin that no longer matches a live seed key would
-refuse that seed for every client, which is why only verified rows are
-pinned. The pin table and its helpers are
+The table was filled on 23 Oct 2026 from live production keys, each id
+from a fresh ephemeral handshake probe on 22 Oct (ant-quic 0.27.61,
+`peer_connected` PeerId) or a live direct session on a production daemon
+at that exact address (22–23 Oct). The `:5483` ids also match the repo's
+April 2026 v0.19.0 sustained-watch captures
+(`proofs/v0.19.0-validation-*`). Only verified rows are pinned, because a
+pin that no longer matches a live seed key would refuse that seed for
+every client. On 19 Nov 2026 (#2094) the two Hetzner hosts (Helsinki
+`65.21.157.229`, Nuremberg `116.203.101.172`, and their IPv6 addresses)
+were removed from the seed list and the pin table: that hosting account
+is closed and the addresses may now belong to other people. Their two
+IPv4 rows (`65.21.157.229:443`, `116.203.101.172:5483`) had been the only
+unpinned seed rows; all 16 remaining seed addresses (4 hosts × 2 ports ×
+2 families) are pinned. Releases before #2094 still dial the old
+addresses. At their six pinned rows a foreign host cannot answer with the
+old PeerId (the TLS 1.3 handshake proves possession of the ML-DSA-65 key
+that the PeerId hashes), so its answer is a pin mismatch and a dropped
+hint. At the two unpinned IPv4 rows it is admitted trust-on-first-use
+under its own PeerId and, because its observed address is a seed
+listener address, it qualifies for the operator capability-hint tier
+below. The pin table and its helpers are
 crate-private (`pub(crate)`): pinning is an operator-compiled behaviour,
 not a public API. Rejection entries expire on their own TTL, so the set
 cannot grow unbounded with dial rate against pinned addresses.

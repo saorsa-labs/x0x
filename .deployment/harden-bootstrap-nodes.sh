@@ -14,8 +14,6 @@ SSH="ssh -o ConnectTimeout=10 -o ControlMaster=no -o ControlPath=none -o BatchMo
 NODES=(
   "saorsa-2:142.93.199.50"
   "saorsa-3:147.182.234.192"
-  "saorsa-6:65.21.157.229"
-  "saorsa-7:116.203.101.172"
   "saorsa-8:152.42.210.67"
   "saorsa-9:170.64.176.102"
 )

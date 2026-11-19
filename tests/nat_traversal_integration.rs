@@ -20,8 +20,6 @@ type TestResult<T> = Result<T, BoxError>;
 const VPS_NODES: &[&str] = &[
     "142.93.199.50:5483",   // saorsa-2 (NYC)
     "147.182.234.192:5483", // saorsa-3 (SFO)
-    "65.21.157.229:5483",   // saorsa-6 (Helsinki)
-    "116.203.101.172:5483", // saorsa-7 (Nuremberg)
     "152.42.210.67:5483",   // saorsa-8 (Singapore)
     "170.64.176.102:5483",  // saorsa-9 (Sydney)
 ];
@@ -319,7 +317,7 @@ fn vps_agent_paths_are_isolated_under_fixture_dir() -> TestResult<()> {
 
 /// Test 1: Verify all VPS nodes are reachable and healthy.
 ///
-/// This test attempts to connect to all 6 VPS bootstrap nodes from the local machine.
+/// This test attempts to connect to all 4 VPS bootstrap nodes from the local machine.
 /// Success indicates NAT traversal is working (local NAT → public VPS).
 #[tokio::test]
 #[ignore = "requires VPS testnet - run with --ignored"]

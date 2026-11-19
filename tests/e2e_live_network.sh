@@ -114,10 +114,10 @@ vps_api() {
 }
 
 # ── VPS node definitions ────────────────────────────────────────────────
-declare -a VPS_NAMES=(nyc sfo helsinki nuremberg singapore sydney)
+declare -a VPS_NAMES=(nyc sfo singapore sydney)
 declare -A VPS_IPS=(
-    [nyc]="142.93.199.50" [sfo]="147.182.234.192" [helsinki]="65.21.157.229"
-    [nuremberg]="116.203.101.172" [singapore]="152.42.210.67" [sydney]="170.64.176.102"
+    [nyc]="142.93.199.50" [sfo]="147.182.234.192"
+    [singapore]="152.42.210.67" [sydney]="170.64.176.102"
 )
 declare -A VPS_TOKENS=()
 
@@ -156,8 +156,6 @@ if [ -f "$SCRIPT_DIR/.vps-tokens.env" ]; then
     # [migrated 2026-05-16] tokens loaded by x0x-network.sh preamble
     [ -n "${NYC_TK:-}" ] && VPS_TOKENS[nyc]="$NYC_TK"
     [ -n "${SFO_TK:-}" ] && VPS_TOKENS[sfo]="$SFO_TK"
-    [ -n "${HELSINKI_TK:-}" ] && VPS_TOKENS[helsinki]="$HELSINKI_TK"
-    [ -n "${NUREMBERG_TK:-}" ] && VPS_TOKENS[nuremberg]="$NUREMBERG_TK"
     [ -n "${SINGAPORE_TK:-}" ] && VPS_TOKENS[singapore]="$SINGAPORE_TK"
     [ -n "${SYDNEY_TK:-}" ] && VPS_TOKENS[sydney]="$SYDNEY_TK"
 fi
@@ -396,10 +394,10 @@ if [ -n "$MG" ]; then
     # Add NYC to the group
     R=$(Lp "/mls/groups/$MG/members" "{\"agent_id\":\"$NYC_AID\"}"); check_ok "add NYC to MLS" "$R"
 
-    # Add Helsinki if available
-    HEL_AID="${VPS_AIDS[helsinki]:-}"
-    if [ -n "$HEL_AID" ]; then
-        R=$(Lp "/mls/groups/$MG/members" "{\"agent_id\":\"$HEL_AID\"}"); check_ok "add Helsinki to MLS" "$R"
+    # Add Singapore if available
+    SGP_AID="${VPS_AIDS[singapore]:-}"
+    if [ -n "$SGP_AID" ]; then
+        R=$(Lp "/mls/groups/$MG/members" "{\"agent_id\":\"$SGP_AID\"}"); check_ok "add Singapore to MLS" "$R"
     fi
 
     # Encrypt and decrypt round-trip
