@@ -262,6 +262,11 @@ impl GossipTransport for PubSubTransport {
 /// sample, before `/status` and `x0x status` warn about it (#1964).
 pub const SUSTAINED_EGRESS_EXCEED_SECS: u64 = 60;
 
+/// Largest gap between two samples that still continues an over-budget
+/// run. A longer gap (a stalled 1 s tick) restarts the run, so a stall is
+/// never counted as time over the budget.
+const MAX_SAMPLE_GAP_SECS: u64 = 5;
+
 /// Rate window of [`EgressMeter`], in seconds.
 const EGRESS_WINDOW_SECS: u64 = 60;
 
@@ -293,14 +298,18 @@ pub struct EgressTopicUsage {
 /// Present while the Leaf hard egress budget has been exceeded on every
 /// sample for at least [`SUSTAINED_EGRESS_EXCEED_SECS`] (#1964).
 ///
-/// It is observation only. Nothing is capped because of it: under
-/// `byte_policy = "shed_normal"` saorsa-gossip defers only forwarded
-/// Normal/Bulk EAGER sends, so local publishes, Critical topics, targeted
-/// sends and IWANT/anti-entropy serves are never held back by this budget.
+/// It is observation only. Nothing is capped because of it. Under the
+/// default `byte_policy = "observe_only"` saorsa-gossip defers nothing.
+/// Under `"shed_normal"` it can defer only forwarded (not locally
+/// originated) traffic on Normal/Bulk topics: EAGER relays, IHAVE/IWANT,
+/// anti-entropy digests and serves of other nodes' messages. Local
+/// publishes and serves of them, Critical topics, own-inbox delivery and
+/// targeted sends are never held back by this budget.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EgressBudgetWarning {
     /// Seconds from the first to the latest sample of the current
-    /// over-budget run (a stalled sampler does not extend it).
+    /// over-budget run. A gap of more than 5 s between samples restarts
+    /// the run, so a stalled sampler does not extend it.
     pub exceeded_for_secs: u64,
     /// [`SUSTAINED_EGRESS_EXCEED_SECS`].
     pub threshold_secs: u64,
@@ -391,6 +400,9 @@ impl EgressMeter {
             .map(|(_, bytes)| *bytes as f64)
             .sum::<f64>()
             / EGRESS_WINDOW_SECS as f64;
+        let stalled = self.sampled_at.is_some_and(|last| {
+            now.saturating_duration_since(last) > Duration::from_secs(MAX_SAMPLE_GAP_SECS)
+        });
         self.sampled_at = Some(now);
         let mut hard_over = false;
         if !config.resolved_participation().forwards_passthrough() {
@@ -406,7 +418,9 @@ impl EgressMeter {
                 hard_over = true;
             }
         }
-        if hard_over {
+        if hard_over && stalled {
+            self.hard_exceeded_since = Some(now);
+        } else if hard_over {
             self.hard_exceeded_since.get_or_insert(now);
         } else {
             self.hard_exceeded_since = None;
@@ -417,9 +431,10 @@ impl EgressMeter {
     /// that run has lasted [`SUSTAINED_EGRESS_EXCEED_SECS`]; `None` before
     /// that and as soon as one sample is back under the budget.
     ///
-    /// The run ends at the last sample, not at the time of the query: if
-    /// the 1 s sampling tick stalls after one over-budget sample, a later
-    /// query must not count the stall as time over the budget.
+    /// The run ends at the last sample, not at the time of the query, and a
+    /// gap of more than `MAX_SAMPLE_GAP_SECS` between samples restarts it:
+    /// a stalled 1 s tick, before or inside a run, is never counted as time
+    /// over the budget. If the tick stops for good the last result stays.
     pub fn sustained_hard_exceed(&self) -> Option<Duration> {
         let since = self.hard_exceeded_since?;
         let last = self.sampled_at?;
@@ -537,16 +552,18 @@ impl EgressMeter {
 fn policy_effect(byte_policy: &str) -> String {
     if byte_policy == super::config::LeafBytePolicy::ShedNormal.as_str() {
         format!(
-            "byte_policy \"{byte_policy}\" can defer only forwarded Normal/Bulk EAGER sends; \
-             local publishes, Critical topics, targeted sends and IWANT/anti-entropy serves \
-             are never held back, so this traffic is not capped"
+            "byte_policy \"{byte_policy}\" can defer only forwarded (not locally \
+             originated) traffic on Normal/Bulk topics: EAGER relays, IHAVE/IWANT, \
+             anti-entropy digests and serves of other nodes' messages; local publishes and \
+             serves of them, Critical topics, own-inbox delivery and targeted sends are never \
+             held back, so that part is not capped"
         )
     } else {
         format!(
-            "byte_policy \"{byte_policy}\" measures only and defers nothing, so this traffic \
-             is not capped; even \"shed_normal\" could defer only forwarded Normal/Bulk EAGER \
-             sends, never local publishes, Critical topics, targeted sends or IWANT/anti-entropy \
-             serves"
+            "byte_policy \"{byte_policy}\" measures only and defers nothing, so none of this \
+             traffic is capped; \"shed_normal\" could defer only forwarded (not locally \
+             originated) traffic on Normal/Bulk topics, never local publishes or serves of \
+             them, Critical topics, own-inbox delivery or targeted sends"
         )
     }
 }
@@ -716,9 +733,18 @@ mod tests {
         assert!(warning
             .message
             .contains("x0x.identity.announce.v2 (critical, mostly eager)"));
-        assert!(warning
-            .message
-            .contains("\"shed_normal\" can defer only forwarded Normal/Bulk EAGER sends"));
+        assert!(warning.message.contains(
+            "\"shed_normal\" can defer only forwarded (not locally originated) traffic on \
+             Normal/Bulk topics: EAGER relays, IHAVE/IWANT, anti-entropy digests and serves of \
+             other nodes' messages; local publishes and serves of them, Critical topics, \
+             own-inbox delivery and targeted sends are never held back"
+        ));
+        assert!(
+            !warning
+                .message
+                .contains("IWANT/anti-entropy serves are never"),
+            "sg can defer forwarded IWANT/anti-entropy traffic under shed_normal"
+        );
     }
 
     /// WHY (#1964 review): under the default `observe_only` nothing is
@@ -734,9 +760,12 @@ mod tests {
         let warning = meter
             .warning(50, "observe_only", &HashMap::new())
             .expect("60 s over budget warns");
-        assert!(warning
-            .message
-            .contains("\"observe_only\" measures only and defers nothing"));
+        assert!(warning.message.contains(
+            "\"observe_only\" measures only and defers nothing, so none of this traffic is \
+             capped; \"shed_normal\" could defer only forwarded (not locally originated) \
+             traffic on Normal/Bulk topics, never local publishes or serves of them, Critical \
+             topics, own-inbox delivery or targeted sends"
+        ));
         assert!(!warning.message.contains("\"observe_only\" can defer"));
         assert_eq!(warning.top_topics[0].name, "unknown-hex");
         assert_eq!(warning.top_topics[0].priority, "unknown");
@@ -756,6 +785,43 @@ mod tests {
         // No further samples: a read at +61 s (any read time) must not warn.
         assert!(meter.sustained_hard_exceed().is_none());
         assert!(meter.warning(50, "shed_normal", &HashMap::new()).is_none());
+    }
+
+    /// WHY (#1964 review): a stall between two over-budget samples must
+    /// not count either; the run restarts after a gap longer than
+    /// `MAX_SAMPLE_GAP_SECS` and needs a full 60 s of samples again.
+    #[test]
+    fn a_stall_inside_a_run_restarts_it() {
+        let config = sustained_config();
+        let mut meter = EgressMeter::default();
+        let start = Instant::now();
+        let mut total = 0;
+        feed(&mut meter, start, 0..1, &mut total, 6_000, &config);
+        // 300 s with no sample, then over budget again.
+        feed(&mut meter, start, 300..360, &mut total, 6_000, &config);
+        assert_eq!(meter.hard_exceeded, 61, "every sample was over budget");
+        assert!(
+            meter.sustained_hard_exceed().is_none(),
+            "59 s since the restart, not 359 s"
+        );
+        feed(&mut meter, start, 360..361, &mut total, 6_000, &config);
+        assert_eq!(
+            meter.sustained_hard_exceed(),
+            Some(Duration::from_secs(SUSTAINED_EGRESS_EXCEED_SECS))
+        );
+        // A gap of exactly MAX_SAMPLE_GAP_SECS still continues the run.
+        feed(
+            &mut meter,
+            start,
+            (361 + MAX_SAMPLE_GAP_SECS - 1)..(361 + MAX_SAMPLE_GAP_SECS),
+            &mut total,
+            6_000,
+            &config,
+        );
+        assert_eq!(
+            meter.sustained_hard_exceed(),
+            Some(Duration::from_secs(60 + MAX_SAMPLE_GAP_SECS))
+        );
     }
 
     /// WHY (#1964): one sample back under the budget ends the run, so the

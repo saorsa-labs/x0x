@@ -71,6 +71,13 @@ DM inbox IDs, rather than rehashing the display name.
   and `shed_suppressed`. The last is the headroom enabling shedding would buy
   and, under the default policy, the only signal the budget is being exceeded
   at all; it is a lower bound, not a shed-count forecast.
+- `egress_budget.sustained_hard_exceeded` (#1964): `null` unless the 60 s
+  rate stayed above the Leaf hard budget on every 1 s sample for at least
+  `egress_budget.sustained_threshold_secs` (60). When set it is the same
+  object as `GET /status` `egress_budget_warning`: run length, rate, budget,
+  effective policy, bytes per wire kind and up to three heaviest subscribed
+  topics. `sustained_hard_exceeded_semantics` states the rule. See
+  [api-reference.md](api-reference.md) for the fields.
 - `egress_budget.repair`: EAGER transport attempts matching authenticated v2
   in-flight IWANT `(peer, topic, message ID)` requests. This separately shows
   cached recovery even though sg includes it in EAGER totals. It is a subset,
