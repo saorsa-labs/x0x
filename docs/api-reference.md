@@ -82,7 +82,8 @@ Auth-class labels used throughout this reference:
   owner-act surfaces `POST /agent/sign` (detached signatures outlive
   any session token), `POST /exec/run`, `POST /exec/cancel`,
   `POST /shutdown`, `POST /upgrade/apply` (binary swap + restart =
-  lifecycle act), `POST /sync/devices/enroll`,
+  lifecycle act), `POST /upgrade/announce` (publishes a release for the
+  whole network), `POST /sync/devices/enroll`,
   `POST /groups/:id/delegate` (signed capability with caller-chosen
   expiry), `POST /home/rename`, `PATCH /groups/:id` /
   `PATCH /groups/:id/policy` **when the target carries Home metadata**
@@ -4048,6 +4049,7 @@ no push; the retry does.
 |---|---|---|---|
 | GET | `/upgrade` | — (CLI does not call this) | Daemon-side check for updates (release manifests over the `x0x/release` gossip topic; GitHub first-discovery fallback). Read-only: a check that finds a newer release announces nothing and never leads to an install on this node (#1169, Engineer ruling 3 Nov 2026 17:40 GMT) |
 | POST | `/upgrade/apply` | `x0x upgrade --apply` | Daemon applies the latest verified release manifest with transactional restart; the observed release is announced on `x0x/release` before the apply work (#1169) |
+| POST | `/upgrade/announce` | `x0x upgrade --announce` | Authenticated (durable owner). Fetches the latest release manifest, checks its ML-DSA-65 signature and timestamp, and publishes it on `x0x/release` (#1169). Needs no signing key. This node installs only through its normal staggered gossip path, as if a peer had announced the release. `200` with `result` `announced`, `already_announced` (this node announced, or published the same bytes, within 300 s; a recent announce answers before any GitHub request) or `nothing_newer` (this node runs a newer version than the latest release); `502` with `fetch_failed`, `verification_failed` or `publish_failed`. Every body has `current_version`, and `version` once a manifest was verified |
 | POST | `/upgrade/clear-hold?version=<v>` | `x0x upgrade --clear-hold <v>` | Authenticated, recorded local clear of this install's failed-release probe hold for exactly `<v>` (D190, #1376). `200` `{cleared:true, version, cause, transaction_id}` after a durable receipt (`<daemon>.upgrade-probe.json.cleared`) and removal of the hold; `404` when no failed-release hold exists for `<v>`; `409` for recovery-failed or an unresolved probe record (never cleared locally) or while another upgrade runs; `400` for a missing or non-semver version; `501` off Unix. A newer release clears such a hold by itself |
 | GET | `/diagnostics/upgrade` | `x0x diagnostics upgrade` | Local version + update policy + version/policy digest for the M1 census (#1383), plus release channel, latest version seen on `x0x/release`, last release check, pending update, and the on-disk upgrade plan, last attempt, backups and holds (#1381); no update check runs, nothing is announced |
 

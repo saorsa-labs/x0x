@@ -141,6 +141,17 @@ Launchd migration and measured process-group limit (amendment of 18 Nov 2026, #1
 
 Authority: Claude under David's delegation, 10 Nov 2026.
 
+Release announcement at promotion (amendment of 19 Nov 2026, #1169 PR 1 and the #2088 review). David decided on 19 Nov 2026 that a release is announced at promotion. The first announcer needs no signing key, because a node accepts a manifest only with a valid ML-DSA-65 signature, a newer version and a fresh timestamp: the announcer relays bytes CI already signed. The local, authenticated route `POST /upgrade/announce` (CLI `x0x upgrade --announce`) does this:
+- A successful announce within the 300 s rebroadcast interval returns `already_announced` before any GitHub fetch.
+- It fetches the latest release manifest through the monitor funnel that the boot broadcast uses (`fetch_current_manifest`) and checks its signature and timestamp. A fetch failure returns `fetch_failed`; a failed check returns `verification_failed`. Neither publishes nor records anything.
+- A node on the release's own version can announce it. A node already newer than the latest release returns `nothing_newer` and publishes nothing.
+- Bytes this node published within 300 s by another path (boot broadcast, fallback poll, relay) return `already_announced` and are not published again.
+- Otherwise it records the payload in the self-published tracker and publishes it on `x0x/release` through the shared observation announcer (10 s bound). The result is `announced`. When the publish fails or times out (`publish_failed`), or the request is dropped mid-publish, a guard undoes only the announce's own record: a record made meanwhile, such as an `/upgrade/apply` claim on the same bytes, stays.
+- The announcing node is on the same footing as a node that received the manifest by gossip (decision of the orchestrating Claude session under A15, #2088 review). The announce never installs at once and never bypasses the node's own policy. The record carries no apply-route claim, so the gossip driver submits this node's echo (or a peer's copy) to its background owner like any gossip copy: same staggered install, same version dedup, same updates-enabled and channel gates. With updates off, no gossip driver runs and nothing is queued.
+- The route does not depend on `update.enabled`, so a node with updates off can announce.
+- Accepted trade-off: after an announce every node applies within the 60-minute stagger window, the announcer included. There is no network-wide halt today.
+- The promotion job that runs the announce from a short-lived node is PR 2. Wire format unchanged; the route is a public API addition decided under A15.
+
 ## Consequences
 
 Updates can be checked and recovered under owner policy. Independent rollback and exact artifact evidence add release work. A successful publication alone cannot prove that deployed devices are healthy.

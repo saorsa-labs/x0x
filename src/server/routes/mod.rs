@@ -167,7 +167,7 @@ pub(super) use trust::evaluate_trust;
 #[cfg(unix)]
 pub(super) use upgrade::StartupStagingContext;
 pub(super) use upgrade::{
-    apply_upgrade, background_channel, broadcast_current_manifest, check_upgrade,
+    announce_upgrade, apply_upgrade, background_channel, broadcast_current_manifest, check_upgrade,
     clear_upgrade_hold, daemon_shutdown_hook, listener_restart_context, run_fallback_github_poll,
     run_gossip_update_listener, run_startup_update_check, BackgroundRuntime,
     SelfPublishedReleaseManifests, StartupUpdateCheckRuntime,

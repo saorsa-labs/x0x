@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 230,
+  "endpoint_count": 231,
   "endpoints": [
     {
       "category": "status",
@@ -3387,6 +3387,16 @@
           }
         ],
         "kind": "fields"
+      }
+    },
+    {
+      "category": "upgrade",
+      "cli_name": "upgrade --announce",
+      "description": "Authenticated: fetch the latest release manifest, verify its ML-DSA-65 signature and timestamp, and publish it on x0x/release (#1169); needs no signing key; this node installs only through its normal staggered gossip path",
+      "method": "POST",
+      "path": "/upgrade/announce",
+      "request": {
+        "kind": "none"
       }
     },
     {
