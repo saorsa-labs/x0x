@@ -54,6 +54,10 @@ mod testkit;
 #[path = "../prepare.rs"]
 mod prepare;
 
+#[cfg(all(test, unix))]
+#[path = "../install_lock.rs"]
+mod install_lock;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{

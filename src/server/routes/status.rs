@@ -385,6 +385,11 @@ pub(in crate::server) struct StatusData {
     /// docs for what rides which kind). Additive field: clients must ignore
     /// unknown fields. Zeros when this embedder runs without a network node.
     bandwidth: x0x::network::bandwidth::BandwidthUsage,
+    /// #1964: non-null while the Leaf hard egress budget has been exceeded
+    /// on every 1 s sample for `x0x::gossip::SUSTAINED_EGRESS_EXCEED_SECS`;
+    /// null again on the first sample back under it. Its `message` is also
+    /// pushed to `warnings`. Additive field.
+    egress_budget_warning: Option<x0x::gossip::EgressBudgetWarning>,
     /// Effective GUI session idle timeout (`gui_idle_timeout_minutes`).
     gui_idle_timeout_secs: u64,
 }
@@ -639,6 +644,12 @@ pub(in crate::server) async fn status(
     if let Some(reason) = degraded_reason {
         warnings.push(reason);
     }
+    // #1964: after classification on purpose — a busy uplink is a cost
+    // warning, not a connectivity state.
+    let egress_budget_warning = state.agent.gossip_egress_budget_warning();
+    if let Some(warning) = &egress_budget_warning {
+        warnings.push(warning.message.clone());
+    }
 
     Json(ApiResponse {
         ok: true,
@@ -655,6 +666,7 @@ pub(in crate::server) async fn status(
             revocation_resync_required,
             warnings,
             bandwidth,
+            egress_budget_warning,
         },
     })
 }
@@ -885,6 +897,7 @@ mod tests {
             revocation_resync_required: false,
             warnings: Vec::new(),
             bandwidth: usage,
+            egress_budget_warning: None,
             gui_idle_timeout_secs: 3600,
         };
         let json =
@@ -908,6 +921,10 @@ mod tests {
             );
         }
         assert_eq!(json["gui_idle_timeout_secs"], 3600);
+        assert!(
+            json["egress_budget_warning"].is_null(),
+            "#1964: the warning field is always present, null when clear"
+        );
         let bandwidth = &json["bandwidth"];
         for group in ["sent_bytes", "received_bytes"] {
             for kind in ["total", "gossip", "direct", "relay", "other"] {

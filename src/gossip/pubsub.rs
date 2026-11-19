@@ -2203,9 +2203,49 @@ impl PubSubManager {
             );
     }
 
+    /// Topic-ID display string → subscribed name, for egress reports.
+    fn topic_names_by_id(&self) -> HashMap<String, String> {
+        let names = self
+            .topic_id_by_name
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut by_id = HashMap::new();
+        for (name, id) in names.iter() {
+            // Several names can share an ID only by hash collision; keep the
+            // smallest so the report is deterministic.
+            by_id
+                .entry(id.to_string())
+                .and_modify(|current: &mut String| {
+                    if name < current {
+                        current.clone_from(name);
+                    }
+                })
+                .or_insert_with(|| name.clone());
+        }
+        by_id
+    }
+
+    /// The #1964 sustained-exceed warning: `Some` while the Leaf hard
+    /// egress budget has been exceeded on every 1 s sample for at least
+    /// [`super::SUSTAINED_EGRESS_EXCEED_SECS`], `None` otherwise (including
+    /// on Full nodes and with a zero hard budget, where no budget applies).
+    pub fn egress_budget_warning(&self) -> Option<super::EgressBudgetWarning> {
+        let names = self.topic_names_by_id();
+        self.egress_meter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .warning(
+                self.egress_config.leaf_egress_hard_bytes_per_sec,
+                self.effective_byte_policy.as_str(),
+                &names,
+            )
+    }
+
     /// Named subscription/outbound diagnostics. Names use stored IDs, including
     /// raw DM inbox IDs; unknown or no-longer-subscribed rows stay unknown-hex.
     pub fn egress_diagnostics(&self) -> serde_json::Value {
+        // Before the name and meter locks below: it takes both itself.
+        let sustained = self.egress_budget_warning();
         let names = self
             .topic_id_by_name
             .read()
@@ -2264,6 +2304,9 @@ impl PubSubManager {
                 "subscribed_outbound_bytes_per_sec_60s": meter.rate,
                 "egress_budget_soft_exceeded": meter.soft_exceeded,
                 "egress_budget_hard_exceeded": meter.hard_exceeded,
+                "sustained_hard_exceeded": sustained,
+                "sustained_hard_exceeded_semantics": "null unless every 1 s sample over at least sustained_threshold_secs (first to last sample, not to the read; a gap over 5 s between samples restarts the run) had the 60 s rate above the Leaf hard budget; clears on the first sample back under it (#1964)",
+                "sustained_threshold_secs": super::SUSTAINED_EGRESS_EXCEED_SECS,
                 "exceed_count_unit": "runtime samples above threshold (nominally 1s)",
                 "rate_semantics": "1s sampled subscribed-topic send-attempt bytes, all kinds including repair; 60s denominator including warm-up",
                 "per_topic_meter_limit": "sg may omit topics beyond its bounded meter; rate is observed bytes, not a hard bound",

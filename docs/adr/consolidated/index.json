@@ -47,7 +47,7 @@
       "revision": 1,
       "path": "A06-r01-gossip-relay-roles-and-resource-limits.md",
       "title": "Gossip Relay Roles and Resource Limits",
-      "sha256": "8de13d595e3032cfc1a61d58700c46ef31964dcc427032e706d344c6d7f4bd22"
+      "sha256": "3658f3910dcb539206b6b4cf6a8394c1a7c92b564630331b3848ec0964c52225"
     },
     {
       "id": "A07",
@@ -103,7 +103,7 @@
       "revision": 1,
       "path": "A14-r01-health-updates-and-recovery.md",
       "title": "Health Updates and Recovery",
-      "sha256": "b9ad8591fb490812b1eef70e5dbc7da1db406b2c21ddb7fb3676a4e1be6cc66f"
+      "sha256": "c47cbd0d980965dee836afb3ec906ec1839940f061419117a3e1c99f1fa70440"
     },
     {
       "id": "A15",

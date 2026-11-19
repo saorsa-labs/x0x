@@ -475,7 +475,8 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:12700/status
 #     "up_bps":         { "total": 0.0, "gossip": 0.0, "direct": 0.0, "relay": 0.0, "other": 0.0 },
 #     "down_bps":       { "total": 0.0, "gossip": 0.0, "direct": 0.0, "relay": 0.0, "other": 0.0 },
 #     "window_secs": 60.0
-#   }
+#   },
+#   "egress_budget_warning": null
 # }
 ```
 
@@ -494,6 +495,30 @@ write succeeds; a received frame counts when it arrives, before any check.
 In text output `x0x status` adds `sent_bytes_human`, `received_bytes_human`,
 `up_human` and `down_human` for the totals; `x0x status --json` prints the
 raw values only.
+
+`egress_budget_warning` (#1964) is `null` unless the Leaf hard egress
+budget (`leaf_egress_hard_bytes_per_sec`) has been exceeded on every 1 s
+sample for at least 60 s (`threshold_secs`). The rate is the 60 s average
+of send-attempt bytes on subscribed topics, all wire kinds. When set, the
+object has `exceeded_for_secs`, `threshold_secs`,
+`rate_bytes_per_sec_60s`, `hard_bytes_per_sec`, `byte_policy` (effective),
+`by_kind` (bytes per second for `eager`, `ihave`, `iwant`,
+`anti_entropy`), `top_topics` (up to three: `name`, `topic_id_hex8`,
+`priority` — `critical`, `normal`, `bulk` or `unknown` — `bytes_per_sec`
+and `by_kind`) and `message`. The same `message` is added to `warnings`,
+so `x0x status` prints it. The message depends on the effective policy.
+Under `observe_only` (the default) it says that the budget only measures
+and defers nothing. Under `shed_normal` it says that only forwarded (not
+locally originated) traffic on Normal/Bulk topics can be deferred: EAGER
+relays, IHAVE/IWANT, anti-entropy digests and serves of other nodes'
+messages. Local publishes and serves of them, Critical topics, own-inbox
+delivery and targeted sends are never held back, so that part is not
+capped. The run is measured from its first to its latest 1 s sample, and
+a gap of more than 5 s between samples restarts it, so a stalled sampler
+does not make it look longer. If sampling stops for good, the last
+result stays. The first sample back under the budget clears the field. Full nodes and a zero hard budget never set it. The
+warning does not change `status`. `GET /diagnostics/gossip` reports the
+same object as `egress_budget.sustained_hard_exceeded`.
 
 `status` is `connected` when a send-ready peer exists. It is `degraded` when
 `GET /health` would be degraded. That includes a one-sided link: one
@@ -4541,7 +4566,7 @@ All diagnostics endpoints require the normal local daemon bearer token and retur
 |---|---|---|---|
 | GET | `/diagnostics/connectivity` | `x0x diagnostics connectivity` | ant-quic NodeStatus snapshot (UPnP, NAT, relay, mDNS) |
 | GET | `/diagnostics/ack` | `x0x diagnostics ack` | ACK-v2 per-stage latency buckets and outcome counters |
-| GET | `/diagnostics/gossip` | `x0x diagnostics gossip` | PubSub drop-detection counters (publish/deliver deltas) plus Leaf/Full participation (`participation.mode`, `passthrough_refresh_runs`, C0 `relay_bytes` = non-subscribed forward, `unsubscribed_refused_frames`), plus [experimental named egress meters](504-slice1-experimental.md) (`subscribed_topics`, `outbound_by_topic_named`, `egress_budget` — including effective `egress_budget.byte_policy`, requested `byte_policy_requested`, and sg's `egress_budget.leaf_egress` snapshot with `shed_suppressed`), plus the first-class Leaf-egress summary (#945, ADR-0078 precondition) `leaf_egress` — `byte_policy` (the effective, sg-accepted policy), `applies_to_leaf`, `soft_exceeded` / `hard_exceeded` (EgressMeter exceed-sample counters), `subscribed_outbound_bytes_per_sec_60s`, `epidemic_forward_bytes` / `epidemic_forward_msgs` (the subscribed-topic epidemic-forward totals from `participation`), and `leaf_egress_snapshot` (the sg snapshot verbatim) — plus inbound attribution (`inbound_by_topic`, keys documented in [diagnostics.md](diagnostics.md#inbound-by-topic-counters-674)), plus [#1170 per-kind efficiency counters](diagnostics.md#per-kind-efficiency-counters-1170--track-e-m1) (`per_kind.current` and `per_kind.last_completed`, each with `since_ts`, `window_secs`, `kinds.<kind>.{bus_dispatched,bus_dropped,delivered,published}`, and `health.bus_pressure_kinds`; `last_completed` is null until the first rotation), plus [#288 soak instrumentation](diagnostics.md#soak-instrumentation-288): `uptime_secs`, `inner_envelope_verify.{count,failed,total_ns}`, `dispatcher.<lane>.over_100ms_count`, plus ADR 0115 `identity_authority` — `identity_announce_unauthenticated`, `activation_bundle_owner_unauthenticated`, `revocation_future_dropped`, `revocation_stranger_self_held` (#1863: held self-revocations of strangers, not published again) and `quarantine.{enabled,started_at,pending_records,pending_bundles,lapsed}` |
+| GET | `/diagnostics/gossip` | `x0x diagnostics gossip` | PubSub drop-detection counters (publish/deliver deltas) plus Leaf/Full participation (`participation.mode`, `passthrough_refresh_runs`, C0 `relay_bytes` = non-subscribed forward, `unsubscribed_refused_frames`), plus [experimental named egress meters](504-slice1-experimental.md) (`subscribed_topics`, `outbound_by_topic_named`, `egress_budget` — including effective `egress_budget.byte_policy`, the #1964 `egress_budget.sustained_hard_exceeded` warning object (null unless the hard budget stayed exceeded for `sustained_threshold_secs`), requested `byte_policy_requested`, and sg's `egress_budget.leaf_egress` snapshot with `shed_suppressed`), plus the first-class Leaf-egress summary (#945, ADR-0078 precondition) `leaf_egress` — `byte_policy` (the effective, sg-accepted policy), `applies_to_leaf`, `soft_exceeded` / `hard_exceeded` (EgressMeter exceed-sample counters), `subscribed_outbound_bytes_per_sec_60s`, `epidemic_forward_bytes` / `epidemic_forward_msgs` (the subscribed-topic epidemic-forward totals from `participation`), and `leaf_egress_snapshot` (the sg snapshot verbatim) — plus inbound attribution (`inbound_by_topic`, keys documented in [diagnostics.md](diagnostics.md#inbound-by-topic-counters-674)), plus [#1170 per-kind efficiency counters](diagnostics.md#per-kind-efficiency-counters-1170--track-e-m1) (`per_kind.current` and `per_kind.last_completed`, each with `since_ts`, `window_secs`, `kinds.<kind>.{bus_dispatched,bus_dropped,delivered,published}`, and `health.bus_pressure_kinds`; `last_completed` is null until the first rotation), plus [#288 soak instrumentation](diagnostics.md#soak-instrumentation-288): `uptime_secs`, `inner_envelope_verify.{count,failed,total_ns}`, `dispatcher.<lane>.over_100ms_count`, plus ADR 0115 `identity_authority` — `identity_announce_unauthenticated`, `activation_bundle_owner_unauthenticated`, `revocation_future_dropped`, `revocation_stranger_self_held` (#1863: held self-revocations of strangers, not published again) and `quarantine.{enabled,started_at,pending_records,pending_bundles,lapsed}` |
 | GET | `/diagnostics/transport` | `x0x diagnostics transport` | Transport connection accounting (zombie-connection hunt, #368) |
 | GET | `/diagnostics/dm` | `x0x diagnostics dm [--agent <id>]` | Bounded local per-peer digest observations plus direct-message send/receive counters, per-peer health, last durable-send stage timers (`last_durable_send`), recipient ACK-publish diagnostics (`last_ack_publish_ms`, `stats.ack_publish_route_failed`), capability-advert freshness pre-check counter (`caps_advert_prefiltered_stale`, #674) |
 | GET | `/diagnostics/groups` | `x0x diagnostics groups` | Per-group ingest counters, listener state, and drop buckets |

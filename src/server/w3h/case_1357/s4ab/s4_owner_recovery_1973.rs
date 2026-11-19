@@ -19,6 +19,31 @@
 //! the arm then records [`CAUSE_DEADLOCK`] with B's seal-refusal log
 //! naming E.
 //!
+//! E receives nothing at the first owner-recovery epoch (#1581, follow-up
+//! to #1973 / #2061). The recovery seal tolerates E's seat, so E keeps
+//! its leaf and the e0+1 commit names it as a survivor; the delivery
+//! stack must withhold every delivery to revoked E. The arm checks the
+//! whole stack, not one gate, on E's side and not with wire-byte
+//! filters: from before the trigger to the end of the arm it reads E's
+//! own direct-message stream (`Agent::subscribe_direct`, the same stream
+//! E's daemon handlers read) and E's own TreeKEM epoch at every poll. E
+//! never holds e0+1, and no frame E receives is an owner-recovery commit,
+//! a GSS share, or a metadata event or catch-up page that carries e0+1.
+//! A delivery to E is the typed cause [`CAUSE_E_RECEIVED_E1`], so it reads
+//! RED. Control: the same watch on survivor C sees the owner-recovery
+//! commit to e0+1.
+//!
+//! Red proofs (Lima VM): with E's self-revocation skipped (and the steps
+//! that need it), E's stream received the e0+1 commit three times and E
+//! held epoch e0+1, so the watch sees a delivery to E on its own stream.
+//! With E revoked, turning off D60's `write_allowed` and its seam check,
+//! the ADR 0107 revoked-member check, and the agent-revoked checks at
+//! connect time and in `pinned_admission_seam`, all together, still left
+//! E with nothing: other gates (the owner-recovery capability lookup and
+//! `join_artifact_member_check`) also withhold. Not watched: pubsub
+//! group and meta topics and KV deltas (no key material there today; E's
+//! epoch is the backstop), and sampling stops once E's eviction commits.
+//!
 //! A child of `s4ab` (as `expiry_skew` is), so the Home, mandate, wait
 //! and watchdog helpers are shared, not copied.
 //!
@@ -31,7 +56,8 @@
 
 use super::*;
 use anyhow::{ensure, Context, Result};
-use serde_json::json;
+use serde_json::{json, Value};
+use std::collections::BTreeSet;
 
 const FOUR_E: &[&str] = &["A", "B", "C", "E"];
 
@@ -40,6 +66,124 @@ const FINAL: &str = "an_owner_recovery_commits_while_a_revoked_member_is_seated_
 const CAUSE_DEADLOCK: &str = "B's owner-recovery seal is refused (ADR-0038 explicit \
      eviction+rekey) for revoked member E, which is still seated, so neither the recovery nor \
      E's eviction can ever commit";
+/// #1581: a delivery to revoked E at the first owner-recovery epoch.
+const CAUSE_E_RECEIVED_E1: &str = "revoked member E holds or receives keys or a commit for the \
+     first owner-recovery epoch e0+1";
+
+/// What a node received and held from the trigger on, read on its own
+/// side: its own direct-message stream and its own TreeKEM epoch. The arm
+/// watches E, and survivor C as the control that the watch sees a
+/// delivered commit.
+struct Watch {
+    label: &'static str,
+    rx: crate::direct::DirectMessageReceiver,
+    /// The first owner-recovery epoch, e0 + 1.
+    e1: u64,
+    /// Every direct frame E received.
+    frames: usize,
+    /// The frames that carry keys or a commit for e0 + 1.
+    keyed: Vec<String>,
+    /// E's own TreeKEM epochs at the polls.
+    epochs: BTreeSet<u64>,
+    /// Polls where E held no live TreeKEM group.
+    no_tree: usize,
+    /// Failed reads of E's view (INFRA, never a pass).
+    read_errors: usize,
+}
+
+impl Watch {
+    fn new(sim: &Sim, label: &'static str, e1: u64) -> Result<Self> {
+        Ok(Self {
+            label,
+            rx: sim.state(label)?.agent.subscribe_direct(),
+            e1,
+            frames: 0,
+            keyed: Vec::new(),
+            epochs: BTreeSet::new(),
+            no_tree: 0,
+            read_errors: 0,
+        })
+    }
+
+    fn drain(&mut self) {
+        while let Some(msg) = self.rx.try_recv() {
+            self.frames += 1;
+            if let Some(kind) = keyed_at(&msg.payload, self.e1) {
+                let sender = hex::encode(msg.sender.as_bytes());
+                self.keyed
+                    .push(format!("{kind} from {}", sender.get(..8).unwrap_or("")));
+            }
+        }
+    }
+
+    async fn sample(&mut self, sim: &Sim, group: &str, e: &crate::identity::AgentId) {
+        self.drain();
+        match try_view_now(sim, self.label, group, e).await {
+            Ok(view) => match view.and_then(|view| view.epoch) {
+                Some(epoch) => {
+                    self.epochs.insert(epoch);
+                }
+                None => self.no_tree += 1,
+            },
+            Err(_) => self.read_errors += 1,
+        }
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "{label} received {} direct frames, keyed for e0+1: {:?}; {label}'s own epochs {:?}, \
+             polls with no tree {}",
+            self.frames,
+            self.keyed,
+            self.epochs,
+            self.no_tree,
+            label = self.label
+        )
+    }
+}
+
+/// The kind of a frame E received that carries keys or a commit for
+/// `e1`, if `payload` is one: an owner-recovery commit (`X0XORC1`, any
+/// epoch: the only one in this arm is the e0+1 recovery), a GSS share
+/// (`secure_share_delivered`), a catch-up page with a link at `e1`, or a
+/// metadata event at `e1`.
+fn keyed_at(payload: &[u8], e1: u64) -> Option<String> {
+    use crate::groups::owner_recovery::{
+        decode_frame, OwnerRecoveryCryptoV1, OwnerRecoveryFrameV1, OWNER_RECOVERY_PREFIX,
+    };
+    if payload.starts_with(OWNER_RECOVERY_PREFIX) {
+        return match decode_frame(payload) {
+            Ok(OwnerRecoveryFrameV1::Commit(commit)) => {
+                let epoch = match &commit.body.crypto {
+                    OwnerRecoveryCryptoV1::TreeKem { next_epoch, .. } => Some(*next_epoch),
+                    OwnerRecoveryCryptoV1::Gss { next_secret_epoch } => Some(*next_secret_epoch),
+                    _ => None,
+                };
+                Some(format!("owner-recovery commit to epoch {epoch:?}"))
+            }
+            Ok(OwnerRecoveryFrameV1::Mandate(_)) => None,
+            Err(error) => Some(format!("undecoded owner-recovery frame ({error:?})")),
+        };
+    }
+    let value: Value = serde_json::from_slice(payload).ok()?;
+    let at_e1 = |event: &Value| {
+        event["treekem_epoch"].as_u64() == Some(e1) || event["secret_epoch"].as_u64() == Some(e1)
+    };
+    if value["event"] == "secure_share_delivered" {
+        return Some(format!(
+            "GSS share (secret_epoch {})",
+            value["secret_epoch"]
+        ));
+    }
+    if value["message_type"] == "treekem_catchup_response" {
+        let linked = value["events"]
+            .as_array()
+            .is_some_and(|events| events.iter().any(at_e1));
+        return linked.then(|| "catch-up page with an e0+1 link".to_string());
+    }
+    (value.get("event").is_some() && at_e1(&value))
+        .then(|| format!("metadata event {} at e0+1", value["event"]))
+}
 
 async fn self_revoke(sim: &Sim, label: &str) -> Result<()> {
     let hex = sim.agent_hex(label)?;
@@ -131,6 +275,10 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     );
     receipt.setup_done(at(sim));
     past_sync_wait(sim, receipt).await?;
+    // #1581: E's own stream, open before the trigger so nothing sent to E
+    // after it is missed.
+    let mut e_watch = Watch::new(sim, "E", e0 + 1)?;
+    let mut c_watch = Watch::new(sim, "C", e0 + 1)?;
 
     let trigger = sim
         .fabric()
@@ -217,6 +365,8 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     let mut commit_reads = Observations::default();
     let waited = sim
         .until("B commits the owner recovery", RECOVERY, async |s: &Sim| {
+            e_watch.sample(s, &group, &e).await;
+            c_watch.sample(s, &group, &e).await;
             let Some(e_on_c) = commit_reads.observe(views_now(s, &["C"], &group, &e)).await else {
                 return true;
             };
@@ -268,6 +418,8 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
             "B ejects the seated revoked member E",
             RECOVERY,
             async |s: &Sim| {
+                e_watch.sample(s, &group, &e).await;
+                c_watch.sample(s, &group, &e).await;
                 let Some(e_on_c) = evict_reads.observe(views_now(s, &["C"], &group, &e)).await
                 else {
                     return true;
@@ -329,6 +481,43 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         "e_cannot_decrypt_after_its_own_eviction_row_commits: {plane_ok}; {}; {}",
         c_after.1, e_after.1
     ));
+    // #1581: E received nothing at e0 + 1. E's own epoch was read at e0
+    // and never at e0 + 1, and no frame E received carries keys or a
+    // commit for it. Control: the same watch on survivor C sees the
+    // owner-recovery commit, so the watch does see a delivered commit. A
+    // failed read of a view is INFRA.
+    for watch in [&mut e_watch, &mut c_watch] {
+        watch.sample(sim, &group, &e).await;
+        ensure!(
+            watch.read_errors == 0,
+            "{} failed reads of {}'s view",
+            watch.read_errors,
+            watch.label
+        );
+    }
+    let c_saw_the_commit = c_watch
+        .keyed
+        .iter()
+        .any(|kind| kind.starts_with(&format!("owner-recovery commit to epoch Some({})", e0 + 1)));
+    let e_nothing_at_e1 = c_saw_the_commit
+        && e_watch.keyed.is_empty()
+        && e_watch.epochs.contains(&e0)
+        && !e_watch.epochs.contains(&(e0 + 1));
+    receipt.note(format!(
+        "e_receives_nothing_at_the_first_owner_recovery_epoch: {e_nothing_at_e1} (control: C \
+         received the e0+1 commit {c_saw_the_commit}); {}; {}",
+        e_watch.describe(),
+        c_watch.describe()
+    ));
+    let e_leak = !e_watch.keyed.is_empty() || e_watch.epochs.contains(&(e0 + 1));
+    if e_leak {
+        receipt.cause(
+            CAUSE_E_RECEIVED_E1,
+            Some(e_watch.describe()),
+            c_saw_the_commit,
+            at(sim),
+        );
+    }
     // #1973's precondition, durably: B's own S4 rows show the recovery
     // (A's row) complete in epoch e0 + 1 while E was still seated — E's
     // own row then completes one epoch later, under the admin the
@@ -399,7 +588,8 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
             && e_evicted
             && e_end_excluded
             && plane_ok
-            && rows_prove_precondition,
+            && rows_prove_precondition
+            && e_nothing_at_e1,
         at(sim),
     );
     Ok(())
