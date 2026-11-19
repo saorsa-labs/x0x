@@ -463,7 +463,10 @@ All notable changes to this project will be documented in this file.
   now reads E's own direct-message stream and E's own TreeKEM epoch from before
   the trigger to the end of the arm. E never holds e0+1, and no frame E
   receives is an owner-recovery commit, a GSS share, or a metadata event or
-  catch-up page at e0+1. Same row and shard (`s4-1973`).
+  catch-up page at e0+1. The row checks the whole delivery stack, not one
+  gate; a delivery to E is a typed cause, so it reads RED. Control: survivor
+  C sees the e0+1 commit on the same watch, and with E's self-revocation
+  skipped the row fails with E holding e0+1. Same row and shard (`s4-1973`).
 
 - **CI cancels superseded PR runs via concurrency groups.** Five workflows
   (`adr-governance`, `build`, `integration`, `release-custody-check`,

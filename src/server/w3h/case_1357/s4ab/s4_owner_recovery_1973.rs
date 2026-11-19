@@ -21,18 +21,28 @@
 //!
 //! E receives nothing at the first owner-recovery epoch (#1581, follow-up
 //! to #1973 / #2061). The recovery seal tolerates E's seat, so E keeps
-//! its leaf and the e0+1 commit names it as a survivor; D60 guarded
-//! egress must withhold every delivery to revoked E. The arm proves it on
-//! E's side, not with wire-byte filters: from before the trigger to the
-//! end of the arm it reads E's own direct-message stream
-//! (`Agent::subscribe_direct`, the same stream E's daemon handlers read)
-//! and E's own TreeKEM epoch at every poll. E never holds e0+1, and no
-//! frame E receives is an owner-recovery commit, a GSS share, or a
-//! metadata event or catch-up page that carries e0+1. Control: the same
-//! watch on survivor C sees the owner-recovery commit to e0+1, so a
-//! delivered commit is seen. (Turning off D60's `write_allowed`, its seam
-//! check and the ADR 0107 revoked-member check together still left E with
-//! nothing, as other gates also withhold, so the control is in the arm.)
+//! its leaf and the e0+1 commit names it as a survivor; the delivery
+//! stack must withhold every delivery to revoked E. The arm checks the
+//! whole stack, not one gate, on E's side and not with wire-byte
+//! filters: from before the trigger to the end of the arm it reads E's
+//! own direct-message stream (`Agent::subscribe_direct`, the same stream
+//! E's daemon handlers read) and E's own TreeKEM epoch at every poll. E
+//! never holds e0+1, and no frame E receives is an owner-recovery commit,
+//! a GSS share, or a metadata event or catch-up page that carries e0+1.
+//! A delivery to E is the typed cause [`CAUSE_E_RECEIVED_E1`], so it reads
+//! RED. Control: the same watch on survivor C sees the owner-recovery
+//! commit to e0+1.
+//!
+//! Red proofs (Lima VM): with E's self-revocation skipped (and the steps
+//! that need it), E's stream received the e0+1 commit three times and E
+//! held epoch e0+1, so the watch sees a delivery to E on its own stream.
+//! With E revoked, turning off D60's `write_allowed` and its seam check,
+//! the ADR 0107 revoked-member check, and the agent-revoked checks at
+//! connect time and in `pinned_admission_seam`, all together, still left
+//! E with nothing: other gates (the owner-recovery capability lookup and
+//! `join_artifact_member_check`) also withhold. Not watched: pubsub
+//! group and meta topics and KV deltas (no key material there today; E's
+//! epoch is the backstop), and sampling stops once E's eviction commits.
 //!
 //! A child of `s4ab` (as `expiry_skew` is), so the Home, mandate, wait
 //! and watchdog helpers are shared, not copied.
@@ -56,6 +66,9 @@ const FINAL: &str = "an_owner_recovery_commits_while_a_revoked_member_is_seated_
 const CAUSE_DEADLOCK: &str = "B's owner-recovery seal is refused (ADR-0038 explicit \
      eviction+rekey) for revoked member E, which is still seated, so neither the recovery nor \
      E's eviction can ever commit";
+/// #1581: a delivery to revoked E at the first owner-recovery epoch.
+const CAUSE_E_RECEIVED_E1: &str = "revoked member E holds or receives keys or a commit for the \
+     first owner-recovery epoch e0+1";
 
 /// What a node received and held from the trigger on, read on its own
 /// side: its own direct-message stream and its own TreeKEM epoch. The arm
@@ -496,6 +509,15 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         e_watch.describe(),
         c_watch.describe()
     ));
+    let e_leak = !e_watch.keyed.is_empty() || e_watch.epochs.contains(&(e0 + 1));
+    if e_leak {
+        receipt.cause(
+            CAUSE_E_RECEIVED_E1,
+            Some(e_watch.describe()),
+            c_saw_the_commit,
+            at(sim),
+        );
+    }
     // #1973's precondition, durably: B's own S4 rows show the recovery
     // (A's row) complete in epoch e0 + 1 while E was still seated — E's
     // own row then completes one epoch later, under the admin the
