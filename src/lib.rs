@@ -12340,6 +12340,10 @@ impl Agent {
                         payload,
                         &config,
                         lifecycle_hint,
+                        dm_send::BusFallbackContext {
+                            peer_rtt_ms: rtt_hint_ms,
+                            diagnostics: Some(&self.direct_messaging),
+                        },
                     )
                     .await
                 }

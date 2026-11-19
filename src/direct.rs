@@ -733,6 +733,13 @@ struct DirectDiagnosticsCounters {
     ack_direct_hedge_saved_failure: AtomicU64,
     ack_direct_hedge_skipped: AtomicU64,
     ack_direct_hedge_failed: AtomicU64,
+    bus_fallback_publish_no_ack: AtomicU64,
+    bus_fallback_publish_primary_failed: AtomicU64,
+    bus_ack_publish_arrived_on_bus: AtomicU64,
+    bus_ack_publish_no_direct: AtomicU64,
+    bus_ack_publish_direct_failed: AtomicU64,
+    bus_ack_publish_direct_slow: AtomicU64,
+    bus_ack_skipped_direct_sent: AtomicU64,
     incoming_delivered_to_subscribe: AtomicU64,
     subscriber_channel_lagged: AtomicU64,
     subscriber_events_evicted: AtomicU64,
@@ -824,6 +831,35 @@ pub struct DmDiagnosticsStats {
     pub ack_direct_hedge_skipped: u64,
     #[serde(default)]
     pub ack_direct_hedge_failed: u64,
+    /// #1964: sender-side publishes of a DM on the compatibility bus
+    /// (`x0x/dm/v1/bus`) because no ACK arrived within the bus fallback
+    /// delay after a successful inbox publish.
+    #[serde(default)]
+    pub bus_fallback_publish_no_ack: u64,
+    /// #1964: sender-side bus publishes because the inbox publish itself
+    /// failed (the bus is then published at once).
+    #[serde(default)]
+    pub bus_fallback_publish_primary_failed: u64,
+    /// #1964: ACKs (v1 or v2) published on the bus because the DM being
+    /// acknowledged arrived on the bus.
+    #[serde(default)]
+    pub bus_ack_publish_arrived_on_bus: u64,
+    /// #1964: durable ACKs published on the bus because no Direct path to
+    /// the sender existed (or no Direct hedge is configured).
+    #[serde(default)]
+    pub bus_ack_publish_no_direct: u64,
+    /// #1964: durable ACKs published on the bus because the Direct send
+    /// failed or timed out.
+    #[serde(default)]
+    pub bus_ack_publish_direct_failed: u64,
+    /// #1964: durable ACKs published on the bus because the Direct send had
+    /// not finished within the Direct grace period.
+    #[serde(default)]
+    pub bus_ack_publish_direct_slow: u64,
+    /// #1964: durable ACKs kept off the bus because the Direct send
+    /// succeeded and the DM did not arrive on the bus — the saving.
+    #[serde(default)]
+    pub bus_ack_skipped_direct_sent: u64,
     pub incoming_delivered_to_subscribe: u64,
     /// Number of oldest buffered events evicted from slow subscriber queues.
     pub subscriber_events_evicted: u64,
@@ -930,6 +966,28 @@ pub(crate) enum AckDirectHedgeOutcomeRecord {
     SkippedOrNoDirect,
     /// Direct send failed after a live connection existed.
     Failed,
+}
+
+/// #1964: why the sender published a DM on the compatibility bus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BusFallbackReason {
+    /// The inbox publish succeeded but no ACK arrived within the delay.
+    NoAckInTime,
+    /// The inbox publish failed, so the bus was published at once.
+    PrimaryPublishFailed,
+}
+
+/// #1964: why an ACK was also published on the compatibility bus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AckBusHedgeReason {
+    /// The DM being acknowledged arrived on the bus.
+    ArrivedOnBus,
+    /// No Direct path to the sender existed (or no Direct hedge is set).
+    NoDirectPath,
+    /// The Direct send failed or timed out.
+    DirectFailed,
+    /// The Direct send had not finished within the grace period.
+    DirectSlow,
 }
 
 impl DirectMessaging {
@@ -1370,6 +1428,35 @@ impl DirectMessaging {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// #1964: count one sender-side DM publish on the compatibility bus.
+    pub(crate) fn record_bus_fallback_publish(&self, reason: BusFallbackReason) {
+        let counter = match reason {
+            BusFallbackReason::NoAckInTime => &self.diagnostics.bus_fallback_publish_no_ack,
+            BusFallbackReason::PrimaryPublishFailed => {
+                &self.diagnostics.bus_fallback_publish_primary_failed
+            }
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// #1964: count one ACK publish on the compatibility bus, by reason.
+    pub(crate) fn record_bus_ack_publish(&self, reason: AckBusHedgeReason) {
+        let counter = match reason {
+            AckBusHedgeReason::ArrivedOnBus => &self.diagnostics.bus_ack_publish_arrived_on_bus,
+            AckBusHedgeReason::NoDirectPath => &self.diagnostics.bus_ack_publish_no_direct,
+            AckBusHedgeReason::DirectFailed => &self.diagnostics.bus_ack_publish_direct_failed,
+            AckBusHedgeReason::DirectSlow => &self.diagnostics.bus_ack_publish_direct_slow,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// #1964: count one durable ACK kept off the bus because Direct sent it.
+    pub(crate) fn record_bus_ack_skipped_direct_sent(&self) {
+        self.diagnostics
+            .bus_ack_skipped_direct_sent
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_ack_publish_route_failed(&self) {
         self.diagnostics
             .ack_publish_route_failed
@@ -1480,6 +1567,34 @@ impl DirectMessaging {
             ack_direct_hedge_failed: self
                 .diagnostics
                 .ack_direct_hedge_failed
+                .load(Ordering::Relaxed),
+            bus_fallback_publish_no_ack: self
+                .diagnostics
+                .bus_fallback_publish_no_ack
+                .load(Ordering::Relaxed),
+            bus_fallback_publish_primary_failed: self
+                .diagnostics
+                .bus_fallback_publish_primary_failed
+                .load(Ordering::Relaxed),
+            bus_ack_publish_arrived_on_bus: self
+                .diagnostics
+                .bus_ack_publish_arrived_on_bus
+                .load(Ordering::Relaxed),
+            bus_ack_publish_no_direct: self
+                .diagnostics
+                .bus_ack_publish_no_direct
+                .load(Ordering::Relaxed),
+            bus_ack_publish_direct_failed: self
+                .diagnostics
+                .bus_ack_publish_direct_failed
+                .load(Ordering::Relaxed),
+            bus_ack_publish_direct_slow: self
+                .diagnostics
+                .bus_ack_publish_direct_slow
+                .load(Ordering::Relaxed),
+            bus_ack_skipped_direct_sent: self
+                .diagnostics
+                .bus_ack_skipped_direct_sent
                 .load(Ordering::Relaxed),
             incoming_delivered_to_subscribe: self
                 .diagnostics
