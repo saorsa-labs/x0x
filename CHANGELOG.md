@@ -606,8 +606,11 @@ All notable changes to this project will be documented in this file.
   bounded 5 s wait (Unix). An arm request while the host lock is held is
   refused at admission (`WouldBlock`). New `acquire_install_lock` returns
   the install lock as an `InstallLock` guard, which the prepare producer
-  can adopt; a refused adoption hands the guards back. The test profile builds `sha2` at
-  opt-level 3.
+  can adopt; a refused adoption hands the guards back. `InstallLock` is
+  defined in `upgrade` so the Windows build keeps compiling. A refused
+  arm can reply after about 37 s, past the launcher's 30 s read timeout;
+  the launcher's recovery then restores the pair. The test profile builds
+  `sha2` at opt-level 3.
 - **A late ACK after a restart must come from the recipient machine (#2007;
   A07 amendment of 17 Nov 2026).** Each queued-send attempt record in
   `direct_send_outcomes.json` now also keeps the recipient machine IDs the

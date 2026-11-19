@@ -465,7 +465,11 @@ launcher's `Host::new` and the arm handler read. No apply path calls it yet.
   Another holder may still have the lock, so it waits at most 5 s. Past
   the wait it changes nothing, and the launcher's recovery, which takes
   the lock, restores the pair. The launcher waits 30 s for the arm reply,
-  so the 5 s wait fits inside it.
+  and that is not always enough: a refused arm can reply only after the
+  30 s flush limit, the 2 s worker join and the 5 s lock wait, about 37 s.
+  On that path the launcher's read times out first. It then stops and
+  reaps the old daemon, and its recovery restores the pair under the host
+  lock. The outcome is the same restore, done by the launcher.
 - **Unix only.** The host lock is taken on Unix only. On Windows (the
   named-pipe arm) the admission check and the restore's lock are absent:
   the restore writes without the host lock. This is an open gap (#2012).

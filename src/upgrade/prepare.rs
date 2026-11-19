@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+use super::install_lock::InstallLock;
 use super::journal::{self, ArtifactPlan, FrozenPlan, JournalRecord, Participant, Phase};
 
 /// What the apply path knows when it prepares: the release, the two
@@ -225,31 +226,6 @@ pub(crate) struct HostLock {
     _locks: [InstallLock; 2],
 }
 
-/// One install lock file, locked. A value exists only after its lock was
-/// taken (`take`, or a `try_lock` that succeeded here), so holding one
-/// proves the holder has the lock (#2074 review). The lock is held until
-/// the value is dropped. `upgrade::acquire_install_lock` returns one.
-pub(crate) struct InstallLock(std::fs::File);
-
-impl InstallLock {
-    /// Take the lock on an install lock file; waits for another holder.
-    pub(crate) fn take(file: std::fs::File) -> io::Result<Self> {
-        file.lock()?;
-        Ok(Self(file))
-    }
-
-    /// The open file, which keeps holding the lock until it is dropped.
-    pub(crate) fn into_file(self) -> std::fs::File {
-        self.0
-    }
-
-    /// The lock if no other holder has it, else `None`.
-    #[cfg(unix)]
-    fn try_take(file: std::fs::File) -> io::Result<Option<Self>> {
-        Ok(try_lock(&file)?.then_some(Self(file)))
-    }
-}
-
 /// `adopt` refused the caller's locks and hands them back, still held.
 pub(crate) struct AdoptRefused {
     pub(crate) error: io::Error,
@@ -350,7 +326,10 @@ impl HostLock {
         let checked = (|| {
             use std::os::unix::fs::MetadataExt;
             let [expected_cli, expected_daemon] = Self::open(plan)?;
-            for (held, expected) in [(&cli.0, &expected_cli), (&daemon.0, &expected_daemon)] {
+            for (held, expected) in [
+                (cli.file(), &expected_cli),
+                (daemon.file(), &expected_daemon),
+            ] {
                 let (a, b) = (held.metadata()?, expected.metadata()?);
                 if a.dev() != b.dev() || a.ino() != b.ino() {
                     return Err(refused("an adopted lock is not this install pair's lock"));
@@ -396,14 +375,6 @@ impl HostLock {
 
 /// `true` when this open file now holds its lock, `false` when another
 /// holder has it.
-fn try_lock(file: &std::fs::File) -> io::Result<bool> {
-    match file.try_lock() {
-        Ok(()) => Ok(true),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(false),
-        Err(std::fs::TryLockError::Error(error)) => Err(error),
-    }
-}
-
 /// The forward phases the producer writes, in order. `Probed` may be
 /// skipped; the two swaps may not.
 const FORWARD: [Phase; 5] = [

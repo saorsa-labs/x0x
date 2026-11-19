@@ -624,9 +624,12 @@ fn arm(state: &ControlContext, root: &Path, bytes: &[u8]) -> Result<ArmedFlush, 
     }
 }
 
-/// How long the arm handler's restore waits for the host lock. The
-/// launcher, the arming caller, waits 30 s for the arm reply
-/// (`launcher::control::flush_and_reap`), so this wait fits inside it.
+/// How long the arm handler's restore waits for the host lock. This does
+/// not fit inside the launcher's 30 s reply timeout
+/// (`launcher::control::flush_and_reap`): a refused arm can reply after the
+/// flush `LIMIT` (30 s), the worker join (`WORKER_JOIN_BOUND`, 2 s) and this
+/// wait, about 37 s. A launcher that times out stops and reaps this daemon,
+/// and its recovery, which takes the host lock, restores the pair.
 #[cfg(unix)]
 const RESTORE_LOCK_WAIT: Duration = Duration::from_secs(5);
 
