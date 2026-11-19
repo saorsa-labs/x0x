@@ -19,6 +19,20 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`x0x autostart --repair --launcher` and launchd acceptance (#1379;
+  A14 amendment of 18 Nov 2026).** The hidden, opt-in `--repair --launcher`
+  moves an existing x0xd launchd job onto the dormant stable launcher. It
+  keeps the job's label and keys, verifies the readback, and restores the
+  backup on failure. `x0x autostart --launcher` now checks the whole
+  launcher argv, uses the canonical `x0xd` and the stable launcher link,
+  refuses to replace another instance's job, and restores the previous job
+  when `bootout` or `bootstrap` fails. A new
+  `scripts/ci/macos-launchd-acceptance.sh` runs an isolated launchd job. It
+  measured that launchd's process-group cleanup sends SIGTERM only, and
+  that a missing daemon path makes the job restart in a loop. The repair
+  takes the host root from the job's own `HOME` and the instance's config
+  file, creates nothing while it plans, writes the new job in one atomic
+  step, and exits non-zero when it leaves a job unmoved (#2072 review).
 - **M2 prepare producer, dormant (#2012; A14 amendment of 18 Nov 2026).**
   New crate-private `upgrade::prepare` freezes the host plan and writes the
   prepared host journal through `Staged` … `SwappedCli`, under the host
