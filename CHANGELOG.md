@@ -28,6 +28,15 @@ All notable changes to this project will be documented in this file.
   `bus_fallback_publish_*`, `bus_ack_publish_*` and
   `bus_ack_skipped_direct_sent` counters. No wire change; earlier versions
   still exchange DMs and ACKs with this one.
+- **Flaky test `a_second_failed_apply_keeps_a_live_retry_claim` (#2090).**
+  The probe retry spawned by request A ran its first check after the
+  test had switched the process-global readback seam to request B's
+  world, so the retry always died. The test passed only when B and the
+  final assertions ran before the retry's death; on a cold first run they
+  did not. The test now waits until the retry has parked on its durable
+  wait (a test-only record of parked retries) before switching the world.
+  No production behaviour change: the retry's check closure only gains
+  a `cfg(test)` record.
 
 - **Launcher refusal record and launcher-bound autostart (#1379, #2019
   review; A14 amendment of 18 Nov 2026).** A trial-form launcher start now
