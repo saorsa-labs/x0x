@@ -9,6 +9,7 @@
 pub mod apply;
 #[cfg(unix)]
 pub(crate) mod fleet_policy;
+pub(crate) mod install_lock;
 #[cfg(unix)]
 mod inventory_accounts;
 #[cfg(unix)]
@@ -309,8 +310,18 @@ fn host_upgrade_lock_path(target: &Path) -> PathBuf {
 }
 
 /// Exclusive OS lock (`std::fs::File::lock`: flock/fcntl on Unix, LockFileEx
-/// on Windows). Created if missing; never truncated or unlinked.
+/// on Windows). Created if missing; never truncated or unlinked. The open
+/// file holds the lock until it is dropped.
 pub(super) fn acquire_host_upgrade_lock(target: &Path) -> Result<File, UpgradeError> {
+    acquire_install_lock(target).map(install_lock::InstallLock::into_file)
+}
+
+/// The same lock as `acquire_host_upgrade_lock`, as the guard type that
+/// proves it is held, so `prepare::HostLock::adopt` can take it over
+/// (#2074 review).
+pub(super) fn acquire_install_lock(
+    target: &Path,
+) -> Result<install_lock::InstallLock, UpgradeError> {
     let lock_path = host_upgrade_lock_path(target);
     let file = OpenOptions::new()
         .read(true)
@@ -324,13 +335,12 @@ pub(super) fn acquire_host_upgrade_lock(target: &Path) -> Result<File, UpgradeEr
                 lock_path.display()
             ))
         })?;
-    file.lock().map_err(|source| {
+    install_lock::InstallLock::take(file).map_err(|source| {
         UpgradeError::Other(format!(
             "failed to take host upgrade lock at {}: {source}",
             lock_path.display()
         ))
-    })?;
-    Ok(file)
+    })
 }
 
 /// Unix postcondition shared with [`Upgrader::atomic_replace`]: Success means
