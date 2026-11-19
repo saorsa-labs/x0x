@@ -1206,13 +1206,20 @@ cover them.
 
 **Missing daemon (measured).** The job names the canonical daemon. For a
 Homebrew install, that is a versioned Cellar path, which a `brew upgrade`
-removes. The dormant launcher then fails the `exec` and exits 75 at once.
-Under `KeepAlive`, launchd starts it again after each throttle interval
-(3 starts in 30 s on 18 Nov 2026): a restart loop until the job is repaired. The acceptance script reports
-how many starts it saw (`LIMIT missing-daemon`).
+removes. Before 19 Nov 2026 the dormant launcher then failed the `exec`
+and exited 75 at once, and launchd started it again after each throttle
+interval (3 starts in 30 s): a restart loop. On macOS the launcher now
+waits instead. It writes one line to the job's standard error, tries the
+`exec` again after 1 s, doubles the pause up to 60 s, and becomes the
+daemon as soon as the path is back. A stop ends the wait; any other
+`exec` error still exits 75. On Linux the exit stays, because systemd's
+start limit ends the restarts. The acceptance script checks the wait
+(`missing-daemon-waits`): one launcher start in 30 s, then the daemon
+runs once its path exists.
 
 **Not done yet (next #1379 slice):**
-- a missing daemon should hold or name a stable path, not loop;
+- a job that pins a removed Cellar path now waits, but it needs a stable
+  daemon path to start again;
 - the autostart commands do not refuse to run as root or under `sudo`,
   and they do not check who owns the plist;
 - `--repair` has no dry run;

@@ -13,8 +13,8 @@
 #      its group goes with it;
 #   3. when the job's main process (the launcher) is SIGKILLed, launchd
 #      ends the rest of its process group (a child that ends on SIGTERM).
-# It also reports how often launchd restarts the job when the daemon path
-# is missing.
+#   4. a missing daemon path is waited for: launchd starts the launcher
+#      once, and the daemon runs as soon as its path exists (#1379).
 # It also reports a measured limit (18 Nov 2026, macOS 27): launchd's
 # process-group cleanup sends SIGTERM only, so a group member that ignores
 # SIGTERM outlives both `bootout` and a crash of the main process. The
@@ -167,17 +167,25 @@ else
 fi
 limit_case
 
-# A daemon path that no longer exists (a Homebrew upgrade removes the
-# versioned Cellar path the job pins). Measured, not a pass/fail case.
+# A daemon path that does not exist yet (a volume not mounted, a package
+# being replaced). The launcher waits for it instead of exiting into
+# launchd's KeepAlive restart loop.
 missing_case() {
-    rm -f "$work/stderr.log"
-    write_job 0 0 25 "$work/missing/x0xd"
+    local name=missing-daemon-waits
+    rm -f "$work/stderr.log" "$pids"
+    rm -rf "$work/later"
+    write_job 0 0 25 "$work/later/x0xd"
     launchctl bootstrap "$domain" "$plist"
     sleep 30
     local starts
-    starts=$(grep -c 'cannot exec' "$work/stderr.log" 2>/dev/null || true)
+    starts=$(grep -cE 'is missing|cannot exec' "$work/stderr.log" 2>/dev/null || true)
+    [[ "${starts:-0}" = 1 ]] || { echo "FAIL $name: launchd started the launcher ${starts:-0} times in 30 s"; cat "$work/stderr.log" 2>/dev/null; exit 1; }
+    mkdir -p "$work/later"
+    cp "$daemon" "$work/later/x0xd"
+    for _ in $(seq 400); do [[ -s "$pids" ]] && break; sleep 0.2; done
+    [[ -s "$pids" ]] || { echo "FAIL $name: the daemon did not start once its path existed"; cat "$work/stderr.log" 2>/dev/null; exit 1; }
     launchctl bootout "$domain/$label" >/dev/null 2>&1 || true
-    echo "LIMIT missing-daemon: the launcher exited at once each time; launchd started it ${starts:-0} times in 30 s (KeepAlive restart loop)"
+    echo "PASS $name: one launcher start in 30 s; the daemon ran once its path existed"
 }
 missing_case
 echo "PASS launchd acceptance ($label)"

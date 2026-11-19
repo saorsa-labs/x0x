@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **No launchd restart loop on a missing daemon (#1379; A14 amendment of
+  19 Nov 2026).** On macOS the launcher no longer exits when the daemon
+  path does not exist. It waits, with a pause that doubles from 1 s to
+  60 s, and starts the daemon as soon as the path is back, so launchd keeps
+  one quiet process instead of a restart every 10 s. A job that pins a
+  removed Homebrew Cellar path still needs a stable path to start again.
+
 - **Removed the two closed Hetzner seeds (#2094).** The Helsinki
   (`65.21.157.229`, `2a01:4f9:c012:684b::1`) and Nuremberg
   (`116.203.101.172`, `2a01:4f8:1c1a:31e6::1`) hosts left the fleet on
