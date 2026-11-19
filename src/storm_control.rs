@@ -22,6 +22,11 @@
 //!   must not be censored by old relays; garbage without a valid gossip
 //!   signature already dies in saorsa-gossip's verify stage.
 //!
+//! `x0x.machine.announce.v3` (#1964) has its own guard, the
+//! `MachineAnnounceV3Guard`. A stale or far-future announce is
+//! delivered but not forwarded, and in one window a machine gets one
+//! forward plus one forward of changed content. See the guard docs.
+//!
 //! The classifier is pure and deterministic (caller supplies `now`), so the
 //! whole policy is unit-testable without a network.
 
@@ -302,6 +307,279 @@ fn classify_broadcast_wire(
     guard.classify(author, inner_hash, now_unix)
 }
 
+/// Domain tag for the content digest of a V3 machine announce (#1964).
+const MACHINE_V3_CONTENT_TAG: &[u8] = b"x0x-storm-machine-announce-v3-content-v1";
+
+/// Forward state of one machine on `x0x.machine.announce.v3` (#1964).
+#[derive(Debug, Clone, Copy)]
+struct MachineV3Window {
+    /// When the forward window of this machine opened (unix seconds).
+    opened_at: u64,
+    /// Content digest of the last forwarded announce.
+    content: [u8; 32],
+    /// True when the one content change of this window was forwarded.
+    change_used: bool,
+}
+
+/// Per-machine forward state for `x0x.machine.announce.v3` (#1964).
+///
+/// Every V3 publish has a fresh `announced_at` and fresh signatures, so
+/// the bytes never repeat. The guard keys on the signed machine id and on
+/// a digest of the content without the timestamp and signatures. In one
+/// [`PER_AUTHOR_FORWARD_WINDOW`] a machine gets one forward, plus one more
+/// forward when the content changes (a real address change is not
+/// delayed). Every other announce of the window is delivered locally but
+/// not forwarded.
+#[derive(Debug, Default)]
+pub struct MachineAnnounceV3Guard {
+    machines: HashMap<[u8; 32], MachineV3Window>,
+}
+
+/// What the V3 machine-announce guard decided, for the counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MachineV3Outcome {
+    /// First announce of the window: forwarded.
+    Forwarded,
+    /// The one content change of the window: forwarded.
+    ForwardedContentChange,
+    /// Same content, or a second change, inside the window: deliver only.
+    RateLimited,
+    /// Signed timestamp too old or too far in the future: deliver only.
+    Stale,
+    /// Bad inner envelope, wrong signed topic, or bad machine signature
+    /// on an announce that would use a forward slot: drop.
+    Forged,
+    /// Not a decodable V3 announce: forward (fail open).
+    Undecodable,
+}
+
+impl MachineV3Outcome {
+    fn verdict(self) -> Verdict {
+        match self {
+            Self::Forwarded | Self::ForwardedContentChange | Self::Undecodable => Verdict::Forward,
+            Self::RateLimited | Self::Stale => Verdict::DeliverOnly,
+            Self::Forged => Verdict::Drop,
+        }
+    }
+}
+
+/// Counters of the V3 machine-announce guard (#1964).
+#[derive(Debug, Default)]
+pub struct MachineAnnounceV3Stats {
+    forwarded: std::sync::atomic::AtomicU64,
+    forwarded_content_change: std::sync::atomic::AtomicU64,
+    deliver_only_rate_limited: std::sync::atomic::AtomicU64,
+    deliver_only_stale: std::sync::atomic::AtomicU64,
+    dropped_forged: std::sync::atomic::AtomicU64,
+    forwarded_undecodable: std::sync::atomic::AtomicU64,
+}
+
+/// Snapshot of [`MachineAnnounceV3Stats`], served on
+/// `GET /diagnostics/gossip` as `storm_control.machine_announce_v3`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct MachineAnnounceV3StatsSnapshot {
+    /// Announces forwarded as the first announce of a machine's window.
+    pub forwarded: u64,
+    /// Announces forwarded as the one content change of a window.
+    pub forwarded_content_change: u64,
+    /// Announces delivered locally but not forwarded (rate limit).
+    pub deliver_only_rate_limited: u64,
+    /// Announces delivered locally but not forwarded (stale or far-future
+    /// signed timestamp).
+    pub deliver_only_stale: u64,
+    /// Announces dropped: bad inner envelope, wrong signed topic, or a bad
+    /// machine signature.
+    pub dropped_forged: u64,
+    /// Payloads that did not decode as a V3 announce and were forwarded
+    /// (fail open).
+    pub forwarded_undecodable: u64,
+}
+
+impl MachineAnnounceV3Stats {
+    const fn new() -> Self {
+        use std::sync::atomic::AtomicU64;
+        Self {
+            forwarded: AtomicU64::new(0),
+            forwarded_content_change: AtomicU64::new(0),
+            deliver_only_rate_limited: AtomicU64::new(0),
+            deliver_only_stale: AtomicU64::new(0),
+            dropped_forged: AtomicU64::new(0),
+            forwarded_undecodable: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, outcome: MachineV3Outcome) {
+        let counter = match outcome {
+            MachineV3Outcome::Forwarded => &self.forwarded,
+            MachineV3Outcome::ForwardedContentChange => &self.forwarded_content_change,
+            MachineV3Outcome::RateLimited => &self.deliver_only_rate_limited,
+            MachineV3Outcome::Stale => &self.deliver_only_stale,
+            MachineV3Outcome::Forged => &self.dropped_forged,
+            MachineV3Outcome::Undecodable => &self.forwarded_undecodable,
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Snapshot the counters.
+    #[must_use]
+    pub fn snapshot(&self) -> MachineAnnounceV3StatsSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        MachineAnnounceV3StatsSnapshot {
+            forwarded: self.forwarded.load(Relaxed),
+            forwarded_content_change: self.forwarded_content_change.load(Relaxed),
+            deliver_only_rate_limited: self.deliver_only_rate_limited.load(Relaxed),
+            deliver_only_stale: self.deliver_only_stale.load(Relaxed),
+            dropped_forged: self.dropped_forged.load(Relaxed),
+            forwarded_undecodable: self.forwarded_undecodable.load(Relaxed),
+        }
+    }
+}
+
+static MACHINE_ANNOUNCE_V3_STATS: MachineAnnounceV3Stats = MachineAnnounceV3Stats::new();
+
+/// Process-wide counters of the `x0x.machine.announce.v3` guard (#1964).
+#[must_use]
+pub fn machine_announce_v3_stats() -> MachineAnnounceV3StatsSnapshot {
+    MACHINE_ANNOUNCE_V3_STATS.snapshot()
+}
+
+/// Decode a bare V3 machine announce. Trailing bytes are refused, so a
+/// later format that appends fields does not decode here and fails open
+/// instead of failing the signature check.
+fn decode_machine_announce_v3(bare: &[u8]) -> Option<crate::MachineAnnouncementV3> {
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(crate::network::MAX_MESSAGE_DESERIALIZE_SIZE)
+        .reject_trailing_bytes()
+        .deserialize(bare)
+        .ok()
+}
+
+/// Digest of the signed content of a V3 machine announce without
+/// `announced_at` and the signatures: two publishes of the same machine
+/// state have the same digest.
+fn machine_v3_content_digest(announcement: &crate::MachineAnnouncementV3) -> Option<[u8; 32]> {
+    let mut unsigned = announcement.to_unsigned();
+    unsigned.base.announced_at = 0;
+    let body = bincode::serialize(&unsigned).ok()?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(MACHINE_V3_CONTENT_TAG);
+    hasher.update(&body);
+    Some(*hasher.finalize().as_bytes())
+}
+
+/// Classify one wire payload of `x0x.machine.announce.v3` (#1964) and
+/// count the outcome in `stats`.
+///
+/// The inner envelope rules are those of `classify_broadcast_wire`: an
+/// unverified envelope, or one signed for another topic, gets `Drop` and
+/// changes no state. Bytes that are not a V2 envelope are read as a bare
+/// announce, as on the v2 topics.
+fn classify_machine_announce_v3_wire(
+    guard: &mut MachineAnnounceV3Guard,
+    payload: &[u8],
+    now_unix: u64,
+    stats: &MachineAnnounceV3Stats,
+) -> Verdict {
+    let outcome = machine_announce_v3_outcome(guard, payload, now_unix);
+    stats.record(outcome);
+    outcome.verdict()
+}
+
+fn machine_announce_v3_outcome(
+    guard: &mut MachineAnnounceV3Guard,
+    payload: &[u8],
+    now_unix: u64,
+) -> MachineV3Outcome {
+    let decoded = crate::gossip::pubsub::decode_v2(payload);
+    let bare: &[u8] = match &decoded {
+        Ok(msg) if !msg.verified || msg.topic != crate::MACHINE_ANNOUNCE_V3_TOPIC => {
+            return MachineV3Outcome::Forged;
+        }
+        Ok(msg) => msg.payload.as_ref(),
+        Err(_) => payload,
+    };
+    let Some(announcement) = decode_machine_announce_v3(bare) else {
+        return MachineV3Outcome::Undecodable;
+    };
+    let Some(content) = machine_v3_content_digest(&announcement) else {
+        return MachineV3Outcome::Undecodable;
+    };
+    guard.classify(
+        announcement.base.machine_id.0,
+        announcement.base.announced_at,
+        content,
+        now_unix,
+        || announcement.verify().is_ok(),
+    )
+}
+
+/// Which forward slot of the window an announce would use.
+enum MachineV3Slot {
+    /// A new window opens.
+    Open,
+    /// The one content change of the current window.
+    Change,
+}
+
+impl MachineAnnounceV3Guard {
+    /// Decide one announce of `machine`. `verify` runs only when the
+    /// announce would use a forward slot, so a flood of copies costs no
+    /// extra signature checks, and a forgery cannot take the slot.
+    fn classify(
+        &mut self,
+        machine: [u8; 32],
+        announced_at: u64,
+        content: [u8; 32],
+        now_unix: u64,
+        verify: impl FnOnce() -> bool,
+    ) -> MachineV3Outcome {
+        let stale = announced_at.saturating_add(STALE_ANNOUNCE_TTL_SECS) < now_unix;
+        let far_future = announced_at > now_unix.saturating_add(MAX_FUTURE_SKEW_SECS);
+        if stale || far_future {
+            return MachineV3Outcome::Stale;
+        }
+        let window = PER_AUTHOR_FORWARD_WINDOW.as_secs();
+        if self.machines.len() >= MAX_TRACKED_AUTHORS {
+            let cutoff = now_unix.saturating_sub(window);
+            self.machines.retain(|_, w| w.opened_at >= cutoff);
+        }
+        let slot = match self.machines.get(&machine) {
+            Some(w) if now_unix.saturating_sub(w.opened_at) < window => {
+                if w.content == content || w.change_used {
+                    return MachineV3Outcome::RateLimited;
+                }
+                MachineV3Slot::Change
+            }
+            _ => MachineV3Slot::Open,
+        };
+        if !verify() {
+            return MachineV3Outcome::Forged;
+        }
+        match slot {
+            MachineV3Slot::Open => {
+                self.machines.insert(
+                    machine,
+                    MachineV3Window {
+                        opened_at: now_unix,
+                        content,
+                        change_used: false,
+                    },
+                );
+                MachineV3Outcome::Forwarded
+            }
+            MachineV3Slot::Change => {
+                if let Some(w) = self.machines.get_mut(&machine) {
+                    w.content = content;
+                    w.change_used = true;
+                }
+                MachineV3Outcome::ForwardedContentChange
+            }
+        }
+    }
+}
+
 /// Register announce-topic validators as the BASE (content) layer of the
 /// #674 relay fan-out composite.
 ///
@@ -373,6 +651,28 @@ pub(crate) fn register_announce_validators<T>(
     let machine_topic = TopicId::from_entity(crate::MACHINE_ANNOUNCE_TOPIC.as_bytes());
     fanout.register_base(machine_topic, machine_validator);
     fanout.ensure_registered(plumtree, machine_topic);
+
+    // #1964: machine announce v3 — stale age, one forward per machine per
+    // window plus one content change, deliver-only otherwise.
+    let machine_v3_guard =
+        std::sync::Arc::new(std::sync::Mutex::new(MachineAnnounceV3Guard::default()));
+    let machine_v3_validator: saorsa_gossip_pubsub::TopicValidator = {
+        let guard = std::sync::Arc::clone(&machine_v3_guard);
+        std::sync::Arc::new(move |_topic, payload| {
+            let Ok(mut guard) = guard.lock() else {
+                return ValidationAction::ForwardAndDeliver;
+            };
+            to_action(classify_machine_announce_v3_wire(
+                &mut guard,
+                payload,
+                now_unix(),
+                &MACHINE_ANNOUNCE_V3_STATS,
+            ))
+        })
+    };
+    let machine_v3_topic = TopicId::from_entity(crate::MACHINE_ANNOUNCE_V3_TOPIC.as_bytes());
+    fanout.register_base(machine_v3_topic, machine_v3_validator);
+    fanout.ensure_registered(plumtree, machine_v3_topic);
 
     // Broadcast topics with no per-format timestamp semantics get the
     // generic guard: inner-payload replay dedupe + per-author rate limit.
@@ -810,6 +1110,317 @@ mod tests {
             ),
             Verdict::Drop
         );
+    }
+
+    /// A signed V3 machine announce for `machine`, wrapped in an inner V2
+    /// envelope that `signer` signed for `topic` — the wire shape of
+    /// `x0x.machine.announce.v3`.
+    fn machine_v3_wire_1964(
+        machine: &crate::identity::MachineKeypair,
+        signer: &crate::gossip::pubsub::SigningContext,
+        topic: &str,
+        port: u16,
+        announced_at: u64,
+    ) -> Vec<u8> {
+        use ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa;
+        let mut base = crate::MachineAnnouncement {
+            machine_id: machine.machine_id(),
+            machine_public_key: machine.public_key().as_bytes().to_vec(),
+            machine_signature: Vec::new(),
+            addresses: vec![std::net::SocketAddr::from(([192, 0, 2, 1], port))],
+            announced_at,
+            nat_type: None,
+            can_receive_direct: Some(true),
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: vec![],
+            relay_candidates: vec![],
+        };
+        let base_body = bincode::serialize(&base.to_unsigned()).unwrap();
+        base.machine_signature = sign_with_ml_dsa(machine.secret_key(), &base_body)
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let mut v3 = crate::MachineAnnouncementV3 {
+            base,
+            machine_kem_public_key: Vec::new(),
+            placement_digests: Vec::new(),
+            move_protocol: 1,
+            machine_signature_v3: Vec::new(),
+        };
+        let v3_body = bincode::serialize(&v3.to_unsigned()).unwrap();
+        v3.machine_signature_v3 = sign_with_ml_dsa(machine.secret_key(), &v3_body)
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        assert!(v3.verify().is_ok(), "fixture announce verifies");
+        let bare = bytes::Bytes::from(bincode::serialize(&v3).unwrap());
+        crate::gossip::pubsub::test_support::signed_inner_v2(signer, topic, &bare).to_vec()
+    }
+
+    struct V3Fixture1964 {
+        machine: crate::identity::MachineKeypair,
+        signer: std::sync::Arc<crate::gossip::pubsub::SigningContext>,
+    }
+
+    impl V3Fixture1964 {
+        fn new() -> Self {
+            Self {
+                machine: crate::identity::MachineKeypair::generate().unwrap(),
+                signer: crate::gossip::pubsub::test_support::signing_context(),
+            }
+        }
+
+        fn wire(&self, port: u16, announced_at: u64) -> Vec<u8> {
+            machine_v3_wire_1964(
+                &self.machine,
+                &self.signer,
+                crate::MACHINE_ANNOUNCE_V3_TOPIC,
+                port,
+                announced_at,
+            )
+        }
+    }
+
+    fn v3_verdict_1964(
+        guard: &mut MachineAnnounceV3Guard,
+        stats: &MachineAnnounceV3Stats,
+        wire: &[u8],
+        now: u64,
+    ) -> Verdict {
+        classify_machine_announce_v3_wire(guard, wire, now, stats)
+    }
+
+    /// A stale V3 announce (or one far in the future) is delivered locally
+    /// but not forwarded, and it does not use the machine's forward slot.
+    #[test]
+    fn v3_stale_announce_is_delivered_not_forwarded_1964() {
+        let m = V3Fixture1964::new();
+        let mut g = MachineAnnounceV3Guard::default();
+        let stats = MachineAnnounceV3Stats::default();
+        let stale = m.wire(5483, NOW - STALE_ANNOUNCE_TTL_SECS - 1);
+        let future = m.wire(5483, NOW + MAX_FUTURE_SKEW_SECS + 1);
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &stale, NOW),
+            Verdict::DeliverOnly
+        );
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &future, NOW),
+            Verdict::DeliverOnly
+        );
+        assert!(g.machines.is_empty(), "stale copies use no forward slot");
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &m.wire(5483, NOW), NOW),
+            Verdict::Forward,
+            "a fresh announce after the stale copies forwards"
+        );
+        let snap = stats.snapshot();
+        assert_eq!(snap.deliver_only_stale, 2);
+        assert_eq!(snap.forwarded, 1);
+    }
+
+    /// A second announce with the same content inside the window is
+    /// delivered but not forwarded; window expiry restores forwarding.
+    #[test]
+    fn v3_second_announce_in_window_is_not_forwarded_1964() {
+        let m = V3Fixture1964::new();
+        let mut g = MachineAnnounceV3Guard::default();
+        let stats = MachineAnnounceV3Stats::default();
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &m.wire(5483, NOW), NOW),
+            Verdict::Forward
+        );
+        for dt in [1, 30, 59] {
+            assert_eq!(
+                v3_verdict_1964(&mut g, &stats, &m.wire(5483, NOW + dt), NOW + dt),
+                Verdict::DeliverOnly,
+                "re-publish at +{dt}s must not be forwarded"
+            );
+        }
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &m.wire(5483, NOW + 60), NOW + 60),
+            Verdict::Forward,
+            "window expiry restores forwarding"
+        );
+        let snap = stats.snapshot();
+        assert_eq!(snap.forwarded, 2);
+        assert_eq!(snap.deliver_only_rate_limited, 3);
+    }
+
+    /// One content change inside the window forwards (a real address
+    /// change is not delayed); a second change in the same window does
+    /// not, and neither does a repeat of the changed content.
+    #[test]
+    fn v3_one_content_change_forwards_second_does_not_1964() {
+        let m = V3Fixture1964::new();
+        let mut g = MachineAnnounceV3Guard::default();
+        let stats = MachineAnnounceV3Stats::default();
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &m.wire(5483, NOW), NOW),
+            Verdict::Forward
+        );
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &m.wire(6000, NOW + 5), NOW + 5),
+            Verdict::Forward,
+            "the first content change of the window forwards"
+        );
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &m.wire(6000, NOW + 6), NOW + 6),
+            Verdict::DeliverOnly,
+            "the changed content repeated is rate limited"
+        );
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &m.wire(7000, NOW + 10), NOW + 10),
+            Verdict::DeliverOnly,
+            "a second change in the window is not forwarded"
+        );
+        // The change does not extend the window.
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &m.wire(7000, NOW + 60), NOW + 60),
+            Verdict::Forward
+        );
+        let snap = stats.snapshot();
+        assert_eq!(snap.forwarded, 2);
+        assert_eq!(snap.forwarded_content_change, 1);
+        assert_eq!(snap.deliver_only_rate_limited, 2);
+    }
+
+    /// Different machines never rate-limit each other, even when one
+    /// relaying agent wraps all of them.
+    #[test]
+    fn v3_machines_are_independent_1964() {
+        let relay_signer = crate::gossip::pubsub::test_support::signing_context();
+        let mut g = MachineAnnounceV3Guard::default();
+        let stats = MachineAnnounceV3Stats::default();
+        for i in 0..3u64 {
+            let machine = crate::identity::MachineKeypair::generate().unwrap();
+            let wire = machine_v3_wire_1964(
+                &machine,
+                &relay_signer,
+                crate::MACHINE_ANNOUNCE_V3_TOPIC,
+                5483,
+                NOW,
+            );
+            assert_eq!(
+                v3_verdict_1964(&mut g, &stats, &wire, NOW + i),
+                Verdict::Forward
+            );
+        }
+        assert_eq!(stats.snapshot().forwarded, 3);
+    }
+
+    /// An announce whose machine signature is wrong names a machine that
+    /// did not sign it (the #1877 trap). It is dropped and does not use
+    /// that machine's forward slot. A V3 announce signed for another topic
+    /// is dropped too.
+    #[test]
+    fn v3_forged_announce_does_not_take_the_forward_slot_1964() {
+        let m = V3Fixture1964::new();
+        let attacker = crate::identity::MachineKeypair::generate().unwrap();
+        // The victim's machine id and key, signed with another key.
+        let genuine_bare = {
+            let decoded = crate::gossip::pubsub::decode_v2(&m.wire(5483, NOW)).unwrap();
+            decoded.payload.to_vec()
+        };
+        let mut forged: crate::MachineAnnouncementV3 = bincode::deserialize(&genuine_bare).unwrap();
+        forged.base.addresses = vec![std::net::SocketAddr::from(([198, 51, 100, 9], 1))];
+        let body = bincode::serialize(&forged.to_unsigned()).unwrap();
+        forged.machine_signature_v3 =
+            ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(attacker.secret_key(), &body)
+                .unwrap()
+                .as_bytes()
+                .to_vec();
+        assert!(forged.verify().is_err());
+        let forged_wire = crate::gossip::pubsub::test_support::signed_inner_v2(
+            &m.signer,
+            crate::MACHINE_ANNOUNCE_V3_TOPIC,
+            &bytes::Bytes::from(bincode::serialize(&forged).unwrap()),
+        );
+        let other_topic = machine_v3_wire_1964(
+            &m.machine,
+            &m.signer,
+            crate::MACHINE_ANNOUNCE_TOPIC,
+            5483,
+            NOW,
+        );
+        let mut g = MachineAnnounceV3Guard::default();
+        let stats = MachineAnnounceV3Stats::default();
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &forged_wire, NOW),
+            Verdict::Drop
+        );
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &other_topic, NOW),
+            Verdict::Drop
+        );
+        assert!(g.machines.is_empty(), "no forward slot from a forgery");
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &m.wire(5483, NOW + 1), NOW + 1),
+            Verdict::Forward,
+            "the genuine announce forwards after the forgeries"
+        );
+        assert_eq!(stats.snapshot().dropped_forged, 2);
+    }
+
+    /// Bytes that are not a V3 announce forward (fail open), so a future
+    /// format is not censored by this relay.
+    #[test]
+    fn v3_undecodable_payload_fails_open_1964() {
+        let signer = crate::gossip::pubsub::test_support::signing_context();
+        let wire = crate::gossip::pubsub::test_support::signed_inner_v2(
+            &signer,
+            crate::MACHINE_ANNOUNCE_V3_TOPIC,
+            &bytes::Bytes::from_static(b"\xF7 future format"),
+        );
+        let mut g = MachineAnnounceV3Guard::default();
+        let stats = MachineAnnounceV3Stats::default();
+        for dt in 0..3 {
+            assert_eq!(
+                v3_verdict_1964(&mut g, &stats, &wire, NOW + dt),
+                Verdict::Forward
+            );
+        }
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, b"not an envelope", NOW),
+            Verdict::Forward
+        );
+        assert_eq!(stats.snapshot().forwarded_undecodable, 4);
+    }
+
+    /// The v2 machine-announce policy is unchanged by #1964: a stale v2
+    /// announce is still dropped (not delivered), a re-publish inside the
+    /// window is deliver-only with no content-change exception, and a v3
+    /// payload on the v2 classifier fails open as before.
+    #[test]
+    fn v2_machine_policy_unchanged_1964() {
+        let mut rate = AuthorRate::default();
+        assert_eq!(
+            classify_announce(facts(4, NOW - STALE_ANNOUNCE_TTL_SECS - 1), &mut rate, NOW),
+            Verdict::Drop
+        );
+        assert_eq!(
+            classify_announce(facts(5, NOW), &mut rate, NOW),
+            Verdict::Forward
+        );
+        assert_eq!(
+            classify_announce(facts(5, NOW + 1), &mut rate, NOW + 1),
+            Verdict::DeliverOnly
+        );
+        let m = V3Fixture1964::new();
+        assert!(machine_announce_facts(&m.wire(5483, NOW)).is_none());
+    }
+
+    /// The machine table stays bounded under a machine-minting adversary.
+    #[test]
+    fn v3_machine_table_is_bounded_1964() {
+        let mut g = MachineAnnounceV3Guard::default();
+        for i in 0..(super::MAX_TRACKED_AUTHORS + 100) {
+            let mut a = [0u8; 32];
+            a[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            g.classify(a, NOW - 120, [0u8; 32], NOW - 120, || true);
+        }
+        g.classify([0xFF; 32], NOW, [0u8; 32], NOW, || true);
+        assert!(g.machines.len() <= super::MAX_TRACKED_AUTHORS);
     }
 
     /// The author table stays bounded under an author-minting adversary.
