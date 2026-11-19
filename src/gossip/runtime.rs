@@ -769,6 +769,21 @@ async fn run_bulk_dispatcher(
     tracing::info!("Gossip Bulk dispatcher shut down");
 }
 
+/// Keepalive ticks (15 s each) per application-level SWIM ping round.
+///
+/// #1964 / PR #2103: the ping round moved from every 15 s tick to every
+/// 4th tick (60 s). It is not what keeps a connection open: ant-quic sends
+/// QUIC PINGs every 15 s (`keep_alive_interval`) under a 30 s idle timeout,
+/// on direct and relayed paths alike, and SWIM failure detection runs its
+/// own probe timer. Active-view stale pruning still runs every tick.
+const KEEPALIVE_SWIM_PING_TICK_STRIDE: u64 = 4;
+
+/// Whether keepalive tick number `tick` (the first tick is 1) sends the
+/// application-level SWIM ping round.
+fn keepalive_swim_ping_due(tick: u64) -> bool {
+    tick.is_multiple_of(KEEPALIVE_SWIM_PING_TICK_STRIDE)
+}
+
 impl GossipRuntime {
     /// Create a new gossip runtime with the given configuration and network node.
     ///
@@ -984,8 +999,13 @@ impl GossipRuntime {
             // saorsa-gossip admits never-connected peers to the HyParView active
             // view and never prunes them (x0x#1036).
             let mut stale_targets = super::stale_targets::StaleTargetTracker::default();
+            // Active-view stale pruning keeps the 15 s tick; the extra
+            // application-level SWIM ping runs on every 4th tick only (see
+            // `keepalive_swim_ping_due`).
+            let mut tick: u64 = 0;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                tick = tick.wrapping_add(1);
 
                 let connected: std::collections::HashSet<PeerId> = keepalive_network
                     .send_ready_peers()
@@ -1000,6 +1020,10 @@ impl GossipRuntime {
                     Instant::now(),
                 )
                 .await;
+
+                if !keepalive_swim_ping_due(tick) {
+                    continue;
+                }
 
                 let peers = keepalive_network.gossip_plane_peers().await;
                 for peer in peers {
@@ -1086,6 +1110,15 @@ impl GossipRuntime {
 mod tests {
     use super::*;
     use crate::network::NetworkConfig;
+
+    /// #1964 / PR #2103 change 7: the 15 s keepalive tick sends the SWIM
+    /// ping round once per minute (ticks 4, 8, 12, ...), not on every tick.
+    #[test]
+    fn keepalive_swim_ping_runs_every_fourth_tick_1964() {
+        let due: Vec<u64> = (1..=12).filter(|t| keepalive_swim_ping_due(*t)).collect();
+        assert_eq!(due, vec![4, 8, 12]);
+        assert_eq!(KEEPALIVE_SWIM_PING_TICK_STRIDE * 15, 60);
+    }
 
     #[test]
     fn first_timeout_always_warns_and_the_burst_is_folded() {

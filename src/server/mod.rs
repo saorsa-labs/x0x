@@ -1167,6 +1167,7 @@ pub async fn serve_with_options(
             .unwrap_or(DIRECTORY_RESUBSCRIBE_JITTER_MS),
         public_messages: RwLock::new(HashMap::new()),
         public_message_tasks: RwLock::new(HashMap::new()),
+        directory_pull_cooldown: std::sync::Mutex::new(Default::default()),
         delegation_index: RwLock::new(HashMap::new()),
         delegation_ids: RwLock::new(std::collections::HashMap::new()),
         agent_kem_keypair: Arc::clone(&agent_kem_keypair),
