@@ -8851,6 +8851,16 @@ impl Agent {
             .map(|rt| rt.pubsub().participation_snapshot())
     }
 
+    /// #1964: `Some` while the Leaf hard egress budget has stayed exceeded
+    /// for [`gossip::SUSTAINED_EGRESS_EXCEED_SECS`]; `None` without a gossip
+    /// runtime or while the budget holds.
+    #[must_use]
+    pub fn gossip_egress_budget_warning(&self) -> Option<gossip::EgressBudgetWarning> {
+        self.gossip_runtime
+            .as_ref()
+            .and_then(|rt| rt.pubsub().egress_budget_warning())
+    }
+
     /// Named topic meters and experimental Leaf egress budget diagnostics.
     #[must_use]
     pub fn gossip_egress_diagnostics(&self) -> Option<serde_json::Value> {
