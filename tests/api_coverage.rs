@@ -643,6 +643,11 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Post, "/upgrade/apply", "gui-upgrade-apply"),
     covered!(
         Post,
+        "/upgrade/announce",
+        announce_route_publishes_a_verified_release_and_never_installs
+    ),
+    covered!(
+        Post,
         "/upgrade/clear-hold",
         clear_upgrade_hold_route_records_and_removes_a_failed_hold
     ),

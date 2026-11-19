@@ -1247,6 +1247,7 @@ no gossip, binds nothing, and takes no instance lock.
    - the fallback poll
    - the gossip relay
    - a manual `/upgrade/apply`
+   - a manual `/upgrade/announce` (see below)
 
    The startup check and the read-only `/upgrade` check announce
    nothing. The startup check's discovery is covered by the manifest
@@ -1345,6 +1346,41 @@ setting is not persisted; launching the daemon normally later restores the
 configured updater behavior.
 
 All nodes verify and rebroadcast manifests (symmetric propagation — no privileged bootstrap role).
+
+### Announcing a release at promotion (#1169)
+
+David decided on 19 Nov 2026 that a release is announced at promotion.
+`POST /upgrade/announce` (CLI `x0x upgrade --announce`) is the local,
+authenticated way to do it. It needs no signing key: peers accept a
+manifest only with a valid ML-DSA-65 signature, a newer version and a
+fresh timestamp, so the announcer only relays bytes CI already signed.
+
+1. It fetches the latest release manifest with `fetch_current_manifest`,
+   the same verified fetch as the boot broadcast, and checks the
+   manifest timestamp.
+2. It decides the result:
+
+   | `result` | Status | When |
+   |---|---|---|
+   | `announced` | 200 | Published on `x0x/release`. |
+   | `already_announced` | 200 | This node published the same bytes within the 300 s rebroadcast interval (boot broadcast, fallback poll, relay or an earlier announce). Nothing is published. |
+   | `nothing_newer` | 200 | This node runs a version newer than the latest release. Nothing is published. A node on the release's own version does announce it. |
+   | `verification_failed` | 502 | The fetch, the signature or the timestamp check failed. Nothing is published or recorded. |
+   | `publish_failed` | 502 | The publish failed or did not finish within 10 s. The tracker entry is restored, so a retry is not refused. |
+
+3. Before it publishes, it records the payload as announced in the
+   self-published tracker. For 30 minutes, the gossip driver neither
+   rebroadcasts this node's echo nor submits it to the background owner,
+   so the announce never installs on this node. The node's own fallback
+   poll can still apply the release later, as usual.
+
+The route does not depend on `update.enabled`: a node with updates off
+can announce. A node that announced at boot (the boot broadcast) within
+the last 300 s answers `already_announced`.
+
+Accepted trade-off: after an announce, every node applies within the
+60-minute stagger window. There is no network-wide halt today. The CI
+promotion job that runs the announce is separate work (#1169 PR 2).
 
 ## Downgrade safety (#451) — Home-Suite group state
 

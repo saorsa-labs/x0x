@@ -1861,6 +1861,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
     },
     EndpointDef {
         method: Method::Post,
+        path: "/upgrade/announce",
+        cli_name: "upgrade --announce",
+        description: "Authenticated: fetch the latest release manifest, verify its ML-DSA-65 signature and timestamp, and publish it on x0x/release without installing (#1169); needs no signing key",
+        category: "upgrade",
+        request: RequestSpec::None,
+    },
+    EndpointDef {
+        method: Method::Post,
         path: "/upgrade/clear-hold",
         cli_name: "upgrade --clear-hold",
         description: "Authenticated, recorded local clear of this install's failed-release probe hold for one version (D190); never clears recovery-failed",

@@ -19,6 +19,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`POST /upgrade/announce` and `x0x upgrade --announce` (#1169; A14
+  amendment of 19 Nov 2026).** A node fetches the latest release
+  manifest, checks its ML-DSA-65 signature and timestamp, and publishes it
+  on `x0x/release`. It needs no signing key and never installs on the
+  announcing node. The result is `announced`, `already_announced` (same
+  bytes published within 300 s), `nothing_newer` (the node runs a newer
+  version), `verification_failed` or `publish_failed`. A node on the
+  release's own version can announce it.
 - **`x0x autostart --repair --launcher` and launchd acceptance (#1379;
   A14 amendment of 18 Nov 2026).** The hidden, opt-in `--repair --launcher`
   moves an existing x0xd launchd job onto the dormant stable launcher. It

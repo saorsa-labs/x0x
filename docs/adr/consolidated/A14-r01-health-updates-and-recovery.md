@@ -135,6 +135,15 @@ Launchd migration and measured process-group limit (amendment of 18 Nov 2026, #1
 
 Authority: Claude under David's delegation, 10 Nov 2026.
 
+Release announcement at promotion (amendment of 19 Nov 2026, #1169 PR 1). David decided on 19 Nov 2026 that a release is announced at promotion. The first announcer needs no signing key, because a node accepts a manifest only with a valid ML-DSA-65 signature, a newer version and a fresh timestamp: the announcer relays bytes CI already signed. The local, authenticated route `POST /upgrade/announce` (CLI `x0x upgrade --announce`) does this:
+- It fetches the latest release manifest through the monitor funnel that the boot broadcast uses (`fetch_current_manifest`) and checks its signature and timestamp. A fetch or check failure returns `verification_failed` and publishes nothing.
+- A node on the release's own version can announce it. A node already newer than the latest release returns `nothing_newer` and publishes nothing.
+- Bytes this node published within the 300 s rebroadcast interval (boot broadcast, fallback poll, relay or an earlier announce) return `already_announced` and are not published again.
+- Otherwise it records the payload as announced in the self-published tracker and publishes it on `x0x/release` through the shared observation announcer (10 s bound). The result is `announced`, or `publish_failed` after the tracker entry is restored.
+- Announcing never installs. While the tracker holds the payload (30 min), the gossip driver neither rebroadcasts this node's echo nor submits it to the background owner. The route does not depend on `update.enabled`, so a node with updates off can announce.
+- Accepted trade-off: after an announce every node applies within the 60-minute stagger window. There is no network-wide halt today.
+- The promotion job that runs the announce from a short-lived node is PR 2. Wire format unchanged; the route is a public API addition decided under A15.
+
 ## Consequences
 
 Updates can be checked and recovered under owner policy. Independent rollback and exact artifact evidence add release work. A successful publication alone cannot prove that deployed devices are healthy.

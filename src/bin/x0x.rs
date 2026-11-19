@@ -332,6 +332,11 @@ enum Commands {
         /// clears a recovery-failed state.
         #[arg(long, requires = "version", conflicts_with_all = ["check", "apply", "force"])]
         clear_hold: bool,
+        /// Ask the running daemon to fetch the latest signed release and
+        /// publish it on the release topic. It verifies the signature, needs
+        /// no signing key and never installs on this node.
+        #[arg(long, conflicts_with_all = ["check", "apply", "force", "clear_hold"])]
+        announce: bool,
         /// Release version for --clear-hold.
         #[arg(requires = "clear_hold")]
         version: Option<String>,
@@ -2440,6 +2445,7 @@ async fn run(
             apply,
             force,
             clear_hold: false,
+            announce: false,
             ..
         } if *check || !*apply => {
             return commands::upgrade::run(*check, *force, name, api).await;
@@ -3556,6 +3562,11 @@ async fn run(
                 .await
             }
         },
+        Commands::Upgrade { announce: true, .. } => {
+            let response = client.post_empty("/upgrade/announce").await?;
+            x0x::cli::print_value(client.format(), &response);
+            Ok(())
+        }
         Commands::Upgrade {
             clear_hold: true,
             version: Some(version),

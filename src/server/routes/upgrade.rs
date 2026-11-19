@@ -55,16 +55,60 @@ pub(in crate::server) struct SelfPublishedReleaseManifests {
 /// handler (the blocking worker owns the replacement and restart) and
 /// ages out with the tracker TTL. Driver rebroadcasts, fallback publishes
 /// and the start-up broadcast record without the claim; the owner's
-/// version dedup absorbs their repeats.
+/// version dedup absorbs their repeats. A payload `/upgrade/announce`
+/// recorded is never submitted from its echo either, for the whole TTL:
+/// announcing must not install (#1169, 19 Nov 2026).
 #[derive(Debug, Clone, Copy)]
 struct SelfPublished {
     first_seen: Instant,
     apply_route: bool,
+    announce_route: bool,
 }
 
 impl SelfPublishedReleaseManifests {
     fn record_payload(&mut self, payload: &[u8], now: Instant) {
         self.record(payload, now, false);
+    }
+
+    /// The `/upgrade/announce` admission: `false` when this node published
+    /// these bytes within `RELEASE_REBROADCAST_INTERVAL`, else records them
+    /// as announced and returns the entry they replace, for
+    /// [`Self::restore_announce`] when the publish fails.
+    fn admit_announce(
+        &mut self,
+        payload: &[u8],
+        now: Instant,
+    ) -> Result<Option<SelfPublished>, ()> {
+        self.prune(now);
+        let digest = release_manifest_payload_digest(payload);
+        let previous = self.published_at.get(&digest).copied();
+        if previous.is_some_and(|entry| {
+            now.saturating_duration_since(entry.first_seen) < RELEASE_REBROADCAST_INTERVAL
+        }) {
+            return Err(());
+        }
+        let entry = self.published_at.entry(digest).or_insert(SelfPublished {
+            first_seen: now,
+            apply_route: false,
+            announce_route: true,
+        });
+        entry.first_seen = now;
+        entry.announce_route = true;
+        Ok(previous)
+    }
+
+    /// Undo [`Self::admit_announce`] after a failed publish, so a retry is
+    /// not refused as already announced.
+    fn restore_announce(&mut self, payload: &[u8], previous: Option<SelfPublished>) {
+        let digest = release_manifest_payload_digest(payload);
+        match previous {
+            Some(entry) => {
+                self.published_at.insert(digest, entry);
+            }
+            None => {
+                self.published_at.remove(&digest);
+            }
+        }
     }
 
     /// Record a payload that `/upgrade/apply` announces for the release it
@@ -92,6 +136,7 @@ impl SelfPublishedReleaseManifests {
             .or_insert(SelfPublished {
                 first_seen: now,
                 apply_route,
+                announce_route: false,
             });
         entry.first_seen = now;
         entry.apply_route |= apply_route;
@@ -105,11 +150,21 @@ impl SelfPublishedReleaseManifests {
     /// Whether `/upgrade/apply` recorded this payload within the TTL and an
     /// apply-route owner still holds it: the apply is in progress, admitted,
     /// or succeeded, or a scheduled probe retry owns its install.
+    #[cfg(test)]
     fn recorded_by_apply_route(&mut self, digest: &[u8; 32], now: Instant) -> bool {
         self.prune(now);
         self.published_at
             .get(digest)
             .is_some_and(|entry| entry.apply_route)
+    }
+
+    /// Whether the gossip driver must not submit this payload's echo: an
+    /// apply-route owner holds it, or `/upgrade/announce` recorded it.
+    fn echo_is_not_submitted(&mut self, digest: &[u8; 32], now: Instant) -> bool {
+        self.prune(now);
+        self.published_at
+            .get(digest)
+            .is_some_and(|entry| entry.apply_route || entry.announce_route)
     }
 
     fn prune(&mut self, now: Instant) {
@@ -1600,7 +1655,8 @@ fn verify_gossip_release_with_key(payload: &[u8], trusted_key: &[u8]) -> Option<
 async fn announce_observed_release<Publish, PublishFuture>(
     release: &VerifiedRelease,
     publish: Publish,
-) where
+) -> bool
+where
     Publish: FnOnce(Vec<u8>) -> PublishFuture,
     PublishFuture: Future<Output = Result<(), String>>,
 {
@@ -1610,12 +1666,21 @@ async fn announce_observed_release<Publish, PublishFuture>(
     )
     .await
     {
-        Ok(Ok(())) => tracing::info!(
-            version = %release.manifest.version,
-            "Observed release announced on the release topic"
-        ),
-        Ok(Err(error)) => tracing::debug!(%error, "Observed release announcement failed"),
-        Err(_) => tracing::debug!("Observed release announcement timed out"),
+        Ok(Ok(())) => {
+            tracing::info!(
+                version = %release.manifest.version,
+                "Observed release announced on the release topic"
+            );
+            true
+        }
+        Ok(Err(error)) => {
+            tracing::debug!(%error, "Observed release announcement failed");
+            false
+        }
+        Err(_) => {
+            tracing::debug!("Observed release announcement timed out");
+            false
+        }
     }
 }
 
@@ -1646,7 +1711,7 @@ async fn run_gossip_update_driver<S, Publish, PublishFuture>(
         if x0x::upgrade::monitor::validate_manifest_timestamp(&verified.manifest).is_err() {
             continue;
         }
-        let (decision, apply_route_echo) = {
+        let (decision, echo_not_submitted) = {
             let mut published = self_published
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1661,15 +1726,16 @@ async fn run_gossip_update_driver<S, Publish, PublishFuture>(
             );
             (
                 decision,
-                published.recorded_by_apply_route(&digest, Instant::now()),
+                published.echo_is_not_submitted(&digest, Instant::now()),
             )
         };
         if decision == ReleaseRebroadcastDecision::SkipNotNewer {
             continue;
         }
-        // #1169: the echo of an `/upgrade/apply` announcement is not
-        // submitted. That route applies the release itself; a submit would
-        // start a second apply of the operator-requested release. The
+        // #1169: the echo of an `/upgrade/apply` or `/upgrade/announce`
+        // announcement is not submitted; an announce never installs.
+        // `/upgrade/apply` applies the release itself; a submit would
+        // start a second apply of the operator-requested release. That
         // route releases its claim only before admission and only when
         // nothing resumes the install — after admission, on success, or
         // while a scheduled probe retry owns it, the claim stands until
@@ -1678,7 +1744,7 @@ async fn run_gossip_update_driver<S, Publish, PublishFuture>(
         // driver rebroadcasts, fallback publishes and the start-up
         // broadcast still reach the owner, whose version dedup absorbs
         // them.
-        if decision == ReleaseRebroadcastDecision::SkipSelfPublished && apply_route_echo {
+        if decision == ReleaseRebroadcastDecision::SkipSelfPublished && echo_not_submitted {
             continue;
         }
         if decision == ReleaseRebroadcastDecision::Rebroadcast {
@@ -2623,6 +2689,93 @@ pub(in crate::server) async fn apply_upgrade(
     }
 }
 
+/// `POST /upgrade/announce` (#1169, decided 19 Nov 2026): fetch the latest
+/// release manifest through the monitor funnel, check its ML-DSA-65
+/// signature and timestamp, and publish it on `RELEASE_TOPIC`. It needs no
+/// signing key: it relays bytes CI already signed. It never installs: the
+/// payload is recorded as announced, so this node's gossip driver does not
+/// submit the echo. A node on the release's own version can announce it;
+/// a node already newer than the latest release has nothing to announce.
+/// Bytes this node published within `RELEASE_REBROADCAST_INTERVAL` are
+/// not published again.
+pub(in crate::server) async fn announce_upgrade(State(state): State<Arc<AppState>>) -> Response {
+    let reply = |status: StatusCode, body: serde_json::Value| (status, Json(body)).into_response();
+    let failed = |error: String| {
+        reply(
+            StatusCode::BAD_GATEWAY,
+            serde_json::json!({
+                "ok": false,
+                "result": "verification_failed",
+                "current_version": x0x::VERSION,
+                "error": error
+            }),
+        )
+    };
+    let monitor = match UpgradeMonitor::new(&state.update_config.repo, "x0xd", x0x::VERSION) {
+        Ok(monitor) => monitor.with_include_prereleases(state.update_config.include_prereleases),
+        Err(error) => return failed(error),
+    };
+    let release = match broadcast_fetch_current_manifest(&monitor).await {
+        Ok(Some(release)) => release,
+        Ok(None) => return failed("no signed release manifest found".into()),
+        Err(error) => return failed(error.to_string()),
+    };
+    if let Err(error) = x0x::upgrade::monitor::validate_manifest_timestamp(&release.manifest) {
+        return failed(error.to_string());
+    }
+    let version = release.manifest.version.clone();
+    let outcome = |result: &str| {
+        reply(
+            StatusCode::OK,
+            serde_json::json!({
+                "ok": true,
+                "result": result,
+                "version": version,
+                "current_version": x0x::VERSION
+            }),
+        )
+    };
+    if is_newer(x0x::VERSION, &version) {
+        return outcome("nothing_newer");
+    }
+    let previous = {
+        let mut published = state
+            .self_published_release_manifests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match published.admit_announce(&release.gossip_payload, Instant::now()) {
+            Ok(previous) => previous,
+            Err(()) => return outcome("already_announced"),
+        }
+    };
+    let agent = Arc::clone(&state.agent);
+    let published = announce_observed_release(&release, move |payload| async move {
+        agent
+            .publish(RELEASE_TOPIC, payload)
+            .await
+            .map_err(|error| error.to_string())
+    })
+    .await;
+    if published {
+        return outcome("announced");
+    }
+    state
+        .self_published_release_manifests
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .restore_announce(&release.gossip_payload, previous);
+    reply(
+        StatusCode::BAD_GATEWAY,
+        serde_json::json!({
+            "ok": false,
+            "result": "publish_failed",
+            "version": version,
+            "current_version": x0x::VERSION,
+            "error": "the release topic publish failed or timed out after 10 s"
+        }),
+    )
+}
+
 /// `POST /upgrade/clear-hold?version=<v>` (D190, #1376).
 #[derive(serde::Deserialize)]
 pub(in crate::server) struct UpgradeClearHoldQuery {
@@ -3472,6 +3625,110 @@ mod tests {
         )
     }
 
+    /// Two loopback gossip agents, A connected to B, both subscribed to
+    /// `RELEASE_TOPIC`, returned only once the topic carries A's messages
+    /// to B, so one real publish cannot race the mesh.
+    struct ReleaseTopicPair {
+        a: Arc<Agent>,
+        b: Arc<Agent>,
+        a_topic: crate::gossip::Subscription,
+        b_topic: crate::gossip::Subscription,
+        _dirs: [tempfile::TempDir; 2],
+    }
+
+    impl ReleaseTopicPair {
+        async fn connected() -> Self {
+            let dir_a = tempfile::tempdir().expect("tmpdir a");
+            let dir_b = tempfile::tempdir().expect("tmpdir b");
+            let a = loopback_gossip_agent(dir_a.path()).await;
+            let b = loopback_gossip_agent(dir_b.path()).await;
+            a.join_network().await.expect("a joins");
+            b.join_network().await.expect("b joins");
+            let a_topic = a.subscribe(RELEASE_TOPIC).await.expect("a subscribes");
+            let b_topic = b.subscribe(RELEASE_TOPIC).await.expect("b subscribes");
+            let b_addr = b.bound_addr().await.expect("b bound");
+            let b_addr = SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), b_addr.port());
+            a.network()
+                .expect("a network")
+                .connect_addr(b_addr)
+                .await
+                .expect("a connects to b");
+
+            // Each probe is unique and fails B's signature check, so B's
+            // driver drops it.
+            let mut b_probe = b
+                .subscribe(RELEASE_TOPIC)
+                .await
+                .expect("b probe subscribes");
+            let mut probe_seq = 0u32;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    probe_seq += 1;
+                    let probe = format!("mesh-probe-{probe_seq}").into_bytes();
+                    a.publish(RELEASE_TOPIC, probe)
+                        .await
+                        .expect("a publishes probe");
+                    if let Ok(Some(message)) =
+                        tokio::time::timeout(Duration::from_millis(250), b_probe.recv()).await
+                    {
+                        if message.payload.starts_with(b"mesh-probe-") {
+                            break;
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("the release topic did not carry A's probes to B within 10 s");
+            drop(b_probe);
+            Self {
+                a,
+                b,
+                a_topic,
+                b_topic,
+                _dirs: [dir_a, dir_b],
+            }
+        }
+    }
+
+    /// A newer release for this platform, signed with a fresh test key;
+    /// returns the key's public bytes for the verifier.
+    fn signed_release_for_this_platform() -> (Vec<u8>, VerifiedRelease) {
+        use x0x::upgrade::signature::sign_with_context;
+        let (pk, sk) = saorsa_pqc::api::sig::ml_dsa_65()
+            .generate_keypair()
+            .expect("test release key");
+        let mut manifest = manifest_with_version(&version_newer_than_current());
+        manifest.assets[0].target = x0x::upgrade::manifest::current_platform_target()
+            .expect("tests run on a supported platform")
+            .to_string();
+        let manifest_json = serde_json::to_vec(&manifest).expect("manifest json");
+        let signature = sign_with_context(&sk.to_bytes(), &manifest_json).expect("sign");
+        let payload = x0x::upgrade::manifest::encode_signed_manifest(&manifest_json, &signature);
+        let verified = VerifiedRelease {
+            manifest,
+            manifest_json,
+            signature,
+            gossip_payload: payload,
+        };
+        (pk.to_bytes(), verified)
+    }
+
+    /// A topic subscription through the real gossip verifier, with `key`
+    /// as the trusted release key.
+    fn verified_release_stream(
+        subscription: crate::gossip::Subscription,
+        key: Vec<u8>,
+    ) -> impl Stream<Item = VerifiedRelease> {
+        futures::stream::unfold((subscription, key), |(mut subscription, key)| async move {
+            loop {
+                let message = subscription.recv().await?;
+                if let Some(verified) = verify_gossip_release_with_key(&message.payload, &key) {
+                    return Some((verified, (subscription, key)));
+                }
+            }
+        })
+    }
+
     /// #1169 acceptance over real loopback gossip: node A's real fallback
     /// driver observes a signed release and publishes it on `x0x/release`;
     /// node B's real gossip driver, fed by its own topic subscription and
@@ -3482,68 +3739,16 @@ mod tests {
     /// proves the same flow with a channel in place of the network.
     #[tokio::test]
     async fn observed_release_propagates_over_real_gossip_to_a_peer_owner() {
-        use x0x::upgrade::signature::sign_with_context;
-        let (pk, sk) = saorsa_pqc::api::sig::ml_dsa_65()
-            .generate_keypair()
-            .expect("test release key");
-        let mut manifest = manifest_with_version(&version_newer_than_current());
-        manifest.assets[0].target = x0x::upgrade::manifest::current_platform_target()
-            .expect("tests run on a supported platform")
-            .to_string();
-        let expected_version = manifest.version.clone();
-        let manifest_json = serde_json::to_vec(&manifest).expect("manifest json");
-        let signature = sign_with_context(&sk.to_bytes(), &manifest_json).expect("sign");
-        let payload = x0x::upgrade::manifest::encode_signed_manifest(&manifest_json, &signature);
-        let verified = VerifiedRelease {
-            manifest,
-            manifest_json,
-            signature,
-            gossip_payload: payload,
-        };
+        let (pk, verified) = signed_release_for_this_platform();
+        let expected_version = verified.manifest.version.clone();
 
-        let dir_a = tempfile::tempdir().expect("tmpdir a");
-        let dir_b = tempfile::tempdir().expect("tmpdir b");
-        let a = loopback_gossip_agent(dir_a.path()).await;
-        let b = loopback_gossip_agent(dir_b.path()).await;
-        a.join_network().await.expect("a joins");
-        b.join_network().await.expect("b joins");
-        let _a_topic = a.subscribe(RELEASE_TOPIC).await.expect("a subscribes");
-        let b_topic = b.subscribe(RELEASE_TOPIC).await.expect("b subscribes");
-        let b_addr = b.bound_addr().await.expect("b bound");
-        let b_addr = SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), b_addr.port());
-        a.network()
-            .expect("a network")
-            .connect_addr(b_addr)
-            .await
-            .expect("a connects to b");
-
-        // Wait until the release topic carries A's messages to B, so the one
-        // real publish below cannot race the mesh. Each probe is unique and
-        // fails B's signature check, so B's driver drops it.
-        let mut b_probe = b
-            .subscribe(RELEASE_TOPIC)
-            .await
-            .expect("b probe subscribes");
-        let mut probe_seq = 0u32;
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                probe_seq += 1;
-                let probe = format!("mesh-probe-{probe_seq}").into_bytes();
-                a.publish(RELEASE_TOPIC, probe)
-                    .await
-                    .expect("a publishes probe");
-                if let Ok(Some(message)) =
-                    tokio::time::timeout(Duration::from_millis(250), b_probe.recv()).await
-                {
-                    if message.payload.starts_with(b"mesh-probe-") {
-                        break;
-                    }
-                }
-            }
-        })
-        .await
-        .expect("the release topic did not carry A's probes to B within 10 s");
-        drop(b_probe);
+        let ReleaseTopicPair {
+            a,
+            b,
+            a_topic: _a_topic,
+            b_topic,
+            _dirs,
+        } = ReleaseTopicPair::connected().await;
 
         // Peer B: subscription -> verifier -> real driver -> owner intake.
         let (queued_tx, mut queued_rx) = mpsc::unbounded_channel();
@@ -3553,17 +3758,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let releases = futures::stream::unfold(
-            (b_topic, pk.to_bytes()),
-            |(mut subscription, key)| async move {
-                loop {
-                    let message = subscription.recv().await?;
-                    if let Some(verified) = verify_gossip_release_with_key(&message.payload, &key) {
-                        return Some((verified, (subscription, key)));
-                    }
-                }
-            },
-        );
+        let releases = verified_release_stream(b_topic, pk);
         let (_b_running, b_shutdown) = watch::channel(false);
         let b_driver = tokio::spawn(run_gossip_update_driver(
             releases,
@@ -3608,6 +3803,79 @@ mod tests {
         b_driver.abort();
         a.shutdown().await;
         b.shutdown().await;
+    }
+
+    /// #1169 PR 1 over real loopback gossip: node A's `/upgrade/announce`
+    /// publishes the signed release; node B's real gossip driver queues it
+    /// with its background owner. A's own driver receives the echo of its
+    /// announcement and does not submit it: announcing never installs.
+    #[tokio::test]
+    async fn announced_release_reaches_a_peer_over_real_gossip_and_the_announcer_does_not_install()
+    {
+        let (pk, verified) = signed_release_for_this_platform();
+        let expected_version = verified.manifest.version.clone();
+
+        let pair = ReleaseTopicPair::connected().await;
+        let state_dir = tempfile::tempdir().expect("tmpdir a state");
+        let a_state = upgrade_route_state(Arc::clone(&pair.a), state_dir.path()).await;
+        let observer = |tx: mpsc::UnboundedSender<(String, SubmitOutcome)>| BackgroundSubmit {
+            processed: Some(Arc::new(move |version, outcome| {
+                let _ = tx.send((version, outcome));
+            })),
+            ..Default::default()
+        };
+
+        let (b_queued_tx, mut b_queued) = mpsc::unbounded_channel();
+        let (_b_running, b_shutdown) = watch::channel(false);
+        let b_driver = tokio::spawn(run_gossip_update_driver(
+            verified_release_stream(pair.b_topic, pk.clone()),
+            Some(observer(b_queued_tx)),
+            Arc::new(StdMutex::new(SelfPublishedReleaseManifests::default())),
+            |_| async { Ok(()) },
+            b_shutdown,
+        ));
+
+        let (a_seen_tx, mut a_seen) = mpsc::unbounded_channel();
+        let (a_queued_tx, mut a_queued) = mpsc::unbounded_channel();
+        let (_a_running, a_shutdown) = watch::channel(false);
+        let a_driver = tokio::spawn(run_gossip_update_driver(
+            verified_release_stream(pair.a_topic, pk).inspect(move |release| {
+                let _ = a_seen_tx.send(release.manifest.version.clone());
+            }),
+            Some(observer(a_queued_tx)),
+            Arc::clone(&a_state.self_published_release_manifests),
+            |_| async { Ok(()) },
+            a_shutdown,
+        ));
+
+        let _feed = broadcast_feed_seam::install(Ok(Some(verified)));
+        let (status, body) =
+            route_response_json(announce_upgrade(State(Arc::clone(&a_state))).await).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["result"], serde_json::json!("announced"), "{body}");
+
+        let queued = tokio::time::timeout(Duration::from_secs(10), b_queued.recv())
+            .await
+            .expect("the peer did not queue the release within 10 s");
+        assert_eq!(
+            queued,
+            Some((expected_version.clone(), SubmitOutcome::Accepted)),
+            "the peer's owner accepted the announced release"
+        );
+        let echoed = tokio::time::timeout(Duration::from_secs(10), a_seen.recv())
+            .await
+            .expect("the announcer's driver did not receive its own echo within 10 s");
+        assert_eq!(echoed, Some(expected_version));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), a_queued.recv())
+                .await
+                .is_err(),
+            "the announcer did not submit its own announcement: no install"
+        );
+        a_driver.abort();
+        b_driver.abort();
+        pair.a.shutdown().await;
+        pair.b.shutdown().await;
     }
 
     /// #1169 review: `/upgrade/apply` records its announcement as
@@ -4851,6 +5119,145 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains_recent_digest(&digest, Instant::now()));
         agent.shutdown().await;
+    }
+
+    /// A signed-release fixture for the announce route, fed through the
+    /// broadcast fetch seam (the route's verified fetch).
+    fn announce_fixture(version: &str, timestamp: Option<u64>) -> VerifiedRelease {
+        let mut manifest = manifest_for_this_platform(version);
+        if let Some(timestamp) = timestamp {
+            manifest.timestamp = timestamp;
+        }
+        let manifest_json = serde_json::to_vec(&manifest).expect("manifest fixture");
+        let payload = x0x::upgrade::manifest::encode_signed_manifest(&manifest_json, b"announce");
+        VerifiedRelease {
+            manifest,
+            manifest_json,
+            signature: b"announce".to_vec(),
+            gossip_payload: payload,
+        }
+    }
+
+    /// #1169 PR 1: `/upgrade/announce` publishes the verified release on
+    /// the release topic, records it so the echo is never submitted, and
+    /// refuses a repeat inside the rebroadcast interval. A release on this
+    /// node's own version is announced; an older one is not; an ineligible
+    /// manifest fails verification and records nothing.
+    #[tokio::test]
+    async fn announce_route_publishes_a_verified_release_and_never_installs() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = loopback_gossip_agent(dir.path()).await;
+        let state = upgrade_route_state(Arc::clone(&agent), dir.path()).await;
+        let mut release_topic = agent
+            .subscribe(RELEASE_TOPIC)
+            .await
+            .expect("release topic subscription");
+        let announce = || announce_upgrade(State(Arc::clone(&state)));
+        let tracker = || {
+            state
+                .self_published_release_manifests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+
+        for version in [version_newer_than_current(), x0x::VERSION.to_string()] {
+            let release = announce_fixture(&version, None);
+            let payload = release.gossip_payload.clone();
+            let digest = release_manifest_payload_digest(&payload);
+            let _feed = broadcast_feed_seam::install(Ok(Some(release)));
+            let (status, body) = route_response_json(announce().await).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["result"], serde_json::json!("announced"), "{body}");
+            assert_eq!(body["version"], serde_json::json!(version));
+            let received = tokio::time::timeout(Duration::from_secs(5), release_topic.recv())
+                .await
+                .expect("the announce self-delivers within the timeout")
+                .expect("subscription still live");
+            assert_eq!(&received.payload[..], payload.as_slice());
+            assert!(
+                tracker().echo_is_not_submitted(&digest, Instant::now()),
+                "the announced payload's echo is never submitted: no install"
+            );
+
+            let _feed = broadcast_feed_seam::install(Ok(Some(announce_fixture(&version, None))));
+            let (status, body) = route_response_json(announce().await).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(
+                body["result"],
+                serde_json::json!("already_announced"),
+                "a repeat inside the rebroadcast interval is not published: {body}"
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), release_topic.recv())
+                .await
+                .is_err(),
+            "the refused repeats published nothing"
+        );
+
+        let older = announce_fixture("0.0.1", None);
+        let older_digest = release_manifest_payload_digest(&older.gossip_payload);
+        let _feed = broadcast_feed_seam::install(Ok(Some(older)));
+        let (status, body) = route_response_json(announce().await).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["result"], serde_json::json!("nothing_newer"), "{body}");
+        assert!(!tracker().contains_recent_digest(&older_digest, Instant::now()));
+
+        let stale = announce_fixture(&version_newer_than_current(), Some(0));
+        let stale_digest = release_manifest_payload_digest(&stale.gossip_payload);
+        let _feed = broadcast_feed_seam::install(Ok(Some(stale)));
+        let (status, body) = route_response_json(announce().await).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(body["result"], serde_json::json!("verification_failed"));
+        assert!(!tracker().contains_recent_digest(&stale_digest, Instant::now()));
+
+        let _feed = broadcast_feed_seam::install(Err(x0x::upgrade::UpgradeError::Other(
+            "signature verification failed".into(),
+        )));
+        let (status, body) = route_response_json(announce().await).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(body["result"], serde_json::json!("verification_failed"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), release_topic.recv())
+                .await
+                .is_err(),
+            "no rejected release was published"
+        );
+        agent.shutdown().await;
+    }
+
+    /// A failed announce publish restores the tracker entry it replaced, so
+    /// a retry is admitted; a recent self-publish of any kind refuses it.
+    #[test]
+    fn announce_admission_follows_the_rebroadcast_interval_and_restores_on_failure() {
+        let mut tracker = SelfPublishedReleaseManifests::default();
+        let payload = b"signed manifest bytes";
+        let digest = release_manifest_payload_digest(payload);
+        let start = Instant::now();
+
+        let previous = tracker.admit_announce(payload, start).expect("first admit");
+        assert!(previous.is_none());
+        assert!(tracker.echo_is_not_submitted(&digest, start));
+        tracker.restore_announce(payload, previous);
+        assert!(!tracker.contains_recent_digest(&digest, start));
+
+        tracker.record_payload(payload, start);
+        assert!(
+            tracker.admit_announce(payload, start).is_err(),
+            "the boot broadcast or a rebroadcast counts as a recent publish"
+        );
+        assert!(!tracker.echo_is_not_submitted(&digest, start));
+        let later = start + RELEASE_REBROADCAST_INTERVAL;
+        let previous = tracker
+            .admit_announce(payload, later)
+            .expect("admitted after the rebroadcast interval");
+        assert!(tracker.echo_is_not_submitted(&digest, later));
+        tracker.restore_announce(payload, previous);
+        assert!(
+            !tracker.echo_is_not_submitted(&digest, later),
+            "the restored entry is the plain publish record"
+        );
+        assert!(tracker.contains_recent_digest(&digest, later));
     }
 
     async fn upgrade_route_state(agent: Arc<Agent>, data_dir: &std::path::Path) -> Arc<AppState> {
