@@ -2235,7 +2235,6 @@ impl PubSubManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .warning(
-                Instant::now(),
                 self.egress_config.leaf_egress_hard_bytes_per_sec,
                 self.effective_byte_policy.as_str(),
                 &names,
@@ -2306,7 +2305,7 @@ impl PubSubManager {
                 "egress_budget_soft_exceeded": meter.soft_exceeded,
                 "egress_budget_hard_exceeded": meter.hard_exceeded,
                 "sustained_hard_exceeded": sustained,
-                "sustained_hard_exceeded_semantics": "null unless every 1 s sample for at least sustained_threshold_secs had the 60 s rate above the Leaf hard budget; clears on the first sample back under it (#1964)",
+                "sustained_hard_exceeded_semantics": "null unless every 1 s sample over at least sustained_threshold_secs (first to last sample, not to the read) had the 60 s rate above the Leaf hard budget; clears on the first sample back under it (#1964)",
                 "sustained_threshold_secs": super::SUSTAINED_EGRESS_EXCEED_SECS,
                 "exceed_count_unit": "runtime samples above threshold (nominally 1s)",
                 "rate_semantics": "1s sampled subscribed-topic send-attempt bytes, all kinds including repair; 60s denominator including warm-up",

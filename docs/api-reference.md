@@ -505,10 +505,14 @@ object has `exceeded_for_secs`, `threshold_secs`,
 `anti_entropy`), `top_topics` (up to three: `name`, `topic_id_hex8`,
 `priority` — `critical`, `normal`, `bulk` or `unknown` — `bytes_per_sec`
 and `by_kind`) and `message`. The same `message` is added to `warnings`,
-so `x0x status` prints it. It states that `shed_normal` defers only
-forwarded Normal/Bulk EAGER sends: local publishes, Critical topics,
-targeted sends and IWANT/anti-entropy serves are never held back, so the
-budget does not cap this traffic. The first sample back under the budget
+so `x0x status` prints it. The message depends on the effective policy.
+Under `observe_only` (the default) it says that the budget only measures
+and defers nothing. Under `shed_normal` it says that only forwarded
+Normal/Bulk EAGER sends can be deferred: local publishes, Critical
+topics, targeted sends and IWANT/anti-entropy serves are never held
+back. In both cases the budget does not cap this traffic. The run is
+measured from its first to its latest 1 s sample, so a stalled sampler
+does not make it look longer. The first sample back under the budget
 clears the field. Full nodes and a zero hard budget never set it. The
 warning does not change `status`. `GET /diagnostics/gossip` reports the
 same object as `egress_budget.sustained_hard_exceeded`.

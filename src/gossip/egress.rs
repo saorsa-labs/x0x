@@ -299,7 +299,8 @@ pub struct EgressTopicUsage {
 /// sends and IWANT/anti-entropy serves are never held back by this budget.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EgressBudgetWarning {
-    /// Seconds since the first sample of the current over-budget run.
+    /// Seconds from the first to the latest sample of the current
+    /// over-budget run (a stalled sampler does not extend it).
     pub exceeded_for_secs: u64,
     /// [`SUSTAINED_EGRESS_EXCEED_SECS`].
     pub threshold_secs: u64,
@@ -415,9 +416,14 @@ impl EgressMeter {
     /// How long the hard budget has been exceeded on every sample, once
     /// that run has lasted [`SUSTAINED_EGRESS_EXCEED_SECS`]; `None` before
     /// that and as soon as one sample is back under the budget.
-    pub fn sustained_hard_exceed(&self, now: Instant) -> Option<Duration> {
+    ///
+    /// The run ends at the last sample, not at the time of the query: if
+    /// the 1 s sampling tick stalls after one over-budget sample, a later
+    /// query must not count the stall as time over the budget.
+    pub fn sustained_hard_exceed(&self) -> Option<Duration> {
         let since = self.hard_exceeded_since?;
-        let run = now.saturating_duration_since(since);
+        let last = self.sampled_at?;
+        let run = last.saturating_duration_since(since);
         (run >= Duration::from_secs(SUSTAINED_EGRESS_EXCEED_SECS)).then_some(run)
     }
 
@@ -427,12 +433,11 @@ impl EgressMeter {
     /// `names` maps a topic ID display string to its subscribed name.
     pub fn warning(
         &self,
-        now: Instant,
         hard_bytes_per_sec: u64,
         byte_policy: &str,
         names: &HashMap<String, String>,
     ) -> Option<EgressBudgetWarning> {
-        let run = self.sustained_hard_exceed(now)?;
+        let run = self.sustained_hard_exceed()?;
         let window = EGRESS_WINDOW_SECS as f64;
         let mut per_topic: BTreeMap<&str, KindBytes> = BTreeMap::new();
         for (_, rows) in &self.topic_samples {
@@ -506,12 +511,10 @@ impl EgressMeter {
             })
             .collect::<Vec<_>>()
             .join(", ");
+        let policy_effect = policy_effect(byte_policy);
         let message = format!(
             "gossip egress has exceeded the Leaf hard budget for {} s: {} (60 s average of \
-             subscribed topics) against {}; top topics: {}. byte_policy \"{byte_policy}\" \
-             can defer only forwarded Normal/Bulk EAGER sends; local publishes, Critical \
-             topics, targeted sends and IWANT/anti-entropy serves are never held back, so \
-             this traffic is not capped (#1964)",
+             subscribed topics) against {}; top topics: {}. {policy_effect} (#1964)",
             run.as_secs(),
             human_bits_per_sec(self.rate),
             human_bits_per_sec(hard_bytes_per_sec as f64),
@@ -527,6 +530,24 @@ impl EgressMeter {
             by_kind: by_kind_of(&totals),
             message,
         })
+    }
+}
+
+/// What the effective byte policy does about an exceeded budget.
+fn policy_effect(byte_policy: &str) -> String {
+    if byte_policy == super::config::LeafBytePolicy::ShedNormal.as_str() {
+        format!(
+            "byte_policy \"{byte_policy}\" can defer only forwarded Normal/Bulk EAGER sends; \
+             local publishes, Critical topics, targeted sends and IWANT/anti-entropy serves \
+             are never held back, so this traffic is not capped"
+        )
+    } else {
+        format!(
+            "byte_policy \"{byte_policy}\" measures only and defers nothing, so this traffic \
+             is not capped; even \"shed_normal\" could defer only forwarded Normal/Bulk EAGER \
+             sends, never local publishes, Critical topics, targeted sends or IWANT/anti-entropy \
+             serves"
+        )
     }
 }
 
@@ -670,21 +691,19 @@ mod tests {
         // 60 s window: 6_000 B/s once warm; the first sample alone is
         // already 6_000 / 60 = 100 B/s, over the 50 B/s hard budget.
         feed(&mut meter, start, 0..60, &mut total, 6_000, &config);
-        let last = start + Duration::from_secs(59);
         assert!(
-            meter.sustained_hard_exceed(last).is_none(),
+            meter.sustained_hard_exceed().is_none(),
             "59 s is not sustained"
         );
-        assert!(meter.warning(last, 50, "observe_only", &names).is_none());
+        assert!(meter.warning(50, "observe_only", &names).is_none());
 
         feed(&mut meter, start, 60..61, &mut total, 6_000, &config);
-        let at = start + Duration::from_secs(60);
         assert_eq!(
-            meter.sustained_hard_exceed(at),
+            meter.sustained_hard_exceed(),
             Some(Duration::from_secs(SUSTAINED_EGRESS_EXCEED_SECS))
         );
         let warning = meter
-            .warning(at, 50, "shed_normal", &names)
+            .warning(50, "shed_normal", &names)
             .expect("60 s over budget warns");
         assert_eq!(warning.exceeded_for_secs, 60);
         assert_eq!(warning.threshold_secs, SUSTAINED_EGRESS_EXCEED_SECS);
@@ -697,7 +716,46 @@ mod tests {
         assert!(warning
             .message
             .contains("x0x.identity.announce.v2 (critical, mostly eager)"));
-        assert!(warning.message.contains("Critical topics"));
+        assert!(warning
+            .message
+            .contains("\"shed_normal\" can defer only forwarded Normal/Bulk EAGER sends"));
+    }
+
+    /// WHY (#1964 review): under the default `observe_only` nothing is
+    /// deferred at all, so the warning must not claim that it defers
+    /// forwarded traffic.
+    #[test]
+    fn sustained_exceed_message_matches_observe_only() {
+        let config = sustained_config();
+        let mut meter = EgressMeter::default();
+        let start = Instant::now();
+        let mut total = 0;
+        feed(&mut meter, start, 0..61, &mut total, 6_000, &config);
+        let warning = meter
+            .warning(50, "observe_only", &HashMap::new())
+            .expect("60 s over budget warns");
+        assert!(warning
+            .message
+            .contains("\"observe_only\" measures only and defers nothing"));
+        assert!(!warning.message.contains("\"observe_only\" can defer"));
+        assert_eq!(warning.top_topics[0].name, "unknown-hex");
+        assert_eq!(warning.top_topics[0].priority, "unknown");
+    }
+
+    /// WHY (#1964 review): the run ends at the last sample. If the 1 s
+    /// tick stalls after one over-budget sample, a later status read must
+    /// not count the stall as time over the budget.
+    #[test]
+    fn stalled_sampling_does_not_extend_the_run() {
+        let config = sustained_config();
+        let mut meter = EgressMeter::default();
+        let start = Instant::now();
+        let mut total = 0;
+        feed(&mut meter, start, 0..1, &mut total, 6_000, &config);
+        assert_eq!(meter.hard_exceeded, 1, "the one sample is over budget");
+        // No further samples: a read at +61 s (any read time) must not warn.
+        assert!(meter.sustained_hard_exceed().is_none());
+        assert!(meter.warning(50, "shed_normal", &HashMap::new()).is_none());
     }
 
     /// WHY (#1964): one sample back under the budget ends the run, so the
@@ -709,23 +767,16 @@ mod tests {
         let start = Instant::now();
         let mut total = 0;
         feed(&mut meter, start, 0..90, &mut total, 6_000, &config);
-        assert!(meter
-            .sustained_hard_exceed(start + Duration::from_secs(89))
-            .is_some());
+        assert!(meter.sustained_hard_exceed().is_some());
         // Idle traffic: the 60 s average is back under 50 B/s once the
         // last 6_000 B sample (t = 89 s) has left the window at t = 149 s.
         feed(&mut meter, start, 90..150, &mut total, 0, &config);
-        let idle = start + Duration::from_secs(149);
         assert!(meter.rate <= 50.0, "rate {} must be back under", meter.rate);
-        assert!(meter.sustained_hard_exceed(idle).is_none());
-        assert!(meter
-            .warning(idle, 50, "observe_only", &HashMap::new())
-            .is_none());
+        assert!(meter.sustained_hard_exceed().is_none());
+        assert!(meter.warning(50, "observe_only", &HashMap::new()).is_none());
         // A fresh burst must wait a full 60 s again.
         feed(&mut meter, start, 150..170, &mut total, 60_000, &config);
-        assert!(meter
-            .sustained_hard_exceed(start + Duration::from_secs(169))
-            .is_none());
+        assert!(meter.sustained_hard_exceed().is_none());
     }
 
     /// WHY: Full nodes and a zero hard budget have no Leaf budget to exceed.
@@ -746,9 +797,7 @@ mod tests {
             let mut meter = EgressMeter::default();
             let mut total = 0;
             feed(&mut meter, start, 0..120, &mut total, 60_000, &config);
-            assert!(meter
-                .sustained_hard_exceed(start + Duration::from_secs(119))
-                .is_none());
+            assert!(meter.sustained_hard_exceed().is_none());
         }
     }
 
