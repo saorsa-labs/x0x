@@ -7,8 +7,11 @@
 //! unseen. Then O stops (not J), its `.grecov` is replaced with 64 bytes
 //! that start `JUNKJUNK`, and O starts again. The sim writes no ADR 0094
 //! upgrade journal, so the host commit gate is open. Last, every hold is
-//! released and O's agent sends J the authorisation it issued before the
-//! stop, so J starts its staged join.
+//! released and J receives from O the authorisation O issued before the
+//! stop, so J starts its staged join. The row hands that frame to J's
+//! inbound direct-message path rather than sending it over the fabric:
+//! after O's restart a send depends on gossip discovery timing that mixes
+//! virtual and real time (see [`send_reseat`]).
 //!
 //! Desired result (the row's "All" and "(3)" cells):
 //! - The old bytes sit, byte-identical, in one ADR 0108 §5a history copy,
@@ -61,10 +64,6 @@ const ADMITTED_FAILING: [&str; 3] = [
 /// O answers the re-seat call with one direct send to J (with its
 /// retries); it has ended by then.
 const PUSH_DONE: Duration = Duration::from_secs(120);
-/// One direct send with J's ack held: every attempt and its retry.
-const SEND_BOUND: Duration = Duration::from_secs(60);
-/// Sends of the lost authorisation before the row gives up (INFRA).
-const SEND_ATTEMPTS: usize = 6;
 /// How long J has to try its staged join and roll it back.
 const REFUSAL_WAIT: Duration = Duration::from_secs(300);
 
@@ -111,12 +110,27 @@ fn reseat_received(
     seen
 }
 
-/// O sends J `issued` as a `group_attest_response`, as O's push would.
-/// Returns whether J received it, read on J's own direct-message stream
-/// (not from wire frames: O's reconnect traffic reaches J too).
-async fn send_reseat(sim: &Sim, group: &str, issued: &IssuedReseatV1) -> Result<bool> {
+/// J receives `issued` from O as a `group_attest_response`, as O's push
+/// would have delivered it. The frame enters J's inbound direct-message
+/// path (`DirectMessaging::handle_incoming`, the entry point the network
+/// receive path calls) as a verified message from O's agent and machine,
+/// so J's own handlers process it. Returns whether J's direct-message
+/// stream then holds it, and how many of J's consumers took it.
+///
+/// Why not `send_direct` from O: after O's restart O has no discovery
+/// entry or capability advert for J, so a send reaches J only once J's
+/// announce comes to O over gossip. That recovery runs on virtual timers
+/// (IHAVE flush, 30 s anti-entropy) while the gossip message cache evicts
+/// after 60 s of REAL time (saorsa-gossip-pubsub `MAX_CACHE_AGE_SECS`, a
+/// `std::time::Instant`), and J's per-peer suppression of O after O's
+/// stop also runs on real time. On a loaded runner the six sends this row
+/// made all failed (studio1 trains 79, 80 and 83, Infra), and passed on
+/// others. Delivering the lost authorisation is set-up for this row, not
+/// what it tests (O's guard refusing J's staged join), so it no longer
+/// depends on that timing.
+async fn send_reseat(sim: &Sim, group: &str, issued: &IssuedReseatV1) -> Result<(bool, u64)> {
     let (j, _) = sim.ids("J")?;
-    let o = sim.ids("O")?.0;
+    let (o, o_machine) = sim.ids("O")?;
     let payload = encode_message(&GroupRecoveryMessageV1::Response(GroupAttestResponseV1 {
         group: group.to_string(),
         subject: j.0,
@@ -129,43 +143,25 @@ async fn send_reseat(sim: &Sim, group: &str, issued: &IssuedReseatV1) -> Result<
     let digest = issued.authorisation.digest();
     let mut rx = sim.state("J")?.agent.subscribe_direct();
     sim.fabric()
-        .mark("case: O sends J the authorisation issued before its stop");
-    let agent = sim.state("O")?.agent.clone();
-    // O's restart emptied its discovery cache, so the first send ends at
-    // once (`RecipientUndiscovered`) and starts O's lookup of J: send again
-    // until J has received it. Before the restart J's last announce is its
-    // heartbeat, minutes of virtual time old. Measured in the plain build
-    // (no shim): the second send found J when that announce was 23-24 s of
-    // real time old, and all six sends failed when it was 71-75 s old (the
-    // row on one CPU with two busy loops, as slow as the coverage build on
-    // the CI runner). The gossip message cache keeps a message for 60 s of
-    // real time (saorsa-gossip-pubsub `MAX_CACHE_AGE_SECS`, a
-    // `std::time::Instant`), not virtual time, and J's next heartbeat is
-    // later than every send here. So J announces before each send: the
-    // lookup then has an announce that is new in real time too, at any
-    // speed of the run.
-    for _ in 0..SEND_ATTEMPTS {
-        announce_all(sim, &["J"]).await?;
-        sim.within("O sends the lost authorisation", SEND_BOUND, async {
-            let _ = agent.send_direct(&j, payload.clone()).await;
-        })
-        .await?;
-        let mut received = false;
-        let _ = sim
-            .until(
-                "J receives the lost authorisation",
-                secs(10),
-                async |_s: &Sim| {
-                    received |= reseat_received(&mut rx, &o, digest.as_slice());
-                    received
-                },
-            )
-            .await;
-        if received {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+        .mark("case: J receives from O the authorisation issued before its stop");
+    let consumers = sim
+        .state("J")?
+        .agent
+        .direct_messaging()
+        .handle_incoming(o_machine, o, payload, true, None, None)
+        .await;
+    let mut received = false;
+    let _ = sim
+        .until(
+            "J's stream holds the lost authorisation",
+            secs(10),
+            async |_s: &Sim| {
+                received |= reseat_received(&mut rx, &o, digest.as_slice());
+                received
+            },
+        )
+        .await;
+    Ok((received, consumers))
 }
 
 /// O's sidecar directory and its file names (O is stopped).
@@ -299,11 +295,11 @@ async fn issuer_rebuild(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         "O's GET /groups/:id/recovery after the rebuild: {route}"
     ));
 
-    // Release the holds; O's agent sends J the lost authorisation.
+    // Release the holds; J receives the lost authorisation from O.
     o_to_j.store(false, Ordering::SeqCst);
     p.j_out_held.store(false, Ordering::SeqCst);
     sim.fabric().mark("fault: O->J and J's writes released");
-    let received = send_reseat(sim, &group, &issued).await?;
+    let (received, consumers) = send_reseat(sim, &group, &issued).await?;
     let mut st = None;
     let waited = sim
         .until(
@@ -346,7 +342,10 @@ async fn issuer_rebuild(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     receipt.request_delivered(
         "o_reached_j_with_the_lost_authorisation",
         received,
-        format!("J's direct-message stream holds O's re-seat answer: {received}"),
+        format!(
+            "J's direct-message stream holds O's re-seat answer: {received}; J's consumers \
+             {consumers}"
+        ),
         at(sim),
     );
 
