@@ -1205,7 +1205,7 @@ launcher is dormant it execs the daemon at once, so that wait and the
 hold are not yet measured through launchd. The launcher's unit tests
 cover them.
 
-**Missing daemon (measured).** The job names the canonical daemon. For a
+**Missing daemon.** The job names the canonical daemon. For a
 Homebrew install, that is a versioned Cellar path, which a `brew upgrade`
 removes. Before 19 Nov 2026 the dormant launcher then failed the `exec`
 and exited 75 at once, and launchd started it again after each throttle
