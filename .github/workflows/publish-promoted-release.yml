@@ -315,6 +315,8 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.release.tag_name }}
+          # The downloaded x0xd runs in this job; keep the token out of .git/config.
+          persist-credentials: false
 
       - name: Download the promoted Linux archive
         id: archive

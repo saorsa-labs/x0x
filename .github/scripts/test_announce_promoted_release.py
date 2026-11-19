@@ -48,7 +48,11 @@ FAKE_X0XD = textwrap.dedent(
 
         def do_GET(self):
             if self.path == "/health":
-                self.reply(200, {"ok": True, "peers": scenario["peers"]})
+                self.reply(200, {
+                    "ok": True,
+                    "peers": scenario["peers"],
+                    "send_ready_peers": scenario["send_ready"],
+                })
             else:
                 self.reply(404, {"ok": False})
 
@@ -83,14 +87,19 @@ def refused(result: str):
 
 
 class AnnounceTests(unittest.TestCase):
-    def run_script(self, peers: int, announce: list) -> tuple[int, str, int]:
+    def run_script(
+        self, peers: int, announce: list, send_ready: int | None = None
+    ) -> tuple[int, str, int]:
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             fake = tmp / "x0xd"
             fake.write_text(f"#!{sys.executable}\n{FAKE_X0XD}")
             fake.chmod(0o755)
             scenario = tmp / "scenario.json"
-            scenario.write_text(json.dumps({"peers": peers, "announce": announce}))
+            send_ready = peers if send_ready is None else send_ready
+            scenario.write_text(json.dumps(
+                {"peers": peers, "send_ready": send_ready, "announce": announce}))
+            summary = tmp / "summary.md"
             calls = tmp / "calls"
             env = dict(
                 os.environ,
@@ -103,6 +112,7 @@ class AnnounceTests(unittest.TestCase):
                 ANNOUNCE_LINGER="0",
                 ANNOUNCE_RETRY_WAIT="0",
                 ANNOUNCE_ATTEMPTS="3",
+                GITHUB_STEP_SUMMARY=str(summary),
             )
             proc = subprocess.run(
                 [sys.executable, str(SCRIPT), "--x0xd", str(fake), "--version", "1.2.3",
@@ -113,12 +123,14 @@ class AnnounceTests(unittest.TestCase):
                 timeout=120,
             )
             n = len(calls.read_text().splitlines()) if calls.exists() else 0
+            self.summary = summary.read_text() if summary.exists() else ""
             return proc.returncode, proc.stdout + proc.stderr, n
 
     def test_announced_with_the_promoted_version_succeeds(self):
         code, out, calls = self.run_script(3, [ok("announced", "1.2.3")])
         self.assertEqual((code, calls), (0, 1), out)
         self.assertIn("announced on the x0x network", out)
+        self.assertIn("Release 1.2.3 announced on the x0x network", self.summary)
 
     def test_an_earlier_version_is_not_success_and_is_retried(self):
         code, out, calls = self.run_script(
@@ -130,6 +142,7 @@ class AnnounceTests(unittest.TestCase):
         code, out, calls = self.run_script(3, [ok("already_announced", "1.2.2")])
         self.assertEqual((code, calls), (1, 3), out)
         self.assertIn("x0x upgrade --announce", out)
+        self.assertIn("Release 1.2.3 was not announced", self.summary)
 
     def test_retryable_refusals_are_retried(self):
         code, out, calls = self.run_script(
@@ -149,7 +162,12 @@ class AnnounceTests(unittest.TestCase):
     def test_no_peers_fails_without_announcing(self):
         code, out, calls = self.run_script(0, [ok("announced", "1.2.3")])
         self.assertEqual((code, calls), (1, 0), out)
-        self.assertIn("found no peers", out)
+        self.assertIn("found no send-ready peers", out)
+
+    def test_connected_peers_that_are_not_send_ready_do_not_count(self):
+        code, out, calls = self.run_script(3, [ok("announced", "1.2.3")], send_ready=0)
+        self.assertEqual((code, calls), (1, 0), out)
+        self.assertIn("found no send-ready peers", out)
 
 
 if __name__ == "__main__":

@@ -33,6 +33,15 @@ ANNOUNCED = {"announced", "already_announced"}
 RETRYABLE = {"fetch_failed", "nothing_newer", "publish_failed"}
 
 
+def report(level: str, message: str) -> None:
+    """Print a workflow annotation and add the outcome to the job summary."""
+    print(f"::{level}::{message}", flush=True)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as out:
+            out.write(f"{message}\n")
+
+
 def env_seconds(name: str, default: float) -> float:
     return float(os.environ.get(name, default))
 
@@ -104,12 +113,13 @@ def announce(api: str, token: str, expected: str) -> int:
         print(f"attempt {attempt}: HTTP {status} {json.dumps(body)}", flush=True)
         verdict = judge(status, body, expected)
         if verdict == "ok":
-            print(f"::notice::Release {expected} announced on the x0x network ({body['result']}).")
+            report("notice", f"Release {expected} announced on the x0x network ({body['result']}).")
             return 0
         if verdict == "absent":
-            print(
-                "::notice::This release's x0xd has no POST /upgrade/announce route "
-                "(older than #1169 PR 1); nothing announced."
+            report(
+                "notice",
+                "This release's x0xd has no POST /upgrade/announce route "
+                "(older than #1169 PR 1); nothing announced.",
             )
             return 0
         if verdict == "fail":
@@ -119,9 +129,10 @@ def announce(api: str, token: str, expected: str) -> int:
             # 300 s rebroadcast interval; wait past it before trying again.
             print(f"retrying in {retry_wait:.0f} s", flush=True)
             time.sleep(retry_wait)
-    print(
-        f"::error::Release {expected} was not announced. Run `x0x upgrade --announce` "
-        "on a node that can reach the network."
+    report(
+        "error",
+        f"Release {expected} was not announced. Run `x0x upgrade --announce` "
+        "on a node that can reach the network.",
     )
     return 1
 
@@ -158,20 +169,23 @@ def main() -> int:
             1,
         )
         if not health or not token:
-            print("::error::x0xd did not start.")
+            report("error", "x0xd did not start.")
             return 1
+        # `send_ready_peers` counts peers this node can publish to; `peers`
+        # can include connections that are not yet usable for gossip.
         peers = wait_for(
-            lambda: (request(f"{api}/health")[1] or {}).get("peers", 0) or None,
+            lambda: (request(f"{api}/health")[1] or {}).get("send_ready_peers", 0) or None,
             env_seconds("ANNOUNCE_PEER_WAIT", 180),
             2,
         )
         if not peers:
-            print(
-                "::error::The announce node found no peers (hosted runners may not reach "
-                "the network over UDP). Run `x0x upgrade --announce` on a node that can."
+            report(
+                "error",
+                "The announce node found no send-ready peers (hosted runners may not reach "
+                "the network over UDP). Run `x0x upgrade --announce` on a node that can.",
             )
             return 1
-        print(f"connected to {peers} peer(s)", flush=True)
+        print(f"{peers} send-ready peer(s)", flush=True)
         # Topic membership follows the first connections by a few seconds.
         time.sleep(env_seconds("ANNOUNCE_SETTLE", 20))
         code = announce(api, token, args.version)

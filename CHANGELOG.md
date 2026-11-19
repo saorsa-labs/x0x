@@ -25,7 +25,7 @@ All notable changes to this project will be documented in this file.
   identity and calls `POST /upgrade/announce`. It passes only when the
   answer's `version` is the promoted version, retries after the 300 s
   refusal window, and names `x0x upgrade --announce` as the fallback when
-  the runner finds no peers. It needs no secret.
+  the runner finds no send-ready peers. It needs no secret.
 
 - **`POST /upgrade/announce` and `x0x upgrade --announce` (#1169; A14
   amendment of 19 Nov 2026).** A node fetches the latest release

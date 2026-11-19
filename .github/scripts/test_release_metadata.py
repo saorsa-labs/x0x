@@ -32,6 +32,7 @@ EXPECTED_RELEASE_JOB_NEEDS = {
 EXPECTED_PROMOTED_JOB_NEEDS = {
     'publish-clawhub': ['validate-promoted-release'],
     'publish-crates': ['validate-promoted-release'],
+    'announce-release': ['validate-promoted-release'],
 }
 
 

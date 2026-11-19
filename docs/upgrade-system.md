@@ -1435,7 +1435,8 @@ runs the announce from a short-lived node:
    a fresh identity in a temporary directory, on the `x0x.prod` plane, with
    `[update] enabled = false`, `--skip-update-check` and mDNS off. It holds
    no secret.
-3. It waits up to 180 s for at least one peer (`peers` in `/health`), then
+3. It waits up to 180 s for at least one send-ready peer (`send_ready_peers`
+   in `/health`), then
    20 s more for topic membership, and calls `POST /upgrade/announce`.
 4. Success is `announced` or `already_announced` **with `version` equal to
    the promoted version**. The result alone is not enough: the 300 s
@@ -1449,10 +1450,11 @@ runs the announce from a short-lived node:
 
 The job passes, and announces nothing, when the release has no announce
 script or its `x0xd` has no announce route (404). It fails when the node
-finds no peers (hosted runners may not reach the network over UDP) or the
+finds no send-ready peers (hosted runners may not reach the network over UDP) or the
 promoted version is not announced; the error names the fallback, `x0x
 upgrade --announce` on a node that can reach the network. The job is
-independent of the crates.io and ClawHub jobs.
+independent of the crates.io and ClawHub jobs. Its outcome is an annotation
+and a line in the job summary.
 
 ## Downgrade safety (#451) — Home-Suite group state
 
