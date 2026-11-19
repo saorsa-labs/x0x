@@ -526,6 +526,9 @@ pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
                     | "/home/rename"
                     | "/home/seat"
                     | "/upgrade/apply"
+                    // #1169: the announce publishes on the release topic for
+                    // the whole network, an owner act like the apply.
+                    | "/upgrade/announce"
                     // #1376 / D190: the local hold clear re-admits a held
                     // release, an owner act like the apply itself.
                     | "/upgrade/clear-hold"
@@ -1270,6 +1273,7 @@ mod tests {
             (Method::POST, "/home/rename"),
             (Method::POST, "/home/seat"),
             (Method::POST, "/upgrade/apply"),
+            (Method::POST, "/upgrade/announce"),
             (Method::POST, "/upgrade/clear-hold"),
             (Method::POST, "/gui/show"),
         ] {

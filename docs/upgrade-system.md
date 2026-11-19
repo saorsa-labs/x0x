@@ -1277,6 +1277,7 @@ no gossip, binds nothing, and takes no instance lock.
    - the fallback poll
    - the gossip relay
    - a manual `/upgrade/apply`
+   - a manual `/upgrade/announce` (see below)
 
    The startup check and the read-only `/upgrade` check announce
    nothing. The startup check's discovery is covered by the manifest
@@ -1375,6 +1376,53 @@ setting is not persisted; launching the daemon normally later restores the
 configured updater behavior.
 
 All nodes verify and rebroadcast manifests (symmetric propagation — no privileged bootstrap role).
+
+### Announcing a release at promotion (#1169)
+
+David decided on 19 Nov 2026 that a release is announced at promotion.
+`POST /upgrade/announce` (CLI `x0x upgrade --announce`) is the local,
+authenticated way to do it. It needs no signing key: peers accept a
+manifest only with a valid ML-DSA-65 signature, a newer version and a
+fresh timestamp, so the announcer only relays bytes CI already signed.
+
+1. A successful announce in the last 300 s answers `already_announced`
+   at once, before any GitHub request.
+2. It fetches the latest release manifest with `fetch_current_manifest`,
+   the same verified fetch as the boot broadcast, and checks the
+   manifest timestamp.
+3. It decides the result:
+
+   | `result` | Status | When |
+   |---|---|---|
+   | `announced` | 200 | Published on `x0x/release`. |
+   | `already_announced` | 200 | This node announced within 300 s, or published the same bytes within 300 s by another path (boot broadcast, fallback poll, relay). Nothing is published. |
+   | `nothing_newer` | 200 | This node runs a version newer than the latest release. Nothing is published. A node on the release's own version does announce it. |
+   | `fetch_failed` | 502 | The GitHub release or its manifest assets could not be fetched. Nothing is published or recorded. |
+   | `verification_failed` | 502 | The signature or the manifest checks failed. Nothing is published or recorded. |
+   | `publish_failed` | 502 | The publish failed or did not finish within 10 s. The announce's record is undone, so a retry is not refused. |
+
+4. Before it publishes, it records the payload in the self-published
+   tracker, so the gossip driver does not rebroadcast this node's echo.
+   If the publish fails, or the request is dropped mid-publish, a guard
+   undoes only that record. A record made meanwhile, such as an
+   `/upgrade/apply` claim on the same bytes, stays.
+
+The announcing node is on the same footing as a node that received the
+manifest by gossip. The announce never installs at once and never
+bypasses the node's own policy. Its record carries no apply-route
+claim, so the gossip driver submits the echo (or a peer's copy) to the
+node's background owner like any gossip copy: same staggered install,
+same version dedup, same updates-enabled and channel gates. With updates
+off, no gossip driver runs and nothing is queued.
+
+The route does not depend on `update.enabled`: a node with updates off
+can announce. A node that published the same bytes at boot (the boot
+broadcast) within the last 300 s answers `already_announced`.
+
+Accepted trade-off: after an announce, every node applies within the
+60-minute stagger window, the announcer included. There is no
+network-wide halt today. The CI promotion job that runs the announce is
+separate work (#1169 PR 2).
 
 ## Downgrade safety (#451) — Home-Suite group state
 
