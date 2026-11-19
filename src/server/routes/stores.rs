@@ -11,7 +11,6 @@ use super::super::{
     api_error, api_error_with_reason, bad_request, direct_message_send_config, forbidden,
     not_found, parse_agent_id_hex,
 };
-use super::named_groups::GROUP_BACKGROUND_PUBLISH_DELAY;
 use crate as x0x;
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
@@ -111,7 +110,10 @@ fn encode_kv_store_delta_direct_payload(
 fn kv_store_delta_direct_delivery_config() -> x0x::dm::DmSendConfig {
     let mut config = direct_message_send_config();
     config.require_gossip = true;
-    config.require_gossip_ack = true;
+    // Best-effort side-channel copy: do not force durable triple-hedged ACKs
+    // (inbox + global DM_BUS_TOPIC + direct QUIC) on every KV write to every
+    // contact, since many contacts have not joined this store.
+    config.require_gossip_ack = false;
     config
 }
 
@@ -196,16 +198,11 @@ fn spawn_kv_store_delta_delivery(
     peer_id: saorsa_gossip_types::PeerId,
     delta: &x0x::kv::KvStoreDelta,
 ) {
+    // Send a single immediate best-effort side-channel DM per recipient
+    // (avoiding the unconditional +8 s duplicate copy that doubled write
+    // amplification across all contacts).
     for recipient in recipients {
         spawn_kv_store_delta_delivery_one(state, &recipient, store_id, peer_id, delta, None);
-        spawn_kv_store_delta_delivery_one(
-            state,
-            &recipient,
-            store_id,
-            peer_id,
-            delta,
-            Some(GROUP_BACKGROUND_PUBLISH_DELAY),
-        );
     }
 }
 
@@ -3805,6 +3802,13 @@ pub(in crate::server) async fn import_legacy_page_store(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kv_store_delta_direct_delivery_config_avoids_durable_ack_storm() {
+        let cfg = kv_store_delta_direct_delivery_config();
+        assert!(cfg.require_gossip);
+        assert!(!cfg.require_gossip_ack);
+    }
 
     #[test]
     fn kv_store_delta_direct_payload_is_prefixed_json() {

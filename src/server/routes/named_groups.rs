@@ -3694,6 +3694,81 @@ pub(super) fn pull_card_record<'a>(
         .filter(|info| !group_recovery::is_card_held_back(state, info.stable_group_id()))
 }
 
+/// Minimum interval between answering duplicate `DirectoryMessage::Pull`
+/// requests for the same `(agent_id, shard_topic, group_id)` triple.
+///
+/// Prevents concurrent/burst pull storms from making every node in a shard
+/// repeatedly re-publish ~20 KiB signed group cards back-to-back.
+const PULL_RESPONSE_COOLDOWN: Duration = Duration::from_secs(30);
+const PULL_RESPONSE_COOLDOWN_MAX_ENTRIES: usize = 1_024;
+
+type PullResponseKey = ([u8; 32], String, String);
+type PullResponseTable = std::sync::Mutex<HashMap<PullResponseKey, Instant>>;
+
+fn allow_pull_response(
+    agent_id: x0x::identity::AgentId,
+    topic: &str,
+    gid: &str,
+    now: Instant,
+) -> bool {
+    static LAST_SENT: std::sync::OnceLock<PullResponseTable> = std::sync::OnceLock::new();
+    let table = LAST_SENT.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = table
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let key = (*agent_id.as_bytes(), topic.to_string(), gid.to_string());
+    if let Some(&last) = guard.get(&key) {
+        if now.saturating_duration_since(last) < PULL_RESPONSE_COOLDOWN {
+            return false;
+        }
+    }
+    if guard.len() >= PULL_RESPONSE_COOLDOWN_MAX_ENTRIES {
+        guard.retain(|_, ts| now.saturating_duration_since(*ts) < PULL_RESPONSE_COOLDOWN);
+    }
+    guard.insert(key, now);
+    true
+}
+
+#[cfg(test)]
+mod pull_response_cooldown_tests {
+    use super::*;
+
+    #[test]
+    fn pull_response_cooldown_suppresses_burst_duplicates_and_allows_after_window() {
+        let agent_a = x0x::identity::AgentId([0xA1; 32]);
+        let agent_b = x0x::identity::AgentId([0xB2; 32]);
+        let t0 = Instant::now();
+
+        assert!(allow_pull_response(agent_a, "shard-topic-1", "gid-1", t0));
+        assert!(!allow_pull_response(
+            agent_a,
+            "shard-topic-1",
+            "gid-1",
+            t0 + Duration::from_secs(5)
+        ));
+        // Different group or different agent is unaffected.
+        assert!(allow_pull_response(
+            agent_a,
+            "shard-topic-1",
+            "gid-2",
+            t0 + Duration::from_secs(5)
+        ));
+        assert!(allow_pull_response(
+            agent_b,
+            "shard-topic-1",
+            "gid-1",
+            t0 + Duration::from_secs(5)
+        ));
+        // Same key allowed again once the cooldown window elapses.
+        assert!(allow_pull_response(
+            agent_a,
+            "shard-topic-1",
+            "gid-1",
+            t0 + PULL_RESPONSE_COOLDOWN + Duration::from_secs(1)
+        ));
+    }
+}
+
 async fn respond_to_pull(
     state: &AppState,
     kind: x0x::groups::ShardKind,
@@ -3701,9 +3776,20 @@ async fn respond_to_pull(
     group_ids: &[String],
 ) {
     let signing_kp = state.agent.identity().agent_keypair();
+    let local_agent_id = state.agent.agent_id();
     let topic = x0x::groups::topic_for(kind, shard);
+    let now = Instant::now();
     let groups = state.named_groups.read().await;
     for gid in group_ids {
+        if !allow_pull_response(local_agent_id, &topic, gid, now) {
+            tracing::debug!(
+                shard,
+                ?kind,
+                group_id = %gid,
+                "C.2: suppressing duplicate directory pull response within cooldown"
+            );
+            continue;
+        }
         // We only re-publish cards for groups we *own* / manage locally,
         // not arbitrary cards from our cache (relays may re-publish cached
         // blobs but cannot re-sign them).
@@ -24001,17 +24087,6 @@ pub(in crate::server) async fn send_group_public_message(
         }
     };
     observe_group_send_fanout(&state, &msg.group_id, fan_out).await;
-    if let Err(e) = state
-        .agent
-        .publish(GLOBAL_PUBLIC_MESSAGE_TOPIC, bytes.clone())
-        .await
-    {
-        tracing::warn!(
-            topic = GLOBAL_PUBLIC_MESSAGE_TOPIC,
-            group_id = %msg.group_id,
-            "E: global public-send fallback publish failed: {e}"
-        );
-    }
     // Publish succeeded, so cache locally. The listener was started before the
     // publish above to avoid first-message topic races. Delivery (fan_out) is
     // a separate fact from this local write — HTTP 200 is preserved even
@@ -24023,6 +24098,7 @@ pub(in crate::server) async fn send_group_public_message(
         bytes,
         direct_recipients,
         msg.clone(),
+        fan_out == 0,
     );
 
     let msg_id = msg.msg_id();
@@ -24389,23 +24465,24 @@ pub(in crate::server) async fn publish_delegation_carrier(
         tracing::warn!("failed to serialize delegation carrier");
         return;
     };
-    if let Err(e) = state.agent.publish_with_fanout(&topic, bytes.clone()).await {
-        tracing::warn!(topic = %LogHexId::topic(&topic), "delegation carrier publish failed: {e}");
-    }
-    if let Err(e) = state
-        .agent
-        .publish(GLOBAL_PUBLIC_MESSAGE_TOPIC, bytes.clone())
-        .await
-    {
-        tracing::warn!(
-            topic = GLOBAL_PUBLIC_MESSAGE_TOPIC,
-            "delegation carrier global fallback failed: {e}"
-        );
-    }
+    let fan_out = match state.agent.publish_with_fanout(&topic, bytes.clone()).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(topic = %LogHexId::topic(&topic), "delegation carrier publish failed: {e}");
+            0
+        }
+    };
     cache_public_message(&state, msg.clone()).await;
     let direct_recipients = active_member_recipients(&state, &msg.group_id).await;
     spawn_delegation_carrier_redelivery(&state, &topic, &bytes, &msg);
-    spawn_group_public_message_fanout_race(state, topic, bytes, direct_recipients, msg);
+    spawn_group_public_message_fanout_race(
+        state,
+        topic,
+        bytes,
+        direct_recipients,
+        msg,
+        fan_out == 0,
+    );
 }
 
 /// Active members of `group_id` other than this daemon, as lowercase hex.
@@ -24932,6 +25009,7 @@ fn spawn_group_public_message_fanout_race(
     bytes: Vec<u8>,
     recipients: Vec<String>,
     msg: x0x::groups::GroupPublicMessage,
+    needs_global_fallback: bool,
 ) {
     let unicast_outstanding = Arc::new(AtomicUsize::new(recipients.len()));
 
@@ -24943,30 +25021,29 @@ fn spawn_group_public_message_fanout_race(
         tracing::info!(
             target: "x0x::groups",
             group_id = %LogHexId::group(&gossip_group),
-            "public group message gossip publish starting (raced with unicast)"
+            needs_global_fallback,
+            "public group message fallback gossip leg starting (raced with unicast)"
         );
         #[cfg(test)]
         detached_send_test_seam::park(&detached_send_test_seam::public_gossip_key(&topic)).await;
-        if let Err(e) = gossip_state
-            .agent
-            .publish(&topic, gossip_bytes.clone())
-            .await
-        {
-            tracing::warn!(
-                topic = %LogHexId::topic(&topic),
-                "E: public-send publish failed: {e}"
-            );
-        }
-        if let Err(e) = gossip_state
-            .agent
-            .publish(GLOBAL_PUBLIC_MESSAGE_TOPIC, gossip_bytes)
-            .await
-        {
-            tracing::warn!(
-                topic = GLOBAL_PUBLIC_MESSAGE_TOPIC,
-                group_id = %gossip_group,
-                "E: global public-send fallback publish failed: {e}"
-            );
+        #[cfg(not(test))]
+        let _ = &topic;
+        // The per-group topic was already published synchronously by the caller
+        // (`publish_with_fanout`); avoid re-publishing the same bytes with a
+        // fresh PlumTree message ID. Only publish to the global fallback topic
+        // when the per-group publish had zero fan-out.
+        if needs_global_fallback {
+            if let Err(e) = gossip_state
+                .agent
+                .publish(GLOBAL_PUBLIC_MESSAGE_TOPIC, gossip_bytes)
+                .await
+            {
+                tracing::warn!(
+                    topic = GLOBAL_PUBLIC_MESSAGE_TOPIC,
+                    group_id = %gossip_group,
+                    "E: global public-send fallback publish failed: {e}"
+                );
+            }
         }
         if gossip_outstanding.load(Ordering::Relaxed) > 0 {
             gossip_state
@@ -24975,7 +25052,7 @@ fn spawn_group_public_message_fanout_race(
             tracing::info!(
                 target: "x0x::groups",
                 group_id = %LogHexId::group(&gossip_group),
-                "public group message gossip published before unicast returned"
+                "public group message gossip leg completed before unicast returned"
             );
         }
     });

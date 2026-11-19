@@ -984,8 +984,16 @@ impl GossipRuntime {
             // saorsa-gossip admits never-connected peers to the HyParView active
             // view and never prunes them (x0x#1036).
             let mut stale_targets = super::stale_targets::StaleTargetTracker::default();
+            // ant-quic already sends transport-level QUIC PINGs every 15 s
+            // (`keep_alive_interval = Some(15s)`). Keep active-view stale
+            // pruning at 15 s, and relax the redundant application-level SWIM
+            // ping cadence to every 4th tick (60 s) to cut idle ping/ack churn
+            // by 75% without losing SWIM failure detection.
+            const SWIM_PING_TICK_STRIDE: u64 = 4;
+            let mut tick: u64 = 0;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                tick = tick.wrapping_add(1);
 
                 let connected: std::collections::HashSet<PeerId> = keepalive_network
                     .send_ready_peers()
@@ -1000,6 +1008,10 @@ impl GossipRuntime {
                     Instant::now(),
                 )
                 .await;
+
+                if !tick.is_multiple_of(SWIM_PING_TICK_STRIDE) {
+                    continue;
+                }
 
                 let peers = keepalive_network.gossip_plane_peers().await;
                 for peer in peers {

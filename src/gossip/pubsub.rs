@@ -3953,7 +3953,10 @@ const BULK_TOPIC_PREFIXES: &[&str] = &[
     "x0x.machine.shard.v2.",   // Machine anti-entropy shards
     "x0x.user.shard.v2.",      // User anti-entropy shards
     "x0x.machine.announce.v2", // Machine announce — bulk
+    "x0x.machine.announce.v3", // Machine announce v3 (600 s ~18.5 KiB heartbeat) — bulk
     "x0x.user.announce.v2",    // User announce — bulk
+    "x0x.move.activation.v1",  // Key-move activation bundle anti-entropy — bulk
+    "x0x/announce/v3/blob",    // Certificate blob fetch/response anti-entropy — bulk
     "x0x.discovery.groups",    // Global group discovery anti-entropy
     "x0x.directory.",          // Group directory tag/name/id shards (src/groups/discovery.rs)
     "x0x.rendezvous.shard",    // Rendezvous shard discovery
@@ -4626,6 +4629,22 @@ mod tests {
         assert_eq!(
             classify_x0x_topic("x0x.identity.announce.v2"),
             TopicPriority::Critical
+        );
+    }
+
+    #[test]
+    fn classify_x0x_topic_routes_bulk_anti_entropy_topics_to_bulk() {
+        assert_eq!(
+            classify_x0x_topic("x0x.machine.announce.v3"),
+            TopicPriority::Bulk
+        );
+        assert_eq!(
+            classify_x0x_topic("x0x.move.activation.v1"),
+            TopicPriority::Bulk
+        );
+        assert_eq!(
+            classify_x0x_topic("x0x/announce/v3/blob"),
+            TopicPriority::Bulk
         );
     }
 

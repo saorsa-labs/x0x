@@ -6336,6 +6336,10 @@ struct HeartbeatContext {
     /// Last `change_generation` the piggyback broadcast saw. Unchanged set
     /// ⇒ skip the publish (except the periodic fallback below).
     last_revocation_generation: std::sync::atomic::AtomicU64,
+    /// Last fingerprint of known move activation bundles published on
+    /// `MOVE_ACTIVATION_TOPIC` (0 = none published yet). Prevents re-flooding
+    /// every known bundle on every 600 s heartbeat when nothing changed.
+    last_move_activation_fingerprint: std::sync::atomic::AtomicU64,
     /// Heartbeat tick counter for the periodic revocation fallback.
     heartbeat_tick: std::sync::atomic::AtomicU64,
     /// L3 retirement flip: publish the legacy V2 announce set only when true.
@@ -6809,25 +6813,52 @@ impl HeartbeatContext {
 
         // ADR-0043 §3.3: activation-bundle republication for late joiners
         // — the latest bundle alone suffices for tombstones + placement.
-        // On-change (generation) + periodic fallback, exactly the
-        // revocation piggyback pattern; the v2 revocation carrier rides
-        // the same block below.
+        // On-change (fingerprint) + periodic fallback, matching the
+        // revocation piggyback pattern below (previously every heartbeat
+        // republished every known bundle unconditionally).
+        const REVOCATION_FALLBACK_TICKS: u64 = 12;
+        let tick = self
+            .heartbeat_tick
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let is_fallback = tick.is_multiple_of(REVOCATION_FALLBACK_TICKS);
+
         {
-            let bundles = {
+            let serialized_bundles: Vec<Vec<u8>> = {
                 let state = self.move_state.read().await;
-                state
-                    .known_agents()
+                let mut agents = state.known_agents();
+                agents.sort_unstable_by_key(|a| *a.as_bytes());
+                agents
                     .into_iter()
-                    .filter_map(|agent| state.bundle(&agent).cloned())
-                    .collect::<Vec<_>>()
+                    .filter_map(|agent| state.bundle(&agent))
+                    .filter_map(|bundle| bincode::serialize(bundle).ok())
+                    .collect()
             };
-            for bundle in bundles {
-                if let Ok(bytes) = bincode::serialize(&bundle) {
-                    let _ = self
-                        .runtime
-                        .pubsub()
-                        .publish(MOVE_ACTIVATION_TOPIC.to_string(), bytes::Bytes::from(bytes))
-                        .await;
+            if !serialized_bundles.is_empty() {
+                let mut hasher = blake3::Hasher::new();
+                for bytes in &serialized_bundles {
+                    hasher.update(&(bytes.len() as u64).to_le_bytes());
+                    hasher.update(bytes);
+                }
+                let digest = hasher.finalize();
+                let mut fp =
+                    u64::from_le_bytes(digest.as_bytes()[..8].try_into().unwrap_or([0u8; 8]));
+                if fp == 0 {
+                    fp = 1;
+                }
+                let last_fp = self
+                    .last_move_activation_fingerprint
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let move_changed = fp != last_fp;
+                if move_changed || is_fallback {
+                    for bytes in serialized_bundles {
+                        let _ = self
+                            .runtime
+                            .pubsub()
+                            .publish(MOVE_ACTIVATION_TOPIC.to_string(), bytes::Bytes::from(bytes))
+                            .await;
+                    }
+                    self.last_move_activation_fingerprint
+                        .store(fp, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -6852,8 +6883,6 @@ impl HeartbeatContext {
         // Vec<RevocationRecord> on x0x.revocation.v1; old nodes that
         // receive it process it identically.
         {
-            const REVOCATION_FALLBACK_TICKS: u64 = 12;
-
             let collected = {
                 let mut set = self.revocation_set.write().await;
                 set.collect_dead_records(Agent::unix_timestamp_secs())
@@ -6876,15 +6905,11 @@ impl HeartbeatContext {
                     .stranger_self_revocation_count() as u64,
             );
 
-            let tick = self
-                .heartbeat_tick
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let current_gen = self.revocation_set.read().await.generation();
             let last_gen = self
                 .last_revocation_generation
                 .load(std::sync::atomic::Ordering::Relaxed);
             let changed = current_gen != last_gen;
-            let is_fallback = tick.is_multiple_of(REVOCATION_FALLBACK_TICKS);
 
             if !changed && !is_fallback && !newly_seen {
                 return Ok(());
@@ -17438,6 +17463,7 @@ impl Agent {
                 allow_local_discovery_addrs: allow_local_discovery_addresses(network.config()),
                 revocation_set: std::sync::Arc::clone(&self.revocation_set),
                 last_revocation_generation: std::sync::atomic::AtomicU64::new(0),
+                last_move_activation_fingerprint: std::sync::atomic::AtomicU64::new(0),
                 heartbeat_tick: std::sync::atomic::AtomicU64::new(0),
                 verified_cert_tx: std::sync::Arc::clone(&self.verified_cert_tx),
                 machine_kem_public: self.machine_kem_public_key(),
@@ -21885,6 +21911,7 @@ impl Agent {
             allow_local_discovery_addrs: allow_local_discovery_addresses(network.config()),
             revocation_set: std::sync::Arc::clone(&self.revocation_set),
             last_revocation_generation: std::sync::atomic::AtomicU64::new(0),
+            last_move_activation_fingerprint: std::sync::atomic::AtomicU64::new(0),
             heartbeat_tick: std::sync::atomic::AtomicU64::new(0),
             verified_cert_tx: std::sync::Arc::clone(&self.verified_cert_tx),
             machine_kem_public: self.machine_kem_public_key(),
@@ -23388,6 +23415,7 @@ impl Agent {
             selection_skew: std::sync::Arc::clone(&self.selection_skew),
             revocation_set: std::sync::Arc::clone(&self.revocation_set),
             last_revocation_generation: std::sync::atomic::AtomicU64::new(0),
+            last_move_activation_fingerprint: std::sync::atomic::AtomicU64::new(0),
             heartbeat_tick: std::sync::atomic::AtomicU64::new(0),
             legacy_announce: self.legacy_announce,
             machine_kem_public: self.machine_kem_public_key(),

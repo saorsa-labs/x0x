@@ -808,7 +808,9 @@ impl CapabilityAdvertService {
                         _ = tokio::time::sleep(publish_interval) => {}
                         res = publisher_caps_rx.changed() => {
                             if res.is_ok() {
-                                burst_idx = 0;
+                                if periodic {
+                                    burst_idx = 0;
+                                }
                                 // The pending→ready transition is the
                                 // readiness announce: the first publishable
                                 // cycle after it is steady-worthy (#656),
@@ -1039,7 +1041,9 @@ impl CapabilityAdvertService {
                         res = publisher_caps_rx.changed() => {
                             if res.is_ok() {
                                 tracing::debug!("capability advert upgraded; republishing");
-                                burst_idx = 0;
+                                if periodic {
+                                    burst_idx = 0;
+                                }
                             }
                             // A capability upgrade is steady-worthy: the
                             // fleet should see the new state immediately,
