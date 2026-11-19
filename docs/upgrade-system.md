@@ -702,7 +702,8 @@ launcher -> child readback. Run as `x0x-launcher /absolute/path/x0xd [args]`, it
 semantics. The daemon path must be absolute. The launcher never searches
 `PATH`. A missing or relative daemon path exits 64 (`EX_USAGE`). A failed
 `exec` exits 75 (`EX_TEMPFAIL`); `Restart=always` retries it as for a
-direct unit. `Restart=always` also restarts on exit 64, so a unit that
+direct unit. On macOS a daemon path that does not exist is waited for
+instead (see "Missing daemon" below). `Restart=always` also restarts on exit 64, so a unit that
 binds the launcher must set `RestartPreventExitStatus=64`: a wrong
 `ExecStart` then stops the job and does not restart it every 5 s. The
 argv contract and the exit codes are provisional and dormant. They are

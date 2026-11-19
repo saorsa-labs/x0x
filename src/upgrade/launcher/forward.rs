@@ -51,7 +51,8 @@ pub(crate) fn exec_daemon(command: &DaemonCommand) -> io::Error {
     daemon.exec()
 }
 
-/// First and longest pause between two `exec` attempts on a missing daemon.
+/// Shortest and longest pause between two `exec` attempts on a missing
+/// daemon.
 const MISSING_FIRST_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 const MISSING_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -130,31 +131,16 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 
-    /// A path whose parent is not a directory is missing too.
+    /// A path whose parent is not a directory is missing too. The errors
+    /// are synthesized: a real failed `exec` in this multi-threaded test
+    /// process swaps `environ` (for `env_remove`) under other tests' spawns.
     #[test]
-    fn a_daemon_under_a_non_directory_is_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("file");
-        std::fs::write(&file, b"").unwrap();
-        let command = DaemonCommand {
-            executable: file.join("x0xd").into_os_string(),
-            args: Vec::new(),
-        };
-        let mut attempts = 0;
-        exec_daemon_when_present(
-            &command,
-            |command| {
-                attempts += 1;
-                if attempts == 1 {
-                    exec_daemon(command)
-                } else {
-                    io::Error::from(io::ErrorKind::PermissionDenied)
-                }
-            },
-            || false,
-            |_| {},
-        );
-        assert_eq!(attempts, 2);
+    fn missing_means_enoent_or_enotdir() {
+        assert!(is_missing(&io::Error::from(io::ErrorKind::NotFound)));
+        assert!(is_missing(&io::Error::from_raw_os_error(libc::ENOENT)));
+        assert!(is_missing(&io::Error::from_raw_os_error(libc::ENOTDIR)));
+        assert!(!is_missing(&io::Error::from_raw_os_error(libc::EACCES)));
+        assert!(!is_missing(&io::Error::from_raw_os_error(libc::ENOEXEC)));
     }
 
     /// Any other exec error returns at once: the manager's restart decides.
@@ -176,7 +162,7 @@ mod tests {
         let mut checks = 0;
         let error = exec_daemon_when_present(
             &missing_daemon(),
-            exec_daemon,
+            |_| io::Error::from(io::ErrorKind::NotFound),
             || {
                 checks += 1;
                 checks == 3
