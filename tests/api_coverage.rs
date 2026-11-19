@@ -644,7 +644,7 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(
         Post,
         "/upgrade/announce",
-        announce_route_publishes_a_verified_release_and_never_installs
+        announce_route_publishes_a_verified_release
     ),
     covered!(
         Post,

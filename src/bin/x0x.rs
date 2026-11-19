@@ -333,8 +333,9 @@ enum Commands {
         #[arg(long, requires = "version", conflicts_with_all = ["check", "apply", "force"])]
         clear_hold: bool,
         /// Ask the running daemon to fetch the latest signed release and
-        /// publish it on the release topic. It verifies the signature, needs
-        /// no signing key and never installs on this node.
+        /// publish it on the release topic. It verifies the signature and
+        /// needs no signing key. This node installs only on its normal
+        /// staggered update path, as if a peer had announced it.
         #[arg(long, conflicts_with_all = ["check", "apply", "force", "clear_hold"])]
         announce: bool,
         /// Release version for --clear-hold.
