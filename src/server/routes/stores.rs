@@ -11,6 +11,7 @@ use super::super::{
     api_error, api_error_with_reason, bad_request, direct_message_send_config, forbidden,
     not_found, parse_agent_id_hex,
 };
+use super::named_groups::GROUP_BACKGROUND_PUBLISH_DELAY;
 use crate as x0x;
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
@@ -110,11 +111,50 @@ fn encode_kv_store_delta_direct_payload(
 fn kv_store_delta_direct_delivery_config() -> x0x::dm::DmSendConfig {
     let mut config = direct_message_send_config();
     config.require_gossip = true;
-    // Best-effort side-channel copy: do not force durable triple-hedged ACKs
-    // (inbox + global DM_BUS_TOPIC + direct QUIC) on every KV write to every
-    // contact, since many contacts have not joined this store.
-    config.require_gossip_ack = false;
+    // #976 / #1964: keep the ACK. A plain store has no anti-entropy after
+    // its bootstrap converges, and on the #976 path (the gossip publish
+    // failed) this DM is the only copy, so the ACK wait, the retries and
+    // the compatibility-bus fallback stay.
+    config.require_gossip_ack = true;
     config
+}
+
+/// Send one kv-store delta DM; send it a second time, after `retry_delay`,
+/// only when the first send returned an error (no ACK in its budget, or a
+/// local failure). Returns how many sends ran.
+///
+/// #1964 / PR #2103: before, every delta went to every contact twice, the
+/// second copy 8 s later even when the first was acknowledged.
+async fn send_kv_store_delta_with_retry_on_failure<F, Fut, T, E>(
+    mut send: F,
+    retry_delay: Duration,
+    store_id: &str,
+    recipient_hex: &str,
+) -> usize
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, E>>,
+    E: std::fmt::Display,
+{
+    match send().await {
+        Ok(_) => 1,
+        Err(first) => {
+            tracing::debug!(
+                store_id,
+                recipient = %LogHexId::agent(&recipient_hex),
+                "kv-store delta DM not acknowledged; one resend after {retry_delay:?}: {first}"
+            );
+            tokio::time::sleep(retry_delay).await;
+            if let Err(e) = send().await {
+                tracing::warn!(
+                    store_id,
+                    recipient = %LogHexId::agent(&recipient_hex),
+                    "failed to direct-deliver kv-store delta: {e}"
+                );
+            }
+            2
+        }
+    }
 }
 
 async fn kv_store_delta_direct_recipients(state: &AppState) -> Vec<String> {
@@ -143,7 +183,6 @@ fn spawn_kv_store_delta_delivery_one(
     store_id: &str,
     peer_id: saorsa_gossip_types::PeerId,
     delta: &x0x::kv::KvStoreDelta,
-    delay: Option<Duration>,
 ) {
     let recipient = match parse_agent_id_hex(recipient_hex) {
         Ok(id) => id,
@@ -168,26 +207,24 @@ fn spawn_kv_store_delta_delivery_one(
     let agent = Arc::clone(&state.agent);
     let recipient_label = recipient_hex.to_string();
     let store_label = store_id.to_string();
-    // #1274: a best-effort copy of a delta the local store has already
-    // written, so the task only sends. It is detached
-    // (`AppState::spawn_detached`) and the shutdown drain may abort it,
-    // which loses no more than a process exit would. Before this, the
-    // delayed copy kept the Agent, and its `history.db` connection, alive
-    // for its delay plus the send after `shutdown_and_wait`.
+    // #1274: a copy of a delta the local store has already written, so the
+    // task only sends. It is detached (`AppState::spawn_detached`) and the
+    // shutdown drain may abort it, which loses no more than a process exit
+    // would; the drain does not wait out the resend delay.
     state.spawn_detached(async move {
-        if let Some(delay) = delay {
-            tokio::time::sleep(delay).await;
-        }
-        if let Err(e) = agent
-            .send_direct_with_config(&recipient, payload, kv_store_delta_direct_delivery_config())
-            .await
-        {
-            tracing::warn!(
-                store_id = %store_label,
-                recipient = %LogHexId::agent(&recipient_label),
-                "failed to direct-deliver kv-store delta: {e}"
-            );
-        }
+        send_kv_store_delta_with_retry_on_failure(
+            || {
+                agent.send_direct_with_config(
+                    &recipient,
+                    payload.clone(),
+                    kv_store_delta_direct_delivery_config(),
+                )
+            },
+            GROUP_BACKGROUND_PUBLISH_DELAY,
+            &store_label,
+            &recipient_label,
+        )
+        .await;
     });
 }
 
@@ -198,11 +235,10 @@ fn spawn_kv_store_delta_delivery(
     peer_id: saorsa_gossip_types::PeerId,
     delta: &x0x::kv::KvStoreDelta,
 ) {
-    // Send a single immediate best-effort side-channel DM per recipient
-    // (avoiding the unconditional +8 s duplicate copy that doubled write
-    // amplification across all contacts).
+    // One acknowledged DM per recipient; the second copy is sent only when
+    // that DM failed (`send_kv_store_delta_with_retry_on_failure`).
     for recipient in recipients {
-        spawn_kv_store_delta_delivery_one(state, &recipient, store_id, peer_id, delta, None);
+        spawn_kv_store_delta_delivery_one(state, &recipient, store_id, peer_id, delta);
     }
 }
 
@@ -3803,11 +3839,56 @@ pub(in crate::server) async fn import_legacy_page_store(
 mod tests {
     use super::*;
 
+    /// #976 / #1964 (PR #2103 B1): the side channel keeps the ACK, so the
+    /// DM layer's ACK wait, retries and bus fallback still run.
     #[test]
-    fn kv_store_delta_direct_delivery_config_avoids_durable_ack_storm() {
+    fn kv_store_delta_direct_delivery_config_keeps_the_ack_1964() {
         let cfg = kv_store_delta_direct_delivery_config();
         assert!(cfg.require_gossip);
-        assert!(!cfg.require_gossip_ack);
+        assert!(cfg.require_gossip_ack);
+    }
+
+    /// #1964 (PR #2103 B1): an acknowledged first send is the only send.
+    #[tokio::test(start_paused = true)]
+    async fn kv_delta_acked_first_send_is_not_repeated_1964() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let sends = send_kv_store_delta_with_retry_on_failure(
+            || {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Ok::<(), String>(()) }
+            },
+            Duration::from_secs(8),
+            "store",
+            "aa",
+        )
+        .await;
+        assert_eq!(sends, 1);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// #1964 (PR #2103 B1): a failed (unacknowledged) first send gets one
+    /// resend, after the delay, and no more.
+    #[tokio::test(start_paused = true)]
+    async fn kv_delta_failed_first_send_is_resent_once_after_delay_1964() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        let second_at = std::sync::Mutex::new(None);
+        let sends = send_kv_store_delta_with_retry_on_failure(
+            || {
+                let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 1 {
+                    *second_at.lock().unwrap() = Some(started.elapsed());
+                }
+                async { Err::<(), String>("no ack".to_string()) }
+            },
+            Duration::from_secs(8),
+            "store",
+            "aa",
+        )
+        .await;
+        assert_eq!(sends, 2);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(*second_at.lock().unwrap(), Some(Duration::from_secs(8)));
     }
 
     #[test]

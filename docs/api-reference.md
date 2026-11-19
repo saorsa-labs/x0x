@@ -3067,8 +3067,14 @@ was offered the message (solo node, or every eligible peer cooled/excluded).
 HTTP 200 is preserved when the local ledger/cache write succeeded; delivery
 is a separate fact.
 
+`"topic"` is the per-group public topic the message was published on.
+`"fallback_topic"` is `"x0x.groups.public.v1"` when one copy also went to
+that global topic, and `null` otherwise (#1964). The global copy is sent
+only while the per-group topic is fresh: the daemon started less than
+120 s ago, or an active member joined or changed less than 120 s ago.
+
 ```json
-{ "ok": true, "msg_id": "<64-char hex>", "group_id": "...", "timestamp": ..., "fan_out": 1 }
+{ "ok": true, "msg_id": "<64-char hex>", "group_id": "...", "topic": "...", "fallback_topic": null, "timestamp": ..., "fan_out": 1 }
 ```
 
 Every message item returned by `GET /groups/:id/messages` also includes

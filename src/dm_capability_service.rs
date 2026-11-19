@@ -59,6 +59,20 @@ const MIN_TARGETED_RESPONSE_INTERVAL_SECS: u64 = 1;
 /// Startup-burst schedule so late-joining peers catch our advert quickly.
 const STARTUP_BURST_INTERVALS_MS: &[u64] = &[5_000, 10_000, 20_000, 45_000];
 
+/// Startup-burst position after a capability watch change.
+///
+/// Periodic mode restarts the burst so the new state spreads fast. On-demand
+/// mode (the L3 default) never runs the burst: the change already wakes a
+/// steady cycle, and before #1964 / PR #2103 each change there also started
+/// four extra fleet-wide adverts within 80 s.
+fn burst_index_after_caps_change(periodic: bool, current: usize) -> usize {
+    if periodic {
+        0
+    } else {
+        current
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct TargetedCapabilityAdvertRequest {
     protocol_version: u16,
@@ -796,8 +810,11 @@ impl CapabilityAdvertService {
                 // already tells senders to use the raw fallback, while a
                 // pending advert on the wire can race ahead of (or arrive
                 // after) the upgraded one and poison receiver caches. The
-                // `changed()` arm below restarts the burst as soon as the
-                // caps watch upgrades, so readiness still propagates fast.
+                // `changed()` arm below wakes the publisher as soon as the
+                // caps watch upgrades and marks that cycle steady, so
+                // readiness still propagates at once. Only periodic mode
+                // restarts the startup burst (`burst_index_after_caps_change`);
+                // on-demand mode has no burst to restart.
                 if !advert_is_publishable(&caps_snapshot) {
                     #[cfg(test)]
                     if let Some(observer) = &observation {
@@ -808,9 +825,7 @@ impl CapabilityAdvertService {
                         _ = tokio::time::sleep(publish_interval) => {}
                         res = publisher_caps_rx.changed() => {
                             if res.is_ok() {
-                                if periodic {
-                                    burst_idx = 0;
-                                }
+                                burst_idx = burst_index_after_caps_change(periodic, burst_idx);
                                 // The pending→ready transition is the
                                 // readiness announce: the first publishable
                                 // cycle after it is steady-worthy (#656),
@@ -1041,9 +1056,7 @@ impl CapabilityAdvertService {
                         res = publisher_caps_rx.changed() => {
                             if res.is_ok() {
                                 tracing::debug!("capability advert upgraded; republishing");
-                                if periodic {
-                                    burst_idx = 0;
-                                }
+                                burst_idx = burst_index_after_caps_change(periodic, burst_idx);
                             }
                             // A capability upgrade is steady-worthy: the
                             // fleet should see the new state immediately,
@@ -1505,6 +1518,21 @@ mod tests {
     use super::*;
     use crate::identity::AgentKeypair;
     use crate::network::{NetworkConfig, NetworkNode};
+
+    /// #1964 / PR #2103 change 3: a capability change restarts the startup
+    /// burst only in periodic mode. In on-demand mode the burst position
+    /// stays exhausted, so no extra fleet-wide adverts follow the change.
+    #[test]
+    fn caps_change_restarts_burst_only_in_periodic_mode_1964() {
+        let exhausted = STARTUP_BURST_INTERVALS_MS.len();
+        assert_eq!(burst_index_after_caps_change(true, exhausted), 0);
+        assert_eq!(burst_index_after_caps_change(true, 2), 0);
+        assert_eq!(
+            burst_index_after_caps_change(false, exhausted),
+            exhausted,
+            "on-demand mode must not restart the startup burst"
+        );
+    }
 
     /// Explicit test-only network config (#417/#337): loopback bind, no
     /// seeds, discovery/port-mapping off. Still a real socket constructor.

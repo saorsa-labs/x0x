@@ -6307,6 +6307,71 @@ pub struct AgentBuilder {
 /// reads the newest name and is also published and written last.
 type OwnAnnounceOrder = std::sync::Arc<tokio::sync::Mutex<()>>;
 
+/// Heartbeats between unconditional move-activation republishes (12 × the
+/// default 600 s heartbeat = 2 h), the backstop behind the triggers of
+/// [`MoveActivationGate`].
+const MOVE_ACTIVATION_FALLBACK_TICKS: u64 = 12;
+
+/// Decides when the heartbeat republishes the move activation bundles on
+/// `MOVE_ACTIVATION_TOPIC` (#1964 / PR #2103).
+///
+/// A beat publishes when (a) the bundle set differs from the last set
+/// published in full, (b) a connected peer is present that was not
+/// connected at the previous beat (a late joiner or a peer back from a
+/// partition), (c) the previous publish failed, or (d) every
+/// [`MOVE_ACTIVATION_FALLBACK_TICKS`] beats. The fingerprint is recorded
+/// only after every bundle was published, so a failure is retried on the
+/// next beat. The peer set held is the connected set of the last beat, so
+/// it is bounded by the connection limit.
+#[derive(Debug, Default)]
+struct MoveActivationGate {
+    last_published: Option<[u8; 32]>,
+    retry_pending: bool,
+    last_peers: std::collections::HashSet<[u8; 32]>,
+}
+
+impl MoveActivationGate {
+    /// Order-sensitive digest of the serialized bundles (the caller sorts
+    /// them by agent ID).
+    fn fingerprint(serialized_bundles: &[Vec<u8>]) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"x0x.move.activation.heartbeat-fingerprint.v1");
+        for bytes in serialized_bundles {
+            hasher.update(&(bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        }
+        *hasher.finalize().as_bytes()
+    }
+
+    /// Whether this beat publishes. Also replaces the remembered peer set
+    /// with `peers`, so call it once per beat.
+    fn publish_due(
+        &mut self,
+        fingerprint: [u8; 32],
+        peers: impl IntoIterator<Item = [u8; 32]>,
+        tick: u64,
+    ) -> bool {
+        let peers: std::collections::HashSet<[u8; 32]> = peers.into_iter().collect();
+        let newly_seen = peers.iter().any(|peer| !self.last_peers.contains(peer));
+        self.last_peers = peers;
+        self.last_published != Some(fingerprint)
+            || newly_seen
+            || self.retry_pending
+            || tick.is_multiple_of(MOVE_ACTIVATION_FALLBACK_TICKS)
+    }
+
+    /// Record a publish attempt. Only a fully successful one stores the
+    /// fingerprint; a failed one makes the next beat publish again.
+    fn record_outcome(&mut self, fingerprint: [u8; 32], all_sent: bool) {
+        if all_sent {
+            self.last_published = Some(fingerprint);
+            self.retry_pending = false;
+        } else {
+            self.retry_pending = true;
+        }
+    }
+}
+
 struct HeartbeatContext {
     /// ADR-0043: this machine's enrolled ML-KEM public bytes (publishes
     /// on the V3 machine announce); `None` disables V3 publication.
@@ -6336,10 +6401,8 @@ struct HeartbeatContext {
     /// Last `change_generation` the piggyback broadcast saw. Unchanged set
     /// ⇒ skip the publish (except the periodic fallback below).
     last_revocation_generation: std::sync::atomic::AtomicU64,
-    /// Last fingerprint of known move activation bundles published on
-    /// `MOVE_ACTIVATION_TOPIC` (0 = none published yet). Prevents re-flooding
-    /// every known bundle on every 600 s heartbeat when nothing changed.
-    last_move_activation_fingerprint: std::sync::atomic::AtomicU64,
+    /// #1964: when the heartbeat republishes the move activation bundles.
+    move_activation_gate: std::sync::Mutex<MoveActivationGate>,
     /// Heartbeat tick counter for the periodic revocation fallback.
     heartbeat_tick: std::sync::atomic::AtomicU64,
     /// L3 retirement flip: publish the legacy V2 announce set only when true.
@@ -6811,17 +6874,19 @@ impl HeartbeatContext {
             }
         }
 
-        // ADR-0043 §3.3: activation-bundle republication for late joiners
-        // — the latest bundle alone suffices for tombstones + placement.
-        // On-change (fingerprint) + periodic fallback, matching the
-        // revocation piggyback pattern below (previously every heartbeat
-        // republished every known bundle unconditionally).
+        // Heartbeat tick for the periodic fallbacks below (tick 0 = first
+        // beat, which is always a fallback beat).
         const REVOCATION_FALLBACK_TICKS: u64 = 12;
         let tick = self
             .heartbeat_tick
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let is_fallback = tick.is_multiple_of(REVOCATION_FALLBACK_TICKS);
 
+        // ADR-0043 §3.3: activation-bundle republication for late joiners
+        // — the latest bundle alone suffices for tombstones + placement.
+        // #1964 / PR #2103: no longer every heartbeat. `MoveActivationGate`
+        // publishes on a change of the bundle set, when a connected peer is
+        // newly seen, after a failed publish, and every 12th beat.
         {
             let serialized_bundles: Vec<Vec<u8>> = {
                 let state = self.move_state.read().await;
@@ -6833,32 +6898,34 @@ impl HeartbeatContext {
                     .filter_map(|bundle| bincode::serialize(bundle).ok())
                     .collect()
             };
-            if !serialized_bundles.is_empty() {
-                let mut hasher = blake3::Hasher::new();
-                for bytes in &serialized_bundles {
-                    hasher.update(&(bytes.len() as u64).to_le_bytes());
-                    hasher.update(bytes);
-                }
-                let digest = hasher.finalize();
-                let mut fp =
-                    u64::from_le_bytes(digest.as_bytes()[..8].try_into().unwrap_or([0u8; 8]));
-                if fp == 0 {
-                    fp = 1;
-                }
-                let last_fp = self
-                    .last_move_activation_fingerprint
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let move_changed = fp != last_fp;
-                if move_changed || is_fallback {
-                    for bytes in serialized_bundles {
-                        let _ = self
-                            .runtime
-                            .pubsub()
-                            .publish(MOVE_ACTIVATION_TOPIC.to_string(), bytes::Bytes::from(bytes))
-                            .await;
+            let peers: Vec<[u8; 32]> = self
+                .network
+                .connected_peers()
+                .await
+                .into_iter()
+                .map(|peer| peer.0)
+                .collect();
+            let fingerprint = MoveActivationGate::fingerprint(&serialized_bundles);
+            let due = match self.move_activation_gate.lock() {
+                Ok(mut gate) => gate.publish_due(fingerprint, peers, tick),
+                // A poisoned gate fails open: publish, as before #1964.
+                Err(_) => true,
+            };
+            if due && !serialized_bundles.is_empty() {
+                let mut all_sent = true;
+                for bytes in serialized_bundles {
+                    if let Err(e) = self
+                        .runtime
+                        .pubsub()
+                        .publish(MOVE_ACTIVATION_TOPIC.to_string(), bytes::Bytes::from(bytes))
+                        .await
+                    {
+                        all_sent = false;
+                        tracing::debug!("heartbeat: move activation publish failed: {e}");
                     }
-                    self.last_move_activation_fingerprint
-                        .store(fp, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Ok(mut gate) = self.move_activation_gate.lock() {
+                    gate.record_outcome(fingerprint, all_sent);
                 }
             }
         }
@@ -17463,7 +17530,7 @@ impl Agent {
                 allow_local_discovery_addrs: allow_local_discovery_addresses(network.config()),
                 revocation_set: std::sync::Arc::clone(&self.revocation_set),
                 last_revocation_generation: std::sync::atomic::AtomicU64::new(0),
-                last_move_activation_fingerprint: std::sync::atomic::AtomicU64::new(0),
+                move_activation_gate: std::sync::Mutex::new(MoveActivationGate::default()),
                 heartbeat_tick: std::sync::atomic::AtomicU64::new(0),
                 verified_cert_tx: std::sync::Arc::clone(&self.verified_cert_tx),
                 machine_kem_public: self.machine_kem_public_key(),
@@ -21911,7 +21978,7 @@ impl Agent {
             allow_local_discovery_addrs: allow_local_discovery_addresses(network.config()),
             revocation_set: std::sync::Arc::clone(&self.revocation_set),
             last_revocation_generation: std::sync::atomic::AtomicU64::new(0),
-            last_move_activation_fingerprint: std::sync::atomic::AtomicU64::new(0),
+            move_activation_gate: std::sync::Mutex::new(MoveActivationGate::default()),
             heartbeat_tick: std::sync::atomic::AtomicU64::new(0),
             verified_cert_tx: std::sync::Arc::clone(&self.verified_cert_tx),
             machine_kem_public: self.machine_kem_public_key(),
@@ -23415,7 +23482,7 @@ impl Agent {
             selection_skew: std::sync::Arc::clone(&self.selection_skew),
             revocation_set: std::sync::Arc::clone(&self.revocation_set),
             last_revocation_generation: std::sync::atomic::AtomicU64::new(0),
-            last_move_activation_fingerprint: std::sync::atomic::AtomicU64::new(0),
+            move_activation_gate: std::sync::Mutex::new(MoveActivationGate::default()),
             heartbeat_tick: std::sync::atomic::AtomicU64::new(0),
             legacy_announce: self.legacy_announce,
             machine_kem_public: self.machine_kem_public_key(),
@@ -40586,6 +40653,69 @@ mod tests {
         // The store still holds both.
         assert_eq!(set.all_records().len(), 2);
         assert!(revocation_publish_records(&set, "x0x.other").is_empty());
+    }
+
+    /// #1964 / PR #2103 (B3): an unchanged bundle set with no new peer
+    /// stays quiet between backstop beats; a changed set publishes.
+    #[test]
+    fn move_activation_gate_publishes_on_change_and_backstop_only_1964() {
+        let mut gate = MoveActivationGate::default();
+        let fp_a = MoveActivationGate::fingerprint(&[vec![1, 2, 3]]);
+        let fp_b = MoveActivationGate::fingerprint(&[vec![1, 2, 4]]);
+        let peers = [[7u8; 32]];
+        assert!(gate.publish_due(fp_a, peers, 0), "first beat publishes");
+        gate.record_outcome(fp_a, true);
+        for tick in 1..MOVE_ACTIVATION_FALLBACK_TICKS {
+            assert!(!gate.publish_due(fp_a, peers, tick), "quiet at tick {tick}");
+        }
+        assert!(
+            gate.publish_due(fp_a, peers, MOVE_ACTIVATION_FALLBACK_TICKS),
+            "backstop beat publishes"
+        );
+        gate.record_outcome(fp_a, true);
+        assert!(gate.publish_due(fp_b, peers, 13), "a changed set publishes");
+    }
+
+    /// #1964 / PR #2103 (B3): a peer connected since the previous beat
+    /// (a late joiner) makes the beat publish, so it does not wait 2 h for
+    /// the tombstones.
+    #[test]
+    fn move_activation_gate_publishes_when_a_peer_is_newly_seen_1964() {
+        let mut gate = MoveActivationGate::default();
+        let fp = MoveActivationGate::fingerprint(&[vec![9]]);
+        assert!(gate.publish_due(fp, [[1u8; 32]], 0));
+        gate.record_outcome(fp, true);
+        assert!(!gate.publish_due(fp, [[1u8; 32]], 1));
+        assert!(
+            gate.publish_due(fp, [[1u8; 32], [2u8; 32]], 2),
+            "a newly seen peer must trigger a publish"
+        );
+        gate.record_outcome(fp, true);
+        assert!(!gate.publish_due(fp, [[1u8; 32], [2u8; 32]], 3));
+        assert!(
+            !gate.publish_due(fp, [[1u8; 32]], 4),
+            "a peer leaving is not a trigger"
+        );
+    }
+
+    /// #1964 / PR #2103 (B3): a failed publish does not store the
+    /// fingerprint, so the next beat publishes again.
+    #[test]
+    fn move_activation_gate_retries_after_a_failed_publish_1964() {
+        let mut gate = MoveActivationGate::default();
+        let fp = MoveActivationGate::fingerprint(&[vec![5]]);
+        assert!(gate.publish_due(fp, [[1u8; 32]], 0));
+        gate.record_outcome(fp, false);
+        assert!(
+            gate.publish_due(fp, [[1u8; 32]], 1),
+            "failed publish is retried"
+        );
+        gate.record_outcome(fp, true);
+        assert!(!gate.publish_due(fp, [[1u8; 32]], 2));
+        // A failed retry of an already-published set is also retried.
+        assert!(gate.publish_due(fp, [[1u8; 32]], 12));
+        gate.record_outcome(fp, false);
+        assert!(gate.publish_due(fp, [[1u8; 32]], 13));
     }
 
     /// #1867: the heartbeat sends one empty-set statement for each topic

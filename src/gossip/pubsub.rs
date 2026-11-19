@@ -3955,8 +3955,6 @@ const BULK_TOPIC_PREFIXES: &[&str] = &[
     "x0x.machine.announce.v2", // Machine announce — bulk
     "x0x.machine.announce.v3", // Machine announce v3 (600 s ~18.5 KiB heartbeat) — bulk
     "x0x.user.announce.v2",    // User announce — bulk
-    "x0x.move.activation.v1",  // Key-move activation bundle anti-entropy — bulk
-    "x0x/announce/v3/blob",    // Certificate blob fetch/response anti-entropy — bulk
     "x0x.discovery.groups",    // Global group discovery anti-entropy
     "x0x.directory.",          // Group directory tag/name/id shards (src/groups/discovery.rs)
     "x0x.rendezvous.shard",    // Rendezvous shard discovery
@@ -4054,6 +4052,10 @@ fn register_x0x_topic_priorities(
     // Bulk — fleet-wide anti-entropy + manifests + capability adverts
     registry.register(
         TopicId::from_entity("x0x.machine.announce.v2".as_bytes()),
+        TopicPriority::Bulk,
+    );
+    registry.register(
+        TopicId::from_entity("x0x.machine.announce.v3".as_bytes()),
         TopicPriority::Bulk,
     );
     registry.register(
@@ -4632,20 +4634,30 @@ mod tests {
         );
     }
 
+    /// #1964 / PR #2103 (B5): only the 600 s machine announce v3 heartbeat
+    /// moves to Bulk. Move-activation bundles carry tombstones (A06 gives
+    /// revocation-class traffic protected capacity) and the announce blob
+    /// topic is a 5 s targeted certificate fetch, so both stay Normal. The
+    /// seeded registry must agree with the dynamic classifier.
     #[test]
-    fn classify_x0x_topic_routes_bulk_anti_entropy_topics_to_bulk() {
-        assert_eq!(
-            classify_x0x_topic("x0x.machine.announce.v3"),
-            TopicPriority::Bulk
-        );
-        assert_eq!(
-            classify_x0x_topic("x0x.move.activation.v1"),
-            TopicPriority::Bulk
-        );
-        assert_eq!(
-            classify_x0x_topic("x0x/announce/v3/blob"),
-            TopicPriority::Bulk
-        );
+    fn machine_announce_v3_is_bulk_but_move_activation_and_blob_stay_normal_1964() {
+        let registry = saorsa_gossip_pubsub::admission::TopicPriorityRegistry::default();
+        register_x0x_topic_priorities(&registry);
+        for (topic, expected) in [
+            (crate::MACHINE_ANNOUNCE_V3_TOPIC, TopicPriority::Bulk),
+            (crate::MOVE_ACTIVATION_TOPIC, TopicPriority::Normal),
+            (
+                crate::announce_blob::ANNOUNCE_BLOB_TOPIC,
+                TopicPriority::Normal,
+            ),
+        ] {
+            assert_eq!(classify_x0x_topic(topic), expected, "classifier: {topic}");
+            assert_eq!(
+                registry.priority_for(&TopicId::from_entity(topic.as_bytes())),
+                expected,
+                "seeded registry: {topic}"
+            );
+        }
     }
 
     #[test]
