@@ -91,14 +91,12 @@ x0x currently declares five main capabilities:
 
 ## Bootstrap Endpoints
 
-x0x provides 6 global bootstrap nodes:
+x0x provides 4 global bootstrap nodes:
 
 | Location | URL | Protocol |
 |----------|-----|----------|
 | NYC, US | `quic://142.93.199.50:5483` | QUIC |
 | SFO, US | `quic://147.182.234.192:5483` | QUIC |
-| Helsinki, FI | `quic://65.21.157.229:5483` | QUIC |
-| Nuremberg, DE | `quic://116.203.101.172:5483` | QUIC |
 | Singapore, SG | `quic://152.42.210.67:5483` | QUIC |
 | Sydney, AU | `quic://170.64.176.102:5483` | QUIC |
 

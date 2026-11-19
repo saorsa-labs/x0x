@@ -18,8 +18,8 @@ done
 
 case "${HEALTH_SCENARIO:-healthy}:$host" in
     mixed:147.182.234.192) printf 'inactive\n{"status":"healthy","version":"%s"}\n{}\n' "$HEALTH_EXPECTED_VERSION" ;;
-    mixed:65.21.157.229) exit 255 ;;
-    mixed:116.203.101.172) printf 'active\nFAILED\n{}\n' ;;
+    mixed:152.42.210.67) exit 255 ;;
+    mixed:170.64.176.102) printf 'active\nFAILED\n{}\n' ;;
     missing:142.93.199.50) printf 'active\n{"status":"healthy"}\n{"connected_peers":5}\n' ;;
     wrong:142.93.199.50) printf 'active\n{"status":"healthy","version":"0.0.0"}\n{"connected_peers":5}\n' ;;
     peersmissing:142.93.199.50) printf 'active\n{"status":"healthy","version":"%s"}\n{"status":"connected"}\n' "$HEALTH_EXPECTED_VERSION" ;;
@@ -49,7 +49,7 @@ assert_contains() {
 
 assert_all_nodes_checked() {
     local file=$1
-    for node in nyc sfo helsinki nuremberg singapore sydney; do
+    for node in nyc sfo singapore sydney; do
         assert_contains "$file" "$node"
     done
 }
@@ -59,14 +59,14 @@ run_check healthy "$out" --extended
 [[ $RUN_STATUS -eq 0 ]]
 assert_all_nodes_checked "$out"
 assert_contains "$out" "Expected version: v$EXPECTED_VERSION"
-assert_contains "$out" "Summary: 6/6 nodes healthy"
+assert_contains "$out" "Summary: 4/4 nodes healthy"
 assert_contains "$out" "peers: 5"
 
 out="$TMP/peersmissing"
 run_check peersmissing "$out" --extended
 [[ $RUN_STATUS -eq 0 ]]
 assert_all_nodes_checked "$out"
-assert_contains "$out" "Summary: 6/6 nodes healthy"
+assert_contains "$out" "Summary: 4/4 nodes healthy"
 assert_contains "$out" "peers: ?"
 
 out="$TMP/mixed"
@@ -76,14 +76,14 @@ assert_all_nodes_checked "$out"
 assert_contains "$out" "SERVICE inactive"
 assert_contains "$out" "SSH FAILED"
 assert_contains "$out" "HEALTH FAILED"
-assert_contains "$out" "Summary: 3/6 nodes healthy"
+assert_contains "$out" "Summary: 1/4 nodes healthy"
 
 for scenario in missing wrong; do
     out="$TMP/$scenario"
     run_check "$scenario" "$out"
     [[ $RUN_STATUS -eq 1 ]]
     assert_all_nodes_checked "$out"
-    assert_contains "$out" "Summary: 5/6 nodes healthy"
+    assert_contains "$out" "Summary: 3/4 nodes healthy"
 done
 assert_contains "$TMP/missing" "VERSION MISSING"
 assert_contains "$TMP/wrong" "VERSION MISMATCH"

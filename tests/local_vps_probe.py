@@ -35,8 +35,6 @@ from pathlib import Path
 NODES = {
     "nyc":       "142.93.199.50",
     "sfo":       "147.182.234.192",
-    "helsinki":  "65.21.157.229",
-    "nuremberg": "116.203.101.172",
     "singapore": "152.42.210.67",
     "sydney":    "170.64.176.102",
 }

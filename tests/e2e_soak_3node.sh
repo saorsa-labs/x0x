@@ -21,19 +21,20 @@ x0x_export_legacy_token_vars
 #
 # Roster:
 #   nyc      — publisher
-#   helsinki — publisher (was OOM-killed pre-fix on 4 GiB box)
+#   singapore — publisher (#2094: this role was on Helsinki, whose host is
+#               gone; Helsinki was the box OOM-killed pre-fix on 4 GiB)
 #   sfo      — subscriber-only
-# All 3 + the other 3 mesh peers stay subscribed; we just don't pump load
-# from the other 3.
+# All 3 + the other mesh peer stay subscribed; we just don't pump load
+# from it.
 #
 # Workload:
-#   nyc + helsinki publish MSG_RATE msgs/s × MSG_SIZE bytes to topic T
+#   nyc + singapore publish MSG_RATE msgs/s × MSG_SIZE bytes to topic T
 #   sfo subscribes to T
 #
 # Acceptance:
 #   - Every node stays <2 GiB RSS (auto-abort if any exceeds)
 #   - decode_to_delivery_drops == 0 on every node throughout
-#   - Mesh stays at ≥4 peers per node (5 ideal) throughout
+#   - Mesh stays at ≥2 peers per node (3 ideal) throughout
 #
 # Usage:
 #   tests/e2e_soak_3node.sh [--duration-hr 8] [--msg-rate 50] [--msg-size 4096]
@@ -67,6 +68,7 @@ LOG="$PROOF_DIR/soak.log"
 log() { echo "[$(date -u +%H:%M:%S)] $*" | tee -a "$LOG"; }
 
 TOKEN_FILE="$(dirname "${BASH_SOURCE[0]}")/.vps-tokens.env"
+x0x_refuse_removed_host_ips "$TOKEN_FILE"
 if [ ! -f "$TOKEN_FILE" ]; then
     log "FAIL: $TOKEN_FILE not found — run tests/e2e_deploy.sh first"
     exit 2
@@ -80,10 +82,10 @@ log "  topic=$TOPIC sample-interval=${SAMPLE_INTERVAL_SEC}s"
 log "  abort-rss=$((ABORT_RSS_KB / 1024 / 1024))GiB"
 log "  proof=$PROOF_DIR"
 
-declare -A IP=([nyc]="$NYC_IP" [sfo]="$SFO_IP" [helsinki]="$HELSINKI_IP")
-declare -A TK=([nyc]="$NYC_TK" [sfo]="$SFO_TK" [helsinki]="$HELSINKI_TK")
-PUBLISHERS=(nyc helsinki)
-ALL_NODES=(nyc sfo helsinki)
+declare -A IP=([nyc]="$NYC_IP" [sfo]="$SFO_IP" [singapore]="$SINGAPORE_IP")
+declare -A TK=([nyc]="$NYC_TK" [sfo]="$SFO_TK" [singapore]="$SINGAPORE_TK")
+PUBLISHERS=(nyc singapore)
+ALL_NODES=(nyc sfo singapore)
 # SSH options:
 #   ConnectTimeout=10        give up if TCP handshake doesn't complete in 10 s
 #   ServerAliveInterval=10   send a keepalive every 10 s …
@@ -155,7 +157,7 @@ done
 # Sampler in background
 # ─────────────────────────────────────────────────────────────────────────
 RSS_CSV="$PROOF_DIR/rss.csv"
-echo "ts_iso,uptime_s,nyc_rss_kb,nyc_cpu,sfo_rss_kb,sfo_cpu,helsinki_rss_kb,helsinki_cpu" > "$RSS_CSV"
+echo "ts_iso,uptime_s,nyc_rss_kb,nyc_cpu,sfo_rss_kb,sfo_cpu,singapore_rss_kb,singapore_cpu" > "$RSS_CSV"
 
 START=$(date +%s)
 END=$((START + DURATION_HR * 3600))
@@ -180,7 +182,7 @@ rm -f "$ABORT_FLAG"
  ' | grep -oE '^[0-9]+' || echo 0)
             R[$n]=${R[$n]:-0}
         done
-        echo "$(date -u +%Y-%m-%dT%H:%M:%SZ),$UP,${R[nyc]},${C[nyc]:-0},${R[sfo]},${C[sfo]:-0},${R[helsinki]},${C[helsinki]:-0}" >> "$RSS_CSV"
+        echo "$(date -u +%Y-%m-%dT%H:%M:%SZ),$UP,${R[nyc]},${C[nyc]:-0},${R[sfo]},${C[sfo]:-0},${R[singapore]},${C[singapore]:-0}" >> "$RSS_CSV"
 
         # Diagnostic snapshot every 5th sample (= every 5 min at 60s intervals).
         if (( sample_idx % 5 == 0 )); then
@@ -199,7 +201,7 @@ rm -f "$ABORT_FLAG"
             fi
         done
 
-        log "uptime=${UP}s nyc=$((R[nyc] / 1024))MB sfo=$((R[sfo] / 1024))MB helsinki=$((R[helsinki] / 1024))MB"
+        log "uptime=${UP}s nyc=$((R[nyc] / 1024))MB sfo=$((R[sfo] / 1024))MB singapore=$((R[singapore] / 1024))MB"
         sample_idx=$((sample_idx + 1))
         sleep "$SAMPLE_INTERVAL_SEC"
     done

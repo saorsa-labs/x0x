@@ -1,7 +1,7 @@
 #!/bin/bash
 # Clean up x0x bootstrap deployment from VPS nodes
 # Usage: ./cleanup.sh [node_name]
-#   node_name: nyc, sfo, helsinki, nuremberg, singapore, sydney, or 'all'
+#   node_name: nyc, sfo, singapore, sydney, or 'all'
 # WARNING: This removes all x0x data from the specified nodes
 
 set -euo pipefail
@@ -10,8 +10,6 @@ set -euo pipefail
 declare -A NODES=(
     ["nyc"]="142.93.199.50"
     ["sfo"]="147.182.234.192"
-    ["helsinki"]="65.21.157.229"
-    ["nuremberg"]="116.203.101.172"
     ["singapore"]="152.42.210.67"
     ["sydney"]="170.64.176.102"
 )

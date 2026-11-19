@@ -33,16 +33,41 @@ from typing import Dict, List, Optional
 
 TESTS_DIR = Path(__file__).resolve().parent
 
-# Node identity (the 6 VPS bootstrap hosts — same IPs for both networks; only
+# Node identity (the 4 VPS bootstrap hosts; #2094 removed Helsinki and
+# Nuremberg on 19 Nov 2026 — same IPs for both networks; only
 # the ports + tokens differ).
 NODES_BY_NAME: Dict[str, str] = {
     "nyc":       "142.93.199.50",
     "sfo":       "147.182.234.192",
-    "helsinki":  "65.21.157.229",
-    "nuremberg": "116.203.101.172",
     "singapore": "152.42.210.67",
     "sydney":    "170.64.176.102",
 }
+
+
+# #2094: the closed Hetzner hosts. Their addresses may now belong to other
+# people, so a tokens or hosts file that still names one is stale and must
+# never be used to aim SSH or API calls.
+REMOVED_HOST_IPS = frozenset({
+    "65.21.157.229",
+    "116.203.101.172",
+    "2a01:4f9:c012:684b::1",
+    "2a01:4f8:1c1a:31e6::1",
+})
+
+
+def refuse_removed_host_ips(tokens: Dict[str, tuple], source: object) -> None:
+    """Fail closed when a parsed tokens map names a closed host (#2094).
+
+    `tokens` maps a node label to `(ip, token)`. The label is not checked:
+    `helsinki`/`nuremberg` are still valid ephemeral-testnet slot labels.
+    """
+    for label, entry in tokens.items():
+        ip = entry[0].strip().strip("[]").lower()
+        if ip in REMOVED_HOST_IPS:
+            raise ValueError(
+                f"{source}: node '{label}' points at {ip}, a closed host "
+                "(#2094); regenerate the tokens file"
+            )
 
 
 @dataclass(frozen=True)

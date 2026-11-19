@@ -5,7 +5,7 @@
 //!
 //! ## Bootstrap Nodes
 //!
-//! The x0x network includes 6 default bootstrap nodes operated by Saorsa Labs.
+//! The x0x network includes 4 default bootstrap nodes operated by Saorsa Labs.
 //! These nodes provide:
 //! - Initial peer discovery when joining the network
 //! - NAT traversal assistance (coordinator/reflector roles)
@@ -17,8 +17,6 @@
 //! Default bootstrap nodes (each reachable on UDP/443 *and* UDP/5483 — ADR-0011):
 //! - `142.93.199.50` - NYC, US (DigitalOcean)
 //! - `147.182.234.192` - SFO, US (DigitalOcean)
-//! - `65.21.157.229` - Helsinki, FI (Hetzner)
-//! - `116.203.101.172` - Nuremberg, DE (Hetzner)
 //! - `152.42.210.67` - Singapore, SG (DigitalOcean)
 //! - `170.64.176.102` - Sydney, AU (DigitalOcean)
 
@@ -744,10 +742,12 @@ pub const MAX_MESSAGE_DESERIALIZE_SIZE: u64 = 4 * 1024 * 1024;
 /// Locations:
 /// - `142.93.199.50` / `2604:a880:400:d1:0:3:7db3:f001` — NYC, US (DigitalOcean)
 /// - `147.182.234.192` / `2604:a880:4:1d0:0:1:6ba1:f000` — SFO, US (DigitalOcean)
-/// - `65.21.157.229` / `2a01:4f9:c012:684b::1` — Helsinki, FI (Hetzner)
-/// - `116.203.101.172` / `2a01:4f8:1c1a:31e6::1` — Nuremberg, DE (Hetzner)
 /// - `152.42.210.67` / `2400:6180:0:d2:0:2:d30b:d000` — Singapore, SG (DigitalOcean)
 /// - `170.64.176.102` / `2400:6180:10:200::ba69:b000` — Sydney, AU (DigitalOcean)
+///
+/// The Helsinki and Nuremberg (Hetzner) hosts were removed on 19 Nov 2026
+/// (#2094): that hosting account is closed and their addresses may now
+/// belong to other people.
 ///
 /// Agents can override these by calling `AgentBuilder::with_network_config`
 /// with a custom [`NetworkConfig`] containing different bootstrap nodes.
@@ -797,30 +797,22 @@ pub const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[
     // IPv4
     "142.93.199.50:443",   // NYC
     "147.182.234.192:443", // SFO
-    "65.21.157.229:443",   // Helsinki
-    "116.203.101.172:443", // Nuremberg
     "152.42.210.67:443",   // Singapore
     "170.64.176.102:443",  // Sydney
     // IPv6
     "[2604:a880:400:d1:0:3:7db3:f001]:443", // NYC
     "[2604:a880:4:1d0:0:1:6ba1:f000]:443",  // SFO
-    "[2a01:4f9:c012:684b::1]:443",          // Helsinki
-    "[2a01:4f8:1c1a:31e6::1]:443",          // Nuremberg
     "[2400:6180:0:d2:0:2:d30b:d000]:443",   // Singapore
     "[2400:6180:10:200::ba69:b000]:443",    // Sydney
     // ── UDP/5483 (original; backward-compatible with pre-ADR-0011 clients) ──
     // IPv4
     "142.93.199.50:5483",   // NYC
     "147.182.234.192:5483", // SFO
-    "65.21.157.229:5483",   // Helsinki
-    "116.203.101.172:5483", // Nuremberg
     "152.42.210.67:5483",   // Singapore
     "170.64.176.102:5483",  // Sydney
     // IPv6
     "[2604:a880:400:d1:0:3:7db3:f001]:5483", // NYC
     "[2604:a880:4:1d0:0:1:6ba1:f000]:5483",  // SFO
-    "[2a01:4f9:c012:684b::1]:5483",          // Helsinki
-    "[2a01:4f8:1c1a:31e6::1]:5483",          // Nuremberg
     "[2400:6180:0:d2:0:2:d30b:d000]:5483",   // Singapore
     "[2400:6180:10:200::ba69:b000]:5483",    // Sydney
 ];
@@ -844,20 +836,14 @@ pub(crate) struct SeedPeerPin {
 }
 
 /// Compiled-in seed PeerId pins (issue #1112), filled 23 Oct 2026 from
-/// live-verified production keys: 22 of the 24 seed addresses. Per-row
-/// provenance: 16 ids from a fresh ephemeral handshake probe on 22 Oct
-/// (ant-quic 0.27.61, `peer_connected`), 6 from a live direct session on
-/// a production daemon at that exact address (22–23 Oct); the six
-/// `:5483` ids also match the April 2026 v0.19.0 sustained-watch
-/// captures, so they have been stable for six months. Two addresses —
-/// `65.21.157.229:443` and `116.203.101.172:5483` (the Hetzner IPv4
-/// rows) — are deliberately NOT pinned: their PeerIds rest on the local
-/// bootstrap cache only, and fresh handshake probes to the Hetzner hosts
-/// time out from this network (22–23 Oct), so those rows keep
-/// trust-on-first-use until a handshake at that exact address verifies
-/// them. A row's set carries more than one id only across a key rotation
-/// (the overlap window); the rotation policy lives in
-/// `docs/trust-and-connectivity.md`.
+/// live-verified production keys (a fresh ephemeral handshake probe on
+/// 22 Oct, ant-quic 0.27.61 `peer_connected`, or a live direct session on
+/// a production daemon at that exact address, 22–23 Oct); the `:5483`
+/// ids also match the April 2026 v0.19.0 sustained-watch captures. Since
+/// #2094 (19 Nov 2026) removed the two Hetzner hosts, every one of the 16
+/// seed addresses is pinned: no seed row is trust-on-first-use. A row's
+/// set carries more than one id only across a key rotation (the overlap
+/// window); the rotation policy lives in `docs/trust-and-connectivity.md`.
 // One identity per host LISTENER: the :443 and :5483 instances on a host
 // hold separate machine keys, while the IPv4 and IPv6 addresses of the
 // same listener answer with the same PeerId.
@@ -877,14 +863,6 @@ const SEED_ID_SYD_443: [u8; 32] = [
     0xcd, 0x5b, 0xad, 0xfb, 0x86, 0xc1, 0xed, 0xd0, 0xbe, 0xb6, 0x63, 0x0a, 0xe4, 0x12, 0x8c, 0x96,
     0xff, 0x5b, 0x1c, 0x23, 0x65, 0x9f, 0xd8, 0xb3, 0xd2, 0x1c, 0x48, 0xf0, 0x27, 0x3a, 0x91, 0x73,
 ];
-const SEED_ID_HEL_443: [u8; 32] = [
-    0x61, 0xbd, 0x01, 0xaa, 0x5a, 0xec, 0xd5, 0x09, 0x1d, 0x53, 0xa8, 0x3e, 0xac, 0x41, 0xc5, 0xf0,
-    0xc8, 0x74, 0x96, 0xf1, 0xc9, 0x00, 0x7c, 0x11, 0x98, 0x0e, 0x56, 0xfc, 0xa7, 0x1f, 0x6b, 0x2d,
-];
-const SEED_ID_NUR_443: [u8; 32] = [
-    0x9b, 0xd7, 0xa4, 0xd5, 0xd3, 0x90, 0x62, 0x1b, 0xc9, 0x7f, 0x83, 0x62, 0x71, 0xef, 0x67, 0x76,
-    0x3b, 0xef, 0x3d, 0xc0, 0x83, 0x4e, 0x6e, 0x88, 0xb3, 0x80, 0xf4, 0xc7, 0x6e, 0xe4, 0x68, 0x52,
-];
 const SEED_ID_NYC_5483: [u8; 32] = [
     0x0b, 0x7b, 0xb5, 0xa3, 0xb9, 0x95, 0x1f, 0x8a, 0x63, 0x01, 0xbe, 0xbc, 0xc4, 0x99, 0xb1, 0xac,
     0x2d, 0xbd, 0x93, 0xd1, 0x18, 0x5b, 0xf1, 0x9b, 0xc1, 0x09, 0x06, 0x61, 0x45, 0x38, 0x0c, 0x5c,
@@ -901,14 +879,6 @@ const SEED_ID_SYD_5483: [u8; 32] = [
     0xb7, 0xa2, 0x3e, 0x48, 0xaa, 0xe4, 0x60, 0x82, 0xf9, 0xc9, 0x52, 0xde, 0x2f, 0x22, 0x5c, 0x7c,
     0x4b, 0xaf, 0xee, 0xe5, 0x0f, 0xea, 0x88, 0xef, 0x50, 0xc5, 0x1b, 0xd0, 0xa6, 0xc4, 0x7c, 0xe8,
 ];
-const SEED_ID_HEL_5483: [u8; 32] = [
-    0x16, 0xf0, 0xbf, 0x03, 0x37, 0xc6, 0x34, 0xed, 0xfd, 0xcf, 0x8a, 0xad, 0xcd, 0xd5, 0x96, 0x8d,
-    0x2d, 0x33, 0xab, 0xbf, 0x0a, 0xc2, 0xa4, 0x7c, 0x34, 0x67, 0x10, 0x61, 0x64, 0xe2, 0xd2, 0x2c,
-];
-const SEED_ID_NUR_5483: [u8; 32] = [
-    0x6a, 0x24, 0xbd, 0xed, 0xdd, 0x82, 0x8e, 0x1e, 0x85, 0x9b, 0x63, 0xd7, 0x2f, 0x0d, 0xae, 0x63,
-    0x55, 0x57, 0xc5, 0xf2, 0x12, 0x07, 0xb4, 0xba, 0xc5, 0xf2, 0x4a, 0xa3, 0xed, 0x54, 0x37, 0x6e,
-];
 pub(crate) const SEED_PEER_ID_PINS: &[SeedPeerPin] = &[
     // ── UDP/443, IPv4 ──
     SeedPeerPin {
@@ -918,12 +888,6 @@ pub(crate) const SEED_PEER_ID_PINS: &[SeedPeerPin] = &[
     SeedPeerPin {
         addr: "147.182.234.192:443",
         expected_peer_ids: &[&SEED_ID_SFO_443],
-    },
-    // 65.21.157.229:443 (Helsinki, IPv4): cache-only PeerId — no handshake
-    // at this exact address yet (probes time out); stays TOFU until one.
-    SeedPeerPin {
-        addr: "116.203.101.172:443",
-        expected_peer_ids: &[&SEED_ID_NUR_443],
     },
     SeedPeerPin {
         addr: "152.42.210.67:443",
@@ -943,14 +907,6 @@ pub(crate) const SEED_PEER_ID_PINS: &[SeedPeerPin] = &[
         expected_peer_ids: &[&SEED_ID_SFO_443],
     },
     SeedPeerPin {
-        addr: "[2a01:4f9:c012:684b::1]:443",
-        expected_peer_ids: &[&SEED_ID_HEL_443],
-    },
-    SeedPeerPin {
-        addr: "[2a01:4f8:1c1a:31e6::1]:443",
-        expected_peer_ids: &[&SEED_ID_NUR_443],
-    },
-    SeedPeerPin {
         addr: "[2400:6180:0:d2:0:2:d30b:d000]:443",
         expected_peer_ids: &[&SEED_ID_SGP_443],
     },
@@ -968,12 +924,6 @@ pub(crate) const SEED_PEER_ID_PINS: &[SeedPeerPin] = &[
         expected_peer_ids: &[&SEED_ID_SFO_5483],
     },
     SeedPeerPin {
-        addr: "65.21.157.229:5483",
-        expected_peer_ids: &[&SEED_ID_HEL_5483],
-    },
-    // 116.203.101.172:5483 (Nuremberg, IPv4): cache-only PeerId — no
-    // handshake at this exact address yet; stays TOFU until one.
-    SeedPeerPin {
         addr: "152.42.210.67:5483",
         expected_peer_ids: &[&SEED_ID_SGP_5483],
     },
@@ -989,14 +939,6 @@ pub(crate) const SEED_PEER_ID_PINS: &[SeedPeerPin] = &[
     SeedPeerPin {
         addr: "[2604:a880:4:1d0:0:1:6ba1:f000]:5483",
         expected_peer_ids: &[&SEED_ID_SFO_5483],
-    },
-    SeedPeerPin {
-        addr: "[2a01:4f9:c012:684b::1]:5483",
-        expected_peer_ids: &[&SEED_ID_HEL_5483],
-    },
-    SeedPeerPin {
-        addr: "[2a01:4f8:1c1a:31e6::1]:5483",
-        expected_peer_ids: &[&SEED_ID_NUR_5483],
     },
     SeedPeerPin {
         addr: "[2400:6180:0:d2:0:2:d30b:d000]:5483",
@@ -11224,13 +11166,14 @@ mod tests {
 
         assert!(config.bind_addr.is_none());
 
-        // Verify default bootstrap nodes are included. ADR-0011: each of the 6
+        // Verify default bootstrap nodes are included. ADR-0011: each of the 4
         // VPS is seeded on both UDP/443 and UDP/5483, in IPv4 and IPv6 →
-        // 6 nodes × 2 ports × 2 families = 24 entries when IPv6 is available.
+        // 4 nodes × 2 ports × 2 families = 16 entries when IPv6 is available
+        // (#2094 removed the two closed Hetzner hosts).
         assert_eq!(
             config.bootstrap_nodes.len(),
-            24,
-            "Should have 24 default bootstrap nodes (6 nodes × {{443,5483}} × {{IPv4,IPv6}})"
+            16,
+            "Should have 16 default bootstrap nodes (4 nodes × {{443,5483}} × {{IPv4,IPv6}})"
         );
 
         // Verify specific bootstrap addresses
@@ -13383,36 +13326,76 @@ mod tests {
     fn issue1112_seed_list_content_is_unchanged() {
         // #1112: the seed list's public type is unchanged; pins live in
         // the separate SEED_PEER_ID_PINS table and must not change the
-        // production seed list. These are the exact 24 address strings
-        // that shipped before pinning existed
-        // (ADR-0011: 6 hosts x {443, 5483} x {IPv4, IPv6}).
+        // production seed list. #2094 (19 Nov 2026) removed the two
+        // closed Hetzner hosts, so these are the exact 16 address strings
+        // (ADR-0011: 4 hosts x {443, 5483} x {IPv4, IPv6}).
         const EXPECTED: &[&str] = &[
             "142.93.199.50:443",
             "147.182.234.192:443",
-            "65.21.157.229:443",
-            "116.203.101.172:443",
             "152.42.210.67:443",
             "170.64.176.102:443",
             "[2604:a880:400:d1:0:3:7db3:f001]:443",
             "[2604:a880:4:1d0:0:1:6ba1:f000]:443",
-            "[2a01:4f9:c012:684b::1]:443",
-            "[2a01:4f8:1c1a:31e6::1]:443",
             "[2400:6180:0:d2:0:2:d30b:d000]:443",
             "[2400:6180:10:200::ba69:b000]:443",
             "142.93.199.50:5483",
             "147.182.234.192:5483",
-            "65.21.157.229:5483",
-            "116.203.101.172:5483",
             "152.42.210.67:5483",
             "170.64.176.102:5483",
             "[2604:a880:400:d1:0:3:7db3:f001]:5483",
             "[2604:a880:4:1d0:0:1:6ba1:f000]:5483",
-            "[2a01:4f9:c012:684b::1]:5483",
-            "[2a01:4f8:1c1a:31e6::1]:5483",
             "[2400:6180:0:d2:0:2:d30b:d000]:5483",
             "[2400:6180:10:200::ba69:b000]:5483",
         ];
         assert_eq!(DEFAULT_BOOTSTRAP_PEERS, EXPECTED);
+    }
+
+    #[test]
+    fn issue2094_closed_hetzner_hosts_are_in_no_seed_or_pin_list() {
+        // #2094: the Helsinki and Nuremberg hosts were given up on
+        // 19 Nov 2026 and their addresses may now belong to other people.
+        // Neither host may come back as a seed hint or a pin row, in any
+        // port or address family (v4-mapped forms included).
+        const REMOVED_IPS: &[&str] = &[
+            "65.21.157.229",
+            "116.203.101.172",
+            "2a01:4f9:c012:684b::1",
+            "2a01:4f8:1c1a:31e6::1",
+        ];
+        let removed: Vec<std::net::IpAddr> = REMOVED_IPS
+            .iter()
+            .map(|ip| ip.parse().expect("removed IP parses"))
+            .collect();
+        let is_removed = |addr: &str| {
+            let addr: SocketAddr = addr.parse().expect("seed address parses");
+            removed.contains(&normalize_v4_mapped_addr(addr).ip())
+        };
+        for seed in DEFAULT_BOOTSTRAP_PEERS {
+            assert!(!is_removed(seed), "closed host is still a seed: {seed}");
+        }
+        for pin in SEED_PEER_ID_PINS {
+            assert!(
+                !is_removed(pin.addr),
+                "closed host still has a pin row: {}",
+                pin.addr
+            );
+        }
+    }
+
+    #[test]
+    fn issue2094_every_seed_address_is_pinned() {
+        // #2094: the only two unpinned (cache-only, trust-on-first-use)
+        // rows were the Hetzner IPv4 addresses. With those hosts gone,
+        // every compiled-in seed address has exactly one pin row, so a
+        // seed address answering with any other PeerId is a failed hint.
+        assert_eq!(SEED_PEER_ID_PINS.len(), DEFAULT_BOOTSTRAP_PEERS.len());
+        for seed in DEFAULT_BOOTSTRAP_PEERS {
+            let addr: SocketAddr = seed.parse().expect("seed address parses");
+            assert!(
+                !pinned_peer_ids_in(SEED_PEER_ID_PINS, addr).is_empty(),
+                "seed {seed} has no pin row"
+            );
+        }
     }
 
     #[test]
@@ -13522,20 +13505,16 @@ mod tests {
             &NO_PINS[..]
         );
         // The compiled-in table's live state: the first seed is pinned,
-        // and the two cache-only Hetzner IPv4 rows stay TOFU until a
-        // handshake at that exact address verifies them (see the pins
-        // content test). The read goes to the table itself, never the
-        // live `pinned_seed_peer_ids`: a seam test holding the override
-        // in a shared libtest process must not be able to mask these
-        // rows (Codex 23 Oct 2026 review).
+        // and a non-seed address resolves to no pin (TOFU). Since #2094
+        // every seed row is pinned (see
+        // `issue2094_every_seed_address_is_pinned`). The read goes to the
+        // table itself, never the live `pinned_seed_peer_ids`: a seam
+        // test holding the override in a shared libtest process must not
+        // be able to mask these rows (Codex 23 Oct 2026 review).
         let first_seed: SocketAddr = DEFAULT_BOOTSTRAP_PEERS[0].parse().unwrap();
         assert!(!pinned_peer_ids_in(SEED_PEER_ID_PINS, first_seed).is_empty());
         assert!(
-            pinned_peer_ids_in(SEED_PEER_ID_PINS, "65.21.157.229:443".parse().unwrap()).is_empty()
-        );
-        assert!(
-            pinned_peer_ids_in(SEED_PEER_ID_PINS, "116.203.101.172:5483".parse().unwrap())
-                .is_empty()
+            pinned_peer_ids_in(SEED_PEER_ID_PINS, "198.51.100.10:5483".parse().unwrap()).is_empty()
         );
         // Review round 2: v4-mapped and plain forms of the same address
         // resolve to the same pin row.
@@ -13601,15 +13580,19 @@ mod tests {
             SeedPinVerdict::Match(_)
         ));
         // The compiled-in table is live: at a pinned seed a non-member
-        // identity is a mismatch, and the two cache-only Hetzner IPv4
-        // rows are still TOFU (see the pins content test).
+        // identity is a mismatch, and a non-seed address stays TOFU.
+        // (Since #2094 no seed row is unpinned.)
         let pinned_seed: SocketAddr = DEFAULT_BOOTSTRAP_PEERS[0].parse().unwrap();
         assert!(matches!(
             seed_pin_gate(pinned_seed, OTHER),
             SeedPinVerdict::Mismatch { .. }
         ));
         assert_eq!(
-            seed_pin_gate("65.21.157.229:443".parse().unwrap(), OTHER),
+            seed_pin_gate_in(
+                SEED_PEER_ID_PINS,
+                "198.51.100.10:443".parse().unwrap(),
+                OTHER
+            ),
             SeedPinVerdict::Unpinned
         );
     }

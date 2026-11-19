@@ -28,7 +28,7 @@ x0x_export_legacy_token_vars
 #   [cli]      CLI command coverage (e2e_cli.sh)
 #   [local-full] Comprehensive local (e2e_comprehensive.sh)
 #   [lan]      LAN nodes: studio1.local + LAN_PEER_HOST (e2e_lan.sh)
-#   [vps]      6 VPS bootstrap nodes (e2e_vps.sh)
+#   [vps]      4 VPS bootstrap nodes (e2e_vps.sh)
 #   [live]     Local node joined to real VPS network (e2e_live_network.sh)
 #   [stress]   Rapid ops + edge cases (e2e_stress.sh)
 #
@@ -721,8 +721,6 @@ run_vps_probe() {
     declare -A VPS_IPS=(
         [nyc]="142.93.199.50"
         [sfo]="147.182.234.192"
-        [hel]="65.21.157.229"
-        [nur]="116.203.101.172"
         [sin]="152.42.210.67"
         [tok]="170.64.176.102"
     )
@@ -734,7 +732,7 @@ run_vps_probe() {
     local TOKENS_FILE="tests/.vps-tokens.env"
     [ -f "$TOKENS_FILE" ] && source "$TOKENS_FILE" 2>/dev/null || true
 
-    for node in nyc sfo hel nur sin tok; do
+    for node in nyc sfo sin tok; do
         local ip="${VPS_IPS[$node]}"
         local tok_var="VPS_TOKEN_${node^^}"
         local tok="${!tok_var:-}"
@@ -776,7 +774,7 @@ run_vps_probe() {
     # Mesh check
     echo ""
     echo "  Mesh connectivity (each node should have ≥1 peer):"
-    for node in nyc sfo hel nur sin tok; do
+    for node in nyc sfo sin tok; do
         local peers="${PD["vps_${node}_peers"]:-0}"
         if [ "${peers:-0}" -ge 1 ] 2>/dev/null; then
             VP_PASS=$((VP_PASS+1))
@@ -837,7 +835,7 @@ TOTALS
 
     [ -n "${PD[alice_agent_id]:-}" ] && echo "- **local/alice:** \`${PD[alice_agent_id]}\`"
     [ -n "${PD[bob_agent_id]:-}"   ] && echo "- **local/bob:** \`${PD[bob_agent_id]}\`"
-    for node in nyc sfo hel nur sin tok; do
+    for node in nyc sfo sin tok; do
         local aid="${PD["vps_${node}_agent"]:-}"
         local ver="${PD["vps_${node}_version"]:-?}"
         local prs="${PD["vps_${node}_peers"]:-?}"

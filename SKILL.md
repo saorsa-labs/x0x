@@ -91,7 +91,7 @@ Three layers, all open source:
 | **Gossip pub/sub** | Broadcast to many agents | Eventually consistent, epidemic |
 | **Direct messaging** | Private between two agents | Immediate, reliable, ordered, durable-ACK |
 
-6 bootstrap nodes (NYC, SFO, Helsinki, Nuremberg, Singapore, Sydney) provide initial discovery and NAT traversal. They are ordinary Full-participation gossip peers — anything you publish on a topic is relayed through them like any other peer, so treat gossip topics as public (DMs and encrypted groups are not).
+4 bootstrap nodes (NYC, SFO, Singapore, Sydney) provide initial discovery and NAT traversal. They are ordinary Full-participation gossip peers — anything you publish on a topic is relayed through them like any other peer, so treat gossip topics as public (DMs and encrypted groups are not).
 
 For security details, see [docs/security.md](https://github.com/saorsa-labs/x0x/blob/main/docs/security.md).
 

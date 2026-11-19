@@ -6,6 +6,18 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Removed the two closed Hetzner seeds (#2094).** The Helsinki
+  (`65.21.157.229`, `2a01:4f9:c012:684b::1`) and Nuremberg
+  (`116.203.101.172`, `2a01:4f8:1c1a:31e6::1`) hosts left the fleet on
+  19 Nov 2026 and their addresses may now belong to other people. They are
+  gone from `DEFAULT_BOOTSTRAP_PEERS` (24 → 16 addresses: NYC, SFO,
+  Singapore, Sydney on UDP/443 and UDP/5483, IPv4 and IPv6) and from the
+  seed PeerId pin table. The two removed IPv4 rows were the only unpinned
+  seed rows, so every compiled-in seed address is now pinned. The agent
+  card, docs, deployment configs and fleet test scripts no longer name
+  those hosts. Released versions keep the old list and still dial the old
+  addresses at start (see `docs/trust-and-connectivity.md`).
+
 - **Launcher refusal record and launcher-bound autostart (#1379, #2019
   review; A14 amendment of 18 Nov 2026).** A trial-form launcher start now
   removes an earlier `launcher-refusal.json` before it starts, so a start

@@ -57,12 +57,12 @@ A core subset; `tests/` holds many more files.
 | `e2e_local_mesh.sh` | 3-instance local DM matrix | 6 directed pairs, no VPS |
 | `e2e_comprehensive.sh` | Local alice+bob+charlie | ~2 min |
 | `e2e_live_network.sh` | Local node → live VPS mesh | ~66 assertions; needs VPS up and SSH access |
-| `e2e_vps_mesh.py` | 6 VPS DM matrix | 30 directed pairs via 1 SSH tunnel, ~16 s |
-| `e2e_vps_groups.py` | 6 VPS groups + contacts | up to 49 assertions, ~60 s |
-| `e2e_vps.sh` | 6 VPS SSH-per-call | ~102 assertions, ~4 min |
+| `e2e_vps_mesh.py` | 4 VPS DM matrix | 12 directed pairs via 1 SSH tunnel; pass `--nodes nyc sfo singapore sydney` on the fixed fleet |
+| `e2e_vps_groups.py` | 4 VPS groups + contacts | up to 49 assertions, ~60 s |
+| `e2e_vps.sh` | 4 VPS SSH-per-call | ~102 assertions, ~4 min |
 | `e2e_vps_kv.py` | Testnet group-store | Needs `--allow-service-restart`; testnet only |
 | `e2e_vps_survivor_rekey.py` | Testnet GSS + TreeKEM rekey | Needs `--nodes` (≥5), `--allow-service-restart` for `restart` variant |
-| `e2e_deploy.sh` | Build + deploy to 6 VPS nodes | `--mesh-verify` chains Phase A + B after deploy |
+| `e2e_deploy.sh` | Build + deploy to 4 VPS nodes | `--mesh-verify` chains Phase A + B after deploy |
 
 Quick commands:
 

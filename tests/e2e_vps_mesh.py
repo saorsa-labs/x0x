@@ -60,6 +60,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from e2e_tunnel import start_ssh_tunnel, stop_ssh_tunnel
 from result_framing import RESULT_PREFIX_V2, ResultReassembler
+from x0x_network import refuse_removed_host_ips
 
 DISCOVER_TOPIC = "x0x.test.discover.v1"
 LEGACY_CONTROL_TOPIC = "x0x.test.control.v1"
@@ -154,6 +155,7 @@ def load_tokens(path: str, var_prefix: str = "") -> Dict[str, Tuple[str, str]]:
     for n, ip in ips.items():
         if n in toks:
             out[n] = (ip, toks[n])
+    refuse_removed_host_ips(out, path)
     return out
 
 

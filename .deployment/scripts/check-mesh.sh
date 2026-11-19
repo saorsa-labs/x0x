@@ -4,7 +4,7 @@
 # Usage: ./check-mesh.sh
 #
 # Checks:
-# - All 6 nodes are responding
+# - All 4 nodes are responding
 # - Each node reports correct peer count
 # - Health endpoints functional
 
@@ -14,15 +14,13 @@ set -euo pipefail
 declare -A NODES=(
     ["saorsa-2"]="142.93.199.50"
     ["saorsa-3"]="147.182.234.192"
-    ["saorsa-6"]="65.21.157.229"
-    ["saorsa-7"]="116.203.101.172"
     ["saorsa-8"]="152.42.210.67"
     ["saorsa-9"]="170.64.176.102"
 )
 
 HEALTH_PORT=12600
 QUIC_PORT=5483
-EXPECTED_PEERS=5  # Each node should have 5 peers (6 total - self)
+EXPECTED_PEERS=3  # Each node should have 3 peers (4 total - self)
 
 echo "========================================="
 echo "x0x Bootstrap Mesh Health Check"
