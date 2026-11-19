@@ -310,6 +310,19 @@ fn classify_broadcast_wire(
 /// Domain tag for the content digest of a V3 machine announce (#1964).
 const MACHINE_V3_CONTENT_TAG: &[u8] = b"x0x-storm-machine-announce-v3-content-v1";
 
+/// Hard cap on the machine table of the V3 guard (#1964 review of #2101).
+///
+/// An entry must live as long as an announce that is not newer than its
+/// `last_announced_at` can still be fresh: up to
+/// [`STALE_ANNOUNCE_TTL_SECS`] (900 s) after that time. Each machine
+/// announces every 600 s, so the live table is about the number of
+/// announcing machines. 32,768 entries is about 3-4 MB and covers the
+/// 10,000-node planning target with a wide margin. When the table is full
+/// after expiry, a new machine's announce is forwarded without an entry
+/// (fail open, counted as `table_full`), so a full table never blocks a
+/// real announce.
+const MAX_TRACKED_V3_MACHINES: usize = 32_768;
+
 /// Forward state of one machine on `x0x.machine.announce.v3` (#1964).
 #[derive(Debug, Clone, Copy)]
 struct MachineV3Window {
@@ -319,20 +332,43 @@ struct MachineV3Window {
     content: [u8; 32],
     /// True when the one content change of this window was forwarded.
     change_used: bool,
+    /// Signed `announced_at` of the last forwarded announce. Kept across
+    /// windows: only a strictly newer announce can use a forward slot.
+    last_announced_at: u64,
+}
+
+impl MachineV3Window {
+    /// True when the entry can be removed: its window is over, and every
+    /// announce that is not newer than the last forwarded one is stale.
+    fn expired(&self, now_unix: u64) -> bool {
+        let window_over =
+            now_unix.saturating_sub(self.opened_at) >= PER_AUTHOR_FORWARD_WINDOW.as_secs();
+        let replays_stale = self
+            .last_announced_at
+            .saturating_add(STALE_ANNOUNCE_TTL_SECS)
+            < now_unix;
+        window_over && replays_stale
+    }
 }
 
 /// Per-machine forward state for `x0x.machine.announce.v3` (#1964).
 ///
 /// Every V3 publish has a fresh `announced_at` and fresh signatures, so
 /// the bytes never repeat. The guard keys on the signed machine id and on
-/// a digest of the content without the timestamp and signatures. In one
-/// [`PER_AUTHOR_FORWARD_WINDOW`] a machine gets one forward, plus one more
-/// forward when the content changes (a real address change is not
-/// delayed). Every other announce of the window is delivered locally but
-/// not forwarded.
+/// a digest of the decoded content without the timestamp and signatures.
+/// Only an announce whose signed `announced_at` is strictly newer than
+/// the last forwarded one of the machine can use a forward slot, so a
+/// replay of older valid announces cannot open a window or take the
+/// change slot. In one [`PER_AUTHOR_FORWARD_WINDOW`] a machine gets one
+/// forward, plus one more forward when the content changes (a real
+/// address change is not delayed). Every other announce is delivered
+/// locally but not forwarded.
 #[derive(Debug, Default)]
 pub struct MachineAnnounceV3Guard {
     machines: HashMap<[u8; 32], MachineV3Window>,
+    /// The second of the last expiry sweep of a full table; the sweep
+    /// runs at most once per second.
+    last_sweep: Option<u64>,
 }
 
 /// What the V3 machine-announce guard decided, for the counters.
@@ -344,6 +380,9 @@ enum MachineV3Outcome {
     ForwardedContentChange,
     /// Same content, or a second change, inside the window: deliver only.
     RateLimited,
+    /// Not newer than the last forwarded announce of the machine (a
+    /// replay or an out-of-order copy): deliver only.
+    NotNewer,
     /// Signed timestamp too old or too far in the future: deliver only.
     Stale,
     /// Bad inner envelope, wrong signed topic, or bad machine signature
@@ -351,13 +390,18 @@ enum MachineV3Outcome {
     Forged,
     /// Not a decodable V3 announce: forward (fail open).
     Undecodable,
+    /// New machine while the table is full: forward (fail open).
+    TableFull,
 }
 
 impl MachineV3Outcome {
     fn verdict(self) -> Verdict {
         match self {
-            Self::Forwarded | Self::ForwardedContentChange | Self::Undecodable => Verdict::Forward,
-            Self::RateLimited | Self::Stale => Verdict::DeliverOnly,
+            Self::Forwarded
+            | Self::ForwardedContentChange
+            | Self::Undecodable
+            | Self::TableFull => Verdict::Forward,
+            Self::RateLimited | Self::NotNewer | Self::Stale => Verdict::DeliverOnly,
             Self::Forged => Verdict::Drop,
         }
     }
@@ -369,9 +413,11 @@ pub struct MachineAnnounceV3Stats {
     forwarded: std::sync::atomic::AtomicU64,
     forwarded_content_change: std::sync::atomic::AtomicU64,
     deliver_only_rate_limited: std::sync::atomic::AtomicU64,
+    deliver_only_not_newer: std::sync::atomic::AtomicU64,
     deliver_only_stale: std::sync::atomic::AtomicU64,
     dropped_forged: std::sync::atomic::AtomicU64,
     forwarded_undecodable: std::sync::atomic::AtomicU64,
+    table_full: std::sync::atomic::AtomicU64,
 }
 
 /// Snapshot of [`MachineAnnounceV3Stats`], served on
@@ -384,6 +430,9 @@ pub struct MachineAnnounceV3StatsSnapshot {
     pub forwarded_content_change: u64,
     /// Announces delivered locally but not forwarded (rate limit).
     pub deliver_only_rate_limited: u64,
+    /// Announces delivered locally but not forwarded because they were not
+    /// newer than the last forwarded announce of the machine.
+    pub deliver_only_not_newer: u64,
     /// Announces delivered locally but not forwarded (stale or far-future
     /// signed timestamp).
     pub deliver_only_stale: u64,
@@ -393,6 +442,9 @@ pub struct MachineAnnounceV3StatsSnapshot {
     /// Payloads that did not decode as a V3 announce and were forwarded
     /// (fail open).
     pub forwarded_undecodable: u64,
+    /// Announces of a new machine forwarded without an entry because the
+    /// machine table was full (fail open).
+    pub table_full: u64,
 }
 
 impl MachineAnnounceV3Stats {
@@ -402,9 +454,11 @@ impl MachineAnnounceV3Stats {
             forwarded: AtomicU64::new(0),
             forwarded_content_change: AtomicU64::new(0),
             deliver_only_rate_limited: AtomicU64::new(0),
+            deliver_only_not_newer: AtomicU64::new(0),
             deliver_only_stale: AtomicU64::new(0),
             dropped_forged: AtomicU64::new(0),
             forwarded_undecodable: AtomicU64::new(0),
+            table_full: AtomicU64::new(0),
         }
     }
 
@@ -413,9 +467,11 @@ impl MachineAnnounceV3Stats {
             MachineV3Outcome::Forwarded => &self.forwarded,
             MachineV3Outcome::ForwardedContentChange => &self.forwarded_content_change,
             MachineV3Outcome::RateLimited => &self.deliver_only_rate_limited,
+            MachineV3Outcome::NotNewer => &self.deliver_only_not_newer,
             MachineV3Outcome::Stale => &self.deliver_only_stale,
             MachineV3Outcome::Forged => &self.dropped_forged,
             MachineV3Outcome::Undecodable => &self.forwarded_undecodable,
+            MachineV3Outcome::TableFull => &self.table_full,
         };
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -428,9 +484,11 @@ impl MachineAnnounceV3Stats {
             forwarded: self.forwarded.load(Relaxed),
             forwarded_content_change: self.forwarded_content_change.load(Relaxed),
             deliver_only_rate_limited: self.deliver_only_rate_limited.load(Relaxed),
+            deliver_only_not_newer: self.deliver_only_not_newer.load(Relaxed),
             deliver_only_stale: self.deliver_only_stale.load(Relaxed),
             dropped_forged: self.dropped_forged.load(Relaxed),
             forwarded_undecodable: self.forwarded_undecodable.load(Relaxed),
+            table_full: self.table_full.load(Relaxed),
         }
     }
 }
@@ -443,15 +501,18 @@ pub fn machine_announce_v3_stats() -> MachineAnnounceV3StatsSnapshot {
     MACHINE_ANNOUNCE_V3_STATS.snapshot()
 }
 
-/// Decode a bare V3 machine announce. Trailing bytes are refused, so a
-/// later format that appends fields does not decode here and fails open
-/// instead of failing the signature check.
+/// Decode a bare V3 machine announce exactly as the receiver does
+/// (`bincode::deserialize` in the discovery listener): fixint encoding,
+/// trailing bytes accepted. If the guard refused bytes that receivers
+/// accept, an appended byte would make a genuine announce "undecodable"
+/// and forwarded without limit (review of #2101). The size limit only
+/// bounds allocation; gossip frames are far below it.
 fn decode_machine_announce_v3(bare: &[u8]) -> Option<crate::MachineAnnouncementV3> {
     use bincode::Options;
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .with_limit(crate::network::MAX_MESSAGE_DESERIALIZE_SIZE)
-        .reject_trailing_bytes()
+        .allow_trailing_bytes()
         .deserialize(bare)
         .ok()
 }
@@ -541,18 +602,26 @@ impl MachineAnnounceV3Guard {
             return MachineV3Outcome::Stale;
         }
         let window = PER_AUTHOR_FORWARD_WINDOW.as_secs();
-        if self.machines.len() >= MAX_TRACKED_AUTHORS {
-            let cutoff = now_unix.saturating_sub(window);
-            self.machines.retain(|_, w| w.opened_at >= cutoff);
-        }
         let slot = match self.machines.get(&machine) {
+            // Only a strictly newer announce can use a slot. The entry
+            // keeps `last_announced_at` until every not-newer announce is
+            // stale, so a replay after the window still fails here.
+            Some(w) if announced_at <= w.last_announced_at => {
+                return MachineV3Outcome::NotNewer;
+            }
             Some(w) if now_unix.saturating_sub(w.opened_at) < window => {
                 if w.content == content || w.change_used {
                     return MachineV3Outcome::RateLimited;
                 }
                 MachineV3Slot::Change
             }
-            _ => MachineV3Slot::Open,
+            Some(_) => MachineV3Slot::Open,
+            None => {
+                if !self.has_room(now_unix) {
+                    return MachineV3Outcome::TableFull;
+                }
+                MachineV3Slot::Open
+            }
         };
         if !verify() {
             return MachineV3Outcome::Forged;
@@ -565,6 +634,7 @@ impl MachineAnnounceV3Guard {
                         opened_at: now_unix,
                         content,
                         change_used: false,
+                        last_announced_at: announced_at,
                     },
                 );
                 MachineV3Outcome::Forwarded
@@ -573,10 +643,25 @@ impl MachineAnnounceV3Guard {
                 if let Some(w) = self.machines.get_mut(&machine) {
                     w.content = content;
                     w.change_used = true;
+                    w.last_announced_at = announced_at;
                 }
                 MachineV3Outcome::ForwardedContentChange
             }
         }
+    }
+
+    /// True when a new machine can get an entry. A full table is swept
+    /// for expired entries at most once per second, so a full table of
+    /// live machines does not cost a full scan on every message.
+    fn has_room(&mut self, now_unix: u64) -> bool {
+        if self.machines.len() < MAX_TRACKED_V3_MACHINES {
+            return true;
+        }
+        if self.last_sweep != Some(now_unix) {
+            self.last_sweep = Some(now_unix);
+            self.machines.retain(|_, w| !w.expired(now_unix));
+        }
+        self.machines.len() < MAX_TRACKED_V3_MACHINES
     }
 }
 
@@ -1410,17 +1495,186 @@ mod tests {
         assert!(machine_announce_facts(&m.wire(5483, NOW)).is_none());
     }
 
-    /// The machine table stays bounded under a machine-minting adversary.
+    /// Review of #2101: a peer holding two older valid announces of a
+    /// machine (still inside the 900 s stale window) replays them after
+    /// the window of the current announce expired. Neither is newer than
+    /// the last forwarded announce, so neither opens a window or takes the
+    /// change slot, and the machine's next real announce forwards.
     #[test]
-    fn v3_machine_table_is_bounded_1964() {
+    fn v3_replayed_older_announces_do_not_take_slots_1964() {
+        let m = V3Fixture1964::new();
         let mut g = MachineAnnounceV3Guard::default();
-        for i in 0..(super::MAX_TRACKED_AUTHORS + 100) {
-            let mut a = [0u8; 32];
-            a[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            g.classify(a, NOW - 120, [0u8; 32], NOW - 120, || true);
+        let stats = MachineAnnounceV3Stats::default();
+        let older_a = m.wire(1000, NOW - 200);
+        let older_b = m.wire(2000, NOW - 100);
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &m.wire(3000, NOW), NOW),
+            Verdict::Forward
+        );
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &older_a, NOW + 61),
+            Verdict::DeliverOnly,
+            "an older replay does not open a new window"
+        );
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &older_b, NOW + 62),
+            Verdict::DeliverOnly,
+            "an older replay does not take the change slot"
+        );
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &m.wire(4000, NOW + 63), NOW + 63),
+            Verdict::Forward,
+            "the real current announce forwards"
+        );
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &m.wire(5000, NOW + 64), NOW + 64),
+            Verdict::Forward,
+            "and its change slot is still free"
+        );
+    }
+
+    /// Honest out-of-order arrival: an older copy that arrives after a
+    /// newer announce is delivered only and does not take the change slot.
+    #[test]
+    fn v3_older_copy_after_newer_does_not_take_change_slot_1964() {
+        let m = V3Fixture1964::new();
+        let mut g = MachineAnnounceV3Guard::default();
+        let stats = MachineAnnounceV3Stats::default();
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &m.wire(2000, NOW), NOW),
+            Verdict::Forward
+        );
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &m.wire(1000, NOW - 5), NOW + 1),
+            Verdict::DeliverOnly,
+            "the older copy is not forwarded"
+        );
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &m.wire(3000, NOW + 2), NOW + 2),
+            Verdict::Forward,
+            "a real change after it still uses the free change slot"
+        );
+    }
+
+    /// Review of #2101: receivers decode with plain `bincode::deserialize`,
+    /// which accepts trailing bytes. A genuine announce with a byte
+    /// appended must be classified as the same announce, not forwarded as
+    /// undecodable and not counted as a content change.
+    #[test]
+    fn v3_trailing_bytes_do_not_bypass_the_limit_1964() {
+        let m = V3Fixture1964::new();
+        let with_trailing = |port: u16, at: u64| {
+            let wire = m.wire(port, at);
+            let mut bare = crate::gossip::pubsub::decode_v2(&wire)
+                .unwrap()
+                .payload
+                .to_vec();
+            bare.push(0);
+            assert!(bincode::deserialize::<crate::MachineAnnouncementV3>(&bare).is_ok());
+            crate::gossip::pubsub::test_support::signed_inner_v2(
+                &m.signer,
+                crate::MACHINE_ANNOUNCE_V3_TOPIC,
+                &bytes::Bytes::from(bare),
+            )
+            .to_vec()
+        };
+        let mut g = MachineAnnounceV3Guard::default();
+        let stats = MachineAnnounceV3Stats::default();
+        assert_eq!(
+            v3_verdict_1964(&mut g, &stats, &with_trailing(5483, NOW), NOW),
+            Verdict::Forward
+        );
+        for dt in [1, 2, 3] {
+            assert_eq!(
+                v3_verdict_1964(&mut g, &stats, &with_trailing(5483, NOW + dt), NOW + dt),
+                Verdict::DeliverOnly,
+                "a trailing byte is neither undecodable nor a content change"
+            );
         }
-        g.classify([0xFF; 32], NOW, [0u8; 32], NOW, || true);
-        assert!(g.machines.len() <= super::MAX_TRACKED_AUTHORS);
+        let snap = stats.snapshot();
+        assert_eq!(snap.forwarded, 1);
+        assert_eq!(snap.forwarded_undecodable, 0);
+        assert_eq!(snap.forwarded_content_change, 0);
+    }
+
+    fn machine_key_1964(i: usize) -> [u8; 32] {
+        let mut a = [0u8; 32];
+        a[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        a[31] = 0xA5;
+        a
+    }
+
+    /// Review of #2101: the machine table has a hard cap. With more live
+    /// machines than the cap in one window, a new machine is forwarded
+    /// without an entry (fail open, `table_full`), the table does not
+    /// grow, and the expiry sweep runs at most once per second.
+    #[test]
+    fn v3_machine_table_has_a_hard_cap_1964() {
+        let cap = super::MAX_TRACKED_V3_MACHINES;
+        let mut g = MachineAnnounceV3Guard::default();
+        let stats = MachineAnnounceV3Stats::default();
+        for i in 0..cap {
+            let outcome = g.classify(machine_key_1964(i), NOW, [0u8; 32], NOW, || true);
+            assert_eq!(outcome, MachineV3Outcome::Forwarded);
+        }
+        assert_eq!(g.machines.len(), cap);
+        for i in cap..cap + 100 {
+            let outcome = g.classify(machine_key_1964(i), NOW + 1, [0u8; 32], NOW + 1, || true);
+            stats.record(outcome);
+            assert_eq!(
+                outcome.verdict(),
+                Verdict::Forward,
+                "a full table fails open"
+            );
+        }
+        assert_eq!(g.machines.len(), cap, "the table does not grow");
+        assert_eq!(stats.snapshot().table_full, 100);
+        assert_eq!(g.last_sweep, Some(NOW + 1), "one sweep in that second");
+        // A known machine is still limited while the table is full.
+        assert_eq!(
+            g.classify(machine_key_1964(0), NOW + 2, [0u8; 32], NOW + 2, || true),
+            MachineV3Outcome::RateLimited
+        );
+        // Entries are kept until a replay of their last announce is stale
+        // (900 s), not only for the 60 s window.
+        let after_window = NOW + 120;
+        assert_eq!(
+            g.classify(
+                machine_key_1964(cap + 1),
+                after_window,
+                [0u8; 32],
+                after_window,
+                || true
+            ),
+            MachineV3Outcome::TableFull
+        );
+        // Once the stale window has passed, the sweep frees entries.
+        let later = NOW + STALE_ANNOUNCE_TTL_SECS + 1;
+        assert_eq!(
+            g.classify(machine_key_1964(cap + 1), later, [0u8; 32], later, || true),
+            MachineV3Outcome::Forwarded
+        );
+        assert!(g.machines.len() <= cap);
+    }
+
+    /// An entry outlives the 60 s window: a replay of an older announce
+    /// that is still fresh finds the entry and gets `NotNewer`.
+    #[test]
+    fn v3_entry_outlives_the_window_for_replays_1964() {
+        let mut g = MachineAnnounceV3Guard::default();
+        let m = [7u8; 32];
+        assert_eq!(
+            g.classify(m, NOW, [1u8; 32], NOW, || true),
+            MachineV3Outcome::Forwarded
+        );
+        let w = g.machines.get(&m).copied().unwrap();
+        assert!(!w.expired(NOW + 61));
+        assert!(!w.expired(NOW + STALE_ANNOUNCE_TTL_SECS));
+        assert!(w.expired(NOW + STALE_ANNOUNCE_TTL_SECS + 1));
+        assert_eq!(
+            g.classify(m, NOW - 1, [2u8; 32], NOW + 800, || true),
+            MachineV3Outcome::NotNewer
+        );
     }
 
     /// The author table stays bounded under an author-minting adversary.
