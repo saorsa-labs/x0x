@@ -56070,7 +56070,10 @@ pub(in crate::server) mod tests {
             #[cfg(unix)]
             upgrade_staging,
             api_token: "test-token".to_string(),
-            sessions: auth::SessionStore::new(auth::SESSION_TOKEN_TTL),
+            sessions: auth::SessionStore::new(
+                auth::SESSION_TOKEN_TTL,
+                std::time::Duration::from_secs(auth::DEFAULT_GUI_IDLE_TIMEOUT_MINUTES * 60),
+            ),
             rider_tokens: tokio::sync::Mutex::new(
                 crate::server::rider_auth::RiderTokenStore::load(
                     data_dir.join(crate::server::rider_auth::RIDER_TOKENS_FILE),

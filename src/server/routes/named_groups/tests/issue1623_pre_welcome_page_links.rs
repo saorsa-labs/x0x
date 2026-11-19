@@ -3229,3 +3229,96 @@ async fn an_attested_requester_served_by_a_cached_add_gets_no_relayed_link() -> 
     assert_eq!(head_of(&joiner, &key).await?.state_hash, base.state_hash);
     Ok(())
 }
+
+/// #2022 (from the review of #2021): the admin-ATA arm. A pre-Welcome
+/// joiner armed only by an admin's ATA takes a relayed rename inside the
+/// ATA's sequence as its signer's. The arm admits the link; it is not the
+/// authority. So a rename that a plain member signed is refused by the
+/// ordinary apply, and the same rename signed by an admin applies
+/// (control). The page comes from a relay seated as a member that signed
+/// neither link. Before, the unit tests used only the owner arm.
+#[tokio::test]
+async fn a_relayed_link_under_an_admin_ata_needs_an_admin_signer() -> anyhow::Result<()> {
+    let owner = AgentKeypair::generate()?;
+    let owner_hex = hex::encode(owner.agent_id().as_bytes());
+    let admin = AgentKeypair::generate()?;
+    let member = AgentKeypair::generate()?;
+    let relay = AgentKeypair::generate()?;
+    let mut base = base_group(&owner, Some(&hex::encode(relay.agent_id().as_bytes())))?;
+    seal_link(&mut base, &owner, 1_500, |next| {
+        for (keys, role) in [
+            (&admin, x0x::groups::GroupRole::Admin),
+            (&member, x0x::groups::GroupRole::Member),
+        ] {
+            next.add_member(
+                hex::encode(keys.agent_id().as_bytes()),
+                role,
+                Some(owner_hex.clone()),
+                None,
+            );
+        }
+    })?;
+    for (signer, applies) in [(&member, false), (&admin, true)] {
+        let mut ahead = base.clone();
+        let name = "renamed under an admin ATA".to_string();
+        let commit = seal_link(&mut ahead, signer, 2_000, |next| next.name = name.clone())?;
+        let event = NamedGroupMetadataEvent::GroupMetadataUpdated {
+            group_id: base.stable_group_id().to_string(),
+            revision: commit.revision,
+            actor: hex::encode(signer.agent_id().as_bytes()),
+            name: Some(name),
+            description: None,
+            commit: Some(commit.clone()),
+        };
+        anyhow::ensure!(relayable_state_only_link(&event).is_some(), "relayable");
+        let (joiner, _dir) = secure_endpoint_test_state().await?;
+        let joiner_hex = hex::encode(joiner.agent.agent_id().as_bytes());
+        let key = install_stub(&joiner, base.clone()).await?;
+        let ata = x0x::groups::recovery::AdminTerminalAttestation::sign(
+            x0x::groups::recovery::AtaFields {
+                group: base.stable_group_id().to_string(),
+                subject: joiner_hex,
+                attested_by: hex::encode(admin.agent_id().as_bytes()),
+                signer_public_key: hex::encode(admin.public_key().as_bytes()),
+                from_revision: base.state_revision,
+                from_state_hash: base.state_hash.clone(),
+                sequence: vec![commit.state_hash.clone()],
+                segment_terminal_revision: commit.revision,
+                segment_terminal_epoch: None,
+                issued_at_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |elapsed| elapsed.as_millis() as u64),
+            },
+            &admin,
+        )
+        .map_err(|refusal| anyhow::anyhow!("sign the ATA: {refusal:?}"))?;
+        anyhow::ensure!(
+            group_recovery::arm_admin_ata_for_test(&joiner, base.stable_group_id(), ata).await,
+            "the ATA is stored"
+        );
+        let stub = head_of(&joiner, &key).await?;
+        anyhow::ensure!(
+            group_recovery::armed_admin_sequence(&joiner, &stub).await
+                == Some(vec![commit.state_hash.clone()]),
+            "the admin ATA arms the joiner"
+        );
+        anyhow::ensure!(armed_anchored_gap_sequence(&stub).is_none(), "no owner arm");
+
+        deliver_page(&joiner, &key, &relay, vec![event]).await;
+
+        let head = head_of(&joiner, &key).await?;
+        let expected = if applies {
+            &commit.state_hash
+        } else {
+            &base.state_hash
+        };
+        assert_eq!(
+            &head.state_hash,
+            expected,
+            "applies: {applies} (a rename signed by a {} relayed under an admin ATA)",
+            if applies { "admin" } else { "member" }
+        );
+        assert_no_tree(&joiner, &key).await;
+    }
+    Ok(())
+}

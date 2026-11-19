@@ -61,7 +61,7 @@
       "revision": 1,
       "path": "A08-r01-groups-home-membership-and-repair.md",
       "title": "Groups Home Membership and Repair",
-      "sha256": "75a40212d50f87d4970559869827236cd6bdcb8f43341ebbece3373251ca7820"
+      "sha256": "67575b5dd7e1855079c2dc4e5815319f68a3dd22264cd6c503ce21f8ae1a5743"
     },
     {
       "id": "A09",
@@ -75,14 +75,14 @@
       "revision": 1,
       "path": "A10-r01-shared-data-files-and-synchronization.md",
       "title": "Shared Data Files and Synchronization",
-      "sha256": "1972d0c6c0bc8f0924a6e48b7f026b19a4753bc40a3a9138b2f9cb4db3551e8e"
+      "sha256": "45ef5ad147a2b0d27b92e6b302cff614307a880f488838491763793a5ff46f59"
     },
     {
       "id": "A11",
       "revision": 1,
       "path": "A11-r01-local-api-applications-and-human-interface.md",
       "title": "Local API Applications and Human Interface",
-      "sha256": "488fb2657073ac5db16f8760a343a04dedc774eff51b83ecb6ae30fc5a6b2ea6"
+      "sha256": "5b356b9139d52c5e25ff5e3dcfb051a32e218d26870acc9163dadfd9aacac378"
     },
     {
       "id": "A12",
@@ -103,7 +103,7 @@
       "revision": 1,
       "path": "A14-r01-health-updates-and-recovery.md",
       "title": "Health Updates and Recovery",
-      "sha256": "a491dc4462edb1a45405eb50d094fde76f20d388445d58e1ac7611c5be24c0df"
+      "sha256": "d6446b097672e5c396d5a3be29bc5b0a30f78ea1f02cdcdf61edc65b6ed4c6ad"
     },
     {
       "id": "A15",

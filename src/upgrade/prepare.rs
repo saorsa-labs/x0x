@@ -373,8 +373,6 @@ impl HostLock {
     }
 }
 
-/// `true` when this open file now holds its lock, `false` when another
-/// holder has it.
 /// The forward phases the producer writes, in order. `Probed` may be
 /// skipped; the two swaps may not.
 const FORWARD: [Phase; 5] = [

@@ -19,6 +19,20 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`x0x autostart --repair --launcher` and launchd acceptance (#1379;
+  A14 amendment of 18 Nov 2026).** The hidden, opt-in `--repair --launcher`
+  moves an existing x0xd launchd job onto the dormant stable launcher. It
+  keeps the job's label and keys, verifies the readback, and restores the
+  backup on failure. `x0x autostart --launcher` now checks the whole
+  launcher argv, uses the canonical `x0xd` and the stable launcher link,
+  refuses to replace another instance's job, and restores the previous job
+  when `bootout` or `bootstrap` fails. A new
+  `scripts/ci/macos-launchd-acceptance.sh` runs an isolated launchd job. It
+  measured that launchd's process-group cleanup sends SIGTERM only, and
+  that a missing daemon path makes the job restart in a loop. The repair
+  takes the host root from the job's own `HOME` and the instance's config
+  file, creates nothing while it plans, writes the new job in one atomic
+  step, and exits non-zero when it leaves a job unmoved (#2072 review).
 - **M2 prepare producer, dormant (#2012; A14 amendment of 18 Nov 2026).**
   New crate-private `upgrade::prepare` freezes the host plan and writes the
   prepared host journal through `Staged` … `SwappedCli`, under the host
@@ -27,6 +41,24 @@ All notable changes to this project will be documented in this file.
   The arm handler now compares the canonical running executable, so a
   daemon started through a symlink is no longer refused. `upgrade::prepare_live` reads the running daemon's own
   participant entry. No apply path calls either yet.
+- **GUI sessions end after inactivity, not 12 h after mint (#2070; A11
+  amendment of 18 Nov 2026).** A browser session is a sliding session with
+  no absolute cap. It ends after `gui_idle_timeout_minutes` (default 60,
+  1–1440; flag `--gui-idle-timeout-minutes[=]<MIN>`, env
+  `X0X_GUI_IDLE_TIMEOUT_MINUTES`) without user activity, measured on the
+  wall clock, so time asleep counts. A clock step back of more than 60 s
+  (such as a corrected forward jump) ends every session; users sign in
+  again. `POST /auth/session/refresh` takes an
+  optional `{"idle_ms": n}`; only that extends the session. **Behaviour
+  change:** a client that refreshes without `idle_ms` (including
+  `x0x auth refresh` without `--idle-ms`) now ends after the idle timeout,
+  60 min by default, where it had 12 h. New `POST /auth/session/revoke`
+  (`x0x auth revoke`, GUI "Sign out") ends the caller's own session, every
+  token of it, live or lapsed, even when a refresh raced the sign-out.
+  `GET /status` adds `gui_idle_timeout_secs`; `x0xd --doctor` prints the
+  timeout. Known limit: open WebSocket and SSE streams of a revoked or
+  idle-expired session are not closed; such a stream can outlive sign-out
+  until the client disconnects, with no time bound.
 - **Relay serving follows participation mode (#1642; A06 amendment of
   18 Nov 2026).** New `NetworkConfig.relay_service_enabled` (default `true`)
   is passed to ant-quic. x0xd reads an optional TOML `relay_service_enabled`;
@@ -670,6 +702,33 @@ All notable changes to this project will be documented in this file.
   to a requester that is an Active member when the page is served. A relayed
   link's `actor` now matches its signer without regard to hex case. ADR A08
   correction of 17 Nov 2026.
+- **Group store images have a 12 MiB put limit and a 16 MiB merge limit
+  (#1970; A10 amendment of 18 Nov 2026).** A group store now retains only
+  entries of live keys and no OR-Set changelog, so a removed key keeps no
+  value bytes and an image cannot plant dead entries. A local put that would
+  take the retained image past 12 MiB is refused (HTTP 507). Every remote
+  merge (delta, retained image, checkpoint adoption, legacy import) is
+  measured and kept only when the merged image (replicated part plus a 16 KiB
+  allowance for per-replica fields) is at most 16 MiB. Honest concurrent
+  writes within the 4 MiB headroom converge on every replica in any order. A
+  refused merge applies nothing. It is shown as `image.state: full_diverged`
+  in `GET /stores` and warned by `x0x doctor`; this replica's pulls from the
+  refused source back off until its image shrinks, and the refused content
+  returns through the next full-image repair. Merges of deltas, retained images and adoption apply in place with no copy of the
+  store; legacy import still measures on a copy. An image saved above 16 MiB loads whole as
+  `over_limit` and serves again once entries are removed. Refusals are also
+  counted in `GET /diagnostics/state-sync`.
+- **Groups (#2022):** a joiner that reaches its catch-up terminal without its
+  keys keeps its `catching_up` recovery object until it has them; if they do
+  not come within the Welcome's 10-minute lifetime it ends
+  `readmission_required {base_beyond_retention}`, which stays until it has
+  keys or joins again. On TreeKEM an Active seat alone no longer counts as
+  keys, here or in the #1661 lost-Welcome rule. Before, the recovery object
+  cleared at the terminal with no keys. With no capable peer at all, the
+  recovery loop no longer counts a round on each tick. Tests cover a relayed
+  link under an admin ATA (a member-signed one is refused), the authority's
+  decision for a head one below its oldest kept commit, and a decrypt at the
+  head epoch in W3-H H-S3-r. ADR A08 amendment of 18 Nov 2026.
 
 - **Granted-store CLI paths and serves (#1953 review).** `x0x grant data`
   (and `grant revoke|renew`) percent-encode each path segment, so a key with

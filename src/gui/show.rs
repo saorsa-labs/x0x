@@ -2708,12 +2708,13 @@ const document = {
 };
 let daemonToken = 'minted-token';
 let daemonExpiry = 10 * 60 * 1000;
-const GRACE = 4 * 60 * 60 * 1000;
+// Every token here was minted at 0 and reports no later activity.
+const IDLE = 60 * 60 * 1000;
 const sent = [];
 function wsSend(obj) { sent.push(obj); }
 async function apiWith(token, path) {
   if (path !== '/auth/session/refresh') return null;
-  if (token !== daemonToken || now >= daemonExpiry + GRACE) {
+  if (token !== daemonToken || now >= IDLE) {
     return { _http_ok: false, _http_status: 401 };
   }
   daemonToken = 'refreshed-' + now;
@@ -2748,7 +2749,8 @@ async function apiWith(token, path) {
   if (wsUrl().indexOf('gui=1') < 0) {
     throw new Error('a live tab omitted gui=1: ' + wsUrl());
   }
-  // Mint at 0, load at 11. The token lapsed, and the daemon still swaps it.
+  // Mint at 0, load at 11. The token lapsed inside the idle timeout, and
+  // the daemon still swaps it.
   now = 11 * 60 * 1000;
   daemonToken = 'late-token';
   daemonExpiry = 10 * 60 * 1000;
@@ -2757,10 +2759,10 @@ async function apiWith(token, path) {
   noteSessionClock();
   await bootstrapGuiSession();
   if (!liveGuiTab()) {
-    throw new Error('a load inside the refresh grace must recover the session');
+    throw new Error('a load inside the idle timeout must recover the session');
   }
-  // Load after the grace. This tab must not suppress a browser open.
-  now = 10 * 60 * 1000 + GRACE;
+  // Load after the idle timeout. This tab must not suppress a browser open.
+  now = IDLE;
   daemonToken = 'stale-token';
   daemonExpiry = 10 * 60 * 1000;
   location.search = '?token=stale-token';
@@ -2792,13 +2794,13 @@ async function apiWith(token, path) {
     }
 
     #[test]
-    fn hidden_tab_session_recovers_within_grace_and_expires_after() {
+    fn gui_session_ends_after_idle_and_lives_while_active() {
         let html = include_str!("x0x-gui.html");
         let source = format!(
             "{}\n{}\n{}",
             r#"
 const MIN = 60 * 1000;
-const TTL = 10 * MIN, GRACE = 240 * MIN, CAP = 720 * MIN;
+const TTL = 10 * MIN, IDLE = 60 * MIN;
 let now = 0;
 Date.now = () => now;
 const store = {};
@@ -2817,27 +2819,44 @@ const document = {
   getElementById() { return { appendChild() { toasts += 1; } }; }
 };
 function wsSend() {}
+// The daemon model: a session lives while now - lastActivity < IDLE, and
+// only a refresh that reports input moves lastActivity.
 let daemon = null;
 let refreshes = 0;
+// lineageRevoke: revoke with a token a refresh replaced ends the session,
+// as the daemon does. Off, only the GUI's own guard can end it.
+let lineageRevoke = true;
 function mint(token) {
-  daemon = { token, mintedAt: now, expiresAt: now + TTL };
+  daemon = { token, lastActivity: now, expiresAt: now + TTL, retired: new Set() };
   location.search = '?token=' + token;
 }
-async function apiWith(token, path) {
+function daemonActive() { return daemon && now - daemon.lastActivity < IDLE; }
+const revoked = [];
+async function apiWith(token, path, opt) {
   await null;
   const known = daemon && token === daemon.token;
+  if (path === '/auth/session/revoke') {
+    revoked.push(token);
+    const replaced = lineageRevoke && daemon && daemon.retired.has(token);
+    if (!(known || replaced) || !daemonActive()) return { _http_ok: false, _http_status: 401 };
+    daemon = null;
+    return { _http_ok: true, revoked: true };
+  }
   if (path !== '/auth/session/refresh') {
-    return known && now < daemon.expiresAt
+    return known && now < daemon.expiresAt && daemonActive()
       ? { _http_ok: true, _http_status: 200 }
       : { _http_ok: false, _http_status: 401 };
   }
   refreshes += 1;
-  if (!known || now >= daemon.expiresAt + GRACE || now - daemon.mintedAt > CAP) {
-    return { _http_ok: false, _http_status: 401 };
+  if (!known || !daemonActive()) return { _http_ok: false, _http_status: 401 };
+  const body = opt && opt.body ? JSON.parse(opt.body) : {};
+  if (typeof body.idle_ms === 'number') {
+    daemon.lastActivity = Math.max(daemon.lastActivity, Math.min(now, now - body.idle_ms));
   }
+  daemon.retired.add(daemon.token);
   daemon.token = 'session-' + refreshes;
   daemon.expiresAt = now + TTL;
-  return { _http_ok: true, session_token: daemon.token, expires_in: 600 };
+  return { _http_ok: true, session_token: daemon.token, expires_in: 600, idle_timeout_secs: IDLE / 1000 };
 }
 "#,
             fn_source(
@@ -2847,19 +2866,14 @@ async function apiWith(token, path) {
             ),
             r#"
 function fail(message) { throw new Error(message + ' at ' + now / MIN + ' min'); }
-async function away(minutes) {
-  document.visibilityState = 'hidden';
-  const before = refreshes;
+async function tick(minutes, input) {
+  // One poll and one timer tick a minute; input every 5 min when active.
   for (let i = 0; i < minutes; i += 1) {
     now += MIN;
+    if (input && i % 5 === 0) noteUserActivity();
     await maybeRefreshSession();
+    await api('/agent');
   }
-  if (refreshes !== before) fail('a hidden tab refreshed the session');
-  const r = await api('/agent');
-  if (refreshes !== before) fail('a hidden request refreshed the session');
-  if (minutes > 10 && r._http_ok) fail('the fixture token did not lapse while hidden');
-  if (sessionExpired) fail('a hidden lapse must not end the session');
-  document.visibilityState = 'visible';
 }
 async function load(token) {
   mint(token);
@@ -2867,55 +2881,103 @@ async function load(token) {
   toasts = 0;
   SESSION_TOKEN = readSessionToken();
   noteSessionClock();
+  noteActivityClock();
   await bootstrapGuiSession();
   if (!liveGuiTab()) fail('the fixture did not start with a live tab');
+  if (sessionIdleTimeoutMs !== IDLE) fail('bootstrap did not learn the idle timeout');
 }
 (async () => {
+  // An active user keeps the session far past the old 12 h cap.
   await load('minted-a');
-  await away(180);
   let before = refreshes;
-  const answers = await Promise.all([api('/agent'), api('/contacts'), api('/groups')]);
-  if (refreshes !== before + 1) fail('a reveal must refresh once, saw ' + (refreshes - before));
-  if (!answers.every((r) => r && r._http_ok)) {
-    fail('requests after a reveal must use the refreshed token: ' + JSON.stringify(answers));
-  }
-  if (sessionExpired || toasts !== 0) fail('a lapse inside grace must not end the session');
-  if (!liveGuiTab()) fail('a recovered session must be a live tab');
+  await tick(14 * 60, true);
+  if (sessionExpired || toasts !== 0) fail('an active session ended');
+  if (refreshes - before < 80) fail('the active session did not keep refreshing');
+  if (!(await api('/agent'))._http_ok) fail('an active session lost its token');
 
-  await away(251);
-  let r = await api('/agent');
-  if (r._http_ok) fail('a request succeeded after the grace');
-  if (!sessionExpired || toasts !== 1) fail('a lapse past grace must end the session');
-  if (liveGuiTab()) fail('an ended session is not a live tab');
+  // A laptop asleep (hidden, polling) for 30 min recovers on reveal.
+  document.visibilityState = 'hidden';
   before = refreshes;
-  await api('/agent');
-  if (refreshes !== before || toasts !== 1) fail('an ended session must not retry refresh');
+  await tick(30, false);
+  if (refreshes !== before) fail('a hidden tab refreshed the session');
+  if (sessionExpired) fail('30 idle minutes ended the session');
+  document.visibilityState = 'visible';
+  noteUserActivity();
+  await maybeRefreshSession();
+  if (!(await api('/agent'))._http_ok || sessionExpired) fail('a reveal after 30 min did not recover');
 
+  // A hidden tab that keeps polling, with no input, ends at the idle limit
+  // and revokes its token, which the daemon still accepts.
+  document.visibilityState = 'hidden';
+  const quietSince = lastUserActivity;
+  const heldToken = SESSION_TOKEN;
+  await tick(61, false);
+  if (!sessionExpired || toasts !== 1) fail('a hidden polling tab outlived the idle timeout');
+  if (now - quietSince < IDLE) fail('the tab ended before the idle timeout');
+  await null; await null;
+  if (revoked[revoked.length - 1] !== heldToken) fail('idle expiry did not revoke the token');
+  if (daemon && daemonActive()) fail('the daemon session survived the idle expiry');
+  if (sessionStorage.getItem('x0x_session_token') !== null) fail('idle expiry left the token stored');
+  if (liveGuiTab()) fail('an ended session is not a live tab');
+  document.visibilityState = 'visible';
+  noteUserActivity();
+  before = refreshes;
+  await maybeRefreshSession();
+  const late = await api('/agent');
+  if (late._http_ok) fail('input after the limit revived the session');
+  if (refreshes !== before || toasts !== 1) fail('an ended session must not retry or toast again');
+
+  // A visible tab whose timer refreshes without input also ends.
   await load('minted-b');
-  for (let i = 0; i < 3; i += 1) {
-    await away(239);
-    r = await api('/agent');
-    if (!r._http_ok || sessionExpired) fail('a lapse inside grace and cap must recover');
+  const mintedAt = now;
+  before = refreshes;
+  await tick(70, false);
+  if (refreshes - before < 5) fail('the background timer did not refresh');
+  if (daemon.lastActivity !== mintedAt) fail('a background refresh moved the daemon activity');
+  if (!sessionExpired || toasts !== 1) fail('a visible tab with no input outlived the idle timeout');
+
+  // Sign out revokes the token, even a lapsed one, and ends the session once.
+  await load('minted-c');
+  const signedOut = SESSION_TOKEN;
+  document.visibilityState = 'hidden';
+  await tick(20, false);
+  signOut();
+  await null; await null;
+  if (revoked[revoked.length - 1] !== signedOut) fail('sign out did not revoke this tab token');
+  if (daemon !== null) fail('sign out left the daemon session alive');
+
+  // Sign out while a refresh is in flight: the refresh wins the daemon,
+  // revoke presents the replaced token. Run with and without the daemon's
+  // lineage revoke; either way the session must end and nothing stays stored.
+  for (const lineage of [true, false]) {
+    lineageRevoke = lineage;
+    document.visibilityState = 'visible';
+    await load('minted-race-' + lineage);
+    now += 9 * MIN;
+    const inFlight = maybeRefreshSession();
+    signOut();
+    await inFlight;
+    for (let i = 0; i < 4; i += 1) await null;
+    if (daemon !== null) fail('a refresh that raced sign out kept the session (lineage ' + lineage + ')');
+    if (sessionStorage.getItem('x0x_session_token') !== null) fail('a raced refresh stored its token');
+    if (!sessionExpired || toasts !== 1) fail('a raced sign out must end the session once');
   }
-  await away(10);
-  if (now - daemon.mintedAt <= CAP) fail('the fixture did not pass the cap');
-  if (now >= daemon.expiresAt + GRACE) fail('the fixture left the grace');
-  r = await api('/agent');
-  if (r._http_ok) fail('a request succeeded past the 12 h cap');
-  if (!sessionExpired || toasts !== 1) fail('the 12 h cap must end the session');
+  lineageRevoke = true;
+  if (!sessionExpired || toasts !== 1) fail('sign out must end the session once');
+  if (sessionStorage.getItem('x0x_session_token') !== null) fail('sign out left the token stored');
 })().catch((error) => { console.error(error); process.exit(1); });
 "#
         );
         let dir = tempfile::tempdir().expect("tempdir");
-        let script = dir.path().join("hidden-lapse.js");
+        let script = dir.path().join("idle-timeout.js");
         std::fs::write(&script, source).expect("write script");
         let output = std::process::Command::new("node")
             .arg(&script)
             .output()
-            .expect("node runs the hidden lapse");
+            .expect("node runs the GUI idle timeout");
         assert!(
             output.status.success(),
-            "a session that lapsed while hidden did not follow the grace and cap\nstdout:\n{}\nstderr:\n{}",
+            "GUI idle timeout\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );

@@ -2335,10 +2335,8 @@ async fn handle_ws_command(
                 // view this tab was opened for. Store every request. The
                 // reveal that is waiting for a slot applies the latest one
                 // when the frame fits, so a later show or hide wins.
-                let now = std::time::Instant::now();
                 let ended_visible = !visible
-                    && session
-                        .visible_with_live_session(|token| state.sessions.is_valid(token, now));
+                    && session.visible_with_live_session(|token| state.sessions.is_valid(token));
                 let reveal = begin_gui_visibility_request(session, visible);
                 (reveal, ended_visible)
             };
@@ -2478,8 +2476,7 @@ async fn finish_queued_reveal(state: &AppState, session_id: &str, sent: bool) {
 
 /// A tab that just became visible still holds a live session token.
 fn live_gui_session(state: &AppState, session: &WsSession) -> bool {
-    let now = std::time::Instant::now();
-    session.visible_with_live_session(|token| state.sessions.is_valid(token, now))
+    session.visible_with_live_session(|token| state.sessions.is_valid(token))
 }
 
 /// Stamp visibility for a `gui=1` connect when that socket is a live GUI.
@@ -2511,8 +2508,7 @@ fn note_gui_tab_visible(state: &AppState) {
 /// The stamp becomes this instant when it is later than the stored
 /// become-visible time. A hidden tab and an expired session do not move it.
 fn note_if_live_visible_ended(state: &AppState, session: &WsSession) {
-    let now = std::time::Instant::now();
-    if session.visible_with_live_session(|token| state.sessions.is_valid(token, now)) {
+    if session.visible_with_live_session(|token| state.sessions.is_valid(token)) {
         record_live_visibility_end(state);
     }
 }
@@ -2874,7 +2870,7 @@ mod tests {
         };
 
         // Browser path: session token via ?token= → durable=false.
-        let session = state.sessions.issue(std::time::Instant::now());
+        let session = state.sessions.issue();
         let (status, body) = read(format!("/ws?token={session}"), None).await?;
         assert_eq!(status, axum::http::StatusCode::OK, "{body}");
         assert_eq!(
@@ -3202,7 +3198,7 @@ mod tests {
                 .await
                 .expect("test state");
         state.gui_show.note_gui_visible(0);
-        let token = state.sessions.issue(std::time::Instant::now());
+        let token = state.sessions.issue();
         state.ws_sessions.write().await.insert(
             "live-tab".to_string(),
             test_live_gui_ws_session("live-tab", &token),
@@ -3290,7 +3286,7 @@ mod tests {
             "an agent socket with gui=1 and no session must not count as active"
         );
 
-        let expired = state.sessions.issue(std::time::Instant::now());
+        let expired = state.sessions.issue();
         state.sessions.expire_for_test(&expired);
         state.ws_sessions.write().await.insert(
             "expired-gui".to_string(),
@@ -3302,7 +3298,7 @@ mod tests {
             "an expired GUI session must not stamp visibility at connect"
         );
 
-        let token = state.sessions.issue(std::time::Instant::now());
+        let token = state.sessions.issue();
         state.ws_sessions.write().await.insert(
             "live-gui".to_string(),
             test_live_gui_ws_session("live-gui", &token),
@@ -3331,7 +3327,7 @@ mod tests {
                 .await
                 .expect("test state");
         state.gui_show.note_gui_visible(0);
-        let expired = state.sessions.issue(std::time::Instant::now());
+        let expired = state.sessions.issue();
         state.sessions.expire_for_test(&expired);
         state.ws_sessions.write().await.insert(
             "expired-tab".to_string(),
@@ -3382,7 +3378,7 @@ mod tests {
             "a queued reveal on an expired session must not refresh the stamp"
         );
 
-        let live = state.sessions.issue(std::time::Instant::now());
+        let live = state.sessions.issue();
         {
             let mut sessions = state.ws_sessions.write().await;
             let session = sessions.get_mut("expired-tab").expect("session");
@@ -3419,7 +3415,7 @@ mod tests {
             crate::server::routes::named_groups::tests::secure_endpoint_test_state()
                 .await
                 .expect("test state");
-        let old = state.sessions.issue(std::time::Instant::now());
+        let old = state.sessions.issue();
         state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
             view: "people".to_string(),
             banner: "Opened by test on test".to_string(),
@@ -3498,7 +3494,7 @@ mod tests {
             crate::server::routes::named_groups::tests::secure_endpoint_test_state()
                 .await
                 .expect("test state");
-        let old = state.sessions.issue(std::time::Instant::now());
+        let old = state.sessions.issue();
         state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
             view: "people".to_string(),
             banner: "Opened by test on test".to_string(),
@@ -3555,7 +3551,7 @@ mod tests {
             crate::server::routes::named_groups::tests::secure_endpoint_test_state()
                 .await
                 .expect("test state");
-        let old = state.sessions.issue(std::time::Instant::now());
+        let old = state.sessions.issue();
         state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
             view: "people".to_string(),
             banner: "Opened by test on test".to_string(),
@@ -3690,7 +3686,7 @@ mod tests {
             crate::server::routes::named_groups::tests::secure_endpoint_test_state()
                 .await
                 .expect("test state");
-        let old = state.sessions.issue(std::time::Instant::now());
+        let old = state.sessions.issue();
         state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
             view: "people".to_string(),
             banner: "Opened by test on test".to_string(),

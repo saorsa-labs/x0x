@@ -605,7 +605,7 @@ async fn minted_session_token_is_refused_before_the_body() -> Result<()> {
         group_id.clone(),
         group_with_local_role(&state, &group_id, x0x::groups::GroupRole::Admin),
     );
-    let session = state.sessions.issue(std::time::Instant::now());
+    let session = state.sessions.issue();
     let durable_token = state.api_token.clone();
     let app = axum::Router::new()
         .route(
@@ -717,7 +717,7 @@ async fn post_open_envelope(
 async fn issue1228_open_envelope_middleware_refuses_scoped_tokens_before_body() -> Result<()> {
     let (state, _dir) = secure_endpoint_test_state().await?;
     assert!(state.agent.network().is_none(), "fixture must stay inert");
-    let session_token = state.sessions.issue(std::time::Instant::now());
+    let session_token = state.sessions.issue();
     let (rider_token, _) = state
         .rider_tokens
         .lock()

@@ -53,6 +53,7 @@ const COVERED: &[CoveredEndpoint] = &[
         "/auth/session/refresh",
         daemon_api_auth_session_refresh
     ),
+    covered!(Post, "/auth/session/revoke", daemon_api_auth_session_revoke),
     // ── ADR-0043 agent key-move ceremony + placement ledger ────────────
     covered!(Post, "/agent/move", move_routes_wired),
     covered!(Post, "/agent/move/export", move_routes_wired),

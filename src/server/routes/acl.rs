@@ -280,7 +280,7 @@ mod tests {
         let (state, _dir) =
             crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
         let app = acl_router(Arc::clone(&state), true);
-        let session = state.sessions.issue(std::time::Instant::now());
+        let session = state.sessions.issue();
         let rider = {
             let mut store = state.rider_tokens.lock().await;
             let (token, _record) = store

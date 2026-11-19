@@ -127,6 +127,18 @@ Host lock for the arm restore and lock adoption (amendment of 18 Nov 2026, #2065
 - **The producer.** It adopts install locks that its caller already holds instead of taking them again. It takes them as the guard type that only a held lock produces, checks that each is the plan pair's lock file, and hands both back, still held, when it refuses.
 - **Unix only.** The host lock is taken on Unix only today. On Windows, the named-pipe arm has neither the admission check nor the locked restore. This is an open gap under #2012.
 
+Launchd migration and measured process-group limit (amendment of 18 Nov 2026, #1379, #2063 review). This amends the launcher refusal-class paragraph (17 Nov 2026) and the refusal-record paragraph (18 Nov 2026) above.
+- **Launcher-bound autostart job.** It names the launcher by its absolute path next to `x0xd` as found, not resolved through symlinks, and the daemon by its canonical path. The whole launcher argv is checked with the launcher's parser before it is written.
+- **One label serves one instance.** Autostart refuses to replace another instance's job.
+- **Reloading.** A failed `bootout` or `bootstrap` restores the previous job file. After a failed `bootstrap`, the previous job is loaded again only if it was loaded before. A failed restore is reported together with the error that caused it.
+- **`x0x autostart --repair --launcher`** moves a job the plain repair accepts onto the launcher's trial form. It keeps every key except the program, its arguments and `ExitTimeOut`, and adds the supervision marker.
+  - The host root is the data directory that x0xd uses for the job: from the job's own `HOME` (else the user's), and the instance's default config file. Planning creates nothing, so the directory must exist.
+  - It refuses a job that passes `--config`, and a config file with invalid TOML, a relative `data_dir` or another `instance_name`, because the host root is then not known.
+  - The whole new job file is built and checked to convert back to the plan. It is then written in one atomic step, so a crash never leaves a job that mixes `Program` with launcher arguments. A readback that differs restores the old file.
+  - It exits non-zero and names every job it did not move (#2072 review).
+- **Measured on macOS 27.** launchd's process-group cleanup (bootout, or the job's main process dying) sends SIGTERM only, so a group member that ignores SIGTERM survives it. The earlier wording that the cleanup "removes a surviving child" is too strong. Safety then rests on the launcher: once `ENABLED` is true, its next start waits up to 45 s for the prior child and then holds, so two daemons never share the data roots. While the launcher is dormant it execs the daemon at once, so this wait is covered by unit tests only, not yet measured through launchd.
+- **Missing daemon (measured, 18 Nov 2026).** The job pins the canonical daemon, which for a Homebrew install is a versioned Cellar path that an upgrade removes. The dormant launcher then exits 75 at once, and launchd's `KeepAlive` restarts it after each throttle interval (3 starts in 30 s): a restart loop. The next #1379 slice must make it hold or name a stable path. Also open for that slice: a refusal to run as root or under `sudo`, a plist-owner check, a dry run for `--repair`, and running the acceptance script in CI.
+
 Authority: Claude under David's delegation, 10 Nov 2026.
 
 ## Consequences

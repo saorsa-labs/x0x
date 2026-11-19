@@ -535,6 +535,12 @@ pub struct DaemonConfig {
     /// ADR 0083 agent-initiated GUI show (`[gui_show]`).
     #[serde(default)]
     pub gui_show: x0x::gui::GuiShowConfig,
+
+    /// Minutes without user activity after which a GUI session ends
+    /// (default 60, range 1..=1440). Overridden by `--gui-idle-timeout-minutes`
+    /// and `X0X_GUI_IDLE_TIMEOUT_MINUTES`.
+    #[serde(default = "default_gui_idle_timeout_minutes")]
+    pub gui_idle_timeout_minutes: u64,
 }
 
 /// WebSocket session tuning (`[ws]` in the daemon TOML).
@@ -752,6 +758,10 @@ fn default_history_config() -> x0x::history::HistoryConfig {
     x0x::history::HistoryConfig::daemon_default()
 }
 
+fn default_gui_idle_timeout_minutes() -> u64 {
+    super::auth::DEFAULT_GUI_IDLE_TIMEOUT_MINUTES
+}
+
 fn default_identity_ttl() -> u64 {
     x0x::IDENTITY_TTL_SECS
 }
@@ -850,6 +860,7 @@ impl Default for DaemonConfig {
             zero_peer_restart_secs: None,
             api_watchdog: super::ApiWatchdogConfig::default(),
             gui_show: x0x::gui::GuiShowConfig::default(),
+            gui_idle_timeout_minutes: default_gui_idle_timeout_minutes(),
         }
     }
 }

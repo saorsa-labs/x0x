@@ -9,6 +9,7 @@ pub(crate) use api_watchdog::ApiWatchdogConfig;
 pub(crate) mod attribution_probe;
 mod auth;
 pub(crate) use auth::SESSION_TOKEN_TTL;
+pub use auth::{gui_idle_timeout, DEFAULT_GUI_IDLE_TIMEOUT_MINUTES, MAX_GUI_IDLE_TIMEOUT_MINUTES};
 pub mod config;
 mod crdt_subscriptions;
 mod data_read;
@@ -1295,7 +1296,11 @@ pub async fn serve_with_options(
         #[cfg(unix)]
         upgrade_staging,
         api_token,
-        sessions: auth::SessionStore::new(auth::SESSION_TOKEN_TTL),
+        sessions: auth::SessionStore::new(
+            auth::SESSION_TOKEN_TTL,
+            auth::gui_idle_timeout(config.gui_idle_timeout_minutes)
+                .map_err(|e| anyhow::anyhow!("invalid daemon config: {e}"))?,
+        ),
         rider_tokens: tokio::sync::Mutex::new(
             rider_auth::RiderTokenStore::load(config.data_dir.join(rider_auth::RIDER_TOKENS_FILE))
                 .await,
@@ -3090,6 +3095,7 @@ pub async fn serve_with_options(
         .route("/gui/show", post(routes::gui_show))
         .route("/auth/session", post(auth::create_session))
         .route("/auth/session/refresh", post(auth::refresh_session))
+        .route("/auth/session/revoke", post(auth::revoke_session))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
         .layer({
             // Restrict CORS to exact loopback origins only.
