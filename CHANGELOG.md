@@ -521,6 +521,14 @@ All notable changes to this project will be documented in this file.
 
 ### Tests and tooling
 
+- **W3-H: `s4_certificate_rebind` run (5), a renewal signed by another
+  user key (#1581).** `w3h_1357_s4_certificate_rebind_pre_cutoff` now has
+  B self-rebind a later certificate for its own agent key that a second
+  user key signed, not the Home's owner. The route refuses it with
+  `422 rebind_certificate_invalid`, and every node still binds the earlier
+  renewal at the same state revision. Control: with the owner check
+  removed, the row reads RED.
+
 - **W3-H: the q3 sidecar row proves O refused J, and every J listener
   took the re-seat answer (#1581, follow-up to #2080).**
   `w3h_1356_control_s3_q3_issuer_unreadable_sidecar` now requires J's new
