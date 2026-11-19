@@ -1223,7 +1223,14 @@ enum AuthSub {
     /// Exchange the durable API token for a short-lived browser session token.
     Session,
     /// Swap a session token (passed via `X0X_API_TOKEN`) for a fresh one.
-    Refresh,
+    Refresh {
+        /// Milliseconds since the user's last input. Without it the refresh
+        /// does not extend the session's idle timeout.
+        #[arg(long)]
+        idle_ms: Option<u64>,
+    },
+    /// End the session whose token is passed via `X0X_API_TOKEN`.
+    Revoke,
 }
 
 /// Key lifecycle sub-actions (`x0x identity revoke`, `x0x identity revocations`).
@@ -2911,7 +2918,8 @@ async fn run(
         },
         Commands::Auth { sub } => match sub {
             AuthSub::Session => commands::auth::session(&client).await,
-            AuthSub::Refresh => commands::auth::refresh(&client).await,
+            AuthSub::Refresh { idle_ms } => commands::auth::refresh(&client, idle_ms).await,
+            AuthSub::Revoke => commands::auth::revoke(&client).await,
         },
         Commands::Find { words } => commands::find::find(&client, &words).await,
         Commands::Connect { words } => commands::connect::connect(&client, &words).await,

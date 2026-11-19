@@ -61,7 +61,7 @@
       "revision": 1,
       "path": "A08-r01-groups-home-membership-and-repair.md",
       "title": "Groups Home Membership and Repair",
-      "sha256": "75a40212d50f87d4970559869827236cd6bdcb8f43341ebbece3373251ca7820"
+      "sha256": "67575b5dd7e1855079c2dc4e5815319f68a3dd22264cd6c503ce21f8ae1a5743"
     },
     {
       "id": "A09",
@@ -75,14 +75,14 @@
       "revision": 1,
       "path": "A10-r01-shared-data-files-and-synchronization.md",
       "title": "Shared Data Files and Synchronization",
-      "sha256": "0fb9878f86e7e9e61fc84293e66f1b51e7e595f6577c7afb859096e8093285f1"
+      "sha256": "929ce76940b4f9eadf0ba725b165e0b6be000ee66a6f095dca7682355dcfdcde"
     },
     {
       "id": "A11",
       "revision": 1,
       "path": "A11-r01-local-api-applications-and-human-interface.md",
       "title": "Local API Applications and Human Interface",
-      "sha256": "488fb2657073ac5db16f8760a343a04dedc774eff51b83ecb6ae30fc5a6b2ea6"
+      "sha256": "65b10c8dcae536b27660cf0be36fc1d33c4da9332963ec672e1b04f96de36986"
     },
     {
       "id": "A12",

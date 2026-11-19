@@ -17,12 +17,33 @@ pub async fn session(client: &DaemonClient) -> Result<()> {
 
 /// `x0x auth refresh` — POST /auth/session/refresh (#893).
 ///
-/// Only a SESSION token is accepted (live, or lapsed for less than 4 h), so
-/// run it as `X0X_API_TOKEN=<session token> x0x auth refresh`; the durable
-/// token is refused. Refresh stops working 12 h after the original session
-/// mint.
-pub async fn refresh(client: &DaemonClient) -> Result<()> {
-    let r = client.post_empty("/auth/session/refresh").await?;
+/// Only a SESSION token is accepted, so run it as
+/// `X0X_API_TOKEN=<session token> x0x auth refresh`; the durable token is
+/// refused. Without `--idle-ms` the refresh reports no user activity, so it
+/// does not extend the session's idle timeout.
+pub async fn refresh(client: &DaemonClient, idle_ms: Option<u64>) -> Result<()> {
+    let r = match idle_ms {
+        Some(idle_ms) => {
+            client
+                .post(
+                    "/auth/session/refresh",
+                    &serde_json::json!({ "idle_ms": idle_ms }),
+                )
+                .await?
+        }
+        None => client.post_empty("/auth/session/refresh").await?,
+    };
+    println!("{}", serde_json::to_string_pretty(&r)?);
+    Ok(())
+}
+
+/// `x0x auth revoke` — POST /auth/session/revoke.
+///
+/// Ends the session whose token is passed as
+/// `X0X_API_TOKEN=<session token> x0x auth revoke`; the durable token is
+/// refused.
+pub async fn revoke(client: &DaemonClient) -> Result<()> {
+    let r = client.post_empty("/auth/session/revoke").await?;
     println!("{}", serde_json::to_string_pretty(&r)?);
     Ok(())
 }

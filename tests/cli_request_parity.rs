@@ -1108,6 +1108,9 @@ const PINNED_MANUAL_BODY_ENDPOINTS: &[(&str, &str, &[&str])] = &[
         "/grants/:id/renew",
         &["deliver_to", "include_names", "ttl_secs"],
     ),
+    // Request body read to bytes; an empty body is a background refresh
+    // (refresh_session).
+    ("POST", "/auth/session/refresh", &["idle_ms"]),
 ];
 
 #[test]

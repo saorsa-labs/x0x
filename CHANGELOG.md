@@ -27,6 +27,24 @@ All notable changes to this project will be documented in this file.
   The arm handler now compares the canonical running executable, so a
   daemon started through a symlink is no longer refused. `upgrade::prepare_live` reads the running daemon's own
   participant entry. No apply path calls either yet.
+- **GUI sessions end after inactivity, not 12 h after mint (#2070; A11
+  amendment of 18 Nov 2026).** A browser session is a sliding session with
+  no absolute cap. It ends after `gui_idle_timeout_minutes` (default 60,
+  1–1440; flag `--gui-idle-timeout-minutes[=]<MIN>`, env
+  `X0X_GUI_IDLE_TIMEOUT_MINUTES`) without user activity, measured on the
+  wall clock, so time asleep counts. A clock step back of more than 60 s
+  (such as a corrected forward jump) ends every session; users sign in
+  again. `POST /auth/session/refresh` takes an
+  optional `{"idle_ms": n}`; only that extends the session. **Behaviour
+  change:** a client that refreshes without `idle_ms` (including
+  `x0x auth refresh` without `--idle-ms`) now ends after the idle timeout,
+  60 min by default, where it had 12 h. New `POST /auth/session/revoke`
+  (`x0x auth revoke`, GUI "Sign out") ends the caller's own session, every
+  token of it, live or lapsed, even when a refresh raced the sign-out.
+  `GET /status` adds `gui_idle_timeout_secs`; `x0xd --doctor` prints the
+  timeout. Known limit: open WebSocket and SSE streams of a revoked or
+  idle-expired session are not closed; such a stream can outlive sign-out
+  until the client disconnects, with no time bound.
 - **Relay serving follows participation mode (#1642; A06 amendment of
   18 Nov 2026).** New `NetworkConfig.relay_service_enabled` (default `true`)
   is passed to ant-quic. x0xd reads an optional TOML `relay_service_enabled`;
@@ -671,10 +689,22 @@ All notable changes to this project will be documented in this file.
   refused merge applies nothing. It is shown as `image.state: full_diverged`
   in `GET /stores` and warned by `x0x doctor`; this replica's pulls from the
   refused source back off until its image shrinks, and the refused content
-  returns through the next full-image repair. Merges and serves no longer copy
-  the whole store under a lock. An image saved above 16 MiB loads whole as
+  returns through the next full-image repair. Merges of deltas, retained images and adoption apply in place with no copy of the
+  store; legacy import still measures on a copy. An image saved above 16 MiB loads whole as
   `over_limit` and serves again once entries are removed. Refusals are also
   counted in `GET /diagnostics/state-sync`.
+- **Groups (#2022):** a joiner that reaches its catch-up terminal without its
+  keys keeps its `catching_up` recovery object until it has them; if they do
+  not come within the Welcome's 10-minute lifetime it ends
+  `readmission_required {base_beyond_retention}`, which stays until it has
+  keys or joins again. On TreeKEM an Active seat alone no longer counts as
+  keys, here or in the #1661 lost-Welcome rule. Before, the recovery object
+  cleared at the terminal with no keys. With no capable peer at all, the
+  recovery loop no longer counts a round on each tick. Tests cover a relayed
+  link under an admin ATA (a member-signed one is refused), the authority's
+  decision for a head one below its oldest kept commit, and a decrypt at the
+  head epoch in W3-H H-S3-r. ADR A08 amendment of 18 Nov 2026.
+
 - **Granted-store CLI paths and serves (#1953 review).** `x0x grant data`
   (and `grant revoke|renew`) percent-encode each path segment, so a key with
   `#`, `?` or `/` reaches the exact key. A slow granted read or write now

@@ -44,7 +44,7 @@ async fn named_group_reads_enforce_session_membership_through_auth_middleware() 
             auth::auth_middleware,
         ))
         .with_state(Arc::clone(&state));
-    let session = state.sessions.issue(std::time::Instant::now());
+    let session = state.sessions.issue();
     let rider = {
         let mut tokens = state.rider_tokens.lock().await;
         tokens

@@ -385,6 +385,8 @@ pub(in crate::server) struct StatusData {
     /// docs for what rides which kind). Additive field: clients must ignore
     /// unknown fields. Zeros when this embedder runs without a network node.
     bandwidth: x0x::network::bandwidth::BandwidthUsage,
+    /// Effective GUI session idle timeout (`gui_idle_timeout_minutes`).
+    gui_idle_timeout_secs: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -647,6 +649,7 @@ pub(in crate::server) async fn status(
             api_address: state.api_address.to_string(),
             external_addrs,
             agent_id: hex::encode(state.agent.agent_id().as_bytes()),
+            gui_idle_timeout_secs: state.sessions.idle_timeout().as_secs(),
             peers,
             send_ready_peers,
             revocation_resync_required,
@@ -882,6 +885,7 @@ mod tests {
             revocation_resync_required: false,
             warnings: Vec::new(),
             bandwidth: usage,
+            gui_idle_timeout_secs: 3600,
         };
         let json =
             serde_json::to_value(&super::ApiResponse { ok: true, data }).expect("serializes");
@@ -903,6 +907,7 @@ mod tests {
                 "legacy key {legacy_key} gone"
             );
         }
+        assert_eq!(json["gui_idle_timeout_secs"], 3600);
         let bandwidth = &json["bandwidth"];
         for group in ["sent_bytes", "received_bytes"] {
             for kind in ["total", "gossip", "direct", "relay", "other"] {
@@ -1542,7 +1547,7 @@ mod tests {
         #[tokio::test]
         async fn non_loopback_session_bearer_gets_full_detail() {
             let (state, _dir) = test_state().await;
-            let token = state.sessions.issue(std::time::Instant::now());
+            let token = state.sessions.issue();
             let payload = get_health(&state, remote(), Some(&token), &[]).await;
             for path in GATED_DETAIL {
                 assert!(

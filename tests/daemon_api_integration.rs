@@ -2738,6 +2738,48 @@ async fn daemon_api_auth_session_refresh() {
 
 #[tokio::test]
 #[ignore]
+async fn daemon_api_auth_session_revoke() {
+    // A session ends its own session; the durable token is refused.
+    let d = daemon().await;
+    let refused = ca(&d)
+        .post(d.url("/auth/session/revoke"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 403, "durable token must be refused");
+
+    let r: Value = ca(&d)
+        .post(d.url("/auth/session"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["idle_timeout_secs"], 3600);
+    let session = r["session_token"].as_str().unwrap().to_string();
+    let plain = reqwest::Client::new();
+    let r: Value = plain
+        .post(d.url("/auth/session/revoke"))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["revoked"], true);
+    let after = plain
+        .get(d.url("/agent"))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(after.status(), 401, "a revoked session must stop working");
+}
+
+#[tokio::test]
+#[ignore]
 async fn daemon_api_diagnostics_exec() {
     let d = daemon().await;
     let r: Value = ca(&d)
