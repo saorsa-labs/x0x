@@ -38,6 +38,9 @@ jobs:
       - name: Test release metadata validation
         run: python3 .github/scripts/test_release_metadata.py
 
+      - name: Test the promoted-release announce job
+        run: python3 .github/scripts/test_announce_promoted_release.py
+
       - name: Validate release metadata (pull request)
         if: github.event_name == 'pull_request'
         run: |

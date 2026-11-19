@@ -71,6 +71,12 @@ is built; delete the tag/release afterward. (A prerelease-shaped tag such as
   `publish-promoted-release.yml`, run in the `release` environment, which
   admits only `v*` tag refs. The promotion workflow runs on
   `release: published`, whose ref is `refs/tags/<tag>`.
+  `announce-release` in the same workflow runs outside the `release`
+  environment on purpose. It reads no secret and signs nothing: it runs the
+  promoted x0xd, which relays the manifest that CI already signed, and peers
+  accept it only on that signature. The job runs a downloaded binary, so it
+  is kept away from the environment's secrets, and its checkout does not
+  persist the token.
 - `.github/scripts/test_release_metadata.py` asserts all three statically,
   and runs the lock guard against a fixture repository.
 

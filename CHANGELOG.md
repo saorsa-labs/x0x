@@ -42,6 +42,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Release announced by the promotion workflow (#1169 PR 2; A14 amendment
+  of 19 Nov 2026).** A new `announce-release` job in `Publish promoted
+  release` runs the promoted `x0xd` as a short-lived node with a fresh
+  identity and calls `POST /upgrade/announce`. It passes only when the
+  answer's `version` is the promoted version, retries after the 300 s
+  refusal window, and names `x0x upgrade --announce` as the fallback when
+  the runner finds no send-ready peers. It needs no secret.
+
 - **`POST /upgrade/announce` and `x0x upgrade --announce` (#1169; A14
   amendment of 19 Nov 2026).** A node fetches the latest release
   manifest, checks its ML-DSA-65 signature and timestamp, and publishes it
