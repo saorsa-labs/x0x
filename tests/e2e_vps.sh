@@ -15,7 +15,7 @@ x0x_export_legacy_token_vars
 # =============================================================================
 # x0x VPS End-to-End Test — All-Pairs Matrix
 # Tests across ALL 4 bootstrap nodes (NYC, SFO, Singapore, Sydney)
-# (#2094, 19 Nov 2026: the Singapore and Sydney hosts are gone; their
+# (#2094, 19 Nov 2026: the Helsinki and Nuremberg hosts are gone; their
 # peer roles in this suite moved to Singapore and Sydney.)
 #
 # PROOF POINTS: Every assertion either echoes actual API data or verifies a

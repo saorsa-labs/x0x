@@ -14,7 +14,7 @@ x0x_export_legacy_token_vars
 
 # =============================================================================
 # x0x Live Network End-to-End Test
-# Starts a LOCAL x0xd node that joins the real bootstrap network (6 VPS nodes),
+# Starts a LOCAL x0xd node that joins the real bootstrap network (4 VPS nodes),
 # then tests bidirectional connectivity, discovery, presence, messaging,
 # groups, KV stores, and more between local node and live VPS nodes.
 #
@@ -134,7 +134,7 @@ trap cleanup EXIT
 # ═════════════════════════════════════════════════════════════════════════
 echo -e "${YELLOW}═══════════════════════════════════════════════════════════════${NC}"
 echo -e "${YELLOW}   x0x v$VERSION Live Network E2E Test${NC}"
-echo -e "${YELLOW}   Local node → 6 bootstrap nodes → bidirectional tests${NC}"
+echo -e "${YELLOW}   Local node → 4 bootstrap nodes → bidirectional tests${NC}"
 echo -e "${YELLOW}═══════════════════════════════════════════════════════════════${NC}"
 
 # ── Verify binary ────────────────────────────────────────────────────────
@@ -535,7 +535,7 @@ echo -e "
 ${YELLOW}═══════════════════════════════════════════════════════════════${NC}"
 if [ $FAIL -eq 0 ]; then
     echo -e "${GREEN}  ALL $TOTAL TESTS PASSED ($PASS passed, $SKIP skipped)${NC}"
-    echo -e "  Local node ↔ 6 bootstrap nodes, 12 categories, v$VERSION"
+    echo -e "  Local node ↔ 4 bootstrap nodes, 12 categories, v$VERSION"
 else
     echo -e "${RED}  $FAIL FAILED / $TOTAL TOTAL${NC} ($PASS passed, $SKIP skipped)"
     echo ""

@@ -28,7 +28,7 @@ x0x_export_legacy_token_vars
 #   [cli]      CLI command coverage (e2e_cli.sh)
 #   [local-full] Comprehensive local (e2e_comprehensive.sh)
 #   [lan]      LAN nodes: studio1.local + LAN_PEER_HOST (e2e_lan.sh)
-#   [vps]      6 VPS bootstrap nodes (e2e_vps.sh)
+#   [vps]      4 VPS bootstrap nodes (e2e_vps.sh)
 #   [live]     Local node joined to real VPS network (e2e_live_network.sh)
 #   [stress]   Rapid ops + edge cases (e2e_stress.sh)
 #

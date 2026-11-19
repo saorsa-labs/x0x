@@ -247,14 +247,18 @@ is closed and the addresses may now belong to other people. Their two
 IPv4 rows (`65.21.157.229:443`, `116.203.101.172:5483`) had been the only
 unpinned seed rows; all 16 remaining seed addresses (4 hosts × 2 ports ×
 2 families) are pinned. Releases before #2094 still dial the old
-addresses. At their six pinned rows a foreign host cannot answer with the
-old PeerId (the TLS 1.3 handshake proves possession of the ML-DSA-65 key
-that the PeerId hashes), so its answer is a pin mismatch and a dropped
-hint. At the two unpinned IPv4 rows it is admitted trust-on-first-use
-under its own PeerId and, because its observed address is a seed
-listener address, it qualifies for the operator capability-hint tier
-below. The pin table and its helpers are
-crate-private (`pub(crate)`): pinning is an operator-compiled behaviour,
+addresses, and no release has a pin table (v0.48.1 and older have none;
+the old addresses were pinned only in `main` builds between #1112 and
+#2094). In every released version all eight old addresses are trust-on-first-use.
+The only guard there is the handshake: a foreign host cannot answer with
+an old seed PeerId, because the TLS 1.3 handshake proves possession of
+the ML-DSA-65 key that the PeerId hashes, but it is admitted under its
+own PeerId as an ordinary peer and join contact. (In those `main` builds,
+six of the eight addresses were pinned, so a foreign answer there was a
+pin mismatch and a dropped hint; the two unpinned IPv4 rows were
+trust-on-first-use and, because the observed address was a seed listener
+address, qualified for the operator capability-hint tier below.)
+The pin table and its helpers are crate-private (`pub(crate)`): pinning is an operator-compiled behaviour,
 not a public API. Rejection entries expire on their own TTL, so the set
 cannot grow unbounded with dial rate against pinned addresses.
 

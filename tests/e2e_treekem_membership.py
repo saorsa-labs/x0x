@@ -50,6 +50,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from x0x_network import refuse_removed_host_ips
+
 LOG = logging.getLogger("treekem_membership")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
@@ -71,7 +73,9 @@ def load_tokens(path: str, var_prefix: str) -> Dict[str, Tuple[str, str]]:
                 continue
             n, kind, value = m.group(1).lower(), m.group(2), m.group(3)
             (ips if kind == "IP" else toks)[n] = value
-    return {n: (ips[n], toks[n]) for n in ips if n in toks}
+    out = {n: (ips[n], toks[n]) for n in ips if n in toks}
+    refuse_removed_host_ips(out, path)
+    return out
 
 
 # ─── HTTP client ────────────────────────────────────────────────────────

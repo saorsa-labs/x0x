@@ -44,6 +44,32 @@ NODES_BY_NAME: Dict[str, str] = {
 }
 
 
+# #2094: the closed Hetzner hosts. Their addresses may now belong to other
+# people, so a tokens or hosts file that still names one is stale and must
+# never be used to aim SSH or API calls.
+REMOVED_HOST_IPS = frozenset({
+    "65.21.157.229",
+    "116.203.101.172",
+    "2a01:4f9:c012:684b::1",
+    "2a01:4f8:1c1a:31e6::1",
+})
+
+
+def refuse_removed_host_ips(tokens: Dict[str, tuple], source: object) -> None:
+    """Fail closed when a parsed tokens map names a closed host (#2094).
+
+    `tokens` maps a node label to `(ip, token)`. The label is not checked:
+    `helsinki`/`nuremberg` are still valid ephemeral-testnet slot labels.
+    """
+    for label, entry in tokens.items():
+        ip = entry[0].strip().strip("[]").lower()
+        if ip in REMOVED_HOST_IPS:
+            raise ValueError(
+                f"{source}: node '{label}' points at {ip}, a closed host "
+                "(#2094); regenerate the tokens file"
+            )
+
+
 @dataclass(frozen=True)
 class Network:
     name: str                # "test" or "prod"

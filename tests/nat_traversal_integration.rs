@@ -1,6 +1,6 @@
 //! Integration tests for NAT traversal across VPS testnet.
 //!
-//! These tests verify QUIC hole punching works correctly across the 6 global
+//! These tests verify QUIC hole punching works correctly across the 4 global
 //! VPS nodes and from local machines behind NAT.
 
 use std::collections::HashSet;

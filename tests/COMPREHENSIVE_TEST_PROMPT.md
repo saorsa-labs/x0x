@@ -1462,4 +1462,4 @@ If any assertion fails:
 
 Upon completion of all 995+ assertions with 100% pass rate:
 
-> **x0x v{VERSION} is certified for production use across all interfaces (CLI, REST API, GUI, Dioxus, Swift) and all 6 global bootstrap nodes. Every endpoint, every function, every interface has been validated with cross-network communication confirmed.**
+> **x0x v{VERSION} is certified for production use across all interfaces (CLI, REST API, GUI, Dioxus, Swift) and all 4 global bootstrap nodes. Every endpoint, every function, every interface has been validated with cross-network communication confirmed.**

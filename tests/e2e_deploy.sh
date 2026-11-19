@@ -138,7 +138,7 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 # 2. DEPLOY TO ALL 4 NODES
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[2/4] Deploy to 6 VPS bootstrap nodes${NC}"
+echo -e "\n${CYAN}[2/4] Deploy to 4 VPS bootstrap nodes${NC}"
 
 # Local binary size for upload verification.  stat flag differs on macOS (-f %z)
 # vs Linux (-c %s); fall back to the other if the first form fails.

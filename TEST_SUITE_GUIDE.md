@@ -782,6 +782,12 @@ or log text are written.
 
 ### Running
 
+`helsinki` and `nuremberg` below are ephemeral-testnet slot labels (the
+testnet-ephemeral skill places them on DigitalOcean ams3 and fra1), not the
+closed Hetzner hosts (#2094). The fixed 4-host fleet cannot supply the
+five nodes this fixture needs; the token loaders refuse a file that names
+a closed host's address.
+
 ```bash
 # Direct (always pass an explicit testnet tokens path):
 python3 -B tests/e2e_vps_survivor_rekey.py --network test \

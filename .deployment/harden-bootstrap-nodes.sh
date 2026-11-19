@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Harden all 6 saorsa-labs bootstrap nodes:
+# Harden all 4 saorsa-labs bootstrap nodes:
 #   1. systemctl enable x0xd       — auto-start on boot
 #   2. clean leaked .x0x-upgrade-* working dirs
 #   3. remove legacy /etc/x0x/{bootstrap.toml,x0xd-test.toml}
