@@ -301,6 +301,51 @@ jobs:
           NODE
 
   # ============================================================
+  # Announce the release on the x0x network (#1169)
+  # ============================================================
+  # A short-lived node with a fresh identity runs the promoted x0xd and
+  # relays the release's CI-signed manifest on the release topic. It holds
+  # no secret: nodes accept the manifest only on its ML-DSA-65 signature.
+  announce-release:
+    name: Announce release on the x0x network
+    needs: validate-promoted-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Download the promoted Linux archive
+        id: archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          if [ ! -f .github/scripts/announce_promoted_release.py ]; then
+            echo "::notice::$RELEASE_TAG predates the announce job; nothing announced."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir announce \
+            --pattern x0x-linux-x64-gnu.tar.gz --pattern x0x-linux-x64-gnu.tar.gz.sha256
+          cd announce
+          sha256sum -c x0x-linux-x64-gnu.tar.gz.sha256
+          tar xzf x0x-linux-x64-gnu.tar.gz
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Announce the release
+        if: steps.archive.outputs.skip == 'false'
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python3 .github/scripts/announce_promoted_release.py \
+            --x0xd announce/x0x-linux-x64-gnu/x0xd \
+            --version "${RELEASE_TAG#v}" \
+            --work-dir "$RUNNER_TEMP/x0x-announce"
+
+  # ============================================================
   # Publish to crates.io
   # ============================================================
   publish-crates:

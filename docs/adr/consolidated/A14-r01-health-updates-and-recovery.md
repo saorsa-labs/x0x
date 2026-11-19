@@ -152,6 +152,8 @@ Release announcement at promotion (amendment of 19 Nov 2026, #1169 PR 1 and the 
 - Accepted trade-off: after an announce every node applies within the 60-minute stagger window, the announcer included. There is no network-wide halt today.
 - The promotion job that runs the announce from a short-lived node is PR 2. Wire format unchanged; the route is a public API addition decided under A15.
 
+Promotion job (amendment of 19 Nov 2026, #1169 PR 2). This applies the paragraph above to CI, as David accepted on 19 Nov 2026. When a release is promoted, the `announce-release` job of the `Publish promoted release` workflow runs the promoted `x0xd` (Linux x64 archive, checked against its `.sha256` asset) as a short-lived node with a fresh identity on the `x0x.prod` plane, with self-update off and no secret, and calls `POST /upgrade/announce` once it has a peer. The job's success condition is the answer's `version` equal to the promoted version, with result `announced` or `already_announced`: the route's 300 s refusal is keyed on time, so a result alone can name an earlier release. Retryable answers (`fetch_failed`, `nothing_newer`, `publish_failed`, a wrong version) are tried again after 305 s, three attempts in all. A release older than the route passes with nothing announced. No peers, or no announce of the promoted version, fails the job; the fallback is `x0x upgrade --announce` by hand. The job needs no new secret or repository setting. Authority: Claude under David's delegation, 10 Nov 2026 (A15: no separate ruling).
+
 ## Consequences
 
 Updates can be checked and recovered under owner policy. Independent rollback and exact artifact evidence add release work. A successful publication alone cannot prove that deployed devices are healthy.

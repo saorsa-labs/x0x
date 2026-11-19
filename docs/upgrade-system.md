@@ -1421,8 +1421,38 @@ broadcast) within the last 300 s answers `already_announced`.
 
 Accepted trade-off: after an announce, every node applies within the
 60-minute stagger window, the announcer included. There is no
-network-wide halt today. The CI promotion job that runs the announce is
-separate work (#1169 PR 2).
+network-wide halt today.
+
+#### The promotion job
+
+When a release is promoted (the `release: published` event), the
+`announce-release` job in `.github/workflows/publish-promoted-release.yml`
+runs the announce from a short-lived node:
+
+1. It downloads the promoted `x0x-linux-x64-gnu.tar.gz` and checks it
+   against the release's `.sha256` asset.
+2. `.github/scripts/announce_promoted_release.py` starts that `x0xd` with
+   a fresh identity in a temporary directory, on the `x0x.prod` plane, with
+   `[update] enabled = false`, `--skip-update-check` and mDNS off. It holds
+   no secret.
+3. It waits up to 180 s for at least one peer (`peers` in `/health`), then
+   20 s more for topic membership, and calls `POST /upgrade/announce`.
+4. Success is `announced` or `already_announced` **with `version` equal to
+   the promoted version**. The result alone is not enough: the 300 s
+   refusal of a repeat is keyed on time, so `already_announced` can carry
+   an earlier version. `fetch_failed`, `nothing_newer`, `publish_failed`
+   and a wrong version are tried again after 305 s (past the 300 s
+   refusal), three attempts in all. GitHub's latest release can point at
+   the previous release for a short time after promotion.
+5. After a success the node stays up 60 s so that peers can pull the
+   payload, then stops.
+
+The job passes, and announces nothing, when the release has no announce
+script or its `x0xd` has no announce route (404). It fails when the node
+finds no peers (hosted runners may not reach the network over UDP) or the
+promoted version is not announced; the error names the fallback, `x0x
+upgrade --announce` on a node that can reach the network. The job is
+independent of the crates.io and ClawHub jobs.
 
 ## Downgrade safety (#451) — Home-Suite group state
 
