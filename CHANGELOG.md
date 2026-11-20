@@ -505,12 +505,24 @@ All notable changes to this project will be documented in this file.
 - **ant-quic 0.29.0 and saorsa-gossip 0.5.94 (A06 amendment of 20 Nov
   2026).** `ant-quic` moves from `=0.28.0` to `=0.29.0` and all eleven
   `saorsa-gossip-*` crates from `=0.5.92` to `=0.5.94`. No x0x code
-  changes. Defaults x0x now gets: the dual-stack UDP socket that x0x
-  binds on `[::]` uses `quinn_udp::UdpSocketState`, so it reports the
-  real `may_fragment()` (0.28.0 always said `true`), which lets QUIC
-  path-MTU probes go above 1200 B, and ECN and GSO/GRO are on. This is
-  standard QUIC but changes packets on the wire; soak before fleet
-  rollout. Not inherited: the relay forward mode stays `Stream` (x0x does
+  changes. Defaults x0x now gets: (1) Only a wildcard bind (x0x binds
+  `[::]`) gets the new dual-stack socket; an explicit bind such as the
+  `127.0.0.1` CI tests does not exercise it. That socket uses
+  `quinn_udp::UdpSocketState`: it reports the real `may_fragment()`
+  (0.28.0 always said `true`), so QUIC path-MTU probes go up to 1452 B
+  every 600 s, and a black hole falls back to 1200 B with a 60 s
+  cooldown; ECN is on and turns itself off on a path that does not
+  handle it; GSO/GRO are on for Linux only (macOS gets don't-fragment and
+  ECN, no GSO). It reads each packet's destination IP (`IP_PKTINFO` /
+  `IP_RECVDSTADDR`), receives in batches, and sends a reply from the local
+  address the packet arrived on, which matters on hosts with more than
+  one address (for example a DigitalOcean reserved/anchor IP). A failure
+  in `UdpSocketState::new` now makes the bind fail. (2) Every relayed
+  connection, in the default `Stream` mode too, has bounded relay queues
+  of 256 packets per side: a full send queue drops the newest packet and
+  a full receive queue drops the oldest (0.28.0's send queue was
+  unbounded). These are standard QUIC/UDP behaviours but change packets
+  on the wire; soak before fleet rollout. Not inherited: the relay forward mode stays `Stream` (x0x does
   not enable `Hybrid`, because `src/voice/link_transport.rs` reads
   datagrams directly), relay-to-direct `auto_migrate` stays `false`, and
   the RFC 8305 Happy Eyeballs change applies only to
@@ -518,7 +530,8 @@ All notable changes to this project will be documented in this file.
   saorsa-gossip 0.5.93 adds the counters `payload_replay_dropped`,
   `ingress_by_topic`, `ingress_topics_uncounted` and `eager_send_causes`
   to the stage snapshot; they appear in `GET /diagnostics/gossip` under
-  `pubsub_stages`. 0.5.94 only moves its ant-quic pin. The #501
+  `pubsub_stages`, and `ingress_by_topic` shows the top signer peer IDs
+  per topic. 0.5.94 only moves its ant-quic pin. The #501
   controlled-load reviewed producer moves to crates.io
   `saorsa-gossip-pubsub` 0.5.94 (checksum `beb6146f...`); no outbound
   meter definition changes. The optional `voice` feature keeps
