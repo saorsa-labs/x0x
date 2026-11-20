@@ -136,6 +136,20 @@ pub(crate) fn start(
     }
 }
 
+/// Before a passthrough `exec`: a trial-form start that found no daemon
+/// holds no install lock, so it takes the lock (and reads the records
+/// again) before it becomes the daemon (#2118 review). Nothing while the
+/// engine is held.
+pub(crate) fn relock(
+    args: &issuer::LauncherArgs,
+    held: &mut Option<std::fs::File>,
+) -> io::Result<()> {
+    match &args.trial {
+        Some(trial) if ENABLED => issuer::relock(trial, &args.command, held),
+        _ => Ok(()),
+    }
+}
+
 /// Run one trial-form start between the two refusal-record steps: remove
 /// the record an earlier start left before the start, since a start that
 /// supervises the daemon returns only when the daemon ends (#2019 review);

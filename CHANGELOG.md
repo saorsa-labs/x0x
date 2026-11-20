@@ -10,8 +10,11 @@ All notable changes to this project will be documented in this file.
   lock (#2012; A14 amendment of 20 Nov 2026).** The dormant launcher reads
   the host journal and the trial record relative to the checked host-root
   directory, refuses a host root with an ancestor another account can
-  write, and reads both under the daemon install lock, which a passthrough
-  keeps until its `exec`.
+  write, and reads both under the daemon install lock (beside the
+  daemon's canonical path, waited for at most 30 s), which a passthrough
+  keeps until its `exec`. A missing daemon passes through to the
+  missing-daemon wait and takes the lock before the `exec`; a lock file the
+  launcher cannot create is refused with a remedy.
 
 - **KV retained-image follow-ups (#2068; A10 amendment of 20 Nov 2026).**
   A delta's `updated` entry now merges only into a key the replica holds

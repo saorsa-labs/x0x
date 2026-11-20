@@ -737,14 +737,35 @@ descriptor (`openat`), so a rename of the path after the checks cannot
 redirect the reads (#2012). Every ancestor of the host root must be a
 directory owned by root or the launcher's account that no other account can
 write; a sticky ancestor such as `/tmp` is allowed, since only an entry's
-owner may rename it there. The issuer reads both records under the daemon
-install lock (`<daemon>.upgrade.lock`), which the prepare producer holds for
-every journal change and swap. A start that becomes the passthrough keeps
-that lock until its `exec`, which closes it, so the producer cannot swap
-the pair between the read and the `exec`. A trial start releases it, since
-the trial takes the CLI and daemon locks itself. On macOS a passthrough
-that waits for a missing daemon keeps the lock while it waits. A retired
-trial's passthrough does not take the lock again. The writer of that journal is the M2
+owner may rename it there.
+
+The issuer reads both records under the daemon install lock: the
+`.upgrade.lock` file beside the daemon's canonical path, the same file the
+prepare producer, the CLI self-update and the daemon's routes lock, so a
+unit that names the daemon through a symlink takes the same lock. It waits
+for the lock at most 30 s, then exits 75. When a journal exists, a
+passthrough whose canonical daemon is not the journal's daemon target is
+refused (78). A start that becomes the passthrough keeps the lock until
+its `exec`, which closes it, so nothing can swap the pair between the read
+and the `exec`. A trial start releases it, since the trial takes the CLI
+and daemon locks itself.
+
+- **Missing daemon.** When the daemon or its directory does not exist,
+  there is nothing to swap and no one can lock there, so the start goes on
+  to the passthrough without the lock: on macOS the missing-daemon wait
+  (#1379), elsewhere the `exec` error (75). Before each `exec` attempt it
+  takes the lock and reads the records again; an `exec` that finds the
+  daemon missing releases it, so a producer or a CLI apply never waits for
+  the missing-daemon wait. If a trial is in flight by the time the daemon
+  is back, the launcher exits 75 and the next start owns the trial.
+- **Lock file it cannot create.** When this account cannot create or open
+  the lock file (EACCES, EPERM, EROFS), the start is refused (78) with the
+  remedy: let the launcher's account write the daemon's directory, or use
+  the plain launcher form. A passthrough without the lock is not safe
+  there, because the CLI self-update can lock and swap as another account
+  (root under `sudo`, for example).
+
+A retired trial's passthrough does not take the lock again. The writer of that journal is the M2
 prepare producer (#2012), which does not exist yet, so with the engine
 held every start is still the passthrough. An owned start installs its SIGTERM and
 SIGINT handler only then, and exits 0 after a stop, 75 when the daemon

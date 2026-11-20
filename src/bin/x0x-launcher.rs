@@ -48,8 +48,8 @@ fn main() -> std::process::ExitCode {
         };
         // The daemon install lock a trial-form passthrough read its records
         // under; the `exec` below closes it (#2012).
-        let mut _held = None;
-        match launcher::start::start(&args, &mut _held, arm, || STOP.load(Ordering::Relaxed)) {
+        let mut held = None;
+        match launcher::start::start(&args, &mut held, arm, || STOP.load(Ordering::Relaxed)) {
             // launchd restarts every exit of a KeepAlive job, so a final
             // refusal holds until a stop instead (#1379). Its reason is in
             // the host root for `x0x doctor`.
@@ -72,15 +72,31 @@ fn main() -> std::process::ExitCode {
         // launchd restarts every exit of a KeepAlive job, so a missing
         // daemon is waited for instead (#1379). systemd's start limit ends
         // its restarts, so there the exit stays.
+        // Each `exec` happens under the install lock: a start that found no
+        // daemon takes it first. While the daemon is missing the lock is
+        // not held, so a producer or CLI apply never waits for this wait.
+        let exec = |command: &launcher::forward::DaemonCommand| {
+            if let Err(error) = launcher::start::relock(&args, &mut held) {
+                return error;
+            }
+            let error = launcher::forward::exec_daemon(command);
+            if launcher::forward::is_missing(&error) {
+                held = None;
+            }
+            error
+        };
         #[cfg(target_os = "macos")]
         let error = launcher::forward::exec_daemon_when_present(
             &args.command,
-            launcher::forward::exec_daemon,
+            exec,
             || STOP.load(Ordering::Relaxed),
             std::thread::sleep,
         );
         #[cfg(not(target_os = "macos"))]
-        let error = launcher::forward::exec_daemon(&args.command);
+        let error = {
+            let mut exec = exec;
+            exec(&args.command)
+        };
         eprintln!(
             "x0x-launcher: cannot exec {}: {error}",
             args.command.executable.display()

@@ -88,19 +88,25 @@ fn issue_held(
     held: &mut Option<File>,
 ) -> io::Result<Option<start::Issued>> {
     let root = open_root(&args.host_root, root_uid)?;
-    let lock = recovery::lock(Path::new(&command.executable))?;
-    lock.lock()?;
+    let daemon = daemon_lock(Path::new(&command.executable), DAEMON_LOCK_WAIT)?;
     let Some(record) = read_journal(&root, record_uid)? else {
         no_authority(args, &root)?;
-        *held = Some(lock);
+        *held = daemon.map(|(_, lock)| lock);
         return Ok(None);
     };
     if !owns_trial(record.phase)? {
         no_authority(args, &root)?;
-        *held = Some(lock);
+        if let Some((canonical, _)) = &daemon {
+            if *canonical != record.plan.daemon.target_path {
+                return Err(start::refused(
+                    "the launcher's daemon is not the host journal's daemon target",
+                ));
+            }
+        }
+        *held = daemon.map(|(_, lock)| lock);
         return Ok(None);
     }
-    drop(lock);
+    drop(daemon);
     let participant = record
         .plan
         .participants
@@ -133,6 +139,90 @@ fn issue_held(
         host,
         instance: args.instance.clone(),
     }))
+}
+
+/// How long a start waits for the daemon install lock before it gives up
+/// with a failed read (75): a producer holds it only for one journal change
+/// or swap.
+const DAEMON_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The daemon install lock, taken, with the daemon's canonical path: the
+/// producer and the daemon's routes lock beside the canonical install
+/// target, so a unit that names the daemon through a symlink must take the
+/// same file (#2118 review). `Ok(None)` when the daemon or its directory
+/// does not exist: there is nothing to swap and the producer cannot lock
+/// there either, so the start goes on to the missing-daemon wait (#1379)
+/// and takes the lock before its `exec` (`relock`). A lock file this
+/// account cannot create or open (EACCES, EPERM, EROFS) is a typed
+/// refusal: the CLI self-update can take the same lock and swap as another
+/// account, root under `sudo` for example, so a passthrough without the
+/// lock is not safe. Waiting longer than `wait` is a failed read.
+fn daemon_lock(
+    executable: &Path,
+    wait: std::time::Duration,
+) -> io::Result<Option<(PathBuf, File)>> {
+    let missing = |e: &io::Error| {
+        e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ENOTDIR)
+    };
+    let canonical = match executable.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(error) if missing(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let lock = match recovery::lock(&canonical) {
+        Ok(lock) => lock,
+        Err(error) if missing(&error) => return Ok(None),
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EACCES | libc::EPERM | libc::EROFS)
+            ) =>
+        {
+            return Err(start::refused(format!(
+                "cannot create or open the install lock beside {} ({error}); let the \
+                 launcher's account write that directory, or use the plain launcher form",
+                canonical.display()
+            )));
+        }
+        Err(error) => return Err(error),
+    };
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(Some((canonical, lock))),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the daemon install lock is still held",
+                ));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
+}
+
+/// Before a passthrough `exec` of a trial-form start that found no daemon:
+/// read the records again under the daemon install lock and keep it in
+/// `held` (#2118 review). A trial that is now in flight is left to the next
+/// start, which owns it: a failed read (75).
+pub(super) fn relock(
+    args: &TrialArgs,
+    command: &forward::DaemonCommand,
+    held: &mut Option<File>,
+) -> io::Result<()> {
+    if held.is_some() {
+        return Ok(());
+    }
+    let uid = effective_uid();
+    match issue_held(args, command, uid, uid, held)? {
+        None => Ok(()),
+        Some(_) => Err(io::Error::other(
+            "a trial is now in flight; the next start owns it",
+        )),
+    }
 }
 
 /// Read the host journal through one descriptor: open it without following
@@ -641,6 +731,125 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .unwrap());
         waiter.join().unwrap();
+    }
+
+    /// #2118 review: a unit that names the daemon through a symlink takes
+    /// the producer's lock, the one beside the canonical install target.
+    #[test]
+    fn a_symlinked_daemon_takes_the_canonical_install_lock() {
+        let (dir, _root, record) = rooted(journal::Phase::Prepared);
+        let (args, mut command) = matching(&record);
+        let link = dir.path().canonicalize().unwrap().join("bin-link");
+        std::os::unix::fs::symlink(&record.plan.daemon.target_path, &link).unwrap();
+        command.executable = link.into_os_string();
+        let producer = recovery::lock(&record.plan.daemon.target_path).unwrap();
+        producer.lock().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let uid = effective_uid();
+            let mut held = None;
+            let issued = issue_held(&args, &command, uid, uid, &mut held).map(|i| i.is_none());
+            sender.send((issued.unwrap(), held.is_some())).unwrap();
+        });
+        assert!(receiver
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_err());
+        drop(producer);
+        assert_eq!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap(),
+            (true, true)
+        );
+        waiter.join().unwrap();
+    }
+
+    /// #2118 review: a passthrough whose daemon is not the journal's daemon
+    /// target is refused.
+    #[test]
+    fn a_passthrough_of_another_daemon_than_the_journals_is_refused() {
+        let (dir, _root, record) = rooted(journal::Phase::Prepared);
+        let (args, mut command) = matching(&record);
+        let other = dir.path().canonicalize().unwrap().join("other-x0xd");
+        std::fs::write(&other, b"").unwrap();
+        command.executable = other.into_os_string();
+        assert!(refused(issue_as(&args, &command, effective_uid())));
+    }
+
+    /// #2118 review: no daemon (or no daemon directory) means nothing to
+    /// swap; the start goes on to the missing-daemon wait without the lock,
+    /// and `relock` takes it once the daemon is back.
+    #[test]
+    fn a_missing_daemon_passes_through_without_the_lock_until_it_is_back() {
+        let (dir, _root, record) = rooted(journal::Phase::Prepared);
+        let (args, mut command) = matching(&record);
+        let target = record.plan.daemon.target_path.clone();
+        let base = dir.path().canonicalize().unwrap();
+        for missing in [base.join("gone/x0xd"), base.join("absent-x0xd")] {
+            command.executable = missing.into_os_string();
+            let mut held = None;
+            let uid = effective_uid();
+            assert!(issue_held(&args, &command, uid, uid, &mut held)
+                .unwrap()
+                .is_none());
+            assert!(held.is_none());
+        }
+        let moved = target.with_extension("away");
+        std::fs::rename(&target, &moved).unwrap();
+        command.executable = target.clone().into_os_string();
+        let mut held = None;
+        relock(&args, &command, &mut held).unwrap();
+        assert!(held.is_none(), "still missing");
+        std::fs::rename(&moved, &target).unwrap();
+        relock(&args, &command, &mut held).unwrap();
+        assert!(held.is_some(), "locked before the exec");
+        assert!(!lock_is_free(&command.executable));
+    }
+
+    /// #2118 review: a trial that is in flight when the daemon is back is
+    /// left to the next start (a failed read, not a passthrough).
+    #[test]
+    fn relock_leaves_an_in_flight_trial_to_the_next_start() {
+        let (_dir, _root, record) = rooted(journal::Phase::SwappedCli);
+        let (args, command) = matching(&record);
+        let mut held = None;
+        let error = relock(&args, &command, &mut held).unwrap_err();
+        assert!(!start::is_refusal(&error), "{error}");
+        assert!(held.is_none());
+    }
+
+    /// #2118 review: an install lock this account cannot create is a typed
+    /// refusal, since another account may lock and swap there.
+    #[test]
+    fn an_install_lock_this_account_cannot_create_is_refused() {
+        if effective_uid() == 0 {
+            return;
+        }
+        let (dir, _root, record) = rooted(journal::Phase::Prepared);
+        let (args, mut command) = matching(&record);
+        let bin = dir.path().canonicalize().unwrap().join("ro-bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(bin.join("x0xd"), b"").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o555)).unwrap();
+        command.executable = bin.join("x0xd").into_os_string();
+        let result = issue_as(&args, &command, effective_uid());
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = result.err().expect("refused");
+        assert!(start::is_refusal(&error), "{error}");
+        assert!(error.to_string().contains("install lock"), "{error}");
+    }
+
+    /// #2118 review: the wait for the install lock is bounded and then a
+    /// failed read, not a refusal.
+    #[test]
+    fn the_wait_for_the_install_lock_is_bounded() {
+        let (_dir, _root, record) = rooted(journal::Phase::Prepared);
+        let target = &record.plan.daemon.target_path;
+        let producer = recovery::lock(target).unwrap();
+        producer.lock().unwrap();
+        let error = daemon_lock(target, std::time::Duration::from_millis(200)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(!start::is_refusal(&error));
     }
 
     /// #2012 (#2014 review): an ancestor of the host root that another
