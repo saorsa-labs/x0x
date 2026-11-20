@@ -1162,6 +1162,10 @@ daemon, and the job's own arguments), removes `Program`, and sets
 `ExitTimeOut` to 60 s when it is absent or 45 s or less. It also adds the
 supervision marker if it is missing.
 
+`x0x autostart --repair --dry-run` (with or without `--launcher`) checks
+and prints each change, the planned `ProgramArguments` for the launcher
+included, and writes nothing.
+
 The host root is the data directory that x0xd uses for that job, found
 the way x0xd finds it:
 - the home is the job's own `EnvironmentVariables.HOME`, else the home of
@@ -1213,18 +1217,31 @@ interval (3 starts in 30 s): a restart loop. On macOS the launcher now
 waits instead. It writes one line to the job's standard error, tries the
 `exec` again after 1 s, doubles the pause up to 60 s, and becomes the
 daemon at the first try after the path is back (at most 60 s later). A
-stop ends the wait; any other `exec` error still exits 75. On Linux the exit stays, because systemd's
-start limit ends the restarts. The acceptance script checks the wait
+stop ends the wait; any other `exec` error still exits 75. On Linux the
+exit stays, because systemd's start limit ends the restarts. The acceptance script checks the wait
 (`missing-daemon-waits`): one launcher start in 30 s, then the daemon
 runs once its path exists.
 
-**Not done yet (next #1379 slice):**
-- a job that pins a removed Cellar path now waits, but it needs a stable
-  daemon path to start again;
-- the autostart commands do not refuse to run as root or under `sudo`,
-  and they do not check who owns the plist;
-- `--repair` has no dry run;
-- the acceptance script runs by hand only.
+**Homebrew keg paths (#1379).** `x0x autostart --launcher` and
+`--repair --launcher` refuse a daemon whose canonical path is inside a
+versioned Homebrew keg (`<prefix>/Cellar/<formula>/<version>/...`). The
+trial form needs the canonical daemon, and `brew upgrade` removes the old
+keg, so such a job would wait for a daemon that never comes back. Keep the
+direct job for a Homebrew install, or install x0xd outside Homebrew. A job
+that already names a missing daemon is reported by `x0x doctor` while the
+daemon is unreachable: the upgrade check fails and names the job, the
+missing path and whether the launcher is waiting for it. Run
+`x0x autostart` again to point the job at the installed x0xd.
+
+**Who may change a job.** On macOS every autostart command (install,
+`--repair`, `--remove`) refuses to run as root or under `sudo`: the agent
+belongs to the user who runs it, and a root-owned file in that user's
+LaunchAgents is one their `launchctl` cannot load. Install and `--repair`
+also refuse a job file that is not owned by the user or that group or
+others can write, which launchd does not load. `--repair` reports such a
+job as refused and leaves it unchanged.
+
+**Not done yet:** the acceptance script runs by hand only.
 
 The handoff transaction (`upgrade::restart`):
 

@@ -103,6 +103,9 @@ enum Commands {
         /// With `--repair`, move each existing x0xd job onto the launcher.
         #[arg(long, hide = true, conflicts_with = "remove")]
         launcher: bool,
+        /// With `--repair`, print what would change and write nothing.
+        #[arg(long, requires = "repair")]
+        dry_run: bool,
     },
     /// Health check.
     Health,
@@ -2487,11 +2490,12 @@ async fn run(
             remove,
             repair,
             launcher,
+            dry_run,
         } => {
             return if *remove {
                 commands::daemon::autostart_remove().await
             } else if *repair {
-                commands::daemon::autostart_repair(*launcher).await
+                commands::daemon::autostart_repair(*launcher, *dry_run).await
             } else {
                 commands::daemon::autostart(name, *launcher).await
             };

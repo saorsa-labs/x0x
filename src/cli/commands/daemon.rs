@@ -234,7 +234,33 @@ pub(crate) async fn collect_doctor_report(
 fn down_upgrade_check(instance_dir: Option<&std::path::Path>) -> DoctorCheck {
     instance_dir
         .and_then(launcher_refusal_check)
+        .or_else(|| instance_dir.and_then(autostart_missing_daemon_check))
         .unwrap_or_else(|| DoctorCheck::fail("skipped: daemon unreachable"))
+}
+
+/// The instance's launchd autostart job, when its daemon path is missing
+/// (`missing_daemon_check`). The instance is the data directory's name:
+/// `x0x` for the default one, `x0x-<name>` for a named one.
+#[cfg(target_os = "macos")]
+fn autostart_missing_daemon_check(instance_dir: &std::path::Path) -> Option<DoctorCheck> {
+    let dir_name = instance_dir.file_name()?.to_str()?;
+    let instance = match dir_name {
+        "x0x" => None,
+        other => Some(other.strip_prefix("x0x-")?),
+    };
+    let plist = dirs::home_dir()?
+        .join("Library/LaunchAgents")
+        .join(format!("{AUTOSTART_LAUNCHD_LABEL}.plist"));
+    if !plist.is_file() {
+        return None;
+    }
+    let job = read_plist_as_json(&plist).ok()??;
+    missing_daemon_check(&job, instance, &|path| path.exists())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn autostart_missing_daemon_check(_instance_dir: &std::path::Path) -> Option<DoctorCheck> {
+    None
 }
 
 /// Read the launcher refusal record (`launcher_contract::REFUSAL_FILE_NAME`)
@@ -1506,12 +1532,16 @@ pub async fn autostart(name: Option<&str>, launcher: bool) -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
+        refuse_privileged_caller()?;
         let plist_dir = dirs::home_dir()
             .context("cannot determine home directory")?
             .join("Library/LaunchAgents");
         std::fs::create_dir_all(&plist_dir)?;
 
         let plist_path = plist_dir.join(format!("{AUTOSTART_LAUNCHD_LABEL}.plist"));
+        if plist_path.exists() {
+            check_plist_file_owner(&plist_path)?;
+        }
         // #690: XML-escape every rendered argument and stamp the template
         // version so upgrade-time drift detection identifies the generation.
         let mut args = Vec::new();
@@ -1528,7 +1558,7 @@ pub async fn autostart(name: Option<&str>, launcher: bool) -> Result<()> {
             (
                 Some(autostart_instance_id(name)?),
                 Some(sibling_launcher(&x0xd_path)?),
-                x0xd_path.canonicalize()?.to_string_lossy().into_owned(),
+                stable_daemon(x0xd_path.canonicalize()?.to_string_lossy().into_owned())?,
             )
         } else {
             (None, None, x0xd.into_owned())
@@ -1954,7 +1984,7 @@ pub(crate) fn plan_launcher_migration(
         )
     })?;
     let launcher = (host.launcher_for)(daemon.executable)?;
-    let executable = (host.canonical_daemon)(daemon.executable)?;
+    let executable = stable_daemon((host.canonical_daemon)(daemon.executable)?)?;
     let program_arguments: Vec<String> = [
         launcher.as_str(),
         "--host-root",
@@ -1981,6 +2011,130 @@ pub(crate) fn plan_launcher_migration(
     }))
 }
 
+/// Whether `path` lies inside a versioned Homebrew keg,
+/// `<prefix>/Cellar/<formula>/<version>/...`.
+#[cfg(any(test, target_os = "macos"))]
+fn in_versioned_keg(path: &Path) -> bool {
+    let parts: Vec<_> = path.components().collect();
+    parts
+        .iter()
+        .position(|part| part.as_os_str() == "Cellar")
+        .is_some_and(|cellar| parts.len() > cellar + 3)
+}
+
+/// The canonical daemon for the launcher's trial form, refused when it lies
+/// inside a versioned Homebrew keg (#1379). `brew upgrade` installs the next
+/// version in a new keg and removes the old one, so a job that names the old
+/// keg loses its daemon and the launcher waits for it.
+#[cfg(any(test, target_os = "macos"))]
+fn stable_daemon(canonical: String) -> Result<String> {
+    if in_versioned_keg(Path::new(&canonical)) {
+        anyhow::bail!(
+            "x0xd resolves to {canonical}, inside a versioned Homebrew keg that `brew upgrade` \
+             removes; the launcher needs a canonical daemon path that stays, so keep the direct \
+             job (`x0x autostart` without --launcher) or install x0xd outside Homebrew"
+        );
+    }
+    Ok(canonical)
+}
+
+/// Refuse to manage launchd agents as root or under `sudo` (#1379). The
+/// agent belongs to the user who runs it: as root the job and its files go
+/// to root's home or, under `sudo`, become root-owned files in the user's
+/// home, which the user's `launchctl` then cannot load or change.
+#[cfg(any(test, target_os = "macos"))]
+fn refuse_privileged(euid: u32, sudo_user: Option<&std::ffi::OsStr>) -> Result<()> {
+    if euid == 0 || sudo_user.is_some() {
+        anyhow::bail!(
+            "x0x autostart manages the launchd agent of the user who runs it; run it as that \
+             user, not as root or under sudo"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn refuse_privileged_caller() -> Result<()> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    refuse_privileged(euid, std::env::var_os("SUDO_USER").as_deref())
+}
+
+/// A job file the autostart commands may change: owned by this user and
+/// writable by no one else (#1379). launchd does not load an agent that
+/// group or others can write.
+#[cfg(any(test, target_os = "macos"))]
+fn check_plist_owner(path: &Path, owner: u32, mode: u32, euid: u32) -> Result<()> {
+    if owner != euid {
+        anyhow::bail!(
+            "{} is owned by uid {owner}, not by this user (uid {euid}); fix its owner first",
+            path.display()
+        );
+    }
+    if mode & 0o022 != 0 {
+        anyhow::bail!(
+            "{} is writable by group or others (mode {:o}), which launchd refuses; remove that \
+             write permission first",
+            path.display(),
+            mode & 0o7777
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn check_plist_file_owner(path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    check_plist_owner(path, meta.uid(), meta.mode(), euid)
+}
+
+/// The doctor finding for a launchd job of `instance` whose x0xd path does
+/// not exist (#1379), for example a Homebrew keg that `brew upgrade`
+/// removed. The launcher then waits for the path without exiting, so
+/// launchd shows the job running with no daemon; a direct job fails each
+/// start instead. `None` for another instance's job or a daemon that exists.
+#[cfg(any(test, target_os = "macos"))]
+fn missing_daemon_check(
+    job: &serde_json::Value,
+    instance: Option<&str>,
+    exists: &dyn Fn(&Path) -> bool,
+) -> Option<DoctorCheck> {
+    let arguments = launchd_job_arguments(job)?;
+    let daemon = crate::upgrade::restart::launchd_job_daemon(
+        job.get("Program").and_then(|p| p.as_str()),
+        &arguments,
+    )?
+    .ok()?;
+    if program_basename(daemon.executable) != "x0xd"
+        || daemon_name_argument(daemon.args).as_deref() != instance
+        || exists(Path::new(daemon.executable))
+    {
+        return None;
+    }
+    let label = job.get("Label").and_then(|l| l.as_str()).unwrap_or("x0xd");
+    let effect = if daemon.via_launcher {
+        "x0x-launcher waits for it, so launchd shows the job running with no daemon"
+    } else {
+        "launchd cannot start the job"
+    };
+    Some(DoctorCheck {
+        status: DoctorCheckStatus::Fail,
+        detail: format!(
+            "the launchd job {label} runs x0xd from {}, which does not exist; {effect}. Run \
+             `x0x autostart` again to point the job at the installed x0xd",
+            daemon.executable
+        ),
+        evidence: Some(serde_json::json!({
+            "launchd_label": label,
+            "missing_daemon": daemon.executable,
+            "via_launcher": daemon.via_launcher,
+        })),
+    })
+}
+
 /// `x0x autostart --repair` — migrate an existing hand-written launchd job to
 /// the supervised-upgrade contract (ADR-0061, #493).
 ///
@@ -1990,10 +2144,13 @@ pub(crate) fn plan_launcher_migration(
 /// on the job's next load; reloading is left to the operator because
 /// unload/load stops a running daemon.
 /// With `launcher` (#1379) it also moves each x0xd job onto the stable
-/// launcher (`plan_launcher_migration`), again without reloading it.
-pub async fn autostart_repair(launcher: bool) -> Result<()> {
+/// launcher (`plan_launcher_migration`), again without reloading it. With
+/// `dry_run` it prints what it would change and writes nothing. A job file
+/// that is not this user's own, or that others can write, is refused.
+pub async fn autostart_repair(launcher: bool, dry_run: bool) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
+        refuse_privileged_caller()?;
         let plist_dir = dirs::home_dir()
             .context("cannot determine home directory")?
             .join("Library/LaunchAgents");
@@ -2028,6 +2185,12 @@ pub async fn autostart_repair(launcher: bool) -> Result<()> {
                 .and_then(|l| l.as_str())
                 .unwrap_or("<unlabelled>");
             println!("Job {label} ({})", path.display());
+            if let Err(error) = check_plist_file_owner(&path) {
+                refused.push(format!("{label} ({})", path.display()));
+                println!("  REFUSED: {error:#}");
+                println!("  Left unchanged.");
+                continue;
+            }
 
             match verdict {
                 RepairVerdict::Refused(reason) => {
@@ -2036,7 +2199,7 @@ pub async fn autostart_repair(launcher: bool) -> Result<()> {
                     println!("  Left unchanged.");
                 }
                 RepairVerdict::NotAnX0xdJob => continue,
-                _ if launcher => match migrate_job_to_launcher(&path, &job) {
+                _ if launcher => match migrate_job_to_launcher(&path, &job, dry_run) {
                     Ok(true) => repaired += 1,
                     Ok(false) => compliant += 1,
                     Err(error) => {
@@ -2049,6 +2212,13 @@ pub async fn autostart_repair(launcher: bool) -> Result<()> {
                     compliant += 1;
                     println!(
                         "  Already declares {}=1 — no change.",
+                        crate::upgrade::restart::SUPERVISED_ENV_VAR
+                    );
+                }
+                RepairVerdict::Repairable { .. } if dry_run => {
+                    repaired += 1;
+                    println!(
+                        "  Would add: {}=1 (all other keys preserved)",
                         crate::upgrade::restart::SUPERVISED_ENV_VAR
                     );
                 }
@@ -2086,12 +2256,20 @@ pub async fn autostart_repair(launcher: bool) -> Result<()> {
             println!("Nothing to repair — `x0x autostart` installs a compliant job.");
             return Ok(());
         }
+        let changed = if dry_run {
+            "would be repaired"
+        } else {
+            "repaired"
+        };
         println!(
-            "\nInspected {inspected} x0xd job(s): {repaired} repaired, {compliant} already \
+            "\nInspected {inspected} x0xd job(s): {repaired} {changed}, {compliant} already \
              compliant, {} refused.",
             refused.len()
         );
-        if repaired > 0 {
+        if dry_run {
+            println!("Dry run: no job file was changed.");
+        }
+        if repaired > 0 && !dry_run {
             println!(
                 "Also confirm `[update] stop_on_upgrade` is true (the default) in the daemon \
                  config: a supervised job with it set to false now refuses self-update."
@@ -2141,9 +2319,10 @@ fn print_reload_hint(path: &Path, label: &str) {
 /// converting it back, then written in one atomic step (#2072 review), so
 /// a crash leaves either the old job or the new one, never a mix. A copy of
 /// the old file is kept, and is put back if the readback does not match.
-/// `Ok(false)` when the job already runs the launcher.
+/// `Ok(false)` when the job already runs the launcher. With `dry_run` the
+/// planned job is checked and printed, and nothing is written.
 #[cfg(target_os = "macos")]
-fn migrate_job_to_launcher(path: &Path, job: &serde_json::Value) -> Result<bool> {
+fn migrate_job_to_launcher(path: &Path, job: &serde_json::Value, dry_run: bool) -> Result<bool> {
     use std::os::unix::fs::PermissionsExt;
     let host = MigrationHost {
         canonical_daemon: &|daemon| {
@@ -2178,6 +2357,16 @@ fn migrate_job_to_launcher(path: &Path, job: &serde_json::Value) -> Result<bool>
     let bytes = json_to_plist(&planned)?;
     if plist_to_json(&bytes)? != planned {
         anyhow::bail!("the migrated job does not convert back as planned; nothing changed");
+    }
+    if dry_run {
+        println!("  Would run: {:?}", migration.program_arguments);
+        if migration.remove_program {
+            println!("  Would remove: Program");
+        }
+        if migration.set_exit_timeout {
+            println!("  Would set: ExitTimeOut {LAUNCHER_EXIT_TIMEOUT_SECS}");
+        }
+        return Ok(true);
     }
     let old = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
     let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
@@ -2343,6 +2532,7 @@ pub async fn autostart_remove() -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
+        refuse_privileged_caller()?;
         let plist_path = dirs::home_dir()
             .context("cannot determine home directory")?
             .join(format!(
@@ -3518,6 +3708,96 @@ mod tests {
     }
 
     const ALICE_ROOT: &str = "/Users/a/Library/Application Support/x0x-alice";
+
+    /// #1379: a daemon inside a versioned Homebrew keg is not a stable path
+    /// for the launcher's trial form; `brew upgrade` removes the keg.
+    #[test]
+    fn a_versioned_homebrew_keg_is_not_a_stable_daemon() {
+        for keg in [
+            "/opt/homebrew/Cellar/x0x/0.50.0/bin/x0xd",
+            "/usr/local/Cellar/x0x/0.50.0_1/libexec/bin/x0xd",
+        ] {
+            let error = stable_daemon(keg.to_string()).expect_err(keg);
+            assert!(format!("{error:#}").contains("Homebrew keg"), "{error:#}");
+        }
+        for stable in [
+            "/opt/x0x/bin/x0xd",
+            "/opt/homebrew/bin/x0xd",
+            "/opt/homebrew/Cellar/x0xd",
+        ] {
+            assert_eq!(stable_daemon(stable.to_string()).expect(stable), stable);
+        }
+        let job = serde_json::json!({
+            "Label": "com.saorsalabs.x0xd",
+            "ProgramArguments": ["/opt/homebrew/bin/x0xd"],
+            "KeepAlive": true,
+        });
+        let host = MigrationHost {
+            canonical_daemon: &|_| Ok("/opt/homebrew/Cellar/x0x/0.50.0/bin/x0xd".to_string()),
+            ..migration_host()
+        };
+        let error = plan_launcher_migration(&job, &host).expect_err("keg");
+        assert!(format!("{error:#}").contains("Homebrew keg"), "{error:#}");
+    }
+
+    /// #1379: the autostart commands manage the calling user's own agent.
+    #[test]
+    fn autostart_refuses_root_and_sudo() {
+        let sudo = std::ffi::OsStr::new("alice");
+        assert!(refuse_privileged(0, None).is_err());
+        assert!(refuse_privileged(501, Some(sudo)).is_err());
+        assert!(refuse_privileged(0, Some(sudo)).is_err());
+        assert!(refuse_privileged(501, None).is_ok());
+    }
+
+    /// #1379: a job file is changed only when it is the user's own and no
+    /// one else can write it.
+    #[test]
+    fn autostart_checks_who_owns_the_plist() {
+        let path = Path::new("/Users/a/Library/LaunchAgents/x.plist");
+        assert!(check_plist_owner(path, 501, 0o100644, 501).is_ok());
+        assert!(check_plist_owner(path, 501, 0o100600, 501).is_ok());
+        let other = check_plist_owner(path, 0, 0o100644, 501).expect_err("root-owned");
+        assert!(format!("{other:#}").contains("uid 0"), "{other:#}");
+        assert!(check_plist_owner(path, 501, 0o100664, 501).is_err());
+        assert!(check_plist_owner(path, 501, 0o100646, 501).is_err());
+    }
+
+    /// #1379: `x0x doctor` names a launchd job whose daemon path is gone,
+    /// which the launcher otherwise waits for without a word to the user.
+    #[test]
+    fn doctor_reports_a_launchd_job_whose_daemon_is_missing() {
+        let keg = "/opt/homebrew/Cellar/x0x/0.49.0/bin/x0xd";
+        let via_launcher = serde_json::json!({
+            "Label": "com.saorsalabs.x0xd",
+            "ProgramArguments": [
+                "/opt/homebrew/bin/x0x-launcher", "--host-root", ALICE_ROOT,
+                "--instance", "alice", "--", keg, "--name", "alice",
+            ],
+        });
+        let missing = |_: &Path| false;
+        let present = |_: &Path| true;
+        let check =
+            missing_daemon_check(&via_launcher, Some("alice"), &missing).expect("missing daemon");
+        assert_eq!(check.status, DoctorCheckStatus::Fail);
+        assert!(check.detail.contains(keg), "{}", check.detail);
+        assert!(check.detail.contains("waits"), "{}", check.detail);
+        let evidence = check.evidence.expect("evidence");
+        assert_eq!(evidence["via_launcher"], true);
+        assert_eq!(evidence["missing_daemon"], keg);
+        assert!(missing_daemon_check(&via_launcher, Some("alice"), &present).is_none());
+        assert!(missing_daemon_check(&via_launcher, None, &missing).is_none());
+        assert!(missing_daemon_check(&via_launcher, Some("bob"), &missing).is_none());
+
+        let direct = serde_json::json!({
+            "Label": "com.saorsalabs.x0xd",
+            "ProgramArguments": [keg],
+        });
+        let check = missing_daemon_check(&direct, None, &missing).expect("direct job");
+        assert!(check.detail.contains("cannot start"), "{}", check.detail);
+        let other = serde_json::json!({ "ProgramArguments": ["/usr/bin/true"] });
+        assert!(missing_daemon_check(&other, None, &missing).is_none());
+    }
 
     /// #1379: `--repair --launcher` moves a KeepAlive x0xd job onto the
     /// launcher's trial form, keeping the daemon's arguments; the daemon is
