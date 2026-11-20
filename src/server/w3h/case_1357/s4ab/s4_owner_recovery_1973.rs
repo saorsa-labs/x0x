@@ -1,5 +1,7 @@
-//! W3-H case for #1973 (ADR 0110 §4b(1) `s4_owner_recovery`): the
-//! owner-recovery commit while another revoked member is still seated.
+//! W3-H cases for #1973 and #2004 (ADR 0110 §4b(1) `s4_owner_recovery`):
+//! the owner-recovery commit while another member that the recovery epoch
+//! must not reach is still seated: revoked (#1973) or with a due
+//! certificate expiry (#2004).
 //!
 //! Nodes A, B, C, E; A provisions its Home (`OwnerCertified`, TreeKEM)
 //! and is the only admin; every device holds the owner key U, so C signs
@@ -44,6 +46,31 @@
 //! group and meta topics and KV deltas (no key material there today; E's
 //! epoch is the backstop), and sampling stops once E's eviction commits.
 //!
+//! The expired arm (#2004, `w3h_1357_s4_owner_recovery_expired_member_2004`)
+//! runs the same scenario with E seated on a certificate that expires,
+//! not revoked. E's certificate has `not_after` N = issue time +
+//! [`E_NOT_AFTER`]. At t = 0, before N, only A revokes its own agent; A
+//! must be revoked before E's expiry, or A would work E's expiry row
+//! itself. B and C show the owner-recovery wait naming A. The case then
+//! waits until the wall clock is [`DUE_MARGIN`] past E's expiry trigger
+//! N + τ, so E's expiry is due on every node, and only then C signs the
+//! mandate naming B. The mandate naming E is not tried (a mandate naming
+//! an expired member is an open item). Desired: B commits the recovery
+//! to e0+1 while E is seated (on C: B is an Admin, A is Removed); E's
+//! own S4 expiry row, under the admin B, then removes E at e0+2 (on C: E
+//! is Removed, two fewer leaves); E cannot open B's later ciphertext. The
+//! E watch is the same as above: E never holds e0+1 and its own stream
+//! gets no e0+1 commit, share or page; a delivery is the typed cause
+//! [`CAUSE_EXPIRED_E_RECEIVED_E1`]. Control C sees the e0+1 commit.
+//! Before #2004 B's seal refused while due-expired E was seated, and E's
+//! expiry row waited for the eligible admin the recovery would seat; the
+//! arm then records [`CAUSE_DEADLOCK_EXPIRED`] with B's seal-refusal log
+//! naming E. The expiry follows the daemons' wall clock, so the arm needs
+//! the shim (wall clock = base + virtual time) and runs about 1000
+//! virtual seconds; it is `#[ignore]`d outside the shim and the W3-H
+//! gate runs it (`--run-ignored all`). Its red proofs are recorded in the
+//! PR that adds it.
+//!
 //! A child of `s4ab` (as `expiry_skew` is), so the Home, mandate, wait
 //! and watchdog helpers are shared, not copied.
 //!
@@ -55,7 +82,7 @@
 //! (`recovery_scenario` records its outcome checks the same way).
 
 use super::*;
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
@@ -69,6 +96,55 @@ const CAUSE_DEADLOCK: &str = "B's owner-recovery seal is refused (ADR-0038 expli
 /// #1581: a delivery to revoked E at the first owner-recovery epoch.
 const CAUSE_E_RECEIVED_E1: &str = "revoked member E holds or receives keys or a commit for the \
      first owner-recovery epoch e0+1";
+
+const FINAL_EXPIRED: &str =
+    "an_owner_recovery_commits_while_an_expired_member_is_seated_then_its_expiry_row_ejects_it";
+/// #2004: the deadlock the fix removes.
+const CAUSE_DEADLOCK_EXPIRED: &str = "B's owner-recovery seal is refused (ADR-0038 explicit \
+     eviction+rekey) for member E, whose certificate expiry is due and which is still seated, so \
+     neither the recovery nor E's own S4 expiry row can ever commit";
+/// #2004: a delivery to due-expired E at the first owner-recovery epoch.
+const CAUSE_EXPIRED_E_RECEIVED_E1: &str = "member E, whose certificate expiry is due, holds or \
+     receives keys or a commit for the first owner-recovery epoch e0+1";
+/// Expired arm: E's certificate expires this long after it is issued.
+/// Setup and the restart sync wait end before this `not_after` N, so A
+/// revokes its agent before E's expiry and A never works E's row.
+const E_NOT_AFTER: u64 = 600;
+/// Expired arm: the mandate waits until the wall clock is this far past
+/// E's expiry trigger N + τ, so E's expiry is due on every node's clock.
+const DUE_MARGIN: u64 = 10;
+
+/// Why member E is not eligible for the owner-recovery epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Seated {
+    /// #1973: E revokes its own agent at t = 0.
+    Revoked,
+    /// #2004: E's certificate expiry is due (`now > not_after + τ`).
+    Expired,
+}
+
+impl Seated {
+    fn final_name(self) -> &'static str {
+        match self {
+            Self::Revoked => FINAL,
+            Self::Expired => FINAL_EXPIRED,
+        }
+    }
+
+    fn deadlock_cause(self) -> &'static str {
+        match self {
+            Self::Revoked => CAUSE_DEADLOCK,
+            Self::Expired => CAUSE_DEADLOCK_EXPIRED,
+        }
+    }
+
+    fn e_received_cause(self) -> &'static str {
+        match self {
+            Self::Revoked => CAUSE_E_RECEIVED_E1,
+            Self::Expired => CAUSE_EXPIRED_E_RECEIVED_E1,
+        }
+    }
+}
 
 /// What a node received and held from the trigger on, read on its own
 /// side: its own direct-message stream and its own TreeKEM epoch. The arm
@@ -229,9 +305,16 @@ async fn holders_hold(
     Ok(())
 }
 
-async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
+async fn scenario(sim: &mut Sim, arm: Seated, receipt: &mut Receipt) -> Result<()> {
     let at = |sim: &Sim| sim.fabric().now().as_micros();
-    let (home_ids, _) = home_with(sim, FOUR_E, None, &[]).await?;
+    if arm == Seated::Expired && sim.shim.is_none() {
+        bail!(
+            "the expired-member arm needs the W3-H shim: E's expiry follows the daemons' wall \
+             clock, which without the shim does not move with virtual time"
+        );
+    }
+    let expiring = (arm == Seated::Expired).then_some(("E", E_NOT_AFTER));
+    let (home_ids, e_not_after) = home_with(sim, FOUR_E, expiring, &[]).await?;
     let group = home_ids.gid.clone();
     let (a, _) = sim.ids("A")?;
     let (e, _) = sim.ids("E")?;
@@ -280,11 +363,28 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     let mut e_watch = Watch::new(sim, "E", e0 + 1)?;
     let mut c_watch = Watch::new(sim, "C", e0 + 1)?;
 
-    let trigger = sim
-        .fabric()
-        .mark_indexed("case: t=0 A and E revoke their own agents");
+    // Expired arm: A must be revoked before E's expiry, or A, still the
+    // designated admin, would work E's expiry row itself.
+    if let Some(n) = e_not_after {
+        let wall_s = wall_ms() / 1000;
+        receipt.evidence(
+            "a_is_revoked_before_e_raw_not_after",
+            wall_s < n,
+            format!("wall {wall_s} s; E's not_after N {n} s"),
+            at(sim),
+        );
+    }
+    let trigger = sim.fabric().mark_indexed(match arm {
+        Seated::Revoked => "case: t=0 A and E revoke their own agents".to_string(),
+        Seated::Expired => format!(
+            "case: t=0 A revokes its own agent; E's not_after N={}",
+            e_not_after.unwrap_or_default()
+        ),
+    });
     self_revoke(sim, "A").await?;
-    self_revoke(sim, "E").await?;
+    if arm == Seated::Revoked {
+        self_revoke(sim, "E").await?;
+    }
     holders_hold(
         sim,
         receipt,
@@ -293,14 +393,16 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         &a_hex,
     )
     .await?;
-    holders_hold(
-        sim,
-        receipt,
-        "b_and_c_hold_e_revocation",
-        &["B", "C"],
-        &e_hex,
-    )
-    .await?;
+    if arm == Seated::Revoked {
+        holders_hold(
+            sim,
+            receipt,
+            "b_and_c_hold_e_revocation",
+            &["B", "C"],
+            &e_hex,
+        )
+        .await?;
+    }
     let mut wait_reads = Observations::default();
     let waited = sim
         .until(
@@ -336,10 +438,44 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         at(sim),
     );
 
-    // A mandate naming the revoked member E is refused.
-    let (status_e, body_e) = mandate(sim, "C", &group, &e_hex).await?;
-    receipt.note(format!("C's mandate naming revoked E: {status_e} {body_e}"));
-    let refused_e = !status_e.is_success() && body_e["error"] == "recovery_member_ineligible";
+    // The gate on E before the mandate naming B. Revoked arm: a mandate
+    // naming revoked E is refused. Expired arm: the wall clock passes E's
+    // expiry trigger N + τ, so B's seal and egress see E as due-expired;
+    // a mandate naming an expired member is not tried here (open item).
+    let mut status_e = None;
+    let e_gate = match arm {
+        Seated::Revoked => {
+            let (status, body) = mandate(sim, "C", &group, &e_hex).await?;
+            receipt.note(format!("C's mandate naming revoked E: {status} {body}"));
+            status_e = Some(status);
+            !status.is_success() && body["error"] == "recovery_member_ineligible"
+        }
+        Seated::Expired => {
+            let n = e_not_after.context("E's not_after")?;
+            pause_until_wall(
+                sim,
+                "wait until E's expiry is due (N + τ + margin)",
+                (n + TAU + DUE_MARGIN) * 1000,
+            )
+            .await?;
+            e_watch.drain();
+            c_watch.drain();
+            let wall_s = wall_ms() / 1000;
+            let due = wall_s > n + TAU;
+            receipt.evidence(
+                "e_expiry_is_due_before_the_mandate",
+                due,
+                format!("wall {wall_s} s; N {n} s; N + \u{3c4} {} s", n + TAU),
+                at(sim),
+            );
+            receipt.note(format!(
+                "before the mandate, E still seated on C: {}; S4 status {}",
+                describe_all(&views(sim, &["C"], &group, &e).await?),
+                statuses(sim, &["B", "C"], &group).await?
+            ));
+            due
+        }
+    };
 
     // C's mandate names B.
     let (status_b, body_b) = mandate(sim, "C", &group, &b_hex).await?;
@@ -402,7 +538,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     };
     commit_reads.verify("B commits the owner recovery")?;
     receipt.note(format!(
-        "refused E recovery_member_ineligible {refused_e}; B mandate signed {signed}; recovery \
+        "E gate ({arm:?}) {e_gate}; B mandate signed {signed}; recovery \
          committed {committed} at {committed_at:?}; E active at the commit \
          {e_active_when_committed:?}; C about A: {}; S4 status {}",
         describe_all(&views(sim, &["C"], &group, &a).await?),
@@ -512,7 +648,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     let e_leak = !e_watch.keyed.is_empty() || e_watch.epochs.contains(&(e0 + 1));
     if e_leak {
         receipt.cause(
-            CAUSE_E_RECEIVED_E1,
+            arm.e_received_cause(),
             Some(e_watch.describe()),
             c_saw_the_commit,
             at(sim),
@@ -555,11 +691,11 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
                 .fabric()
                 .delivered_writes_after(&sim.peer("A")?, &sim.peer("C")?, trigger)
                 .is_empty(),
-        format!("mandate replies {status_e} / {status_b}"),
+        format!("mandate replies {status_e:?} / {status_b}"),
         at(sim),
     );
     if !committed {
-        // #1973: the seal refusal that names E is the deadlock's
+        // #1973 / #2004: the seal refusal that names E is the deadlock's
         // signature. It counts only when every step before the commit
         // held, so a broken mandate reply leaves the arm INFRA.
         let refusals = sim.logs_containing(&[
@@ -573,16 +709,16 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
             refusals.first().map(|log| (log.at, log.text.clone()))
         ));
         receipt.cause(
-            CAUSE_DEADLOCK,
+            arm.deadlock_cause(),
             refusals.first().map(|log| log.text.clone()),
-            !refusals.is_empty() && waits_typed && refused_e && signed,
+            !refusals.is_empty() && waits_typed && e_gate && signed,
             at(sim),
         );
     }
     receipt.finish(
-        FINAL,
+        arm.final_name(),
         waits_typed
-            && refused_e
+            && e_gate
             && signed
             && committed
             && e_evicted
@@ -595,18 +731,28 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     Ok(())
 }
 
-async fn run(case: &str, seed: u64) -> Receipt {
+async fn run(case: &str, seed: u64, arm: Seated) -> Receipt {
     let mut receipt = Receipt::new(case, seed);
+    let form = match arm {
+        Seated::Revoked => "#1973 / ADR 0110 S4 s4_owner_recovery with a second revoked member",
+        Seated::Expired => {
+            "#2004 / ADR 0110 S4 s4_owner_recovery with a seated member whose expiry is due"
+        }
+    };
     receipt.note(format!(
-        "#1973 / ADR 0110 S4 s4_owner_recovery with a second revoked member. Timing from \
-         S4Timing::default(): {:?}.",
+        "{form}. Timing from S4Timing::default(): {:?}; \u{3c4} = {TAU} s.",
         timing()
     ));
     match Sim::empty(case, seed, FOUR_E) {
         Ok(mut sim) => {
             let fabric = Arc::clone(sim.fabric());
-            let watchdog = real_time_watchdog(case, fabric);
-            let outcome = scenario(&mut sim, &mut receipt).await;
+            // The expired arm runs about 1000 virtual seconds, longer than
+            // the real-time limit allows on a slow runner.
+            let watchdog = match arm {
+                Seated::Revoked => real_time_watchdog(case, fabric),
+                Seated::Expired => super::expiry_skew::stall_watchdog(case, fabric),
+            };
+            let outcome = scenario(&mut sim, arm, &mut receipt).await;
             watchdog.disarm();
             if let Err(error) = outcome {
                 receipt.infra(format!("{error:#}"), sim.fabric().now().as_micros());
@@ -618,7 +764,7 @@ async fn run(case: &str, seed: u64) -> Receipt {
         Err(error) => receipt.infra(format!("sim: {error:#}"), 0),
     }
     if receipt.verdict().is_none() || receipt.has_infra() {
-        receipt.reclassify(FINAL);
+        receipt.reclassify(arm.final_name());
     }
     receipt.emit();
     receipt
@@ -636,6 +782,30 @@ fn w3h_1357_s4_owner_recovery_revoked_member_1973() -> Result<()> {
         let receipt = run(
             "w3h_1357_s4_owner_recovery_revoked_member_1973",
             0x1973_0051,
+            Seated::Revoked,
+        )
+        .await;
+        ensure!(
+            receipt.verdict() == Some(Verdict::Green),
+            "expected Green, got {:?}",
+            receipt.verdict()
+        );
+        Ok(())
+    })
+}
+
+/// ADR 0110 `s4_owner_recovery`, the seated-expired-member form (#2004):
+/// the recovery commits while E's expiry is due, then E's own S4 expiry
+/// row ejects E. Needs the shim (wall clock = base + virtual time), so it
+/// runs in the W3-H gate only.
+#[test]
+#[ignore = "needs the W3-H LD_PRELOAD shim: the W3-H gate runs it with --run-ignored all"]
+fn w3h_1357_s4_owner_recovery_expired_member_2004() -> Result<()> {
+    super::super::super::block_on_paused(async move {
+        let receipt = run(
+            "w3h_1357_s4_owner_recovery_expired_member_2004",
+            0x2004_0051,
+            Seated::Expired,
         )
         .await;
         ensure!(

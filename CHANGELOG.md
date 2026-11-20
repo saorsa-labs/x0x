@@ -6,6 +6,19 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Owner recovery no longer deadlocks on a seated expired member (#2004;
+  A09 decision of 20 Nov 2026).** When every admin is revoked, the
+  owner-recovery seal now also tolerates a below-Admin member whose
+  certificate's S4 expiry is due (`now > not_after + τ`), as it already
+  tolerates a revoked one. That member keeps its seat for one epoch, and
+  its own expiry row removes it under the admin the recovery seated. The
+  owner-recovery egress and the TreeKEM catch-up handler refuse such a
+  member (the handler answers nothing, as for a revoked member, cached-add
+  fallback included), so the recovery epoch's key never reaches it. The
+  creator seat is not tolerated this way, because no expiry row targets it. A member whose
+  certificate expired less than τ ago is treated as before. New W3-H arm
+  `w3h_1357_s4_owner_recovery_expired_member_2004` (shard `s4-2004`).
+
 - **KV retained-image follow-ups (#2068; A10 amendment of 20 Nov 2026).**
   A delta's `updated` entry now merges only into a key the replica holds
   live, so a stale update can no longer bring back a key that an image

@@ -4044,6 +4044,9 @@ struct RecoverySealScope {
     /// Lowercase hex of the Active, below-Admin seats of the working
     /// copy whose verified agent revocations this node holds.
     revoked_members: BTreeSet<String>,
+    /// #2004: lowercase hex of the Active, below-Admin seats whose
+    /// committed certificate's S4 expiry is due.
+    expired_members: BTreeSet<String>,
 }
 
 /// #1973: the seats the owner-recovery seal tolerates. The recovery
@@ -4054,6 +4057,14 @@ struct RecoverySealScope {
 /// promoted member is verified not revoked by the mandate
 /// (`recovery_member_ineligible`), and the mandate names every revoked
 /// admin, so neither class can appear in this set.
+///
+/// #2004: the same holds for a below-Admin seat whose committed
+/// certificate's expiry is due (the rule of its own S4 expiry row): its
+/// expiry row also waits for an eligible admin. The creator seat is
+/// exempt from expiry rows, so it is not collected. Such a seat keeps its
+/// leaf for one epoch, and the owner-recovery egress refuses it
+/// (`owner_recovery::recovery_write_allowed`), so the recovery epoch's
+/// key never reaches it.
 async fn owner_recovery_seal_scope(state: &AppState, next: &GroupInfo) -> RecoverySealScope {
     let revoked: BTreeSet<String> = {
         let set = state.agent.revocation_set();
@@ -4066,9 +4077,21 @@ async fn owner_recovery_seal_scope(state: &AppState, next: &GroupInfo) -> Recove
             .map(hex::encode)
             .collect()
     };
+    let now_unix = x0x::groups::owner_cert::restore_clock_now();
+    let creator_hex = hex::encode(next.creator.as_bytes());
+    // The creator seat is exempt, as from its own S4 expiry row: no row
+    // would ever remove it, so it is not tolerated as one.
+    let expired: BTreeSet<String> = next
+        .active_members()
+        .filter(|member| !member.role.at_least(GroupRole::Admin))
+        .filter(|member| member.agent_id != creator_hex)
+        .filter(|member| x0x::groups::cert_rebind::seat_expiry_due(member, now_unix))
+        .map(|member| member.agent_id.to_ascii_lowercase())
+        .collect();
     RecoverySealScope {
         stable_group_id: next.stable_group_id().to_string(),
         revoked_members: revoked,
+        expired_members: expired,
     }
 }
 
@@ -4177,9 +4200,10 @@ fn eviction_seal_tolerates(scope: &EvictionSealScope, info: &GroupInfo, failed: 
 fn recovery_seal_tolerates(scope: &RecoverySealScope, info: &GroupInfo, failed: &[String]) -> bool {
     scope.stable_group_id == info.stable_group_id()
         && !failed.is_empty()
-        && failed
-            .iter()
-            .all(|hex| scope.revoked_members.contains(&hex.to_ascii_lowercase()))
+        && failed.iter().all(|hex| {
+            let hex = hex.to_ascii_lowercase();
+            scope.revoked_members.contains(&hex) || scope.expired_members.contains(&hex)
+        })
 }
 
 /// Whether the current task runs the worker's own removal or ban of the
@@ -6256,7 +6280,7 @@ pub(super) mod tests {
     /// ([`owner_recovery_seal_scope`]); the daemon tests of
     /// `issue1973_revoked_member_seal` run it end to end.
     #[test]
-    fn an_owner_recovery_seal_tolerates_only_its_revoked_member_seats() {
+    fn an_owner_recovery_seal_tolerates_only_its_collected_revoked_and_expired_seats() {
         let (admin, member, revoked, expired) = ([1; 32], [2; 32], [3; 32], [4; 32]);
         let mut info = group_with(admin, member);
         info.add_member(hex::encode(revoked), GroupRole::Member, None, None);
@@ -6264,6 +6288,7 @@ pub(super) mod tests {
         let scope = RecoverySealScope {
             stable_group_id: info.stable_group_id().to_string(),
             revoked_members: BTreeSet::from([hex::encode(revoked)]),
+            expired_members: BTreeSet::new(),
         };
         let failed_revoked = vec![hex::encode(revoked)];
         // The scope's own revoked member seat is tolerated.
@@ -6276,10 +6301,17 @@ pub(super) mod tests {
         ));
         // An empty failing set keeps the refusal.
         assert!(!recovery_seal_tolerates(&scope, &info, &[]));
-        // A mixed set — a tolerated revoked seat plus a merely expired
-        // one — keeps the all-clean refusal.
+        // A mixed set — a tolerated revoked seat plus a failing seat the
+        // builder did not collect — keeps the all-clean refusal.
         let mixed = vec![hex::encode(revoked), hex::encode(expired)];
         assert!(!recovery_seal_tolerates(&scope, &info, &mixed));
+        // #2004: once the builder collects the seat as due-expired, the
+        // same set is tolerated.
+        let with_expired = RecoverySealScope {
+            expired_members: BTreeSet::from([hex::encode(expired)]),
+            ..scope.clone()
+        };
+        assert!(recovery_seal_tolerates(&with_expired, &info, &mixed));
         // An Admin-or-higher seat the builder never collects keeps the
         // refusal.
         assert!(!recovery_seal_tolerates(
@@ -6291,6 +6323,7 @@ pub(super) mod tests {
         let other = RecoverySealScope {
             stable_group_id: "other".into(),
             revoked_members: BTreeSet::from([hex::encode(revoked)]),
+            expired_members: BTreeSet::new(),
         };
         assert!(!recovery_seal_tolerates(&other, &info, &failed_revoked));
         // Outside an owner-recovery scope nothing is tolerated.
