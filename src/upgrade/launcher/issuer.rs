@@ -14,6 +14,7 @@
 //! verify is an error (the main loop exits 75), never a guess.
 use super::*;
 use std::ffi::OsString;
+use std::fs::File;
 use std::os::unix::fs::MetadataExt;
 
 pub(crate) use contract::TrialArgs;
@@ -35,11 +36,18 @@ pub(crate) fn launcher_argv(argv: &[OsString]) -> io::Result<LauncherArgs> {
 }
 
 /// The issuer for a launcher whose argv names a host root and instance.
-pub(super) struct JournalIssuer<'a>(pub(super) &'a TrialArgs);
+/// After a start that is a passthrough, `held` holds the daemon install
+/// lock the issuer read the records under, for the caller to keep until
+/// the `exec` (#2012).
+pub(super) struct JournalIssuer<'a> {
+    pub(super) args: &'a TrialArgs,
+    pub(super) held: std::cell::RefCell<Option<File>>,
+}
 
 impl start::Issuer for JournalIssuer<'_> {
     fn issue(&self, command: &forward::DaemonCommand) -> io::Result<Option<start::Issued>> {
-        issue_as(self.0, command, effective_uid())
+        let uid = effective_uid();
+        issue_held(self.args, command, uid, uid, &mut self.held.borrow_mut())
     }
 }
 
@@ -61,13 +69,38 @@ fn issue_with(
     root_uid: u32,
     record_uid: u32,
 ) -> io::Result<Option<start::Issued>> {
-    check_root(&args.host_root, root_uid)?;
-    let Some(record) = read_journal(&args.host_root, record_uid)? else {
-        return no_authority(args);
+    issue_held(args, command, root_uid, record_uid, &mut None)
+}
+
+/// Read the host journal and the trial record under the daemon install
+/// lock (`<daemon>.upgrade.lock`), which the prepare producer holds for
+/// every journal change and swap (#2012, #2014 review). Without it a start
+/// could read a Prepared journal, the producer could then swap, and the
+/// passthrough would `exec` the candidate unsupervised. A passthrough
+/// leaves the lock in `held`, so the caller keeps it until the `exec`
+/// (the descriptor is close-on-exec). A trial start releases it, since
+/// `Host::locked` takes the CLI and daemon locks itself.
+fn issue_held(
+    args: &TrialArgs,
+    command: &forward::DaemonCommand,
+    root_uid: u32,
+    record_uid: u32,
+    held: &mut Option<File>,
+) -> io::Result<Option<start::Issued>> {
+    let root = open_root(&args.host_root, root_uid)?;
+    let lock = recovery::lock(Path::new(&command.executable))?;
+    lock.lock()?;
+    let Some(record) = read_journal(&root, record_uid)? else {
+        no_authority(args, &root)?;
+        *held = Some(lock);
+        return Ok(None);
     };
     if !owns_trial(record.phase)? {
-        return no_authority(args);
+        no_authority(args, &root)?;
+        *held = Some(lock);
+        return Ok(None);
     }
+    drop(lock);
     let participant = record
         .plan
         .participants
@@ -106,17 +139,9 @@ fn issue_with(
 /// a symlink, check owner, mode, type and size on that descriptor, and read
 /// from it, so nothing can swap the file between the check and the read
 /// (#2014 review). `Ok(None)` only when there is no journal.
-fn read_journal(root: &Path, uid: u32) -> io::Result<Option<journal::JournalRecord>> {
+fn read_journal(root: &File, uid: u32) -> io::Result<Option<journal::JournalRecord>> {
     use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
-    let path = root.join(journal::JOURNAL_FILE_NAME);
-    let opened = std::fs::OpenOptions::new()
-        .read(true)
-        // No symlink is followed; a FIFO opens without blocking and then
-        // fails the regular-file check.
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(&path);
-    let file = match opened {
+    let file = match open_at(root, journal::JOURNAL_FILE_NAME) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
@@ -155,11 +180,10 @@ fn read_journal(root: &Path, uid: u32) -> io::Result<Option<journal::JournalReco
 /// Authorized trial means a swapped candidate could start unsupervised, so
 /// the start is refused instead (#2014 review). A Committed or Restored
 /// trial is finished: its daemon is the installed or the restored bytes.
-fn no_authority(args: &TrialArgs) -> io::Result<Option<start::Issued>> {
-    let path = args.host_root.join(coordinator::TRIAL_FILE_NAME);
-    let bytes = match journal::read_auxiliary_record(&path) {
+fn no_authority(args: &TrialArgs, root: &File) -> io::Result<()> {
+    let bytes = match read_record_at(root, coordinator::TRIAL_FILE_NAME) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         // A symlinked, non-regular or oversized trial record stays so: a
         // fixed refusal, never a passthrough (#2014 review).
         Err(error)
@@ -173,7 +197,7 @@ fn no_authority(args: &TrialArgs) -> io::Result<Option<start::Issued>> {
     let trial: Trial =
         serde_json::from_slice(&bytes).map_err(|_| start::refused("trial record is unreadable"))?;
     match trial.phase {
-        Phase::Committed | Phase::Restored if trial.instance == args.instance => Ok(None),
+        Phase::Committed | Phase::Restored if trial.instance == args.instance => Ok(()),
         _ => Err(start::refused(
             "an unfinished trial exists without an in-flight host journal",
         )),
@@ -200,16 +224,92 @@ fn owns_trial(phase: journal::Phase) -> io::Result<bool> {
 /// The host root must be canonical (no symlink can move it), a directory
 /// of this account, and writable by nobody else.
 pub(super) fn check_root(root: &Path, uid: u32) -> io::Result<()> {
+    open_root(root, uid).map(drop)
+}
+
+/// Open the host root once, as a directory, after its checks, so the
+/// records are read relative to the checked directory and a rename of the
+/// path cannot redirect them (#2014 review). Every ancestor must also be a
+/// directory that only root or this account can change: one that another
+/// account can write could move the root aside. A sticky ancestor (such as
+/// `/tmp`) is allowed, since only the owner of an entry may rename it.
+fn open_root(root: &Path, uid: u32) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
     if root.canonicalize()? != root {
         return Err(start::refused("--host-root must be canonical"));
     }
-    let metadata = std::fs::symlink_metadata(root)?;
+    for ancestor in root.ancestors().skip(1) {
+        let metadata = std::fs::symlink_metadata(ancestor)?;
+        let writable_by_others = metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0;
+        if !metadata.is_dir()
+            || (metadata.uid() != 0 && metadata.uid() != uid)
+            || writable_by_others
+        {
+            return Err(start::refused(format!(
+                "--host-root ancestor {} must be a directory that only root or this account \
+                 can change",
+                ancestor.display()
+            )));
+        }
+    }
+    let dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(root)?;
+    let metadata = dir.metadata()?;
     if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o022 != 0 {
         return Err(start::refused(
             "--host-root must be a directory of this account that no other can write",
         ));
     }
-    Ok(())
+    Ok(dir)
+}
+
+/// Open `name` in the checked directory `dir` without following a
+/// symlink; a FIFO opens without blocking and then fails the caller's
+/// regular-file check.
+fn open_at(dir: &File, name: &str) -> io::Result<File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let name = std::ffi::CString::new(name).map_err(io::Error::other)?;
+    // SAFETY: `dir` is an open directory descriptor for the whole call and
+    // `name` is a NUL-terminated string that outlives it. A non-negative
+    // result is a new descriptor that nothing else owns.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a fresh descriptor this function owns.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// A record in the checked directory: a regular file within the record
+/// size limit. A symlink fails with `ELOOP`, anything else that is not a
+/// usable record with `InvalidData`.
+fn read_record_at(dir: &File, name: &str) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let file = open_at(dir, name)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "record is not a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(journal::MAX_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > journal::MAX_RECORD_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "record exceeds the size limit",
+        ));
+    }
+    Ok(bytes)
 }
 
 pub(super) fn effective_uid() -> u32 {
@@ -462,7 +562,10 @@ mod tests {
         trial.phase = Phase::Authorized;
         trial.save(&path).unwrap();
         let exit = start::start_with(
-            &JournalIssuer(&args),
+            &JournalIssuer {
+                args: &args,
+                held: std::cell::RefCell::new(None),
+            },
             &command,
             || {},
             Clock::now,
@@ -479,6 +582,104 @@ mod tests {
             Err(error) => start::is_refusal(&error),
             Ok(_) => false,
         }
+    }
+
+    /// Whether another open of `executable`'s install lock can take it now.
+    fn lock_is_free(executable: &std::ffi::OsStr) -> bool {
+        recovery::lock(Path::new(executable))
+            .unwrap()
+            .try_lock()
+            .is_ok()
+    }
+
+    /// #2012 (#2014 review): a passthrough start keeps the daemon install
+    /// lock it read the records under, for the caller to hold until the
+    /// `exec`; a trial start releases it for `Host::locked`.
+    #[test]
+    fn a_passthrough_keeps_the_daemon_lock_and_a_trial_releases_it() {
+        let (_dir, _root, record) = rooted(journal::Phase::Prepared);
+        let (args, command) = matching(&record);
+        let mut held = None;
+        let uid = effective_uid();
+        assert!(issue_held(&args, &command, uid, uid, &mut held)
+            .unwrap()
+            .is_none());
+        assert!(held.is_some());
+        assert!(!lock_is_free(&command.executable), "held through the exec");
+        drop(held);
+        assert!(lock_is_free(&command.executable));
+
+        let (_dir, _root, record) = rooted(journal::Phase::SwappedCli);
+        let (args, command) = matching(&record);
+        let mut held = None;
+        assert!(issue_held(&args, &command, uid, uid, &mut held)
+            .unwrap()
+            .is_some());
+        assert!(held.is_none());
+        assert!(lock_is_free(&command.executable));
+    }
+
+    /// #2012: the records are read under the daemon install lock, so a
+    /// start waits while the producer holds it.
+    #[test]
+    fn a_start_waits_for_the_producers_daemon_lock() {
+        let (_dir, _root, record) = rooted(journal::Phase::Prepared);
+        let (args, command) = matching(&record);
+        let producer = recovery::lock(Path::new(&command.executable)).unwrap();
+        producer.lock().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let uid = effective_uid();
+            let issued = issue_held(&args, &command, uid, uid, &mut None).map(|i| i.is_none());
+            sender.send(issued.unwrap()).unwrap();
+        });
+        assert!(receiver
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_err());
+        drop(producer);
+        assert!(receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap());
+        waiter.join().unwrap();
+    }
+
+    /// #2012 (#2014 review): an ancestor of the host root that another
+    /// account can write could move the root aside; a sticky one cannot.
+    #[test]
+    fn an_ancestor_others_can_write_is_refused_unless_sticky() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().canonicalize().unwrap().join("shared");
+        let root = shared.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let error = check_root(&root, effective_uid()).unwrap_err();
+        assert!(start::is_refusal(&error), "{error}");
+        assert!(error.to_string().contains("ancestor"), "{error}");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        check_root(&root, effective_uid()).unwrap();
+    }
+
+    /// #2012 (#2014 review): the records are read relative to the checked
+    /// directory, so a rename of the path after the check cannot redirect
+    /// them.
+    #[test]
+    fn records_are_read_from_the_checked_directory() {
+        let (_dir, root, record) = rooted(journal::Phase::SwappedCli);
+        let opened = open_root(&root, effective_uid()).unwrap();
+        let moved = root.with_file_name("moved-aside");
+        std::fs::rename(&root, &moved).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let read = read_journal(&opened, effective_uid())
+            .unwrap()
+            .expect("journal");
+        assert_eq!(read.transaction_id, record.transaction_id);
+        assert!(root
+            .join(journal::JOURNAL_FILE_NAME)
+            .symlink_metadata()
+            .is_err());
+        std::fs::remove_dir(&root).unwrap();
+        std::fs::rename(&moved, &root).unwrap();
     }
 
     fn write_0600(path: &Path, bytes: &[u8]) {
@@ -647,7 +848,10 @@ mod tests {
         let (args, command) = matching(&record);
         let exit = |args: &TrialArgs| {
             start::start_with(
-                &JournalIssuer(args),
+                &JournalIssuer {
+                    args,
+                    held: std::cell::RefCell::new(None),
+                },
                 &command,
                 || {},
                 Clock::now,

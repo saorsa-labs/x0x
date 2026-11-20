@@ -46,7 +46,10 @@ fn main() -> std::process::ExitCode {
             libc::signal(libc::SIGTERM, stop as *const () as libc::sighandler_t);
             libc::signal(libc::SIGINT, stop as *const () as libc::sighandler_t);
         };
-        match launcher::start::start(&args, arm, || STOP.load(Ordering::Relaxed)) {
+        // The daemon install lock a trial-form passthrough read its records
+        // under; the `exec` below closes it (#2012).
+        let mut _held = None;
+        match launcher::start::start(&args, &mut _held, arm, || STOP.load(Ordering::Relaxed)) {
             // launchd restarts every exit of a KeepAlive job, so a final
             // refusal holds until a stop instead (#1379). Its reason is in
             // the host root for `x0x doctor`.

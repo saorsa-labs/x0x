@@ -729,7 +729,22 @@ volume not yet mounted at boot). Only the issuer's typed refusal exits 78;
 an untyped I/O error is a failed read. The journal
 has no hash or signature: anything that runs as the launcher's account,
 the candidate daemon included, is trusted to write it, until the producer
-(#2012) adds an integrity binding. The writer of that journal is the M2
+(#2012) adds an integrity binding.
+
+The issuer opens the host root once as a directory (`O_DIRECTORY`,
+`O_NOFOLLOW`) and reads the journal and the trial record relative to that
+descriptor (`openat`), so a rename of the path after the checks cannot
+redirect the reads (#2012). Every ancestor of the host root must be a
+directory owned by root or the launcher's account that no other account can
+write; a sticky ancestor such as `/tmp` is allowed, since only an entry's
+owner may rename it there. The issuer reads both records under the daemon
+install lock (`<daemon>.upgrade.lock`), which the prepare producer holds for
+every journal change and swap. A start that becomes the passthrough keeps
+that lock until its `exec`, which closes it, so the producer cannot swap
+the pair between the read and the `exec`. A trial start releases it, since
+the trial takes the CLI and daemon locks itself. On macOS a passthrough
+that waits for a missing daemon keeps the lock while it waits. A retired
+trial's passthrough does not take the lock again. The writer of that journal is the M2
 prepare producer (#2012), which does not exist yet, so with the engine
 held every start is still the passthrough. An owned start installs its SIGTERM and
 SIGINT handler only then, and exits 0 after a stop, 75 when the daemon

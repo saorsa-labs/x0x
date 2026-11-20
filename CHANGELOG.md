@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Launcher issuer reads by directory descriptor and under the install
+  lock (#2012; A14 amendment of 20 Nov 2026).** The dormant launcher reads
+  the host journal and the trial record relative to the checked host-root
+  directory, refuses a host root with an ancestor another account can
+  write, and reads both under the daemon install lock, which a passthrough
+  keeps until its `exec`.
+
 - **No launchd restart loop on a missing daemon (#1379; A14 amendment of
   19 Nov 2026).** On macOS the launcher no longer exits when the daemon
   path does not exist. It tries again after a pause that doubles from 1 s

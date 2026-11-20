@@ -5,7 +5,9 @@ use super::*;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
-fn lock(path: &Path) -> io::Result<File> {
+/// The install lock file of `path`, `<path>.upgrade.lock`, opened (not
+/// locked).
+pub(super) fn lock(path: &Path) -> io::Result<File> {
     let mut name = path.as_os_str().to_os_string();
     name.push(".upgrade.lock");
     let file = OpenOptions::new()

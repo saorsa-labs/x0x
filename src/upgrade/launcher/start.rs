@@ -108,8 +108,11 @@ impl Issuer for NoIssuer {
 /// launcher as it ends a direct job. `stop` reads the stop flag. Only the
 /// argv's trial form (`--host-root ... --instance ...`) consults the
 /// journal issuer; the plain form is always a passthrough.
+/// After a passthrough of the trial form, `held` holds the daemon install
+/// lock: the caller keeps it until the `exec`, which closes it (#2012).
 pub(crate) fn start(
     args: &issuer::LauncherArgs,
+    held: &mut Option<std::fs::File>,
     arm: impl FnOnce(),
     stop: impl FnMut() -> bool,
 ) -> Start {
@@ -120,14 +123,15 @@ pub(crate) fn start(
     match &args.trial {
         None => start_with(&NoIssuer, &args.command, arm, Clock::now, stop, pause),
         Some(trial) => with_refusal_record(&trial.host_root, || {
-            start_with(
-                &issuer::JournalIssuer(trial),
-                &args.command,
-                arm,
-                Clock::now,
-                stop,
-                pause,
-            )
+            let issuer = issuer::JournalIssuer {
+                args: trial,
+                held: std::cell::RefCell::new(None),
+            };
+            let started = start_with(&issuer, &args.command, arm, Clock::now, stop, pause);
+            if started == Start::Passthrough {
+                *held = issuer.held.into_inner();
+            }
+            started
         }),
     }
 }
@@ -419,7 +423,10 @@ mod tests {
             }),
             command: command(),
         };
-        assert_eq!(start(&args, || armed = true, || false), Start::Passthrough);
+        assert_eq!(
+            start(&args, &mut None, || armed = true, || false),
+            Start::Passthrough
+        );
         assert!(!armed);
     }
 
