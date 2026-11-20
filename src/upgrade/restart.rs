@@ -327,6 +327,11 @@ fn path_basename(s: &str) -> &str {
 /// Basename of the stable launcher a launchd job may run (#1379).
 pub use super::launcher_contract::LAUNCHER_BASENAME;
 
+/// The launcher's `EX_TEMPFAIL` exit after a daemon it owns ends; the
+/// manager must restart it (`x0x-launcher` `start::EXIT_TEMPFAIL`).
+#[cfg(any(test, target_os = "linux"))]
+const LAUNCHER_RESTART_EXIT: i64 = 75;
+
 /// The daemon a launchd job runs (#1379).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchdDaemon<'a> {
@@ -1407,7 +1412,8 @@ fn readback_systemd_observation_in(
         return refuse(format!(
             "unit `{unit}` runs x0x-launcher with Restart={restart:?}; a launcher-bound unit \
              needs Restart=always, since the launcher exits 75 after its daemon ends (set it \
-             in the unit or rerun `.deployment/install.sh --launcher`)"
+             in the unit or rerun `.deployment/install.sh [--instance ID] --launcher \
+             /path/to/x0x-launcher`)"
         ));
     }
     if !RESTART_POLICIES_GUARANTEEING_CLEAN_EXIT_RESTART.contains(&restart) {
@@ -1418,43 +1424,43 @@ fn readback_systemd_observation_in(
         ));
     }
 
-    /// What one `RestartPreventExitStatus=` entry says about the clean exit
-    /// status (exit 0). Entries are numeric statuses, `low-high` ranges, or
-    /// signal names (man systemd.service); a signal never covers a clean exit,
+    /// What one `RestartPreventExitStatus=` entry says about an exit
+    /// status. Entries are numeric statuses, `low-high` ranges, or signal
+    /// names (man systemd.service); a signal never covers an exit status,
     /// and anything this parser cannot decode is [`PreventCoverage::Unparseable`]
     /// so the caller fails closed.
     enum PreventCoverage {
-        CoversCleanExit,
-        CleanExitNotCovered,
+        Covers,
+        NotCovered,
         Unparseable,
     }
 
     #[cfg(any(test, target_os = "linux"))]
-    fn prevent_token_covers_clean_exit(token: &str) -> PreventCoverage {
+    fn prevent_token_covers(token: &str, status: i64) -> PreventCoverage {
         let token = token.trim();
         if token.is_empty() {
             return PreventCoverage::Unparseable;
         }
-        if let Ok(status) = token.parse::<i64>() {
-            return if status == 0 {
-                PreventCoverage::CoversCleanExit
+        if let Ok(listed) = token.parse::<i64>() {
+            return if listed == status {
+                PreventCoverage::Covers
             } else {
-                PreventCoverage::CleanExitNotCovered
+                PreventCoverage::NotCovered
             };
         }
         if let Some((low, high)) = token.split_once('-') {
             if let (Ok(low), Ok(high)) = (low.trim().parse::<i64>(), high.trim().parse::<i64>()) {
-                return if low <= 0 && 0 <= high {
-                    PreventCoverage::CoversCleanExit
+                return if low <= status && status <= high {
+                    PreventCoverage::Covers
                 } else {
-                    PreventCoverage::CleanExitNotCovered
+                    PreventCoverage::NotCovered
                 };
             }
         }
-        // Signal names (SIGTERM, SIGKILL, …) name terminations, not clean
-        // exits; systemd renders them with the SIG prefix.
+        // Signal names (SIGTERM, SIGKILL, …) name terminations, not exit
+        // statuses; systemd renders them with the SIG prefix.
         if token.to_ascii_uppercase().starts_with("SIG") {
-            return PreventCoverage::CleanExitNotCovered;
+            return PreventCoverage::NotCovered;
         }
         PreventCoverage::Unparseable
     }
@@ -1462,7 +1468,16 @@ fn readback_systemd_observation_in(
     // RestartPreventExitStatus (man systemd.service): a matching exit
     // status prevents the restart REGARDLESS of Restart= — a unit with
     // Restart=always and `0` (or a range covering 0) listed here still
-    // leaves the daemon down after exit 0. Fail closed when the property
+    // leaves the daemon down after exit 0. A launcher that owns the daemon
+    // exits 75 after it, so a launcher-bound unit must not list 75 either.
+    // Fail closed when the property is missing or unparseable.
+    let mut exits: Vec<(i64, &str)> = vec![(0, "the clean exit status")];
+    if launcher_daemon.is_some() {
+        exits.push((
+            LAUNCHER_RESTART_EXIT,
+            "the launcher's exit 75 after its daemon ends",
+        ));
+    }
     match show_property(&show_output, "RestartPreventExitStatus") {
         None => {
             return refuse(
@@ -1474,21 +1489,30 @@ fn readback_systemd_observation_in(
         Some(v) if v.trim().is_empty() => {}
         Some(v) => {
             for token in v.split_whitespace() {
-                match prevent_token_covers_clean_exit(token) {
-                    PreventCoverage::CoversCleanExit => {
-                        return refuse(format!(
-                            "RestartPreventExitStatus lists `{token}`, which covers the \
-                             clean exit status and prevents the restart regardless of \
-                             Restart={restart}"
-                        ));
+                for &(status, what) in &exits {
+                    match prevent_token_covers(token, status) {
+                        PreventCoverage::Covers if status == 0 => {
+                            return refuse(format!(
+                                "RestartPreventExitStatus lists `{token}`, which covers {what} \
+                                 and prevents the restart regardless of Restart={restart}"
+                            ));
+                        }
+                        PreventCoverage::Covers => {
+                            return refuse(format!(
+                                "unit `{unit}` runs x0x-launcher and RestartPreventExitStatus \
+                                 lists `{token}`, which covers {what}; list only `64 78` there \
+                                 (or rerun `.deployment/install.sh [--instance ID] --launcher \
+                                 /path/to/x0x-launcher`)"
+                            ));
+                        }
+                        PreventCoverage::Unparseable => {
+                            return refuse(format!(
+                                "RestartPreventExitStatus entry `{token}` cannot be parsed; \
+                                 coverage of {what} cannot be proven"
+                            ));
+                        }
+                        PreventCoverage::NotCovered => {}
                     }
-                    PreventCoverage::Unparseable => {
-                        return refuse(format!(
-                            "RestartPreventExitStatus entry `{token}` cannot be parsed; \
-                             coverage of the clean exit status cannot be proven"
-                        ));
-                    }
-                    PreventCoverage::CleanExitNotCovered => {}
                 }
             }
         }
@@ -6333,11 +6357,21 @@ mod tests {
         restart: &str,
         parent: Option<&str>,
     ) -> SystemdPolicyReadback {
+        launcher_unit_readback_preventing(main_pid, exec_start, restart, "64 78", parent)
+    }
+
+    fn launcher_unit_readback_preventing(
+        main_pid: u32,
+        exec_start: &[&str],
+        restart: &str,
+        prevent: &str,
+        parent: Option<&str>,
+    ) -> SystemdPolicyReadback {
         let daemon = "/opt/x0x/x0xd";
         let invocation = "aa01aa01aa01aa01aa01aa01aa01aa01";
         let show = healthy_show(main_pid, invocation, daemon, restart).replace(
             "RestartPreventExitStatus=\n",
-            "RestartPreventExitStatus=64 78\n",
+            &format!("RestartPreventExitStatus={prevent}\n"),
         );
         let argv = real_fixture_argv(daemon);
         let structured = BusctlExecStart {
@@ -6465,6 +6499,75 @@ mod tests {
             launcher_unit_readback(4242, &direct, "on-success", None),
             SystemdPolicyReadback::Verified(_)
         ));
+    }
+
+    /// #1378 (#2115 ZCode review, finding 3): a launcher that owns the
+    /// daemon exits 75 after it, so a launcher-bound unit whose
+    /// `RestartPreventExitStatus` covers 75 is refused with the remedy. A
+    /// direct unit may list 75, since x0xd's own supervised exit is 0.
+    #[test]
+    fn systemd_readback_refuses_a_launcher_bound_unit_that_prevents_exit_75() {
+        for prevent in ["64 75 78", "70-80", "75"] {
+            for main_pid in [4242, 4100] {
+                match launcher_unit_readback_preventing(
+                    main_pid,
+                    &TRIAL,
+                    "always",
+                    prevent,
+                    Some(LAUNCHER),
+                ) {
+                    SystemdPolicyReadback::NotGuaranteed { detail } => {
+                        assert!(detail.contains("exit 75"), "{prevent}: {detail}");
+                        assert!(
+                            detail.contains("--launcher /path/to/x0x-launcher"),
+                            "{detail}"
+                        );
+                    }
+                    other => panic!("{prevent}: expected NotGuaranteed, got {other:?}"),
+                }
+            }
+        }
+        assert!(matches!(
+            launcher_unit_readback_preventing(4242, &TRIAL, "always", "64 76-80 SIGKILL", None),
+            SystemdPolicyReadback::Verified(_)
+        ));
+        let direct = ["/opt/x0x/x0xd", "--name", "testnet"];
+        assert!(matches!(
+            launcher_unit_readback_preventing(4242, &direct, "always", "75", None),
+            SystemdPolicyReadback::Verified(_)
+        ));
+    }
+
+    /// #1378 (#2115 ZCode review, finding 6): the launcher's own
+    /// `--host-root` and `--instance` select its journal, not whether the
+    /// unit restarts the daemon, so the restart readback does not bind
+    /// them; the installer derives them from x0xd itself. Another host
+    /// root or instance verifies; the daemon and its arguments must still
+    /// match.
+    #[test]
+    fn systemd_readback_restart_verdict_does_not_read_the_launchers_journal_selectors() {
+        let mut other_root = TRIAL;
+        other_root[2] = "/srv/elsewhere";
+        let mut other_instance = TRIAL;
+        other_instance[4] = "prod";
+        for (exec_start, why) in [
+            (other_root, "another host root"),
+            (other_instance, "another instance"),
+        ] {
+            match launcher_unit_readback(4242, &exec_start, "always", None) {
+                SystemdPolicyReadback::Verified(_) => {}
+                other => panic!("{why}: expected Verified, got {other:?}"),
+            }
+        }
+        let mut other_name = other_instance;
+        other_name[8] = "prod";
+        launcher_unit_refused(
+            4242,
+            &other_name,
+            "always",
+            None,
+            "the daemon's --name differs",
+        );
     }
 
     #[test]

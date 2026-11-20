@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Render the systemd drop-in that runs an instance's x0xd through the stable
-launcher (#1378). Used by `install.sh --launcher`; off unless that flag is
-given.
+"""Install the stable launcher and the systemd drop-in that runs an
+instance's x0xd through it (#1378). Used by `install.sh --launcher`; off
+unless that flag is given.
 
 The drop-in replaces the unit's ExecStart with the launcher's trial form:
 
@@ -14,14 +14,20 @@ after a daemon it owns ends, so the unit needs Restart=always. The launcher
 exits 78 when no restart can help and 64 on a usage error, so systemd must not
 restart either. KillMode=mixed sends the stop signal to the launcher only,
 which stops x0xd within its own 45 s window.
+
+The unit's user is the last `User=` in the unit and its other drop-ins (in
+name order), or root. Any failure leaves no launcher drop-in behind, so the
+unit runs x0xd directly; install.sh then reloads systemd.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import pwd
 import re
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -31,6 +37,8 @@ INSTANCE_ID = re.compile(r"[A-Za-z0-9._-]{1,128}")
 # Tokens that systemd reads literally in ExecStart: no quoting, `$` or `%`.
 SAFE_TOKEN = re.compile(r"[A-Za-z0-9_@+=:,./-]+")
 DATA_DIR_LINE = re.compile(r'^\s*data_dir: "(?P<path>[^"\\]+)",$', re.MULTILINE)
+# runuser is in /usr/sbin on Debian, Ubuntu and Fedora.
+CHECK_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 
 
 class Refused(Exception):
@@ -45,19 +53,45 @@ def unit_exec_start(unit_text: str) -> list[str]:
     ]
     if len(lines) != 1 or not lines[0]:
         raise Refused("the unit must have exactly one non-empty ExecStart line")
-    tokens = shlex.split(lines[0])
+    try:
+        tokens = shlex.split(lines[0])
+    except ValueError as error:
+        raise Refused(f"the unit's ExecStart cannot be split ({error}); migrate by hand")
     for token in tokens:
         if not SAFE_TOKEN.fullmatch(token):
             raise Refused(f"ExecStart token {token!r} needs systemd quoting; migrate by hand")
     return tokens
 
 
+def unit_user(unit_text: str, dropin: Path) -> str:
+    """The last `User=` in the unit, then in its other drop-ins by name."""
+    texts = [unit_text]
+    if dropin.parent.is_dir():
+        texts += [
+            conf.read_text(encoding="utf-8")
+            for conf in sorted(dropin.parent.glob("*.conf"))
+            if conf.name != dropin.name and conf.is_file()
+        ]
+    users = [
+        line.split("=", 1)[1].strip()
+        for text in texts
+        for line in text.splitlines()
+        if line.strip().startswith("User=")
+    ]
+    return users[-1] if users and users[-1] else "root"
+
+
 def daemon_data_root(binary: str, args: list[str], home: str, user: str) -> str:
     # As root, run the check as the unit's user, so it reads what x0xd reads.
-    prefix = ["runuser", "-u", user, "--"] if os.geteuid() == 0 and user != "root" else []
+    prefix: list[str] = []
+    if os.geteuid() == 0 and user != "root":
+        runuser = shutil.which("runuser", path=CHECK_PATH)
+        if runuser is None:
+            raise Refused(f"runuser is not in {CHECK_PATH}; it runs the check as {user}")
+        prefix = [runuser, "-u", user, "--"]
     result = subprocess.run(
         [*prefix, binary, *args, "--check"],
-        env={"HOME": home, "PATH": "/usr/bin:/bin"},
+        env={"HOME": home, "PATH": CHECK_PATH},
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
@@ -128,31 +162,75 @@ def render(
     )
 
 
+def install_launcher(source: Path, launcher: Path) -> None:
+    if not source.is_file():
+        raise Refused(f"launcher not found: {source}")
+    staged = launcher.with_name(f".{launcher.name}.tmp")
+    shutil.copyfile(source, staged)
+    staged.chmod(0o755)
+    os.replace(staged, launcher)
+
+
+def write_dropin(dropin: Path, text: str) -> None:
+    dropin.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    staged = dropin.with_name(f".{dropin.name}.tmp")
+    with open(staged, "w", encoding="utf-8") as file:
+        file.write(text)
+        file.flush()
+        os.fsync(file.fileno())
+    staged.chmod(0o644)
+    os.replace(staged, dropin)
+
+
+def install(options: argparse.Namespace) -> None:
+    dropin = Path(options.dropin)
+    if dropin.name != "30-x0x-launcher.conf":
+        raise Refused(f"{dropin} is not a 30-x0x-launcher.conf drop-in")
+    if not os.access(options.binary, os.X_OK):
+        raise Refused(f"x0xd is not installed at {options.binary}")
+    unit_text = Path(options.unit).read_text(encoding="utf-8")
+    user = unit_user(unit_text, dropin)
+    try:
+        account = pwd.getpwnam(user)
+    except KeyError:
+        raise Refused(f"the unit's user {user} does not exist")
+    install_launcher(Path(options.launcher_source), Path(options.launcher))
+    text = render(
+        unit_text,
+        options.binary,
+        options.launcher,
+        options.instance,
+        account.pw_dir,
+        account.pw_uid,
+        user,
+    )
+    write_dropin(dropin, text)
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Render the x0x-launcher systemd drop-in.")
-    parser.add_argument("--unit", required=True, help="the instance's unit file")
+    parser = argparse.ArgumentParser(
+        description="Install x0x-launcher and its systemd drop-in for one instance."
+    )
+    parser.add_argument("--unit", required=True, help="the instance's installed unit file")
     parser.add_argument("--binary", required=True, help="the installed x0xd path")
-    parser.add_argument("--launcher", required=True, help="the installed launcher path")
+    parser.add_argument("--launcher-source", required=True, help="the x0x-launcher to install")
+    parser.add_argument("--launcher", required=True, help="where to install the launcher")
     parser.add_argument("--instance", required=True, help="the manifest instance id")
-    parser.add_argument("--home", required=True, help="HOME of the unit's user")
-    parser.add_argument("--owner", required=True, type=int, help="uid of the unit's user")
-    parser.add_argument("--user", required=True, help="the unit's user")
+    parser.add_argument("--dropin", required=True, help="the drop-in path to write")
     options = parser.parse_args()
     try:
-        sys.stdout.write(
-            render(
-                Path(options.unit).read_text(encoding="utf-8"),
-                options.binary,
-                options.launcher,
-                options.instance,
-                options.home,
-                options.owner,
-                options.user,
-            )
-        )
-    except Refused as error:
-        print(f"error: {error}", file=sys.stderr)
+        install(options)
+    except Exception as error:
+        dropin = Path(options.dropin)
+        try:
+            dropin.with_name(f".{dropin.name}.tmp").unlink(missing_ok=True)
+            dropin.unlink(missing_ok=True)
+        except OSError as cleanup:
+            print(f"error: cannot remove {dropin}: {cleanup}", file=sys.stderr)
+        detail = str(error) if isinstance(error, Refused) else f"{type(error).__name__}: {error}"
+        print(f"error: {detail}", file=sys.stderr)
         return 1
+    print(f"[install] launcher drop-in: {options.dropin}")
     return 0
 
 

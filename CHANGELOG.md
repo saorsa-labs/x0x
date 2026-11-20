@@ -135,10 +135,12 @@ All notable changes to this project will be documented in this file.
   stable launcher installed next to x0xd: the daemon is read from the
   launcher's arguments, the unit's main process must be the daemon (the
   launcher passed through) or its launcher parent, and the unit needs
-  `Restart=always`. `.deployment/install.sh --launcher PATH` (off by
+  `Restart=always` and a `RestartPreventExitStatus` that does not cover
+  the launcher's exit 75. `.deployment/install.sh --launcher PATH` (off by
   default) installs the launcher and a drop-in that runs x0xd through it,
-  with `Restart=always` and `RestartPreventExitStatus=64 78`; an install
-  without the flag removes the drop-in.
+  with `Restart=always` and `RestartPreventExitStatus=64 78`. A failed
+  install leaves no drop-in and reloads systemd, so the unit runs x0xd
+  directly; an install without the flag removes the drop-in.
 
 - **Local problem reports: `POST /report` and `x0x report` (#1354 slice 2;
   A14 amendment of 20 Nov 2026).** The daemon builds a redacted

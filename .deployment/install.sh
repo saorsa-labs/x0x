@@ -178,29 +178,17 @@ svc_name="$(basename "$UNIT_DST" .service)"
 # --- stable launcher drop-in (#1378, opt-in) ---------------------------------
 LAUNCHER_DROPIN="$(dirname "$UNIT_DST")/$svc_name.service.d/30-x0x-launcher.conf"
 if [ -n "$LAUNCHER_SRC" ]; then
-    [ -f "$LAUNCHER_SRC" ] || { echo "error: launcher not found: $LAUNCHER_SRC" >&2; exit 1; }
-    [ -x "$BINARY_DST" ] || { echo "error: x0xd not installed at $BINARY_DST" >&2; exit 1; }
-    # The effective User= is the last one in the unit and its drop-ins
-    # (in name order), the launcher drop-in itself excluded.
-    unit_user="$(
-        for f in "$UNIT_DST" "$(dirname "$LAUNCHER_DROPIN")"/*.conf; do
-            [ -f "$f" ] && [ "$f" != "$LAUNCHER_DROPIN" ] && sed -n 's/^User=//p' "$f"
-        done | tail -1
-    )"
-    unit_user="${unit_user:-root}"
-    unit_home="$(getent passwd "$unit_user" | cut -d: -f6)"
-    [ -n "$unit_home" ] || { echo "error: no home directory for user $unit_user" >&2; exit 1; }
-    install -m 0755 "$LAUNCHER_SRC" "$LAUNCHER_DST"
-    dropin_tmp="$(mktemp)"
-    trap 'rm -f "$dropin_tmp"' EXIT
-    python3 "$SCRIPT_DIR/launcher-dropin.py" \
-        --unit "$UNIT_DST" --binary "$BINARY_DST" --launcher "$LAUNCHER_DST" \
-        --instance "$INST_ID" --home "$unit_home" --owner "$(id -u "$unit_user")" \
-        --user "$unit_user" \
-        > "$dropin_tmp"
-    mkdir -p "$(dirname "$LAUNCHER_DROPIN")"
-    install -m 0644 "$dropin_tmp" "$LAUNCHER_DROPIN"
-    echo "[install] launcher drop-in: $LAUNCHER_DROPIN"
+    # The helper installs the launcher and writes the drop-in atomically; on
+    # any failure it leaves no drop-in, so the reload below restores the
+    # direct job before the error exit.
+    if ! python3 "$SCRIPT_DIR/launcher-dropin.py" \
+        --unit "$UNIT_DST" --binary "$BINARY_DST" \
+        --launcher-source "$LAUNCHER_SRC" --launcher "$LAUNCHER_DST" \
+        --instance "$INST_ID" --dropin "$LAUNCHER_DROPIN"; then
+        systemctl daemon-reload
+        echo "error: the launcher drop-in is not installed; $svc_name runs x0xd directly" >&2
+        exit 1
+    fi
 elif [ -f "$LAUNCHER_DROPIN" ]; then
     rm -f "$LAUNCHER_DROPIN"
     echo "[install] removed launcher drop-in: $LAUNCHER_DROPIN"
