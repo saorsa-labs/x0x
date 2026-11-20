@@ -13,6 +13,23 @@ All notable changes to this project will be documented in this file.
   write, and reads both under the daemon install lock, which a passthrough
   keeps until its `exec`.
 
+- **KV retained-image follow-ups (#2068; A10 amendment of 20 Nov 2026).**
+  A delta's `updated` entry now merges only into a key the replica holds
+  live, so a stale update can no longer bring back a key that an image
+  tombstone removed. A delta that carries a removal re-arms its writer's
+  retry window, so a replica that refused that writer pulls from it again
+  without waiting up to 30 minutes when the removed keys were only on the
+  writer. New tests drive a real refused merge through to the `x0x doctor`
+  warning, and merge an image from a pre-#1970 peer that still holds
+  removed keys' entries.
+- **GUI session streams close when the session ends (#2079; A11 amendment
+  of 20 Nov 2026).** An SSE stream or WebSocket opened with a session token
+  now ends on sign-out, at the idle limit (within 30 s) and when a clock
+  step ends every session; a WebSocket closes with code `1008`
+  (`session ended`). A token refresh keeps the streams open. The GUI no
+  longer reconnects a socket closed that way. The daemon logs a warning
+  when a backward clock step ends every session.
+
 - **No launchd restart loop on a missing daemon (#1379; A14 amendment of
   19 Nov 2026).** On macOS the launcher no longer exits when the daemon
   path does not exist. It tries again after a pause that doubles from 1 s
@@ -86,6 +103,19 @@ All notable changes to this project will be documented in this file.
   stable launcher.
 
 ### Added
+
+- **Local problem reports: `POST /report` and `x0x report` (#1354 slice 2;
+  A14 amendment of 20 Nov 2026).** The daemon builds a redacted
+  problem-report bundle and stores it as
+  `<data_dir>/reports/x0x-report-<unix-secs>.json` (mode 0600). The bundle
+  holds the version, OS, uptime, 8-character agent and machine id
+  prefixes, the redacted `/health` body, a name-and-size listing of the
+  data directory and a bounded log tail. A redactor removes the API token,
+  contact labels, home and user paths, the user name, quoted log values,
+  long hex runs (cut to a prefix) and long base64-like runs. The bundle is
+  at most 256 KiB. Durable owner token only, one report per minute, the
+  newest 10 kept. Nothing is sent: delivery to the owner's devices and
+  opt-in maintainer delivery are later slices.
 
 - **Release announced by the promotion workflow (#1169 PR 2; A14 amendment
   of 19 Nov 2026).** A new `announce-release` job in `Publish promoted

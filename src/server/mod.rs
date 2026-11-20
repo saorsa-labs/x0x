@@ -26,6 +26,7 @@ pub mod health_verdict;
 mod instance_lock;
 mod kv_change_events;
 mod legacy_store_migration;
+mod report;
 pub(crate) mod reseat_scope;
 mod rider_auth;
 mod routes;
@@ -3085,6 +3086,7 @@ pub async fn serve_with_options(
         .route("/ws/direct", get(ws_direct_handler))
         .route("/ws/sessions", get(ws_sessions))
         .route("/shutdown", post(shutdown_handler))
+        .route("/report", post(report::create_report))
         .route("/files/send", post(file_send_handler))
         .route("/files/transfers", get(file_transfers_handler))
         .route("/files/transfers/:id", get(file_transfer_status_handler))

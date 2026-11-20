@@ -103,6 +103,9 @@ struct Refusal {
     last_at_ms: u64,
     retry_after_ms: u64,
     backoff_ms: u64,
+    /// A removal by this source already made the current window's retry
+    /// due (#2068 point 4): at most one such re-arm per window.
+    removal_rearmed: bool,
 }
 
 /// Non-persisted admission state carried by a `KvStore`.
@@ -170,6 +173,7 @@ impl ImageAdmission {
             last_at_ms: now,
             retry_after_ms: 0,
             backoff_ms: 0,
+            removal_rearmed: false,
         });
         r.count = r.count.saturating_add(1);
         r.last_image = image;
@@ -182,6 +186,7 @@ impl ImageAdmission {
                 r.backoff_ms.saturating_mul(2).min(BACKOFF_CAP_MS)
             };
             r.retry_after_ms = now.saturating_add(r.backoff_ms);
+            r.removal_rearmed = false;
         }
         log
     }
@@ -197,6 +202,20 @@ impl ImageAdmission {
         for r in self.refusals.values_mut() {
             r.retry_after_ms = 0;
             r.backoff_ms = 0;
+        }
+    }
+
+    /// `source` sent a removal: its own image may have shrunk even when
+    /// this replica's did not (#2068 point 4), so its next pull is due now.
+    /// The back-off level stays: only a merged pull clears it, and a refused
+    /// one opens the next, longer window. At most one such re-arm per
+    /// window, so removals cost at most one extra pull per window.
+    pub(crate) fn rearm_source(&mut self, source: &AgentId, now: u64) {
+        if let Some(r) = self.refusals.get_mut(source) {
+            if !r.removal_rearmed && now < r.retry_after_ms {
+                r.retry_after_ms = now;
+                r.removal_rearmed = true;
+            }
         }
     }
 
@@ -239,5 +258,46 @@ impl ImageAdmission {
             diverged_sources: live.len(),
             last_refusal,
         }
+    }
+}
+
+#[cfg(test)]
+mod removal_rearm_tests {
+    use super::*;
+
+    /// #2068 point 4 (review of #2109): many removals in one window make
+    /// the source's next pull due once; the back-off level is unchanged,
+    /// so the next refusal opens a doubled window, and a new window allows
+    /// one more re-arm.
+    #[test]
+    fn removals_rearm_a_source_once_per_window_without_resetting_the_back_off() {
+        let source = AgentId([4; 32]);
+        let mut a = ImageAdmission::default();
+        let t0 = 1_000_000;
+        a.note_refusal(source, 1, t0);
+        let first = a.refusals[&source].backoff_ms;
+        assert!(!a.retry_due(&source, t0 + 1));
+
+        a.rearm_source(&source, t0 + 1);
+        assert!(a.retry_due(&source, t0 + 1), "the first removal re-arms");
+        let rearmed_at = a.refusals[&source].retry_after_ms;
+        for i in 2..50 {
+            a.rearm_source(&source, t0 + i);
+        }
+        assert_eq!(a.refusals[&source].retry_after_ms, rearmed_at);
+        assert_eq!(a.refusals[&source].backoff_ms, first, "the level is kept");
+
+        // The re-armed pull is refused again: the next window doubles.
+        let t1 = t0 + 100;
+        a.note_refusal(source, 1, t1);
+        assert_eq!(a.refusals[&source].backoff_ms, first * 2);
+        assert!(!a.retry_due(&source, t1 + 1));
+        a.rearm_source(&source, t1 + 1);
+        assert!(
+            a.retry_due(&source, t1 + 1),
+            "a new window allows one re-arm"
+        );
+        a.note_refusal(source, 1, t1 + 2);
+        assert_eq!(a.refusals[&source].backoff_ms, first * 4);
     }
 }

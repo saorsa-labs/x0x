@@ -2676,7 +2676,6 @@ impl KvStore {
     fn merge_delta_self_keyed(
         &mut self,
         delta: &KvStoreDelta,
-        peer_id: PeerId,
         writer: Option<&AgentId>,
     ) -> Result<()> {
         let Some(w) = writer else {
@@ -2719,8 +2718,10 @@ impl KvStore {
                 puts.insert(key.clone(), entry.value.len() as u64);
             }
         }
+        // An update of a key that is not live here adds nothing, so it must
+        // not take a quota slot from a live key (#2068 point 2).
         for (key, entry) in &delta.updated {
-            if key_agent_prefix(key) == Some(*w) {
+            if key_agent_prefix(key) == Some(*w) && self.keys.contains(key) {
                 puts.insert(key.clone(), entry.value.len() as u64);
             }
         }
@@ -2743,15 +2744,12 @@ impl KvStore {
             }
         }
         for (key, entry) in &delta.updated {
-            if !admitted.contains(key.as_str()) {
+            if !admitted.contains(key.as_str()) || !self.keys.contains(key) {
                 continue;
             }
             if let Some(existing) = self.entries.get_mut(key) {
                 existing.merge(entry);
             } else {
-                self.keys
-                    .add(key.clone(), (peer_id, 0))
-                    .map_err(|e| KvError::Merge(format!("OR-Set add failed: {e}")))?;
                 self.entries.insert(key.clone(), entry.clone());
             }
         }
@@ -2853,7 +2851,7 @@ impl KvStore {
         // both owner-anchored blocks below would no-op anyway.
         if matches!(self.policy, AccessPolicy::SelfKeyed) {
             return self
-                .merge_delta_self_keyed(delta, peer_id, writer)
+                .merge_delta_self_keyed(delta, writer)
                 .map(|()| MergeOutcome::Applied);
         }
         // GroupSigned authority is anchored exclusively in the canonical
@@ -2957,9 +2955,9 @@ impl KvStore {
         }
 
         if self.serves_retained_group_image() {
-            return self.merge_delta_bounded(delta, peer_id, writer);
+            return self.merge_delta_bounded(delta, writer);
         }
-        self.apply_delta_content(delta, peer_id, writer, &mut EntryJournal::default())
+        self.apply_delta_content(delta, writer, &mut EntryJournal::default())
     }
 
     /// #1970: merge `delta` under the admission rule: it is kept only when
@@ -2983,7 +2981,23 @@ impl KvStore {
     fn merge_delta_bounded(
         &mut self,
         delta: &KvStoreDelta,
-        peer_id: PeerId,
+        writer: Option<&AgentId>,
+    ) -> Result<MergeOutcome> {
+        let outcome = self.merge_delta_bounded_inner(delta, writer)?;
+        // A removal from `writer` can shrink the writer's own image even when
+        // this replica held none of the removed keys, so the writer's
+        // deferred pull is retried now (#2068 point 4).
+        if !delta.removed.is_empty() {
+            if let Some(source) = writer {
+                self.image.rearm_source(source, now_ms());
+            }
+        }
+        Ok(outcome)
+    }
+
+    fn merge_delta_bounded_inner(
+        &mut self,
+        delta: &KvStoreDelta,
         writer: Option<&AgentId>,
     ) -> Result<MergeOutcome> {
         let (keys_growth, entries_growth, rest_growth) = self.delta_growth_bound(delta)?;
@@ -3002,7 +3016,7 @@ impl KvStore {
             .collect();
         let mut journal = EntryJournal::default();
         if bound <= HARD_IMAGE_LIMIT_BYTES as u64 {
-            let outcome = self.apply_delta_content(delta, peer_id, writer, &mut journal)?;
+            let outcome = self.apply_delta_content(delta, writer, &mut journal)?;
             self.settle_retained(Some(touched), &mut journal);
             let change = i128::from(keys_growth) + self.journal_entry_delta(&journal);
             let refreshed = (i128::from(content) + change).max(0) as u64;
@@ -3015,7 +3029,7 @@ impl KvStore {
         }
         let before = self.retained_image_len()?;
         let snapshot = self.snapshot_without_entries();
-        let outcome = match self.apply_delta_content(delta, peer_id, writer, &mut journal) {
+        let outcome = match self.apply_delta_content(delta, writer, &mut journal) {
             Ok(outcome) => outcome,
             Err(e) => {
                 self.rollback(snapshot, journal);
@@ -3035,7 +3049,6 @@ impl KvStore {
     fn apply_delta_content(
         &mut self,
         delta: &KvStoreDelta,
-        peer_id: PeerId,
         writer: Option<&AgentId>,
         journal: &mut EntryJournal,
     ) -> Result<MergeOutcome> {
@@ -3085,15 +3098,14 @@ impl KvStore {
             }
         }
 
-        // Apply updated entries (upsert)
+        // Apply updated entries. An update carries no OR-Set tag, so it only
+        // merges into a live key: for a key this replica does not hold live
+        // (never added, or removed, an image tombstone included) it is
+        // skipped. Adding a tag here would bring a removed key back (#2068
+        // point 2).
         for (key, entry) in &delta.updated {
-            if self.append_only_rejects_entry(key, entry) {
+            if self.append_only_rejects_entry(key, entry) || !self.keys.contains(key) {
                 continue; // skip this entry; the rest of the delta still applies
-            }
-            if !self.entries.contains_key(key) {
-                self.keys
-                    .add(key.clone(), (peer_id, 0))
-                    .map_err(|e| KvError::Merge(format!("OR-Set add failed: {e}")))?;
             }
             self.journal_merge_entry(key, entry, journal);
         }
@@ -5699,6 +5711,47 @@ mod tests {
         d
     }
 
+    /// #2068 point 4: a removal by the refused writer of keys only that
+    /// writer held does not shrink this replica's image, so the shrink
+    /// re-arm does not fire. The writer's delta re-arms its own window,
+    /// so this replica retries the writer's image now.
+    #[test]
+    fn a_removal_from_the_refused_writer_rearms_that_writer() {
+        let soft = SOFT_IMAGE_LIMIT_BYTES as u64;
+        let mut base = two_writer_group(32);
+        fill_canonical_to(&mut base, soft - 500_000, "base", peer(3));
+        let da = bulk_delta("a", 50, peer(1), base.version);
+        let db = bulk_delta("b", 50, peer(2), base.version);
+        let mut ab = base.clone();
+        ab.merge_delta(&da, peer(1), Some(&agent(1)))
+            .expect("A fits alone");
+        assert!(matches!(
+            ab.merge_delta(&db, peer(2), Some(&agent(2))),
+            Err(KvError::StoreFull { .. })
+        ));
+        assert!(!ab.image_retry_due(&agent(2)), "B's window is open");
+        let before = ab.retained_image_len().expect("size");
+
+        // Writer B removes keys of its own refused delta: none is on this
+        // replica.
+        let mut removal = KvStoreDelta::new(base.version);
+        for i in 0..40u64 {
+            removal
+                .removed
+                .insert(format!("b{i:05}"), std::collections::HashSet::new());
+        }
+        ab.merge_delta(&removal, peer(2), Some(&agent(2)))
+            .expect("a removal is admitted");
+        assert!(
+            ab.retained_image_len().expect("size") >= before,
+            "this replica's image did not shrink"
+        );
+        assert!(
+            ab.image_retry_due(&agent(2)),
+            "B's removal re-arms B's retry window"
+        );
+    }
+
     /// #1970 point 3: concurrent writes past the headroom (here two 3 MB
     /// deltas that bypass the soft gate) make A-then-B and B-then-A
     /// replicas refuse each other's delta. The refusal is typed, visible
@@ -5973,6 +6026,142 @@ mod tests {
             s.image_status().expect("status").state,
             crate::kv::ImageState::Ok
         );
+    }
+
+    /// #2068 point 2: a stale delta that carries a removed key in
+    /// `updated` does not bring it back. The key here was removed by an
+    /// image tombstone, so its entry is gone and the update has no live
+    /// key to merge into; it is skipped.
+    #[test]
+    fn a_stale_update_does_not_bring_back_an_image_removed_key() {
+        let mut s = two_writer_group(37);
+        s.put(
+            "k".to_string(),
+            vec![b'v'; 100],
+            "text/plain".to_string(),
+            peer(1),
+        )
+        .expect("put");
+        let stale = s.entries.get("k").expect("entry").clone();
+        let mut remover = s.clone();
+        remover.keys.remove(&"k".to_string()).expect("remove");
+        s.merge_group_retained_image(&remover, agent(2), peer(2))
+            .expect("the tombstone image merges");
+        assert!(s.get("k").is_none(), "k is removed");
+        assert!(!s.entries.contains_key("k"));
+
+        let mut newer = stale;
+        newer.updated_at = newer.updated_at.saturating_add(10_000);
+        let update = KvStoreDelta::for_update("k".to_string(), newer, s.version);
+        s.merge_delta(&update, peer(2), Some(&agent(2)))
+            .expect("the update is admitted");
+        assert!(
+            s.get("k").is_none(),
+            "the stale update did not bring k back"
+        );
+        assert!(!s.entries.contains_key("k"));
+        assert!(!s.keys.contains(&"k".to_string()));
+    }
+
+    /// #2068 point 6: a real refused merge, reported as `GET /stores`
+    /// reports it (`image` is the serialized [`ImageStatus`]), makes
+    /// `x0x doctor` warn and name the store; once the repair image merges,
+    /// the doctor is quiet again.
+    #[test]
+    fn a_refused_merge_reaches_the_doctor_warning() {
+        use crate::cli::commands::daemon::{store_integrity_check, DoctorCheckStatus};
+        let doctor = |s: &KvStore| {
+            let image = serde_json::to_value(s.image_status().expect("group store"))
+                .expect("status serializes");
+            store_integrity_check(&serde_json::json!({ "stores": [
+                { "id": "x0x/group/wiki", "durability_degraded": false, "image": image },
+            ]}))
+        };
+        let soft = SOFT_IMAGE_LIMIT_BYTES as u64;
+        let mut base = two_writer_group(35);
+        fill_canonical_to(&mut base, soft - 500_000, "base", peer(3));
+        let da = bulk_delta("a", 50, peer(1), base.version);
+        let db = bulk_delta("b", 50, peer(2), base.version);
+        let mut ab = base.clone();
+        ab.merge_delta(&da, peer(1), Some(&agent(1)))
+            .expect("A fits alone");
+        assert_eq!(
+            doctor(&ab).status,
+            DoctorCheckStatus::Ok,
+            "full is not a warning"
+        );
+        assert!(ab.merge_delta(&db, peer(2), Some(&agent(2))).is_err());
+        let check = doctor(&ab);
+        assert_eq!(check.status, DoctorCheckStatus::Warn, "{}", check.detail);
+        assert!(
+            check.detail.contains("x0x/group/wiki (full_diverged)"),
+            "{}",
+            check.detail
+        );
+
+        let mut base_keys: Vec<String> = base.entries.keys().cloned().collect();
+        base_keys.sort();
+        let mut removal = KvStoreDelta::new(base.version);
+        for key in base_keys.iter().take(40) {
+            removal
+                .removed
+                .insert(key.clone(), std::collections::HashSet::new());
+        }
+        let mut b = base.clone();
+        b.merge_delta(&db, peer(2), Some(&agent(2)))
+            .expect("B fits alone");
+        b.merge_delta(&removal, peer(1), Some(&agent(1)))
+            .expect("a removal is admitted");
+        ab.merge_delta(&removal, peer(1), Some(&agent(1)))
+            .expect("a removal is admitted");
+        ab.merge_group_retained_image(&b.served_image_for_test(), agent(2), peer(1))
+            .expect("the repair image merges");
+        let check = doctor(&ab);
+        assert_eq!(check.status, DoctorCheckStatus::Ok, "{}", check.detail);
+    }
+
+    /// #2068 point 6: a peer on a version before #1970 serves its raw
+    /// image, which still holds the entries of keys it removed (and here a
+    /// newer value under one of them). The receiver applies the removal,
+    /// drops those entries, and neither resurrects the key nor retains
+    /// their bytes.
+    #[test]
+    fn an_old_peers_image_with_removed_keys_entries_retains_nothing_dead() {
+        let mut s = two_writer_group(36);
+        for i in 0..20u32 {
+            s.put(
+                format!("k{i:02}"),
+                vec![b'v'; 1_000],
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+        }
+        let mut old = s.clone();
+        for i in 0..10u32 {
+            let key = format!("k{i:02}");
+            old.keys.remove(&key).expect("remove");
+            let mut kept = KvEntry::new(key.clone(), vec![b'o'; 60_000], "text/plain".to_string());
+            kept.updated_at = u64::MAX / 2;
+            old.entries.insert(key, kept);
+        }
+        assert_eq!(old.entries.len(), 20, "the old peer kept every entry");
+        s.merge_group_retained_image(&old, agent(2), peer(2))
+            .expect("the old image merges");
+        for i in 0..10u32 {
+            let key = format!("k{i:02}");
+            assert!(s.get(&key).is_none(), "{key} stays removed");
+            assert!(!s.entries.contains_key(&key), "{key}'s entry is dropped");
+        }
+        assert_eq!(s.entries.len(), 10);
+        let mut settled = s.clone();
+        settled.settle_retained(None, &mut EntryJournal::default());
+        assert_eq!(
+            s.retained_image_len().expect("size"),
+            settled.retained_image_len().expect("size"),
+            "nothing dead is retained"
+        );
+        assert!(s.retained_image_len().expect("size") < 60_000);
     }
 
     /// #2067 review finding 5: the per-replica fields (here a history
@@ -9402,6 +9591,40 @@ mod tests {
         let mut non_hex = hex_w.clone();
         non_hex.replace_range(0..1, "z");
         assert_eq!(key_agent_prefix(&non_hex), None);
+    }
+
+    /// #2068 point 2 (review of #2109): in a SelfKeyed directory, an
+    /// `updated` entry for a key that is not live takes no quota slot.
+    /// With the writer at its key cap, a stale update of a lower key must
+    /// not push a live key out of the admitted set and evict it.
+    #[test]
+    fn selfkeyed_stale_update_takes_no_quota_slot() {
+        let w = agent(7);
+        let mut store = self_keyed_store();
+        let mut fill = KvStoreDelta::new(0);
+        for i in 1..=MAX_SELFKEYED_KEYS_PER_AGENT as u64 {
+            let key = hex_key(&w, Some(&format!("{i:03}")));
+            fill.added
+                .insert(key.clone(), (kv_entry(&key, b"v"), (peer(1), i)));
+        }
+        store
+            .merge_delta(&fill, peer(1), Some(&w))
+            .expect("fill to the cap");
+        assert_eq!(store.active_keys().len(), MAX_SELFKEYED_KEYS_PER_AGENT);
+
+        let stale_key = hex_key(&w, Some("000"));
+        let stale =
+            KvStoreDelta::for_update(stale_key.clone(), kv_entry(&stale_key, b"s"), store.version);
+        store
+            .merge_delta(&stale, peer(1), Some(&w))
+            .expect("the stale update is admitted");
+        assert!(
+            store.get(&stale_key).is_none(),
+            "the stale key stays absent"
+        );
+        let last = hex_key(&w, Some(&format!("{MAX_SELFKEYED_KEYS_PER_AGENT:03}")));
+        assert!(store.get(&last).is_some(), "the highest live key is kept");
+        assert_eq!(store.active_keys().len(), MAX_SELFKEYED_KEYS_PER_AGENT);
     }
 
     #[test]
