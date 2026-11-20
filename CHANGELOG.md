@@ -80,6 +80,19 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Local problem reports: `POST /report` and `x0x report` (#1354 slice 2;
+  A14 amendment of 20 Nov 2026).** The daemon builds a redacted
+  problem-report bundle and stores it as
+  `<data_dir>/reports/x0x-report-<unix-secs>.json` (mode 0600). The bundle
+  holds the version, OS, uptime, 8-character agent and machine id
+  prefixes, the redacted `/health` body, a name-and-size listing of the
+  data directory and a bounded log tail. A redactor removes the API token,
+  contact labels, home and user paths, the user name, quoted log values,
+  long hex runs (cut to a prefix) and long base64-like runs. The bundle is
+  at most 256 KiB. Durable owner token only, one report per minute, the
+  newest 10 kept. Nothing is sent: delivery to the owner's devices and
+  opt-in maintainer delivery are later slices.
+
 - **Release announced by the promotion workflow (#1169 PR 2; A14 amendment
   of 19 Nov 2026).** A new `announce-release` job in `Publish promoted
   release` runs the promoted `x0xd` as a short-lived node with a fresh

@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 231,
+  "endpoint_count": 232,
   "endpoints": [
     {
       "category": "status",
@@ -45,6 +45,16 @@
       "description": "Gracefully stop the daemon",
       "method": "POST",
       "path": "/shutdown",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "status",
+      "cli_name": "report",
+      "description": "Authenticated (durable owner): build a redacted problem-report bundle and store it under the data directory's reports/ (#1354); one per minute; nothing is sent",
+      "method": "POST",
+      "path": "/report",
       "request": {
         "kind": "none"
       }
