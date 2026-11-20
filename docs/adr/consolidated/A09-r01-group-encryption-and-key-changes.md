@@ -327,7 +327,9 @@ longer keeps the refusal. The owner-recovery seal also tolerates an
 Active below-Admin seat whose committed certificate's S4 expiry is due,
 by the rule of the seat's own expiry row (`now > not_after + τ`). The
 creator seat is not tolerated this way, because no expiry row ever
-targets it (Engineer ruling of 1 Nov 2026), so it keeps the refusal. A seat
+targets it (Engineer ruling of 1 Nov 2026): a creator whose own
+committed certificate is expired is a digest-pending hold, so it holds
+the seal (see the #2120 paragraph below). A seat
 whose certificate expired less than τ ago is not yet due and is treated
 as before. A seat whose certificate bytes this node does not hold, or
 whose renewal fetch is in flight, is a digest-pending or grace hold, not
@@ -349,6 +351,25 @@ the admin the recovery seated. Before this, every admin revoked plus one
 seated expired member was a deadlock; the only exit was the owner
 re-certifying that member. The `OwnerRecoveryV1` body is unchanged: it
 removes exactly the named admins, and no wire format changes.
+
+On 20 Nov 2026 Claude, under David's delegation of design decisions of
+10 Nov 2026 and A15 as amended on 12 Nov 2026, made the wait for an
+expired creator typed
+([#2120](https://github.com/saorsa-labs/x0x/issues/2120)). When the
+group's creator holds its own expired committed certificate,
+`owner_cert_verdict` holds that seat digest-pending, and the recovery
+seal is refused as `OwnerCertMemberPending`. That hold does not end by
+itself: no eviction removes the creator, and only the owner
+re-certifying the creator's agent ends it. So the promoted member's wait
+is now `waiting_for_creator_certificate_renewal`, naming the creator,
+and its status carries `"remedy": "owner_recertifies_creator"`. This
+holds only when the creator is among the pending seats of the refusal;
+any other grace or digest-pending hold keeps the bare
+`mandate_received`, because it ends when its fetch lands. The rule is
+unchanged: recovery still does not proceed past an expired creator seat.
+A rule that lets it proceed needs a decision on who then removes or
+renews that seat, and is not part of this change. No wire format
+changes; the local status gains the new cause and the `remedy` field.
 
 [A08](A08-r01-groups-home-membership-and-repair.md) defines valid group-state and fork recovery. A09 must not bypass that authority to obtain keys faster.
 

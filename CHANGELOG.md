@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Owner recovery names an expired creator certificate (#2120; A09
+  paragraph of 20 Nov 2026).** When the group's creator holds its own
+  expired certificate, the promoted member's recovery status is now
+  `waiting_for_creator_certificate_renewal`, naming the creator, with
+  `"remedy": "owner_recertifies_creator"`, instead of the bare
+  `mandate_received`. Recovery still waits until the owner re-certifies
+  the creator.
 - **Launcher issuer reads by directory descriptor and under the install
   lock (#2012; A14 amendment of 20 Nov 2026).** The dormant launcher reads
   the host journal and the trial record relative to the checked host-root

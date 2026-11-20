@@ -1074,6 +1074,32 @@ async fn accept_mandate(state: &Arc<AppState>, mandate: orc::SignedOwnerRecovery
     state.agent.s4_revocation_intake().request_reconcile();
 }
 
+/// #2120: the typed wait for a recovery seal that an `OwnerCertMemberPending`
+/// refusal holds on the creator's own expired certificate. `None` when the
+/// creator is not among the pending seats, or its seat is not held that
+/// way, so an ordinary grace hold keeps the bare `mandate_received`.
+fn held_creator_wait(
+    next: &GroupInfo,
+    pending: &[String],
+) -> Option<(&'static str, Vec<[u8; 32]>)> {
+    let creator_hex = hex::encode(next.creator.as_bytes());
+    let held = pending.contains(&creator_hex)
+        && next.creator_expired_certificate_hold(&creator_hex, now_unix());
+    held.then(|| {
+        (
+            x0x::groups::eviction::WaitingCause::WaitingForCreatorCertificateRenewal.as_str(),
+            vec![*next.creator.as_bytes()],
+        )
+    })
+}
+
+/// #2120: what the operator does to end a typed recovery wait, for the
+/// promoted member's status. Only the creator-certificate wait has one.
+fn wait_remedy(cause: &str) -> Option<&'static str> {
+    (cause == x0x::groups::eviction::WaitingCause::WaitingForCreatorCertificateRenewal.as_str())
+        .then_some("owner_recertifies_creator")
+}
+
 async fn set_wait(state: &AppState, stable: &str, wait: Option<(&'static str, Vec<[u8; 32]>)>) {
     if let Some(pending) = state
         .revocation_evictions
@@ -1494,7 +1520,9 @@ async fn finish_commit(
             // typed wait naming them. A refusal caused only by a
             // grace or digest-pending hold is `OwnerCertMemberPending`
             // and keeps the bare `mandate_received` until the hold
-            // ends.
+            // ends, unless the hold is the creator's own expired
+            // certificate (#2120): that hold never ends by itself, so
+            // the wait names the creator and the owner's remedy.
             let wait = match &error {
                 x0x::groups::state_commit::ApplyError::OwnerCertifiedEvictionRequired {
                     members,
@@ -1503,6 +1531,9 @@ async fn finish_commit(
                     x0x::groups::eviction::WaitingCause::WaitingForMemberEviction.as_str(),
                     members.iter().filter_map(|id| agent_bytes(id)).collect(),
                 )),
+                x0x::groups::state_commit::ApplyError::OwnerCertMemberPending {
+                    members, ..
+                } => held_creator_wait(&next, members),
                 _ => None,
             };
             set_wait(state, &stable, wait).await;
@@ -3868,11 +3899,15 @@ pub(super) async fn status_json(state: &AppState, stable_group_id: &str) -> serd
             .map_or(("mandate_received", Vec::new()), |(cause, named)| {
                 (*cause, named.iter().map(hex::encode).collect::<Vec<_>>())
             });
-        serde_json::json!({
+        let mut status = serde_json::json!({
             "state": cause,
             "named": named,
             "parent_head": pending.mandate.body.parent_head,
-        })
+        });
+        if let Some(remedy) = wait_remedy(cause) {
+            status["remedy"] = serde_json::Value::from(remedy);
+        }
+        status
     });
     let stranded: Vec<serde_json::Value> = inner
         .orc
@@ -3912,6 +3947,7 @@ mod tests {
 
     mod issue1973_revoked_member_seal;
     mod issue2004_expired_member_seal;
+    mod issue2120_expired_creator_wait;
 
     #[test]
     fn refusals_map_to_http_statuses() {
