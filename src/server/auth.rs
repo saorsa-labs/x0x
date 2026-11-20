@@ -203,10 +203,29 @@ pub(super) async fn auth_middleware(
             )
                 .into_response();
         }
+        let link = if durable {
+            None
+        } else {
+            header_token
+                .as_deref()
+                .or(query_token.as_deref())
+                .and_then(|token| state.sessions.lineage_of(token))
+                .map(|lineage| SessionLink {
+                    state: Arc::clone(&state),
+                    lineage,
+                })
+        };
         let mut req = req;
         req.extensions_mut()
             .insert(super::rider_auth::ActorContext::Owner { durable });
-        return next.run(req).await;
+        if let Some(link) = link.clone() {
+            req.extensions_mut().insert(link);
+        }
+        let response = next.run(req).await;
+        return match link {
+            Some(link) if is_event_stream(&response) => end_with_session(response, link),
+            _ => response,
+        };
     }
 
     // Rider fallback: bearer header only, never a query string.
@@ -276,6 +295,39 @@ pub(super) async fn auth_middleware(
         })),
     )
         .into_response()
+}
+
+/// The browser session a request was authenticated by. A stream opened
+/// with a session token ends when that session ends: on sign-out, on idle
+/// expiry, and when a clock step ends every session (#2079).
+#[derive(Clone)]
+pub(super) struct SessionLink {
+    state: Arc<AppState>,
+    lineage: u64,
+}
+
+impl SessionLink {
+    /// Resolves once the session has ended.
+    pub(super) async fn ended(&self) {
+        self.state.sessions.lineage_ended(self.lineage).await;
+    }
+}
+
+fn is_event_stream(response: &Response) -> bool {
+    response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/event-stream"))
+}
+
+/// End an SSE response body when its session ends.
+fn end_with_session(response: Response, link: SessionLink) -> Response {
+    use futures::StreamExt;
+    let (parts, body) = response.into_parts();
+    let ended = Box::pin(async move { link.ended().await });
+    let stream = body.into_data_stream().take_until(ended);
+    Response::from_parts(parts, axum::body::Body::from_stream(stream))
 }
 
 /// `POST /auth/session` — exchange the durable API token for a short-lived
@@ -407,10 +459,10 @@ pub(super) async fn refresh_session(
 /// Ends the whole session the bearer belongs to, every token of its
 /// lineage. Accepts a session bearer that refresh would accept (live, or
 /// lapsed inside the idle timeout) or one a refresh just replaced; the
-/// durable token is refused, since it is not a session. Open WebSocket and
-/// SSE streams of the session are not closed: they were authenticated at
-/// connect. The token stops working at once, and a pending GUI
-/// show bound to it is dropped. No other session is touched.
+/// durable token is refused, since it is not a session. The token stops
+/// working at once, the session's open WebSocket and SSE streams close,
+/// and a pending GUI show bound to it is dropped. No other session is
+/// touched.
 pub(super) async fn revoke_session(
     State(state): State<Arc<AppState>>,
     req: axum::http::Request<axum::body::Body>,
@@ -758,6 +810,11 @@ pub(super) type SessionClock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
 /// timers for sessions minted after the step.
 const CLOCK_STEP_TOLERANCE: Duration = Duration::from_secs(60);
 
+/// A stream of a session re-reads the session's state at least this often,
+/// so an idle expiry or a wall-clock change is seen while the machine
+/// sleeps or the clock moves.
+const SESSION_END_RECHECK: Duration = Duration::from_secs(30);
+
 /// Replaced tokens remembered for revoke, at most this many.
 const MAX_RETIRED_TOKENS: usize = 4096;
 
@@ -822,6 +879,8 @@ pub(super) struct SessionStore {
     /// small step cannot extend a session.
     high_water: StdMutex<SystemTime>,
     next_lineage: std::sync::atomic::AtomicU64,
+    /// Woken when sessions end by revoke or by a clock step.
+    ended: tokio::sync::Notify,
 }
 
 fn hash_matches(candidate: &[u8], stored: &[u8; 32]) -> bool {
@@ -842,6 +901,7 @@ impl SessionStore {
             clock,
             high_water: StdMutex::new(SystemTime::UNIX_EPOCH),
             next_lineage: std::sync::atomic::AtomicU64::new(1),
+            ended: tokio::sync::Notify::new(),
         }
     }
 
@@ -858,10 +918,21 @@ impl SessionStore {
         };
         match seen.duration_since(wall) {
             Ok(behind) if behind > CLOCK_STEP_TOLERANCE => {
-                if let Ok(mut table) = self.table.lock() {
+                let ended = self.table.lock().map_or(0, |mut table| {
+                    let lineages: std::collections::HashSet<u64> =
+                        table.live.iter().map(|s| s.lineage).collect();
                     table.live.clear();
                     table.retired.clear();
+                    lineages.len()
+                });
+                if ended > 0 {
+                    tracing::warn!(
+                        sessions = ended,
+                        behind_secs = behind.as_secs(),
+                        "wall clock stepped back past the tolerance: every GUI session ended"
+                    );
                 }
+                self.ended.notify_waiters();
                 *seen = wall;
             }
             Ok(_) => {}
@@ -993,7 +1064,62 @@ impl SessionStore {
         let before = table.live.len();
         table.live.retain(|s| s.lineage != lineage);
         table.retired.retain(|r| r.lineage != lineage);
-        table.live.len() < before
+        let removed = table.live.len() < before;
+        drop(table);
+        self.ended.notify_waiters();
+        removed
+    }
+
+    /// The lineage of a live, unexpired session token.
+    pub(super) fn lineage_of(&self, token: &str) -> Option<u64> {
+        let now = self.now();
+        let candidate = Sha256::digest(token.as_bytes());
+        let mut table = self.table.lock().ok()?;
+        self.prune(&mut table, now);
+        table
+            .live
+            .iter()
+            .find(|s| s.expires_at > now && hash_matches(&candidate, &s.token_hash))
+            .map(|s| s.lineage)
+    }
+
+    /// When the session `lineage` reaches its idle timeout, if no more
+    /// activity comes; `None` once it has ended.
+    fn lineage_idle_deadline(&self, lineage: u64) -> Option<(SystemTime, SystemTime)> {
+        let now = self.now();
+        let mut table = self.table.lock().ok()?;
+        self.prune(&mut table, now);
+        table
+            .live
+            .iter()
+            .filter(|s| s.lineage == lineage)
+            .map(|s| s.last_activity)
+            .max()
+            .map(|last| (now, last.checked_add(self.idle_timeout).unwrap_or(last)))
+    }
+
+    /// Resolves once the session `lineage` has ended: revoked, idle past
+    /// the timeout, or ended by a clock step.
+    pub(super) async fn lineage_ended(&self, lineage: u64) {
+        loop {
+            let notified = self.ended.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let Some((now, deadline)) = self.lineage_idle_deadline(lineage) else {
+                return;
+            };
+            let Ok(wait) = deadline.duration_since(now) else {
+                return;
+            };
+            if wait.is_zero() {
+                return;
+            }
+            let wait = wait.min(SESSION_END_RECHECK);
+            tokio::select! {
+                () = &mut notified => {}
+                () = tokio::time::sleep(wait) => {}
+            }
+        }
     }
 
     /// Recorded last activity of a live token's session (tests only).
@@ -1844,6 +1970,205 @@ mod tests {
         assert!(!authorize_refresh(&store, &old), "refresh");
         assert_eq!(store.refresh(&old, None), Err(SessionRefreshError::Unknown));
         assert!(store.is_valid(&new), "the successor is untouched");
+    }
+
+    /// Whether `lineage_ended` has resolved after letting paused time run
+    /// `by` (a wall-clock move needs the store's recheck to see it).
+    async fn ended_within(store: &SessionStore, lineage: u64, by: Duration) -> bool {
+        tokio::time::timeout(by, store.lineage_ended(lineage))
+            .await
+            .is_ok()
+    }
+
+    /// #2079 point 1: a session's streams learn that it ended, by sign-out
+    /// (also through a replaced token), by idle expiry, and by a clock
+    /// step; an active session's stream stays open.
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_learns_when_its_session_ends() {
+        let clock = TestClock::new();
+        let store = clock.store(IDLE);
+
+        let a = store.issue();
+        let lineage = store.lineage_of(&a).expect("a live session");
+        let a2 = store.refresh(&a, Some(Duration::ZERO)).expect("refresh");
+        assert_eq!(store.lineage_of(&a2), Some(lineage), "refresh keeps it");
+        assert!(
+            store.lineage_of(&a).is_none(),
+            "a replaced token opens nothing"
+        );
+        assert!(!ended_within(&store, lineage, Duration::from_secs(60)).await);
+        let waiting = store.lineage_ended(lineage);
+        tokio::pin!(waiting);
+        let short = Duration::from_millis(1);
+        assert!(
+            tokio::time::timeout(short, &mut waiting).await.is_err(),
+            "a live session's stream waits"
+        );
+        assert!(store.revoke(&a));
+        assert!(
+            tokio::time::timeout(short, &mut waiting).await.is_ok(),
+            "sign-out wakes a waiting stream at once"
+        );
+
+        let b = store.issue();
+        let lineage = store.lineage_of(&b).expect("a live session");
+        let waiting = store.lineage_ended(lineage);
+        tokio::pin!(waiting);
+        clock.advance(IDLE - Duration::from_secs(10));
+        assert!(tokio::time::timeout(short, &mut waiting).await.is_err());
+        let b2 = store.refresh(&b, Some(Duration::ZERO)).expect("activity");
+        clock.advance(Duration::from_secs(20));
+        assert!(
+            tokio::time::timeout(SESSION_END_RECHECK * 2, &mut waiting)
+                .await
+                .is_err(),
+            "activity moved the idle deadline"
+        );
+        clock.advance(IDLE);
+        assert!(
+            tokio::time::timeout(SESSION_END_RECHECK * 2, &mut waiting)
+                .await
+                .is_ok(),
+            "a waiting stream sees the idle expiry"
+        );
+        assert!(store.lineage_of(&b2).is_none());
+
+        let c = store.issue();
+        let lineage = store.lineage_of(&c).expect("a live session");
+        let waiting = store.lineage_ended(lineage);
+        tokio::pin!(waiting);
+        assert!(tokio::time::timeout(short, &mut waiting).await.is_err());
+        clock.back(CLOCK_STEP_TOLERANCE + Duration::from_secs(1));
+        assert!(
+            tokio::time::timeout(SESSION_END_RECHECK * 2, &mut waiting)
+                .await
+                .is_ok(),
+            "a waiting stream sees a clock step that ends every session"
+        );
+    }
+
+    /// #2079 point 3: `POST /auth/session/refresh` accepts `idle_ms`
+    /// absent or null (a background refresh) and refuses a negative or
+    /// fractional value with 400, leaving the session untouched.
+    #[tokio::test]
+    async fn refresh_route_reads_idle_ms_null_and_refuses_negative_or_float() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = Arc::new(
+            crate::Agent::builder()
+                .with_identity_dir(dir.path())
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key(crate::identity::AgentKeypair::generate().expect("key"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .build()
+                .await
+                .expect("agent"),
+        );
+        let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+            dir.path(),
+            agent,
+        )
+        .await
+        .expect("state");
+        let refresh = |token: String, body: &'static str| {
+            let state = Arc::clone(&state);
+            async move {
+                let req = axum::http::Request::post(SESSION_REFRESH_PATH)
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .expect("request");
+                let response = refresh_session(State(state), req).await;
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .expect("body");
+                let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+                (status, json)
+            }
+        };
+        let token = state.sessions.issue();
+        for bad in [r#"{"idle_ms": -1}"#, r#"{"idle_ms": 1.5}"#] {
+            let (status, body) = refresh(token.clone(), bad).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+            assert!(state.sessions.is_valid(&token), "{bad} left the token live");
+        }
+        let (status, body) = refresh(token.clone(), r#"{"idle_ms": null}"#).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let next = body["session_token"].as_str().expect("token").to_string();
+        let (status, body) = refresh(next, "").await;
+        assert_eq!(status, StatusCode::OK, "an empty body: {body}");
+    }
+
+    /// #2079 point 3: two backward steps that are each inside the
+    /// tolerance add up against the high-water mark.
+    #[test]
+    fn compound_backward_steps_add_up_past_the_tolerance() {
+        let clock = TestClock::new();
+        let store = clock.store(IDLE);
+        let a = store.issue();
+        clock.back(Duration::from_secs(40));
+        assert!(store.is_valid(&a), "40 s is inside the tolerance");
+        clock.back(Duration::from_secs(21));
+        assert!(!store.is_valid(&a), "61 s behind the high-water mark");
+        assert_eq!(store.live_len(), 0);
+    }
+
+    /// #2079 point 3: a step back of exactly the tolerance is absorbed;
+    /// one second more ends every session.
+    #[test]
+    fn a_step_back_of_exactly_the_tolerance_is_absorbed() {
+        let clock = TestClock::new();
+        let store = clock.store(IDLE);
+        let a = store.issue();
+        clock.back(CLOCK_STEP_TOLERANCE);
+        assert!(store.is_valid(&a), "exactly 60 s is absorbed");
+        clock.advance(CLOCK_STEP_TOLERANCE);
+        clock.back(CLOCK_STEP_TOLERANCE + Duration::from_secs(1));
+        assert!(!store.is_valid(&a), "61 s ends it");
+    }
+
+    /// #2079 point 3: only the newest `MAX_RETIRED_TOKENS` replaced
+    /// tokens can sign their session out.
+    #[test]
+    fn the_oldest_replaced_token_is_forgotten_at_the_cap() {
+        let store = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
+        let first = store.issue();
+        let mut token = first.clone();
+        let mut second = None;
+        for _ in 0..=MAX_RETIRED_TOKENS {
+            let next = store.refresh(&token, None).expect("refresh");
+            if second.is_none() {
+                second = Some(next.clone());
+            }
+            token = next;
+        }
+        let second = second.expect("second token");
+        assert!(
+            !authorize_revoke(&store, &first),
+            "the oldest replaced token was evicted"
+        );
+        assert!(!store.revoke(&first));
+        assert!(store.is_valid(&token), "the session is untouched");
+        assert!(
+            authorize_revoke(&store, &second),
+            "the next one still revokes"
+        );
+        assert!(store.revoke(&second));
+        assert!(!store.is_valid(&token));
+    }
+
+    /// #2079 point 3: a token replaced twice (a grandparent of the live
+    /// token) still signs the session out.
+    #[test]
+    fn revoke_with_a_grandparent_token_ends_the_session() {
+        let store = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
+        let grandparent = store.issue();
+        let parent = store.refresh(&grandparent, None).expect("refresh");
+        let live = store.refresh(&parent, None).expect("refresh");
+        assert!(authorize_revoke(&store, &grandparent));
+        assert!(store.revoke(&grandparent));
+        assert!(!store.is_valid(&live));
+        assert!(!authorize_revoke(&store, &parent), "the session is gone");
     }
 
     #[test]
