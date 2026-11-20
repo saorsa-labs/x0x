@@ -325,7 +325,9 @@ amended on 12 Nov 2026
 the last rule of the paragraph above: an expired below-Admin seat no
 longer keeps the refusal. The owner-recovery seal also tolerates an
 Active below-Admin seat whose committed certificate's S4 expiry is due,
-by the rule of the seat's own expiry row (`now > not_after + τ`). A seat
+by the rule of the seat's own expiry row (`now > not_after + τ`). The
+creator seat is not tolerated this way, because no expiry row ever
+targets it (Engineer ruling of 1 Nov 2026), so it keeps the refusal. A seat
 whose certificate expired less than τ ago is not yet due and is treated
 as before. A seat whose certificate bytes this node does not hold, or
 whose renewal fetch is in flight, is a digest-pending or grace hold, not
@@ -338,7 +340,9 @@ revoked seat does. Delivery to it is withheld:
 - the ADR 0107 member check at the guarded admission already refuses an
   expired certificate;
 - the TreeKEM catch-up page handler answers nothing to a requester whose
-  seat expiry is due, as it answers nothing to a revoked one.
+  seat expiry is due. It returns at once, as for a revoked requester, so
+  the cached-add fallback that serves a recent joiner does not serve it
+  either.
 
 The seat's own S4 expiry row then removes it and rekeys at e0+2 under
 the admin the recovery seated. Before this, every admin revoked plus one

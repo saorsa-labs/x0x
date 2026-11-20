@@ -4060,7 +4060,8 @@ struct RecoverySealScope {
 ///
 /// #2004: the same holds for a below-Admin seat whose committed
 /// certificate's expiry is due (the rule of its own S4 expiry row): its
-/// expiry row also waits for an eligible admin. Such a seat keeps its
+/// expiry row also waits for an eligible admin. The creator seat is
+/// exempt from expiry rows, so it is not collected. Such a seat keeps its
 /// leaf for one epoch, and the owner-recovery egress refuses it
 /// (`owner_recovery::recovery_write_allowed`), so the recovery epoch's
 /// key never reaches it.
@@ -4077,9 +4078,13 @@ async fn owner_recovery_seal_scope(state: &AppState, next: &GroupInfo) -> Recove
             .collect()
     };
     let now_unix = x0x::groups::owner_cert::restore_clock_now();
+    let creator_hex = hex::encode(next.creator.as_bytes());
+    // The creator seat is exempt, as from its own S4 expiry row: no row
+    // would ever remove it, so it is not tolerated as one.
     let expired: BTreeSet<String> = next
         .active_members()
         .filter(|member| !member.role.at_least(GroupRole::Admin))
+        .filter(|member| member.agent_id != creator_hex)
         .filter(|member| x0x::groups::cert_rebind::seat_expiry_due(member, now_unix))
         .map(|member| member.agent_id.to_ascii_lowercase())
         .collect();
@@ -6275,7 +6280,7 @@ pub(super) mod tests {
     /// ([`owner_recovery_seal_scope`]); the daemon tests of
     /// `issue1973_revoked_member_seal` run it end to end.
     #[test]
-    fn an_owner_recovery_seal_tolerates_only_its_revoked_member_seats() {
+    fn an_owner_recovery_seal_tolerates_only_its_collected_revoked_and_expired_seats() {
         let (admin, member, revoked, expired) = ([1; 32], [2; 32], [3; 32], [4; 32]);
         let mut info = group_with(admin, member);
         info.add_member(hex::encode(revoked), GroupRole::Member, None, None);

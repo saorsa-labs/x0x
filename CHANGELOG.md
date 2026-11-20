@@ -13,7 +13,9 @@ All notable changes to this project will be documented in this file.
   tolerates a revoked one. That member keeps its seat for one epoch, and
   its own expiry row removes it under the admin the recovery seated. The
   owner-recovery egress and the TreeKEM catch-up handler refuse such a
-  member, so the recovery epoch's key never reaches it. A member whose
+  member (the handler answers nothing, as for a revoked member, cached-add
+  fallback included), so the recovery epoch's key never reaches it. The
+  creator seat is not tolerated this way, because no expiry row targets it. A member whose
   certificate expired less than τ ago is treated as before. New W3-H arm
   `w3h_1357_s4_owner_recovery_expired_member_2004` (shard `s4-2004`).
 

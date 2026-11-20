@@ -96,7 +96,7 @@ async fn owner_recovery_commits_while_an_expired_member_is_seated() {
 
 /// #2004: the scope builder collects a below-Admin seat whose expiry is
 /// due, and not one that is still inside τ (the S4 expiry row's own
-/// rule), nor an expired Admin seat.
+/// rule), nor an expired Admin seat, nor the creator seat.
 #[tokio::test]
 async fn the_recovery_seal_scope_collects_only_due_expired_below_admin_seats() {
     let (_dir, state, mut info, _admin_hex) = recovery_fixture().await;
@@ -109,6 +109,11 @@ async fn the_recovery_seal_scope_collects_only_due_expired_below_admin_seats() {
     if let Some(seat) = info.members_v2.get_mut(&admin_hex) {
         seat.role = x0x::groups::GroupRole::Admin;
     }
+    // A below-Admin creator seat whose expiry is due: no expiry row ever
+    // targets the creator, so it is not collected.
+    let creator = x0x::identity::AgentKeypair::generate().unwrap();
+    let creator_hex = seat_with_expiry(&state, &mut info, &creator, long_expired());
+    info.creator = creator.agent_id();
     info.recompute_state_hash();
     install(&state, &info).await;
 
@@ -116,6 +121,7 @@ async fn the_recovery_seal_scope_collects_only_due_expired_below_admin_seats() {
     assert_eq!(scope.expired_members, BTreeSet::from([due_hex]));
     assert!(!scope.expired_members.contains(&not_due_hex));
     assert!(!scope.expired_members.contains(&admin_hex));
+    assert!(!scope.expired_members.contains(&creator_hex));
     state.agent.shutdown().await;
 }
 

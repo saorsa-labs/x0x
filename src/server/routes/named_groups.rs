@@ -13806,20 +13806,25 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
                 info.state_revision,
             );
             // #2004: a seat past its certificate's S4 expiry point is
-            // answered nothing, as a revoked one is. The owner-recovery
-            // seal can leave such a seat its leaf for one epoch, and a page
-            // must not hand it that epoch.
+            // answered nothing, by the same unconditional return as a
+            // revoked one, so the cached-add fallback below cannot serve
+            // it either. The owner-recovery seal can leave such a seat its
+            // leaf for one epoch, and a page must not hand it that epoch.
             let expired = info.members_v2.get(&sender_hex).is_some_and(|seat| {
                 x0x::groups::cert_rebind::seat_expiry_due(
                     seat,
                     x0x::groups::owner_cert::restore_clock_now(),
                 )
             });
-            (
-                info.has_active_member(&sender_hex) && !expired,
-                keys,
-                Some(claim),
-            )
+            if expired {
+                tracing::warn!(
+                    group_id = %LogHexId::group(&request.group_id),
+                    requester = %LogHexId::agent(&sender_hex),
+                    "rejecting TreeKEM catch-up request from a seat whose certificate expiry is due"
+                );
+                return;
+            }
+            (info.has_active_member(&sender_hex), keys, Some(claim))
         } else {
             (false, vec![request.group_id.clone()], None)
         }
@@ -55443,6 +55448,7 @@ pub(in crate::server) mod tests {
     mod issue1809_secret_file_mode;
     mod issue1840_join_request_outcome;
     mod issue1840_sequence;
+    mod issue2004_expired_catchup;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue646_base_roster_fetch;
