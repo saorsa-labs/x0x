@@ -200,6 +200,16 @@ impl ImageAdmission {
         }
     }
 
+    /// `source` sent a removal: its own image may have shrunk even when
+    /// this replica's did not (#2068 point 4), so retry it now, from the
+    /// first window again.
+    pub(crate) fn rearm_source(&mut self, source: &AgentId) {
+        if let Some(r) = self.refusals.get_mut(source) {
+            r.retry_after_ms = 0;
+            r.backoff_ms = 0;
+        }
+    }
+
     fn prune(&mut self, now: u64) {
         self.refusals
             .retain(|_, r| now < r.last_at_ms.saturating_add(REFUSAL_MEMORY_MS));

@@ -96,7 +96,9 @@ impl KvStoreDelta {
         delta
     }
 
-    /// Create a delta for a value update.
+    /// Create a delta for a value update. The update carries no OR-Set
+    /// tag, so a replica merges it only into a key it holds live; for any
+    /// other key it is skipped. Use [`Self::for_put`] to add a key.
     #[must_use]
     pub fn for_update(key: String, entry: KvEntry, version: u64) -> Self {
         let mut delta = Self::new(version);

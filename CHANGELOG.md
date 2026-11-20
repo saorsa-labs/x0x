@@ -6,6 +6,16 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **KV retained-image follow-ups (#2068; A10 amendment of 20 Nov 2026).**
+  A delta's `updated` entry now merges only into a key the replica holds
+  live, so a stale update can no longer bring back a key that an image
+  tombstone removed. A delta that carries a removal re-arms its writer's
+  retry window, so a replica that refused that writer pulls from it again
+  without waiting up to 30 minutes when the removed keys were only on the
+  writer. New tests drive a real refused merge through to the `x0x doctor`
+  warning, and merge an image from a pre-#1970 peer that still holds
+  removed keys' entries.
+
 - **No launchd restart loop on a missing daemon (#1379; A14 amendment of
   19 Nov 2026).** On macOS the launcher no longer exits when the daemon
   path does not exist. It tries again after a pause that doubles from 1 s
