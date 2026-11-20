@@ -53,6 +53,7 @@ class LauncherDropinTests(unittest.TestCase):
             "--instance": "testnet",
             "--home": str(self.tmp / "home"),
             "--owner": str(os.getuid()),
+            "--user": "root" if os.getuid() == 0 else os.environ.get("USER", "nobody"),
         }
         options.update(overrides)
         argv = [sys.executable, "-I", str(SCRIPT)]
@@ -76,6 +77,7 @@ class LauncherDropinTests(unittest.TestCase):
                 "ExecStart=",
                 f"ExecStart={self.launcher} --host-root {self.data_root} --instance testnet "
                 f"-- {self.binary} --name testnet --config /etc/x0x/config-testnet.toml",
+                "Restart=always",
                 "RestartPreventExitStatus=64 78",
                 "KillMode=mixed",
                 "TimeoutStopSec=60",

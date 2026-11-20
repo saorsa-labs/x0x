@@ -769,9 +769,15 @@ switch also needs David's approval because it changes production hosts.
 accepts a unit whose `ExecStart` runs the stable launcher, in the plain or
 the trial form. It reads the daemon and its arguments from the launcher's
 argv with the launcher's own parser, and they must be this daemon and its
-arguments. The unit's main process must then be the launcher, the parent of
-this daemon; for any other unit it must be this daemon. The rest of the
-readback (restart policy, `RestartPreventExitStatus`, start-rate window) is
+arguments; the launcher must be the one installed next to this x0xd
+(compared by canonical path). The unit's main process must then be either
+this daemon, when the launcher passed through and became the daemon by
+`exec` (always, while the launcher is dormant), or this daemon's parent
+when that parent's executable is the launcher. Anything else is refused;
+for any other unit the main process must be this daemon. A launcher-bound
+unit must also have `Restart=always`: a launcher that owns the daemon exits
+75 after the daemon ends, which `Restart=on-success` does not restart. The
+rest of the readback (`RestartPreventExitStatus`, start-rate window) is
 unchanged.
 
 `.deployment/install.sh --launcher /path/to/x0x-launcher` (off by default)
@@ -782,14 +788,17 @@ installs the launcher next to the instance's `x0xd` and writes
 [Service]
 ExecStart=
 ExecStart=/opt/x0x/x0x-launcher --host-root <data root> --instance <id> -- /opt/x0x/x0xd <unit args>
+Restart=always
 RestartPreventExitStatus=64 78
 KillMode=mixed
 TimeoutStopSec=60
 ```
 
 - The data root is the one x0xd reports for the unit's own arguments
-  (`x0xd <args> --check`, run with the unit user's `HOME`), resolved
-  through symlinks. It must exist, so x0xd must have started once, and it
+  (`x0xd <args> --check`, run as the unit's user with that user's `HOME`;
+  it reads the config and writes nothing), resolved through symlinks. The
+  unit's user is the last `User=` in the unit and its other drop-ins
+  (`root` when none is set). It must exist, so x0xd must have started once, and it
   must be owned by the unit's user and not writable by group or others.
 - The instance is the manifest instance id.
 - An `ExecStart` token that needs systemd quoting (spaces, quotes, `$` or

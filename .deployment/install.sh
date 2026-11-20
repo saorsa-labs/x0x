@@ -180,7 +180,13 @@ LAUNCHER_DROPIN="$(dirname "$UNIT_DST")/$svc_name.service.d/30-x0x-launcher.conf
 if [ -n "$LAUNCHER_SRC" ]; then
     [ -f "$LAUNCHER_SRC" ] || { echo "error: launcher not found: $LAUNCHER_SRC" >&2; exit 1; }
     [ -x "$BINARY_DST" ] || { echo "error: x0xd not installed at $BINARY_DST" >&2; exit 1; }
-    unit_user="$(sed -n 's/^User=//p' "$UNIT_DST" | tail -1)"
+    # The effective User= is the last one in the unit and its drop-ins
+    # (in name order), the launcher drop-in itself excluded.
+    unit_user="$(
+        for f in "$UNIT_DST" "$(dirname "$LAUNCHER_DROPIN")"/*.conf; do
+            [ -f "$f" ] && [ "$f" != "$LAUNCHER_DROPIN" ] && sed -n 's/^User=//p' "$f"
+        done | tail -1
+    )"
     unit_user="${unit_user:-root}"
     unit_home="$(getent passwd "$unit_user" | cut -d: -f6)"
     [ -n "$unit_home" ] || { echo "error: no home directory for user $unit_user" >&2; exit 1; }
@@ -190,6 +196,7 @@ if [ -n "$LAUNCHER_SRC" ]; then
     python3 "$SCRIPT_DIR/launcher-dropin.py" \
         --unit "$UNIT_DST" --binary "$BINARY_DST" --launcher "$LAUNCHER_DST" \
         --instance "$INST_ID" --home "$unit_home" --owner "$(id -u "$unit_user")" \
+        --user "$unit_user" \
         > "$dropin_tmp"
     mkdir -p "$(dirname "$LAUNCHER_DROPIN")"
     install -m 0644 "$dropin_tmp" "$LAUNCHER_DROPIN"

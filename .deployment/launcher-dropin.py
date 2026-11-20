@@ -7,8 +7,10 @@ The drop-in replaces the unit's ExecStart with the launcher's trial form:
 
     x0x-launcher --host-root <data root> --instance <id> -- <x0xd> <args>
 
-The data root is the one x0xd itself reports (`x0xd <args> --check`), so the
-installer has no second data_dir algorithm (design chapter §2). The launcher
+The data root is the one x0xd itself reports (`x0xd <args> --check`, run as
+the unit's user; it reads the config and writes nothing), so the installer
+has no second data_dir algorithm (design chapter §2). The launcher exits 75
+after a daemon it owns ends, so the unit needs Restart=always. The launcher
 exits 78 when no restart can help and 64 on a usage error, so systemd must not
 restart either. KillMode=mixed sends the stop signal to the launcher only,
 which stops x0xd within its own 45 s window.
@@ -50,9 +52,11 @@ def unit_exec_start(unit_text: str) -> list[str]:
     return tokens
 
 
-def daemon_data_root(binary: str, args: list[str], home: str) -> str:
+def daemon_data_root(binary: str, args: list[str], home: str, user: str) -> str:
+    # As root, run the check as the unit's user, so it reads what x0xd reads.
+    prefix = ["runuser", "-u", user, "--"] if os.geteuid() == 0 and user != "root" else []
     result = subprocess.run(
-        [binary, *args, "--check"],
+        [*prefix, binary, *args, "--check"],
         env={"HOME": home, "PATH": "/usr/bin:/bin"},
         stdin=subprocess.DEVNULL,
         capture_output=True,
@@ -88,7 +92,13 @@ def check_host_root(path: str, owner: int) -> str:
 
 
 def render(
-    unit_text: str, binary: str, launcher: str, instance: str, home: str, owner: int
+    unit_text: str,
+    binary: str,
+    launcher: str,
+    instance: str,
+    home: str,
+    owner: int,
+    user: str,
 ) -> str:
     if not INSTANCE_ID.fullmatch(instance) or instance in (".", ".."):
         raise Refused(f"instance id {instance!r} is not valid for the launcher")
@@ -101,7 +111,7 @@ def render(
     if tokens[0] != binary:
         raise Refused(f"the unit runs {tokens[0]}, not {binary}")
     args = tokens[1:]
-    root = check_host_root(daemon_data_root(binary, args, home), owner)
+    root = check_host_root(daemon_data_root(binary, args, home, user), owner)
     exec_start = " ".join(
         [launcher, "--host-root", root, "--instance", instance, "--", binary, *args]
     )
@@ -111,6 +121,7 @@ def render(
         "[Service]\n"
         "ExecStart=\n"
         f"ExecStart={exec_start}\n"
+        "Restart=always\n"
         "RestartPreventExitStatus=64 78\n"
         "KillMode=mixed\n"
         "TimeoutStopSec=60\n"
@@ -125,6 +136,7 @@ def main() -> int:
     parser.add_argument("--instance", required=True, help="the manifest instance id")
     parser.add_argument("--home", required=True, help="HOME of the unit's user")
     parser.add_argument("--owner", required=True, type=int, help="uid of the unit's user")
+    parser.add_argument("--user", required=True, help="the unit's user")
     options = parser.parse_args()
     try:
         sys.stdout.write(
@@ -135,6 +147,7 @@ def main() -> int:
                 options.instance,
                 options.home,
                 options.owner,
+                options.user,
             )
         )
     except Refused as error:
