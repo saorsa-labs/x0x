@@ -28,6 +28,16 @@ All notable changes to this project will be documented in this file.
   direct lane stop the metadata listener too. Records that share a stable id keep the shared listener
   while any of them needs it. Events applied by catch-up, replay or
   recovery paths still wait for a restart.
+- **Safer launchd autostart on macOS (#1379; A14 amendment of 20 Nov
+  2026).** `x0x autostart --launcher` and `--repair --launcher` refuse a
+  daemon inside a versioned Homebrew keg, which `brew upgrade` removes
+  (launcher support for Homebrew is #2111); `--repair --launcher` also
+  refuses a job that already runs the launcher with a keg daemon.
+  `x0x doctor` reports a launchd job whose daemon path no longer exists.
+  `x0x autostart`, `--repair` and `--remove` refuse to run as root or
+  under `sudo`; install and `--repair` refuse a job file that is not the
+  user's own or that others can write.
+  `x0x autostart --repair --dry-run` prints the changes and writes nothing.
 
 - **KV retained-image follow-ups (#2068; A10 amendment of 20 Nov 2026).**
   A delta's `updated` entry now merges only into a key the replica holds
