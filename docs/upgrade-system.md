@@ -1265,7 +1265,8 @@ anything is written, so a job the launcher would refuse (a relative
 daemon, an invalid instance) is never installed. A package-manager
 upgrade that moves the canonical `x0xd` needs `x0x autostart --launcher`
 again. A daemon inside a versioned Homebrew keg is refused (see
-"Homebrew keg paths" below), so a Homebrew install keeps the direct job.
+"Homebrew keg paths" below): a Homebrew install keeps the direct job and
+updates with `brew upgrade`.
 
 One label (`com.saorsalabs.x0xd`) serves one instance. `x0x autostart`
 refuses to replace a job under that label that starts another `--name`;
@@ -1362,17 +1363,20 @@ trial form needs the canonical daemon, and `brew upgrade` removes the old
 keg, so such a job would wait for a daemon that never comes back. Keep the
 direct job for a Homebrew install, or install x0xd outside Homebrew.
 `--repair --launcher` also refuses a job that already runs the launcher
-with a daemon path inside a keg, instead of counting it as compliant, and
-says to run `x0x autostart` without `--launcher`. A job
+with a daemon path inside a keg, instead of counting it as compliant. Both
+refusals name the command that puts the direct job back for the instance:
+`x0x autostart`, or `x0x autostart --name <name>` for a named instance. A job
 that already names a missing daemon is reported by `x0x doctor` while the
 daemon is unreachable: the upgrade check fails and names the job, the
 missing path and whether the launcher is waiting for it. Run
 `x0x autostart` again to point the job at the installed x0xd.
 
-The keg path is not replaced by the `<prefix>/opt/<formula>` link. The
-launcher compares the journal's canonical executable with the daemon path
-in its arguments byte for byte, and a trial swap would write into a keg
-that Homebrew owns. Launcher support for a Homebrew install is #2111.
+The keg path is not replaced by the `<prefix>/opt/<formula>` link, and
+this is the decision, not a gap (#2111, A14 of 20 Nov 2026). The launcher
+compares the journal's canonical executable with the daemon path in its
+arguments byte for byte, and a trial swap would write into a keg that
+Homebrew owns. Homebrew owns a Homebrew install's upgrades: `brew upgrade`
+is its update path, so that install never uses the launcher's trial form.
 
 **Who may change a job.** On macOS every autostart command (install,
 `--repair`, `--remove`) refuses to run as root or under `sudo`: the agent

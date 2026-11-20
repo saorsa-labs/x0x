@@ -230,7 +230,9 @@ pub(crate) async fn collect_doctor_report(
 
 /// The upgrade check while the daemon is unreachable: the stable
 /// launcher's refusal, if it left one in the instance's data directory
-/// (#2016 review), else skipped.
+/// (#2016 review); else, on macOS, the instance's launchd autostart job
+/// whose daemon path does not exist (#1379), with whether the launcher
+/// waits for it; else skipped.
 fn down_upgrade_check(instance_dir: Option<&std::path::Path>) -> DoctorCheck {
     instance_dir
         .and_then(launcher_refusal_check)
@@ -1567,7 +1569,7 @@ pub async fn autostart(name: Option<&str>, launcher: bool) -> Result<()> {
             (
                 Some(autostart_instance_id(name)?),
                 Some(sibling_launcher(&x0xd_path)?),
-                stable_daemon(x0xd_path.canonicalize()?.to_string_lossy().into_owned())?,
+                launcher_trial_daemon(&x0xd_path, name)?,
             )
         } else {
             (None, None, x0xd.into_owned())
@@ -1967,15 +1969,17 @@ pub(crate) fn plan_launcher_migration(
     )
     .context("job names no executable")?
     .map_err(|usage| anyhow::anyhow!(usage))?;
+    let name = daemon_name_argument(daemon.args);
     if daemon.via_launcher {
         // A job migrated before the keg refusal (#2108 review) is not left
         // as compliant: it loses its daemon at the next `brew upgrade`.
         if in_versioned_keg(Path::new(daemon.executable)) {
             anyhow::bail!(
                 "the job already runs x0x-launcher, but its daemon {} is inside a versioned \
-                 Homebrew keg that `brew upgrade` removes; run `x0x autostart` without \
-                 --launcher to put the direct job back",
-                daemon.executable
+                 Homebrew keg that `brew upgrade` removes; run {} (without --launcher) to put \
+                 the direct job back",
+                daemon.executable,
+                direct_job_command(name.as_deref())
             );
         }
         return Ok(None);
@@ -1989,7 +1993,6 @@ pub(crate) fn plan_launcher_migration(
              known from the job; migrate it by hand"
         );
     }
-    let name = daemon_name_argument(daemon.args);
     let instance = autostart_instance_id(name.as_deref())?;
     // x0xd finds its data directory from the job's own HOME (#2072 review).
     let home = match job
@@ -2013,7 +2016,7 @@ pub(crate) fn plan_launcher_migration(
         )
     })?;
     let launcher = (host.launcher_for)(daemon.executable)?;
-    let executable = stable_daemon((host.canonical_daemon)(daemon.executable)?)?;
+    let executable = stable_daemon((host.canonical_daemon)(daemon.executable)?, name.as_deref())?;
     let program_arguments: Vec<String> = [
         launcher.as_str(),
         "--host-root",
@@ -2052,19 +2055,37 @@ fn in_versioned_keg(path: &Path) -> bool {
 }
 
 /// The canonical daemon for the launcher's trial form, refused when it lies
-/// inside a versioned Homebrew keg (#1379). `brew upgrade` installs the next
-/// version in a new keg and removes the old one, so a job that names the old
-/// keg loses its daemon and the launcher waits for it.
+/// inside a versioned Homebrew keg (#1379, #2111). `brew upgrade` installs
+/// the next version in a new keg and removes the old one, so a job that
+/// names the old keg loses its daemon. A Homebrew install keeps the direct
+/// job: Homebrew owns its upgrades (A14, 20 Nov 2026).
 #[cfg(any(test, target_os = "macos"))]
-fn stable_daemon(canonical: String) -> Result<String> {
+fn stable_daemon(canonical: String, name: Option<&str>) -> Result<String> {
     if in_versioned_keg(Path::new(&canonical)) {
         anyhow::bail!(
             "x0xd resolves to {canonical}, inside a versioned Homebrew keg that `brew upgrade` \
-             removes; the launcher needs a canonical daemon path that stays, so keep the direct \
-             job (`x0x autostart` without --launcher) or install x0xd outside Homebrew"
+             removes. A Homebrew install keeps the direct job and updates with `brew upgrade`: \
+             run {} (without --launcher), or install x0xd outside Homebrew to use the launcher",
+            direct_job_command(name)
         );
     }
     Ok(canonical)
+}
+
+/// The trial-form daemon of `x0x autostart --launcher`: `x0xd` as found,
+/// resolved to its canonical path and refused inside a Homebrew keg.
+#[cfg(any(test, target_os = "macos"))]
+fn launcher_trial_daemon(x0xd: &Path, name: Option<&str>) -> Result<String> {
+    stable_daemon(x0xd.canonicalize()?.to_string_lossy().into_owned(), name)
+}
+
+/// The command that installs the direct job for the instance `name`.
+#[cfg(any(test, target_os = "macos"))]
+fn direct_job_command(name: Option<&str>) -> String {
+    match name {
+        Some(name) => format!("`x0x autostart --name {name}`"),
+        None => "`x0x autostart`".to_string(),
+    }
 }
 
 /// Refuse to manage launchd agents as root or under `sudo` (#1379). The
@@ -3814,7 +3835,7 @@ mod tests {
             "/opt/homebrew/Cellar/x0x/0.50.0/bin/x0xd",
             "/usr/local/Cellar/x0x/0.50.0_1/libexec/bin/x0xd",
         ] {
-            let error = stable_daemon(keg.to_string()).expect_err(keg);
+            let error = stable_daemon(keg.to_string(), None).expect_err(keg);
             assert!(format!("{error:#}").contains("Homebrew keg"), "{error:#}");
         }
         for stable in [
@@ -3822,7 +3843,10 @@ mod tests {
             "/opt/homebrew/bin/x0xd",
             "/opt/homebrew/Cellar/x0xd",
         ] {
-            assert_eq!(stable_daemon(stable.to_string()).expect(stable), stable);
+            assert_eq!(
+                stable_daemon(stable.to_string(), None).expect(stable),
+                stable
+            );
         }
         let job = serde_json::json!({
             "Label": "com.saorsalabs.x0xd",
@@ -3854,12 +3878,54 @@ mod tests {
         let error = plan_launcher_migration(&keg_job, &migration_host()).expect_err("keg");
         let error = format!("{error:#}");
         assert!(error.contains("already runs x0x-launcher"), "{error}");
-        assert!(error.contains("x0x autostart` without"), "{error}");
+        assert!(
+            error.contains("`x0x autostart --name alice` (without --launcher)"),
+            "{error}"
+        );
         assert!(
             plan_launcher_migration(&migrated("/opt/x0x/bin/x0xd"), &migration_host())
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// #2111: `x0x autostart --launcher` resolves `x0xd` as found and
+    /// refuses one inside a versioned Homebrew keg, naming the direct-job
+    /// command for the instance. The entry calls this step before it writes
+    /// anything; the rest of the entry writes the user's LaunchAgents, so
+    /// the test drives the step it calls, over a real symlink into a keg.
+    #[cfg(unix)]
+    #[test]
+    fn autostart_launcher_refuses_a_homebrew_keg_daemon() {
+        let root = tempfile::tempdir().unwrap();
+        let keg_bin = root.path().join("Cellar/x0x/0.50.0/bin");
+        std::fs::create_dir_all(&keg_bin).unwrap();
+        std::fs::write(keg_bin.join("x0xd"), b"").unwrap();
+        let link_bin = root.path().join("bin");
+        std::fs::create_dir_all(&link_bin).unwrap();
+        let found = link_bin.join("x0xd");
+        std::os::unix::fs::symlink(keg_bin.join("x0xd"), &found).unwrap();
+
+        let named = format!(
+            "{:#}",
+            launcher_trial_daemon(&found, Some("alice")).unwrap_err()
+        );
+        assert!(named.contains("versioned Homebrew keg"), "{named}");
+        assert!(
+            named.contains("`x0x autostart --name alice` (without --launcher)"),
+            "{named}"
+        );
+        let default = format!("{:#}", launcher_trial_daemon(&found, None).unwrap_err());
+        assert!(
+            default.contains("run `x0x autostart` (without --launcher)"),
+            "{default}"
+        );
+
+        let stable_bin = root.path().join("opt/x0x/bin");
+        std::fs::create_dir_all(&stable_bin).unwrap();
+        std::fs::write(stable_bin.join("x0xd"), b"").unwrap();
+        let resolved = launcher_trial_daemon(&stable_bin.join("x0xd"), None).unwrap();
+        assert!(resolved.ends_with("opt/x0x/bin/x0xd"), "{resolved}");
     }
 
     /// #1379: the autostart commands manage the calling user's own agent.
