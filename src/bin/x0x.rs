@@ -107,6 +107,9 @@ enum Commands {
         /// With `--repair`, move each existing x0xd job onto the launcher.
         #[arg(long, hide = true, conflicts_with = "remove")]
         launcher: bool,
+        /// With `--repair`, print what would change and write nothing.
+        #[arg(long, requires = "repair")]
+        dry_run: bool,
     },
     /// Health check.
     Health,
@@ -2491,11 +2494,12 @@ async fn run(
             remove,
             repair,
             launcher,
+            dry_run,
         } => {
             return if *remove {
                 commands::daemon::autostart_remove().await
             } else if *repair {
-                commands::daemon::autostart_repair(*launcher).await
+                commands::daemon::autostart_repair(*launcher, *dry_run).await
             } else {
                 commands::daemon::autostart(name, *launcher).await
             };
@@ -4242,6 +4246,24 @@ mod tests {
                 withdraw_consent: true,
             } => Ok(()),
             _ => anyhow::bail!("expected announce with only withdraw_consent set"),
+        }
+    }
+
+    // #1379 (#2108 review): `--dry-run` only plans a `--repair`.
+    #[test]
+    fn autostart_dry_run_requires_repair() -> anyhow::Result<()> {
+        match Cli::try_parse_from(["x0x", "autostart", "--dry-run"]) {
+            Err(e) => assert_eq!(e.kind(), clap::error::ErrorKind::MissingRequiredArgument),
+            Ok(_) => anyhow::bail!("--dry-run without --repair must be refused"),
+        }
+        let cli = Cli::try_parse_from(["x0x", "autostart", "--repair", "--dry-run"])?;
+        match cli.command {
+            Commands::Autostart {
+                repair: true,
+                dry_run: true,
+                ..
+            } => Ok(()),
+            _ => anyhow::bail!("expected autostart with repair and dry_run set"),
         }
     }
 

@@ -555,7 +555,7 @@ const STALL_POLL: Duration = Duration::from_secs(5);
 /// does. The shim's wall clock is base + virtual time on every thread, so
 /// the watchdog thread reads it with [`wall_ms`]; nextest's kill for these
 /// arms (the `w3h-gate` override) stays the limit on a run that moves.
-fn stall_watchdog(case: &str, fabric: Arc<SimFabric>) -> Watchdog {
+pub(super) fn stall_watchdog(case: &str, fabric: Arc<SimFabric>) -> Watchdog {
     let disarmed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = Arc::clone(&disarmed);
     let case = case.to_string();

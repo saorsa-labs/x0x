@@ -6,6 +6,39 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Owner recovery no longer deadlocks on a seated expired member (#2004;
+  A09 decision of 20 Nov 2026).** When every admin is revoked, the
+  owner-recovery seal now also tolerates a below-Admin member whose
+  certificate's S4 expiry is due (`now > not_after + τ`), as it already
+  tolerates a revoked one. That member keeps its seat for one epoch, and
+  its own expiry row removes it under the admin the recovery seated. The
+  owner-recovery egress and the TreeKEM catch-up handler refuse such a
+  member (the handler answers nothing, as for a revoked member, cached-add
+  fallback included), so the recovery epoch's key never reaches it. The
+  creator seat is not tolerated this way, because no expiry row targets it. A member whose
+  certificate expired less than τ ago is treated as before. New W3-H arm
+  `w3h_1357_s4_owner_recovery_expired_member_2004` (shard `s4-2004`).
+- **Group listeners stop when no stored record needs them (#1366 second
+  slice; A08 amendment of 20 Nov 2026).** A self-leave (GSS and TreeKEM), a
+  local-only drop, a refused join stub, a cleared stale join row, a
+  self-removal applied from the topic or a direct lane, a card refresh that
+  made a stub `MlsEncrypted` and a withdrawn card left the group's
+  public-message listener running until a restart. Each now stops it, and
+  the TreeKEM self-leave, the cleared join row and a self-removal from a
+  direct lane stop the metadata listener too. Records that share a stable id keep the shared listener
+  while any of them needs it. Events applied by catch-up, replay or
+  recovery paths still wait for a restart.
+- **Safer launchd autostart on macOS (#1379; A14 amendment of 20 Nov
+  2026).** `x0x autostart --launcher` and `--repair --launcher` refuse a
+  daemon inside a versioned Homebrew keg, which `brew upgrade` removes
+  (launcher support for Homebrew is #2111); `--repair --launcher` also
+  refuses a job that already runs the launcher with a keg daemon.
+  `x0x doctor` reports a launchd job whose daemon path no longer exists.
+  `x0x autostart`, `--repair` and `--remove` refuse to run as root or
+  under `sudo`; install and `--repair` refuse a job file that is not the
+  user's own or that others can write.
+  `x0x autostart --repair --dry-run` prints the changes and writes nothing.
+
 - **KV retained-image follow-ups (#2068; A10 amendment of 20 Nov 2026).**
   A delta's `updated` entry now merges only into a key the replica holds
   live, so a stale update can no longer bring back a key that an image

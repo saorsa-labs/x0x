@@ -807,7 +807,7 @@ jobs:
     # `s3-d2`, H-S3-r has `s3-r` (its replay variant `s3-rr`), H-S3-q (1)
     # has `s3-q`, H-S3-q2 has `s3-q2`, and H-S3-q (3) has `s3-q3.1` and
     # `s3-q3.2` (10 reruns each). The #1973 S4 owner-recovery arm has
-    # `s4-1973`.
+    # `s4-1973`, and the #2004 expired-member arm has `s4-2004`.
     # A group is omitted when the tree has no matching test.
     name: W3-H shard plan
     runs-on: ubuntu-latest
@@ -1120,6 +1120,8 @@ jobs:
           --expect w3h_1357_s4_owner_recovery=GREEN
           --require w3h_1357_s4_owner_recovery_revoked_member_1973
           --expect w3h_1357_s4_owner_recovery_revoked_member_1973=GREEN
+          --require w3h_1357_s4_owner_recovery_expired_member_2004
+          --expect w3h_1357_s4_owner_recovery_expired_member_2004=GREEN
           --require w3h_1023_red_baseline_all_holders_offline_wait_is_typed_then_resumes
           --expect w3h_1023_red_baseline_all_holders_offline_wait_is_typed_then_resumes=RED
           --require w3h_1023_restart_one_holder_online_admits

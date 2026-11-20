@@ -329,6 +329,17 @@ pub fn committed_certificate(member: &GroupMember) -> Option<&AgentCertificate> 
         .filter(|cert| owner_cert::certificate_digest_hex(cert) == digest)
 }
 
+/// Whether a seat's committed certificate has passed its S4 expiry point
+/// at `now_unix`: the rule of the seat's own expiry row
+/// ([`own_expiry_trigger_due`], τ included). A seat with no committed
+/// bytes or no `not_after` is never due here (#2004).
+#[must_use]
+pub fn seat_expiry_due(member: &GroupMember, now_unix: u64) -> bool {
+    committed_certificate(member)
+        .and_then(AgentCertificate::not_after)
+        .is_some_and(|not_after| own_expiry_trigger_due(not_after, now_unix))
+}
+
 /// Whether `new` expires later than `old`. A certificate with no
 /// `not_after` never expires; nothing is later than it.
 #[must_use]
@@ -968,6 +979,53 @@ mod tests {
 
     fn hex_of(agent: &AgentKeypair) -> String {
         hex::encode(agent.agent_id().as_bytes())
+    }
+
+    /// #2004: `seat_expiry_due` follows the S4 expiry row's rule on the
+    /// committed certificate only: due past `not_after + τ`, not inside τ,
+    /// never without committed bytes (a digest with no bytes, or bytes
+    /// whose digest differs from the committed one), never without
+    /// `not_after`.
+    #[test]
+    fn seat_expiry_due_reads_only_committed_bytes() {
+        let owner = UserKeypair::generate().expect("user keypair");
+        let member = agent();
+        let seat_with = |certificate: Option<AgentCertificate>, digest: Option<String>| {
+            let mut seat = GroupMember::new_member(hex_of(&member), None, None, 1);
+            seat.certificate = certificate;
+            seat.certificate_digest = digest;
+            seat
+        };
+        let expired = cert(&owner, &member, Some(NOW - EXPIRY_TOLERANCE_SECS - 1));
+        let expired_digest = owner_cert::certificate_digest_hex(&expired);
+        let due = seat_with(Some(expired.clone()), Some(expired_digest.clone()));
+        assert!(seat_expiry_due(&due, NOW), "past not_after + tau");
+
+        let inside = cert(&owner, &member, Some(NOW - EXPIRY_TOLERANCE_SECS));
+        let inside_digest = owner_cert::certificate_digest_hex(&inside);
+        assert!(
+            !seat_expiry_due(&seat_with(Some(inside), Some(inside_digest)), NOW),
+            "inside tau is not due"
+        );
+
+        assert!(
+            !seat_expiry_due(&seat_with(None, Some(expired_digest)), NOW),
+            "a digest with no bytes is not due"
+        );
+
+        let other = cert(&owner, &member, Some(NOW + 6_000));
+        let other_digest = owner_cert::certificate_digest_hex(&other);
+        assert!(
+            !seat_expiry_due(&seat_with(Some(expired), Some(other_digest)), NOW),
+            "bytes whose digest is not the committed one are not due"
+        );
+
+        let open_ended = cert(&owner, &member, None);
+        let open_digest = owner_cert::certificate_digest_hex(&open_ended);
+        assert!(
+            !seat_expiry_due(&seat_with(Some(open_ended), Some(open_digest)), NOW),
+            "no not_after never expires"
+        );
     }
 
     fn fixture() -> Fixture {

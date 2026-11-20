@@ -145,9 +145,10 @@ async fn owner_recovery_commits_while_a_revoked_member_is_seated() {
 
 /// #1973 (the second defect): a recovery seal refusal that still names
 /// members keeps a typed wait naming them, not the bare
-/// `mandate_received`. The seated member's certificate expired long
-/// ago; expiry is not a tolerated revocation, so the ADR-0038 refusal
-/// stands, and the promoted member's status names that member with
+/// `mandate_received`. The seated member's certificate was signed by a
+/// user key other than the owner; that failure is neither a tolerated
+/// revocation nor a due expiry (#2004), so the ADR-0038 refusal stands,
+/// and the promoted member's status names that member with
 /// `waiting_for_member_eviction`.
 #[tokio::test]
 async fn a_standing_seal_refusal_keeps_a_typed_wait_naming_the_members() {
@@ -157,11 +158,10 @@ async fn a_standing_seal_refusal_keeps_a_typed_wait_naming_the_members() {
     let local_hex = hex::encode(local.agent_id().as_bytes());
     let expired = x0x::identity::AgentKeypair::generate().unwrap();
     let expired_hex = hex::encode(expired.agent_id().as_bytes());
-    // Two hours past expiry: beyond the 300 s expiry clock skew, and a
-    // definitive failure (no fetch in flight, so no grace).
-    let not_after = now_unix().saturating_sub(2 * 3_600);
-    let cert = x0x::identity::AgentCertificate::issue_with_expiry(owner, &expired, Some(not_after))
-        .unwrap();
+    // A definitive failure (no fetch in flight, so no grace) that the
+    // recovery seal does not tolerate.
+    let other_owner = x0x::identity::UserKeypair::generate().unwrap();
+    let cert = x0x::identity::AgentCertificate::issue(&other_owner, &expired).unwrap();
     let mut member = x0x::groups::GroupMember::new_member(expired_hex.clone(), None, None, 1);
     member.certificate_digest = Some(x0x::groups::owner_cert::certificate_digest_hex(&cert));
     member.certificate = Some(cert);
