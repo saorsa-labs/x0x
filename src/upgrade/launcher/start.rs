@@ -36,6 +36,23 @@ pub(super) fn refused(reason: impl Into<String>) -> io::Error {
     io::Error::other(Refused(reason.into()))
 }
 
+/// An error from before the `exec`: the launcher never tried to become the
+/// daemon (a lock wait that ran out, a trial in flight, a missing daemon).
+#[derive(Debug)]
+struct NotExecuted(String);
+
+impl std::fmt::Display for NotExecuted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotExecuted {}
+
+fn not_executed(kind: io::ErrorKind, reason: impl Into<String>) -> io::Error {
+    io::Error::new(kind, NotExecuted(reason.into()))
+}
+
 pub(super) fn is_refusal(error: &io::Error) -> bool {
     error.get_ref().is_some_and(|inner| inner.is::<Refused>())
 }
@@ -159,10 +176,13 @@ pub(super) fn exec_locked_with(
 ) -> io::Error {
     if let (true, Some(trial)) = (enabled, &args.trial) {
         if let Err(error) = issuer::relock(trial, &args.command, held) {
-            return error;
+            if is_refusal(&error) {
+                return error;
+            }
+            return not_executed(error.kind(), error.to_string());
         }
         if held.is_none() {
-            return io::Error::new(
+            return not_executed(
                 io::ErrorKind::NotFound,
                 "the daemon is missing; no install lock is held",
             );
@@ -181,8 +201,12 @@ pub(super) fn exec_locked_with(
 /// a failed read (75) (#2118 review).
 pub(crate) fn exec_failed(args: &issuer::LauncherArgs, error: &io::Error) -> Start {
     if !is_refusal(error) {
+        let tried = !error
+            .get_ref()
+            .is_some_and(|inner| inner.is::<NotExecuted>());
         eprintln!(
-            "x0x-launcher: cannot exec {}: {error}",
+            "x0x-launcher: {} {}: {error}",
+            if tried { "cannot exec" } else { "did not exec" },
             args.command.executable.display()
         );
         return Start::Exit(EXIT_TEMPFAIL);

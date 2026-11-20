@@ -207,9 +207,11 @@ fn daemon_lock_with(
             ) =>
         {
             return Err(start::refused(format!(
-                "cannot create or open the install lock beside {} ({error}); let the \
-                 launcher's account write that directory, or use the plain launcher form",
-                canonical.display()
+                "cannot create or open the install lock {} ({error}); let the launcher's \
+                 account write that directory, remove a lock file another account \
+                 created there (root under sudo, for example) or give it to this \
+                 account, or use the plain launcher form",
+                recovery::lock_path(&canonical).display()
             )));
         }
         Err(error) => {
@@ -324,21 +326,9 @@ fn read_journal(root: &File, uid: u32) -> io::Result<Option<journal::JournalReco
 /// the start is refused instead (#2014 review). A Committed or Restored
 /// trial is finished: its daemon is the installed or the restored bytes.
 fn no_authority(args: &TrialArgs, root: &File) -> io::Result<()> {
-    let bytes = match read_record_at(root, coordinator::TRIAL_FILE_NAME) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        // A symlinked, non-regular or oversized trial record stays so: a
-        // fixed refusal, never a passthrough (#2014 review).
-        Err(error)
-            if error.kind() == io::ErrorKind::InvalidData
-                || error.raw_os_error() == Some(libc::ELOOP) =>
-        {
-            return Err(start::refused(format!("trial record is unusable: {error}")));
-        }
-        Err(error) => return Err(error),
+    let Some(trial) = read_trial(root)? else {
+        return Ok(());
     };
-    let trial: Trial =
-        serde_json::from_slice(&bytes).map_err(|_| start::refused("trial record is unreadable"))?;
     match trial.phase {
         Phase::Committed | Phase::Restored if trial.instance == args.instance => Ok(()),
         _ => Err(start::refused(
@@ -355,14 +345,28 @@ fn committed_trial(args: &TrialArgs, root: &File, phase: journal::Phase) -> io::
     if phase != journal::Phase::HostCommitted {
         return Ok(false);
     }
+    Ok(read_trial(root)?
+        .is_some_and(|trial| trial.phase == Phase::Committed && trial.instance == args.instance))
+}
+
+/// The trial record in the host root; `None` when there is none. A
+/// symlinked, non-regular, oversized or unparseable record stays so: a
+/// fixed refusal, never a passthrough (#2014 review).
+fn read_trial(root: &File) -> io::Result<Option<Trial>> {
     let bytes = match read_record_at(root, coordinator::TRIAL_FILE_NAME) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error)
+            if error.kind() == io::ErrorKind::InvalidData
+                || error.raw_os_error() == Some(libc::ELOOP) =>
+        {
+            return Err(start::refused(format!("trial record is unusable: {error}")));
+        }
         Err(error) => return Err(error),
     };
-    let trial: Trial =
-        serde_json::from_slice(&bytes).map_err(|_| start::refused("trial record is unreadable"))?;
-    Ok(trial.phase == Phase::Committed && trial.instance == args.instance)
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|_| start::refused("trial record is unreadable"))
 }
 
 /// Whether the journal phase gives the launcher trial authority. Before
@@ -953,6 +957,10 @@ mod tests {
         let mut held = None;
         let error = relock(&args, &command, &mut held).unwrap_err();
         assert!(!start::is_refusal(&error), "{error}");
+        assert!(
+            error.to_string().contains("trial is now in flight"),
+            "{error}"
+        );
         assert!(held.is_none());
     }
 
@@ -997,6 +1005,8 @@ mod tests {
         assert_eq!(error.to_string(), "exec");
         assert_eq!(execs, 1);
         assert!(held.is_some());
+        drop(held);
+        assert!(lock_is_free(&args.command.executable));
 
         let other = dir.path().canonicalize().unwrap().join("other-x0xd");
         std::fs::write(&other, b"").unwrap();
@@ -1006,6 +1016,7 @@ mod tests {
             panic!("no exec of another daemon")
         });
         assert!(start::is_refusal(&error), "{error}");
+        assert!(error.to_string().contains("daemon target"), "{error}");
         assert!(held.is_none());
 
         let (trial, command) = matching(&record);
@@ -1015,11 +1026,46 @@ mod tests {
             trial: Some(trial),
             command,
         };
+        let begun = std::time::Instant::now();
         let error = start::exec_locked_with(true, &args, &mut held, |_| {
             panic!("no exec while a trial is unretired")
         });
         assert!(!start::is_refusal(&error), "{error}");
+        assert!(
+            error.to_string().contains("trial is now in flight"),
+            "{error}"
+        );
+        assert!(
+            begun.elapsed() < std::time::Duration::from_secs(5),
+            "no lock wait"
+        );
         assert!(held.is_none());
+    }
+
+    /// #2118 review: a symlinked or oversized trial record on a committed
+    /// host is a typed refusal at the re-read, not a 75 loop.
+    #[test]
+    fn an_unusable_trial_record_on_a_committed_host_is_refused_at_relock() {
+        let (_dir, root, record) = rooted(journal::Phase::HostCommitted);
+        let (args, command) = matching(&record);
+        let trial = root.join(coordinator::TRIAL_FILE_NAME);
+        let target = root.join("elsewhere.json");
+        std::fs::write(&target, b"{}").unwrap();
+        std::os::unix::fs::symlink(&target, &trial).unwrap();
+        let error = relock(&args, &command, &mut None).unwrap_err();
+        assert!(start::is_refusal(&error), "symlink: {error}");
+        std::fs::remove_file(&trial).unwrap();
+        let file = std::fs::File::create(&trial).unwrap();
+        file.set_len(journal::MAX_RECORD_BYTES + 1).unwrap();
+        std::fs::set_permissions(&trial, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let error = relock(&args, &command, &mut None).unwrap_err();
+        assert!(start::is_refusal(&error), "oversized: {error}");
+    }
+
+    /// The bounded wait for the install lock is 30 s (#2118 review).
+    #[test]
+    fn the_install_lock_wait_is_30_s() {
+        assert_eq!(DAEMON_LOCK_WAIT, std::time::Duration::from_secs(30));
     }
 
     /// #2118 review: a typed refusal from the re-read before the `exec` is
@@ -1056,16 +1102,20 @@ mod tests {
         let elsewhere = dir.path().canonicalize().unwrap().join("elsewhere.lock");
         std::fs::write(&elsewhere, b"").unwrap();
         std::os::unix::fs::symlink(&elsewhere, &lock).unwrap();
-        assert!(
-            refused(issue_as(&args, &command, effective_uid())),
-            "symlink"
-        );
+        let not_regular = |what: &str| {
+            let error = issue_as(&args, &command, effective_uid())
+                .err()
+                .expect("refused");
+            assert!(start::is_refusal(&error), "{what}: {error}");
+            assert!(
+                error.to_string().contains("not a regular file"),
+                "{what}: {error}"
+            );
+        };
+        not_regular("symlink");
         std::fs::remove_file(&lock).unwrap();
         std::fs::create_dir(&lock).unwrap();
-        assert!(
-            refused(issue_as(&args, &command, effective_uid())),
-            "directory"
-        );
+        not_regular("directory");
     }
 
     /// #2118 review: an install lock this account cannot create is a typed

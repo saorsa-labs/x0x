@@ -805,7 +805,18 @@ and daemon locks itself.
 
 A typed refusal found by the re-read just before an `exec` is final as at
 the start: exit 78 (the hold under launchd) with the refusal record. Every
-other `exec` failure exits 75.
+other `exec` failure exits 75; the launcher logs "did not exec" when it
+stopped before trying (a lock wait that ran out, a trial in flight, a
+missing daemon) and "cannot exec" when the `exec` itself failed.
+
+The lock scheme rests on one invariant: only an account that is allowed to
+replace the daemon can write the daemon's directory. Such an account can
+replace the daemon, or remove or replace its lock file, without the lock,
+so the lock orders the swaps of the producer, the CLI self-update and the
+daemon's routes; it does not protect against an account that ignores it.
+Every opener of the lock (the launcher, the producer, the CLI self-update
+and the daemon's routes) creates it with mode 0600 and does not follow a
+symlink at its path.
 
 Still open under #2012: wiring the producer into the apply path, the
 multi-instance journal copies, an integrity binding for the journal, and
