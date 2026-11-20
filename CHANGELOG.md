@@ -676,6 +676,27 @@ All notable changes to this project will be documented in this file.
 
 ### Tests and tooling
 
+- **W3-H: four on-demand ADR 0110 S4 rows (#1581, 1581n).** New rows,
+  not in the W3-H gate and run on demand only (`tests/AGENTS.md`); each
+  confirms behaviour the code already has, and none found a defect:
+  `on_demand_1581n_certificate_rebind_run9_owner_never_renews` (every
+  admin's certificate expires and U never renews: every node keeps
+  `waiting_for_admin_certificate_renewal` naming A and D, and no commit
+  lands), `on_demand_1581n_owner_recovery_owner_silent` (the sole admin is
+  revoked and the owner never signs: B and C keep
+  `waiting_for_eligible_admin_revocation` with exit `owner_recovery`,
+  sends stay refused, and no commit lands),
+  `on_demand_1581n_expiry_skew_run7_every_admin_expired_renewal_rebinds_then_evicts`
+  (A, D, E and B expire together; the renewal wait names A, D and E; after
+  U renews A, A self-rebinds and then removes B within the bound) and
+  `on_demand_1581n_certificate_rebind_run2_offline_seat_announced_renewal`
+  (run (5a) with B offline: the designated admin rebinds the announced
+  renewal at expiry, with no rekey). The two wait rows hold for one
+  virtual hour, not the ADR's 24, which is longer than every S4 timer.
+  The harness can now start the owner device with an expiring certificate
+  (`Sim::start_owner_device_until`). Each row has a red proof in its
+  module doc.
+
 - **W3-H: `s4_certificate_rebind` run (5), a renewal signed by another
   user key (#1581).** `w3h_1357_s4_certificate_rebind_pre_cutoff` now has
   B self-rebind a later certificate for its own agent key that a second

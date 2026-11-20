@@ -48,6 +48,28 @@ A core subset; `tests/` holds many more files.
 | `upgrade_integration.rs` | Self-update manifest signing, verification, rollout |
 | `vps_e2e_integration.rs` | VPS bootstrap node end-to-end |
 
+## On-demand W3-H rows
+
+Some W3-H rows only confirm behaviour the code already has. They are
+`#[ignore]`d, their names start with `on_demand_` (not `w3h_`), so the
+W3-H gate's shard plan does not run them, and no CI job runs them. Run them
+in the Linux VM with the shim before a change to the code they cover:
+
+```bash
+just w3h-shim
+python3 scripts/dev/test-isolated.py nextest --all-features --lib -- --run-ignored all --profile w3h --ignore-default-filter -E 'test(/(^|::)on_demand_1581n_/)'
+```
+
+The `1581n` rows (#1581, ADR 0110 S4) take about 100–250 s of real time
+each in a 12-CPU VM:
+
+| Row | ADR 0110 run |
+|---|---|
+| `on_demand_1581n_certificate_rebind_run9_owner_never_renews` | `s4_certificate_rebind` (9), held 1 virtual hour, not 24 |
+| `on_demand_1581n_owner_recovery_owner_silent` | `s4_owner_recovery`, O silent, held 1 virtual hour, not 24 |
+| `on_demand_1581n_expiry_skew_run7_every_admin_expired_renewal_rebinds_then_evicts` | `s4_certificate_expiry_skew` (7) |
+| `on_demand_1581n_certificate_rebind_run2_offline_seat_announced_renewal` | `s4_certificate_rebind` (2) |
+
 ## E2E scripts
 
 | Script | Scope | Notes |

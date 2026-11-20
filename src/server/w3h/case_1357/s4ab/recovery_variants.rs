@@ -33,8 +33,8 @@
 //! Not here (named on #1581): a mandate naming an older head, signed by a
 //! non-owner key, or replayed on a later head (each needs a mandate built
 //! outside the route, which always signs the current head with the local
-//! U); the expired-member form; a released 0.46.1 member L; O silent for
-//! 24 virtual hours; the joiner J's `JoinPendingNotice`; and the
+//! U); the expired-member form; a released 0.46.1 member L; the joiner
+//! J's `JoinPendingNotice`; and the
 //! `SignedPublic` and non-Home `OwnerCertified` variants.
 
 use super::*;
