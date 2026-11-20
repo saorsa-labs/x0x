@@ -754,9 +754,12 @@ and daemon locks itself.
   there is nothing to swap and no one can lock there, so the start goes on
   to the passthrough without the lock: on macOS the missing-daemon wait
   (#1379), elsewhere the `exec` error (75). Before each `exec` attempt it
-  takes the lock and reads the records again; an `exec` that finds the
-  daemon missing releases it, so a producer or a CLI apply never waits for
-  the missing-daemon wait. If a trial is in flight by the time the daemon
+  takes the lock and reads the records again; while the daemon is still
+  missing it does not `exec` at all, so it never becomes the daemon
+  without the lock. An `exec` that finds the daemon missing releases the
+  lock, so a producer or a CLI apply never waits for the missing-daemon
+  wait. After the lock is taken the daemon path is resolved again; a path
+  that now names another file, or none, is a failed read (75). If a trial is in flight by the time the daemon
   is back, the launcher exits 75 and the next start owns the trial.
 - **Lock file it cannot create.** When this account cannot create or open
   the lock file (EACCES, EPERM, EROFS), the start is refused (78) with the

@@ -161,10 +161,22 @@ fn daemon_lock(
     executable: &Path,
     wait: std::time::Duration,
 ) -> io::Result<Option<(PathBuf, File)>> {
+    daemon_lock_with(executable, wait, &|path| path.canonicalize())
+}
+
+/// `daemon_lock` with the path resolution injected, so a test can move the
+/// daemon path while the lock is taken. After the lock is held the path is
+/// resolved again: one that now names another file is a retryable error
+/// (`Interrupted`, a failed read), since the lock taken is not the daemon's.
+fn daemon_lock_with(
+    executable: &Path,
+    wait: std::time::Duration,
+    resolve: &dyn Fn(&Path) -> io::Result<PathBuf>,
+) -> io::Result<Option<(PathBuf, File)>> {
     let missing = |e: &io::Error| {
         e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ENOTDIR)
     };
-    let canonical = match executable.canonicalize() {
+    let canonical = match resolve(executable) {
         Ok(canonical) => canonical,
         Err(error) if missing(&error) => return Ok(None),
         Err(error) => return Err(error),
@@ -189,7 +201,20 @@ fn daemon_lock(
     let deadline = std::time::Instant::now() + wait;
     loop {
         match lock.try_lock() {
-            Ok(()) => return Ok(Some((canonical, lock))),
+            Ok(()) => {
+                return match resolve(executable) {
+                    Ok(again) if again == canonical => Ok(Some((canonical, lock))),
+                    Ok(_) => Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "the daemon path changed while its install lock was taken",
+                    )),
+                    Err(error) if missing(&error) => Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "the daemon went missing while its install lock was taken",
+                    )),
+                    Err(error) => Err(error),
+                };
+            }
             Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
@@ -804,6 +829,71 @@ mod tests {
         relock(&args, &command, &mut held).unwrap();
         assert!(held.is_some(), "locked before the exec");
         assert!(!lock_is_free(&command.executable));
+    }
+
+    /// #2118 review: a trial-form passthrough never `exec`s without the
+    /// install lock. While the daemon is missing it returns `NotFound` for
+    /// the missing-daemon wait instead; once the daemon is back it `exec`s
+    /// under the lock, and an `exec` that finds it missing releases it.
+    #[test]
+    fn a_passthrough_execs_only_under_the_install_lock() {
+        let (_dir, _root, record) = rooted(journal::Phase::Prepared);
+        let (trial, command) = matching(&record);
+        let target = record.plan.daemon.target_path.clone();
+        let args = LauncherArgs {
+            trial: Some(trial),
+            command,
+        };
+        let moved = target.with_extension("away");
+        std::fs::rename(&target, &moved).unwrap();
+        let mut held = None;
+        let mut execs = 0;
+        let error = start::exec_locked_with(true, &args, &mut held, |_| {
+            execs += 1;
+            io::Error::other("exec")
+        });
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(forward::is_missing(&error), "the #1379 wait retries it");
+        assert_eq!(execs, 0, "no exec without the lock");
+        assert!(held.is_none());
+
+        std::fs::rename(&moved, &target).unwrap();
+        let error = start::exec_locked_with(true, &args, &mut held, |command| {
+            assert!(!lock_is_free(&command.executable), "exec under the lock");
+            io::Error::other("exec")
+        });
+        assert_eq!(error.to_string(), "exec");
+        assert!(held.is_some());
+
+        let error = start::exec_locked_with(true, &args, &mut held, |_| {
+            io::Error::from(io::ErrorKind::NotFound)
+        });
+        assert!(forward::is_missing(&error));
+        assert!(held.is_none(), "released for the missing-daemon wait");
+        assert!(lock_is_free(&args.command.executable));
+    }
+
+    /// #2118 review: a daemon path that names another file once the lock is
+    /// held is a retryable error, not the lock of the wrong file.
+    #[test]
+    fn a_daemon_path_that_moves_while_locking_is_retried() {
+        let (dir, _root, record) = rooted(journal::Phase::Prepared);
+        let target = record.plan.daemon.target_path.clone();
+        let other = dir.path().canonicalize().unwrap().join("other-x0xd");
+        let calls = std::cell::Cell::new(0);
+        let resolve = |_: &Path| {
+            calls.set(calls.get() + 1);
+            Ok(if calls.get() == 1 {
+                target.clone()
+            } else {
+                other.clone()
+            })
+        };
+        let error =
+            daemon_lock_with(&target, std::time::Duration::from_secs(1), &resolve).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(!start::is_refusal(&error));
+        assert_eq!(calls.get(), 2);
     }
 
     /// #2118 review: a trial that is in flight when the daemon is back is

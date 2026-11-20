@@ -136,18 +136,43 @@ pub(crate) fn start(
     }
 }
 
-/// Before a passthrough `exec`: a trial-form start that found no daemon
-/// holds no install lock, so it takes the lock (and reads the records
-/// again) before it becomes the daemon (#2118 review). Nothing while the
-/// engine is held.
-pub(crate) fn relock(
+/// One passthrough `exec` attempt (#2118 review). A trial-form start takes
+/// the daemon install lock and reads the records again before it becomes
+/// the daemon; while the daemon is missing it holds no lock and does not
+/// `exec` at all, but returns `NotFound`, so the missing-daemon wait
+/// (#1379) tries again later. An `exec` that finds the daemon missing
+/// releases the lock, so no producer or CLI apply waits on that wait.
+/// Nothing changes while the engine is held.
+pub(crate) fn exec_locked(
     args: &issuer::LauncherArgs,
     held: &mut Option<std::fs::File>,
-) -> io::Result<()> {
-    match &args.trial {
-        Some(trial) if ENABLED => issuer::relock(trial, &args.command, held),
-        _ => Ok(()),
+    exec: impl FnMut(&forward::DaemonCommand) -> io::Error,
+) -> io::Error {
+    exec_locked_with(ENABLED, args, held, exec)
+}
+
+pub(super) fn exec_locked_with(
+    enabled: bool,
+    args: &issuer::LauncherArgs,
+    held: &mut Option<std::fs::File>,
+    mut exec: impl FnMut(&forward::DaemonCommand) -> io::Error,
+) -> io::Error {
+    if let (true, Some(trial)) = (enabled, &args.trial) {
+        if let Err(error) = issuer::relock(trial, &args.command, held) {
+            return error;
+        }
+        if held.is_none() {
+            return io::Error::new(
+                io::ErrorKind::NotFound,
+                "the daemon is missing; no install lock is held",
+            );
+        }
     }
+    let error = exec(&args.command);
+    if forward::is_missing(&error) {
+        *held = None;
+    }
+    error
 }
 
 /// Run one trial-form start between the two refusal-record steps: remove

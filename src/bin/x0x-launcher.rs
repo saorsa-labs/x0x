@@ -72,18 +72,9 @@ fn main() -> std::process::ExitCode {
         // launchd restarts every exit of a KeepAlive job, so a missing
         // daemon is waited for instead (#1379). systemd's start limit ends
         // its restarts, so there the exit stays.
-        // Each `exec` happens under the install lock: a start that found no
-        // daemon takes it first. While the daemon is missing the lock is
-        // not held, so a producer or CLI apply never waits for this wait.
-        let exec = |command: &launcher::forward::DaemonCommand| {
-            if let Err(error) = launcher::start::relock(&args, &mut held) {
-                return error;
-            }
-            let error = launcher::forward::exec_daemon(command);
-            if launcher::forward::is_missing(&error) {
-                held = None;
-            }
-            error
+        // Each `exec` happens under the install lock; see `exec_locked`.
+        let exec = |_: &launcher::forward::DaemonCommand| {
+            launcher::start::exec_locked(&args, &mut held, launcher::forward::exec_daemon)
         };
         #[cfg(target_os = "macos")]
         let error = launcher::forward::exec_daemon_when_present(
