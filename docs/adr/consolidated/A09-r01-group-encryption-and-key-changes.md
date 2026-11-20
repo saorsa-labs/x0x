@@ -363,9 +363,13 @@ itself: no eviction removes the creator, and only the owner
 re-certifying the creator's agent ends it. So the promoted member's wait
 is now `waiting_for_creator_certificate_renewal`, naming the creator,
 and its status carries `"remedy": "owner_recertifies_creator"`. This
-holds only when the creator is among the pending seats of the refusal;
-any other grace or digest-pending hold keeps the bare
-`mandate_received`, because it ends when its fetch lands. The rule is
+holds only when the seal's verdict holds the creator digest-pending on
+its own expired committed certificate. A creator in grace, whose renewed
+certificate is announced and still being fetched, keeps the bare
+`mandate_received`, because the owner has already re-certified it; so
+does every other grace or digest-pending hold, because it ends when its
+fetch lands. Once the renewed certificate resolves, the next recovery
+attempt commits and the wait ends with the mandate. The rule is
 unchanged: recovery still does not proceed past an expired creator seat.
 A rule that lets it proceed needs a decision on who then removes or
 renews that seat, and is not part of this change. No wire format

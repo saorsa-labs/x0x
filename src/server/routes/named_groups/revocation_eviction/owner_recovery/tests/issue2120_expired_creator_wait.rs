@@ -85,34 +85,156 @@ async fn an_expired_creator_certificate_keeps_a_typed_wait_naming_the_creator() 
     state.agent.shutdown().await;
 }
 
-/// #2120: a grace hold on a seat that is not the creator still ends by
-/// itself (the certificate fetch lands), so it keeps the bare
-/// `mandate_received` with no remedy.
+/// #2120: a digest-pending hold on a seat that is not the creator (its
+/// committed digest is known, its certificate bytes are not) ends when the
+/// bytes arrive, so it keeps the bare `mandate_received` with no remedy.
 #[tokio::test]
-async fn a_grace_hold_on_another_seat_keeps_the_bare_wait() {
+async fn a_digest_pending_seat_that_is_not_the_creator_keeps_the_bare_wait() {
     let (_dir, state, mut info, _admin_hex) = recovery_fixture().await;
     let member = x0x::identity::AgentKeypair::generate().unwrap();
     seat_member(&state, &mut info, &member, None);
     let stable = commit_attempt(&state, &mut info).await;
+    assert_bare_wait(&state, &stable).await;
+    state.agent.shutdown().await;
+}
 
+/// #2120: a creator whose renewal fetch is in flight (its new digest is
+/// announced, the certificate has not resolved here) is in grace, not
+/// held. Its renewal is under way, so the wait stays bare and does not
+/// tell the owner to re-certify.
+#[tokio::test]
+async fn a_creator_renewal_in_flight_keeps_the_bare_wait() {
+    let (_dir, state, mut info, _admin_hex) = recovery_fixture().await;
+    let creator = x0x::identity::AgentKeypair::generate().unwrap();
+    let creator_hex = seat_member(
+        &state,
+        &mut info,
+        &creator,
+        Some(now_unix().saturating_sub(2 * 3_600)),
+    );
+    info.creator = creator.agent_id();
+    let owner = state.agent.identity().user_keypair().unwrap();
+    let renewed = x0x::identity::AgentCertificate::issue(owner, &creator).unwrap();
+    announce(&state, &creator, None, Some(renewed_digest(&renewed))).await;
+    assert!(
+        info.creator_expired_certificate_hold(&creator_hex, now_unix()),
+        "precondition: the creator's committed certificate is expired"
+    );
+    let stable = commit_attempt(&state, &mut info).await;
+    assert_bare_wait(&state, &stable).await;
+    state.agent.shutdown().await;
+}
+
+/// #2120: once the owner re-certifies the creator and the renewed
+/// certificate resolves here, the next recovery attempt (the retry the
+/// worker runs) commits, and the typed wait is gone with the mandate.
+#[tokio::test]
+async fn the_typed_wait_clears_once_the_owner_recertifies_the_creator() {
+    let (_dir, state, mut info, _admin_hex) = recovery_fixture().await;
+    let creator = x0x::identity::AgentKeypair::generate().unwrap();
+    seat_member(
+        &state,
+        &mut info,
+        &creator,
+        Some(now_unix().saturating_sub(2 * 3_600)),
+    );
+    info.creator = creator.agent_id();
+    let stable = commit_attempt(&state, &mut info).await;
+    {
+        let inner = state.revocation_evictions.inner.lock().await;
+        let wait = inner.orc.pending.get(&stable).and_then(|p| p.wait.clone());
+        assert_eq!(
+            wait.map(|w| w.0),
+            Some(CREATOR_WAIT),
+            "precondition: the typed creator wait"
+        );
+    }
+
+    let owner = state.agent.identity().user_keypair().unwrap();
+    let renewed = x0x::identity::AgentCertificate::issue(owner, &creator).unwrap();
+    let digest = renewed_digest(&renewed);
+    announce(&state, &creator, Some(renewed), Some(digest)).await;
+    try_commit(&state, &stable).await;
+
+    let inner = state.revocation_evictions.inner.lock().await;
+    assert!(
+        !inner.orc.pending.contains_key(&stable),
+        "the recovery committed, so no wait is left"
+    );
+    drop(inner);
+    let local_hex = hex::encode(state.agent.identity().agent_keypair().agent_id().as_bytes());
+    assert_eq!(
+        state.named_groups.read().await[&stable].members_v2[&local_hex].role,
+        x0x::groups::GroupRole::Admin,
+        "the recovery seated the promoted member as Admin"
+    );
+    let status = status_json(&state, &stable).await;
+    assert!(
+        status["promoted_member"].is_null(),
+        "no promoted-member wait in the status: {status}"
+    );
+    state.agent.shutdown().await;
+}
+
+async fn assert_bare_wait(state: &Arc<AppState>, stable: &str) {
     let inner = state.revocation_evictions.inner.lock().await;
     let pending = inner
         .orc
         .pending
-        .get(&stable)
+        .get(stable)
         .expect("the mandate stays held while the seal refuses");
-    assert!(pending.wait.is_none(), "a grace hold keeps the bare wait");
+    assert!(
+        pending.wait.is_none(),
+        "the wait stays bare: {:?}",
+        pending.wait
+    );
     drop(inner);
-
-    let status = status_json(&state, &stable).await;
+    let status = status_json(state, stable).await;
     let promoted = &status["promoted_member"];
     assert_eq!(promoted["state"], "mandate_received");
     assert!(promoted.get("remedy").is_none(), "no remedy: {promoted}");
-    state.agent.shutdown().await;
+}
+
+fn renewed_digest(cert: &x0x::identity::AgentCertificate) -> [u8; 32] {
+    x0x::announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone()))
+}
+
+/// Seed the identity-discovery cache as a verified announce does: the
+/// announced digest, and the certificate once it has resolved here.
+async fn announce(
+    state: &Arc<AppState>,
+    agent: &x0x::identity::AgentKeypair,
+    cert: Option<x0x::identity::AgentCertificate>,
+    digest: Option<[u8; 32]>,
+) {
+    let agent_id = agent.agent_id();
+    state.agent.identity_discovery_cache().write().await.insert(
+        agent_id,
+        x0x::DiscoveredAgent {
+            agent_id,
+            machine_id: x0x::identity::MachineId([0u8; 32]),
+            user_id: cert.as_ref().and_then(|c| c.user_id().ok()),
+            self_name: None,
+            addresses: Vec::new(),
+            announced_at: 0,
+            last_seen: 0,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: cert.as_ref().and_then(|c| c.not_after()),
+            agent_certificate: cert,
+            agent_public_key: Vec::new(),
+            cert_digest: digest,
+        },
+    );
 }
 
 /// #2120: the wait builder names the creator only when the creator is
-/// among the pending seats and is held on its own expired certificate.
+/// digest-pending and is held on its own expired certificate.
 #[test]
 fn the_creator_wait_needs_a_pending_held_creator() {
     let owner = x0x::identity::UserKeypair::generate().unwrap();
@@ -139,19 +261,19 @@ fn the_creator_wait_needs_a_pending_held_creator() {
     info.members_v2
         .insert(creator_hex.clone(), seat(now_unix().saturating_sub(7_200)));
     assert_eq!(
-        held_creator_wait(&info, &pending),
+        held_creator_wait(&info, &pending, now_unix()),
         Some((CREATOR_WAIT, vec![*creator.agent_id().as_bytes()]))
     );
     assert_eq!(
-        held_creator_wait(&info, &["aa".repeat(32)]),
+        held_creator_wait(&info, &["aa".repeat(32)], now_unix()),
         None,
-        "the creator is not among the pending seats"
+        "the creator is not digest-pending"
     );
 
     info.members_v2
         .insert(creator_hex.clone(), seat(now_unix().saturating_add(7_200)));
     assert_eq!(
-        held_creator_wait(&info, &pending),
+        held_creator_wait(&info, &pending, now_unix()),
         None,
         "a creator with a valid certificate is not held"
     );

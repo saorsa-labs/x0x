@@ -1075,16 +1075,19 @@ async fn accept_mandate(state: &Arc<AppState>, mandate: orc::SignedOwnerRecovery
 }
 
 /// #2120: the typed wait for a recovery seal that an `OwnerCertMemberPending`
-/// refusal holds on the creator's own expired certificate. `None` when the
-/// creator is not among the pending seats, or its seat is not held that
-/// way, so an ordinary grace hold keeps the bare `mandate_received`.
+/// refusal holds on the creator's own expired certificate. `digest_pending`
+/// is the verdict's digest-pending class and `now_unix` its evidence clock.
+/// `None` when the creator is not digest-pending, or its seat is not held
+/// on its own expired certificate, so an ordinary hold keeps the bare
+/// `mandate_received`.
 fn held_creator_wait(
     next: &GroupInfo,
-    pending: &[String],
+    digest_pending: &[String],
+    now_unix: u64,
 ) -> Option<(&'static str, Vec<[u8; 32]>)> {
     let creator_hex = hex::encode(next.creator.as_bytes());
-    let held = pending.contains(&creator_hex)
-        && next.creator_expired_certificate_hold(&creator_hex, now_unix());
+    let held = digest_pending.contains(&creator_hex)
+        && next.creator_expired_certificate_hold(&creator_hex, now_unix);
     held.then(|| {
         (
             x0x::groups::eviction::WaitingCause::WaitingForCreatorCertificateRenewal.as_str(),
@@ -1522,7 +1525,20 @@ async fn finish_commit(
             // and keeps the bare `mandate_received` until the hold
             // ends, unless the hold is the creator's own expired
             // certificate (#2120): that hold never ends by itself, so
-            // the wait names the creator and the owner's remedy.
+            // the wait names the creator and the owner's remedy. The
+            // refusal does not carry the verdict's classes, so the
+            // verdict is taken again over fresh evidence, on a copy:
+            // only a digest-pending creator is that hold. A creator in
+            // grace has a renewal fetch in flight and keeps the bare wait.
+            let pending_creator_hold = match &error {
+                x0x::groups::state_commit::ApplyError::OwnerCertMemberPending { .. } => {
+                    let evidence = ng::owner_cert_seal_evidence(state, &next).await;
+                    let digest_pending =
+                        next.clone().owner_cert_verdict(&evidence).digest_pending();
+                    held_creator_wait(&next, &digest_pending, evidence.now_unix())
+                }
+                _ => None,
+            };
             let wait = match &error {
                 x0x::groups::state_commit::ApplyError::OwnerCertifiedEvictionRequired {
                     members,
@@ -1531,9 +1547,9 @@ async fn finish_commit(
                     x0x::groups::eviction::WaitingCause::WaitingForMemberEviction.as_str(),
                     members.iter().filter_map(|id| agent_bytes(id)).collect(),
                 )),
-                x0x::groups::state_commit::ApplyError::OwnerCertMemberPending {
-                    members, ..
-                } => held_creator_wait(&next, members),
+                x0x::groups::state_commit::ApplyError::OwnerCertMemberPending { .. } => {
+                    pending_creator_hold
+                }
                 _ => None,
             };
             set_wait(state, &stable, wait).await;
