@@ -16,6 +16,7 @@ mod group_recovery;
 mod gss_share_hold;
 pub(in crate::server) use gss_share_hold::GssShareHolds;
 mod key_republish;
+mod listener_lifecycle;
 pub(in crate::server) use key_republish::republish_outstanding_keyless_seats;
 pub(in crate::server) use key_republish::PendingKeyRepublish;
 mod revocation_eviction;
@@ -22396,8 +22397,17 @@ pub(in crate::server) async fn apply_listener_metadata_event(
     }
     // #1366: a remote policy change from either transport (topic or direct
     // lane) moves the public listener, after the apply locks are released.
-    if policy_update && applied.as_ref().is_some_and(|result| result.accepted) {
-        reconcile_public_message_listener(state, &group_id_for_rearm).await;
+    if applied.as_ref().is_some_and(|result| result.accepted) {
+        if policy_update {
+            reconcile_public_message_listener(state, &group_id_for_rearm).await;
+        } else {
+            // #1366: an accepted event can take the record away (a remote
+            // self-removal) or withdraw it. Stop the public listener that
+            // no stored record needs any more. Starts stay with the paths
+            // that seat the record.
+            listener_lifecycle::retire_unwanted_public_message_listener(state, &group_id_for_rearm)
+                .await;
+        }
     }
     applied
 }
@@ -25759,31 +25769,25 @@ pub(in crate::server) async fn reconcile_public_message_listener(
     group_id: &str,
 ) {
     let wanted = public_message_listener_wanted(&*state.named_groups.read().await, group_id);
-    let Some((stable_id, wanted)) = wanted else {
-        return;
+    let retire_key = match wanted {
+        Some((stable_id, true)) => {
+            // The insert reads the desired state again under the registry lock.
+            spawn_public_message_listener(Arc::clone(state), stable_id).await;
+            return;
+        }
+        Some((stable_id, false)) => stable_id,
+        // #1366: no stored record needs the listener any more (a leave, a
+        // self-removal or a refused join stub took the record away).
+        None => group_id.to_string(),
     };
-    if wanted {
-        // The insert reads the desired state again under the registry lock.
-        spawn_public_message_listener(Arc::clone(state), stable_id).await;
-        return;
-    }
     // #1366 test hook: let a concurrent policy change run between the
     // decision above and the removal below.
     #[cfg(test)]
     tokio::task::yield_now().await;
-    let mut tasks = state.public_message_tasks.write().await;
     // A later policy change can have made the listener wanted again, and
-    // its reconcile can have installed it: read the desired state again
-    // under the registry lock, so this removal does not undo it.
-    let still_unwanted =
-        public_message_listener_wanted(&*state.named_groups.read().await, &stable_id)
-            .is_none_or(|(_, wanted)| !wanted);
-    if !still_unwanted {
-        return;
-    }
-    if let Some(handle) = tasks.remove(&stable_id) {
-        handle.abort();
-    }
+    // its reconcile can have installed it: the removal reads the desired
+    // state again under the registry lock, so it does not undo that.
+    listener_lifecycle::retire_unwanted_public_message_listener(state, &retire_key).await;
 }
 
 /// POST /groups/:id/invite — generate an invite link (admin+; body optional).
@@ -34509,7 +34513,14 @@ pub(in crate::server) async fn leave_group(
     state.treekem_groups.write().await.remove(&id);
     remove_treekem_persistence_for_group_id(&state, &id, "leave_group").await;
     save_mls_groups(&state).await;
-    stop_named_group_metadata_listener(&state, &id).await;
+    // #1366: the record is gone, so neither listener is wanted. The
+    // public-message listener is keyed by the stable id.
+    listener_lifecycle::reconcile_named_group_listeners(
+        &state,
+        &id,
+        Some(named_group_metadata_event_group_id(&event)),
+    )
+    .await;
 
     (
         StatusCode::OK,
@@ -39287,7 +39298,10 @@ pub(in crate::server) async fn import_group_card(
             "named-group state is not directory-durable",
         );
     }
-    ensure_named_group_listeners(Arc::clone(&state), &group_id).await;
+    // #1366: a refreshed card can change the stub's policy. Start the
+    // listeners the stored record needs and stop the ones it no longer
+    // needs (a flip to `MlsEncrypted` stops the public-message listener).
+    listener_lifecycle::reconcile_named_group_listeners(&state, &group_id, None).await;
 
     (
         StatusCode::OK,
@@ -49741,6 +49755,11 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
             if let Some(token) = listener_token {
                 stop_named_group_metadata_listener_if_token(state, local_group_key, token).await;
             }
+            // #1366: the stub is gone; stop its public-message listener,
+            // which is keyed by the stable id.
+            for key in [local_group_key, event_group_id] {
+                listener_lifecycle::retire_unwanted_public_message_listener(state, key).await;
+            }
             state.mls_groups.write().await.remove(local_group_key);
             state.treekem_groups.write().await.remove(local_group_key);
         }
@@ -55405,6 +55424,7 @@ pub(in crate::server) mod tests {
     pub(in crate::server) mod issue1275_listener_apply_shield;
     mod issue1288_bootstrap_outbox_shutdown;
     mod issue1347_join_request_token_class;
+    mod issue1366_listener_lifecycle;
     mod issue1366_metadata_listener;
     pub(in crate::server) mod issue1366_public_listener;
     pub(in crate::server) mod issue1368_crash_matrix;

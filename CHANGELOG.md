@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Group listeners stop when no stored record needs them (#1366 second
+  slice; A08 amendment of 20 Nov 2026).** A self-leave, a remote
+  self-removal, a refused join stub and a card refresh that made a stub
+  `MlsEncrypted` left the group's public-message listener running until a
+  restart. Each now stops it; a self-leave also stops the metadata
+  listener through the same rule.
+
 - **No launchd restart loop on a missing daemon (#1379; A14 amendment of
   19 Nov 2026).** On macOS the launcher no longer exits when the daemon
   path does not exist. It tries again after a pause that doubles from 1 s
