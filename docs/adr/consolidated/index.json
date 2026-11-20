@@ -75,14 +75,14 @@
       "revision": 1,
       "path": "A10-r01-shared-data-files-and-synchronization.md",
       "title": "Shared Data Files and Synchronization",
-      "sha256": "45ef5ad147a2b0d27b92e6b302cff614307a880f488838491763793a5ff46f59"
+      "sha256": "2e65d48a3e26d9b3f7483efa9c640d24470472c1efd47729fc981d52a4792b92"
     },
     {
       "id": "A11",
       "revision": 1,
       "path": "A11-r01-local-api-applications-and-human-interface.md",
       "title": "Local API Applications and Human Interface",
-      "sha256": "5b356b9139d52c5e25ff5e3dcfb051a32e218d26870acc9163dadfd9aacac378"
+      "sha256": "09319181ef5546931292b592e7e9e743a245050b4d0941c8f161bcaa1eed9d3d"
     },
     {
       "id": "A12",
@@ -103,7 +103,7 @@
       "revision": 1,
       "path": "A14-r01-health-updates-and-recovery.md",
       "title": "Health Updates and Recovery",
-      "sha256": "e311ef6a6ddbd42f34c14db50b39500be9e63a4d58c2f28e39afbb01f4ccc812"
+      "sha256": "515076401e0371bc24f9cc2c76eb774df1e54aa235f1be67d8f4468b7d664b33"
     },
     {
       "id": "A15",

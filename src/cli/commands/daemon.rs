@@ -328,7 +328,7 @@ async fn check_store_integrity(client: &DaemonClient) -> DoctorCheck {
 }
 
 /// The store-integrity verdict for a `GET /stores` body.
-fn store_integrity_check(val: &serde_json::Value) -> DoctorCheck {
+pub(crate) fn store_integrity_check(val: &serde_json::Value) -> DoctorCheck {
     let stores = val
         .get("stores")
         .and_then(|v| v.as_array())

@@ -277,6 +277,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
     },
     EndpointDef {
         method: Method::Post,
+        path: "/report",
+        cli_name: "report",
+        description: "Authenticated (durable owner): build a redacted problem-report bundle and store it under the data directory's reports/ (#1354); one per minute; nothing is sent",
+        category: "status",
+        request: RequestSpec::None,
+    },
+    EndpointDef {
+        method: Method::Post,
         path: "/auth/session",
         cli_name: "auth session",
         description: "Exchange the durable API token for a short-lived browser session token",
