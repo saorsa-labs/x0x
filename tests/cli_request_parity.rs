@@ -762,6 +762,7 @@ const SERVER_SOURCES: &[&str] = &[
     "src/server/auth.rs",
     "src/server/delegations.rs",
     "src/server/data_read.rs",
+    "src/server/report.rs",
     "src/server/sse.rs",
     "src/server/ws.rs",
     "src/server/routes/mod.rs",

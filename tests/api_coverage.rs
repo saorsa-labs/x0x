@@ -47,6 +47,11 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Get, "/health", daemon_api_health),
     covered!(Get, "/status", daemon_api_status),
     covered!(Post, "/shutdown", daemon_api_shutdown_with_sse_client),
+    covered!(
+        Post,
+        "/report",
+        post_report_route_writes_a_redacted_local_bundle
+    ),
     covered!(Post, "/auth/session", daemon_api_auth_session_exchange),
     covered!(
         Post,
@@ -720,6 +725,12 @@ const COVERED: &[CoveredEndpoint] = &[
 ];
 
 const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
+    // #1354 slice 2: the problem-report route's coverage lives in the
+    // report lib tests.
+    (
+        "src/server/report_tests.rs",
+        include_str!("../src/server/report_tests.rs"),
+    ),
     // #1109: the queued-send cancel route's coverage lives in the direct
     // route lib tests.
     (

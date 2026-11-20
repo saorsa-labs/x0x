@@ -72,6 +72,10 @@ enum Commands {
     },
     /// Stop a running daemon.
     Stop,
+    /// Create a redacted problem-report bundle in the daemon's data
+    /// directory (`reports/`). The bundle stays on this machine; nothing
+    /// is sent. One report per minute.
+    Report,
     /// List running daemon instances. [dev]
     #[command(hide = true)]
     Instances,
@@ -3618,6 +3622,7 @@ async fn run(
             Some(WsSub::Direct { backfill }) => commands::ws::direct(&client, backfill).await,
         },
         Commands::Stop => commands::daemon::stop(&client).await,
+        Commands::Report => commands::report::create(&client).await,
         Commands::Doctor { .. } => {
             anyhow::bail!("command dispatched earlier — dispatch table out of sync")
         }

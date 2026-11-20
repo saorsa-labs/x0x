@@ -526,6 +526,8 @@ pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
                     | "/home/rename"
                     | "/home/seat"
                     | "/upgrade/apply"
+                    // #1354: a problem report reads the daemon log tail.
+                    | "/report"
                     // #1169: the announce publishes on the release topic for
                     // the whole network, an owner act like the apply.
                     | "/upgrade/announce"
@@ -1275,6 +1277,7 @@ mod tests {
             (Method::POST, "/upgrade/apply"),
             (Method::POST, "/upgrade/announce"),
             (Method::POST, "/upgrade/clear-hold"),
+            (Method::POST, "/report"),
             (Method::POST, "/gui/show"),
         ] {
             // The route is classified durable-owner…
