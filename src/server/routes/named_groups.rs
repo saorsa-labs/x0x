@@ -17218,7 +17218,18 @@ pub(in crate::server) async fn apply_named_group_metadata_event(
     // recovery not yet installed here waits for it.
     let newly_held = verified
         && revocation_eviction::owner_recovery::hold_unchained_event(state, &event, &sender).await;
-    let held_group = newly_held.then(|| named_group_metadata_event_group_id(&event).to_string());
+    let group_id = named_group_metadata_event_group_id(&event).to_string();
+    let held_group = newly_held.then(|| group_id.clone());
+    // #2124: the local keys of the event's group, read before the apply,
+    // which can remove the record. The metadata registry is keyed by them.
+    let local_keys: Vec<String> = state
+        .named_groups
+        .read()
+        .await
+        .iter()
+        .filter(|(key, info)| *key == &group_id || info.stable_group_id() == group_id)
+        .map(|(key, _)| key.clone())
+        .collect();
     let applied = apply_named_group_metadata_event_with_binding(
         state,
         event,
@@ -17236,6 +17247,12 @@ pub(in crate::server) async fn apply_named_group_metadata_event(
         if let Some(group_key) = local_group_key_for_parking(state, &group_id).await {
             Box::pin(replay_parked_gss_removals(state, &group_key)).await;
         }
+    }
+    // #2124: an accepted event can take the record away (a self-removal) or
+    // withdraw it, on any path that applies it.
+    if applied.accepted {
+        listener_lifecycle::retire_listeners_after_accepted_apply(state, &group_id, &local_keys)
+            .await;
     }
     applied
 }
@@ -22386,16 +22403,6 @@ pub(in crate::server) async fn apply_listener_metadata_event(
     let group_id = named_group_metadata_event_group_id(&event).to_string();
     let group_id_for_rearm = group_id.clone();
     let policy_update = matches!(event, NamedGroupMetadataEvent::PolicyUpdated { .. });
-    // #1366: the local keys of the event's group, read before the apply,
-    // which can remove the record. The metadata registry is keyed by them.
-    let local_keys: Vec<String> = state
-        .named_groups
-        .read()
-        .await
-        .iter()
-        .filter(|(key, info)| *key == &group_id || info.stable_group_id() == group_id)
-        .map(|(key, _)| key.clone())
-        .collect();
     // Boxed: the apply future is large; keep it off this caller's frame.
     let applied = state
         .run_shielded(Box::pin(async move {
@@ -22426,21 +22433,10 @@ pub(in crate::server) async fn apply_listener_metadata_event(
     }
     // #1366: a remote policy change from either transport (topic or direct
     // lane) moves the public listener, after the apply locks are released.
-    if applied.as_ref().is_some_and(|result| result.accepted) {
-        if policy_update {
-            reconcile_public_message_listener(state, &group_id_for_rearm).await;
-        } else {
-            // #1366: an accepted event can take the record away (a remote
-            // self-removal) or withdraw it. Stop the listeners that no
-            // stored record needs any more. Starts stay with the paths
-            // that seat the record. The metadata stop comes last: when the
-            // caller is that metadata listener, the stop ends the caller.
-            listener_lifecycle::retire_unwanted_public_message_listener(state, &group_id_for_rearm)
-                .await;
-            for key in &local_keys {
-                listener_lifecycle::retire_unwanted_metadata_listener(state, key).await;
-            }
-        }
+    // The apply itself stops the listeners a removal or withdrawal leaves
+    // unneeded (#2124).
+    if policy_update && applied.as_ref().is_some_and(|result| result.accepted) {
+        reconcile_public_message_listener(state, &group_id_for_rearm).await;
     }
     applied
 }
@@ -25751,18 +25747,35 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
     // since: read the desired state again under this lock (lock order:
     // `public_message_tasks`, then `named_groups`; no path takes them the
     // other way round), so a reconcile that ran in between is not undone.
-    let wanted = public_message_listener_wanted(&*state.named_groups.read().await, &group_id);
+    let groups = state.named_groups.read().await;
+    let wanted = public_message_listener_wanted(&groups, &group_id);
     // A group with no stored record (`None`) is installed on purpose: the
     // public-cache read `GET /groups/:id/messages` fails open for an unknown
     // group and listens on the supplied id. So an install that started
     // before a removal can still land after the removal's retire, and
     // nothing stops it until a restart (a known limit, A08 of 20 Nov 2026).
-    if tasks.contains_key(&group_id) || wanted.is_some_and(|(_, wanted)| !wanted) {
+    // #2124: such listeners are capped, so a local caller cannot grow the
+    // registry without bound; past the cap the read serves the cache alone.
+    let over_unrecorded_cap = wanted.is_none()
+        && tasks
+            .keys()
+            .filter(|key| public_message_listener_wanted(&groups, key).is_none())
+            .count()
+            >= MAX_UNRECORDED_PUBLIC_MESSAGE_LISTENERS;
+    drop(groups);
+    if tasks.contains_key(&group_id)
+        || wanted.is_some_and(|(_, wanted)| !wanted)
+        || over_unrecorded_cap
+    {
         handle.abort();
         return;
     }
     tasks.insert(group_id, handle);
 }
+
+/// #2124: the most public-message listeners that run for groups with no
+/// stored record (the fail-open install of `GET /groups/:id/messages`).
+pub(in crate::server) const MAX_UNRECORDED_PUBLIC_MESSAGE_LISTENERS: usize = 64;
 
 /// #1366: the stable id of `group_id` and whether its public-message
 /// listener must run. `group_id` is a local map key or a stable id. The
@@ -29998,6 +30011,8 @@ async fn wipe_local_group_crypto_material(
             messages.remove(alias);
         }
     }
+    #[cfg(test)]
+    listener_lifecycle::note_listener_step(state);
     {
         let mut tasks = state.group_metadata_tasks.write().await;
         for alias in &aliases {
@@ -49839,6 +49854,13 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
             // write lock — no TOCTOU).
             if let Some(token) = listener_token {
                 stop_named_group_metadata_listener_if_token(state, local_group_key, token).await;
+            } else if clear_pin_after_release {
+                // #2124: the legacy (post-restart) TimedOut owner holds no
+                // attempt, so no token; the restart started the stub's
+                // listener. Stop it unless a stored record under this key
+                // needs it again. An owned attempt with no token keeps the
+                // J2 rule: a newer registration survives.
+                listener_lifecycle::retire_unwanted_metadata_listener(state, local_group_key).await;
             }
             // #1366: the stub is gone; stop its public-message listener,
             // which is keyed by the stable id (read from the stored stub).

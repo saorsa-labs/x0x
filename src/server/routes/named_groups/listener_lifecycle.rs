@@ -20,19 +20,36 @@
 //!
 //! Lock order: a registry lock (`group_metadata_tasks` or
 //! `public_message_tasks`), then `named_groups`, as in the install paths.
-//! The callers hold no `named_groups` lock and no registry lock. Some hold
-//! the per-group membership mutex, which these functions never take.
+//! The callers hold no `named_groups` lock, no registry lock and no card
+//! cache. Some hold the per-group membership mutex, which these functions
+//! never take.
 
 use super::*;
+
+/// Test hook: no listener step may run while its caller holds
+/// `group_card_cache`. Another path holds `named_groups` while it waits for
+/// that cache, so the other order could deadlock. The record is per state,
+/// so tests that share a process do not see each other's steps.
+#[cfg(test)]
+pub(super) fn note_listener_step(state: &AppState) {
+    let recorders = &state.named_group_test_recorders;
+    recorders
+        .listener_steps
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if state.group_card_cache.try_write().is_err() {
+        recorders
+            .listener_step_held_card_cache
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 /// Stop the public-message listener of `group_id` when no stored record
 /// needs it. `group_id` is a local map key or a stable id. The desired
 /// state is read under the registry write lock, so a concurrent install
 /// for a record that needs the listener is kept.
 pub(super) async fn retire_unwanted_public_message_listener(state: &AppState, group_id: &str) {
-    // #1366 test hook: no caller may hold the card cache here (lock order).
     #[cfg(test)]
-    super::tests::issue1366_listener_lifecycle::note_listener_step(state);
+    note_listener_step(state);
     // Cheap check first: most callers run after an apply that changed no
     // listener input, so the registry write lock is not needed.
     if public_message_listener_wanted(&*state.named_groups.read().await, group_id)
@@ -62,6 +79,8 @@ pub(super) async fn retire_unwanted_public_message_listener(state: &AppState, gr
 /// given and only for a record stored under exactly that key, so the
 /// wanted rule is per key.
 pub(super) async fn retire_unwanted_metadata_listener(state: &AppState, group_key: &str) {
+    #[cfg(test)]
+    note_listener_step(state);
     // Cheap check first: most accepted applies keep the record.
     if state
         .named_groups
@@ -82,8 +101,39 @@ pub(super) async fn retire_unwanted_metadata_listener(state: &AppState, group_ke
     if wanted {
         return;
     }
+    // An apply that runs on the listener's own task must not abort it: the
+    // abort would cut the rest of that apply at its next await. That
+    // listener ends itself when its apply reports `should_exit` and the
+    // record is gone or withdrawn.
+    if tasks
+        .get(group_key)
+        .is_some_and(|reg| tokio::task::try_id() == Some(reg.handle.id()))
+    {
+        return;
+    }
     if let Some(reg) = tasks.remove(group_key) {
         reg.handle.abort();
+    }
+}
+
+/// Stop the listeners that no stored record needs after an accepted
+/// metadata event of `group_id` (a stable id or local key). `local_keys`
+/// are the local keys of that group read before the apply, which can
+/// remove the record. Every path that applies a metadata event calls this
+/// through [`apply_named_group_metadata_event`]: the topic listener, the
+/// direct lanes, catch-up, the parked-event replays and the recovery
+/// replays. Starts stay with the paths that seat a record.
+///
+/// The caller holds no group lock: the apply has released its membership,
+/// persistence and map locks when it returns.
+pub(super) async fn retire_listeners_after_accepted_apply(
+    state: &AppState,
+    group_id: &str,
+    local_keys: &[String],
+) {
+    retire_unwanted_public_message_listener(state, group_id).await;
+    for key in local_keys {
+        retire_unwanted_metadata_listener(state, key).await;
     }
 }
 
@@ -95,9 +145,6 @@ pub(super) async fn retire_listeners_of_removed_record(
     group_key: &str,
     stable_id: Option<&str>,
 ) {
-    // #1366 test hook: no caller may hold the card cache here (lock order).
-    #[cfg(test)]
-    super::tests::issue1366_listener_lifecycle::note_listener_step(state);
     retire_unwanted_metadata_listener(state, group_key).await;
     retire_unwanted_public_message_listener(state, group_key).await;
     if let Some(stable_id) = stable_id.filter(|stable_id| *stable_id != group_key) {
@@ -115,9 +162,6 @@ pub(super) async fn reconcile_named_group_listeners(
     group_key: &str,
     stable_id: Option<&str>,
 ) {
-    // #1366 test hook: no caller may hold the card cache here (lock order).
-    #[cfg(test)]
-    super::tests::issue1366_listener_lifecycle::note_listener_step(state);
     retire_unwanted_metadata_listener(state, group_key).await;
     ensure_named_group_metadata_listener(Arc::clone(state), group_key).await;
     reconcile_public_message_listener(state, group_key).await;

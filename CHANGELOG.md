@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Group listeners stop on every apply path (#2124; A08 amendment of 20
+  Nov 2026).** A self-removal or withdrawal applied by catch-up, a fetched
+  control blob, a parked-event replay or a recovery replay now stops the
+  listeners no stored record needs, as the topic listener and the direct
+  lanes already did. A restart-time `TimedOut` join stub stops its metadata
+  listener. Listeners for groups with no local record (from
+  `GET /groups/:id/messages`) are capped at 64.
 - **Launcher issuer reads by directory descriptor and under the install
   lock (#2012; A14 amendment of 20 Nov 2026).** The dormant launcher reads
   the host journal and the trial record relative to the checked host-root
