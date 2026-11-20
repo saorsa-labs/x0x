@@ -30,6 +30,9 @@ use super::*;
 /// state is read under the registry write lock, so a concurrent install
 /// for a record that needs the listener is kept.
 pub(super) async fn retire_unwanted_public_message_listener(state: &AppState, group_id: &str) {
+    // #1366 test hook: no caller may hold the card cache here (lock order).
+    #[cfg(test)]
+    super::tests::issue1366_listener_lifecycle::note_listener_step(state);
     // Cheap check first: most callers run after an apply that changed no
     // listener input, so the registry write lock is not needed.
     if public_message_listener_wanted(&*state.named_groups.read().await, group_id)
@@ -58,7 +61,17 @@ pub(super) async fn retire_unwanted_public_message_listener(state: &AppState, gr
 /// [`ensure_named_group_metadata_listener`] installs under the key it is
 /// given and only for a record stored under exactly that key, so the
 /// wanted rule is per key.
-async fn retire_unwanted_metadata_listener(state: &AppState, group_key: &str) {
+pub(super) async fn retire_unwanted_metadata_listener(state: &AppState, group_key: &str) {
+    // Cheap check first: most accepted applies keep the record.
+    if state
+        .named_groups
+        .read()
+        .await
+        .get(group_key)
+        .is_some_and(metadata_listener_wanted)
+    {
+        return;
+    }
     let mut tasks = state.group_metadata_tasks.write().await;
     let wanted = state
         .named_groups
@@ -82,6 +95,9 @@ pub(super) async fn retire_listeners_of_removed_record(
     group_key: &str,
     stable_id: Option<&str>,
 ) {
+    // #1366 test hook: no caller may hold the card cache here (lock order).
+    #[cfg(test)]
+    super::tests::issue1366_listener_lifecycle::note_listener_step(state);
     retire_unwanted_metadata_listener(state, group_key).await;
     retire_unwanted_public_message_listener(state, group_key).await;
     if let Some(stable_id) = stable_id.filter(|stable_id| *stable_id != group_key) {
@@ -99,6 +115,9 @@ pub(super) async fn reconcile_named_group_listeners(
     group_key: &str,
     stable_id: Option<&str>,
 ) {
+    // #1366 test hook: no caller may hold the card cache here (lock order).
+    #[cfg(test)]
+    super::tests::issue1366_listener_lifecycle::note_listener_step(state);
     retire_unwanted_metadata_listener(state, group_key).await;
     ensure_named_group_metadata_listener(Arc::clone(state), group_key).await;
     reconcile_public_message_listener(state, group_key).await;

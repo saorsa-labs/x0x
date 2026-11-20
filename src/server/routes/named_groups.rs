@@ -22367,6 +22367,16 @@ pub(in crate::server) async fn apply_listener_metadata_event(
     let group_id = named_group_metadata_event_group_id(&event).to_string();
     let group_id_for_rearm = group_id.clone();
     let policy_update = matches!(event, NamedGroupMetadataEvent::PolicyUpdated { .. });
+    // #1366: the local keys of the event's group, read before the apply,
+    // which can remove the record. The metadata registry is keyed by them.
+    let local_keys: Vec<String> = state
+        .named_groups
+        .read()
+        .await
+        .iter()
+        .filter(|(key, info)| *key == &group_id || info.stable_group_id() == group_id)
+        .map(|(key, _)| key.clone())
+        .collect();
     // Boxed: the apply future is large; keep it off this caller's frame.
     let applied = state
         .run_shielded(Box::pin(async move {
@@ -22402,11 +22412,15 @@ pub(in crate::server) async fn apply_listener_metadata_event(
             reconcile_public_message_listener(state, &group_id_for_rearm).await;
         } else {
             // #1366: an accepted event can take the record away (a remote
-            // self-removal) or withdraw it. Stop the public listener that
-            // no stored record needs any more. Starts stay with the paths
-            // that seat the record.
+            // self-removal) or withdraw it. Stop the listeners that no
+            // stored record needs any more. Starts stay with the paths
+            // that seat the record. The metadata stop comes last: when the
+            // caller is that metadata listener, the stop ends the caller.
             listener_lifecycle::retire_unwanted_public_message_listener(state, &group_id_for_rearm)
                 .await;
+            for key in &local_keys {
+                listener_lifecycle::retire_unwanted_metadata_listener(state, key).await;
+            }
         }
     }
     applied
@@ -25785,8 +25799,10 @@ pub(in crate::server) async fn reconcile_public_message_listener(
     #[cfg(test)]
     tokio::task::yield_now().await;
     // A later policy change can have made the listener wanted again, and
-    // its reconcile can have installed it: the removal reads the desired
-    // state again under the registry lock, so it does not undo that.
+    // its reconcile can have installed it. The retire checks the desired
+    // state twice: a cheap check without the registry lock, then a second
+    // check under the `public_message_tasks` write lock, which decides the
+    // removal, so it does not undo that install.
     listener_lifecycle::retire_unwanted_public_message_listener(state, &retire_key).await;
 }
 
@@ -34537,6 +34553,11 @@ pub(in crate::server) async fn leave_group(
     let mut cache = state.group_card_cache.write().await;
     prune_expired_group_cards(&mut cache, now_millis_u64());
     cache.remove(&id);
+    // #1366: release the card cache before the listener reconcile below,
+    // which reads `named_groups`. Another path holds `named_groups` while it
+    // waits for this cache (`refresh_group_card_cache_from_info`), so
+    // holding both here in the other order could deadlock.
+    drop(cache);
     state.mls_groups.write().await.remove(&id);
     // ADR-0012: drop the live TreeKEM group and wipe at-rest TreeKEM
     // persistence (snapshot plus replay journal, both containing private key
@@ -49744,8 +49765,15 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
         // taken at the top of this function). A reader under the same
         // lock observes either the pending stub (no outcome) or the
         // 404-with-outcome shape — never a bare 404.
+        let mut removed_stub_stable_id = None;
         if stub_is_pending {
-            state.named_groups.write().await.remove(local_group_key);
+            // #1366: keep the removed stub's stable id for its listener.
+            removed_stub_stable_id = state
+                .named_groups
+                .write()
+                .await
+                .remove(local_group_key)
+                .map(|info| info.stable_group_id().to_string());
             state
                 .pending_join_stubs
                 .lock()
@@ -49794,8 +49822,11 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
                 stop_named_group_metadata_listener_if_token(state, local_group_key, token).await;
             }
             // #1366: the stub is gone; stop its public-message listener,
-            // which is keyed by the stable id.
-            for key in [local_group_key, event_group_id] {
+            // which is keyed by the stable id (read from the stored stub).
+            for key in [local_group_key, event_group_id]
+                .into_iter()
+                .chain(removed_stub_stable_id.as_deref())
+            {
                 listener_lifecycle::retire_unwanted_public_message_listener(state, key).await;
             }
             state.mls_groups.write().await.remove(local_group_key);
@@ -55462,7 +55493,7 @@ pub(in crate::server) mod tests {
     pub(in crate::server) mod issue1275_listener_apply_shield;
     mod issue1288_bootstrap_outbox_shutdown;
     mod issue1347_join_request_token_class;
-    mod issue1366_listener_lifecycle;
+    pub(in crate::server) mod issue1366_listener_lifecycle;
     mod issue1366_metadata_listener;
     pub(in crate::server) mod issue1366_public_listener;
     pub(in crate::server) mod issue1368_crash_matrix;

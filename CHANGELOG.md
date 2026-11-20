@@ -12,8 +12,8 @@ All notable changes to this project will be documented in this file.
   self-removal applied from the topic or a direct lane, a card refresh that
   made a stub `MlsEncrypted` and a withdrawn card left the group's
   public-message listener running until a restart. Each now stops it, and
-  the TreeKEM self-leave and the cleared join row stop the metadata
-  listener too. Records that share a stable id keep the shared listener
+  the TreeKEM self-leave, the cleared join row and a self-removal from a
+  direct lane stop the metadata listener too. Records that share a stable id keep the shared listener
   while any of them needs it. Events applied by catch-up, replay or
   recovery paths still wait for a restart.
 

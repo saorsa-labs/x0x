@@ -27,12 +27,61 @@
 use super::issue1366_public_listener::live;
 use super::*;
 
-/// Lets aborted tasks drop and new tasks reach their first poll.
+/// Set when a listener step ran while its caller held the card cache.
+static CARD_CACHE_HELD_AT_LISTENER_STEP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test hook of `listener_lifecycle`: no listener step may run while its
+/// caller holds `group_card_cache`. Another path holds `named_groups` while
+/// it waits for that cache, so the other order could deadlock. Each test
+/// runs in its own process under nextest, so the flag is per test.
+pub(in crate::server) fn note_listener_step(state: &AppState) {
+    if state.group_card_cache.try_write().is_err() {
+        CARD_CACHE_HELD_AT_LISTENER_STEP.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn assert_no_listener_step_held_the_card_cache(why: &str) {
+    assert!(
+        !CARD_CACHE_HELD_AT_LISTENER_STEP.load(std::sync::atomic::Ordering::SeqCst),
+        "#1366: {why}: a listener step ran while its caller held the card cache"
+    );
+}
+
+/// Lets queued tasks run a turn (no wall-clock wait).
 async fn settle() {
     for _ in 0..50 {
         tokio::task::yield_now().await;
     }
-    tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
+/// Polls `check` until it holds, for up to 10 s.
+async fn eventually<F, Fut>(mut check: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if check().await {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// The public-message listener of `stable_id` is registered and its one
+/// task runs. A stopped listener never comes back, so polling for this also
+/// catches a wrong stop.
+async fn assert_public_running(state: &AppState, stable_id: &str, why: &str) {
+    assert!(
+        eventually(|| async { public_registered(state, stable_id).await && live(stable_id) == 1 })
+            .await,
+        "#1366: {why}: the public-message listener runs"
+    );
 }
 
 async fn metadata_registered(state: &AppState, group_key: &str) -> bool {
@@ -55,14 +104,14 @@ async fn public_registered(state: &AppState, stable_id: &str) -> bool {
 /// task has ended.
 async fn assert_public_stopped(state: &AppState, stable_id: &str, why: &str) {
     assert!(
-        !public_registered(state, stable_id).await,
+        eventually(|| async { !public_registered(state, stable_id).await }).await,
         "#1366: {why}: the public-message listener is deregistered"
     );
-    assert_eq!(
-        live(stable_id),
-        0,
+    assert!(
+        eventually(|| async { live(stable_id) == 0 }).await,
         "#1366: {why}: the public-message listener task has ended"
     );
+    assert_no_listener_step_held_the_card_cache(why);
 }
 
 /// The abort handle of the running metadata listener under `group_key`.
@@ -85,13 +134,14 @@ async fn assert_metadata_stopped(
     why: &str,
 ) {
     assert!(
-        !metadata_registered(state, group_key).await,
+        eventually(|| async { !metadata_registered(state, group_key).await }).await,
         "#1366: {why}: the metadata listener is deregistered"
     );
     assert!(
-        task.is_finished(),
+        eventually(|| async { task.is_finished() }).await,
         "#1366: {why}: the metadata listener task has ended"
     );
+    assert_no_listener_step_held_the_card_cache(why);
 }
 
 fn local_hex(state: &AppState) -> String {
@@ -121,15 +171,11 @@ async fn signed_public_fixture_with(
         .await
         .insert(group_id.to_string(), info);
     ensure_named_group_listeners(Arc::clone(&state), group_id).await;
-    settle().await;
     assert!(
         metadata_registered(&state, group_id).await,
         "precondition: the metadata listener runs"
     );
-    assert!(
-        public_registered(&state, &stable).await && live(&stable) == 1,
-        "precondition: the public-message listener runs"
-    );
+    assert_public_running(&state, &stable, "precondition").await;
     Ok((state, dir, stable))
 }
 
@@ -155,6 +201,8 @@ async fn leave(state: &Arc<AppState>, group_id: &str) -> Result<serde_json::Valu
     Ok(body)
 }
 
+/// Also the lock-order check: the leave releases the card cache before the
+/// listener reconcile (`assert_metadata_stopped` checks the test hook).
 #[tokio::test]
 async fn issue1366_self_leave_stops_both_listeners() -> Result<()> {
     let group_id = "1366-lifecycle-leave-key";
@@ -243,6 +291,7 @@ async fn issue1366_applied_self_removal_stops_the_public_listener() -> Result<()
         .cloned()
         .context("fixture record")?;
     let local = local_hex(&state);
+    let meta = metadata_task(&state, group_id).await?;
     let mut next = parent.clone();
     next.roster_revision = next.roster_revision.saturating_add(1);
     next.remove_member(&local, Some(local.clone()));
@@ -271,7 +320,7 @@ async fn issue1366_applied_self_removal_stops_the_public_listener() -> Result<()
         !state.named_groups.read().await.contains_key(group_id),
         "the self-removal takes the record away"
     );
-    settle().await;
+    assert_metadata_stopped(&state, group_id, &meta, "an applied self-removal").await;
     assert_public_stopped(&state, &stable, "an applied self-removal").await;
     Ok(())
 }
@@ -311,9 +360,15 @@ async fn issue1366_applied_rename_keeps_the_public_listener() -> Result<()> {
         "the signed rename applies"
     );
     settle().await;
+    assert_public_running(
+        &state,
+        &stable,
+        "an accepted event that keeps the SignedPublic record keeps its listener",
+    )
+    .await;
     assert!(
-        public_registered(&state, &stable).await && live(&stable) == 1,
-        "#1366: an accepted event that keeps the SignedPublic record keeps its listener"
+        metadata_registered(&state, group_id).await,
+        "#1366: an accepted event that keeps the record keeps its metadata listener"
     );
     Ok(())
 }
@@ -392,10 +447,12 @@ async fn issue1366_withdrawn_card_stops_an_unneeded_public_listener() -> Result<
     // listener on the supplied id (the fail-open path).
     spawn_public_message_listener(Arc::clone(&state), group_id.clone()).await;
     settle().await;
-    assert!(
-        public_registered(&state, &group_id).await && live(&group_id) == 1,
-        "precondition: the fail-open listener runs"
-    );
+    assert_public_running(
+        &state,
+        &group_id,
+        "precondition: the fail-open listener runs",
+    )
+    .await;
     let creator = x0x::identity::AgentKeypair::generate()?;
     let mut card = lifecycle_card(
         &creator,
@@ -445,10 +502,12 @@ async fn issue1366_shared_stable_id_listener_runs_while_any_record_needs_it() ->
     reconcile_public_message_listener(&state, alias_key).await;
     listener_lifecycle::retire_unwanted_public_message_listener(&state, alias_key).await;
     settle().await;
-    assert!(
-        public_registered(&state, &stable).await && live(&stable) == 1,
-        "#1366: an MlsEncrypted alias does not stop the listener another record needs"
-    );
+    assert_public_running(
+        &state,
+        &stable,
+        "an MlsEncrypted alias does not stop the listener another record needs",
+    )
+    .await;
 
     state.named_groups.write().await.remove(group_id);
     reconcile_public_message_listener(&state, alias_key).await;
@@ -476,10 +535,7 @@ async fn issue1366_a_stored_record_keeps_the_public_listener() -> Result<()> {
     listener_lifecycle::retire_unwanted_public_message_listener(&state, &stable).await;
     listener_lifecycle::retire_unwanted_public_message_listener(&state, group_id).await;
     settle().await;
-    assert!(
-        public_registered(&state, &stable).await && live(&stable) == 1,
-        "#1366: a record that needs the listener keeps it"
-    );
+    assert_public_running(&state, &stable, "a record that needs the listener keeps it").await;
     Ok(())
 }
 
@@ -544,6 +600,7 @@ async fn issue1366_applied_withdrawal_stops_the_public_listener() -> Result<()> 
         .get(group_id)
         .cloned()
         .context("fixture record")?;
+    let meta = metadata_task(&state, group_id).await?;
     let mut terminal = parent.clone();
     terminal.withdrawn = true;
     let event = NamedGroupMetadataEvent::GroupDeleted {
@@ -563,7 +620,7 @@ async fn issue1366_applied_withdrawal_stops_the_public_listener() -> Result<()> 
         applied.as_ref().is_some_and(|result| result.accepted),
         "the signed GroupDeleted applies"
     );
-    settle().await;
+    assert_metadata_stopped(&state, group_id, &meta, "an applied withdrawal").await;
     assert_public_stopped(&state, &stable, "an applied withdrawal").await;
     Ok(())
 }
@@ -593,10 +650,12 @@ async fn issue1366_withdrawn_card_keeps_the_listener_of_a_live_keyed_record() ->
             .is_some_and(|info| !info.withdrawn),
         "the keyed record ignores the withdrawn card"
     );
-    assert!(
-        public_registered(&state, &stable).await && live(&stable) == 1,
-        "#1366: a withdrawn card keeps the listener a live keyed record needs"
-    );
+    assert_public_running(
+        &state,
+        &stable,
+        "a withdrawn card keeps the listener a live keyed record needs",
+    )
+    .await;
     Ok(())
 }
 
@@ -659,13 +718,18 @@ async fn issue1366_install_beside_a_withdrawn_tombstone_follows_the_live_record(
         handle.abort();
     }
     settle().await;
-    assert_eq!(live(&stable), 0, "precondition: no listener runs");
+    assert!(
+        eventually(|| async { live(&stable) == 0 }).await,
+        "precondition: no listener runs"
+    );
     spawn_public_message_listener(Arc::clone(&state), stable.clone()).await;
     settle().await;
-    assert!(
-        public_registered(&state, &stable).await && live(&stable) == 1,
-        "#1366: the live SignedPublic record still gets its listener"
-    );
+    assert_public_running(
+        &state,
+        &stable,
+        "the live SignedPublic record still gets its listener",
+    )
+    .await;
     Ok(())
 }
 
@@ -719,10 +783,12 @@ async fn issue1366_card_refresh_to_mls_stops_the_stub_public_listener() -> Resul
         metadata_registered(&state, &group_id).await,
         "an imported non-member stub runs its metadata listener"
     );
-    assert!(
-        public_registered(&state, &group_id).await && live(&group_id) == 1,
-        "a SignedPublic stub runs its public-message listener"
-    );
+    assert_public_running(
+        &state,
+        &group_id,
+        "a SignedPublic stub runs its public-message listener",
+    )
+    .await;
 
     import(
         &state,
