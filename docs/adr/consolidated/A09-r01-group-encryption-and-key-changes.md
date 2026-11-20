@@ -318,6 +318,38 @@ removes exactly the named admins; no wire format changes. The local
 status of a promoted member can name the new wait cause. ADR 0110 stays
 Accepted and its text is unchanged.
 
+On 20 Nov 2026 the Claude orchestrator decided the expired-seat case
+under David's delegation of design decisions of 10 Nov 2026 and A15 as
+amended on 12 Nov 2026
+([#2004](https://github.com/saorsa-labs/x0x/issues/2004)). This replaces
+the last rule of the paragraph above: an expired below-Admin seat no
+longer keeps the refusal. The owner-recovery seal also tolerates an
+Active below-Admin seat whose committed certificate's S4 expiry is due,
+by the rule of the seat's own expiry row (`now > not_after + τ`). The
+creator seat is not tolerated this way, because no expiry row ever
+targets it (Engineer ruling of 1 Nov 2026), so it keeps the refusal. A seat
+whose certificate expired less than τ ago is not yet due and is treated
+as before. A seat whose certificate bytes this node does not hold, or
+whose renewal fetch is in flight, is a digest-pending or grace hold, not
+a failure, and still holds the seal. The tolerated expired seat keeps
+its seat and its TreeKEM leaf at the recovery epoch e0+1, as a tolerated
+revoked seat does. Delivery to it is withheld:
+- the owner-recovery egress adds an expiry check to D60, so the
+  recovery commit, the only carrier of that epoch's path secrets, is
+  never written to a seat whose expiry is due;
+- the ADR 0107 member check at the guarded admission already refuses an
+  expired certificate;
+- the TreeKEM catch-up page handler answers nothing to a requester whose
+  seat expiry is due. It returns at once, as for a revoked requester, so
+  the cached-add fallback that serves a recent joiner does not serve it
+  either.
+
+The seat's own S4 expiry row then removes it and rekeys at e0+2 under
+the admin the recovery seated. Before this, every admin revoked plus one
+seated expired member was a deadlock; the only exit was the owner
+re-certifying that member. The `OwnerRecoveryV1` body is unchanged: it
+removes exactly the named admins, and no wire format changes.
+
 [A08](A08-r01-groups-home-membership-and-repair.md) defines valid group-state and fork recovery. A09 must not bypass that authority to obtain keys faster.
 
 ## Security claims

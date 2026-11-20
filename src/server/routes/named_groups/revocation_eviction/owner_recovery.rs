@@ -945,6 +945,23 @@ async fn drive_mandates(state: &Arc<AppState>) {
     }
 }
 
+/// D60 at the owner-recovery egress: [`write_allowed`], and (#2004) the
+/// recipient's seat in `info` is not past its certificate's S4 expiry
+/// point. The recovery seal tolerates such a seat, which keeps its leaf
+/// for one epoch until its own expiry row removes it, so the recovery
+/// commit, the only carrier of that epoch's path secrets, must never be
+/// written to it. A seat whose expiry is not yet due is served as before.
+async fn recovery_write_allowed(state: &AppState, info: &GroupInfo, agent: &AgentId) -> bool {
+    !recipient_expiry_due(info, agent, x0x::groups::owner_cert::restore_clock_now())
+        && write_allowed(state, agent).await
+}
+
+fn recipient_expiry_due(info: &GroupInfo, agent: &AgentId, now_unix: u64) -> bool {
+    info.members_v2
+        .get(&hex::encode(agent.as_bytes()))
+        .is_some_and(|seat| x0x::groups::cert_rebind::seat_expiry_due(seat, now_unix))
+}
+
 /// One guarded frame write of an owner-recovery frame to `agent`: the
 /// ADR 0107 serving guard, D60, the `owner_recovery_v1` gate and `rule`,
 /// in the pre-phase and again at the write seam.
@@ -1739,7 +1756,7 @@ async fn drive_deliveries(state: &Arc<AppState>) {
             if *status == RecipientDelivery::Sent {
                 head_asks.push(agent);
             }
-            if !write_allowed(state, &agent).await {
+            if !recovery_write_allowed(state, &info, &agent).await {
                 continue;
             }
             let next = match capabilities
@@ -3894,6 +3911,7 @@ mod tests {
     use super::*;
 
     mod issue1973_revoked_member_seal;
+    mod issue2004_expired_member_seal;
 
     #[test]
     fn refusals_map_to_http_statuses() {

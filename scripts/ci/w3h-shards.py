@@ -41,6 +41,12 @@ GROUPS = (
     # that have their own shard. Its own shard, so `s4` does not grow; the
     # budget is not raised (31 Oct ruling, #1733).
     ('s4-1973', 'w3h_1357_s4_owner_recovery_revoked_member_1973$'),
+    # #2004 expired-member arm: the same four-node run, but it waits for
+    # E's certificate expiry (600 s after issue, then N + tau), about 1000
+    # virtual seconds and 55 s of real time in the 12-CPU VM (about 20 min
+    # for 20 reruns on the runner). Its own shard, so neither `s4-1973`
+    # nor `s4` grows; the budget is not raised (31 Oct ruling, #1733).
+    ('s4-2004', 'w3h_1357_s4_owner_recovery_expired_member_2004$'),
     ('s4', 'w3h_1357_'),
     ('s3-c', 'w3h_1356_red_s3_c_promoted_admin_reseats_owner_axis_node$'),
     ('s3-c2', 'w3h_1356_red_s3_c2_reseat_retires_marker_and_gap$'),
