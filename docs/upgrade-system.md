@@ -765,6 +765,69 @@ authority-inventory check accepting a launcher-owned `ExecStart`; and the
 these hold, a launcher-bound unit would refuse every self-update. The unit
 switch also needs David's approval because it changes production hosts.
 
+**Launcher-bound systemd unit (#1378).** The systemd restart readback
+accepts a unit whose `ExecStart` runs the stable launcher, in the plain or
+the trial form. It reads the daemon and its arguments from the launcher's
+argv with the launcher's own parser, and they must be this daemon and its
+arguments; the launcher must be the one installed next to this x0xd
+(compared by canonical path). The unit's main process must then be either
+this daemon, when the launcher passed through and became the daemon by
+`exec` (always, while the launcher is dormant), or this daemon's parent
+when that parent's executable is the launcher. Anything else is refused;
+for any other unit the main process must be this daemon. A launcher-bound
+unit must also have `Restart=always`: a launcher that owns the daemon exits
+75 after the daemon ends, which `Restart=on-success` does not restart. For
+the same reason its `RestartPreventExitStatus` must not cover 75 (a number
+or a range); the drop-in below lists only `64 78`. The start-rate window is
+unchanged.
+
+The readback checks only what decides the restart. The launcher's own
+`--host-root` and `--instance` select its journal, so the readback does not
+bind them; the installer takes them from x0xd itself.
+
+`.deployment/install.sh --launcher /path/to/x0x-launcher` (off by default)
+installs the launcher next to the instance's `x0xd` and writes
+`<unit>.service.d/30-x0x-launcher.conf` (by a temporary file and a rename):
+
+```ini
+# Installed by .deployment/install.sh --launcher (#1378). Remove this file
+# and run `systemctl daemon-reload` to return to the direct job.
+[Service]
+ExecStart=
+ExecStart=/opt/x0x/x0x-launcher --host-root <data root> --instance <id> -- /opt/x0x/x0xd <unit args>
+Restart=always
+RestartPreventExitStatus=64 78
+KillMode=mixed
+TimeoutStopSec=60
+```
+
+- The data root is the one x0xd reports for the unit's own arguments
+  (`x0xd <args> --check`, run as the unit's user with that user's `HOME`;
+  it reads the config and writes nothing), resolved through symlinks. The
+  unit's user is the last `User=` in the unit and its other drop-ins
+  (`root` when none is set); the launcher drop-in itself is not read. As
+  root, the check runs through `runuser` (looked up in `/usr/sbin`, `/usr/bin`,
+  `/sbin` and `/bin`). The data root must exist, so x0xd must have started
+  once, and it must be owned by the unit's user and not writable by group or
+  others.
+- The instance is the manifest instance id.
+- An `ExecStart` token that needs systemd quoting (spaces, quotes, `$` or
+  `%`), or an `ExecStart` that cannot be split, is refused; such a unit is
+  migrated by hand.
+- Any failure leaves no launcher drop-in: the installer removes an earlier
+  one, reloads systemd so the unit runs x0xd directly, and exits 1 with the
+  reason.
+- `KillMode=mixed` sends the stop signal to the launcher only, which stops
+  x0xd within its own 45 s window; `TimeoutStopSec=60` is above that window.
+- An install without `--launcher` removes the drop-in, so the tracked unit
+  runs x0xd directly again.
+
+The helper is `.deployment/launcher-dropin.py`. `tests/test_launcher_dropin.py`
+tests it and runs `install.sh --launcher` from a scratch copy of the
+deployment tree (fresh host, rerun, `User=` drop-ins, a failed rerun). Not done yet: an exit test of the
+supervised upgrade exit on a launcher-bound host, which needs a private
+testnet host.
+
 #### 2. Restore the known-good binary
 
 Only needed when the replacement will not start. On Unix a rename over the
@@ -1133,7 +1196,8 @@ The whole launcher argv is checked with the launcher's own parser before
 anything is written, so a job the launcher would refuse (a relative
 daemon, an invalid instance) is never installed. A package-manager
 upgrade that moves the canonical `x0xd` needs `x0x autostart --launcher`
-again.
+again. A daemon inside a versioned Homebrew keg is refused (see
+"Homebrew keg paths" below), so a Homebrew install keeps the direct job.
 
 One label (`com.saorsalabs.x0xd`) serves one instance. `x0x autostart`
 refuses to replace a job under that label that starts another `--name`;
@@ -1209,9 +1273,10 @@ launcher is dormant it execs the daemon at once, so that wait and the
 hold are not yet measured through launchd. The launcher's unit tests
 cover them.
 
-**Missing daemon.** The job names the canonical daemon. For a
-Homebrew install, that is a versioned Cellar path, which a `brew upgrade`
-removes. Before 19 Nov 2026 the dormant launcher then failed the `exec`
+**Missing daemon.** The job names the canonical daemon, which a
+package-manager upgrade can remove. (A job migrated before the keg check
+of #1379 can name a versioned Homebrew Cellar path, which `brew upgrade`
+removes.) Before 19 Nov 2026 the dormant launcher then failed the `exec`
 and exited 75 at once, and launchd started it again after each throttle
 interval (3 starts in 30 s): a restart loop. On macOS the launcher now
 waits instead. It writes one line to the job's standard error, tries the

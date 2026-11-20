@@ -327,6 +327,11 @@ fn path_basename(s: &str) -> &str {
 /// Basename of the stable launcher a launchd job may run (#1379).
 pub use super::launcher_contract::LAUNCHER_BASENAME;
 
+/// The launcher's `EX_TEMPFAIL` exit after a daemon it owns ends; the
+/// manager must restart it (`x0x-launcher` `start::EXIT_TEMPFAIL`).
+#[cfg(any(test, target_os = "linux"))]
+const LAUNCHER_RESTART_EXIT: i64 = 75;
+
 /// The daemon a launchd job runs (#1379).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchdDaemon<'a> {
@@ -1191,6 +1196,11 @@ type SameExecutable<'a> = dyn Fn(&str, &Path) -> bool + 'a;
 struct SystemdReadbackInput<'a> {
     cgroup: &'a str,
     pid: u32,
+    /// This process's parent: the unit's main process when the stable
+    /// launcher owns x0xd as its child (#1378).
+    parent_pid: u32,
+    /// The parent's executable (`/proc/<ppid>/exe`), when readable.
+    parent_executable: Option<&'a Path>,
     invocation_id: Option<&'a str>,
     executable: &'a Path,
     argv: &'a [String],
@@ -1232,6 +1242,8 @@ fn readback_systemd_observation_in(
     let SystemdReadbackInput {
         cgroup,
         pid,
+        parent_pid,
+        parent_executable,
         invocation_id,
         executable,
         argv,
@@ -1262,7 +1274,7 @@ fn readback_systemd_observation_in(
     let main_pid = show_property(&show_output, "MainPID")
         .and_then(|v| v.trim().parse::<u32>().ok())
         .unwrap_or(0);
-    if main_pid != pid {
+    if main_pid != pid && main_pid != parent_pid {
         return refuse(format!(
             "unit `{unit}` reports MainPID {main_pid}, not this process ({pid}); \
              INVOCATION_ID presence alone does not bind the unit to this instance"
@@ -1309,12 +1321,6 @@ fn readback_systemd_observation_in(
             ));
         }
     };
-    if structured_pid != pid {
-        return refuse(format!(
-            "unit `{unit}` reports MainPID {structured_pid} in the structured snapshot, \
-             not this process ({pid})"
-        ));
-    }
     if structured_invocation != Some(textual_invocation) {
         return refuse(format!(
             "unit `{unit}` reports different InvocationIDs in the textual and structured snapshots"
@@ -1333,24 +1339,62 @@ fn readback_systemd_observation_in(
              spawned argv is not derivable"
         ));
     };
-    let exec_ok = {
-        if !same_executable(&loaded_path, executable) {
+    // A unit that runs the stable launcher (#1378): the daemon is the one
+    // the launcher's argv names, checked with the launcher's own parser,
+    // and the launcher is the one installed next to this x0xd (compared by
+    // canonical path). The unit's main process is then either this process,
+    // when the launcher passed through and became the daemon by `exec`
+    // (always, while the launcher is dormant), or this process's parent
+    // when that parent is the launcher and owns the daemon. Any other
+    // unit's main process is this process.
+    let launcher_daemon = match launchd_job_daemon(Some(&loaded_path), &tokens) {
+        Some(Ok(daemon)) if daemon.via_launcher => Some(daemon),
+        _ => None,
+    };
+    let main_is = |expected: u32| main_pid == expected && structured_pid == expected;
+    let main_ok = match &launcher_daemon {
+        None => main_is(pid),
+        Some(_) => {
+            main_is(pid)
+                || (main_is(parent_pid)
+                    && parent_executable
+                        .is_some_and(|parent| same_executable(&loaded_path, parent)))
+        }
+    };
+    if !main_ok {
+        return refuse(format!(
+            "unit `{unit}` reports MainPID {structured_pid} in the structured snapshot, \
+             not this process ({pid}){}",
+            if launcher_daemon.is_some() {
+                " nor its x0x-launcher parent"
+            } else {
+                ""
+            }
+        ));
+    }
+    let exec_ok = if let Some(daemon) = &launcher_daemon {
+        let first = tokens.first().map(String::as_str).unwrap_or_default();
+        (first == loaded_path || path_basename(first) == LAUNCHER_BASENAME)
+            && same_executable(&loaded_path, &executable.with_file_name(LAUNCHER_BASENAME))
+            && same_executable(daemon.executable, executable)
+            && !argv.is_empty()
+            && daemon.args == argv.get(1..).unwrap_or_default()
+    } else if !same_executable(&loaded_path, executable) {
+        false
+    } else {
+        // argv[0] in the stored array: either the path itself or an
+        // `argv[0]=` override (`@`-prefixed `$$`-escaped copy), which
+        // must still be this executable.
+        let first = tokens.first().map(String::as_str).unwrap_or_default();
+        if first != loaded_path && !same_executable(first, executable) {
             false
         } else {
-            // argv[0] in the stored array: either the path itself or an
-            // `argv[0]=` override (`@`-prefixed `$$`-escaped copy), which
-            // must still be this executable.
-            let first = tokens.first().map(String::as_str).unwrap_or_default();
-            if first != loaded_path && !same_executable(first, executable) {
-                false
-            } else {
-                tokens.len() == argv.len()
-                    && tokens
-                        .iter()
-                        .zip(argv.iter())
-                        .skip(1)
-                        .all(|(loaded, ours)| loaded == ours)
-            }
+            tokens.len() == argv.len()
+                && tokens
+                    .iter()
+                    .zip(argv.iter())
+                    .skip(1)
+                    .all(|(loaded, ours)| loaded == ours)
         }
     };
     if !exec_ok {
@@ -1362,6 +1406,16 @@ fn readback_systemd_observation_in(
     // Restart policy: only the clean-exit-covering values may back a
     // SupervisedExit (see RESTART_POLICIES_GUARANTEEING_CLEAN_EXIT_RESTART).
     let restart = show_property(&show_output, "Restart").unwrap_or("").trim();
+    // A launcher that owns the daemon exits 75 after the daemon ends, which
+    // `on-success` does not restart (#2115 review).
+    if launcher_daemon.is_some() && restart != "always" {
+        return refuse(format!(
+            "unit `{unit}` runs x0x-launcher with Restart={restart:?}; a launcher-bound unit \
+             needs Restart=always, since the launcher exits 75 after its daemon ends (set it \
+             in the unit or rerun `.deployment/install.sh [--instance ID] --launcher \
+             /path/to/x0x-launcher`)"
+        ));
+    }
     if !RESTART_POLICIES_GUARANTEEING_CLEAN_EXIT_RESTART.contains(&restart) {
         return refuse(format!(
             "unit `{unit}` has Restart={restart:?}, which does not guarantee a respawn \
@@ -1370,43 +1424,43 @@ fn readback_systemd_observation_in(
         ));
     }
 
-    /// What one `RestartPreventExitStatus=` entry says about the clean exit
-    /// status (exit 0). Entries are numeric statuses, `low-high` ranges, or
-    /// signal names (man systemd.service); a signal never covers a clean exit,
+    /// What one `RestartPreventExitStatus=` entry says about an exit
+    /// status. Entries are numeric statuses, `low-high` ranges, or signal
+    /// names (man systemd.service); a signal never covers an exit status,
     /// and anything this parser cannot decode is [`PreventCoverage::Unparseable`]
     /// so the caller fails closed.
     enum PreventCoverage {
-        CoversCleanExit,
-        CleanExitNotCovered,
+        Covers,
+        NotCovered,
         Unparseable,
     }
 
     #[cfg(any(test, target_os = "linux"))]
-    fn prevent_token_covers_clean_exit(token: &str) -> PreventCoverage {
+    fn prevent_token_covers(token: &str, status: i64) -> PreventCoverage {
         let token = token.trim();
         if token.is_empty() {
             return PreventCoverage::Unparseable;
         }
-        if let Ok(status) = token.parse::<i64>() {
-            return if status == 0 {
-                PreventCoverage::CoversCleanExit
+        if let Ok(listed) = token.parse::<i64>() {
+            return if listed == status {
+                PreventCoverage::Covers
             } else {
-                PreventCoverage::CleanExitNotCovered
+                PreventCoverage::NotCovered
             };
         }
         if let Some((low, high)) = token.split_once('-') {
             if let (Ok(low), Ok(high)) = (low.trim().parse::<i64>(), high.trim().parse::<i64>()) {
-                return if low <= 0 && 0 <= high {
-                    PreventCoverage::CoversCleanExit
+                return if low <= status && status <= high {
+                    PreventCoverage::Covers
                 } else {
-                    PreventCoverage::CleanExitNotCovered
+                    PreventCoverage::NotCovered
                 };
             }
         }
-        // Signal names (SIGTERM, SIGKILL, …) name terminations, not clean
-        // exits; systemd renders them with the SIG prefix.
+        // Signal names (SIGTERM, SIGKILL, …) name terminations, not exit
+        // statuses; systemd renders them with the SIG prefix.
         if token.to_ascii_uppercase().starts_with("SIG") {
-            return PreventCoverage::CleanExitNotCovered;
+            return PreventCoverage::NotCovered;
         }
         PreventCoverage::Unparseable
     }
@@ -1414,7 +1468,16 @@ fn readback_systemd_observation_in(
     // RestartPreventExitStatus (man systemd.service): a matching exit
     // status prevents the restart REGARDLESS of Restart= — a unit with
     // Restart=always and `0` (or a range covering 0) listed here still
-    // leaves the daemon down after exit 0. Fail closed when the property
+    // leaves the daemon down after exit 0. A launcher that owns the daemon
+    // exits 75 after it, so a launcher-bound unit must not list 75 either.
+    // Fail closed when the property is missing or unparseable.
+    let mut exits: Vec<(i64, &str)> = vec![(0, "the clean exit status")];
+    if launcher_daemon.is_some() {
+        exits.push((
+            LAUNCHER_RESTART_EXIT,
+            "the launcher's exit 75 after its daemon ends",
+        ));
+    }
     match show_property(&show_output, "RestartPreventExitStatus") {
         None => {
             return refuse(
@@ -1426,21 +1489,30 @@ fn readback_systemd_observation_in(
         Some(v) if v.trim().is_empty() => {}
         Some(v) => {
             for token in v.split_whitespace() {
-                match prevent_token_covers_clean_exit(token) {
-                    PreventCoverage::CoversCleanExit => {
-                        return refuse(format!(
-                            "RestartPreventExitStatus lists `{token}`, which covers the \
-                             clean exit status and prevents the restart regardless of \
-                             Restart={restart}"
-                        ));
+                for &(status, what) in &exits {
+                    match prevent_token_covers(token, status) {
+                        PreventCoverage::Covers if status == 0 => {
+                            return refuse(format!(
+                                "RestartPreventExitStatus lists `{token}`, which covers {what} \
+                                 and prevents the restart regardless of Restart={restart}"
+                            ));
+                        }
+                        PreventCoverage::Covers => {
+                            return refuse(format!(
+                                "unit `{unit}` runs x0x-launcher and RestartPreventExitStatus \
+                                 lists `{token}`, which covers {what}; list only `64 78` there \
+                                 (or rerun `.deployment/install.sh [--instance ID] --launcher \
+                                 /path/to/x0x-launcher`)"
+                            ));
+                        }
+                        PreventCoverage::Unparseable => {
+                            return refuse(format!(
+                                "RestartPreventExitStatus entry `{token}` cannot be parsed; \
+                                 coverage of {what} cannot be proven"
+                            ));
+                        }
+                        PreventCoverage::NotCovered => {}
                     }
-                    PreventCoverage::Unparseable => {
-                        return refuse(format!(
-                            "RestartPreventExitStatus entry `{token}` cannot be parsed; \
-                             coverage of the clean exit status cannot be proven"
-                        ));
-                    }
-                    PreventCoverage::CleanExitNotCovered => {}
                 }
             }
         }
@@ -2007,6 +2079,7 @@ fn run_busctl_exec_start(
     user_manager: bool,
     unit: &str,
     pid: u32,
+    parent_pid: u32,
     deadline: Instant,
 ) -> Result<BusctlExecStart, String> {
     let unit_json = run_busctl_json(
@@ -2067,9 +2140,10 @@ fn run_busctl_exec_start(
     .map_err(|e| format!("InvocationID on `{object_path}`: {e}"))?;
     let invocation_id = parse_busctl_invocation_json(&inv_json)
         .ok_or_else(|| format!("InvocationID on `{object_path}`: unexpected payload shape"))?;
-    if main_pid != pid {
+    if main_pid != pid && main_pid != parent_pid {
         return Err(format!(
-            "MainPID {main_pid} does not match this process ({pid}) in the structured snapshot"
+            "MainPID {main_pid} is neither this process ({pid}) nor its parent ({parent_pid}) \
+             in the structured snapshot"
         ));
     }
     Ok(BusctlExecStart {
@@ -2149,18 +2223,24 @@ fn readback_systemd_observation(
         .ok()
         .filter(|v| !v.is_empty());
     let pid = std::process::id();
+    let parent_pid = std::os::unix::process::parent_id();
+    let parent_executable = std::fs::read_link(format!("/proc/{parent_pid}/exe")).ok();
     let deadline = Instant::now() + SYSTEMCTL_SHOW_BOUND;
     readback_systemd_observation_in(
         SystemdReadbackInput {
             cgroup: &cgroup,
             pid,
+            parent_pid,
+            parent_executable: parent_executable.as_deref(),
             invocation_id: invocation.as_deref(),
             executable,
             argv,
             monotonic_now_us: monotonic_now_us(),
         },
         &mut |user_manager, unit| run_systemctl_show(user_manager, unit, deadline),
-        &mut |user_manager, unit| run_busctl_exec_start(user_manager, unit, pid, deadline),
+        &mut |user_manager, unit| {
+            run_busctl_exec_start(user_manager, unit, pid, parent_pid, deadline)
+        },
         &same_executable_canonical,
     )
 }
@@ -2331,6 +2411,8 @@ pub(crate) mod systemd_readback_seam {
             SystemdReadbackInput {
                 cgroup: &cgroup,
                 pid,
+                parent_pid: 0,
+                parent_executable: None,
                 invocation_id: invocation_id.as_deref(),
                 executable,
                 argv,
@@ -5941,6 +6023,8 @@ mod tests {
             SystemdReadbackInput {
                 cgroup,
                 pid,
+                parent_pid: 0,
+                parent_executable: None,
                 invocation_id: invocation,
                 executable: exec,
                 argv,
@@ -6238,6 +6322,8 @@ mod tests {
             SystemdReadbackInput {
                 cgroup: SYSTEM_CGROUP,
                 pid: 4242,
+                parent_pid: 0,
+                parent_executable: None,
                 invocation_id: Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
                 executable: Path::new(exec),
                 argv: &argv,
@@ -6257,6 +6343,231 @@ mod tests {
             SystemdPolicyReadback::Verified(unit) => assert_eq!(unit.unit, "x0xd.service"),
             other => panic!("expected Verified for literal-% deployment, got {other:?}"),
         }
+    }
+
+    const LAUNCHER: &str = "/opt/x0x/x0x-launcher";
+
+    /// A systemd readback of a unit whose `ExecStart` is `exec_start`,
+    /// whose main process is `main_pid` and whose restart policy is
+    /// `restart`, for x0xd at `/opt/x0x/x0xd` with pid 4242 and a parent,
+    /// pid 4100, that runs `parent` (#1378).
+    fn launcher_unit_readback(
+        main_pid: u32,
+        exec_start: &[&str],
+        restart: &str,
+        parent: Option<&str>,
+    ) -> SystemdPolicyReadback {
+        launcher_unit_readback_preventing(main_pid, exec_start, restart, "64 78", parent)
+    }
+
+    fn launcher_unit_readback_preventing(
+        main_pid: u32,
+        exec_start: &[&str],
+        restart: &str,
+        prevent: &str,
+        parent: Option<&str>,
+    ) -> SystemdPolicyReadback {
+        let daemon = "/opt/x0x/x0xd";
+        let invocation = "aa01aa01aa01aa01aa01aa01aa01aa01";
+        let show = healthy_show(main_pid, invocation, daemon, restart).replace(
+            "RestartPreventExitStatus=\n",
+            &format!("RestartPreventExitStatus={prevent}\n"),
+        );
+        let argv = real_fixture_argv(daemon);
+        let structured = BusctlExecStart {
+            path: exec_start[0].to_string(),
+            argv: exec_start.iter().map(|t| t.to_string()).collect(),
+            main_pid,
+            invocation_id: parse_invocation_id_hex(invocation),
+        };
+        readback_systemd_policy_in(
+            SystemdReadbackInput {
+                cgroup: SYSTEM_CGROUP,
+                pid: 4242,
+                parent_pid: 4100,
+                parent_executable: parent.map(Path::new),
+                invocation_id: Some(invocation),
+                executable: Path::new(daemon),
+                argv: &argv,
+                monotonic_now_us: Some(101_000_000),
+            },
+            &mut |_user, _unit| Ok(Some(show.clone())),
+            &mut move |_user, _unit| Ok(structured.clone()),
+            &|loaded, ours| {
+                Path::new(loaded) == ours && matches!(loaded, "/opt/x0x/x0xd" | LAUNCHER)
+            },
+        )
+    }
+
+    const TRIAL: [&str; 9] = [
+        LAUNCHER,
+        "--host-root",
+        "/root/.local/share/x0x-testnet",
+        "--instance",
+        "testnet",
+        "--",
+        "/opt/x0x/x0xd",
+        "--name",
+        "testnet",
+    ];
+
+    fn launcher_unit_refused(
+        main_pid: u32,
+        exec_start: &[&str],
+        restart: &str,
+        parent: Option<&str>,
+        why: &str,
+    ) -> String {
+        match launcher_unit_readback(main_pid, exec_start, restart, parent) {
+            SystemdPolicyReadback::NotGuaranteed { detail } => detail,
+            other => panic!("{why}: expected NotGuaranteed, got {other:?}"),
+        }
+    }
+
+    /// #1378 (#2115 review): a launcher-bound unit verifies when its main
+    /// process is this daemon (the launcher passed through by `exec`, as it
+    /// always does while dormant) or this daemon's parent when that parent
+    /// is the launcher, and the launcher's argv names this daemon with
+    /// these arguments.
+    #[test]
+    fn systemd_readback_accepts_a_launcher_bound_unit() {
+        for (main_pid, parent, why) in [
+            (4242, None, "passthrough: the launcher became the daemon"),
+            (4100, Some(LAUNCHER), "the launcher owns the daemon"),
+        ] {
+            match launcher_unit_readback(main_pid, &TRIAL, "always", parent) {
+                SystemdPolicyReadback::Verified(unit) => assert_eq!(unit.unit, "x0xd.service"),
+                other => panic!("{why}: expected Verified, got {other:?}"),
+            }
+        }
+        let plain = [LAUNCHER, "/opt/x0x/x0xd", "--name", "testnet"];
+        assert!(matches!(
+            launcher_unit_readback(4242, &plain, "always", None),
+            SystemdPolicyReadback::Verified(_)
+        ));
+    }
+
+    /// #1378 (#2115 review): everything else about a launcher-bound unit is
+    /// refused.
+    #[test]
+    fn systemd_readback_refuses_a_launcher_bound_unit_it_cannot_prove() {
+        let detail = launcher_unit_refused(4100, &TRIAL, "always", None, "parent not readable");
+        assert!(detail.contains("x0x-launcher parent"), "{detail}");
+        launcher_unit_refused(
+            4100,
+            &TRIAL,
+            "always",
+            Some("/usr/bin/other"),
+            "parent not the launcher",
+        );
+        launcher_unit_refused(
+            4300,
+            &TRIAL,
+            "always",
+            Some(LAUNCHER),
+            "unrelated main process",
+        );
+        let detail = launcher_unit_refused(4242, &TRIAL, "on-success", None, "on-success");
+        assert!(detail.contains("Restart=always"), "{detail}");
+        let mut other_instance = TRIAL;
+        other_instance[8] = "prod";
+        launcher_unit_refused(4242, &other_instance, "always", None, "another instance");
+        let mut other_daemon = TRIAL;
+        other_daemon[6] = "/opt/x0x/x0xd-other";
+        launcher_unit_refused(4242, &other_daemon, "always", None, "another daemon");
+        let mut bad_argv = TRIAL;
+        bad_argv[1] = "--host-rot";
+        launcher_unit_refused(4242, &bad_argv, "always", None, "argv the launcher refuses");
+        let mut elsewhere = TRIAL;
+        elsewhere[0] = "/tmp/x0x-launcher";
+        launcher_unit_refused(
+            4242,
+            &elsewhere,
+            "always",
+            None,
+            "a launcher not next to x0xd",
+        );
+        let direct = ["/opt/x0x/x0xd", "--name", "testnet"];
+        launcher_unit_refused(
+            4100,
+            &direct,
+            "always",
+            Some(LAUNCHER),
+            "direct unit, parent main",
+        );
+        assert!(matches!(
+            launcher_unit_readback(4242, &direct, "on-success", None),
+            SystemdPolicyReadback::Verified(_)
+        ));
+    }
+
+    /// #1378 (#2115 ZCode review, finding 3): a launcher that owns the
+    /// daemon exits 75 after it, so a launcher-bound unit whose
+    /// `RestartPreventExitStatus` covers 75 is refused with the remedy. A
+    /// direct unit may list 75, since x0xd's own supervised exit is 0.
+    #[test]
+    fn systemd_readback_refuses_a_launcher_bound_unit_that_prevents_exit_75() {
+        for prevent in ["64 75 78", "70-80", "75"] {
+            for main_pid in [4242, 4100] {
+                match launcher_unit_readback_preventing(
+                    main_pid,
+                    &TRIAL,
+                    "always",
+                    prevent,
+                    Some(LAUNCHER),
+                ) {
+                    SystemdPolicyReadback::NotGuaranteed { detail } => {
+                        assert!(detail.contains("exit 75"), "{prevent}: {detail}");
+                        assert!(
+                            detail.contains("--launcher /path/to/x0x-launcher"),
+                            "{detail}"
+                        );
+                    }
+                    other => panic!("{prevent}: expected NotGuaranteed, got {other:?}"),
+                }
+            }
+        }
+        assert!(matches!(
+            launcher_unit_readback_preventing(4242, &TRIAL, "always", "64 76-80 SIGKILL", None),
+            SystemdPolicyReadback::Verified(_)
+        ));
+        let direct = ["/opt/x0x/x0xd", "--name", "testnet"];
+        assert!(matches!(
+            launcher_unit_readback_preventing(4242, &direct, "always", "75", None),
+            SystemdPolicyReadback::Verified(_)
+        ));
+    }
+
+    /// #1378 (#2115 ZCode review, finding 6): the launcher's own
+    /// `--host-root` and `--instance` select its journal, not whether the
+    /// unit restarts the daemon, so the restart readback does not bind
+    /// them; the installer derives them from x0xd itself. Another host
+    /// root or instance verifies; the daemon and its arguments must still
+    /// match.
+    #[test]
+    fn systemd_readback_restart_verdict_does_not_read_the_launchers_journal_selectors() {
+        let mut other_root = TRIAL;
+        other_root[2] = "/srv/elsewhere";
+        let mut other_instance = TRIAL;
+        other_instance[4] = "prod";
+        for (exec_start, why) in [
+            (other_root, "another host root"),
+            (other_instance, "another instance"),
+        ] {
+            match launcher_unit_readback(4242, &exec_start, "always", None) {
+                SystemdPolicyReadback::Verified(_) => {}
+                other => panic!("{why}: expected Verified, got {other:?}"),
+            }
+        }
+        let mut other_name = other_instance;
+        other_name[8] = "prod";
+        launcher_unit_refused(
+            4242,
+            &other_name,
+            "always",
+            None,
+            "the daemon's --name differs",
+        );
     }
 
     #[test]
@@ -6318,6 +6629,8 @@ mod tests {
             SystemdReadbackInput {
                 cgroup: SYSTEM_CGROUP,
                 pid: 4242,
+                parent_pid: 0,
+                parent_executable: None,
                 invocation_id: Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
                 executable: Path::new(running),
                 argv: &argv,
@@ -6358,6 +6671,8 @@ mod tests {
             SystemdReadbackInput {
                 cgroup: SYSTEM_CGROUP,
                 pid: 4242,
+                parent_pid: 0,
+                parent_executable: None,
                 invocation_id: Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
                 executable: Path::new("/opt/x0x/x0xd"),
                 argv: &[
@@ -6394,6 +6709,8 @@ mod tests {
                 SystemdReadbackInput {
                     cgroup: SYSTEM_CGROUP,
                     pid: 4242,
+                    parent_pid: 0,
+                    parent_executable: None,
                     invocation_id: Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
                     executable: Path::new("/opt/x0x/x0xd"),
                     argv: &argv,
@@ -6453,6 +6770,8 @@ mod tests {
             SystemdReadbackInput {
                 cgroup: SYSTEM_CGROUP,
                 pid: 4242,
+                parent_pid: 0,
+                parent_executable: None,
                 invocation_id: None,
                 executable: Path::new("/opt/x0x/x0xd"),
                 argv: &argv,
@@ -6548,6 +6867,8 @@ mod tests {
                 SystemdReadbackInput {
                     cgroup: SYSTEM_CGROUP,
                     pid: 4242,
+                    parent_pid: 0,
+                    parent_executable: None,
                     invocation_id: Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
                     executable: Path::new(path),
                     argv: &argv,
