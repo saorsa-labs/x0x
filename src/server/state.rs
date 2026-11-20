@@ -1810,6 +1810,8 @@ pub(super) struct NamedGroupTestRecorders {
     /// #2124: set when a listener step ran while its caller held
     /// `group_card_cache`.
     pub(super) listener_step_held_card_cache: std::sync::atomic::AtomicBool,
+    /// #2124: how many metadata-listener stop checks ran on this state.
+    pub(super) metadata_retire_steps: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]

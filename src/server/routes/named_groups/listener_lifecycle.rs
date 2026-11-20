@@ -80,7 +80,13 @@ pub(super) async fn retire_unwanted_public_message_listener(state: &AppState, gr
 /// wanted rule is per key.
 pub(super) async fn retire_unwanted_metadata_listener(state: &AppState, group_key: &str) {
     #[cfg(test)]
-    note_listener_step(state);
+    {
+        note_listener_step(state);
+        state
+            .named_group_test_recorders
+            .metadata_retire_steps
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
     // Cheap check first: most accepted applies keep the record.
     if state
         .named_groups
@@ -119,22 +125,35 @@ pub(super) async fn retire_unwanted_metadata_listener(state: &AppState, group_ke
 /// Stop the listeners that no stored record needs after an accepted
 /// metadata event of `group_id` (a stable id or local key). `local_keys`
 /// are the local keys of that group read before the apply, which can
-/// remove the record. Every path that applies a metadata event calls this
-/// through [`apply_named_group_metadata_event`]: the topic listener, the
-/// direct lanes, catch-up, the parked-event replays and the recovery
-/// replays. Starts stay with the paths that seat a record.
+/// remove the record. [`apply_named_group_metadata_event`] calls this for
+/// the topic listener, the direct lanes, catch-up, fetched control blobs,
+/// the parked-event replays and the recovery replays, and
+/// `replay_pending_treekem_events` calls it after its queue drain. Starts
+/// stay with the paths that seat a record.
 ///
-/// The caller holds no group lock: the apply has released its membership,
+/// Four callers apply below that entry and do not call this, because none
+/// can remove a record: the causal-approval replay (`JoinRequestApproved`
+/// only), the join result and its intervening events (`MemberAdded` only),
+/// and the predecessor relay (`JoinRequestCreated` only).
+///
+/// The caller holds no group lock: each apply has released its membership,
 /// persistence and map locks when it returns.
+///
+/// The checks read the live map even when the apply ran in an ADR 0109
+/// re-seat scope: the registries are not scoped, so an event that removes
+/// the staged record must not stop the listeners the live record needs.
 pub(super) async fn retire_listeners_after_accepted_apply(
     state: &AppState,
     group_id: &str,
     local_keys: &[String],
 ) {
-    retire_unwanted_public_message_listener(state, group_id).await;
-    for key in local_keys {
-        retire_unwanted_metadata_listener(state, key).await;
-    }
+    crate::server::reseat_scope::outside_reseat_scope(async {
+        retire_unwanted_public_message_listener(state, group_id).await;
+        for key in local_keys {
+            retire_unwanted_metadata_listener(state, key).await;
+        }
+    })
+    .await;
 }
 
 /// Stop both listeners of a record the caller has just removed from

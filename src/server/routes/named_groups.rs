@@ -12247,6 +12247,10 @@ async fn replay_pending_treekem_events(
         entries
     };
     let mut still_pending = VecDeque::new();
+    // #2124: a queued self-removal or ban can take the record away; read
+    // the keys before the applies.
+    let local_keys = local_keys_of_group(state, group_id).await;
+    let mut any_accepted = false;
     // #1113: do not seal a responsive rekey between replayed events.
     // The pass runs once after this batch, and only when the queue is empty.
     SELF_LEAVE_REKEY_BATCH
@@ -12261,6 +12265,7 @@ async fn replay_pending_treekem_events(
                     None,
                 )
                 .await;
+                any_accepted |= applied.accepted;
                 if !applied.accepted && treekem_membership_event_frontier(&pending.event).is_some()
                 {
                     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
@@ -12330,6 +12335,13 @@ async fn replay_pending_treekem_events(
     // stay inside the detached re-arm tasks.
     maybe_rearm_stopped_treekem_pages(state, group_id, skip_rearm_peer).await;
     schedule_self_leave_rekey_if_idle(state, group_id).await;
+    // #2124: this replay applies through `apply_named_group_metadata_event_inner`,
+    // not the apply entry, so it stops unneeded listeners itself. It holds
+    // no group lock here.
+    if any_accepted {
+        listener_lifecycle::retire_listeners_after_accepted_apply(state, group_id, &local_keys)
+            .await;
+    }
 }
 
 /// #1685 round 5: the catch-up cursor `(state_revision, secret_epoch,
@@ -17220,16 +17232,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event(
         && revocation_eviction::owner_recovery::hold_unchained_event(state, &event, &sender).await;
     let group_id = named_group_metadata_event_group_id(&event).to_string();
     let held_group = newly_held.then(|| group_id.clone());
-    // #2124: the local keys of the event's group, read before the apply,
-    // which can remove the record. The metadata registry is keyed by them.
-    let local_keys: Vec<String> = state
-        .named_groups
-        .read()
-        .await
-        .iter()
-        .filter(|(key, info)| *key == &group_id || info.stable_group_id() == group_id)
-        .map(|(key, _)| key.clone())
-        .collect();
+    // #2124: read before the apply, which can remove the record.
+    let local_keys = local_keys_of_group(state, &group_id).await;
     let applied = apply_named_group_metadata_event_with_binding(
         state,
         event,
@@ -17255,6 +17259,21 @@ pub(in crate::server) async fn apply_named_group_metadata_event(
             .await;
     }
     applied
+}
+
+/// #2124: the local map keys of `group_id` (a local key or a stable id)
+/// in the live map, whatever the re-seat scope: the metadata registry is
+/// unscoped and keyed by them. A caller reads them before an apply that
+/// can remove the record.
+async fn local_keys_of_group(state: &AppState, group_id: &str) -> Vec<String> {
+    state
+        .named_groups
+        .live_read()
+        .await
+        .iter()
+        .filter(|(key, info)| *key == group_id || info.stable_group_id() == group_id)
+        .map(|(key, _)| key.clone())
+        .collect()
 }
 
 async fn apply_named_group_metadata_event_with_binding(
@@ -24464,6 +24483,18 @@ pub(in crate::server) async fn get_group_public_messages(
     // actor-scoped and must not drift from `GET /history`.
     let stable_id = access.stable_id().to_string();
 
+    // #2124: past the cap of listeners for groups with no stored record,
+    // refuse with a typed error instead of serving a cache no listener fills.
+    if unrecorded_public_listener_cap_reached(&state, &stable_id).await {
+        return api_error_with_reason(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "this daemon already follows {MAX_UNRECORDED_PUBLIC_MESSAGE_LISTENERS} public groups \
+                 it holds no record for; import the group's card or join it, or retry after a restart"
+            ),
+            "public_listener_cap",
+        );
+    }
     // Ensure the listener is live on the stable-id topic.
     spawn_public_message_listener(Arc::clone(&state), stable_id.clone()).await;
 
@@ -25684,6 +25715,10 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
             return;
         }
     }
+    // #2124: refuse before subscribing; the insert below checks again.
+    if unrecorded_public_listener_cap_reached(&state, &group_id).await {
+        return;
+    }
     // #1366 test hook: let a concurrent install run between the check
     // above and the insert below, as a slow subscribe does.
     #[cfg(test)]
@@ -25757,10 +25792,7 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
     // #2124: such listeners are capped, so a local caller cannot grow the
     // registry without bound; past the cap the read serves the cache alone.
     let over_unrecorded_cap = wanted.is_none()
-        && tasks
-            .keys()
-            .filter(|key| public_message_listener_wanted(&groups, key).is_none())
-            .count()
+        && unrecorded_public_listener_count(&tasks, &groups)
             >= MAX_UNRECORDED_PUBLIC_MESSAGE_LISTENERS;
     drop(groups);
     if tasks.contains_key(&group_id)
@@ -25776,6 +25808,30 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
 /// #2124: the most public-message listeners that run for groups with no
 /// stored record (the fail-open install of `GET /groups/:id/messages`).
 pub(in crate::server) const MAX_UNRECORDED_PUBLIC_MESSAGE_LISTENERS: usize = 64;
+
+fn unrecorded_public_listener_count(
+    tasks: &HashMap<String, tokio::task::JoinHandle<()>>,
+    groups: &HashMap<String, x0x::groups::GroupInfo>,
+) -> usize {
+    tasks
+        .keys()
+        .filter(|key| public_message_listener_wanted(groups, key).is_none())
+        .count()
+}
+
+/// #2124: whether an install for `group_id` would be refused by the cap:
+/// no stored record names it, no listener runs for it, and the cap is
+/// full. Lock order: `public_message_tasks`, then `named_groups`.
+async fn unrecorded_public_listener_cap_reached(state: &AppState, group_id: &str) -> bool {
+    let tasks = state.public_message_tasks.read().await;
+    if tasks.contains_key(group_id) {
+        return false;
+    }
+    let groups = state.named_groups.read().await;
+    public_message_listener_wanted(&groups, group_id).is_none()
+        && unrecorded_public_listener_count(&tasks, &groups)
+            >= MAX_UNRECORDED_PUBLIC_MESSAGE_LISTENERS
+}
 
 /// #1366: the stable id of `group_id` and whether its public-message
 /// listener must run. `group_id` is a local map key or a stable id. The

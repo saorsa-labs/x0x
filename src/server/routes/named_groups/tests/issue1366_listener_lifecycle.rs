@@ -921,6 +921,96 @@ async fn issue2124_self_removal_applied_outside_the_listener_stops_both_listener
     Ok(())
 }
 
+/// #2124 item 1: catch-up drains the TreeKEM pending queue through
+/// `replay_pending_treekem_events`, which applies below the apply entry.
+/// A queued self-removal there stops both listeners too.
+#[tokio::test]
+async fn issue2124_queued_self_removal_replayed_by_catch_up_stops_both_listeners() -> Result<()> {
+    let group_id = "2124-queued-removal-key";
+    let (state, _dir, stable) = signed_public_fixture("2124-queued-removal", group_id).await?;
+    let meta = metadata_task(&state, group_id).await?;
+    let event = self_removal_event(&state, group_id, &stable).await?;
+    state
+        .treekem_pending_events
+        .write()
+        .await
+        .entry(group_id.to_string())
+        .or_default()
+        .push_back(PendingTreeKemMetadataEvent {
+            event,
+            sender: state.agent.agent_id(),
+            queued_at: Instant::now(),
+        });
+    replay_pending_treekem_events(&state, group_id, None).await;
+    assert!(
+        !state.named_groups.read().await.contains_key(group_id),
+        "the replayed self-removal takes the record away"
+    );
+    assert_metadata_stopped(&state, group_id, &meta, "a queued self-removal").await;
+    assert_public_stopped(&state, &stable, "a queued self-removal").await;
+    Ok(())
+}
+
+/// #2124 (ZCode review of 3f8ffd41): an event applied inside an open
+/// ADR 0109 re-seat staging changes the staged record only. A self-removal
+/// there takes the staged record away while the live record stays, so the
+/// live record keeps both listeners.
+#[tokio::test]
+async fn issue2124_staged_self_removal_keeps_the_live_listeners() -> Result<()> {
+    let group_id = "2124-staged-removal-key";
+    let (state, _dir, stable) = signed_public_fixture("2124-staged-removal", group_id).await?;
+    let live_record = state
+        .named_groups
+        .read()
+        .await
+        .get(group_id)
+        .cloned()
+        .context("fixture record")?;
+    let meta = metadata_task(&state, group_id).await?;
+    let event = self_removal_event(&state, group_id, &stable).await?;
+    state
+        .named_groups
+        .staging_write()
+        .await
+        .insert(group_id.to_string(), live_record);
+    state.reseat_stagings.open(group_id, &stable);
+    let applied = state
+        .reseat_stagings
+        .run_in_staging_of(
+            group_id,
+            apply_named_group_metadata_event(&state, event, state.agent.agent_id(), true, None),
+        )
+        .await;
+    assert!(applied.accepted, "the staged self-removal applies");
+    assert!(
+        !state
+            .named_groups
+            .staging_read()
+            .await
+            .contains_key(group_id),
+        "the self-removal took the staged record away"
+    );
+    assert!(
+        state.named_groups.live_read().await.contains_key(group_id),
+        "the live record stays"
+    );
+    assert!(
+        state
+            .named_group_test_recorders
+            .metadata_retire_steps
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0,
+        "the apply reached its metadata-listener stop check"
+    );
+    settle().await;
+    assert!(
+        metadata_registered(&state, group_id).await && !meta.is_finished(),
+        "the live record keeps its metadata listener"
+    );
+    assert_public_running(&state, &stable, "a staged self-removal").await;
+    Ok(())
+}
+
 /// #2124 item 1: an accepted event that keeps the record keeps both
 /// listeners on the same path.
 #[tokio::test]
@@ -966,10 +1056,10 @@ async fn issue2124_rename_applied_outside_the_listener_keeps_both_listeners() ->
     assert!(
         state
             .named_group_test_recorders
-            .listener_steps
+            .metadata_retire_steps
             .load(std::sync::atomic::Ordering::SeqCst)
             > 0,
-        "the apply reached its listener step"
+        "the apply reached its metadata-listener stop check"
     );
     settle().await;
     assert!(
@@ -980,9 +1070,10 @@ async fn issue2124_rename_applied_outside_the_listener_keeps_both_listeners() ->
     Ok(())
 }
 
-/// #2124 item 2: after a restart a pending join stub has its metadata
-/// listener but no attempt entry, so the legacy `TimedOut` owner finalizes
-/// it with no listener token. That finalize stops the listener too.
+/// #2124 item 2: a pending join stub whose attempt entry is gone (its
+/// stub marker survived, the attempt registry did not) has its metadata
+/// listener, and the legacy `TimedOut` owner finalizes it with no listener
+/// token. That finalize stops the listener too.
 #[tokio::test]
 async fn issue2124_legacy_timed_out_stub_stops_its_metadata_listener() -> Result<()> {
     let group_id = "2124-legacy-stub-key";
@@ -1003,7 +1094,7 @@ async fn issue2124_legacy_timed_out_stub_stops_its_metadata_listener() -> Result
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_empty(),
-        "precondition: no attempt owns the stub, as after a restart"
+        "precondition: no attempt owns the stub"
     );
     let lock = group_membership_lock_for_known_group(&state, group_id)
         .await
@@ -1061,9 +1152,34 @@ async fn issue2124_unrecorded_public_listeners_are_capped() -> Result<()> {
         "the refused install's task has ended"
     );
 
+    // The public-cache read refuses a further unrecorded group with a
+    // typed error.
+    let (status, body) = response_json(
+        get_group_public_messages(
+            State(Arc::clone(&state)),
+            Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+            Path(over.clone()),
+            Query(GetMessagesQuery::default()),
+            crate::server::group_access::GroupAccess::for_test_unknown(&over),
+        )
+        .await
+        .into_response(),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["reason"], "public_listener_cap", "{body}");
+
     // A stored group is not counted against the cap.
-    state.public_message_tasks.write().await.remove(&stable);
+    if let Some(handle) = state.public_message_tasks.write().await.remove(&stable) {
+        handle.abort();
+    }
+    settle().await;
+    assert!(
+        eventually(|| async { live(&stable) == 0 }).await,
+        "precondition: the stored group's listener has ended"
+    );
     reconcile_public_message_listener(&state, group_id).await;
+    settle().await;
     assert_public_running(&state, &stable, "a stored group past the cap").await;
     Ok(())
 }
