@@ -3632,7 +3632,16 @@ async fn subscribe_shard(state: Arc<AppState>, kind: x0x::groups::ShardKind, sha
                 }
                 maybe_msg = sub.recv() => {
                     let Some(msg) = maybe_msg else { break; };
-                    handle_directory_message(&state_for_listener, kind, shard, &msg.payload).await;
+                    // #1964: the verified signer keys the pull cooldown.
+                    let requester = msg.verified.then_some(msg.sender).flatten();
+                    handle_directory_message(
+                        &state_for_listener,
+                        kind,
+                        shard,
+                        &msg.payload,
+                        requester.as_ref(),
+                    )
+                    .await;
                 }
             }
         }
@@ -3694,11 +3703,223 @@ pub(super) fn pull_card_record<'a>(
         .filter(|info| !group_recovery::is_card_held_back(state, info.stable_group_id()))
 }
 
+/// Minimum interval between two answers to the same requester's
+/// `DirectoryMessage::Pull` for the same `(shard topic, group)` (#1964).
+///
+/// A burst of pulls from one requester would otherwise make every holder
+/// in the shard re-publish a ~20 KiB signed card back-to-back.
+const PULL_RESPONSE_COOLDOWN: Duration = Duration::from_secs(30);
+/// Hard cap on [`PullResponseCooldown`] entries (A06 bounds).
+const PULL_RESPONSE_COOLDOWN_MAX_ENTRIES: usize = 4_096;
+/// Least spacing between two expiry sweeps of a full cooldown table, so a
+/// full table costs at most one O(n) pass per second, not one per message.
+const PULL_RESPONSE_COOLDOWN_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+type PullResponseKey = ([u8; 32], String, String);
+
+/// Per-requester pull-response cooldown (#1964 / PR #2103 B4).
+///
+/// Keyed by the verified requester agent, the shard topic and the group.
+/// The caller checks it only for a group it can answer (owned or cached
+/// card) and records an entry only after the answer was published, so a
+/// remote peer cannot fill it with arbitrary group IDs and a failed
+/// publish is retried at the next pull. When the table is full and a
+/// sweep frees nothing, the pull is served without an entry (fail open).
+#[derive(Debug, Default)]
+pub(in crate::server) struct PullResponseCooldown {
+    entries: HashMap<PullResponseKey, Instant>,
+    last_sweep: Option<Instant>,
+}
+
+impl PullResponseCooldown {
+    fn key(requester: &x0x::identity::AgentId, topic: &str, gid: &str) -> PullResponseKey {
+        (*requester.as_bytes(), topic.to_string(), gid.to_string())
+    }
+
+    /// Whether this requester's pull for `(topic, gid)` was answered less
+    /// than [`PULL_RESPONSE_COOLDOWN`] ago.
+    fn suppressed(
+        &self,
+        requester: &x0x::identity::AgentId,
+        topic: &str,
+        gid: &str,
+        now: Instant,
+    ) -> bool {
+        self.entries
+            .get(&Self::key(requester, topic, gid))
+            .is_some_and(|last| now.saturating_duration_since(*last) < PULL_RESPONSE_COOLDOWN)
+    }
+
+    /// Record an answer that was published. Returns `false` when the table
+    /// is full and nothing could be recorded (the pull was still served).
+    fn record_served(
+        &mut self,
+        requester: &x0x::identity::AgentId,
+        topic: &str,
+        gid: &str,
+        now: Instant,
+    ) -> bool {
+        let key = Self::key(requester, topic, gid);
+        if let Some(slot) = self.entries.get_mut(&key) {
+            *slot = now;
+            return true;
+        }
+        if self.entries.len() >= PULL_RESPONSE_COOLDOWN_MAX_ENTRIES {
+            let sweep_due = self.last_sweep.is_none_or(|last| {
+                now.saturating_duration_since(last) >= PULL_RESPONSE_COOLDOWN_SWEEP_INTERVAL
+            });
+            if sweep_due {
+                self.last_sweep = Some(now);
+                self.entries
+                    .retain(|_, at| now.saturating_duration_since(*at) < PULL_RESPONSE_COOLDOWN);
+            }
+            if self.entries.len() >= PULL_RESPONSE_COOLDOWN_MAX_ENTRIES {
+                return false;
+            }
+        }
+        self.entries.insert(key, now);
+        true
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// Answer one pulled group with `card_bytes` on `topic`, under the
+/// requester's cooldown (#1964). Returns whether a publish was attempted.
+/// An unknown requester (unsigned or unverified pull) is answered without
+/// a cooldown, as before #1964.
+async fn serve_pull_with_cooldown<F, Fut, E>(
+    cooldown: &std::sync::Mutex<PullResponseCooldown>,
+    requester: Option<&x0x::identity::AgentId>,
+    topic: &str,
+    gid: &str,
+    publish: F,
+) -> bool
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<(), E>>,
+    E: std::fmt::Display,
+{
+    if let Some(requester) = requester {
+        let suppressed = cooldown
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .suppressed(requester, topic, gid, Instant::now());
+        if suppressed {
+            tracing::debug!(
+                group_id = %gid,
+                "C.2: suppressing a repeated directory pull from one requester within the cooldown"
+            );
+            return false;
+        }
+    }
+    match publish().await {
+        Ok(()) => {
+            if let Some(requester) = requester {
+                let _recorded = cooldown
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .record_served(requester, topic, gid, Instant::now());
+            }
+        }
+        Err(e) => {
+            tracing::debug!(group_id = %gid, "C.2: directory pull answer publish failed: {e}");
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod pull_response_cooldown_tests {
+    use super::*;
+
+    fn agent(byte: u8) -> x0x::identity::AgentId {
+        x0x::identity::AgentId([byte; 32])
+    }
+
+    /// #1964 / PR #2103 (B4): the cooldown is per requester. A second
+    /// requester's pull inside the window is answered.
+    #[tokio::test]
+    async fn pull_cooldown_is_keyed_by_requester_1964() {
+        let cooldown = std::sync::Mutex::new(PullResponseCooldown::default());
+        let published = std::sync::atomic::AtomicUsize::new(0);
+        let publish = || async {
+            published.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok::<(), String>(())
+        };
+        assert!(serve_pull_with_cooldown(&cooldown, Some(&agent(1)), "t", "g", publish).await);
+        assert!(!serve_pull_with_cooldown(&cooldown, Some(&agent(1)), "t", "g", publish).await);
+        assert!(serve_pull_with_cooldown(&cooldown, Some(&agent(2)), "t", "g", publish).await);
+        assert!(serve_pull_with_cooldown(&cooldown, Some(&agent(1)), "t", "g2", publish).await);
+        assert!(serve_pull_with_cooldown(&cooldown, None, "t", "g", publish).await);
+        assert!(serve_pull_with_cooldown(&cooldown, None, "t", "g", publish).await);
+        assert_eq!(published.load(std::sync::atomic::Ordering::SeqCst), 5);
+    }
+
+    /// #1964 / PR #2103 (B4): a failed publish records nothing, so the
+    /// same requester's next pull is answered at once.
+    #[tokio::test]
+    async fn pull_cooldown_failed_publish_is_retried_at_next_pull_1964() {
+        let cooldown = std::sync::Mutex::new(PullResponseCooldown::default());
+        let failing = || async { Err::<(), String>("no peers".to_string()) };
+        assert!(serve_pull_with_cooldown(&cooldown, Some(&agent(1)), "t", "g", failing).await);
+        assert_eq!(cooldown.lock().unwrap().len(), 0);
+        let ok = || async { Ok::<(), String>(()) };
+        assert!(
+            serve_pull_with_cooldown(&cooldown, Some(&agent(1)), "t", "g", ok).await,
+            "a failed answer must not start the cooldown"
+        );
+        assert!(!serve_pull_with_cooldown(&cooldown, Some(&agent(1)), "t", "g", ok).await);
+    }
+
+    /// #1964 / PR #2103 (B4): entries expire after the window.
+    #[test]
+    fn pull_cooldown_expires_after_window_1964() {
+        let mut table = PullResponseCooldown::default();
+        let t0 = Instant::now();
+        assert!(table.record_served(&agent(1), "t", "g", t0));
+        assert!(table.suppressed(&agent(1), "t", "g", t0 + Duration::from_secs(5)));
+        assert!(!table.suppressed(
+            &agent(1),
+            "t",
+            "g",
+            t0 + PULL_RESPONSE_COOLDOWN + Duration::from_secs(1)
+        ));
+    }
+
+    /// #1964 / PR #2103 (B4): the table never exceeds its cap. A full
+    /// table sweeps expired entries at most once per second; when nothing
+    /// expired the answer is served without an entry (fail open).
+    #[test]
+    fn pull_cooldown_table_is_hard_capped_and_fails_open_1964() {
+        let mut table = PullResponseCooldown::default();
+        let t0 = Instant::now();
+        for i in 0..PULL_RESPONSE_COOLDOWN_MAX_ENTRIES {
+            assert!(table.record_served(&agent(1), "t", &i.to_string(), t0));
+        }
+        assert_eq!(table.len(), PULL_RESPONSE_COOLDOWN_MAX_ENTRIES);
+        // Full, nothing expired: not recorded, so not suppressed later.
+        assert!(!table.record_served(&agent(2), "t", "new", t0));
+        assert!(!table.suppressed(&agent(2), "t", "new", t0));
+        assert_eq!(table.len(), PULL_RESPONSE_COOLDOWN_MAX_ENTRIES);
+        // An existing key still refreshes in place.
+        assert!(table.record_served(&agent(1), "t", "0", t0));
+        // After the window the sweep frees room.
+        let later = t0 + PULL_RESPONSE_COOLDOWN + Duration::from_secs(1);
+        assert!(table.record_served(&agent(2), "t", "new", later));
+        assert!(table.len() <= 2);
+    }
+}
+
 async fn respond_to_pull(
     state: &AppState,
     kind: x0x::groups::ShardKind,
     shard: u32,
     group_ids: &[String],
+    requester: Option<&x0x::identity::AgentId>,
 ) {
     let signing_kp = state.agent.identity().agent_keypair();
     let topic = x0x::groups::topic_for(kind, shard);
@@ -3706,27 +3927,46 @@ async fn respond_to_pull(
     for gid in group_ids {
         // We only re-publish cards for groups we *own* / manage locally,
         // not arbitrary cards from our cache (relays may re-publish cached
-        // blobs but cannot re-sign them).
+        // blobs but cannot re-sign them). This ownership / cache check runs
+        // before the cooldown, so a pull for a group we cannot answer never
+        // touches the cooldown table.
+        let mut card_bytes = None;
         if let Some(info) = pull_card_record(state, &groups, gid) {
             if !x0x::groups::may_publish_to_public_shards(info.policy.discoverability) {
                 continue;
             }
             if let Ok(Some(card)) = info.to_signed_group_card(signing_kp) {
-                let msg = x0x::groups::DirectoryMessage::Card {
-                    card: Box::new(card),
-                };
-                let _ = state.agent.publish(&topic, msg.encode()).await;
-                continue;
+                card_bytes = Some(
+                    x0x::groups::DirectoryMessage::Card {
+                        card: Box::new(card),
+                    }
+                    .encode(),
+                );
             }
         }
-        // Fall back to re-broadcasting a cached card verbatim if we have one
-        // (relay-forward semantics).
-        if let Some(cached) = state.directory_cache.read().await.get(gid) {
-            let msg = x0x::groups::DirectoryMessage::Card {
-                card: Box::new(cached.clone()),
-            };
-            let _ = state.agent.publish(&topic, msg.encode()).await;
+        if card_bytes.is_none() {
+            // Fall back to re-broadcasting a cached card verbatim if we have
+            // one (relay-forward semantics).
+            if let Some(cached) = state.directory_cache.read().await.get(gid) {
+                card_bytes = Some(
+                    x0x::groups::DirectoryMessage::Card {
+                        card: Box::new(cached.clone()),
+                    }
+                    .encode(),
+                );
+            }
         }
+        let Some(bytes) = card_bytes else {
+            continue;
+        };
+        serve_pull_with_cooldown(
+            &state.directory_pull_cooldown,
+            requester,
+            &topic,
+            gid,
+            || async { state.agent.publish(&topic, bytes).await.map(|_| ()) },
+        )
+        .await;
     }
 }
 
@@ -3736,6 +3976,7 @@ pub(in crate::server) async fn handle_directory_message(
     kind: x0x::groups::ShardKind,
     shard: u32,
     payload: &[u8],
+    requester: Option<&x0x::identity::AgentId>,
 ) {
     let msg = match x0x::groups::DirectoryMessage::decode(payload) {
         Ok(m) => m,
@@ -3852,7 +4093,7 @@ pub(in crate::server) async fn handle_directory_message(
             if peer_shard != shard || peer_kind != kind {
                 return;
             }
-            respond_to_pull(state, kind, shard, &group_ids).await;
+            respond_to_pull(state, kind, shard, &group_ids, requester).await;
         }
     }
 }
@@ -23968,6 +24209,10 @@ pub(in crate::server) async fn send_group_public_message(
             );
         }
     };
+    // #1964: the global fallback copy goes out only while the per-group
+    // topic is fresh. Read before the effect-point check below, which must
+    // stay the last await before the publish.
+    let global_copy = group_public_topic_is_fresh(&state, &msg.group_id).await;
     // ADR-0066 §1 row 1 / §4 (slice 9): THE EFFECT POINT. The publish below
     // is the irreversible step — once the bytes are handed to gossip they are
     // on the wire and the contested state has been exported. So the marker is
@@ -24001,17 +24246,6 @@ pub(in crate::server) async fn send_group_public_message(
         }
     };
     observe_group_send_fanout(&state, &msg.group_id, fan_out).await;
-    if let Err(e) = state
-        .agent
-        .publish(GLOBAL_PUBLIC_MESSAGE_TOPIC, bytes.clone())
-        .await
-    {
-        tracing::warn!(
-            topic = GLOBAL_PUBLIC_MESSAGE_TOPIC,
-            group_id = %msg.group_id,
-            "E: global public-send fallback publish failed: {e}"
-        );
-    }
     // Publish succeeded, so cache locally. The listener was started before the
     // publish above to avoid first-message topic races. Delivery (fan_out) is
     // a separate fact from this local write — HTTP 200 is preserved even
@@ -24023,6 +24257,7 @@ pub(in crate::server) async fn send_group_public_message(
         bytes,
         direct_recipients,
         msg.clone(),
+        global_copy,
     );
 
     let msg_id = msg.msg_id();
@@ -24034,23 +24269,68 @@ pub(in crate::server) async fn send_group_public_message(
             msg.timestamp,
             &msg_id,
             fan_out,
+            global_copy,
         )),
     )
 }
 
+/// How long a per-group public topic counts as fresh (#1964): after this
+/// daemon starts, and after any active member of the group joins or
+/// changes. Covers the first-seconds asymmetric PlumTree reachability that
+/// [`GLOBAL_PUBLIC_MESSAGE_TOPIC`] exists for, with margin for clock skew
+/// between the member record's writer and this daemon.
+const PUBLIC_TOPIC_FRESH_WINDOW: Duration = Duration::from_secs(120);
+
+/// Whether a group's per-group public topic is fresh at `now_ms`: the
+/// daemon started inside the window, or an active member's `joined_at` or
+/// `updated_at` (unix ms) is inside it or in the future.
+fn public_topic_fresh_at(
+    daemon_uptime: Duration,
+    member_times_ms: impl IntoIterator<Item = (u64, u64)>,
+    now_ms: u64,
+) -> bool {
+    let window_ms = PUBLIC_TOPIC_FRESH_WINDOW.as_millis() as u64;
+    daemon_uptime < PUBLIC_TOPIC_FRESH_WINDOW
+        || member_times_ms
+            .into_iter()
+            .any(|(joined, updated)| now_ms.saturating_sub(joined.max(updated)) < window_ms)
+}
+
+/// [`public_topic_fresh_at`] for `group_id` now. An unknown group counts
+/// as fresh (fail open: send the global copy).
+async fn group_public_topic_is_fresh(state: &AppState, group_id: &str) -> bool {
+    let groups = state.named_groups.read().await;
+    let Some(info) = groups.get(group_id).or_else(|| {
+        groups
+            .values()
+            .find(|info| info.stable_group_id() == group_id)
+    }) else {
+        return true;
+    };
+    public_topic_fresh_at(
+        state.start_time.elapsed(),
+        info.active_members()
+            .map(|member| (member.joined_at, member.updated_at)),
+        now_millis_u64(),
+    )
+}
+
 /// Successful `POST /groups/:id/send` body. `fan_out` is always present.
+/// `fallback_topic` names the global topic only when a copy went there
+/// (#1964); otherwise it is `null`.
 fn group_public_send_ok_json(
     group_id: &str,
     topic: &str,
     timestamp: u64,
     msg_id: &str,
     fan_out: u32,
+    global_copy: bool,
 ) -> serde_json::Value {
     serde_json::json!({
         "ok": true,
         "group_id": group_id,
         "topic": topic,
-        "fallback_topic": GLOBAL_PUBLIC_MESSAGE_TOPIC,
+        "fallback_topic": global_copy.then_some(GLOBAL_PUBLIC_MESSAGE_TOPIC),
         "timestamp": timestamp,
         "msg_id": msg_id,
         "fan_out": fan_out,
@@ -24392,20 +24672,12 @@ pub(in crate::server) async fn publish_delegation_carrier(
     if let Err(e) = state.agent.publish_with_fanout(&topic, bytes.clone()).await {
         tracing::warn!(topic = %LogHexId::topic(&topic), "delegation carrier publish failed: {e}");
     }
-    if let Err(e) = state
-        .agent
-        .publish(GLOBAL_PUBLIC_MESSAGE_TOPIC, bytes.clone())
-        .await
-    {
-        tracing::warn!(
-            topic = GLOBAL_PUBLIC_MESSAGE_TOPIC,
-            "delegation carrier global fallback failed: {e}"
-        );
-    }
     cache_public_message(&state, msg.clone()).await;
     let direct_recipients = active_member_recipients(&state, &msg.group_id).await;
     spawn_delegation_carrier_redelivery(&state, &topic, &bytes, &msg);
-    spawn_group_public_message_fanout_race(state, topic, bytes, direct_recipients, msg);
+    // The first send of a carrier always keeps its global copy: a delegate
+    // may not be on the per-group topic yet.
+    spawn_group_public_message_fanout_race(state, topic, bytes, direct_recipients, msg, true);
 }
 
 /// Active members of `group_id` other than this daemon, as lowercase hex.
@@ -24932,6 +25204,7 @@ fn spawn_group_public_message_fanout_race(
     bytes: Vec<u8>,
     recipients: Vec<String>,
     msg: x0x::groups::GroupPublicMessage,
+    global_copy: bool,
 ) {
     let unicast_outstanding = Arc::new(AtomicUsize::new(recipients.len()));
 
@@ -24943,30 +25216,29 @@ fn spawn_group_public_message_fanout_race(
         tracing::info!(
             target: "x0x::groups",
             group_id = %LogHexId::group(&gossip_group),
-            "public group message gossip publish starting (raced with unicast)"
+            topic = %LogHexId::topic(&topic),
+            global_copy,
+            "public group message gossip leg starting (raced with unicast)"
         );
         #[cfg(test)]
         detached_send_test_seam::park(&detached_send_test_seam::public_gossip_key(&topic)).await;
-        if let Err(e) = gossip_state
-            .agent
-            .publish(&topic, gossip_bytes.clone())
-            .await
-        {
-            tracing::warn!(
-                topic = %LogHexId::topic(&topic),
-                "E: public-send publish failed: {e}"
-            );
-        }
-        if let Err(e) = gossip_state
-            .agent
-            .publish(GLOBAL_PUBLIC_MESSAGE_TOPIC, gossip_bytes)
-            .await
-        {
-            tracing::warn!(
-                topic = GLOBAL_PUBLIC_MESSAGE_TOPIC,
-                group_id = %gossip_group,
-                "E: global public-send fallback publish failed: {e}"
-            );
+        // #1964: the caller already published once on the per-group topic
+        // (`publish_with_fanout`); a second per-group publish would only add
+        // a copy under a new message ID. The global topic gets one copy
+        // when `global_copy` (a fresh per-group topic, or a delegation
+        // carrier's first send).
+        if global_copy {
+            if let Err(e) = gossip_state
+                .agent
+                .publish(GLOBAL_PUBLIC_MESSAGE_TOPIC, gossip_bytes)
+                .await
+            {
+                tracing::warn!(
+                    topic = GLOBAL_PUBLIC_MESSAGE_TOPIC,
+                    group_id = %gossip_group,
+                    "E: global public-send fallback publish failed: {e}"
+                );
+            }
         }
         if gossip_outstanding.load(Ordering::Relaxed) > 0 {
             gossip_state
@@ -24975,7 +25247,7 @@ fn spawn_group_public_message_fanout_race(
             tracing::info!(
                 target: "x0x::groups",
                 group_id = %LogHexId::group(&gossip_group),
-                "public group message gossip published before unicast returned"
+                "public group message gossip leg completed before unicast returned"
             );
         }
     });
@@ -55945,6 +56217,7 @@ pub(in crate::server) mod tests {
             delegation_ids: RwLock::new(std::collections::HashMap::new()),
             public_messages: RwLock::new(HashMap::new()),
             public_message_tasks: RwLock::new(HashMap::new()),
+            directory_pull_cooldown: std::sync::Mutex::new(Default::default()),
             agent_kem_keypair: Arc::new(x0x::groups::kem_envelope::AgentKemKeypair::generate()?),
             contacts,
             profile: RwLock::new(
@@ -71676,12 +71949,60 @@ pub(in crate::server) mod tests {
         Ok(())
     }
 
+    /// #1964 / PR #2103 (B2): `fallback_topic` names the global topic only
+    /// when a global copy was sent, and is `null` otherwise.
+    #[test]
+    fn group_send_ok_json_reports_fallback_topic_truthfully_1964() {
+        let with = group_public_send_ok_json("g1", "t", 1, "ab", 3, true);
+        assert_eq!(with["fallback_topic"], GLOBAL_PUBLIC_MESSAGE_TOPIC);
+        let without = group_public_send_ok_json("g1", "t", 1, "ab", 3, false);
+        assert!(
+            without["fallback_topic"].is_null(),
+            "no global copy => fallback_topic null: {without}"
+        );
+    }
+
+    /// #1964 / PR #2103 (B2): the per-group topic is fresh after a daemon
+    /// start or a member join/change inside the window, whatever the
+    /// eager fan-out; otherwise the send uses the per-group topic only.
+    #[test]
+    fn public_topic_freshness_window_1964() {
+        let window_ms = PUBLIC_TOPIC_FRESH_WINDOW.as_millis() as u64;
+        let now = 10_000_000_u64;
+        let long_up = PUBLIC_TOPIC_FRESH_WINDOW * 10;
+        let old = (now - 10 * window_ms, now - 10 * window_ms);
+        // Fresh daemon start.
+        assert!(public_topic_fresh_at(Duration::from_secs(5), [old], now));
+        // Settled group, long-running daemon: per-group topic only.
+        assert!(!public_topic_fresh_at(long_up, [old], now));
+        assert!(!public_topic_fresh_at(
+            long_up,
+            [(now - window_ms, now - window_ms)],
+            now
+        ));
+        // A member joined just now.
+        assert!(public_topic_fresh_at(
+            long_up,
+            [old, (now - 1_000, now - 1_000)],
+            now
+        ));
+        // A re-activated member (old join, recent update).
+        assert!(public_topic_fresh_at(long_up, [(old.0, now - 1_000)], now));
+        // A member record from a clock ahead of ours counts as fresh.
+        assert!(public_topic_fresh_at(
+            long_up,
+            [(now + 5_000, now + 5_000)],
+            now
+        ));
+    }
+
     /// Why (#296): callers detect the gossip black-hole from `fan_out`.
     /// A send body without the field must never be produced.
     #[test]
     fn group_send_ok_json_always_includes_fan_out() {
         for fan_out in [0_u32, 1, 8] {
-            let body = group_public_send_ok_json("g1", "x0x.groups.public.g1", 1, "ab", fan_out);
+            let body =
+                group_public_send_ok_json("g1", "x0x.groups.public.g1", 1, "ab", fan_out, true);
             assert!(
                 body.get("fan_out").is_some(),
                 "fan_out must always be present: {body}"

@@ -221,6 +221,7 @@ async fn shard_delivery_refuses_unsigned_and_damaged_cards() -> Result<()> {
             x0x::groups::ShardKind::Id,
             0,
             &message.encode(),
+            None,
         )
         .await;
         let (in_cards, in_directory) = caches_contain(&state, &card.group_id).await;
@@ -243,6 +244,7 @@ async fn shard_delivery_refuses_unsigned_and_damaged_cards() -> Result<()> {
         x0x::groups::ShardKind::Id,
         0,
         &message.encode(),
+        None,
     )
     .await;
     let (in_cards, in_directory) = caches_contain(&state, &signed.group_id).await;

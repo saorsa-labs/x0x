@@ -8,10 +8,32 @@ All notable changes to this project will be documented in this file.
 
 - **No launchd restart loop on a missing daemon (#1379; A14 amendment of
   19 Nov 2026).** On macOS the launcher no longer exits when the daemon
-  path does not exist. It waits, with a pause that doubles from 1 s to
-  60 s, and starts the daemon as soon as the path is back, so launchd keeps
-  one quiet process instead of a restart every 10 s. A job that pins a
-  removed Homebrew Cellar path still needs a stable path to start again.
+  path does not exist. It tries again after a pause that doubles from 1 s
+  to 60 s, so it starts the daemon at most 60 s after the path is back, and
+  launchd keeps one quiet process instead of a restart every 10 s. A job
+  that pins a removed Homebrew Cellar path still needs a stable path to
+  start again.
+
+- **Less repeat traffic on seven idle and write paths (#1964, PR #2103;
+  A06 and A07 amendments of 19 Nov 2026).** (1) A plain KV store write sent
+  its delta DM to each contact twice, the second copy 8 s later; it now
+  sends the second copy only when the first DM got no ACK. The ACK, the
+  retries and the compatibility-bus fallback stay. (2) The heartbeat
+  republished every known move activation bundle every 600 s; it now
+  publishes on a change of the bundle set, when a connected peer is newly
+  seen, after a failed publish, and every 12th beat (2 h). (3) In on-demand
+  capability mode a capability change no longer restarts the four-advert
+  startup burst. (4) A public group message was published four times (twice
+  per-group, twice on `x0x.groups.public.v1`); it now goes once on the
+  per-group topic, plus once on the global topic only while the per-group
+  topic is fresh (daemon up < 120 s, or a member joined or changed < 120 s
+  ago) and for a delegation carrier's first send. The `POST /groups/:id/send`
+  field `fallback_topic` is now `null` when no global copy was sent.
+  (5) A directory shard holder answers the same verified requester's pull
+  for the same group at most once per 30 s (table capped at 4,096 entries,
+  fail open). (6) `x0x.machine.announce.v3` is Bulk priority. (7) The
+  application-level SWIM ping round runs every 60 s, not every 15 s. No wire
+  change; older versions interoperate.
 
 - **Removed the two closed Hetzner seeds (#2094).** The Helsinki
   (`65.21.157.229`, `2a01:4f9:c012:684b::1`) and Nuremberg
@@ -527,6 +549,14 @@ All notable changes to this project will be documented in this file.
   alone do not install updates.
 
 ### Tests and tooling
+
+- **W3-H: `s4_certificate_rebind` run (5), a renewal signed by another
+  user key (#1581).** `w3h_1357_s4_certificate_rebind_pre_cutoff` now has
+  B self-rebind a later certificate for its own agent key that a second
+  user key signed, not the Home's owner. The route refuses it with
+  `422 rebind_certificate_invalid`, and every node still binds the earlier
+  renewal at the same state revision. Control: with the owner check
+  removed, the row reads RED.
 
 - **W3-H: the q3 sidecar row proves O refused J, and every J listener
   took the re-seat answer (#1581, follow-up to #2080).**

@@ -14,8 +14,7 @@ use tempfile::TempDir;
 
 /// 75 is EX_TEMPFAIL: the manager restarts the job, as for a direct unit
 /// whose daemon cannot exec. On macOS a missing daemon is waited for
-/// instead (#1379).
-#[cfg(not(target_os = "macos"))]
+/// instead (#1379); any other exec error still exits 75.
 const EXIT_TEMPFAIL: i32 = 75;
 /// 64 is EX_USAGE: the unit supplied no daemon to run.
 const EXIT_USAGE: i32 = 64;
@@ -177,6 +176,26 @@ fn launcher_waits_for_a_missing_daemon_and_then_runs_it() {
     // The next attempt (after the 1 s pause) execs the daemon, so its own
     // exit status reaches the manager.
     assert_eq!(exit_within_bound(&mut child).code(), Some(42));
+}
+
+/// #1379: only a missing daemon is waited for. A daemon that exists but
+/// cannot be executed (mode 000, `EACCES`) still exits 75 on macOS.
+#[cfg(target_os = "macos")]
+#[test]
+fn launcher_reports_tempfail_when_an_existing_daemon_cannot_exec() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = stub_daemon(&root, 0);
+    std::fs::set_permissions(&daemon, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_x0x-launcher"))
+        .arg(&daemon)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let status = exit_within_bound(&mut child);
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+    assert_eq!(status.code(), Some(EXIT_TEMPFAIL), "{stderr}");
+    assert!(stderr.contains("cannot exec"), "{stderr}");
 }
 
 #[cfg(target_os = "macos")]

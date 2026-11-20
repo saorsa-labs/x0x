@@ -970,6 +970,9 @@ pub(super) struct AppState {
     pub(super) public_messages: RwLock<HashMap<String, Vec<x0x::groups::GroupPublicMessage>>>,
     /// Phase E: background listener tasks on public-chat topics.
     pub(super) public_message_tasks: RwLock<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// #1964: per-requester cooldown for directory pull answers (bounded).
+    pub(super) directory_pull_cooldown:
+        std::sync::Mutex<super::routes::named_groups::PullResponseCooldown>,
     /// ADR-0040 delegation registry: per-group index of delegation
     /// envelopes whose carriers are durably committed in THIS daemon's
     /// history. Lazily rebuilt from history (crash/restart re-derives from

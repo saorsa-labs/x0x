@@ -20,16 +20,23 @@
 //! `s4_certificate_rebind` (nodes A, B, C; A is the Home owner and only
 //! admin; B is the seat whose certificate expires):
 //!
-//! - `w3h_1357_s4_certificate_rebind_pre_cutoff`, runs (1), (4) and (7). B's
-//!   first certificate has `not_after` = issue time + [`LONG_NOT_AFTER`].
+//! - `w3h_1357_s4_certificate_rebind_pre_cutoff`, runs (1), (4), (5) and
+//!   (7). B's first certificate has `not_after` = issue time + [`LONG_NOT_AFTER`].
 //!   At t = 0, U issues B's renewal and B self-rebinds through the route.
 //!   Desired (1): every node keeps B's seat, role, leaf and TreeKEM epoch,
 //!   only B's committed digest changes (to the renewal's), the head commit
 //!   is B's own, no S4 row for B stays open, and B and C still decrypt A's
 //!   new traffic. Then (4): B tries to rebind a certificate that expires
 //!   before the one now committed; the route refuses with
-//!   `rebind_not_later` and nothing changes. Then (7): B revokes its own
-//!   agent; once A and C hold the record, B's rebind of a later renewal
+//!   `rebind_not_later` and nothing changes. Then (5): B tries to rebind a
+//!   later certificate for its own agent key signed by a second user key
+//!   U2, not the Home's owner U; the route refuses with
+//!   `422 rebind_certificate_invalid`, and every node still binds the
+//!   renewal at the same state revision. B's route refuses before it
+//!   builds a commit, so A's and C's own check of a foreign owner is not
+//!   reached here; `cert_rebind`'s unit test
+//!   `certificate_from_another_owner_is_invalid` covers it. Then (7): B
+//!   revokes its own agent; once A and C hold the record, B's rebind of a later renewal
 //!   is refused with `rebind_signer_ineligible` and no node binds it.
 //!   This arm does not depend on the wall clock moving, so it also runs
 //!   without the shim.
@@ -53,11 +60,10 @@
 //!   and the 20-rerun W3-H gate runs it (`--run-ignored all`) and requires
 //!   GREEN in every rerun, as for the other `s4_` arms.
 //!
-//! Not in this case yet (ADR rows (2), (3), (5), (8)–(10) and the
+//! Not in this case yet (ADR rows (2), (3), (8)–(10) and the
 //! D-fallback form of (6)): (2) needs B offline with the renewal reaching
 //! A only by announce; (3) needs a released 0.46.1 member whose advert
-//! lacks `certificate_rebind_v1` (W3-H runs one build); (5) needs a second
-//! user key's certificate over a Home device; (8) and (9) need every admin certificate
+//! lacks `certificate_rebind_v1` (W3-H runs one build); (8) and (9) need every admin certificate
 //! to expire, so the owner device needs an expiring certificate, and
 //! [`Sim::start_owner_device`] issues a non-expiring one; (10) needs a
 //! fault rule that holds one commit frame for 600 s + W; (6) with A
@@ -134,6 +140,9 @@ const CAUSE_NO_REBIND: &str = "no rebinding commit: every node still binds B's f
                                digest (the ADR's red-on-main observation)";
 const CAUSE_REVOKED_REBIND: &str = "run (7): a revoked agent's self-rebind was not refused with \
                                     rebind_signer_ineligible, or a node bound its certificate";
+const CAUSE_FOREIGN_RENEWAL: &str = "run (5): a renewal signed by another user key was not \
+                                     refused with rebind_certificate_invalid, or a node's \
+                                     binding or revision moved";
 const CAUSE_REBIND_EVICTED: &str = "B's seat was removed at expiry instead of rebound: a survivor \
                                     lists B as not Active";
 const CAUSE_NO_RECOVERY: &str = "no owner-recovery exit: A stays seated at e0 on B and C and B is \
@@ -142,7 +151,7 @@ const CAUSE_NO_RECOVERY: &str = "no owner-recovery exit: A stays seated at e0 on
 /// Which `s4_certificate_rebind` runs an arm does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RebindRun {
-    /// Runs (1), (4) and (7).
+    /// Runs (1), (4), (5) and (7).
     PreCutoff,
     /// Run (6), designated admin reachable.
     PostCutoff,
@@ -315,6 +324,19 @@ fn all_bind(seats: &Seats, digest: &str) -> bool {
             seat.as_ref()
                 .is_some_and(|seat| seat.digest.as_deref() == Some(digest))
         })
+}
+
+/// Every node has a record in both reads and its state revision did not
+/// move between them.
+fn same_revisions(now: &Seats, was: &Seats) -> bool {
+    now.len() == was.len()
+        && now
+            .iter()
+            .zip(was)
+            .all(|((_, now), (_, was))| match (now, was) {
+                (Some(now), Some(was)) => now.view.state_revision == was.view.state_revision,
+                _ => false,
+            })
 }
 
 /// No node binds `digest` to the seat, and every node except `gone` has
@@ -895,7 +917,7 @@ async fn rebind_scenario(sim: &mut Sim, run: RebindRun, receipt: &mut Receipt) -
     }
 }
 
-/// Runs (1), (4) and (7).
+/// Runs (1), (4), (5) and (7).
 #[allow(clippy::too_many_arguments)]
 async fn pre_cutoff(
     sim: &Sim,
@@ -989,20 +1011,48 @@ async fn pre_cutoff(
     let after4 = seats(sim, THREE, group, b).await?;
     let refused =
         status4 == StatusCode::UNPROCESSABLE_ENTITY && body4["error"] == "rebind_not_later";
-    let unchanged = all_bind(&after4, &d1)
-        && after4
-            .iter()
-            .zip(&after)
-            .all(|((_, now), (_, was))| match (now, was) {
-                (Some(now), Some(was)) => now.view.state_revision == was.view.state_revision,
-                _ => false,
-            });
+    let unchanged = all_bind(&after4, &d1) && same_revisions(&after4, &after);
     let run4 = refused && unchanged;
     receipt.note(format!(
         "run (4) older certificate (digest {older_digest}, not_after {}): {status4} {body4}; \
          refused rebind_not_later {refused}; nothing changed {unchanged}; {}",
         not_after0 + RENEWAL_EXTRA / 2,
         describe_seats(&after4)
+    ));
+
+    // Run (5): a renewal for B's agent key signed by a second user key U2,
+    // not the Home's owner U. It expires later than the committed one, so
+    // only the owner check can refuse it.
+    let other_user = UserKeypair::generate()?;
+    let foreign = AgentCertificate::issue_for_public_key(
+        &other_user,
+        sim.state("B")?
+            .agent
+            .identity()
+            .agent_keypair()
+            .public_key()
+            .as_bytes(),
+        Some(not_after0 + RENEWAL_EXTRA + RENEWAL_EXTRA / 2),
+    )?;
+    let foreign_digest = crate::groups::owner_cert::certificate_digest_hex(&foreign);
+    let (status5, body5) = sim
+        .api(
+            "B",
+            Method::POST,
+            &path,
+            Some(json!({"certificate": BASE64.encode(foreign.to_storage_bytes()?)})),
+        )
+        .await?;
+    pause(sim, "after the other user's renewal", QUIET).await?;
+    let after5 = seats(sim, THREE, group, b).await?;
+    let refused5 = status5 == StatusCode::UNPROCESSABLE_ENTITY
+        && body5["error"] == "rebind_certificate_invalid";
+    let unchanged5 = all_bind(&after5, &d1) && same_revisions(&after5, &after);
+    let run5 = refused5 && unchanged5;
+    receipt.note(format!(
+        "run (5) renewal signed by another user key (digest {foreign_digest}): {status5} \
+         {body5}; refused rebind_certificate_invalid {refused5}; nothing changed {unchanged5}; {}",
+        describe_seats(&after5)
     ));
 
     // Run (7): a revoked agent tries to self-rebind. B revokes its own
@@ -1069,8 +1119,15 @@ async fn pre_cutoff(
         format!("B's reply {status}; frames since t=0: B->A={to_a} B->C={to_c}"),
         at(sim),
     );
-    let passed = run1 && run4 && run7;
-    if run1 && run4 && !run7 {
+    let passed = run1 && run4 && run5 && run7;
+    if run1 && run4 && !run5 {
+        receipt.cause(
+            CAUSE_FOREIGN_RENEWAL,
+            Some(format!("{status5} {body5}; {}", describe_seats(&after5))),
+            true,
+            at(sim),
+        );
+    } else if run1 && run4 && !run7 {
         receipt.cause(
             CAUSE_REVOKED_REBIND,
             Some(format!("{status7} {body7}; {}", describe_seats(&after7))),
@@ -1743,7 +1800,7 @@ async fn expect2(case: &str, seed: u64, arm: Arm2, want: Verdict) -> Result<()> 
     Ok(())
 }
 
-/// ADR 0110 `s4_certificate_rebind` runs (1), (4) and (7): GREEN with S4.
+/// ADR 0110 `s4_certificate_rebind` runs (1), (4), (5) and (7): GREEN with S4.
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),

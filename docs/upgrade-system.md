@@ -1212,8 +1212,8 @@ and exited 75 at once, and launchd started it again after each throttle
 interval (3 starts in 30 s): a restart loop. On macOS the launcher now
 waits instead. It writes one line to the job's standard error, tries the
 `exec` again after 1 s, doubles the pause up to 60 s, and becomes the
-daemon as soon as the path is back. A stop ends the wait; any other
-`exec` error still exits 75. On Linux the exit stays, because systemd's
+daemon at the first try after the path is back (at most 60 s later). A
+stop ends the wait; any other `exec` error still exits 75. On Linux the exit stays, because systemd's
 start limit ends the restarts. The acceptance script checks the wait
 (`missing-daemon-waits`): one launcher start in 30 s, then the daemon
 runs once its path exists.
