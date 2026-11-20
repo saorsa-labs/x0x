@@ -2086,10 +2086,16 @@ fn prepare_measurement() -> MeasurementPreparation {
 }
 
 fn reviewed_pubsub_producer(package: &toml::Value) -> bool {
-    // crates.io 0.5.92 retains the reviewed outbound meter, per-peer wire
+    // crates.io 0.5.94 retains the reviewed outbound meter, per-peer wire
     // lengths and key-cache accounting. Its pubsub sources are
-    // byte-identical to 0.5.91; 0.5.92 only moves the family and ant-quic
-    // pins (ant-quic =0.28.0). Against 0.5.90, 0.5.91 added per-kind
+    // byte-identical to 0.5.93; 0.5.94 only moves the family and ant-quic
+    // pins (ant-quic =0.29.0). Against 0.5.92, 0.5.93 added additive
+    // ingress and EAGER send-cause counters to the stage snapshot
+    // (`payload_replay_dropped`, `ingress_by_topic`,
+    // `ingress_topics_uncounted`, `eager_send_causes`), booked at the same
+    // points as `outbound_by_kind["eager"]`, and a no-op clippy rewrite in
+    // the egress reserve; neither changes an outbound meter definition.
+    // 0.5.92's pubsub sources were byte-identical to 0.5.91. Against 0.5.90, 0.5.91 added per-kind
     // verify counters, msg_id-carrying subscriptions, the Critical Data
     // cooling exemption at claim time, V3 recovery-intent keying, no send
     // attempts for a stale eager-reply claim (pruned or token mismatch), no
@@ -2099,10 +2105,10 @@ fn reviewed_pubsub_producer(package: &toml::Value) -> bool {
     // byte-identical to 0.5.89, which changed only payload replay refusal
     // relative to 0.5.88. Refused replays and claim changes can move
     // attempt counts without changing the meter.
-    const REGISTRY_PUBSUB_VERSION: &str = "0.5.92";
+    const REGISTRY_PUBSUB_VERSION: &str = "0.5.94";
     const REGISTRY_PUBSUB_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
     const REGISTRY_PUBSUB_SHA: &str =
-        "63b4b434fcce9f2cd5efb0d502dca6a6b75987c170f93ede8dafa7db3c4fea62";
+        "beb6146f3e75f1ffbcc97bc1e69c2a0ba77dc22cfd5736ffd2239c6f596ec75c";
     const GIT_PUBSUB_VERSION: &str = "0.5.85";
     // SG 997abc75 supplies the reviewed meter accounting. Its descendant
     // 9258cee9 adds local delivery, cold-relay ID offers, the ant-quic
@@ -2126,7 +2132,7 @@ fn reviewed_pubsub_producer(package: &toml::Value) -> bool {
 #[test]
 fn controlled_load_producer_allowlist_is_exact() {
     let registry: toml::Value = toml::from_str(
-        "version = '0.5.92'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '63b4b434fcce9f2cd5efb0d502dca6a6b75987c170f93ede8dafa7db3c4fea62'",
+        "version = '0.5.94'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = 'beb6146f3e75f1ffbcc97bc1e69c2a0ba77dc22cfd5736ffd2239c6f596ec75c'",
     )
     .expect("registry fixture");
     let git_accounting: toml::Value = toml::from_str(
@@ -2182,7 +2188,19 @@ fn controlled_load_producer_allowlist_is_exact() {
     )
     .expect("replaced registry fixture");
     assert!(!reviewed_pubsub_producer(&replaced_registry));
-    // 0.5.91 has the same pubsub sources as 0.5.92 but is superseded.
+    // 0.5.93 has the same pubsub sources as 0.5.94 but is superseded.
+    let same_source_registry: toml::Value = toml::from_str(
+        "version = '0.5.93'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = 'a127ad3e5303d41dbe36a477b584e6a57821d9ae01445a692cff3c2f58a69920'",
+    )
+    .expect("same-source registry fixture");
+    assert!(!reviewed_pubsub_producer(&same_source_registry));
+    // 0.5.92 was the reviewed producer before 0.5.94 and is superseded.
+    let earlier_registry: toml::Value = toml::from_str(
+        "version = '0.5.92'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '63b4b434fcce9f2cd5efb0d502dca6a6b75987c170f93ede8dafa7db3c4fea62'",
+    )
+    .expect("earlier registry fixture");
+    assert!(!reviewed_pubsub_producer(&earlier_registry));
+    // 0.5.91 has the same pubsub sources as 0.5.92 and is superseded.
     let last_registry: toml::Value = toml::from_str(
         "version = '0.5.91'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = 'f69989fc3f21060f6294a359eb1ca15e0ccede5065bb8f92d75ed8fa703867e6'",
     )

@@ -492,6 +492,30 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **ant-quic 0.29.0 and saorsa-gossip 0.5.94 (A06 amendment of 20 Nov
+  2026).** `ant-quic` moves from `=0.28.0` to `=0.29.0` and all eleven
+  `saorsa-gossip-*` crates from `=0.5.92` to `=0.5.94`. No x0x code
+  changes. Defaults x0x now gets: the dual-stack UDP socket that x0x
+  binds on `[::]` uses `quinn_udp::UdpSocketState`, so it reports the
+  real `may_fragment()` (0.28.0 always said `true`), which lets QUIC
+  path-MTU probes go above 1200 B, and ECN and GSO/GRO are on. This is
+  standard QUIC but changes packets on the wire; soak before fleet
+  rollout. Not inherited: the relay forward mode stays `Stream` (x0x does
+  not enable `Hybrid`, because `src/voice/link_transport.rs` reads
+  datagrams directly), relay-to-direct `auto_migrate` stays `false`, and
+  the RFC 8305 Happy Eyeballs change applies only to
+  `connect_dual_stack` / `connect_cached`, which x0x does not call.
+  saorsa-gossip 0.5.93 adds the counters `payload_replay_dropped`,
+  `ingress_by_topic`, `ingress_topics_uncounted` and `eager_send_causes`
+  to the stage snapshot; they appear in `GET /diagnostics/gossip` under
+  `pubsub_stages`. 0.5.94 only moves its ant-quic pin. The #501
+  controlled-load reviewed producer moves to crates.io
+  `saorsa-gossip-pubsub` 0.5.94 (checksum `beb6146f...`); no outbound
+  meter definition changes. The optional `voice` feature keeps
+  `saorsa-webrtc-core` 0.6.1, which needs ant-quic 0.28, so `Cargo.lock`
+  now holds ant-quic 0.28.0 (voice only) beside 0.29.0; x0x passes no
+  ant-quic type to saorsa-webrtc.
+
 - **The listeners a restart starts for stored groups follow one written
   rule (#1366 first slice, A08 amendment of 16 Nov 2026).** Only a
   withdrawn group gets no metadata listener. An Active member, a Pending
