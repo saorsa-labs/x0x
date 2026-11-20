@@ -160,6 +160,11 @@ pub enum WaitingCause {
     /// failing seats are still the members named; the wait clears when
     /// the hold ends.
     WaitingForMemberEviction,
+    /// The group's creator holds its own expired committed certificate,
+    /// so an `OwnerCertified` seal holds it digest-pending (#2120). No
+    /// eviction removes the creator; the owner re-certifies the creator's
+    /// agent to end the wait.
+    WaitingForCreatorCertificateRenewal,
 }
 
 impl WaitingCause {
@@ -183,6 +188,7 @@ impl WaitingCause {
             Self::RebuildingObligationStore => "rebuilding_obligation_store",
             Self::WaitingForCertificateExpiry => "waiting_for_certificate_expiry",
             Self::WaitingForMemberEviction => "waiting_for_member_eviction",
+            Self::WaitingForCreatorCertificateRenewal => "waiting_for_creator_certificate_renewal",
         }
     }
 }
@@ -2483,6 +2489,7 @@ mod tests {
             WaitingCause::RebuildingObligationStore,
             WaitingCause::WaitingForCertificateExpiry,
             WaitingCause::WaitingForMemberEviction,
+            WaitingCause::WaitingForCreatorCertificateRenewal,
         ] {
             let json = serde_json::to_string(&cause).expect("json");
             assert_eq!(json, format!("\"{}\"", cause.as_str()));

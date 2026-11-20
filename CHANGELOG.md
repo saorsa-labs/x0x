@@ -15,6 +15,15 @@ All notable changes to this project will be documented in this file.
   `GET /groups/:id/messages`) are capped at 64; past the cap that read
   starts no listener, still serves stored history, and answers a typed
   `429` `public_listener_cap` only when it has nothing to serve.
+- **Owner recovery names an expired creator certificate (#2120; A09
+  paragraph of 20 Nov 2026).** When the group's creator holds its own
+  expired certificate, the promoted member's recovery status is now
+  `waiting_for_creator_certificate_renewal`, naming the creator, with
+  `"remedy": "owner_recertifies_creator"`, instead of the bare
+  `mandate_received`; while a digest announced for the creator is still
+  being fetched it shows after the 300 s missing-evidence grace. When the
+  creator is the only hold, recovery waits until the owner re-certifies
+  it.
 - **Launcher issuer reads by directory descriptor and under the install
   lock (#2012; A14 amendment of 20 Nov 2026).** The dormant launcher reads
   the host journal and the trial record relative to the checked host-root

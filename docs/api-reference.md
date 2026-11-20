@@ -2323,7 +2323,12 @@ every wait. A wait always names its cause; it does not stop silently.
     `mandate_received`, `waiting_for_receiver_upgrade` (D76 hold, `named`
     lists each Active member whose current advert lacks bit 7),
     `waiting_for_member_key_package`, `waiting_for_member_eviction`
-    (#1973: the recovery seal was refused) or `recovery_not_needed` (the
+    (#1973: the recovery seal was refused),
+    `waiting_for_creator_certificate_renewal` (#2120: the creator's own
+    committed certificate is expired and holds the seal; `named` lists the
+    creator and the object has `"remedy": "owner_recertifies_creator"`.
+    While a digest announced for the creator is still being fetched, the
+    state stays `mandate_received` for 300 s from the first such refusal) or `recovery_not_needed` (the
     named revocation records have not arrived yet).
     `waiting_for_member_eviction` appears only here, in
     `promoted_member.state`; no obligation row emits it, and its only
