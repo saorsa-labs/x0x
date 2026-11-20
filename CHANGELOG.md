@@ -11,8 +11,10 @@ All notable changes to this project will be documented in this file.
   expired certificate, the promoted member's recovery status is now
   `waiting_for_creator_certificate_renewal`, naming the creator, with
   `"remedy": "owner_recertifies_creator"`, instead of the bare
-  `mandate_received`. Recovery still waits until the owner re-certifies
-  the creator.
+  `mandate_received`; while a digest announced for the creator is still
+  being fetched it shows after the 300 s missing-evidence grace. When the
+  creator is the only hold, recovery waits until the owner re-certifies
+  it.
 - **Launcher issuer reads by directory descriptor and under the install
   lock (#2012; A14 amendment of 20 Nov 2026).** The dormant launcher reads
   the host journal and the trial record relative to the checked host-root

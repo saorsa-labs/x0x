@@ -327,9 +327,7 @@ longer keeps the refusal. The owner-recovery seal also tolerates an
 Active below-Admin seat whose committed certificate's S4 expiry is due,
 by the rule of the seat's own expiry row (`now > not_after + τ`). The
 creator seat is not tolerated this way, because no expiry row ever
-targets it (Engineer ruling of 1 Nov 2026): a creator whose own
-committed certificate is expired is a digest-pending hold, so it holds
-the seal (see the #2120 paragraph below). A seat
+targets it (Engineer ruling of 1 Nov 2026), so it keeps the refusal. A seat
 whose certificate expired less than τ ago is not yet due and is treated
 as before. A seat whose certificate bytes this node does not hold, or
 whose renewal fetch is in flight, is a digest-pending or grace hold, not
@@ -355,25 +353,38 @@ removes exactly the named admins, and no wire format changes.
 On 20 Nov 2026 Claude, under David's delegation of design decisions of
 10 Nov 2026 and A15 as amended on 12 Nov 2026, made the wait for an
 expired creator typed
-([#2120](https://github.com/saorsa-labs/x0x/issues/2120)). When the
-group's creator holds its own expired committed certificate,
-`owner_cert_verdict` holds that seat digest-pending, and the recovery
-seal is refused as `OwnerCertMemberPending`. That hold does not end by
-itself: no eviction removes the creator, and only the owner
-re-certifying the creator's agent ends it. So the promoted member's wait
-is now `waiting_for_creator_certificate_renewal`, naming the creator,
-and its status carries `"remedy": "owner_recertifies_creator"`. This
-holds only when the seal's verdict holds the creator digest-pending on
-its own expired committed certificate. A creator in grace, whose renewed
-certificate is announced and still being fetched, keeps the bare
-`mandate_received`, because the owner has already re-certified it; so
-does every other grace or digest-pending hold, because it ends when its
-fetch lands. Once the renewed certificate resolves, the next recovery
-attempt commits and the wait ends with the mandate. The rule is
-unchanged: recovery still does not proceed past an expired creator seat.
-A rule that lets it proceed needs a decision on who then removes or
-renews that seat, and is not part of this change. No wire format
-changes; the local status gains the new cause and the `remedy` field.
+([#2120](https://github.com/saorsa-labs/x0x/issues/2120)). Correction to
+the #2004 paragraph above: the creator seat does not "keep the refusal"
+as a failure. `owner_cert_verdict` holds a creator whose own committed
+certificate is expired at digest-pending, or in grace while a digest
+announced for it has bytes that have not resolved here, and never fails
+it. The creator holds the seal only when it is the only hold: then the
+recovery seal is refused as `OwnerCertMemberPending`. When other
+below-Admin seats also fail, recovery proceeds past the held creator, by
+David's decision of 20 Nov 2026
+([#2133](https://github.com/saorsa-labs/x0x/issues/2133)): the creator
+stays seated, gets no key material for the recovery epoch, and stays so
+until the owner re-certifies it. This change does not alter that case.
+
+On an `OwnerCertMemberPending` refusal the recovery takes a second
+verdict over fresh evidence and classes the creator at that evidence's
+clock. A digest-pending creator ends only when the owner re-certifies
+the creator's agent, so the promoted member's wait is
+`waiting_for_creator_certificate_renewal` at once, naming the creator,
+and its status carries `"remedy": "owner_recertifies_creator"`. A
+creator in grace (a digest announced, its bytes not resolved here, which
+can be a renewal or a re-announce of the expired certificate) keeps the
+bare `mandate_received` for the missing-evidence grace (300 s) counted
+from the first refusal that held the creator, then gets the same typed
+wait, so a fetch that never completes does not hide the remedy. The
+count is in memory: a restart starts it again. Any other grace or
+digest-pending hold keeps the bare `mandate_received`, because it ends
+when its fetch lands. Once the renewed certificate resolves, the next
+recovery attempt commits and the wait ends with the mandate. When the
+creator is the only hold, recovery does not proceed past it; the owner
+re-certifying the creator is the exit.
+No wire format changes; the local status gains the new cause and the
+`remedy` field.
 
 [A08](A08-r01-groups-home-membership-and-repair.md) defines valid group-state and fork recovery. A09 must not bypass that authority to obtain keys faster.
 
