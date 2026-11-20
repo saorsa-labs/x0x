@@ -264,6 +264,7 @@ jobs:
           python3 -B tests/test_install_shell_autostart.py -v
           python3 -B tests/test_install_manifest_verify.py -v
           python3 -B tests/test_install_ps1_verify.py -v
+          python3 -B tests/test_launcher_dropin.py -v
 
       # Cargo marks the x0x binary test=false. Select its real parser/registry
       # controls explicitly after preserving the broad suite's results above.

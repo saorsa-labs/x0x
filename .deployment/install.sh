@@ -30,10 +30,12 @@
 #   .deployment/install.sh                           # production instance (default)
 #   .deployment/install.sh --instance testnet        # another install-served instance
 #   .deployment/install.sh --binary /path/to/x0xd    # also install the binary
+#   .deployment/install.sh --launcher /path/to/x0x-launcher  # opt in (#1378)
 #
 # Options:
 #   --instance ID   stable instance id from the manifest (default: production)
 #   --binary PATH   x0xd binary to install at the instance's binary.destination
+#   --launcher PATH run x0xd through this stable launcher (off by default)
 #   -h, --help      show this help
 # =============================================================================
 set -euo pipefail
@@ -42,6 +44,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MANIFEST="$SCRIPT_DIR/authority-inventory.json"
 INSTANCE=""
 BINARY_SRC="${BINARY:-}"
+LAUNCHER_SRC=""
 
 usage() {
     cat <<'EOF'
@@ -55,6 +58,10 @@ Does NOT start the service.
 Options:
   --instance ID   stable instance id from the manifest (default: production)
   --binary PATH   x0xd binary to install at the instance's binary.destination
+  --launcher PATH install this x0x-launcher next to x0xd and add a drop-in
+                  that runs x0xd through it (off by default; x0xd must have
+                  started once, so its data directory exists). Without it,
+                  an earlier launcher drop-in is removed.
   -h, --help      show this help
 EOF
 }
@@ -63,6 +70,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --instance) INSTANCE="${2:?--instance requires an id}"; shift 2 ;;
         --binary)   BINARY_SRC="${2:?--binary requires a path}"; shift 2 ;;
+        --launcher) LAUNCHER_SRC="${2:?--launcher requires a path}"; shift 2 ;;
         -h|--help)  usage; exit 0 ;;
         *) echo "error: unknown argument: $1" >&2; usage >&2; exit 1 ;;
     esac
@@ -141,6 +149,8 @@ echo "[install] instance: $INST_ID"
 echo "[install] unit:     $UNIT_SRC -> $UNIT_DST"
 echo "[install] config:   $CONFIG_SRC -> $CONFIG_DST"
 [ -n "$BINARY_SRC" ] && echo "[install] binary:   $BINARY_SRC -> $BINARY_DST"
+LAUNCHER_DST="$(dirname "$BINARY_DST")/x0x-launcher"
+[ -n "$LAUNCHER_SRC" ] && echo "[install] launcher: $LAUNCHER_SRC -> $LAUNCHER_DST"
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "error: must run as root (writes $UNIT_DST, $CONFIG_DST, $BINARY_DST)" >&2
@@ -162,9 +172,34 @@ install -m 0644 "$CONFIG_SRC_PATH" "$CONFIG_DST"
 mkdir -p "$(dirname "$UNIT_DST")"
 install -m 0644 "$UNIT_SRC_PATH" "$UNIT_DST"
 
-systemctl daemon-reload
 # Enable by the service name the installed unit provides (basename minus .service).
 svc_name="$(basename "$UNIT_DST" .service)"
+
+# --- stable launcher drop-in (#1378, opt-in) ---------------------------------
+LAUNCHER_DROPIN="$(dirname "$UNIT_DST")/$svc_name.service.d/30-x0x-launcher.conf"
+if [ -n "$LAUNCHER_SRC" ]; then
+    [ -f "$LAUNCHER_SRC" ] || { echo "error: launcher not found: $LAUNCHER_SRC" >&2; exit 1; }
+    [ -x "$BINARY_DST" ] || { echo "error: x0xd not installed at $BINARY_DST" >&2; exit 1; }
+    unit_user="$(sed -n 's/^User=//p' "$UNIT_DST" | tail -1)"
+    unit_user="${unit_user:-root}"
+    unit_home="$(getent passwd "$unit_user" | cut -d: -f6)"
+    [ -n "$unit_home" ] || { echo "error: no home directory for user $unit_user" >&2; exit 1; }
+    install -m 0755 "$LAUNCHER_SRC" "$LAUNCHER_DST"
+    dropin_tmp="$(mktemp)"
+    trap 'rm -f "$dropin_tmp"' EXIT
+    python3 "$SCRIPT_DIR/launcher-dropin.py" \
+        --unit "$UNIT_DST" --binary "$BINARY_DST" --launcher "$LAUNCHER_DST" \
+        --instance "$INST_ID" --home "$unit_home" --owner "$(id -u "$unit_user")" \
+        > "$dropin_tmp"
+    mkdir -p "$(dirname "$LAUNCHER_DROPIN")"
+    install -m 0644 "$dropin_tmp" "$LAUNCHER_DROPIN"
+    echo "[install] launcher drop-in: $LAUNCHER_DROPIN"
+elif [ -f "$LAUNCHER_DROPIN" ]; then
+    rm -f "$LAUNCHER_DROPIN"
+    echo "[install] removed launcher drop-in: $LAUNCHER_DROPIN"
+fi
+
+systemctl daemon-reload
 if ! systemctl enable "$svc_name" >/dev/null 2>&1; then
     echo "[install] ERROR: systemctl enable $svc_name failed" >&2
     exit 1

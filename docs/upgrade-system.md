@@ -765,6 +765,45 @@ authority-inventory check accepting a launcher-owned `ExecStart`; and the
 these hold, a launcher-bound unit would refuse every self-update. The unit
 switch also needs David's approval because it changes production hosts.
 
+**Launcher-bound systemd unit (#1378).** The systemd restart readback
+accepts a unit whose `ExecStart` runs the stable launcher, in the plain or
+the trial form. It reads the daemon and its arguments from the launcher's
+argv with the launcher's own parser, and they must be this daemon and its
+arguments. The unit's main process must then be the launcher, the parent of
+this daemon; for any other unit it must be this daemon. The rest of the
+readback (restart policy, `RestartPreventExitStatus`, start-rate window) is
+unchanged.
+
+`.deployment/install.sh --launcher /path/to/x0x-launcher` (off by default)
+installs the launcher next to the instance's `x0xd` and writes
+`<unit>.service.d/30-x0x-launcher.conf`:
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/opt/x0x/x0x-launcher --host-root <data root> --instance <id> -- /opt/x0x/x0xd <unit args>
+RestartPreventExitStatus=64 78
+KillMode=mixed
+TimeoutStopSec=60
+```
+
+- The data root is the one x0xd reports for the unit's own arguments
+  (`x0xd <args> --check`, run with the unit user's `HOME`), resolved
+  through symlinks. It must exist, so x0xd must have started once, and it
+  must be owned by the unit's user and not writable by group or others.
+- The instance is the manifest instance id.
+- An `ExecStart` token that needs systemd quoting (spaces, quotes, `$` or
+  `%`) is refused; such a unit is migrated by hand.
+- `KillMode=mixed` sends the stop signal to the launcher only, which stops
+  x0xd within its own 45 s window; `TimeoutStopSec=60` is above that window.
+- An install without `--launcher` removes the drop-in, so the tracked unit
+  runs x0xd directly again.
+
+The renderer is `.deployment/launcher-dropin.py`, tested by
+`tests/test_launcher_dropin.py`. Not done yet: an exit test of the
+supervised upgrade exit on a launcher-bound host, which needs a private
+testnet host.
+
 #### 2. Restore the known-good binary
 
 Only needed when the replacement will not start. On Unix a rename over the

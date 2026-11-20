@@ -1191,6 +1191,9 @@ type SameExecutable<'a> = dyn Fn(&str, &Path) -> bool + 'a;
 struct SystemdReadbackInput<'a> {
     cgroup: &'a str,
     pid: u32,
+    /// This process's parent: the unit's main process when the unit runs
+    /// the stable launcher, which starts x0xd as its child (#1378).
+    parent_pid: u32,
     invocation_id: Option<&'a str>,
     executable: &'a Path,
     argv: &'a [String],
@@ -1232,6 +1235,7 @@ fn readback_systemd_observation_in(
     let SystemdReadbackInput {
         cgroup,
         pid,
+        parent_pid,
         invocation_id,
         executable,
         argv,
@@ -1262,7 +1266,7 @@ fn readback_systemd_observation_in(
     let main_pid = show_property(&show_output, "MainPID")
         .and_then(|v| v.trim().parse::<u32>().ok())
         .unwrap_or(0);
-    if main_pid != pid {
+    if main_pid != pid && main_pid != parent_pid {
         return refuse(format!(
             "unit `{unit}` reports MainPID {main_pid}, not this process ({pid}); \
              INVOCATION_ID presence alone does not bind the unit to this instance"
@@ -1309,12 +1313,6 @@ fn readback_systemd_observation_in(
             ));
         }
     };
-    if structured_pid != pid {
-        return refuse(format!(
-            "unit `{unit}` reports MainPID {structured_pid} in the structured snapshot, \
-             not this process ({pid})"
-        ));
-    }
     if structured_invocation != Some(textual_invocation) {
         return refuse(format!(
             "unit `{unit}` reports different InvocationIDs in the textual and structured snapshots"
@@ -1333,24 +1331,53 @@ fn readback_systemd_observation_in(
              spawned argv is not derivable"
         ));
     };
-    let exec_ok = {
-        if !same_executable(&loaded_path, executable) {
+    // A unit that runs the stable launcher (#1378) runs x0xd as the
+    // launcher's child: the daemon is the one the launcher's argv names,
+    // checked with the launcher's own parser, and the unit's main process
+    // is the launcher, this process's parent. Any other unit's main
+    // process is this process.
+    let launcher_daemon = match launchd_job_daemon(Some(&loaded_path), &tokens) {
+        Some(Ok(daemon)) if daemon.via_launcher => Some(daemon),
+        _ => None,
+    };
+    let expected_main_pid = if launcher_daemon.is_some() {
+        parent_pid
+    } else {
+        pid
+    };
+    if main_pid != expected_main_pid || structured_pid != expected_main_pid {
+        return refuse(format!(
+            "unit `{unit}` reports MainPID {structured_pid} in the structured snapshot, \
+             not {} ({expected_main_pid})",
+            if launcher_daemon.is_some() {
+                "this process's launcher"
+            } else {
+                "this process"
+            }
+        ));
+    }
+    let exec_ok = if let Some(daemon) = launcher_daemon {
+        let first = tokens.first().map(String::as_str).unwrap_or_default();
+        (first == loaded_path || path_basename(first) == LAUNCHER_BASENAME)
+            && same_executable(daemon.executable, executable)
+            && argv.first().is_some()
+            && daemon.args == argv.get(1..).unwrap_or_default()
+    } else if !same_executable(&loaded_path, executable) {
+        false
+    } else {
+        // argv[0] in the stored array: either the path itself or an
+        // `argv[0]=` override (`@`-prefixed `$$`-escaped copy), which
+        // must still be this executable.
+        let first = tokens.first().map(String::as_str).unwrap_or_default();
+        if first != loaded_path && !same_executable(first, executable) {
             false
         } else {
-            // argv[0] in the stored array: either the path itself or an
-            // `argv[0]=` override (`@`-prefixed `$$`-escaped copy), which
-            // must still be this executable.
-            let first = tokens.first().map(String::as_str).unwrap_or_default();
-            if first != loaded_path && !same_executable(first, executable) {
-                false
-            } else {
-                tokens.len() == argv.len()
-                    && tokens
-                        .iter()
-                        .zip(argv.iter())
-                        .skip(1)
-                        .all(|(loaded, ours)| loaded == ours)
-            }
+            tokens.len() == argv.len()
+                && tokens
+                    .iter()
+                    .zip(argv.iter())
+                    .skip(1)
+                    .all(|(loaded, ours)| loaded == ours)
         }
     };
     if !exec_ok {
@@ -2007,6 +2034,7 @@ fn run_busctl_exec_start(
     user_manager: bool,
     unit: &str,
     pid: u32,
+    parent_pid: u32,
     deadline: Instant,
 ) -> Result<BusctlExecStart, String> {
     let unit_json = run_busctl_json(
@@ -2067,9 +2095,10 @@ fn run_busctl_exec_start(
     .map_err(|e| format!("InvocationID on `{object_path}`: {e}"))?;
     let invocation_id = parse_busctl_invocation_json(&inv_json)
         .ok_or_else(|| format!("InvocationID on `{object_path}`: unexpected payload shape"))?;
-    if main_pid != pid {
+    if main_pid != pid && main_pid != parent_pid {
         return Err(format!(
-            "MainPID {main_pid} does not match this process ({pid}) in the structured snapshot"
+            "MainPID {main_pid} is neither this process ({pid}) nor its parent ({parent_pid}) \
+             in the structured snapshot"
         ));
     }
     Ok(BusctlExecStart {
@@ -2149,19 +2178,23 @@ fn readback_systemd_observation(
         .ok()
         .filter(|v| !v.is_empty());
     let pid = std::process::id();
+    let parent_pid = std::os::unix::process::parent_id();
     let deadline = Instant::now() + SYSTEMCTL_SHOW_BOUND;
     readback_systemd_observation_in(
         SystemdReadbackInput {
             cgroup: &cgroup,
             pid,
+            parent_pid,
             invocation_id: invocation.as_deref(),
             executable,
             argv,
             monotonic_now_us: monotonic_now_us(),
         },
         &mut |user_manager, unit| run_systemctl_show(user_manager, unit, deadline),
-        &mut |user_manager, unit| run_busctl_exec_start(user_manager, unit, pid, deadline),
-        &same_executable_canonical,
+        &mut |user_manager, unit| {
+            run_busctl_exec_start(user_manager, unit, pid, parent_pid, deadline)
+                & same_executable_canonical
+        },
     )
 }
 
@@ -2331,6 +2364,7 @@ pub(crate) mod systemd_readback_seam {
             SystemdReadbackInput {
                 cgroup: &cgroup,
                 pid,
+                parent_pid: 0,
                 invocation_id: invocation_id.as_deref(),
                 executable,
                 argv,
@@ -5941,6 +5975,7 @@ mod tests {
             SystemdReadbackInput {
                 cgroup,
                 pid,
+                parent_pid: 0,
                 invocation_id: invocation,
                 executable: exec,
                 argv,
@@ -6238,6 +6273,7 @@ mod tests {
             SystemdReadbackInput {
                 cgroup: SYSTEM_CGROUP,
                 pid: 4242,
+                parent_pid: 0,
                 invocation_id: Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
                 executable: Path::new(exec),
                 argv: &argv,
@@ -6257,6 +6293,98 @@ mod tests {
             SystemdPolicyReadback::Verified(unit) => assert_eq!(unit.unit, "x0xd.service"),
             other => panic!("expected Verified for literal-% deployment, got {other:?}"),
         }
+    }
+
+    const LAUNCHER: &str = "/opt/x0x/x0x-launcher";
+
+    /// A systemd readback of a unit whose `ExecStart` is `exec_start` and
+    /// whose main process is `main_pid`, for x0xd at `/opt/x0x/x0xd` with
+    /// pid 4242 and parent 4100 (#1378).
+    fn launcher_unit_readback(main_pid: u32, exec_start: &[&str]) -> SystemdPolicyReadback {
+        let daemon = "/opt/x0x/x0xd";
+        let invocation = "aa01aa01aa01aa01aa01aa01aa01aa01";
+        let show = healthy_show(main_pid, invocation, daemon, "always").replace(
+            "RestartPreventExitStatus=\n",
+            "RestartPreventExitStatus=64 78\n",
+        );
+        let argv = real_fixture_argv(daemon);
+        let structured = BusctlExecStart {
+            path: exec_start[0].to_string(),
+            argv: exec_start.iter().map(|t| t.to_string()).collect(),
+            main_pid,
+            invocation_id: parse_invocation_id_hex(invocation),
+        };
+        readback_systemd_policy_in(
+            SystemdReadbackInput {
+                cgroup: SYSTEM_CGROUP,
+                pid: 4242,
+                parent_pid: 4100,
+                invocation_id: Some(invocation),
+                executable: Path::new(daemon),
+                argv: &argv,
+                monotonic_now_us: Some(101_000_000),
+            },
+            &mut |_user, _unit| Ok(Some(show.clone())),
+            &mut move |_user, _unit| Ok(structured.clone()),
+            &|loaded, ours| {
+                Path::new(loaded) == ours && matches!(loaded, "/opt/x0x/x0xd" | LAUNCHER)
+            },
+        )
+    }
+
+    /// #1378: a unit that runs x0xd through the stable launcher verifies
+    /// when its main process is this daemon's parent and the launcher's
+    /// argv names this daemon with these arguments.
+    #[test]
+    fn systemd_readback_accepts_a_launcher_bound_unit() {
+        let trial = [
+            LAUNCHER,
+            "--host-root",
+            "/root/.local/share/x0x-testnet",
+            "--instance",
+            "testnet",
+            "--",
+            "/opt/x0x/x0xd",
+            "--name",
+            "testnet",
+        ];
+        match launcher_unit_readback(4100, &trial) {
+            SystemdPolicyReadback::Verified(unit) => assert_eq!(unit.unit, "x0xd.service"),
+            other => panic!("expected Verified for a launcher-bound unit, got {other:?}"),
+        }
+        let plain = [LAUNCHER, "/opt/x0x/x0xd", "--name", "testnet"];
+        assert!(matches!(
+            launcher_unit_readback(4100, &plain),
+            SystemdPolicyReadback::Verified(_)
+        ));
+
+        let refused = |main_pid: u32, exec_start: &[&str], why: &str| match launcher_unit_readback(
+            main_pid, exec_start,
+        ) {
+            SystemdPolicyReadback::NotGuaranteed { detail } => detail,
+            other => panic!("{why}: expected NotGuaranteed, got {other:?}"),
+        };
+        let detail = refused(4242, &trial, "the launcher is not the main process");
+        assert!(detail.contains("launcher"), "{detail}");
+        let mut other_instance = trial;
+        other_instance[8] = "prod";
+        refused(4100, &other_instance, "the launcher runs another instance");
+        let mut other_daemon = trial;
+        other_daemon[6] = "/opt/x0x/x0xd-other";
+        refused(4100, &other_daemon, "the launcher runs another daemon");
+        let mut bad_argv = trial;
+        bad_argv[1] = "--host-rot";
+        refused(4100, &bad_argv, "the launcher would refuse its argv");
+        let direct = ["/opt/x0x/x0xd", "--name", "testnet"];
+        refused(
+            4100,
+            &direct,
+            "a direct unit whose main process is the parent",
+        );
+        assert!(matches!(
+            launcher_unit_readback(4242, &direct),
+            SystemdPolicyReadback::Verified(_)
+        ));
     }
 
     #[test]
@@ -6318,6 +6446,7 @@ mod tests {
             SystemdReadbackInput {
                 cgroup: SYSTEM_CGROUP,
                 pid: 4242,
+                parent_pid: 0,
                 invocation_id: Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
                 executable: Path::new(running),
                 argv: &argv,
@@ -6358,6 +6487,7 @@ mod tests {
             SystemdReadbackInput {
                 cgroup: SYSTEM_CGROUP,
                 pid: 4242,
+                parent_pid: 0,
                 invocation_id: Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
                 executable: Path::new("/opt/x0x/x0xd"),
                 argv: &[
@@ -6394,6 +6524,7 @@ mod tests {
                 SystemdReadbackInput {
                     cgroup: SYSTEM_CGROUP,
                     pid: 4242,
+                    parent_pid: 0,
                     invocation_id: Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
                     executable: Path::new("/opt/x0x/x0xd"),
                     argv: &argv,
@@ -6453,6 +6584,7 @@ mod tests {
             SystemdReadbackInput {
                 cgroup: SYSTEM_CGROUP,
                 pid: 4242,
+                parent_pid: 0,
                 invocation_id: None,
                 executable: Path::new("/opt/x0x/x0xd"),
                 argv: &argv,
@@ -6548,6 +6680,7 @@ mod tests {
                 SystemdReadbackInput {
                     cgroup: SYSTEM_CGROUP,
                     pid: 4242,
+                    parent_pid: 0,
                     invocation_id: Some("aa01aa01aa01aa01aa01aa01aa01aa01"),
                     executable: Path::new(path),
                     argv: &argv,

@@ -80,6 +80,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Launcher-bound systemd unit (#1378; A14 amendment of 20 Nov 2026).**
+  The systemd restart readback accepts a unit that runs x0xd through the
+  stable launcher: the daemon is read from the launcher's arguments and the
+  unit's main process must be the launcher. `.deployment/install.sh
+  --launcher PATH` (off by default) installs the launcher and a drop-in
+  that runs x0xd through it, with `RestartPreventExitStatus=64 78`; an
+  install without the flag removes the drop-in.
+
 - **Release announced by the promotion workflow (#1169 PR 2; A14 amendment
   of 19 Nov 2026).** A new `announce-release` job in `Publish promoted
   release` runs the promoted `x0xd` as a short-lived node with a fresh
