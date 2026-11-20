@@ -3,21 +3,24 @@
 //! only at a restart.
 //!
 //! - A self-leave takes the record away, on the GSS and the TreeKEM plane,
-//!   and so does a local-only drop of a non-member TreeKEM record: both
-//!   listeners stop.
-//! - A self-removal applied through `apply_listener_metadata_event` (the
-//!   apply that the topic listener and the direct lanes share) and a
-//!   refused join stub (`finalize_join_attempt_with_reason`) stop the
-//!   public-message listener. An accepted event that keeps the record keeps
-//!   it.
+//!   and so does a local-only drop of a non-member TreeKEM record and a
+//!   cleared stale join row: both listeners stop.
+//! - A sole-member leave and a terminal withdrawal keep a withdrawn
+//!   tombstone, which needs no listener: both stop.
+//! - A self-removal and a withdrawal applied through
+//!   `apply_listener_metadata_event` (the apply that the topic listener and
+//!   the direct lanes share) and a refused join stub
+//!   (`finalize_join_attempt_with_reason`) stop the public-message
+//!   listener. An accepted event that keeps the record keeps it.
 //! - A refreshed card that changes a non-member stub to `MlsEncrypted`, and
-//!   a withdrawn card, stop the public-message listener.
+//!   a withdrawn card, stop the public-message listener; a withdrawn card
+//!   that a live keyed record ignores keeps it.
 //! - Records that share a stable id share one public-message listener: it
-//!   runs while any of them needs it.
+//!   runs while any of them needs it, also beside a withdrawn tombstone.
 //! - A request-access applicant keeps its metadata listener while it waits.
 //!
-//! The `LiveListener` counter of the sibling file proves that a stopped
-//! public-message listener task really ended. Local topics drive the real
+//! The `LiveListener` counter of the sibling file, and the abort handle of
+//! a metadata listener, prove that a stopped listener task really ended. Local topics drive the real
 //! subscribers. Inert apart from the loopback-only test network of
 //! `networked_test_state`.
 
@@ -59,6 +62,35 @@ async fn assert_public_stopped(state: &AppState, stable_id: &str, why: &str) {
         live(stable_id),
         0,
         "#1366: {why}: the public-message listener task has ended"
+    );
+}
+
+/// The abort handle of the running metadata listener under `group_key`.
+async fn metadata_task(state: &AppState, group_key: &str) -> Result<tokio::task::AbortHandle> {
+    state
+        .group_metadata_tasks
+        .read()
+        .await
+        .get(group_key)
+        .map(|reg| reg.handle.abort_handle())
+        .context("precondition: the metadata listener is registered")
+}
+
+/// The metadata listener under `group_key` is deregistered and its task
+/// has ended.
+async fn assert_metadata_stopped(
+    state: &AppState,
+    group_key: &str,
+    task: &tokio::task::AbortHandle,
+    why: &str,
+) {
+    assert!(
+        !metadata_registered(state, group_key).await,
+        "#1366: {why}: the metadata listener is deregistered"
+    );
+    assert!(
+        task.is_finished(),
+        "#1366: {why}: the metadata listener task has ended"
     );
 }
 
@@ -127,16 +159,14 @@ async fn leave(state: &Arc<AppState>, group_id: &str) -> Result<serde_json::Valu
 async fn issue1366_self_leave_stops_both_listeners() -> Result<()> {
     let group_id = "1366-lifecycle-leave-key";
     let (state, _dir, stable) = signed_public_fixture("1366-lifecycle-leave", group_id).await?;
+    let meta = metadata_task(&state, group_id).await?;
     leave(&state, group_id).await?;
     settle().await;
     assert!(
         !state.named_groups.read().await.contains_key(group_id),
         "the leave removes the record"
     );
-    assert!(
-        !metadata_registered(&state, group_id).await,
-        "#1366: a self-leave stops the metadata listener"
-    );
+    assert_metadata_stopped(&state, group_id, &meta, "a self-leave").await;
     assert_public_stopped(&state, &stable, "a self-leave").await;
     Ok(())
 }
@@ -149,16 +179,14 @@ async fn issue1366_treekem_self_leave_stops_both_listeners() -> Result<()> {
             info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
         })
         .await?;
+    let meta = metadata_task(&state, group_id).await?;
     leave(&state, group_id).await?;
     settle().await;
     assert!(
         !state.named_groups.read().await.contains_key(group_id),
         "the TreeKEM leave removes the record"
     );
-    assert!(
-        !metadata_registered(&state, group_id).await,
-        "#1366: a TreeKEM self-leave stops the metadata listener"
-    );
+    assert_metadata_stopped(&state, group_id, &meta, "a TreeKEM self-leave").await;
     assert_public_stopped(&state, &stable, "a TreeKEM self-leave").await;
     Ok(())
 }
@@ -177,6 +205,7 @@ async fn issue1366_treekem_local_only_drop_stops_both_listeners() -> Result<()> 
     if let Some(info) = state.named_groups.write().await.get_mut(group_id) {
         info.members_v2.remove(&local);
     }
+    let meta = metadata_task(&state, group_id).await?;
     let (status, body) = response_json(
         leave_treekem_group(Arc::clone(&state), group_id.to_string(), local)
             .await
@@ -195,10 +224,7 @@ async fn issue1366_treekem_local_only_drop_stops_both_listeners() -> Result<()> 
     );
     settle().await;
     assert!(!state.named_groups.read().await.contains_key(group_id));
-    assert!(
-        !metadata_registered(&state, group_id).await,
-        "#1366: a local-only drop stops the metadata listener"
-    );
+    assert_metadata_stopped(&state, group_id, &meta, "a local-only drop").await;
     assert_public_stopped(&state, &stable, "a local-only drop").await;
     Ok(())
 }
@@ -302,6 +328,7 @@ async fn issue1366_refused_join_stub_stops_the_public_listener() -> Result<()> {
     if let Some(info) = state.named_groups.write().await.get_mut(group_id) {
         info.members_v2.remove(&member);
     }
+    let meta = metadata_task(&state, group_id).await?;
     let token = state
         .group_metadata_tasks
         .read()
@@ -352,10 +379,7 @@ async fn issue1366_refused_join_stub_stops_the_public_listener() -> Result<()> {
         "the refusal removes the pending stub"
     );
     settle().await;
-    assert!(
-        !metadata_registered(&state, group_id).await,
-        "the token-matching metadata listener is removed"
-    );
+    assert_metadata_stopped(&state, group_id, &meta, "a refused join stub").await;
     assert_public_stopped(&state, &stable, "a refused join stub").await;
     Ok(())
 }
@@ -455,6 +479,192 @@ async fn issue1366_a_stored_record_keeps_the_public_listener() -> Result<()> {
     assert!(
         public_registered(&state, &stable).await && live(&stable) == 1,
         "#1366: a record that needs the listener keeps it"
+    );
+    Ok(())
+}
+
+/// A sole member's leave withdraws the group (`withdraw_named_group_terminal`):
+/// the retained tombstone needs no listener.
+#[tokio::test]
+async fn issue1366_sole_member_leave_stops_both_listeners() -> Result<()> {
+    let group_id = "1366-lifecycle-sole-key";
+    let (state, _dir, stable) =
+        signed_public_fixture_with("1366-lifecycle-sole", group_id, |info| {
+            info.members_v2.remove(&"22".repeat(32));
+        })
+        .await?;
+    let meta = metadata_task(&state, group_id).await?;
+    leave(&state, group_id).await?;
+    settle().await;
+    assert!(
+        state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .is_none_or(|info| info.withdrawn),
+        "the sole-member leave withdraws the group"
+    );
+    assert_metadata_stopped(&state, group_id, &meta, "a sole-member leave").await;
+    assert_public_stopped(&state, &stable, "a sole-member leave").await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn issue1366_terminal_withdraw_stops_both_listeners() -> Result<()> {
+    let group_id = "1366-lifecycle-withdraw-key";
+    let (state, _dir, stable) = signed_public_fixture("1366-lifecycle-withdraw", group_id).await?;
+    let meta = metadata_task(&state, group_id).await?;
+    let (status, body) = response_json(
+        withdraw_group_state(
+            State(Arc::clone(&state)),
+            Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+            Path(group_id.to_string()),
+        )
+        .await
+        .into_response(),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "the withdrawal applies: {body}");
+    settle().await;
+    assert_metadata_stopped(&state, group_id, &meta, "a terminal withdrawal").await;
+    assert_public_stopped(&state, &stable, "a terminal withdrawal").await;
+    Ok(())
+}
+
+/// A signed `GroupDeleted` applied through the listener apply.
+#[tokio::test]
+async fn issue1366_applied_withdrawal_stops_the_public_listener() -> Result<()> {
+    let group_id = "1366-lifecycle-deleted-key";
+    let (state, _dir, stable) = signed_public_fixture("1366-lifecycle-deleted", group_id).await?;
+    let parent = state
+        .named_groups
+        .read()
+        .await
+        .get(group_id)
+        .cloned()
+        .context("fixture record")?;
+    let mut terminal = parent.clone();
+    terminal.withdrawn = true;
+    let event = NamedGroupMetadataEvent::GroupDeleted {
+        group_id: stable.clone(),
+        revision: parent.roster_revision.saturating_add(1),
+        actor: local_hex(&state),
+        commit: Some(sign_metadata_terminality_commit(
+            &parent,
+            &terminal,
+            &state,
+            now_millis_u64(),
+        )),
+    };
+    let applied =
+        apply_listener_metadata_event(&state, event, state.agent.agent_id(), true, None).await;
+    assert!(
+        applied.as_ref().is_some_and(|result| result.accepted),
+        "the signed GroupDeleted applies"
+    );
+    settle().await;
+    assert_public_stopped(&state, &stable, "an applied withdrawal").await;
+    Ok(())
+}
+
+/// A withdrawn card that a live keyed record ignores keeps its listener.
+#[tokio::test]
+async fn issue1366_withdrawn_card_keeps_the_listener_of_a_live_keyed_record() -> Result<()> {
+    let group_id = "1366-lifecycle-keyed-key";
+    let (state, _dir, stable) = signed_public_fixture("1366-lifecycle-keyed", group_id).await?;
+    let now = now_millis_u64();
+    let mut card = sample_group_card(&stable, 1_000, now);
+    card.owner_agent_id = local_hex(&state);
+    card.expires_at = now.saturating_add(3_600_000);
+    card.updated_at = now.saturating_add(1_000);
+    card.policy_summary.confidentiality = x0x::groups::GroupConfidentiality::SignedPublic;
+    card.policy_summary.read_access = x0x::groups::GroupReadAccess::Public;
+    card.withdrawn = true;
+    card.sign(state.agent.identity().agent_keypair())?;
+    import(&state, card).await?;
+    settle().await;
+    assert!(
+        state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .is_some_and(|info| !info.withdrawn),
+        "the keyed record ignores the withdrawn card"
+    );
+    assert!(
+        public_registered(&state, &stable).await && live(&stable) == 1,
+        "#1366: a withdrawn card keeps the listener a live keyed record needs"
+    );
+    Ok(())
+}
+
+/// D39/#1161: a cleared stale join row leaves no listener behind.
+#[tokio::test]
+async fn issue1366_cleared_stale_join_row_stops_both_listeners() -> Result<()> {
+    let group_id = "1366-lifecycle-remnant-key";
+    let (state, _dir, stable) =
+        signed_public_fixture_with("1366-lifecycle-remnant", group_id, |info| {
+            info.invite_lineage = Some(x0x::groups::InviteLineage::default());
+        })
+        .await?;
+    let local = local_hex(&state);
+    if let Some(info) = state.named_groups.write().await.get_mut(group_id) {
+        info.members_v2.remove(&local);
+    }
+    let meta = metadata_task(&state, group_id).await?;
+    let cleared = clear_stale_not_member_join_row(&state, group_id, &local, &stable).await;
+    assert!(
+        matches!(cleared, ClearStaleNotMemberJoinRowResult::Cleared),
+        "the unseated join remnant is cleared"
+    );
+    settle().await;
+    assert_metadata_stopped(&state, group_id, &meta, "a cleared join row").await;
+    assert_public_stopped(&state, &stable, "a cleared join row").await;
+    Ok(())
+}
+
+/// A withdrawn tombstone under the stable id and a live SignedPublic record
+/// with the same stable id: an install for the stable id proceeds.
+#[tokio::test]
+async fn issue1366_install_beside_a_withdrawn_tombstone_follows_the_live_record() -> Result<()> {
+    let group_id = "1366-lifecycle-tomb-key";
+    let (state, _dir, stable) = signed_public_fixture("1366-lifecycle-tomb", group_id).await?;
+    let mut tombstone = state
+        .named_groups
+        .read()
+        .await
+        .get(group_id)
+        .cloned()
+        .context("fixture record")?;
+    tombstone.withdrawn = true;
+    let live_record = state
+        .named_groups
+        .write()
+        .await
+        .remove(group_id)
+        .context("fixture record")?;
+    state
+        .named_groups
+        .write()
+        .await
+        .insert("1366-lifecycle-tomb-live".to_string(), live_record);
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(stable.clone(), tombstone);
+    if let Some(handle) = state.public_message_tasks.write().await.remove(&stable) {
+        handle.abort();
+    }
+    settle().await;
+    assert_eq!(live(&stable), 0, "precondition: no listener runs");
+    spawn_public_message_listener(Arc::clone(&state), stable.clone()).await;
+    settle().await;
+    assert!(
+        public_registered(&state, &stable).await && live(&stable) == 1,
+        "#1366: the live SignedPublic record still gets its listener"
     );
     Ok(())
 }

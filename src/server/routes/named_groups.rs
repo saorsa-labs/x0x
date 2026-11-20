@@ -25641,19 +25641,13 @@ pub(in crate::server) async fn spawn_global_public_message_listener(
 /// message published after group creation/join cannot race ahead of the local
 /// listener. The spawned task owns only the receive loop.
 async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
+    // #1366: the same rule as the locked check below
+    // (`public_message_listener_wanted`): skip when stored records exist
+    // and none of them needs the listener.
+    if public_message_listener_wanted(&*state.named_groups.read().await, &group_id)
+        .is_some_and(|(_, wanted)| !wanted)
     {
-        let groups = state.named_groups.read().await;
-        if groups
-            .get(&group_id)
-            .or_else(|| {
-                groups
-                    .values()
-                    .find(|info| info.stable_group_id() == group_id.as_str())
-            })
-            .is_some_and(|info| info.withdrawn)
-        {
-            return;
-        }
+        return;
     }
     {
         let tasks = state.public_message_tasks.read().await;
@@ -26819,12 +26813,17 @@ async fn clear_stale_not_member_join_row(
 
     let mut refused_keyed = false;
     let mut keys: Vec<String> = Vec::new();
+    // #1366: the stable id of each cleared row, for its listeners.
+    let mut stable_ids: Vec<String> = Vec::new();
     for (key, info) in groups.iter() {
         if key.as_str() != group_id_hex && info.mls_group_id != group_id_hex {
             continue;
         }
         match classify_not_member_join_row(info, joiner_hex) {
-            NotMemberJoinRow::UnseatedJoinRemnant => keys.push(key.clone()),
+            NotMemberJoinRow::UnseatedJoinRemnant => {
+                keys.push(key.clone());
+                stable_ids.push(info.stable_group_id().to_string());
+            }
             NotMemberJoinRow::InertCardImportStub => {
                 let eligible_shape = is_inert_card_import_stub_shape(info, joiner_hex)
                     && inert_stub_matches_verified_invite(info, invite_stable_group_id)
@@ -26836,6 +26835,7 @@ async fn clear_stale_not_member_join_row(
                     refused_keyed = true;
                 } else {
                     keys.push(key.clone());
+                    stable_ids.push(info.stable_group_id().to_string());
                 }
             }
             _ => {}
@@ -26870,6 +26870,11 @@ async fn clear_stale_not_member_join_row(
         for key in &keys {
             stubs.remove(key);
         }
+    }
+    // #1366: the rows are gone; stop the listeners no stored record needs.
+    // The fresh join attempt installs its own.
+    for (key, stable_id) in keys.iter().zip(&stable_ids) {
+        listener_lifecycle::retire_listeners_of_removed_record(state, key, Some(stable_id)).await;
     }
     tracing::info!(
         group_id = %LogHexId::group(group_id_hex),
@@ -30121,6 +30126,14 @@ async fn drop_local_named_group_state(
     stable_group_id: Option<&str>,
     reason: &str,
 ) -> bool {
+    // #1366: the stored record names its stable id even when the caller
+    // passes none; read it before the record goes.
+    let stored_stable_id = state
+        .named_groups
+        .read()
+        .await
+        .get(id)
+        .map(|info| info.stable_group_id().to_string());
     // ADR 0107 (r5, G5): retire the group's join-artifact serving state
     // (quiesce, awaited, then purge) before the group leaves the roster.
     let mut artifact_aliases = join_artifact_group_aliases(state, id).await;
@@ -30317,7 +30330,10 @@ async fn drop_local_named_group_state(
     }
     // #1366: the record is gone; stop the public-message listener that no
     // stored record needs any more (it is keyed by the stable id).
-    for key in std::iter::once(id).chain(stable_group_id) {
+    for key in std::iter::once(id)
+        .chain(stable_group_id)
+        .chain(stored_stable_id.as_deref())
+    {
         listener_lifecycle::retire_unwanted_public_message_listener(state, key).await;
     }
     true
@@ -34301,6 +34317,9 @@ async fn withdraw_named_group_terminal(
     if event_group_id != id {
         stop_named_group_metadata_listener(state, &event_group_id).await;
     }
+    // #1366: no public-message stop is needed here: the tombstone path
+    // (`retain_withdrawn_group_tombstone` -> `wipe_local_group_crypto_material`)
+    // already aborted both listener registries under every alias.
 
     // Keep the per-group membership lock until local key material is gone and
     // the retained record is visibly withdrawn, so no concurrent API mutator can

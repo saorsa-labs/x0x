@@ -9,16 +9,19 @@
 //!   `MlsEncrypted` ([`public_message_listener_wanted`]).
 //!
 //! Before #1366 the start paths followed this rule, but some exit paths did
-//! not. A self-leave (both planes), a local-only drop, a remote self-removal
-//! and a refused join stub took the record away and left the public-message
-//! listener running; the TreeKEM self-leave left the metadata listener too.
-//! A refreshed card that changed a stub to `MlsEncrypted`, and a withdrawn
-//! card, left it running as well. The functions here stop a listener when
-//! no stored record needs it.
+//! not. A self-leave (both planes), a local-only drop, a remote
+//! self-removal, a refused join stub and a cleared stale join row took the
+//! record away and left the public-message listener running;
+//! the TreeKEM self-leave and the cleared join row left the metadata
+//! listener too. A refreshed card
+//! that changed a stub to `MlsEncrypted`, and a withdrawn card, left it
+//! running as well. The functions here stop a listener when no stored
+//! record needs it.
 //!
 //! Lock order: a registry lock (`group_metadata_tasks` or
 //! `public_message_tasks`), then `named_groups`, as in the install paths.
-//! The callers hold no group lock.
+//! The callers hold no `named_groups` lock and no registry lock. Some hold
+//! the per-group membership mutex, which these functions never take.
 
 use super::*;
 
@@ -68,6 +71,21 @@ async fn retire_unwanted_metadata_listener(state: &AppState, group_key: &str) {
     }
     if let Some(reg) = tasks.remove(group_key) {
         reg.handle.abort();
+    }
+}
+
+/// Stop both listeners of a record the caller has just removed from
+/// `named_groups`, when no stored record needs them. `group_key` is the
+/// removed local map key; `stable_id` is the stable id it carried.
+pub(super) async fn retire_listeners_of_removed_record(
+    state: &AppState,
+    group_key: &str,
+    stable_id: Option<&str>,
+) {
+    retire_unwanted_metadata_listener(state, group_key).await;
+    retire_unwanted_public_message_listener(state, group_key).await;
+    if let Some(stable_id) = stable_id.filter(|stable_id| *stable_id != group_key) {
+        retire_unwanted_public_message_listener(state, stable_id).await;
     }
 }
 

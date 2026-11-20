@@ -7,13 +7,15 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 
 - **Group listeners stop when no stored record needs them (#1366 second
-  slice; A08 amendment of 20 Nov 2026).** A self-leave (GSS and TreeKEM
-  planes), a local-only drop, a self-removal applied from the topic or a
-  direct lane, a refused join stub, a card refresh that made a stub
-  `MlsEncrypted` and a withdrawn card left the group's public-message
-  listener running until a restart. Each now stops it. A TreeKEM
-  self-leave also stops the metadata listener. Records that share a
-  stable id keep the shared listener while any of them needs it.
+  slice; A08 amendment of 20 Nov 2026).** A self-leave (GSS and TreeKEM), a
+  local-only drop, a refused join stub, a cleared stale join row, a
+  self-removal applied from the topic or a direct lane, a card refresh that
+  made a stub `MlsEncrypted` and a withdrawn card left the group's
+  public-message listener running until a restart. Each now stops it, and
+  the TreeKEM self-leave and the cleared join row stop the metadata
+  listener too. Records that share a stable id keep the shared listener
+  while any of them needs it. Events applied by catch-up, replay or
+  recovery paths still wait for a restart.
 
 - **No launchd restart loop on a missing daemon (#1379; A14 amendment of
   19 Nov 2026).** On macOS the launcher no longer exits when the daemon
