@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **A Homebrew install keeps the direct autostart job (#2111; A14
+  amendment of 20 Nov 2026).** `x0x autostart --launcher` and
+  `--repair --launcher` keep refusing a daemon inside a versioned Homebrew
+  keg; Homebrew owns that install's upgrades. The refusal now names the
+  direct-job command for the instance, with `--name` for a named one.
 - **Group listeners stop on every apply path (#2124; A08 amendment of 20
   Nov 2026).** A self-removal or withdrawal applied by catch-up, a fetched
   control blob, a parked-event, TreeKEM pending-event or recovery replay now stops the
