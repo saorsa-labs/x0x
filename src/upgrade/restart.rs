@@ -1360,7 +1360,7 @@ fn readback_systemd_observation_in(
         let first = tokens.first().map(String::as_str).unwrap_or_default();
         (first == loaded_path || path_basename(first) == LAUNCHER_BASENAME)
             && same_executable(daemon.executable, executable)
-            && argv.first().is_some()
+            && !argv.is_empty()
             && daemon.args == argv.get(1..).unwrap_or_default()
     } else if !same_executable(&loaded_path, executable) {
         false
@@ -2193,8 +2193,8 @@ fn readback_systemd_observation(
         &mut |user_manager, unit| run_systemctl_show(user_manager, unit, deadline),
         &mut |user_manager, unit| {
             run_busctl_exec_start(user_manager, unit, pid, parent_pid, deadline)
-                & same_executable_canonical
         },
+        &same_executable_canonical,
     )
 }
 
