@@ -4244,6 +4244,24 @@ mod tests {
         }
     }
 
+    // #1379 (#2108 review): `--dry-run` only plans a `--repair`.
+    #[test]
+    fn autostart_dry_run_requires_repair() -> anyhow::Result<()> {
+        match Cli::try_parse_from(["x0x", "autostart", "--dry-run"]) {
+            Err(e) => assert_eq!(e.kind(), clap::error::ErrorKind::MissingRequiredArgument),
+            Ok(_) => anyhow::bail!("--dry-run without --repair must be refused"),
+        }
+        let cli = Cli::try_parse_from(["x0x", "autostart", "--repair", "--dry-run"])?;
+        match cli.command {
+            Commands::Autostart {
+                repair: true,
+                dry_run: true,
+                ..
+            } => Ok(()),
+            _ => anyhow::bail!("expected autostart with repair and dry_run set"),
+        }
+    }
+
     #[test]
     fn bare_presence_alias_parses_without_nested_subcommand() -> anyhow::Result<()> {
         let cli = Cli::try_parse_from(["x0x", "presence"])?;

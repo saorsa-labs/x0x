@@ -1233,6 +1233,11 @@ daemon is unreachable: the upgrade check fails and names the job, the
 missing path and whether the launcher is waiting for it. Run
 `x0x autostart` again to point the job at the installed x0xd.
 
+The keg path is not replaced by the `<prefix>/opt/<formula>` link. The
+launcher compares the journal's canonical executable with the daemon path
+in its arguments byte for byte, and a trial swap would write into a keg
+that Homebrew owns. Launcher support for a Homebrew install is #2111.
+
 **Who may change a job.** On macOS every autostart command (install,
 `--repair`, `--remove`) refuses to run as root or under `sudo`: the agent
 belongs to the user who runs it, and a root-owned file in that user's

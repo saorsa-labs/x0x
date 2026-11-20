@@ -243,11 +243,7 @@ fn down_upgrade_check(instance_dir: Option<&std::path::Path>) -> DoctorCheck {
 /// `x0x` for the default one, `x0x-<name>` for a named one.
 #[cfg(target_os = "macos")]
 fn autostart_missing_daemon_check(instance_dir: &std::path::Path) -> Option<DoctorCheck> {
-    let dir_name = instance_dir.file_name()?.to_str()?;
-    let instance = match dir_name {
-        "x0x" => None,
-        other => Some(other.strip_prefix("x0x-")?),
-    };
+    let instance = instance_of_data_dir(instance_dir.file_name()?.to_str()?)?;
     let plist = dirs::home_dir()?
         .join("Library/LaunchAgents")
         .join(format!("{AUTOSTART_LAUNCHD_LABEL}.plist"));
@@ -256,6 +252,19 @@ fn autostart_missing_daemon_check(instance_dir: &std::path::Path) -> Option<Doct
     }
     let job = read_plist_as_json(&plist).ok()??;
     missing_daemon_check(&job, instance, &|path| path.exists())
+}
+
+/// The instance a data directory name belongs to: `Some(None)` for the
+/// default `x0x`, `Some(Some(name))` for `x0x-<name>`, `None` for another.
+#[cfg(any(test, target_os = "macos"))]
+fn instance_of_data_dir(dir_name: &str) -> Option<Option<&str>> {
+    match dir_name {
+        "x0x" => Some(None),
+        other => other
+            .strip_prefix("x0x-")
+            .filter(|name| !name.is_empty())
+            .map(Some),
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -3706,6 +3715,63 @@ mod tests {
             read_file: &|_| Ok(None),
             canonical_dir: &|dir| Ok(dir.to_string_lossy().into_owned()),
         }
+    }
+
+    #[test]
+    fn doctor_finds_the_instance_from_the_data_directory_name() {
+        assert_eq!(instance_of_data_dir("x0x"), Some(None));
+        assert_eq!(instance_of_data_dir("x0x-alice"), Some(Some("alice")));
+        for other in ["x0x-", "x0xalice", "alice", "X0X", ""] {
+            assert_eq!(instance_of_data_dir(other), None, "{other}");
+        }
+    }
+
+    /// #1379 (#2108 review): `--repair --launcher --dry-run` plans the
+    /// migration and writes nothing, not even the backup.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_dry_run_migration_leaves_the_job_file_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let bin = root.join("bin");
+        let home = root.join("home");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(home.join("Library/Application Support/x0x")).unwrap();
+        std::fs::write(bin.join("x0xd"), b"").unwrap();
+        std::fs::write(bin.join("x0x-launcher"), b"").unwrap();
+        let job = serde_json::json!({
+            "Label": AUTOSTART_LAUNCHD_LABEL,
+            "ProgramArguments": [bin.join("x0xd").to_string_lossy()],
+            "EnvironmentVariables": { "HOME": home.to_string_lossy() },
+            "KeepAlive": true,
+        });
+        let path = root.join("job.plist");
+        let before = json_to_plist(&job).unwrap();
+        std::fs::write(&path, &before).unwrap();
+        assert!(migrate_job_to_launcher(&path, &job, true).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!path.with_extension("plist.x0x-backup").exists());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 3);
+    }
+
+    /// #1379 (#2108 review): the file check the autostart commands call
+    /// reads the real owner and mode.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_plist_file_check_reads_owner_and_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("job.plist");
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        check_plist_file_owner(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+        let error = check_plist_file_owner(&path).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("writable by group"),
+            "{error:#}"
+        );
+        assert!(check_plist_file_owner(&dir.path().join("missing.plist")).is_err());
     }
 
     const ALICE_ROOT: &str = "/Users/a/Library/Application Support/x0x-alice";
