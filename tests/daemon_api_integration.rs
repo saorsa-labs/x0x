@@ -2780,6 +2780,114 @@ async fn daemon_api_auth_session_revoke() {
 
 #[tokio::test]
 #[ignore]
+async fn daemon_api_auth_session_revoke_closes_its_streams() {
+    // #2079: an open SSE stream and WebSocket of a session end when the
+    // session signs out, also one opened with a junk bearer header beside
+    // the session's `?token=` (#2112 review); a stream of another session
+    // and one opened with the durable token stay open.
+    let d = daemon().await;
+    let mint = || async {
+        let r: Value = ca(&d)
+            .post(d.url("/auth/session"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        r["session_token"].as_str().unwrap().to_string()
+    };
+    let session = mint().await;
+    let other = mint().await;
+    let plain = reqwest::Client::new();
+    let mut sse = plain
+        .get(format!("{}?token={session}", d.url("/events")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sse.status(), StatusCode::OK);
+    let mut other_sse = plain
+        .get(format!("{}?token={other}", d.url("/events")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other_sse.status(), StatusCode::OK);
+    let mut junk_header_sse = plain
+        .get(format!("{}?token={session}", d.url("/events")))
+        .bearer_auth("junk")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(junk_header_sse.status(), StatusCode::OK);
+    let mut durable_sse = ca(&d).get(d.url("/events")).send().await.unwrap();
+    assert_eq!(durable_sse.status(), StatusCode::OK);
+    let ws_url = d.url("/ws").replacen("http://", "ws://", 1);
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("{ws_url}?token={session}"))
+        .await
+        .expect("WS connect failed");
+    let first = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("connected frame in time")
+        .expect("a frame")
+        .expect("a valid frame");
+    assert!(
+        first.is_text(),
+        "the connected frame comes first: {first:?}"
+    );
+
+    let r: Value = plain
+        .post(d.url("/auth/session/revoke"))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["revoked"], true);
+
+    let sse_end = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Ok(Some(_)) = sse.chunk().await {}
+    })
+    .await;
+    assert!(sse_end.is_ok(), "the session's SSE stream ends on sign-out");
+    let junk_end = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Ok(Some(_)) = junk_header_sse.chunk().await {}
+    })
+    .await;
+    assert!(
+        junk_end.is_ok(),
+        "a junk bearer header does not unbind the session's stream"
+    );
+    let close = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Close(frame))) => return frame,
+                Some(Ok(_)) => continue,
+                _ => return None,
+            }
+        }
+    })
+    .await
+    .expect("the session's WebSocket closes on sign-out");
+    let frame = close.expect("a close frame");
+    assert_eq!(u16::from(frame.code), 1008, "policy close: {frame:?}");
+    assert_eq!(&*frame.reason, "session ended");
+
+    let other_open = tokio::time::timeout(Duration::from_secs(2), other_sse.chunk()).await;
+    assert!(
+        !matches!(other_open, Ok(Ok(None)) | Ok(Err(_))),
+        "another session's stream stays open: {other_open:?}"
+    );
+    let durable_open = tokio::time::timeout(Duration::from_secs(2), durable_sse.chunk()).await;
+    assert!(
+        !matches!(durable_open, Ok(Ok(None)) | Ok(Err(_))),
+        "a durable-token stream stays open: {durable_open:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
 async fn daemon_api_diagnostics_exec() {
     let d = daemon().await;
     let r: Value = ca(&d)

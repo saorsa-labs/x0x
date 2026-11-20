@@ -15,6 +15,13 @@ All notable changes to this project will be documented in this file.
   writer. New tests drive a real refused merge through to the `x0x doctor`
   warning, and merge an image from a pre-#1970 peer that still holds
   removed keys' entries.
+- **GUI session streams close when the session ends (#2079; A11 amendment
+  of 20 Nov 2026).** An SSE stream or WebSocket opened with a session token
+  now ends on sign-out, at the idle limit (within 30 s) and when a clock
+  step ends every session; a WebSocket closes with code `1008`
+  (`session ended`). A token refresh keeps the streams open. The GUI no
+  longer reconnects a socket closed that way. The daemon logs a warning
+  when a backward clock step ends every session.
 
 - **No launchd restart loop on a missing daemon (#1379; A14 amendment of
   19 Nov 2026).** On macOS the launcher no longer exits when the daemon

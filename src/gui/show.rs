@@ -2983,6 +2983,63 @@ async function load(token) {
         );
     }
 
+    /// #2079: the daemon closes a session's socket with 1008 when the
+    /// session ends. The page ends its session and does not reconnect;
+    /// any other close reconnects while the session lives.
+    #[test]
+    fn a_policy_close_ends_the_session_and_does_not_reconnect() {
+        let html = include_str!("x0x-gui.html");
+        let source = format!(
+            "{}\n{}\n{}",
+            r#"
+let sessionExpired = false;
+const ended = [];
+function endSession(message) { if (sessionExpired) return; sessionExpired = true; ended.push(message); }
+const timers = [];
+function setTimeout(fn, ms) { timers.push(ms); }
+const S = { set() {} };
+let ws = null;
+class WebSocket { constructor() { this.readyState = 0; } }
+function wsUrl() { return 'ws://127.0.0.1:9/ws?token=t'; }
+async function refreshAgentIdentity() {}
+function advertiseGuiVisibility() {}
+const wsSubs = [];
+function handleWsMsg() {}
+function fail(message) { throw new Error(message); }
+"#,
+            fn_source(html, "function wsConnect()", "function wsSend("),
+            r#"
+wsConnect();
+ws.readyState = 3;
+ws.onclose({ code: 1006 });
+if (timers.length !== 1) fail('an abnormal close must reconnect');
+if (ended.length !== 0) fail('an abnormal close must not end the session');
+wsConnect();
+ws.readyState = 3;
+ws.onclose({ code: 1008 });
+if (timers.length !== 1) fail('a 1008 close must not reconnect');
+if (ended.length !== 1 || !sessionExpired) fail('a 1008 close must end the session');
+wsConnect();
+ws.readyState = 3;
+ws.onclose({ code: 1006 });
+if (timers.length !== 1) fail('an ended session must not reconnect');
+"#
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("ws-close.js");
+        std::fs::write(&script, source).expect("write script");
+        let output = std::process::Command::new("node")
+            .arg(&script)
+            .output()
+            .expect("node runs the GUI socket close");
+        assert!(
+            output.status.success(),
+            "GUI socket close\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     fn fn_source<'a>(html: &'a str, start: &str, end: &str) -> &'a str {
         let at = html
             .find(start)
