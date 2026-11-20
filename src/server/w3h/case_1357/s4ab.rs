@@ -60,15 +60,13 @@
 //!   and the 20-rerun W3-H gate runs it (`--run-ignored all`) and requires
 //!   GREEN in every rerun, as for the other `s4_` arms.
 //!
-//! Not in this case yet (ADR rows (2), (3), (8)–(10) and the
-//! D-fallback form of (6)): (2) needs B offline with the renewal reaching
-//! A only by announce; (3) needs a released 0.46.1 member whose advert
-//! lacks `certificate_rebind_v1` (W3-H runs one build); (8) and (9) need every admin certificate
-//! to expire, so the owner device needs an expiring certificate, and
-//! [`Sim::start_owner_device`] issues a non-expiring one; (10) needs a
-//! fault rule that holds one commit frame for 600 s + W; (6) with A
-//! offline until N + W needs a second admin D and about 2 × 600 virtual
-//! seconds.
+//! Run (2) is `expiry_skew`'s B-offline arm and run (9) is in
+//! `long_waits` (1581n). Not in this case yet (ADR rows (3), (8), (10) and
+//! the D-fallback form of (6)): (3) needs a released 0.46.1 member whose
+//! advert lacks `certificate_rebind_v1` (W3-H runs one build); (8) needs
+//! that member L too; (10) needs a fault rule that holds one commit frame
+//! for 600 s + W; (6) with A offline until N + W needs a second admin D
+//! and about 2 × 600 virtual seconds.
 //!
 //! `s4_owner_recovery` (Home; A is the owner device and the only admin):
 //!
@@ -92,8 +90,8 @@
 //! (the harness has no non-Home owner-certified group setup); a mandate
 //! naming an expired member, an older head, a non-owner signer or a
 //! replay (each needs a mandate built outside the route, which always
-//! signs the current head with the local U); a 0.46.1 member L; O silent
-//! for 24 virtual hours; and the joiner J's `JoinPendingNotice`.
+//! signs the current head with the local U); a 0.46.1 member L; and the
+//! joiner J's `JoinPendingNotice`. O silent is in `long_waits` (1581n).
 
 // #1581: ADR 0110 `s4_certificate_expiry_skew`, sim-feasible runs. A child
 // module, so that it uses this file's Home, seat and certificate helpers.
@@ -103,6 +101,9 @@ mod expiry_skew;
 mod s4_owner_recovery_1973;
 // #1581: the `s4_owner_recovery` variants the public mandate route drives.
 mod recovery_variants;
+// #1581: the 24-virtual-hour waits of `s4_certificate_rebind` run (9) and
+// `s4_owner_recovery` with O silent.
+mod long_waits;
 
 use super::*;
 use crate::groups::cert_rebind as cr;
@@ -129,6 +130,7 @@ const RECOVERY: Duration = Duration::from_secs(120);
 const RECEIVER_UPGRADE: &str = "waiting_for_receiver_upgrade";
 const ADMIN_REBIND: &str = "waiting_for_admin_rebind";
 const ELIGIBLE_ADMIN_REVOCATION: &str = "waiting_for_eligible_admin_revocation";
+const ADMIN_CERTIFICATE_RENEWAL: &str = "waiting_for_admin_certificate_renewal";
 
 const FINAL_REBIND_PRE: &str =
     "pre_cutoff_self_rebind_changes_only_the_digest_and_an_older_certificate_is_refused";
@@ -427,6 +429,23 @@ fn rows_for(body: &serde_json::Value, target_hex: &str) -> Vec<serde_json::Value
         .unwrap_or_default()
 }
 
+/// `body` lists an S4 row for `target_hex` that waits for an owner
+/// renewal (`waiting_for_admin_certificate_renewal`) naming exactly
+/// `named` (agent hex, any order).
+fn waits_for_renewal(body: &serde_json::Value, target_hex: &str, named: &[String]) -> bool {
+    let mut want: Vec<&str> = named.iter().map(String::as_str).collect();
+    want.sort_unstable();
+    rows_for(body, target_hex).iter().any(|row| {
+        let waiting = &row["waiting"];
+        let mut seen: Vec<&str> = waiting["named"]
+            .as_array()
+            .map(|ids| ids.iter().filter_map(serde_json::Value::as_str).collect())
+            .unwrap_or_default();
+        seen.sort_unstable();
+        waiting["cause"] == ADMIN_CERTIFICATE_RENEWAL && seen == want
+    })
+}
+
 /// No open S4 row for `target_hex` on any of `labels`: each listed row is
 /// `terminated` with `certificate_valid`. Returns the verdict and what was
 /// seen.
@@ -654,17 +673,37 @@ async fn home_with(
     expiring: Option<(&str, u64)>,
     admins: &[&str],
 ) -> Result<(super::super::home::HomeIds, Option<u64>)> {
+    match expiring {
+        Some((label, offset)) => home_expiring(sim, labels, &[label], offset, admins).await,
+        None => home_expiring(sim, labels, &[], 0, admins).await,
+    }
+}
+
+/// [`home_with`] where every device in `expiring` (the owner device A
+/// included) gets one certificate `not_after`: `offset` after the first
+/// of them is certified. The rest get non-expiring certificates. Returns
+/// that `not_after` when `expiring` is not empty.
+async fn home_expiring(
+    sim: &mut Sim,
+    labels: &[&'static str],
+    expiring: &[&str],
+    offset: u64,
+    admins: &[&str],
+) -> Result<(super::super::home::HomeIds, Option<u64>)> {
     let owner = UserKeypair::generate()?;
-    let home = sim.start_owner_device("A", &owner).await?;
-    let mut not_after = None;
+    let mut not_after: Option<u64> = None;
+    let owner_until = expiring
+        .contains(&"A")
+        .then(|| *not_after.get_or_insert(wall_ms() / 1000 + offset));
+    let home = sim
+        .start_owner_device_until("A", &owner, owner_until)
+        .await?;
     for device in labels.iter().filter(|label| **label != "A") {
-        match expiring {
-            Some((label, offset)) if label == *device => {
-                let at = wall_ms() / 1000 + offset;
-                certify_expiring_device(sim, "A", device, &owner, &home, at).await?;
-                not_after = Some(at);
-            }
-            _ => sim.certify_owner_device("A", device, &owner, &home).await?,
+        if expiring.contains(device) {
+            let at = *not_after.get_or_insert(wall_ms() / 1000 + offset);
+            certify_expiring_device(sim, "A", device, &owner, &home, at).await?;
+        } else {
+            sim.certify_owner_device("A", device, &owner, &home).await?;
         }
     }
     for member in labels.iter().filter(|label| **label != "A") {

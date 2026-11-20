@@ -42,11 +42,38 @@
 //!   survivor's head, signed by A after raw N and within the bound, with
 //!   no crypto event (no TreeKEM group, no epoch).
 //!
+//! - `on_demand_1581n_certificate_rebind_run2_offline_seat_announced_renewal`
+//!   (`s4_certificate_rebind` run (2)): run (5a), but B announces its
+//!   renewal 30 s before N and then stops, and stays offline. Run (5a)
+//!   already proves the rebind with B online, so B offline is the only
+//!   difference (this setup has admins A < D < E, not the row's A < D).
+//!   Desired: as (5a), with the data plane read on C, D and E only. Red
+//!   proof (never committed): the designated worker ignored the announce
+//!   cache (`discovered_agent` read as no certificate in
+//!   `rebind.rs`), and the row read RED for [`CAUSE_RENEWAL_IGNORED`].
+//! - `on_demand_1581n_expiry_skew_run7_every_admin_expired_renewal_rebinds_then_evicts`
+//!   (run (7)). The certificates of A (the owner device), D, E and B all
+//!   expire at N. Desired: nothing moves before raw N; every survivor's
+//!   row for B shows `waiting_for_admin_certificate_renewal` naming A, D
+//!   and E, and no commit lands while it waits; C (a U holder) renews A,
+//!   and A's self-rebind is accepted (§4b(2)) and reaches A and C; A then
+//!   removes B (one or more epoch steps: A also removes the expired D and
+//!   E), signs the head, and B is excluded within the completion bound
+//!   from A's rebind (H, D126); A's new ciphertext opens on C and not on
+//!   B. The ADR renews A at t = 60 s + 2W. The code starts the wait and
+//!   the §4b(2) exception at each admin's own trigger N + τ
+//!   (`self_rebind_rule`, #1533 Codex P2), so the case renews A 2W after
+//!   the wait shows. Red proof (never committed): `self_rebind_rule` never
+//!   returned `EveryAdminExpired`, and the row read RED for
+//!   [`CAUSE_SELF_REBIND_REFUSED`].
+//!
 //! The other runs are not here: (5b) and the late admin rebind overlap
-//! `s4_certificate_rebind` run (6); (5c), (7) and (9) are follow-ups on
+//! `s4_certificate_rebind` run (6); (5c) and (9) are follow-ups on
 //! #1581. The shim moves the daemons' wall clock with virtual time, so
 //! these arms are `#[ignore]`d outside it and the W3-H gate runs them
-//! (`--run-ignored all`), as for `s4_certificate_rebind` run (6).
+//! (`--run-ignored all`), as for `s4_certificate_rebind` run (6). The two
+//! `on_demand_1581n_` arms are not in the gate: they confirm behaviour the
+//! code already has, so they run on demand only (`tests/AGENTS.md`).
 
 use super::*;
 
@@ -58,6 +85,10 @@ const T0_BEFORE_N: u64 = 60;
 /// Run (5a): the renewal reaches the admins by announce this long before
 /// N (the ADR's t = 55 s).
 const RENEWAL_BEFORE_N: u64 = 5;
+/// `s4_certificate_rebind` run (2): B announces its renewal and then
+/// stops, which takes a few seconds, so its announce starts this long
+/// before N.
+const OFFLINE_RENEWAL_BEFORE_N: u64 = 30;
 
 const FIVE_SKEW: &[&str] = &["A", "D", "E", "B", "C"];
 const SURVIVORS: &[&str] = &["A", "D", "E", "C"];
@@ -75,9 +106,25 @@ const CAUSE_SIBLING: &str =
 const CAUSE_LATE: &str =
     "B was excluded by A, but later than A's trigger N + \u{3c4} plus the completion bound";
 const FINAL_REBIND: &str = "the_designated_admin_rebinds_the_announced_renewal_at_expiry";
+const FINAL_REBIND_B_OFFLINE: &str =
+    "the_designated_admin_rebinds_an_offline_seat_s_announced_renewal_at_expiry";
 const CAUSE_RENEWAL_IGNORED: &str = "A held B's verified renewal by announce, but the survivors \
                                      excluded B instead of committing the rebind (ADR 0110 \
                                      L289, s4_certificate_rebind run (2))";
+const FINAL_RUN7: &str =
+    "every_admin_expired_waits_for_renewal_then_the_renewed_admin_rebinds_and_evicts_b";
+const CAUSE_NO_RENEWAL_WAIT: &str = "every admin's certificate expired, but a survivor does not \
+                                     show waiting_for_admin_certificate_renewal naming A, D and \
+                                     E for B's row";
+const CAUSE_EXIT_WITHOUT_ADMIN: &str = "a commit landed while every admin's certificate was \
+                                        expired and before the owner renewed one";
+const CAUSE_SELF_REBIND_REFUSED: &str = "every admin was expired, but A's self-rebind of its \
+                                         owner renewal was refused or never reached the \
+                                         survivors (\u{a7}4b(2))";
+const CAUSE_NO_EVICTION_AFTER_RENEWAL: &str = "A rebound its renewal, but after the completion \
+                                               bound the survivors still list B Active: the \
+                                               renewed admin did not run the pending expiry \
+                                               work (D126)";
 const CAUSE_NO_REBIND: &str = "after A's trigger N + \u{3c4} and the completion bound every \
                                survivor still lists B Active on its first certificate: no rebind \
                                and no eviction";
@@ -90,6 +137,11 @@ enum SkewRun {
     /// (5a): run (1) with U's renewal reaching the admins by announce at
     /// t = 55 s.
     AnnouncedRenewal,
+    /// `s4_certificate_rebind` run (2): run (5a), but B stops once A, D
+    /// and E hold the announced renewal and stays offline.
+    AnnouncedRenewalBOffline,
+    /// (7): A, D and E certificates expire with B's; U renews A's.
+    AllAdminsExpire,
     /// (8): run (1) in an `OwnerCertified` `SignedPublic` group.
     SignedPublic,
 }
@@ -99,11 +151,23 @@ impl SkewRun {
         self != Self::SignedPublic
     }
 
+    fn announced(self) -> bool {
+        matches!(
+            self,
+            Self::AnnouncedRenewal | Self::AnnouncedRenewalBOffline
+        )
+    }
+
+    fn b_offline(self) -> bool {
+        self == Self::AnnouncedRenewalBOffline
+    }
+
     fn final_name(self) -> &'static str {
-        if self == Self::AnnouncedRenewal {
-            FINAL_REBIND
-        } else {
-            FINAL_EXPIRY
+        match self {
+            Self::AnnouncedRenewal => FINAL_REBIND,
+            Self::AnnouncedRenewalBOffline => FINAL_REBIND_B_OFFLINE,
+            Self::AllAdminsExpire => FINAL_RUN7,
+            Self::AllZero | Self::SignedPublic => FINAL_EXPIRY,
         }
     }
 }
@@ -259,7 +323,10 @@ async fn skew_scenario(sim: &mut Sim, run: SkewRun, receipt: &mut Receipt) -> Re
         home_with(sim, FIVE_SKEW, Some(("B", NOT_AFTER_OFFSET)), &["D", "E"]).await?;
     let n = not_after.context("B's not_after")?;
     let group = match run {
-        SkewRun::AllZero | SkewRun::AnnouncedRenewal => home.gid.clone(),
+        SkewRun::AllZero
+        | SkewRun::AnnouncedRenewal
+        | SkewRun::AnnouncedRenewalBOffline
+        | SkewRun::AllAdminsExpire => home.gid.clone(),
         SkewRun::SignedPublic => signed_public_group(sim, &home).await?.gid,
     };
     let (b, _) = sim.ids("B")?;
@@ -338,13 +405,13 @@ async fn skew_scenario(sim: &mut Sim, run: SkewRun, receipt: &mut Receipt) -> Re
     ));
 
     let mut renewal_digest: Option<String> = None;
-    if run == SkewRun::AnnouncedRenewal {
-        pause_until_wall(
-            sim,
-            "wait to t = 55 s (N − 5 s)",
-            (n - RENEWAL_BEFORE_N) * 1000,
-        )
-        .await?;
+    if run.announced() {
+        let lead = if run.b_offline() {
+            OFFLINE_RENEWAL_BEFORE_N
+        } else {
+            RENEWAL_BEFORE_N
+        };
+        pause_until_wall(sim, "wait to the renewal's announce", (n - lead) * 1000).await?;
         // The pause above returns at once when the wall clock is already
         // past N − 5 s, so the timing is proved here: A, D and E must hold
         // the renewal before raw N, or the run shows nothing about a
@@ -371,6 +438,21 @@ async fn skew_scenario(sim: &mut Sim, run: SkewRun, receipt: &mut Receipt) -> Re
             n * 1000
         );
         renewal_digest = Some(d1);
+        if run.b_offline() {
+            sim.stop("B", RestartMode::Graceful).await?;
+            let stopped_ms = wall_ms();
+            receipt.evidence(
+                "b_is_offline_before_raw_not_after",
+                stopped_ms < n * 1000,
+                format!("B stopped at wall {stopped_ms} ms; raw N {} ms", n * 1000),
+                at(sim),
+            );
+            ensure!(
+                stopped_ms < n * 1000,
+                "INFRA: B stopped at wall {stopped_ms} ms, after raw not_after {} ms",
+                n * 1000
+            );
+        }
     }
     // Run (5a)'s outcome on one survivor: the seat is still Active with
     // its base role and leaf tracking, bound to the renewal, at the same
@@ -395,7 +477,7 @@ async fn skew_scenario(sim: &mut Sim, run: SkewRun, receipt: &mut Receipt) -> Re
         })
     };
     let outcome = |label: &str, seat: &Seat| -> bool {
-        if run == SkewRun::AnnouncedRenewal {
+        if run.announced() {
             rebound(label, seat)
         } else {
             excluded_on(seat, run, e0, leaves0)
@@ -457,8 +539,13 @@ async fn skew_scenario(sim: &mut Sim, run: SkewRun, receipt: &mut Receipt) -> Re
             .is_some_and(|ms| ms > n * 1000)
     });
     let in_bound = reached_ms.is_some_and(|ms| ms <= deadline_ms);
+    let readers: &[&str] = if run.b_offline() {
+        &["C", "D", "E"]
+    } else {
+        &["C", "D", "E", "B"]
+    };
     let plane = if run.treekem() {
-        data_plane(sim, &group, "A", &["C", "D", "E", "B"]).await?
+        data_plane(sim, &group, "A", readers).await?
     } else {
         Vec::new()
     };
@@ -468,7 +555,7 @@ async fn skew_scenario(sim: &mut Sim, run: SkewRun, receipt: &mut Receipt) -> Re
     // the other runs B must not open the post-exclusion ciphertext.
     let plane_ok = plane.iter().all(|(reader, ok, _)| {
         if reader.as_str() == "B" {
-            run == SkewRun::AnnouncedRenewal || !*ok
+            run.announced() || !*ok
         } else {
             *ok
         }
@@ -503,13 +590,13 @@ async fn skew_scenario(sim: &mut Sim, run: SkewRun, receipt: &mut Receipt) -> Re
         if !early_unmoved {
             receipt.cause(CAUSE_EARLY, Some(describe_seats(&early)), true, at(sim));
         } else if unmoved_end {
-            let cause = if run == SkewRun::AnnouncedRenewal {
+            let cause = if run.announced() {
                 CAUSE_NO_REBIND
             } else {
                 CAUSE_NO_EXPIRY_EVICTION
             };
             receipt.cause(cause, Some(describe_seats(&end)), true, at(sim));
-        } else if run == SkewRun::AnnouncedRenewal
+        } else if run.announced()
             && end.iter().all(|(_, seat)| {
                 seat.as_ref()
                     .is_some_and(|seat| excluded_on(seat, SkewRun::AllZero, e0, leaves0))
@@ -541,6 +628,371 @@ async fn skew_scenario(sim: &mut Sim, run: SkewRun, receipt: &mut Receipt) -> Re
     Ok(())
 }
 
+/// Run (7): B's row on each of `labels` waits for an owner renewal
+/// naming A, D and E. Returns the verdict and what each label lists.
+async fn renewal_wait_on(
+    sim: &Sim,
+    labels: &[&'static str],
+    group: &str,
+    b_hex: &str,
+    named: &[String],
+) -> (bool, String) {
+    let mut all = true;
+    let mut seen = Vec::with_capacity(labels.len());
+    for label in labels {
+        match group_body(sim, label, group).await {
+            Ok(body) => {
+                all &= waits_for_renewal(&body, b_hex, named);
+                seen.push(format!("{label}: {:?}", rows_for(&body, b_hex)));
+            }
+            Err(error) => {
+                all = false;
+                seen.push(format!("{label}: {error:#}"));
+            }
+        }
+    }
+    (all, seen.join("; "))
+}
+
+/// `s4_certificate_expiry_skew` run (7). The ADR renews A at t = 60 s +
+/// 2W. The renewal wait and the §4b(2) self-rebind start at each admin's
+/// own trigger N + \u{3c4} (`self_rebind_rule`, #1533 Codex P2), so before
+/// that no renewal wait shows and A's self-rebind is handed off. The case
+/// therefore renews A 2W after every survivor shows the wait.
+async fn all_admins_expire(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
+    let at = |sim: &Sim| sim.fabric().now().as_micros();
+    if sim.shim.is_none() {
+        bail!(
+            "s4_certificate_expiry_skew needs the W3-H shim: the expiry follows the daemons' \
+             wall clock, which without the shim does not move with virtual time"
+        );
+    }
+    let timing = timing();
+    sim.rank_keys(&["A", "D", "E"])?;
+    let (home, not_after) = home_expiring(
+        sim,
+        FIVE_SKEW,
+        &["A", "D", "E", "B"],
+        NOT_AFTER_OFFSET,
+        &["D", "E"],
+    )
+    .await?;
+    let n = not_after.context("the certificates' not_after")?;
+    let group = home.gid.clone();
+    let (b, _) = sim.ids("B")?;
+    let b_hex = sim.agent_hex("B")?;
+    let a_hex = sim.agent_hex("A")?;
+    let admins: Vec<String> = ["A", "D", "E"]
+        .into_iter()
+        .map(|label| sim.agent_hex(label))
+        .collect::<Result<_>>()?;
+    same_head(sim, FIVE_SKEW, &group, &b).await?;
+    let base = seats(sim, FIVE_SKEW, &group, &b).await?;
+    let a_base = base
+        .first()
+        .and_then(|(_, seat)| seat.clone())
+        .context("A has no record of the group")?;
+    let e0 = a_base.view.epoch;
+    let leaves0 = a_base.view.leaves;
+    let rev0 = a_base.view.state_revision;
+    let d0 = a_base
+        .digest
+        .clone()
+        .context("A holds no committed certificate digest for B")?;
+    let mut admin_not_after = Vec::with_capacity(3);
+    for label in ["A", "D", "E"] {
+        let (id, _) = sim.ids(label)?;
+        let seat = seats(sim, &["A"], &group, &id)
+            .await?
+            .into_iter()
+            .next()
+            .and_then(|(_, seat)| seat);
+        admin_not_after.push((label, seat.and_then(|seat| seat.not_after)));
+    }
+    receipt.setup_done(at(sim));
+    let (same, detail) = runtime_timing(sim, FIVE_SKEW)?;
+    receipt.evidence("every_node_runs_s4timing_default", same, detail, at(sim));
+    let mut ranked: Vec<(String, &str)> = ["A", "D", "E"]
+        .into_iter()
+        .map(|label| sim.agent_hex(label).map(|hex| (hex, label)))
+        .collect::<Result<_>>()?;
+    ranked.sort();
+    let order: Vec<&str> = ranked.iter().map(|(_, label)| *label).collect();
+    receipt.evidence(
+        "admins_rank_a_before_d_before_e",
+        order == ["A", "D", "E"],
+        format!("admin agent-id order {order:?}"),
+        at(sim),
+    );
+    receipt.evidence(
+        "group_settled_with_a_d_e_and_b_seated_on_certificates_expiring_at_n",
+        all_bind(&base, &d0)
+            && e0.is_some()
+            && leaves0 == Some(5)
+            && base.iter().all(|(_, seat)| {
+                seat.as_ref()
+                    .is_some_and(|seat| seat.active() && seat.not_after == Some(n))
+            })
+            && admin_not_after.iter().all(|(_, until)| *until == Some(n)),
+        format!(
+            "e0={e0:?} leaves0={leaves0:?} d0={d0} N={n}; admins' committed not_after on A \
+             {admin_not_after:?}; {}",
+            describe_seats(&base)
+        ),
+        at(sim),
+    );
+    pinned_bindings_ready(sim, FIVE_SKEW, receipt).await?;
+    past_sync_wait(sim, receipt).await?;
+    let t0_s = n - T0_BEFORE_N;
+    receipt.evidence(
+        "setup_ended_before_t0",
+        wall_ms() / 1000 < t0_s,
+        format!("wall {} s; t0 {t0_s} s; N {n} s", wall_ms() / 1000),
+        at(sim),
+    );
+    pause_until_wall(sim, "wait to t = 0 (N − 60 s)", t0_s * 1000).await?;
+    let trigger = sim.fabric().mark_indexed(format!(
+        "case: t=0, every certificate expires at N={n} (run 7)"
+    ));
+
+    pause_until_wall(sim, "wait to just before raw not_after", (n - 1) * 1000).await?;
+    let early = seats(sim, SURVIVORS, &group, &b).await?;
+    let early_unmoved = all_bind(&early, &d0)
+        && early
+            .iter()
+            .all(|(_, seat)| seat.as_ref().is_some_and(Seat::active));
+    receipt.note(format!(
+        "just before raw not_after ({} s): {}",
+        n - 1,
+        describe_seats(&early)
+    ));
+
+    // The wait starts at the admins' own trigger N + τ.
+    let wait_deadline_ms = (n + TAU) * 1000 + u64::try_from(EVIDENCE.as_millis()).unwrap_or(0);
+    let mut wait_seen = String::new();
+    let mut wait_ms: Option<u64> = None;
+    let waited = sim
+        .until(
+            "the survivors wait for an owner renewal naming A, D and E",
+            Duration::from_millis(wait_deadline_ms.saturating_sub(wall_ms())),
+            async |s: &Sim| {
+                let (all, seen) = renewal_wait_on(s, SURVIVORS, &group, &b_hex, &admins).await;
+                wait_seen = seen;
+                if all {
+                    wait_ms.get_or_insert(wall_ms());
+                }
+                all
+            },
+        )
+        .await;
+    if let Err(error) = waited {
+        if !expired(&error) {
+            return Err(error);
+        }
+    }
+    receipt.note(format!(
+        "renewal wait at wall {wait_ms:?} ms (N + \u{3c4} = {} ms): {wait_seen}",
+        (n + TAU) * 1000
+    ));
+    let mut hold_ok = wait_ms.is_some();
+    let mut held_until = String::new();
+    if let Some(from_ms) = wait_ms {
+        let renew_ms = from_ms + 2 * u64::try_from(timing.designated_window.as_millis())?;
+        let mut held = true;
+        let waited = sim
+            .until(
+                "the wait holds for 2W with no commit",
+                Duration::from_millis(renew_ms.saturating_sub(wall_ms())),
+                async |s: &Sim| {
+                    let (all, seen) = renewal_wait_on(s, SURVIVORS, &group, &b_hex, &admins).await;
+                    let unmoved = match seats_now(s, SURVIVORS, &group, &b).await {
+                        Ok(now) => now.iter().all(|(_, seat)| {
+                            seat.as_ref()
+                                .is_some_and(|seat| seat.view.state_revision == rev0)
+                        }),
+                        Err(_) => false,
+                    };
+                    if !(all && unmoved) {
+                        held = false;
+                        held_until = format!("at wall {} ms: unmoved {unmoved}; {seen}", wall_ms());
+                    }
+                    !held
+                },
+            )
+            .await;
+        if let Err(error) = waited {
+            if !expired(&error) {
+                return Err(error);
+            }
+        }
+        hold_ok = held;
+    }
+    let before_renewal = seats(sim, SURVIVORS, &group, &b).await?;
+    let no_commit_before_renewal = before_renewal.iter().all(|(_, seat)| {
+        seat.as_ref()
+            .is_some_and(|seat| seat.view.state_revision == rev0)
+    });
+    receipt.note(format!(
+        "renewal wait held for 2W {hold_ok} ({held_until}); before the renewal: {}",
+        describe_seats(&before_renewal)
+    ));
+
+    // U (on C) renews A; A self-rebinds under §4b(2).
+    let (renewal, a1, _) = issue_for(sim, "C", "A", n + RENEWAL_EXTRA).await?;
+    let renewed_ms = wall_ms();
+    let (status, body, retries) = rebind_request(sim, "A", &group, &renewal, EVIDENCE).await?;
+    receipt.note(format!(
+        "A's self-rebind at wall {renewed_ms} ms: {status} {body}; retries {retries:?}"
+    ));
+    let (a_id, _) = sim.ids("A")?;
+    let mut rebound_ms: Option<u64> = None;
+    let waited = sim
+        .until("A and C bind A's renewal", EVIDENCE, async |s: &Sim| {
+            let bound = seats_now(s, &["A", "C"], &group, &a_id)
+                .await
+                .is_ok_and(|now| all_bind(&now, &a1));
+            if bound {
+                rebound_ms.get_or_insert(wall_ms());
+            }
+            bound
+        })
+        .await;
+    if let Err(error) = waited {
+        if !expired(&error) {
+            return Err(error);
+        }
+    }
+    let self_rebound = status.is_success() && rebound_ms.is_some();
+
+    // H: once A is eligible again it runs B's pending expiry work.
+    let deadline_ms = rebound_ms.unwrap_or(renewed_ms)
+        + u64::try_from(timing.completion_bound.as_millis()).unwrap_or(u64::MAX)
+        + 1000;
+    let mut reached_ms: Option<u64> = None;
+    let mut seen = Observations::default();
+    let removed = |seat: &Seat| !seat.active() && !seat.view.lists_b && !seat.view.quarantined;
+    let waited = sim
+        .until(
+            "A and C exclude B",
+            Duration::from_millis(deadline_ms.saturating_sub(wall_ms())),
+            async |s: &Sim| {
+                let Some(now) = seen.observe(seats_now(s, &["A", "C"], &group, &b)).await else {
+                    return true;
+                };
+                let done = now
+                    .iter()
+                    .all(|(_, seat)| seat.as_ref().is_some_and(removed));
+                if done {
+                    reached_ms.get_or_insert(wall_ms());
+                }
+                done
+            },
+        )
+        .await;
+    if let Err(error) = waited {
+        if !expired(&error) {
+            return Err(error);
+        }
+    }
+    seen.verify("A and C exclude B")?;
+    if reached_ms.is_none() {
+        // A late eviction is told apart from none at all.
+        pause(sim, "a late eviction", timing.completion_bound).await?;
+    }
+    pause(sim, "the exclusion settles", SETTLE).await?;
+    let end = seats(sim, &["A", "C"], &group, &b).await?;
+    let b_removed = end
+        .iter()
+        .all(|(_, seat)| seat.as_ref().is_some_and(removed));
+    let b_leaf_gone = end.iter().all(|(_, seat)| {
+        seat.as_ref().is_some_and(|seat| {
+            seat.view.tracks_b != Some(true)
+                && seat.view.epoch.zip(e0).is_some_and(|(now, was)| now > was)
+        })
+    });
+    let by_a = head_signed_by(&end, &a_hex);
+    let in_bound = reached_ms.is_some_and(|ms| ms <= deadline_ms);
+    let plane = data_plane(sim, &group, "A", &["C", "B"]).await?;
+    let plane_ok = plane
+        .iter()
+        .all(|(reader, ok, _)| if reader.as_str() == "B" { !*ok } else { *ok });
+    let passed = early_unmoved
+        && hold_ok
+        && no_commit_before_renewal
+        && self_rebound
+        && b_removed
+        && b_leaf_gone
+        && by_a
+        && in_bound
+        && plane_ok;
+    receipt.note(format!(
+        "run (7): unmoved before raw N {early_unmoved}; wait held {hold_ok}; no commit before \
+         the renewal {no_commit_before_renewal}; A self-rebound at wall {rebound_ms:?} ms \
+         {self_rebound}; B removed on A and C {b_removed}, leaf gone {b_leaf_gone}; head \
+         signed by A {by_a}; reached at wall {reached_ms:?} ms (deadline {deadline_ms}: \
+         {in_bound}); data plane {plane:?}; end: {}",
+        describe_seats(&end)
+    ));
+    receipt.note(format!(
+        "S4 status at the end: {}",
+        statuses(sim, SURVIVORS, &group).await?
+    ));
+    let to_c = sim
+        .fabric()
+        .delivered_writes_after(&sim.peer("A")?, &sim.peer("C")?, trigger)
+        .len();
+    receipt.request_delivered(
+        "a_reached_c_after_t0",
+        to_c > 0,
+        format!("frames since t=0: A->C={to_c}"),
+        at(sim),
+    );
+    if !passed {
+        if !early_unmoved {
+            receipt.cause(CAUSE_EARLY, Some(describe_seats(&early)), true, at(sim));
+        } else if !no_commit_before_renewal {
+            receipt.cause(
+                CAUSE_EXIT_WITHOUT_ADMIN,
+                Some(describe_seats(&before_renewal)),
+                true,
+                at(sim),
+            );
+        } else if !hold_ok {
+            receipt.cause(
+                CAUSE_NO_RENEWAL_WAIT,
+                Some(format!("{wait_seen}; {held_until}")),
+                true,
+                at(sim),
+            );
+        } else if !self_rebound {
+            receipt.cause(
+                CAUSE_SELF_REBIND_REFUSED,
+                Some(format!("{status} {body}")),
+                true,
+                at(sim),
+            );
+        } else if !b_removed {
+            receipt.cause(
+                CAUSE_NO_EVICTION_AFTER_RENEWAL,
+                Some(describe_seats(&end)),
+                true,
+                at(sim),
+            );
+        } else if b_removed && b_leaf_gone && by_a && !in_bound {
+            receipt.cause(CAUSE_LATE, Some(format!("{reached_ms:?}")), true, at(sim));
+        } else {
+            receipt.cause(
+                CAUSE_NO_EVICTION_AFTER_RENEWAL,
+                Some(describe_seats(&end)),
+                false,
+                at(sim),
+            );
+        }
+    }
+    receipt.finish(FINAL_RUN7, passed, at(sim));
+    Ok(())
+}
+
 /// How often the stall watchdog reads the daemons' wall clock.
 const STALL_POLL: Duration = Duration::from_secs(5);
 
@@ -555,7 +1007,7 @@ const STALL_POLL: Duration = Duration::from_secs(5);
 /// does. The shim's wall clock is base + virtual time on every thread, so
 /// the watchdog thread reads it with [`wall_ms`]; nextest's kill for these
 /// arms (the `w3h-gate` override) stays the limit on a run that moves.
-fn stall_watchdog(case: &str, fabric: Arc<SimFabric>) -> Watchdog {
+pub(super) fn stall_watchdog(case: &str, fabric: Arc<SimFabric>) -> Watchdog {
     let disarmed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = Arc::clone(&disarmed);
     let case = case.to_string();
@@ -602,7 +1054,11 @@ async fn run_skew(case: &str, seed: u64, run: SkewRun) -> Receipt {
         Ok(mut sim) => {
             let fabric = Arc::clone(sim.fabric());
             let watchdog = stall_watchdog(case, fabric);
-            let outcome = skew_scenario(&mut sim, run, &mut receipt).await;
+            let outcome = if run == SkewRun::AllAdminsExpire {
+                all_admins_expire(&mut sim, &mut receipt).await
+            } else {
+                skew_scenario(&mut sim, run, &mut receipt).await
+            };
             watchdog.disarm();
             if let Err(error) = outcome {
                 receipt.infra(format!("{error:#}"), sim.fabric().now().as_micros());
@@ -670,6 +1126,38 @@ fn w3h_1581j_expiry_skew_run8_signed_public() -> Result<()> {
             "w3h_1581j_expiry_skew_run8_signed_public",
             0x1581_0032,
             SkewRun::SignedPublic,
+            Verdict::Green,
+        )
+        .await
+    })
+}
+
+/// ADR 0110 `s4_certificate_expiry_skew` run (7): GREEN with S4.
+#[test]
+#[ignore = "on demand only (tests/AGENTS.md): needs the W3-H shim, not in the W3-H gate"]
+fn on_demand_1581n_expiry_skew_run7_every_admin_expired_renewal_rebinds_then_evicts() -> Result<()>
+{
+    super::super::super::block_on_paused(async move {
+        expect_skew(
+            "on_demand_1581n_expiry_skew_run7_every_admin_expired_renewal_rebinds_then_evicts",
+            0x1581_0040,
+            SkewRun::AllAdminsExpire,
+            Verdict::Green,
+        )
+        .await
+    })
+}
+
+/// ADR 0110 `s4_certificate_rebind` run (2): run (5a) with B offline from
+/// before raw `not_after`. GREEN with S4.
+#[test]
+#[ignore = "on demand only (tests/AGENTS.md): needs the W3-H shim, not in the W3-H gate"]
+fn on_demand_1581n_certificate_rebind_run2_offline_seat_announced_renewal() -> Result<()> {
+    super::super::super::block_on_paused(async move {
+        expect_skew(
+            "on_demand_1581n_certificate_rebind_run2_offline_seat_announced_renewal",
+            0x1581_0041,
+            SkewRun::AnnouncedRenewalBOffline,
             Verdict::Green,
         )
         .await

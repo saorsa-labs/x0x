@@ -114,8 +114,20 @@ impl Sim {
         label: &str,
         owner: &UserKeypair,
     ) -> Result<HomeIds> {
+        self.start_owner_device_until(label, owner, None).await
+    }
+
+    /// [`Self::start_owner_device`] with the owner device's own
+    /// certificate `not_after` (Unix s); `None` issues the same
+    /// non-expiring certificate.
+    pub(crate) async fn start_owner_device_until(
+        &mut self,
+        label: &str,
+        owner: &UserKeypair,
+        not_after: Option<u64>,
+    ) -> Result<HomeIds> {
         let (machine, agent) = self.take_keys(label)?;
-        let cert = AgentCertificate::issue(owner, &agent)?;
+        let cert = AgentCertificate::issue_with_expiry(owner, &agent, not_after)?;
         self.start_node_with(
             label,
             Provision {
