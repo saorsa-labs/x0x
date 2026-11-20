@@ -13805,7 +13805,21 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
                 revocation_eviction::crypto_exclusion::own_seat_cannot_take_a_share(state, info),
                 info.state_revision,
             );
-            (info.has_active_member(&sender_hex), keys, Some(claim))
+            // #2004: a seat past its certificate's S4 expiry point is
+            // answered nothing, as a revoked one is. The owner-recovery
+            // seal can leave such a seat its leaf for one epoch, and a page
+            // must not hand it that epoch.
+            let expired = info.members_v2.get(&sender_hex).is_some_and(|seat| {
+                x0x::groups::cert_rebind::seat_expiry_due(
+                    seat,
+                    x0x::groups::owner_cert::restore_clock_now(),
+                )
+            });
+            (
+                info.has_active_member(&sender_hex) && !expired,
+                keys,
+                Some(claim),
+            )
         } else {
             (false, vec![request.group_id.clone()], None)
         }

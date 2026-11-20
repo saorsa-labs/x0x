@@ -329,6 +329,17 @@ pub fn committed_certificate(member: &GroupMember) -> Option<&AgentCertificate> 
         .filter(|cert| owner_cert::certificate_digest_hex(cert) == digest)
 }
 
+/// Whether a seat's committed certificate has passed its S4 expiry point
+/// at `now_unix`: the rule of the seat's own expiry row
+/// ([`own_expiry_trigger_due`], τ included). A seat with no committed
+/// bytes or no `not_after` is never due here (#2004).
+#[must_use]
+pub fn seat_expiry_due(member: &GroupMember, now_unix: u64) -> bool {
+    committed_certificate(member)
+        .and_then(AgentCertificate::not_after)
+        .is_some_and(|not_after| own_expiry_trigger_due(not_after, now_unix))
+}
+
 /// Whether `new` expires later than `old`. A certificate with no
 /// `not_after` never expires; nothing is later than it.
 #[must_use]
