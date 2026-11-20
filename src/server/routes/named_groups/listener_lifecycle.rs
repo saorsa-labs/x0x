@@ -4,15 +4,17 @@
 //! Two listeners belong to a stored group:
 //! - the metadata listener, keyed by the local map key. It runs while the
 //!   record is stored and not withdrawn ([`metadata_listener_wanted`]).
-//! - the public-message listener, keyed by the stable id. It runs while a
-//!   record with that stable id is stored, not withdrawn and not
+//! - the public-message listener, keyed by the stable id. It runs while any
+//!   stored record with that stable id is not withdrawn and not
 //!   `MlsEncrypted` ([`public_message_listener_wanted`]).
 //!
 //! Before #1366 the start paths followed this rule, but some exit paths did
-//! not. A self-leave, a remote self-removal and a refused join stub took the
-//! record away and left the public-message listener running. A refreshed
-//! card that changed a stub to `MlsEncrypted` left it running too. The
-//! functions here stop a listener when no stored record needs it.
+//! not. A self-leave (both planes), a local-only drop, a remote self-removal
+//! and a refused join stub took the record away and left the public-message
+//! listener running; the TreeKEM self-leave left the metadata listener too.
+//! A refreshed card that changed a stub to `MlsEncrypted`, and a withdrawn
+//! card, left it running as well. The functions here stop a listener when
+//! no stored record needs it.
 //!
 //! Lock order: a registry lock (`group_metadata_tasks` or
 //! `public_message_tasks`), then `named_groups`, as in the install paths.
@@ -47,6 +49,12 @@ pub(super) async fn retire_unwanted_public_message_listener(state: &AppState, gr
 /// key is gone or withdrawn. The check and the removal run under the
 /// registry write lock, so an install for a record stored again since is
 /// kept.
+///
+/// Unlike its public twin this needs no stable-id fallback: the metadata
+/// registry is keyed by the local map key only.
+/// [`ensure_named_group_metadata_listener`] installs under the key it is
+/// given and only for a record stored under exactly that key, so the
+/// wanted rule is per key.
 async fn retire_unwanted_metadata_listener(state: &AppState, group_key: &str) {
     let mut tasks = state.group_metadata_tasks.write().await;
     let wanted = state

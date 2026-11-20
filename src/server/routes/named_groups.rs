@@ -25725,6 +25725,11 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
     // `public_message_tasks`, then `named_groups`; no path takes them the
     // other way round), so a reconcile that ran in between is not undone.
     let wanted = public_message_listener_wanted(&*state.named_groups.read().await, &group_id);
+    // A group with no stored record (`None`) is installed on purpose: the
+    // public-cache read `GET /groups/:id/messages` fails open for an unknown
+    // group and listens on the supplied id. So an install that started
+    // before a removal can still land after the removal's retire, and
+    // nothing stops it until a restart (a known limit, A08 of 20 Nov 2026).
     if tasks.contains_key(&group_id) || wanted.is_some_and(|(_, wanted)| !wanted) {
         handle.abort();
         return;
@@ -25733,28 +25738,29 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
 }
 
 /// #1366: the stable id of `group_id` and whether its public-message
-/// listener must run: the group is not withdrawn and not `MlsEncrypted`
-/// (the rule of [`ensure_named_group_listeners`]). `None`: the group is
-/// not stored.
+/// listener must run. `group_id` is a local map key or a stable id. The
+/// listener runs when ANY stored record with that stable id is not
+/// withdrawn and not `MlsEncrypted` (the rule of
+/// [`ensure_named_group_listeners`]), because the records share one
+/// listener. `None`: no record with that key or stable id is stored.
 fn public_message_listener_wanted(
     groups: &HashMap<String, x0x::groups::GroupInfo>,
     group_id: &str,
 ) -> Option<(String, bool)> {
-    groups
-        .get(group_id)
-        .or_else(|| {
-            groups
-                .values()
-                .find(|info| info.stable_group_id() == group_id)
-        })
-        .map(|info| {
-            (
-                info.stable_group_id().to_string(),
-                !info.withdrawn
-                    && info.policy.confidentiality
-                        != x0x::groups::GroupConfidentiality::MlsEncrypted,
-            )
-        })
+    let stable_id = match groups.get(group_id) {
+        Some(info) => info.stable_group_id().to_string(),
+        None => groups
+            .values()
+            .find(|info| info.stable_group_id() == group_id)?
+            .stable_group_id()
+            .to_string(),
+    };
+    let wanted = groups.values().any(|info| {
+        info.stable_group_id() == stable_id
+            && !info.withdrawn
+            && info.policy.confidentiality != x0x::groups::GroupConfidentiality::MlsEncrypted
+    });
+    Some((stable_id, wanted))
 }
 
 /// #1366: start or stop the public-message listener of `group_id` to match
@@ -30309,6 +30315,11 @@ async fn drop_local_named_group_state(
     if let Some(stable_group_id) = stable_group_id {
         stop_named_group_metadata_listener(state, stable_group_id).await;
     }
+    // #1366: the record is gone; stop the public-message listener that no
+    // stored record needs any more (it is keyed by the stable id).
+    for key in std::iter::once(id).chain(stable_group_id) {
+        listener_lifecycle::retire_unwanted_public_message_listener(state, key).await;
+    }
     true
 }
 
@@ -33048,6 +33059,9 @@ async fn leave_treekem_group(
     state.treekem_groups.write().await.remove(&id);
     remove_treekem_persistence_for_group_id(&state, &id, "treekem_leave").await;
     save_mls_groups(&state).await;
+    // #1366: the record is gone, so neither listener is wanted. The
+    // public-message listener is keyed by the stable id.
+    listener_lifecycle::reconcile_named_group_listeners(&state, &id, Some(&event_group_id)).await;
 
     let event = NamedGroupMetadataEvent::MemberRemoved {
         group_id: event_group_id,
@@ -39202,6 +39216,11 @@ pub(in crate::server) async fn import_group_card(
             )
             .await;
         }
+        // #1366: the group is withdrawn. Stop a public-message listener
+        // that no stored record needs (for example one a public-cache read
+        // started for a group with no local record). A live keyed record
+        // that ignored this card still needs its listener and keeps it.
+        listener_lifecycle::retire_unwanted_public_message_listener(&state, &group_id).await;
         return (
             StatusCode::OK,
             Json(serde_json::json!({ "ok": true, "group_id": group_id, "withdrawn": true })),
