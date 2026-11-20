@@ -648,6 +648,9 @@ mod tests {
     #[test]
     fn an_ancestor_others_can_write_is_refused_unless_sticky() {
         let dir = tempfile::tempdir().unwrap();
+        // The temporary directory is itself an ancestor; a umask such as
+        // 0002 leaves it group-writable.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let shared = dir.path().canonicalize().unwrap().join("shared");
         let root = shared.join("root");
         std::fs::create_dir_all(&root).unwrap();
