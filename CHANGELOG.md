@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **No launchd restart loop on a missing daemon (#1379; A14 amendment of
+  19 Nov 2026).** On macOS the launcher no longer exits when the daemon
+  path does not exist. It tries again after a pause that doubles from 1 s
+  to 60 s, so it starts the daemon at most 60 s after the path is back, and
+  launchd keeps one quiet process instead of a restart every 10 s. A job
+  that pins a removed Homebrew Cellar path still needs a stable path to
+  start again.
+
 - **Less repeat traffic on seven idle and write paths (#1964, PR #2103;
   A06 and A07 amendments of 19 Nov 2026).** (1) A plain KV store write sent
   its delta DM to each contact twice, the second copy 8 s later; it now
