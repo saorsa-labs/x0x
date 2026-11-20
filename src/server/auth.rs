@@ -44,21 +44,24 @@ pub(super) fn authorize(
     query_token: Option<&str>,
     api_token: &str,
     sessions: &SessionStore,
-) -> Result<(), StatusCode> {
+) -> Result<Grant, StatusCode> {
     // (1) CORS preflight: browsers send OPTIONS without auth headers.
     if method == Method::OPTIONS {
-        return Ok(());
+        return Ok(Grant::Open);
     }
     // (2) Exempt: health check + public constitution resources.
     if is_auth_exempt_path(path) {
-        return Ok(());
+        return Ok(Grant::Open);
     }
     // (3) Authorization: Bearer header (works everywhere).
     // Accepts either the durable API token OR a short-lived session token
     // (#127 / WS1.6) — browser clients use the session token after exchange.
     if let Some(token) = header_token {
-        if ct_eq(token, api_token) || sessions.is_valid(token) {
-            return Ok(());
+        if ct_eq(token, api_token) {
+            return Ok(Grant::Durable);
+        }
+        if let Some(lineage) = sessions.lineage_of(token) {
+            return Ok(Grant::Session(lineage));
         }
     }
     // (4) `?token=` query param, only on browser-only endpoints.
@@ -67,8 +70,8 @@ pub(super) fn authorize(
     // Referer / HAR leak surface for the long-lived secret.
     if accepts_query_token(path) {
         if let Some(token) = query_token {
-            if sessions.is_valid(token) {
-                return Ok(());
+            if let Some(lineage) = sessions.lineage_of(token) {
+                return Ok(Grant::Session(lineage));
             }
         }
     }
@@ -78,14 +81,28 @@ pub(super) fn authorize(
     if method == Method::POST {
         if let Some(token) = header_token {
             if path == SESSION_REFRESH_PATH && sessions.is_refreshable(token) {
-                return Ok(());
+                return Ok(Grant::SessionControl);
             }
             if path == SESSION_REVOKE_PATH && sessions.is_revocable(token) {
-                return Ok(());
+                return Ok(Grant::SessionControl);
             }
         }
     }
     Err(StatusCode::UNAUTHORIZED)
+}
+
+/// What [`authorize`] accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Grant {
+    /// A preflight or an exempt path: no credential.
+    Open,
+    /// The durable API token.
+    Durable,
+    /// A live browser session token of this lineage, from the same lookup
+    /// that accepted it, so a stream is bound to exactly that session.
+    Session(u64),
+    /// A lapsed or replaced session token on refresh or revoke only.
+    SessionControl,
 }
 
 // ── Middleware (thin extraction layer over `authorize`) ──────────────────
@@ -169,25 +186,20 @@ pub(super) async fn auth_middleware(
     let header_token = extract_bearer(req.headers());
     let query_token = extract_query_token(req.uri().query());
 
-    // Review fix #4: distinguish the DURABLE token (full authority,
-    // including owner-admin acts) from a short-lived browser session
-    // bearer (read-only principal). The durable check re-uses the same
-    // constant-time comparison as `authorize`.
-    let durable = header_token
-        .as_deref()
-        .is_some_and(|token| ct_eq(token, &state.api_token));
-
-    let owner_ok = authorize(
+    let grant = authorize(
         &path,
         &method,
         header_token.as_deref(),
         query_token.as_deref(),
         &state.api_token,
         &state.sessions,
-    )
-    .is_ok();
+    );
 
-    if owner_ok {
+    if let Ok(grant) = grant {
+        // Review fix #4: distinguish the DURABLE token (full authority,
+        // including owner-admin acts) from a short-lived browser session
+        // bearer (read-only principal).
+        let durable = grant == Grant::Durable;
         // Issue #446 (review round 2): owner-act surfaces require the
         // DURABLE token at the route layer — BEFORE extractors, so a
         // session bearer gets the typed 403 whatever the body looks
@@ -203,17 +215,12 @@ pub(super) async fn auth_middleware(
             )
                 .into_response();
         }
-        let link = if durable {
-            None
-        } else {
-            header_token
-                .as_deref()
-                .or(query_token.as_deref())
-                .and_then(|token| state.sessions.lineage_of(token))
-                .map(|lineage| SessionLink {
-                    state: Arc::clone(&state),
-                    lineage,
-                })
+        let link = match grant {
+            Grant::Session(lineage) => Some(SessionLink {
+                state: Arc::clone(&state),
+                lineage,
+            }),
+            Grant::Open | Grant::Durable | Grant::SessionControl => None,
         };
         let mut req = req;
         req.extensions_mut()
@@ -1317,6 +1324,7 @@ mod tests {
             TEST_API_TOKEN,
             sessions,
         )
+        .map(|_| ())
     }
 
     // -- Protected endpoints: representative sample + /agent/sign + /agent/verify.
@@ -2097,6 +2105,39 @@ mod tests {
         let next = body["session_token"].as_str().expect("token").to_string();
         let (status, body) = refresh(next, "").await;
         assert_eq!(status, StatusCode::OK, "an empty body: {body}");
+    }
+
+    /// #2112 review: the stream link is the session `authorize` accepted.
+    /// A junk bearer header beside a valid `?token=` session on a stream
+    /// path grants that session's lineage, and the durable token grants
+    /// no session.
+    #[test]
+    fn authorize_grants_the_lineage_of_the_token_it_accepted() {
+        let store = SessionStore::new(SESSION_TOKEN_TTL, IDLE);
+        let session = store.issue();
+        let lineage = store.lineage_of(&session).expect("live");
+        assert_eq!(
+            authorize(
+                "/events",
+                &Method::GET,
+                Some("junk"),
+                Some(&session),
+                TEST_API_TOKEN,
+                &store
+            ),
+            Ok(Grant::Session(lineage))
+        );
+        assert_eq!(
+            authorize(
+                "/events",
+                &Method::GET,
+                Some(TEST_API_TOKEN),
+                Some(&session),
+                TEST_API_TOKEN,
+                &store
+            ),
+            Ok(Grant::Durable)
+        );
     }
 
     /// #2079 point 3: two backward steps that are each inside the
