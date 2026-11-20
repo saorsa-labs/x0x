@@ -2054,10 +2054,14 @@ fn refuse_privileged(euid: u32, sudo_user: Option<&std::ffi::OsStr>) -> Result<(
 }
 
 #[cfg(target_os = "macos")]
-fn refuse_privileged_caller() -> Result<()> {
+fn current_euid() -> u32 {
     // SAFETY: geteuid has no preconditions and cannot fail.
-    let euid = unsafe { libc::geteuid() };
-    refuse_privileged(euid, std::env::var_os("SUDO_USER").as_deref())
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(target_os = "macos")]
+fn refuse_privileged_caller() -> Result<()> {
+    refuse_privileged(current_euid(), std::env::var_os("SUDO_USER").as_deref())
 }
 
 /// A job file the autostart commands may change: owned by this user and
@@ -2086,9 +2090,7 @@ fn check_plist_owner(path: &Path, owner: u32, mode: u32, euid: u32) -> Result<()
 fn check_plist_file_owner(path: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    let euid = unsafe { libc::geteuid() };
-    check_plist_owner(path, meta.uid(), meta.mode(), euid)
+    check_plist_owner(path, meta.uid(), meta.mode(), current_euid())
 }
 
 /// The doctor finding for a launchd job of `instance` whose x0xd path does
@@ -2185,12 +2187,10 @@ pub async fn autostart_repair(launcher: bool, dry_run: bool) -> Result<()> {
                 .and_then(|l| l.as_str())
                 .unwrap_or("<unlabelled>");
             println!("Job {label} ({})", path.display());
-            if let Err(error) = check_plist_file_owner(&path) {
-                refused.push(format!("{label} ({})", path.display()));
-                println!("  REFUSED: {error:#}");
-                println!("  Left unchanged.");
-                continue;
-            }
+            let verdict = match check_plist_file_owner(&path) {
+                Ok(()) => verdict,
+                Err(error) => RepairVerdict::Refused(format!("{error:#}")),
+            };
 
             match verdict {
                 RepairVerdict::Refused(reason) => {
