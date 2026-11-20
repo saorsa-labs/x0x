@@ -51,9 +51,126 @@ pub(crate) fn exec_daemon(command: &DaemonCommand) -> io::Error {
     daemon.exec()
 }
 
+/// Shortest and longest pause between two `exec` attempts on a missing
+/// daemon.
+const MISSING_FIRST_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+const MISSING_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The `exec` error of a daemon path that does not exist (now).
+fn is_missing(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ENOTDIR)
+}
+
+/// `exec_daemon`, but a daemon path that does not exist is waited for
+/// (#1379). launchd restarts a `KeepAlive` job after every exit, so an
+/// exit on a missing daemon (a volume not yet mounted, a package being
+/// replaced) is a restart every throttle interval for as long as the path
+/// is missing. Waiting keeps one quiet process that execs the daemon at
+/// the first try after the path is back (at most 60 s later). The pause doubles from 1 s to 60 s. Any other
+/// `exec` error, or a stop, returns the error. The passthrough arms no
+/// signal handler, so a stop is SIGTERM's default action; `stop` covers a
+/// launcher that armed one.
+pub(crate) fn exec_daemon_when_present(
+    command: &DaemonCommand,
+    mut exec: impl FnMut(&DaemonCommand) -> io::Error,
+    mut stop: impl FnMut() -> bool,
+    mut pause: impl FnMut(std::time::Duration),
+) -> io::Error {
+    let mut wait = MISSING_FIRST_WAIT;
+    let mut reported = false;
+    loop {
+        let error = exec(command);
+        if !is_missing(&error) || stop() {
+            return error;
+        }
+        if !reported {
+            eprintln!(
+                "x0x-launcher: daemon {} is missing ({error}); waiting for it",
+                std::path::Path::new(&command.executable).display()
+            );
+            reported = true;
+        }
+        pause(wait);
+        wait = (wait * 2).min(MISSING_MAX_WAIT);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    fn missing_daemon() -> DaemonCommand {
+        DaemonCommand {
+            executable: "/nonexistent/x0xd".into(),
+            args: Vec::new(),
+        }
+    }
+
+    /// #1379: a missing daemon is waited for with a doubling pause up to
+    /// 60 s, and exec'd once it is back; launchd sees one process.
+    #[test]
+    fn a_missing_daemon_is_waited_for_then_execd() {
+        let mut attempts = 0;
+        let mut pauses = Vec::new();
+        let error = exec_daemon_when_present(
+            &missing_daemon(),
+            |_| {
+                attempts += 1;
+                if attempts <= 9 {
+                    io::Error::from(io::ErrorKind::NotFound)
+                } else {
+                    io::Error::from(io::ErrorKind::PermissionDenied)
+                }
+            },
+            || false,
+            |wait| pauses.push(wait.as_secs()),
+        );
+        assert_eq!(attempts, 10);
+        assert_eq!(pauses, [1, 2, 4, 8, 16, 32, 60, 60, 60]);
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    /// A path whose parent is not a directory is missing too. The errors
+    /// are synthesized: a real failed `exec` in this multi-threaded test
+    /// process swaps `environ` (for `env_remove`) under other tests' spawns.
+    #[test]
+    fn missing_means_enoent_or_enotdir() {
+        assert!(is_missing(&io::Error::from(io::ErrorKind::NotFound)));
+        assert!(is_missing(&io::Error::from_raw_os_error(libc::ENOENT)));
+        assert!(is_missing(&io::Error::from_raw_os_error(libc::ENOTDIR)));
+        assert!(!is_missing(&io::Error::from_raw_os_error(libc::EACCES)));
+        assert!(!is_missing(&io::Error::from_raw_os_error(libc::ENOEXEC)));
+    }
+
+    /// Any other exec error returns at once: the manager's restart decides.
+    #[test]
+    fn other_exec_errors_return_at_once() {
+        let mut pauses = 0;
+        let error = exec_daemon_when_present(
+            &missing_daemon(),
+            |_| io::Error::from(io::ErrorKind::PermissionDenied),
+            || false,
+            |_| pauses += 1,
+        );
+        assert_eq!((error.kind(), pauses), (io::ErrorKind::PermissionDenied, 0));
+    }
+
+    /// A stop ends the wait.
+    #[test]
+    fn a_stop_ends_the_wait() {
+        let mut checks = 0;
+        let error = exec_daemon_when_present(
+            &missing_daemon(),
+            |_| io::Error::from(io::ErrorKind::NotFound),
+            || {
+                checks += 1;
+                checks == 3
+            },
+            |_: Duration| {},
+        );
+        assert_eq!((error.kind(), checks), (io::ErrorKind::NotFound, 3));
+    }
 
     #[test]
     fn daemon_argv_is_forwarded_untouched() {

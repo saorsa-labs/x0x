@@ -66,6 +66,17 @@ fn main() -> std::process::ExitCode {
             launcher::start::Start::Exit(status) => return std::process::ExitCode::from(status),
             launcher::start::Start::Passthrough => {}
         }
+        // launchd restarts every exit of a KeepAlive job, so a missing
+        // daemon is waited for instead (#1379). systemd's start limit ends
+        // its restarts, so there the exit stays.
+        #[cfg(target_os = "macos")]
+        let error = launcher::forward::exec_daemon_when_present(
+            &args.command,
+            launcher::forward::exec_daemon,
+            || STOP.load(Ordering::Relaxed),
+            std::thread::sleep,
+        );
+        #[cfg(not(target_os = "macos"))]
         let error = launcher::forward::exec_daemon(&args.command);
         eprintln!(
             "x0x-launcher: cannot exec {}: {error}",

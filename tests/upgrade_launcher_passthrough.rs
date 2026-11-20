@@ -13,7 +13,8 @@ use std::process::Command;
 use tempfile::TempDir;
 
 /// 75 is EX_TEMPFAIL: the manager restarts the job, as for a direct unit
-/// whose daemon cannot exec.
+/// whose daemon cannot exec. On macOS a missing daemon is waited for
+/// instead (#1379); any other exec error still exits 75.
 const EXIT_TEMPFAIL: i32 = 75;
 /// 64 is EX_USAGE: the unit supplied no daemon to run.
 const EXIT_USAGE: i32 = 64;
@@ -99,6 +100,7 @@ fn relative_daemon_path_exits_usage_at_the_binary_level() {
     assert!(stderr.contains("absolute"), "{stderr}");
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn launcher_reports_tempfail_when_the_daemon_cannot_exec() {
     let root = tempfile::tempdir().unwrap();
@@ -109,6 +111,103 @@ fn launcher_reports_tempfail_when_the_daemon_cannot_exec() {
     assert_eq!(output.status.code(), Some(EXIT_TEMPFAIL));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("cannot exec"), "{stderr}");
+}
+
+/// Bounds every wait on a launcher that waits for its daemon, so a
+/// regression fails the test instead of hanging it.
+#[cfg(target_os = "macos")]
+const WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Start the launcher on a daemon path that does not exist yet and wait
+/// for its "is missing" line (#1379: on macOS it waits, launchd would
+/// restart an exit).
+#[cfg(target_os = "macos")]
+fn launcher_waiting_for(daemon: &std::path::Path) -> std::process::Child {
+    use std::io::BufRead;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_x0x-launcher"))
+        .arg(daemon)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (lines, read) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stderr).lines() {
+            if lines.send(line.unwrap_or_default()).is_err() {
+                break;
+            }
+        }
+    });
+    match read.recv_timeout(WAIT_BOUND) {
+        Ok(line) if line.contains("is missing") && line.contains("waiting") => child,
+        other => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("expected the launcher's wait line, got {other:?}");
+        }
+    }
+}
+
+/// The child's exit status, or a kill and a failure after `WAIT_BOUND`.
+#[cfg(target_os = "macos")]
+fn exit_within_bound(child: &mut std::process::Child) -> std::process::ExitStatus {
+    let deadline = std::time::Instant::now() + WAIT_BOUND;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the launcher did not exit within {WAIT_BOUND:?}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn launcher_waits_for_a_missing_daemon_and_then_runs_it() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = root.path().join("x0xd");
+    let mut child = launcher_waiting_for(&daemon);
+    assert!(child.try_wait().unwrap().is_none(), "the launcher exited");
+    stub_daemon(&root, 42);
+    // The next attempt (after the 1 s pause) execs the daemon, so its own
+    // exit status reaches the manager.
+    assert_eq!(exit_within_bound(&mut child).code(), Some(42));
+}
+
+/// #1379: only a missing daemon is waited for. A daemon that exists but
+/// cannot be executed (mode 000, `EACCES`) still exits 75 on macOS.
+#[cfg(target_os = "macos")]
+#[test]
+fn launcher_reports_tempfail_when_an_existing_daemon_cannot_exec() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = stub_daemon(&root, 0);
+    std::fs::set_permissions(&daemon, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_x0x-launcher"))
+        .arg(&daemon)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let status = exit_within_bound(&mut child);
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+    assert_eq!(status.code(), Some(EXIT_TEMPFAIL), "{stderr}");
+    assert!(stderr.contains("cannot exec"), "{stderr}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_stop_ends_the_launchers_wait_for_a_missing_daemon() {
+    use std::os::unix::process::ExitStatusExt;
+    let root = tempfile::tempdir().unwrap();
+    let mut child = launcher_waiting_for(&root.path().join("absent-daemon"));
+    let pid = libc::pid_t::try_from(child.id()).unwrap();
+    // SAFETY: `pid` is this test's own unreaped child.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    assert_eq!(exit_within_bound(&mut child).signal(), Some(libc::SIGTERM));
 }
 
 #[test]
