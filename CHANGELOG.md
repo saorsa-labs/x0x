@@ -9,12 +9,49 @@ All notable changes to this project will be documented in this file.
 - **Launcher issuer reads by directory descriptor and under the install
   lock (#2012; A14 amendment of 20 Nov 2026).** The dormant launcher reads
   the host journal and the trial record relative to the checked host-root
-  directory, refuses a host root with an ancestor another account can
-  write, and reads both under the daemon install lock (beside the
-  daemon's canonical path, waited for at most 30 s), which a passthrough
-  keeps until its `exec`. A missing daemon passes through to the
-  missing-daemon wait and takes the lock before the `exec`; a lock file the
-  launcher cannot create is refused with a remedy.
+  directory. It refuses a host root with an ancestor another account can
+  write, unless that ancestor is sticky (as `/tmp` is). It reads both
+  records under the daemon install lock (beside the daemon's canonical
+  path, waited for at most 30 s), which a passthrough keeps until its
+  `exec`. A missing daemon passes through to the missing-daemon wait and
+  takes the lock before the `exec`. After a start retires its trial on a
+  committed host, the passthrough takes the lock again, checks the
+  journal's daemon target and `exec`s under it. A lock file the launcher
+  cannot create, or one that is not a regular file, is refused with a
+  remedy, and a refusal found just before the `exec` is final (78) as at
+  the start.
+- **Owner recovery no longer deadlocks on a seated expired member (#2004;
+  A09 decision of 20 Nov 2026).** When every admin is revoked, the
+  owner-recovery seal now also tolerates a below-Admin member whose
+  certificate's S4 expiry is due (`now > not_after + τ`), as it already
+  tolerates a revoked one. That member keeps its seat for one epoch, and
+  its own expiry row removes it under the admin the recovery seated. The
+  owner-recovery egress and the TreeKEM catch-up handler refuse such a
+  member (the handler answers nothing, as for a revoked member, cached-add
+  fallback included), so the recovery epoch's key never reaches it. The
+  creator seat is not tolerated this way, because no expiry row targets it. A member whose
+  certificate expired less than τ ago is treated as before. New W3-H arm
+  `w3h_1357_s4_owner_recovery_expired_member_2004` (shard `s4-2004`).
+- **Group listeners stop when no stored record needs them (#1366 second
+  slice; A08 amendment of 20 Nov 2026).** A self-leave (GSS and TreeKEM), a
+  local-only drop, a refused join stub, a cleared stale join row, a
+  self-removal applied from the topic or a direct lane, a card refresh that
+  made a stub `MlsEncrypted` and a withdrawn card left the group's
+  public-message listener running until a restart. Each now stops it, and
+  the TreeKEM self-leave, the cleared join row and a self-removal from a
+  direct lane stop the metadata listener too. Records that share a stable id keep the shared listener
+  while any of them needs it. Events applied by catch-up, replay or
+  recovery paths still wait for a restart.
+- **Safer launchd autostart on macOS (#1379; A14 amendment of 20 Nov
+  2026).** `x0x autostart --launcher` and `--repair --launcher` refuse a
+  daemon inside a versioned Homebrew keg, which `brew upgrade` removes
+  (launcher support for Homebrew is #2111); `--repair --launcher` also
+  refuses a job that already runs the launcher with a keg daemon.
+  `x0x doctor` reports a launchd job whose daemon path no longer exists.
+  `x0x autostart`, `--repair` and `--remove` refuse to run as root or
+  under `sudo`; install and `--repair` refuse a job file that is not the
+  user's own or that others can write.
+  `x0x autostart --repair --dry-run` prints the changes and writes nothing.
 
 - **KV retained-image follow-ups (#2068; A10 amendment of 20 Nov 2026).**
   A delta's `updated` entry now merges only into a key the replica holds
@@ -106,6 +143,18 @@ All notable changes to this project will be documented in this file.
   stable launcher.
 
 ### Added
+
+- **Launcher-bound systemd unit (#1378; A14 amendment of 20 Nov 2026).**
+  The systemd restart readback accepts a unit that runs x0xd through the
+  stable launcher installed next to x0xd: the daemon is read from the
+  launcher's arguments, the unit's main process must be the daemon (the
+  launcher passed through) or its launcher parent, and the unit needs
+  `Restart=always` and a `RestartPreventExitStatus` that does not cover
+  the launcher's exit 75. `.deployment/install.sh --launcher PATH` (off by
+  default) installs the launcher and a drop-in that runs x0xd through it,
+  with `Restart=always` and `RestartPreventExitStatus=64 78`. A failed
+  install leaves no drop-in and reloads systemd, so the unit runs x0xd
+  directly; an install without the flag removes the drop-in.
 
 - **Local problem reports: `POST /report` and `x0x report` (#1354 slice 2;
   A14 amendment of 20 Nov 2026).** The daemon builds a redacted
@@ -478,6 +527,43 @@ All notable changes to this project will be documented in this file.
   still peeks a PubSub kind only under ADR 0013 pressure.
 
 ### Changed
+
+- **ant-quic 0.29.0 and saorsa-gossip 0.5.94 (A06 amendment of 20 Nov
+  2026).** `ant-quic` moves from `=0.28.0` to `=0.29.0` and all eleven
+  `saorsa-gossip-*` crates from `=0.5.92` to `=0.5.94`. No x0x code
+  changes. Defaults x0x now gets: (1) Only a wildcard bind (x0x binds
+  `[::]`) gets the new dual-stack socket; an explicit bind such as the
+  `127.0.0.1` CI tests does not exercise it. That socket uses
+  `quinn_udp::UdpSocketState`: it reports the real `may_fragment()`
+  (0.28.0 always said `true`), so QUIC path-MTU probes go up to 1452 B
+  every 600 s, and a black hole falls back to 1200 B with a 60 s
+  cooldown; ECN is on and turns itself off on a path that does not
+  handle it; GSO/GRO are on for Linux only (macOS gets don't-fragment and
+  ECN, no GSO). It reads each packet's destination IP (`IP_PKTINFO` /
+  `IP_RECVDSTADDR`), receives in batches, and sends a reply from the local
+  address the packet arrived on, which matters on hosts with more than
+  one address (for example a DigitalOcean reserved/anchor IP). A failure
+  in `UdpSocketState::new` now makes the bind fail. (2) Every relayed
+  connection, in the default `Stream` mode too, has bounded relay queues
+  of 256 packets per side: a full send queue drops the newest packet and
+  a full receive queue drops the oldest (0.28.0's send queue was
+  unbounded). These are standard QUIC/UDP behaviours but change packets
+  on the wire; soak before fleet rollout. Not inherited: the relay forward mode stays `Stream` (x0x does
+  not enable `Hybrid`, because `src/voice/link_transport.rs` reads
+  datagrams directly), relay-to-direct `auto_migrate` stays `false`, and
+  the RFC 8305 Happy Eyeballs change applies only to
+  `connect_dual_stack` / `connect_cached`, which x0x does not call.
+  saorsa-gossip 0.5.93 adds the counters `payload_replay_dropped`,
+  `ingress_by_topic`, `ingress_topics_uncounted` and `eager_send_causes`
+  to the stage snapshot; they appear in `GET /diagnostics/gossip` under
+  `pubsub_stages`, and `ingress_by_topic` shows the top signer peer IDs
+  per topic. 0.5.94 only moves its ant-quic pin. The #501
+  controlled-load reviewed producer moves to crates.io
+  `saorsa-gossip-pubsub` 0.5.94 (checksum `beb6146f...`); no outbound
+  meter definition changes. The optional `voice` feature keeps
+  `saorsa-webrtc-core` 0.6.1, which needs ant-quic 0.28, so `Cargo.lock`
+  now holds ant-quic 0.28.0 (voice only) beside 0.29.0; x0x passes no
+  ant-quic type to saorsa-webrtc.
 
 - **The listeners a restart starts for stored groups follow one written
   rule (#1366 first slice, A08 amendment of 16 Nov 2026).** Only a

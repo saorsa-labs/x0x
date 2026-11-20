@@ -98,8 +98,8 @@
 // #1581: ADR 0110 `s4_certificate_expiry_skew`, sim-feasible runs. A child
 // module, so that it uses this file's Home, seat and certificate helpers.
 mod expiry_skew;
-// #1973: ADR 0110 `s4_owner_recovery` while another revoked member is
-// seated. A child module for the same reason.
+// #1973 / #2004: ADR 0110 `s4_owner_recovery` while another revoked or
+// due-expired member is seated. A child module for the same reason.
 mod s4_owner_recovery_1973;
 // #1581: the `s4_owner_recovery` variants the public mandate route drives.
 mod recovery_variants;

@@ -729,7 +729,30 @@ volume not yet mounted at boot). Only the issuer's typed refusal exits 78;
 an untyped I/O error is a failed read. The journal
 has no hash or signature: anything that runs as the launcher's account,
 the candidate daemon included, is trusted to write it, until the producer
-(#2012) adds an integrity binding.
+(#2012) adds an integrity binding. The writer of that journal is the M2
+prepare producer (#2012), which does not exist yet, so with the engine
+held every start is still the passthrough. An owned start installs its SIGTERM and
+SIGINT handler only then, and exits 0 after a stop, 75 when the daemon
+exits or a step can be retried (an issuer error never falls back to the
+passthrough), and 78 (`EX_CONFIG`) when no automatic start is allowed
+(`RecoveryFailed`, a final host phase, a participant missing from the
+plan or stopped, or a prior child that still runs after a 45 s wait for it
+to end). A unit that binds the owned launcher must also set
+`RestartPreventExitStatus=78`. A trial-form launcher records each final
+refusal in `<host-root>/launcher-refusal.json` (reason, launcher pid and
+process start time, time; mode 0600). Each trial-form start removes the
+earlier record before it starts, so a start that supervises the daemon
+leaves none. `x0x doctor` reports the record while the daemon is
+unreachable, and shows the launcher as holding only when a process with
+the recorded pid and start time still exists. A retired trial on a
+committed host is an ordinary start: the passthrough. The launcher strips a stray `X0X_M2_BOOT_FD` from the daemon's
+environment before the `exec`. While activation is held, `x0xd` ignores a
+stray `X0X_M2_BOOT_FD` with one warning. It refuses to start only for a
+permit present on descriptor 3 that fails its checks or cannot be
+verified (see
+[Dormant pair transaction](#dormant-pair-transaction-m2-s2e)). The
+launcher sits outside the daemon/CLI swap set. The daemon updater never
+replaces it.
 
 The issuer opens the host root once as a directory (`O_DIRECTORY`,
 `O_NOFOLLOW`) and reads the journal and the trial record relative to that
@@ -759,39 +782,34 @@ and daemon locks itself.
   without the lock. An `exec` that finds the daemon missing releases the
   lock, so a producer or a CLI apply never waits for the missing-daemon
   wait. After the lock is taken the daemon path is resolved again; a path
-  that now names another file, or none, is a failed read (75). If a trial is in flight by the time the daemon
-  is back, the launcher exits 75 and the next start owns the trial.
-- **Lock file it cannot create.** When this account cannot create or open
+  that now names another file, or none, is a failed read (75). If a trial
+  is in flight by the time the daemon is back, the launcher exits 75 and
+  the next start owns the trial.
+- **Retired trial.** A start that retires its trial on a committed host
+  released the lock for the trial, so before its `exec` it takes the lock
+  and reads the records again. When the journal is HostCommitted and this
+  instance's trial record is Committed, it checks that its canonical
+  daemon is the journal's daemon target and `exec`s under the lock;
+  another daemon is refused (78). Any other trial is left to the next
+  start (75). A trial is saved Committed only under the host lock while
+  the journal is HostCommitted, and only a new producer transaction moves
+  the journal on, so this is the steady state after every committed
+  upgrade.
+- **Lock file it cannot use.** When this account cannot create or open
   the lock file (EACCES, EPERM, EROFS), the start is refused (78) with the
   remedy: let the launcher's account write the daemon's directory, or use
   the plain launcher form. A passthrough without the lock is not safe
   there, because the CLI self-update can lock and swap as another account
-  (root under `sudo`, for example).
+  (root under `sudo`, for example). A symlink, a directory or another
+  non-regular file at the lock path is refused (78) too.
 
-A retired trial's passthrough does not take the lock again. The writer of that journal is the M2
-prepare producer (#2012), which does not exist yet, so with the engine
-held every start is still the passthrough. An owned start installs its SIGTERM and
-SIGINT handler only then, and exits 0 after a stop, 75 when the daemon
-exits or a step can be retried (an issuer error never falls back to the
-passthrough), and 78 (`EX_CONFIG`) when no automatic start is allowed
-(`RecoveryFailed`, a final host phase, a participant missing from the
-plan or stopped, or a prior child that still runs after a 45 s wait for it
-to end). A unit that binds the owned launcher must also set
-`RestartPreventExitStatus=78`. A trial-form launcher records each final
-refusal in `<host-root>/launcher-refusal.json` (reason, launcher pid and
-process start time, time; mode 0600). Each trial-form start removes the
-earlier record before it starts, so a start that supervises the daemon
-leaves none. `x0x doctor` reports the record while the daemon is
-unreachable, and shows the launcher as holding only when a process with
-the recorded pid and start time still exists. A retired trial on a
-committed host is an ordinary start: the passthrough. The launcher strips a stray `X0X_M2_BOOT_FD` from the daemon's
-environment before the `exec`. While activation is held, `x0xd` ignores a
-stray `X0X_M2_BOOT_FD` with one warning. It refuses to start only for a
-permit present on descriptor 3 that fails its checks or cannot be
-verified (see
-[Dormant pair transaction](#dormant-pair-transaction-m2-s2e)). The
-launcher sits outside the daemon/CLI swap set. The daemon updater never
-replaces it.
+A typed refusal found by the re-read just before an `exec` is final as at
+the start: exit 78 (the hold under launchd) with the refusal record. Every
+other `exec` failure exits 75.
+
+Still open under #2012: wiring the producer into the apply path, the
+multi-instance journal copies, an integrity binding for the journal, and
+leaving an old `INVOCATION_ID` out of a trial child's captured environment.
 
 No tracked unit binds the launcher yet, and default builds do not build it
 (it needs the `m2-launcher` feature). ADR 0094 §5 preconditions for
@@ -803,6 +821,69 @@ authority-inventory check accepting a launcher-owned `ExecStart`; and the
 `KillMode` and restart readbacks accepting launcher-owned jobs. Until
 these hold, a launcher-bound unit would refuse every self-update. The unit
 switch also needs David's approval because it changes production hosts.
+
+**Launcher-bound systemd unit (#1378).** The systemd restart readback
+accepts a unit whose `ExecStart` runs the stable launcher, in the plain or
+the trial form. It reads the daemon and its arguments from the launcher's
+argv with the launcher's own parser, and they must be this daemon and its
+arguments; the launcher must be the one installed next to this x0xd
+(compared by canonical path). The unit's main process must then be either
+this daemon, when the launcher passed through and became the daemon by
+`exec` (always, while the launcher is dormant), or this daemon's parent
+when that parent's executable is the launcher. Anything else is refused;
+for any other unit the main process must be this daemon. A launcher-bound
+unit must also have `Restart=always`: a launcher that owns the daemon exits
+75 after the daemon ends, which `Restart=on-success` does not restart. For
+the same reason its `RestartPreventExitStatus` must not cover 75 (a number
+or a range); the drop-in below lists only `64 78`. The start-rate window is
+unchanged.
+
+The readback checks only what decides the restart. The launcher's own
+`--host-root` and `--instance` select its journal, so the readback does not
+bind them; the installer takes them from x0xd itself.
+
+`.deployment/install.sh --launcher /path/to/x0x-launcher` (off by default)
+installs the launcher next to the instance's `x0xd` and writes
+`<unit>.service.d/30-x0x-launcher.conf` (by a temporary file and a rename):
+
+```ini
+# Installed by .deployment/install.sh --launcher (#1378). Remove this file
+# and run `systemctl daemon-reload` to return to the direct job.
+[Service]
+ExecStart=
+ExecStart=/opt/x0x/x0x-launcher --host-root <data root> --instance <id> -- /opt/x0x/x0xd <unit args>
+Restart=always
+RestartPreventExitStatus=64 78
+KillMode=mixed
+TimeoutStopSec=60
+```
+
+- The data root is the one x0xd reports for the unit's own arguments
+  (`x0xd <args> --check`, run as the unit's user with that user's `HOME`;
+  it reads the config and writes nothing), resolved through symlinks. The
+  unit's user is the last `User=` in the unit and its other drop-ins
+  (`root` when none is set); the launcher drop-in itself is not read. As
+  root, the check runs through `runuser` (looked up in `/usr/sbin`, `/usr/bin`,
+  `/sbin` and `/bin`). The data root must exist, so x0xd must have started
+  once, and it must be owned by the unit's user and not writable by group or
+  others.
+- The instance is the manifest instance id.
+- An `ExecStart` token that needs systemd quoting (spaces, quotes, `$` or
+  `%`), or an `ExecStart` that cannot be split, is refused; such a unit is
+  migrated by hand.
+- Any failure leaves no launcher drop-in: the installer removes an earlier
+  one, reloads systemd so the unit runs x0xd directly, and exits 1 with the
+  reason.
+- `KillMode=mixed` sends the stop signal to the launcher only, which stops
+  x0xd within its own 45 s window; `TimeoutStopSec=60` is above that window.
+- An install without `--launcher` removes the drop-in, so the tracked unit
+  runs x0xd directly again.
+
+The helper is `.deployment/launcher-dropin.py`. `tests/test_launcher_dropin.py`
+tests it and runs `install.sh --launcher` from a scratch copy of the
+deployment tree (fresh host, rerun, `User=` drop-ins, a failed rerun). Not done yet: an exit test of the
+supervised upgrade exit on a launcher-bound host, which needs a private
+testnet host.
 
 #### 2. Restore the known-good binary
 
@@ -1172,7 +1253,8 @@ The whole launcher argv is checked with the launcher's own parser before
 anything is written, so a job the launcher would refuse (a relative
 daemon, an invalid instance) is never installed. A package-manager
 upgrade that moves the canonical `x0xd` needs `x0x autostart --launcher`
-again.
+again. A daemon inside a versioned Homebrew keg is refused (see
+"Homebrew keg paths" below), so a Homebrew install keeps the direct job.
 
 One label (`com.saorsalabs.x0xd`) serves one instance. `x0x autostart`
 refuses to replace a job under that label that starts another `--name`;
@@ -1200,6 +1282,10 @@ paths and every other key. It writes the trial-form `ProgramArguments`
 daemon, and the job's own arguments), removes `Program`, and sets
 `ExitTimeOut` to 60 s when it is absent or 45 s or less. It also adds the
 supervision marker if it is missing.
+
+`x0x autostart --repair --dry-run` (with or without `--launcher`) checks
+and prints each change, the planned `ProgramArguments` for the launcher
+and the `X0X_SUPERVISED=1` marker included, and writes nothing.
 
 The host root is the data directory that x0xd uses for that job, found
 the way x0xd finds it:
@@ -1244,26 +1330,48 @@ launcher is dormant it execs the daemon at once, so that wait and the
 hold are not yet measured through launchd. The launcher's unit tests
 cover them.
 
-**Missing daemon.** The job names the canonical daemon. For a
-Homebrew install, that is a versioned Cellar path, which a `brew upgrade`
-removes. Before 19 Nov 2026 the dormant launcher then failed the `exec`
+**Missing daemon.** The job names the canonical daemon, which a
+package-manager upgrade can remove. (A job migrated before the keg check
+of #1379 can name a versioned Homebrew Cellar path, which `brew upgrade`
+removes.) Before 19 Nov 2026 the dormant launcher then failed the `exec`
 and exited 75 at once, and launchd started it again after each throttle
 interval (3 starts in 30 s): a restart loop. On macOS the launcher now
 waits instead. It writes one line to the job's standard error, tries the
 `exec` again after 1 s, doubles the pause up to 60 s, and becomes the
 daemon at the first try after the path is back (at most 60 s later). A
-stop ends the wait; any other `exec` error still exits 75. On Linux the exit stays, because systemd's
-start limit ends the restarts. The acceptance script checks the wait
-(`missing-daemon-waits`): one launcher start in 30 s, then the daemon
-runs once its path exists.
+stop ends the wait; any other `exec` error still exits 75. On Linux the
+exit stays, because systemd's start limit ends the restarts. The
+acceptance script checks the wait (`missing-daemon-waits`): one launcher
+start in 30 s, then the daemon runs once its path exists.
 
-**Not done yet (next #1379 slice):**
-- a job that pins a removed Cellar path now waits, but it needs a stable
-  daemon path to start again;
-- the autostart commands do not refuse to run as root or under `sudo`,
-  and they do not check who owns the plist;
-- `--repair` has no dry run;
-- the acceptance script runs by hand only.
+**Homebrew keg paths (#1379).** `x0x autostart --launcher` and
+`--repair --launcher` refuse a daemon whose canonical path is inside a
+versioned Homebrew keg (`<prefix>/Cellar/<formula>/<version>/...`). The
+trial form needs the canonical daemon, and `brew upgrade` removes the old
+keg, so such a job would wait for a daemon that never comes back. Keep the
+direct job for a Homebrew install, or install x0xd outside Homebrew.
+`--repair --launcher` also refuses a job that already runs the launcher
+with a daemon path inside a keg, instead of counting it as compliant, and
+says to run `x0x autostart` without `--launcher`. A job
+that already names a missing daemon is reported by `x0x doctor` while the
+daemon is unreachable: the upgrade check fails and names the job, the
+missing path and whether the launcher is waiting for it. Run
+`x0x autostart` again to point the job at the installed x0xd.
+
+The keg path is not replaced by the `<prefix>/opt/<formula>` link. The
+launcher compares the journal's canonical executable with the daemon path
+in its arguments byte for byte, and a trial swap would write into a keg
+that Homebrew owns. Launcher support for a Homebrew install is #2111.
+
+**Who may change a job.** On macOS every autostart command (install,
+`--repair`, `--remove`) refuses to run as root or under `sudo`: the agent
+belongs to the user who runs it, and a root-owned file in that user's
+LaunchAgents is one their `launchctl` cannot load. Install and `--repair`
+also refuse a job file that is not owned by the user or that group or
+others can write, which launchd does not load. `--repair` reports such a
+job as refused and leaves it unchanged.
+
+**Not done yet:** the acceptance script runs by hand only.
 
 The handoff transaction (`upgrade::restart`):
 

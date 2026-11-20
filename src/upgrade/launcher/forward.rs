@@ -66,10 +66,10 @@ pub(crate) fn is_missing(error: &io::Error) -> bool {
 /// exit on a missing daemon (a volume not yet mounted, a package being
 /// replaced) is a restart every throttle interval for as long as the path
 /// is missing. Waiting keeps one quiet process that execs the daemon at
-/// the first try after the path is back (at most 60 s later). The pause doubles from 1 s to 60 s. Any other
-/// `exec` error, or a stop, returns the error. The passthrough arms no
-/// signal handler, so a stop is SIGTERM's default action; `stop` covers a
-/// launcher that armed one.
+/// the first try after the path is back (at most 60 s later). The pause
+/// doubles from 1 s to 60 s. Any other `exec` error, or a stop, returns
+/// the error. The passthrough arms no signal handler, so a stop is
+/// SIGTERM's default action; `stop` covers a launcher that armed one.
 pub(crate) fn exec_daemon_when_present(
     command: &DaemonCommand,
     mut exec: impl FnMut(&DaemonCommand) -> io::Error,

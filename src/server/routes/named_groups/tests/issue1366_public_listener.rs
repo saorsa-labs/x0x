@@ -42,7 +42,7 @@ impl Drop for LiveListener {
     }
 }
 
-fn live(group_id: &str) -> usize {
+pub(in crate::server) fn live(group_id: &str) -> usize {
     LIVE.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
