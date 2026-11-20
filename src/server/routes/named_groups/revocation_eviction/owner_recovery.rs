@@ -94,6 +94,10 @@ struct PendingMandate {
     /// The last typed wait of a commit attempt, with the named members.
     wait: Option<(&'static str, Vec<[u8; 32]>)>,
     next_at: Instant,
+    /// #2120: when a seal refusal first held the creator on its own expired
+    /// certificate (digest-pending or in grace). In memory only; a restart
+    /// starts it again.
+    creator_pending_since: Option<Instant>,
 }
 
 /// The promoted member's delivery of one committed recovery.
@@ -501,6 +505,7 @@ async fn restore_mandates(state: &AppState) {
                         mandate,
                         wait: None,
                         next_at: Instant::now(),
+                        creator_pending_since: None,
                     },
                 );
                 kept = true;
@@ -1066,12 +1071,97 @@ async fn accept_mandate(state: &Arc<AppState>, mandate: orc::SignedOwnerRecovery
                 mandate,
                 wait: None,
                 next_at: now,
+                creator_pending_since: None,
             },
         );
     // #1625: the held mandate is written to the pending-mandate file, so a
     // restart of the promoted member keeps it.
     persist_mandates(state, &stable).await;
     state.agent.s4_revocation_intake().request_reconcile();
+}
+
+/// #2120: how a seal refusal holds the creator on its own expired committed
+/// certificate, from the second verdict's classes at its evidence clock
+/// `now_unix`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreatorHold {
+    /// Digest-pending: no announced digest is being fetched, so only the
+    /// owner re-certifying the creator ends it.
+    Held,
+    /// In grace: a digest is announced for the creator and its certificate
+    /// bytes have not resolved here (a renewal, or a re-announce of the
+    /// expired certificate). It may end by itself, or never.
+    Fetching,
+}
+
+fn creator_hold_class(
+    next: &GroupInfo,
+    digest_pending: &[String],
+    in_grace: &[String],
+    now_unix: u64,
+) -> Option<CreatorHold> {
+    let creator_hex = hex::encode(next.creator.as_bytes());
+    if !next.creator_expired_certificate_hold(&creator_hex, now_unix) {
+        return None;
+    }
+    if digest_pending.contains(&creator_hex) {
+        Some(CreatorHold::Held)
+    } else if in_grace.contains(&creator_hex) {
+        Some(CreatorHold::Fetching)
+    } else {
+        None
+    }
+}
+
+/// #2120: record a creator-hold refusal on the held mandate. A held creator
+/// gets the typed wait at once. A creator whose fetch is in flight keeps
+/// the bare `mandate_received` for the missing-evidence grace
+/// (`OWNER_CERT_MISSING_EVIDENCE_GRACE_SECS`) counted from the first
+/// creator-hold refusal, then gets the typed wait too, so a fetch that
+/// never completes does not hide the remedy. A refusal that does not hold
+/// the creator clears the count.
+async fn set_creator_wait(
+    state: &AppState,
+    stable: &str,
+    next: &GroupInfo,
+    class: Option<CreatorHold>,
+) {
+    let mut inner = state.revocation_evictions.inner.lock().await;
+    let Some(pending) = inner.orc.pending.get_mut(stable) else {
+        return;
+    };
+    let now = Instant::now();
+    let typed = match class {
+        None => {
+            pending.creator_pending_since = None;
+            false
+        }
+        Some(CreatorHold::Held) => {
+            pending.creator_pending_since.get_or_insert(now);
+            true
+        }
+        Some(CreatorHold::Fetching) => {
+            let since = *pending.creator_pending_since.get_or_insert(now);
+            now.saturating_duration_since(since)
+                >= Duration::from_secs(
+                    x0x::groups::owner_cert::OWNER_CERT_MISSING_EVIDENCE_GRACE_SECS,
+                )
+        }
+    };
+    pending.wait = typed.then(|| {
+        (
+            x0x::groups::eviction::WaitingCause::WaitingForCreatorCertificateRenewal.as_str(),
+            vec![*next.creator.as_bytes()],
+        )
+    });
+    pending.next_at = now + ORC_COMMIT_RETRY;
+}
+
+/// #2120: what the operator does to end a typed recovery wait, for the
+/// promoted member's status. Only the creator-certificate wait has one.
+fn wait_remedy(cause: &str) -> Option<&'static str> {
+    (cause == x0x::groups::eviction::WaitingCause::WaitingForCreatorCertificateRenewal.as_str())
+        .then_some("owner_recertifies_creator")
 }
 
 async fn set_wait(state: &AppState, stable: &str, wait: Option<(&'static str, Vec<[u8; 32]>)>) {
@@ -1494,7 +1584,23 @@ async fn finish_commit(
             // typed wait naming them. A refusal caused only by a
             // grace or digest-pending hold is `OwnerCertMemberPending`
             // and keeps the bare `mandate_received` until the hold
-            // ends.
+            // ends, unless the hold is the creator's own expired
+            // certificate (#2120), which no eviction ends: then the wait
+            // names the creator and the owner's remedy. The refusal does
+            // not carry the verdict's classes, so a second verdict is
+            // taken over fresh evidence, on a copy of `next`.
+            if let x0x::groups::state_commit::ApplyError::OwnerCertMemberPending { .. } = &error {
+                let evidence = ng::owner_cert_seal_evidence(state, &next).await;
+                let verdict = next.clone().owner_cert_verdict(&evidence);
+                let class = creator_hold_class(
+                    &next,
+                    &verdict.digest_pending(),
+                    &verdict.in_grace(),
+                    evidence.now_unix(),
+                );
+                set_creator_wait(state, &stable, &next, class).await;
+                return false;
+            }
             let wait = match &error {
                 x0x::groups::state_commit::ApplyError::OwnerCertifiedEvictionRequired {
                     members,
@@ -3868,11 +3974,15 @@ pub(super) async fn status_json(state: &AppState, stable_group_id: &str) -> serd
             .map_or(("mandate_received", Vec::new()), |(cause, named)| {
                 (*cause, named.iter().map(hex::encode).collect::<Vec<_>>())
             });
-        serde_json::json!({
+        let mut status = serde_json::json!({
             "state": cause,
             "named": named,
             "parent_head": pending.mandate.body.parent_head,
-        })
+        });
+        if let Some(remedy) = wait_remedy(cause) {
+            status["remedy"] = serde_json::Value::from(remedy);
+        }
+        status
     });
     let stranded: Vec<serde_json::Value> = inner
         .orc
@@ -3912,6 +4022,7 @@ mod tests {
 
     mod issue1973_revoked_member_seal;
     mod issue2004_expired_member_seal;
+    mod issue2120_expired_creator_wait;
 
     #[test]
     fn refusals_map_to_http_statuses() {
@@ -4519,6 +4630,7 @@ mod tests {
                 mandate,
                 wait: None,
                 next_at: Instant::now(),
+                creator_pending_since: None,
             },
         );
         let rounds = orc.head_round_groups();
