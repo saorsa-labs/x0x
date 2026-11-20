@@ -388,6 +388,38 @@ No wire format changes; the local status gains the new cause and the
 
 [A08](A08-r01-groups-home-membership-and-repair.md) defines valid group-state and fork recovery. A09 must not bypass that authority to obtain keys faster.
 
+On 20 Nov 2026 David decided the mixed case of owner recovery with an
+expired creator ([#2133](https://github.com/saorsa-labs/x0x/issues/2133)),
+and Claude records it here under his delegation of 10 Nov 2026 and A15.
+The creator holds the recovery seal only when it is the only hold. When
+every admin is revoked and another below-Admin seat is also tolerated
+(revoked, or with a due expiry), recovery proceeds past the held creator:
+it commits, and the creator stays seated until the owner re-certifies it.
+What the creator gets depends on the plane:
+- **GSS plane.** A creator whose committed certificate is expired gets
+  no key material in any rekey until it is re-certified: not for the
+  recovery epoch, and not for a later epoch such as the tolerated seat's
+  eviction rekey. Every share write passes the class-K serving guard,
+  which refuses a seat whose committed certificate fails (the expired
+  certificate is a definitive refusal, so the share is dropped), and the
+  recovery frame and the TreeKEM catch-up refuse a seat whose expiry is
+  due (#2004). This is how the code already behaved; this paragraph
+  states it for every rekey, not only for recovery. After the owner
+  re-certifies the creator and its seat commits the renewed certificate,
+  its next catch-up seals it the current secret.
+- **TreeKEM plane, a known limit
+  ([#2139](https://github.com/saorsa-labs/x0x/issues/2139)).** The
+  recovery frame and the catch-up refuse the creator, so it does not get
+  the recovery epoch. But it keeps its leaf, so any later commit
+  published on the metadata topic carries path secrets encrypted to that
+  leaf, and the creator can derive the new epoch key. On TreeKEM groups
+  "no new keys until re-certification" holds only for the recovery epoch
+  itself. A non-creator seat whose expiry is due is in the same position
+  until its own eviction commit, because each S4 target gets its own
+  transition and another commit can land first.
+
+No wire format changes.
+
 ## Security claims
 
 State the exact properties of each released path. Post-quantum signatures and key encapsulation do not alone prove forward secrecy or recovery after key compromise.
