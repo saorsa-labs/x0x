@@ -409,10 +409,33 @@ fn read_api_token(data_dir: &Path) -> Option<String> {
     (!token.is_empty()).then_some(token)
 }
 
+/// Open `path` for reading only when it is a regular file. A symlink is
+/// refused (checked with `symlink_metadata`, and on unix again at open
+/// time with `O_NOFOLLOW`), and a FIFO or device is refused without
+/// blocking (`O_NONBLOCK` on unix, then a check on the opened handle).
+fn open_regular_file(path: &Path) -> Result<std::fs::File> {
+    let meta = std::fs::symlink_metadata(path).context("log file metadata")?;
+    if !meta.file_type().is_file() {
+        anyhow::bail!("log path is not a regular file (symlink, FIFO or other)");
+    }
+    let mut options = std::fs::File::options();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).context("open log file")?;
+    if !file.metadata().context("log file metadata")?.is_file() {
+        anyhow::bail!("log path is not a regular file (symlink, FIFO or other)");
+    }
+    Ok(file)
+}
+
 /// The last lines of `path`: at most [`LOG_TAIL_READ_BYTES`] read from the
 /// end, at most [`MAX_LOG_LINES`] lines, each scrubbed.
 fn log_tail(path: &Path, redactor: &Redactor) -> Result<Vec<String>> {
-    let mut file = std::fs::File::open(path).context("open log file")?;
+    let mut file = open_regular_file(path)?;
     let len = file.metadata().context("log file metadata")?.len();
     let start = len.saturating_sub(LOG_TAIL_READ_BYTES);
     file.seek(SeekFrom::Start(start)).context("seek log file")?;
@@ -511,6 +534,10 @@ pub(crate) fn build_report(inputs: &ReportInputs, redactor: &Redactor) -> Result
     let (log_source, mut log) = match &inputs.log_file {
         Some(path) => match log_tail(path, redactor) {
             Ok(lines) => ("daemon log file (X0X_LOG_DIR)", lines),
+            Err(e) if format!("{e:#}").contains("not a regular file") => (
+                "skipped: the daemon log path is not a regular file (symlink, FIFO or other)",
+                Vec::new(),
+            ),
             Err(_) => ("daemon log file could not be read", Vec::new()),
         },
         None => (
@@ -565,8 +592,28 @@ fn report_file_secs(name: &str) -> Option<u64> {
 /// unix). The file is created new with mode 0600; an existing file or
 /// symlink at the path is refused.
 pub(crate) fn store_report(reports_dir: &Path, secs: u64, bytes: &[u8]) -> Result<PathBuf> {
-    std::fs::create_dir_all(reports_dir)
-        .with_context(|| format!("create {}", reports_dir.display()))?;
+    match std::fs::symlink_metadata(reports_dir) {
+        Ok(meta) if meta.file_type().is_dir() => {}
+        Ok(_) => anyhow::bail!(
+            "{} exists and is not a plain directory (a symlink is refused)",
+            reports_dir.display()
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            builder
+                .create(reports_dir)
+                .with_context(|| format!("create {}", reports_dir.display()))?;
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("inspect {}", reports_dir.display()));
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

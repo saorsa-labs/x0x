@@ -450,3 +450,85 @@ async fn post_report_route_writes_a_redacted_local_bundle() {
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(body["error"], "rate_limited");
 }
+
+/// Hardening (#2114 review): a symlinked log path is never followed, and
+/// (unix) a FIFO is skipped without blocking. The bundle is still built,
+/// with a note in `log_tail.source`.
+#[cfg(unix)]
+#[test]
+fn report_skips_a_symlinked_or_fifo_log() {
+    let p = Planted::new();
+    let f = plant(&p);
+    let link = f.log_file.with_file_name("x0xd-link.log");
+    std::os::unix::fs::symlink(&f.log_file, &link).unwrap();
+    let mut inputs = inputs_for(&p, &f);
+    inputs.log_file = Some(link);
+    let built = build_report(&inputs, &redactor_for(&p, &f)).unwrap();
+    assert_eq!(built.log_lines, 0);
+    let value: serde_json::Value = serde_json::from_slice(&built.bytes).unwrap();
+    assert!(value["log_tail"]["source"]
+        .as_str()
+        .unwrap()
+        .starts_with("skipped: the daemon log path is not a regular file"));
+
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let fifo = f.log_file.with_file_name("x0xd-fifo.log");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: c_path is a valid NUL-terminated path for this call.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo");
+        inputs.log_file = Some(fifo);
+        // No writer ever opens the FIFO: a blocking open would hang here.
+        let built = build_report(&inputs, &redactor_for(&p, &f)).unwrap();
+        assert_eq!(built.log_lines, 0);
+        let value: serde_json::Value = serde_json::from_slice(&built.bytes).unwrap();
+        assert!(value["log_tail"]["source"]
+            .as_str()
+            .unwrap()
+            .starts_with("skipped: the daemon log path is not a regular file"));
+    }
+}
+
+/// Hardening (#2114 review): a symlinked `reports/` is refused, nothing is
+/// written through it; a fresh `reports/` is created 0700.
+#[cfg(unix)]
+#[test]
+fn store_report_refuses_a_symlinked_reports_dir() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("elsewhere");
+    std::fs::create_dir_all(&target).unwrap();
+    let reports = tmp.path().join(REPORTS_DIR);
+    std::os::unix::fs::symlink(&target, &reports).unwrap();
+    let err = store_report(&reports, 7, b"{}").unwrap_err();
+    assert!(
+        format!("{err:#}").contains("not a plain directory"),
+        "{err:#}"
+    );
+    assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+
+    let fresh = tmp.path().join("data").join(REPORTS_DIR);
+    store_report(&fresh, 7, b"{}").unwrap();
+    let mode = std::fs::metadata(&fresh).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o700);
+}
+
+/// A rider token is refused with 403 and writes nothing.
+#[tokio::test]
+async fn post_report_route_refuses_a_rider() {
+    let (state, _dir) = route_test_state().await;
+    let rider = ActorContext::Rider {
+        sub_agent_id: "00".repeat(32),
+        token_id: 1,
+        token_hash: "11".repeat(32),
+        groups: Vec::new(),
+        scopes: Vec::new(),
+    };
+    let (status, body) =
+        body_json(create_report(State(Arc::clone(&state)), axum::extract::Extension(rider)).await)
+            .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], "durable_owner_required");
+    assert!(!state.data_dir.join(REPORTS_DIR).exists());
+}

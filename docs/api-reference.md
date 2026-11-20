@@ -470,9 +470,16 @@ line keeps only timestamp, level, target and message), hex runs of 16 or
 more characters are cut to an 8-character prefix, and base64-like runs
 of 32 or more characters are removed. Each log line is cut to 400
 characters and the whole bundle to 256 KiB (oldest log lines are dropped
-first). Unquoted free text in a log message that matches none of these
-rules is kept, so the bundle stays owner-local; sending a report to the
-owner's other devices or to maintainers is a later slice.
+first). The log path must be a regular file: a symlink, FIFO or other
+special file is skipped (the bundle notes it), and a symlinked
+`reports/` directory is refused.
+
+What the redactor KEEPS: peer IP addresses and ports, four-word
+addresses, unquoted names and other free text in log messages,
+`:`-separated hex, byte arrays printed as `[..]`, and base64 runs under
+32 characters. So the bundle stays owner-local. Every one of these must
+be closed before any slice sends a report off the machine (to the
+owner's other devices or to maintainers).
 
 ### Example: status
 
