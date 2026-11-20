@@ -9,10 +9,12 @@ All notable changes to this project will be documented in this file.
 - **Safer launchd autostart on macOS (#1379; A14 amendment of 20 Nov
   2026).** `x0x autostart --launcher` and `--repair --launcher` refuse a
   daemon inside a versioned Homebrew keg, which `brew upgrade` removes
-  (launcher support for Homebrew is #2111).
+  (launcher support for Homebrew is #2111); `--repair --launcher` also
+  refuses a job that already runs the launcher with a keg daemon.
   `x0x doctor` reports a launchd job whose daemon path no longer exists.
-  The autostart commands refuse to run as root or under `sudo`, and refuse
-  a job file that is not the user's own or that others can write.
+  `x0x autostart`, `--repair` and `--remove` refuse to run as root or
+  under `sudo`; install and `--repair` refuse a job file that is not the
+  user's own or that others can write.
   `x0x autostart --repair --dry-run` prints the changes and writes nothing.
 
 - **No launchd restart loop on a missing daemon (#1379; A14 amendment of

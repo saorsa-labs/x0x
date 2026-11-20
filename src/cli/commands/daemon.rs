@@ -1858,6 +1858,16 @@ fn daemon_name_argument(args: &[String]) -> Option<String> {
     None
 }
 
+/// The arguments launchd passes: `ProgramArguments`, or none for a job
+/// that sets only `Program` (#2108 review). `None` when they are not text.
+#[cfg(any(test, target_os = "macos"))]
+fn launchd_job_argv(job: &serde_json::Value) -> Option<Vec<String>> {
+    match job.get("ProgramArguments") {
+        None => Some(Vec::new()),
+        Some(_) => launchd_job_arguments(job),
+    }
+}
+
 /// The arguments of a launchd job (`ProgramArguments`), if they are text.
 #[cfg(any(test, target_os = "macos"))]
 fn launchd_job_arguments(job: &serde_json::Value) -> Option<Vec<String>> {
@@ -1873,7 +1883,7 @@ fn launchd_job_arguments(job: &serde_json::Value) -> Option<Vec<String>> {
 /// not an x0xd job this can read.
 #[cfg(any(test, target_os = "macos"))]
 fn launchd_job_instance(job: &serde_json::Value) -> Option<Option<String>> {
-    let arguments = launchd_job_arguments(job)?;
+    let arguments = launchd_job_argv(job)?;
     let daemon = crate::upgrade::restart::launchd_job_daemon(
         job.get("Program").and_then(|p| p.as_str()),
         &arguments,
@@ -1958,6 +1968,16 @@ pub(crate) fn plan_launcher_migration(
     .context("job names no executable")?
     .map_err(|usage| anyhow::anyhow!(usage))?;
     if daemon.via_launcher {
+        // A job migrated before the keg refusal (#2108 review) is not left
+        // as compliant: it loses its daemon at the next `brew upgrade`.
+        if in_versioned_keg(Path::new(daemon.executable)) {
+            anyhow::bail!(
+                "the job already runs x0x-launcher, but its daemon {} is inside a versioned \
+                 Homebrew keg that `brew upgrade` removes; run `x0x autostart` without \
+                 --launcher to put the direct job back",
+                daemon.executable
+            );
+        }
         return Ok(None);
     }
     if !Path::new(daemon.executable).is_absolute() {
@@ -2113,7 +2133,7 @@ fn missing_daemon_check(
     instance: Option<&str>,
     exists: &dyn Fn(&Path) -> bool,
 ) -> Option<DoctorCheck> {
-    let arguments = launchd_job_arguments(job)?;
+    let arguments = launchd_job_argv(job)?;
     let daemon = crate::upgrade::restart::launchd_job_daemon(
         job.get("Program").and_then(|p| p.as_str()),
         &arguments,
@@ -2375,6 +2395,16 @@ fn migrate_job_to_launcher(path: &Path, job: &serde_json::Value, dry_run: bool) 
         }
         if migration.set_exit_timeout {
             println!("  Would set: ExitTimeOut {LAUNCHER_EXIT_TIMEOUT_SECS}");
+        }
+        let marker = format!(
+            "/EnvironmentVariables/{}",
+            crate::upgrade::restart::SUPERVISED_ENV_VAR
+        );
+        if job.pointer(&marker) != planned.pointer(&marker) {
+            println!(
+                "  Would add: {}=1",
+                crate::upgrade::restart::SUPERVISED_ENV_VAR
+            );
         }
         return Ok(true);
     }
@@ -3805,6 +3835,31 @@ mod tests {
         };
         let error = plan_launcher_migration(&job, &host).expect_err("keg");
         assert!(format!("{error:#}").contains("Homebrew keg"), "{error:#}");
+
+        // A job already migrated onto the launcher with a keg daemon is
+        // refused, not reported as compliant (#2108 review).
+        let migrated = |daemon: &str| {
+            serde_json::json!({
+                "Label": "com.saorsalabs.x0xd",
+                "ProgramArguments": [
+                    "/opt/homebrew/bin/x0x-launcher", "--host-root", ALICE_ROOT,
+                    "--instance", "alice", "--", daemon, "--name", "alice",
+                ],
+                "KeepAlive": true,
+                "ExitTimeOut": 60,
+                "EnvironmentVariables": { "X0X_SUPERVISED": "1" },
+            })
+        };
+        let keg_job = migrated("/opt/homebrew/Cellar/x0x/0.49.0/bin/x0xd");
+        let error = plan_launcher_migration(&keg_job, &migration_host()).expect_err("keg");
+        let error = format!("{error:#}");
+        assert!(error.contains("already runs x0x-launcher"), "{error}");
+        assert!(error.contains("x0x autostart` without"), "{error}");
+        assert!(
+            plan_launcher_migration(&migrated("/opt/x0x/bin/x0xd"), &migration_host())
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// #1379: the autostart commands manage the calling user's own agent.
@@ -3844,6 +3899,9 @@ mod tests {
         });
         let missing = |_: &Path| false;
         let present = |_: &Path| true;
+        let program_only = serde_json::json!({ "Label": "com.saorsalabs.x0xd", "Program": keg });
+        assert!(missing_daemon_check(&program_only, None, &missing).is_some());
+        assert!(missing_daemon_check(&program_only, None, &present).is_none());
         let check =
             missing_daemon_check(&via_launcher, Some("alice"), &missing).expect("missing daemon");
         assert_eq!(check.status, DoctorCheckStatus::Fail);

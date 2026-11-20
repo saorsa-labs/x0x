@@ -1164,7 +1164,7 @@ supervision marker if it is missing.
 
 `x0x autostart --repair --dry-run` (with or without `--launcher`) checks
 and prints each change, the planned `ProgramArguments` for the launcher
-included, and writes nothing.
+and the `X0X_SUPERVISED=1` marker included, and writes nothing.
 
 The host root is the data directory that x0xd uses for that job, found
 the way x0xd finds it:
@@ -1218,16 +1218,19 @@ waits instead. It writes one line to the job's standard error, tries the
 `exec` again after 1 s, doubles the pause up to 60 s, and becomes the
 daemon at the first try after the path is back (at most 60 s later). A
 stop ends the wait; any other `exec` error still exits 75. On Linux the
-exit stays, because systemd's start limit ends the restarts. The acceptance script checks the wait
-(`missing-daemon-waits`): one launcher start in 30 s, then the daemon
-runs once its path exists.
+exit stays, because systemd's start limit ends the restarts. The
+acceptance script checks the wait (`missing-daemon-waits`): one launcher
+start in 30 s, then the daemon runs once its path exists.
 
 **Homebrew keg paths (#1379).** `x0x autostart --launcher` and
 `--repair --launcher` refuse a daemon whose canonical path is inside a
 versioned Homebrew keg (`<prefix>/Cellar/<formula>/<version>/...`). The
 trial form needs the canonical daemon, and `brew upgrade` removes the old
 keg, so such a job would wait for a daemon that never comes back. Keep the
-direct job for a Homebrew install, or install x0xd outside Homebrew. A job
+direct job for a Homebrew install, or install x0xd outside Homebrew.
+`--repair --launcher` also refuses a job that already runs the launcher
+with a daemon path inside a keg, instead of counting it as compliant, and
+says to run `x0x autostart` without `--launcher`. A job
 that already names a missing daemon is reported by `x0x doctor` while the
 daemon is unreachable: the upgrade check fails and names the job, the
 missing path and whether the launcher is waiting for it. Run
