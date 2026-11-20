@@ -49,6 +49,12 @@ run-wrapper = 'w3h-sim'
 default-filter = 'test(/(^|::)w3h_/)'
 slow-timeout = { period = "60s", terminate-after = 5 }
 
+# The on-demand #1581 1581n rows (tests/AGENTS.md): up to about 250 s of
+# real time in a 12-CPU VM, close to the 300 s kill above.
+[[profile.w3h.overrides]]
+filter = 'test(/(^|::)on_demand_1581n_/)'
+slow-timeout = { period = "60s", terminate-after = 20 }
+
 # H-S3-d3 runs about 2 h 15 min of virtual time (the authorisation's
 # 1 h lifetime, then the row's 1 h quiet advance): 520 s of wall time on
 # a 12-CPU Linux VM and 940-1000 s on the 4-vCPU CI runner, so it gets
