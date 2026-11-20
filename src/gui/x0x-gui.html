@@ -754,8 +754,9 @@ async function api(path,opt){await maybeRefreshSession();return apiWith(SESSION_
 // before its next request. Each refresh reports how long ago the user last
 // gave input; polling and timers are not activity. After the idle timeout
 // (default 60 min) the daemon refuses refresh and the user reopens with
-// `x0x gui`. Already-open WS/SSE streams are authenticated at connect and
-// keep running; reconnects read the current SESSION_TOKEN.
+// `x0x gui`. Open WS/SSE streams follow the session, not the token: a
+// refresh keeps them open, and the daemon closes them when the session
+// ends. Reconnects read the current SESSION_TOKEN.
 const SESSION_REFRESH_MS=8*60*1000;
 let sessionIssuedAt=0;
 let sessionClockKnown=false;
@@ -968,7 +969,13 @@ function wsConnect(){
     advertiseGuiVisibility();
     wsSubs.forEach(t=>wsSend({type:'subscribe',topics:[t]}));
   };
-  ws.onclose=()=>{S.set('connected',false);setTimeout(wsConnect,3000)};
+  // #2079: the daemon closes a signed-out or idle-expired session's socket
+  // with 1008; reconnecting would only retry a dead token.
+  ws.onclose=e=>{
+    S.set('connected',false);
+    if(e&&e.code===1008){endSession('Session ended — reopen with `x0x gui`');return}
+    if(!sessionExpired)setTimeout(wsConnect,3000);
+  };
   ws.onerror=()=>{};
   ws.onmessage=e=>{try{handleWsMsg(JSON.parse(e.data))}catch(e){}};
 }

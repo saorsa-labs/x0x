@@ -692,6 +692,7 @@ fn detach_ws_session(
     durable_owner: bool,
     visible_gui: bool,
     session_token: Option<String>,
+    session: Option<crate::server::auth::SessionLink>,
 ) -> tokio::sync::oneshot::Sender<axum::extract::ws::WebSocket> {
     let (socket_tx, socket_rx) = tokio::sync::oneshot::channel();
     let session_state = Arc::clone(&state);
@@ -710,6 +711,7 @@ fn detach_ws_session(
             durable_owner,
             visible_gui,
             session_token,
+            session,
         )
         .await;
     });
@@ -724,6 +726,7 @@ pub(super) async fn ws_handler(
     axum::extract::Extension(actor): axum::extract::Extension<
         crate::server::rider_auth::ActorContext,
     >,
+    session: Option<axum::extract::Extension<crate::server::auth::SessionLink>>,
 ) -> impl IntoResponse {
     let (visible_gui, session_token) = crate::gui::parse_gui_ws_query(raw.as_deref());
     let socket_tx = detach_ws_session(
@@ -733,6 +736,7 @@ pub(super) async fn ws_handler(
         actor.is_durable_owner(),
         visible_gui,
         session_token,
+        session.map(|axum::extract::Extension(link)| link),
     );
     ws.on_upgrade(move |socket| async move {
         let _ = socket_tx.send(socket);
@@ -756,6 +760,7 @@ pub(super) async fn ws_direct_handler(
     axum::extract::Extension(actor): axum::extract::Extension<
         crate::server::rider_auth::ActorContext,
     >,
+    session: Option<axum::extract::Extension<crate::server::auth::SessionLink>>,
 ) -> impl IntoResponse {
     let (visible_gui, session_token) = crate::gui::parse_gui_ws_query(raw.as_deref());
     let socket_tx = detach_ws_session(
@@ -765,6 +770,7 @@ pub(super) async fn ws_direct_handler(
         actor.is_durable_owner(),
         visible_gui,
         session_token,
+        session.map(|axum::extract::Extension(link)| link),
     );
     ws.on_upgrade(move |socket| async move {
         let _ = socket_tx.send(socket);
@@ -1429,6 +1435,7 @@ async fn arm_navigation_and_advertise_session(
 }
 
 /// Core WebSocket connection lifecycle.
+#[allow(clippy::too_many_arguments)]
 async fn handle_ws_connection(
     socket: axum::extract::ws::WebSocket,
     state: Arc<AppState>,
@@ -1437,6 +1444,7 @@ async fn handle_ws_connection(
     durable_owner: bool,
     visible_gui: bool,
     session_token: Option<String>,
+    session_link: Option<crate::server::auth::SessionLink>,
 ) {
     use axum::extract::ws::Message;
     use futures::StreamExt as FutStreamExt;
@@ -1695,10 +1703,23 @@ async fn handle_ws_connection(
     // Reader loop: ws_rx → dispatch commands
     let mut shutdown_rx = state.shutdown_notify.subscribe();
     let reader_slow_close = slow_close.clone();
+    let session_ended = async {
+        match &session_link {
+            Some(link) => link.ended().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(session_ended);
+    let mut ended_by_session = false;
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => {
                 tracing::info!(session_id = %session_id, "Closing WebSocket session due to daemon shutdown");
+                break;
+            }
+            () = &mut session_ended => {
+                tracing::info!(session_id = %session_id, "Closing WebSocket session: its browser session ended");
+                ended_by_session = true;
                 break;
             }
             _ = reader_slow_close.cancelled() => {
@@ -1777,6 +1798,17 @@ async fn handle_ws_connection(
                 let _ = tokio::time::timeout_at(
                     grace_deadline,
                     futures::SinkExt::flush(&mut ws_tx_back),
+                )
+                .await;
+            }
+            if ended_by_session {
+                let close = Message::Close(Some(axum::extract::ws::CloseFrame {
+                    code: axum::extract::ws::close_code::POLICY,
+                    reason: "session ended".into(),
+                }));
+                let _ = tokio::time::timeout_at(
+                    grace_deadline,
+                    futures::SinkExt::send(&mut ws_tx_back, close),
                 )
                 .await;
             }
