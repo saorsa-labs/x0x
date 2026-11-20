@@ -1337,6 +1337,18 @@ impl GroupAccess {
             acting_hex: acting_hex.into(),
         }
     }
+
+    /// Snapshot of the public-cache fail-open for a group with no local
+    /// record, for a handler test that calls `get_group_public_messages`
+    /// directly: the supplied id is the stable id.
+    #[cfg(test)]
+    pub(in crate::server) fn for_test_unknown(stable_id: impl Into<String>) -> Self {
+        Self {
+            level: AccessLevel::OwnerDurable,
+            stable_id: stable_id.into(),
+            acting_hex: String::new(),
+        }
+    }
 }
 
 /// Fail closed when the extractor meets a request the classification

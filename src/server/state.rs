@@ -1804,6 +1804,14 @@ pub(super) struct NamedGroupTestRecorders {
     /// apply gate, or every send failed) and the row stays armed. The
     /// page fence stays open in both shapes. Tests read the reason here.
     pub(super) catchup_page_deferred: StdMutex<Vec<(String, String, &'static str)>>,
+    /// #2124: how many listener stop or reconcile steps ran on this state,
+    /// so a lock-order check can tell that its path reached one.
+    pub(super) listener_steps: std::sync::atomic::AtomicUsize,
+    /// #2124: set when a listener step ran while its caller held
+    /// `group_card_cache`.
+    pub(super) listener_step_held_card_cache: std::sync::atomic::AtomicBool,
+    /// #2124: how many metadata-listener stop checks ran on this state.
+    pub(super) metadata_retire_steps: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
