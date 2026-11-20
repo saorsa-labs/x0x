@@ -2718,8 +2718,10 @@ impl KvStore {
                 puts.insert(key.clone(), entry.value.len() as u64);
             }
         }
+        // An update of a key that is not live here adds nothing, so it must
+        // not take a quota slot from a live key (#2068 point 2).
         for (key, entry) in &delta.updated {
-            if key_agent_prefix(key) == Some(*w) {
+            if key_agent_prefix(key) == Some(*w) && self.keys.contains(key) {
                 puts.insert(key.clone(), entry.value.len() as u64);
             }
         }
@@ -2987,7 +2989,7 @@ impl KvStore {
         // deferred pull is retried now (#2068 point 4).
         if !delta.removed.is_empty() {
             if let Some(source) = writer {
-                self.image.rearm_source(source);
+                self.image.rearm_source(source, now_ms());
             }
         }
         Ok(outcome)
@@ -9589,6 +9591,40 @@ mod tests {
         let mut non_hex = hex_w.clone();
         non_hex.replace_range(0..1, "z");
         assert_eq!(key_agent_prefix(&non_hex), None);
+    }
+
+    /// #2068 point 2 (review of #2109): in a SelfKeyed directory, an
+    /// `updated` entry for a key that is not live takes no quota slot.
+    /// With the writer at its key cap, a stale update of a lower key must
+    /// not push a live key out of the admitted set and evict it.
+    #[test]
+    fn selfkeyed_stale_update_takes_no_quota_slot() {
+        let w = agent(7);
+        let mut store = self_keyed_store();
+        let mut fill = KvStoreDelta::new(0);
+        for i in 1..=MAX_SELFKEYED_KEYS_PER_AGENT as u64 {
+            let key = hex_key(&w, Some(&format!("{i:03}")));
+            fill.added
+                .insert(key.clone(), (kv_entry(&key, b"v"), (peer(1), i)));
+        }
+        store
+            .merge_delta(&fill, peer(1), Some(&w))
+            .expect("fill to the cap");
+        assert_eq!(store.active_keys().len(), MAX_SELFKEYED_KEYS_PER_AGENT);
+
+        let stale_key = hex_key(&w, Some("000"));
+        let stale =
+            KvStoreDelta::for_update(stale_key.clone(), kv_entry(&stale_key, b"s"), store.version);
+        store
+            .merge_delta(&stale, peer(1), Some(&w))
+            .expect("the stale update is admitted");
+        assert!(
+            store.get(&stale_key).is_none(),
+            "the stale key stays absent"
+        );
+        let last = hex_key(&w, Some(&format!("{MAX_SELFKEYED_KEYS_PER_AGENT:03}")));
+        assert!(store.get(&last).is_some(), "the highest live key is kept");
+        assert_eq!(store.active_keys().len(), MAX_SELFKEYED_KEYS_PER_AGENT);
     }
 
     #[test]
