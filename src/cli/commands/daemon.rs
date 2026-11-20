@@ -2149,6 +2149,7 @@ fn missing_daemon_check(
 /// launcher (`plan_launcher_migration`), again without reloading it. With
 /// `dry_run` it prints what it would change and writes nothing. A job file
 /// that is not this user's own, or that others can write, is refused.
+#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
 pub async fn autostart_repair(launcher: bool, dry_run: bool) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
