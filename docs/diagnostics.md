@@ -202,7 +202,7 @@ already held state at least as new.
 
 `GET /diagnostics/gossip` exposes `per_kind` for bus pressure, local delivery,
 and outbound publish per PlumTree `MessageKind`. Per-kind verify CPU is not
-in this slice. The pinned saorsa-gossip 0.5.92 crate has a per-kind verify
+in this slice. The pinned saorsa-gossip 0.5.94 crate has a per-kind verify
 meter (`verify_by_kind_stats()`), but x0x does not read it yet (#1397) and
 does not sample `stage_stats()` on the receive path.
 
