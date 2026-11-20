@@ -27,25 +27,32 @@
 use super::issue1366_public_listener::live;
 use super::*;
 
-/// Set when a listener step ran while its caller held the card cache.
-static CARD_CACHE_HELD_AT_LISTENER_STEP: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Test hook of `listener_lifecycle`: no listener step may run while its
-/// caller holds `group_card_cache`. Another path holds `named_groups` while
-/// it waits for that cache, so the other order could deadlock. Each test
-/// runs in its own process under nextest, so the flag is per test.
-pub(in crate::server) fn note_listener_step(state: &AppState) {
-    if state.group_card_cache.try_write().is_err() {
-        CARD_CACHE_HELD_AT_LISTENER_STEP.store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-fn assert_no_listener_step_held_the_card_cache(why: &str) {
+/// The lock-order check of `listener_lifecycle::note_listener_step`, on
+/// this state only: the path under test reached a listener step since the
+/// fixture reset the count, and no step ran while its caller held the card
+/// cache.
+fn assert_no_listener_step_held_the_card_cache(state: &AppState, why: &str) {
+    let recorders = &state.named_group_test_recorders;
     assert!(
-        !CARD_CACHE_HELD_AT_LISTENER_STEP.load(std::sync::atomic::Ordering::SeqCst),
+        recorders
+            .listener_steps
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0,
+        "#2124: {why}: the path reached a listener step"
+    );
+    assert!(
+        !recorders
+            .listener_step_held_card_cache
+            .load(std::sync::atomic::Ordering::SeqCst),
         "#1366: {why}: a listener step ran while its caller held the card cache"
     );
+}
+
+fn reset_listener_steps(state: &AppState) {
+    state
+        .named_group_test_recorders
+        .listener_steps
+        .store(0, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Lets queued tasks run a turn (no wall-clock wait).
@@ -111,7 +118,7 @@ async fn assert_public_stopped(state: &AppState, stable_id: &str, why: &str) {
         eventually(|| async { live(stable_id) == 0 }).await,
         "#1366: {why}: the public-message listener task has ended"
     );
-    assert_no_listener_step_held_the_card_cache(why);
+    assert_no_listener_step_held_the_card_cache(state, why);
 }
 
 /// The abort handle of the running metadata listener under `group_key`.
@@ -141,7 +148,7 @@ async fn assert_metadata_stopped(
         eventually(|| async { task.is_finished() }).await,
         "#1366: {why}: the metadata listener task has ended"
     );
-    assert_no_listener_step_held_the_card_cache(why);
+    assert_no_listener_step_held_the_card_cache(state, why);
 }
 
 fn local_hex(state: &AppState) -> String {
@@ -153,6 +160,17 @@ fn local_hex(state: &AppState) -> String {
 async fn signed_public_fixture_with(
     plane: &str,
     group_id: &str,
+    adjust: impl FnOnce(&mut x0x::groups::GroupInfo),
+) -> Result<(Arc<AppState>, tempfile::TempDir, String)> {
+    signed_public_fixture_keyed(plane, group_id, group_id, adjust).await
+}
+
+/// As [`signed_public_fixture_with`], with the record stored under the map
+/// key `group_key`; its stable id stays `group_id`.
+async fn signed_public_fixture_keyed(
+    plane: &str,
+    group_id: &str,
+    group_key: &str,
     adjust: impl FnOnce(&mut x0x::groups::GroupInfo),
 ) -> Result<(Arc<AppState>, tempfile::TempDir, String)> {
     let (state, dir) = networked_test_state(plane).await?;
@@ -169,13 +187,14 @@ async fn signed_public_fixture_with(
         .named_groups
         .write()
         .await
-        .insert(group_id.to_string(), info);
-    ensure_named_group_listeners(Arc::clone(&state), group_id).await;
+        .insert(group_key.to_string(), info);
+    ensure_named_group_listeners(Arc::clone(&state), group_key).await;
     assert!(
-        metadata_registered(&state, group_id).await,
+        metadata_registered(&state, group_key).await,
         "precondition: the metadata listener runs"
     );
     assert_public_running(&state, &stable, "precondition").await;
+    reset_listener_steps(&state);
     Ok((state, dir, stable))
 }
 
@@ -854,6 +873,455 @@ async fn issue1366_request_access_applicant_keeps_its_metadata_listener() -> Res
     assert!(
         !public_registered(&state, &group_id).await,
         "an MlsEncrypted applicant stub runs no public-message listener"
+    );
+    Ok(())
+}
+
+/// The local agent's signed self-removal of the fixture group.
+async fn self_removal_event(
+    state: &Arc<AppState>,
+    group_id: &str,
+    stable: &str,
+) -> Result<NamedGroupMetadataEvent> {
+    let parent = state
+        .named_groups
+        .read()
+        .await
+        .get(group_id)
+        .cloned()
+        .context("fixture record")?;
+    let local = local_hex(state);
+    let mut next = parent.clone();
+    next.roster_revision = next.roster_revision.saturating_add(1);
+    next.remove_member(&local, Some(local.clone()));
+    Ok(NamedGroupMetadataEvent::MemberRemoved {
+        group_id: stable.to_string(),
+        revision: next.roster_revision,
+        actor: local.clone(),
+        agent_id: local,
+        treekem_commit_b64: None,
+        treekem_epoch: None,
+        secret_epoch: None,
+        commit: Some(sign_metadata_terminality_commit(
+            &parent,
+            &next,
+            state,
+            now_millis_u64(),
+        )),
+    })
+}
+
+/// #2124 item 1: catch-up, the parked-event replays and the recovery
+/// replays apply through `apply_named_group_metadata_event`, not through
+/// the listener apply. A self-removal applied there stops both listeners.
+#[tokio::test]
+async fn issue2124_self_removal_applied_outside_the_listener_stops_both_listeners() -> Result<()> {
+    let group_id = "2124-replay-removal-key";
+    let (state, _dir, stable) = signed_public_fixture("2124-replay-removal", group_id).await?;
+    let meta = metadata_task(&state, group_id).await?;
+    let event = self_removal_event(&state, group_id, &stable).await?;
+    let applied =
+        apply_named_group_metadata_event(&state, event, state.agent.agent_id(), true, None).await;
+    assert!(applied.accepted, "the signed self-removal applies");
+    assert!(
+        !state.named_groups.read().await.contains_key(group_id),
+        "the self-removal takes the record away"
+    );
+    assert_metadata_stopped(&state, group_id, &meta, "a replayed self-removal").await;
+    assert_public_stopped(&state, &stable, "a replayed self-removal").await;
+    Ok(())
+}
+
+/// #2124 item 1: catch-up drains the TreeKEM pending queue through
+/// `replay_pending_treekem_events`, which applies below the apply entry.
+/// A queued self-removal there stops both listeners too.
+#[tokio::test]
+async fn issue2124_queued_self_removal_replayed_by_catch_up_stops_both_listeners() -> Result<()> {
+    let group_id = "2124-queued-removal-key";
+    let (state, _dir, stable) = signed_public_fixture("2124-queued-removal", group_id).await?;
+    let meta = metadata_task(&state, group_id).await?;
+    let event = self_removal_event(&state, group_id, &stable).await?;
+    state
+        .treekem_pending_events
+        .write()
+        .await
+        .entry(group_id.to_string())
+        .or_default()
+        .push_back(PendingTreeKemMetadataEvent {
+            event,
+            sender: state.agent.agent_id(),
+            queued_at: Instant::now(),
+        });
+    replay_pending_treekem_events(&state, group_id, None).await;
+    assert!(
+        !state.named_groups.read().await.contains_key(group_id),
+        "the replayed self-removal takes the record away"
+    );
+    assert_metadata_stopped(&state, group_id, &meta, "a queued self-removal").await;
+    assert_public_stopped(&state, &stable, "a queued self-removal").await;
+    Ok(())
+}
+
+/// #2124 (ZCode review of 3f8ffd41): an event applied inside an open
+/// ADR 0109 re-seat staging changes the staged record only. A self-removal
+/// there takes the staged record away while the live record stays, so the
+/// live record keeps both listeners.
+#[tokio::test]
+async fn issue2124_staged_self_removal_keeps_the_live_listeners() -> Result<()> {
+    let group_id = "2124-staged-removal-key";
+    let (state, _dir, stable) = signed_public_fixture("2124-staged-removal", group_id).await?;
+    let live_record = state
+        .named_groups
+        .read()
+        .await
+        .get(group_id)
+        .cloned()
+        .context("fixture record")?;
+    let meta = metadata_task(&state, group_id).await?;
+    let event = self_removal_event(&state, group_id, &stable).await?;
+    state
+        .named_groups
+        .staging_write()
+        .await
+        .insert(group_id.to_string(), live_record);
+    state.reseat_stagings.open(group_id, &stable);
+    let applied = state
+        .reseat_stagings
+        .run_in_staging_of(
+            group_id,
+            apply_named_group_metadata_event(&state, event, state.agent.agent_id(), true, None),
+        )
+        .await;
+    assert!(applied.accepted, "the staged self-removal applies");
+    assert!(
+        !state
+            .named_groups
+            .staging_read()
+            .await
+            .contains_key(group_id),
+        "the self-removal took the staged record away"
+    );
+    assert!(
+        state.named_groups.live_read().await.contains_key(group_id),
+        "the live record stays"
+    );
+    assert!(
+        state
+            .named_group_test_recorders
+            .metadata_retire_steps
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0,
+        "the apply reached its metadata-listener stop check"
+    );
+    settle().await;
+    assert!(
+        metadata_registered(&state, group_id).await && !meta.is_finished(),
+        "the live record keeps its metadata listener"
+    );
+    assert_public_running(&state, &stable, "a staged self-removal").await;
+    Ok(())
+}
+
+/// #2124 (Fable review of 6d1e440e): the public registry is keyed by the
+/// stable id and the metadata registry by the map key. With a record whose
+/// map key differs from its stable id, a queued self-removal replayed by
+/// catch-up (which names the group by its map key) stops both listeners.
+#[tokio::test]
+async fn issue2124_queued_self_removal_under_a_distinct_key_stops_both_listeners() -> Result<()> {
+    let group_key = "2124-distinct-key";
+    let (state, _dir, stable) =
+        signed_public_fixture_keyed("2124-distinct", "2124-distinct-stable", group_key, |_| {})
+            .await?;
+    assert_ne!(
+        stable, group_key,
+        "precondition: the key is not the stable id"
+    );
+    let meta = metadata_task(&state, group_key).await?;
+    let event = self_removal_event(&state, group_key, &stable).await?;
+    state
+        .treekem_pending_events
+        .write()
+        .await
+        .entry(group_key.to_string())
+        .or_default()
+        .push_back(PendingTreeKemMetadataEvent {
+            event,
+            sender: state.agent.agent_id(),
+            queued_at: Instant::now(),
+        });
+    replay_pending_treekem_events(&state, group_key, None).await;
+    assert!(
+        !state.named_groups.read().await.contains_key(group_key),
+        "the replayed self-removal takes the record away"
+    );
+    assert_metadata_stopped(&state, group_key, &meta, "a distinct-key self-removal").await;
+    assert_public_stopped(&state, &stable, "a distinct-key self-removal").await;
+    Ok(())
+}
+
+/// #2124 item 1: an accepted event that keeps the record keeps both
+/// listeners on the same path.
+#[tokio::test]
+async fn issue2124_rename_applied_outside_the_listener_keeps_both_listeners() -> Result<()> {
+    let group_id = "2124-replay-rename-key";
+    let (state, _dir, stable) = signed_public_fixture("2124-replay-rename", group_id).await?;
+    let parent = state
+        .named_groups
+        .read()
+        .await
+        .get(group_id)
+        .cloned()
+        .context("fixture record")?;
+    let meta = metadata_task(&state, group_id).await?;
+    let mut next = parent.clone();
+    next.name = "renamed".to_string();
+    next.roster_revision = next.roster_revision.saturating_add(1);
+    let event = NamedGroupMetadataEvent::GroupMetadataUpdated {
+        group_id: stable.clone(),
+        revision: next.roster_revision,
+        actor: local_hex(&state),
+        name: Some(next.name.clone()),
+        description: None,
+        commit: Some(sign_metadata_terminality_commit(
+            &parent,
+            &next,
+            &state,
+            now_millis_u64(),
+        )),
+    };
+    let applied =
+        apply_named_group_metadata_event(&state, event, state.agent.agent_id(), true, None).await;
+    assert!(applied.accepted, "the signed rename applies");
+    assert!(
+        state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .is_some_and(|info| info.name == "renamed"),
+        "the rename keeps the record"
+    );
+    assert!(
+        state
+            .named_group_test_recorders
+            .metadata_retire_steps
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0,
+        "the apply reached its metadata-listener stop check"
+    );
+    settle().await;
+    assert!(
+        metadata_registered(&state, group_id).await && !meta.is_finished(),
+        "the metadata listener keeps running"
+    );
+    assert_public_running(&state, &stable, "a replayed rename").await;
+    Ok(())
+}
+
+/// #2124 item 2: a pending join stub whose attempt entry is gone (its
+/// stub marker survived, the attempt registry did not) has its metadata
+/// listener, and the legacy `TimedOut` owner finalizes it with no listener
+/// token. That finalize stops the listener too.
+#[tokio::test]
+async fn issue2124_legacy_timed_out_stub_stops_its_metadata_listener() -> Result<()> {
+    let group_id = "2124-legacy-stub-key";
+    let (state, _dir, stable) = signed_public_fixture("2124-legacy-stub", group_id).await?;
+    let member = local_hex(&state);
+    if let Some(info) = state.named_groups.write().await.get_mut(group_id) {
+        info.members_v2.remove(&member);
+    }
+    let meta = metadata_task(&state, group_id).await?;
+    state
+        .pending_join_stubs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(group_id.to_string());
+    assert!(
+        state
+            .pending_join_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty(),
+        "precondition: no attempt owns the stub"
+    );
+    let lock = group_membership_lock_for_known_group(&state, group_id)
+        .await
+        .context("known group")?;
+    let guard = lock.lock().await;
+    let disposition = finalize_join_attempt_with_reason(
+        &state,
+        group_id,
+        &stable,
+        &member,
+        "legacy",
+        JoinAttemptOutcome::TimedOut,
+        None,
+        JoinFinalizeGuard::Owned(guard),
+    )
+    .await;
+    assert!(
+        matches!(disposition, JoinFinalizeDisposition::Finalized),
+        "the legacy owner finalizes the pending stub"
+    );
+    assert!(
+        !state.named_groups.read().await.contains_key(group_id),
+        "the timeout removes the pending stub"
+    );
+    assert_metadata_stopped(&state, group_id, &meta, "a legacy timed-out stub").await;
+    assert_public_stopped(&state, &stable, "a legacy timed-out stub").await;
+    Ok(())
+}
+
+/// #2124 item 5: listeners for groups with no stored record are capped.
+/// Past the cap such an install runs nothing; a stored group still gets
+/// its listener.
+#[tokio::test]
+async fn issue2124_unrecorded_public_listeners_are_capped() -> Result<()> {
+    let group_id = "2124-cap-key";
+    let (state, _dir, stable) = signed_public_fixture("2124-cap", group_id).await?;
+    let unrecorded = |i: usize| format!("{i:064x}");
+    for i in 0..MAX_UNRECORDED_PUBLIC_MESSAGE_LISTENERS {
+        spawn_public_message_listener(Arc::clone(&state), unrecorded(i)).await;
+    }
+    let installed = state.public_message_tasks.read().await.len();
+    assert_eq!(
+        installed,
+        MAX_UNRECORDED_PUBLIC_MESSAGE_LISTENERS + 1,
+        "the fixture's listener and one per unrecorded id up to the cap"
+    );
+    let over = unrecorded(MAX_UNRECORDED_PUBLIC_MESSAGE_LISTENERS);
+    spawn_public_message_listener(Arc::clone(&state), over.clone()).await;
+    assert!(
+        !public_registered(&state, &over).await,
+        "an unrecorded install past the cap is refused"
+    );
+    // The public-cache read refuses a further unrecorded group with a
+    // typed error.
+    let (status, body) = response_json(
+        get_group_public_messages(
+            State(Arc::clone(&state)),
+            Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+            Path(over.clone()),
+            Query(GetMessagesQuery::default()),
+            crate::server::group_access::GroupAccess::for_test_unknown(&over),
+        )
+        .await
+        .into_response(),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["reason"], "public_listener_cap", "{body}");
+
+    // A stored group is not counted against the cap.
+    if let Some(handle) = state.public_message_tasks.write().await.remove(&stable) {
+        handle.abort();
+    }
+    settle().await;
+    assert!(
+        eventually(|| async { live(&stable) == 0 }).await,
+        "precondition: the stored group's listener has ended"
+    );
+    reconcile_public_message_listener(&state, group_id).await;
+    settle().await;
+    assert_public_running(&state, &stable, "a stored group past the cap").await;
+    Ok(())
+}
+
+/// #2124 (Fable review of 6d1e440e): two installs that both pass the cap
+/// pre-check race to the insert. The check under the registry write lock
+/// refuses the one past the cap, and that install's task does not run on.
+#[tokio::test]
+async fn issue2124_the_insert_check_refuses_an_install_that_raced_past_the_cap() -> Result<()> {
+    let group_id = "2124-race-key";
+    let (state, _dir, _stable) = signed_public_fixture("2124-race", group_id).await?;
+    let unrecorded = |i: usize| format!("{:064x}", i + 0x2124_0000);
+    for i in 0..MAX_UNRECORDED_PUBLIC_MESSAGE_LISTENERS - 1 {
+        spawn_public_message_listener(Arc::clone(&state), unrecorded(i)).await;
+    }
+    let first = unrecorded(1_000);
+    let second = unrecorded(1_001);
+    assert!(
+        !unrecorded_public_listener_cap_reached(&state, &first).await
+            && !unrecorded_public_listener_cap_reached(&state, &second).await,
+        "precondition: both installs pass the cap pre-check"
+    );
+    tokio::join!(
+        spawn_public_message_listener(Arc::clone(&state), first.clone()),
+        spawn_public_message_listener(Arc::clone(&state), second.clone()),
+    );
+    let first_in = public_registered(&state, &first).await;
+    let second_in = public_registered(&state, &second).await;
+    assert!(
+        first_in != second_in,
+        "exactly one raced install is registered (first {first_in}, second {second_in})"
+    );
+    let (kept, refused) = if first_in {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    settle().await;
+    assert!(
+        eventually(|| async { live(&kept) == 1 }).await,
+        "the registered install runs"
+    );
+    assert_eq!(live(&refused), 0, "the refused install's task does not run");
+    Ok(())
+}
+
+/// #2124 (orchestrator decision on 6d1e440e): at the cap the public-cache
+/// read still serves what is stored for an unrecorded group, with 200, and
+/// starts no listener for it.
+#[tokio::test]
+async fn issue2124_at_the_cap_the_read_serves_stored_history() -> Result<()> {
+    let group_id = "2124-history-key";
+    let (state, _dir, _stable) = signed_public_fixture("2124-history", group_id).await?;
+    let unrecorded = |i: usize| format!("{:064x}", i + 0x2125_0000);
+    for i in 0..MAX_UNRECORDED_PUBLIC_MESSAGE_LISTENERS {
+        spawn_public_message_listener(Arc::clone(&state), unrecorded(i)).await;
+    }
+    let stored_id = unrecorded(5_000);
+    let author = x0x::identity::AgentKeypair::generate()?;
+    let message = x0x::groups::GroupPublicMessage::sign(
+        stored_id.clone(),
+        "state-hash-1".into(),
+        1,
+        &author,
+        None,
+        x0x::groups::GroupPublicMessageKind::Chat,
+        "kept".to_string(),
+        1_000,
+        None,
+        None,
+        None,
+    )?;
+    state
+        .public_messages
+        .write()
+        .await
+        .entry(stored_id.clone())
+        .or_default()
+        .push(message);
+    let (status, body) = response_json(
+        get_group_public_messages(
+            State(Arc::clone(&state)),
+            Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+            Path(stored_id.clone()),
+            Query(GetMessagesQuery::default()),
+            crate::server::group_access::GroupAccess::for_test_unknown(&stored_id),
+        )
+        .await
+        .into_response(),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["messages"][0]["body"], "kept",
+        "the stored message is served: {body}"
+    );
+    assert!(
+        !public_registered(&state, &stored_id).await,
+        "no listener starts past the cap"
     );
     Ok(())
 }
