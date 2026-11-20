@@ -36,6 +36,23 @@ pub(super) fn refused(reason: impl Into<String>) -> io::Error {
     io::Error::other(Refused(reason.into()))
 }
 
+/// An error from before the `exec`: the launcher never tried to become the
+/// daemon (a lock wait that ran out, a trial in flight, a missing daemon).
+#[derive(Debug)]
+struct NotExecuted(String);
+
+impl std::fmt::Display for NotExecuted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotExecuted {}
+
+fn not_executed(kind: io::ErrorKind, reason: impl Into<String>) -> io::Error {
+    io::Error::new(kind, NotExecuted(reason.into()))
+}
+
 pub(super) fn is_refusal(error: &io::Error) -> bool {
     error.get_ref().is_some_and(|inner| inner.is::<Refused>())
 }
@@ -108,8 +125,11 @@ impl Issuer for NoIssuer {
 /// launcher as it ends a direct job. `stop` reads the stop flag. Only the
 /// argv's trial form (`--host-root ... --instance ...`) consults the
 /// journal issuer; the plain form is always a passthrough.
+/// After a passthrough of the trial form, `held` holds the daemon install
+/// lock: the caller keeps it until the `exec`, which closes it (#2012).
 pub(crate) fn start(
     args: &issuer::LauncherArgs,
+    held: &mut Option<std::fs::File>,
     arm: impl FnOnce(),
     stop: impl FnMut() -> bool,
 ) -> Start {
@@ -120,16 +140,82 @@ pub(crate) fn start(
     match &args.trial {
         None => start_with(&NoIssuer, &args.command, arm, Clock::now, stop, pause),
         Some(trial) => with_refusal_record(&trial.host_root, || {
-            start_with(
-                &issuer::JournalIssuer(trial),
-                &args.command,
-                arm,
-                Clock::now,
-                stop,
-                pause,
-            )
+            let issuer = issuer::JournalIssuer {
+                args: trial,
+                held: std::cell::RefCell::new(None),
+            };
+            let started = start_with(&issuer, &args.command, arm, Clock::now, stop, pause);
+            if started == Start::Passthrough {
+                *held = issuer.held.into_inner();
+            }
+            started
         }),
     }
+}
+
+/// One passthrough `exec` attempt (#2118 review). A trial-form start takes
+/// the daemon install lock and reads the records again before it becomes
+/// the daemon; while the daemon is missing it holds no lock and does not
+/// `exec` at all, but returns `NotFound`, so the missing-daemon wait
+/// (#1379) tries again later. An `exec` that finds the daemon missing
+/// releases the lock, so no producer or CLI apply waits on that wait.
+/// Nothing changes while the engine is held.
+pub(crate) fn exec_locked(
+    args: &issuer::LauncherArgs,
+    held: &mut Option<std::fs::File>,
+    exec: impl FnMut(&forward::DaemonCommand) -> io::Error,
+) -> io::Error {
+    exec_locked_with(ENABLED, args, held, exec)
+}
+
+pub(super) fn exec_locked_with(
+    enabled: bool,
+    args: &issuer::LauncherArgs,
+    held: &mut Option<std::fs::File>,
+    mut exec: impl FnMut(&forward::DaemonCommand) -> io::Error,
+) -> io::Error {
+    if let (true, Some(trial)) = (enabled, &args.trial) {
+        if let Err(error) = issuer::relock(trial, &args.command, held) {
+            if is_refusal(&error) {
+                return error;
+            }
+            return not_executed(error.kind(), error.to_string());
+        }
+        if held.is_none() {
+            return not_executed(
+                io::ErrorKind::NotFound,
+                "the daemon is missing; no install lock is held",
+            );
+        }
+    }
+    let error = exec(&args.command);
+    if forward::is_missing(&error) {
+        *held = None;
+    }
+    error
+}
+
+/// How the launcher ends after its passthrough `exec` failed. A typed
+/// refusal from the re-read under the install lock (`relock`) is final, as
+/// it is at the start, and leaves the refusal record; every other error is
+/// a failed read (75) (#2118 review).
+pub(crate) fn exec_failed(args: &issuer::LauncherArgs, error: &io::Error) -> Start {
+    if !is_refusal(error) {
+        let tried = !error
+            .get_ref()
+            .is_some_and(|inner| inner.is::<NotExecuted>());
+        eprintln!(
+            "x0x-launcher: {} {}: {error}",
+            if tried { "cannot exec" } else { "did not exec" },
+            args.command.executable.display()
+        );
+        return Start::Exit(EXIT_TEMPFAIL);
+    }
+    let started = final_start(error.to_string());
+    if let (Some(trial), Start::Final(reason)) = (&args.trial, &started) {
+        record_refusal(&trial.host_root, reason);
+    }
+    started
 }
 
 /// Run one trial-form start between the two refusal-record steps: remove
@@ -419,7 +505,10 @@ mod tests {
             }),
             command: command(),
         };
-        assert_eq!(start(&args, || armed = true, || false), Start::Passthrough);
+        assert_eq!(
+            start(&args, &mut None, || armed = true, || false),
+            Start::Passthrough
+        );
         assert!(!armed);
     }
 

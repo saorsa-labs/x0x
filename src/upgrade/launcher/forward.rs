@@ -57,7 +57,7 @@ const MISSING_FIRST_WAIT: std::time::Duration = std::time::Duration::from_secs(1
 const MISSING_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The `exec` error of a daemon path that does not exist (now).
-fn is_missing(error: &io::Error) -> bool {
+pub(crate) fn is_missing(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ENOTDIR)
 }
 

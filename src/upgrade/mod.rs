@@ -323,18 +323,19 @@ pub(super) fn acquire_install_lock(
     target: &Path,
 ) -> Result<install_lock::InstallLock, UpgradeError> {
     let lock_path = host_upgrade_lock_path(target);
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .map_err(|source| {
-            UpgradeError::Other(format!(
-                "failed to take host upgrade lock at {}: {source}",
-                lock_path.display()
-            ))
-        })?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(&lock_path).map_err(|source| {
+        UpgradeError::Other(format!(
+            "failed to take host upgrade lock at {}: {source}",
+            lock_path.display()
+        ))
+    })?;
     install_lock::InstallLock::take(file).map_err(|source| {
         UpgradeError::Other(format!(
             "failed to take host upgrade lock at {}: {source}",
