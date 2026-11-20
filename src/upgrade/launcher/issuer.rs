@@ -47,7 +47,14 @@ pub(super) struct JournalIssuer<'a> {
 impl start::Issuer for JournalIssuer<'_> {
     fn issue(&self, command: &forward::DaemonCommand) -> io::Result<Option<start::Issued>> {
         let uid = effective_uid();
-        issue_held(self.args, command, uid, uid, &mut self.held.borrow_mut())
+        issue_held(
+            self.args,
+            command,
+            uid,
+            uid,
+            &mut self.held.borrow_mut(),
+            false,
+        )
     }
 }
 
@@ -69,7 +76,7 @@ fn issue_with(
     root_uid: u32,
     record_uid: u32,
 ) -> io::Result<Option<start::Issued>> {
-    issue_held(args, command, root_uid, record_uid, &mut None)
+    issue_held(args, command, root_uid, record_uid, &mut None, false)
 }
 
 /// Read the host journal and the trial record under the daemon install
@@ -79,13 +86,17 @@ fn issue_with(
 /// passthrough would `exec` the candidate unsupervised. A passthrough
 /// leaves the lock in `held`, so the caller keeps it until the `exec`
 /// (the descriptor is close-on-exec). A trial start releases it, since
-/// `Host::locked` takes the CLI and daemon locks itself.
+/// `Host::locked` takes the CLI and daemon locks itself. `retired` is set
+/// by `relock` after a start retired its trial: a committed host whose
+/// trial for this instance is Committed is then the steady state, and its
+/// passthrough keeps the lock as an ordinary one does.
 fn issue_held(
     args: &TrialArgs,
     command: &forward::DaemonCommand,
     root_uid: u32,
     record_uid: u32,
     held: &mut Option<File>,
+    retired: bool,
 ) -> io::Result<Option<start::Issued>> {
     let root = open_root(&args.host_root, root_uid)?;
     let daemon = daemon_lock(Path::new(&command.executable), DAEMON_LOCK_WAIT)?;
@@ -94,8 +105,13 @@ fn issue_held(
         *held = daemon.map(|(_, lock)| lock);
         return Ok(None);
     };
-    if !owns_trial(record.phase)? {
+    let passthrough = if owns_trial(record.phase)? {
+        retired && committed_trial(args, &root, record.phase)?
+    } else {
         no_authority(args, &root)?;
+        true
+    };
+    if passthrough {
         if let Some((canonical, _)) = &daemon {
             if *canonical != record.plan.daemon.target_path {
                 return Err(start::refused(
@@ -196,7 +212,18 @@ fn daemon_lock_with(
                 canonical.display()
             )));
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            // A symlink, directory or other non-regular file at the lock
+            // path stays so: a fixed refusal, as for EACCES above.
+            let path = recovery::lock_path(&canonical);
+            if std::fs::symlink_metadata(&path).is_ok_and(|m| !m.file_type().is_file()) {
+                return Err(start::refused(format!(
+                    "the install lock {} is not a regular file ({error})",
+                    path.display()
+                )));
+            }
+            return Err(error);
+        }
     };
     let deadline = std::time::Instant::now() + wait;
     loop {
@@ -229,10 +256,11 @@ fn daemon_lock_with(
     }
 }
 
-/// Before a passthrough `exec` of a trial-form start that found no daemon:
-/// read the records again under the daemon install lock and keep it in
-/// `held` (#2118 review). A trial that is now in flight is left to the next
-/// start, which owns it: a failed read (75).
+/// Before a passthrough `exec` of a trial-form start that holds no lock
+/// (it found no daemon, or it retired its trial on a committed host): read
+/// the records again under the daemon install lock and keep it in `held`
+/// (#2118 review). A trial that is in flight, not this instance's retired
+/// one, is left to the next start, which owns it: a failed read (75).
 pub(super) fn relock(
     args: &TrialArgs,
     command: &forward::DaemonCommand,
@@ -242,7 +270,7 @@ pub(super) fn relock(
         return Ok(());
     }
     let uid = effective_uid();
-    match issue_held(args, command, uid, uid, held)? {
+    match issue_held(args, command, uid, uid, held, true)? {
         None => Ok(()),
         Some(_) => Err(io::Error::other(
             "a trial is now in flight; the next start owns it",
@@ -317,6 +345,24 @@ fn no_authority(args: &TrialArgs, root: &File) -> io::Result<()> {
             "an unfinished trial exists without an in-flight host journal",
         )),
     }
+}
+
+/// A retired trial: the host is committed and this instance's trial record
+/// is Committed. A trial is saved Committed only under the host lock while
+/// the journal is HostCommitted (`run::retire`), and only a new producer
+/// transaction, under the install lock, moves the journal on.
+fn committed_trial(args: &TrialArgs, root: &File, phase: journal::Phase) -> io::Result<bool> {
+    if phase != journal::Phase::HostCommitted {
+        return Ok(false);
+    }
+    let bytes = match read_record_at(root, coordinator::TRIAL_FILE_NAME) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let trial: Trial =
+        serde_json::from_slice(&bytes).map_err(|_| start::refused("trial record is unreadable"))?;
+    Ok(trial.phase == Phase::Committed && trial.instance == args.instance)
 }
 
 /// Whether the journal phase gives the launcher trial authority. Before
@@ -716,7 +762,7 @@ mod tests {
         let (args, command) = matching(&record);
         let mut held = None;
         let uid = effective_uid();
-        assert!(issue_held(&args, &command, uid, uid, &mut held)
+        assert!(issue_held(&args, &command, uid, uid, &mut held, false)
             .unwrap()
             .is_none());
         assert!(held.is_some());
@@ -727,7 +773,7 @@ mod tests {
         let (_dir, _root, record) = rooted(journal::Phase::SwappedCli);
         let (args, command) = matching(&record);
         let mut held = None;
-        assert!(issue_held(&args, &command, uid, uid, &mut held)
+        assert!(issue_held(&args, &command, uid, uid, &mut held, false)
             .unwrap()
             .is_some());
         assert!(held.is_none());
@@ -745,7 +791,8 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
             let uid = effective_uid();
-            let issued = issue_held(&args, &command, uid, uid, &mut None).map(|i| i.is_none());
+            let issued =
+                issue_held(&args, &command, uid, uid, &mut None, false).map(|i| i.is_none());
             sender.send(issued.unwrap()).unwrap();
         });
         assert!(receiver
@@ -773,7 +820,8 @@ mod tests {
         let waiter = std::thread::spawn(move || {
             let uid = effective_uid();
             let mut held = None;
-            let issued = issue_held(&args, &command, uid, uid, &mut held).map(|i| i.is_none());
+            let issued =
+                issue_held(&args, &command, uid, uid, &mut held, false).map(|i| i.is_none());
             sender.send((issued.unwrap(), held.is_some())).unwrap();
         });
         assert!(receiver
@@ -814,7 +862,7 @@ mod tests {
             command.executable = missing.into_os_string();
             let mut held = None;
             let uid = effective_uid();
-            assert!(issue_held(&args, &command, uid, uid, &mut held)
+            assert!(issue_held(&args, &command, uid, uid, &mut held, false)
                 .unwrap()
                 .is_none());
             assert!(held.is_none());
@@ -906,6 +954,118 @@ mod tests {
         let error = relock(&args, &command, &mut held).unwrap_err();
         assert!(!start::is_refusal(&error), "{error}");
         assert!(held.is_none());
+    }
+
+    /// Save alice's trial record in `phase` under `record`'s host.
+    fn save_trial(root: &Path, record: &journal::JournalRecord, phase: Phase) {
+        let host = recovery::Host::new(root.to_path_buf(), record.clone()).unwrap();
+        let path = coordinator::trial_path(&host.plan().participants[0]);
+        let mut trial = Trial::new(
+            host.binding().unwrap(),
+            "alice".into(),
+            &Clock::now().unwrap(),
+        )
+        .unwrap();
+        if phase == Phase::Committed {
+            trial.attempts = 1;
+        }
+        trial.phase = phase;
+        trial.save(&path).unwrap();
+    }
+
+    /// #2118 review: after a start retired its trial on a committed host,
+    /// the passthrough takes the install lock, checks the journal's daemon
+    /// target and `exec`s under the lock, not a 75 loop. Another daemon is
+    /// still refused, and an unretired trial is still left to the next
+    /// start.
+    #[test]
+    fn a_retired_trial_passthrough_execs_under_the_install_lock() {
+        let (dir, root, record) = rooted(journal::Phase::HostCommitted);
+        save_trial(&root, &record, Phase::Committed);
+        let (trial, command) = matching(&record);
+        let mut args = LauncherArgs {
+            trial: Some(trial),
+            command,
+        };
+        let mut held = None;
+        let mut execs = 0;
+        let error = start::exec_locked_with(true, &args, &mut held, |command| {
+            execs += 1;
+            assert!(!lock_is_free(&command.executable), "exec under the lock");
+            io::Error::other("exec")
+        });
+        assert_eq!(error.to_string(), "exec");
+        assert_eq!(execs, 1);
+        assert!(held.is_some());
+
+        let other = dir.path().canonicalize().unwrap().join("other-x0xd");
+        std::fs::write(&other, b"").unwrap();
+        args.command.executable = other.into_os_string();
+        let mut held = None;
+        let error = start::exec_locked_with(true, &args, &mut held, |_| {
+            panic!("no exec of another daemon")
+        });
+        assert!(start::is_refusal(&error), "{error}");
+        assert!(held.is_none());
+
+        let (trial, command) = matching(&record);
+        std::fs::remove_file(root.join(coordinator::TRIAL_FILE_NAME)).unwrap();
+        save_trial(&root, &record, Phase::Authorized);
+        let args = LauncherArgs {
+            trial: Some(trial),
+            command,
+        };
+        let error = start::exec_locked_with(true, &args, &mut held, |_| {
+            panic!("no exec while a trial is unretired")
+        });
+        assert!(!start::is_refusal(&error), "{error}");
+        assert!(held.is_none());
+    }
+
+    /// #2118 review: a typed refusal from the re-read before the `exec` is
+    /// final and leaves the refusal record; any other `exec` error is a
+    /// failed read (75).
+    #[test]
+    fn a_refusal_at_the_exec_is_final() {
+        let (_dir, root, record) = rooted(journal::Phase::Prepared);
+        let (trial, command) = matching(&record);
+        let args = LauncherArgs {
+            trial: Some(trial),
+            command,
+        };
+        let refusal =
+            start::refused("the launcher's daemon is not the host journal's daemon target");
+        assert!(matches!(
+            start::exec_failed(&args, &refusal),
+            start::Start::Final(reason) if reason.contains("daemon target")
+        ));
+        assert!(root.join(contract::REFUSAL_FILE_NAME).is_file());
+        assert_eq!(
+            start::exec_failed(&args, &io::Error::from(io::ErrorKind::PermissionDenied)),
+            start::Start::Exit(start::EXIT_TEMPFAIL)
+        );
+    }
+
+    /// #2118 review: a symlink or a directory at the install lock path
+    /// stays so; it is a typed refusal, not a 75 loop.
+    #[test]
+    fn an_install_lock_that_is_not_a_regular_file_is_refused() {
+        let (dir, _root, record) = rooted(journal::Phase::Prepared);
+        let (args, command) = matching(&record);
+        let lock = recovery::lock_path(&record.plan.daemon.target_path);
+        let elsewhere = dir.path().canonicalize().unwrap().join("elsewhere.lock");
+        std::fs::write(&elsewhere, b"").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &lock).unwrap();
+        assert!(
+            refused(issue_as(&args, &command, effective_uid())),
+            "symlink"
+        );
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        assert!(
+            refused(issue_as(&args, &command, effective_uid())),
+            "directory"
+        );
     }
 
     /// #2118 review: an install lock this account cannot create is a typed

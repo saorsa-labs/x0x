@@ -175,6 +175,25 @@ pub(super) fn exec_locked_with(
     error
 }
 
+/// How the launcher ends after its passthrough `exec` failed. A typed
+/// refusal from the re-read under the install lock (`relock`) is final, as
+/// it is at the start, and leaves the refusal record; every other error is
+/// a failed read (75) (#2118 review).
+pub(crate) fn exec_failed(args: &issuer::LauncherArgs, error: &io::Error) -> Start {
+    if !is_refusal(error) {
+        eprintln!(
+            "x0x-launcher: cannot exec {}: {error}",
+            args.command.executable.display()
+        );
+        return Start::Exit(EXIT_TEMPFAIL);
+    }
+    let started = final_start(error.to_string());
+    if let (Some(trial), Start::Final(reason)) = (&args.trial, &started) {
+        record_refusal(&trial.host_root, reason);
+    }
+    started
+}
+
 /// Run one trial-form start between the two refusal-record steps: remove
 /// the record an earlier start left before the start, since a start that
 /// supervises the daemon returns only when the daemon ends (#2019 review);

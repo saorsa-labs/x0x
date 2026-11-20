@@ -49,25 +49,10 @@ fn main() -> std::process::ExitCode {
         // The daemon install lock a trial-form passthrough read its records
         // under; the `exec` below closes it (#2012).
         let mut held = None;
-        match launcher::start::start(&args, &mut held, arm, || STOP.load(Ordering::Relaxed)) {
-            // launchd restarts every exit of a KeepAlive job, so a final
-            // refusal holds until a stop instead (#1379). Its reason is in
-            // the host root for `x0x doctor`.
-            #[cfg(target_os = "macos")]
-            launcher::start::Start::Final(_) => {
-                eprintln!("x0x-launcher: holding until stopped (launchd would restart an exit)");
-                launcher::start::hold_final(
-                    || STOP.load(Ordering::Relaxed),
-                    || std::thread::sleep(std::time::Duration::from_secs(1)),
-                );
-                return std::process::ExitCode::from(0);
-            }
-            #[cfg(not(target_os = "macos"))]
-            launcher::start::Start::Final(_) => {
-                return std::process::ExitCode::from(launcher::start::EXIT_FINAL);
-            }
-            launcher::start::Start::Exit(status) => return std::process::ExitCode::from(status),
-            launcher::start::Start::Passthrough => {}
+        let started =
+            launcher::start::start(&args, &mut held, arm, || STOP.load(Ordering::Relaxed));
+        if let Some(code) = ended(started) {
+            return code;
         }
         // launchd restarts every exit of a KeepAlive job, so a missing
         // daemon is waited for instead (#1379). systemd's start limit ends
@@ -88,15 +73,38 @@ fn main() -> std::process::ExitCode {
             let mut exec = exec;
             exec(&args.command)
         };
-        eprintln!(
-            "x0x-launcher: cannot exec {}: {error}",
-            args.command.executable.display()
-        );
-        std::process::ExitCode::from(EXIT_TEMPFAIL)
+        ended(launcher::start::exec_failed(&args, &error))
+            .unwrap_or(std::process::ExitCode::from(EXIT_TEMPFAIL))
     }
     #[cfg(not(unix))]
     {
         eprintln!("x0x-launcher: process custody requires Unix");
         std::process::ExitCode::from(EXIT_UNAVAILABLE)
+    }
+}
+
+/// The exit of a start that does not become the daemon; `None` for a
+/// passthrough.
+#[cfg(unix)]
+fn ended(started: launcher::start::Start) -> Option<std::process::ExitCode> {
+    match started {
+        // launchd restarts every exit of a KeepAlive job, so a final
+        // refusal holds until a stop instead (#1379). Its reason is in
+        // the host root for `x0x doctor`.
+        #[cfg(target_os = "macos")]
+        launcher::start::Start::Final(_) => {
+            eprintln!("x0x-launcher: holding until stopped (launchd would restart an exit)");
+            launcher::start::hold_final(
+                || STOP.load(Ordering::Relaxed),
+                || std::thread::sleep(std::time::Duration::from_secs(1)),
+            );
+            Some(std::process::ExitCode::from(0))
+        }
+        #[cfg(not(target_os = "macos"))]
+        launcher::start::Start::Final(_) => {
+            Some(std::process::ExitCode::from(launcher::start::EXIT_FINAL))
+        }
+        launcher::start::Start::Exit(status) => Some(std::process::ExitCode::from(status)),
+        launcher::start::Start::Passthrough => None,
     }
 }
