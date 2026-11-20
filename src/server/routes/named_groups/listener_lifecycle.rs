@@ -123,9 +123,9 @@ pub(super) async fn retire_unwanted_metadata_listener(state: &AppState, group_ke
 }
 
 /// Stop the listeners that no stored record needs after an accepted
-/// metadata event of `group_id` (a stable id or local key). `local_keys`
-/// are the local keys of that group read before the apply, which can
-/// remove the record. [`apply_named_group_metadata_event`] calls this for
+/// metadata event of `group_id` (a stable id or local key). `ids` are the
+/// local keys and stable ids of that group read before the apply, which
+/// can remove the record. [`apply_named_group_metadata_event`] calls this for
 /// the topic listener, the direct lanes, catch-up, fetched control blobs,
 /// the parked-event replays and the recovery replays, and
 /// `replay_pending_treekem_events` calls it after its queue drain. Starts
@@ -145,15 +145,26 @@ pub(super) async fn retire_unwanted_metadata_listener(state: &AppState, group_ke
 pub(super) async fn retire_listeners_after_accepted_apply(
     state: &AppState,
     group_id: &str,
-    local_keys: &[String],
+    ids: &ListenerIds,
 ) {
     crate::server::reseat_scope::outside_reseat_scope(async {
         retire_unwanted_public_message_listener(state, group_id).await;
-        for key in local_keys {
+        for stable_id in ids.stable_ids.iter().filter(|id| id.as_str() != group_id) {
+            retire_unwanted_public_message_listener(state, stable_id).await;
+        }
+        for key in &ids.local_keys {
             retire_unwanted_metadata_listener(state, key).await;
         }
     })
     .await;
+}
+
+/// #2124: the registry keys of one group, read before an apply: the local
+/// map keys key the metadata registry, the stable ids key the public one.
+#[derive(Debug, Default)]
+pub(super) struct ListenerIds {
+    pub(super) local_keys: Vec<String>,
+    pub(super) stable_ids: Vec<String>,
 }
 
 /// Stop both listeners of a record the caller has just removed from

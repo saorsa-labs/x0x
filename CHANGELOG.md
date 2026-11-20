@@ -13,7 +13,8 @@ All notable changes to this project will be documented in this file.
   lanes already did. A restart-time `TimedOut` join stub stops its metadata
   listener. Listeners for groups with no local record (from
   `GET /groups/:id/messages`) are capped at 64; past the cap that read
-  answers a typed `429` `public_listener_cap`.
+  starts no listener, still serves stored history, and answers a typed
+  `429` `public_listener_cap` only when it has nothing to serve.
 - **Launcher issuer reads by directory descriptor and under the install
   lock (#2012; A14 amendment of 20 Nov 2026).** The dormant launcher reads
   the host journal and the trial record relative to the checked host-root
