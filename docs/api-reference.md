@@ -81,7 +81,8 @@ Auth-class labels used throughout this reference:
   ADR-0043 binding form of `/identity/revoke`, and (since #446) the
   owner-act surfaces `POST /agent/sign` (detached signatures outlive
   any session token), `POST /exec/run`, `POST /exec/cancel`,
-  `POST /shutdown`, `POST /upgrade/apply` (binary swap + restart =
+  `POST /shutdown`, `POST /report` (reads the daemon log tail, #1354),
+  `POST /upgrade/apply` (binary swap + restart =
   lifecycle act), `POST /upgrade/announce` (publishes a release for the
   whole network), `POST /sync/devices/enroll`,
   `POST /groups/:id/delegate` (signed capability with caller-chosen
@@ -259,6 +260,7 @@ daemon, so it shows the routes of the CLI build, not of a running `x0xd`.
 | GET | `/health` | `x0x health` | Health probe with the M1 structured verdict (#1380); the node-specific detail is gated to loopback/authenticated callers (see the privacy boundary below) |
 | GET | `/status` | `x0x status` | Runtime status, bound API address, connectivity, peers, warnings, `gui_idle_timeout_secs` (effective GUI session idle timeout) |
 | POST | `/shutdown` | `x0x stop` | Gracefully stop the daemon |
+| POST | `/report` | `x0x report` | Authenticated (durable owner only). Builds a redacted problem-report bundle and stores it as `<data_dir>/reports/x0x-report-<unix-secs>.json` (mode 0600, directory 0700). Nothing is sent. One report per minute per daemon (`429` with `retry_after_secs`); the newest 10 bundles are kept and older ones deleted. `201` body: `path`, `file_name`, `schema`, `created_unix`, `size_bytes`, `log_lines`, `log_lines_dropped_for_size`, `older_reports_deleted`, `sent: false` (#1354 slice 2; see below) |
 | POST | `/auth/session` | `x0x auth session` | Exchange the durable API token for a short-lived browser session token (WS1.6). Response: `session_token`, `expires_in`, `idle_timeout_secs`; a mint counts as user activity |
 | POST | `/auth/session/refresh` | `x0x auth refresh` | Swap a **session** token for a fresh 10-minute one. Optional body `{"idle_ms": n}`: milliseconds since the client's last user input; the daemon moves the session's last activity to `now - idle_ms` when later, never past now. No body (or no `idle_ms`) is a background refresh and does not extend the session: a client that only refreshes this way now ends after the idle timeout (60 min by default), where it had 12 h before. Idle time is wall-clock time, so time asleep counts. A wall-clock step back of up to 60 s freezes the store's time at the high-water mark until the wall clock passes it; a larger step back ends every session, and users sign in again. The token can be live or lapsed; a lapsed token is accepted on this route only. Refused (`401`) once the session has had no recorded activity for the idle timeout (default 60 min; `gui_idle_timeout_minutes`, `--gui-idle-timeout-minutes`, `X0X_GUI_IDLE_TIMEOUT_MINUTES`, 1–1440). The durable token gets `403`, a malformed or oversized body (over 1 024 bytes) `400`, and the replaced token stops working at once. Response: `session_token`, `expires_in`, `idle_timeout_secs` (#893) |
 | POST | `/auth/session/revoke` | `x0x auth revoke` | End the caller's own **session**: the bearer session token stops working at once and a pending GUI show bound to it is dropped. Ends every token of the session's lineage, so a refresh that raced the sign-out is ended too. Accepts any session token refresh accepts (live, or lapsed inside the idle timeout), or a token a refresh replaced while the session is live; the durable token gets `403`. Open WebSocket and SSE streams of a revoked or idle-expired session are not closed: such a stream can outlive sign-out until the client disconnects, with no time bound. Response: `{"revoked": bool}` |
@@ -451,6 +453,26 @@ unix: an existing file or a symlink at the path is refused, never
 overwritten or followed. The file stays on the
 owner's machine: this slice adds no sending (`POST /report` and opt-in
 maintainer delivery are later slices of #1354).
+
+`POST /report` / `x0x report` (#1354 slice 2) builds a problem-report
+bundle inside the daemon and stores it locally; it sends nothing. The
+bundle (`schema: "x0x-report-bundle"`, `version: 1`) holds only these
+sections: `generator`, `host` (OS, architecture, uptime), `identity`
+(agent and machine ids as 8-character prefixes only), `health` (the
+`GET /health?detail=redacted` body), `data_dir` (the top-level entries
+of the data directory by name, kind and size; no file is opened) and
+`log_tail` (the last 200 lines of the daemon log file when `X0X_LOG_DIR`
+is set, read from at most the last 128 KiB). Every string then passes a
+redactor: the API token and contact labels are removed, the data
+directory, home directory, `/Users/<name>` / `/home/<name>` segments and
+the user name are replaced, quoted log values are removed (a JSON log
+line keeps only timestamp, level, target and message), hex runs of 16 or
+more characters are cut to an 8-character prefix, and base64-like runs
+of 32 or more characters are removed. Each log line is cut to 400
+characters and the whole bundle to 256 KiB (oldest log lines are dropped
+first). Unquoted free text in a log message that matches none of these
+rules is kept, so the bundle stays owner-local; sending a report to the
+owner's other devices or to maintainers is a later slice.
 
 ### Example: status
 
