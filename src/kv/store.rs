@@ -843,6 +843,10 @@ pub struct KvStore {
     /// #1970: retained-image admission state; not persisted.
     #[serde(skip, default)]
     image: ImageAdmission,
+
+    /// #2110: the last [`Self::orset_digest`]; not persisted.
+    #[serde(skip, default)]
+    orset_digest_cache: OrsetDigestCache,
 }
 
 impl std::fmt::Debug for KvStore {
@@ -876,7 +880,23 @@ impl std::fmt::Debug for KvStore {
 /// to `T::default()` on EOF / any malformed tail, makes such a blob load with
 /// the newer fields defaulted rather than failing outright. Only sound at
 /// stream-EOF for genuinely trailing fields (see the struct's TRAILING note).
-fn de_tolerant<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+/// The last OR-Set digest with the `(version, keys.version())` it was
+/// computed at. Every path that changes the OR-Set moves the store version.
+#[derive(Debug, Default)]
+struct OrsetDigestCache(std::sync::Mutex<Option<(u64, u64, [u8; 32])>>);
+
+impl Clone for OrsetDigestCache {
+    fn clone(&self) -> Self {
+        Self(std::sync::Mutex::new(
+            *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        ))
+    }
+}
+
+pub(crate) fn de_tolerant<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: serde::Deserialize<'de> + Default,
@@ -995,6 +1015,7 @@ impl KvStore {
             seq_counter: Arc::new(AtomicU64::new(0)),
             secure: None,
             image: ImageAdmission::default(),
+            orset_digest_cache: OrsetDigestCache::default(),
         })
     }
 
@@ -1053,6 +1074,7 @@ impl KvStore {
             seq_counter: Arc::new(AtomicU64::new(0)),
             secure: Some(ctx),
             image: ImageAdmission::default(),
+            orset_digest_cache: OrsetDigestCache::default(),
         })
     }
 
@@ -1212,6 +1234,7 @@ impl KvStore {
             seq_counter: Arc::new(AtomicU64::new(0)),
             secure: None,
             image: ImageAdmission::default(),
+            orset_digest_cache: OrsetDigestCache::default(),
         }
     }
 
@@ -1242,6 +1265,7 @@ impl KvStore {
             seq_counter: Arc::new(AtomicU64::new(0)),
             secure: None,
             image: ImageAdmission::default(),
+            orset_digest_cache: OrsetDigestCache::default(),
         }
     }
 
@@ -1346,6 +1370,7 @@ impl KvStore {
             seq_counter: default_seq_counter(),
             secure: None,
             image: ImageAdmission::default(),
+            orset_digest_cache: OrsetDigestCache::default(),
         }
     }
 
@@ -2481,6 +2506,12 @@ impl KvStore {
         }
     }
 
+    /// Whether this replica holds an entry for `key`: the test
+    /// [`Self::remove`] applies.
+    pub(crate) fn holds_entry(&self, key: &str) -> bool {
+        self.entries.contains_key(key)
+    }
+
     /// Remove a key from the store.
     ///
     /// # Errors
@@ -2489,7 +2520,7 @@ impl KvStore {
     /// - [`KvError::ImmutableKey`] under [`AccessPolicy::AppendOnly`]: keys
     ///   can never be deleted, even by the owner.
     pub fn remove(&mut self, key: &str) -> Result<()> {
-        if !self.entries.contains_key(key) {
+        if !self.holds_entry(key) {
             return Err(KvError::KeyNotFound(key.to_string()));
         }
         if matches!(self.policy, AccessPolicy::AppendOnly) {
@@ -3921,6 +3952,62 @@ impl KvStore {
         served_content_digest(&self.id, &self.checkpoint_pairs())
     }
 
+    /// BLAKE3 over a domain tag, the store id and the canonical retained
+    /// OR-Set: live tags and tombstones in canonical order, with the
+    /// replica-local version and changelog cleared. Two replicas with the
+    /// same OR-Set state give the same digest whatever their values (#2110).
+    ///
+    /// Cached until the store version or the OR-Set version moves.
+    pub(crate) fn orset_digest(&self) -> Result<[u8; 32]> {
+        let at = (self.version, self.keys.version());
+        let mut cache = self
+            .orset_digest_cache
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((version, keys_version, digest)) = *cache {
+            if (version, keys_version) == at {
+                return Ok(digest);
+            }
+        }
+        let digest = self.orset_digest_uncached()?;
+        *cache = Some((at.0, at.1, digest));
+        Ok(digest)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn keys_canonical_for_test(
+        &self,
+    ) -> saorsa_gossip_crdt_sync::CanonicalRetainedOrSet<String> {
+        self.keys.canonical_retained_wire()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_id_for_test(&mut self, id: KvStoreId) {
+        self.id = id;
+    }
+
+    pub(crate) fn orset_digest_uncached(&self) -> Result<[u8; 32]> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"x0x.kv.orset-digest.v1");
+        hasher.update(self.id.as_bytes());
+        bincode::serialize_into(&mut hasher, &self.keys.canonical_retained_wire())?;
+        Ok(*hasher.finalize().as_bytes())
+    }
+
+    /// #2110: whether a matching OR-Set digest from `source` may wake a
+    /// repair inside its retry window; true at most once per window.
+    pub(crate) fn take_image_orset_skip(&mut self, source: &AgentId) -> bool {
+        self.image.take_orset_skip(source, now_ms())
+    }
+
+    /// Test-only: record a refused image merge from `source`, so its
+    /// pulls wait for the retry window.
+    #[cfg(test)]
+    pub(crate) fn refuse_image_source_for_test(&mut self, source: AgentId) {
+        self.image.note_refusal(source, 0, now_ms());
+    }
+
     /// Remove local keys absent from a digest-verified full-state serve
     /// (`delta.added` is then the verified complete entry set).
     ///
@@ -5051,6 +5138,84 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clear();
         }
+    }
+
+    /// The removal an owner publishes for a key it does not hold
+    /// (#2110): it names only the key.
+    fn removal_by_key(key: &str) -> KvStoreDelta {
+        let mut delta = KvStoreDelta::new(1);
+        delta.removed.insert(key.to_string(), HashSet::new());
+        delta
+    }
+
+    /// #2110 item 3, group store: a holder that receives the removal
+    /// tombstones its tags, and a holder that was offline loses the key at
+    /// its next retained-image merge with it.
+    #[test]
+    fn removal_by_key_reaches_an_offline_holder_of_a_group_store() {
+        let owner = agent(1);
+        let ctx = TestCtx::new(7, &[owner]);
+        let mut holder =
+            KvStore::new_group_signed(store_id(8), "Wiki".to_string(), owner, vec![7u8; 16], ctx)
+                .expect("holder");
+        holder
+            .put(
+                "k".to_string(),
+                b"v".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+        let mut offline = holder.clone();
+        holder
+            .merge_delta(&removal_by_key("k"), peer(2), Some(&owner))
+            .expect("removal");
+        assert!(holder.get("k").is_none(), "a live holder applies it");
+        offline
+            .merge_group_retained_image(&holder.served_image_for_test(), agent(7), peer(3))
+            .expect("retained image");
+        assert!(
+            offline.get("k").is_none(),
+            "the offline holder loses the key through the image tombstones"
+        );
+    }
+
+    /// #2110 item 3, plain store: cold sync is a full delta, which carries
+    /// no tombstones, so a holder that missed the removal keeps the key.
+    #[test]
+    fn removal_by_key_does_not_reach_an_offline_holder_of_a_plain_store() {
+        let owner = agent(1);
+        let mut holder = KvStore::new(
+            store_id(9),
+            "plain".to_string(),
+            owner,
+            AccessPolicy::Allowlisted,
+        )
+        .expect("holder");
+        holder
+            .put(
+                "k".to_string(),
+                b"v".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+        let mut offline = holder.clone();
+        holder
+            .merge_delta(&removal_by_key("k"), peer(2), Some(&owner))
+            .expect("removal");
+        assert!(holder.get("k").is_none(), "a live holder applies it");
+        offline
+            .merge_delta(
+                &holder.full_delta().expect("full delta"),
+                peer(2),
+                Some(&owner),
+            )
+            .expect("cold sync");
+        assert!(
+            offline.get("k").is_some(),
+            "known limit: a full delta carries no tombstone"
+        );
     }
 
     #[test]

@@ -879,6 +879,15 @@ enum KvSyncMessage {
         digest: [u8; 32],
         /// Number of entries in the declaring replica's set.
         entry_count: u32,
+        /// The declaring replica's [`KvStore::orset_digest`] (#2110).
+        ///
+        /// Wire compatibility: it is the last field of the last item in the
+        /// payload. An older receiver decodes with `bincode::deserialize`,
+        /// which allows trailing bytes, so it reads the two fields above and
+        /// ignores this one. An older sender's beacon ends before it;
+        /// bincode then fails at EOF and `de_tolerant` gives `None`.
+        #[serde(default, deserialize_with = "crate::kv::store::de_tolerant")]
+        orset_digest: Option<[u8; 32]>,
     },
 }
 
@@ -901,6 +910,10 @@ fn kv_sync_message_wire_matches_main() {
         ],
     );
 }
+
+#[cfg(test)]
+#[path = "beacon_orset_digest_tests.rs"]
+mod beacon_orset_digest_tests;
 
 /// One responder's latest v2 digest declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1116,6 +1129,46 @@ impl BeaconWakeGate {
         self.last_wake.insert(author, now);
         self.group_wakes.push_back(now);
         true
+    }
+}
+
+/// What a verified peer beacon asks of this replica.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BeaconWake {
+    /// The content digests match: nothing to repair.
+    InStep,
+    /// The digests differ, but this replica refused the author's image
+    /// merge at the image limit and its retry window is open (#1970).
+    Deferred,
+    /// The digests differ: offer the wake to the beacon wake gate.
+    Wake,
+    /// The digests differ inside the image back-off, and the beacon's
+    /// OR-Set digest equals the local one: wake only if the author's one
+    /// skip for this window is unused.
+    SkipBackoff,
+}
+
+/// The receiver rule for a peer beacon. A difference waits for the image
+/// back-off, except that a beacon whose OR-Set digest equals the local one
+/// may skip it once per window (#2110). The digest is the sender's claim
+/// and equal OR-Sets do not mean the merge fits, since values count in the
+/// measure; the merge is still measured, so this never admits anything.
+/// `local_orset` runs only inside the back-off with a declared digest.
+fn beacon_wake(
+    local_digest: [u8; 32],
+    digest: [u8; 32],
+    retry_due: bool,
+    orset_digest: Option<[u8; 32]>,
+    local_orset: impl FnOnce() -> Option<[u8; 32]>,
+) -> BeaconWake {
+    if local_digest == digest {
+        BeaconWake::InStep
+    } else if retry_due {
+        BeaconWake::Wake
+    } else if orset_digest.is_some_and(|theirs| local_orset() == Some(theirs)) {
+        BeaconWake::SkipBackoff
+    } else {
+        BeaconWake::Deferred
     }
 }
 
@@ -3380,13 +3433,18 @@ impl KvStoreSync {
                     let Some(store) = store.upgrade() else {
                         return;
                     };
-                    let (digest, entry_count) = {
+                    let (digest, entry_count, orset_digest) = {
                         let s = store.read().await;
-                        (s.served_digest(), s.checkpoint_pairs().len() as u32)
+                        (
+                            s.served_digest(),
+                            s.checkpoint_pairs().len() as u32,
+                            s.orset_digest().ok(),
+                        )
                     };
                     let beacon = KvSyncMessage::StateDigestBeacon {
                         digest,
                         entry_count,
+                        orset_digest,
                     };
                     // Same gate + deadline discipline as every other sealed
                     // control publication.
@@ -4452,6 +4510,7 @@ impl KvStoreSync {
                     KvSyncMessage::StateDigestBeacon {
                         digest,
                         entry_count: _,
+                        orset_digest,
                     } => {
                         // Beacons are sealed-plane only (#1117). One that
                         // decoded on a plaintext store was never published
@@ -4485,18 +4544,33 @@ impl KvStoreSync {
                         // bounded re-request tail; the repair serve is
                         // itself verified, so a beacon can neither inject
                         // nor truncate state.
-                        let (local_digest, retry_due) = {
+                        let (local_digest, wake) = {
                             let store = responder_store.read().await;
-                            (store.served_digest(), store.image_retry_due(&author))
+                            let local_digest = store.served_digest();
+                            let wake = beacon_wake(
+                                local_digest,
+                                digest,
+                                store.image_retry_due(&author),
+                                orset_digest,
+                                || store.orset_digest().ok(),
+                            );
+                            (local_digest, wake)
                         };
-                        // #1970: after this replica refused `author`'s merge
-                        // at the image limit, its pulls from `author` wait
-                        // for the retry window (a shrink re-opens it).
-                        if local_digest != digest && !retry_due {
+                        let wake = match wake {
+                            BeaconWake::SkipBackoff => {
+                                if responder_store.write().await.take_image_orset_skip(&author) {
+                                    BeaconWake::Wake
+                                } else {
+                                    BeaconWake::Deferred
+                                }
+                            }
+                            other => other,
+                        };
+                        if wake == BeaconWake::Deferred {
                             responder_counters
                                 .digest_beacon_wakes_deferred
                                 .fetch_add(1, Ordering::Relaxed);
-                        } else if local_digest != digest
+                        } else if wake == BeaconWake::Wake
                             && record_divergent_beacon(
                                 &mut beacon_wakes,
                                 responder_counters.as_ref(),
@@ -15670,5 +15744,191 @@ mod tests {
                 4 + round
             );
         }
+    }
+
+    /// #2110 item 2 responder-loop fixture: P holds `k = one` and has
+    /// refused the images of Q and R, so their back-off windows are open.
+    /// Q's store has the same OR-Set and `k = two`.
+    struct BeaconFixture {
+        pubsub: Arc<PubSubManager>,
+        p_sync: KvStoreSync,
+        q_store: KvStore,
+        q_kp: AgentKeypair,
+        r_kp: AgentKeypair,
+        contexts: Vec<Arc<GssKvSecureContext>>,
+        orset: [u8; 32],
+    }
+
+    const BEACON_TOPIC_2110: &str = "group/private/beacon-2110";
+
+    async fn beacon_fixture() -> BeaconFixture {
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
+        let (p_kp, q_kp, r_kp) = (
+            AgentKeypair::generate().expect("p"),
+            AgentKeypair::generate().expect("q"),
+            AgentKeypair::generate().expect("r"),
+        );
+        let (p, q, r) = (p_kp.agent_id(), q_kp.agent_id(), r_kp.agent_id());
+        let (_, contexts, group_id) = encrypted_group(&[p, q, r]);
+        let p_sync = make_encrypted_sync(
+            BEACON_TOPIC_2110,
+            Arc::clone(&pubsub),
+            40,
+            p,
+            p,
+            &p_kp,
+            contexts[0].clone(),
+            group_id,
+            peer(1),
+        )
+        .await;
+        p_sync
+            .write()
+            .await
+            .put(
+                "k".to_string(),
+                b"one".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+        let mut q_store = p_sync.read().await.clone();
+        q_store.entries_mut_for_test().insert(
+            "k".to_string(),
+            KvEntry::new("k".to_string(), b"two".to_vec(), "text/plain".to_string()),
+        );
+        {
+            let mut store = p_sync.write().await;
+            store.refuse_image_source_for_test(q);
+            store.refuse_image_source_for_test(r);
+        }
+        let orset = p_sync.read().await.orset_digest().expect("orset");
+        assert_eq!(q_store.orset_digest().expect("q orset"), orset);
+        assert_ne!(q_store.served_digest(), p_sync.read().await.served_digest());
+        BeaconFixture {
+            pubsub,
+            p_sync,
+            q_store,
+            q_kp,
+            r_kp,
+            contexts,
+            orset,
+        }
+    }
+
+    impl BeaconFixture {
+        async fn beacon(&self, author: usize, digest: [u8; 32], orset_digest: [u8; 32]) {
+            let kp = if author == 1 { &self.q_kp } else { &self.r_kp };
+            let signing = Arc::new(AuthorSigning::from_keypair(kp).expect("signing"));
+            let context = self.contexts[author].clone() as SharedKvSecureContext;
+            let beacon = KvSyncMessage::StateDigestBeacon {
+                digest,
+                entry_count: 1,
+                orset_digest: Some(orset_digest),
+            };
+            let bytes = KvStoreSync::seal_control_message(
+                &context,
+                None,
+                &signing,
+                &store_id(40),
+                peer(3),
+                &beacon,
+            )
+            .await
+            .expect("sealed beacon");
+            self.pubsub
+                .publish(
+                    format!("{BEACON_TOPIC_2110}{STATE_SYNC_TOPIC_SUFFIX}"),
+                    bytes::Bytes::from(bytes),
+                )
+                .await
+                .expect("publish beacon");
+        }
+
+        fn counters(&self) -> (u64, u64) {
+            let snap = self.p_sync.state_sync_snapshot();
+            (
+                snap.digest_beacon_divergences,
+                snap.digest_beacon_wakes_deferred,
+            )
+        }
+
+        async fn wait_for(&self, want: (u64, u64)) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while self.counters() != want {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("counters {:?}, want {want:?}", self.counters()));
+        }
+    }
+
+    /// Through the real responder loop: Q's beacon with P's OR-Set digest
+    /// and a different content digest wakes P's repair inside Q's back-off
+    /// window, and P converges on Q's newer value; R's beacon with another
+    /// OR-Set digest is deferred.
+    #[tokio::test]
+    async fn a_value_only_beacon_wakes_the_repair_and_the_values_converge() {
+        let f = beacon_fixture().await;
+        let mut q_sync = KvStoreSync::new(
+            f.q_store.clone(),
+            Arc::clone(&f.pubsub),
+            BEACON_TOPIC_2110.to_string(),
+            peer(2),
+            Some(f.q_kp.agent_id()),
+        )
+        .expect("q sync");
+        q_sync.set_secure_context(f.contexts[1].clone(), None);
+        q_sync.set_author_signing(AuthorSigning::from_keypair(&f.q_kp).expect("q signing"));
+        f.p_sync.start().await.expect("start p");
+        q_sync.start().await.expect("start q");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let base = f.counters();
+        f.beacon(2, [0xB1; 32], [0xEE; 32]).await;
+        f.wait_for((base.0, base.1 + 1)).await;
+        f.beacon(1, f.q_store.served_digest(), f.orset).await;
+        f.wait_for((base.0 + 1, base.1 + 1)).await;
+
+        let converged = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let value = f.p_sync.read().await.get("k").map(|e| e.value.clone());
+                if value.as_deref() == Some(b"two".as_slice()) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(
+            converged.is_ok(),
+            "P takes Q's newer value through the repair"
+        );
+        q_sync.stop().await.expect("stop q");
+        f.p_sync.stop().await.expect("stop p");
+    }
+
+    /// Through the real responder loop: a second OR-Set-matching beacon
+    /// from Q in the same back-off window is deferred, even after the wake
+    /// gate's per-author gap has passed. Q does not serve here, so nothing
+    /// clears Q's back-off.
+    #[tokio::test]
+    async fn a_second_matching_beacon_in_one_backoff_window_is_deferred() {
+        let f = beacon_fixture().await;
+        f.p_sync.start().await.expect("start p");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let base = f.counters();
+        f.beacon(1, [0xA1; 32], f.orset).await;
+        f.wait_for((base.0 + 1, base.1)).await;
+        tokio::time::sleep(KEY_GAP_REPAIR_RETRY_AFTER + Duration::from_millis(500)).await;
+        assert!(
+            !f.p_sync.read().await.image_retry_due(&f.q_kp.agent_id()),
+            "precondition: still inside Q's back-off window"
+        );
+        f.beacon(1, [0xA2; 32], f.orset).await;
+        f.wait_for((base.0 + 1, base.1 + 1)).await;
+        f.p_sync.stop().await.expect("stop p");
     }
 }

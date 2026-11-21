@@ -28799,10 +28799,33 @@ impl KvStoreHandle {
     ///
     /// # Errors
     ///
-    /// Returns an error if the key does not exist, or
-    /// [`error::IdentityError::Unauthorized`] if this agent is not permitted
-    /// to write under the store's access policy.
+    /// [`error::IdentityError::KeyNotFound`] if this replica does not hold
+    /// the key, or [`error::IdentityError::Unauthorized`] if this agent is
+    /// not permitted to write under the store's access policy.
     pub async fn remove_with_outcome(&self, key: &str) -> error::Result<KvRemoveOutcome> {
+        self.remove_inner(key, false).await
+    }
+
+    /// Remove a key, publishing the removal even when this replica does
+    /// not hold it (#2110). A removal on the wire names only the key, and
+    /// each receiver tombstones every tag it holds for that key, so the
+    /// remover needs none of them. When the key is not held, the local
+    /// store is unchanged and the outcome has `held: false`.
+    ///
+    /// # Errors
+    ///
+    /// [`error::IdentityError::Unauthorized`] if this agent may not write
+    /// the key, or [`error::IdentityError::ImmutableKey`] on an AppendOnly
+    /// store, whose receivers never apply a removal.
+    pub async fn remove_absent_with_outcome(&self, key: &str) -> error::Result<KvRemoveOutcome> {
+        self.remove_inner(key, true).await
+    }
+
+    async fn remove_inner(
+        &self,
+        key: &str,
+        publish_absent: bool,
+    ) -> error::Result<KvRemoveOutcome> {
         self.sync
             .authorize_local_write(&self.agent_id)
             .await
@@ -28817,38 +28840,53 @@ impl KvStoreHandle {
                  local writes refused until a snapshot succeeds"
             )))
         })?;
-        let delta = {
+        let (delta, held) = {
             let mut store = self.sync.write().await;
             Self::check_local_remove(&store, &self.agent_id, key)?;
-            store.remove(key).map_err(|e| match e {
-                // AppendOnly immutability violation — surfaced distinctly
-                // so the API layer can map it to HTTP 409 Conflict.
-                kv::KvError::ImmutableKey(k) => error::IdentityError::ImmutableKey(k),
-                other => error::IdentityError::Storage(std::io::Error::other(format!(
-                    "kv remove failed: {other}",
-                ))),
-            })?;
+            let held = store.holds_entry(key);
+            if !held && publish_absent {
+                // `KvStore::remove` refuses AppendOnly for a held key; an
+                // absent key never reaches it.
+                if matches!(store.policy(), kv::AccessPolicy::AppendOnly) {
+                    return Err(error::IdentityError::ImmutableKey(key.to_string()));
+                }
+            } else {
+                store.remove(key).map_err(|e| match e {
+                    // AppendOnly immutability violation — surfaced distinctly
+                    // so the API layer can map it to HTTP 409 Conflict.
+                    kv::KvError::ImmutableKey(k) => error::IdentityError::ImmutableKey(k),
+                    kv::KvError::KeyNotFound(k) => error::IdentityError::KeyNotFound(k),
+                    other => error::IdentityError::Storage(std::io::Error::other(format!(
+                        "kv remove failed: {other}",
+                    ))),
+                })?;
+            }
             let mut d = kv::KvStoreDelta::new(store.current_version());
             d.removed
                 .insert(key.to_string(), std::collections::HashSet::new());
-            // Owner: attach an owner-signed checkpoint for the post-remove state.
-            if let Some(cp) = self.produce_checkpoint(&mut store) {
-                d.owner_checkpoint = Some(cp);
-                // Carry the authoritative owner name alongside the checkpoint
-                // so a relay can cache it regardless of local name state.
-                d.name_update = Some(store.name_register().clone());
+            // An absent key leaves the local state unchanged: no checkpoint
+            // to attest, nothing to persist and no change to report.
+            if held {
+                if let Some(cp) = self.produce_checkpoint(&mut store) {
+                    d.owner_checkpoint = Some(cp);
+                    // Carry the authoritative owner name alongside the checkpoint
+                    // so a relay can cache it regardless of local name state.
+                    d.name_update = Some(store.name_register().clone());
+                }
             }
-            d
+            (d, held)
         };
-        // #1094: the content changed here, whatever persist and publish do.
-        self.sync.note_change(kv::KvChangeOrigin::Local);
-        // Durability before announcement — see put_with_delta.
-        self.sync.persist().await.map_err(|e| {
-            error::IdentityError::Storage(std::io::Error::other(format!(
-                "kv remove applied locally but snapshot persistence FAILED ({e}); \
-                 delta not published; store is durability-degraded"
-            )))
-        })?;
+        if held {
+            // #1094: the content changed here, whatever persist and publish do.
+            self.sync.note_change(kv::KvChangeOrigin::Local);
+            // Durability before announcement — see put_with_delta.
+            self.sync.persist().await.map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "kv remove applied locally but snapshot persistence FAILED ({e}); \
+                     delta not published; store is durability-degraded"
+                )))
+            })?;
+        }
         // #976 symmetry: a failed remove-publish is queued for
         // re-publish (reported via diagnostics; the remove IS applied and
         // persisted — a CRDT remove cannot be unwound either).
@@ -28865,6 +28903,7 @@ impl KvStoreHandle {
             };
         Ok(KvRemoveOutcome {
             delta,
+            held,
             published,
             publish_error,
         })
@@ -28980,6 +29019,9 @@ pub struct KvPutOutcome {
 pub struct KvRemoveOutcome {
     /// The CRDT remove delta.
     pub delta: kv::KvStoreDelta,
+    /// False when this replica did not hold the key: the removal was
+    /// published for the replicas that hold it, and nothing changed here.
+    pub held: bool,
     /// False when the gossip publish failed. No queue, no replay.
     pub published: bool,
     /// The publish failure cause when published is false.

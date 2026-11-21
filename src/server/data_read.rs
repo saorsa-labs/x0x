@@ -293,6 +293,7 @@ async fn write_local_store(state: &Arc<AppState>, request: &DataWriteRequest) ->
             super::routes::stores::delete_kv_value(
                 State(Arc::clone(state)),
                 Path((topic, key.clone())),
+                axum::extract::Query(super::routes::stores::DeleteValueQuery::default()),
             )
             .await
         }
@@ -304,7 +305,7 @@ async fn write_local_store(state: &Arc<AppState>, request: &DataWriteRequest) ->
 fn write_reply(request_id: &str, code: StatusCode, body: &serde_json::Value) -> DataReadReply {
     let status = match code {
         StatusCode::OK | StatusCode::ACCEPTED => DataReadStatus::Ok,
-        // The store is not open here.
+        // The store is not open here, or the key is not held.
         StatusCode::NOT_FOUND => DataReadStatus::Unavailable,
         StatusCode::PAYLOAD_TOO_LARGE => DataReadStatus::TooLarge,
         code if code.is_client_error() => DataReadStatus::Refused,

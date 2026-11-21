@@ -1790,7 +1790,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "store rm",
         description: "Remove key from store",
         category: "stores",
-        request: RequestSpec::None,
+        request: RequestSpec::Fields(&[RequestField::query("absent", false)]),
     },
     // ── Files ──────────────────────────────────────────────────────────
     EndpointDef {
