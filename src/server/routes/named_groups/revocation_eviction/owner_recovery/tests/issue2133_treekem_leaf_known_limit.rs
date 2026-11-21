@@ -68,10 +68,11 @@ fn a_creator_one_commit_behind_cannot_follow_the_next_public_commit() {
         admin.tracks_member(&creator_id),
         "the admin's tree still holds the creator's leaf"
     );
-    assert!(
-        creator.process_commit(&eviction).is_err(),
-        "a commit two epochs ahead is refused"
-    );
+    let expected = format!("Invalid epoch: expected {}, got {}", start + 1, start + 2);
+    match creator.process_commit(&eviction) {
+        Err(crate::mls::MlsError::SaorsaMls(message)) if message.contains(&expected) => {}
+        other => panic!("a commit two epochs ahead is refused as InvalidEpoch: {other:?}"),
+    }
     assert_eq!(creator.epoch(), start, "the creator stays at its epoch");
     let ciphertext = admin
         .encrypt_message(b"after the eviction")

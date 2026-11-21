@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Behaviour now documented (no code change)
 
+- **The TreeKEM limits of an owner recovery past an expired creator are
+  accepted limits (#2139; A09 paragraph of 21 Nov 2026).** The creator
+  keeps its leaf: no recovery removes or blanks it, because every current
+  receiver refuses a recovery whose TreeKEM commits do not match the
+  revoked admins that hold a leaf. A recovery whose revoked admins hold no
+  leaf does not move the epoch, so the creator follows later commits. A
+  creator still inside the 300 s skew at the recovery, or due only after
+  it, is served the recovery frame. On GSS the creator still gets no key
+  until re-certified.
 - **Owner recovery proceeds past an expired creator in the mixed case;
   on GSS the creator gets no new keys until re-certified (#2133; A09
   paragraph of 20 Nov 2026).** When every admin is revoked and another

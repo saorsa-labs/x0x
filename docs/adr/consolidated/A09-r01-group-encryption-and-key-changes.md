@@ -432,6 +432,55 @@ What the creator gets depends on the plane:
 
 No wire format changes.
 
+On 21 Nov 2026 the open items of
+[#2139](https://github.com/saorsa-labs/x0x/issues/2139) were decided by
+the orchestrator session under A15, 21 Nov 2026. The TreeKEM limits above
+stay as **accepted limits**. No code removes, blanks or skips the held
+creator's leaf. The reasons and the corrections follow.
+- **Excluding the creator's leaf (limits i and ii) is not built.** Every
+  receiver accepts a recovery only when its TreeKEM commits match the
+  revoked admins that hold a leaf, one commit for each
+  (`validate_against_parent`: the commit count equals the leafed removed
+  seats, and `next_epoch` is the parent epoch plus that count). A recovery
+  that also removed or blanked the creator's leaf, or that added a commit
+  when no revoked admin holds a leaf, is refused as
+  `RecoveryProofInvalid` by every current peer. To ship it needs a new
+  recovery body and a receiver capability gate, and it leaves an Active
+  seat with no leaf, which the other TreeKEM paths do not expect. A commit
+  keeps a live leaf out of its path secrets only by removing that leaf, so
+  limit (i) has the same cost. The creator's certificate is expired, not
+  revoked, and the GSS plane already meets David's rule.
+- **Restoring the leaf after re-certification needs no new path.** No leaf
+  is removed. When the owner re-certifies the creator and its seat commits
+  the renewed certificate, the `seat_expiry_due` return of the catch-up
+  handler and the recovery-frame gate no longer apply to it, and the
+  ordinary catch-up serves it.
+- **Mixed versions: nothing changes.** No wire format or receive rule
+  changes, so old and new peers run the same rules.
+- **Limit (iii).** The recovery-frame gate refuses only a seat whose expiry
+  is due (past `not_after` plus τ, 300 s). A creator whose certificate is
+  still inside τ at the recovery, or becomes due only after it, is served
+  the recovery frame. On TreeKEM it then follows every later commit until
+  its seat is evicted or re-certified. On GSS each later share write checks
+  the committed certificate again.
+- **Correction to item 4 above.** The seal route, like the S4 worker,
+  gives each failing seat its own transition (one TreeKEM commit for each
+  evicted seat). One seal-route call runs them one after the other, so on
+  TreeKEM another commit can land before a seat's own eviction on both
+  routes.
+- **Correction to the GSS bullet above.** `POST /groups/:id/secure/reseal`
+  is a session-bearer route: the owner API token or a session token is
+  enough. The local daemon must be an Active member of the group that
+  holds the current secret; it need not be an admin. The route seals the
+  secret to any Active seat with a KEM key, with no certificate check, and
+  returns the envelope to the caller. It sends nothing.
+
+Tests pin this behaviour, so a later change is deliberate:
+`issue2139_treekem_leafless_recovery` (limit ii at the daemon level, with
+the real recovery attempt, and limit iii at the frame gate) and
+`issue2133_treekem_leaf_known_limit` (TreeKEM layer: a creator one commit
+behind is refused with `InvalidEpoch`). No wire format changes.
+
 ## Security claims
 
 State the exact properties of each released path. Post-quantum signatures and key encapsulation do not alone prove forward secrecy or recovery after key compromise.

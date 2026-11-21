@@ -4024,6 +4024,7 @@ mod tests {
     mod issue2004_expired_member_seal;
     mod issue2120_expired_creator_wait;
     mod issue2133_treekem_leaf_known_limit;
+    mod issue2139_treekem_leafless_recovery;
 
     #[test]
     fn refusals_map_to_http_statuses() {
@@ -6643,9 +6644,6 @@ mod restart_tests {
                 );
             }
         }
-        // Positive control for the eviction epoch: the survivor's writes
-        // so far are all recovery-epoch writes.
-        let survivor_recovery_writes = share_writes(&survivor_hex);
         // The admin the recovery seated seals the tolerated seat's S4
         // removal through the seal route; the held creator still answers
         // `members pending certificate resolution`, and the removal commits.
@@ -6680,19 +6678,30 @@ mod restart_tests {
             x0x::groups::GroupMemberState::Removed,
             "the seal route evicts the due-expired Member with the revoked one"
         );
-        // Wait, with a bound, until the survivor's eviction-epoch share is
-        // written and every egress task has ended; only then are the
-        // negatives below meaningful.
+        // Positive control: wait, with a bound, until a share AT the
+        // eviction epoch is written to the survivor (a resend of its
+        // recovery-epoch share does not count) and every egress task has
+        // ended; only then are the negatives below meaningful.
+        let eviction_share_written = || {
+            author
+                .named_group_test_recorders
+                .secure_share_written
+                .lock()
+                .map(|writes| {
+                    writes.iter().any(|(recipient, epoch)| {
+                        *recipient == survivor_hex && *epoch == after.secret_epoch
+                    })
+                })
+                .unwrap_or_default()
+        };
         let bound = tokio::time::Instant::now() + Duration::from_secs(20);
-        while share_writes(&survivor_hex) <= survivor_recovery_writes
-            && tokio::time::Instant::now() < bound
-        {
+        while !eviction_share_written() && tokio::time::Instant::now() < bound {
             worker_tick(&author).await;
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(
-            share_writes(&survivor_hex) > survivor_recovery_writes,
-            "the survivor's eviction-epoch share is written"
+            eviction_share_written(),
+            "the survivor's share at the eviction epoch is written"
         );
         tokio::time::timeout(
             Duration::from_secs(20),

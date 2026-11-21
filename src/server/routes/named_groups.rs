@@ -3025,6 +3025,14 @@ fn spawn_secure_share_delivery_notifying(
                     Err(_) => false,
                 };
                 if written {
+                    #[cfg(test)]
+                    if let Ok(mut writes) = task_state
+                        .named_group_test_recorders
+                        .secure_share_written
+                        .lock()
+                    {
+                        writes.push((recipient_hex.clone(), epoch));
+                    }
                     sent += 1;
                     // #1663 review P1 (Codex controller, 30 Oct): the
                     // first carrier-accepted write is the share-debt
