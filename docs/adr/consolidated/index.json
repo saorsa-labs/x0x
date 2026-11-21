@@ -47,7 +47,7 @@
       "revision": 1,
       "path": "A06-r01-gossip-relay-roles-and-resource-limits.md",
       "title": "Gossip Relay Roles and Resource Limits",
-      "sha256": "d09a69b915f872f756f58d73d994b44bb394f2e46d3bc0230b04c327e66f95d7"
+      "sha256": "584835d13b59aedc6f5583c0b74b62753aa5544d943c6b6abcede2d010ac31eb"
     },
     {
       "id": "A07",
@@ -75,7 +75,7 @@
       "revision": 1,
       "path": "A10-r01-shared-data-files-and-synchronization.md",
       "title": "Shared Data Files and Synchronization",
-      "sha256": "762b7d3af5350c938195342be9d4fce21c3888759c32df45b2c239bc5df07291"
+      "sha256": "d586e5da1424e9b7218643e66c737deb2c127669d82bafb3369844bf724f4061"
     },
     {
       "id": "A11",

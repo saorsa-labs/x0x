@@ -1792,7 +1792,7 @@ impl KvStore {
             OwnershipAnnounceEffect::Conflict { anchored } => {
                 // Immutable owner: record the conflict for auditability and reject.
                 self.ownership_conflict = Some((anchored, claimed_owner));
-                self.version += 1;
+                self.bump_version_keeping_content();
                 Err(KvError::OwnershipConflict {
                     anchored,
                     claimed: claimed_owner,
@@ -1802,7 +1802,7 @@ impl KvStore {
                 self.policy = policy;
                 self.policy_version = policy_version;
                 self.ownership_conflict = None;
-                self.version += 1;
+                self.bump_version_keeping_content();
                 Ok(())
             }
             OwnershipAnnounceEffect::Stale => Ok(()),
@@ -1926,7 +1926,7 @@ impl KvStore {
         // Bump the policy freshness counter so the owner's next announce
         // carries a newer version (blocks replay of a pre-change announce).
         self.policy_version = self.policy_version.saturating_add(1);
-        self.version += 1;
+        self.bump_version_keeping_content();
         Ok(())
     }
 
@@ -1943,7 +1943,7 @@ impl KvStore {
         }
         self.allowed_writers.remove(writer);
         self.policy_version = self.policy_version.saturating_add(1);
-        self.version += 1;
+        self.bump_version_keeping_content();
         Ok(())
     }
 
@@ -2663,7 +2663,19 @@ impl KvStore {
     /// Update the store name.
     pub fn update_name(&mut self, name: String, peer_id: PeerId) {
         self.name.set(name, peer_id);
+        self.bump_version_keeping_content();
+    }
+
+    /// Move the store version for a change outside the content (OR-Set and
+    /// entries), carrying a cached content length across it (#2110), so a
+    /// remote owner announce cannot make the next delta measure the store.
+    fn bump_version_keeping_content(&mut self) {
+        let cached = self.image.cached_content(self.version, self.keys.version());
         self.version += 1;
+        if let Some(content) = cached {
+            self.image
+                .set_content(self.version, self.keys.version(), content);
+        }
     }
 
     // -----------------------------------------------------------------
@@ -3094,10 +3106,11 @@ impl KvStore {
     /// The cached content length is exact, and every delta changes it by
     /// the exact change in its touched keys' OR-Set slots and entries, so
     /// while it is cached the measure is O(keys in the delta) (#2110). A
-    /// local write or a load drops it; the next delta measures it once. When an upper growth
-    /// bound fits, the delta just applies. Otherwise a lower bound over the
-    /// limit refuses it unapplied; else it applies in place under an undo
-    /// journal and a copy of the OR-Set, and is kept or rolled back.
+    /// local put, remove or writer mark, or a load, drops it; the next delta
+    /// measures it once. When an upper growth bound fits, the delta just
+    /// applies. Otherwise a lower bound over the limit refuses it unapplied;
+    /// else it applies in place under an undo journal and a copy of the
+    /// OR-Set, and is kept or rolled back.
     ///
     /// # Errors
     ///

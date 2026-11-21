@@ -23,7 +23,8 @@ All notable changes to this project will be documented in this file.
   item 1; A10 amendment of 21 Nov 2026).** The store keeps its content
   length exact from the OR-Set tag counts (saorsa-gossip 0.5.95), so a delta
   does not walk the store while that length is cached. The first delta after
-  a local put, remove or load still measures the store once. A delta that
+  a local put, remove, writer mark or load still measures the store once;
+  owner announces, allowlist changes and renames keep the length cached. A delta that
   cannot fit even at its lowest possible size is refused before anything is
   copied. A delta that passes that check but does not fit still copies the
   OR-Set's tags to roll back (#2146); the known limit is narrowed, not

@@ -331,3 +331,64 @@ fn the_lower_bound_counts_a_losing_incoming_entry_as_the_local_one() {
     assert_eq!(s.get("pad").expect("pad").value.len(), local);
     assert_cached_is_exact(&s);
 }
+
+/// An action that moves the store version but not its content leaves the
+/// cached length warm: the next delta takes no whole-store measure. A
+/// remote owner announce is one of them, so a member cannot force a walk
+/// before every delta.
+fn assert_next_delta_stays_warm(name: &str, act: impl FnOnce(&mut KvStore)) {
+    let mut s = two_writer_group(68);
+    s.put(
+        "k".to_string(),
+        vec![b'v'; 50],
+        "text/plain".to_string(),
+        peer(1),
+    )
+    .expect("put");
+    s.content_exact().expect("prime");
+    let version = s.version;
+    act(&mut s);
+    assert!(s.version > version, "{name}: the version moved");
+    let before = full_measures();
+    let delta = put_delta("n", 40, b'n', (peer(2), 77), s.version);
+    s.merge_delta(&delta, peer(2), Some(&agent(2)))
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+    assert_eq!(full_measures(), before, "{name}: no whole-store measure");
+    assert_cached_is_exact(&s);
+}
+
+#[test]
+fn a_remote_owner_announce_conflict_keeps_the_cached_length() {
+    assert_next_delta_stays_warm("conflict", |s| {
+        let rogue = agent(9);
+        let policy = s.policy.clone();
+        assert!(matches!(
+            s.learn_ownership(rogue, policy, 99, &rogue),
+            Err(KvError::OwnershipConflict { .. })
+        ));
+    });
+}
+
+#[test]
+fn a_remote_owner_announce_refresh_keeps_the_cached_length() {
+    assert_next_delta_stays_warm("refresh", |s| {
+        let owner = agent(1);
+        let policy = s.policy.clone();
+        let next = s.policy_version + 1;
+        s.learn_ownership(owner, policy, next, &owner)
+            .expect("refresh");
+    });
+}
+
+#[test]
+fn owner_allowlist_and_name_changes_keep_the_cached_length() {
+    assert_next_delta_stays_warm("allow_writer", |s| {
+        s.allow_writer(agent(5), &agent(1)).expect("allow");
+    });
+    assert_next_delta_stays_warm("deny_writer", |s| {
+        s.deny_writer(&agent(5), &agent(1)).expect("deny");
+    });
+    assert_next_delta_stays_warm("update_name", |s| {
+        s.update_name("Renamed".to_string(), peer(1));
+    });
+}
