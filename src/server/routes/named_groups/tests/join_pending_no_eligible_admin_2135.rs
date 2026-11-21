@@ -52,6 +52,17 @@ fn insert_notice_capable_advert(state: &Arc<AppState>, agent: &AgentId) {
 /// A PublicOpen group whose sole admin seat is this node (the creator),
 /// with one live Member invite `invite_secret`.
 async fn seed_inviter_group(state: &AppState, group_id: &str, invite_secret: &str) {
+    seed_inviter_group_with(state, group_id, invite_secret, |_| {}).await;
+}
+
+/// [`seed_inviter_group`], with `adjust` applied to the group before it
+/// is stored.
+async fn seed_inviter_group_with(
+    state: &AppState,
+    group_id: &str,
+    invite_secret: &str,
+    adjust: impl FnOnce(&mut x0x::groups::GroupInfo),
+) {
     let mut info = x0x::groups::GroupInfo::with_policy(
         "2135".to_string(),
         String::new(),
@@ -65,6 +76,7 @@ async fn seed_inviter_group(state: &AppState, group_id: &str, invite_secret: &st
         0,
         x0x::groups::GroupRole::Member,
     );
+    adjust(&mut info);
     state
         .named_groups
         .write()
@@ -281,63 +293,320 @@ async fn the_notice_drops_when_an_eligible_admin_returns() -> Result<()> {
     Ok(())
 }
 
-/// Old peers keep working. The wire gains no field: a v0.46 joiner's fetch
-/// (no §8 fields) still decodes and never asks for a notice, and the
-/// `no_eligible_admin` notice has exactly the field set of every other
-/// authority-signed notice (the optional member key is omitted).
-#[test]
-fn the_old_fetch_shape_decodes_and_the_notice_adds_no_field() -> Result<()> {
-    let legacy = serde_json::json!({
-        "type": "fetch_request",
-        "group_id": "d5".repeat(32),
-        "member_agent_id": "ef".repeat(32),
-        "accepts_refusal": true,
-        "attempt_id": "at2135",
-    });
-    let decoded: JoinResultMessage = serde_json::from_value(legacy)?;
+/// Apply `joiner`'s self-delivered `MemberJoined` for `invite_secret` to
+/// the local inviter (after `adjust_event`), and return whether a
+/// `no_eligible_admin` notice was staged for its attempt. The admission
+/// itself must be withheld.
+async fn withheld_join_staged_notice(
+    state: &Arc<AppState>,
+    group_id: &str,
+    joiner: &AgentKeypair,
+    invite_secret: &str,
+    adjust_event: impl FnOnce(&mut NamedGroupMetadataEvent),
+) -> Result<bool> {
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let (joiner_id, joiner_hex, _, mut event) = signed_member_joined_event_for_test(
+        joiner,
+        group_id,
+        &local_hex,
+        invite_secret,
+        x0x::groups::GroupRole::Member,
+    )?;
+    adjust_event(&mut event);
+    let attempt = member_joined_event_attempt_id(&event).expect("attempt id");
+    let result = Box::pin(apply_named_group_metadata_event_inner(
+        state, event, joiner_id, true, true, None,
+    ))
+    .await;
+    assert!(!result.accepted, "{invite_secret}: not admitted");
+    Ok(staged_notice_cause(state, group_id, &joiner_hex, &attempt).is_some())
+}
+
+/// A banned joiner holding a live, unaddressed invite gets no notice: the
+/// normal path refuses a banned agent (#1149), so the notice would tell a
+/// banned peer the group's admin state.
+#[tokio::test]
+async fn a_banned_joiner_gets_no_notice() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let group_id = "d6".repeat(32);
+    let joiner = AgentKeypair::generate()?;
+    let joiner_hex = hex::encode(joiner.agent_id().as_bytes());
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    seed_inviter_group_with(&state, &group_id, "2135-banned", |info| {
+        info.ban_member(&joiner_hex, Some(local_hex.clone()));
+    })
+    .await;
+    revoke_agent(&state, state.agent.identity().agent_keypair()).await;
+    assert!(
+        !withheld_join_staged_notice(&state, &group_id, &joiner, "2135-banned", |_| {}).await?,
+        "a banned joiner gets no notice"
+    );
+    Ok(())
+}
+
+/// The #1941 hold: while the group's revocation of lost re-seat invites is
+/// pending, a targeted invite's redemption is refused as unknown, so its
+/// holder gets no notice. Control: the same invite with no hold pending
+/// stages the notice.
+#[tokio::test]
+async fn the_1941_unpaired_invite_hold_gets_no_notice() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    revoke_agent(&state, state.agent.identity().agent_keypair()).await;
+    for (group_id, held) in [("d7".repeat(32), false), ("d8".repeat(32), true)] {
+        let joiner = AgentKeypair::generate()?;
+        let joiner_hex = hex::encode(joiner.agent_id().as_bytes());
+        seed_inviter_group_with(&state, &group_id, "2135-unused", |info| {
+            info.record_issued_invite_v2(
+                "2135-targeted".to_string(),
+                now_millis_u64() / 1_000,
+                0,
+                x0x::groups::GroupRole::Member,
+                Some(joiner_hex.clone()),
+                x0x::groups::InviteOrigin::Explicit,
+                None,
+            );
+        })
+        .await;
+        if held {
+            group_recovery::mark_revoke_pending_for_test(&state, &group_id).await;
+        }
+        assert_eq!(
+            withheld_join_staged_notice(&state, &group_id, &joiner, "2135-targeted", |_| {})
+                .await?,
+            !held,
+            "held = {held}: a notice only when the #1941 hold does not apply"
+        );
+    }
+    Ok(())
+}
+
+/// In an `OwnerCertified` group a joiner whose certificate does not chain
+/// to the owner, or who carries none and has no evidence (NoCertificate),
+/// gets no notice. Control: a certificate the owner issued stages it.
+#[tokio::test]
+async fn an_uncertified_joiner_gets_no_notice() -> Result<()> {
+    use base64::Engine as _;
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let owner = x0x::identity::UserKeypair::generate()?;
+    let stranger = x0x::identity::UserKeypair::generate()?;
+    let group_id = "d9".repeat(32);
+    let owner_id = owner.user_id();
+    seed_inviter_group_with(&state, &group_id, "2135-unused", |info| {
+        info.policy.admission = x0x::groups::GroupAdmission::OwnerCertified(owner_id);
+        for secret in ["2135-oc-valid", "2135-oc-foreign", "2135-oc-none"] {
+            info.record_issued_invite(
+                secret.to_string(),
+                now_millis_u64() / 1_000,
+                0,
+                x0x::groups::GroupRole::Member,
+            );
+        }
+    })
+    .await;
+    revoke_agent(&state, state.agent.identity().agent_keypair()).await;
+
+    let with_certificate = |certificate: Option<String>| {
+        move |event: &mut NamedGroupMetadataEvent| {
+            if let NamedGroupMetadataEvent::MemberJoined {
+                certificate_b64, ..
+            } = event
+            {
+                *certificate_b64 = certificate;
+            }
+        }
+    };
+    let encode = |cert: &x0x::identity::AgentCertificate| -> Result<String> {
+        Ok(BASE64.encode(bincode::serialize(cert)?))
+    };
+
+    let joiner = AgentKeypair::generate()?;
+    let cert = encode(&x0x::identity::AgentCertificate::issue(&owner, &joiner)?)?;
+    assert!(
+        withheld_join_staged_notice(
+            &state,
+            &group_id,
+            &joiner,
+            "2135-oc-valid",
+            with_certificate(Some(cert))
+        )
+        .await?,
+        "control: an owner-issued certificate stages the notice"
+    );
+
+    let joiner = AgentKeypair::generate()?;
+    let cert = encode(&x0x::identity::AgentCertificate::issue(&stranger, &joiner)?)?;
+    assert!(
+        !withheld_join_staged_notice(
+            &state,
+            &group_id,
+            &joiner,
+            "2135-oc-foreign",
+            with_certificate(Some(cert))
+        )
+        .await?,
+        "a certificate from another user gets no notice"
+    );
+
+    let joiner = AgentKeypair::generate()?;
+    assert!(
+        !withheld_join_staged_notice(
+            &state,
+            &group_id,
+            &joiner,
+            "2135-oc-none",
+            with_certificate(None)
+        )
+        .await?,
+        "no certificate and no evidence (NoCertificate) gets no notice"
+    );
+    Ok(())
+}
+
+/// A consumed invite and an expired invite get no notice: the normal path
+/// refuses both with a typed refusal, so their holders never learn the
+/// group's admin state.
+#[tokio::test]
+async fn a_consumed_or_expired_invite_gets_no_notice() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let group_id = "da".repeat(32);
+    let now_secs = now_millis_u64() / 1_000;
+    seed_inviter_group_with(&state, &group_id, "2135-consumed", |info| {
+        assert!(info
+            .consume_issued_invite(
+                "2135-consumed",
+                &"ab".repeat(32),
+                x0x::groups::GroupRole::Member,
+                now_millis_u64(),
+                now_millis_u64(),
+            )
+            .is_ok());
+        info.record_issued_invite(
+            "2135-expired".to_string(),
+            now_secs.saturating_sub(120),
+            now_secs.saturating_sub(60),
+            x0x::groups::GroupRole::Member,
+        );
+    })
+    .await;
+    revoke_agent(&state, state.agent.identity().agent_keypair()).await;
+    for secret in ["2135-consumed", "2135-expired"] {
+        let joiner = AgentKeypair::generate()?;
+        assert!(
+            !withheld_join_staged_notice(&state, &group_id, &joiner, secret, |_| {}).await?,
+            "{secret}: no notice"
+        );
+    }
+    Ok(())
+}
+
+/// The normal path's two silent rejects are mirrored: a joiner that is
+/// already Active and presents another live invite, and a TreeKEM join
+/// with no key package, get no notice.
+#[tokio::test]
+async fn an_active_joiner_or_a_treekem_join_without_key_package_gets_no_notice() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    revoke_agent(&state, state.agent.identity().agent_keypair()).await;
+
+    let group_id = "db".repeat(32);
+    let joiner = AgentKeypair::generate()?;
+    let joiner_hex = hex::encode(joiner.agent_id().as_bytes());
+    seed_inviter_group_with(&state, &group_id, "2135-second", |info| {
+        info.add_member(
+            joiner_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(local_hex.clone()),
+            None,
+        );
+        info.recompute_state_hash();
+    })
+    .await;
+    assert!(
+        !withheld_join_staged_notice(&state, &group_id, &joiner, "2135-second", |_| {}).await?,
+        "an already Active joiner gets no notice"
+    );
+
+    let group_id = "dc".repeat(32);
+    seed_inviter_group_with(&state, &group_id, "2135-treekem", |info| {
+        info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+    })
+    .await;
+    let joiner = AgentKeypair::generate()?;
+    assert!(
+        !withheld_join_staged_notice(&state, &group_id, &joiner, "2135-treekem", |_| {}).await?,
+        "a TreeKEM join with no key package gets no notice"
+    );
+    Ok(())
+}
+
+/// Old peers keep working: the fetch a released (v0.46) joiner sends has
+/// no §8 fields. Decoded from its exact JSON and answered by the authority
+/// while a `no_eligible_admin` notice is staged for that attempt (and the
+/// joiner's advert even sets the capability bit), it builds no `Pending`
+/// reply. Control: the notice is servable to a capable fetch.
+#[tokio::test]
+async fn a_released_joiners_fetch_gets_no_pending_reply() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let group_id = "dd".repeat(32);
+    seed_inviter_group(&state, &group_id, "2135-legacy").await;
+    revoke_agent(&state, state.agent.identity().agent_keypair()).await;
+    let joiner = AgentKeypair::generate()?;
+    let (joiner_id, joiner_hex, _, event) = signed_member_joined_event_for_test(
+        &joiner,
+        &group_id,
+        &local_hex,
+        "2135-legacy",
+        x0x::groups::GroupRole::Member,
+    )?;
+    let attempt = member_joined_event_attempt_id(&event).expect("attempt id");
+    let _ =
+        apply_named_group_metadata_event_inner(&state, event, joiner_id, true, true, None).await;
+    insert_notice_capable_advert(&state, &joiner_id);
+    assert!(
+        serve_staged_join_pending_notice(
+            &state,
+            &group_id,
+            &joiner_hex,
+            &attempt,
+            &joiner_id,
+            None,
+            false
+        )
+        .await
+        .is_some(),
+        "control: the staged notice is servable to a capable fetch"
+    );
+
+    let legacy = format!(
+        r#"{{"type":"fetch_request","group_id":"{group_id}","member_agent_id":"{joiner_hex}","accepts_refusal":true,"attempt_id":"{attempt}"}}"#
+    );
     let JoinResultMessage::FetchRequest {
+        group_id: fetched_group,
+        member_agent_id,
+        attempt_id,
         accepts_pending_notice,
         held_notice_hash,
         notice_only,
         attempt_evidence,
         ..
-    } = decoded
+    } = serde_json::from_str::<JoinResultMessage>(&legacy)?
     else {
-        panic!("the legacy fetch decodes as a FetchRequest");
+        panic!("the released joiner's fetch decodes as a FetchRequest");
     };
-    assert!(
-        !accepts_pending_notice,
-        "a legacy joiner never asks for a notice"
-    );
-    assert!(held_notice_hash.is_none() && !notice_only && attempt_evidence.is_none());
-
-    let notice_keys = |cause: &str, detail: JoinPendingNoticeDetail| -> Result<Vec<String>> {
-        let notice = JoinPendingNotice {
-            group_id: "g".to_string(),
-            member_agent_id: "m".to_string(),
-            signer_agent_id: "s".to_string(),
-            attempt_id: "a".to_string(),
-            cause: cause.to_string(),
-            detail,
-            issued_at_ms: 1,
-            nonce: "n".to_string(),
-            signature_b64: String::new(),
-            signer_public_key_b64: None,
-        };
-        let value = serde_json::to_value(JoinResultMessage::Pending {
-            notice: Box::new(notice),
-        })?;
-        let mut keys: Vec<String> = value["notice"]
-            .as_object()
-            .map(|object| object.keys().cloned().collect())
-            .unwrap_or_default();
-        keys.sort();
-        Ok(keys)
-    };
-    assert_eq!(
-        notice_keys("no_eligible_admin", JoinPendingNoticeDetail::default())?,
-        notice_keys("authority_catching_up", JoinPendingNoticeDetail::default())?,
-        "the no_eligible_admin notice has the existing wire fields only"
-    );
+    let built = answer_join_pending_notice_fetch(
+        &state,
+        &joiner_id,
+        &fetched_group,
+        &member_agent_id,
+        attempt_id.as_deref(),
+        attempt_evidence.as_deref(),
+        accepts_pending_notice,
+        held_notice_hash.as_deref(),
+        notice_only,
+        None,
+    )
+    .await;
+    assert!(!built, "a released joiner's fetch builds no Pending reply");
     Ok(())
 }

@@ -1948,6 +1948,7 @@ struct WithheldJoinFacts<'a> {
     role: x0x::groups::GroupRole,
     ts_ms: u64,
     certificate_b64: Option<&'a str>,
+    treekem_key_package_b64: Option<&'a str>,
 }
 
 /// #2135 (ADR 0108 §8 authority staging, D154; ADR 0110 §4): the local
@@ -1958,12 +1959,13 @@ struct WithheldJoinFacts<'a> {
 /// join-result poll under §8's serving rule.
 ///
 /// The notice is staged only for an attempt the withhold alone stops: the
-/// joiner is not banned, an addressed invite names it, the invite secret
-/// probes as consumable (on a clone; nothing is consumed), the #1941
-/// unpaired-invite hold does not apply, and in an `OwnerCertified` group
-/// the joiner's admission certificate verifies. Any other attempt gets
-/// today's refusal or silence, so an invalid invite never learns that the
-/// group has no eligible admin. The member-signed half of D154 (a joiner
+/// joiner is not banned and not already Active, the invite is unaddressed
+/// or addressed to the joiner, the invite secret probes as consumable (on a
+/// clone; nothing is consumed), the #1941 unpaired-invite hold does not
+/// apply, in an `OwnerCertified` group the joiner's admission certificate
+/// verifies, and in a TreeKEM group the event carries a decodable key
+/// package. Any other attempt gets today's refusal or silence, so an
+/// invalid invite never learns that the group has no eligible admin. The member-signed half of D154 (a joiner
 /// polling other members while its authority is unreachable) is not built:
 /// [`D154_STAGING_ENABLED`] stays off.
 async fn stage_no_eligible_admin_notice_for_withheld_join(
@@ -1977,7 +1979,15 @@ async fn stage_no_eligible_admin_notice_for_withheld_join(
     let Some(attempt_id) = member_joined_event_attempt_id(event) else {
         return;
     };
-    if info.is_banned(member_agent_id) {
+    if info.is_banned(member_agent_id) || info.has_active_member(member_agent_id) {
+        return;
+    }
+    if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+        && !facts.treekem_key_package_b64.is_some_and(|kp| {
+            use base64::Engine as _;
+            BASE64.decode(kp).is_ok()
+        })
+    {
         return;
     }
     if info
@@ -21606,6 +21616,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                             role,
                             ts_ms,
                             certificate_b64: certificate_b64.as_deref(),
+                            treekem_key_package_b64: treekem_key_package_b64.as_deref(),
                         },
                     )
                     .await;
