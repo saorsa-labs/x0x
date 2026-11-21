@@ -3025,6 +3025,14 @@ fn spawn_secure_share_delivery_notifying(
                     Err(_) => false,
                 };
                 if written {
+                    #[cfg(test)]
+                    if let Ok(mut writes) = task_state
+                        .named_group_test_recorders
+                        .secure_share_written
+                        .lock()
+                    {
+                        writes.push((recipient_hex.clone(), epoch));
+                    }
                     sent += 1;
                     // #1663 review P1 (Codex controller, 30 Oct): the
                     // first carrier-accepted write is the share-debt
@@ -33674,11 +33682,9 @@ pub(in crate::server) async fn get_group_state_commits(
 /// `TaskList` write then `named_groups` read — forbidden under this
 /// helper's guards.
 ///
-/// TreeKEM groups: the roster prune + commit still run here, but ratchet
-/// rekey stays with the TreeKEM remove/ban handlers
-/// (`remove_member_verified`) — there is no GSS secret to rotate and the
-/// MLS-layer eviction is delivered by those paths when the certificate
-/// failure is observed there.
+/// TreeKEM groups: each evicted seat gets its own committed transition
+/// here, one `remove_member_verified` TreeKEM commit per seat, carried as
+/// `treekem_commit_b64` with its epoch; there is no GSS secret to rotate.
 async fn owner_certified_seal_with_eviction(
     state: &Arc<AppState>,
     id: &str,

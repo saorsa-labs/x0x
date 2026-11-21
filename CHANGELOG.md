@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Behaviour now documented (no code change)
 
+- **TreeKEM does not yet meet the "no new keys" rule for an expired
+  creator held by an owner recovery (#2139, open; A09 paragraph of 21 Nov
+  2026).** The creator keeps its leaf and can read every later TreeKEM
+  epoch, with no time limit, until the owner acts. This happens when the
+  recovery frame leaks, when the revoked admins hold no leaf, or when the
+  creator is still inside the 300 s skew (or due only later) at the
+  recovery. The GSS plane meets the rule. The gap waits for a fix or for
+  David's acceptance.
+
 - **Owner recovery proceeds past an expired creator in the mixed case;
   on GSS the creator gets no new keys until re-certified (#2133; A09
   paragraph of 20 Nov 2026).** When every admin is revoked and another
@@ -36,6 +45,14 @@ All notable changes to this project will be documented in this file.
   and the directory, whatever the umask. `docs/upgrade-system.md` says how
   to fix an install lock file that root created.
 
+- **A received TreeKEM owner recovery may remove only the revoked seats'
+  leaves (#2139; A09 paragraph of 21 Nov 2026).** Before, a receiver
+  checked only that the revoked seats' leaves were gone, so a recovery
+  could also drop a valid member's leaf. Now each recovery commit must add
+  no leaf and remove one, the leaf count must fall by one per commit, and
+  every other seat's leaf must survive; if not, the recovery is refused as
+  `recovery_proof_invalid`. Every sender this release ships already meets
+  it; a peer on an earlier release does not check it.
 - **A delta into a group store is measured in O(keys in the delta) (#2110
   item 1; A10 amendment of 21 Nov 2026).** The store keeps its content
   length exact from the OR-Set tag counts (saorsa-gossip 0.5.95), so a delta
