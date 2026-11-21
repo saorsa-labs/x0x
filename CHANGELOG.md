@@ -19,6 +19,19 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Launcher host root and `install.sh --launcher` hardening (#1378 review
+  carry-overs; A14 amendment of 21 Nov 2026).** The dormant launcher's
+  issuer refuses (exit 78) a `--host-root` that is not the data directory
+  of the daemon it runs, derived as x0xd derives it; a data directory that
+  is a symlink does not match. `install.sh --launcher` reads the unit's
+  effective `User=` and `ExecStart=` from the unit and every drop-in under
+  `/etc`, `/run` and `/usr/lib`, asks systemd too when it answers, and
+  refuses when they differ or when another unit file or drop-in would
+  shadow or undo the launcher drop-in. It writes the launcher and the
+  drop-in through an `O_EXCL` 0700 temporary file with fsync of the file
+  and the directory, whatever the umask. `docs/upgrade-system.md` says how
+  to fix an install lock file that root created.
+
 - **A delta into a group store is measured in O(keys in the delta) (#2110
   item 1; A10 amendment of 21 Nov 2026).** The store keeps its content
   length exact from the OR-Set tag counts (saorsa-gossip 0.5.95), so a delta

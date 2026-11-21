@@ -14,6 +14,7 @@ mod commit;
 pub(crate) mod contract;
 mod control;
 mod coordinator;
+mod daemon_root;
 mod filesystem;
 pub(crate) mod forward;
 pub(crate) mod issuer;

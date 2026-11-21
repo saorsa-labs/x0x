@@ -54,8 +54,17 @@ impl start::Issuer for JournalIssuer<'_> {
             uid,
             &mut self.held.borrow_mut(),
             false,
+            &process_data_dir,
         )
     }
+}
+
+/// How the issuer finds the data directory of the daemon in the argv.
+type DataDir<'a> = &'a dyn Fn(&forward::DaemonCommand) -> io::Result<PathBuf>;
+
+/// The daemon's data directory, as `x0xd` derives it in this environment.
+fn process_data_dir(command: &forward::DaemonCommand) -> io::Result<PathBuf> {
+    daemon_root::data_dir(&command.args, &daemon_root::Bases::of_process())
 }
 
 /// `uid` is the account the root and records must belong to: the
@@ -76,7 +85,10 @@ fn issue_with(
     root_uid: u32,
     record_uid: u32,
 ) -> io::Result<Option<start::Issued>> {
-    issue_held(args, command, root_uid, record_uid, &mut None, false)
+    let data_dir = |_: &forward::DaemonCommand| Ok(args.host_root.clone());
+    issue_held(
+        args, command, root_uid, record_uid, &mut None, false, &data_dir,
+    )
 }
 
 /// Read the host journal and the trial record under the daemon install
@@ -90,6 +102,12 @@ fn issue_with(
 /// by `relock` after a start retired its trial: a committed host whose
 /// trial for this instance is Committed is then the steady state, and its
 /// passthrough keeps the lock as an ordinary one does.
+///
+/// The host root must be the daemon's own data directory (`data_dir`,
+/// #1378): records read from any other directory say nothing about this
+/// daemon, so a mismatch could pass through to a candidate swapped in under
+/// another journal. It is a typed refusal.
+#[allow(clippy::too_many_arguments)]
 fn issue_held(
     args: &TrialArgs,
     command: &forward::DaemonCommand,
@@ -97,8 +115,17 @@ fn issue_held(
     record_uid: u32,
     held: &mut Option<File>,
     retired: bool,
+    data_dir: DataDir<'_>,
 ) -> io::Result<Option<start::Issued>> {
     let root = open_root(&args.host_root, root_uid)?;
+    let daemon_data = data_dir(command)?;
+    if !daemon_root::names_root(&daemon_data, &args.host_root)? {
+        return Err(start::refused(format!(
+            "--host-root {} is not the daemon's data directory {}",
+            args.host_root.display(),
+            daemon_data.display()
+        )));
+    }
     let daemon = daemon_lock(Path::new(&command.executable), DAEMON_LOCK_WAIT)?;
     let Some(record) = read_journal(&root, record_uid)? else {
         no_authority(args, &root)?;
@@ -272,7 +299,7 @@ pub(super) fn relock(
         return Ok(());
     }
     let uid = effective_uid();
-    match issue_held(args, command, uid, uid, held, true)? {
+    match issue_held(args, command, uid, uid, held, true, &process_data_dir)? {
         None => Ok(()),
         Some(_) => Err(io::Error::other(
             "a trial is now in flight; the next start owns it",
@@ -586,13 +613,29 @@ mod tests {
     }
 
     /// The fixture's journal is in alice's data root, the launcher's host
-    /// root. Alice gets one daemon argument, so argument checks bite.
+    /// root. Alice gets daemon arguments, so argument checks bite.
+    /// Alice's argv names a config file that sets the host root as her
+    /// data directory, so the issuer's data directory check passes in any
+    /// environment.
     fn rooted(phase: journal::Phase) -> (tempfile::TempDir, PathBuf, journal::JournalRecord) {
         let (dir, root, _host, record) = fixture_with(phase, |record| {
-            record.plan.participants[0].argv.push("--name".into());
+            let alice = &mut record.plan.participants[0];
+            let config = alice.data_root.join("x0xd.toml");
+            alice.argv.push("--config".into());
+            alice.argv.push(config.to_string_lossy().into_owned());
         });
+        set_data_dir(&root, &root);
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         (dir, root, record)
+    }
+
+    /// Point the config file of `rooted`'s alice at `data_dir`.
+    fn set_data_dir(root: &Path, data_dir: &Path) {
+        std::fs::write(
+            root.join("x0xd.toml"),
+            format!("data_dir = {:?}\n", data_dir.to_str().unwrap()),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -710,6 +753,84 @@ mod tests {
         assert!(issue_as(&args, &command, effective_uid()).is_err());
     }
 
+    /// #1378: a host root that is not the daemon's data directory reads
+    /// another directory's records. Here it holds no journal, while the
+    /// daemon's own directory holds a swapped pair: the start is a typed
+    /// refusal (78), not a passthrough to the candidate.
+    #[test]
+    fn a_host_root_that_is_not_the_daemons_data_directory_is_refused() {
+        let (dir, root, record) = rooted(journal::Phase::SwappedCli);
+        let (mut args, command) = matching(&record);
+        let elsewhere = dir.path().canonicalize().unwrap().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o700)).unwrap();
+        args.host_root = elsewhere;
+        let uid = effective_uid();
+        let error = issue_held(
+            &args,
+            &command,
+            uid,
+            uid,
+            &mut None,
+            false,
+            &process_data_dir,
+        )
+        .err()
+        .expect("refused");
+        assert!(start::is_refusal(&error), "{error}");
+        assert!(error.to_string().contains("data directory"), "{error}");
+        let exit = start::start_with(
+            &JournalIssuer {
+                args: &args,
+                held: std::cell::RefCell::new(None),
+            },
+            &command,
+            || {},
+            Clock::now,
+            || false,
+            || {},
+        );
+        assert!(matches!(exit, start::Start::Final(_)), "{exit:?}");
+        assert!(relock(&args, &command, &mut None).is_err_and(|e| start::is_refusal(&e)));
+        assert!(root.join(journal::JOURNAL_FILE_NAME).is_file());
+    }
+
+    /// #1378: a daemon data directory that is a symlink to the host root is
+    /// not the host root; the link is never followed.
+    #[test]
+    fn a_daemon_data_directory_that_links_to_the_host_root_is_refused() {
+        let (dir, root, record) = rooted(journal::Phase::Prepared);
+        let (args, command) = matching(&record);
+        let link = dir.path().canonicalize().unwrap().join("data-link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        set_data_dir(&root, &link);
+        let uid = effective_uid();
+        let error = issue_held(
+            &args,
+            &command,
+            uid,
+            uid,
+            &mut None,
+            false,
+            &process_data_dir,
+        )
+        .err()
+        .expect("refused");
+        assert!(start::is_refusal(&error), "{error}");
+        set_data_dir(&root, &root);
+        assert!(issue_held(
+            &args,
+            &command,
+            uid,
+            uid,
+            &mut None,
+            false,
+            &process_data_dir
+        )
+        .unwrap()
+        .is_none());
+    }
+
     /// End to end: the trial-form argv, the journal issuer and the main
     /// loop. A stop before the first attempt saves the trial Stopped.
     #[test]
@@ -766,9 +887,17 @@ mod tests {
         let (args, command) = matching(&record);
         let mut held = None;
         let uid = effective_uid();
-        assert!(issue_held(&args, &command, uid, uid, &mut held, false)
-            .unwrap()
-            .is_none());
+        assert!(issue_held(
+            &args,
+            &command,
+            uid,
+            uid,
+            &mut held,
+            false,
+            &process_data_dir
+        )
+        .unwrap()
+        .is_none());
         assert!(held.is_some());
         assert!(!lock_is_free(&command.executable), "held through the exec");
         drop(held);
@@ -777,9 +906,17 @@ mod tests {
         let (_dir, _root, record) = rooted(journal::Phase::SwappedCli);
         let (args, command) = matching(&record);
         let mut held = None;
-        assert!(issue_held(&args, &command, uid, uid, &mut held, false)
-            .unwrap()
-            .is_some());
+        assert!(issue_held(
+            &args,
+            &command,
+            uid,
+            uid,
+            &mut held,
+            false,
+            &process_data_dir
+        )
+        .unwrap()
+        .is_some());
         assert!(held.is_none());
         assert!(lock_is_free(&command.executable));
     }
@@ -795,8 +932,16 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
             let uid = effective_uid();
-            let issued =
-                issue_held(&args, &command, uid, uid, &mut None, false).map(|i| i.is_none());
+            let issued = issue_held(
+                &args,
+                &command,
+                uid,
+                uid,
+                &mut None,
+                false,
+                &process_data_dir,
+            )
+            .map(|i| i.is_none());
             sender.send(issued.unwrap()).unwrap();
         });
         assert!(receiver
@@ -824,8 +969,16 @@ mod tests {
         let waiter = std::thread::spawn(move || {
             let uid = effective_uid();
             let mut held = None;
-            let issued =
-                issue_held(&args, &command, uid, uid, &mut held, false).map(|i| i.is_none());
+            let issued = issue_held(
+                &args,
+                &command,
+                uid,
+                uid,
+                &mut held,
+                false,
+                &process_data_dir,
+            )
+            .map(|i| i.is_none());
             sender.send((issued.unwrap(), held.is_some())).unwrap();
         });
         assert!(receiver
@@ -866,9 +1019,17 @@ mod tests {
             command.executable = missing.into_os_string();
             let mut held = None;
             let uid = effective_uid();
-            assert!(issue_held(&args, &command, uid, uid, &mut held, false)
-                .unwrap()
-                .is_none());
+            assert!(issue_held(
+                &args,
+                &command,
+                uid,
+                uid,
+                &mut held,
+                false,
+                &process_data_dir
+            )
+            .unwrap()
+            .is_none());
             assert!(held.is_none());
         }
         let moved = target.with_extension("away");

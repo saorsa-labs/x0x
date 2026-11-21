@@ -15,9 +15,14 @@ exits 78 when no restart can help and 64 on a usage error, so systemd must not
 restart either. KillMode=mixed sends the stop signal to the launcher only,
 which stops x0xd within its own 45 s window.
 
-The unit's user is the last `User=` in the unit and its other drop-ins (in
-name order), or root. Any failure leaves no launcher drop-in behind, so the
-unit runs x0xd directly; install.sh then reloads systemd.
+The unit's user and ExecStart are the effective ones: the unit file and every
+drop-in systemd applies to it (under /etc, /run and /usr/lib, in name order),
+the launcher drop-in itself left out. The helper reads them from the files
+and, when systemd answers, asks it too (`systemctl daemon-reload`, then
+`systemctl show`); an answer that differs from the files is refused, as is a
+unit file or drop-in that shadows this one or a later drop-in that would
+undo the launcher drop-in. Any failure leaves no launcher drop-in behind, so
+the unit runs x0xd directly; install.sh then reloads systemd.
 """
 
 from __future__ import annotations
@@ -26,12 +31,14 @@ import argparse
 import os
 import pwd
 import re
+import secrets
 import shlex
 import shutil
 import stat
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 INSTANCE_ID = re.compile(r"[A-Za-z0-9._-]{1,128}")
 # Tokens that systemd reads literally in ExecStart: no quoting, `$` or `%`.
@@ -41,20 +48,78 @@ DATA_DIR_LINE = re.compile(r'^\s*data_dir: "(?P<path>[^"\\]+)",$', re.MULTILINE)
 CHECK_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 
 
+# The system manager's unit search path, highest precedence first
+# (systemd.unit(5)). The directory of the unit being installed takes the
+# place of /etc/systemd/system.
+ETC_UNITS = "/etc/systemd/system"
+SEARCH_PATH = (
+    "/etc/systemd/system.control",
+    "/run/systemd/system.control",
+    "/run/systemd/transient",
+    "/run/systemd/generator.early",
+    ETC_UNITS,
+    "/etc/systemd/system.attached",
+    "/run/systemd/system",
+    "/run/systemd/system.attached",
+    "/run/systemd/generator",
+    "/usr/local/lib/systemd/system",
+    "/usr/lib/systemd/system",
+    "/lib/systemd/system",
+    "/run/systemd/generator.late",
+)
+# What the launcher drop-in sets; a drop-in applied after it must not set any.
+DROPIN_KEYS = (
+    "ExecStart",
+    "Restart",
+    "RestartPreventExitStatus",
+    "KillMode",
+    "TimeoutStopSec",
+    "TimeoutSec",
+)
+SHOW_PROPERTIES = ("LoadState", "FragmentPath", "DropInPaths", "User", "ExecStart")
+
+
 class Refused(Exception):
     pass
 
 
-def unit_exec_start(unit_text: str) -> list[str]:
-    lines = [
-        line.split("=", 1)[1].strip()
-        for line in unit_text.splitlines()
-        if line.strip().startswith("ExecStart=")
-    ]
-    if len(lines) != 1 or not lines[0]:
-        raise Refused("the unit must have exactly one non-empty ExecStart line")
+class Settings(NamedTuple):
+    user: str
+    exec_start: list[str]
+    fragment: str
+    dropins: list[str]
+
+
+def service_assignments(text: str) -> list[tuple[str, str]]:
+    """The `Key=value` lines of the [Service] section in order, as systemd
+    reads them: comments skipped, a line ending in `\\` joined to the next."""
+    lines: list[str] = []
+    pending: str | None = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line[:1] in ("#", ";") or (pending is None and not line):
+            continue
+        if line.endswith("\\"):
+            pending = line[:-1] if pending is None else f"{pending} {line[:-1]}"
+            continue
+        lines.append(line if pending is None else f"{pending} {line}")
+        pending = None
+    if pending is not None:
+        lines.append(pending)
+    section = None
+    assignments = []
+    for line in lines:
+        if line.startswith("["):
+            section = line
+        elif section == "[Service]" and "=" in line:
+            key, value = line.split("=", 1)
+            assignments.append((key.strip(), value.strip()))
+    return assignments
+
+
+def exec_tokens(value: str) -> list[str]:
     try:
-        tokens = shlex.split(lines[0])
+        tokens = shlex.split(value)
     except ValueError as error:
         raise Refused(f"the unit's ExecStart cannot be split ({error}); migrate by hand")
     for token in tokens:
@@ -63,22 +128,150 @@ def unit_exec_start(unit_text: str) -> list[str]:
     return tokens
 
 
-def unit_user(unit_text: str, dropin: Path) -> str:
-    """The last `User=` in the unit, then in its other drop-ins by name."""
-    texts = [unit_text]
-    if dropin.parent.is_dir():
-        texts += [
-            conf.read_text(encoding="utf-8")
-            for conf in sorted(dropin.parent.glob("*.conf"))
-            if conf.name != dropin.name and conf.is_file()
-        ]
-    users = [
-        line.split("=", 1)[1].strip()
-        for text in texts
-        for line in text.splitlines()
-        if line.strip().startswith("User=")
-    ]
-    return users[-1] if users and users[-1] else "root"
+def unit_exec_start(*texts: str) -> list[str]:
+    """The one ExecStart that `texts` (the unit, then its drop-ins in
+    order) leave: an empty `ExecStart=` clears the earlier ones."""
+    values: list[str] = []
+    for text in texts:
+        for key, value in service_assignments(text):
+            if key == "ExecStart":
+                values = values + [value] if value else []
+    if len(values) != 1:
+        raise Refused("the unit must have exactly one effective ExecStart")
+    tokens = exec_tokens(values[0])
+    if not tokens:
+        raise Refused("the unit's ExecStart is empty")
+    return tokens
+
+
+def unit_user(*texts: str) -> str:
+    """The last `User=` in `texts`; an empty one, or none, is root."""
+    user = ""
+    for text in texts:
+        for key, value in service_assignments(text):
+            if key == "User":
+                user = value
+    return user or "root"
+
+
+def dropin_dirs(name: str) -> list[str]:
+    """The drop-in directory names systemd reads for unit `name`, the unit's
+    own first: `x0xd-a.service.d`, `x0xd-.service.d`, `service.d`."""
+    stem, _, kind = name.rpartition(".")
+    names = [f"{name}.d"]
+    if "@" in stem:
+        names.append(f"{stem.split('@', 1)[0]}@.{kind}.d")
+    parts = stem.split("-")
+    names += [f"{'-'.join(parts[:i])}-.{kind}.d" for i in range(len(parts) - 1, 0, -1)]
+    names.append(f"{kind}.d")
+    return names
+
+
+def unit_files(unit: Path, dropin: Path) -> tuple[Path, list[Path]]:
+    """The unit file systemd loads for `unit`'s name and the drop-ins it
+    applies, in order, without the launcher drop-in `dropin`."""
+    roots = [unit.parent if d == ETC_UNITS else Path(d) for d in SEARCH_PATH]
+    fragment = next((d / unit.name for d in roots if os.path.lexists(d / unit.name)), None)
+    if fragment is None:
+        raise Refused(f"the unit {unit} does not exist")
+    if fragment != unit:
+        raise Refused(f"{fragment} overrides {unit}; migrate by hand")
+    if os.path.realpath(unit) == os.devnull:
+        raise Refused(f"{unit.name} is masked")
+    found: dict[str, Path] = {}
+    for root in roots:
+        for directory in dropin_dirs(unit.name):
+            path = root / directory
+            if not path.is_dir():
+                continue
+            for conf in sorted(path.glob("*.conf")):
+                if conf == dropin:
+                    continue
+                if conf.name == dropin.name:
+                    raise Refused(f"{conf} would replace the launcher drop-in; remove it")
+                if conf.name in found:
+                    raise Refused(
+                        f"drop-ins {found[conf.name]} and {conf} share a name; "
+                        "systemd applies one of them only; migrate by hand"
+                    )
+                found[conf.name] = conf
+    return unit, [found[name] for name in sorted(found)]
+
+
+def file_settings(unit: Path, dropin: Path) -> Settings:
+    fragment, dropins = unit_files(unit, dropin)
+    texts = [fragment.read_text(encoding="utf-8")]
+    for conf in dropins:
+        if os.path.realpath(conf) == os.devnull:
+            texts.append("")
+            continue
+        text = conf.read_text(encoding="utf-8")
+        texts.append(text)
+        if conf.name > dropin.name:
+            for key, _ in service_assignments(text):
+                if key in DROPIN_KEYS:
+                    raise Refused(f"{conf} sets {key}= after the launcher drop-in; migrate by hand")
+    return Settings(
+        user=unit_user(*texts),
+        exec_start=unit_exec_start(*texts),
+        fragment=str(fragment),
+        dropins=[str(conf) for conf in dropins],
+    )
+
+
+def systemd_settings(name: str) -> Settings | None:
+    """systemd's view of unit `name` after a reload, or None when systemd
+    does not answer (no systemctl, or no running systemd)."""
+    systemctl = shutil.which("systemctl")
+    if systemctl is None:
+        return None
+
+    def run(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [systemctl, *args],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+
+    if run("daemon-reload").returncode != 0:
+        return None
+    properties = [arg for prop in SHOW_PROPERTIES for arg in ("-p", prop)]
+    shown = run("show", *properties, "--", name)
+    if shown.returncode != 0:
+        return None
+    values = dict(line.split("=", 1) for line in shown.stdout.splitlines() if "=" in line)
+    if values.get("LoadState") != "loaded":
+        raise Refused(f"systemd does not load {name} (LoadState={values.get('LoadState')})")
+    commands = re.findall(r"\{ path=(\S+) ; argv\[\]=([^;]*) ; ", values.get("ExecStart", ""))
+    if len(commands) != 1 or values.get("ExecStart", "").count("{") != 1:
+        raise Refused(f"systemd reports {name} without exactly one ExecStart")
+    path, argv = commands[0]
+    tokens = argv.split()
+    if not tokens or tokens[0] != path or not all(SAFE_TOKEN.fullmatch(t) for t in tokens):
+        raise Refused(f"systemd reports an ExecStart for {name} that needs quoting: {argv!r}")
+    return Settings(
+        user=values.get("User") or "root",
+        exec_start=tokens,
+        fragment=values.get("FragmentPath", ""),
+        dropins=values.get("DropInPaths", "").split(),
+    )
+
+
+def effective_settings(unit: Path, dropin: Path) -> Settings:
+    files = file_settings(unit, dropin)
+    asked = systemd_settings(unit.name)
+    if asked is None:
+        print("[install] systemd did not answer; using the unit files", file=sys.stderr)
+    elif asked != files:
+        differs = [field for field in Settings._fields if getattr(asked, field) != getattr(files, field)]
+        raise Refused(
+            f"systemd's {', '.join(differs)} for {unit.name} differs from its unit files; "
+            "migrate by hand"
+        )
+    return files
 
 
 def daemon_data_root(binary: str, args: list[str], home: str, user: str) -> str:
@@ -107,13 +300,21 @@ def daemon_data_root(binary: str, args: list[str], home: str, user: str) -> str:
 
 
 def check_host_root(path: str, owner: int) -> str:
+    """The data root with its parent resolved. Its last component is not
+    followed, as the launcher does not follow it: a symlink is refused."""
     if not os.path.isabs(path):
         raise Refused(f"the data root {path} is not absolute")
+    name = os.path.basename(path.rstrip("/"))
+    if name in ("", ".", ".."):
+        raise Refused(f"the data root {path} names no directory")
     try:
-        canonical = os.path.realpath(path, strict=True)
+        parent = os.path.realpath(os.path.dirname(path.rstrip("/")), strict=True)
+        canonical = os.path.join(parent, name)
+        info = os.lstat(canonical)
     except OSError as error:
         raise Refused(f"the data root {path} must exist (start x0xd once first): {error}")
-    info = os.stat(canonical)
+    if stat.S_ISLNK(info.st_mode):
+        raise Refused(f"the data root {path} is a symlink; the launcher does not follow it")
     if not stat.S_ISDIR(info.st_mode):
         raise Refused(f"the data root {canonical} is not a directory")
     if info.st_uid != owner:
@@ -126,7 +327,7 @@ def check_host_root(path: str, owner: int) -> str:
 
 
 def render(
-    unit_text: str,
+    exec_start: list[str],
     binary: str,
     launcher: str,
     instance: str,
@@ -141,10 +342,9 @@ def render(
             raise Refused(f"{path!r} must be an absolute path without spaces or quotes")
     if os.path.basename(launcher) != "x0x-launcher":
         raise Refused(f"{launcher} is not named x0x-launcher")
-    tokens = unit_exec_start(unit_text)
-    if tokens[0] != binary:
-        raise Refused(f"the unit runs {tokens[0]}, not {binary}")
-    args = tokens[1:]
+    if exec_start[0] != binary:
+        raise Refused(f"the unit runs {exec_start[0]}, not {binary}")
+    args = exec_start[1:]
     root = check_host_root(daemon_data_root(binary, args, home, user), owner)
     exec_start = " ".join(
         [launcher, "--host-root", root, "--instance", instance, "--", binary, *args]
@@ -162,24 +362,46 @@ def render(
     )
 
 
+def replace_file(target: Path, write, mode: int) -> None:
+    """Put a new `target` in one step: a new temporary file in its
+    directory (O_EXCL, mode 0700, so no other account can open it while it
+    is written), `write(file)`, the final mode, fsync, rename, then fsync of
+    the directory. The umask plays no part. A failure removes the temporary
+    file and leaves `target` as it was."""
+    staged = target.with_name(f".{target.name}.{secrets.token_hex(8)}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = os.open(staged, flags, 0o700)
+    try:
+        with os.fdopen(fd, "wb") as file:
+            write(file)
+            file.flush()
+            os.fchmod(file.fileno(), mode)
+            os.fsync(file.fileno())
+        os.replace(staged, target)
+    except BaseException:
+        staged.unlink(missing_ok=True)
+        raise
+    directory = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
 def install_launcher(source: Path, launcher: Path) -> None:
     if not source.is_file():
         raise Refused(f"launcher not found: {source}")
-    staged = launcher.with_name(f".{launcher.name}.tmp")
-    shutil.copyfile(source, staged)
-    staged.chmod(0o755)
-    os.replace(staged, launcher)
+
+    def copy(file) -> None:
+        with open(source, "rb") as original:
+            shutil.copyfileobj(original, file)
+
+    replace_file(launcher, copy, 0o755)
 
 
 def write_dropin(dropin: Path, text: str) -> None:
     dropin.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-    staged = dropin.with_name(f".{dropin.name}.tmp")
-    with open(staged, "w", encoding="utf-8") as file:
-        file.write(text)
-        file.flush()
-        os.fsync(file.fileno())
-    staged.chmod(0o644)
-    os.replace(staged, dropin)
+    replace_file(dropin, lambda file: file.write(text.encode("utf-8")), 0o644)
 
 
 def install(options: argparse.Namespace) -> None:
@@ -188,15 +410,17 @@ def install(options: argparse.Namespace) -> None:
         raise Refused(f"{dropin} is not a 30-x0x-launcher.conf drop-in")
     if not os.access(options.binary, os.X_OK):
         raise Refused(f"x0xd is not installed at {options.binary}")
-    unit_text = Path(options.unit).read_text(encoding="utf-8")
-    user = unit_user(unit_text, dropin)
+    # systemd must not see an earlier launcher drop-in when it is asked.
+    dropin.unlink(missing_ok=True)
+    settings = effective_settings(Path(options.unit), dropin)
+    user = settings.user
     try:
         account = pwd.getpwnam(user)
     except KeyError:
         raise Refused(f"the unit's user {user} does not exist")
     install_launcher(Path(options.launcher_source), Path(options.launcher))
     text = render(
-        unit_text,
+        settings.exec_start,
         options.binary,
         options.launcher,
         options.instance,
@@ -223,7 +447,6 @@ def main() -> int:
     except Exception as error:
         dropin = Path(options.dropin)
         try:
-            dropin.with_name(f".{dropin.name}.tmp").unlink(missing_ok=True)
             dropin.unlink(missing_ok=True)
         except OSError as cleanup:
             print(f"error: cannot remove {dropin}: {cleanup}", file=sys.stderr)
