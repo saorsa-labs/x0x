@@ -336,6 +336,51 @@ fn pubsub_delivered(sim: &Sim, src: &str, dst: &str, cut: usize, needle: &[u8]) 
         .count())
 }
 
+/// The frames in `deliveries` (sender label and write) that carry one of
+/// `needles`, as `"<sender>-><dst> <lane> seq=<n> at=<us>us len=<n> by=<needle>"`
+/// (#2149: which delivery brought O's r+1 to J).
+fn carriers(
+    deliveries: &[(String, crate::network::sim::Write)],
+    dst: &str,
+    needles: &[(&'static str, Vec<u8>)],
+) -> Vec<String> {
+    deliveries
+        .iter()
+        .filter_map(|(src, w)| {
+            let (name, _) = needles
+                .iter()
+                .find(|(_, n)| !n.is_empty() && w.bytes.windows(n.len()).any(|x| x == n))?;
+            Some(format!(
+                "{src}->{dst} {:?} seq={} at={}us len={} by={name}",
+                w.lane.class,
+                w.seq,
+                w.at.as_micros(),
+                w.bytes.len()
+            ))
+        })
+        .collect()
+}
+
+/// The frames delivered to `dst` from any node since write `cut` that
+/// carry one of `needles`.
+fn delivered_carriers(
+    sim: &Sim,
+    dst: &str,
+    cut: usize,
+    needles: &[(&'static str, Vec<u8>)],
+) -> Result<Vec<String>> {
+    let to = sim.peer(dst)?;
+    let mut deliveries = Vec::new();
+    for src in sim.labels().into_iter().filter(|l| l != dst) {
+        let from = sim.peer(&src)?;
+        for (write, _) in sim.fabric().delivered_writes_after(&from, &to, cut) {
+            deliveries.push((src.clone(), write));
+        }
+    }
+    deliveries.sort_by_key(|(_, w)| w.at);
+    Ok(carriers(&deliveries, dst, needles))
+}
+
 /// The `MemberAdded(member)` events `src` wrote since write `cut`: how
 /// many, and whether any carried a `reseat_mandate` or an `owner_mandate`.
 fn member_added_mandates(
@@ -382,6 +427,11 @@ struct Prefix {
     held_to_j: Arc<std::sync::atomic::AtomicUsize>,
     /// H-S3-c2: re-published canonical r+1 frames delivered to J.
     canonical: usize,
+    /// The fabric write index when X published r+1′.
+    forked_at: usize,
+    /// What identifies O's r+1 in a frame: its recorded event bytes and
+    /// its state hash (#2149).
+    r1_needles: Vec<(&'static str, Vec<u8>)>,
 }
 
 /// The H-S3-c setup up to J on X's fork r+1′ (ADR 0109 §10), shared by the
@@ -822,6 +872,11 @@ async fn fork_prefix_with(
         j_out_held,
         held_to_j,
         canonical,
+        forked_at,
+        r1_needles: vec![
+            ("r+1 event bytes", removal_bytes.to_vec()),
+            ("r+1 state hash", removal.state_hash.as_bytes().to_vec()),
+        ],
     }))
 }
 
@@ -886,6 +941,23 @@ async fn advance(
     seen.verify("the gate window")?;
     let j_status = status(sim, "J", &group).await?;
     let j1 = view(sim, "J", &group).await?;
+    if !both && j1.marker.is_some() {
+        // #2149: J was to see no canonical commit after r+1′. Name each
+        // delivery to J that carried O's r+1, so a hit shows its path. The
+        // verdict does not change.
+        let found = delivered_carriers(sim, "J", p.forked_at, &p.r1_needles)?;
+        let shown: Vec<&String> = found.iter().take(20).collect();
+        receipt.note(format!(
+            "J holds a marker after the advance; frames carrying O's r+1 delivered to J since \
+             r+1′: {} {shown:?}{}",
+            found.len(),
+            if found.is_empty() {
+                " (none in clear: an encrypted lane, or a state J read from a node)"
+            } else {
+                ""
+            }
+        ));
+    }
     if both {
         // H-S3-c2 prerequisite: canonical r+1 reached J, so J holds both
         // the marker and the gap record before the re-seat. A missing one
@@ -1860,4 +1932,59 @@ fn w3h_1356_staging_containment_mutation_proof() {
         4,
     );
     assert_eq!(receipt.verdict(), Some(Verdict::Infra));
+}
+
+/// #2149: a deliberate relay. A node other than O delivers O's r+1 bytes to
+/// J in a reply, and another carries only r+1's state hash; the diagnostic
+/// names both, in delivery order, and nothing else.
+#[test]
+fn carriers_name_each_delivery_of_o_r1_to_j() {
+    use crate::network::sim::{LaneClass, LaneKey, Write};
+    let write = |src: u8, class, seq, at_ms: u64, bytes: &[u8]| Write {
+        lane: LaneKey {
+            src: [src; 32],
+            dst: [9; 32],
+            class,
+        },
+        seq,
+        pair_ordinal: 0,
+        at: Duration::from_millis(at_ms),
+        bytes: bytes.into(),
+    };
+    let event = br#"{"member_removed":"x","rev":12}"#.to_vec();
+    let hash = b"7970b640bdabc33e".to_vec();
+    let needles = vec![
+        ("r+1 event bytes", event.clone()),
+        ("r+1 state hash", hash.clone()),
+    ];
+    let mut reply = b"reply:".to_vec();
+    reply.extend_from_slice(&event);
+    let mut page = b"page:{\"state_hash\":\"".to_vec();
+    page.extend_from_slice(&hash);
+    let deliveries = vec![
+        (
+            "A".to_string(),
+            write(1, LaneClass::Direct, 4, 1_500, &reply),
+        ),
+        (
+            "O".to_string(),
+            write(2, LaneClass::PubSub, 7, 1_600, b"unrelated"),
+        ),
+        ("M1".to_string(), write(3, LaneClass::Bulk, 2, 1_700, &page)),
+    ];
+    let found = carriers(&deliveries, "J", &needles);
+    assert_eq!(
+        found,
+        vec![
+            format!(
+                "A->J Direct seq=4 at=1500000us len={} by=r+1 event bytes",
+                reply.len()
+            ),
+            format!(
+                "M1->J Bulk seq=2 at=1700000us len={} by=r+1 state hash",
+                page.len()
+            ),
+        ]
+    );
+    assert!(carriers(&deliveries[1..2], "J", &needles).is_empty());
 }
