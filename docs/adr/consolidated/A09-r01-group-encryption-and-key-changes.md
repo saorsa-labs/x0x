@@ -432,6 +432,39 @@ What the creator gets depends on the plane:
 
 No wire format changes.
 
+Amendment of 21 Nov 2026 (#2135 item 2), decided by the orchestrator
+session under A15 (21 Nov 2026) to build what ADR 0110 §3 already requires;
+ADR 0110 stays Accepted and its text is unchanged. A saved S4 removal that
+meets a competing branch is kept as fork evidence and is never published,
+and its row waits as `waiting_for_fork_resolution` until an admin resolves
+the fork, across restarts. Three changes. (1) A live or resumed removal
+delivery whose saved event (parent P to result R) is no longer on the chain
+at its epoch is classified against the chain first. When a different child
+of P is on this node's chain, the delivery stops, the row joins the fork
+set, and that competing commit is installed with the existing fork-evidence
+install (ADR-0066): the group's `fork_quarantine` marker, `no_anchor` for
+an ordinary group. Before, the delivery was dropped as if superseded, with
+no marker and no typed state. A removal behind a later epoch change on the
+same chain is still discarded as before; it is not a fork. (2) The
+completion pass keeps every row in the fork set open, so a row whose own
+chain shows the exclusion no longer completes while it waits. This applies
+to crypto-only frames in the fork set too. (3) Storage: no new field and no
+new file. The evidence that survives a restart is the existing persisted
+`fork_quarantine` marker in the group record, together with the row's saved
+`outgoing_event` in the `.evs`, which an open row keeps. Records and markers
+stored by earlier builds load unchanged. At a restart the saved event is
+classified as a fork while the marker stands. The exit is the existing
+manual clear (`POST /groups/:id/quarantine/clear`). After it, the next
+worker pass classifies the row again, as a restart would: a resumed
+delivery still waits for the group's head sync, and a competing child still
+on the chain keeps the row in the fork set. Known limit: this detects a
+competing commit only when it is on this node's chain, or when the group
+already carries a marker. A node that keeps its own removal as its head
+(the W3-H 1581e fork arm) learns of the competing commit only if that
+commit reaches the ordinary apply path, which records it as fork evidence
+(ADR-0066). This change does not alter how a relayed commit is
+authenticated. No wire or API change.
+
 ## Security claims
 
 State the exact properties of each released path. Post-quantum signatures and key encapsulation do not alone prove forward secrecy or recovery after key compromise.

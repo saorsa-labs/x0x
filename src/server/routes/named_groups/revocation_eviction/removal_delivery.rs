@@ -418,47 +418,181 @@ pub(super) fn resume_after_load(
         else {
             continue;
         };
-        let Some(row) = store.get_mut(&key) else {
+        resume_saved_removal(info, local, &key, saved, store, removals, ce_state);
+    }
+}
+
+/// #2135 (ADR 0110 §3, manual resolution): a saved removal that met a
+/// competing branch waits in `ce_state.fork` while its group carries the
+/// fork-quarantine marker. Once an admin clears the marker
+/// (`POST /groups/:id/quarantine/clear`), the row leaves the fork set and
+/// is classified again against the current chain, exactly as at a
+/// restart: a resumed delivery still waits for the group's head sync
+/// before any resend, and a competing child still on the chain keeps the
+/// row in the fork set. Crypto-only frames in the fork set are not saved
+/// removals and are left as they are. Returns whether a row left the set.
+pub(super) fn reclassify_cleared_forks(
+    groups: &[(String, GroupInfo)],
+    local: &[u8; 32],
+    store: &mut ObligationStore,
+    removals: &mut HashMap<EvictionKey, RemovalDelivery>,
+    ce_state: &mut crypto_exclusion::CeState,
+) -> bool {
+    let cleared: Vec<(EvictionKey, SavedRemoval)> = ce_state
+        .fork
+        .iter()
+        .filter_map(|key| {
+            let info = groups
+                .iter()
+                .map(|(_, info)| info)
+                .find(|info| info.stable_group_id() == key.stable_group_id)?;
+            if info.fork_quarantine.is_some() || info.withdrawn {
+                return None;
+            }
+            let row = store.get(key).filter(|row| row.phase.is_open())?;
+            let saved = decode_saved_removal(row.outgoing_event.as_deref()?)?;
+            Some((key.clone(), saved))
+        })
+        .collect();
+    let changed = !cleared.is_empty();
+    for (key, saved) in cleared {
+        ce_state.fork.remove(&key);
+        let Some(info) = groups
+            .iter()
+            .map(|(_, info)| info)
+            .find(|info| info.stable_group_id() == key.stable_group_id)
+        else {
             continue;
         };
-        match classify(info, row.parent_head.as_deref(), &saved.result_head) {
-            ResumeAction::Deliver => {
-                row.phase = Phase::CommittedDeliveryPending;
-                row.result_head = Some(saved.result_head.clone());
-                let delivery = new_delivery(
-                    saved.event,
-                    saved.result_head,
-                    survivors(info, local, &key.target),
-                    true,
-                    Instant::now(),
-                );
-                removals.insert(key.clone(), delivery);
-            }
-            ResumeAction::Discard => {
-                row.phase = Phase::CommittedDeliveryPending;
-                row.result_head = Some(saved.result_head);
-                row.outgoing_event = None;
-            }
-            ResumeAction::Abandon => {
-                row.phase = Phase::Pending;
-                row.parent_head = None;
-                row.result_head = None;
-                row.result_epoch = None;
-                row.outgoing_event = None;
-            }
-            ResumeAction::Fork => {
-                ce_state.fork.insert(key.clone());
-                tracing::warn!(
-                    group_id = %super::super::LogHexId::group(&key.stable_group_id),
-                    target = %super::super::LogHexId::agent(&hex::encode(key.target)),
-                    "ADR 0110 S4: a saved removal meets a competing branch; waiting for fork resolution"
-                );
-            }
-            ResumeAction::WaitForHeadSync => {
-                row.waiting = Some(WaitingState::cause(WaitingCause::WaitingForHeadSync));
-            }
+        resume_saved_removal(info, local, &key, saved, store, removals, ce_state);
+    }
+    changed
+}
+
+/// Classify one open row's saved removal against `info` and act on it
+/// (§3): resume its delivery, discard it, abandon the preparation, keep it
+/// as fork evidence, or wait for the head sync.
+fn resume_saved_removal(
+    info: &GroupInfo,
+    local: &[u8; 32],
+    key: &EvictionKey,
+    saved: SavedRemoval,
+    store: &mut ObligationStore,
+    removals: &mut HashMap<EvictionKey, RemovalDelivery>,
+    ce_state: &mut crypto_exclusion::CeState,
+) {
+    let Some(row) = store.get_mut(key) else {
+        return;
+    };
+    match classify(info, row.parent_head.as_deref(), &saved.result_head) {
+        ResumeAction::Deliver => {
+            row.phase = Phase::CommittedDeliveryPending;
+            row.result_head = Some(saved.result_head.clone());
+            let delivery = new_delivery(
+                saved.event,
+                saved.result_head,
+                survivors(info, local, &key.target),
+                true,
+                Instant::now(),
+            );
+            removals.insert(key.clone(), delivery);
+        }
+        ResumeAction::Discard => {
+            row.phase = Phase::CommittedDeliveryPending;
+            row.result_head = Some(saved.result_head);
+            row.outgoing_event = None;
+        }
+        ResumeAction::Abandon => {
+            row.phase = Phase::Pending;
+            row.parent_head = None;
+            row.result_head = None;
+            row.result_epoch = None;
+            row.outgoing_event = None;
+        }
+        ResumeAction::Fork => {
+            ce_state.fork.insert(key.clone());
+            tracing::warn!(
+                group_id = %super::super::LogHexId::group(&key.stable_group_id),
+                target = %super::super::LogHexId::agent(&hex::encode(key.target)),
+                "ADR 0110 S4: a saved removal meets a competing branch; waiting for fork resolution"
+            );
+        }
+        ResumeAction::WaitForHeadSync => {
+            row.waiting = Some(WaitingState::cause(WaitingCause::WaitingForHeadSync));
         }
     }
+}
+
+/// #2135 (ADR 0110 §3): a live or resumed delivery whose saved removal no
+/// longer sits on the chain at its epoch, because a different child of
+/// the saved parent is on the chain. The saved event is never published:
+/// the delivery stops, the row waits in the fork set (shown as
+/// `waiting_for_fork_resolution`, kept open by the completion pass), and
+/// the competing commit is installed as fork evidence with the persistent
+/// fork-quarantine marker. The marker is what survives a restart: the
+/// restart classifies the saved event as a fork while it stands, and an
+/// admin's manual clear is the exit ([`reclassify_cleared_forks`]). The
+/// competing commit is already on this node's verified chain, so it was
+/// authenticated when it applied. Returns `false` when the chain shows no
+/// competing child (an ordinary superseded or abandoned removal).
+async fn contain_competing_branch(
+    state: &Arc<AppState>,
+    group_key: &str,
+    info: &GroupInfo,
+    key: &EvictionKey,
+    result_head: &str,
+) -> bool {
+    let parent_head = state
+        .revocation_evictions
+        .inner
+        .lock()
+        .await
+        .store
+        .get(key)
+        .and_then(|row| row.parent_head.clone());
+    let Some(parent_head) = parent_head else {
+        return false;
+    };
+    if classify(info, Some(&parent_head), result_head) != ResumeAction::Fork {
+        return false;
+    }
+    let competing = info
+        .commit_log
+        .iter()
+        .rev()
+        .find(|retained| {
+            retained.commit.prev_state_hash.as_deref() == Some(parent_head.as_str())
+                && retained.commit.state_hash != result_head
+        })
+        .map(|retained| retained.commit.clone());
+    if let Some(competing) = competing {
+        let evidence = x0x::groups::ForkEvidence {
+            revision: competing.revision,
+            state_hash: competing.state_hash.clone(),
+            committed_by: competing.committed_by.clone(),
+            observed_at_ms: super::super::now_millis_u64(),
+        };
+        let quarantine =
+            super::super::fork_quarantine_for_evidence(info, &evidence, &competing, None);
+        if !super::super::install_fork_evidence(state, group_key, evidence, quarantine, false, None)
+            .await
+        {
+            tracing::warn!(
+                group_id = %super::super::LogHexId::group(&key.stable_group_id),
+                "ADR 0110 S4: the fork-quarantine marker for a saved removal is not durable yet; the row waits in memory"
+            );
+        }
+    }
+    let mut inner = state.revocation_evictions.inner.lock().await;
+    inner.removals.remove(key);
+    inner.ce.fork.insert(key.clone());
+    inner.dirty = true;
+    tracing::warn!(
+        group_id = %super::super::LogHexId::group(&key.stable_group_id),
+        target = %super::super::LogHexId::agent(&hex::encode(key.target)),
+        "ADR 0110 S4: a delivered removal meets a competing branch; the saved event is not published; waiting for fork resolution"
+    );
+    true
 }
 
 // ─── Delivery ──────────────────────────────────────────────────────────────
@@ -515,17 +649,17 @@ pub(super) async fn drive(state: &Arc<AppState>) {
         // shape in the removal barrier's `live_head_is`). The guard covers
         // only the read; the round and send work below take no lock that a
         // roster write holds.
-        let info = {
+        let found = {
             let _committed = state.named_groups_persistence_lock.lock().await;
             state
                 .named_groups
                 .read()
                 .await
-                .values()
-                .find(|info| info.stable_group_id() == key.stable_group_id)
-                .cloned()
+                .iter()
+                .find(|(_, info)| info.stable_group_id() == key.stable_group_id)
+                .map(|(group_key, info)| (group_key.clone(), info.clone()))
         };
-        let Some(info) = info.filter(|info| !info.withdrawn) else {
+        let Some((group_key, info)) = found.filter(|(_, info)| !info.withdrawn) else {
             runtime.inner.lock().await.removals.remove(&key);
             continue;
         };
@@ -536,6 +670,13 @@ pub(super) async fn drive(state: &Arc<AppState>) {
             continue;
         }
         if !delivery_retained(&info, &delivery.result_head) {
+            // #2135 (§3): a different child of the saved parent on the
+            // chain is a competing branch, not a superseded removal: keep
+            // the saved event as fork evidence and never publish it.
+            if contain_competing_branch(state, &group_key, &info, &key, &delivery.result_head).await
+            {
+                continue;
+            }
             // The removal left the chain, or an epoch change followed it:
             // never resend old crypto material. A later epoch-less commit
             // keeps the delivery (#1508 rc12).
@@ -1096,6 +1237,135 @@ mod tests {
         resume_after_load(&groups, &local, &mut store, &mut removals, &mut ce_state);
         (removals, store, key)
     }
+
+    /// A fork-quarantine marker naming the competing child `other` of `p`.
+    fn marker(info: &GroupInfo) -> x0x::groups::ForkQuarantine {
+        x0x::groups::ForkQuarantine {
+            revision: 4,
+            state_hash: "other".to_string(),
+            committed_by: String::new(),
+            observed_at_ms: 1,
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: info.terminal_commit_header(),
+                conflicting_commit: commit("p", "other"),
+                classification: None,
+            },
+            no_anchor: true,
+        }
+    }
+
+    /// #2135 (ADR 0110 §3, "fork evidence and typed manual-resolution exit
+    /// survive"): this node keeps its own removal (`p` → `r`) as its head
+    /// and the persisted fork-quarantine marker names the competing child.
+    /// A restart keeps the saved event, holds no delivery and puts the row
+    /// in the fork set (shown as `waiting_for_fork_resolution`), so nothing
+    /// is published and the row stays open.
+    #[test]
+    fn a_restart_over_the_persisted_marker_keeps_the_row_waiting_for_fork_resolution() {
+        let mut info = info_with_log("r", &[("p", "r")]);
+        info.fork_quarantine = Some(marker(&info));
+        // The marker is persisted in the group record (named_groups.json):
+        // it round-trips through the stored JSON.
+        let stored = serde_json::to_string(&info).expect("encode");
+        let info: GroupInfo = serde_json::from_str(&stored).expect("decode");
+        assert!(info.fork_quarantine.is_some(), "the marker is persisted");
+        let (removals, store, key) = resume_one(info);
+        assert!(removals.is_empty(), "no delivery for a forked removal");
+        let row = store.get(&key).expect("row");
+        assert!(row.phase.is_open(), "the row stays open");
+        assert!(
+            row.outgoing_event.is_some(),
+            "the saved event is kept as fork evidence"
+        );
+    }
+
+    /// #2135 manual resolution: while the marker stands, the fork row does
+    /// not move. Once an admin clears it, the row leaves the fork set and is
+    /// classified again; with its own removal still the head, the resumed
+    /// delivery waits for the head sync (`resumed`) before any resend.
+    #[test]
+    fn a_cleared_marker_reclassifies_the_fork_row() {
+        let local = [1; 32];
+        let mut info = info_with_log("r", &[("p", "r")]);
+        let (_, mut store, key) = resume_one(info.clone());
+        let mut removals = HashMap::new();
+        let mut ce_state = crypto_exclusion::CeState::default();
+        ce_state.fork.insert(key.clone());
+        for id in [local, [0xbb; 32], [0xcc; 32]] {
+            info.add_member(hex::encode(id), GroupRole::Member, None, None);
+        }
+        info.remove_member(&hex::encode([0xbb; 32]), Some(hex::encode(local)));
+        let mut quarantined = info.clone();
+        quarantined.fork_quarantine = Some(marker(&quarantined));
+        let groups = vec![("g".to_string(), quarantined)];
+        assert!(!reclassify_cleared_forks(
+            &groups,
+            &local,
+            &mut store,
+            &mut removals,
+            &mut ce_state
+        ));
+        assert!(
+            ce_state.fork.contains(&key),
+            "the marker still holds the row"
+        );
+        assert!(removals.is_empty());
+
+        let groups = vec![("g".to_string(), info)];
+        assert!(reclassify_cleared_forks(
+            &groups,
+            &local,
+            &mut store,
+            &mut removals,
+            &mut ce_state
+        ));
+        assert!(
+            !ce_state.fork.contains(&key),
+            "the cleared row leaves the fork set"
+        );
+        let delivery = removals.get(&key).expect("the delivery resumes");
+        assert!(delivery.resumed, "no resend before the head sync");
+    }
+
+    /// #2135: a cleared marker with the competing child still on this
+    /// node's chain keeps the row in the fork set.
+    #[test]
+    fn a_cleared_marker_with_the_competing_child_on_the_chain_stays_a_fork() {
+        let local = [1; 32];
+        let info = info_with_log("other", &[("p", "other")]);
+        let (_, mut store, key) = resume_one(info.clone());
+        let mut removals = HashMap::new();
+        let mut ce_state = crypto_exclusion::CeState::default();
+        ce_state.fork.insert(key.clone());
+        let groups = vec![("g".to_string(), info)];
+        reclassify_cleared_forks(&groups, &local, &mut store, &mut removals, &mut ce_state);
+        assert!(ce_state.fork.contains(&key));
+        assert!(removals.is_empty());
+    }
+
+    /// #2135 storage compatibility: a group record stored before any
+    /// fork-quarantine marker existed (no `fork_quarantine` key) loads with
+    /// no marker, and a marker stored before ADR-0066 (no `no_anchor` key)
+    /// loads as an owner-axis marker. No new field is stored.
+    #[test]
+    fn the_old_stored_shapes_still_load() {
+        let info = info_with_log("r", &[("p", "r")]);
+        let mut value = serde_json::to_value(&info).expect("encode");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("fork_quarantine");
+        let old: GroupInfo = serde_json::from_value(value).expect("an old record loads");
+        assert!(old.fork_quarantine.is_none());
+        let mut marker_value = serde_json::to_value(marker(&info)).expect("encode");
+        marker_value
+            .as_object_mut()
+            .expect("object")
+            .remove("no_anchor");
+        let old_marker: x0x::groups::ForkQuarantine =
+            serde_json::from_value(marker_value).expect("an old marker loads");
+        assert!(!old_marker.no_anchor);
+    }
 }
 
 #[cfg(test)]
@@ -1445,6 +1715,108 @@ mod daemon_tests {
                 .contains_key(&key),
             "an epoch change ends the delivery"
         );
+        // #2135: an ordinary superseded removal is not a fork.
+        assert!(
+            !state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .ce
+                .fork
+                .contains(&key),
+            "a superseded removal does not wait for fork resolution"
+        );
+        assert!(
+            state.named_groups.read().await[&group_id]
+                .fork_quarantine
+                .is_none(),
+            "a superseded removal installs no fork marker"
+        );
+        Ok(())
+    }
+
+    /// #2135 (ADR 0110 §3 L225): a delivery whose saved removal (`p` →
+    /// `r`) meets a different child of `p` on this node's chain stops, is
+    /// never sent, and the row waits for fork resolution: the competing
+    /// commit is installed as fork evidence with the persistent
+    /// fork-quarantine marker, and the completion pass keeps the row open.
+    /// Before the fix the delivery was dropped as superseded, with no marker
+    /// and no typed state, and the row then completed from the local chain.
+    #[tokio::test]
+    async fn a_delivery_that_meets_a_competing_child_waits_for_fork_resolution() -> Result<()> {
+        let (state, _dir) = state_past_restart_wait().await?;
+        let survivor = AgentId([0x63; 32]);
+        let target = [0x64; 32];
+        let group_id = "e6".repeat(16);
+        let mut info = insert_group(&state, &group_id, &survivor).await;
+        let stable = info.stable_group_id().to_string();
+        let key = EvictionKey::new(stable.clone(), target);
+        let mut competing = super::tests::commit("p", "other");
+        competing.committed_by = "dd".repeat(32);
+        info.commit_log
+            .push(x0x::groups::state_commit::RetainedCommit {
+                commit: competing,
+                roster: std::collections::BTreeMap::new(),
+                meta: None,
+            });
+        info.state_hash = "other".to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.store.intake(
+                &key,
+                x0x::groups::eviction::EvictionTrigger::AgentRevocation {
+                    record_hash: [7; 32],
+                    record_bytes: vec![7],
+                },
+                None,
+                0,
+                [0; 16],
+            );
+            let row = inner.store.get_mut(&key).context("row")?;
+            row.phase = Phase::CommittedDeliveryPending;
+            row.parent_head = Some("p".to_string());
+            inner.removals.insert(
+                key.clone(),
+                new_delivery(
+                    removal_event(&group_id, &target),
+                    "r".to_string(),
+                    vec![*survivor.as_bytes()],
+                    false,
+                    Instant::now(),
+                ),
+            );
+        }
+
+        drive(&state).await;
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            assert!(
+                !inner.removals.contains_key(&key),
+                "the saved event is not delivered across the fork"
+            );
+            assert!(
+                inner.ce.fork.contains(&key),
+                "the row waits for fork resolution"
+            );
+            assert!(
+                super::super::delivering_keys(&inner).contains(&key),
+                "the completion pass keeps the fork row open"
+            );
+            assert!(inner.store.get(&key).is_some_and(|row| row.phase.is_open()));
+        }
+        let marker = state.named_groups.read().await[&group_id]
+            .fork_quarantine
+            .clone()
+            .context("the fork-quarantine marker is installed")?;
+        assert_eq!(marker.state_hash, "other");
+        assert_eq!(marker.committed_by, "dd".repeat(32));
+        assert!(marker.no_anchor, "an ordinary group: manual clear only");
         Ok(())
     }
 

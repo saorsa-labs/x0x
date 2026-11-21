@@ -1316,6 +1316,19 @@ pub(in crate::server) async fn run_revocation_eviction_worker(state: Arc<AppStat
     }
 }
 
+/// The rows the completion pass keeps open whatever the local chain
+/// shows: every crypto-only frame and saved removal still being delivered
+/// (§3), and (#2135) every saved frame or removal that met a competing
+/// branch and waits for fork resolution. A fork row holds no delivery, but
+/// it must not complete from this node's own chain: the exclusion that
+/// chain shows is on a branch the group did not take.
+fn delivering_keys(inner: &S4Inner) -> BTreeSet<EvictionKey> {
+    let mut delivering = inner.ce.delivering();
+    delivering.extend(inner.removals.keys().cloned());
+    delivering.extend(inner.ce.fork.iter().cloned());
+    delivering
+}
+
 /// One worker pass: intake, scan, reconcile, evaluate. It never commits.
 pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
     let groups = snapshot_groups(state).await;
@@ -1404,8 +1417,21 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
             .budgets
             .insert(key, RowBudget::resume(Duration::ZERO, now));
     }
-    let mut delivering = inner.ce.delivering();
-    delivering.extend(inner.removals.keys().cloned());
+    // #2135 (§3 manual resolution): a saved removal whose fork marker an
+    // admin cleared is classified again before the completion pass.
+    {
+        let inner = &mut *inner;
+        if removal_delivery::reclassify_cleared_forks(
+            &groups,
+            &local,
+            &mut inner.store,
+            &mut inner.removals,
+            &mut inner.ce,
+        ) {
+            inner.dirty = true;
+        }
+    }
+    let delivering = delivering_keys(&inner);
     let memory_only = !inner.sidecar.state.writable();
     reconcile_and_retain(
         &mut inner,

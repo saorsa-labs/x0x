@@ -19,6 +19,17 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **A saved S4 removal that meets a competing branch waits for fork
+  resolution and is never sent (#2135 item 2; A09 amendment of 21 Nov
+  2026, ADR 0110 §3).** When a different child of the removal's parent is
+  on the node's chain, the delivery stops, the competing commit is
+  recorded as fork evidence with the persistent fork-quarantine marker,
+  and the S4 row shows `waiting_for_fork_resolution` instead of being
+  dropped as superseded and then completing. The row stays open across a
+  restart while the marker stands; `POST /groups/:id/quarantine/clear` is
+  the exit, after which the row is classified again. No new stored field.
+  Known limit: a node that keeps its own removal as its head sees the
+  competing commit only through the ordinary apply path.
 - **A delta into a group store is measured in O(keys in the delta) (#2110
   item 1; A10 amendment of 21 Nov 2026).** The store keeps its content
   length exact from the OR-Set tag counts (saorsa-gossip 0.5.95), so a delta
