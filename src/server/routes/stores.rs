@@ -857,11 +857,30 @@ pub(in crate::server) async fn get_kv_value(
     }
 }
 
+/// Query of `DELETE /stores/:id/:key`.
+#[derive(Debug, Default, Deserialize)]
+pub(in crate::server) struct DeleteValueQuery {
+    /// `publish`: when this replica does not hold the key, publish the
+    /// removal for the replicas that do (#2110).
+    absent: Option<String>,
+}
+
 /// DELETE /stores/:id/:key
 pub(in crate::server) async fn delete_kv_value(
     State(state): State<Arc<AppState>>,
     Path((id, key)): Path<(String, String)>,
+    Query(query): Query<DeleteValueQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let publish_absent = match query.absent.as_deref() {
+        None => false,
+        Some("publish") => true,
+        Some(other) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                format!("absent must be \"publish\", got {other:?}"),
+            )
+        }
+    };
     if let Some(refusal) = group_store_write_refusal(&state, &id).await {
         return refusal;
     }
@@ -873,9 +892,15 @@ pub(in crate::server) async fn delete_kv_value(
         handle.clone()
     };
 
-    match handle.remove_with_outcome(&key).await {
+    let outcome = if publish_absent {
+        handle.remove_absent_with_outcome(&key).await
+    } else {
+        handle.remove_with_outcome(&key).await
+    };
+    match outcome {
         Ok(x0x::KvRemoveOutcome {
             delta,
+            held,
             published,
             publish_error,
         }) => {
@@ -890,7 +915,10 @@ pub(in crate::server) async fn delete_kv_value(
                 spawn_kv_store_delta_delivery(&state, recipients, &id, handle.peer_id(), &delta);
             }
             if published {
-                (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "ok": true, "held": held })),
+                )
             } else {
                 // #976 ruling: the remove happened — 202, saved locally,
                 // not yet published. No replay.
@@ -898,6 +926,7 @@ pub(in crate::server) async fn delete_kv_value(
                     StatusCode::ACCEPTED,
                     Json(serde_json::json!({
                         "ok": true,
+                        "held": held,
                         "published": false,
                         "reason": publish_error,
                         "direct_attempted": direct_attempted,
@@ -905,6 +934,7 @@ pub(in crate::server) async fn delete_kv_value(
                 )
             }
         }
+        Err(x0x::error::IdentityError::KeyNotFound(_)) => not_found("key not found"),
         Err(e) if matches!(e, x0x::error::IdentityError::ImmutableKey(_)) => {
             // AppendOnly store: keys can never be deleted, even by the owner.
             api_error(StatusCode::CONFLICT, format!("{e}"))
@@ -7642,6 +7672,7 @@ mod tests {
         let response = delete_kv_value(
             State(Arc::clone(&state)),
             Path((binding.topic.clone(), "before".to_string())),
+            Query(DeleteValueQuery::default()),
         )
         .await
         .into_response();
@@ -8587,3 +8618,7 @@ mod tests {
 #[cfg(test)]
 #[path = "stores_writer_tests.rs"]
 mod writer_tests;
+
+#[cfg(test)]
+#[path = "stores_absent_remove_tests.rs"]
+mod absent_remove_tests;

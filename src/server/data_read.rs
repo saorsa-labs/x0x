@@ -293,6 +293,7 @@ async fn write_local_store(state: &Arc<AppState>, request: &DataWriteRequest) ->
             super::routes::stores::delete_kv_value(
                 State(Arc::clone(state)),
                 Path((topic, key.clone())),
+                axum::extract::Query(super::routes::stores::DeleteValueQuery::default()),
             )
             .await
         }
