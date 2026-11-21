@@ -106,6 +106,9 @@ struct Refusal {
     /// A removal by this source already made the current window's retry
     /// due (#2068 point 4): at most one such re-arm per window.
     removal_rearmed: bool,
+    /// A beacon from this source with a matching OR-Set digest already
+    /// woke a repair in the current window (#2110): at most one per window.
+    orset_skip_used: bool,
 }
 
 /// Non-persisted admission state carried by a `KvStore`.
@@ -174,6 +177,7 @@ impl ImageAdmission {
             retry_after_ms: 0,
             backoff_ms: 0,
             removal_rearmed: false,
+            orset_skip_used: false,
         });
         r.count = r.count.saturating_add(1);
         r.last_image = image;
@@ -187,6 +191,7 @@ impl ImageAdmission {
             };
             r.retry_after_ms = now.saturating_add(r.backoff_ms);
             r.removal_rearmed = false;
+            r.orset_skip_used = false;
         }
         log
     }
@@ -216,6 +221,18 @@ impl ImageAdmission {
                 r.retry_after_ms = now;
                 r.removal_rearmed = true;
             }
+        }
+    }
+
+    /// Whether a beacon from `source` whose OR-Set digest matches may wake
+    /// a repair inside `source`'s retry window (#2110). True at most once
+    /// per window: the digest is the sender's claim, and a refusal inside
+    /// the window does not widen it, so without this bound a refused
+    /// writer could earn a wake per beacon.
+    pub(crate) fn take_orset_skip(&mut self, source: &AgentId, now: u64) -> bool {
+        match self.refusals.get_mut(source) {
+            Some(r) if now < r.retry_after_ms => !std::mem::replace(&mut r.orset_skip_used, true),
+            _ => true,
         }
     }
 

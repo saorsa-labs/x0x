@@ -109,7 +109,7 @@ fn beacon_wake_rule() {
     );
     assert_eq!(
         beacon_wake(a, b, false, Some(o), local(o)),
-        BeaconWake::Wake
+        BeaconWake::SkipBackoff
     );
     assert_eq!(
         beacon_wake(a, b, false, Some(o), || None),
@@ -164,7 +164,7 @@ fn a_value_only_difference_wakes_through_the_backoff() {
             || local.orset_digest().ok(),
         )
     };
-    assert_eq!(wake(&theirs), BeaconWake::Wake);
+    assert_eq!(wake(&theirs), BeaconWake::SkipBackoff);
 
     theirs
         .put(
@@ -183,6 +183,149 @@ fn a_value_only_difference_wakes_through_the_backoff() {
         BeaconWake::Deferred,
         "a different OR-Set keeps the back-off"
     );
+    assert!(
+        local.take_image_orset_skip(&author),
+        "the window's one skip"
+    );
+    assert!(
+        !local.take_image_orset_skip(&author),
+        "a second matching beacon in the same window is deferred"
+    );
+}
+
+#[test]
+fn one_orset_skip_per_author_per_window() {
+    use crate::kv::image_admission::ImageAdmission;
+    let (q, r) = (AgentId([2; 32]), AgentId([3; 32]));
+    let mut image = ImageAdmission::default();
+    assert!(
+        image.take_orset_skip(&q, 0),
+        "no refusal: no back-off to skip"
+    );
+    image.note_refusal(q, 1, 1_000);
+    image.note_refusal(r, 1, 1_000);
+    assert!(image.take_orset_skip(&q, 2_000));
+    assert!(!image.take_orset_skip(&q, 3_000), "used for this window");
+    image.note_refusal(q, 1, 4_000);
+    assert!(
+        !image.take_orset_skip(&q, 5_000),
+        "a refusal inside the window does not open a new one"
+    );
+    assert!(image.take_orset_skip(&r, 5_000), "the bound is per author");
+    image.note_refusal(q, 1, 40_000);
+    assert!(
+        image.take_orset_skip(&q, 41_000),
+        "the next window has its own skip"
+    );
+}
+
+#[test]
+fn the_orset_digest_binds_the_domain_tag_and_the_store_id() {
+    let local = store_with(&[("k", b"one")]);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"x0x.kv.orset-digest.v1");
+    hasher.update(local.id().as_bytes());
+    hasher.update(&bincode::serialize(&local.keys_canonical_for_test()).expect("canonical"));
+    assert_eq!(
+        local.orset_digest().expect("digest"),
+        *hasher.finalize().as_bytes()
+    );
+    let mut moved = KvStore::new(
+        KvStoreId::new([10; 32]),
+        "store".to_string(),
+        AgentId([1; 32]),
+        AccessPolicy::Signed,
+    )
+    .expect("store");
+    moved
+        .merge(&{
+            let mut same = local.clone();
+            same.set_id_for_test(KvStoreId::new([10; 32]));
+            same
+        })
+        .expect("same OR-Set under another id");
+    assert_eq!(
+        bincode::serialize(&moved.keys_canonical_for_test()).expect("moved"),
+        bincode::serialize(&local.keys_canonical_for_test()).expect("local"),
+        "precondition: the same OR-Set"
+    );
+    assert_ne!(
+        moved.orset_digest().expect("moved"),
+        local.orset_digest().expect("local"),
+        "the store id is bound"
+    );
+}
+
+/// Every path that changes the OR-Set moves the cache key, so a cached
+/// digest always equals a fresh one.
+#[test]
+fn the_cached_orset_digest_follows_every_path_that_changes_the_or_set() {
+    fn check(store: &KvStore, path: &str) {
+        assert_eq!(
+            store.orset_digest().expect("cached"),
+            store.orset_digest_uncached().expect("fresh"),
+            "{path}"
+        );
+    }
+    let owner = AgentId([1; 32]);
+    let mut store = store_with(&[("k", b"one")]);
+    let mut before = store.orset_digest().expect("first");
+    let mut step = |store: &KvStore, path: &str| {
+        check(store, path);
+        let now = store.orset_digest().expect("now");
+        assert_ne!(now, before, "{path} changed the OR-Set");
+        before = now;
+    };
+
+    store
+        .put(
+            "a".into(),
+            b"1".to_vec(),
+            "text/plain".into(),
+            PeerId::new([5; 32]),
+        )
+        .expect("put");
+    step(&store, "put");
+    store.remove("a").expect("remove");
+    step(&store, "remove");
+
+    let entry = KvEntry::new("d".to_string(), b"v".to_vec(), "text/plain".to_string());
+    store
+        .merge_delta(
+            &KvStoreDelta::for_put("d".to_string(), entry, (PeerId::new([6; 32]), 1), 1),
+            PeerId::new([6; 32]),
+            Some(&owner),
+        )
+        .expect("delta add");
+    step(&store, "delta add");
+    let mut removal = KvStoreDelta::new(2);
+    removal
+        .removed
+        .insert("d".to_string(), std::collections::HashSet::new());
+    store
+        .merge_delta(&removal, PeerId::new([6; 32]), Some(&owner))
+        .expect("delta removal");
+    step(&store, "delta removal");
+
+    let mut other = store.clone();
+    other
+        .put(
+            "img".into(),
+            b"1".to_vec(),
+            "text/plain".into(),
+            PeerId::new([7; 32]),
+        )
+        .expect("put");
+    store.merge(&other).expect("image merge");
+    step(&store, "image merge");
+
+    let cached = store.orset_digest().expect("cached");
+    store.settle_loaded();
+    check(&store, "settle");
+    let loaded: KvStore =
+        bincode::deserialize(&bincode::serialize(&store).expect("encode")).expect("load");
+    check(&loaded, "load");
+    assert_eq!(loaded.orset_digest().expect("loaded"), cached);
 }
 
 #[test]
@@ -195,10 +338,61 @@ fn the_orset_digest_ignores_replica_local_state() {
         image.orset_digest().expect("served image"),
         "the changelog and version are not part of the digest"
     );
-    let mut other_id = store_with(&[("k", b"one"), ("gone", b"x")]);
-    other_id.remove("gone").expect("remove");
+    let mut replica = store_with(&[("k", b"one"), ("gone", b"x")]);
+    replica.remove("gone").expect("remove");
     assert_eq!(
         local.orset_digest().expect("local"),
-        other_id.orset_digest().expect("same state")
+        replica.orset_digest().expect("same state"),
+        "same id and same OR-Set: the same digest"
     );
+}
+
+/// The cache on the production group path: a retained-image merge into an
+/// encrypted store.
+#[test]
+fn the_cached_orset_digest_follows_a_group_image_merge() {
+    let owner = AgentId([1; 32]);
+    let mut info = crate::groups::GroupInfo::new(
+        "kv-group".to_string(),
+        String::new(),
+        owner,
+        "ab".repeat(16),
+    );
+    info.migrate_from_v1();
+    let _ = info.rotate_shared_secret();
+    let group_id = info.stable_group_id().as_bytes().to_vec();
+    let ctx = Arc::new(crate::groups::GssKvSecureContext::from_group(&info).expect("ctx"));
+    let mut store = KvStore::new_encrypted(
+        KvStoreId::new([11; 32]),
+        "Enc".to_string(),
+        owner,
+        group_id,
+        ctx as Arc<dyn crate::kv::encrypted::KvSecureContext>,
+    )
+    .expect("store");
+    store
+        .put(
+            "k".into(),
+            b"1".to_vec(),
+            "text/plain".into(),
+            PeerId::new([5; 32]),
+        )
+        .expect("put");
+    let before = store.orset_digest().expect("cached");
+    let mut other = store.clone();
+    other
+        .put(
+            "img".into(),
+            b"1".to_vec(),
+            "text/plain".into(),
+            PeerId::new([7; 32]),
+        )
+        .expect("put");
+    other.remove("k").expect("remove");
+    store
+        .merge_group_retained_image(&other.served_image_for_test(), owner, PeerId::new([8; 32]))
+        .expect("image merge");
+    let after = store.orset_digest().expect("cached");
+    assert_ne!(after, before, "the merge changed the OR-Set");
+    assert_eq!(after, store.orset_digest_uncached().expect("fresh"));
 }
