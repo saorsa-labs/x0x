@@ -876,7 +876,7 @@ impl std::fmt::Debug for KvStore {
 /// to `T::default()` on EOF / any malformed tail, makes such a blob load with
 /// the newer fields defaulted rather than failing outright. Only sound at
 /// stream-EOF for genuinely trailing fields (see the struct's TRAILING note).
-fn de_tolerant<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+pub(crate) fn de_tolerant<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: serde::Deserialize<'de> + Default,
@@ -3919,6 +3919,25 @@ impl KvStore {
     /// entry set — see [`served_content_digest`].
     pub(crate) fn served_digest(&self) -> [u8; 32] {
         served_content_digest(&self.id, &self.checkpoint_pairs())
+    }
+
+    /// BLAKE3 over a domain tag, the store id and the canonical retained
+    /// OR-Set: live tags and tombstones in canonical order, with the
+    /// replica-local version and changelog cleared. Two replicas with the
+    /// same OR-Set state give the same digest whatever their values (#2110).
+    pub(crate) fn orset_digest(&self) -> Result<[u8; 32]> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"x0x.kv.orset-digest.v1");
+        hasher.update(self.id.as_bytes());
+        hasher.update(&bincode::serialize(&self.keys.canonical_retained_wire())?);
+        Ok(*hasher.finalize().as_bytes())
+    }
+
+    /// Test-only: record a refused image merge from `source`, so its
+    /// pulls wait for the retry window.
+    #[cfg(test)]
+    pub(crate) fn refuse_image_source_for_test(&mut self, source: AgentId) {
+        self.image.note_refusal(source, 0, now_ms());
     }
 
     /// Remove local keys absent from a digest-verified full-state serve

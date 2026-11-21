@@ -879,6 +879,15 @@ enum KvSyncMessage {
         digest: [u8; 32],
         /// Number of entries in the declaring replica's set.
         entry_count: u32,
+        /// The declaring replica's [`KvStore::orset_digest`] (#2110).
+        ///
+        /// Wire compatibility: it is the last field of the last item in the
+        /// payload. An older receiver decodes with `bincode::deserialize`,
+        /// which allows trailing bytes, so it reads the two fields above and
+        /// ignores this one. An older sender's beacon ends before it;
+        /// bincode then fails at EOF and `de_tolerant` gives `None`.
+        #[serde(default, deserialize_with = "crate::kv::store::de_tolerant")]
+        orset_digest: Option<[u8; 32]>,
     },
 }
 
@@ -901,6 +910,10 @@ fn kv_sync_message_wire_matches_main() {
         ],
     );
 }
+
+#[cfg(test)]
+#[path = "beacon_orset_digest_tests.rs"]
+mod beacon_orset_digest_tests;
 
 /// One responder's latest v2 digest declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1116,6 +1129,39 @@ impl BeaconWakeGate {
         self.last_wake.insert(author, now);
         self.group_wakes.push_back(now);
         true
+    }
+}
+
+/// What a verified peer beacon asks of this replica.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BeaconWake {
+    /// The content digests match: nothing to repair.
+    InStep,
+    /// The digests differ, but this replica refused the author's image
+    /// merge at the image limit and its retry window is open (#1970).
+    Deferred,
+    /// The digests differ: offer the wake to the beacon wake gate.
+    Wake,
+}
+
+/// The receiver rule for a peer beacon. A difference waits for the image
+/// back-off, except when the beacon's OR-Set digest equals the local one
+/// (#2110): then only values differ, an image merge from the author adds
+/// no tags, and the repair need not wait. The merge is still measured, so
+/// this never admits anything. `local_orset` runs only in that case.
+fn beacon_wake(
+    local_digest: [u8; 32],
+    digest: [u8; 32],
+    retry_due: bool,
+    orset_digest: Option<[u8; 32]>,
+    local_orset: impl FnOnce() -> Option<[u8; 32]>,
+) -> BeaconWake {
+    if local_digest == digest {
+        BeaconWake::InStep
+    } else if retry_due || orset_digest.is_some_and(|theirs| local_orset() == Some(theirs)) {
+        BeaconWake::Wake
+    } else {
+        BeaconWake::Deferred
     }
 }
 
@@ -3380,13 +3426,18 @@ impl KvStoreSync {
                     let Some(store) = store.upgrade() else {
                         return;
                     };
-                    let (digest, entry_count) = {
+                    let (digest, entry_count, orset_digest) = {
                         let s = store.read().await;
-                        (s.served_digest(), s.checkpoint_pairs().len() as u32)
+                        (
+                            s.served_digest(),
+                            s.checkpoint_pairs().len() as u32,
+                            s.orset_digest().ok(),
+                        )
                     };
                     let beacon = KvSyncMessage::StateDigestBeacon {
                         digest,
                         entry_count,
+                        orset_digest,
                     };
                     // Same gate + deadline discipline as every other sealed
                     // control publication.
@@ -4452,6 +4503,7 @@ impl KvStoreSync {
                     KvSyncMessage::StateDigestBeacon {
                         digest,
                         entry_count: _,
+                        orset_digest,
                     } => {
                         // Beacons are sealed-plane only (#1117). One that
                         // decoded on a plaintext store was never published
@@ -4485,18 +4537,23 @@ impl KvStoreSync {
                         // bounded re-request tail; the repair serve is
                         // itself verified, so a beacon can neither inject
                         // nor truncate state.
-                        let (local_digest, retry_due) = {
+                        let (local_digest, wake) = {
                             let store = responder_store.read().await;
-                            (store.served_digest(), store.image_retry_due(&author))
+                            let local_digest = store.served_digest();
+                            let wake = beacon_wake(
+                                local_digest,
+                                digest,
+                                store.image_retry_due(&author),
+                                orset_digest,
+                                || store.orset_digest().ok(),
+                            );
+                            (local_digest, wake)
                         };
-                        // #1970: after this replica refused `author`'s merge
-                        // at the image limit, its pulls from `author` wait
-                        // for the retry window (a shrink re-opens it).
-                        if local_digest != digest && !retry_due {
+                        if wake == BeaconWake::Deferred {
                             responder_counters
                                 .digest_beacon_wakes_deferred
                                 .fetch_add(1, Ordering::Relaxed);
-                        } else if local_digest != digest
+                        } else if wake == BeaconWake::Wake
                             && record_divergent_beacon(
                                 &mut beacon_wakes,
                                 responder_counters.as_ref(),
