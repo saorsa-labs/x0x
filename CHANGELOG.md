@@ -216,6 +216,20 @@ All notable changes to this project will be documented in this file.
   install leaves no drop-in and reloads systemd, so the unit runs x0xd
   directly; an install without the flag removes the drop-in.
 
+- **Problem reports to an owner device: `POST /report` `deliver_to` and
+  `x0x report --deliver-to <agent_id>` (#1354 slice 3; A14 amendment of
+  21 Nov 2026).** The daemon still stores the local bundle, and also
+  queues a sent copy to the named device on the durable direct-send
+  outbox (#1109), which retries it while the device is offline, for up to
+  24 hours. The device must hold a certificate this owner issued (not a
+  rider, not this daemon, not expired). The sent copy leaves out the log
+  tail and the data-directory listing, holds the rest of the bundle after
+  the same redactor, and is at most 32 KiB (`413
+  report_too_large_to_send` otherwise). It is an ordinary direct message
+  with logical id `x0x-report-<unix-secs>`; follow it with
+  `GET /direct/receipts/{logical_id}?agent_id=<device>`. A refused target
+  does not use the one-per-minute slot. Nothing goes to the maintainers.
+
 - **Local problem reports: `POST /report` and `x0x report` (#1354 slice 2;
   A14 amendment of 20 Nov 2026).** The daemon builds a redacted
   problem-report bundle and stores it as

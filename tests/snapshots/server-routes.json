@@ -51,10 +51,18 @@
     "method": "POST",
     "path": "/report",
     "cli_name": "report",
-    "description": "Authenticated (durable owner): build a redacted problem-report bundle and store it under the data directory's reports/ (#1354); one per minute; nothing is sent",
+    "description": "Authenticated (durable owner): build a redacted problem-report bundle and store it under the data directory's reports/ (#1354); one per minute; with deliver_to (an owner device), also queue a sent copy without log lines or file names on the durable direct-send outbox",
     "category": "status",
     "request": {
-      "kind": "none"
+      "fields": [
+        {
+          "cli": "default",
+          "in": "body",
+          "name": "deliver_to",
+          "required": false
+        }
+      ],
+      "kind": "fields"
     }
   },
   {
