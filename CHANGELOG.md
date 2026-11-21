@@ -12,9 +12,10 @@ All notable changes to this project will be documented in this file.
   below-Admin seat is tolerated, recovery commits and the expired creator
   stays seated. On the GSS plane no share for any later epoch is written
   to a seat whose committed certificate is expired. **On the TreeKEM
-  plane** the creator keeps its leaf, so any commit after the recovery
-  reaches it: the rule holds there for the recovery epoch only (known
-  limit, #2139).
+  plane** the creator keeps its leaf: it cannot follow later commits when
+  the recovery carried a TreeKEM commit (withheld from it), but it follows
+  every later commit when the recovery carried none, and a leaked
+  recovery frame gives it all later epochs (known limits, #2139).
 
 ### Fixed
 

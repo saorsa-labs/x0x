@@ -397,26 +397,38 @@ every admin is revoked and another below-Admin seat is also tolerated
 it commits, and the creator stays seated until the owner re-certifies it.
 What the creator gets depends on the plane:
 - **GSS plane.** A creator whose committed certificate is expired gets
-  no key material in any rekey until it is re-certified: not for the
-  recovery epoch, and not for a later epoch such as the tolerated seat's
-  eviction rekey. Every share write passes the class-K serving guard,
-  which refuses a seat whose committed certificate fails (the expired
-  certificate is a definitive refusal, so the share is dropped), and the
-  recovery frame and the TreeKEM catch-up refuse a seat whose expiry is
-  due (#2004). This is how the code already behaved; this paragraph
-  states it for every rekey, not only for recovery. After the owner
-  re-certifies the creator and its seat commits the renewed certificate,
-  its next catch-up seals it the current secret.
-- **TreeKEM plane, a known limit
-  ([#2139](https://github.com/saorsa-labs/x0x/issues/2139)).** The
-  recovery frame and the catch-up refuse the creator, so it does not get
-  the recovery epoch. But it keeps its leaf, so any later commit
-  published on the metadata topic carries path secrets encrypted to that
-  leaf, and the creator can derive the new epoch key. On TreeKEM groups
-  "no new keys until re-certification" holds only for the recovery epoch
-  itself. A non-creator seat whose expiry is due is in the same position
-  until its own eviction commit, because each S4 target gets its own
-  transition and another commit can land first.
+  no key material written to it in any automatic rekey until it is
+  re-certified: not for the recovery epoch, and not for a later epoch
+  such as the tolerated seat's eviction rekey. Every share write passes
+  the class-K serving guard, which reads the certificate embedded in the
+  committed seat: an expired one is a definitive refusal and the share is
+  dropped (a seat with a digest but no bytes is withheld, not dropped).
+  The recovery frame and the TreeKEM catch-up also refuse a seat whose
+  expiry is due (#2004). This is how the code already behaved; this
+  paragraph states it for every rekey, not only for recovery. After the
+  owner re-certifies the creator and its seat commits the renewed
+  certificate, its next catch-up seals it the current secret. One local
+  path is outside this rule: `POST /groups/:id/secure/reseal` seals the
+  current secret to any Active seat with no certificate check and returns
+  the envelope to the local owner caller only, who decides whether to
+  hand it over; it delivers nothing.
+- **TreeKEM plane.** The creator keeps its leaf, and what it can derive
+  depends on whether a commit is withheld from it. A recovery that
+  carries a TreeKEM commit moves the epoch, and that commit travels only
+  in the recovery frame, which is refused to the creator. A commit applies
+  only at the next epoch and the new epoch derives from the previous
+  epoch's secret, so the creator cannot apply any later public commit or
+  read a later epoch. Two known limits remain
+  ([#2139](https://github.com/saorsa-labs/x0x/issues/2139)). (i) The
+  withholding is delivery only: the recovery commit itself is encrypted to
+  the creator's leaf, so a leaked frame gives the creator that epoch and
+  every later one. (ii) A recovery that carries no TreeKEM commit (the
+  revoked admins hold no leaf) leaves the creator in step, so it follows
+  every later public commit and reads every later epoch. A non-creator
+  seat whose expiry is due is in the same position until it is evicted;
+  one seal-route call evicts it together with a revoked seat, while
+  the S4 worker gives each target its own transition, so another commit
+  can land first.
 
 No wire format changes.
 

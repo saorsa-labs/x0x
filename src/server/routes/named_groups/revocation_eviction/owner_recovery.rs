@@ -6608,11 +6608,13 @@ mod restart_tests {
                 x0x::dm_capability::now_unix_ms(),
             );
         }
-        let written_to = |hex_id: &str| {
+        let share_writes = |hex_id: &str| {
             key_writes(&author)
                 .iter()
-                .any(|(recipient, kind)| recipient == hex_id && *kind == "secure_share")
+                .filter(|(recipient, kind)| recipient == hex_id && *kind == "secure_share")
+                .count()
         };
+        let written_to = |hex_id: &str| share_writes(hex_id) > 0;
         // The real worker ticks: the frame and its share go to the valid
         // survivors.
         for _ in 0..200 {
@@ -6627,6 +6629,23 @@ mod restart_tests {
             written_to(&inside_hex),
             "a seat inside the 300 s skew is served as before"
         );
+        // At the recovery epoch the expired creator and the due-expired
+        // Member are both Active, so a refusal of either is the certificate
+        // refusal, not `NotActive`. Their writes are checked at the end,
+        // over both epochs.
+        {
+            let groups = author.named_groups.read().await;
+            for hex_id in [&creator_hex, &expired_hex] {
+                assert_eq!(
+                    groups[&stable].members_v2[hex_id].state,
+                    x0x::groups::GroupMemberState::Active,
+                    "precondition: {hex_id} is Active at the recovery epoch"
+                );
+            }
+        }
+        // Positive control for the eviction epoch: the survivor's writes
+        // so far are all recovery-epoch writes.
+        let survivor_recovery_writes = share_writes(&survivor_hex);
         // The admin the recovery seated seals the tolerated seat's S4
         // removal through the seal route; the held creator still answers
         // `members pending certificate resolution`, and the removal commits.
@@ -6655,10 +6674,32 @@ mod restart_tests {
             x0x::groups::GroupMemberState::Active,
             "the creator stays seated after the eviction"
         );
-        for _ in 0..20 {
+        // The same seal-route call evicts the due-expired Member too.
+        assert_eq!(
+            after.members_v2[&expired_hex].state,
+            x0x::groups::GroupMemberState::Removed,
+            "the seal route evicts the due-expired Member with the revoked one"
+        );
+        // Wait, with a bound, until the survivor's eviction-epoch share is
+        // written and every egress task has ended; only then are the
+        // negatives below meaningful.
+        let bound = tokio::time::Instant::now() + Duration::from_secs(20);
+        while share_writes(&survivor_hex) <= survivor_recovery_writes
+            && tokio::time::Instant::now() < bound
+        {
             worker_tick(&author).await;
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        assert!(
+            share_writes(&survivor_hex) > survivor_recovery_writes,
+            "the survivor's eviction-epoch share is written"
+        );
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            super::super::super::join_artifact_egress_idle(&author),
+        )
+        .await
+        .context("every share egress task ends")?;
 
         // TreeKEM catch-up: the expired creator is answered nothing.
         let pages = |state: &AppState| {
@@ -6688,9 +6729,6 @@ mod restart_tests {
             },
         )
         .await;
-        for _ in 0..20 {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
         assert_eq!(
             pages(&author),
             pages_before,
@@ -6735,12 +6773,14 @@ mod restart_tests {
             "the recovery frame was never written to the expired creator: {creator_frame:?}"
         );
 
-        // The owner re-certifies the creator, and the creator's seat commits
-        // the renewed certificate (its certificate rebind; the write guard
-        // reads the committed certificate). The shares refused above were
+        // The owner re-certifies the creator, and the creator's seat holds
+        // the renewed certificate. The test injects that record with
+        // `hold_persisted` instead of a real rebind commit; the write guard
+        // reads the committed seat certificate either way. The shares refused above were
         // purged, so the creator's next catch-up is the re-seal: the admin
         // serves it the recovery frame and seals its current secret to it,
         // which opens to the current epoch's secret.
+        let scheduled_before_recert = scheduled_shares(&author).len();
         let renewed = x0x::identity::AgentCertificate::issue(owner, &creator)?;
         let mut rebound = author.named_groups.read().await[&stable].clone();
         {
@@ -6781,8 +6821,11 @@ mod restart_tests {
             "after the re-certification the catch-up re-seal is written"
         );
         let current = author.named_groups.read().await[&stable].clone();
+        // Only shares sealed after the re-certification: the refused ones
+        // stay in the scheduling recorder.
         let opened = scheduled_shares(&author)
             .into_iter()
+            .skip(scheduled_before_recert)
             .filter(|(recipient, _)| *recipient == creator_hex)
             .filter_map(|(_, share)| open_share(&share, &creator_kem).ok())
             .find(|(epoch, _)| *epoch == current.secret_epoch)
