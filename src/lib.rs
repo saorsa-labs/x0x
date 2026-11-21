@@ -28843,7 +28843,7 @@ impl KvStoreHandle {
         let (delta, held) = {
             let mut store = self.sync.write().await;
             Self::check_local_remove(&store, &self.agent_id, key)?;
-            let held = store.get(key).is_some();
+            let held = store.holds_entry(key);
             if !held && publish_absent {
                 // `KvStore::remove` refuses AppendOnly for a held key; an
                 // absent key never reaches it.

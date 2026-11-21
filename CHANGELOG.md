@@ -23,7 +23,9 @@ All notable changes to this project will be documented in this file.
   amendment of 21 Nov 2026).** `DELETE /stores/:id/:key?absent=publish`
   publishes the removal for the replicas that hold the key and replies
   `"held": false`; every release since v0.9.0 already applies a removal by
-  key, so no wire change. Without the flag, deleting a key this replica
+  key, so no wire change. On a group store a holder that was offline loses
+  the key at its next image merge; on a plain store it keeps the key until
+  it is removed again. Without the flag, deleting a key this replica
   does not hold now returns 404 `key not found` instead of 500.
 - **A Homebrew install keeps the direct autostart job (#2111; A14
   amendment of 20 Nov 2026).** `x0x autostart --launcher` and

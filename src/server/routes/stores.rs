@@ -914,6 +914,20 @@ pub(in crate::server) async fn delete_kv_value(
                 direct_attempted = recipients.len();
                 spawn_kv_store_delta_delivery(&state, recipients, &id, handle.peer_id(), &delta);
             }
+            if !held && !published && direct_attempted == 0 {
+                // Nothing changed here, nothing was sent and the removal is
+                // not replayed: it did nothing anywhere.
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "held": false,
+                        "published": false,
+                        "reason": publish_error,
+                        "direct_attempted": direct_attempted,
+                    })),
+                );
+            }
             if published {
                 (
                     StatusCode::OK,

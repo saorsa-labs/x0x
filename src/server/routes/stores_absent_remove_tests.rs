@@ -114,8 +114,8 @@ async fn owner_removes_a_key_it_does_not_hold() {
     assert!(delta.owner_checkpoint.is_none() && delta.name_update.is_none());
     assert!(delta.allowlist_additions.is_none() && delta.allowlist_removals.is_none());
 
-    // A holder, and a second holder of the same tag that is offline when
-    // the removal is published.
+    // A replica that holds the key and receives the removal live. Offline
+    // holders: `kv::store` tests (group stores heal, plain stores do not).
     let mut holder = KvStore::new(
         handle.store_id().await,
         "store".to_string(),
@@ -131,19 +131,148 @@ async fn owner_removes_a_key_it_does_not_hold() {
             saorsa_gossip_types::PeerId::new([7; 32]),
         )
         .expect("put");
-    let mut offline = holder.clone();
-
     holder
         .merge_delta(&delta, handle.peer_id(), Some(&owner))
         .expect("merge removal");
     assert!(holder.get("k").is_none(), "a holder applies the removal");
+    handle.retire_and_drain().await;
+}
 
-    assert!(offline.get("k").is_some());
-    offline.merge(&holder).expect("image merge");
+#[tokio::test]
+async fn absent_removal_changes_nothing_locally() {
+    let (state, _dir) = state().await;
+    let handle = state
+        .agent
+        .create_kv_store_persistent(
+            "store",
+            "absent/local",
+            AccessPolicy::Signed,
+            &state.kv_store_state_dir,
+        )
+        .await
+        .expect("store");
+    handle
+        .put("other".to_string(), b"v".to_vec(), "text/plain".to_string())
+        .await
+        .expect("put");
+    let path = crate::kv_snapshot_path(&state.kv_store_state_dir, &handle.store_id().await);
+    let snapshot = tokio::fs::read(&path).await.expect("snapshot");
+    let version = handle.sync.read().await.current_version();
+
+    let outcome = handle
+        .remove_absent_with_outcome("k")
+        .await
+        .expect("absent removal");
+    assert!(!outcome.held);
+    assert_eq!(handle.sync.read().await.current_version(), version);
+    assert_eq!(tokio::fs::read(&path).await.expect("snapshot"), snapshot);
+    handle.retire_and_drain().await;
+}
+
+/// `held` is the test `KvStore::remove` applies: an entry this replica
+/// holds without a live OR-Set tag is held, removed and persisted.
+#[tokio::test]
+async fn held_follows_the_entry_that_remove_checks() {
+    let (state, _dir) = state().await;
+    let handle = open(&state, "absent/ghost", AccessPolicy::Signed).await;
+    let version = {
+        let mut store = handle.sync.write().await;
+        store.entries_mut_for_test().insert(
+            "ghost".to_string(),
+            x0x::kv::KvEntry::new("ghost".to_string(), b"v".to_vec(), "text/plain".to_string()),
+        );
+        assert!(store.get("ghost").is_none(), "no live tag");
+        store.current_version()
+    };
+    let (status, body) = delete(&state, "absent/ghost", "ghost", None).await;
     assert!(
-        offline.get("k").is_none(),
-        "an offline holder loses the key at its next image merge"
+        status == StatusCode::OK || status == StatusCode::ACCEPTED,
+        "{status} {body}"
     );
+    assert_eq!(body["held"], true, "{body}");
+    let store = handle.sync.read().await;
+    assert!(!store.holds_entry("ghost"));
+    assert!(store.current_version() > version);
+    drop(store);
+    handle.retire_and_drain().await;
+}
+
+#[tokio::test]
+async fn absent_removal_keeps_the_self_keyed_prefix_rule() {
+    let (state, _dir) = state().await;
+    let topic = "absent/directory";
+    let handle = state
+        .agent
+        .join_self_keyed_kv_store_persistent(topic, &state.kv_store_state_dir)
+        .await
+        .expect("directory");
+    state
+        .kv_stores
+        .write()
+        .await
+        .insert(topic.to_string(), handle.clone());
+    let own = format!("{}/k", hex::encode(state.agent.agent_id().as_bytes()));
+    let foreign = format!("{}/k", "ab".repeat(32));
+    let (status, body) = delete(&state, topic, &foreign, Some("publish")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = delete(&state, topic, &own, Some("publish")).await;
+    assert!(
+        status == StatusCode::OK || status == StatusCode::ACCEPTED,
+        "{status} {body}"
+    );
+    assert_eq!(body["held"], false, "{body}");
+    handle.retire_and_drain().await;
+}
+
+#[tokio::test]
+async fn absent_removal_on_an_encrypted_group_store() {
+    let (state, _dir) = state().await;
+    let group_key = "a7".repeat(16);
+    let mut info = crate::groups::GroupInfo::new(
+        "kv-group".to_string(),
+        String::new(),
+        state.agent.agent_id(),
+        group_key.clone(),
+    );
+    info.migrate_from_v1();
+    let _ = info.rotate_shared_secret();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_key.clone(), info);
+    let (code, resp) = create_group_kv_store(
+        State(Arc::clone(&state)),
+        Path(group_key.clone()),
+        Extension(ActorContext::Owner { durable: true }),
+        Json(CreateGroupStoreRequest {
+            name: "ws".to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{resp:?}");
+    let topic = resp.0["topic"].as_str().expect("topic").to_string();
+    let handle = state
+        .kv_stores
+        .read()
+        .await
+        .get(&topic)
+        .cloned()
+        .expect("handle");
+    assert!(handle.is_encrypted().await);
+    let (status, body) = delete(&state, &topic, "k", Some("publish")).await;
+    assert!(
+        status == StatusCode::OK || status == StatusCode::ACCEPTED,
+        "{status} {body}"
+    );
+    assert_eq!(body["held"], false, "{body}");
+    let delta = handle
+        .remove_absent_with_outcome("k")
+        .await
+        .expect("absent removal")
+        .delta;
+    assert!(delta.removed["k"].is_empty());
+    assert!(delta.owner_checkpoint.is_none());
     handle.retire_and_drain().await;
 }
 
