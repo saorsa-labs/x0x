@@ -961,6 +961,33 @@ async fn recovery_write_allowed(state: &AppState, info: &GroupInfo, agent: &Agen
         && write_allowed(state, agent).await
 }
 
+/// #2139: a received TreeKEM recovery may remove the revoked seats' leaves
+/// and no other. A wire commit can add leaves and remove several, so the
+/// check is: every commit adds none and removes one, the tree's active
+/// leaf count falls by exactly the number of commits, and every non-revoked
+/// seat whose leaf was present before is still present after. The author
+/// (`commit_treekem`) makes one single-leaf removal per leafed revoked seat.
+fn recovery_commits_remove_only_revoked_leaves(
+    commits: &[Vec<u8>],
+    leaves_before: u32,
+    leaves_after: u32,
+    presence_before: &BTreeMap<String, Option<bool>>,
+    presence_after: &BTreeMap<String, Option<bool>>,
+    revoked: &BTreeSet<String>,
+) -> bool {
+    let one_removal_each = commits
+        .iter()
+        .all(|commit| matches!(x0x::mls::treekem::commit_leaf_changes(commit), Ok((0, 1))));
+    let count_matches = leaves_before
+        .checked_sub(leaves_after)
+        .is_some_and(|dropped| dropped as usize == commits.len());
+    let survivors_kept = presence_before
+        .iter()
+        .filter(|(seat, present)| **present == Some(true) && !revoked.contains(*seat))
+        .all(|(seat, _)| presence_after.get(seat) == Some(&Some(true)));
+    one_removal_each && count_matches && survivors_kept
+}
+
 fn recipient_expiry_due(info: &GroupInfo, agent: &AgentId, now_unix: u64) -> bool {
     info.members_v2
         .get(&hex::encode(agent.as_bytes()))
@@ -3740,6 +3767,8 @@ async fn receive_commit(
             let Ok(rollback_snapshot) = guard.to_snapshot_bytes() else {
                 return ReceiveOutcome::Retained { verified: true };
             };
+            let leaves_before = guard.member_count();
+            let presence_before = ng::roster_treekem_leaf_presence(guard, &info);
             let processed = commits
                 .iter()
                 .all(|treekem_commit| guard.process_commit(treekem_commit).is_ok());
@@ -3748,6 +3777,31 @@ async fn receive_commit(
             // a seat with no evidence keeps the frame pending (#1508
             // review P1).
             let presence = ng::roster_treekem_leaf_presence(guard, &info);
+            let removed_hex: BTreeSet<String> = removed
+                .iter()
+                .map(|agent| hex::encode(agent.as_bytes()))
+                .collect();
+            if processed
+                && !recovery_commits_remove_only_revoked_leaves(
+                    commits,
+                    leaves_before,
+                    guard.member_count(),
+                    &presence_before,
+                    &presence,
+                    &removed_hex,
+                )
+            {
+                ng::rollback_treekem_group_after_failed_install(
+                    state,
+                    &group_key,
+                    &next,
+                    &rollback_snapshot,
+                    guard,
+                    "owner_recovery_extra_leaf_change",
+                );
+                replay_log::rewrite_without(state, ext, held, &stable, at).await;
+                return ReceiveOutcome::Refused(orc::OwnerRecoveryRefusal::RecoveryProofInvalid);
+            }
             let leaves: Vec<Option<bool>> = removed
                 .iter()
                 .map(|agent| {
@@ -4024,6 +4078,7 @@ mod tests {
     mod issue2004_expired_member_seal;
     mod issue2120_expired_creator_wait;
     mod issue2133_treekem_leaf_known_limit;
+    mod issue2139_treekem_leafless_recovery;
 
     #[test]
     fn refusals_map_to_http_statuses() {
@@ -6643,9 +6698,6 @@ mod restart_tests {
                 );
             }
         }
-        // Positive control for the eviction epoch: the survivor's writes
-        // so far are all recovery-epoch writes.
-        let survivor_recovery_writes = share_writes(&survivor_hex);
         // The admin the recovery seated seals the tolerated seat's S4
         // removal through the seal route; the held creator still answers
         // `members pending certificate resolution`, and the removal commits.
@@ -6680,19 +6732,30 @@ mod restart_tests {
             x0x::groups::GroupMemberState::Removed,
             "the seal route evicts the due-expired Member with the revoked one"
         );
-        // Wait, with a bound, until the survivor's eviction-epoch share is
-        // written and every egress task has ended; only then are the
-        // negatives below meaningful.
+        // Positive control: wait, with a bound, until a share AT the
+        // eviction epoch is written to the survivor (a resend of its
+        // recovery-epoch share does not count) and every egress task has
+        // ended; only then are the negatives below meaningful.
+        let eviction_share_written = || {
+            author
+                .named_group_test_recorders
+                .secure_share_written
+                .lock()
+                .map(|writes| {
+                    writes.iter().any(|(recipient, epoch)| {
+                        *recipient == survivor_hex && *epoch == after.secret_epoch
+                    })
+                })
+                .unwrap_or_default()
+        };
         let bound = tokio::time::Instant::now() + Duration::from_secs(20);
-        while share_writes(&survivor_hex) <= survivor_recovery_writes
-            && tokio::time::Instant::now() < bound
-        {
+        while !eviction_share_written() && tokio::time::Instant::now() < bound {
             worker_tick(&author).await;
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(
-            share_writes(&survivor_hex) > survivor_recovery_writes,
-            "the survivor's eviction-epoch share is written"
+            eviction_share_written(),
+            "the survivor's share at the eviction epoch is written"
         );
         tokio::time::timeout(
             Duration::from_secs(20),

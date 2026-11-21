@@ -432,6 +432,70 @@ What the creator gets depends on the plane:
 
 No wire format changes.
 
+On 21 Nov 2026 the orchestrator session recorded the state of
+[#2139](https://github.com/saorsa-labs/x0x/issues/2139) under David's
+delegation of design decisions of 10 Nov 2026 (A15). **The TreeKEM gap is
+OPEN.** It waits for a fix or for David to accept it. This paragraph
+accepts nothing.
+- **What is true now.** In limits (i), (ii) and (iii) the held creator
+  keeps its leaf and can read every later TreeKEM epoch, with **no time
+  limit**, until the owner acts (re-certifies it, or removes it through an
+  admin). In those limits TreeKEM **does not meet** David's rule of 20 Nov
+  2026 that the creator "gets no new keys". Only the GSS plane meets it.
+- **Limit (iii).** The recovery-frame gate refuses only a seat whose expiry
+  is due (past `not_after` plus τ, 300 s). A creator whose certificate is
+  still inside τ at the recovery, or becomes due only after it, is served
+  the recovery frame. On TreeKEM it then follows every later commit. On
+  GSS each later share write checks the committed certificate again.
+- **What a fix needs.** The wire `TreeKemCommit` carries
+  `removed_leaves`, a list, so one commit can remove a revoked admin's leaf
+  and the creator's leaf without changing the commit count that
+  `validate_against_parent` checks. The library that x0x uses
+  (saorsa-mls 0.3.8) has no public producer for such a commit:
+  `remove_member` removes one leaf, and the multi-leaf `make_commit` is
+  private. A fix also leaves an Active seat with no leaf, which the other
+  TreeKEM paths do not expect. A recovery that adds a separate commit, or
+  a commit when no revoked admin holds a leaf (limit ii), changes the
+  count, and every current peer refuses it as `RecoveryProofInvalid`.
+  Limit (i) has the same cost, because a commit keeps a live leaf out of
+  its path secrets only by removing that leaf.
+- **Receiver tightening (this change).** A received TreeKEM recovery may
+  remove the revoked seats' leaves and no other leaf. Before this change
+  the receiver checked only that the revoked seats' leaves were gone, so a
+  mandated recovery actor could also drop a valid member's leaf and every
+  receiver accepted it. Now every recovery commit must add no leaf and
+  remove one leaf, the tree's active leaf count must fall by exactly the
+  number of commits, and every non-revoked seat whose leaf was present
+  before must still be present after. If not, the recovery is refused as
+  `RecoveryProofInvalid` and the tree is rolled back. Every honest author
+  already meets this (`commit_treekem` makes one single-leaf removal per
+  leafed revoked seat). This check also refuses a future recovery that
+  removes the creator's leaf in the same commit. That fix therefore needs
+  a new recovery body version and a receiver capability gate after all.
+- **Restoring a leaf, mixed versions.** No leaf is removed today, so
+  nothing restores one. When the owner re-certifies the creator, the
+  `seat_expiry_due` return of the catch-up handler and the recovery-frame
+  gate no longer apply to it. A peer on an earlier release accepts a
+  recovery that removes other leaves too; the senders that this release
+  ships never make one.
+- **Correction to item 4 above.** The seal route, like the S4 worker,
+  gives each failing seat its own transition (one TreeKEM commit for each
+  evicted seat). One seal-route call runs them one after the other, so on
+  TreeKEM another commit can land before a seat's own eviction on both
+  routes.
+- **Correction to the GSS bullet above.** `POST /groups/:id/secure/reseal`
+  is a session-bearer route: the owner API token or a session token is
+  enough. The local daemon must be an Active member of the group that
+  holds the current secret; it need not be an admin. The route seals the
+  secret to any Active seat with a KEM key, with no certificate check, and
+  returns the envelope to the caller. It sends nothing.
+
+Tests: `issue2139_treekem_leafless_recovery` pins limit (ii) at the daemon
+level with the real recovery attempt, limit (iii) at the frame gate, and
+the receiver's leaf rule. `issue2133_treekem_leaf_known_limit` shows that
+a creator one commit behind is refused with `InvalidEpoch`. These tests
+show the gap; they do not accept it. No wire format changes.
+
 ## Security claims
 
 State the exact properties of each released path. Post-quantum signatures and key encapsulation do not alone prove forward secrecy or recovery after key compromise.
