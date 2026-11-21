@@ -6033,11 +6033,38 @@ mod socks_startup_port_release_tests {
 
     use crate::server::{serve_with_options, DaemonConfig, ServeOptions};
 
+    /// The first port the kernel hands to a port-0 bind.
+    fn ephemeral_range_start() -> u16 {
+        #[cfg(target_os = "linux")]
+        if let Ok(range) = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range") {
+            if let Some(start) = range.split_whitespace().next().and_then(|p| p.parse().ok()) {
+                return start;
+            }
+        }
+        // macOS and Windows start at 49152.
+        49_152
+    }
+
+    /// A free loopback port below the ephemeral range (#2145). The test has
+    /// to free the port before startup binds it, and startup takes seconds.
+    /// A port from a port-0 bind could be handed in that gap to any other
+    /// port-0 bind (this daemon's API listener, or a test running beside
+    /// it); one below the range can only collide with an explicit bind.
+    fn free_port_below_the_ephemeral_range() -> u16 {
+        let hi = ephemeral_range_start().min(32_000);
+        let lo = hi.saturating_sub(2_000).max(1_024);
+        let span = hi - lo;
+        assert!(span > 0, "no ports below the ephemeral range start {hi}");
+        let offset = (std::process::id() % u32::from(span)) as u16;
+        (0..span)
+            .map(|i| lo + (offset + i) % span)
+            .find(|&port| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok())
+            .expect("a free loopback port below the ephemeral range")
+    }
+
     #[tokio::test]
     async fn startup_failure_after_socks_bind_releases_the_port() {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind free port");
-        let port = probe.local_addr().expect("probe address").port();
-        drop(probe);
+        let port = free_port_below_the_ephemeral_range();
 
         let dir = tempfile::tempdir().expect("tempdir");
         let mut config = DaemonConfig {
