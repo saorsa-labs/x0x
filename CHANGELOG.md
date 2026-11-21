@@ -19,6 +19,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **A value-only difference between sealed group-store replicas no longer
+  waits for the image back-off (#2110 item 2; A10 amendment of 21 Nov
+  2026).** The digest beacon carries the sender's OR-Set digest; when it
+  matches the receiver's, the repair wakes even inside the back-off
+  window. Wire: one trailing optional field that older peers ignore.
 - **A Homebrew install keeps the direct autostart job (#2111; A14
   amendment of 20 Nov 2026).** `x0x autostart --launcher` and
   `--repair --launcher` keep refusing a daemon inside a versioned Homebrew

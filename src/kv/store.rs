@@ -843,6 +843,10 @@ pub struct KvStore {
     /// #1970: retained-image admission state; not persisted.
     #[serde(skip, default)]
     image: ImageAdmission,
+
+    /// #2110: the last [`Self::orset_digest`]; not persisted.
+    #[serde(skip, default)]
+    orset_digest_cache: OrsetDigestCache,
 }
 
 impl std::fmt::Debug for KvStore {
@@ -876,7 +880,23 @@ impl std::fmt::Debug for KvStore {
 /// to `T::default()` on EOF / any malformed tail, makes such a blob load with
 /// the newer fields defaulted rather than failing outright. Only sound at
 /// stream-EOF for genuinely trailing fields (see the struct's TRAILING note).
-fn de_tolerant<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+/// The last OR-Set digest with the `(version, keys.version())` it was
+/// computed at. Every path that changes the OR-Set moves the store version.
+#[derive(Debug, Default)]
+struct OrsetDigestCache(std::sync::Mutex<Option<(u64, u64, [u8; 32])>>);
+
+impl Clone for OrsetDigestCache {
+    fn clone(&self) -> Self {
+        Self(std::sync::Mutex::new(
+            *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        ))
+    }
+}
+
+pub(crate) fn de_tolerant<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: serde::Deserialize<'de> + Default,
@@ -995,6 +1015,7 @@ impl KvStore {
             seq_counter: Arc::new(AtomicU64::new(0)),
             secure: None,
             image: ImageAdmission::default(),
+            orset_digest_cache: OrsetDigestCache::default(),
         })
     }
 
@@ -1053,6 +1074,7 @@ impl KvStore {
             seq_counter: Arc::new(AtomicU64::new(0)),
             secure: Some(ctx),
             image: ImageAdmission::default(),
+            orset_digest_cache: OrsetDigestCache::default(),
         })
     }
 
@@ -1212,6 +1234,7 @@ impl KvStore {
             seq_counter: Arc::new(AtomicU64::new(0)),
             secure: None,
             image: ImageAdmission::default(),
+            orset_digest_cache: OrsetDigestCache::default(),
         }
     }
 
@@ -1242,6 +1265,7 @@ impl KvStore {
             seq_counter: Arc::new(AtomicU64::new(0)),
             secure: None,
             image: ImageAdmission::default(),
+            orset_digest_cache: OrsetDigestCache::default(),
         }
     }
 
@@ -1346,6 +1370,7 @@ impl KvStore {
             seq_counter: default_seq_counter(),
             secure: None,
             image: ImageAdmission::default(),
+            orset_digest_cache: OrsetDigestCache::default(),
         }
     }
 
@@ -3919,6 +3944,62 @@ impl KvStore {
     /// entry set — see [`served_content_digest`].
     pub(crate) fn served_digest(&self) -> [u8; 32] {
         served_content_digest(&self.id, &self.checkpoint_pairs())
+    }
+
+    /// BLAKE3 over a domain tag, the store id and the canonical retained
+    /// OR-Set: live tags and tombstones in canonical order, with the
+    /// replica-local version and changelog cleared. Two replicas with the
+    /// same OR-Set state give the same digest whatever their values (#2110).
+    ///
+    /// Cached until the store version or the OR-Set version moves.
+    pub(crate) fn orset_digest(&self) -> Result<[u8; 32]> {
+        let at = (self.version, self.keys.version());
+        let mut cache = self
+            .orset_digest_cache
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((version, keys_version, digest)) = *cache {
+            if (version, keys_version) == at {
+                return Ok(digest);
+            }
+        }
+        let digest = self.orset_digest_uncached()?;
+        *cache = Some((at.0, at.1, digest));
+        Ok(digest)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn keys_canonical_for_test(
+        &self,
+    ) -> saorsa_gossip_crdt_sync::CanonicalRetainedOrSet<String> {
+        self.keys.canonical_retained_wire()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_id_for_test(&mut self, id: KvStoreId) {
+        self.id = id;
+    }
+
+    pub(crate) fn orset_digest_uncached(&self) -> Result<[u8; 32]> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"x0x.kv.orset-digest.v1");
+        hasher.update(self.id.as_bytes());
+        bincode::serialize_into(&mut hasher, &self.keys.canonical_retained_wire())?;
+        Ok(*hasher.finalize().as_bytes())
+    }
+
+    /// #2110: whether a matching OR-Set digest from `source` may wake a
+    /// repair inside its retry window; true at most once per window.
+    pub(crate) fn take_image_orset_skip(&mut self, source: &AgentId) -> bool {
+        self.image.take_orset_skip(source, now_ms())
+    }
+
+    /// Test-only: record a refused image merge from `source`, so its
+    /// pulls wait for the retry window.
+    #[cfg(test)]
+    pub(crate) fn refuse_image_source_for_test(&mut self, source: AgentId) {
+        self.image.note_refusal(source, 0, now_ms());
     }
 
     /// Remove local keys absent from a digest-verified full-state serve
