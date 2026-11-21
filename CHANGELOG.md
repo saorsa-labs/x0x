@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Behaviour now documented (no code change)
+
+- **Owner recovery proceeds past an expired creator in the mixed case;
+  on GSS the creator gets no new keys until re-certified (#2133; A09
+  paragraph of 20 Nov 2026).** When every admin is revoked and another
+  below-Admin seat is tolerated, recovery commits and the expired creator
+  stays seated. On the GSS plane no share for any later epoch is written
+  to a seat whose committed certificate is expired. **On the TreeKEM
+  plane** the creator keeps its leaf: it cannot follow later commits when
+  the recovery carried a TreeKEM commit (withheld from it), but it follows
+  every later commit when the recovery carried none, and a leaked
+  recovery frame gives it all later epochs (known limits, #2139).
+
 ### Fixed
 
 - **A Homebrew install keeps the direct autostart job (#2111; A14
