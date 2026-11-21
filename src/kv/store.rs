@@ -39,7 +39,7 @@ use crate::kv::{KvEntry, KvError, KvStoreDelta, Result};
 use saorsa_gossip_crdt_sync::{DeltaCrdt, LwwRegister, OrSet};
 use saorsa_gossip_types::PeerId;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -695,6 +695,17 @@ pub(crate) enum MergeRejection {
     InconsistentEntry,
 }
 
+/// Encoded bytes of one OR-Set tag: a peer id and a sequence number.
+const ORSET_TAG_BYTES: u64 = 40;
+
+#[cfg(test)]
+thread_local! {
+    /// Whole-store content measures on this thread (#2110 tests).
+    pub(crate) static FULL_MEASURES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Rollback snapshots taken on this thread (#2110 tests).
+    pub(crate) static SNAPSHOTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Encoded bytes of a writer mark (#1094 P1): agent id, signature, version
 /// tag and their names, with length prefixes, rider label at its bound. The
 /// test `writer_mark_bytes_bound_the_mark` checks it.
@@ -872,14 +883,6 @@ impl std::fmt::Debug for KvStore {
     }
 }
 
-/// Deserialize a trailing, defaultable `KvStore` field, tolerating its absence.
-///
-/// bincode is positional and non-self-describing: a blob written by an older
-/// `KvStore` shape simply ends before these trailing fields, so bincode hits
-/// EOF when asked to read them. Decoding the value if present, or falling back
-/// to `T::default()` on EOF / any malformed tail, makes such a blob load with
-/// the newer fields defaulted rather than failing outright. Only sound at
-/// stream-EOF for genuinely trailing fields (see the struct's TRAILING note).
 /// The last OR-Set digest with the `(version, keys.version())` it was
 /// computed at. Every path that changes the OR-Set moves the store version.
 #[derive(Debug, Default)]
@@ -896,6 +899,14 @@ impl Clone for OrsetDigestCache {
     }
 }
 
+/// Deserialize a trailing, defaultable `KvStore` field, tolerating its absence.
+///
+/// bincode is positional and non-self-describing: a blob written by an older
+/// `KvStore` shape simply ends before these trailing fields, so bincode hits
+/// EOF when asked to read them. Decoding the value if present, or falling back
+/// to `T::default()` on EOF / any malformed tail, makes such a blob load with
+/// the newer fields defaulted rather than failing outright. Only sound at
+/// stream-EOF for genuinely trailing fields (see the struct's TRAILING note).
 pub(crate) fn de_tolerant<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -2107,8 +2118,12 @@ impl KvStore {
     /// included. The test `the_retained_measure_is_the_stored_bytes` pins
     /// it to `bincode::serialized_size`.
     pub(crate) fn retained_image_len(&self) -> Result<u64> {
-        Ok(self
-            .content_len()?
+        self.retained_with_content(self.content_len()?)
+    }
+
+    /// [`Self::retained_image_len`] with the content length given.
+    fn retained_with_content(&self, content: u64) -> Result<u64> {
+        Ok(content
             .saturating_add(self.replicated_rest_len()?)
             .saturating_add(self.local_len()?))
     }
@@ -2128,6 +2143,8 @@ impl KvStore {
     /// The OR-Set and the entries, walked by length: no value bytes are read
     /// and nothing is allocated.
     fn content_len(&self) -> Result<u64> {
+        #[cfg(test)]
+        FULL_MEASURES.with(|n| n.set(n.get() + 1));
         let keys = bincode::serialized_size(&self.keys)?;
         let entries = self.entries.iter().fold(8u64, |sum, (key, entry)| {
             sum.saturating_add(8 + key.len() as u64)
@@ -2174,12 +2191,33 @@ impl KvStore {
             .map_or(0, |entry| 8 + key.len() as u64 + entry.wire_len())
     }
 
-    /// An upper bound on the content part of the image: the cached bound
-    /// while no other mutation has happened, else the exact length, which
-    /// is then cached.
-    fn content_bound(&mut self) -> Result<u64> {
-        if let Some(bound) = self.image.cached_content(self.version, self.keys.version()) {
-            return Ok(bound);
+    /// The bytes of `key`'s live and tombstone slots in the OR-Set
+    /// encoding. With an empty changelog the OR-Set encodes to 40 fixed
+    /// bytes plus this sum over its keys (`OrSet::retained_tags`).
+    fn orset_key_len(&self, key: &String) -> u64 {
+        let tags = self.keys.retained_tags(key);
+        let slot = |n: Option<usize>| {
+            n.map_or(0, |n| {
+                (16 + key.len() as u64).saturating_add((n as u64).saturating_mul(ORSET_TAG_BYTES))
+            })
+        };
+        slot(tags.live).saturating_add(slot(tags.tombstoned))
+    }
+
+    /// The exact content part of the image: the cached length while no
+    /// other mutation has happened, else a measure, which is then cached.
+    /// A cached length is exact only while the OR-Set changelog is empty,
+    /// as it is after every settle.
+    fn content_exact(&mut self) -> Result<u64> {
+        if self.keys.changelog_len() != 0 {
+            // Compacting does not move the OR-Set version, so a cached
+            // length taken with changelog entries would stay keyed as
+            // valid after they are gone.
+            self.keys.compact(0);
+            self.image.invalidate_content();
+        }
+        if let Some(exact) = self.image.cached_content(self.version, self.keys.version()) {
+            return Ok(exact);
         }
         let exact = self.content_len()?;
         self.image
@@ -2225,6 +2263,44 @@ impl KvStore {
         Ok((keys, entries, rest))
     }
 
+    /// #2110: a lower bound on the admission image after `delta` less the
+    /// cached content length, so a delta whose lowest result is over the
+    /// hard limit is refused before anything is copied or applied. It never
+    /// exceeds the real result:
+    /// - A key added and not removed is live afterwards with its new tag,
+    ///   and its entry is the local or the incoming one (one LWW rule).
+    /// - Any other touched key can lose all its OR-Set slots and its entry.
+    /// - The name register can shrink to nothing, each allowlist removal
+    ///   frees at most one agent id, and the per-replica fields count at
+    ///   least [`LOCAL_IMAGE_ALLOWANCE`].
+    fn delta_lowest_growth(&self, delta: &KvStoreDelta, touched: &[String]) -> Result<i128> {
+        let mut growth = 0i128;
+        for key in touched {
+            let slots = i128::from(self.orset_key_len(key));
+            let entry = i128::from(self.entry_len(key));
+            let kept = match delta.added.get(key) {
+                Some((incoming, _)) if !delta.removed.contains_key(key) => {
+                    let slot = 16 + key.len() as u64 + ORSET_TAG_BYTES;
+                    let local = self.entries.get(key).map_or(u64::MAX, KvEntry::wire_len);
+                    let value = 8 + key.len() as u64 + local.min(incoming.wire_len());
+                    i128::from(slot) + i128::from(value)
+                }
+                _ => 0,
+            };
+            growth += kept - slots - entry;
+        }
+        let mut rest = i128::from(self.replicated_rest_len()?);
+        if delta.name_update.is_some() {
+            rest -= i128::from(bincode::serialized_size(&self.name)?);
+        }
+        let freed = delta
+            .allowlist_removals
+            .as_ref()
+            .map_or(0, |r| r.len() as u64);
+        rest -= i128::from(freed.saturating_mul(32));
+        Ok(growth + rest + i128::from(LOCAL_IMAGE_ALLOWANCE))
+    }
+
     /// The exact change in entry bytes that `journal` recorded.
     fn journal_entry_delta(&self, journal: &EntryJournal) -> i128 {
         journal
@@ -2247,14 +2323,18 @@ impl KvStore {
     /// convergence needs), and the OR-Set changelog is cleared: nothing
     /// reads it, since store deltas are built from the entries. `keys`
     /// limits the entry check to the keys a delta touched.
-    fn settle_retained(&mut self, keys: Option<Vec<String>>, journal: &mut EntryJournal) {
-        let candidates: Vec<String> = match keys {
+    fn settle_retained(&mut self, keys: Option<&[String]>, journal: &mut EntryJournal) {
+        let every: Vec<String>;
+        let candidates = match keys {
             Some(keys) => keys,
-            None => self.entries.keys().cloned().collect(),
+            None => {
+                every = self.entries.keys().cloned().collect();
+                &every
+            }
         };
         for key in candidates {
-            if !self.keys.contains(&key) {
-                self.journal_remove_entry(&key, journal);
+            if !self.keys.contains(key) {
+                self.journal_remove_entry(key, journal);
             }
         }
         self.keys.compact(0);
@@ -2347,6 +2427,8 @@ impl KvStore {
     /// A copy of this store without its entries, for [`Self::rollback`].
     /// The OR-Set is copied (tags only, no values).
     fn snapshot_without_entries(&mut self) -> Box<Self> {
+        #[cfg(test)]
+        SNAPSHOTS.with(|n| n.set(n.get() + 1));
         let entries = std::mem::take(&mut self.entries);
         let snapshot = Box::new(self.clone());
         self.entries = entries;
@@ -2381,20 +2463,25 @@ impl KvStore {
     /// [`HARD_IMAGE_LIMIT_BYTES`]; else roll it back and record the refusal
     /// against `source`. `before` is the retained size before the merge;
     /// a kept merge that shrank the image re-opens every retry window.
+    /// `content` is the exact content length after the merge when the
+    /// caller kept it; `None` measures it.
     fn admit_or_rollback(
         &mut self,
         snapshot: Box<Self>,
         journal: EntryJournal,
         source: Option<AgentId>,
         before: u64,
+        content: Option<u64>,
     ) -> Result<()> {
-        let measured = self.content_len().and_then(|content| {
-            Ok((
-                content,
-                self.admission_rest_len()?,
-                self.retained_image_len()?,
-            ))
-        });
+        let measured = content
+            .map_or_else(|| self.content_len(), Ok)
+            .and_then(|content| {
+                Ok((
+                    content,
+                    self.admission_rest_len()?,
+                    self.retained_with_content(content)?,
+                ))
+            });
         let (content, rest, retained) = match measured {
             Ok(sizes) => sizes,
             Err(e) => {
@@ -2405,23 +2492,7 @@ impl KvStore {
         let image = content.saturating_add(rest);
         if image > HARD_IMAGE_LIMIT_BYTES as u64 {
             self.rollback(snapshot, journal);
-            let log = match source {
-                Some(source) => self.image.note_refusal(source, image, now_ms()),
-                None => true,
-            };
-            if log {
-                tracing::warn!(
-                    store = %self.id,
-                    source = source.map(|s| hex::encode(s.as_bytes())).unwrap_or_default(),
-                    image,
-                    max = HARD_IMAGE_LIMIT_BYTES,
-                    "refused a merge: the merged retained image would pass the hard limit"
-                );
-            }
-            return Err(KvError::StoreFull {
-                image,
-                max: HARD_IMAGE_LIMIT_BYTES,
-            });
+            return Err(self.refuse_merge(source, image, false));
         }
         self.image
             .set_content(self.version, self.keys.version(), content);
@@ -2429,6 +2500,29 @@ impl KvStore {
             self.image.rearm();
         }
         Ok(())
+    }
+
+    /// Record a refused merge against `source` and return its error.
+    /// `lower_bound`: `image` is the pre-check's lower bound, not a measure.
+    fn refuse_merge(&mut self, source: Option<AgentId>, image: u64, lower_bound: bool) -> KvError {
+        let log = match source {
+            Some(source) => self.image.note_refusal(source, image, now_ms()),
+            None => true,
+        };
+        if log {
+            tracing::warn!(
+                store = %self.id,
+                source = source.map(|s| hex::encode(s.as_bytes())).unwrap_or_default(),
+                image,
+                lower_bound,
+                max = HARD_IMAGE_LIMIT_BYTES,
+                "refused a merge: the merged retained image would pass the hard limit"
+            );
+        }
+        KvError::StoreFull {
+            image,
+            max: HARD_IMAGE_LIMIT_BYTES,
+        }
     }
 
     /// Merge `entry` into `key`'s entry with the one LWW rule, or insert it,
@@ -2997,12 +3091,13 @@ impl KvStore {
     /// [`HARD_IMAGE_LIMIT_BYTES`]. Every delta is measured; nothing is
     /// refused on a bound or a back-off alone.
     ///
-    /// The cheap measure: an upper growth bound on top of the cached bound.
-    /// When that fits, the delta applies at O(delta) cost and the cache is
-    /// refreshed with the exact change in entry bytes, so it stays within a
-    /// few tags of exact. When it does not fit, the delta applies in place
-    /// under an undo journal and the exact image is measured: a walk of the
-    /// keys and tags with no value bytes read and nothing allocated.
+    /// The cached content length is exact, and every delta changes it by
+    /// the exact change in its touched keys' OR-Set slots and entries, so
+    /// while it is cached the measure is O(keys in the delta) (#2110). A
+    /// local write or a load drops it; the next delta measures it once. When an upper growth
+    /// bound fits, the delta just applies. Otherwise a lower bound over the
+    /// limit refuses it unapplied; else it applies in place under an undo
+    /// journal and a copy of the OR-Set, and is kept or rolled back.
     ///
     /// # Errors
     ///
@@ -3031,34 +3126,48 @@ impl KvStore {
         delta: &KvStoreDelta,
         writer: Option<&AgentId>,
     ) -> Result<MergeOutcome> {
-        let (keys_growth, entries_growth, rest_growth) = self.delta_growth_bound(delta)?;
-        let content = self.content_bound()?;
-        let bound = content
-            .saturating_add(keys_growth)
-            .saturating_add(entries_growth)
-            .saturating_add(self.admission_rest_len()?)
-            .saturating_add(rest_growth);
         let touched: Vec<String> = delta
             .added
             .keys()
             .chain(delta.removed.keys())
             .chain(delta.updated.keys())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .cloned()
             .collect();
+        // No key cap: every ingress path decodes a delta under a 4 MiB
+        // limit (`gossip::wire::decode_delta` for plain and sealed records,
+        // 64 KiB DM envelopes), which bounds a delta to about 250 000
+        // removals or 25 000 entries, and the work below is O(touched keys).
+        let (keys_growth, entries_growth, rest_growth) = self.delta_growth_bound(delta)?;
+        let content = self.content_exact()?;
+        let bound = content
+            .saturating_add(keys_growth)
+            .saturating_add(entries_growth)
+            .saturating_add(self.admission_rest_len()?)
+            .saturating_add(rest_growth);
+        let orset_before: i128 = touched
+            .iter()
+            .map(|key| i128::from(self.orset_key_len(key)))
+            .sum();
         let mut journal = EntryJournal::default();
         if bound <= HARD_IMAGE_LIMIT_BYTES as u64 {
             let outcome = self.apply_delta_content(delta, writer, &mut journal)?;
-            self.settle_retained(Some(touched), &mut journal);
-            let change = i128::from(keys_growth) + self.journal_entry_delta(&journal);
-            let refreshed = (i128::from(content) + change).max(0) as u64;
+            let (change, after) =
+                self.settle_and_measure(content, &touched, orset_before, &mut journal);
             self.image
-                .set_content(self.version, self.keys.version(), refreshed);
+                .set_content(self.version, self.keys.version(), after);
             if change < 0 {
                 self.image.rearm();
             }
             return Ok(outcome);
         }
-        let before = self.retained_image_len()?;
+        let lowest = i128::from(content) + self.delta_lowest_growth(delta, &touched)?;
+        if lowest > i128::from(HARD_IMAGE_LIMIT_BYTES as u64) {
+            let image = u64::try_from(lowest).unwrap_or(u64::MAX);
+            return Err(self.refuse_merge(writer.copied(), image, true));
+        }
+        let before = self.retained_with_content(content)?;
         let snapshot = self.snapshot_without_entries();
         let outcome = match self.apply_delta_content(delta, writer, &mut journal) {
             Ok(outcome) => outcome,
@@ -3067,9 +3176,32 @@ impl KvStore {
                 return Err(e);
             }
         };
-        self.settle_retained(Some(touched), &mut journal);
-        self.admit_or_rollback(snapshot, journal, writer.copied(), before)?;
+        let (_, after) = self.settle_and_measure(content, &touched, orset_before, &mut journal);
+        self.admit_or_rollback(snapshot, journal, writer.copied(), before, Some(after))?;
         Ok(outcome)
+    }
+
+    /// Settle the keys a delta touched and return the exact change in
+    /// content bytes (each touched key's OR-Set slots and entry, before and
+    /// after) with the content length `content` becomes. Settling empties
+    /// the OR-Set changelog, so the OR-Set encoding is the sum of its key
+    /// slots again.
+    fn settle_and_measure(
+        &mut self,
+        content: u64,
+        touched: &[String],
+        orset_before: i128,
+        journal: &mut EntryJournal,
+    ) -> (i128, u64) {
+        self.settle_retained(Some(touched), journal);
+        let orset_after: i128 = touched
+            .iter()
+            .map(|key| i128::from(self.orset_key_len(key)))
+            .sum();
+        let change = orset_after - orset_before + self.journal_entry_delta(journal);
+        let after = i128::from(content) + change;
+        debug_assert!(after >= 0, "content {content} changed by {change}");
+        (change, after.max(0) as u64)
     }
 
     /// Apply an admitted delta's content and authority: allowlist changes,
@@ -3224,7 +3356,7 @@ impl KvStore {
         let snapshot = self.snapshot_without_entries();
         self.apply_full_snapshot(delta, peer_id, cp, &mut journal);
         self.settle_retained(None, &mut journal);
-        self.admit_or_rollback(snapshot, journal, self.owner, before)?;
+        self.admit_or_rollback(snapshot, journal, self.owner, before, None)?;
         Ok(true)
     }
 
@@ -3757,7 +3889,7 @@ impl KvStore {
         if changed {
             self.version = self.version.saturating_add(1);
         }
-        self.admit_or_rollback(snapshot, journal, Some(endorser), before)?;
+        self.admit_or_rollback(snapshot, journal, Some(endorser), before, None)?;
         if let Some(floor) = retained_sequence_floor {
             self.restore_seq_counter(floor);
         }
@@ -3826,7 +3958,7 @@ impl KvStore {
             self.version = self.version.saturating_add(1);
         }
         // #1970: legacy history merges into the retained image too.
-        self.admit_or_rollback(snapshot, journal, Some(endorser), before)?;
+        self.admit_or_rollback(snapshot, journal, Some(endorser), before, None)?;
         if let Some(floor) = retained_sequence_floor {
             self.restore_seq_counter(floor);
         }
@@ -4008,6 +4140,11 @@ impl KvStore {
         self.image.note_refusal(source, 0, now_ms());
     }
 
+    #[cfg(test)]
+    pub(crate) fn clear_image_source_for_test(&mut self, source: &AgentId) {
+        self.image.clear(source);
+    }
+
     /// Remove local keys absent from a digest-verified full-state serve
     /// (`delta.added` is then the verified complete entry set).
     ///
@@ -4056,15 +4193,15 @@ impl KvStore {
 mod tests {
     use super::*;
 
-    fn agent(n: u8) -> AgentId {
+    pub(super) fn agent(n: u8) -> AgentId {
         AgentId([n; 32])
     }
 
-    fn peer(n: u8) -> PeerId {
+    pub(super) fn peer(n: u8) -> PeerId {
         PeerId::new([n; 32])
     }
 
-    fn store_id(n: u8) -> KvStoreId {
+    pub(super) fn store_id(n: u8) -> KvStoreId {
         KvStoreId::new([n; 32])
     }
 
@@ -5744,7 +5881,7 @@ mod tests {
 
     /// A group store whose roster holds two writers, `agent(1)` (also the
     /// owner) and `agent(2)`.
-    fn two_writer_group(slot: u8) -> KvStore {
+    pub(super) fn two_writer_group(slot: u8) -> KvStore {
         let owner = agent(1);
         KvStore::new_group_signed(
             store_id(slot),
@@ -5758,7 +5895,12 @@ mod tests {
 
     /// Fill `s` with 60 KB entries by direct puts while the canonical image
     /// stays at or below `target`.
-    fn fill_canonical_to(s: &mut KvStore, target: u64, prefix: &str, writer_peer: PeerId) {
+    pub(super) fn fill_canonical_to(
+        s: &mut KvStore,
+        target: u64,
+        prefix: &str,
+        writer_peer: PeerId,
+    ) {
         for i in 0u32.. {
             if s.retained_image_len().expect("size") + 61_000 > target {
                 break;
@@ -5773,7 +5915,7 @@ mod tests {
         }
     }
 
-    fn put_delta(
+    pub(super) fn put_delta(
         key: &str,
         len: usize,
         byte: u8,
@@ -6107,13 +6249,9 @@ mod tests {
                     bincode::serialized_size(entry).expect("entry")
                 );
             }
-            if let Some(bound) = s.image.cached_content(s.version, s.keys.version()) {
+            if let Some(cached) = s.image.cached_content(s.version, s.keys.version()) {
                 let exact = s.content_len().expect("content");
-                assert!(bound >= exact, "the bound covers the content");
-                assert!(
-                    bound - exact <= 4_096,
-                    "the bound tracks it: {bound} vs {exact}"
-                );
+                assert_eq!(cached, exact, "the cached content length is exact");
             }
         };
         check(&s);
@@ -6146,7 +6284,7 @@ mod tests {
             KvEntry::new("u000".to_string(), vec![b'u'; 40], "text/plain".to_string()),
         );
         deltas.push(upsert);
-        s.content_bound().expect("prime the cache");
+        s.content_exact().expect("prime the cache");
         for (i, d) in deltas.iter().enumerate() {
             s.merge_delta(d, peer(2), Some(&agent(2)))
                 .unwrap_or_else(|e| panic!("delta {i}: {e}"));
@@ -10363,3 +10501,7 @@ mod tests {
         assert!(store.allowed_writers().is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "incremental_measure_tests.rs"]
+mod incremental_measure_tests;

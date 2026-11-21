@@ -3288,7 +3288,15 @@
     "description": "Remove key from store",
     "category": "stores",
     "request": {
-      "kind": "none"
+      "fields": [
+        {
+          "cli": "default",
+          "in": "query",
+          "name": "absent",
+          "required": false
+        }
+      ],
+      "kind": "fields"
     }
   },
   {

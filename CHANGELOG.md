@@ -19,6 +19,15 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **A delta into a group store is measured in O(keys in the delta) (#2110
+  item 1; A10 amendment of 21 Nov 2026).** The store keeps its content
+  length exact from the OR-Set tag counts (saorsa-gossip 0.5.95), so a delta
+  does not walk the store while that length is cached. The first delta after
+  a local put, remove or load still measures the store once. A delta that
+  cannot fit even at its lowest possible size is refused before anything is
+  copied. A delta that passes that check but does not fit still copies the
+  OR-Set's tags to roll back (#2146); the known limit is narrowed, not
+  closed.
 - **A value-only difference between sealed group-store replicas no longer
   waits for the image back-off (#2110 item 2; A10 amendment of 21 Nov
   2026).** The digest beacon carries the sender's OR-Set digest; when it
@@ -26,7 +35,8 @@ All notable changes to this project will be documented in this file.
   window. Wire: one trailing optional field that older peers ignore.
 - **The owner can remove a key its replica does not hold (#2110 item 3; A10
   amendment of 21 Nov 2026).** `DELETE /stores/:id/:key?absent=publish`
-  publishes the removal for the replicas that hold the key and replies
+  (CLI: `x0x store rm <store_id> <key> --absent publish`) publishes the
+  removal for the replicas that hold the key and replies
   `"held": false`; every release since v0.9.0 already applies a removal by
   key, so no wire change. On a group store a holder that was offline loses
   the key at its next image merge; on a plain store it keeps the key until

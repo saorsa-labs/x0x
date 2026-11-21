@@ -6,7 +6,7 @@
 //! stop at [`SOFT_IMAGE_LIMIT_BYTES`]; a remote merge is admitted when the
 //! merged canonical image is at most the hard limit. This module holds the
 //! per-store state that makes a refused merge visible and lets it heal: the
-//! cached content-size bound and the per-source refusal table with its
+//! cached content length and the per-source refusal table with its
 //! back-off.
 
 use crate::identity::AgentId;
@@ -114,8 +114,8 @@ struct Refusal {
 /// Non-persisted admission state carried by a `KvStore`.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ImageAdmission {
-    /// An upper bound on the content part (OR-Set and live entries) of the
-    /// canonical image, valid while the store and OR-Set versions match.
+    /// The exact content part (OR-Set and live entries) of the canonical
+    /// image, valid while the store and OR-Set versions match.
     content: Option<ContentBound>,
     refusals: HashMap<AgentId, Refusal>,
     refused_total: u64,
