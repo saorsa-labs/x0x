@@ -2492,7 +2492,7 @@ impl KvStore {
         let image = content.saturating_add(rest);
         if image > HARD_IMAGE_LIMIT_BYTES as u64 {
             self.rollback(snapshot, journal);
-            return Err(self.refuse_merge(source, image));
+            return Err(self.refuse_merge(source, image, false));
         }
         self.image
             .set_content(self.version, self.keys.version(), content);
@@ -2503,7 +2503,8 @@ impl KvStore {
     }
 
     /// Record a refused merge against `source` and return its error.
-    fn refuse_merge(&mut self, source: Option<AgentId>, image: u64) -> KvError {
+    /// `lower_bound`: `image` is the pre-check's lower bound, not a measure.
+    fn refuse_merge(&mut self, source: Option<AgentId>, image: u64, lower_bound: bool) -> KvError {
         let log = match source {
             Some(source) => self.image.note_refusal(source, image, now_ms()),
             None => true,
@@ -2513,6 +2514,7 @@ impl KvStore {
                 store = %self.id,
                 source = source.map(|s| hex::encode(s.as_bytes())).unwrap_or_default(),
                 image,
+                lower_bound,
                 max = HARD_IMAGE_LIMIT_BYTES,
                 "refused a merge: the merged retained image would pass the hard limit"
             );
@@ -3091,7 +3093,8 @@ impl KvStore {
     ///
     /// The cached content length is exact, and every delta changes it by
     /// the exact change in its touched keys' OR-Set slots and entries, so
-    /// the measure is O(keys in the delta) (#2110). When an upper growth
+    /// while it is cached the measure is O(keys in the delta) (#2110). A
+    /// local write or a load drops it; the next delta measures it once. When an upper growth
     /// bound fits, the delta just applies. Otherwise a lower bound over the
     /// limit refuses it unapplied; else it applies in place under an undo
     /// journal and a copy of the OR-Set, and is kept or rolled back.
@@ -3162,7 +3165,7 @@ impl KvStore {
         let lowest = i128::from(content) + self.delta_lowest_growth(delta, &touched)?;
         if lowest > i128::from(HARD_IMAGE_LIMIT_BYTES as u64) {
             let image = u64::try_from(lowest).unwrap_or(u64::MAX);
-            return Err(self.refuse_merge(writer.copied(), image));
+            return Err(self.refuse_merge(writer.copied(), image, true));
         }
         let before = self.retained_with_content(content)?;
         let snapshot = self.snapshot_without_entries();
@@ -3196,7 +3199,9 @@ impl KvStore {
             .map(|key| i128::from(self.orset_key_len(key)))
             .sum();
         let change = orset_after - orset_before + self.journal_entry_delta(journal);
-        (change, (i128::from(content) + change).max(0) as u64)
+        let after = i128::from(content) + change;
+        debug_assert!(after >= 0, "content {content} changed by {change}");
+        (change, after.max(0) as u64)
     }
 
     /// Apply an admitted delta's content and authority: allowlist changes,

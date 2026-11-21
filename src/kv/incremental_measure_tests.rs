@@ -255,22 +255,27 @@ fn a_delta_over_only_after_apply_is_rolled_back() {
     assert_cached_is_exact(&s);
 }
 
-/// The largest delta one frame can carry, all removals of short keys,
-/// merges on the group path with no whole-store measure and well inside
-/// its budget.
+/// The largest delta one frame can carry takes the slow path (its cheap
+/// bound is over the limit, its result fits) and is measured from its own
+/// keys: one rollback copy and no whole-store measure, for 150 000+ keys.
 #[test]
-fn a_largest_frame_delta_merges_in_o_delta() {
-    let mut s = two_writer_group(66);
-    s.put(
-        "k".to_string(),
-        vec![b'v'; 10],
-        "text/plain".to_string(),
-        peer(1),
-    )
-    .expect("put");
-    s.content_exact().expect("prime");
-    let mut delta = KvStoreDelta::new(s.version);
+fn a_largest_frame_delta_is_measured_from_its_keys() {
+    let hard = HARD_IMAGE_LIMIT_BYTES as u64;
+    let room = 300_000;
+    let mut s = store_with_room(66, room);
     let limit = crate::network::MAX_MESSAGE_DESERIALIZE_SIZE;
+    let mut probe = s.clone();
+    probe
+        .merge_delta(
+            &put_delta("big", 0, b'b', (peer(2), 1), s.version),
+            peer(2),
+            Some(&agent(2)),
+        )
+        .expect("probe");
+    // One byte under the exact fit: the result fits, and the cheap bound
+    // (exact here plus the delta's optional fields) does not.
+    let fit = hard - probe.admission_image_len().expect("image") - 1;
+    let mut delta = put_delta("big", fit as usize, b'b', (peer(2), 1), s.version);
     let mut size = bincode::serialized_size(&(PeerId::new([2; 32]), &delta)).expect("size");
     let mut i = 0u32;
     loop {
@@ -289,21 +294,16 @@ fn a_largest_frame_delta_merges_in_o_delta() {
         size
     );
     assert!(
-        delta.removed.len() > 200_000,
+        delta.removed.len() > 150_000,
         "{} removals",
         delta.removed.len()
     );
-    let before = full_measures();
-    let started = std::time::Instant::now();
+    let (measures, copies) = (full_measures(), snapshots());
     s.merge_delta(&delta, peer(2), Some(&agent(2)))
-        .expect("merge");
-    let took = started.elapsed();
-    assert_eq!(full_measures(), before);
-    assert!(
-        took < std::time::Duration::from_secs(20),
-        "{} removals took {took:?}",
-        delta.removed.len()
-    );
+        .expect("the result fits");
+    assert_eq!(snapshots(), copies + 1, "the slow path ran");
+    assert_eq!(full_measures(), measures, "no whole-store measure");
+    assert_eq!(s.admission_image_len().expect("image"), hard - 1);
     assert_cached_is_exact(&s);
 }
 

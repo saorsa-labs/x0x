@@ -21,11 +21,13 @@ All notable changes to this project will be documented in this file.
 
 - **A delta into a group store is measured in O(keys in the delta) (#2110
   item 1; A10 amendment of 21 Nov 2026).** The store keeps its content
-  length exact from the OR-Set tag counts (saorsa-gossip 0.5.95), so no
-  delta walks the store. A delta that cannot fit even at its lowest
-  possible size is refused before anything is copied. A delta that passes
-  that check but does not fit still copies the OR-Set's tags to roll back
-  (#2146); the known limit is narrowed, not closed.
+  length exact from the OR-Set tag counts (saorsa-gossip 0.5.95), so a delta
+  does not walk the store while that length is cached. The first delta after
+  a local put, remove or load still measures the store once. A delta that
+  cannot fit even at its lowest possible size is refused before anything is
+  copied. A delta that passes that check but does not fit still copies the
+  OR-Set's tags to roll back (#2146); the known limit is narrowed, not
+  closed.
 - **A value-only difference between sealed group-store replicas no longer
   waits for the image back-off (#2110 item 2; A10 amendment of 21 Nov
   2026).** The digest beacon carries the sender's OR-Set digest; when it
