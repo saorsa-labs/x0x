@@ -19,7 +19,7 @@ POST  /groups/:id/stores/:app/legacy-imports/:source_id   group store legacy imp
 GET  /stores/:id/keys                                    store keys                                              List keys in store
 PUT  /stores/:id/:key                                    store put                 body: value,content_type      Put value in store
 GET  /stores/:id/:key                                    store get                                               Get value from store
-DELETE  /stores/:id/:key                                    store rm                                                Remove key from store
+DELETE  /stores/:id/:key                                    store rm                  query: absent                 Remove key from store
 GET  /agent                                              agent                                                   Agent identity info
 POST  /announce                                           announce                  body: include_user_identity,human_consent,withdraw_consent  Announce identity to network
 GET  /agent/user-id                                      agent user-id                                           Current agent user ID

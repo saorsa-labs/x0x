@@ -92,10 +92,7 @@ async fn owner_removes_a_key_it_does_not_hold() {
     let handle = open(&state, "absent/owner", AccessPolicy::Signed).await;
 
     let (status, body) = delete(&state, "absent/owner", "k", Some("publish")).await;
-    assert!(
-        status == StatusCode::OK || status == StatusCode::ACCEPTED,
-        "{status} {body}"
-    );
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["ok"], true, "{body}");
     assert_eq!(body["held"], false, "{body}");
 
@@ -185,10 +182,7 @@ async fn held_follows_the_entry_that_remove_checks() {
         store.current_version()
     };
     let (status, body) = delete(&state, "absent/ghost", "ghost", None).await;
-    assert!(
-        status == StatusCode::OK || status == StatusCode::ACCEPTED,
-        "{status} {body}"
-    );
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["held"], true, "{body}");
     let store = handle.sync.read().await;
     assert!(!store.holds_entry("ghost"));
@@ -216,10 +210,7 @@ async fn absent_removal_keeps_the_self_keyed_prefix_rule() {
     let (status, body) = delete(&state, topic, &foreign, Some("publish")).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     let (status, body) = delete(&state, topic, &own, Some("publish")).await;
-    assert!(
-        status == StatusCode::OK || status == StatusCode::ACCEPTED,
-        "{status} {body}"
-    );
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["held"], false, "{body}");
     handle.retire_and_drain().await;
 }
@@ -261,10 +252,7 @@ async fn absent_removal_on_an_encrypted_group_store() {
         .expect("handle");
     assert!(handle.is_encrypted().await);
     let (status, body) = delete(&state, &topic, "k", Some("publish")).await;
-    assert!(
-        status == StatusCode::OK || status == StatusCode::ACCEPTED,
-        "{status} {body}"
-    );
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["held"], false, "{body}");
     let delta = handle
         .remove_absent_with_outcome("k")
@@ -330,4 +318,42 @@ async fn absent_removal_keeps_the_write_rules() {
 
     append_only.retire_and_drain().await;
     joined.retire_and_drain().await;
+}
+
+/// Nothing changed here, the publish failed and a store with no
+/// gossip-inbox contact sends no direct message: the removal did nothing,
+/// so the reply is 503 with an `error` the CLI prints.
+#[tokio::test]
+async fn an_absent_removal_that_reaches_no_one_is_503() {
+    let (state, _dir) = state().await;
+    let handle = open(&state, "absent/503", AccessPolicy::Signed).await;
+    handle.sync_fail_next_publish_for_test().await;
+    let (status, body) = delete(&state, "absent/503", "k", Some("publish")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["ok"], false, "{body}");
+    assert_eq!(body["held"], false, "{body}");
+    assert_eq!(body["published"], false, "{body}");
+    assert_eq!(body["direct_attempted"], 0, "{body}");
+    assert!(
+        body["error"].as_str().is_some_and(|e| !e.is_empty()),
+        "the CLI prints `error`: {body}"
+    );
+    assert!(
+        body["reason"].as_str().is_some_and(|r| !r.is_empty()),
+        "the publish cause is carried: {body}"
+    );
+
+    handle
+        .put("k".to_string(), b"v".to_vec(), "text/plain".to_string())
+        .await
+        .expect("put");
+    handle.sync_fail_next_publish_for_test().await;
+    let (status, body) = delete(&state, "absent/503", "k", Some("publish")).await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "a held key is removed here: {body}"
+    );
+    assert_eq!(body["held"], true, "{body}");
+    handle.retire_and_drain().await;
 }

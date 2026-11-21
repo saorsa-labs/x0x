@@ -921,6 +921,7 @@ pub(in crate::server) async fn delete_kv_value(
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(serde_json::json!({
                         "ok": false,
+                        "error": "the removal was not published and not sent",
                         "held": false,
                         "published": false,
                         "reason": publish_error,
