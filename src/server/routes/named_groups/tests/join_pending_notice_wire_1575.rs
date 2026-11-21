@@ -2686,3 +2686,70 @@ async fn a_timed_out_join_names_its_last_cause_or_no_admission_result() -> Resul
     }
     Ok(())
 }
+
+/// #2135 (ADR 0108 §8 Joiner, D154): the authority-signed
+/// `no_eligible_admin` notice is held, join-status shows it as the typed
+/// `pending_cause` (not `unrecognized_cause`), and the attempt's
+/// `timed_out` reason at its deadline is `no_eligible_admin`, not
+/// `no_admission_result`.
+#[tokio::test]
+async fn the_joiner_shows_and_times_out_with_no_eligible_admin() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let inviter = AgentKeypair::generate()?;
+    let member_signer = AgentKeypair::generate()?;
+    let joiner_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let inviter_hex = hex::encode(inviter.agent_id().as_bytes());
+    let group_key = "2135".repeat(16);
+    let attempt_id = "at2135".to_string();
+    let _ = seed_joiner_attempt(&state, &group_key, &attempt_id, &inviter, &member_signer).await;
+    state
+        .pending_join_stubs
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(group_key.clone());
+    let stable = state
+        .named_groups
+        .read()
+        .await
+        .get(&group_key)
+        .map(|info| info.stable_group_id().to_string())
+        .expect("stub installed");
+    let notice = signed_notice(
+        notice_body(
+            &group_key,
+            &joiner_hex,
+            &inviter_hex,
+            &attempt_id,
+            "no_eligible_admin",
+            JoinPendingNoticeDetail::default(),
+            now_millis_u64(),
+        ),
+        &inviter,
+    );
+    assert!(
+        verify_and_hold_join_pending_notice(&state, true, &notice).await,
+        "the authority-signed no_eligible_admin notice is held"
+    );
+    let (code, body) = join_status_body(&state, &group_key).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(body["join_state"], "pending_authority_commit");
+    assert_eq!(body["pending_cause"]["cause"], "no_eligible_admin");
+    assert_eq!(body["pending_cause"]["signer_agent_id"], inviter_hex);
+
+    let disposition = finalize_join_attempt(
+        &state,
+        &group_key,
+        &stable,
+        &joiner_hex,
+        &attempt_id,
+        JoinAttemptOutcome::TimedOut,
+        JoinFinalizeGuard::Unlocked,
+    )
+    .await;
+    assert_eq!(disposition, JoinFinalizeDisposition::Finalized);
+    let (code, body) = join_status_body(&state, &group_key).await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "the stub is removed");
+    assert_eq!(body["last_join_outcome"]["outcome"], "timed_out");
+    assert_eq!(body["last_join_outcome"]["reason"], "no_eligible_admin");
+    Ok(())
+}
