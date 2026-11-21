@@ -98,11 +98,22 @@ pub async fn get(client: &DaemonClient, store_id: &str, key: &str) -> Result<()>
     client.run_get(&format!("/stores/{store_id}/{key}")).await
 }
 
-/// `x0x store rm` — DELETE /stores/:id/:key.
-pub async fn rm(client: &DaemonClient, store_id: &str, key: &str) -> Result<()> {
-    client
-        .run_delete(&format!("/stores/{store_id}/{key}"))
-        .await
+/// `x0x store rm` — DELETE /stores/:id/:key, with `?absent=<mode>` when
+/// `absent` is set.
+pub async fn rm(
+    client: &DaemonClient,
+    store_id: &str,
+    key: &str,
+    absent: Option<&str>,
+) -> Result<()> {
+    client.run_delete(&rm_path(store_id, key, absent)).await
+}
+
+fn rm_path(store_id: &str, key: &str, absent: Option<&str>) -> String {
+    match absent {
+        Some(mode) => format!("/stores/{store_id}/{key}?absent={mode}"),
+        None => format!("/stores/{store_id}/{key}"),
+    }
 }
 
 #[cfg(test)]
@@ -112,6 +123,15 @@ mod tests {
     use crate::cli::DaemonClient;
 
     use crate::cli::commands::test_support::{start_capturing_mock_server, start_mock_server};
+
+    #[test]
+    fn rm_sends_absent_as_a_query() {
+        assert_eq!(rm_path("s", "k", None), "/stores/s/k");
+        assert_eq!(
+            rm_path("s", "k", Some("publish")),
+            "/stores/s/k?absent=publish"
+        );
+    }
 
     /// WHY (review r2, finding 2): prove the join body omits `expected_owner`
     /// for owner-free joins and carries the policy override.
