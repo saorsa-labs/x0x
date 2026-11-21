@@ -4,6 +4,7 @@
 //! that read another directory's records could pass through to a swapped
 //! candidate. The directory is derived as `x0xd` derives it at startup
 //! (`src/bin/x0xd.rs`), from the environment the launcher passes on to it.
+//! `tests/launcher_data_dir_parity.rs` checks it against `x0xd --check`.
 use super::*;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;

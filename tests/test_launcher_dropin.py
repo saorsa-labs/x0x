@@ -135,6 +135,13 @@ class RenderTests(unittest.TestCase):
         self.write_daemon("    nothing: 1,")
         self.assertIn("exactly one data_dir", self.refused("no data_dir"))
 
+    def test_refuses_a_config_path_the_check_cannot_resolve(self) -> None:
+        for args in (["--config", "rel.toml"], ["--config=/etc/x0x/c.toml"], ["--config"]):
+            self.assertIn(
+                "--config",
+                self.refused(" ".join(args), exec_start=[str(self.binary), *args]),
+            )
+
     def exec_refused(self, why: str, *texts: str) -> str:
         with self.assertRaises(dropin.Refused, msg=why) as caught:
             dropin.unit_exec_start(*texts)
@@ -204,9 +211,13 @@ class UnitFileTests(unittest.TestCase):
         for directory in (self.transient, self.etc, self.run_dir, self.usr):
             directory.mkdir(parents=True)
         search = (str(self.transient), dropin.ETC_UNITS, str(self.run_dir), str(self.usr))
-        patcher = mock.patch.object(dropin, "SEARCH_PATH", search)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for name, value in (
+            ("SEARCH_PATH", search),
+            ("SYSTEMD_RUNTIME", str(self.tmp / "no-systemd")),
+        ):
+            patcher = mock.patch.object(dropin, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.unit = self.etc / "x0xd-testnet.service"
         self.unit.write_text(
             "[Service]\nUser=alice\nExecStart=/opt/x0x/x0xd --name testnet\n", "utf-8"
@@ -260,6 +271,37 @@ class UnitFileTests(unittest.TestCase):
         (self.usr / self.unit.name).write_text("[Service]\nExecStart=/bin/true\n", "utf-8")
         self.assertEqual(self.settings().user, "alice", "a lower unit file is shadowed")
 
+    def test_a_linked_search_root_is_read_once(self) -> None:
+        # Merged /usr: /lib/systemd/system is /usr/lib/systemd/system.
+        lib = self.tmp / "lib"
+        lib.mkdir()
+        (lib / "systemd").symlink_to(self.usr.parent)
+        search = (*dropin.SEARCH_PATH, str(lib / "systemd" / "system"))
+        vendor = self.conf(self.usr, "service.d", "10-x.conf", "TimeoutStopFailureMode=abort")
+        with mock.patch.object(dropin, "SEARCH_PATH", search):
+            self.assertEqual(self.settings().dropins, [str(vendor)])
+
+    def test_an_environment_that_moves_the_data_directory_is_refused(self) -> None:
+        for line in ("Environment=XDG_DATA_HOME=/srv", 'Environment="A=1" HOME=/srv',
+                     "EnvironmentFile=/etc/default/x0x"):
+            conf = self.conf(self.etc, "x0xd-testnet.service.d", "20-env.conf", line)
+            self.assertIn("migrate by hand", self.refused(line))
+            conf.unlink()
+        self.conf(self.etc, "x0xd-testnet.service.d", "20-env.conf", "Environment=RUST_LOG=info")
+        self.assertEqual(self.settings().user, "alice")
+
+    def test_a_failed_question_to_a_running_systemd_is_refused(self) -> None:
+        running = self.tmp / "run-systemd"
+        running.mkdir()
+        with mock.patch.object(dropin, "SYSTEMD_RUNTIME", str(running)):
+            for why, script in (
+                ("reload fails", self.fake_systemctl("", status=1)),
+                ("show fails", self.fake_systemctl("", status=0, show_status=1)),
+                ("no systemctl", None),
+            ):
+                with self.assertRaises(dropin.Refused, msg=why):
+                    self.effective(script)
+
     def test_a_drop_in_after_the_launchers_that_undoes_it_is_refused(self) -> None:
         for key in ("ExecStart=", "Restart=no", "KillMode=process", "TimeoutSec=5"):
             conf = self.conf(self.etc, "x0xd-testnet.service.d", "50-late.conf", key)
@@ -268,12 +310,12 @@ class UnitFileTests(unittest.TestCase):
         self.conf(self.etc, "x0xd-testnet.service.d", "50-late.conf", "User=dave")
         self.assertEqual(self.settings().user, "dave")
 
-    def fake_systemctl(self, show: str, status: int = 0) -> Path:
+    def fake_systemctl(self, show: str, status: int = 0, show_status: int = 0) -> Path:
         script = self.tmp / "systemctl"
         script.write_text(
             "#!/bin/sh\n"
             f'[ "$1" = daemon-reload ] && exit {status}\n'
-            f"cat <<'EOF'\n{show}\nEOF\n",
+            f"cat <<'EOF'\n{show}\nEOF\nexit {show_status}\n",
             "utf-8",
         )
         script.chmod(0o755)
@@ -421,6 +463,7 @@ class InstallShTests(unittest.TestCase):
         # `systemctl show` answers with show.out when the test wrote one;
         # otherwise it fails, as on a host without a running systemd.
         self.show_out = self.tmp / "show.out"
+        self.answer: dict[str, object] = {}
         self.stub(
             "systemctl",
             f'echo "$*" >> "{self.calls}"\n'
@@ -445,7 +488,17 @@ class InstallShTests(unittest.TestCase):
         (self.deploy / "systemd" / "x0xd-testnet.service").write_text(text, "utf-8")
 
     def install(self, launcher: bool = True) -> subprocess.CompletedProcess[str]:
+        """Run install.sh. systemd's stubbed answer agrees with the unit
+        files, changed by `self.answer`, so the run does not depend on
+        whether this host runs systemd."""
         self.calls.unlink(missing_ok=True)
+        self.show_out.unlink(missing_ok=True)
+        self.unit.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(self.deploy / "systemd" / "x0xd-testnet.service", self.unit)
+        try:
+            self.systemd_answers(**self.answer)
+        except dropin.Refused:
+            pass
         argv = ["bash", str(self.deploy / "install.sh"), "--instance", "testnet"]
         if launcher:
             argv += ["--launcher", str(self.launcher_src)]
@@ -518,9 +571,7 @@ class InstallShTests(unittest.TestCase):
 
     def test_systemd_is_asked_and_must_agree_with_the_unit_files(self) -> None:
         self.assert_installed(self.install())
-        self.systemd_answers()
-        self.assert_installed(self.install())
-        self.systemd_answers(user="nobody")
+        self.answer = {"user": "nobody"}
         result = self.install()
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("systemd's user for x0xd-testnet.service differs", result.stderr)

@@ -76,6 +76,11 @@ DROPIN_KEYS = (
     "TimeoutStopSec",
     "TimeoutSec",
 )
+# The daemon's data directory depends on these; the installer's `--check`
+# runs with HOME and PATH only, so a unit that sets them is refused.
+DATA_ENV = ("HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME")
+# Present when systemd is the running service manager (sd_booted(3)).
+SYSTEMD_RUNTIME = "/run/systemd/system"
 SHOW_PROPERTIES = ("LoadState", "FragmentPath", "DropInPaths", "User", "ExecStart")
 
 
@@ -170,7 +175,15 @@ def dropin_dirs(name: str) -> list[str]:
 def unit_files(unit: Path, dropin: Path) -> tuple[Path, list[Path]]:
     """The unit file systemd loads for `unit`'s name and the drop-ins it
     applies, in order, without the launcher drop-in `dropin`."""
-    roots = [unit.parent if d == ETC_UNITS else Path(d) for d in SEARCH_PATH]
+    # On a merged-/usr host /lib is a link to usr/lib: one directory, read once.
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for entry in SEARCH_PATH:
+        root = unit.parent if entry == ETC_UNITS else Path(entry)
+        real = os.path.realpath(root)
+        if real not in seen:
+            seen.add(real)
+            roots.append(root)
     fragment = next((d / unit.name for d in roots if os.path.lexists(d / unit.name)), None)
     if fragment is None:
         raise Refused(f"the unit {unit} does not exist")
@@ -211,6 +224,7 @@ def file_settings(unit: Path, dropin: Path) -> Settings:
             for key, _ in service_assignments(text):
                 if key in DROPIN_KEYS:
                     raise Refused(f"{conf} sets {key}= after the launcher drop-in; migrate by hand")
+    check_environment(texts)
     return Settings(
         user=unit_user(*texts),
         exec_start=unit_exec_start(*texts),
@@ -219,11 +233,36 @@ def file_settings(unit: Path, dropin: Path) -> Settings:
     )
 
 
+def check_environment(texts: list[str]) -> None:
+    """Refuse a unit whose environment can move the daemon's data
+    directory away from what the installer's `--check` (HOME and PATH
+    only) reports: an EnvironmentFile=, or an Environment= that sets HOME
+    or an XDG base directory."""
+    for text in texts:
+        for key, value in service_assignments(text):
+            if key == "EnvironmentFile" and value:
+                raise Refused("the unit sets EnvironmentFile=; migrate by hand")
+            if key != "Environment":
+                continue
+            try:
+                assignments = shlex.split(value)
+            except ValueError as error:
+                raise Refused(f"the unit's Environment= cannot be split ({error})")
+            for assignment in assignments:
+                name = assignment.split("=", 1)[0]
+                if name in DATA_ENV:
+                    raise Refused(f"the unit sets {name} in Environment=; migrate by hand")
+
+
 def systemd_settings(name: str) -> Settings | None:
-    """systemd's view of unit `name` after a reload, or None when systemd
-    does not answer (no systemctl, or no running systemd)."""
+    """systemd's view of unit `name` after a reload. None only when systemd
+    is not the running service manager; when it is, a reload or a query
+    that fails is refused."""
+    running = os.path.isdir(SYSTEMD_RUNTIME)
     systemctl = shutil.which("systemctl")
     if systemctl is None:
+        if running:
+            raise Refused("systemd is running but systemctl is not found")
         return None
 
     def run(*args: str) -> subprocess.CompletedProcess[str]:
@@ -236,11 +275,16 @@ def systemd_settings(name: str) -> Settings | None:
             check=False,
         )
 
-    if run("daemon-reload").returncode != 0:
+    reload = run("daemon-reload")
+    if reload.returncode != 0:
+        if running:
+            raise Refused(f"systemctl daemon-reload failed: {reload.stderr.strip()}")
         return None
     properties = [arg for prop in SHOW_PROPERTIES for arg in ("-p", prop)]
     shown = run("show", *properties, "--", name)
     if shown.returncode != 0:
+        if running:
+            raise Refused(f"systemctl show {name} failed: {shown.stderr.strip()}")
         return None
     values = dict(line.split("=", 1) for line in shown.stdout.splitlines() if "=" in line)
     if values.get("LoadState") != "loaded":
@@ -345,6 +389,11 @@ def render(
     if exec_start[0] != binary:
         raise Refused(f"the unit runs {exec_start[0]}, not {binary}")
     args = exec_start[1:]
+    for index, token in enumerate(args):
+        if token.startswith("--config="):
+            raise Refused("x0xd does not read --config=; use --config <absolute path>")
+        if token == "--config" and not os.path.isabs(args[index + 1] if index + 1 < len(args) else ""):
+            raise Refused("the unit's --config must be an absolute path (WorkingDirectory= is not used)")
     root = check_host_root(daemon_data_root(binary, args, home, user), owner)
     exec_start = " ".join(
         [launcher, "--host-root", root, "--instance", instance, "--", binary, *args]
@@ -366,8 +415,10 @@ def replace_file(target: Path, write, mode: int) -> None:
     """Put a new `target` in one step: a new temporary file in its
     directory (O_EXCL, mode 0700, so no other account can open it while it
     is written), `write(file)`, the final mode, fsync, rename, then fsync of
-    the directory. The umask plays no part. A failure removes the temporary
-    file and leaves `target` as it was."""
+    the directory. The umask plays no part. A failure before the rename
+    removes the temporary file and leaves `target` as it was; a failed
+    directory fsync is raised after the rename, when `target` is already
+    the new file."""
     staged = target.with_name(f".{target.name}.{secrets.token_hex(8)}.tmp")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
     fd = os.open(staged, flags, 0o700)

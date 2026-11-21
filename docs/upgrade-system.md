@@ -763,7 +763,8 @@ write; a sticky ancestor such as `/tmp` is allowed, since only an entry's
 owner may rename it there.
 
 The host root must also be the data directory of the daemon in the argv
-(#1378). Records read from another directory say nothing about this
+(#1378; it runs only once the launcher is turned on). Records read from
+another directory say nothing about this
 daemon: with no journal there, the start would pass through to a candidate
 swapped in under the daemon's own journal. The issuer derives that
 directory as x0xd does at startup, from the daemon arguments and the
@@ -777,7 +778,10 @@ not match, even one that points at the host root. A mismatch is refused
 relative one, a config file that is not valid TOML, an instance name x0xd
 would refuse, a repeated `--config` or `--name`, or the `--config=`
 spelling, which x0xd does not read. A config file that cannot be read is a
-failed read (75).
+failed read (75). The check runs before the records are read, and again
+when a passthrough that holds no install lock reads them again before its
+`exec`. `tests/launcher_data_dir_parity.rs` checks the derivation against
+`x0xd --check`.
 
 The issuer reads both records under the daemon install lock: the
 `.upgrade.lock` file beside the daemon's canonical path, the same file the
@@ -909,9 +913,17 @@ TimeoutStopSec=60
   must be left. The launcher drop-in itself is removed first and not read.
   The installer then asks systemd as well (`systemctl daemon-reload`, then
   `systemctl show -p LoadState -p FragmentPath -p DropInPaths -p User -p
-  ExecStart`), and refuses when systemd's answer differs from the files or
-  systemd does not load the unit. When systemd does not answer (no
-  `systemctl`, or no running systemd) it uses the files and says so.
+  ExecStart`), and refuses when systemd's answer differs from the files,
+  systemd does not load the unit, or the reload or the query fails while
+  systemd runs (`/run/systemd/system` exists). Only without a running
+  systemd does it use the files alone, and it says so. A search directory
+  that resolves to one already read (`/lib` on a merged-`/usr` host) is
+  read once.
+- The installer's `--check` runs with only `HOME` and `PATH`, so it refuses
+  a unit whose environment could move the data directory: `HOME`,
+  `XDG_CONFIG_HOME` or `XDG_DATA_HOME` in `Environment=`, any
+  `EnvironmentFile=`, a relative `--config` (the unit's
+  `WorkingDirectory=` is not used), and the `--config=` spelling.
 - The installer refuses ambiguity: a unit file of the same name earlier in
   systemd's search path (for example `/run/systemd/transient`), two
   drop-ins with the same file name, another `30-x0x-launcher.conf` in any
@@ -921,7 +933,8 @@ TimeoutStopSec=60
 - The launcher and the drop-in are each written as a new temporary file in
   the target directory (`O_EXCL`, mode 0700, whatever the umask), given
   their mode (0755 and 0644), synced, renamed over the target, and the
-  directory is synced.
+  directory is synced. A failed directory sync is reported after the
+  rename, when the target is already the new file.
 - The instance is the manifest instance id.
 - An `ExecStart` token that needs systemd quoting (spaces, quotes, `$` or
   `%`), or an `ExecStart` that cannot be split, is refused; such a unit is
