@@ -73,9 +73,15 @@ enum Commands {
     /// Stop a running daemon.
     Stop,
     /// Create a redacted problem-report bundle in the daemon's data
-    /// directory (`reports/`). The bundle stays on this machine; nothing
-    /// is sent. One report per minute.
-    Report,
+    /// directory (`reports/`). One report per minute. Nothing is sent
+    /// unless `--deliver-to` names one of the owner's devices.
+    Report {
+        /// Agent id (hex) of one of the owner's devices: also queue a
+        /// smaller sent copy (no log lines, no file names) to it on the
+        /// durable direct-send outbox, retried while it is offline (24 h).
+        #[arg(long)]
+        deliver_to: Option<String>,
+    },
     /// List running daemon instances. [dev]
     #[command(hide = true)]
     Instances,
@@ -3628,7 +3634,9 @@ async fn run(
             Some(WsSub::Direct { backfill }) => commands::ws::direct(&client, backfill).await,
         },
         Commands::Stop => commands::daemon::stop(&client).await,
-        Commands::Report => commands::report::create(&client).await,
+        Commands::Report { deliver_to } => {
+            commands::report::create(&client, deliver_to.as_deref()).await
+        }
         Commands::Doctor { .. } => {
             anyhow::bail!("command dispatched earlier — dispatch table out of sync")
         }

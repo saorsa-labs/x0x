@@ -3,7 +3,7 @@ METHOD  PATH                                                CLI COMMAND         
 GET  /health                                             health                                                  Health check
 GET  /status                                             status                                                  Runtime status with uptime
 POST  /shutdown                                           stop                                                    Gracefully stop the daemon
-POST  /report                                             report                                                  Authenticated (durable owner): build a redacted problem-report bundle and store it under the data directory's reports/ (#1354); one per minute; nothing is sent
+POST  /report                                             report                    body: deliver_to              Authenticated (durable owner): build a redacted problem-report bundle and store it under the data directory's reports/ (#1354); one per minute; with deliver_to (an owner device), also queue a sent copy without log lines or file names on the durable direct-send outbox
 POST  /auth/session                                       auth session                                            Exchange the durable API token for a short-lived browser session token
 POST  /auth/session/refresh                               auth refresh              body: idle_ms                 Swap a session token, live or lapsed, for a fresh one; refused once the session is idle past its timeout
 POST  /auth/session/revoke                                auth revoke                                             End the caller's own browser session (session token only)
